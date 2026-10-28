@@ -1896,11 +1896,15 @@ fn a_publication_above_the_stream_cap_is_refused_with_its_code() {
         publish(&mut driver, &small, 60),
         Outcome::Publication(_)
     ));
-    assert!(matches!(
-        publish(&mut driver, &large, 61),
+    // The detail is the lane's bytes (karyos#824): a 128 KiB-term lane.
+    let mut wider = lane;
+    wider.term_length = karyos_sys::sizing::TermLength::try_new(131_072).unwrap();
+    let bytes = crate::embedded::stream_lane_bytes(&wider, None).unwrap();
+    match publish(&mut driver, &large, 61) {
         Outcome::Refused {
             code: ErrorCode::StreamTooLarge,
-            ..
-        }
-    ));
+            detail,
+        } => assert_eq!(detail, bytes),
+        other => panic!("not refused by the cap: {other:?}"),
+    }
 }

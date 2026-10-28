@@ -517,6 +517,30 @@ impl<T: TermBytes> ReceiveOwner<T> {
         Ok(owner.first_hole()?)
     }
 
+    /// The tail hole of `lane` a sender's heartbeat at `mark` reveals, as
+    /// `(position, extent)`: from the resolved prefix to `mark`, within the
+    /// prefix's term, when nothing above the prefix is covered
+    /// (`quantstratum-docs: karyos/SPEC.md` §6, G1). `None` when the prefix
+    /// reaches `mark` or a covered extent lies above it
+    /// ([`ReceiveOwner::first_hole`] names that hole). A reliable image
+    /// NAKs it, an unreliable one seals it at its deadline.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError::Foreign`] for a lane the image does not have,
+    /// [`ReceiveError::Sys`] for a position outside the incarnation.
+    pub fn heartbeat_tail(
+        &self,
+        lane: Lane,
+        mark: u64,
+    ) -> Result<Option<(u64, u32)>, ReceiveError> {
+        let owner = self
+            .lanes
+            .get(usize::from(lane.get()))
+            .ok_or(ReceiveError::Foreign)?;
+        Ok(owner.heartbeat_tail(mark)?)
+    }
+
     /// Whether `position` of `lane` lies in the window `{r, r + 1}` of
     /// terms, `r` the term of the resolved prefix (GU-6: a position beyond
     /// it cannot be resumed). A position outside the incarnation, which a
@@ -925,6 +949,22 @@ impl<T: TermBytes> LaneOwner<T> {
                 reason: "hole extent",
             })?;
         Ok(Some((self.rebuild, end_offset - offset)))
+    }
+
+    /// The tail hole a heartbeat at `mark` reveals: from the resolved
+    /// prefix to `mark`, within the prefix's term, while nothing above the
+    /// prefix is covered. The prefix starts at the join point and never
+    /// moves below it, so neither does the hole.
+    fn heartbeat_tail(&self, mark: u64) -> Result<Option<(u64, u32)>, SysError> {
+        if self.high > self.rebuild || mark <= self.rebuild {
+            return Ok(None);
+        }
+        let (_, offset) = self.buffer.split(self.rebuild)?;
+        // Both fit: `offset` is inside the term, so the room is at most
+        // `term_length`.
+        let room = self.buffer.term_length - offset;
+        let extent = u32::try_from(mark - self.rebuild).map_or(room, |extent| extent.min(room));
+        Ok(Some((self.rebuild, extent)))
     }
 
     /// [`LogBuffer::split`], except that the end of the incarnation's last

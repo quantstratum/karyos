@@ -1001,3 +1001,109 @@ fn a_contradiction_makes_the_lane_unknown_and_finishes_it() {
     assert_eq!(frontier.read(lane(0)), faulted);
     assert_eq!(frontier.read(lane(1)).0, Final::Open);
 }
+
+/// R-CORE-21: the gate applies a newer policy the driver published at its
+/// next `set_now`, earning the old rate up to then and clamping its level
+/// to the new burst; an older or equal version, or a publication in
+/// progress, changes nothing.
+#[test]
+fn the_gate_applies_a_newer_published_policy_at_its_next_serve() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, Some(rate(10, 8)));
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (0, Some(8))
+    );
+    publish(slot.words(), 0, 2, &rate(5, 3));
+    f.gate.set_now(1);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (2, Some(3))
+    );
+    // Not newer: ignored.
+    publish(slot.words(), 0, 2, &rate(1, 1));
+    f.gate.set_now(2);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (2, Some(3))
+    );
+    // A publication in progress (an odd sequence) waits for the next call.
+    publish(slot.words(), 0, 3, &rate(1, 1));
+    slot.words()[0].fetch_add(1, Ordering::Relaxed);
+    f.gate.set_now(3);
+    assert_eq!(f.gate.policy_version(), 2);
+    slot.words()[0].fetch_add(1, Ordering::Relaxed);
+    f.gate.set_now(4);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (3, Some(1))
+    );
+}
+
+/// Words that complete a publication of version 3 right after the first
+/// plain load of the sequence word once `armed` returns: the load that
+/// validates a read, so the read is whole and the publication lands
+/// between it and anything the reader does next.
+#[derive(Debug)]
+struct RacingSlot {
+    words: HeapWords,
+    loads: AtomicU64,
+    armed: core::sync::atomic::AtomicBool,
+}
+
+impl LoadWords for RacingSlot {
+    fn load(&self, index: usize) -> Option<u64> {
+        let value = self.words.load(index);
+        if index == 0
+            && self.armed.load(Ordering::Relaxed)
+            && self.loads.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            self.armed.store(false, Ordering::Relaxed);
+            karyos_sys::rate_policy_slot::publish(self.words.words(), 0, 3, &rate(1, 1));
+        }
+        value
+    }
+
+    fn load_acquire(&self, index: usize) -> Option<u64> {
+        self.words.load_acquire(index)
+    }
+
+    fn len(&self) -> usize {
+        self.words.len()
+    }
+}
+
+/// R-CORE-21, review B2 of #814: a publication that completes right after
+/// the gate read the slot is applied at the next serve, never recorded as
+/// seen and lost.
+#[test]
+fn a_publication_completed_during_a_read_is_not_lost() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, Some(rate(10, 8)));
+    let slot = Arc::new(RacingSlot {
+        words: HeapWords::zeroed(SLOT_WORDS),
+        loads: AtomicU64::new(0),
+        armed: core::sync::atomic::AtomicBool::new(false),
+    });
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    publish(slot.words.words(), 0, 2, &rate(5, 3));
+    slot.armed.store(true, Ordering::Relaxed);
+    f.gate.set_now(1);
+    assert_eq!(f.gate.policy_version(), 2);
+    // Version 3 completed right after that read: a gate that loaded the
+    // sequence again there would take it as seen and keep version 2 for
+    // good. This one applies it at the next serve.
+    f.gate.set_now(2);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (3, Some(1))
+    );
+}

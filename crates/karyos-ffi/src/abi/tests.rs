@@ -2820,6 +2820,23 @@ fn a_zero_startup_timeout_is_refused() {
     assert_eq!(status, Status::InvalidArgument.code());
 }
 
+/// The `complete` write under Miri (ADR-0034): a caller-thread driver
+/// writes 1 into a live `uint32_t`, and its readiness is then READY. The
+/// threaded case and the deadline stay native only.
+#[test]
+fn startup_complete_writes_a_live_u32_on_the_callers_thread() {
+    use karyos_protocol::admission::probe;
+    let driver = readiness_driver(None);
+    assert_eq!(complete(driver), (Status::Ok.code(), 1));
+    let (status, out) = readiness_of(driver);
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(
+        (out.state, out.reason),
+        (u32::try_from(probe::READY).unwrap(), 0)
+    );
+    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+}
+
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn readiness_goes_from_starting_to_ready_on_the_callers_thread_and_its_own() {

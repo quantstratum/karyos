@@ -1324,6 +1324,20 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
         self.role.reclaimed_tombstones()
     }
 
+    /// The receive sessions' counters: SOLICITs, challenges, installs
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn session_counters(&self) -> crate::sessions::receive::SessionCounters {
+        self.role.session_counters()
+    }
+
+    /// How often each reason made the receive sessions ignore a control
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn ignored_controls(&self) -> crate::sessions::receive::IgnoredCounts {
+        self.role.ignored_controls()
+    }
+
     /// Whether `alias` is published on `endpoint` (tests).
     #[cfg(test)]
     pub(crate) fn is_published(
@@ -1478,6 +1492,12 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
     #[must_use]
     pub fn counters(&self) -> roles::SenderCounters {
         self.role.counters()
+    }
+
+    /// The send sessions' counters: answers and their rate drops (tests).
+    #[cfg(test)]
+    pub(crate) fn session_counters(&self) -> crate::sessions::send::SendCounters {
+        self.role.session_counters()
     }
 
     /// Whether the agent stopped: its flag was set or its conductor is
