@@ -12,6 +12,7 @@ publish.workspace = true
 
 [dependencies]
 karyos-archive.workspace = true
+karyos-codec.workspace = true
 thiserror.workspace = true
 
 [lints]

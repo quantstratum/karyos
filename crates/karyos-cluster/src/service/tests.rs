@@ -88,7 +88,7 @@ fn entry(index: u64, event_time: u64, envelope: Envelope<'_>) -> Entry {
         index,
         term: 1,
         event_time,
-        payload: envelope.to_vec(),
+        payload: envelope.to_vec().unwrap(),
     }
 }
 
@@ -124,58 +124,238 @@ fn registered() -> ServiceContainer<Register> {
 }
 
 #[test]
-fn test_envelope_round_trips_every_kind() {
+fn test_envelope_round_trips_every_template() {
     let command = [9, 8, 7];
-    for envelope in [
-        Envelope::Register { client: 3 },
-        Envelope::Close {
-            client: 3,
-            epoch: 11,
-        },
-        Envelope::Request {
-            request: Request::new(3, 11, 5, 4),
-            command: &command,
-        },
-        Envelope::Request {
-            request: Request::new(3, 11, 5, 4),
-            command: &[],
-        },
-        Envelope::TimerFired {
-            timer: 2,
-            deadline: 900,
-        },
-        Envelope::Configuration(&command),
-        Envelope::Configuration(&[]),
+    let largest = vec![0xA5; MAX_COMMAND];
+    let configuration = vec![0x5A; MAX_CONFIGURATION];
+    for (envelope, template, length) in [
+        (Envelope::Register { client: 3 }, 1, 20),
+        (
+            Envelope::Close {
+                client: 3,
+                epoch: 11,
+            },
+            2,
+            28,
+        ),
+        (
+            Envelope::Request {
+                request: Request::new(3, 11, 5, 4),
+                command: &command,
+            },
+            3,
+            12 + 32 + 2 + 3,
+        ),
+        (
+            Envelope::Request {
+                request: Request::new(3, 11, 5, 6),
+                command: &[],
+            },
+            3,
+            12 + 32 + 2,
+        ),
+        (
+            Envelope::Request {
+                request: Request::new(3, 11, u64::MAX, u64::MAX),
+                command: &largest,
+            },
+            3,
+            65581,
+        ),
+        (
+            Envelope::TimerFired {
+                timer: 2,
+                deadline: 900,
+            },
+            4,
+            28,
+        ),
+        (Envelope::Configuration(&command), 5, 12 + 2 + 3),
+        (Envelope::Configuration(&configuration), 5, 4110),
     ] {
-        let bytes = envelope.to_vec();
-        assert_eq!(bytes[0], ENVELOPE_VERSION, "{envelope:?}");
+        let bytes = envelope.to_vec().unwrap();
+        assert_eq!(bytes.len(), length, "{template}");
+        // The ADR-0036 envelope: schema 2, the template, version 1.
+        assert_eq!(&bytes[..6], &[2, 0, template, 0, 1, 0], "{template}");
+        assert_eq!(
+            u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize,
+            length
+        );
         assert_eq!(Envelope::decode(&bytes), Ok(envelope));
     }
 }
 
 #[test]
-fn test_envelope_refuses_another_version_kind_or_length() {
-    let mut bytes = Envelope::Register { client: 3 }.to_vec();
-    bytes[0] = 2;
-    assert_eq!(Envelope::decode(&bytes), Err(EnvelopeError::Version(2)));
-    assert_eq!(Envelope::decode(&[1, 9]), Err(EnvelopeError::Kind(9)));
-    assert_eq!(Envelope::decode(&[1]), Err(EnvelopeError::Length));
-    let mut long = Envelope::Close {
+fn test_envelope_refuses_what_schema_2_refuses() {
+    let out_of_range = |field| Err(CodecError::ValueOutOfRange { field });
+    // Value rules, encoding and decoding.
+    for (envelope, field) in [
+        (Envelope::Register { client: 0 }, "client"),
+        (
+            Envelope::Close {
+                client: 0,
+                epoch: 1,
+            },
+            "client",
+        ),
+        (
+            Envelope::Close {
+                client: 1,
+                epoch: 0,
+            },
+            "epoch",
+        ),
+        (
+            Envelope::Request {
+                request: Request::new(0, 1, 0, 0),
+                command: &[],
+            },
+            "client",
+        ),
+        (
+            Envelope::Request {
+                request: Request::new(1, 0, 0, 0),
+                command: &[],
+            },
+            "epoch",
+        ),
+        (
+            Envelope::Request {
+                request: Request::new(1, 1, 5, 7),
+                command: &[],
+            },
+            "lowest_unanswered",
+        ),
+    ] {
+        assert_eq!(envelope.to_vec(), out_of_range(field), "{envelope:?}");
+    }
+    let mut zero_client = Envelope::Register { client: 1 }.to_vec().unwrap();
+    zero_client[12] = 0;
+    assert_eq!(
+        Envelope::decode(&zero_client),
+        Err(CodecError::ValueOutOfRange { field: "client" })
+    );
+    let mut past = Envelope::Request {
+        request: Request::new(1, 1, 5, 6),
+        command: &[],
+    }
+    .to_vec()
+    .unwrap();
+    past[36] = 7;
+    assert_eq!(
+        Envelope::decode(&past),
+        Err(CodecError::ValueOutOfRange {
+            field: "lowest_unanswered"
+        })
+    );
+    // Length bounds of the variable fields.
+    let too_long = vec![0; MAX_CONFIGURATION + 1];
+    assert!(matches!(
+        Envelope::Configuration(&too_long).to_vec(),
+        Err(CodecError::LengthOutOfRange {
+            field: "configuration",
+            ..
+        })
+    ));
+    assert!(matches!(
+        Envelope::Configuration(&[]).to_vec(),
+        Err(CodecError::LengthOutOfRange {
+            field: "configuration",
+            min: 1,
+            ..
+        })
+    ));
+    let command = vec![0; MAX_COMMAND + 1];
+    assert!(matches!(
+        Envelope::Request {
+            request: Request::new(1, 1, 0, 0),
+            command: &command,
+        }
+        .to_vec(),
+        Err(CodecError::LengthOutOfRange {
+            field: "command",
+            ..
+        })
+    ));
+    // The envelope: another schema, version or template, a block of
+    // another length, a length that is not the input's.
+    let good = Envelope::Close {
         client: 3,
         epoch: 4,
     }
-    .to_vec();
-    long.push(0);
-    assert_eq!(Envelope::decode(&long), Err(EnvelopeError::Length));
-    let short = Envelope::TimerFired {
-        timer: 1,
-        deadline: 2,
+    .to_vec()
+    .unwrap();
+    for (at, value) in [(0, 1u8), (4, 2), (2, 9)] {
+        let mut bytes = good.clone();
+        bytes[at] = value;
+        assert!(
+            matches!(
+                Envelope::decode(&bytes),
+                Err(CodecError::UnsupportedSchema { .. })
+            ),
+            "byte {at}"
+        );
     }
-    .to_vec();
-    assert_eq!(
-        Envelope::decode(&short[..short.len() - 1]),
-        Err(EnvelopeError::Length)
-    );
+    let mut block = good.clone();
+    block[6] = 8;
+    assert!(matches!(
+        Envelope::decode(&block),
+        Err(CodecError::UnsupportedSchema { .. })
+    ));
+    let mut longer = good.clone();
+    longer.push(0);
+    assert!(matches!(
+        Envelope::decode(&longer),
+        Err(CodecError::MessageLength { .. })
+    ));
+    assert!(Envelope::decode(&good[..good.len() - 1]).is_err());
+}
+
+/// karyos#797: a payload that is not a schema 2 message stops every
+/// replica at the same index, for the same reason, and none applies past
+/// it: a safety stop.
+#[test]
+fn test_container_a_payload_not_schema_2_stops_every_replica_at_the_same_index() {
+    let bad = Entry {
+        index: 3,
+        term: 1,
+        event_time: 0,
+        payload: vec![1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    };
+    let log = [
+        entry(1, 0, Envelope::Register { client: 7 }),
+        entry(2, 0, request(1, &append(5))),
+        bad,
+        entry(4, 0, request(2, &append(6))),
+    ];
+    let stops: Vec<_> = (0..3)
+        .map(|_| {
+            let mut container = container();
+            let mut stop = None;
+            for entry in &log {
+                if let Err(error) = container.apply(entry) {
+                    stop = Some((entry.index, error));
+                    break;
+                }
+            }
+            (
+                stop,
+                container.applied(),
+                container.service().values.clone(),
+            )
+        })
+        .collect();
+    assert!(stops.windows(2).all(|pair| pair[0] == pair[1]), "{stops:?}");
+    let (stop, applied, values) = &stops[0];
+    assert!(matches!(
+        stop,
+        Some((
+            3,
+            ApplyError::Envelope(CodecError::UnsupportedSchema { .. })
+        ))
+    ));
+    assert_eq!(*applied, Some(2), "nothing past the stop");
+    assert_eq!(values, &[5]);
 }
 
 #[test]
@@ -227,7 +407,10 @@ fn test_container_refuses_an_entry_out_of_order_or_not_an_envelope() {
     };
     assert_eq!(
         container.apply(&bad),
-        Err(ApplyError::Envelope(EnvelopeError::Version(2)))
+        Err(ApplyError::Envelope(CodecError::Truncated {
+            needed: 12,
+            available: 2
+        }))
     );
     assert_eq!(container.applied(), Some(1), "nothing was applied");
 }
@@ -252,7 +435,10 @@ fn test_container_the_first_entry_must_be_index_1() {
     };
     assert_eq!(
         container.apply(&bad),
-        Err(ApplyError::Envelope(EnvelopeError::Kind(9)))
+        Err(ApplyError::Envelope(CodecError::Truncated {
+            needed: 12,
+            available: 2
+        }))
     );
     assert_eq!(
         container.apply(&entry(2, 0, Envelope::Register { client: 7 })),

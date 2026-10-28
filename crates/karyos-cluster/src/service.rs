@@ -33,35 +33,83 @@
 //!   [`Propose`], which a core's adapter implements; nothing here depends
 //!   on which core is used.
 //!
-//! The envelope's bytes are version [`ENVELOPE_VERSION`], not frozen
-//! (karyos#686, design decision D3); a schema 2 version 1 of SPEC.md §8.5
-//! replaces them before the phase 4 gate. Little endian; every envelope starts with the version byte and a
-//! kind byte:
+//! Every entry the container reads is one message of schema 2 version 1
+//! (SPEC.md §8.5; quantstratum-docs:
+//! karyos/design/cluster-service-container.md §4, karyos#797), over the
+//! ADR-0036 envelope of `karyos-codec`:
 //!
-//! | Kind | Byte | Then |
-//! | --- | --- | --- |
-//! | register | 1 | client 8 |
-//! | close | 2 | client 8, epoch 8 |
-//! | request | 3 | client 8, epoch 8, sequence 8, lowest unanswered 8, command |
-//! | timer fired | 4 | timer 8, deadline 8 |
-//! | configuration | 5 | configuration |
+//! | Template | Id | Block | Then | Maximum |
+//! | --- | --- | --- | --- | --- |
+//! | `Register` | 1 | client 8 | | 20 |
+//! | `Close` | 2 | client 8, epoch 8 | | 28 |
+//! | `Request` | 3 | client 8, epoch 8, sequence 8, lowest unanswered 8 | command, 0 to 65535 bytes | 65581 |
+//! | `TimerFired` | 4 | timer 8, deadline 8 | | 28 |
+//! | `Configuration` | 5 | none | configuration, 1 to 4096 bytes | 4110 |
+//!
+//! A client or an epoch of 0, and a lowest unanswered sequence past the
+//! sequence plus one, are `ValueOutOfRange`.
 
 #[cfg(test)]
 mod tests;
+
+use karyos_codec::{CodecError, Decoder, ENVELOPE_LENGTH, Encoder, Template, VAR_HEADER_LENGTH};
 
 use crate::dedup::{
     ConfigError, DedupConfig, Outcome, RegisterError, Registered, Request, SessionTable,
 };
 use crate::log::Entry;
 
-/// The envelope's version.
-pub const ENVELOPE_VERSION: u8 = 1;
+/// Schema 2, the Cluster's log entries.
+pub const SCHEMA_ID: u16 = 2;
+/// The only version of schema 2.
+pub const VERSION: u16 = 1;
+/// The longest command a `Request` carries.
+pub const MAX_COMMAND: usize = 65535;
+/// The longest configuration a `Configuration` carries.
+pub const MAX_CONFIGURATION: usize = 4096;
 
-const REGISTER: u8 = 1;
-const CLOSE: u8 = 2;
-const REQUEST: u8 = 3;
-const TIMER_FIRED: u8 = 4;
-const CONFIGURATION: u8 = 5;
+const fn template(template_id: u16, block_length: u16, variable: u32) -> Template {
+    Template {
+        schema_id: SCHEMA_ID,
+        template_id,
+        version: VERSION,
+        block_length,
+        max_length: ENVELOPE_LENGTH as u32 + block_length as u32 + variable,
+    }
+}
+
+const VARIABLE: u32 = VAR_HEADER_LENGTH as u32;
+/// `Register`, template 1.
+pub const REGISTER: Template = template(1, 8, 0);
+/// `Close`, template 2.
+pub const CLOSE: Template = template(2, 16, 0);
+/// `Request`, template 3.
+pub const REQUEST: Template = template(3, 32, VARIABLE + MAX_COMMAND as u32);
+/// `TimerFired`, template 4.
+pub const TIMER_FIRED: Template = template(4, 16, 0);
+/// `Configuration`, template 5.
+pub const CONFIGURATION: Template = template(5, 0, VARIABLE + MAX_CONFIGURATION as u32);
+
+/// `value`, or `ValueOutOfRange` naming `field` when it is 0.
+fn nonzero(field: &'static str, value: u64) -> Result<u64, CodecError> {
+    if value == 0 {
+        Err(CodecError::ValueOutOfRange { field })
+    } else {
+        Ok(value)
+    }
+}
+
+/// A request's lowest unanswered sequence is at most its sequence plus one.
+fn check_request(request: &Request) -> Result<(), CodecError> {
+    let _ = nonzero("client", request.client)?;
+    let _ = nonzero("epoch", request.epoch)?;
+    if request.sequence != u64::MAX && request.lowest_unanswered > request.sequence + 1 {
+        return Err(CodecError::ValueOutOfRange {
+            field: "lowest_unanswered",
+        });
+    }
+    Ok(())
+}
 
 /// One entry's content, as the container proposes and applies it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,123 +145,120 @@ pub enum Envelope<'a> {
     Configuration(&'a [u8]),
 }
 
-/// Bytes that are not an envelope of this version.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum EnvelopeError {
-    /// Another version.
-    #[error("envelope version {0}, not {ENVELOPE_VERSION}")]
-    Version(u8),
-    /// An unknown kind.
-    #[error("unknown envelope kind {0}")]
-    Kind(u8),
-    /// Cut short, or bytes left over.
-    #[error("envelope of the wrong length")]
-    Length,
-}
-
 impl<'a> Envelope<'a> {
-    /// Appends the envelope's bytes to `out`.
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        out.push(ENVELOPE_VERSION);
-        match *self {
-            Self::Register { client } => {
-                out.push(REGISTER);
-                out.extend_from_slice(&client.to_le_bytes());
-            }
-            Self::Close { client, epoch } => {
-                out.push(CLOSE);
-                out.extend_from_slice(&client.to_le_bytes());
-                out.extend_from_slice(&epoch.to_le_bytes());
-            }
-            Self::Request { request, command } => {
-                out.push(REQUEST);
-                for field in [
-                    request.client,
-                    request.epoch,
-                    request.sequence,
-                    request.lowest_unanswered,
-                ] {
-                    out.extend_from_slice(&field.to_le_bytes());
-                }
-                out.extend_from_slice(command);
-            }
-            Self::TimerFired { timer, deadline } => {
-                out.push(TIMER_FIRED);
-                out.extend_from_slice(&timer.to_le_bytes());
-                out.extend_from_slice(&deadline.to_le_bytes());
-            }
-            Self::Configuration(configuration) => {
-                out.push(CONFIGURATION);
-                out.extend_from_slice(configuration);
-            }
-        }
-    }
-
-    /// The envelope's bytes.
-    #[must_use]
-    pub fn to_vec(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        self.encode(&mut out);
-        out
-    }
-
-    /// The envelope in `bytes`.
+    /// Encodes into `out`; returns the message's length.
     ///
     /// # Errors
     ///
-    /// [`EnvelopeError`] for another version, an unknown kind, or bytes
-    /// cut short or left over.
-    pub fn decode(bytes: &'a [u8]) -> Result<Self, EnvelopeError> {
-        let [version, kind, rest @ ..] = bytes else {
-            return Err(EnvelopeError::Length);
-        };
-        if *version != ENVELOPE_VERSION {
-            return Err(EnvelopeError::Version(*version));
-        }
-        let mut fields = Fields(rest);
-        let envelope = match *kind {
-            REGISTER => Self::Register {
-                client: fields.u64()?,
-            },
-            CLOSE => Self::Close {
-                client: fields.u64()?,
-                epoch: fields.u64()?,
-            },
-            REQUEST => {
-                let request =
-                    Request::new(fields.u64()?, fields.u64()?, fields.u64()?, fields.u64()?);
-                return Ok(Self::Request {
-                    request,
-                    command: fields.0,
-                });
+    /// [`CodecError::Truncated`] for a short `out`,
+    /// [`CodecError::ValueOutOfRange`] for a value rule of schema 2, and
+    /// [`CodecError::LengthOutOfRange`] for a command or configuration
+    /// outside its bounds.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        match *self {
+            Self::Register { client } => {
+                let mut encoder = Encoder::new(out, &REGISTER)?;
+                encoder.u64(0, nonzero("client", client)?)?;
+                encoder.finish()
             }
-            TIMER_FIRED => Self::TimerFired {
-                timer: fields.u64()?,
-                deadline: fields.u64()?,
-            },
-            CONFIGURATION => return Ok(Self::Configuration(rest)),
-            other => return Err(EnvelopeError::Kind(other)),
-        };
-        if fields.0.is_empty() {
-            Ok(envelope)
-        } else {
-            Err(EnvelopeError::Length)
+            Self::Close { client, epoch } => {
+                let mut encoder = Encoder::new(out, &CLOSE)?;
+                encoder.u64(0, nonzero("client", client)?)?;
+                encoder.u64(8, nonzero("epoch", epoch)?)?;
+                encoder.finish()
+            }
+            Self::Request { request, command } => {
+                check_request(&request)?;
+                let mut encoder = Encoder::new(out, &REQUEST)?;
+                encoder.u64(0, request.client)?;
+                encoder.u64(8, request.epoch)?;
+                encoder.u64(16, request.sequence)?;
+                encoder.u64(24, request.lowest_unanswered)?;
+                encoder.bytes("command", 0, MAX_COMMAND, command)?;
+                encoder.finish()
+            }
+            Self::TimerFired { timer, deadline } => {
+                let mut encoder = Encoder::new(out, &TIMER_FIRED)?;
+                encoder.u64(0, timer)?;
+                encoder.u64(8, deadline)?;
+                encoder.finish()
+            }
+            Self::Configuration(configuration) => {
+                let mut encoder = Encoder::new(out, &CONFIGURATION)?;
+                encoder.bytes("configuration", 1, MAX_CONFIGURATION, configuration)?;
+                encoder.finish()
+            }
         }
     }
-}
 
-/// The fixed fields of an envelope, read in order.
-struct Fields<'a>(&'a [u8]);
+    /// The message's bytes.
+    ///
+    /// # Errors
+    ///
+    /// As [`Envelope::encode`], but never `Truncated`.
+    pub fn to_vec(&self) -> Result<Vec<u8>, CodecError> {
+        let max = match self {
+            Self::Register { .. } => REGISTER.max_length,
+            Self::Close { .. } => CLOSE.max_length,
+            Self::Request { .. } => REQUEST.max_length,
+            Self::TimerFired { .. } => TIMER_FIRED.max_length,
+            Self::Configuration(_) => CONFIGURATION.max_length,
+        };
+        let mut out = vec![0; usize::try_from(max).unwrap_or(usize::MAX)];
+        let length = self.encode(&mut out)?;
+        out.truncate(length);
+        Ok(out)
+    }
 
-impl Fields<'_> {
-    fn u64(&mut self) -> Result<u64, EnvelopeError> {
-        let (field, rest) = self
-            .0
-            .split_first_chunk::<8>()
-            .ok_or(EnvelopeError::Length)?;
-        self.0 = rest;
-        Ok(u64::from_le_bytes(*field))
+    /// Decodes exactly one schema 2 message from `bytes`, validated whole.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::UnsupportedSchema`] for any tuple but schema 2,
+    /// version 1 and a listed template, and every other [`CodecError`] its
+    /// fields can raise.
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, CodecError> {
+        let envelope = karyos_codec::Envelope::read(bytes)?;
+        let unsupported = CodecError::UnsupportedSchema {
+            schema: envelope.schema_id,
+            template: envelope.template_id,
+            version: envelope.version,
+        };
+        if envelope.schema_id != SCHEMA_ID || envelope.version != VERSION {
+            return Err(unsupported);
+        }
+        let template = match envelope.template_id {
+            1 => &REGISTER,
+            2 => &CLOSE,
+            3 => &REQUEST,
+            4 => &TIMER_FIRED,
+            5 => &CONFIGURATION,
+            _ => return Err(unsupported),
+        };
+        let (block, mut decoder) = Decoder::new(bytes, template)?;
+        let envelope = match envelope.template_id {
+            1 => Self::Register {
+                client: nonzero("client", block.u64(0)?)?,
+            },
+            2 => Self::Close {
+                client: nonzero("client", block.u64(0)?)?,
+                epoch: nonzero("epoch", block.u64(8)?)?,
+            },
+            3 => {
+                let request =
+                    Request::new(block.u64(0)?, block.u64(8)?, block.u64(16)?, block.u64(24)?);
+                check_request(&request)?;
+                let command = decoder.bytes("command", 0, MAX_COMMAND)?;
+                Self::Request { request, command }
+            }
+            4 => Self::TimerFired {
+                timer: block.u64(0)?,
+                deadline: block.u64(8)?,
+            },
+            _ => Self::Configuration(decoder.bytes("configuration", 1, MAX_CONFIGURATION)?),
+        };
+        decoder.finish()?;
+        Ok(envelope)
     }
 }
 
@@ -454,9 +499,10 @@ pub enum ApplyError {
         /// The last applied.
         last: Option<u64>,
     },
-    /// Its payload is not an envelope this container reads.
-    #[error(transparent)]
-    Envelope(#[from] EnvelopeError),
+    /// Its payload is not a schema 2 message: a safety stop (see
+    /// [`ServiceContainer::apply`]).
+    #[error("not a schema 2 message: {0}")]
+    Envelope(CodecError),
 }
 
 /// The container: a service, its session table and its timers, applying
@@ -528,7 +574,11 @@ impl<S: ClusteredService> ServiceContainer<S> {
     /// # Errors
     ///
     /// [`ApplyError`] for an entry out of order or a payload that is not
-    /// an envelope; the container applies nothing more.
+    /// a schema 2 message. That is a safety stop, not a recoverable error:
+    /// every replica applies the same committed entries, so every replica
+    /// stops at the same index for the same reason, and none applies past
+    /// it. The entry is never delivered, and the container applies nothing
+    /// more until an operator acts.
     pub fn apply(&mut self, entry: &Entry) -> Result<Applied<'_>, ApplyError> {
         // The log starts at index 1 until snapshot install (#065) gives
         // the container another start.
@@ -542,7 +592,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
         let envelope = if entry.payload.is_empty() {
             None
         } else {
-            Some(Envelope::decode(&entry.payload)?)
+            Some(Envelope::decode(&entry.payload).map_err(ApplyError::Envelope)?)
         };
         self.applied = Some(entry.index);
         let Self {
