@@ -42,7 +42,7 @@ const MINIMUM_ABI: [u32; 3] = [0, 1, 3];
 /// Versions): a runner offers one only on a library at its floor or
 /// later, and declares it absent otherwise, so the rest of the suite still
 /// runs. `embedded-network` needs 0.1.4's `karyos_driver_options.network`
-/// (karyos#735).
+/// (karyos#735), and `stream-cap` 0.1.5's `max_stream_bytes` (karyos#818).
 const FEATURE_ABI: [(&str, [u32; 3]); 2] =
     [("embedded-network", [0, 1, 4]), ("stream-cap", [0, 1, 5])];
 
@@ -617,12 +617,18 @@ fn check_op(step: &Step, features: &BTreeSet<String>, names: &BTreeSet<String>, 
                 status, "invalid_handle",
                 "{at}: `invalid_handle` is no op outcome"
             );
-            // Only an Archive's refusal carries a result: its code.
+            // Only an Archive's refusal carries a result, its code, and a
+            // stream's refusal its detail (karyos#818).
             let code_only = status == "refused"
                 && ARCHIVE_REFUSALS.contains(&op.name)
                 && step.results.keys().all(|name| name == "code");
+            let detail = op.name == "driver.add_stream"
+                && step
+                    .results
+                    .keys()
+                    .all(|name| name == "code" || name == "value");
             assert!(
-                step.results.is_empty() || code_only,
+                step.results.is_empty() || code_only || detail,
                 "{at}: a status expects no results"
             );
         }

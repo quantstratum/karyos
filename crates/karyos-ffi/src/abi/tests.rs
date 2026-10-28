@@ -3191,8 +3191,16 @@ fn an_older_driver_options_struct_has_no_network_and_a_bad_value_is_refused() {
 /// A driver whose options carry `max_stream_bytes`, and the default
 /// stream's `karyos_driver_add_stream`: the status and the detail.
 fn capped_add_stream(max_stream_bytes: u64) -> (i32, Detail) {
+    capped_add_stream_sized(max_stream_bytes, size_of_u32::<DriverOptions>())
+}
+
+/// As [`capped_add_stream`], from a driver options struct of `size` bytes:
+/// the bytes past it hold the cap all the same, as an older caller's
+/// memory may.
+fn capped_add_stream_sized(max_stream_bytes: u64, size: u32) -> (i32, Detail) {
     let mut options = default_driver_options();
     options.max_stream_bytes = max_stream_bytes;
+    options.size = size;
     let mut driver = 0;
     // SAFETY: live, aligned pointers; no detail.
     let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
@@ -3249,4 +3257,61 @@ fn an_older_driver_options_struct_has_no_stream_cap() {
     // SAFETY: as above.
     let read = unsafe { read_sized(&given, DRIVER_OPTIONS_SIZE_0_1, default_driver_options()) };
     assert_eq!(read.unwrap().max_stream_bytes, 1);
+}
+
+/// An older caller's struct (ABI 0.1.4, 72 bytes) through
+/// `karyos_driver_create`: no cap, whatever lies past it, so a stream a
+/// 1-byte cap would refuse is added.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn an_older_callers_stream_cap_is_none_whatever_lies_past_its_struct() {
+    assert_eq!(capped_add_stream_sized(1, 72).0, Status::Ok.code());
+    assert_eq!(
+        capped_add_stream_sized(1, size_of_u32::<DriverOptions>()).0,
+        Status::InvalidArgument.code()
+    );
+}
+
+/// A client's `karyos:udp` publication on a driver with its network on and
+/// a cap set through the C options (ABI 0.1.5) is `KARYOS_E_REFUSED` with
+/// CnC code 24 in `code` and the lane's bytes in `value`.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_network_publication_above_the_options_cap_is_refused_with_code_24() {
+    let mut options = default_driver_options();
+    options.network = api::driver::NETWORK_ON;
+    options.max_stream_bytes = 1;
+    let mut driver = 0;
+    // SAFETY: live, aligned pointers; no detail.
+    let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(
+        karyos_driver_start(driver, crate::api::client::IDLE_YIELD, 0),
+        Status::Ok.code()
+    );
+    let mut client = 0;
+    // SAFETY: a live, aligned `u64`; no detail.
+    let status = unsafe { karyos_driver_connect(driver, &mut client, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    let _opened = Opened {
+        driver,
+        client,
+        ..Opened::default()
+    };
+    let uri =
+        std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{}", test_port())).unwrap();
+    let mut publication = 0;
+    let mut detail = Detail {
+        size: size_of_u32::<Detail>(),
+        reserved: 7,
+        code: 7,
+        value: 7,
+    };
+    // SAFETY: a live C string, a live `u64` and a sized detail.
+    let status = unsafe {
+        karyos_client_add_publication(client, uri.as_ptr(), 818, &mut publication, &mut detail)
+    };
+    assert_eq!(status, Status::Refused.code());
+    assert_eq!(detail.code, 24, "StreamTooLarge");
+    assert!(detail.value > 1, "the lane's bytes: {}", detail.value);
 }

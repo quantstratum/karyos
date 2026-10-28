@@ -664,7 +664,8 @@ int32_t karyos_client_close(uint64_t client);
  * driver in another process; an embedded driver's client is refused one
  * with KARYOS_E_REFUSED, detail code 6 (invalid publication mode). A
  * karyos:udp publication whose lanes are above the driver's
- * max_stream_bytes (karyosd --max-stream-bytes) is KARYOS_E_REFUSED,
+ * max_stream_bytes (karyos_driver_options or karyosd --max-stream-bytes)
+ * is KARYOS_E_REFUSED,
  * detail code 24 with the lane's bytes in value; no retry of the same
  * uri succeeds.
  */

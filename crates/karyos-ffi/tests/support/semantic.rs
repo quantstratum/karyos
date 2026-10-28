@@ -330,7 +330,10 @@ impl Adapter {
                 let (status, driver) = match op {
                     "driver.create" => abi::driver_create(),
                     "driver.create_networked" => abi::driver_create_networked(),
-                    _ => abi::driver_create_capped(args.narrow("max_stream_bytes", None)),
+                    "driver.create_capped" => {
+                        abi::driver_create_capped(args.narrow("max_stream_bytes", None))
+                    }
+                    other => unreachable!("{at}: {other} is no driver.create op"),
                 };
                 if status != 0 {
                     return Answer::Status(self.name(status, at));
@@ -389,8 +392,19 @@ impl Adapter {
                     "conflation_journal_capacity",
                     Some(options.conflation_journal_capacity),
                 );
-                let (status, _) = abi::driver_add_stream(self.objects[driver].handle, &options);
-                self.plain(status, at)
+                let (status, detail) =
+                    abi::driver_add_stream(self.objects[driver].handle, &options);
+                if status == 0 {
+                    return self.plain(status, at);
+                }
+                // A refusal carries its detail (FORMAT.md, Ops; karyos#818).
+                Answer::StatusWith(
+                    self.name(status, at),
+                    results([
+                        ("code", Value::Integer(i128::from(detail.code))),
+                        ("value", Value::Integer(i128::from(detail.value))),
+                    ]),
+                )
             }
             "driver.start" => {
                 let driver = args.object("driver");

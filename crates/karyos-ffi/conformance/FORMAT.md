@@ -238,7 +238,7 @@ An `op` is followed by an `expect` that starts with its outcome:
 - `ok`, then the results it checks as `name=value`;
 - `status=<name>`: a failure, named by its header status in lower case
   without `KARYOS_E_` (`not_connected`, `claim_outstanding`, `closed`),
-  with no results but one exception below. A binding maps its own
+  with no results but two exceptions below. A binding maps its own
   results to these names through the one mapping it already has
   (BIND-S1); the class follows the header's range, and whether the
   binding returns or raises it is the binding's own policy. A name the
@@ -248,7 +248,9 @@ An `op` is followed by an `expect` that starts with its outcome:
   Archive's response code (1 an error, such as a host's refusal; 2 an
   unknown recording; 3 an unknown replay; 4 an invalid request; 5 an
   unsupported schema), so a refusal for one reason cannot pass for
-  another.
+  another. And after any status, `driver.add_stream` may check `code` and
+  `value`, its `karyos_detail` (karyos#818): above a driver's stream cap,
+  the lane's bytes and the cap.
 
 A result checked as `name>=value` (format 2, either layer) holds an
 integer at least `value`; `value` is a literal or a bound variable.
@@ -292,7 +294,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `driver.create` | none | `driver` | `embedded-driver` |
 | `driver.create_networked` | none: the options of `karyos_driver_options_init` with `network` set to `KARYOS_NETWORK_ON` | `driver` | `embedded-driver`, `embedded-network` |
 | `driver.create_capped` | `max_stream_bytes`: the options of `karyos_driver_options_init` with `max_stream_bytes` set | `driver` | `embedded-driver`, `stream-cap` |
-| `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none | `embedded-driver` |
+| `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none; on a failure, `code` and `value` of its `karyos_detail` beside the status | `embedded-driver` |
 | `driver.start` | `driver`, [`idle_strategy`: `"busy_spin"`, `"yield"`, `"sleep"` or `"yield_then_sleep"`, default `"yield_then_sleep"`, the ABI's declared default; `idle_sleep_ns`] | none | `embedded-driver` |
 | `driver.do_work` | `driver` | `work` | `embedded-driver` |
 | `driver.subscribe_conflated` | `driver`, `stream_id` | `conflated` | `embedded-driver`, `conflation` |
