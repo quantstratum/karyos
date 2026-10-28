@@ -9,21 +9,24 @@
     removal is reported in the cycle it happens, whatever the state of
     the publication (served or not, established or not) or of its
     queues (an endpoint reset included), and it is retired at that
-    report. Its route and queues go to the sender's close list: items
-    still pending in its queues come back as `QueueClosed` and are
-    counted in `removed_returned`, as for a removed publication, and
-    another epoch's handles are skipped. Until its report it holds its
-    slot: while the conductor's event ring was full, remove and add
-    churn grew the per-destination state past `MAX_DESTINATIONS` and
-    allocated on the duty path. An addition now answers `Full` instead,
-    and a move at capacity retried after the removal shows in
-    `network_removed_destinations` finds the slot free. A removal, a
-    refused addition, a report with its retirement and the drain
-    allocate nothing; only an accepted addition does. When the sender's
-    fixed close list has no room, retired routes and queues are carried
-    over to the next duty (`close_deferred`), and a retirement that finds
-    the retired list full waits with its slot (`retire_deferred`):
-    nothing is dropped.
+    report, with its quarantine counted from its removal (MD-14). Its
+    route and queues go to the sender's close list: items still pending
+    in its queues come back as `QueueClosed` and are counted in
+    `removed_returned` and `removed_closed` (both now cover retired
+    destinations too). Handles of an epoch older than the publication's
+    died with that epoch and are dropped. Its slot is held until its
+    route and queues leave for the close list, which the next duty
+    closes before it serves commands, so a new destination never opens
+    beside an old route. While the conductor's event ring was full,
+    remove and add churn grew the per-destination state past
+    `MAX_DESTINATIONS` and allocated on the duty path; an addition now
+    answers `Full` instead, and a move at capacity retried after the
+    removal shows in `network_removed_destinations` finds the slot free.
+    A removal, a refused addition, a report with its retirement and the
+    drain allocate nothing; only an accepted addition does. When the
+    close list has no room, retired routes and queues are carried over to
+    the next duty, counted once each (`close_deferred`), and keep their
+    slots: nothing is dropped.
   - A route table, queue entries or TX slots that other publications
     filled (`RouteLimit`, `QueueLimit`, `OverCommitted`) no longer count
     as the destination's own fault, so an optional destination is not

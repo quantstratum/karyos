@@ -609,8 +609,9 @@ fn a_required_destination_neither_moves_nor_restarts() {
     );
 }
 
-/// Design 3.7: a removed destination retires once drained and reported:
-/// its queues and route close and its slot is freed. Twenty moves of an
+/// Design 3.7: a removed destination is reported and retired, as a
+/// removed publication is: its queues and route close at the next duty
+/// and its slot is freed then. Twenty moves of an
 /// optional destination never answer `Full`, never fail to open, and leave
 /// the publication with its two destinations; the removal history keeps
 /// the newest sixteen and counts the rest.
@@ -675,8 +676,9 @@ fn twenty_moves_neither_fill_the_table_nor_leak() {
 
 /// Plan 157, point 2: a move at `MAX_DESTINATIONS` answers `Full` while
 /// the removed destination holds its slot, and once its removal shows in
-/// `network_removed_destinations` (reported only once drained), the move
-/// retried is added. It checks the public contract end to end in both
+/// `network_removed_destinations` (it is reported at once, retired at the
+/// report, and its route and queues closed at the next duty, before that
+/// duty serves commands), the move retried is added. It checks the public contract end to end in both
 /// threading modes; the timing it relies on (an addition retires what was
 /// reported) is guarded by the unit test
 /// `an_addition_after_the_removal_is_reported_finds_the_slot_free`, and
@@ -722,14 +724,14 @@ fn move_at_capacity(threading: ThreadingMode) {
     }
     let changes: Vec<DestinationChange> = answers.iter().map(|(_, change)| *change).collect();
     match threading {
-        // One thread serves the two commands back to back: the removal
-        // has not drained yet.
+        // One thread serves the two commands back to back, before the
+        // removal is reported.
         ThreadingMode::Shared => assert_eq!(
             changes,
             [DestinationChange::Removed, DestinationChange::Full],
             "the slot is held until the removal retires"
         ),
-        // The sender's thread may drain, report and retire the removal
+        // The sender's thread may report, retire and close the removal
         // between the two posts: either answer, then the end state below.
         _ => assert!(
             matches!(

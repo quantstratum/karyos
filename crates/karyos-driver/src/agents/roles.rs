@@ -364,16 +364,19 @@ pub struct SenderCounters {
     /// single-path lanes that sent nothing for `sender_heartbeat_interval`
     /// (SPEC §6).
     pub heartbeats_sent: u64,
-    /// Queues and routes of removed publications the sender closed at its
-    /// next duty (driver-network-agents.md §7: the sender drops its
-    /// queues); a repair queue counts as one, a route as one.
+    /// Queues and routes of removed publications, and of retired
+    /// destinations of a multi-destination publication, the sender closed
+    /// at its next duty (driver-network-agents.md §7: the sender drops its
+    /// queues; multi-destination-unicast.md 3.7); a repair queue counts as
+    /// one, a route as one.
     pub removed_closed: u64,
-    /// Items still pending in a removed publication's queues when they
-    /// closed, returned with `QueueClosed`.
+    /// Items still pending in those queues when they closed, returned
+    /// with `QueueClosed`.
     pub removed_returned: u64,
     /// Removed publications' routes or queues not recorded for closing:
     /// the preallocated close list was full (never, by construction; their
-    /// endpoint's next reset drops them).
+    /// endpoint's next reset drops them). A retired destination's are
+    /// carried over instead (`OutboundCounters::close_deferred`).
     pub removed_unrecorded: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
@@ -4785,9 +4788,6 @@ impl<T: StreamTerms> SenderRole<T> {
         let now = (self.clock)();
         for outbound in &mut self.publications {
             while let Some(removal) = outbound.removal_unreported() {
-                if let Some(membership) = outbound.membership_mut() {
-                    let _ = membership.release_source(removal.destination, now);
-                }
                 let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
                 let Some(identity) = self.sessions.identity(endpoint, alias) else {
                     break;
@@ -4800,6 +4800,11 @@ impl<T: StreamTerms> SenderRole<T> {
                 };
                 if !post(event) {
                     return;
+                }
+                // Its member expires once, with the report: a retry while
+                // the ring is full never expires it again.
+                if let Some(membership) = outbound.membership_mut() {
+                    let _ = membership.release_source(removal.destination, now);
                 }
                 outbound.removal_reported(removal.destination, now);
             }
