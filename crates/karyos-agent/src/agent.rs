@@ -82,7 +82,7 @@ impl AgentConfig {
     #[must_use]
     pub fn with_agent_id(mut self, id: String) -> Self {
         // The same rule as `--agent-id`; an id outside it is not taken.
-        self.agent_id = valid_agent_id(&id).then_some(id);
+        self.agent_id = crate::api::valid_agent_id(&id).then_some(id);
         self
     }
 
@@ -129,16 +129,6 @@ impl AgentConfig {
         self.archives.push((dir, catalog));
         self
     }
-}
-
-/// Whether `id` is an agent id `--agent-id` takes: 1 to 64 bytes of
-/// letters, digits, `.`, `_`, `:`, `/` and `-` (R-CORE-24).
-#[must_use]
-pub fn valid_agent_id(id: &str) -> bool {
-    (1..=64).contains(&id.len())
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
 }
 
 /// One watched driver.

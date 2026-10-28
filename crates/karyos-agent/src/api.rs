@@ -25,6 +25,16 @@ pub struct AgentView {
     pub agent: AgentIdentity,
 }
 
+/// Whether `id` is an agent id `--agent-id` takes: 1 to 64 bytes of
+/// letters, digits, `.`, `_`, `:`, `/` and `-` (R-CORE-24).
+#[must_use]
+pub fn valid_agent_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
+}
+
 /// The agent's own identity, distinct from the drivers it watches
 /// (R-CORE-24; karyos#728).
 #[derive(Debug, Clone, PartialEq, Eq)]

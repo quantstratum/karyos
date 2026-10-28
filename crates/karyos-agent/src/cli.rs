@@ -80,7 +80,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
             "--api-dir" if api_dir.is_none() => api_dir = Some(PathBuf::from(value)),
             "--journal" if journal.is_none() => journal = Some(PathBuf::from(value)),
             "--agent-id" if agent_id.is_none() => {
-                if !crate::agent::valid_agent_id(value) {
+                if !crate::api::valid_agent_id(value) {
                     return None;
                 }
                 agent_id = Some(value.clone());
