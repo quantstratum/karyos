@@ -745,7 +745,7 @@ impl<T: StreamTerms> Outbound<T> {
         let spacing = fanout.open_spacing;
         let (mut route_failures, mut queue_failures, mut removed) = (0u64, 0u64, 0u64);
         let mut limits = 0u64;
-        let mut route_limited = false;
+        let mut limited = false;
         let endpoint = self.endpoint;
         for target in &mut fanout.targets {
             if target.opened == Some(epoch) || target.removed.is_some() {
@@ -765,7 +765,7 @@ impl<T: StreamTerms> Outbound<T> {
                     route_failures = route_failures.saturating_add(1);
                     if error == karyos_io::backend::RouteError::RouteLimit {
                         limits = limits.saturating_add(1);
-                        route_limited = true;
+                        limited = true;
                     }
                     if open_failed(target, route_own(error), (now, spacing)) {
                         removed = removed.saturating_add(1);
@@ -814,6 +814,7 @@ impl<T: StreamTerms> Outbound<T> {
                 queue_failures = queue_failures.saturating_add(1);
                 if queue_limit(error) {
                     limits = limits.saturating_add(1);
+                    limited = true;
                 }
                 continue;
             }
@@ -840,8 +841,8 @@ impl<T: StreamTerms> Outbound<T> {
             .bump(|c| &mut c.queue_failures, queue_failures);
         self.counters.bump(|c| &mut c.removed_fault, removed);
         self.counters.bump(|c| &mut c.endpoint_limits, limits);
-        if route_limited {
-            self.note_route_limit(endpoint);
+        if limited {
+            super::note_limited(&mut self.limited, endpoint, epoch);
         }
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return false;
@@ -1443,7 +1444,7 @@ const fn route_own(error: karyos_io::backend::RouteError) -> bool {
 /// failure is the destination's own; the others are not limits either: a
 /// reset (`NotActive`, `NeedsReset`), identities exhausted, a report not
 /// empty, or a stale handle.
-const fn queue_limit(error: karyos_io::backend::QueueError) -> bool {
+pub(super) const fn queue_limit(error: karyos_io::backend::QueueError) -> bool {
     use karyos_io::backend::QueueError;
     matches!(
         error,

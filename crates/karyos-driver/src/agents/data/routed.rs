@@ -960,13 +960,8 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 Ok(route) => route,
                 Err(error) => {
                     self.counters.bump(|c| &mut c.route_failures, 1);
-                    // Its endpoint refused it for the route limit
-                    // (`Outbound::note_route_limit`).
-                    if error == karyos_io::backend::RouteError::RouteLimit
-                        && !self.route_limited.contains(&Some(slot.endpoint))
-                        && let Some(free) = self.route_limited.iter_mut().find(|at| at.is_none())
-                    {
-                        *free = Some(slot.endpoint);
+                    if error == karyos_io::backend::RouteError::RouteLimit {
+                        super::note_limited(&mut self.limited, slot.endpoint, epoch);
                     }
                     continue;
                 }
@@ -983,8 +978,11 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                             *held = queue;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.counters.bump(|c| &mut c.queue_failures, 1);
+                        if super::fanout::queue_limit(error) {
+                            super::note_limited(&mut self.limited, slot.endpoint, epoch);
+                        }
                         for queue in slot.queues.iter().take(lane) {
                             let _ = tx.close_queue(*queue, &mut self.report);
                             while self.report.pop_front().is_some() {}

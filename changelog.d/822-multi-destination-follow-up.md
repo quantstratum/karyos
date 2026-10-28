@@ -28,12 +28,18 @@
     endpoint's TX half is not held at its duty (the half is in a reset,
     which drops the handles, or retired), or is of another epoch, is
     dropped and counted once (`removed_dropped`); a handle already gone
-    counts as closed. An entry with a live handle the endpoint will not
-    close is counted once (`removed_close_failed`) and not retried. When
-    that endpoint then refuses a route for its route limit, on any open
-    path, in the same epoch, its reset is asked for, once per epoch,
-    which drops what did not close; without a failed close in the epoch
-    the limit is an ordinary refusal and resets nothing. With the
+    counts as closed. An entry whose queue still has frames in flight is
+    closed once more at the next duty (`removed_close_deferred`); one
+    with a live handle the endpoint will not close is counted once
+    (`removed_close_failed`), as is a control route of the sender that
+    will not close. When that endpoint then refuses a route or a queue
+    for its limit (`RouteLimit`, `QueueLimit`, `OverCommitted`), on any
+    open path or control route, in the same epoch, its reset is asked
+    for, and asked again every `RESET_REQUEST_CYCLES` while the limit
+    holds, so the endpoint table's backoff cannot swallow it; the served
+    reset starts a new epoch, which drops what did not close. Without a
+    failed close in the epoch the limit is an ordinary refusal and
+    resets nothing. With the
     quarantine full, the record removed earliest makes room, the
     incoming one included; an incoming record already past its
     quarantine is not kept.

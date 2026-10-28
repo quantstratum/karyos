@@ -363,9 +363,10 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     route: Option<RouteId>,
     /// See [`Outbound::needs_reset`].
     needs_reset: bool,
-    /// The endpoints that refused one of its routes for their route limit
-    /// since the sender last asked ([`Outbound::take_route_limited`]).
-    route_limited: [Option<EndpointId>; karyos_io::lanes::routes::MAX_ROUTES],
+    /// The endpoints that refused one of its routes or queues for their
+    /// limit since the sender last asked, with the epoch they refused it
+    /// in ([`Outbound::take_limited`]).
+    limited: Limited,
     /// The sender cycle its last reset request was posted in, while it
     /// needs a reset.
     reset_requested: Option<u64>,
@@ -581,7 +582,7 @@ impl<T: StreamTerms> Outbound<T> {
             tracks,
             opened: None,
             needs_reset: false,
-            route_limited: [None; karyos_io::lanes::routes::MAX_ROUTES],
+            limited: [None; karyos_io::lanes::routes::MAX_ROUTES],
             reset_requested: None,
             report: TxReport::new(),
             next_token: 1,
@@ -1164,7 +1165,7 @@ impl<T: StreamTerms> Outbound<T> {
             Err(error) => {
                 self.counters.bump(|c| &mut c.route_failures, 1);
                 if error == karyos_io::backend::RouteError::RouteLimit {
-                    self.note_route_limit(self.endpoint);
+                    note_limited(&mut self.limited, self.endpoint, epoch);
                 }
                 return false;
             }
@@ -1177,14 +1178,20 @@ impl<T: StreamTerms> Outbound<T> {
                 route,
                 max_pending: NonZeroU16::new(STAGED_PER_LANE).unwrap_or(NonZeroU16::MIN),
             });
-            let Ok(opened) = opened else {
-                self.counters.bump(|c| &mut c.queue_failures, 1);
-                for queue in self.queues.iter().take(lane) {
-                    let _ = tx.close_queue(*queue, &mut self.report);
-                    while self.report.pop_front().is_some() {}
+            let opened = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    if fanout::queue_limit(error) {
+                        note_limited(&mut self.limited, self.endpoint, epoch);
+                    }
+                    self.counters.bump(|c| &mut c.queue_failures, 1);
+                    for queue in self.queues.iter().take(lane) {
+                        let _ = tx.close_queue(*queue, &mut self.report);
+                        while self.report.pop_front().is_some() {}
+                    }
+                    let _ = tx.remove_route(route);
+                    return false;
                 }
-                let _ = tx.remove_route(route);
-                return false;
             };
             if let Some(queue) = self.queues.get_mut(lane) {
                 *queue = opened;
@@ -1735,23 +1742,10 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
-    /// The endpoints that refused one of its routes for their route limit
-    /// since the last call, which clears them.
-    pub(crate) fn take_route_limited(
-        &mut self,
-    ) -> [Option<EndpointId>; karyos_io::lanes::routes::MAX_ROUTES] {
-        std::mem::take(&mut self.route_limited)
-    }
-
-    /// Records that `endpoint` refused one of its routes for its route
-    /// limit: on any open path, single, routed or multi-destination.
-    pub(super) fn note_route_limit(&mut self, endpoint: EndpointId) {
-        if self.route_limited.contains(&Some(endpoint)) {
-            return;
-        }
-        if let Some(slot) = self.route_limited.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(endpoint);
-        }
+    /// The endpoints that refused one of its routes or queues for their
+    /// limit since the last call, which clears them.
+    pub(crate) fn take_limited(&mut self) -> Limited {
+        std::mem::take(&mut self.limited)
     }
 
     /// Whether the endpoint needs a reset before this publication can send
@@ -2435,6 +2429,23 @@ const _: () = assert!(
     karyos_sys::frame::Lane::COUNT == 4,
     "OPENED_QUEUES is a queue per lane and the repair queue"
 );
+
+/// The endpoints that refused a route or a queue for their limit, each
+/// with the epoch it refused in.
+pub(crate) type Limited = [Option<(EndpointId, BackendEpoch)>; MAX_ROUTES];
+
+/// Records in `limited` that `endpoint` refused a route or a queue for its
+/// limit in `epoch` (`RouteLimit`, `QueueLimit` or `OverCommitted`): on
+/// any open path, single, routed or multi-destination. Once per endpoint
+/// and epoch; a full table drops it, since the paths' routes bound it.
+pub(super) fn note_limited(limited: &mut Limited, endpoint: EndpointId, epoch: BackendEpoch) {
+    if limited.contains(&Some((endpoint, epoch))) {
+        return;
+    }
+    if let Some(slot) = limited.iter_mut().find(|slot| slot.is_none()) {
+        *slot = Some((endpoint, epoch));
+    }
+}
 
 /// A publication's route and queues on one endpoint, in one epoch
 /// ([`Outbound::opened_resources`]).

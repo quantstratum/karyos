@@ -970,8 +970,9 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
     },
     /// An agent asks for an endpoint reset: on the sender, a publication on
     /// `endpoint` needs one before it can send again
-    /// (`Outbound::needs_reset`); on the receiver, a route fault holds an
-    /// image's NAKs (RC-6). Posted unsolicited into a free slot, and again
+    /// (`Outbound::needs_reset`), or a route or queue it refused for its
+    /// limit after a close failed in that epoch (#838); on the receiver, a
+    /// route fault holds an image's NAKs (RC-6). Posted unsolicited into a free slot, and again
     /// every `RESET_REQUEST_CYCLES` cycles while the need holds; the
     /// endpoint table ignores it unless the endpoint is active.
     ResetRequested {
