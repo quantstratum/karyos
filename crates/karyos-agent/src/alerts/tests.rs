@@ -17,6 +17,7 @@ fn sample(consistent: bool, lags: &[(u64, Option<i64>)]) -> Sample {
         age_ns: Some(0),
         counters: Vec::new(),
         lanes: vec![Lane {
+            sampled_ns: None,
             stream: 3,
             lane: 0,
             limit: Some(1 << 30),
@@ -26,6 +27,8 @@ fn sample(consistent: bool, lags: &[(u64, Option<i64>)]) -> Sample {
             subscribers: lags
                 .iter()
                 .map(|&(registration, lag)| Subscriber {
+                    cell_registration: 0,
+                    changed_ns: None,
                     registration,
                     label: String::new(),
                     position: 0,

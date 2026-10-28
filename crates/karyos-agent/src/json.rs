@@ -527,7 +527,12 @@ fn counter_json(out: &mut Out<'_>, counter: &Counter) {
         fields.number("lane", counter.lane);
         fields.number("kind", counter.kind);
         fields.number("participant", counter.participant);
+        fields.number("cell_registration", counter.cell_registration);
         fields.number("value", counter.value);
+        fields.number("read_ns", counter.read_ns);
+        fields
+            .key("changed_ns")
+            .option(counter.changed_ns, |out, at| out.number(at));
     });
 }
 
@@ -552,17 +557,24 @@ fn lane_json(out: &mut Out<'_>, lane: &Lane) {
             .array(&lane.subscribers, |out, subscriber| {
                 subscriber_json(out, subscriber)
             });
+        fields
+            .key("sampled_ns")
+            .option(lane.sampled_ns, |out, at| out.number(at));
     });
 }
 
 fn subscriber_json(out: &mut Out<'_>, subscriber: &Subscriber) {
     out.object(|fields| {
         fields.number("registration", subscriber.registration);
+        fields.number("cell_registration", subscriber.cell_registration);
         fields.string("label", &subscriber.label);
         fields.number("position", subscriber.position);
         fields
             .key("lag")
             .option(subscriber.lag, |out, value| out.number(value));
+        fields
+            .key("changed_ns")
+            .option(subscriber.changed_ns, |out, at| out.number(at));
     });
 }
 

@@ -17,6 +17,9 @@ use crate::api::{
 
 fn counter(label: &str, type_id: u64, value: u64) -> Counter {
     Counter {
+        cell_registration: 0,
+        read_ns: 0,
+        changed_ns: None,
         label: label.to_owned(),
         type_id,
         stream: 0,
@@ -44,6 +47,7 @@ fn view() -> AgentView {
                 counter("odd\nlabel", 99, 1),
             ],
             lanes: vec![Lane {
+                sampled_ns: None,
                 stream: 3,
                 lane: 1,
                 limit: Some(4096),
@@ -51,6 +55,8 @@ fn view() -> AgentView {
                 floor: None,
                 headroom: Some(3072),
                 subscribers: vec![Subscriber {
+                    cell_registration: 0,
+                    changed_ns: None,
                     registration: 5,
                     label: "subscriber position".to_owned(),
                     position: 2048,
@@ -61,11 +67,17 @@ fn view() -> AgentView {
         client_counters: vec![
             counter("messages", TYPE_EVENT, 3),
             Counter {
+                cell_registration: 0,
+                read_ns: 0,
+                changed_ns: None,
                 kind: karyos_sys::counters::KIND_CLIENT,
                 participant: 11,
                 ..counter("orders \"filled\"\nby desk", TYPE_APPLICATION_EVENT, 42)
             },
             Counter {
+                cell_registration: 0,
+                read_ns: 0,
+                changed_ns: None,
                 kind: karyos_sys::counters::KIND_CLIENT,
                 participant: 11,
                 ..counter("queue\\depth", TYPE_APPLICATION_GAUGE, 7)

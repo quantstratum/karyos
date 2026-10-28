@@ -139,7 +139,11 @@ struct Driver {
     instance: Option<u128>,
     state: DriverState,
     sample: Option<Sample>,
+    /// The driver counters' last values, for their `changed_ns`.
+    changes: model::Changes,
     client_counters: Vec<Counter>,
+    /// The client counters' last values.
+    client_changes: model::Changes,
     errors: Follower<ErrorEntry>,
     losses: Follower<LossEntry>,
     guards: Follower<GuardEntry>,
@@ -185,7 +189,9 @@ impl Agent {
                     reason: "not attached yet".to_owned(),
                 },
                 sample: None,
+                changes: model::Changes::default(),
                 client_counters: Vec::new(),
+                client_changes: model::Changes::default(),
                 errors: Follower::new(config.history),
                 losses: Follower::new(config.history),
                 guards: Follower::new(config.history),
@@ -456,6 +462,8 @@ impl Driver {
                 Ok(tool) => {
                     // A new instance is a new driver: its rings start over.
                     if self.instance != Some(tool.instance()) {
+                        self.changes.restart();
+                        self.client_changes.restart();
                         self.errors.restart();
                         self.losses.restart();
                         self.guards.restart();
@@ -487,11 +495,12 @@ impl Driver {
             return;
         };
         // Read first, so the last values of a driver that exits are kept.
-        self.sample = Some(read_sample(tool.counters()));
-        self.client_counters = read_cells(tool.client_counters())
-            .iter()
-            .map(|(metadata, value)| model::counter(metadata, *value))
-            .collect();
+        self.sample = Some(read_sample(tool.counters(), &mut self.changes));
+        self.client_counters = model::counters(
+            &read_cells(tool.client_counters()),
+            host_monotonic_ns(),
+            &mut self.client_changes,
+        );
         read_rings(tool, &mut self.errors, &mut self.losses, &mut self.guards);
         if let Some(window) = self.trace.as_mut() {
             window.scan(tool.trace_mirror(), host_monotonic_ns());
@@ -594,7 +603,7 @@ fn read_cells(reader: &CountersReader) -> Vec<Cell> {
 }
 
 /// One sampling pass of the driver counters.
-fn read_sample(counters: &CountersReader) -> Sample {
+fn read_sample(counters: &CountersReader, changes: &mut model::Changes) -> Sample {
     let epoch = (0..counters.capacity()).find(|&index| {
         matches!(counters.read(index), CellRead::Allocated { metadata, .. }
             if metadata.label() == b"positions epoch" && metadata.keys.stream == 0)
@@ -613,7 +622,7 @@ fn read_sample(counters: &CountersReader) -> Sample {
         PassRead::Consistent(cells) => (true, cells),
         PassRead::Inconsistent(cells) => (false, cells),
     };
-    model::sample(&cells, consistent, host_monotonic_ns())
+    model::sample(&cells, consistent, host_monotonic_ns(), changes)
 }
 
 /// Scans the three diagnostic rings from their followers' cursors.
