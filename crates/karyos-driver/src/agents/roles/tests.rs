@@ -4513,3 +4513,62 @@ fn a_close_waits_for_its_endpoints_tx_half() {
         "the queue and the route"
     );
 }
+
+/// Review H2 of #829 (karyos#630): with the conductor's event ring full,
+/// a removed destination's report cannot be posted, yet its member stops
+/// counting for the strategy edge at once, so a slow member never keeps
+/// holding the publisher while the ring stays full.
+#[test]
+fn a_removed_destinations_member_is_released_with_the_ring_full() {
+    use crate::agents::data::DestinationChange;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(64).unwrap());
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let other: SocketAddr = "10.0.0.9:5001".parse().unwrap();
+    let term = publication(EndpointId(1)).term;
+    let (mut outbound, _log) =
+        super::super::data::testing::outbound(EndpointId(1), alias(), receiver, term, 1, false);
+    outbound
+        .set_destinations(&[receiver, other], &[], Some(true))
+        .unwrap();
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound,
+        guard: None,
+        roles: None,
+    });
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
+    let live = |sender: &mut super::SenderRole| {
+        sender.publications[0]
+            .membership_mut()
+            .is_some_and(|membership| membership.live_at(receiver, 2))
+    };
+    assert!(live(&mut sender), "a member bound to the destination");
+    let removed = sender.command(AgentCommand::<OsSocket>::ChangeDestination {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        alias: alias(),
+        registration: 1,
+        destination: receiver,
+        add: false,
+    });
+    assert!(matches!(
+        removed,
+        Some((
+            _,
+            AgentEvent::DestinationChanged {
+                outcome: DestinationChange::Removed,
+                ..
+            }
+        ))
+    ));
+    // The ring is full: nothing is posted.
+    sender.report_removals(|_: AgentEvent<OsSocket>| false);
+    assert!(!live(&mut sender), "released though not reported");
+    assert!(sender.publications[0].removal_unreported().is_some());
+}
