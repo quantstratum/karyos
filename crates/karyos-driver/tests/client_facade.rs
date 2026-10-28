@@ -1080,6 +1080,36 @@ mod remote {
         ));
     }
 
+    /// Plan 166 (karyos#851): `Client::connect` waits the socket timeout,
+    /// not the control call's: with the driver paused past a 50 ms call
+    /// timeout, a 10 s socket timeout attaches once the driver resumes, and
+    /// a socket timeout left at 50 ms does not.
+    #[test]
+    fn connect_waits_the_socket_timeout() {
+        let (_driver, dir, paused) = ipc_driver_with("socket-timeout", 1, DriverConfig::default());
+        let context = |socket: Duration| {
+            Context::builder()
+                .dir(&dir)
+                .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
+                .timeout(Duration::from_millis(50))
+                .socket_timeout(socket)
+                .build()
+                .unwrap()
+        };
+        paused.hold();
+        assert!(matches!(
+            Client::connect(context(Duration::from_millis(50))).err(),
+            Some(ClientError::Attach(_))
+        ));
+        let resume = paused.clone();
+        let resumer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            resume.resume();
+        });
+        assert!(Client::connect(context(Duration::from_secs(10))).is_ok());
+        resumer.join().unwrap();
+    }
+
     /// A remote publication grant that arrives after its request timed out
     /// is taken and removed at once: a `karyos:udp` publication the client
     /// created by URI ends, so with room for one owned network resource
@@ -1102,9 +1132,11 @@ mod remote {
                 .dir(&dir)
                 .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
                 .timeout(Duration::from_millis(50))
-                // 50 ms is for the paused request to time out; the attach
-                // is the setup and waits as a client's would (plan 166).
-                .attach_timeout(karyos_client::DEFAULT_TIMEOUT)
+                // 50 ms is for the paused request to time out. The socket,
+                // the attach and the late grant's fetch, waits as a
+                // client's would: under load, 50 ms there timed out the
+                // attach or the fetch the release needs (plan 166).
+                .socket_timeout(karyos_client::DEFAULT_TIMEOUT)
                 .build()
                 .unwrap(),
         )
@@ -1154,9 +1186,11 @@ mod remote {
                 .dir(&dir)
                 .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
                 .timeout(Duration::from_millis(50))
-                // 50 ms is for the paused request to time out; the attach
-                // is the setup and waits as a client's would (plan 166).
-                .attach_timeout(karyos_client::DEFAULT_TIMEOUT)
+                // 50 ms is for the paused request to time out. The socket,
+                // the attach and the late grant's fetch, waits as a
+                // client's would: under load, 50 ms there timed out the
+                // attach or the fetch the release needs (plan 166).
+                .socket_timeout(karyos_client::DEFAULT_TIMEOUT)
                 .build()
                 .unwrap(),
         )
@@ -1302,9 +1336,11 @@ mod remote {
                 .dir(&dir)
                 .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
                 .timeout(Duration::from_millis(50))
-                // 50 ms is for the paused request to time out; the attach
-                // is the setup and waits as a client's would (plan 166).
-                .attach_timeout(karyos_client::DEFAULT_TIMEOUT)
+                // 50 ms is for the paused request to time out. The socket,
+                // the attach and the late grant's fetch, waits as a
+                // client's would: under load, 50 ms there timed out the
+                // attach or the fetch the release needs (plan 166).
+                .socket_timeout(karyos_client::DEFAULT_TIMEOUT)
                 .build()
                 .unwrap(),
         )

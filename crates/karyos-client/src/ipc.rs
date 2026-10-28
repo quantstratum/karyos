@@ -1871,7 +1871,11 @@ fn fetch_descriptor(
         fetch
     };
     send(&session.socket, &Message::Fetch { fetch, key }, None)?;
-    let (records, stream_registration, incarnation, base) = match receive(&session.socket)? {
+    // A manifest that does not arrive (the socket timeout, plan 166) may
+    // still come: the session is out of step, as for any message of no
+    // fetch of ours, and the next fetch is refused rather than misread.
+    let manifest = receive(&session.socket).inspect_err(|_| session.state().broken = true)?;
+    let (records, stream_registration, incarnation, base) = match manifest {
         (Message::Refused { fetch: got, code }, None) if got == fetch => {
             return Err(AttachError::Refused { code });
         }
