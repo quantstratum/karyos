@@ -363,9 +363,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     route: Option<RouteId>,
     /// See [`Outbound::needs_reset`].
     needs_reset: bool,
-    /// A route of a destination was refused for the endpoint's route limit
+    /// The endpoints that refused one of its routes for their route limit
     /// since the sender last asked ([`Outbound::take_route_limited`]).
-    route_limited: bool,
+    route_limited: [Option<EndpointId>; karyos_io::lanes::routes::MAX_ROUTES],
     /// The sender cycle its last reset request was posted in, while it
     /// needs a reset.
     reset_requested: Option<u64>,
@@ -581,7 +581,7 @@ impl<T: StreamTerms> Outbound<T> {
             tracks,
             opened: None,
             needs_reset: false,
-            route_limited: false,
+            route_limited: [None; karyos_io::lanes::routes::MAX_ROUTES],
             reset_requested: None,
             report: TxReport::new(),
             next_token: 1,
@@ -1159,9 +1159,15 @@ impl<T: StreamTerms> Outbound<T> {
         if self.opened == Some(epoch) {
             return true;
         }
-        let Ok(route) = tx.add_route(self.destination) else {
-            self.counters.bump(|c| &mut c.route_failures, 1);
-            return false;
+        let route = match tx.add_route(self.destination) {
+            Ok(route) => route,
+            Err(error) => {
+                self.counters.bump(|c| &mut c.route_failures, 1);
+                if error == karyos_io::backend::RouteError::RouteLimit {
+                    self.note_route_limit(self.endpoint);
+                }
+                return false;
+            }
         };
         // All or nothing: a partial open is closed again, so a failing
         // endpoint does not leak a route and queues every cycle.
@@ -1729,10 +1735,23 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
-    /// Whether a destination's route was refused for the endpoint's route
-    /// limit since the last call, which clears it.
-    pub(crate) fn take_route_limited(&mut self) -> bool {
+    /// The endpoints that refused one of its routes for their route limit
+    /// since the last call, which clears them.
+    pub(crate) fn take_route_limited(
+        &mut self,
+    ) -> [Option<EndpointId>; karyos_io::lanes::routes::MAX_ROUTES] {
         std::mem::take(&mut self.route_limited)
+    }
+
+    /// Records that `endpoint` refused one of its routes for its route
+    /// limit: on any open path, single, routed or multi-destination.
+    pub(super) fn note_route_limit(&mut self, endpoint: EndpointId) {
+        if self.route_limited.contains(&Some(endpoint)) {
+            return;
+        }
+        if let Some(slot) = self.route_limited.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(endpoint);
+        }
     }
 
     /// Whether the endpoint needs a reset before this publication can send

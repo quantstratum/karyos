@@ -746,6 +746,7 @@ impl<T: StreamTerms> Outbound<T> {
         let (mut route_failures, mut queue_failures, mut removed) = (0u64, 0u64, 0u64);
         let mut limits = 0u64;
         let mut route_limited = false;
+        let endpoint = self.endpoint;
         for target in &mut fanout.targets {
             if target.opened == Some(epoch) || target.removed.is_some() {
                 continue;
@@ -839,7 +840,9 @@ impl<T: StreamTerms> Outbound<T> {
             .bump(|c| &mut c.queue_failures, queue_failures);
         self.counters.bump(|c| &mut c.removed_fault, removed);
         self.counters.bump(|c| &mut c.endpoint_limits, limits);
-        self.route_limited |= route_limited;
+        if route_limited {
+            self.note_route_limit(endpoint);
+        }
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return false;
         };

@@ -956,9 +956,20 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 open = true;
                 continue;
             }
-            let Ok(route) = tx.add_route(slot.destination) else {
-                self.counters.bump(|c| &mut c.route_failures, 1);
-                continue;
+            let route = match tx.add_route(slot.destination) {
+                Ok(route) => route,
+                Err(error) => {
+                    self.counters.bump(|c| &mut c.route_failures, 1);
+                    // Its endpoint refused it for the route limit
+                    // (`Outbound::note_route_limit`).
+                    if error == karyos_io::backend::RouteError::RouteLimit
+                        && !self.route_limited.contains(&Some(slot.endpoint))
+                        && let Some(free) = self.route_limited.iter_mut().find(|at| at.is_none())
+                    {
+                        *free = Some(slot.endpoint);
+                    }
+                    continue;
+                }
             };
             let mut ok = true;
             for lane in 0..slot.queues.len() {
