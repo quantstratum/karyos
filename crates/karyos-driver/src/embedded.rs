@@ -662,6 +662,13 @@ fn largest_charge(config: &StreamConfig) -> Result<u64, DriverError> {
     charge_of(config.buffer.mtu).ok_or(DriverError::InvalidConfig)
 }
 
+/// The bound a sender gate validates a rate policy against for a stream of
+/// `mtu` (R-CORE-21): [`charge_of`]. An MTU no frame aligns never reaches
+/// a gate (its add was refused), so the MTU itself stands in for it.
+fn gate_bound(mtu: u32) -> u64 {
+    charge_of(mtu).unwrap_or(u64::from(mtu))
+}
+
 /// The largest charge of a frame on a stream of `mtu`, the MTU aligned to
 /// 32 bytes: [`largest_charge`]'s, and the bound a sender gate validates a
 /// rate policy against (R-CORE-21); `None` for an MTU no frame aligns.
@@ -737,6 +744,14 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// reopen (`quantstratum-docs: karyos/design/guards-and-abort.md`,
     /// The fresh incarnation), never reused within the registration.
     pub(crate) incarnation: u64,
+    /// When the current incarnation began, past the first: host monotonic
+    /// nanoseconds, written in each of its handles' rings
+    /// (`outcome_ring::REINCARNATED_AT`), so a handle's rate copy starts
+    /// where the reincarnation's gate did (R-CORE-21); 0 for the first.
+    pub(crate) reincarnated_at: u64,
+    /// Tests: how much earlier than now the next reincarnation is stamped
+    /// ([`EmbeddedDriver::backdate_next_reincarnation`]); 0 otherwise.
+    pub(crate) reincarnation_backdate: u64,
     /// Incarnations a guard close sealed and a fresh incarnation replaced,
     /// retiring: served until their walker ended and their readers passed
     /// the seal.
@@ -1333,6 +1348,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 feeder_counters: None,
                 guarded: None,
                 incarnation: FIRST_INCARNATION,
+                reincarnated_at: 0,
+                reincarnation_backdate: 0,
                 replaced: Vec::new(),
                 network: NetworkLane::Local,
                 schedule: None,
@@ -2330,7 +2347,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // The largest charge a route's sender gate validates against:
                 // the MTU aligned as a frame, so a policy accepted here is
                 // never one the gate refuses (#841 review, A1).
-                let frame = charge_of(found.config.mtu).unwrap_or(u64::from(found.config.mtu));
+                let frame = gate_bound(found.config.mtu);
                 policy
                     .validate(frame)
                     .map_err(DriverError::InvalidRatePolicy)?;
@@ -2583,8 +2600,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     lookup.get_or_insert(error);
                 }
                 Ok(found) => {
-                    frame = frame
-                        .max(charge_of(found.config.mtu).unwrap_or(u64::from(found.config.mtu)));
+                    frame = frame.max(gate_bound(found.config.mtu));
                     registration.get_or_insert(found.aggregate.registration);
                     if found.retiring {
                         lookup.get_or_insert(DriverError::StreamRetiring { stream: found.id });
@@ -2771,6 +2787,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// As [`EmbeddedDriver::add_stream`], but for the schedule ring.
+    /// Tests: stamps `stream`'s next reincarnation `by_ns` nanoseconds
+    /// earlier than it happens, as if it had begun then, for its handles'
+    /// rate copies (R-CORE-21).
+    ///
+    /// # Errors
+    ///
+    /// The stream lookup's errors.
+    #[doc(hidden)]
+    pub fn backdate_next_reincarnation(
+        &mut self,
+        stream: StreamHandle,
+        by_ns: u64,
+    ) -> Result<(), DriverError> {
+        self.stream(stream)?.reincarnation_backdate = by_ns;
+        Ok(())
+    }
+
     #[doc(hidden)]
     pub fn add_stream_with_external_schedule(
         &mut self,
@@ -3113,6 +3146,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             feeder_counters,
             guarded: None,
             incarnation: FIRST_INCARNATION,
+            reincarnated_at: 0,
+            reincarnation_backdate: 0,
             replaced: Vec::new(),
             network: NetworkLane::Local,
             schedule: None,
@@ -3557,6 +3592,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // The buffer's configuration, which a network sender announces.
         found.config = plan.config;
         found.incarnation = plan.incarnation;
+        found.reincarnated_at = karyos_sys::host_clock::host_monotonic_ns()
+            .saturating_sub(std::mem::take(&mut found.reincarnation_backdate))
+            .max(1);
         // A fresh incarnation has a fresh ring. A local lane takes new
         // settings before its next handle; a network lane's are its
         // sender's, fixed from the add: kept, with its counters, on every
@@ -3786,6 +3824,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let (words, index) = self.guards.view(guarded.guard)?;
         let (ring, consumed, writer) =
             crate::guard_streams::new_ring(guarded.messages, state.epoch, index, place)?;
+        // A reincarnation's start, for the handle's rate copy, local or
+        // remote.
+        if found.incarnation > FIRST_INCARNATION {
+            karyos_sys::outcome_ring::set_reincarnated_at(ring.words(), found.reincarnated_at);
+        }
         let client = karyos_client::GuardBinding::new(
             words,
             index,
@@ -3799,7 +3842,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // clock; the sender gate's bucket is authoritative. A reincarnation's
         // copy starts empty, as its gate does (R-CORE-21).
         let client = if found.incarnation > FIRST_INCARNATION {
-            client.reincarnated()
+            client.reincarnated_at(found.reincarnated_at)
         } else {
             client
         };

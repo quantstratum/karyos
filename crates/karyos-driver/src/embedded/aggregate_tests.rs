@@ -709,6 +709,55 @@ fn a_byte_burst_below_the_aligned_mtu_is_refused_at_the_change() {
     );
 }
 
+/// #841 review, point 6: the control reserve's byte floor counts each
+/// reserved message as the aligned charge too, so on an MTU of 1400 a
+/// reserve of 10 messages a second needs 14 080 bytes a second, not 14 000.
+#[test]
+fn the_reserve_floor_counts_the_aligned_charge() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let mtu = 1400;
+    let aligned = u64::from(karyos_sys::sizing::align_frame(mtu).unwrap());
+    let policy = |bytes_per_second| RatePolicy {
+        messages: Rate {
+            per_second: 100,
+            burst: 100,
+        },
+        bytes: Some(Rate {
+            per_second: bytes_per_second,
+            burst: aligned * 100,
+        }),
+    };
+    let reserve = Rate {
+        per_second: 10,
+        burst: 10,
+    };
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut config = stream(2);
+    config.buffer.mtu = mtu;
+    let handle = driver.add_stream(config).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    driver
+        .guard_stream(
+            handle,
+            guard,
+            4,
+            Some(crate::guards::GuardRate::publication(policy(1_000_000)).with_reserve(reserve)),
+        )
+        .unwrap();
+    let admin = (crate::guards::RateAuthority::Administrator, 1);
+    assert_eq!(
+        driver.change_rate_policy(handle, 1, policy(10 * u64::from(mtu)), admin),
+        Err(DriverError::RateChange(
+            crate::guards::RateChangeError::ReserveCrossed
+        ))
+    );
+    assert_eq!(
+        driver.change_rate_policy(handle, 1, policy(10 * aligned), admin),
+        Ok(2)
+    );
+}
+
 /// QS-COORDINATOR, ACS 33899: with every lane the driver can hold guarded
 /// with a rate, the stored policies never pass `max_streams`, and the next
 /// stream is refused before any policy could be stored for it.

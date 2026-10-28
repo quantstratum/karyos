@@ -2039,26 +2039,16 @@ fn a_reincarnation_starts_its_gate_and_handle_empty() {
     });
     let publication = taken.unwrap().unwrap();
     assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
-    // The reincarnation's gate, once its sender serves it: empty. A full
-    // one would hold the burst of 4.
+    // The reincarnation's gate, once its sender serves it: started empty,
+    // so below the burst of 4 a full one would hold (at one a second, a
+    // loaded run earns a token or so meanwhile, never the burst).
     until(&mut driver, |driver| {
-        driver
-            .net
-            .as_ref()
-            .unwrap()
-            .gate_message_tokens()
-            .contains(&Some(0))
+        let gates = driver.net.as_ref().unwrap().gate_message_tokens();
+        gates
+            .iter()
+            .any(|tokens| tokens.is_some_and(|tokens| tokens < 4))
+            && !gates.contains(&Some(4))
     });
-    assert!(
-        !driver
-            .net
-            .as_ref()
-            .unwrap()
-            .gate_message_tokens()
-            .contains(&Some(4)),
-        "{:?}",
-        driver.net.as_ref().unwrap().gate_message_tokens()
-    );
 }
 
 /// P2.11 PR1: what a timed network publication's software route does

@@ -631,8 +631,10 @@ fn guard_stream_validates_its_rate_limit() {
 
 /// Every handle bound to a rate-limited guard carries the copy, a fresh
 /// incarnation's too: past the burst it refuses early and appends nothing.
-/// A fresh incarnation's copy starts empty, so reincarnating buys no new
-/// burst (#841 review, decided 2026-10-28 by QS-COORDINATOR).
+/// A fresh incarnation's copy starts empty at the reincarnation, so
+/// reincarnating buys no new burst, and a handle bound later has earned
+/// what the time since earns, as the reincarnation's gate has (#841 and
+/// #852 reviews, decided 2026-10-28 by QS-COORDINATOR).
 #[test]
 fn a_rate_limited_handle_refuses_past_its_burst() {
     let mut driver = EmbeddedDriver::new().unwrap();
@@ -668,6 +670,40 @@ fn a_rate_limited_handle_refuses_past_its_burst() {
     let mut fresh = driver.publication(handle).unwrap();
     assert_eq!(fresh.guard().unwrap().rate_tokens(), Some(0));
     assert_eq!(fresh.offer(b"d").unwrap(), OfferOutcome::RateLimited);
+}
+
+/// The #852 review (decided 2026-10-28 by QS-COORDINATOR): a handle bound
+/// a while after its publication reincarnated has earned what that while
+/// earns, as the reincarnation's gate has, never more than the burst: it
+/// is not stricter than the gate.
+#[test]
+fn a_handle_bound_after_a_reincarnation_earns_since_it_began() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
+    let guard = driver.add_guard("orders").unwrap();
+    // A thousand messages a second, a burst of two: 50 ms earns the burst.
+    driver
+        .guard_stream(handle, guard, 4, Some(per_second(1_000, 2, None)))
+        .unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let publication = driver.publication(handle).unwrap();
+    assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
+    drop(publication);
+    let _ = driver.do_work().unwrap();
+    // The host clock of a process is past 50 ms before the stamp.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    driver
+        .backdate_next_reincarnation(handle, 50_000_000)
+        .unwrap();
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let mut later = driver.publication(handle).unwrap();
+    assert_eq!(later.guard().unwrap().rate_tokens(), Some(2));
+    for value in [b"e", b"f"] {
+        assert!(matches!(
+            later.offer(value).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
 }
 
 /// R-CORE-21: a guarded stream's rate policy changes by version (compare

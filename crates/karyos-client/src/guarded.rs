@@ -117,7 +117,7 @@ pub struct GuardBinding {
     /// gives the handle its copy at its next call.
     pending_rate: Option<RateWatch>,
     /// How a copy made at bind starts: full, or empty for a reincarnation
-    /// ([`Self::reincarnated`]).
+    /// ([`Self::reincarnated_at`]).
     bind_bucket: Bucket,
 }
 
@@ -129,6 +129,9 @@ pub struct GuardBinding {
 enum Bucket {
     Full,
     Empty,
+    /// Empty at the reincarnation's start, host monotonic nanoseconds,
+    /// refilled from then on, as its gate.
+    EmptySince(u64),
 }
 
 /// A handle's watch of its ring for a published policy: the clock to make
@@ -220,12 +223,20 @@ impl GuardBinding {
     }
 
     /// Binds to a reincarnation of its publication (an incarnation past the
-    /// first): a rate copy made at bind starts empty, as the reincarnation's
-    /// sender gate does, so reincarnating buys no new burst (R-CORE-21).
-    /// Call it before [`Self::with_rate`] or [`Self::with_published_rate`].
+    /// first) that began at `at`, host monotonic nanoseconds (the ring's
+    /// `REINCARNATED_AT` word): a rate copy made at bind starts empty at
+    /// `at` and has earned since, as the reincarnation's sender gate has,
+    /// so reincarnating buys no new burst and a handle bound later is not
+    /// stricter than the gate (R-CORE-21). `at` 0 (unknown) starts it
+    /// empty now. Call it before [`Self::with_rate`] or
+    /// [`Self::with_published_rate`]; a copy already made keeps its level.
     #[must_use]
-    pub fn reincarnated(mut self) -> Self {
-        self.bind_bucket = Bucket::Empty;
+    pub fn reincarnated_at(mut self, at: u64) -> Self {
+        self.bind_bucket = if at == 0 {
+            Bucket::Empty
+        } else {
+            Bucket::EmptySince(at)
+        };
         self
     }
 
@@ -246,6 +257,11 @@ impl GuardBinding {
         let limiter = match bucket {
             Bucket::Full => RateLimiter::new(messages, clock()),
             Bucket::Empty => RateLimiter::empty(messages, clock()),
+            Bucket::EmptySince(at) => {
+                let mut limiter = RateLimiter::empty(messages, at);
+                limiter.refill_at(clock());
+                limiter
+            }
         };
         self.rate = Some(RateCopy {
             limiter,

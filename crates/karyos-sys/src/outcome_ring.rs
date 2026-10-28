@@ -68,6 +68,27 @@ const RANGES: usize = 3;
 const GUARD_INDEX: usize = 4;
 /// Header word: the open epoch the handle was admitted under.
 const EPOCH: usize = 5;
+/// Header word: when the incarnation the ring's handle binds to began, a
+/// reincarnation of its publication, on the driver host's monotonic clock
+/// in nanoseconds ([`crate::host_clock::host_monotonic_ns`]); 0 for the
+/// first incarnation, or unknown (a driver that predates the word, which
+/// was reserved and zero). The handle's rate copy starts empty at that
+/// time, as the reincarnation's sender gate did (R-CORE-21, karyos#852). It
+/// is shared memory of one host, so the clock is the reader's too. Words 6
+/// to 12 are the policy slot (`crate::rate_policy_slot::OUTCOME_SLOT`).
+pub const REINCARNATED_AT: usize = 13;
+const _: () = assert!(
+    crate::rate_policy_slot::OUTCOME_SLOT + crate::rate_policy_slot::SLOT_WORDS <= REINCARNATED_AT
+        && REINCARNATED_AT < HEADER_WORDS
+);
+
+/// Writes `at` as the ring's [`REINCARNATED_AT`] word, before the ring is
+/// granted (the grant orders it before the client's read).
+pub fn set_reincarnated_at(ring: &[AtomicU64], at: u64) {
+    if let Some(cell) = ring.get(REINCARNATED_AT) {
+        cell.store(at, Ordering::Relaxed);
+    }
+}
 
 /// Words of a ring of `capacity` slots, header included; `None` on
 /// overflow.

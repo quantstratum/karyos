@@ -490,6 +490,13 @@ impl BindingFds {
         )
         .map_err(|_| AttachError::Protocol)?;
         let index = usize::try_from(binding.guard_index).map_err(|_| AttachError::Protocol)?;
+        // When a reincarnation began, which the driver wrote before the
+        // grant (0: the first incarnation, or unknown).
+        let reincarnated = karyos_sys::load_words::LoadWords::load_acquire(
+            &ring,
+            karyos_sys::outcome_ring::REINCARNATED_AT,
+        )
+        .unwrap_or(0);
         GuardBinding::new(
             Arc::new(guards),
             index,
@@ -501,9 +508,10 @@ impl BindingFds {
         )
         .map(|bound| {
             // Past the first incarnation, a reincarnation: its copy starts
-            // empty, as its gate does (R-CORE-21).
-            let bound = if incarnation > 1 {
-                bound.reincarnated()
+            // empty at the time the driver wrote (0, unknown: now), as its
+            // gate did (R-CORE-21).
+            let bound = if incarnation > FIRST_INCARNATION {
+                bound.reincarnated_at(reincarnated)
             } else {
                 bound
             };
@@ -512,6 +520,10 @@ impl BindingFds {
         .map_err(|_| AttachError::Protocol)
     }
 }
+
+/// A publication's first incarnation (the driver's `FIRST_INCARNATION`):
+/// a grant of a later one binds to a reincarnation.
+const FIRST_INCARNATION: u64 = 1;
 
 /// One received message, with its descriptor.
 pub(crate) fn receive(socket: &OwnedFd) -> Result<(Message, Option<OwnedFd>), AttachError> {
