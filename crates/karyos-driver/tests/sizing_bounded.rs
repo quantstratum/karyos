@@ -130,15 +130,21 @@ fn a_driver_full_of_lanes_at_the_cap_maps_within_the_bounded_figure() {
     let mut driver: EmbeddedDriver<SharedTerms> =
         EmbeddedDriver::with_ipc(config, ipc(&dir), Box::new(SystemClock::new())).unwrap();
     let fixed = mapped_regions();
-    // The regions that are not streams, mapped at start, are within the
-    // report's lines that are not streams: a report that undercounts them
-    // fails here (karyos#824).
+    // The regions that are not streams, mapped at start, are exactly the
+    // report's lines that are not streams, less the budgets and the
+    // command rings of clients not yet connected, as `tests/sizing.rs`
+    // counts them: a report that undercounts or overcounts one fails here
+    // (karyos#824).
     let fixed_bytes: u64 = fixed.values().sum();
-    assert!(fixed_bytes > 0, "no region mapped at start");
-    let regions: u64 = sizing.configured.iter().map(|line| line.total).sum();
-    assert!(
-        fixed_bytes <= regions,
-        "the driver maps {fixed_bytes} B before any lane, above the report's {regions} B of shared regions"
+    let regions: u64 = sizing
+        .configured
+        .iter()
+        .filter(|line| !line.region.contains("(budget") && line.region != "command rings")
+        .map(|line| line.total)
+        .sum();
+    assert_eq!(
+        fixed_bytes, regions,
+        "the driver maps {fixed_bytes} B before any lane; the report's regions are {regions} B"
     );
     // Every lane-creating call refused above the cap maps nothing.
     let larger = TERM * 2;

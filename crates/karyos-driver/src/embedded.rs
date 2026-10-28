@@ -6244,9 +6244,28 @@ pub(crate) fn log_region_bytes(buffer: &LogBufferConfig) -> Option<u64> {
 }
 
 /// The bytes of a conflation table region of `table`, as
-/// [`log_region_bytes`] for a log buffer.
+/// [`log_region_bytes`] for a log buffer: `None` also for a table that
+/// [`conflation_shape`] refuses (a value capacity past `u32`), so the cap
+/// and the sizing report refuse what `add_stream` refuses (karyos#824).
 pub(crate) fn table_region_bytes(table: &ConflationConfig) -> Option<u64> {
+    conflation_shape(*table).ok()?;
     region_bytes(table.structure_length())
+}
+
+/// The bytes of one stream lane's regions (R-CORE-34): its log buffer's,
+/// and its conflation table's when it has one. The one definition behind
+/// [`stream_lane_bytes`] and the sizing report. `None` for a configuration
+/// a buffer or a table refuses.
+pub(crate) fn lane_regions(
+    buffer: &LogBufferConfig,
+    conflation: Option<&ConflationConfig>,
+) -> Option<(u64, Option<u64>)> {
+    let log = log_region_bytes(buffer)?;
+    let table = match conflation {
+        Some(table) => Some(table_region_bytes(table)?),
+        None => None,
+    };
+    Some((log, table))
 }
 
 pub(crate) fn region_bytes(structure: Option<usize>) -> Option<u64> {
@@ -6265,11 +6284,8 @@ pub fn stream_lane_bytes(
     buffer: &LogBufferConfig,
     conflation: Option<&ConflationConfig>,
 ) -> Option<u64> {
-    let log = log_region_bytes(buffer)?;
-    match conflation {
-        Some(table) => log.checked_add(table_region_bytes(table)?),
-        None => Some(log),
-    }
+    let (log, table) = lane_regions(buffer, conflation)?;
+    log.checked_add(table.unwrap_or(0))
 }
 
 /// `max` against [`stream_lane_bytes`]: [`DriverError::StreamTooLarge`]

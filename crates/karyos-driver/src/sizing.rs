@@ -190,21 +190,17 @@ fn sum(lines: &[SizingLine]) -> Result<u64, SizingError> {
         .ok_or(SizingError::Overflow)
 }
 
-/// The mapped bytes of one generation of `stream`'s log buffer, and of its
-/// conflation table when it has one; and the lane's bytes before rounding,
-/// which `max_stream_bytes` bounds (`stream_lane_bytes`): each region
-/// sized once.
-fn stream_bytes(pages: &Pages, stream: &StreamConfig) -> Result<(u64, u64, u64), SizingError> {
-    let log = crate::embedded::log_region_bytes(&stream.buffer)
-        .ok_or(SizingError::Invalid("a stream's log buffer configuration"))?;
-    let table = match &stream.conflation {
-        Some(conflation) => crate::embedded::table_region_bytes(conflation)
-            .ok_or(SizingError::Invalid("a stream's conflation configuration"))?,
-        None => 0,
-    };
-    let lane = log.checked_add(table).ok_or(SizingError::Overflow)?;
-    let table = if table == 0 { 0 } else { pages.round(table)? };
-    Ok((pages.round(log)?, table, lane))
+/// The bytes of one generation of `stream`'s log buffer region and of its
+/// conflation table's region when it has one, unrounded, from
+/// `embedded::lane_regions`, the definition `max_stream_bytes` bounds.
+fn stream_regions(stream: &StreamConfig) -> Result<(u64, Option<u64>), SizingError> {
+    crate::embedded::lane_regions(&stream.buffer, stream.conflation.as_ref()).ok_or(
+        if crate::embedded::log_region_bytes(&stream.buffer).is_none() {
+            SizingError::Invalid("a stream's log buffer configuration")
+        } else {
+            SizingError::Invalid("a stream's conflation configuration")
+        },
+    )
 }
 
 /// The sizing report of a driver of `config` in IPC mode serving `streams`
@@ -355,10 +351,18 @@ pub fn report(
     let mut retained = Vec::new();
     let generations = count(config.max_retained_generations)?;
     for (index, stream) in streams.iter().enumerate() {
-        let (buffer, table, lane) = stream_bytes(&pages, stream)?;
-        // A declared stream above the cap is one `add_stream` refuses.
-        if config.max_stream_bytes.is_some_and(|max| lane > max) {
-            return Err(SizingError::Invalid("a stream above max_stream_bytes"));
+        let (log, raw_table) = stream_regions(stream)?;
+        let buffer = pages.round(log)?;
+        let table = raw_table.map(|bytes| pages.round(bytes)).transpose()?;
+        // A declared stream above the cap is one `add_stream` refuses; the
+        // lane's bytes are summed only when there is a cap to compare.
+        if let Some(max) = config.max_stream_bytes {
+            let lane = log
+                .checked_add(raw_table.unwrap_or(0))
+                .ok_or(SizingError::Overflow)?;
+            if lane > max {
+                return Err(SizingError::Invalid("a stream above max_stream_bytes"));
+            }
         }
         let name = format!(
             "stream {}:{} (declared {index})",
@@ -375,7 +379,7 @@ pub fn report(
                 "mtu",
             ],
         )?);
-        if table > 0 {
+        if let Some(table) = table {
             configured.push(line(
                 format!("{name}: conflation table"),
                 1,
@@ -472,16 +476,18 @@ impl fmt::Display for SizingReport {
     /// figures, the peak's assumption, what the cgroup counts and what is
     /// excluded.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut groups = vec![
+        // Without the cap the report is the one it was before it.
+        let bounded = self
+            .bounded_bytes
+            .map(|_| ("bounded by max_stream_bytes", &self.bounded));
+        for (title, lines) in [
             ("configured shared regions", &self.configured),
             ("configured heap budgets", &self.heap),
             ("retained across a cutover or restart", &self.retained),
-        ];
-        // Without the cap the report is the one it was before it.
-        if self.bounded_bytes.is_some() {
-            groups.push(("bounded by max_stream_bytes", &self.bounded));
-        }
-        for (title, lines) in groups {
+        ]
+        .into_iter()
+        .chain(bounded)
+        {
             writeln!(f, "{title}:")?;
             if lines.is_empty() {
                 writeln!(f, "  (none)")?;

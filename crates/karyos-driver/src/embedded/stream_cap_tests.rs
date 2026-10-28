@@ -165,6 +165,28 @@ fn the_cap_does_not_hide_a_tables_own_refusal() {
     assert!(driver.streams.is_empty(), "nothing created");
 }
 
+/// The invariant behind every path (karyos#824): `table_region_bytes`, and
+/// so `lane_regions` and `stream_lane_bytes`, refuse a table that
+/// `conflation_shape` refuses, so no caller can size it, cap it or report
+/// it. A reconfiguration reuses the live stream's table, already
+/// validated by `conflation_shape`, and is unreachable with such a table
+/// from the public API; this covers it and any later path.
+#[test]
+fn table_region_bytes_refuses_what_conflation_shape_refuses() {
+    let refused = ConflationConfig::new(1, 1 << 32, 4096);
+    assert!(conflation_shape(refused).is_err());
+    assert_eq!(table_region_bytes(&refused), None);
+    let buffer = stream(2, MIN_TERM_LENGTH).buffer;
+    assert_eq!(lane_regions(&buffer, Some(&refused)), None);
+    assert_eq!(stream_lane_bytes(&buffer, Some(&refused)), None);
+    let accepted = ConflationConfig::new(1, usize::try_from(u32::MAX).unwrap(), 4096);
+    assert!(conflation_shape(accepted).is_ok());
+    assert_eq!(
+        table_region_bytes(&accepted).is_some(),
+        accepted.structure_length().is_some()
+    );
+}
+
 #[test]
 fn a_replay_target_above_the_cap_is_refused() {
     let (mut driver, max) = capped();
@@ -259,4 +281,48 @@ fn a_refused_lane_takes_no_region_id() {
     assert!(next(&driver) > before);
     drop(driver);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The report without a cap is byte for byte the one of `d01c477a`, before
+/// karyos#824 (plan 160, criterion 4): two declared streams, one
+/// conflated, at the defaults and 4 KiB pages.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_uncapped_report_is_unchanged() {
+    let mut conflated = stream(3, MIN_TERM_LENGTH);
+    conflated.conflation = Some(ConflationConfig::new(4, 64, 4096));
+    let report = crate::sizing::report(
+        &DriverConfig::default(),
+        &[stream(2, MIN_TERM_LENGTH), conflated],
+        4096,
+    )
+    .unwrap();
+    assert_eq!(
+        report.to_string(),
+        include_str!("sizing_uncapped_d01c477a.txt")
+    );
+}
+
+/// The sizing report refuses a table that `add_stream` refuses (a value
+/// capacity past `u32`), with or without a cap, as the same invalid
+/// conflation configuration (karyos#824).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_report_refuses_a_table_that_add_stream_refuses() {
+    let mut table = stream(2, MIN_TERM_LENGTH);
+    table.conflation = Some(ConflationConfig::new(1, 1 << 32, 4096));
+    let refused = Err(crate::sizing::SizingError::Invalid(
+        "a stream's conflation configuration",
+    ));
+    for max_stream_bytes in [None, Some(lane_bytes(MIN_TERM_LENGTH))] {
+        let config = DriverConfig {
+            max_stream_bytes,
+            ..DriverConfig::default()
+        };
+        assert_eq!(
+            crate::sizing::report(&config, &[table], 4096).map(|_| ()),
+            refused,
+            "cap {max_stream_bytes:?}"
+        );
+    }
 }

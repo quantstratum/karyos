@@ -505,10 +505,12 @@ pub extern "C" fn karyos_client_close(client: u64) -> i32 {
 /// through `publication`. A control call: it waits for the driver up to
 /// the client's timeout, and holds the client handle meanwhile
 /// (`KARYOS_E_BUSY` to another thread). On failure nothing is opened and
-/// `detail` (may be null) receives the failure's detail: a driver's
-/// refusal is `KARYOS_E_REFUSED` with its CnC code in `code`, such as 24
-/// for a `karyos:udp` publication above the driver's `max_stream_bytes`,
-/// with the lane's bytes in `value`.
+/// `detail` (may be null) receives the failure's detail. A driver's
+/// refusal is `KARYOS_E_REFUSED` with its CnC code in `code` and its
+/// detail in `value`, such as 24 for a `karyos:udp` publication above the
+/// driver's `max_stream_bytes`, with the lane's bytes; a channel the
+/// driver does not serve (code 13) is `KARYOS_E_UNSUPPORTED_CHANNEL`
+/// instead.
 ///
 /// # Safety
 ///
