@@ -171,6 +171,14 @@ const CONTROL_FLOOR: usize = 32;
 /// `sessions.max_paths × path_queue_datagrams × MAX_DATAGRAM`.
 pub const MAX_PATH_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 
+/// How long a removed route or queue may stay closing with frames in
+/// flight, from the first duty that found it so, before it counts as a
+/// failed close (#838, #849; QS-COORDINATOR): a kernel backend shows no
+/// progress on frames it holds until it sends them, possibly over many
+/// cycles, so a cycle count would fail closes that are only slow. Past
+/// this, the endpoint's standing reset frees what is left.
+pub const CLOSE_IN_FLIGHT_TIMEOUT: u64 = 1_000_000_000;
+
 /// The bytes the receiver's path queues allocate for `config`; `None` past
 /// `usize`.
 pub(crate) fn path_queue_bytes(config: &AgentConfig) -> Option<usize> {

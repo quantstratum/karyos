@@ -4374,7 +4374,7 @@ fn a_retired_destinations_pending_items_return_queue_closed() {
         route,
         queues,
     });
-    sender.close_removed(&mut halves);
+    sender.close_removed(&mut halves, 0);
     let counters = sender.counters();
     assert_eq!(counters.removed_returned, 1, "{counters:?}");
     assert_eq!(counters.removed_closed, 2, "the queue and the route");
@@ -4502,11 +4502,11 @@ fn a_close_without_its_tx_half_is_dropped_once() {
     });
     // A duty that does not hold endpoint 1's half.
     let mut none: Halves = Vec::new();
-    sender.close_removed(&mut none);
+    sender.close_removed(&mut none, 0);
     assert!(sender.closing.is_empty(), "dropped");
     assert_eq!(sender.counters().removed_dropped, 1);
     // The next duty, holding the half, has nothing of it left.
-    sender.close_removed(&mut halves);
+    sender.close_removed(&mut halves, 0);
     assert_eq!(sender.counters().removed_dropped, 1, "once");
     assert_eq!(sender.counters().removed_closed, 0);
 }
@@ -4550,7 +4550,7 @@ fn a_route_in_use_counts_once_and_resets_nothing() {
     };
     sender.closing.push(entry);
     sender.closing.push(entry);
-    sender.close_removed(&mut halves);
+    sender.close_removed(&mut halves, 0);
     let counters = sender.counters();
     assert_eq!(
         counters.removed_close_failed, 2,
@@ -4596,7 +4596,7 @@ fn a_close_of_handles_already_gone_asks_no_reset() {
         route,
         queues,
     });
-    sender.close_removed(&mut halves);
+    sender.close_removed(&mut halves, 0);
     let counters = sender.counters();
     assert_eq!(counters.removed_close_failed, 0, "{counters:?}");
     assert_eq!(
@@ -4643,7 +4643,7 @@ fn an_entry_of_another_epoch_is_dropped_and_counted() {
         route,
         queues: [None; super::super::data::OPENED_QUEUES],
     });
-    sender.close_removed(&mut halves);
+    sender.close_removed(&mut halves, 0);
     let counters = sender.counters();
     assert_eq!(counters.removed_dropped, 1, "{counters:?}");
     assert_eq!(
@@ -5054,12 +5054,15 @@ fn a_fanout_route_limit_after_a_failed_close_asks_one_reset() {
     assert!(opened, "the target opens after the reset");
 }
 
-/// Y3 (#838): a removed entry whose queue still has frames in flight gets
-/// one more duty; closed then, it is not counted as failed, and no reset
-/// follows. In flight on both tries, it counts once.
+/// Y3 (#838; QS-COORDINATOR 34443): a removed entry whose queue still has
+/// frames in flight is closed again at each duty and is not counted as
+/// failed while it is within `CLOSE_IN_FLIGHT_TIMEOUT`; closed then, no
+/// reset follows. Still in flight past the bound, it counts once.
 #[test]
 fn a_close_in_flight_gets_one_more_duty() {
-    for (in_flight, failed) in [(1u32, 0u64), (2, 1)] {
+    use super::super::CLOSE_IN_FLIGHT_TIMEOUT;
+
+    for (in_flight, failed) in [(3u32, 0u64), (u32::MAX, 1)] {
         let (mut sender, _receiver) =
             super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
         let (half, _frames, _data, _rx) = header_only_endpoint();
@@ -5076,15 +5079,24 @@ fn a_close_in_flight_gets_one_more_duty() {
             queues: [None; super::super::data::OPENED_QUEUES],
         });
         sender.close_in_flight = in_flight;
-        for now in 0..3 {
+        // Duties within the bound: in flight, never failed.
+        for now in [0, 1, 2, CLOSE_IN_FLIGHT_TIMEOUT / 2] {
             let _ = sender.duty(&mut halves, now).unwrap();
+            assert_eq!(
+                sender.counters().removed_close_failed,
+                0,
+                "within the bound at {now}"
+            );
         }
+        let _ = sender.duty(&mut halves, CLOSE_IN_FLIGHT_TIMEOUT).unwrap();
         let counters = sender.counters();
         assert_eq!(counters.removed_close_deferred, 1, "deferred once");
         assert_eq!(
             counters.removed_close_failed, failed,
             "in flight {in_flight}"
         );
+        assert_eq!(counters.removed_close_timeouts, failed, "past the bound");
         assert_eq!(counters.removed_closed, 1 - failed, "the route closed");
+        sender.close_in_flight = 0;
     }
 }

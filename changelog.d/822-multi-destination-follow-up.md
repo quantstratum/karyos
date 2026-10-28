@@ -29,7 +29,11 @@
     which drops the handles, or retired), or is of another epoch, is
     dropped and counted once (`removed_dropped`); a handle already gone
     counts as closed. An entry whose queue still has frames in flight is
-    closed once more at the next duty (`removed_close_deferred`); one
+    closed again at each duty (`removed_close_deferred`) and counts as
+    failed only on a close error or after `CLOSE_IN_FLIGHT_TIMEOUT` (1 s)
+    in flight (`removed_close_timeouts`): a kernel backend shows no
+    progress on frames it holds, so a cycle count would fail closes that
+    are only slow; one
     with a live handle the endpoint will not close is counted once
     (`removed_close_failed`). When that endpoint then refuses a route or
     a queue for its limit (`RouteLimit`, `QueueLimit`, `OverCommitted`),

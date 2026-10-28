@@ -396,6 +396,9 @@ pub struct SenderCounters {
     /// Removed publications' entries closed again at the next duty because
     /// a queue still had frames in flight (#838).
     pub removed_close_deferred: u64,
+    /// Of those, the ones still in flight after
+    /// [`super::CLOSE_IN_FLIGHT_TIMEOUT`]: counted as failed closes.
+    pub removed_close_timeouts: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -1534,9 +1537,11 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     /// reset drops what would not close, which nothing else frees.
     close_failures: Vec<EndpointCloses>,
     /// Removed publications' entries whose queues still had frames in
-    /// flight: closed once more at the next duty before they count as
-    /// failed (allocated at creation, as `closing`).
-    closing_again: Vec<super::data::Opened>,
+    /// flight, with the duty that first found them so: closed again at each
+    /// duty until they close, fail with a close error, or outlive
+    /// [`super::CLOSE_IN_FLIGHT_TIMEOUT`] (allocated at creation, as
+    /// `closing`).
+    closing_again: Vec<(super::data::Opened, u64)>,
     /// Test only: the next closes of removed entries to report in flight,
     /// before touching any handle (the sockets backend has no such state
     /// a driver test can reach).
@@ -5030,7 +5035,7 @@ impl<T: StreamTerms> SenderRole<T> {
     /// [`SenderRole::remove`]), on each endpoint whose TX half it holds in
     /// the same epoch. An endpoint whose half it does not hold, or now in
     /// another epoch, dropped them already (a reset or a retirement).
-    fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
+    fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)], now: u64) {
         // An endpoint whose half is gone (in a reset, or retired) or back
         // in another epoch starts afresh.
         self.close_failures.retain(|record| {
@@ -5039,23 +5044,40 @@ impl<T: StreamTerms> SenderRole<T> {
                 _ => false,
             })
         });
-        // Last cycle's entries with frames in flight get their one more
-        // try: what still does not close has failed.
-        while let Some(mut opened) = self.closing_again.pop() {
-            if self.close_entry(halves, &mut opened) != EntryClosed::Done {
-                self.close_failed(opened.endpoint, opened.epoch);
+        // The entries still in flight are closed again: closed, they go;
+        // a close error, or the time bound in flight, fails them; else they
+        // wait for the next duty.
+        let mut index = 0;
+        while let Some((mut opened, since)) = self.closing_again.get(index).copied() {
+            let outcome = self.close_entry(halves, &mut opened);
+            let late = now < since || age_ns(now, since) >= super::CLOSE_IN_FLIGHT_TIMEOUT;
+            match outcome {
+                EntryClosed::Done => {
+                    self.closing_again.swap_remove(index);
+                }
+                EntryClosed::InFlight if !late => {
+                    if let Some(slot) = self.closing_again.get_mut(index) {
+                        slot.0 = opened;
+                    }
+                    index += 1;
+                }
+                EntryClosed::InFlight | EntryClosed::Failed => {
+                    if outcome == EntryClosed::InFlight {
+                        self.count(|c| &mut c.removed_close_timeouts);
+                    }
+                    self.closing_again.swap_remove(index);
+                    self.close_failed(opened.endpoint, opened.epoch);
+                }
             }
         }
         while let Some(mut opened) = self.closing.pop() {
             match self.close_entry(halves, &mut opened) {
                 EntryClosed::Done => {}
-                // Both lists have the same capacity, and this one is
-                // emptied first, so it has room.
                 EntryClosed::InFlight
                     if self.closing_again.len() < self.closing_again.capacity() =>
                 {
                     self.count(|c| &mut c.removed_close_deferred);
-                    self.closing_again.push(opened);
+                    self.closing_again.push((opened, now));
                 }
                 // Once per entry, no retry: the endpoint is reset when
                 // what did not close holds it at its limit.
@@ -5368,7 +5390,7 @@ impl<T: StreamTerms> SenderRole<T> {
         for _ in 0..unrecorded {
             self.count(|c| &mut c.removed_unrecorded);
         }
-        self.close_removed(halves);
+        self.close_removed(halves, now);
         self.naks_this_cycle = 0;
         // Bindings past their lifetime go even when nothing arrives.
         self.expire_bindings(now);
