@@ -1,30 +1,50 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Checks the committed ABI manifest, crates/karyos-ffi/abi/manifest.txt,
-# against the header measured on this host (scripts/abi-manifest.sh, less
-# its `target` line, karyos#700). A layout or constant that changed with
-# the same ABI version fails as an unversioned ABI change; one that
-# changed with a new ABI version fails until the manifest is regenerated
-# and committed with it:
+# Checks libkaryos's ABI manifest (scripts/abi-manifest.sh, less its
+# `target` line, karyos#700) measured on this host against two records:
 #
-#   scripts/abi-manifest.sh | grep -v '^target=' > crates/karyos-ffi/abi/manifest.txt
+# - The committed manifest, crates/karyos-ffi/abi/manifest.txt: a layout,
+#   constant or declaration that changed fails until the manifest is
+#   regenerated and committed with it:
+#
+#     scripts/abi-manifest.sh | grep -v '^target=' > crates/karyos-ffi/abi/manifest.txt
+#
+# - The last released manifest, crates/karyos-ffi/abi/released/<abi>.txt
+#   (RELEASING.md adds one per release): a manifest that differs from it
+#   must carry a higher ABI version, so regenerating the committed manifest
+#   never passes an unversioned change (owner item 48). Before the first
+#   release there is none, and the check says so.
 #
 # Run in pre-push on macOS; LP64 Linux is expected to measure the same
 # file, which a Linux run of this script confirms.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-committed="$root/crates/karyos-ffi/abi/manifest.txt"
+abi="$root/crates/karyos-ffi/abi"
+committed="$abi/manifest.txt"
 measured="$("$root/scripts/abi-manifest.sh" | grep -v '^target=')"
-if [ "$measured" = "$(cat "$committed")" ]; then
-    echo "abi manifest: $(sed -n 's/^abi_version=//p' "$committed"), $(grep -c '^struct' "$committed") structs, $(grep -c '^const' "$committed") constants: matches"
-    exit 0
+version() { sed -n 's/^abi_version=//p'; }
+new="$(echo "$measured" | version)"
+
+if [ "$measured" != "$(cat "$committed")" ]; then
+    diff <(cat "$committed") <(echo "$measured") >&2 || true
+    echo "check-abi-manifest: the header at ABI $new does not match crates/karyos-ffi/abi/manifest.txt: regenerate and commit it (see this script)" >&2
+    exit 1
 fi
-diff <(cat "$committed") <(echo "$measured") >&2 || true
-old="$(sed -n 's/^abi_version=//p' "$committed")"
-new="$(echo "$measured" | sed -n 's/^abi_version=//p')"
-if [ "$old" = "$new" ]; then
-    echo "check-abi-manifest: the header's layout or constants changed at ABI $new without a new ABI version (owner item 48)" >&2
+
+released=""
+if [ -d "$abi/released" ]; then
+    released="$(find "$abi/released" -name '*.txt' | sed 's|.*/||; s|\.txt$||' | sort -V | tail -n 1)"
+fi
+if [ -z "$released" ]; then
+    against="no released manifest yet"
+elif [ "$measured" = "$(cat "$abi/released/$released.txt")" ]; then
+    against="the same as released ABI $released"
+elif [ "$(printf '%s\n%s\n' "$released" "$new" | sort -V | tail -n 1)" = "$new" ] &&
+    [ "$new" != "$released" ]; then
+    against="changed since released ABI $released, at the new ABI $new"
 else
-    echo "check-abi-manifest: ABI $old -> $new: regenerate crates/karyos-ffi/abi/manifest.txt and commit it (see this script)" >&2
+    diff <(cat "$abi/released/$released.txt") <(echo "$measured") >&2 || true
+    echo "check-abi-manifest: the header changed since released ABI $released without a higher ABI version (owner item 48)" >&2
+    exit 1
 fi
-exit 1
+echo "abi manifest: $new, $(grep -c '^struct' "$committed") structs, $(grep -c '^const' "$committed") constants, $(grep -c '^decl' "$committed") declarations: matches; $against"

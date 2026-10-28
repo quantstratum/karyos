@@ -16,10 +16,14 @@
 # package. Signing is a separate step, scripts/sign-release.sh, run by the
 # release key's custodian; this script signs nothing.
 #
-# The archives are deterministic for a commit and a toolchain: sorted
-# entries, owner 0, file times set to the commit's time, and gzip without
-# a name or time. Whether two independent builds give the same bytes is
-# karyos-deploy's reproducibility gate (C-REPRO), not checked here.
+# The archives are deterministic for a commit, a toolchain and a host
+# tar: sorted entries, owner 0, modes from the file's kind (not the
+# umask), file times set to the commit's time in UTC (not the builder's
+# TZ), no extended attributes, ACLs or Mac metadata, and gzip without a
+# name or time. scripts/check-release-reproducible.sh builds twice under
+# different TZ and umask and compares. Whether two independent machines
+# give the same bytes is karyos-deploy's reproducibility gate (C-REPRO),
+# not checked here.
 #
 # Usage: scripts/release-libkaryos.sh [DEST] (default target/release-artifacts).
 set -euo pipefail
@@ -31,6 +35,8 @@ case "$dest" in
 /*) ;;
 *) dest="$PWD/$dest" ;;
 esac
+# Without trailing slashes, as package-libkaryos.sh's DEST.
+while [ "$dest" != / ] && [ "${dest%/}" != "$dest" ]; do dest="${dest%/}"; done
 
 fail() {
     echo "release-libkaryos: $*" >&2
@@ -39,8 +45,20 @@ fail() {
 
 [ -z "$(git -C "$root" status --porcelain)" ] ||
     fail "the tree has uncommitted changes; a release artifact is built from a commit"
-if [ -e "$dest" ] && [ ! -f "$dest/SHA256SUMS" ]; then
-    fail "$dest exists and is not a release directory; remove it or pick another DEST"
+# DEST is replaced at the end, so it must be absent or an unsigned
+# release directory of this script: SHA256SUMS and the archives it lists,
+# nothing else (a signature included: a signed release is never
+# overwritten). Never / or $HOME.
+if [ "$dest" = / ] || [ "$dest" = "${HOME%/}" ]; then
+    fail "refusing DEST $dest"
+fi
+if [ -e "$dest" ]; then
+    [ -d "$dest" ] && [ -f "$dest/SHA256SUMS" ] ||
+        fail "$dest exists and is not a release directory; remove it or pick another DEST"
+    listed="$(awk '{print $2}' "$dest/SHA256SUMS" | sed 's/^\*//' | LC_ALL=C sort)"
+    present="$(cd "$dest" && find . -mindepth 1 | sed 's|^\./||' | grep -vx SHA256SUMS | LC_ALL=C sort || true)"
+    [ "$present" = "$listed" ] ||
+        fail "$dest holds files other than its SHA256SUMS and the archives it lists; remove it or pick another DEST"
 fi
 commit="$(git -C "$root" rev-parse HEAD)"
 epoch="$(git -C "$root" log -1 --format=%ct HEAD)"
@@ -88,16 +106,27 @@ sha256() {
 # bsdtar (their owner and time options differ).
 archive() {
     local name="$1" dir="$2"
+    # Modes from the files' kind, not the builder's umask: 755 for
+    # directories and executables, 644 for the rest.
+    find "$dir" -type d -exec chmod 755 {} +
+    find "$dir" -type f -perm -u+x -exec chmod 755 {} +
+    find "$dir" -type f ! -perm -u+x -exec chmod 644 {} +
+    # The commit's time, in UTC whichever TZ the builder has: BSD
+    # `touch -t` reads its argument as local time.
     find "$dir" -exec touch -h -d "@$epoch" {} + 2>/dev/null ||
-        find "$dir" -exec touch -h -t "$(date -u -r "$epoch" +%Y%m%d%H%M.%S)" {} +
+        find "$dir" -exec env TZ=UTC touch -h -t "$(date -u -r "$epoch" +%Y%m%d%H%M.%S)" {} +
     (
         cd "$(dirname "$dir")"
         find "$(basename "$dir")" -print | LC_ALL=C sort >"$work/$name.list"
         if tar --version 2>/dev/null | grep -q 'GNU tar'; then
             tar --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
+                --no-xattrs --no-acls --no-selinux --format=gnu \
                 --no-recursion -cf - -T "$work/$name.list"
         else
+            # No extended attributes, ACLs or Mac metadata: pax headers
+            # that would follow the builder's files.
             COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --uname '' --gname '' \
+                --no-xattrs --no-acls --no-mac-metadata --format=ustar \
                 --no-recursion -cf - -T "$work/$name.list"
         fi
     ) | gzip -n -9 >"$work/out/$name.tar.gz"

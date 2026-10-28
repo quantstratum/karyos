@@ -83,14 +83,21 @@ item 44; karyos#700). At the release head, on each host:
    `MANIFEST` with `contents=library` and `excludes=karyosd`, and the ABI
    manifest), the daemon alone (`karyosd-<core>-<triple>.tar.gz`), and
    `SHA256SUMS`. It refuses a library artifact holding `karyosd` or a
-   daemon artifact holding the library.
+   daemon artifact holding the library, and a DEST that is `/`, `$HOME`,
+   or anything but an unsigned release directory of its own. The archives
+   are deterministic on a host; `scripts/check-release-reproducible.sh`
+   builds twice under different `TZ` and umask and compares.
 2. `scripts/conformance-package.sh <libkaryos tarball>` runs the
    conformance suite against the artifact itself, which it checks against
-   `SHA256SUMS` first; its last line, with the artifact's SHA-256, is the
-   Evidence row. The cross-process scenarios run on Linux only.
-3. `scripts/sign-release.sh` signs each artifact with key-based `cosign`
-   and verifies it (karyos-deploy ADR-0003). The release key's custodian
-   runs it; it refuses without the key's URI and has no fallback. Until
+   `SHA256SUMS` first, from a clean tree at the package's `core_commit`
+   (the suite is the tree's); its last line, with the artifact's SHA-256,
+   is the Evidence row, pass or fail. The cross-process scenarios run on
+   Linux only.
+3. `scripts/sign-release.sh` signs exactly the artifacts `SHA256SUMS`
+   lists with key-based `cosign` and verifies each (karyos-deploy
+   ADR-0003); it refuses a directory holding an archive it does not list.
+   The release key's custodian runs it; it refuses without the key's
+   `pkcs11:` URI (a key file's path included) and has no fallback. Until
    karyos-deploy's D1 gates (the R8 record for `cosign`, the custody
    procedure) are met, there is no key, and no signed artifact is
    published.
@@ -99,9 +106,14 @@ The soname policy is owner item 48's ruling: the soname carries `0.y`
 before 1.0 and the major from 1.0 on (`scripts/package-libkaryos.sh`).
 The ABI manifest, `share/karyos/abi-manifest.txt` in the package and
 `crates/karyos-ffi/abi/manifest.txt` in the tree, gives every public
-struct's size, alignment and field offsets and every constant of the
-released header; `make abi-manifest-check` (in pre-push) fails a layout
-change without a new ABI version.
+struct's size, alignment and field offsets, every constant's value, and
+every other declaration of the header (prototypes, inline functions'
+signatures, callback and other typedefs) as written; a header it cannot
+parse is an error. `make abi-manifest-check` (in pre-push) fails when the
+header no longer matches the committed manifest, and when the manifest
+differs from the last released one, `crates/karyos-ffi/abi/released/<abi>.txt`,
+without a higher ABI version (owner item 48). At each release, the
+manifest is copied there as the released ABI version's and committed.
 
 The conformance test kit (`make libkaryos-testkit`) is not a release
 package: its `MANIFEST` says `release_package=no` and its `README` says
