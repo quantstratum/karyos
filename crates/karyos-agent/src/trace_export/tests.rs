@@ -532,3 +532,100 @@ fn a_full_page_stays_within_the_reply_bound() {
     assert_eq!(page.next, u64::try_from(page.records.len()).unwrap());
     assert!(page.next < u64::try_from(EXPORT_MAX).unwrap());
 }
+
+/// QS-COORDINATOR, ACS 33839 (U1): an entry busy for less than the wait
+/// budget is waited out, and its journal's records come out calibrated,
+/// never unreadable.
+#[test]
+fn a_transient_busy_entry_is_waited_for() {
+    let mut mirror = mirror(16);
+    let other = JournalEntry::open(11, 1, JournalKind::Publisher, 2, 16);
+    assert!(mirror.write_entry(1, Some(&other)));
+    let _ = mirror.append(11, 0, &[0, !0]).unwrap();
+    assert!(mirror.hold_entry(1, true));
+    let reader = mirror.reader();
+    // Released well within the budget the read waits.
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(mirror.hold_entry(1, false));
+        mirror
+    });
+    let page = export_within(
+        &reader,
+        (EPOCH, None),
+        0,
+        16,
+        usize::MAX,
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+    let _mirror = writer.join().unwrap();
+    assert_eq!(seqs(&page), [0]);
+    assert!(matches!(&page.journals[..], [ExportJournal::Live(entry)] if entry.journal == 11));
+    assert_eq!(page.unreadable_records, 0);
+}
+
+/// ACS 33839 (U2): one page of more records than one batch reads them all,
+/// in order, across its batches.
+#[test]
+fn a_page_spans_several_batches() {
+    let mut mirror = mirror(256);
+    append(&mut mirror, 0..200);
+    let page = read_page(&mirror.reader(), EPOCH, 0, 200, None).unwrap();
+    assert_eq!(seqs(&page), (0..200).collect::<Vec<_>>());
+    assert_eq!(page.next, 200);
+}
+
+/// ACS 33839 (U2): a page fills up exactly at its byte bound: the records
+/// that fit are in it, and one byte less leaves the last of them out.
+#[test]
+fn a_page_fills_exactly_at_its_bound() {
+    let mut mirror = mirror(16);
+    append(&mut mirror, 0..10);
+    let reader = mirror.reader();
+    let one = crate::json::export_record_len_of(0, 10, 0, &[0, !0]);
+    // The records all encode alike but for their sequence digits.
+    let lens: Vec<usize> = (0..5u64)
+        .map(|seq| crate::json::export_record_len_of(seq, 10, seq, &[seq, !seq]))
+        .collect();
+    assert_eq!(lens[0], one);
+    let bound = crate::json::EXPORT_REPLY_OVERHEAD
+        + crate::api::MAX_JOURNAL_REPLY
+        + lens.iter().sum::<usize>();
+    let page = export(&reader, EPOCH, 0, 16, None, bound).unwrap();
+    assert_eq!(seqs(&page), [0, 1, 2, 3, 4]);
+    assert_eq!(page.next, 5);
+    let page = export(&reader, EPOCH, 0, 16, None, bound - 1).unwrap();
+    assert_eq!(seqs(&page), [0, 1, 2, 3]);
+    assert_eq!(page.next, 4);
+}
+
+/// ACS 33839 (U2): a page lapped by the ring after its first records (here
+/// between its first and second batches) ends where it was, stating no
+/// loss after its records; the next page states the lost range first.
+#[test]
+fn a_page_lapped_after_its_first_records_ends_there() {
+    let mirror = std::rc::Rc::new(std::cell::RefCell::new(mirror(64)));
+    append(&mut mirror.borrow_mut(), 0..64);
+    let reader = mirror.borrow().reader();
+    let writer = std::rc::Rc::clone(&mirror);
+    BETWEEN_BATCHES.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || append(&mut writer.borrow_mut(), 64..164)));
+    });
+    let page = read_page(&reader, EPOCH, 0, 200, None);
+    BETWEEN_BATCHES.with(|hook| *hook.borrow_mut() = None);
+    let page = page.unwrap();
+    assert_eq!(seqs(&page), (0..64).collect::<Vec<_>>());
+    assert!(page.lost.is_empty(), "{:?}", page.lost);
+    assert_eq!(page.next, 64);
+    let page = read_page(&reader, EPOCH, 64, 200, None).unwrap();
+    assert_eq!(
+        page.lost,
+        vec![ExportLoss {
+            first: 64,
+            last: 99,
+            reason: LossReason::Overwritten
+        }]
+    );
+    assert_eq!(seqs(&page), (100..164).collect::<Vec<_>>());
+}

@@ -56,8 +56,17 @@ pub(crate) const LOSS_BYTES: usize = 96;
 /// Records one scan of a page reads at most, so a page that ends early
 /// copies no more than this past its end.
 const SCAN_BATCH: usize = 64;
+#[cfg(test)]
+thread_local! {
+    /// Tests: run between two batches of a page, to lap the ring there.
+    pub(crate) static BETWEEN_BATCHES: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+}
 /// The time a read of the table and the log waits, in all, for entries
-/// being written, yielding between attempts.
+/// being written, yielding between attempts: a driver writes an entry in
+/// a few stores, so a busy entry is a writer mid-write, which this waits
+/// out unless it was preempted or stopped there; 1 ms is past any write
+/// but a preempted one, and short enough not to hold the agent.
 const BUSY_BUDGET: std::time::Duration = std::time::Duration::from_millis(1);
 /// Reads of the ring's bounds retried while a publication is in progress.
 const BUSY_RETRIES: usize = 16;
@@ -85,6 +94,19 @@ pub fn export(
     count: usize,
     asked: Option<u128>,
     max_bytes: usize,
+) -> Result<ExportPage, ExportRefusal> {
+    export_within(mirror, (epoch, asked), from, count, max_bytes, BUSY_BUDGET)
+}
+
+/// [`export`], waiting `busy_budget` at most for table and log entries
+/// being written.
+pub(crate) fn export_within(
+    mirror: &TraceMirrorReader,
+    (epoch, asked): (u128, Option<u128>),
+    from: u64,
+    count: usize,
+    max_bytes: usize,
+    busy_budget: std::time::Duration,
 ) -> Result<ExportPage, ExportRefusal> {
     if asked.is_some_and(|asked| asked != epoch) {
         return Err(ExportRefusal::EpochChanged { epoch });
@@ -216,9 +238,15 @@ pub fn export(
             None if usize::try_from(scan.delivered).unwrap_or(usize::MAX) < batch => break,
             None => {}
         }
+        #[cfg(test)]
+        BETWEEN_BATCHES.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
     }
     let mut next = stop.unwrap_or(cursor);
-    let (mut journals, unread) = journals(mirror, &records);
+    let (mut journals, unread) = journals(mirror, &records, busy_budget);
     if records
         .first()
         .is_some_and(|record| unread.contains(&record.journal))
@@ -307,6 +335,7 @@ fn journal_number(journal: &ExportJournal) -> u64 {
 fn journals(
     mirror: &TraceMirrorReader,
     records: &[ExportRecord],
+    busy_budget: std::time::Duration,
 ) -> (Vec<ExportJournal>, BTreeSet<u64>) {
     #[derive(Clone, Copy)]
     enum Slot {
@@ -350,7 +379,7 @@ fn journals(
         }
     }
     let start = std::time::Instant::now();
-    while !busy.is_empty() && !wanted.is_empty() && start.elapsed() < BUSY_BUDGET {
+    while !busy.is_empty() && !wanted.is_empty() && start.elapsed() < busy_budget {
         std::thread::yield_now();
         busy.retain(|slot| !take(*slot, &mut found, &mut wanted));
     }
