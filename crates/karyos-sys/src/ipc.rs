@@ -42,7 +42,7 @@ use crate::mmap::retry_interrupted;
 
 /// Bytes before a region's structure: the 64-byte header, padded to the
 /// 128-byte stride (`quantstratum-docs: karyos/design/cnc-primitives.md`).
-pub const HEADER_STRIDE: usize = 128;
+pub const HEADER_STRIDE: usize = crate::sizing::REGION_HEADER_STRIDE;
 /// Words of the header.
 const HEADER_WORDS: usize = 8;
 /// The first header word of every region: "KARYOS" and a format byte.
@@ -167,13 +167,7 @@ impl RegionRecord {
     /// The region's total size: the header stride plus the structure.
     fn size(&self) -> Result<usize, SysError> {
         let len = self.structure_length;
-        if len == 0 || !len.is_multiple_of(HEADER_STRIDE) {
-            return Err(SysError::InvalidRegion { address: 0, len });
-        }
-        HEADER_STRIDE
-            .checked_add(len)
-            .filter(|total| isize::try_from(*total).is_ok())
-            .ok_or(SysError::InvalidRegion { address: 0, len })
+        crate::sizing::region_length(len).ok_or(SysError::InvalidRegion { address: 0, len })
     }
 
     fn header_words(&self) -> [u64; HEADER_WORDS] {

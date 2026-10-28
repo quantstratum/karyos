@@ -20,7 +20,6 @@ use crate::atomic_view::HeapWords;
 pub const LAYOUT_VERSION: u64 = 1;
 
 /// Words of a 128-byte stride.
-#[cfg(target_os = "linux")]
 const STRIDE: usize = 16;
 
 /// Where the words live.
@@ -42,6 +41,24 @@ pub(crate) struct RingStore {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "used by regions"))]
     trailer_words: usize,
     max_extent: u64,
+}
+
+/// Bytes of a ring region's structure: the configuration line, the
+/// trailer and the data of `capacity` bytes (R-CORE-34); `None` for a
+/// capacity or trailer a ring refuses.
+pub(crate) fn ring_structure_length(
+    capacity: usize,
+    min_capacity: usize,
+    trailer_words: usize,
+) -> Option<usize> {
+    let (data_words, _) = geometry(capacity, min_capacity)?;
+    if !trailer_words.is_multiple_of(STRIDE) {
+        return None;
+    }
+    STRIDE
+        .checked_add(trailer_words)?
+        .checked_add(data_words)?
+        .checked_mul(crate::atomic_view::WORD_BYTES)
 }
 
 /// The geometry every owned ring has: a power-of-two `capacity` of at least
@@ -107,15 +124,9 @@ impl RingStore {
 mod mapped {
     use core::sync::atomic::Ordering;
 
-    use super::{LAYOUT_VERSION, RingStore, STRIDE, Store, geometry};
-    use crate::atomic_view::WORD_BYTES;
+    use super::{LAYOUT_VERSION, RingStore, STRIDE, Store, geometry, ring_structure_length};
     use crate::error::SysError;
     use crate::ipc::{Region, RegionKind, RegionRecord};
-
-    /// Words of the structure: configuration line, trailer, data.
-    fn structure_words(trailer_words: usize, data_words: usize) -> Option<usize> {
-        STRIDE.checked_add(trailer_words)?.checked_add(data_words)
-    }
 
     impl RingStore {
         /// A ring of `capacity` bytes in a new shared region of `kind`
@@ -136,9 +147,8 @@ mod mapped {
             if !trailer_words.is_multiple_of(STRIDE) {
                 return Err(invalid);
             }
-            let structure_length = structure_words(trailer_words, data_words)
-                .and_then(|words| words.checked_mul(WORD_BYTES))
-                .ok_or(invalid)?;
+            let structure_length =
+                ring_structure_length(capacity, min_capacity, trailer_words).ok_or(invalid)?;
             let mapped = Region::create(RegionRecord {
                 instance,
                 region,
@@ -192,8 +202,7 @@ mod mapped {
             let [capacity, max_extent, trailer, rest @ ..] = config;
             let capacity = usize::try_from(capacity).map_err(|_| invalid)?;
             let (data_words, expected_extent) = geometry(capacity, min_capacity).ok_or(invalid)?;
-            let structure_length = structure_words(trailer_words, data_words)
-                .and_then(|words| words.checked_mul(WORD_BYTES));
+            let structure_length = ring_structure_length(capacity, min_capacity, trailer_words);
             if max_extent != expected_extent
                 || trailer != trailer_words as u64
                 || rest.iter().any(|word| *word != 0)

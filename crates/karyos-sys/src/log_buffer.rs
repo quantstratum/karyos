@@ -402,6 +402,17 @@ impl LogBuffer<SharedTerms> {
 
 #[cfg(target_os = "linux")]
 impl LogBuffer<SharedTerms> {
+    /// Bytes of a log buffer region's structure for `config` (R-CORE-34):
+    /// the size one mapping generation is created with, after the region
+    /// header, terms included. Only a buffer over [`SharedTerms`] is a
+    /// region; a [`HeapTerms`] buffer keeps its terms outside its words.
+    /// `None` for a configuration a buffer refuses.
+    #[must_use]
+    pub fn structure_length(config: &LogBufferConfig) -> Option<usize> {
+        let (layout, _, _) = Self::plan(config).ok()?;
+        Self::structure_length_of(&layout)
+    }
+
     /// Creates a buffer in a new shared region (driver side,
     /// `quantstratum-docs: karyos/design/ipc-log-buffer.md`): the region is created and
     /// size-sealed for this layout, then initialised. Its descriptor is
@@ -417,9 +428,7 @@ impl LogBuffer<SharedTerms> {
         generation: Generation,
     ) -> Result<Self, SysError> {
         let (layout, slots, max_message_length) = Self::plan(&config)?;
-        let structure_length = layout
-            .total
-            .checked_mul(crate::atomic_view::WORD_BYTES)
+        let structure_length = Self::structure_length_of(&layout)
             .ok_or(SysError::InvalidRegion { address: 0, len: 0 })?;
         let mapped = crate::ipc::Region::create(crate::ipc::RegionRecord {
             instance,
@@ -558,6 +567,12 @@ impl<T: TermBytes> LogBuffer<T> {
     /// As [`LogBuffer::new`].
     pub fn validate(config: &LogBufferConfig) -> Result<(), SysError> {
         Self::plan(config).map(|_| ())
+    }
+
+    /// Bytes of the structure of `layout`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "used by regions"))]
+    fn structure_length_of(layout: &Layout) -> Option<usize> {
+        layout.total.checked_mul(crate::atomic_view::WORD_BYTES)
     }
 
     /// Validates `config` and computes its layout, slot count and largest
@@ -6245,5 +6260,26 @@ mod region_tests {
             LogBuffer::attach(attached),
             Err(SysError::InvalidRegion { .. })
         ));
+    }
+
+    /// The structure length of a log buffer region counts its terms: it is
+    /// the mapping a shared buffer is created with, and it is the words a
+    /// heap buffer lays out plus the terms that buffer keeps outside them.
+    #[test]
+    fn the_structure_length_counts_the_terms_for_each_backing() {
+        let exclusive = config(PublicationMode::Exclusive);
+        let more_slots = LogBufferConfig {
+            spare_slots: exclusive.spare_slots + 1,
+            ..exclusive
+        };
+        for config in [exclusive, more_slots] {
+            let length = LogBuffer::<SharedTerms>::structure_length(&config).unwrap();
+            let shared = LogBuffer::create_in(1, 11, config, generation()).unwrap();
+            assert_eq!(length, shared.region().unwrap().record().structure_length);
+            let (layout, slots, _) = LogBuffer::<HeapTerms>::plan(&config).unwrap();
+            let words = LogBuffer::<HeapTerms>::structure_length_of(&layout).unwrap();
+            let terms = usize::from(slots) * usize::try_from(config.term_length.get()).unwrap();
+            assert_eq!(words + terms, length);
+        }
     }
 }
