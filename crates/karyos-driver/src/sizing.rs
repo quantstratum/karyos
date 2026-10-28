@@ -194,13 +194,13 @@ fn sum(lines: &[SizingLine]) -> Result<u64, SizingError> {
 /// conflation table's region when it has one, unrounded, from
 /// `embedded::lane_regions`, the definition `max_stream_bytes` bounds.
 fn stream_regions(stream: &StreamConfig) -> Result<(u64, Option<u64>), SizingError> {
-    crate::embedded::lane_regions(&stream.buffer, stream.conflation.as_ref()).ok_or(
+    crate::embedded::lane_regions(&stream.buffer, stream.conflation.as_ref()).ok_or_else(|| {
         if crate::embedded::log_region_bytes(&stream.buffer).is_none() {
             SizingError::Invalid("a stream's log buffer configuration")
         } else {
             SizingError::Invalid("a stream's conflation configuration")
-        },
-    )
+        }
+    })
 }
 
 /// The sizing report of a driver of `config` in IPC mode serving `streams`
@@ -357,9 +357,7 @@ pub fn report(
         // A declared stream above the cap is one `add_stream` refuses; the
         // lane's bytes are summed only when there is a cap to compare.
         if let Some(max) = config.max_stream_bytes {
-            let lane = log
-                .checked_add(raw_table.unwrap_or(0))
-                .ok_or(SizingError::Overflow)?;
+            let lane = crate::embedded::lane_sum(log, raw_table).ok_or(SizingError::Overflow)?;
             if lane > max {
                 return Err(SizingError::Invalid("a stream above max_stream_bytes"));
             }

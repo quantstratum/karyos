@@ -3027,7 +3027,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             ));
         }
         let key = (config.buffer.stream_id, config.buffer.session_id);
-        // The table's own refusal first, so the cap never hides it.
+        // The table's shape, before the lane is sized for the cap. Since
+        // `table_region_bytes` refuses what `conflation_shape` refuses,
+        // the order no longer decides the error (karyos#824).
         let shape = config.conflation.map(conflation_shape).transpose()?;
         self.check_stream_bytes(&buffer_config, config.conflation.as_ref())?;
         let buffer = Arc::new(<T as sealed::Create>::create(
@@ -6648,6 +6650,13 @@ pub fn stream_lane_bytes(
     conflation: Option<&ConflationConfig>,
 ) -> Option<u64> {
     let (log, table) = lane_regions(buffer, conflation)?;
+    lane_sum(log, table)
+}
+
+/// A lane's bytes from its regions' (R-CORE-34): the one sum behind
+/// [`stream_lane_bytes`] and the sizing report's cap check. `None` past 64
+/// bits.
+pub(crate) fn lane_sum(log: u64, table: Option<u64>) -> Option<u64> {
     log.checked_add(table.unwrap_or(0))
 }
 
