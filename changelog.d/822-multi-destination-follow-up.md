@@ -36,9 +36,11 @@
     on any open path, in the same epoch, its reset is asked for once,
     tagged with that epoch; the served reset starts a new epoch, which
     drops what did not close. The endpoint table keeps this standing
-    request while the endpoint is not active, within its interval, or
-    with its command ring full, and serves it once in that epoch; a new
-    epoch drops it. Other reset requests are dropped then, as before,
+    request while the endpoint is not active or within its interval, and
+    serves it once in that epoch; with its command ring full it is
+    counted refused once and tried again at most once per endpoint
+    interval (`standing_retries`); an agent gone, or a new epoch, drops
+    it. Other reset requests are dropped then, as before,
     and asked again by their owner while the need holds. Without a
     failed close in the epoch the limit is an ordinary refusal and
     resets nothing. With the

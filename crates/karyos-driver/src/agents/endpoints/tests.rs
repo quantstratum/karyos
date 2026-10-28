@@ -791,3 +791,70 @@ fn a_standing_request_is_dropped_when_its_epoch_changes() {
     assert!(poll_at(&mut endpoints, &mut agents, &links, 30 * SEC).is_empty());
     assert_eq!(endpoints.counters().resets, resets);
 }
+
+/// #838 (E1): a standing request the command ring is too full for is kept,
+/// counted refused once, and tried again at most once per endpoint
+/// interval, never on every poll; once the ring has room, it is served.
+#[test]
+fn a_standing_request_the_ring_refuses_is_retried_paced() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    settle(&mut agents, &links, &mut endpoints, 1);
+    // The sender's ring full: every slot reserved and held.
+    let mut held = Vec::new();
+    while let Ok(prepared) = links.sender.prepare() {
+        held.push(prepared);
+    }
+    let epoch = epoch_of(&endpoints, id);
+    endpoints.requested(&links, id, Some(epoch), 10 * SEC);
+    assert_eq!(endpoints.counters().resets, 0);
+    // Polled often over three intervals: at most three tries.
+    for step in 0..300 {
+        endpoints.poll(&links, 10 * SEC + step * SEC / 100, |_| {}, |_| {});
+    }
+    let counters = endpoints.counters();
+    assert_eq!(counters.resets_refused, 1, "refused once");
+    assert!(
+        counters.standing_retries <= 3,
+        "paced: {}",
+        counters.standing_retries
+    );
+    assert!(counters.standing_retries >= 1, "tried again");
+    // Room again: served at the next try, once.
+    drop(held);
+    let events = poll_at(&mut endpoints, &mut agents, &links, 20 * SEC);
+    assert!(
+        matches!(events.as_slice(), [EndpointEvent::Reopened { endpoint, .. }] if *endpoint == id),
+        "{events:?}"
+    );
+    assert_eq!(endpoints.counters().resets, 1);
+}
+
+/// #838 (E2): a standing request refused because the agent is gone is
+/// not kept: nothing is tried again.
+#[test]
+fn a_standing_request_refused_for_good_is_dropped() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    settle(&mut agents, &links, &mut endpoints, 1);
+    let epoch = epoch_of(&endpoints, id);
+    drop(agents);
+    endpoints.requested(&links, id, Some(epoch), 10 * SEC);
+    for step in 0..10 {
+        endpoints.poll(&links, 10 * SEC + step * 10 * SEC, |_| {}, |_| {});
+    }
+    let counters = endpoints.counters();
+    assert_eq!(counters.resets, 0);
+    assert_eq!(counters.resets_refused, 1);
+    assert_eq!(counters.standing_retries, 0, "dropped");
+}

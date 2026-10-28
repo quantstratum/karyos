@@ -213,6 +213,9 @@ struct Entry<O: SocketOps> {
     /// in that epoch, dropped when the epoch changes; the sender asks once
     /// (#838). Other requests are dropped and asked again by their owner.
     waiting: Option<karyos_io::backend::BackendEpoch>,
+    /// When a kept standing request may be tried again after the command
+    /// ring refused it: one endpoint interval on, never every poll.
+    retry_at: Option<u64>,
 }
 
 /// The first interval between two requested resets of an endpoint (ns).
@@ -236,8 +239,13 @@ pub struct EndpointCounters {
     /// duplicate while a reset is in flight).
     pub requests_ignored: u64,
     /// Requested resets that could not start ([`Endpoints::reset`]
-    /// failed; the sender asks again).
+    /// failed), each counted once: an ordinary request's owner asks again;
+    /// a standing one is tried again by the table while only the command
+    /// ring is full, and dropped otherwise.
     pub resets_refused: u64,
+    /// Tries of a standing reset request after the command ring refused
+    /// it, at most one per endpoint interval (#838).
+    pub standing_retries: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -435,6 +443,7 @@ impl<O: SocketOps> Endpoints<O> {
                     last_reset: None,
                     deferred: false,
                     waiting: None,
+                    retry_at: None,
                     state: State::Failing {
                         error: EndpointError::Agent(error.clone()),
                         sender: Fate::Posted,
@@ -454,6 +463,7 @@ impl<O: SocketOps> Endpoints<O> {
             last_reset: None,
             deferred: false,
             waiting: None,
+            retry_at: None,
         });
         Ok(id)
     }
@@ -483,6 +493,7 @@ impl<O: SocketOps> Endpoints<O> {
         // request asked for.
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint) {
             entry.waiting = None;
+            entry.retry_at = None;
         }
         Ok(())
     }
@@ -574,13 +585,18 @@ impl<O: SocketOps> Endpoints<O> {
                 .is_some_and(|epoch| epoch != entry.capabilities.epoch)
             {
                 entry.waiting = None;
+                entry.retry_at = None;
             }
             let due = entry.waiting.is_some()
+                && entry.retry_at.is_none_or(|at| now >= at)
                 && matches!(entry.state, State::Active)
                 && entry
                     .last_reset
                     .is_none_or(|at| now < at || age_ns(now, at) >= entry.backoff);
             if due {
+                if entry.retry_at.is_some() {
+                    self.counters.bump(|c| &mut c.standing_retries);
+                }
                 let endpoint = entry.id;
                 let standing = self
                     .entries
@@ -660,7 +676,12 @@ impl<O: SocketOps> Endpoints<O> {
         };
         if !matches!(entry.state, State::Active) {
             match standing {
-                Some(epoch) => entry.waiting = Some(epoch),
+                Some(epoch) => {
+                    // A fault while its reset is in flight: the next reset
+                    // doubles the interval, as a deferral does.
+                    entry.deferred = true;
+                    entry.waiting = Some(epoch);
+                }
                 None => self.counters.bump(|c| &mut c.requests_ignored),
             }
             return;
@@ -698,15 +719,29 @@ impl<O: SocketOps> Endpoints<O> {
                 }
                 self.counters.bump(|c| &mut c.resets);
             }
-            Err(_) => {
-                // A standing request waits for the next poll.
-                if let Some(epoch) = standing
-                    && let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint)
-                    && entry.waiting.replace(epoch).is_some()
-                {
-                    return;
+            Err(error) => {
+                // Refused once, counted once. A standing one the command
+                // ring was too full for is tried again an interval on;
+                // any other error (the agent gone, a broken invariant)
+                // drops it.
+                let busy = matches!(error, EndpointError::Agent(AgentError::Busy(_)));
+                let entry = self.entries.iter_mut().find(|entry| entry.id == endpoint);
+                let retried = entry.as_ref().is_some_and(|entry| entry.retry_at.is_some());
+                if let Some(entry) = entry {
+                    match standing {
+                        Some(epoch) if busy => {
+                            entry.waiting = Some(epoch);
+                            entry.retry_at = now.checked_add(entry.backoff);
+                        }
+                        _ => {
+                            entry.waiting = None;
+                            entry.retry_at = None;
+                        }
+                    }
                 }
-                self.counters.bump(|c| &mut c.resets_refused);
+                if !retried {
+                    self.counters.bump(|c| &mut c.resets_refused);
+                }
             }
         }
     }
