@@ -15,14 +15,16 @@
     (`LaneRefusal`), with the refusal's own CnC code. A publication has one
     policy and one version, kept by the driver for its aggregate: a lane
     guarded with no rate takes it, one guarded with the same policy joins
-    at its version, and one guarded with another policy is refused
-    (`InvalidConfig`), only a change changes it; the first lane guarded
-    with a rate gives the policy to the lanes guarded before without one.
+    at its version, and one guarded with another policy is refused and
+    audited (`RateChangeError::PolicyConflict`, with both, code 25): only
+    a change changes it. The first lane guarded with a rate gives the
+    policy, at version 1, to the lanes guarded before without one, each
+    audited from no rate (version 0).
     A retiring lane, guarded or not, refuses a change as retiring.
     Unguarded lanes are left as they are. Refusals are `DriverError::RateChange` (`VersionMismatch`,
     `NotATightening`, `ReserveCrossed`, `NoRate`) and
     `DriverError::InvalidRatePolicy`, with CnC error codes 19 to 23 (23
-    `RateInvalidPolicy`). A byte burst is validated against the largest
+    `RateInvalidPolicy`) and 25 (`RatePolicyConflict`). A byte burst is validated against the largest
     lane MTU.
   - A change binds at once and never grants tokens: each bucket earns the
     old rates up to the change, then its level is clamped to the new

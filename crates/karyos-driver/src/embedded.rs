@@ -2274,11 +2274,30 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 policy,
                 reserve,
             }) => {
-                // A policy other than the aggregate's would change it
-                // without a version or an audit: refused. Only a change
-                // changes it.
-                if held.is_some_and(|(held, _)| held != policy) {
-                    return Err(DriverError::InvalidConfig);
+                // A policy other than the publication's would change it
+                // without a version: refused, typed with both, and audited.
+                // Only a change changes it.
+                if let Some((held, version)) = held
+                    && held != policy
+                {
+                    let error =
+                        DriverError::RateChange(crate::guards::RateChangeError::PolicyConflict {
+                            requested: policy,
+                            held,
+                        });
+                    let now = self.clock.now();
+                    self.guards.audit_rate(
+                        guard,
+                        (version, version),
+                        (
+                            0,
+                            crate::guards::Requester::InProcess,
+                            crate::guards::RateAuthority::Administrator,
+                        ),
+                        Err(&error),
+                        now,
+                    );
+                    return Err(error);
                 }
                 // Every datagram fits the MTU (aggregate-lanes.md), so a byte
                 // burst that holds the MTU holds whatever a route's sender
@@ -2345,9 +2364,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let found = self.active_stream(stream)?;
         found.guarded = Some(guarded);
         // The aggregate's first policy: its other guarded lanes, guarded
-        // without a rate before, take it too, at version 1.
+        // without a rate before, take it too, at version 1, in the same
+        // operation, each audited from no rate (version 0).
         if let (None, Some((policy, _))) = (held, rate) {
             let _ = self.rate_policies.insert(registration, (policy, 1));
+            let mut moved = Vec::new();
             for lane in self
                 .streams
                 .iter_mut()
@@ -2357,7 +2378,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     && guarded.rate.is_none()
                 {
                     guarded.set_rate(policy, 1);
+                    moved.push(guarded.guard);
                 }
+            }
+            let now = self.clock.now();
+            for moved in moved {
+                self.guards.audit_rate(
+                    moved,
+                    (0, 1),
+                    (
+                        0,
+                        crate::guards::Requester::InProcess,
+                        crate::guards::RateAuthority::Administrator,
+                    ),
+                    Ok(()),
+                    now,
+                );
             }
         }
         Ok(())

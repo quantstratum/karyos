@@ -1233,11 +1233,15 @@ fn a_lane_refusal_and_a_retiring_lane_are_named_and_audited() {
     assert_eq!(audit, [(a.id(), gone), (b.id(), gone)]);
 }
 
-/// Re-review P1 of #814: guarding a lane with a policy other than its
-/// aggregate's is refused, never a silent change of either; the same
-/// policy, or none, is taken.
+/// Re-review P1 of #814 (ACS 33751): guarding a lane with a rate other
+/// than its publication's policy, here a looser one, is refused with both
+/// rates and audited, never a silent change of either; the same policy,
+/// or none, is taken at the publication's version.
 #[test]
 fn a_lane_guarded_with_another_policy_is_refused() {
+    use karyos_driver::{AuditOutcome, RateChangeError};
+    use karyos_protocol::cnc::ErrorCode;
+
     let mut driver = EmbeddedDriver::new().unwrap();
     let aggregate = two_lanes(&mut driver, 2);
     let guard = driver.add_guard("orders").unwrap();
@@ -1254,9 +1258,17 @@ fn a_lane_guarded_with_another_policy_is_refused() {
             lane_of(&aggregate, 1),
             guard,
             4,
-            Some(per_second(20, 10, None))
+            Some(per_second(200, 10, None))
         ),
-        Err(DriverError::InvalidConfig)
+        Err(DriverError::RateChange(RateChangeError::PolicyConflict {
+            requested: per_second(200, 10, None).policy,
+            held: per_second(100, 10, None).policy,
+        }))
+    );
+    let last = *driver.guard_audit().records.last().unwrap();
+    assert_eq!(
+        (last.before, last.after, last.outcome),
+        (1, 1, AuditOutcome::Refused(ErrorCode::RatePolicyConflict))
     );
     driver
         .guard_stream(
@@ -1292,6 +1304,9 @@ fn a_lane_guarded_first_without_a_rate_follows_the_policy() {
             Some(per_second(100, 10, None)),
         )
         .unwrap();
+    // Lane 0 moved from no rate to the policy, audited from version 0.
+    let moved = *driver.guard_audit().records.last().unwrap();
+    assert_eq!((moved.guard, moved.before, moved.after), (a.id(), 0, 1));
     let safety = (RateAuthority::Safety, 7);
     assert_eq!(
         driver.change_aggregate_rate_policy(&aggregate, 1, per_second(50, 10, None).policy, safety),

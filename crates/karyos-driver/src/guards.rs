@@ -282,6 +282,15 @@ pub enum RateChangeError {
     /// The stream has no rate policy to change.
     #[error("the stream has no rate policy")]
     NoRate,
+    /// A lane guarded with a rate other than its publication's policy:
+    /// only a policy change changes it (R-CORE-21).
+    #[error("the lane's rate {requested:?} is not its publication's {held:?}")]
+    PolicyConflict {
+        /// The rate the lane was guarded with.
+        requested: karyos_sys::rate_limit::RatePolicy,
+        /// The publication's policy.
+        held: karyos_sys::rate_limit::RatePolicy,
+    },
 }
 
 /// The guard registry and audit ring of one driver.
@@ -805,6 +814,9 @@ pub(crate) fn error_code(error: &DriverError) -> ErrorCode {
         DriverError::RateChange(RateChangeError::NotATightening) => ErrorCode::RateNotATightening,
         DriverError::RateChange(RateChangeError::ReserveCrossed) => ErrorCode::RateReserveCrossed,
         DriverError::RateChange(RateChangeError::NoRate) => ErrorCode::RateNotSet,
+        DriverError::RateChange(RateChangeError::PolicyConflict { .. }) => {
+            ErrorCode::RatePolicyConflict
+        }
         DriverError::InvalidRatePolicy(_) => ErrorCode::RateInvalidPolicy,
         // A lane's refusal has its own code.
         DriverError::RateChangeOnLane { refusal, .. } => error_code(&refusal.error()),

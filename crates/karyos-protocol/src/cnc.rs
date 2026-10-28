@@ -1163,6 +1163,9 @@ pub enum ErrorCode {
     /// A rate policy change names a policy its stream refuses: a zero
     /// rate, or a byte burst below the largest frame (R-CORE-21).
     RateInvalidPolicy,
+    /// A lane guarded with a rate other than its publication's policy
+    /// (R-CORE-21): only a policy change changes it.
+    RatePolicyConflict,
 }
 
 impl ErrorCode {
@@ -1194,6 +1197,7 @@ impl ErrorCode {
             Self::RateReserveCrossed => 21,
             Self::RateNotSet => 22,
             Self::RateInvalidPolicy => 23,
+            Self::RatePolicyConflict => 25,
         }
     }
 
@@ -1223,6 +1227,7 @@ impl ErrorCode {
             21 => Self::RateReserveCrossed,
             22 => Self::RateNotSet,
             23 => Self::RateInvalidPolicy,
+            25 => Self::RatePolicyConflict,
             _ => return None,
         })
     }
@@ -3579,13 +3584,14 @@ mod tests {
     /// values, added in place under admission `VERSION` 3 before a release
     /// published it, as `InvalidRoles` was.
     #[test]
-    fn rate_change_error_codes_are_19_to_23() {
+    fn rate_change_error_codes_are_19_to_23_and_25() {
         for (code, word) in [
             (ErrorCode::RateVersionMismatch, 19),
             (ErrorCode::RateNotATightening, 20),
             (ErrorCode::RateReserveCrossed, 21),
             (ErrorCode::RateNotSet, 22),
             (ErrorCode::RateInvalidPolicy, 23),
+            (ErrorCode::RatePolicyConflict, 25),
         ] {
             assert_eq!(code.code(), word);
             assert_eq!(ErrorCode::from_code(word), Some(code));
