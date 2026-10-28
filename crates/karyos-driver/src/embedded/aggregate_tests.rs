@@ -475,3 +475,41 @@ fn a_publications_rate_policy_goes_with_its_last_lane() {
         assert!(driver.rate_policies.is_empty(), "round {round}");
     }
 }
+
+/// QS-COORDINATOR, ACS 33899: with every lane the driver can hold guarded
+/// with a rate, the stored policies never pass `max_streams`, and the next
+/// stream is refused before any policy could be stored for it.
+#[test]
+fn the_stored_policies_never_pass_max_streams() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let max_streams = 4;
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        max_streams,
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 100,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    for stream_id in 0..i32::try_from(max_streams).unwrap() {
+        let handle = driver.add_stream(stream(10 + stream_id)).unwrap();
+        driver
+            .guard_stream(
+                handle,
+                guard,
+                4,
+                Some(crate::guards::GuardRate::publication(policy)),
+            )
+            .unwrap();
+        assert!(driver.rate_policies.len() <= max_streams);
+    }
+    assert_eq!(driver.rate_policies.len(), max_streams);
+    assert!(driver.add_stream(stream(99)).is_err());
+    assert_eq!(driver.rate_policies.len(), max_streams);
+}

@@ -1181,7 +1181,10 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// Each guarded publication's rate policy and its version, by its
     /// aggregate's registration (a stream's own for a single lane): one
     /// policy and one version per aggregate, which its guarded lanes copy
-    /// (R-CORE-21).
+    /// (R-CORE-21). Bounded by construction: an entry is made only by
+    /// guarding a lane in the table and goes with its publication's last
+    /// lane, so `rate_policies.len() <= streams.len() <= max_streams`
+    /// always, and no entry is ever refused for room.
     pub(crate) rate_policies:
         std::collections::BTreeMap<u64, (karyos_sys::rate_limit::RatePolicy, u64)>,
     /// The sender gates registered with their guards (G-e4).
