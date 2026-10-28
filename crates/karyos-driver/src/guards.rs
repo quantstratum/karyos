@@ -459,6 +459,11 @@ impl Guards {
         let outcome = match result {
             Ok(()) if before == after => AuditOutcome::RateUnchanged { authority },
             Ok(()) => AuditOutcome::RateChanged { authority },
+            // A lane of the call that is gone or retiring is audited as
+            // such; other commands keep their own mapping (`error_code`).
+            Err(DriverError::UnknownStream { .. } | DriverError::StreamRetiring { .. }) => {
+                AuditOutcome::Refused(ErrorCode::UnknownStream)
+            }
             Err(error) => refused(error),
         };
         self.record(
@@ -803,10 +808,6 @@ pub(crate) fn error_code(error: &DriverError) -> ErrorCode {
         DriverError::InvalidRatePolicy(_) => ErrorCode::RateInvalidPolicy,
         // A lane's refusal has its own code.
         DriverError::RateChangeOnLane { refusal, .. } => error_code(&refusal.error()),
-        // A lane of the call that is gone or retiring names no guard.
-        DriverError::UnknownStream { .. } | DriverError::StreamRetiring { .. } => {
-            ErrorCode::UnknownStream
-        }
         // A corrupt word is a broken invariant, reported as unknown to
         // the requester; the guard stays closed.
         _ => ErrorCode::UnknownGuard,
@@ -816,6 +817,37 @@ pub(crate) fn error_code(error: &DriverError) -> ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Re-review R3 of #814: other commands keep their wire answer for a
+    /// stream that is gone or retiring (`UnknownGuard`); only a rate
+    /// change's audit names it `UnknownStream`.
+    #[test]
+    fn a_stream_gone_keeps_its_code_outside_the_rate_audit() {
+        let gone = DriverError::UnknownStream { stream: 3 };
+        let retiring = DriverError::StreamRetiring { stream: 3 };
+        assert_eq!(error_code(&gone), ErrorCode::UnknownGuard);
+        assert_eq!(error_code(&retiring), ErrorCode::UnknownGuard);
+        let mut guards = Guards::new(
+            7,
+            2,
+            Words::heap(2),
+            3,
+            karyos_sys::diag::guard_audit(4).unwrap(),
+        );
+        let guard = guards.add("orders").unwrap();
+        guards.audit_rate(
+            guard,
+            (1, 1),
+            (9, Requester::InProcess, RateAuthority::Safety),
+            Err(&gone),
+            5,
+        );
+        let last = *guards.audit().records.last().unwrap();
+        assert_eq!(
+            last.outcome,
+            AuditOutcome::Refused(ErrorCode::UnknownStream)
+        );
+    }
 
     #[test]
     fn guards_are_named_closed_and_audited() {

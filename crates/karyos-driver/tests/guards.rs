@@ -847,7 +847,6 @@ fn a_rate_policy_change_reaches_an_issued_handle() {
 #[test]
 fn a_change_on_one_lane_changes_its_aggregate() {
     use karyos_driver::{AggregateConfig, AuditOutcome, RateAuthority, RateChangeError};
-    use karyos_protocol::cnc::ErrorCode;
 
     let mut driver = EmbeddedDriver::new().unwrap();
     let config = |stream_id| AggregateConfig {
@@ -949,7 +948,6 @@ fn a_change_on_one_lane_changes_its_aggregate() {
         driver.change_aggregate_rate_policy(&bare, 0, per_second(30, 10, None).policy, safety(5)),
         Err(DriverError::RateChange(RateChangeError::NoRate))
     );
-    let _ = ErrorCode::RateNotSet;
 }
 
 /// Review N1 of #814: an aggregate change is weighed on each guarded lane
@@ -965,7 +963,7 @@ fn an_aggregate_change_is_weighed_on_every_lane() {
     use karyos_protocol::cnc::ErrorCode;
 
     let mut driver = EmbeddedDriver::new().unwrap();
-    let mut stream = StreamConfig {
+    let stream = StreamConfig {
         buffer: LogBufferConfig {
             term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
             spare_slots: 6,
@@ -984,7 +982,6 @@ fn an_aggregate_change_is_weighed_on_every_lane() {
         on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
         conflation: None,
     };
-    stream.buffer.stream_id = 2;
     let aggregate = driver
         .add_aggregate(AggregateConfig {
             stream,
@@ -1078,4 +1075,170 @@ fn an_aggregate_change_is_weighed_on_every_lane() {
             (3, b, 1, 2, changed),
         ]
     );
+}
+
+/// An aggregate of two exclusive lanes on stream `stream_id`.
+fn two_lanes(driver: &mut EmbeddedDriver, stream_id: i32) -> karyos_driver::AggregateHandle {
+    driver
+        .add_aggregate(karyos_driver::AggregateConfig {
+            stream: StreamConfig {
+                buffer: LogBufferConfig {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 6,
+                    max_subscribers: 4,
+                    mtu: DEFAULT_MTU,
+                    max_reserved: MIN_TERM_LENGTH / 8,
+                    initial_term_id: TermId::new(7),
+                    lane: Lane::ZERO,
+                    session_id: 1,
+                    stream_id,
+                    claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                    publication: PublicationMode::Exclusive,
+                    schedule_capacity: 0,
+                },
+                allow_unconnected: true,
+                on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                conflation: None,
+            },
+            quanta: vec![u64::from(DEFAULT_MTU) * 4; 2],
+        })
+        .unwrap()
+}
+
+fn lane_of(aggregate: &karyos_driver::AggregateHandle, lane: u8) -> StreamHandle {
+    aggregate.lane(Lane::try_new(lane).unwrap()).unwrap()
+}
+
+/// Re-review R1 of #814: a lane guarded without a rate has no rate to
+/// change, as an unguarded one: it is left out, and never blocks the
+/// aggregate's change, the safety path's included.
+#[test]
+fn a_lane_guarded_without_a_rate_is_left_out() {
+    use karyos_driver::RateAuthority;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = two_lanes(&mut driver, 2);
+    let guard = driver.add_guard("orders").unwrap();
+    driver
+        .guard_stream(
+            lane_of(&aggregate, 0),
+            guard,
+            4,
+            Some(per_second(100, 10, None)),
+        )
+        .unwrap();
+    driver
+        .guard_stream(lane_of(&aggregate, 1), guard, 4, None)
+        .unwrap();
+    let safety = (RateAuthority::Safety, 1);
+    assert_eq!(
+        driver.change_aggregate_rate_policy(&aggregate, 1, per_second(50, 10, None).policy, safety),
+        Ok(2)
+    );
+}
+
+/// Re-review R2 of #814: a lane guarded after its aggregate's policy
+/// changed joins at the aggregate's version, so one `expected` still
+/// names every lane and the aggregate keeps changing.
+#[test]
+fn a_lane_guarded_later_joins_at_the_aggregates_version() {
+    use karyos_driver::RateAuthority;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = two_lanes(&mut driver, 2);
+    let guard = driver.add_guard("orders").unwrap();
+    driver
+        .guard_stream(
+            lane_of(&aggregate, 0),
+            guard,
+            4,
+            Some(per_second(100, 10, None)),
+        )
+        .unwrap();
+    let admin = |operation| (RateAuthority::Administrator, operation);
+    assert_eq!(
+        driver.change_aggregate_rate_policy(
+            &aggregate,
+            1,
+            per_second(80, 10, None).policy,
+            admin(1)
+        ),
+        Ok(2)
+    );
+    driver
+        .guard_stream(
+            lane_of(&aggregate, 1),
+            guard,
+            4,
+            Some(per_second(80, 10, None)),
+        )
+        .unwrap();
+    assert_eq!(
+        driver.change_aggregate_rate_policy(
+            &aggregate,
+            2,
+            per_second(60, 10, None).policy,
+            admin(2)
+        ),
+        Ok(3)
+    );
+}
+
+/// Re-review of #814: a change named on one lane refuses with the lane
+/// that refused, as on its aggregate; a retiring lane is audited for its
+/// guard, as a lane gone (`UnknownStream`).
+#[test]
+fn a_lane_refusal_and_a_retiring_lane_are_named_and_audited() {
+    use karyos_driver::{AuditOutcome, LaneRefusal, RateAuthority, RateChangeError};
+    use karyos_protocol::cnc::ErrorCode;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = two_lanes(&mut driver, 2);
+    let (a, b) = (
+        driver.add_guard("a").unwrap(),
+        driver.add_guard("b").unwrap(),
+    );
+    driver
+        .guard_stream(
+            lane_of(&aggregate, 0),
+            a,
+            4,
+            Some(per_second(100, 10, None)),
+        )
+        .unwrap();
+    driver
+        .guard_stream(lane_of(&aggregate, 1), b, 4, Some(per_second(20, 10, None)))
+        .unwrap();
+    let safety = |operation| (RateAuthority::Safety, operation);
+    assert_eq!(
+        driver.change_rate_policy(
+            lane_of(&aggregate, 0),
+            1,
+            per_second(50, 10, None).policy,
+            safety(1)
+        ),
+        Err(DriverError::RateChangeOnLane {
+            lane: 1,
+            refusal: LaneRefusal::Change(RateChangeError::NotATightening)
+        })
+    );
+    driver.remove_aggregate(&aggregate).unwrap();
+    assert!(matches!(
+        driver.change_aggregate_rate_policy(
+            &aggregate,
+            1,
+            per_second(10, 10, None).policy,
+            safety(2)
+        ),
+        Err(DriverError::StreamRetiring { .. })
+    ));
+    let audit: Vec<_> = driver
+        .guard_audit()
+        .records
+        .iter()
+        .filter(|record| record.operation == 2)
+        .map(|record| (record.guard, record.outcome))
+        .collect();
+    let gone = AuditOutcome::Refused(ErrorCode::UnknownStream);
+    assert_eq!(audit, [(a.id(), gone), (b.id(), gone)]);
 }

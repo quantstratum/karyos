@@ -303,3 +303,77 @@ fn counters_and_positions_name_the_aggregate_and_the_lane() {
     lanes.sort_unstable();
     assert_eq!(lanes, vec![0, 1]);
 }
+
+/// Re-review of #814: an aggregate's change publishes its lanes' shared
+/// gate slot exactly once, at the new version.
+#[test]
+fn an_aggregate_change_publishes_its_gate_slot_once() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+    use karyos_sys::rate_policy_slot::{SEQUENCE, SLOT_WORDS, SlotRead, try_read};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = driver
+        .add_aggregate(AggregateConfig {
+            stream: stream(2),
+            quanta: vec![u64::from(DEFAULT_MTU) * 4; 2],
+        })
+        .unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = |per_second| RatePolicy {
+        messages: Rate {
+            per_second,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    for lane in aggregate.streams() {
+        driver
+            .guard_stream(
+                lane,
+                guard,
+                4,
+                Some(crate::guards::GuardRate::publication(policy(100))),
+            )
+            .unwrap();
+    }
+    // The lanes share one slot, as a guarded network publication's do.
+    let slot = Arc::new(crate::shared_words::Words::heap(SLOT_WORDS));
+    let mut lanes = aggregate.streams();
+    let first = lanes.next().unwrap();
+    driver
+        .stream(first)
+        .unwrap()
+        .guarded
+        .as_mut()
+        .unwrap()
+        .set_gate_slot(Arc::clone(&slot));
+    for lane in lanes {
+        driver
+            .stream(lane)
+            .unwrap()
+            .guarded
+            .as_mut()
+            .unwrap()
+            .keep_gate_slot(Arc::clone(&slot));
+    }
+    let sequence = |slot: &crate::shared_words::Words| {
+        slot.words()[SEQUENCE].load(std::sync::atomic::Ordering::Acquire)
+    };
+    let before = sequence(&slot);
+    assert_eq!(
+        driver.change_aggregate_rate_policy(
+            &aggregate,
+            1,
+            policy(50),
+            (crate::guards::RateAuthority::Safety, 1)
+        ),
+        Ok(2)
+    );
+    // One publication: the sequence word moves by 2 (odd, then even).
+    assert_eq!(sequence(&slot), before + 2);
+    let words = slot.words();
+    assert!(matches!(
+        try_read(&words, 0),
+        SlotRead::Policy { version: 2, policy: published } if published == policy(50)
+    ));
+}
