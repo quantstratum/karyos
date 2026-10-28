@@ -3096,7 +3096,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     fn prepare_incarnation(&mut self, plan: &Incarnation) -> Result<Fresh<T>, DriverError> {
         // A conflated stream has no fresh incarnation
         // (`reincarnation_plan` refuses it), so its buffer has no table.
-        self.check_stream_bytes(&plan.config, None)?;
+        // Its configuration is the stream's current one, already within
+        // `max_stream_bytes`, so it needs no cap check.
         let buffer = Arc::new(<T as sealed::Create>::create(
             self,
             plan.config,
@@ -6205,13 +6206,26 @@ mod stream_cells_tests {
     }
 }
 
-/// The shape of `config`'s table that its publications check, written in
-/// every log buffer of the stream (F7b-2c-2).
-///
-/// # Errors
-///
-/// [`DriverError::InvalidConfig`] for a value capacity past `u32`, which
-/// no message carries.
+/// The bytes of a log buffer region of `buffer` (R-CORE-34), header
+/// included, by the function that sizes it when it is created; `None` for
+/// a configuration a buffer refuses. One definition for the stream cap
+/// and the sizing report.
+pub(crate) fn log_region_bytes(buffer: &LogBufferConfig) -> Option<u64> {
+    region_bytes(LogBuffer::<karyos_sys::term_bytes::SharedTerms>::structure_length(buffer))
+}
+
+/// The bytes of a conflation table region of `table`, as
+/// [`log_region_bytes`] for a log buffer.
+pub(crate) fn table_region_bytes(table: &ConflationConfig) -> Option<u64> {
+    region_bytes(table.structure_length())
+}
+
+fn region_bytes(structure: Option<usize>) -> Option<u64> {
+    structure
+        .and_then(karyos_sys::sizing::region_length)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+}
+
 /// The bytes one stream lane takes (R-CORE-34): its log buffer region,
 /// header included, plus its conflation table's region if it has one, by
 /// the functions that size them when they are created. It is what
@@ -6222,35 +6236,38 @@ pub fn stream_lane_bytes(
     buffer: &LogBufferConfig,
     conflation: Option<&ConflationConfig>,
 ) -> Option<u64> {
-    let region = |structure: Option<usize>| {
-        structure
-            .and_then(karyos_sys::sizing::region_length)
-            .and_then(|bytes| u64::try_from(bytes).ok())
-    };
-    let log = region(LogBuffer::<karyos_sys::term_bytes::SharedTerms>::structure_length(buffer))?;
+    let log = log_region_bytes(buffer)?;
     match conflation {
-        Some(table) => log.checked_add(region(table.structure_length())?),
+        Some(table) => log.checked_add(table_region_bytes(table)?),
         None => Some(log),
     }
 }
 
 /// `max` against [`stream_lane_bytes`]: [`DriverError::StreamTooLarge`]
-/// above it, nothing checked without it.
+/// above it, nothing checked without it. A configuration a buffer or a
+/// table refuses passes here, so that its creation refuses it with its own
+/// error, whether a cap is set or not.
 pub(crate) fn check_lane_bytes(
     max: Option<u64>,
     buffer: &LogBufferConfig,
     conflation: Option<&ConflationConfig>,
 ) -> Result<(), DriverError> {
-    let Some(max) = max else {
+    let (Some(max), Some(bytes)) = (max, stream_lane_bytes(buffer, conflation)) else {
         return Ok(());
     };
-    let bytes = stream_lane_bytes(buffer, conflation).ok_or(DriverError::InvalidConfig)?;
     if bytes > max {
         return Err(DriverError::StreamTooLarge { bytes, max });
     }
     Ok(())
 }
 
+/// The shape of `config`'s table that its publications check, written in
+/// every log buffer of the stream (F7b-2c-2).
+///
+/// # Errors
+///
+/// [`DriverError::InvalidConfig`] for a value capacity past `u32`, which
+/// no message carries.
 pub(crate) fn conflation_shape(
     config: ConflationConfig,
 ) -> Result<karyos_sys::log_buffer::ConflationShape, DriverError> {

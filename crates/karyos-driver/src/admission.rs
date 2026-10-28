@@ -482,6 +482,13 @@ impl<T: StreamTerms> Admission<T> {
         self.region_ids().next()
     }
 
+    /// The next region id this admission gives, for a test that checks
+    /// a refusal took none.
+    #[cfg(test)]
+    pub(crate) fn peek_next_region(&self) -> u64 {
+        self.next_region
+    }
+
     /// The instance and the region id counter, borrowed apart from the
     /// rest of the admission: the image table takes its lanes' region ids
     /// from it on the driver thread.

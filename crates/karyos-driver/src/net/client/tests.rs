@@ -1843,3 +1843,64 @@ fn a_multicast_subscription_reports_its_group_and_port() {
         other => panic!("not a network subscription: {other:?}"),
     }
 }
+
+/// karyos#809: a network publication whose lanes are above the driver's
+/// `max_stream_bytes` reaches its client as `StreamTooLarge`, not as a
+/// limit a retry could pass; one within it is granted.
+#[test]
+fn a_publication_above_the_stream_cap_is_refused_with_its_code() {
+    let capped = |max_stream_bytes| {
+        let mut network = NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        };
+        network.stream_defaults.term_length = 64 * 1024;
+        EmbeddedDriver::with_config(DriverConfig {
+            network: Some(network),
+            max_stream_bytes,
+            ..DriverConfig::default()
+        })
+        .unwrap()
+    };
+    let sink = silent();
+    let small = format!(
+        "karyos:udp?endpoint=127.0.0.1:{}",
+        sink.local_addr().unwrap().port()
+    );
+    let large = format!("{small}|term-length=131072");
+    let publish = |driver: &mut EmbeddedDriver, uri: &str, stream_id| {
+        let mut client = driver.connect().unwrap();
+        let mut outcomes = Vec::new();
+        let sequence = client
+            .add_network_publication(uri, stream_id, true)
+            .unwrap();
+        run(
+            &mut [driver],
+            &mut [&mut client],
+            &mut outcomes,
+            |outcomes, _| outcomes.iter().any(|(_, found, _)| *found == sequence),
+        );
+        take_of(&mut outcomes, 0, sequence)
+    };
+    // The bytes of a lane at the defaults' 64 KiB terms, read from a
+    // driver without the cap: the cap below admits it and nothing larger.
+    let mut uncapped = capped(None);
+    let Outcome::Publication(_) = publish(&mut uncapped, &small, 60) else {
+        panic!("not granted");
+    };
+    let lane = *uncapped.streams[0].buffer.config();
+    let mut driver = capped(Some(
+        crate::embedded::stream_lane_bytes(&lane, None).unwrap(),
+    ));
+    assert!(matches!(
+        publish(&mut driver, &small, 60),
+        Outcome::Publication(_)
+    ));
+    assert!(matches!(
+        publish(&mut driver, &large, 61),
+        Outcome::Refused {
+            code: ErrorCode::StreamTooLarge,
+            ..
+        }
+    ));
+}

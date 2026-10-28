@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! R-CORE-34 with `max_stream_bytes` (Linux; karyos#809): a driver filled
-//! to `max_streams` with lanes at the cap, one of them conflated, maps no
-//! more than the report's bounded steady state, read from
-//! `/proc/self/maps` by inode. This test binary holds one test, so no other
-//! driver's regions are in the process.
+//! to `max_streams` with conflated lanes at the cap maps, per lane, no more
+//! than the report's lane line and no less than the cap, and a refused
+//! `add_stream`, `add_aggregate` or `replay_target` maps nothing. Regions
+//! are read from `/proc/self/maps` by inode. This test binary holds one
+//! test, so no other driver's regions are in the process.
 
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
@@ -12,10 +13,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use karyos_driver::sizing::{UNCAPPED_STREAMS, report};
+use karyos_driver::replay::ReplayTargetConfig;
+use karyos_driver::sizing::{EXCLUDED, EXCLUDED_CAPPED, report};
 use karyos_driver::{
-    DriverConfig, DriverError, EmbeddedDriver, IpcConfig, LossPolicy, StreamConfig, SystemClock,
-    stream_lane_bytes,
+    AggregateConfig, DriverConfig, DriverError, EmbeddedDriver, IpcConfig, LossPolicy,
+    StreamConfig, SystemClock, stream_lane_bytes,
 };
 use karyos_sys::conflation::ConflationConfig;
 use karyos_sys::frame::Lane;
@@ -92,17 +94,21 @@ fn mapped_regions() -> BTreeMap<u64, u64> {
     regions
 }
 
+fn conflated(stream_id: i32) -> StreamConfig {
+    let mut lane = stream(stream_id, TERM);
+    lane.conflation = Some(ConflationConfig::new(64, 32, 4096));
+    lane
+}
+
 #[test]
 fn a_driver_full_of_lanes_at_the_cap_maps_within_the_bounded_figure() {
-    let mut conflated = stream(5, TERM);
-    conflated.conflation = Some(ConflationConfig::new(64, 32, 4096));
-    let cap = stream_lane_bytes(&conflated.buffer, conflated.conflation.as_ref()).unwrap();
+    let cap = stream_lane_bytes(&conflated(1).buffer, conflated(1).conflation.as_ref()).unwrap();
     let config = DriverConfig {
         max_streams: 4,
         max_stream_bytes: Some(cap),
         ..DriverConfig::default()
     };
-    // Without the cap the report has no bounded figure and says why.
+    // Without the cap the report is the one it was before the cap.
     let uncapped = DriverConfig {
         max_stream_bytes: None,
         ..config
@@ -110,35 +116,72 @@ fn a_driver_full_of_lanes_at_the_cap_maps_within_the_bounded_figure() {
     let page = karyos_sys::ipc::page_size();
     let plain = report(&uncapped, &[], page).unwrap();
     assert_eq!(plain.bounded_bytes, None);
-    assert!(plain.excluded.contains(&UNCAPPED_STREAMS));
+    assert!(plain.bounded.is_empty());
+    assert_eq!(plain.excluded, &EXCLUDED[..]);
     // A declared stream above the cap is refused, as add_stream refuses it.
     assert!(report(&config, &[stream(9, TERM * 4)], page).is_err());
     let sizing = report(&config, &[], page).unwrap();
-    let bounded = sizing.bounded_bytes.unwrap();
-    assert!(sizing.bounded_peak_bytes.unwrap() > bounded);
-    assert!(!sizing.excluded.contains(&UNCAPPED_STREAMS));
-    let before = mapped_regions();
-    assert!(before.is_empty(), "another driver's regions: {before:?}");
+    assert!(sizing.bounded_peak_bytes.unwrap() > sizing.bounded_bytes.unwrap());
+    assert_eq!(sizing.excluded, &EXCLUDED_CAPPED[..]);
+    let lane_line = &sizing.bounded[0];
+    assert_eq!(lane_line.count, 4);
+    assert!(mapped_regions().is_empty(), "another driver's regions");
     let dir = dir("full");
     let mut driver: EmbeddedDriver<SharedTerms> =
         EmbeddedDriver::with_ipc(config, ipc(&dir), Box::new(SystemClock::new())).unwrap();
-    // A lane above the cap is refused, with nothing mapped.
+    let fixed = mapped_regions();
+    // Every lane-creating call refused above the cap maps nothing.
+    let larger = TERM * 2;
     assert!(matches!(
-        driver.add_stream(stream(7, TERM * 2)),
+        driver.add_stream(stream(7, larger)),
         Err(DriverError::StreamTooLarge { .. })
     ));
-    for stream_id in 2..5 {
-        let _ = driver.add_stream(stream(stream_id, TERM)).unwrap();
+    assert_eq!(mapped_regions(), fixed, "add_stream mapped a region");
+    let frame = u64::from(karyos_sys::sizing::align_frame(DEFAULT_MTU).unwrap()) * 4;
+    assert!(matches!(
+        driver.add_aggregate(AggregateConfig {
+            stream: stream(8, larger),
+            quanta: vec![frame; 2],
+        }),
+        Err(DriverError::StreamTooLarge { .. })
+    ));
+    assert_eq!(mapped_regions(), fixed, "add_aggregate mapped a region");
+    assert!(matches!(
+        driver.replay_target(ReplayTargetConfig {
+            stream_id: 9,
+            session_id: 9,
+            term_length: larger,
+            initial_term_id: 0,
+            mtu: DEFAULT_MTU,
+            join: 0,
+            lane: Lane::ZERO,
+            source_stream_id: 2,
+            source_session_id: 1,
+        }),
+        Err(DriverError::StreamTooLarge { .. })
+    ));
+    assert_eq!(mapped_regions(), fixed, "replay_target mapped a region");
+    // max_streams lanes, every one at the cap.
+    for stream_id in 2..6 {
+        let _ = driver.add_stream(conflated(stream_id)).unwrap();
     }
-    let _ = driver.add_stream(conflated).unwrap();
     // Full: the count refuses before the cap is looked at.
     assert_eq!(
         driver.add_stream(stream(6, TERM)).map(|_| ()),
         Err(DriverError::TooManyStreams)
     );
-    let mapped: u64 = mapped_regions().values().sum();
+    let lanes: u64 = mapped_regions()
+        .iter()
+        .filter(|(inode, _)| !fixed.contains_key(inode))
+        .map(|(_, bytes)| bytes)
+        .sum();
     assert!(
-        mapped <= bounded,
-        "mapped {mapped} B above the bounded figure {bounded} B"
+        lanes <= lane_line.total,
+        "the lanes map {lanes} B, above the report's {} B",
+        lane_line.total
+    );
+    assert!(
+        lanes >= cap * 4,
+        "the lanes map {lanes} B, below 4 lanes at the cap ({cap} B each)"
     );
 }

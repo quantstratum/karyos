@@ -105,10 +105,7 @@ fn the_sizing_report_prints_two_figures_and_exits_without_starting() {
     let configured = figure(&report, "configured steady state:");
     let peak = figure(&report, "restart peak:");
     assert!(configured > 0 && configured < peak, "{report}");
-    assert!(
-        report.contains("bounded:                 none, max_stream_bytes is unset"),
-        "no bounded figure without the cap: {report}"
-    );
+    assert!(!report.contains("bounded"), "no bounded figure: {report}");
     assert!(
         report.contains("stream 2:1 (declared 0): log buffer"),
         "{report}"
@@ -121,7 +118,7 @@ fn the_sizing_report_prints_two_figures_and_exits_without_starting() {
 }
 
 /// With `--max-stream-bytes` the report adds its bounded figures, which
-/// need no assumption, and no longer excludes added streams (karyos#809);
+/// state their assumption, and no longer excludes added streams (karyos#809);
 /// a declared stream above the cap is refused as a start refuses it.
 #[test]
 fn with_the_stream_cap_the_report_is_bounded() {
@@ -132,6 +129,10 @@ fn with_the_stream_cap_the_report_is_bounded() {
     let bounded = figure(&report, "bounded steady state:");
     let peak = figure(&report, "bounded restart peak:");
     assert!(configured < bounded && bounded < peak, "{report}");
+    assert!(
+        report.contains("the bounded figures assume no incarnation a guard close replaced"),
+        "{report}"
+    );
     assert!(
         !report.contains("streams added after start and Archive replay targets"),
         "{report}"
