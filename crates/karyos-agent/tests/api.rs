@@ -163,7 +163,7 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"gap-ack","state":"unavailable","reason":"not_configured"},"#,
             r#"{"name":"catalog","state":"unavailable","reason":"not_configured"},"#,
             r#"{"name":"trace-window","state":"served","reason":null},"#,
-            r#"{"name":"limits","state":"served","reason":null}]}"#,
+            r#"{"name":"limits","state":"served","reason":null},{"name":"trace-buckets","state":"served","reason":null}]}"#,
             "\n"
         )
     );
