@@ -977,26 +977,27 @@ impl TraceMirror {
     /// dependent crate's test of a busy entry.
     #[cfg(feature = "test-hooks")]
     pub fn hold_entry(&mut self, index: usize, held: bool) -> bool {
-        let Some(version) = slot_start(self.geometry.table, index, self.entries, ENTRY_WORDS)
-            .and_then(|start| self.store.words().get(start))
-        else {
-            return false;
-        };
-        let now = version.load(Ordering::Relaxed);
-        let odd = now % 2 == 1;
-        if odd != held {
-            version.store(now.wrapping_add(1), Ordering::Release);
-        }
-        true
+        self.hold_at(
+            slot_start(self.geometry.table, index, self.entries, ENTRY_WORDS),
+            held,
+        )
     }
 
     /// Test hook: holds recycle log entry `index` mid-write (its seqlock
     /// odd) when `held`, as [`Self::hold_entry`] does a table entry.
     #[cfg(feature = "test-hooks")]
     pub fn hold_log(&mut self, index: usize, held: bool) -> bool {
-        let Some(version) = slot_start(STRIDE_WORDS, index, self.log, LOG_ENTRY_WORDS)
-            .and_then(|start| self.store.words().get(start))
-        else {
+        self.hold_at(
+            slot_start(STRIDE_WORDS, index, self.log, LOG_ENTRY_WORDS),
+            held,
+        )
+    }
+
+    /// Holds the seqlock whose version word is at `start` odd when `held`,
+    /// even otherwise; `false` for no such word.
+    #[cfg(feature = "test-hooks")]
+    fn hold_at(&mut self, start: Option<usize>, held: bool) -> bool {
+        let Some(version) = start.and_then(|start| self.store.words().get(start)) else {
             return false;
         };
         let now = version.load(Ordering::Relaxed);

@@ -41,8 +41,14 @@
 //! - **Bounds.** At most [`crate::api::EXPORT_MAX`] records per page, read
 //!   in batches that stop where the page ends, and a pass over the table
 //!   and one over the log, the busy entries of each retried for
-//!   `BUSY_BUDGET` (1 ms): 2 ms in all, past which one yield and one more
-//!   read of the busy entries may run.
+//!   `BUSY_BUDGET` (1 ms), which each part may overrun by one yield and
+//!   one more read of its busy entries.
+//! - **The trade-off of a stuck entry.** Once an entry stays busy past
+//!   its wait, every record of the page's first journal goes out
+//!   uncalibrated, those the entry would have calibrated had it come free
+//!   included; the next page waits again. The agent keeps no memory of a
+//!   stuck entry across requests (that needs the entry's version word in
+//!   the reader API), so with one stuck, each request waits its 1 ms.
 
 use std::collections::BTreeSet;
 
@@ -66,6 +72,10 @@ thread_local! {
     /// Tests: run while busy table entries are waited for, to recycle a
     /// journal there.
     pub(crate) static DURING_TABLE_WAIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
+    /// Tests: run while busy log entries are waited for, to release one
+    /// there.
+    pub(crate) static DURING_LOG_WAIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         std::cell::RefCell::new(None);
     /// Tests: run between two batches of a page, to lap the ring there.
     pub(crate) static BETWEEN_BATCHES: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
@@ -423,8 +433,12 @@ fn journals(
         while !busy.is_empty() && !wanted.is_empty() && start.elapsed() < busy_budget {
             std::thread::yield_now();
             #[cfg(test)]
-            if matches!(busy.first(), Some(Slot::Table(_))) {
-                DURING_TABLE_WAIT.with(|hook| {
+            {
+                let during = match busy.first() {
+                    Some(Slot::Table(_)) => &DURING_TABLE_WAIT,
+                    _ => &DURING_LOG_WAIT,
+                };
+                during.with(|hook| {
                     if let Some(hook) = hook.borrow_mut().as_mut() {
                         hook();
                     }

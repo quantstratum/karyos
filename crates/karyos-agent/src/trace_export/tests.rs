@@ -462,7 +462,9 @@ fn mirror_hold(mirror: &mut TraceMirror, held: bool) -> bool {
 
 /// Re-review U2 of #826: against a writer that keeps appending to a small
 /// ring, pages of the most records a request may ask for (several batches
-/// each, lapped mid-page by the writer) deliver or lose every sequence
+/// each, which the writer may lap mid-page; that a mid-page lap ends the
+/// page is `a_page_lapped_after_its_first_records_ends_there`'s, made
+/// deterministic there) deliver or lose every sequence
 /// exactly once, every loss below its page's `next`, and every record
 /// whole.
 #[test]
@@ -814,12 +816,14 @@ fn a_page_stops_at_its_cap_across_several_laps() {
 /// Points 2 and 4 of the #826 review: with a table entry stuck for the
 /// whole of the table's wait, a recycle log entry busy for less than the
 /// log's own wait is still waited out, and the journal it holds is found
-/// there, calibrated.
+/// there, calibrated. The log entry is released from inside the log's wait
+/// (a hook), so the test needs no sleep: under one budget shared with the
+/// table, that wait would never run.
 #[test]
 fn the_log_waits_with_its_own_budget_after_a_stuck_table() {
-    let mut mirror = mirror(16);
+    let mirror = std::rc::Rc::new(std::cell::RefCell::new(mirror(16)));
     let stuck = JournalEntry::open(12, 1, JournalKind::Publisher, 2, 16);
-    assert!(mirror.write_entry(1, Some(&stuck)));
+    assert!(mirror.borrow_mut().write_entry(1, Some(&stuck)));
     let gone = RecycledJournal {
         journal: 11,
         stream: 3,
@@ -834,18 +838,16 @@ fn the_log_waits_with_its_own_budget_after_a_stuck_table() {
         pair_count: 0,
         sequence: 2,
     };
-    assert!(mirror.write_log(0, Some(&gone)));
-    let _ = mirror.append(11, 0, &[0, !0]).unwrap();
-    assert!(mirror.hold_entry(1, true));
-    assert!(mirror.hold_log(0, true));
-    let reader = mirror.reader();
-    // The table waits 0.5 s for its stuck entry; the log entry is released
-    // during the log's own wait, which starts after it.
-    let budget = std::time::Duration::from_millis(500);
-    let writer = std::thread::spawn(move || {
-        std::thread::sleep(budget + budget / 2);
-        assert!(mirror.hold_log(0, false));
-        mirror
+    assert!(mirror.borrow_mut().write_log(0, Some(&gone)));
+    let _ = mirror.borrow_mut().append(11, 0, &[0, !0]).unwrap();
+    assert!(mirror.borrow_mut().hold_entry(1, true));
+    assert!(mirror.borrow_mut().hold_log(0, true));
+    let reader = mirror.borrow().reader();
+    let writer = std::rc::Rc::clone(&mirror);
+    DURING_LOG_WAIT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert!(writer.borrow_mut().hold_log(0, false));
+        }));
     });
     let page = export_within(
         &reader,
@@ -854,12 +856,12 @@ fn the_log_waits_with_its_own_budget_after_a_stuck_table() {
         16,
         usize::MAX,
         Waits {
-            busy_budget: budget,
+            busy_budget: BUSY_BUDGET,
             max_lost_ranges: MAX_LOST_RANGES,
         },
-    )
-    .unwrap();
-    let _mirror = writer.join().unwrap();
+    );
+    DURING_LOG_WAIT.with(|hook| *hook.borrow_mut() = None);
+    let page = page.unwrap();
     assert_eq!(seqs(&page), [0]);
     assert_eq!(page.journals, [ExportJournal::Recycled(Box::new(gone))]);
     assert_eq!(page.unreadable_records, 0);
