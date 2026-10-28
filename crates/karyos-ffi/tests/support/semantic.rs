@@ -9,7 +9,7 @@
 //! staged state across the retryable statuses.
 
 use std::collections::BTreeMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 
 use super::abi;
 use crate::Value;
@@ -64,8 +64,16 @@ struct Object {
     network: bool,
     /// The stream id of a publication or a subscription.
     stream_id: Option<i32>,
-    /// A `karyos:udp` subscription that has reported an image.
-    imaged: bool,
+    /// The `endpoint=` or `group=` value of a `karyos:udp` channel.
+    endpoint: Option<String>,
+    /// A `karyos:udp` subscription's images reported so far.
+    images: u32,
+    /// A `karyos:udp` publication's matching subscriptions, each with its
+    /// images when the publication was added: its own image is one more
+    /// (karyos#830). Emptied once the wait for them is done.
+    awaits: Vec<(usize, u32)>,
+    /// An embedded driver its scenario started (`driver.start`).
+    started: bool,
 }
 
 /// The answer of an op: `ok` with its results, or a status name.
@@ -180,7 +188,10 @@ impl Adapter {
             networked: false,
             network: false,
             stream_id: None,
-            imaged: false,
+            endpoint: None,
+            images: 0,
+            awaits: Vec::new(),
+            started: false,
         });
         Value::Object(self.objects.len() - 1)
     }
@@ -257,55 +268,136 @@ impl Adapter {
         }
     }
 
-    /// Before an offer on a `karyos:udp` publication of a provided client
-    /// or of a client of an embedded driver with its network on, waits,
-    /// serving the client,
-    /// until every open `karyos:udp` subscription of that client and stream
-    /// has reported an image (FORMAT.md, Features, `embedded-network`;
-    /// karyos#830). A reader joins an image at its head (SPEC §4, Joining)
-    /// and the publication is connected once the receiver answers (SPEC §4,
-    /// Connection), so an offer before the client attached the image may
-    /// never reach it. Fails at 10 s.
-    fn await_images(&mut self, publication: usize, at: &str) {
+    /// Records `object`'s channel: whether it is `karyos:udp`, its stream
+    /// and its endpoint or group.
+    fn channel(&mut self, object: usize, uri: &CStr, stream_id: i32) {
+        let text = uri.to_string_lossy();
+        let network = text.starts_with("karyos:udp");
+        let endpoint = network
+            .then(|| {
+                text.split(['?', '|'])
+                    .find_map(|part| {
+                        part.strip_prefix("endpoint=")
+                            .or_else(|| part.strip_prefix("group="))
+                    })
+                    .map(str::to_owned)
+            })
+            .flatten();
+        let object = &mut self.objects[object];
+        object.network = network;
+        object.stream_id = Some(stream_id);
+        object.endpoint = endpoint;
+    }
+
+    /// Whether `publication` connects asynchronously: a provided client's,
+    /// or a `karyos:udp` one of a client of an embedded driver with its
+    /// network on (FORMAT.md, Remote driver).
+    fn connects_async(&self, publication: usize) -> Option<usize> {
         let object = &self.objects[publication];
-        let (Some(client), Some(stream_id)) = (object.parent, object.stream_id) else {
-            return;
-        };
-        let networked = self.objects[client].provided
-            || self.objects[client]
-                .parent
-                .is_some_and(|driver| self.objects[driver].networked);
-        if !object.network || !networked {
-            return;
-        }
-        let waiting: Vec<usize> = (0..self.objects.len())
+        object.parent.filter(|&client| {
+            let client = &self.objects[client];
+            client.provided
+                || (object.network
+                    && client
+                        .parent
+                        .is_some_and(|driver| self.objects[driver].networked))
+        })
+    }
+
+    /// The open `karyos:udp` subscriptions on `publication`'s stream and
+    /// endpoint or group, of any client.
+    fn matching(&self, publication: usize) -> Vec<usize> {
+        let object = &self.objects[publication];
+        (0..self.objects.len())
             .filter(|&index| {
                 let other = &self.objects[index];
                 other.kind == Kind::Subscription
                     && !other.closed
                     && other.network
-                    && !other.imaged
-                    && other.parent == Some(client)
-                    && other.stream_id == Some(stream_id)
+                    && other.stream_id == object.stream_id
+                    && other.endpoint == object.endpoint
             })
-            .collect();
-        let start = std::time::Instant::now();
-        for index in waiting {
-            while !self.objects[index].imaged {
-                assert!(
-                    start.elapsed() < UNTIL_DEADLINE,
-                    "{at}: the subscription of stream {stream_id} has no image after the deadline"
-                );
-                let _ = abi::client_poll(self.objects[client].handle);
-                while let (0, Some(change)) =
-                    abi::subscription_next_image_change(self.objects[index].handle)
-                {
+            .collect()
+    }
+
+    /// Takes the queued image changes of `subscription` into its count;
+    /// a failing status fails the step.
+    fn take_image_changes(&mut self, subscription: usize, at: &str) {
+        loop {
+            match abi::subscription_next_image_change(self.objects[subscription].handle) {
+                (0, Some(change)) => {
                     if change.available == 1 {
-                        self.objects[index].imaged = true;
+                        self.objects[subscription].images += 1;
                     }
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                (0, None) => return,
+                (status, _) => panic!(
+                    "{at}: karyos_subscription_next_image_change: {}",
+                    self.name(status, at)
+                ),
             }
+        }
+    }
+
+    /// When `publication` is added, records the images of each matching
+    /// subscription: an offer or a claim on it waits for one more.
+    fn note_awaits(&mut self, publication: usize, at: &str) {
+        if !self.objects[publication].network || self.connects_async(publication).is_none() {
+            return;
+        }
+        let matching = self.matching(publication);
+        for &subscription in &matching {
+            self.take_image_changes(subscription, at);
+        }
+        self.objects[publication].awaits = matching
+            .into_iter()
+            .map(|subscription| (subscription, self.objects[subscription].images))
+            .collect();
+    }
+
+    /// Before the first offer or claim on a `karyos:udp` publication that
+    /// connects asynchronously, waits until each subscription it matched
+    /// when it was added has reported one more image: the image of this
+    /// publication's session (FORMAT.md, Remote driver; karyos#830). It
+    /// serves every client involved, and runs an embedded driver its
+    /// scenario did not start. A reader joins an image at its head (SPEC
+    /// §4, "Monotonic limits and joining") and the publication is
+    /// connected once the receiver answers (SPEC §4, "Connection"), so an
+    /// offer before the image is attached may never reach it. At 10 s it
+    /// goes on to the offer, whose answer the scenario checks.
+    fn await_images(&mut self, publication: usize, at: &str) {
+        let awaits = core::mem::take(&mut self.objects[publication].awaits);
+        if awaits.is_empty() {
+            return;
+        }
+        let mut clients: Vec<usize> = awaits
+            .iter()
+            .filter_map(|&(subscription, _)| self.objects[subscription].parent)
+            .chain(self.objects[publication].parent)
+            .collect();
+        clients.sort_unstable();
+        clients.dedup();
+        let start = std::time::Instant::now();
+        while start.elapsed() < UNTIL_DEADLINE {
+            for &client in &clients {
+                if let Some(driver) = self.objects[client].parent
+                    && !self.objects[driver].started
+                {
+                    let _ = abi::driver_do_work(self.objects[driver].handle);
+                }
+                let _ = abi::client_poll(self.objects[client].handle);
+            }
+            let mut ready = true;
+            for &(subscription, before) in &awaits {
+                if !self.objects[subscription].closed {
+                    self.take_image_changes(subscription, at);
+                    ready &= self.objects[subscription].images > before;
+                }
+            }
+            if ready {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -323,21 +415,10 @@ impl Adapter {
         mut offer: impl FnMut() -> (i32, T),
         at: &str,
     ) -> (i32, T) {
-        // A provided client's, or a network publication of a client of an
-        // embedded driver with its network on: those connect
-        // asynchronously. Its IPC publications answer at once.
-        let network = self.objects[publication].network;
-        let client = self.objects[publication]
-            .parent
-            .filter(|parent| {
-                let object = &self.objects[*parent];
-                object.provided
-                    || (network
-                        && object
-                            .parent
-                            .is_some_and(|driver| self.objects[driver].networked))
-            })
-            .map(|parent| self.objects[parent].handle);
+        // Its IPC publications answer at once.
+        let client = self
+            .connects_async(publication)
+            .map(|client| self.objects[client].handle);
         let start = std::time::Instant::now();
         loop {
             let (status, value) = offer();
@@ -465,10 +546,11 @@ impl Adapter {
                     other => panic!("{at}: `idle_strategy` {other:?} is no idle strategy"),
                 };
                 let sleep = args.narrow("idle_sleep_ns", Some(0));
-                self.plain(
-                    abi::driver_start(self.objects[driver].handle, idle, sleep),
-                    at,
-                )
+                let status = abi::driver_start(self.objects[driver].handle, idle, sleep);
+                if status == 0 {
+                    self.objects[driver].started = true;
+                }
+                self.plain(status, at)
             }
             "driver.do_work" => {
                 let driver = args.object("driver");
@@ -507,10 +589,11 @@ impl Adapter {
                     return answer;
                 }
                 let uri = args.uri();
+                let stream_id = args.narrow("stream_id", None);
                 let (status, publication, _) = abi::client_add_publication_of(
                     self.objects[client].handle,
                     &uri,
-                    args.narrow("stream_id", None),
+                    stream_id,
                     u32::try_from(size_of::<abi::Detail>()).unwrap(),
                     op == "publication.add_concurrent",
                 );
@@ -519,8 +602,8 @@ impl Adapter {
                 }
                 let publication = self.insert(Kind::Publication, publication, Some(client));
                 if let Value::Object(index) = publication {
-                    self.objects[index].network = uri.to_bytes().starts_with(b"karyos:udp");
-                    self.objects[index].stream_id = Some(args.narrow("stream_id", None));
+                    self.channel(index, &uri, stream_id);
+                    self.note_awaits(index, at);
                 }
                 Answer::Ok(results([("publication", publication)]))
             }
@@ -596,6 +679,7 @@ impl Adapter {
                 if let Some(answer) = self.open(publication, Kind::Publication, at) {
                     return answer;
                 }
+                self.await_images(publication, at);
                 let message = args.message();
                 let (status, claim) = abi::publication_claim_filled(
                     self.objects[publication].handle,
@@ -627,6 +711,7 @@ impl Adapter {
                 if let Some(answer) = self.open(publication, Kind::Publication, at) {
                     return answer;
                 }
+                self.await_images(publication, at);
                 let (status, claim) = abi::publication_claim(
                     self.objects[publication].handle,
                     args.narrow("lane", Some(0)),
@@ -695,8 +780,7 @@ impl Adapter {
                 }
                 let subscription = self.insert(Kind::Subscription, subscription, Some(client));
                 if let Value::Object(index) = subscription {
-                    self.objects[index].network = uri.to_bytes().starts_with(b"karyos:udp");
-                    self.objects[index].stream_id = Some(stream_id);
+                    self.channel(index, &uri, stream_id);
                 }
                 Answer::Ok(results([("subscription", subscription)]))
             }

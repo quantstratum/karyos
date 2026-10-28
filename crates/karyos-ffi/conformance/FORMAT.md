@@ -212,7 +212,7 @@ offers. The features are:
 | `concurrent-publication` | `publication.add_concurrent` |
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
-| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner picks for the scenario, outside the ephemeral range. As for a remote publication, the runner retries an offer of such a driver's client on a `karyos:udp` channel that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously. Before such an offer, and before an offer on a `karyos:udp` publication of a provided client (Remote driver), the runner also waits, serving the client, until each open `karyos:udp` subscription of that client and stream has reported an image (`karyos_subscription_next_image_change`), or fails at 10 s: a reader joins an image at its head (SPEC §4, Monotonic limits and joining) and the publication is connected once the receiver answers (SPEC §4, Connection), so an offer before the client attached the image may never reach it (karyos#830) |
+| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner picks for the scenario, outside the ephemeral range. As for a remote publication, the runner retries an offer of such a driver's client on a `karyos:udp` channel that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously. The runner waits for an image before an offer or a claim on such a publication (Remote driver). |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
 | `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded, plain and timed network streams, and a loopback endpoint `$loopback_uri` (Remote driver, below; Linux only) |
@@ -449,6 +449,20 @@ serves `$remote_client` before every scenario and provisions it after
 anything slow (the incompatible driver's stubs), so the client is silent
 for one scenario at most (karyos#820). A scenario that does not use the
 client must take less than karyosd's client liveness timeout (10 s).
+
+A reader joins an image at its head (SPEC §4, "Monotonic limits and
+joining"), and a network publication is connected once its receiver's
+status messages are live (SPEC §4, "Connection"), before the client that
+subscribed has attached the image. So before the first offer or claim on
+a `karyos:udp` publication of a provided client, or of a client of an
+embedded driver with its network on (`embedded-network`), the runner
+waits until each open `karyos:udp` subscription on the same stream and
+endpoint (or group), of any client, has reported one more image than it
+had when the publication was added (`karyos_subscription_next_image_change`).
+It serves every client involved, and runs an embedded driver the scenario
+did not start. At 10 s it goes on to the offer, whose answer the scenario
+checks. A message offered before that image exists may never reach the
+subscription (karyos#830).
 
 Each exclusive stream's publication is added at most once in the whole
 suite run, since karyosd serves every scenario: a remote publication is

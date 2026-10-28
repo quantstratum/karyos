@@ -68,6 +68,10 @@ fn the_replay_wrappers_pass_their_pointers() {
     );
     let (status, end) = abi::subscription_end_state(0);
     assert_eq!((status, end.reason, end.position), (INVALID_HANDLE, 0, 0));
+    // karyos#830: the image change's sized struct and `has` pointer.
+    let (status, change) = abi::subscription_next_image_change(0);
+    assert_eq!(status, INVALID_HANDLE);
+    assert!(change.is_none());
     let (status, kept) = abi::archive_recordings(0, 0, 4);
     assert_eq!(status, INVALID_HANDLE);
     assert!(kept.is_empty());
