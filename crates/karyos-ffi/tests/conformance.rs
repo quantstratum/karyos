@@ -15,6 +15,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+// Against a released package (`--cfg karyos_package`,
+// scripts/conformance-package.sh) the symbols come from its libkaryos,
+// not from this crate.
+#[cfg(not(karyos_package))]
 use karyos_ffi as _;
 
 mod support {

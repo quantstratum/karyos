@@ -44,6 +44,9 @@ karyos-protocol.workspace = true
 unsafe_code = "deny"
 missing_docs = "deny"
 unsafe_op_in_unsafe_fn = "deny"
+# `karyos_package`: the conformance test links a released libkaryos
+# package instead of this crate (scripts/conformance-package.sh).
+unexpected_cfgs = { level = "deny", check-cfg = ["cfg(karyos_package)"] }
 
 [lints.clippy]
 unwrap_used = "deny"

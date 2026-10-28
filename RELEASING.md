@@ -72,6 +72,67 @@ it, with the Miri version.
 A gate that fails gets an issue of its own, linked from its row; the
 fix is not folded into the pull request that records the evidence.
 
+## libkaryos and karyosd artifacts
+
+`libkaryos` and `karyosd` are released as two separate artifacts (owner
+item 44; karyos#700). At the release head, on each host:
+
+1. `scripts/release-libkaryos.sh` builds, from a clean tree, the library
+   package (`libkaryos-<abi>-<core>-<triple>.tar.gz`: header, static and
+   shared libraries, pkg-config files, the conformance suite's files,
+   `MANIFEST` with `contents=library` and `excludes=karyosd`, and the ABI
+   manifest), the daemon alone (`karyosd-<core>-<triple>.tar.gz`), and
+   `SHA256SUMS`. It refuses a library artifact holding `karyosd` or a
+   daemon artifact holding the library.
+2. `scripts/conformance-package.sh <libkaryos tarball>` runs the
+   conformance suite against the artifact itself, which it checks against
+   `SHA256SUMS` first; its last line, with the artifact's SHA-256, is the
+   Evidence row. The cross-process scenarios run on Linux only.
+3. `scripts/sign-release.sh` signs each artifact with key-based `cosign`
+   and verifies it (karyos-deploy ADR-0003). The release key's custodian
+   runs it; it refuses without the key's URI and has no fallback. Until
+   karyos-deploy's D1 gates (the R8 record for `cosign`, the custody
+   procedure) are met, there is no key, and no signed artifact is
+   published.
+
+The soname policy is owner item 48's ruling: the soname carries `0.y`
+before 1.0 and the major from 1.0 on (`scripts/package-libkaryos.sh`).
+The ABI manifest, `share/karyos/abi-manifest.txt` in the package and
+`crates/karyos-ffi/abi/manifest.txt` in the tree, gives every public
+struct's size, alignment and field offsets and every constant of the
+released header; `make abi-manifest-check` (in pre-push) fails a layout
+change without a new ABI version.
+
+The conformance test kit (`make libkaryos-testkit`) is not a release
+package: its `MANIFEST` says `release_package=no` and its `README` says
+so. It is never put in a release directory.
+
+### Registry check
+
+Owner item 44 asks for a check of registry control and policy before
+publication, under the candidate names of
+`quantstratum-docs: owner-decisions/2026-10-21/decisions.md:214` to
+`:226`. It is read-only: anonymous requests with a User-Agent naming the
+project, no account, and nothing reserved. "Free" means the registry
+lists nothing under the name; it is not a reservation, and the names stay
+open to anyone until they are published.
+
+| Checked | Registry | Name | Result |
+| --- | --- | --- | --- |
+| 2026-10-28 | PyPI | `karyos` | free |
+| 2026-10-28 | PyPI | `quantstratum-karyos` (fallback) | free |
+| 2026-10-28 | NuGet | `Karyos` | free |
+| 2026-10-28 | NuGet | `QuantStratum.Karyos` (fallback) | free |
+| 2026-10-28 | Maven Central | `com.quantstratum:karyos` | free (no artifact); control of the `com.quantstratum` namespace, which Central verifies by domain, is unknown |
+| 2026-10-28 | Maven Central | `io.github.quantstratum` (fallback) | free (no artifact); its control is unknown |
+| 2026-10-28 | Go module proxy | `github.com/quantstratum/karyos-go` | free (no public module) |
+| 2026-10-28 | GitHub | `quantstratum/karyos-go` | unknown: an anonymous request cannot tell a missing repository from a private one |
+| 2026-10-28 | crates.io | `karyos`, `libkaryos` | free |
+
+The C++ names (CMake `karyos`; Conan and vcpkg deferred) are not
+registry names and are not checked. Each binding's own release repeats
+the check for its names before it publishes.
+
 ## After the tag
 
 After a release is tagged, its release notes on `main` only gain dated

@@ -202,6 +202,9 @@ pub struct SubscriptionEnd {
     pub seal_code: u64,
 }
 
+// From a released package's libkaryos under `--cfg karyos_package`
+// (scripts/conformance-package.sh); from the crate's rlib otherwise.
+#[cfg_attr(karyos_package, link(name = "karyos"))]
 unsafe extern "C" {
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
