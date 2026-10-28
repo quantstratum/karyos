@@ -14,7 +14,10 @@
 //!   is sealed, up to the start of the next committed extent. No NAK is
 //!   sent. A tail above the covered end that only a sender's heartbeat
 //!   reveals ([`SkipPolicy::revealed`]) is a hole too, from the resolved
-//!   prefix (never below the join point) to the heartbeat's position.
+//!   prefix to the heartbeat's position. Each lost range ages from when it
+//!   was first seen: a hole that grows (a higher mark, or DATA above it)
+//!   adds a part with its own deadline, and each part is sealed at its own,
+//!   only up to its end (karyos#806).
 //! - **Reliable.** A timer never seals. Under `on_unrecoverable = close`
 //!   (the default) a correlated `RANGE_UNAVAILABLE` closes the image with
 //!   the interval; under `skip` it seals the whole hole with reason
@@ -52,6 +55,60 @@ pub const DEFAULT_REORDER_TIMEOUT_NS: u64 = 1_000_000;
 pub const DEFAULT_FAR_WINDOW_TIMEOUT_NS: u64 = 1_000_000_000;
 /// Seals one duty applies at most per lane, so a duty stays bounded.
 const SEALS_PER_DUTY: u32 = 8;
+/// The parts of a lane's open loss each with its own detection time, at
+/// most: past it the newest part takes the later time, so a part is sealed
+/// late, never early.
+const PARTS: usize = 8;
+
+/// A lane's open loss as parts revealed one after another, oldest first:
+/// each `(detected, end)` covers from the previous part's end (or the
+/// prefix) to `end`, and ages from its own detection (karyos#806).
+#[derive(Debug, Clone, Copy, Default)]
+struct Parts {
+    parts: [(u64, u64); PARTS],
+    len: usize,
+}
+
+impl Parts {
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    /// The parts held, oldest first.
+    fn held(&self) -> &[(u64, u64)] {
+        self.parts.get(..self.len).unwrap_or(&[])
+    }
+
+    /// Drops the parts that end at or below `position`, sealed or covered.
+    fn resolve(&mut self, position: u64) {
+        let resolved = self
+            .held()
+            .iter()
+            .take_while(|(_, end)| *end <= position)
+            .count();
+        self.parts.copy_within(resolved..self.len, 0);
+        self.len -= resolved;
+    }
+
+    /// Records that the loss is seen up to `seen` at `now`: a part from
+    /// the last end to `seen`, detected now. When every part is taken, the
+    /// newest is extended and takes `now`, so it waits longer, never less.
+    fn seen(&mut self, seen: u64, now: u64) {
+        if self.held().last().is_some_and(|(_, end)| seen <= *end) {
+            return;
+        }
+        let at = self.len.min(PARTS - 1);
+        if let Some(part) = self.parts.get_mut(at) {
+            *part = (now, seen);
+            self.len = at + 1;
+        }
+    }
+
+    /// The oldest part: its detection time and end.
+    fn first(&self) -> Option<(u64, u64)> {
+        self.held().first().copied()
+    }
+}
 
 /// What a reliable channel does with a range proven unrecoverable (GU-5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -234,16 +291,18 @@ impl SkipCounters {
 /// One lane's hole and far-window state.
 #[derive(Debug, Clone, Copy, Default)]
 struct LaneState {
-    /// The current loss episode: when holes were first detected, and the
-    /// covered end then. A hole starting below that end was detected then;
-    /// one at or above it is a new detection.
-    episode: Option<(u64, u64)>,
+    /// The open loss, in parts each detected when it was first seen: a
+    /// hole below a part's end was detected with that part, and is sealed
+    /// only up to that end at its deadline; what lies above is a later
+    /// part with its own deadline.
+    parts: Parts,
     /// Holes below this position are proven unrecoverable (reliable, skip).
     unrecoverable_to: u64,
     /// Since when every arrival was `Ahead`, and the earliest such position.
     ahead: Option<(u64, u64)>,
-    /// The highest position a sender's heartbeat named (unreliable): a
-    /// tail above the covered end that no frame revealed.
+    /// The lane's heartbeat mark, the sender's next position as the
+    /// driver last fed it, clamped to a recorded terminal bound
+    /// (unreliable): a tail above the covered end that no frame revealed.
     mark: u64,
     /// The lane was reported closed.
     closed: bool,
@@ -312,14 +371,15 @@ impl SkipPolicy {
         }
     }
 
-    /// Records that a sender's heartbeat on `lane` named `mark`, its next
-    /// position (SPEC §6, G1): on an unreliable channel, a tail from the
-    /// covered end to `mark` that no frame revealed is a hole like any
-    /// other, sealed once its deadline passes. A lower or equal mark
-    /// changes nothing; a higher one extends the open hole.
+    /// Sets `lane`'s heartbeat mark, the sender's next position its
+    /// heartbeats named, clamped to the lane's terminal bound (SPEC §6,
+    /// G1): on an unreliable channel, a tail from the covered end to `mark`
+    /// that no frame revealed is a hole like any other. A higher mark adds
+    /// a part with its own deadline; a lower one (a terminal bound
+    /// recorded since) shortens what may be sealed.
     pub fn revealed(&mut self, lane: Lane, mark: u64) {
         if let Some(state) = self.lanes.get_mut(usize::from(lane.get())) {
-            state.mark = state.mark.max(mark);
+            state.mark = mark;
         }
     }
 
@@ -502,20 +562,27 @@ impl SkipPolicy {
             // A tail hole is seen up to the heartbeat's mark.
             let (hole, seen) = match owner.first_hole(lane)? {
                 Some(hole) => (Some(hole), owner.high_water(lane)),
-                None if !config.reliable => (owner.tail_hole(lane, state.mark)?, Some(state.mark)),
+                None if !config.reliable => {
+                    (owner.heartbeat_tail(lane, state.mark)?, Some(state.mark))
+                }
                 None => (None, None),
             };
             let Some((position, extent)) = hole else {
-                state.episode = None;
+                state.parts.clear();
                 return Ok(());
             };
-            let high = seen.unwrap_or(position);
-            let (detected, seen_to) = match state.episode {
-                Some((at, seen_to)) if position < seen_to => (at, seen_to),
-                // A hole above what the episode saw: a new detection.
-                _ => (now, high),
+            state.parts.resolve(position);
+            state.parts.seen(
+                seen.unwrap_or(position.saturating_add(u64::from(extent))),
+                now,
+            );
+            let Some((detected, part_end)) = state.parts.first() else {
+                return Ok(());
             };
-            state.episode = Some((detected, seen_to));
+            // Only the part detected then is due: what lies above it was
+            // seen later and waits for its own deadline.
+            let extent = u32::try_from(part_end.saturating_sub(position))
+                .map_or(extent, |part| extent.min(part));
             let reason = if config.reliable {
                 if config.on_unrecoverable == Unrecoverable::Skip
                     && position < state.unrecoverable_to
