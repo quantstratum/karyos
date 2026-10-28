@@ -2280,11 +2280,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if let Some((held, version)) = held
                     && held != policy
                 {
-                    let error =
-                        DriverError::RateChange(crate::guards::RateChangeError::PolicyConflict {
-                            requested: policy,
-                            held,
-                        });
+                    let error = DriverError::RatePolicyConflict {
+                        requested: policy,
+                        held,
+                    };
                     let now = self.clock.now();
                     self.guards.audit_rate(
                         guard,

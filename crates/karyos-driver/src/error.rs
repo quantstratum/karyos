@@ -277,6 +277,15 @@ pub enum DriverError {
     /// A rate policy change was refused (R-CORE-21).
     #[error(transparent)]
     RateChange(crate::guards::RateChangeError),
+    /// A lane guarded with a rate other than its publication's policy
+    /// (R-CORE-21): only a policy change changes it.
+    #[error("the lane's rate {requested:?} is not its publication's {held:?}")]
+    RatePolicyConflict {
+        /// The rate the lane was guarded with.
+        requested: karyos_sys::rate_limit::RatePolicy,
+        /// The publication's policy.
+        held: karyos_sys::rate_limit::RatePolicy,
+    },
     /// A rate policy change of an aggregate was refused by one of its
     /// guarded lanes, named, so nothing changed on any lane (R-CORE-21).
     #[error("lane {lane} refused the rate policy change: {refusal}")]

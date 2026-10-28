@@ -1239,7 +1239,7 @@ fn a_lane_refusal_and_a_retiring_lane_are_named_and_audited() {
 /// or none, is taken at the publication's version.
 #[test]
 fn a_lane_guarded_with_another_policy_is_refused() {
-    use karyos_driver::{AuditOutcome, RateChangeError};
+    use karyos_driver::AuditOutcome;
     use karyos_protocol::cnc::ErrorCode;
 
     let mut driver = EmbeddedDriver::new().unwrap();
@@ -1260,10 +1260,10 @@ fn a_lane_guarded_with_another_policy_is_refused() {
             4,
             Some(per_second(200, 10, None))
         ),
-        Err(DriverError::RateChange(RateChangeError::PolicyConflict {
+        Err(DriverError::RatePolicyConflict {
             requested: per_second(200, 10, None).policy,
             held: per_second(100, 10, None).policy,
-        }))
+        })
     );
     let last = *driver.guard_audit().records.last().unwrap();
     assert_eq!(

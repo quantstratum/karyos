@@ -16,7 +16,7 @@
     policy and one version, kept by the driver for its aggregate: a lane
     guarded with no rate takes it, one guarded with the same policy joins
     at its version, and one guarded with another policy is refused and
-    audited (`RateChangeError::PolicyConflict`, with both, code 25): only
+    audited (`DriverError::RatePolicyConflict`, with both, code 25): only
     a change changes it. The first lane guarded with a rate gives the
     policy, at version 1, to the lanes guarded before without one, each
     audited from no rate (version 0).
