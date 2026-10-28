@@ -6,8 +6,12 @@
   detached" no longer misses it.
   - Only messages that release something are served; a queued `Fetch` is
     dropped.
-  - The drain is bounded by `max_exports_per_client +
-    max_fetches_per_client + 1` messages.
-  - New driver counters: "grants released at exit" (grants the exit
-    ended), "fetches dropped at exit" and "admission messages dropped at
-    exit".
+  - An exited client is drained instead of served, never after its
+    turn, so nothing is fetched or sent for it.
+  - The drain reads at most 1024 datagrams, twice Linux's default
+    `net.unix.max_dgram_qlen`, so a default socket's whole queue fits.
+  - Messages queued for the exited client are dropped unsent.
+  - New driver counters: "grants released at exit" (grants whose
+    descriptor left and that the exit ended), "fetches dropped at exit",
+    "admission messages dropped at exit" and "admission messages not sent
+    at exit".

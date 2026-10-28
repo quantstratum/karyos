@@ -1135,6 +1135,11 @@ fn a_remote_client_takes_handles_that_exchange_and_detach_on_drop() {
     serve_until(&mut driver, |driver| driver.clients() == 0);
     assert_eq!(counter(&driver, "grants exported"), 2);
     assert_eq!(counter(&driver, "grants detached"), 2);
+    assert_eq!(
+        counter(&driver, "grants exported"),
+        2,
+        "a fetch served after the exit"
+    );
 }
 
 /// A stream's `allow_unconnected` reaches a remote client's publication
@@ -2036,23 +2041,34 @@ fn an_ipc_driver_with_a_network_checks_its_descriptor_limit_at_start() {
 
 const DRAIN_CHILD: &str = "KARYOS_ADMISSION_DRAIN_CHILD";
 
+/// The `Fetch` messages the drain child queues in front of its `Detach`
+/// messages: more than `ipc_config`'s `max_fetches_per_client` (4).
+const DRAIN_FETCHES: u64 = 12;
+
 /// karyos#827: what a client queued on its socket before it exited is
-/// read before its exit proof releases it. The child holds two exported
-/// grants, then sends both `Detach` messages and a `Fetch` and exits
-/// while the driver does not run. One duty cycle used to read one
-/// datagram and then release the client, so the second `Detach` went
-/// unread and its grant ended as a release at exit. Now both count as
-/// detached, the `Fetch` is dropped and counted, and nothing is left to
-/// release at exit.
+/// read before its exit proof releases it, and nothing is served for the
+/// dead client. The child holds two exported grants and a third, held
+/// and never fetched; it sends 12 `Fetch` messages of the held grant, more
+/// than it may have open, then both `Detach` messages, and exits while the
+/// driver does not run. One duty
+/// cycle used to read one datagram and then release the client, so the
+/// second `Detach` went unread and its grant ended as a release at exit.
+/// Now both count as detached, the `Fetch` messages are dropped and
+/// counted without pushing a `Detach` out (no third export), and no grant
+/// whose descriptor left is released at exit:
+/// the held one never left.
 #[test]
 fn an_exited_clients_queued_detaches_are_served_before_its_release() {
     let dir = dir("drain-exited");
     let mut driver = system_driver(&dir);
     let mut second = shared_stream_config();
     second.buffer.stream_id = 3;
+    let mut third = shared_stream_config();
+    third.buffer.stream_id = 4;
     let _streams = (
         driver.add_stream(shared_stream_config()).unwrap(),
         driver.add_stream(second).unwrap(),
+        driver.add_stream(third).unwrap(),
     );
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -2071,7 +2087,7 @@ fn an_exited_clients_queued_detaches_are_served_before_its_release() {
     assert!(child.wait().unwrap().success());
     serve_until(&mut driver, |driver| driver.clients() == 0);
     assert_eq!(counter(&driver, "grants detached"), 2);
-    assert_eq!(counter(&driver, "fetches dropped at exit"), 1);
+    assert_eq!(counter(&driver, "fetches dropped at exit"), DRAIN_FETCHES);
     assert_eq!(counter(&driver, "grants released at exit"), 0);
     assert_eq!(counter(&driver, "admission messages dropped at exit"), 0);
 }
@@ -2084,7 +2100,7 @@ fn child_detaches_twice_fetches_and_exits() {
         return;
     };
     let mut client = attach(Path::new(&dir), Duration::from_secs(5), 16).unwrap();
-    for stream_id in [2, 3] {
+    for stream_id in [2, 3, 4] {
         let _ = client
             .add_subscription(
                 StreamKey {
@@ -2097,7 +2113,7 @@ fn child_detaches_twice_fetches_and_exits() {
     }
     let mut keys = Vec::new();
     let start = Instant::now();
-    while keys.len() < 2 {
+    while keys.len() < 3 {
         assert!(start.elapsed() < Duration::from_secs(10), "no grants");
         let _ = client.poll(usize::MAX, |completion| {
             if let Outcome::Fetchable(fetchable) = completion.outcome {
@@ -2120,6 +2136,7 @@ fn child_detaches_twice_fetches_and_exits() {
             std::thread::sleep(Duration::from_millis(1));
         }
     };
+    let held = keys.pop().unwrap();
     let mut exports = Vec::new();
     for (fetch, key) in (1..).zip(keys) {
         let message = encode(&Message::Fetch { fetch, key });
@@ -2131,12 +2148,17 @@ fn child_detaches_twice_fetches_and_exits() {
         let _ = receive();
         exports.push(records[0].export);
     }
+    // More `Fetch` messages than the client may have open, in front of the
+    // `Detach` messages: discarded unread, they must not push a `Detach`
+    // out of the drain.
+    for fetch in 3..3 + DRAIN_FETCHES {
+        let message = encode(&Message::Fetch { fetch, key: held });
+        assert_eq!(ipc::send(socket, &message, None).unwrap(), Sent::Sent);
+    }
     for export in exports {
         let message = encode(&Message::Detach { export });
         assert_eq!(ipc::send(socket, &message, None).unwrap(), Sent::Sent);
     }
-    let message = encode(&Message::Fetch { fetch: 3, key: 1 });
-    assert_eq!(ipc::send(socket, &message, None).unwrap(), Sent::Sent);
     // Exit without dropping the client: no Leave, and the driver has not
     // run since the last region.
     std::mem::forget(client);

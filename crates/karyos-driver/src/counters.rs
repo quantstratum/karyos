@@ -149,7 +149,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 71] = [
+const LABELS: [(u64, &str); 72] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -221,6 +221,7 @@ const LABELS: [(u64, &str); 71] = [
     (TYPE_EVENTS, "grants released at exit"),
     (TYPE_EVENTS, "fetches dropped at exit"),
     (TYPE_EVENTS, "admission messages dropped at exit"),
+    (TYPE_EVENTS, "admission messages not sent at exit"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -417,14 +418,22 @@ pub(crate) enum Event {
         allow(dead_code, reason = "admission is served only on Linux")
     )]
     FetchesDroppedAtExit,
-    /// Other admission messages left after a client's exit proof: past the
-    /// drain's bound, undecodable, or carrying a descriptor. Last, so no
-    /// other counter's id moves.
+    /// Other admission messages left after a client's exit proof: a
+    /// `Detach` naming no detachable export, undecodable, carrying a
+    /// descriptor, a receive error, or still queued at the drain's bound
+    /// (counted once).
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "admission is served only on Linux")
     )]
     AdmissionMessagesDroppedAtExit,
+    /// Admission messages queued for a client when its exit was proven,
+    /// dropped unsent. Last, so no other counter's id moves.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    OutboundDroppedAtExit,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -720,6 +729,10 @@ mod tests {
             (
                 Event::AdmissionMessagesDroppedAtExit,
                 "admission messages dropped at exit",
+            ),
+            (
+                Event::OutboundDroppedAtExit,
+                "admission messages not sent at exit",
             ),
         ];
         assert_eq!(events.len(), LABELS.len());

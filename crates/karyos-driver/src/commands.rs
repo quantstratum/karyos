@@ -606,8 +606,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // its Leave): every grant it holds ends, sent or not.
                 if let Some(ledger) = slot.ledger.take() {
                     for grant in ledger.into_grants() {
+                        // Counted when its descriptor left: a grant the
+                        // client could have detached, and did not.
+                        if grant.sent {
+                            self.counters.add(Event::GrantsReleasedAtExit, 1);
+                        }
                         self.end_grant(&grant);
-                        self.counters.add(Event::GrantsReleasedAtExit, 1);
                     }
                 }
             } else {
