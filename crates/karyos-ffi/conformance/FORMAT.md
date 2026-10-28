@@ -212,7 +212,7 @@ offers. The features are:
 | `concurrent-publication` | `publication.add_concurrent` |
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
-| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner binds for the scenario. As for a remote publication, the runner retries an offer of such a driver's client that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously |
+| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner picks for the scenario, outside the ephemeral range. As for a remote publication, the runner retries an offer of such a driver's client on a `karyos:udp` channel that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
 | `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded, plain and timed network streams, and a loopback endpoint `$loopback_uri` (Remote driver, below; Linux only) |
@@ -554,16 +554,20 @@ A scenario fails, and is reported as failed, on any of these:
 
 The ABI version is independent of the workspace version. A runner calls
 `karyos_abi_version` first, before any other call. This suite needs ABI
-0.1.4 or a later 0.1.z (0.1.2 adds the roles calls,
+0.1.3 or a later 0.1.z (0.1.2 adds the roles calls,
 `karyos_client_add_publication_with_roles` and
 `karyos_client_add_subscription_as`, and
 `karyos_publication_network_admission`, karyos#637; 0.1.3 adds
 `karyos_driver_startup_complete` and `karyos_driver_readiness`,
-karyos#794; 0.1.4 adds `karyos_driver_options.network`, karyos#735):
-before 1.0 a runner
+karyos#794): before 1.0 a runner
 accepts exactly the 0.y the suite targets, with at least its minimum
 0.y.z, and checks it once, before any scenario; a library outside it
 fails the run.
+
+A feature may need a later ABI than the suite: `embedded-network` needs
+0.1.4, which adds `karyos_driver_options.network` (karyos#735). A runner
+offers such a feature only on a library at its floor or later, and
+declares it absent otherwise; the rest of the suite runs as before.
 
 A runner then compares each scenario's `abi` with the library's. A
 scenario runs when the major versions are equal and:

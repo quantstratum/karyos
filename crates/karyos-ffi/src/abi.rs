@@ -2068,7 +2068,12 @@ fn default_driver_options() -> DriverOptions {
         client_liveness_timeout_ns: defaults.client_liveness_timeout_ns,
         cutover_deadline_ns: defaults.cutover_deadline_ns,
         startup_timeout_ns: defaults.startup_timeout_ns,
-        network: driver::NETWORK_OFF,
+        // The driver's default, as every other field.
+        network: if defaults.network {
+            driver::NETWORK_ON
+        } else {
+            driver::NETWORK_OFF
+        },
         reserved0: 0,
     }
 }

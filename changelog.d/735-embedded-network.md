@@ -12,6 +12,7 @@
   - Only on and off are exposed. The rest of the network configuration
     keeps its defaults, as with `karyosd --network on`, and the header
     lists it.
-- The conformance suite needs ABI 0.1.4. It adds the feature
-  `embedded-network`, with `driver.create_networked` and `$network_uri`,
-  and the scenario `op.embedded.network`.
+- The conformance suite adds the feature `embedded-network`, with
+  `driver.create_networked` and `$network_uri`, and the scenario
+  `op.embedded.network`. The suite still needs ABI 0.1.3; the feature
+  alone needs 0.1.4, and a 0.1.3 binding declares it absent.

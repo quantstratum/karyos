@@ -2926,10 +2926,45 @@ unsafe extern "C" fn count_message(
     unsafe { *context.cast::<u32>() += 1 };
 }
 
+/// The handles a network test opened, closed when it ends, a panic
+/// included, so a failed test leaves no driver, client or network thread
+/// running for the next one.
+#[derive(Default)]
+struct Opened {
+    driver: u64,
+    client: u64,
+    publication: u64,
+    subscription: u64,
+}
+
+impl Drop for Opened {
+    fn drop(&mut self) {
+        if self.publication != 0 {
+            let _ = karyos_publication_close(self.publication);
+        }
+        if self.subscription != 0 {
+            let _ = karyos_subscription_close(self.subscription);
+        }
+        if self.client != 0 {
+            let _ = karyos_client_close(self.client);
+        }
+        if self.driver != 0 {
+            let _ = karyos_driver_close(self.driver);
+        }
+    }
+}
+
 /// A driver of `network` on its own thread, and a client of it.
 fn network_driver(network: u32) -> (i32, u64, u64) {
+    network_driver_sized(network, size_of_u32::<DriverOptions>())
+}
+
+/// As [`network_driver`], from a struct of `size` bytes: the bytes past
+/// it hold `network` all the same, as an older caller's memory may.
+fn network_driver_sized(network: u32, size: u32) -> (i32, u64, u64) {
     let mut options = default_driver_options();
     options.network = network;
+    options.size = size;
     let mut driver = 0;
     // SAFETY: live, aligned pointers; no detail.
     let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
@@ -2948,11 +2983,16 @@ fn network_driver(network: u32) -> (i32, u64, u64) {
 }
 
 #[test]
-#[cfg_attr(miri, ignore = "UDP sockets")]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn an_embedded_driver_with_its_network_carries_a_udp_channel() {
     const STREAM: i32 = 735;
     let (status, driver, client) = network_driver(api::driver::NETWORK_ON);
     assert_eq!(status, Status::Ok.code());
+    let mut opened = Opened {
+        driver,
+        client,
+        ..Opened::default()
+    };
     let port = test_port();
     let receive = std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{port}")).unwrap();
     let send = std::ffi::CString::new(format!(
@@ -2971,6 +3011,7 @@ fn an_embedded_driver_with_its_network_carries_a_udp_channel() {
         )
     };
     assert_eq!(status, Status::Ok.code());
+    opened.subscription = subscription;
     let mut publication = 0;
     // SAFETY: a live C string, a live `u64`, no detail.
     let status = unsafe {
@@ -2983,6 +3024,7 @@ fn an_embedded_driver_with_its_network_carries_a_udp_channel() {
         )
     };
     assert_eq!(status, Status::Ok.code());
+    opened.publication = publication;
     let mut seen = 0u32;
     let start = std::time::Instant::now();
     let payload = b"over udp";
@@ -2995,9 +3037,20 @@ fn an_embedded_driver_with_its_network_carries_a_udp_channel() {
         // exists is not delivered to it.
         let mut done = accepted();
         // SAFETY: a live payload and a live `karyos_accepted`.
-        let _ = unsafe {
+        let offered = unsafe {
             karyos_publication_offer(publication, 0, payload.as_ptr(), payload.len(), &mut done)
         };
+        // Until the publication connects, only a retryable status.
+        assert!(
+            [
+                Status::Ok.code(),
+                Status::NotConnected.code(),
+                Status::BackPressured.code(),
+                Status::AdminAction.code(),
+            ]
+            .contains(&offered),
+            "offer: {offered}"
+        );
         // The client attaches the subscription's images as it is served.
         let _ = poll(client);
         let mut delivered = 0;
@@ -3015,18 +3068,23 @@ fn an_embedded_driver_with_its_network_carries_a_udp_channel() {
         idle();
     }
     assert!(seen >= 1);
-    assert_eq!(karyos_publication_close(publication), Status::Ok.code());
-    assert_eq!(karyos_subscription_close(subscription), Status::Ok.code());
-    assert_eq!(karyos_client_close(client), Status::Ok.code());
-    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+    let opened = core::mem::take(&mut opened);
+    assert_eq!(
+        karyos_publication_close(opened.publication),
+        Status::Ok.code()
+    );
+    assert_eq!(
+        karyos_subscription_close(opened.subscription),
+        Status::Ok.code()
+    );
+    assert_eq!(karyos_client_close(opened.client), Status::Ok.code());
+    assert_eq!(karyos_driver_close(opened.driver), Status::Ok.code());
+    core::mem::forget(opened);
 }
 
-#[test]
-#[cfg_attr(miri, ignore = "driver integration; covered natively")]
-fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
-    // The default, as an older caller's struct reads it.
-    let (status, driver, client) = network_driver(api::driver::NETWORK_OFF);
-    assert_eq!(status, Status::Ok.code());
+/// A `karyos:udp` publication and subscription of `client`'s driver are
+/// refused with `KARYOS_E_UNSUPPORTED_CHANNEL`.
+fn refuses_udp(client: u64) {
     let uri =
         std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{}", test_port())).unwrap();
     let mut subscription = 0;
@@ -3040,9 +3098,50 @@ fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
             core::ptr::null_mut(),
         )
     };
-    assert_ne!(status, Status::Ok.code());
-    assert_eq!(karyos_client_close(client), Status::Ok.code());
-    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+    assert_eq!(status, Status::UnsupportedChannel.code(), "subscription");
+    let mut publication = 0;
+    // SAFETY: a live C string, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_publication(
+            client,
+            uri.as_ptr(),
+            9,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::UnsupportedChannel.code(), "publication");
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
+    let (status, driver, client) = network_driver(api::driver::NETWORK_OFF);
+    assert_eq!(status, Status::Ok.code());
+    let _opened = Opened {
+        driver,
+        client,
+        ..Opened::default()
+    };
+    refuses_udp(client);
+}
+
+/// An older caller's struct, ABI 0.1.1's 56 bytes or 0.1.3's 64, works
+/// through `karyos_driver_create` and its driver is IPC-only, even with
+/// `network = KARYOS_NETWORK_ON` in the bytes past its size.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn an_older_callers_driver_is_ipc_only_whatever_lies_past_its_struct() {
+    for size in [DRIVER_OPTIONS_SIZE_0_1, 64] {
+        let (status, driver, client) = network_driver_sized(api::driver::NETWORK_ON, size);
+        assert_eq!(status, Status::Ok.code(), "size {size}");
+        let _opened = Opened {
+            driver,
+            client,
+            ..Opened::default()
+        };
+        refuses_udp(client);
+    }
 }
 
 #[test]

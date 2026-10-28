@@ -58,6 +58,9 @@ struct Object {
     /// An embedded driver created with its network on
     /// (`driver.create_networked`).
     networked: bool,
+    /// A publication on a `karyos:udp` channel, which connects
+    /// asynchronously.
+    network: bool,
 }
 
 /// The answer of an op: `ok` with its results, or a status name.
@@ -170,6 +173,7 @@ impl Adapter {
             closed: false,
             provided: false,
             networked: false,
+            network: false,
         });
         Value::Object(self.objects.len() - 1)
     }
@@ -248,7 +252,7 @@ impl Adapter {
 
     /// Runs `offer` on `publication`. On a remote publication (its client is
     /// a provided one, `$remote_client` or `$archive_client`; FORMAT.md,
-    /// Remote driver), or one of a client of an embedded driver with its
+    /// Remote driver), or a `karyos:udp` one of a client of an embedded driver with its
     /// network on (FORMAT.md, Features, `embedded-network`), a
     /// `back_pressured`, `admin_action` or `not_connected` answer is
     /// retried, serving the client, until the offer answers anything else
@@ -260,16 +264,19 @@ impl Adapter {
         mut offer: impl FnMut() -> (i32, T),
         at: &str,
     ) -> (i32, T) {
-        // A provided client's, or a client of an embedded driver with its
-        // network on: their network publications connect asynchronously.
+        // A provided client's, or a network publication of a client of an
+        // embedded driver with its network on: those connect
+        // asynchronously. Its IPC publications answer at once.
+        let network = self.objects[publication].network;
         let client = self.objects[publication]
             .parent
             .filter(|parent| {
                 let object = &self.objects[*parent];
                 object.provided
-                    || object
-                        .parent
-                        .is_some_and(|driver| self.objects[driver].networked)
+                    || (network
+                        && object
+                            .parent
+                            .is_some_and(|driver| self.objects[driver].networked))
             })
             .map(|parent| self.objects[parent].handle);
         let start = std::time::Instant::now();
@@ -452,6 +459,9 @@ impl Adapter {
                     return Answer::Status(self.name(status, at));
                 }
                 let publication = self.insert(Kind::Publication, publication, Some(client));
+                if let Value::Object(index) = publication {
+                    self.objects[index].network = uri.to_bytes().starts_with(b"karyos:udp");
+                }
                 Answer::Ok(results([("publication", publication)]))
             }
             "publication.offer" => {

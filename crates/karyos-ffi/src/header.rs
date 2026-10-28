@@ -454,8 +454,7 @@ fn the_parsers_read_what_they_are_given() {
     );
 }
 
-/// The readiness codes are the admission protocol's probe codes, so a
-/// host and a probe read the same values (R-CORE-35).
+/// `karyos_driver_options.network`'s values are the library's (karyos#735).
 #[test]
 fn the_header_states_the_network_constants() {
     use crate::api::driver;
@@ -467,6 +466,8 @@ fn the_header_states_the_network_constants() {
     assert_eq!(defines["KARYOS_NETWORK_ON"], i64::from(driver::NETWORK_ON));
 }
 
+/// The readiness codes are the admission protocol's probe codes, so a
+/// host and a probe read the same values (R-CORE-35).
 #[test]
 fn the_header_states_the_readiness_constants() {
     use karyos_protocol::admission::probe;
