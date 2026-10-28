@@ -88,7 +88,8 @@ const WRITE_CHUNK: usize = 64 << 10;
 /// The time one [`Server::poll`] starts connections in. One started before
 /// it may still take [`READ_DEADLINE`] to read and [`WRITE_DEADLINE`] to
 /// answer, besides the work of building its answer (an export page is
-/// bounded by its count and bytes), so a poll's waiting on clients is at
+/// bounded by its count and bytes, and waits for busy journal entries 1 ms
+/// at most), so a poll's waiting on clients is at
 /// most `POLL_BUDGET + READ_DEADLINE + WRITE_DEADLINE`, 1 s, however many
 /// clients wait.
 pub const POLL_BUDGET: Duration = Duration::from_millis(500);

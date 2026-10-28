@@ -25,10 +25,12 @@
   (a length past the payload bound, `MirrorRecord::truncated`) is never
   delivered: it is lost with its sequence and reason `malformed`, and the
   page goes on. A table or log entry being written is retried, yielding,
-  for 1 ms; one still busy then, while a page's first record is its
-  journal's, never stalls the cursor and loses nothing: those records go
-  out without calibration, their journal `unreadable`, counted in
-  `unreadable_records`. Each lost range carries its `reason`
+  for 1 ms, the table's before the log is read, as the driver writes a
+  log entry before it reuses a table entry; one still busy then, while a
+  page's first record is its journal's, never stalls the cursor and loses
+  nothing: that journal's leading run of records goes out without
+  calibration, its journal `unreadable`, counted in `unreadable_records`,
+  and the page ends at the next record whose journal was not read. Each lost range carries its `reason`
   (`overwritten` or `malformed`), is stated once, and is below the page's
   `next`. The read alone bounds the page, in
   batches of 64 records; `json::trace_export` encodes it whole.

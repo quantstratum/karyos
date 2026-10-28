@@ -31,10 +31,14 @@
 //!   the table showed them when the page was read: the entry (with the
 //!   clock provenance, the time namespace and the drop ranges a record
 //!   needs to be decoded and calibrated), the recycle log's entry for a
-//!   journal recycled since, unknown (gone from both), or unreadable (an
-//!   entry still being written after `BUSY_BUDGET` (1 ms), while the page's
-//!   first record was its journal's; otherwise the page ends before such a
-//!   record).
+//!   journal recycled since, unknown (gone from both, every entry read),
+//!   or unreadable: an entry still being written after `BUSY_BUDGET`
+//!   (1 ms) while the page's first record was its journal's, whose leading
+//!   run of records then goes out without calibration. Otherwise, and past
+//!   that run, the page ends before a record whose journal was not read.
+//!   The table is read, its busy entries waited for, before the log, as
+//!   the driver writes a log entry before it reuses a table entry.
+
 //! - **Bounds.** At most [`crate::api::EXPORT_MAX`] records per page, read
 //!   in batches that stop where the page ends, and a pass over the table
 //!   and the log, its busy entries retried for `BUSY_BUDGET` (1 ms) at most.
@@ -58,6 +62,10 @@ pub(crate) const LOSS_BYTES: usize = 96;
 const SCAN_BATCH: usize = 64;
 #[cfg(test)]
 thread_local! {
+    /// Tests: run while busy table entries are waited for, to recycle a
+    /// journal there.
+    pub(crate) static DURING_TABLE_WAIT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        std::cell::RefCell::new(None);
     /// Tests: run between two batches of a page, to lap the ring there.
     pub(crate) static BETWEEN_BATCHES: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         std::cell::RefCell::new(None);
@@ -95,18 +103,39 @@ pub fn export(
     asked: Option<u128>,
     max_bytes: usize,
 ) -> Result<ExportPage, ExportRefusal> {
-    export_within(mirror, (epoch, asked), from, count, max_bytes, BUSY_BUDGET)
+    export_within(
+        mirror,
+        (epoch, asked),
+        from,
+        count,
+        max_bytes,
+        Waits {
+            busy_budget: BUSY_BUDGET,
+            max_lost_ranges: MAX_LOST_RANGES,
+        },
+    )
 }
 
-/// [`export`], waiting `busy_budget` at most for table and log entries
-/// being written.
+/// What one export waits for and states at most: the time busy table and
+/// log entries are waited for, and the overwritten ranges a page states.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Waits {
+    pub(crate) busy_budget: std::time::Duration,
+    pub(crate) max_lost_ranges: usize,
+}
+
+/// [`export`] with its [`Waits`]: `busy_budget` at most for table and log
+/// entries being written, and `max_lost_ranges` overwritten ranges.
 pub(crate) fn export_within(
     mirror: &TraceMirrorReader,
     (epoch, asked): (u128, Option<u128>),
     from: u64,
     count: usize,
     max_bytes: usize,
-    busy_budget: std::time::Duration,
+    Waits {
+        busy_budget,
+        max_lost_ranges,
+    }: Waits,
 ) -> Result<ExportPage, ExportRefusal> {
     if asked.is_some_and(|asked| asked != epoch) {
         return Err(ExportRefusal::EpochChanged { epoch });
@@ -216,7 +245,7 @@ pub(crate) fn export_within(
             overwritten_ranges += 1;
             // The reply's overhead holds MAX_LOST_RANGES of them: the
             // page ends at the last one it can state.
-            if overwritten_ranges >= MAX_LOST_RANGES {
+            if overwritten_ranges >= max_lost_ranges {
                 break;
             }
         }
@@ -247,27 +276,33 @@ pub(crate) fn export_within(
     }
     let mut next = stop.unwrap_or(cursor);
     let (mut journals, unread) = journals(mirror, &records, busy_budget);
-    if records
+    // Records whose journal could not be read are not decodable: the page
+    // ends before the first of them, and the reader retries. When that is
+    // the page's first record, an entry stayed busy past the budget: the
+    // agent keeps no state to tell a writer stopped mid-write from an
+    // unlucky moment, so nothing is lost and the cursor never stalls: that
+    // journal's leading run of records goes out without calibration, its
+    // journal `unreadable`, and the page ends at the next record whose
+    // journal is unread.
+    let mut skip = 0;
+    if let Some(first) = records
         .first()
-        .is_some_and(|record| unread.contains(&record.journal))
+        .filter(|record| unread.contains(&record.journal))
+        .map(|record| record.journal)
     {
-        // An entry busy on every attempt while the page's first record is
-        // its journal's: the agent keeps no state to tell a writer stopped
-        // mid-write from an unlucky moment, so nothing is lost and the
-        // cursor never stalls. The records go out without calibration,
-        // their journal `unreadable`.
-        journals.extend(
-            unread
-                .iter()
-                .map(|journal| ExportJournal::Unreadable { journal: *journal }),
-        );
+        skip = records
+            .iter()
+            .position(|record| record.journal != first)
+            .unwrap_or(records.len());
+        journals.push(ExportJournal::Unreadable { journal: first });
         journals.sort_by_key(journal_number);
-    } else if let Some(at) = records
+    }
+    if let Some(at) = records
         .iter()
+        .skip(skip)
         .position(|record| unread.contains(&record.journal))
+        .map(|at| at + skip)
     {
-        // A record whose journal could not be read would not be
-        // decodable: the page ends before it, and the reader retries.
         next = records.get(at).map_or(next, |record| record.seq);
         records.truncate(at);
     }
@@ -280,6 +315,10 @@ pub(crate) fn export_within(
         lost.iter().all(|loss| loss.last < next),
         "{lost:?} past {next}"
     );
+    // Kept in release too: a range past the end is never stated.
+    for loss in &mut lost {
+        loss.last = loss.last.min(next.saturating_sub(1));
+    }
     lost.sort_by_key(|loss| loss.first);
     let kept: BTreeSet<u64> = records.iter().map(|record| record.journal).collect();
     let journals: Vec<ExportJournal> = journals
@@ -366,11 +405,13 @@ fn journals(
             LogRead::Free => true,
         },
     };
-    let mut busy: Vec<Slot> = Vec::new();
-    let slots = (0..mirror.entries())
-        .map(Slot::Table)
-        .chain((0..mirror.log_entries()).map(Slot::Log));
-    for slot in slots {
+    // The table first, its busy entries waited for, and only then the log:
+    // the driver writes a log entry before it reuses a table entry, so a
+    // journal recycled while the table is waited for is in the log read
+    // after (trace-journal-region.md, "Recycling").
+    let start = std::time::Instant::now();
+    let mut busy = Vec::new();
+    for slot in (0..mirror.entries()).map(Slot::Table) {
         if wanted.is_empty() {
             break;
         }
@@ -378,12 +419,30 @@ fn journals(
             busy.push(slot);
         }
     }
-    let start = std::time::Instant::now();
     while !busy.is_empty() && !wanted.is_empty() && start.elapsed() < busy_budget {
         std::thread::yield_now();
+        #[cfg(test)]
+        DURING_TABLE_WAIT.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook();
+            }
+        });
         busy.retain(|slot| !take(*slot, &mut found, &mut wanted));
     }
-    found.sort_by_key(journal_number);
+    let mut log_busy = Vec::new();
+    for slot in (0..mirror.log_entries()).map(Slot::Log) {
+        if wanted.is_empty() {
+            break;
+        }
+        if !take(slot, &mut found, &mut wanted) {
+            log_busy.push(slot);
+        }
+    }
+    while !log_busy.is_empty() && !wanted.is_empty() && start.elapsed() < busy_budget {
+        std::thread::yield_now();
+        log_busy.retain(|slot| !take(*slot, &mut found, &mut wanted));
+    }
+    busy.extend(log_busy);
     if busy.is_empty() || wanted.is_empty() {
         found.extend(
             wanted
@@ -393,6 +452,7 @@ fn journals(
         found.sort_by_key(journal_number);
         return (found, BTreeSet::new());
     }
+    found.sort_by_key(journal_number);
     (found, wanted)
 }
 

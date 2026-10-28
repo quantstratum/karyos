@@ -397,14 +397,16 @@ fn a_stuck_entry_is_delivered_uncalibrated_not_lost() {
     let _ = mirror.append(11, 2, &[2, !2]).unwrap();
     assert!(mirror.hold_entry(1, true));
     let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
-    assert_eq!(seqs(&page), [0, 1, 2]);
-    assert_eq!(page.next, 3);
+    // Journal 11's leading run (record 0) goes out uncalibrated; the page
+    // ends at its next record (2), which the next read retries.
+    assert_eq!(seqs(&page), [0, 1]);
+    assert_eq!(page.next, 2);
     assert!(page.lost.is_empty());
     assert!(
         page.journals
             .contains(&ExportJournal::Unreadable { journal: 11 })
     );
-    assert_eq!(page.unreadable_records, 2);
+    assert_eq!(page.unreadable_records, 1);
 }
 
 /// QS-COORDINATOR, ACS 33663 (F1): across pages cut by bytes and by a busy
@@ -471,6 +473,7 @@ fn full_count_pages_against_a_writer_cover_every_sequence_once() {
     let reader = mirror.reader();
     let writer = std::thread::spawn(move || append(&mut mirror, 0..WRITTEN));
     let mut seen = vec![0u8; usize::try_from(WRITTEN).unwrap()];
+    let mut lost = 0u64;
     let mut cursor = 0;
     while cursor < WRITTEN {
         let page = export(
@@ -484,6 +487,7 @@ fn full_count_pages_against_a_writer_cover_every_sequence_once() {
         .unwrap();
         for loss in &page.lost {
             assert!(loss.last < page.next, "{loss:?} past {}", page.next);
+            lost += loss.last - loss.first + 1;
             for seq in loss.first..=loss.last {
                 seen[usize::try_from(seq).unwrap()] += 1;
             }
@@ -497,6 +501,8 @@ fn full_count_pages_against_a_writer_cover_every_sequence_once() {
     }
     writer.join().unwrap();
     assert!(seen.iter().all(|count| *count == 1));
+    // The writer outran the reader: some of it was lost, stated so.
+    assert!(lost > 0);
 }
 
 /// Re-review U2 of #826: a full page, the most records of the largest
@@ -556,7 +562,10 @@ fn a_transient_busy_entry_is_waited_for() {
         0,
         16,
         usize::MAX,
-        std::time::Duration::from_secs(5),
+        Waits {
+            busy_budget: std::time::Duration::from_secs(5),
+            max_lost_ranges: MAX_LOST_RANGES,
+        },
     )
     .unwrap();
     let _mirror = writer.join().unwrap();
@@ -583,12 +592,10 @@ fn a_page_fills_exactly_at_its_bound() {
     let mut mirror = mirror(16);
     append(&mut mirror, 0..10);
     let reader = mirror.reader();
-    let one = crate::json::export_record_len_of(0, 10, 0, &[0, !0]);
     // The records all encode alike but for their sequence digits.
     let lens: Vec<usize> = (0..5u64)
         .map(|seq| crate::json::export_record_len_of(seq, 10, seq, &[seq, !seq]))
         .collect();
-    assert_eq!(lens[0], one);
     let bound = crate::json::EXPORT_REPLY_OVERHEAD
         + crate::api::MAX_JOURNAL_REPLY
         + lens.iter().sum::<usize>();
@@ -628,4 +635,94 @@ fn a_page_lapped_after_its_first_records_ends_there() {
         }]
     );
     assert_eq!(seqs(&page), (100..164).collect::<Vec<_>>());
+}
+
+/// Re-review W1 of #826: a journal recycled while its busy table entry is
+/// waited for is found in the recycle log, read after the table, never
+/// left unknown: the driver writes the log entry before it reuses the
+/// table's.
+#[test]
+fn a_journal_recycled_during_the_wait_is_found_in_the_log() {
+    let mirror = std::rc::Rc::new(std::cell::RefCell::new(mirror(16)));
+    {
+        let mut mirror = mirror.borrow_mut();
+        let other = JournalEntry::open(11, 1, JournalKind::Subscriber, 2, 16);
+        assert!(mirror.write_entry(1, Some(&other)));
+        let _ = mirror.append(11, 0, &[0, !0]).unwrap();
+        assert!(mirror.hold_entry(1, true));
+    }
+    let reader = mirror.borrow().reader();
+    let recycler = std::rc::Rc::clone(&mirror);
+    let recycled = RecycledJournal {
+        journal: 11,
+        stream: 3,
+        lane: Lane::ZERO,
+        incarnation: 1,
+        state: JournalState::Closed,
+        boundary: Some(64),
+        pairs: [NotedPublisher {
+            journal: 0,
+            attempted: 0,
+        }; MAX_RECYCLE_PAIRS],
+        pair_count: 0,
+        sequence: 2,
+    };
+    DURING_TABLE_WAIT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            let mut mirror = recycler.borrow_mut();
+            // The driver's order: the log entry first, then the table
+            // entry reused for another journal.
+            assert!(mirror.write_log(0, Some(&recycled)));
+            let next = JournalEntry::open(12, 1, JournalKind::Publisher, 2, 16);
+            assert!(mirror.write_entry(1, Some(&next)));
+        }));
+    });
+    let page = export_within(
+        &reader,
+        (EPOCH, None),
+        0,
+        16,
+        usize::MAX,
+        Waits {
+            busy_budget: std::time::Duration::from_secs(5),
+            max_lost_ranges: MAX_LOST_RANGES,
+        },
+    );
+    DURING_TABLE_WAIT.with(|hook| *hook.borrow_mut() = None);
+    let page = page.unwrap();
+    assert_eq!(seqs(&page), [0]);
+    assert!(
+        matches!(&page.journals[..], [ExportJournal::Recycled(entry)] if entry.journal == 11),
+        "{:?}",
+        page.journals
+    );
+    assert_eq!((page.unknown_records, page.unreadable_records), (0, 0));
+}
+
+/// Re-review of #826: a page states at most `max_lost_ranges` overwritten
+/// ranges, its reply's overhead; it ends at the last it can state.
+#[test]
+fn a_page_ends_at_the_overwritten_ranges_it_can_state() {
+    let mut mirror = mirror(128);
+    append(&mut mirror, 0..300);
+    let reader = mirror.reader();
+    let waits = |max_lost_ranges| Waits {
+        busy_budget: BUSY_BUDGET,
+        max_lost_ranges,
+    };
+    // One range allowed: the page ends after the batch that stated it.
+    let page = export_within(&reader, (EPOCH, None), 0, 200, usize::MAX, waits(1)).unwrap();
+    assert_eq!(page.lost.len(), 1);
+    assert_eq!(page.next, 172 + 64);
+    // The default allows it to go on to its count.
+    let page = export_within(
+        &reader,
+        (EPOCH, None),
+        0,
+        200,
+        usize::MAX,
+        waits(MAX_LOST_RANGES),
+    )
+    .unwrap();
+    assert_eq!(page.next, 300);
 }
