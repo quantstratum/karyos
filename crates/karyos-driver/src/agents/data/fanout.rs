@@ -1237,7 +1237,7 @@ impl<T: StreamTerms> Outbound<T> {
 
     /// Admits `nak` from the receiver at `source` into its destination's
     /// repair path (MD-8); dropped for a source that is no destination.
-    pub(crate) fn nak_from(
+    pub(super) fn nak_from(
         &mut self,
         source: SocketAddr,
         nak: &karyos_protocol::network::Nak,

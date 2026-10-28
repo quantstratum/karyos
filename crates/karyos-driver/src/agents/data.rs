@@ -862,8 +862,27 @@ impl<T: StreamTerms> Outbound<T> {
         self.nak_on(nak, requester, (0, true), now)
     }
 
+    /// Admits `nak` from the receiver at `source`, on route `route` (0 on
+    /// one path), whatever the publication's shape: a multi-destination
+    /// one repairs toward the requester's destination only (MD-8), any
+    /// other through [`Outbound::nak_on`]. The one entry point of a NAK.
+    pub(crate) fn nak_at(
+        &mut self,
+        source: std::net::SocketAddr,
+        nak: &Nak,
+        requester: Requester,
+        (route, validated): (usize, bool),
+        now: u64,
+    ) -> NakOutcome {
+        if self.fanout.is_some() {
+            return self.nak_from(source, nak, requester, now);
+        }
+        self.nak_on(nak, requester, (route, validated), now)
+    }
+
     /// [`Outbound::nak`] for a NAK that arrived on route `route` (0 on one
-    /// path). One from a `validated` receiver id is recorded to absorb its
+    /// path). A multi-destination publication has no single repair path
+    /// and drops it: its NAKs go through [`Outbound::nak_at`]. One from a `validated` receiver id is recorded to absorb its
     /// copies on other routes (RP-11); one whose receiver id is not
     /// validated yet takes no part in absorption.
     pub fn nak_on(

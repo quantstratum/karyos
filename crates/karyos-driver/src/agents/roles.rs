@@ -5794,13 +5794,7 @@ impl<T: StreamTerms> SenderRole<T> {
             .map_or(Requester::Unknown, |membership| {
                 membership.requester(nak.receiver, nak.range.lane, now)
             });
-        // A multi-destination publication repairs toward the requester's
-        // destination only (MD-8).
-        let intake = if outbound.destinations().is_some() {
-            outbound.nak_from(normal, nak, requester, now)
-        } else {
-            outbound.nak_on(nak, requester, (route, validated), now)
-        };
+        let intake = outbound.nak_at(normal, nak, requester, (route, validated), now);
         if let NakIntake::Reply(reply) = intake
             && self
                 .send(halves, endpoint, source, &Control::NakReply(reply))

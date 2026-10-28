@@ -13,3 +13,6 @@
     removed or added at run time. A restart of its receiver at the same
     endpoint is rejected, so the publication's admission is
     `LostRequired`.
+  - A NAK has one entry point in the sender's publication, which repairs
+    toward the requester's destination on a multi-destination
+    publication and on the single path otherwise.
