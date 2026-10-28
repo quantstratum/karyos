@@ -729,6 +729,24 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// Its registration, echoed in the answer.
         registration: u64,
     },
+    /// Sender only: add (`add`) or remove the optional destination
+    /// `destination` of the multi-destination publication `alias` on
+    /// `endpoint` (MD-3; karyos#630). Answer
+    /// [`AgentEvent::DestinationChanged`].
+    ChangeDestination {
+        /// The reply's slot.
+        reply: Reservation,
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// The publication's alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration, echoed in the answer.
+        registration: u64,
+        /// The destination.
+        destination: std::net::SocketAddr,
+        /// Add it, or remove it.
+        add: bool,
+    },
     /// Test only: panic in the duty cycle.
     #[cfg(test)]
     Panic,
@@ -819,6 +837,19 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         alias: karyos_protocol::network::Alias,
         /// Its registration.
         registration: u64,
+    },
+    /// The answer to [`AgentCommand::ChangeDestination`].
+    DestinationChanged {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
+        registration: u64,
+        /// The destination.
+        destination: std::net::SocketAddr,
+        /// What became of it.
+        outcome: data::DestinationChange,
     },
     /// A multi-destination publication removed a destination (design 4.5;
     /// MD-7, MD-12; karyos#630).
@@ -1064,6 +1095,7 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
                 command @ (AgentCommand::AddPublication { .. }
                 | AgentCommand::RemovePublication { .. }
                 | AgentCommand::RemoveSenderSession { .. }
+                | AgentCommand::ChangeDestination { .. }
                 | AgentCommand::RemovePublishedAlias { .. }
                 | AgentCommand::RemoveSubscription { .. }
                 | AgentCommand::AddSubscription { .. }
@@ -1360,6 +1392,15 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
             .outbound(index)
             .map(data::Outbound::destination_counters)
             .unwrap_or_default()
+    }
+
+    /// The repair jobs of its `index`-th publication's destinations,
+    /// summed (tests).
+    #[cfg(test)]
+    pub(crate) fn fanout_job_capacity(&self, index: usize) -> usize {
+        self.role
+            .outbound(index)
+            .map_or(0, data::Outbound::fanout_job_capacity)
     }
 
     /// What the timed gate of its `index`-th publication counted (tests).

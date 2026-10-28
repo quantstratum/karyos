@@ -1335,3 +1335,21 @@ fn table_of_one() -> Membership {
         },
     )
 }
+
+/// karyos#630, design 3.7: a removed destination's member, released by its
+/// source, stops counting for the strategy edge at once (no wait for its
+/// liveness), so under `min` the others' edge moves; releasing an address
+/// with no member changes nothing.
+#[test]
+fn a_released_source_stops_bounding_the_strategy_edge() {
+    let mut table = table(config(1), &Roles::default());
+    accepted(status(&mut table, &sm(1, &[(100, 100)]), 0));
+    accepted(status(&mut table, &sm(2, &[(150, 10)]), 0));
+    assert_eq!(table.limit(lane(0), 0), Limit::Edge(160));
+    let second = path(receiver(2, 1), 1).source;
+    assert!(table.live_at(second, 1));
+    assert!(table.release_source(second, 1));
+    assert!(!table.live_at(second, 1));
+    assert_eq!(table.limit(lane(0), 1), Limit::Edge(200));
+    assert!(!table.release_source(second, 2));
+}

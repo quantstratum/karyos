@@ -1468,6 +1468,9 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     path_heartbeat_interval: u64,
     /// `sender_heartbeat_interval` in ns (SPEC §6).
     sender_heartbeat_interval: u64,
+    /// `setup_interval`: the spacing of a destination's counted open
+    /// failures (karyos#630).
+    setup_interval: u64,
     /// Removed publications' routes and queues, closed at the next duty
     /// with the TX halves (allocated at creation: `publications` routes'
     /// worth, the most removals can leave).
@@ -1615,10 +1618,14 @@ pub(super) fn roles<T: StreamTerms>(
             due: Vec::with_capacity(config.publications),
             path_heartbeat_interval: config.path_heartbeat_interval,
             sender_heartbeat_interval: config.sender_heartbeat_interval,
+            setup_interval: config.setup_interval,
             closing: Vec::with_capacity(
                 config
                     .publications
-                    .checked_mul(karyos_io::lanes::routes::MAX_ROUTES)
+                    .checked_mul(
+                        karyos_io::lanes::routes::MAX_ROUTES
+                            .saturating_add(super::data::MAX_DESTINATIONS),
+                    )
                     .ok_or(AgentError::InvalidConfig("publications too large"))?,
             ),
             close_report: karyos_io::backend::TxReport::new(),
@@ -1871,7 +1878,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 Some((reply, configured(found.is_some())))
             }
             AgentCommand::RemovePublication { reply, .. }
-            | AgentCommand::RemoveSenderSession { reply, .. } => Some((
+            | AgentCommand::RemoveSenderSession { reply, .. }
+            | AgentCommand::ChangeDestination { reply, .. } => Some((
                 reply,
                 AgentEvent::Unsupported {
                     agent: AgentKind::Receiver,
@@ -4544,55 +4552,85 @@ impl<T: StreamTerms> SenderRole<T> {
         &mut self,
         command: AgentCommand<O, T>,
     ) -> Option<(Reservation, AgentEvent<O, T>)> {
-        let (reply, publication, outbound, guard, roles) =
-            match command {
-                AgentCommand::AddPublication {
+        let (reply, publication, outbound, guard, roles) = match command {
+            AgentCommand::AddPublication {
+                reply,
+                publication,
+                outbound,
+                guard,
+                roles,
+            } => (reply, publication, outbound, guard, roles),
+            AgentCommand::ChangeDestination {
+                reply,
+                endpoint,
+                alias,
+                registration,
+                destination,
+                add,
+            } => {
+                let now = (self.clock)();
+                let quarantine = self.membership.receiver_timeout;
+                let outcome = self
+                    .publications
+                    .iter_mut()
+                    .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+                    .map_or(
+                        crate::agents::data::DestinationChange::Unknown,
+                        |outbound| outbound.change_destination(destination, add, now, quarantine),
+                    );
+                return Some((
                     reply,
-                    publication,
-                    outbound,
-                    guard,
-                    roles,
-                } => (reply, publication, outbound, guard, roles),
-                AgentCommand::RemovePublication {
+                    AgentEvent::DestinationChanged {
+                        endpoint,
+                        alias,
+                        registration,
+                        destination,
+                        outcome,
+                    },
+                ));
+            }
+            AgentCommand::RemovePublication {
+                reply,
+                endpoint,
+                alias,
+                registration,
+                linger,
+            } => {
+                return Some((
                     reply,
-                    endpoint,
-                    alias,
-                    registration,
-                    linger,
-                } => {
-                    return Some((
-                        reply,
-                        self.begin_remove(endpoint, alias, registration, linger),
-                    ));
+                    self.begin_remove(endpoint, alias, registration, linger),
+                ));
+            }
+            AgentCommand::RemoveSenderSession {
+                reply,
+                endpoint,
+                alias,
+                registration,
+            } => return Some((reply, self.remove(endpoint, alias, registration))),
+            #[cfg(test)]
+            AgentCommand::ForceReset { endpoint, alias } => {
+                if let Some(outbound) = self
+                    .publications
+                    .iter_mut()
+                    .find(|outbound| outbound.endpoint() == endpoint && outbound.alias() == alias)
+                {
+                    outbound.force_needs_reset();
                 }
-                AgentCommand::RemoveSenderSession {
+                return None;
+            }
+            AgentCommand::AddSubscription { reply, .. }
+            | AgentCommand::AddPublishedAlias { reply, .. }
+            | AgentCommand::RemovePublishedAlias { reply, .. }
+            | AgentCommand::RemoveSubscription { reply, .. } => {
+                return Some((
                     reply,
-                    endpoint,
-                    alias,
-                    registration,
-                } => return Some((reply, self.remove(endpoint, alias, registration))),
-                #[cfg(test)]
-                AgentCommand::ForceReset { endpoint, alias } => {
-                    if let Some(outbound) = self.publications.iter_mut().find(|outbound| {
-                        outbound.endpoint() == endpoint && outbound.alias() == alias
-                    }) {
-                        outbound.force_needs_reset();
-                    }
-                    return None;
-                }
-                AgentCommand::AddSubscription { reply, .. }
-                | AgentCommand::AddPublishedAlias { reply, .. }
-                | AgentCommand::RemovePublishedAlias { reply, .. }
-                | AgentCommand::RemoveSubscription { reply, .. } => {
-                    return Some((
-                        reply,
-                        AgentEvent::Unsupported {
-                            agent: AgentKind::Sender,
-                        },
-                    ));
-                }
-                command => return self.trace.command(&mut self.publications, command),
-            };
+                    AgentEvent::Unsupported {
+                        agent: AgentKind::Sender,
+                    },
+                ));
+            }
+            command => return self.trace.command(&mut self.publications, command),
+        };
         let mut outbound = outbound;
         let matches = outbound.endpoint() == publication.endpoint
             && outbound.alias() == publication.alias
@@ -4657,6 +4695,9 @@ impl<T: StreamTerms> SenderRole<T> {
             Ok(()) => {
                 // `add` refuses past `publications` entries, the capacity.
                 // Kept boxed: removal hands the box back without allocating.
+                let mut outbound = outbound;
+                outbound
+                    .set_destination_timing(self.membership.receiver_timeout, self.setup_interval);
                 self.publications.push(outbound);
                 AgentEvent::PublicationAdded {
                     endpoint: publication.endpoint,
@@ -5062,6 +5103,9 @@ impl<T: StreamTerms> SenderRole<T> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         self.prune(halves);
+        for outbound in &mut self.publications {
+            outbound.drain_retired(&mut self.closing);
+        }
         self.close_removed(halves);
         self.naks_this_cycle = 0;
         // Bindings past their lifetime go even when nothing arrives.
@@ -5763,13 +5807,7 @@ impl<T: StreamTerms> SenderRole<T> {
             .map_or(Requester::Unknown, |membership| {
                 membership.requester(nak.receiver, nak.range.lane, now)
             });
-        // A multi-destination publication repairs toward the requester's
-        // destination only (MD-8).
-        let intake = if outbound.destinations().is_some() {
-            outbound.nak_from(normal, nak, requester, now)
-        } else {
-            outbound.nak_on(nak, requester, (route, validated), now)
-        };
+        let intake = outbound.nak_at(normal, nak, requester, (route, validated), now);
         if let NakIntake::Reply(reply) = intake
             && self
                 .send(halves, endpoint, source, &Control::NakReply(reply))

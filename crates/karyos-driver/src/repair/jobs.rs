@@ -245,6 +245,12 @@ impl Jobs {
         &self.counts
     }
 
+    /// The jobs the table holds at most.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Steps 6 and 7 for `request` answered in `domain` at `now`.
     pub fn join_or_create(&mut self, request: &Request, domain: Domain, now: u64) -> Joined {
         self.join_or_create_on(request, domain, 0, now)
