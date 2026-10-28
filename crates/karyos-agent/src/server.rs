@@ -33,9 +33,10 @@
 //! - **Bounds.** Each connection is served on the calling thread with
 //!   [`IO_TIMEOUT`] on its reads and each write, and [`WRITE_DEADLINE`] on
 //!   writing its whole reply: a client that reads a large reply too slowly
-//!   gets it cut short, never the polling thread held for longer. A reply
-//!   cut short has no final newline, so the client knows it is incomplete,
-//!   and reads again from the same cursor: reading consumes nothing.
+//!   gets it cut short, never the polling thread held for longer, and the
+//!   connection closed. A reply without a final newline, followed by EOF,
+//!   is incomplete and is discarded; the reader retries with the same
+//!   cursor, as reading consumes nothing.
 //! - **Limits (R-CORE-38).** `limits` answers every dimension of [`LIMITS`]
 //!   with one of three answers, never "unknown": `{"value":N,
 //!   "negotiable":true}`, a bound a client may propose within;
@@ -507,6 +508,9 @@ impl Server {
         let mut reply = answer.into_bytes();
         reply.push(b'\n');
         if !write_within(&mut stream, &reply, WRITE_DEADLINE) {
+            // Closed at once, both ways: the cut reply ends at EOF, and
+            // nothing is ever written after it on this connection.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return Served::Dropped;
         }
         served
@@ -828,12 +832,30 @@ mod tests {
     }
 
     /// A reply that a client reads too slowly is cut short at the write
-    /// deadline, never holding the polling thread for longer; one it reads
-    /// is written whole (review of #817, QS-COORDINATOR, ACS 33400).
+    /// deadline, never holding the polling thread for longer, and the
+    /// connection closed: the client reads part of it with no final
+    /// newline, then EOF, and discards it. Its retry with the same cursor
+    /// gets the same buckets, whole (review of #817, QS-COORDINATOR, ACS
+    /// 33400 and 33440).
     #[test]
-    fn a_reply_is_written_within_its_deadline() {
-        let (mut writer, reader) = UnixStream::pair().unwrap();
-        let reply = vec![b'x'; 16 << 20];
+    fn a_reply_cut_at_its_deadline_ends_at_eof_and_a_retry_gets_it_whole() {
+        let mut window = crate::trace_window::TraceWindow::new(
+            crate::WindowConfig::default().with_window(60, 6),
+            [1, 2],
+        );
+        let mirror = karyos_sys::trace_mirror::trace_mirror(4, 4, 4).unwrap();
+        window.scan(&mirror.reader(), 1);
+        window.scan(&mirror.reader(), 25);
+        let cursor = crate::api::BucketCursor::new(0, 0);
+        let first = window
+            .buckets(cursor, 6, None, crate::api::MAX_BUCKET_REPLY)
+            .unwrap();
+        // The reply, padded past any socket buffer so a peer that does not
+        // read blocks the write.
+        let mut reply = json::trace_buckets(&first).into_bytes();
+        reply.resize(16 << 20, b' ');
+        reply.push(b'\n');
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
         let start = std::time::Instant::now();
         assert!(!write_within(&mut writer, &reply, WRITE_DEADLINE));
         assert!(
@@ -841,17 +863,28 @@ mod tests {
             "{:?}",
             start.elapsed()
         );
-        drop(reader);
+        // As `serve` does after a cut.
+        writer.shutdown(std::net::Shutdown::Both).unwrap();
+        let mut cut = Vec::new();
+        reader.read_to_end(&mut cut).unwrap();
+        assert!(!cut.is_empty() && cut.len() < reply.len(), "{}", cut.len());
+        assert_ne!(cut.last(), Some(&b'\n'), "a cut reply has no final newline");
+        // The retry, with the same cursor, read whole.
+        let again = window
+            .buckets(cursor, 6, None, crate::api::MAX_BUCKET_REPLY)
+            .unwrap();
+        assert_eq!(again.buckets, first.buckets);
+        let mut reply = json::trace_buckets(&again).into_bytes();
+        reply.push(b'\n');
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
-        let reply = vec![b'y'; 1 << 20];
         let read = std::thread::spawn(move || {
             let mut all = Vec::new();
             reader.read_to_end(&mut all).unwrap();
-            all.len()
+            all
         });
         assert!(write_within(&mut writer, &reply, WRITE_DEADLINE));
         drop(writer);
-        assert_eq!(read.join().unwrap(), 1 << 20);
+        assert_eq!(read.join().unwrap(), reply);
     }
 
     /// R-CORE-38: a dimension this agent does not know is refused by
