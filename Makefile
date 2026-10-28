@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit deny deps-inventory deps-check lint-sync changelog-check pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit deny deps-inventory deps-check lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -14,6 +14,12 @@ fmt-check:
 
 lint:
 	$(CARGO) clippy --workspace --all-targets --locked -- -D warnings
+
+# Clippy for Linux with every feature, from any host: the Linux-only code
+# (cfg(target_os = "linux")) is checked before a push, not first in Docker.
+# Needs `rustup target add aarch64-unknown-linux-gnu`.
+lint-linux:
+	$(CARGO) clippy --workspace --all-targets --all-features --locked --target aarch64-unknown-linux-gnu -- -D warnings
 
 doc:
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --workspace --no-deps --locked
@@ -118,4 +124,4 @@ changelog-check:
 netem:
 	scripts/netem-test.sh
 
-pre-push: fmt-check changelog-check lint-sync deps-check lint doc test loom build-release timing-build-check
+pre-push: fmt-check changelog-check lint-sync deps-check lint lint-linux doc test loom build-release timing-build-check
