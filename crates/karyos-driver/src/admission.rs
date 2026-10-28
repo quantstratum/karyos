@@ -610,15 +610,20 @@ impl<T: StreamTerms> Admission<T> {
         // A faulty client no longer admitted has nothing left to retire.
         driver.faulty_pending.clear();
         self.serve_tools(driver, &mut now, &mut work);
-        // Exit proofs.
+        // Exit proofs. What an exited client queued before it exited is
+        // read first, so a `Detach` it sent ends its grant as a detach
+        // (karyos#827); the rest is released by the exit.
         let before = self.remotes.len() + self.retiring.len();
-        self.remotes.retain(|remote| {
-            let exited = remote.pidfd.exited().unwrap_or(false);
-            if exited {
+        let mut index = 0;
+        while let Some(remote) = self.remotes.get_mut(index) {
+            if remote.pidfd.exited().unwrap_or(false) {
+                Self::drain_exited(remote, driver, &self.config);
+                let remote = self.remotes.swap_remove(index);
                 remote.link.mark_closed();
+            } else {
+                index += 1;
             }
-            !exited
-        });
+        }
         self.retiring.retain(|retiring| {
             let exited = retiring.pidfd.exited().unwrap_or(false);
             if exited {
@@ -963,6 +968,49 @@ impl<T: StreamTerms> Admission<T> {
             // A descriptor on a message that takes none, a closed socket or
             // a receive error.
             Ok(Recv::Message(_) | Recv::PeerClosed) | Err(_) => Step::Retire,
+        }
+    }
+
+    /// Reads what an exited client queued on its socket before it exited
+    /// (karyos#827): a `Detach` ends its grant as one, as when the client
+    /// was alive. Only messages that release something are served: a
+    /// `Leave` changes nothing, since the exit releases the client anyway,
+    /// and a `Fetch` would create state for a dead client, so it is
+    /// dropped and counted. The drain is bounded by what a client that
+    /// follows the protocol can have queued: one `Detach` per export, its
+    /// `Leave`, and one `Fetch` per fetch it may open. Whatever is left
+    /// past the bound, or does not decode, is dropped and counted; the
+    /// exit releases the client anyway.
+    fn drain_exited(remote: &mut Remote<T>, driver: &mut EmbeddedDriver<T>, config: &IpcConfig) {
+        let bound = config
+            .max_exports_per_client
+            .saturating_add(config.max_fetches_per_client)
+            .saturating_add(1);
+        let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
+        for read in 0.. {
+            let received = match ipc::recv(remote.socket.as_fd(), &mut buffer) {
+                Ok(Recv::Message(received)) => received,
+                Ok(Recv::WouldBlock | Recv::PeerClosed) | Err(_) => return,
+            };
+            if read >= bound {
+                driver
+                    .counters
+                    .add(Event::AdmissionMessagesDroppedAtExit, 1);
+                continue;
+            }
+            let bytes = buffer.get(..received.len).unwrap_or(&[]);
+            match (Message::decode(bytes), received.fd) {
+                (Ok(Message::Detach { export }), None) => {
+                    let _ = Self::detach(remote, driver, export);
+                }
+                (Ok(Message::Leave), None) => {}
+                (Ok(Message::Fetch { .. }), None) => {
+                    driver.counters.add(Event::FetchesDroppedAtExit, 1);
+                }
+                _ => driver
+                    .counters
+                    .add(Event::AdmissionMessagesDroppedAtExit, 1),
+            }
         }
     }
 

@@ -149,7 +149,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 68] = [
+const LABELS: [(u64, &str); 71] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -218,6 +218,9 @@ const LABELS: [(u64, &str); 68] = [
     (TYPE_EVENTS, "guard audit records dropped"),
     (TYPE_EVENTS, "schedule violations"),
     (TYPE_EVENTS, "schedule violations dropped"),
+    (TYPE_EVENTS, "grants released at exit"),
+    (TYPE_EVENTS, "fetches dropped at exit"),
+    (TYPE_EVENTS, "admission messages dropped at exit"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -400,9 +403,28 @@ pub(crate) enum Event {
     /// karyos/design/timed-tx.md`, section 11, TT-6).
     ScheduleViolations,
     /// Schedule violation reports dropped: past their bound, or naming a
-    /// publication, lane or incarnation no longer live. Last, so no other
-    /// counter's id moves.
+    /// publication, lane or incarnation no longer live.
     ScheduleViolationsDropped,
+    /// Grants a remote client still held when its exit proof (or its
+    /// `Leave`) released it, after its queued messages were drained: ended
+    /// by the exit, not by a `Detach`, which `GrantsDetached` counts
+    /// (karyos#827).
+    GrantsReleasedAtExit,
+    /// `Fetch` messages found queued after a client's exit proof: not
+    /// served, since they would create state for a dead client.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    FetchesDroppedAtExit,
+    /// Other admission messages left after a client's exit proof: past the
+    /// drain's bound, undecodable, or carrying a descriptor. Last, so no
+    /// other counter's id moves.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    AdmissionMessagesDroppedAtExit,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -692,6 +714,12 @@ mod tests {
             (
                 Event::ScheduleViolationsDropped,
                 "schedule violations dropped",
+            ),
+            (Event::GrantsReleasedAtExit, "grants released at exit"),
+            (Event::FetchesDroppedAtExit, "fetches dropped at exit"),
+            (
+                Event::AdmissionMessagesDroppedAtExit,
+                "admission messages dropped at exit",
             ),
         ];
         assert_eq!(events.len(), LABELS.len());

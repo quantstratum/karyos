@@ -607,6 +607,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if let Some(ledger) = slot.ledger.take() {
                     for grant in ledger.into_grants() {
                         self.end_grant(&grant);
+                        self.counters.add(Event::GrantsReleasedAtExit, 1);
                     }
                 }
             } else {

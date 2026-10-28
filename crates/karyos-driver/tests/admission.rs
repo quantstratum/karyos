@@ -2033,3 +2033,112 @@ fn an_ipc_driver_with_a_network_checks_its_descriptor_limit_at_start() {
     .unwrap();
     let _ = fits.close_network();
 }
+
+const DRAIN_CHILD: &str = "KARYOS_ADMISSION_DRAIN_CHILD";
+
+/// karyos#827: what a client queued on its socket before it exited is
+/// read before its exit proof releases it. The child holds two exported
+/// grants, then sends both `Detach` messages and a `Fetch` and exits
+/// while the driver does not run. One duty cycle used to read one
+/// datagram and then release the client, so the second `Detach` went
+/// unread and its grant ended as a release at exit. Now both count as
+/// detached, the `Fetch` is dropped and counted, and nothing is left to
+/// release at exit.
+#[test]
+fn an_exited_clients_queued_detaches_are_served_before_its_release() {
+    let dir = dir("drain-exited");
+    let mut driver = system_driver(&dir);
+    let mut second = shared_stream_config();
+    second.buffer.stream_id = 3;
+    let _streams = (
+        driver.add_stream(shared_stream_config()).unwrap(),
+        driver.add_stream(second).unwrap(),
+    );
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "child_detaches_twice_fetches_and_exits",
+            "--nocapture",
+        ])
+        .env(DRAIN_CHILD, &dir)
+        .spawn()
+        .unwrap();
+    // Served until both grants are exported; then the driver stops, so
+    // whatever the child sends next is still queued when it exits.
+    serve_until(&mut driver, |driver| {
+        counter(driver, "grants exported") == 2
+    });
+    assert!(child.wait().unwrap().success());
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(counter(&driver, "grants detached"), 2);
+    assert_eq!(counter(&driver, "fetches dropped at exit"), 1);
+    assert_eq!(counter(&driver, "grants released at exit"), 0);
+    assert_eq!(counter(&driver, "admission messages dropped at exit"), 0);
+}
+
+/// Runs only as the child of
+/// `an_exited_clients_queued_detaches_are_served_before_its_release`.
+#[test]
+fn child_detaches_twice_fetches_and_exits() {
+    let Some(dir) = std::env::var_os(DRAIN_CHILD) else {
+        return;
+    };
+    let mut client = attach(Path::new(&dir), Duration::from_secs(5), 16).unwrap();
+    for stream_id in [2, 3] {
+        let _ = client
+            .add_subscription(
+                StreamKey {
+                    stream_id,
+                    session_id: 1,
+                },
+                SubscriberRole::Required,
+            )
+            .unwrap();
+    }
+    let mut keys = Vec::new();
+    let start = Instant::now();
+    while keys.len() < 2 {
+        assert!(start.elapsed() < Duration::from_secs(10), "no grants");
+        let _ = client.poll(usize::MAX, |completion| {
+            if let Outcome::Fetchable(fetchable) = completion.outcome {
+                keys.push(fetchable.key);
+            }
+        });
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let socket = client.admission_socket().unwrap();
+    // The next message on the socket, waiting for the parent's driver.
+    let receive = || {
+        let mut buffer = [0u8; MAX_MESSAGE_LENGTH];
+        let start = Instant::now();
+        loop {
+            assert!(start.elapsed() < Duration::from_secs(10), "no message");
+            if let Ok(Recv::Message(received)) = ipc::recv(socket, &mut buffer) {
+                let message = Message::decode(&buffer[..received.len]).unwrap();
+                return (message, received.fd);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let mut exports = Vec::new();
+    for (fetch, key) in (1..).zip(keys) {
+        let message = encode(&Message::Fetch { fetch, key });
+        assert_eq!(ipc::send(socket, &message, None).unwrap(), Sent::Sent);
+        let (Message::Manifest { records, .. }, _) = receive() else {
+            panic!("no manifest");
+        };
+        // The region's descriptor, closed at once: nothing stays mapped.
+        let _ = receive();
+        exports.push(records[0].export);
+    }
+    for export in exports {
+        let message = encode(&Message::Detach { export });
+        assert_eq!(ipc::send(socket, &message, None).unwrap(), Sent::Sent);
+    }
+    let message = encode(&Message::Fetch { fetch: 3, key: 1 });
+    assert_eq!(ipc::send(socket, &message, None).unwrap(), Sent::Sent);
+    // Exit without dropping the client: no Leave, and the driver has not
+    // run since the last region.
+    std::mem::forget(client);
+    std::process::exit(0);
+}
