@@ -2393,6 +2393,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // operation, each audited from no rate (version 0).
         if let (None, Some((policy, _))) = (held, rate) {
             let _ = self.rate_policies.insert(registration, (policy, 1));
+            // Bounded by the streams: an entry is a publication with a lane
+            // in the table, removed with its last lane, and the table holds
+            // at most `max_streams` lanes, so no entry needs refusing.
+            debug_assert!(self.rate_policies.len() <= self.streams.len());
             let mut moved = Vec::new();
             let mut published: Vec<Arc<crate::shared_words::Words>> = Vec::new();
             for lane in self
