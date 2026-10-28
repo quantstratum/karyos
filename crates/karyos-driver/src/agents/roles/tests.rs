@@ -5589,3 +5589,55 @@ fn a_blocked_control_is_counted_by_kind() {
         sender.counters()
     );
 }
+
+/// D2 (#849 review): through the sender, ANNOUNCEs waiting for a
+/// publication's endpoint are purged once the publication starts draining:
+/// it announces nothing more.
+#[test]
+fn a_draining_publication_purges_its_waiting_announces() {
+    use karyos_protocol::network::Control;
+
+    let config = AgentConfig {
+        control_routes: 1,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
+    let (path, _log) = outbound(EndpointId(1), "10.0.0.9:5000".parse().unwrap());
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let announce = Control::SetupAnnounce(karyos_protocol::network::SetupAnnounce {
+        alias: alias(),
+        identity: identity(),
+        term: TermParams {
+            term_length: 65_536,
+            initial_term_id: 9,
+            mtu: 1408,
+        },
+        lane_count: 1,
+    });
+    let at = |port| SocketAddr::from(([10, 0, 0, 9], port));
+    let _ = sender.send_or_wait(&mut halves, EndpointId(1), at(5000), &announce);
+    let slot = sender
+        .routes
+        .iter_mut()
+        .position(|slot| slot.endpoint == Some(EndpointId(1)))
+        .unwrap();
+    sender.routes[slot].routes.hold_closes = true;
+    for port in 5001..5006 {
+        let _ = sender.send_or_wait(&mut halves, EndpointId(1), at(port), &announce);
+    }
+    assert!(sender.routes[slot].routes.waiting() > 0, "some wait");
+    let _ = sender.begin_remove::<OsSocket>(EndpointId(1), alias(), 1, 0);
+    assert_eq!(sender.routes[slot].routes.waiting(), 0, "purged");
+    sender.routes[slot].routes.hold_closes = false;
+}

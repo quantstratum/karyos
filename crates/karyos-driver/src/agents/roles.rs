@@ -406,6 +406,9 @@ pub struct SenderCounters {
     pub blocked_setup_answers: u64,
     /// See [`SenderCounters::blocked_status`].
     pub blocked_other: u64,
+    /// ANNOUNCEs dropped with no room to wait (never, by the waiting
+    /// room's bound; see [`SenderCounters::blocked_status`]).
+    pub blocked_announces: u64,
     /// Removed publications' entries closed again at the next duty because
     /// a queue still had frames in flight (#838).
     pub removed_close_deferred: u64,
@@ -4860,6 +4863,14 @@ impl<T: StreamTerms> SenderRole<T> {
         let found = outbound.is_some();
         if let Some(outbound) = outbound {
             outbound.begin_removal(registration, linger, interval);
+            // A draining publication announces nothing more (#849).
+            for path in outbound.route_endpoints() {
+                for slot in &mut self.routes {
+                    if slot.endpoint == Some(path) {
+                        slot.routes.purge_announces(alias, None);
+                    }
+                }
+            }
         }
         AgentEvent::PublicationDraining {
             endpoint,
@@ -5448,6 +5459,9 @@ impl<T: StreamTerms> SenderRole<T> {
                     Control::Status(_) => self.count(|c| &mut c.blocked_status),
                     Control::Nak(_) => self.count(|c| &mut c.blocked_naks),
                     Control::SetupAnswer(_) => self.count(|c| &mut c.blocked_setup_answers),
+                    // Only past the waiting room's bound, which the
+                    // per-key replacement keeps from being reached.
+                    Control::SetupAnnounce(_) => self.count(|c| &mut c.blocked_announces),
                     _ => self.count(|c| &mut c.blocked_other),
                 }
                 Sent::NotSubmitted
