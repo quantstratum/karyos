@@ -309,6 +309,16 @@ pub struct DriverConfig {
     /// [`FailedReason::StartupDeadline`] (R-CORE-35). Nonzero; 30 s by
     /// default.
     pub startup_timeout: u64,
+    /// The most bytes one stream lane may take (R-CORE-34): its log buffer
+    /// region, header included, plus its conflation table's region if it
+    /// has one, by the functions that size them. Every lane the driver
+    /// creates is checked against it: `add_stream`, `add_aggregate`,
+    /// network publications, replay targets, a reincarnation and a
+    /// reconfiguration's successor. A larger one is refused with
+    /// [`DriverError::StreamTooLarge`] and nothing is created. `None`, the
+    /// default, bounds nothing; `Some(0)` is refused. Network image lanes
+    /// have their own budget, `ImageTemplate::storage_budget`.
+    pub max_stream_bytes: Option<u64>,
     /// The network agents (`quantstratum-docs:
     /// karyos/design/driver-network-agents.md`); `None`, the default, for
     /// a driver without network channels. In
@@ -363,6 +373,7 @@ impl DriverConfig {
             && self.trace_mirror_records > 0
             && self.cutover_deadline > 0
             && self.startup_timeout > 0
+            && self.max_stream_bytes != Some(0)
             && self.heartbeat_interval > 0
             && self
                 .heartbeat_interval
@@ -438,6 +449,7 @@ impl Default for DriverConfig {
             max_guard_senders: 64,
             guard_ack_timeout: 1_000_000_000,
             startup_timeout: 30_000_000_000,
+            max_stream_bytes: None,
             network: None,
             initial_term_id: None,
         }
@@ -2615,6 +2627,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         )?)
     }
 
+    /// Refuses a lane above `max_stream_bytes` (R-CORE-34) before
+    /// anything is created: every stream the driver makes passes here.
+    pub(crate) fn check_stream_bytes(
+        &self,
+        buffer: &LogBufferConfig,
+        conflation: Option<&ConflationConfig>,
+    ) -> Result<(), DriverError> {
+        check_lane_bytes(self.config.max_stream_bytes, buffer, conflation)
+    }
+
     /// Builds one lane stream of an aggregate, not yet added: its buffer,
     /// conductor, conflation feeder and counters.
     fn stage_lane(
@@ -2631,6 +2653,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             ));
         }
         let key = (config.buffer.stream_id, config.buffer.session_id);
+        self.check_stream_bytes(&buffer_config, config.conflation.as_ref())?;
         let shape = config.conflation.map(conflation_shape).transpose()?;
         let buffer = Arc::new(<T as sealed::Create>::create(
             self,
@@ -3073,6 +3096,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     fn prepare_incarnation(&mut self, plan: &Incarnation) -> Result<Fresh<T>, DriverError> {
         // A conflated stream has no fresh incarnation
         // (`reincarnation_plan` refuses it), so its buffer has no table.
+        self.check_stream_bytes(&plan.config, None)?;
         let buffer = Arc::new(<T as sealed::Create>::create(
             self,
             plan.config,
@@ -6128,6 +6152,8 @@ mod aggregate_subscriber_tests;
 mod aggregate_tests;
 #[cfg(test)]
 mod initial_term_id_tests;
+#[cfg(test)]
+mod stream_cap_tests;
 
 /// M2b: a stream's cells are allocated all or none.
 #[cfg(test)]
@@ -6186,6 +6212,45 @@ mod stream_cells_tests {
 ///
 /// [`DriverError::InvalidConfig`] for a value capacity past `u32`, which
 /// no message carries.
+/// The bytes one stream lane takes (R-CORE-34): its log buffer region,
+/// header included, plus its conflation table's region if it has one, by
+/// the functions that size them when they are created. It is what
+/// `DriverConfig::max_stream_bytes` bounds. `None` for a configuration a
+/// buffer or a table refuses, or a sum past 64 bits.
+#[must_use]
+pub fn stream_lane_bytes(
+    buffer: &LogBufferConfig,
+    conflation: Option<&ConflationConfig>,
+) -> Option<u64> {
+    let region = |structure: Option<usize>| {
+        structure
+            .and_then(karyos_sys::sizing::region_length)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+    };
+    let log = region(LogBuffer::<karyos_sys::term_bytes::SharedTerms>::structure_length(buffer))?;
+    match conflation {
+        Some(table) => log.checked_add(region(table.structure_length())?),
+        None => Some(log),
+    }
+}
+
+/// `max` against [`stream_lane_bytes`]: [`DriverError::StreamTooLarge`]
+/// above it, nothing checked without it.
+pub(crate) fn check_lane_bytes(
+    max: Option<u64>,
+    buffer: &LogBufferConfig,
+    conflation: Option<&ConflationConfig>,
+) -> Result<(), DriverError> {
+    let Some(max) = max else {
+        return Ok(());
+    };
+    let bytes = stream_lane_bytes(buffer, conflation).ok_or(DriverError::InvalidConfig)?;
+    if bytes > max {
+        return Err(DriverError::StreamTooLarge { bytes, max });
+    }
+    Ok(())
+}
+
 pub(crate) fn conflation_shape(
     config: ConflationConfig,
 ) -> Result<karyos_sys::log_buffer::ConflationShape, DriverError> {

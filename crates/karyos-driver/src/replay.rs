@@ -408,6 +408,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             schedule_capacity: 0,
         };
         LogBuffer::<T>::validate(&buffer).map_err(|_| DriverError::InvalidConfig)?;
+        // A replay target is a stream the driver makes: within the cap.
+        self.check_stream_bytes(&buffer, None)?;
         let scratch = vec![0; usize::try_from(config.mtu).map_err(|_| DriverError::InvalidConfig)?];
         let lane = Arc::new(self.replay_lane(buffer)?);
         let owner = ReceiveOwner::new(params, vec![Arc::clone(&lane)])?;

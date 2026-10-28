@@ -400,19 +400,23 @@ impl LogBuffer<SharedTerms> {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl LogBuffer<SharedTerms> {
     /// Bytes of a log buffer region's structure for `config` (R-CORE-34):
     /// the size one mapping generation is created with, after the region
     /// header, terms included. Only a buffer over [`SharedTerms`] is a
     /// region; a [`HeapTerms`] buffer keeps its terms outside its words.
-    /// `None` for a configuration a buffer refuses.
+    /// It is arithmetic only, on every platform, so a driver's stream cap
+    /// (`max_stream_bytes`) is the same everywhere. `None` for a
+    /// configuration a buffer refuses.
     #[must_use]
     pub fn structure_length(config: &LogBufferConfig) -> Option<usize> {
         let (layout, _, _) = Self::plan(config).ok()?;
         Self::structure_length_of(&layout)
     }
+}
 
+#[cfg(target_os = "linux")]
+impl LogBuffer<SharedTerms> {
     /// Creates a buffer in a new shared region (driver side,
     /// `quantstratum-docs: karyos/design/ipc-log-buffer.md`): the region is created and
     /// size-sealed for this layout, then initialised. Its descriptor is
@@ -570,7 +574,6 @@ impl<T: TermBytes> LogBuffer<T> {
     }
 
     /// Bytes of the structure of `layout`.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code, reason = "used by regions"))]
     fn structure_length_of(layout: &Layout) -> Option<usize> {
         layout.total.checked_mul(crate::atomic_view::WORD_BYTES)
     }

@@ -139,6 +139,15 @@ pub enum DriverError {
     /// `max_streams` streams are configured (active or retiring).
     #[error("too many streams")]
     TooManyStreams,
+    /// A stream lane would take more than `DriverConfig::max_stream_bytes`
+    /// (R-CORE-34); nothing was created.
+    #[error("a stream lane of {bytes} bytes is above max_stream_bytes ({max})")]
+    StreamTooLarge {
+        /// The lane's bytes: its log buffer region and its table's.
+        bytes: u64,
+        /// The configured maximum.
+        max: u64,
+    },
     /// Stream identities are exhausted.
     #[error("stream identities exhausted")]
     StreamIdsExhausted,

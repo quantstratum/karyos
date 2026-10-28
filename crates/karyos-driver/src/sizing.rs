@@ -23,9 +23,24 @@
 //!   that a predecessor has the current geometry; the report states that
 //!   assumption.
 //!
-//! Streams added after start, by the host or as replay targets a client
-//! asks for, are excluded: no configuration bounds their geometry, so no
-//! figure could bound them.
+//! With `DriverConfig::max_stream_bytes` set (karyos#809), every stream
+//! lane the driver makes is within it, so the report adds two bounded
+//! figures, which need no assumption:
+//!
+//! - **bounded steady state**: the regions that are not streams, the heap
+//!   budgets, and `max_streams` lanes at the cap. `max_streams` counts
+//!   lanes, not streams: `EmbeddedDriver::add_aggregate_checked` refuses
+//!   when the table's entries plus the new lanes pass it, and
+//!   `add_image_aggregate` does the same for an image or a replay target,
+//!   so an aggregate or a network publication of several lanes is inside
+//!   it, each lane with its own retained generations;
+//! - **bounded restart peak**: bounded plus `max_retained_generations`
+//!   predecessor log buffers of every lane, each within the cap, since a
+//!   reconfiguration's successor is checked against it too.
+//!
+//! Without the cap, streams added after start, by the host or as replay
+//! targets a client asks for, are excluded: no configuration bounds their
+//! geometry, so no figure could bound them.
 //!
 //! **What the cgroup counts.** A shared page is charged once, to the memory
 //! cgroup of the process that first touches it, however many processes map
@@ -42,9 +57,11 @@ use karyos_sys::term_bytes::SharedTerms;
 
 use crate::embedded::{DriverConfig, StreamConfig};
 
-/// What the report does not cover.
-pub const EXCLUDED: [&str; 7] = [
-    "streams added after start and Archive replay targets: no configuration sets their maximum geometry, so nothing bounds them",
+/// What the report excludes without `max_stream_bytes`.
+pub const UNCAPPED_STREAMS: &str = "streams added after start and Archive replay targets: no configuration sets their maximum geometry (max_stream_bytes is unset), so nothing bounds them";
+
+/// What the report never covers.
+pub const EXCLUDED: [&str; 6] = [
     "the application's and karyosd's own heap, code and thread stacks, except the network trace journal budget",
     "kernel socket buffers and network receive buffers",
     "the Archive's page cache and recording files",
@@ -91,6 +108,18 @@ pub struct SizingReport {
     /// Configured plus the retained predecessor mappings, under
     /// [`PEAK_ASSUMPTION`].
     pub peak_bytes: u64,
+    /// With `max_stream_bytes`: the lines of `max_streams` lanes at the
+    /// cap and of their retained generations; empty without it.
+    pub bounded: Vec<SizingLine>,
+    /// With `max_stream_bytes`: the regions that are not streams, the heap
+    /// budgets, and `max_streams` lanes at the cap.
+    pub bounded_bytes: Option<u64>,
+    /// With `max_stream_bytes`: bounded plus every lane's retained
+    /// generations at the cap. No assumption.
+    pub bounded_peak_bytes: Option<u64>,
+    /// What this report excludes: [`EXCLUDED`], and [`UNCAPPED_STREAMS`]
+    /// without the cap.
+    pub excluded: Vec<&'static str>,
 }
 
 /// Why no report could be made.
@@ -309,9 +338,17 @@ pub fn report(
             &["max_trace_journal_bytes", "max_trace_journals"],
         )?,
     ];
+    let fixed = sum(&configured)?;
     let mut retained = Vec::new();
     let generations = count(config.max_retained_generations)?;
     for (index, stream) in streams.iter().enumerate() {
+        // A declared stream above the cap is one `add_stream` refuses.
+        crate::embedded::check_lane_bytes(
+            config.max_stream_bytes,
+            &stream.buffer,
+            stream.conflation.as_ref(),
+        )
+        .map_err(|_| SizingError::Invalid("a stream above max_stream_bytes"))?;
         let (buffer, table) = stream_bytes(&pages, stream)?;
         let name = format!(
             "stream {}:{} (declared {index})",
@@ -363,12 +400,60 @@ pub fn report(
     let peak_bytes = configured_bytes
         .checked_add(sum(&retained)?)
         .ok_or(SizingError::Overflow)?;
+    let mut excluded = Vec::with_capacity(EXCLUDED.len() + 1);
+    let mut bounded = Vec::new();
+    let (bounded_bytes, bounded_peak_bytes) = match config.max_stream_bytes {
+        Some(cap) => {
+            // A lane's log buffer is one region within the cap, rounded up
+            // to the page; with a table, two regions, so one page more.
+            let buffer = pages.round(cap)?;
+            let lane = buffer.checked_add(pages.0).ok_or(SizingError::Overflow)?;
+            let lanes = count(config.max_streams)?;
+            let lanes_line = line(
+                "every stream lane, at max_stream_bytes (log buffer and table)",
+                lanes,
+                lane,
+                &["max_streams", "max_stream_bytes"],
+            )?;
+            let retained_line = line(
+                "every lane's retained generations, at max_stream_bytes",
+                lanes
+                    .checked_mul(generations)
+                    .ok_or(SizingError::Overflow)?,
+                buffer,
+                &[
+                    "max_streams",
+                    "max_retained_generations",
+                    "max_stream_bytes",
+                ],
+            )?;
+            let steady = fixed
+                .checked_add(sum(&heap)?)
+                .and_then(|bytes| bytes.checked_add(lanes_line.total))
+                .ok_or(SizingError::Overflow)?;
+            let peak = steady
+                .checked_add(retained_line.total)
+                .ok_or(SizingError::Overflow)?;
+            bounded.push(lanes_line);
+            bounded.push(retained_line);
+            (Some(steady), Some(peak))
+        }
+        None => {
+            excluded.push(UNCAPPED_STREAMS);
+            (None, None)
+        }
+    };
+    excluded.extend(EXCLUDED);
     Ok(SizingReport {
         configured,
         heap,
         retained,
         configured_bytes,
         peak_bytes,
+        bounded,
+        bounded_bytes,
+        bounded_peak_bytes,
+        excluded,
     })
 }
 
@@ -381,6 +466,7 @@ impl fmt::Display for SizingReport {
             ("configured shared regions", &self.configured),
             ("configured heap budgets", &self.heap),
             ("retained across a cutover or restart", &self.retained),
+            ("bounded by max_stream_bytes", &self.bounded),
         ] {
             writeln!(f, "{title}:")?;
             if lines.is_empty() {
@@ -405,6 +491,16 @@ impl fmt::Display for SizingReport {
         )?;
         writeln!(f, "restart peak:            {} bytes", self.peak_bytes)?;
         writeln!(f, "the restart peak assumes {PEAK_ASSUMPTION}.")?;
+        match (self.bounded_bytes, self.bounded_peak_bytes) {
+            (Some(steady), Some(peak)) => {
+                writeln!(f, "bounded steady state:    {steady} bytes")?;
+                writeln!(f, "bounded restart peak:    {peak} bytes")?;
+            }
+            _ => writeln!(
+                f,
+                "bounded:                 none, max_stream_bytes is unset"
+            )?,
+        }
         writeln!(
             f,
             "cgroup: every region is a shared memfd, mapped in whole pages and \
@@ -412,7 +508,7 @@ impl fmt::Display for SizingReport {
              page; the figures are mapped pages, a ceiling."
         )?;
         writeln!(f, "excluded:")?;
-        for excluded in EXCLUDED {
+        for excluded in &self.excluded {
             writeln!(f, "  - {excluded}")?;
         }
         Ok(())

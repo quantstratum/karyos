@@ -58,6 +58,10 @@ Driver limits:
   --ring-capacity <size>            bytes of each command ring, at least 8k [8k]
   --broadcast-capacity <size>       bytes of the broadcast buffer [32k]
   --max-retained-generations <n>    predecessor mappings per stream [2]
+  --max-stream-bytes <size>         the most bytes one stream lane may take, its log
+                                    buffer and table; a larger stream, replay target or
+                                    reconfiguration is refused, and the sizing report
+                                    gains its bounded figures [unset: no bound]
   --cutover-deadline <duration>     time a handle has to move to a successor [1s]
   --heartbeat-interval <duration>   driver heartbeat period [100ms]
   --client-liveness-timeout <duration>  silence before a client times out [10s]
@@ -535,6 +539,7 @@ const OPTIONS: &[&str] = &[
     "--max-counters-per-client",
     "--max-trace-journals",
     "--max-trace-journal-bytes",
+    "--max-stream-bytes",
     "--trace-drain-budget",
     "--trace-mirror-records",
     "--sample-interval",
@@ -600,6 +605,9 @@ fn apply(options: &mut Options, option: &str, value: &str) -> Option<()> {
         "--max-counters-per-client" => driver.max_counters_per_client = count(value)?,
         "--max-trace-journals" => driver.max_trace_journals = count(value)?,
         "--max-trace-journal-bytes" => driver.max_trace_journal_bytes = size(value)?,
+        "--max-stream-bytes" => {
+            driver.max_stream_bytes = Some(size(value).filter(|bytes| *bytes > 0)?);
+        }
         "--trace-drain-budget" => driver.trace_drain_budget = count(value)?,
         "--trace-mirror-records" => driver.trace_mirror_records = count(value)?,
         "--sample-interval" => driver.position_sample_interval = nanos(value)?,
@@ -1065,6 +1073,33 @@ mod tests {
         assert_eq!(parsed, Options::new(PathBuf::from("/run/karyos")));
         assert_eq!(parsed.driver, DriverConfig::default());
         assert_eq!(parsed.shutdown_linger, DEFAULT_SHUTDOWN_LINGER);
+    }
+
+    #[test]
+    fn the_stream_cap_takes_a_size_and_refuses_zero() {
+        assert_eq!(
+            options(&["--dir", "/run/karyos"]).driver.max_stream_bytes,
+            None
+        );
+        assert_eq!(
+            options(&["--dir", "/run/karyos", "--max-stream-bytes", "4m"])
+                .driver
+                .max_stream_bytes,
+            Some(4 << 20)
+        );
+        assert_eq!(
+            options(&["--dir", "/run/karyos", "--max-stream-bytes=397568"])
+                .driver
+                .max_stream_bytes,
+            Some(397_568)
+        );
+        assert!(matches!(
+            run(&["--dir", "/run/karyos", "--max-stream-bytes", "0"]),
+            Err(ArgsError::InvalidValue {
+                option: "--max-stream-bytes",
+                ..
+            })
+        ));
     }
 
     #[test]
