@@ -1185,7 +1185,7 @@ pub(crate) const SENDER_CELLS: [&str; 5] = [
 /// M2b), keyed by its stream's registration: datagrams and their bytes
 /// staged for sending (PAD and ABORTED records included), repair
 /// datagrams submitted, and NAKs received.
-pub(crate) const PUBLICATION_CELLS: [&str; 5] = [
+pub(crate) const PUBLICATION_CELLS: [&str; 6] = [
     "network frames sent",
     "network bytes sent",
     "network retransmits",
@@ -1194,6 +1194,10 @@ pub(crate) const PUBLICATION_CELLS: [&str; 5] = [
     // sender's first cycle, then 1 open, 2 not joined, 3 lost required
     // (karyos#637).
     "network admission",
+    // Rate policies its guard's sender gate refused (R-CORE-21): never
+    // reached while the driver validates first, so a non-zero value is a
+    // broken invariant, visible to the agent.
+    "network rate policies refused",
 ];
 
 /// A network image's counters in the CnC (M2b), keyed by its stream's

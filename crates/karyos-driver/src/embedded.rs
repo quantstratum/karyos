@@ -1988,18 +1988,28 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let count = u64::try_from(freed.len()).unwrap_or(u64::MAX);
             // The feeder counters go with their stream, and a publication's
             // rate policy with its last lane (registrations are never
-            // reused, so a kept one would only grow the map).
+            // reused, so a kept one would only grow the map): one pass over
+            // the lanes left, each looked up among the freed registrations.
+            let mut gone: Vec<_> = Vec::with_capacity(freed.len());
             for stream in freed {
-                let registration = stream.aggregate.registration;
+                gone.push(stream.aggregate.registration);
                 if let Some(counters) = stream.feeder_counters {
                     counters.free(&mut self.counters);
                 }
-                if !self
-                    .streams
-                    .iter()
-                    .any(|lane| lane.aggregate.registration == registration)
+            }
+            gone.sort_unstable();
+            gone.dedup();
+            let mut kept = vec![false; gone.len()];
+            for lane in &self.streams {
+                if let Ok(index) = gone.binary_search(&lane.aggregate.registration)
+                    && let Some(kept) = kept.get_mut(index)
                 {
-                    let _ = self.rate_policies.remove(&registration);
+                    *kept = true;
+                }
+            }
+            for (registration, kept) in gone.iter().zip(kept) {
+                if !kept {
+                    let _ = self.rate_policies.remove(registration);
                 }
             }
             self.counters.add(Event::StreamsFreed, count);
@@ -2312,10 +2322,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     );
                     return Err(error);
                 }
-                // Every datagram fits the MTU (aggregate-lanes.md), so a byte
-                // burst that holds the MTU holds whatever a route's sender
-                // gate is validated against.
-                let frame = u64::from(found.config.mtu);
+                // The largest charge a route's sender gate validates against:
+                // the MTU aligned as a frame, so a policy accepted here is
+                // never one the gate refuses (#841 review, A1).
+                let frame = gate_charge(found.config.mtu);
                 policy
                     .validate(frame)
                     .map_err(DriverError::InvalidRatePolicy)?;
@@ -2522,10 +2532,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ///
     /// # Errors
     ///
-    /// As [`Self::change_rate_policy`]; a guarded lane's refusal, a lane at
-    /// another version than `expected` included, is
-    /// [`DriverError::RateChangeOnLane`], naming the lane, and refuses the
-    /// change on every lane.
+    /// As [`Self::change_rate_policy`]. The version, the transition and the
+    /// policy's validity are the publication's: their refusals name no
+    /// lane. A guarded lane whose control reserve the policy would cross is
+    /// [`DriverError::RateChangeOnLane`] with `ReserveCrossed`, naming the
+    /// lane, and refuses the change on every lane.
     pub fn change_aggregate_rate_policy(
         &mut self,
         aggregate: &AggregateHandle,
@@ -2567,7 +2578,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     lookup.get_or_insert(error);
                 }
                 Ok(found) => {
-                    frame = frame.max(u64::from(found.config.mtu));
+                    frame = frame.max(gate_charge(found.config.mtu));
                     registration.get_or_insert(found.aggregate.registration);
                     if found.retiring {
                         lookup.get_or_insert(DriverError::StreamRetiring { stream: found.id });
@@ -3027,7 +3038,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             ));
         }
         let key = (config.buffer.stream_id, config.buffer.session_id);
-        // The table's own refusal first, so the cap never hides it.
+        // The table's shape, before the lane is sized for the cap. Since
+        // `table_region_bytes` refuses what `conflation_shape` refuses,
+        // the order no longer decides the error (karyos#824).
         let shape = config.conflation.map(conflation_shape).transpose()?;
         self.check_stream_bytes(&buffer_config, config.conflation.as_ref())?;
         let buffer = Arc::new(<T as sealed::Create>::create(
@@ -6565,20 +6578,20 @@ mod stream_cells_tests {
             .count()
     }
 
-    /// With room for four cells, a publication's five are refused whole:
-    /// the four taken are freed, `counters unavailable` counts one, and
-    /// the region holds what it held. With room, all five are keyed by the
+    /// With room for five cells, a publication's six are refused whole:
+    /// the five taken are freed, `counters unavailable` counts one, and
+    /// the region holds what it held. With room, all six are keyed by the
     /// stream's registration.
     #[test]
     fn a_full_region_refuses_the_whole_group_once() {
         let labels = &crate::agents::PUBLICATION_CELLS;
-        assert_eq!(labels.len(), 5);
-        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 4).unwrap();
+        assert_eq!(labels.len(), 6);
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 5).unwrap();
         let before = allocated(&counters);
         assert!(stream_network_cells(&mut counters, 7, labels).is_none());
         assert_eq!(allocated(&counters), before);
         assert_eq!(counters.value(Event::CountersUnavailable), 1);
-        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 5).unwrap();
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 6).unwrap();
         let mut cells = stream_network_cells(&mut counters, 7, labels).unwrap();
         assert_eq!(counters.value(Event::CountersUnavailable), 0);
         let reader = counters.reader();
@@ -6648,6 +6661,13 @@ pub fn stream_lane_bytes(
     conflation: Option<&ConflationConfig>,
 ) -> Option<u64> {
     let (log, table) = lane_regions(buffer, conflation)?;
+    lane_sum(log, table)
+}
+
+/// A lane's bytes from its regions' (R-CORE-34): the one sum behind
+/// [`stream_lane_bytes`] and the sizing report's cap check. `None` past 64
+/// bits.
+pub(crate) fn lane_sum(log: u64, table: Option<u64>) -> Option<u64> {
     log.checked_add(table.unwrap_or(0))
 }
 
@@ -6685,6 +6705,14 @@ pub(crate) fn conflation_shape(
         config.keys,
         value_capacity,
     ))
+}
+
+/// The largest charge a sender gate validates a rate policy against for a
+/// stream of `mtu`: the MTU aligned as a frame, as the gate's outbound
+/// computes it and as [`largest_charge`] does (R-CORE-21). An MTU no frame aligns is refused when the
+/// outbound is made; the MTU itself stands for it here.
+fn gate_charge(mtu: u32) -> u64 {
+    karyos_sys::sizing::align_frame(mtu).map_or(u64::from(mtu), u64::from)
 }
 
 /// Whether `policy` replaces `rate` at version `current`, as the caller

@@ -301,6 +301,51 @@ fn term_copies(c: &mut Criterion) {
     term_read(c, "shared", shared_lane);
 }
 
+/// The cost of a `trace-export` page (R-CORE-13), from a full mirror: the
+/// scan and copy of the most records a request may ask for with no byte
+/// bound, then a page as served, within the 1 MiB bound, encoded.
+fn trace_export_page(c: &mut Criterion) {
+    use karyos_agent::api::{EXPORT_MAX, MAX_EXPORT_REPLY};
+    use karyos_sys::trace_mirror::{JournalEntry, JournalKind, trace_mirror};
+
+    let mut mirror = trace_mirror(4, 4, EXPORT_MAX).unwrap_or_else(|_| std::process::abort());
+    let entry = JournalEntry::open(10, 1, JournalKind::Publisher, 26, 16);
+    let _ = mirror.write_entry(0, Some(&entry));
+    let payload = [u64::MAX / 3; 26];
+    for sequence in 0..u64::try_from(EXPORT_MAX).unwrap_or(u64::MAX) {
+        let _ = mirror.append(10, sequence, &payload);
+    }
+    let reader = mirror.reader();
+    let mut group = c.benchmark_group("trace export");
+    let _ = group.bench_function("16384 records, no byte bound", |b| {
+        b.iter(|| {
+            black_box(karyos_agent::trace_export::export(
+                &reader,
+                1,
+                0,
+                EXPORT_MAX,
+                Some(1),
+                usize::MAX,
+            ))
+        });
+    });
+    let _ = group.bench_function("a page within 1 MiB, encoded", |b| {
+        b.iter(|| {
+            if let Ok(page) = karyos_agent::trace_export::export(
+                &reader,
+                1,
+                0,
+                EXPORT_MAX,
+                Some(1),
+                MAX_EXPORT_REPLY,
+            ) {
+                black_box(karyos_agent::json::trace_export(&page));
+            }
+        });
+    });
+    group.finish();
+}
+
 // criterion 0.7's `criterion_group!` generates an undocumented public
 // function, which the workspace `missing_docs` lint would reject.
 #[allow(
@@ -308,12 +353,15 @@ fn term_copies(c: &mut Criterion) {
     reason = "criterion_group! generates an undocumented pub fn"
 )]
 mod group {
-    use super::{conflation_write_poll, rate_serve, term_copies, trace_decisions};
+    use super::{
+        conflation_write_poll, rate_serve, term_copies, trace_decisions, trace_export_page,
+    };
     criterion::criterion_group!(
         benches,
         conflation_write_poll,
         trace_decisions,
         term_copies,
+        trace_export_page,
         rate_serve
     );
 }

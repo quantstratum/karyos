@@ -1365,20 +1365,18 @@ fn a_handle_of_a_rateless_lane_is_limited_once_a_policy_comes() {
             OfferOutcome::Accepted { .. }
         ));
     }
-    // Lane 1 brings one message a second, a burst of one, to both lanes.
+    // Lane 1 brings one message a second, a burst of ten, to both lanes.
+    // Taken at run time, the handle's copy starts empty (#841 review,
+    // decided 2026-10-28 by QS-COORDINATOR): no burst at once.
     driver
         .guard_stream(
             lane_of(&aggregate, 1),
             guard,
             4,
-            Some(per_second(1, 1, None)),
+            Some(per_second(1, 10, None)),
         )
         .unwrap();
-    assert!(matches!(
-        publication.offer(b"b").unwrap(),
-        OfferOutcome::Accepted { .. }
-    ));
-    assert_eq!(publication.offer(b"c").unwrap(), OfferOutcome::RateLimited);
+    assert_eq!(publication.offer(b"b").unwrap(), OfferOutcome::RateLimited);
 }
 
 /// Re-review of #814: a lane guarded without a rate on a publication that

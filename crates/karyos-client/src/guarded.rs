@@ -118,6 +118,15 @@ pub struct GuardBinding {
     pending_rate: Option<RateWatch>,
 }
 
+/// How a handle's rate copy starts: full when the handle binds to a policy
+/// in force, read whole at bind, as a lane guarded with it; empty when it
+/// takes one later, which never grants tokens (R-CORE-21).
+#[derive(Debug, Clone, Copy)]
+enum Bucket {
+    Full,
+    Empty,
+}
+
 /// A handle's watch of its ring for a published policy: the clock to make
 /// its copy with, and the slot's sequence word when last read whole.
 #[derive(Debug, Clone, Copy)]
@@ -201,25 +210,30 @@ impl GuardBinding {
     /// seal before the copy is asked.
     #[must_use]
     pub fn with_rate(mut self, policy: RatePolicy, clock: fn() -> u64) -> Self {
-        self.set_rate(policy, clock, 0, None);
+        self.set_rate(policy, clock, 0, None, Bucket::Full);
         self
     }
 
     /// Gives the handle a copy of `policy`'s message bucket at `version`,
-    /// read at slot `sequence`.
+    /// read at slot `sequence`, starting `bucket`.
     fn set_rate(
         &mut self,
         policy: RatePolicy,
         clock: fn() -> u64,
         version: u64,
         sequence: Option<u64>,
+        bucket: Bucket,
     ) {
         let messages = RatePolicy {
             messages: policy.messages,
             bytes: None,
         };
+        let limiter = match bucket {
+            Bucket::Full => RateLimiter::new(messages, clock()),
+            Bucket::Empty => RateLimiter::empty(messages, clock()),
+        };
         self.rate = Some(RateCopy {
-            limiter: RateLimiter::new(messages, clock()),
+            limiter,
             clock,
             version,
             sequence,
@@ -230,14 +244,16 @@ impl GuardBinding {
     /// [`Self::with_rate`] from the policy the driver published in the
     /// outcome ring, if any (R-CORE-21): how a handle gets its copy when
     /// the grant carries no policy, a remote one's or a rateless lane's.
-    /// With none published yet, the handle watches the ring: its sequence
-    /// word, one Acquire load a call, and takes a policy published later at
-    /// its next call; the sender gate stays authoritative.
+    /// A policy read whole here starts the copy full, as a lane guarded
+    /// with it. With none published yet, or one being written, the handle
+    /// watches the ring: its sequence word, one Acquire load a call, and
+    /// takes the policy at its next call that reads it whole, its copy
+    /// starting empty; the sender gate stays authoritative.
     #[must_use]
     pub fn with_published_rate(mut self, clock: fn() -> u64) -> Self {
         // A publication in progress is short: a few reads see it whole.
         for _ in 0..8 {
-            if self.adopt_published(clock)
+            if self.adopt_published(clock, Bucket::Full)
                 || self.pending_rate.is_some_and(|watch| watch.seen.is_some())
             {
                 return self;
@@ -248,13 +264,13 @@ impl GuardBinding {
     }
 
     /// One read of the published policy for a handle without a copy:
-    /// `true` with the copy made from it; `false` with the handle watching
-    /// the ring, at the sequence it read whole (none published) or at none
-    /// (a publication in progress).
-    fn adopt_published(&mut self, clock: fn() -> u64) -> bool {
+    /// `true` with the copy made from it, starting `bucket`; `false` with
+    /// the handle watching the ring, at the sequence it read whole (none
+    /// published) or at none (a publication in progress).
+    fn adopt_published(&mut self, clock: fn() -> u64, bucket: Bucket) -> bool {
         match try_read_sequenced(&*self.ring, OUTCOME_SLOT) {
             (SlotRead::Policy { version, policy }, sequence) => {
-                self.set_rate(policy, clock, version, sequence);
+                self.set_rate(policy, clock, version, sequence, bucket);
                 true
             }
             (SlotRead::Unpublished, seen) => {
@@ -288,7 +304,11 @@ impl GuardBinding {
         if let Some(watch) = self.pending_rate
             && self.ring.load_acquire(OUTCOME_SLOT + SEQUENCE) != watch.seen
         {
-            let _ = self.adopt_published(watch.clock);
+            // A policy taken at run time never grants tokens: the copy
+            // starts empty, as the sender gate's bucket does (R-CORE-21).
+            // So does one a read at bind found mid-write: the handle cannot
+            // tell a policy in force from one coming then.
+            let _ = self.adopt_published(watch.clock, Bucket::Empty);
         }
         let Some(copy) = self.rate.as_mut() else {
             return true;

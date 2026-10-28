@@ -11,11 +11,14 @@ abi 0.1
 covers "typed status codes"
 since B3
 feature remote-driver
+feature image-wait
 
 op subscription.add client=$remote_client stream_id=25 uri=$loopback_uri
 expect ok subscription=$reading
 op publication.add client=$remote_client stream_id=25 uri=$loopback_uri
 expect ok publication=$timed
+op subscription.await_image subscription=$reading
+expect ok
 op publication.offer_at publication=$timed payload="timed" delay_ns=500000000
 expect ok tx_time=$at
 op subscription.poll subscription=$reading limit=8 until=1 not_before=$at

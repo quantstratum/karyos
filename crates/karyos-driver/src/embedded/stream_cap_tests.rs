@@ -181,10 +181,10 @@ fn table_region_bytes_refuses_what_conflation_shape_refuses() {
     assert_eq!(stream_lane_bytes(&buffer, Some(&refused)), None);
     let accepted = ConflationConfig::new(1, usize::try_from(u32::MAX).unwrap(), 4096);
     assert!(conflation_shape(accepted).is_ok());
-    assert_eq!(
-        table_region_bytes(&accepted).is_some(),
-        accepted.structure_length().is_some()
-    );
+    // Accepted: sized exactly as its region is.
+    let bytes = region_bytes(accepted.structure_length());
+    assert!(bytes.is_some(), "an accepted table has a size");
+    assert_eq!(table_region_bytes(&accepted), bytes);
 }
 
 #[test]
@@ -286,6 +286,12 @@ fn a_refused_lane_takes_no_region_id() {
 /// The report without a cap is byte for byte the one of `d01c477a`, before
 /// karyos#824 (plan 160, criterion 4): two declared streams, one
 /// conflated, at the defaults and 4 KiB pages.
+///
+/// `sizing_uncapped_d01c477a.txt` is that commit's
+/// `crate::sizing::report(..).to_string()` for exactly these inputs,
+/// captured on Linux (`rust:1.99`) with this test's body run at
+/// `d01c477a`. A change to the uncapped report must be deliberate: it
+/// regenerates the file the same way, and says so.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_uncapped_report_is_unchanged() {

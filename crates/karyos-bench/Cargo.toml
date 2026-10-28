@@ -49,6 +49,8 @@ karyos-sim.workspace = true
 karyos.workspace = true
 
 [dev-dependencies]
+# The raw trace export's page cost (R-CORE-13).
+karyos-agent.workspace = true
 # The bench itself with `test-hooks`, for the fault tests of tests/smoke.rs.
 karyos-bench = { path = ".", features = ["test-hooks", "alloc-count", "synthetic"] }
 criterion = { version = "=0.7.0", default-features = false, features = ["cargo_bench_support"] }
