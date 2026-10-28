@@ -2235,7 +2235,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             self.report_guard_error(guard.id(), &error);
             return Err(error);
         }
-        let sibling_version = self.aggregate_rate_version(stream);
+        // The aggregate's policy and version, when another lane of it is
+        // guarded with a rate: one policy and one version per aggregate.
+        let joined = self.aggregate_rate(stream);
         let found = self.active_stream(stream)?;
         if !matches!(
             found.config.publication,
@@ -2280,6 +2282,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 return Err(DriverError::RateScopeUnsupported { scope });
             }
         };
+        // A lane of an aggregate that has a policy takes it, guarded with a
+        // rate or not, keeping its own reserve, which the policy must keep.
+        let rate = match (joined, rate) {
+            (Some((policy, _)), given) => {
+                let reserve = given.and_then(|(_, reserve)| reserve);
+                let frame = u64::from(found.config.mtu);
+                if reserve.is_some_and(|reserve| !policy.keeps(&reserve, frame)) {
+                    return Err(DriverError::RateChange(
+                        crate::guards::RateChangeError::ReserveCrossed,
+                    ));
+                }
+                Some((policy, reserve))
+            }
+            (None, given) => given,
+        };
         // The credit is checked first, as admission counts it, so its
         // refusal is told apart from a full cell table.
         let id = found.id;
@@ -2319,10 +2336,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             walker,
             scratch,
         );
-        // A lane of an aggregate whose other lanes already changed their
-        // policy joins at their version, so one `expected` still names
-        // every lane (R-CORE-21).
-        if let (Some(version), Some((policy, _))) = (sibling_version, rate) {
+        // It joins at the aggregate's version, never at 1 on its own, so
+        // one `expected` names every lane (R-CORE-21).
+        if let Some((policy, version)) = joined {
             guarded.set_rate(policy, version);
         }
         let found = self.active_stream(stream)?;
@@ -2330,9 +2346,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(())
     }
 
-    /// The rate policy version the other guarded lanes of `stream`'s
-    /// aggregate are at, if it has several lanes and any has a rate.
-    fn aggregate_rate_version(&self, stream: StreamHandle) -> Option<u64> {
+    /// The rate policy and version of `stream`'s aggregate, from its other
+    /// guarded lanes, if it has several lanes and any has a rate.
+    fn aggregate_rate(
+        &self,
+        stream: StreamHandle,
+    ) -> Option<(karyos_sys::rate_limit::RatePolicy, u64)> {
         let lane = self.stream_ref(stream).ok()?;
         let aggregate = lane.aggregate;
         if aggregate.lanes < 2 {
@@ -2344,9 +2363,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 other.aggregate.registration == aggregate.registration && other.id != lane.id
             })
             .filter_map(|other| other.guarded.as_ref())
-            .filter(|guarded| guarded.rate.is_some())
-            .map(|guarded| guarded.rate_version)
-            .max()
+            .filter_map(|guarded| Some((guarded.rate?, guarded.rate_version)))
+            .max_by_key(|(_, version)| *version)
     }
 
     /// Changes the rate policy of `stream`, guarded with a rate, from
@@ -2455,6 +2473,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // an unguarded one), each guard named, and the largest frame, a
         // byte burst holding the largest datagram.
         let mut lanes = Vec::with_capacity(streams.len());
+        // Guarded lanes with no rate yet: not weighed, they take the
+        // aggregate's new policy with the others (one policy per
+        // aggregate).
+        let mut followers = Vec::new();
         let mut guards: Vec<(GuardHandle, u64)> = Vec::new();
         let mut lookup = None;
         let mut frame = 0;
@@ -2473,7 +2495,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     }
                     if found.retiring {
                         lookup.get_or_insert(DriverError::StreamRetiring { stream: found.id });
-                    } else if guarded.rate.is_some() {
+                    } else if guarded.rate.is_none() {
+                        followers.push(*stream);
+                    } else {
                         lanes.push((
                             *stream,
                             guarded.guard,
@@ -2520,7 +2544,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             // unchanged ones included, so their versions stay one; each
             // shared gate slot is published once.
             let mut published: Vec<Arc<crate::shared_words::Words>> = Vec::new();
-            for &(stream, ..) in &lanes {
+            let changed = lanes
+                .iter()
+                .map(|&(stream, ..)| stream)
+                .chain(followers.iter().copied());
+            for stream in changed {
                 if let Some(guarded) = self.active_stream(stream)?.guarded.as_mut() {
                     guarded.set_rate(policy, next);
                     if let Some(slot) = guarded.gate_slot().cloned()

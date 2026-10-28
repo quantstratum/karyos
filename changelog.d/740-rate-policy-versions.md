@@ -12,10 +12,12 @@
     its guarded lanes, each weighed with its own policy, version and
     reserve, take it together or not at all, and each guard audits it;
     a lane's refusal is `DriverError::RateChangeOnLane`, naming the lane
-    (`LaneRefusal`), with the refusal's own CnC code. Unguarded lanes, and
-    lanes guarded without a rate, are left as they are. A lane guarded
-    after its aggregate's policy changed joins at the aggregate's
-    version, so the lanes keep one version. Refusals are `DriverError::RateChange` (`VersionMismatch`,
+    (`LaneRefusal`), with the refusal's own CnC code. An aggregate has one
+    policy and one version: a lane guarded on an aggregate that has a
+    policy takes it and its version, with or without a rate of its own
+    (keeping its own reserve), and a lane guarded without a rate before
+    the aggregate had one takes its next change. Unguarded lanes are left
+    as they are. Refusals are `DriverError::RateChange` (`VersionMismatch`,
     `NotATightening`, `ReserveCrossed`, `NoRate`) and
     `DriverError::InvalidRatePolicy`, with CnC error codes 19 to 23 (23
     `RateInvalidPolicy`). A byte burst is validated against the largest
