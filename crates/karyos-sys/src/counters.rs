@@ -1264,6 +1264,42 @@ mod tests {
         assert_eq!(counter.increment(1), Err(CounterError::Overflow));
     }
 
+    /// R-CORE-17 (karyos#737): a datum's identity is its instance and its
+    /// cell's registration, so a registration is never reused within a
+    /// region, however often the region is exhausted and its cells
+    /// recycled, under the same label and keys or not.
+    #[test]
+    fn test_counters_a_registration_is_never_reused_as_cells_recycle() {
+        let (mut manager, reader) = counters(4).unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..50 {
+            let cells: Vec<_> = (0..4)
+                .map(|_| manager.allocate(1, "orders").unwrap())
+                .collect();
+            assert_eq!(
+                manager.allocate(1, "orders").err(),
+                Some(CounterError::Exhausted),
+                "the region is full"
+            );
+            for cell in &cells {
+                assert!(seen.insert(cell.registration_id()), "a reused registration");
+            }
+            // The reader sees the same registrations the allocator gave.
+            for index in 0..4 {
+                let CellRead::Allocated { metadata, .. } = reader.read(index) else {
+                    panic!("cell {index} not allocated");
+                };
+                assert!(
+                    cells
+                        .iter()
+                        .any(|cell| cell.registration_id() == metadata.registration_id)
+                );
+            }
+            drop(cells);
+        }
+        assert_eq!(seen.len(), 200);
+    }
+
     #[test]
     fn exhaustion_drop_and_reuse_with_fresh_identity() {
         let (mut manager, reader) = counters(1).unwrap();
