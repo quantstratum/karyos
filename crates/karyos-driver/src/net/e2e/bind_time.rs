@@ -43,8 +43,8 @@ use super::{BUDGET, aggregate, driver, free_port, shared};
 use crate::agents::ThreadingMode;
 
 /// The longest one join is waited for: well past three lost exchanges of
-/// about 2 s each. A join still unbound then is censored: counted, and
-/// ranked at this value.
+/// about 2 s each. A join still unbound then is censored: its times, taken
+/// at that moment, are lower bounds.
 const JOIN_LIMIT: Duration = Duration::from_secs(30);
 /// The publisher's pace: one 1000-byte message per millisecond.
 const PACE: Duration = Duration::from_millis(1);
@@ -301,7 +301,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
                 });
                 break;
             }
-            if subscribed.elapsed() >= JOIN_LIMIT {
+            if now.duration_since(subscribed) >= JOIN_LIMIT {
                 let sessions = shared(&mut joiner).receiver.session_counters();
                 // Censored at `now`: a lower bound of its times.
                 let bind = unbound_at.map(|at| now.duration_since(at));
@@ -315,7 +315,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
                 });
                 if joins.iter().filter(|join| join.censored).count() > CENSORED_LIMIT {
                     publisher_line(&mut a, label);
-                    report(label, &joins, sent, count);
+                    report(label, &joins, sent, Some(count));
                     panic!(
                         "more than {CENSORED_LIMIT} joins never bound within {JOIN_LIMIT:?}: \
                          the bind path is broken"
@@ -327,7 +327,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
         }
     }
     publisher_line(&mut a, label);
-    report(label, &joins, sent, count);
+    report(label, &joins, sent, None);
 }
 
 /// Prints the publisher's answers and their drops.
@@ -339,22 +339,69 @@ fn publisher_line(a: &mut crate::embedded::EmbeddedDriver, label: &str) {
     );
 }
 
-/// Prints `joins`' distribution, of the `planned` joins: one line for the
-/// log and one record. Censored joins rank after every other (their times
-/// are lower bounds); a statistic whose rank falls among them prints as
-/// `>= x (censored)`, and so do their samples.
-fn report(label: &str, joins: &[Join], sent: u32, planned: usize) {
-    // (censored, time), so the censored sort last.
-    let mut bind: Vec<(bool, Duration)> = joins
-        .iter()
-        .filter_map(|join| join.bind.map(|bind| (join.censored, bind)))
-        .collect();
-    bind.sort_unstable();
-    let mut subscribe: Vec<(bool, Duration)> = joins
-        .iter()
-        .map(|join| (join.censored, join.subscribe))
-        .collect();
-    subscribe.sort_unstable();
+/// A sample sorted by time alone, each marked censored or not: a rank is
+/// exact only when no censored entry lies at or below it, otherwise the
+/// value there is a lower bound.
+struct Sample(Vec<(Duration, bool)>);
+
+impl Sample {
+    fn new(mut entries: Vec<(Duration, bool)>) -> Self {
+        entries.sort_unstable_by_key(|(time, _)| *time);
+        Self(entries)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The value at 1-based `rank`, clamped, as printed.
+    fn at(&self, rank: usize) -> String {
+        let Some(at) = rank.clamp(1, self.len().max(1)).checked_sub(1) else {
+            return "none".to_owned();
+        };
+        let Some(&(time, _)) = self.0.get(at) else {
+            return "none".to_owned();
+        };
+        let bounded = self.0.iter().take(at + 1).any(|(_, censored)| *censored);
+        shown(time, bounded)
+    }
+
+    /// The maximum, as printed: a lower bound when any entry is censored.
+    fn max(&self) -> String {
+        let censored = self.0.iter().any(|(_, censored)| *censored);
+        self.0
+            .last()
+            .map_or_else(|| "none".to_owned(), |&(time, _)| shown(time, censored))
+    }
+}
+
+/// `time` in milliseconds, as a lower bound when `bounded`.
+fn shown(time: Duration, bounded: bool) -> String {
+    let ms = time.as_secs_f64() * 1000.0;
+    if bounded {
+        format!(">= {ms:.1} (censored)")
+    } else {
+        format!("{ms:.1}")
+    }
+}
+
+/// Prints `joins`' distribution: one line for the log and one record,
+/// which says when the run stopped early, of `planned` joins. A censored
+/// join's times are lower bounds: a statistic whose rank has one at or
+/// below it prints as `>= x (censored)`, and so do the censored samples.
+fn report(label: &str, joins: &[Join], sent: u32, stopped_of: Option<usize>) {
+    let bind = Sample::new(
+        joins
+            .iter()
+            .filter_map(|join| join.bind.map(|bind| (bind, join.censored)))
+            .collect(),
+    );
+    let subscribe = Sample::new(
+        joins
+            .iter()
+            .map(|join| (join.subscribe, join.censored))
+            .collect(),
+    );
     let by_solicits = |solicits: u64| {
         joins
             .iter()
@@ -365,47 +412,32 @@ fn report(label: &str, joins: &[Join], sent: u32, planned: usize) {
     let expired: u64 = joins.iter().map(|join| join.expired).sum();
     let censored = joins.iter().filter(|join| join.censored).count();
     let no_unbound = joins.iter().filter(|join| join.bind.is_none()).count();
-    let ms = |duration: Duration| duration.as_secs_f64() * 1000.0;
-    let shown = |(censored, time): (bool, Duration)| {
-        if censored {
-            format!(">= {:.1} (censored)", ms(time))
-        } else {
-            format!("{:.1}", ms(time))
-        }
-    };
-    let value = |sorted: &[(bool, Duration)], rank: usize| {
-        sorted
-            .get(rank.clamp(1, sorted.len().max(1)) - 1)
-            .map_or_else(|| "none".to_owned(), |entry| shown(*entry))
-    };
-    let interval = if bind.is_empty() {
+    let interval = if bind.len() == 0 {
         "no interval".to_owned()
     } else {
         let (low, high, coverage) = interval_ranks(bind.len(), 0.99, 0.95);
         format!(
             "{:.1}% {} to {}",
             coverage * 100.0,
-            value(&bind, low),
-            high.map_or_else(|| "open".to_owned(), |high| value(&bind, high)),
+            bind.at(low),
+            high.map_or_else(|| "open".to_owned(), |high| bind.at(high)),
         )
     };
-    let stopped = if joins.len() < planned {
+    let stopped = stopped_of.map_or_else(String::new, |planned| {
         format!(" | stopped early: {} of {planned} joins", joins.len())
-    } else {
-        String::new()
-    };
+    });
     println!(
         "bind_time {label}: joins {} (with unbound DATA {}) | t_bind ms median {} p90 {} p99 {} ({interval}) max {} \
          | t_subscribe ms median {} max {} | solicits 1: {} 2: {} 3+: {} (0: {}) expired {} \
          | censored {censored}, no unbound DATA {no_unbound} | {} sent{stopped}",
         joins.len(),
         bind.len(),
-        value(&bind, nearest_rank(bind.len(), 0.5)),
-        value(&bind, nearest_rank(bind.len(), 0.9)),
-        value(&bind, nearest_rank(bind.len(), 0.99)),
-        value(&bind, bind.len()),
-        value(&subscribe, nearest_rank(subscribe.len(), 0.5)),
-        value(&subscribe, subscribe.len()),
+        bind.at(nearest_rank(bind.len(), 0.5)),
+        bind.at(nearest_rank(bind.len(), 0.9)),
+        bind.at(nearest_rank(bind.len(), 0.99)),
+        bind.max(),
+        subscribe.at(nearest_rank(subscribe.len(), 0.5)),
+        subscribe.max(),
         by_solicits(1),
         by_solicits(2),
         more,
@@ -418,16 +450,26 @@ fn report(label: &str, joins: &[Join], sent: u32, planned: usize) {
         std::env::var("KARYOS_NETEM_PROFILE").unwrap_or_default()
     );
     let samples: Vec<String> = bind
+        .0
         .iter()
-        .map(|&(censored, time)| {
-            if censored {
-                format!(">={:.2}", ms(time))
-            } else {
-                format!("{:.2}", ms(time))
-            }
-        })
+        .map(|&(time, censored)| shown(time, censored))
         .collect();
     println!("bind_time {label} samples ms: {}", samples.join(" "));
+}
+
+/// A censored entry bounds every rank at or above its own, and the max.
+#[test]
+fn a_censored_entry_bounds_the_ranks_above_it() {
+    let sample = Sample::new(vec![
+        (Duration::from_millis(5), false),
+        (Duration::from_millis(12), false),
+        (Duration::from_millis(7), true),
+        (Duration::from_millis(20_000), false),
+    ]);
+    assert_eq!(sample.at(1), "5.0");
+    assert_eq!(sample.at(2), ">= 7.0 (censored)");
+    assert_eq!(sample.at(3), ">= 12.0 (censored)");
+    assert_eq!(sample.max(), ">= 20000.0 (censored)");
 }
 
 /// The late join of a reliable multicast group.

@@ -506,9 +506,12 @@ fn n5_two_reliable_lanes_each_deliver_exactly_once_in_order() {
 /// group's datagrams leave by the default route, unshaped. Undone on drop.
 /// The route is the host's, so one test holds it at a time, whatever the
 /// test threads.
-pub(super) struct MulticastOnLoopback(
-    #[allow(dead_code, reason = "held for its lock")] std::sync::MutexGuard<'static, ()>,
-);
+pub(super) struct MulticastOnLoopback {
+    /// Whether this holder added the route, and so deletes it.
+    added: bool,
+    #[allow(dead_code, reason = "held for its lock")]
+    guard: std::sync::MutexGuard<'static, ()>,
+}
 
 /// The one holder of the loopback's multicast route.
 static ROUTE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -520,22 +523,38 @@ impl MulticastOnLoopback {
         let guard = ROUTE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Built first, so a failed second call still undoes the first.
-        let route = Self(guard);
+        // Built first, so a failed later call still undoes what it did.
+        let mut route = Self {
+            added: false,
+            guard,
+        };
         ip(&["link", "set", "lo", "multicast", "on"]);
-        // A route left on `lo` by an aborted run is no error; one the host
-        // set elsewhere is never replaced.
-        let added = ip_status(&["route", "add", "239.255.0.0/16", "dev", "lo"])
-            .is_some_and(|status| status.success());
-        if !added {
+        let output = std::process::Command::new("ip")
+            .args(["route", "add", "239.255.0.0/16", "dev", "lo"])
+            .output()
+            .unwrap();
+        if output.status.success() {
+            route.added = true;
+        } else {
+            // Only an existing route is accepted, and only on `lo`: one
+            // the host set elsewhere is never replaced, nor deleted.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("File exists"),
+                "ip route add failed: {} {stderr}",
+                output.status
+            );
             let shown = std::process::Command::new("ip")
                 .args(["route", "show", "239.255.0.0/16"])
                 .output()
                 .unwrap();
-            assert!(
-                String::from_utf8_lossy(&shown.stdout).contains("dev lo"),
-                "239.255.0.0/16 is routed elsewhere on this host"
-            );
+            let on_lo = String::from_utf8_lossy(&shown.stdout).lines().any(|line| {
+                line.split_whitespace()
+                    .collect::<Vec<_>>()
+                    .windows(2)
+                    .any(|pair| pair == ["dev", "lo"])
+            });
+            assert!(on_lo, "239.255.0.0/16 is routed elsewhere on this host");
         }
         route
     }
@@ -543,8 +562,11 @@ impl MulticastOnLoopback {
 
 impl Drop for MulticastOnLoopback {
     fn drop(&mut self) {
-        // Never panics: a drop during a test's panic must not abort it.
-        let _ = ip_status(&["route", "del", "239.255.0.0/16", "dev", "lo"]);
+        // Never panics: a drop during a test's panic must not abort it. It
+        // deletes only the route it added.
+        if self.added {
+            let _ = ip_status(&["route", "del", "239.255.0.0/16", "dev", "lo"]);
+        }
         let _ = ip_status(&["link", "set", "lo", "multicast", "off"]);
     }
 }
