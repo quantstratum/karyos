@@ -5161,8 +5161,8 @@ fn control_routes_report_limits_and_failed_closes() {
     }
     // An eviction in flight, then a burst of sends: none of them marks it
     // failed. The duty closes it again, with no further send: closed, or
-    // failed when still in flight; either way nothing is left lingering.
-    for (in_flight, close_failed) in [(1u32, false), (2, true)] {
+    // still in flight and kept in its place, not failed.
+    for (in_flight, lingering) in [(1u32, 0usize), (3, 1)] {
         let mut tx = open(4, 4);
         let mut routes = ControlRoutes::new(1);
         routes
@@ -5178,14 +5178,17 @@ fn control_routes_report_limits_and_failed_closes() {
                 .unwrap();
         }
         assert_eq!(routes.take_refusal(), None, "not failed before the duty");
-        routes.close_lingering(&mut tx);
-        assert_eq!(routes.lingering(), 0, "nothing leaks");
-        let refusal = routes.take_refusal().map(|(_, refusal)| refusal);
+        routes.close_lingering(&mut tx, 0);
         assert_eq!(
-            refusal.unwrap_or_default().close_failed,
-            close_failed,
-            "in flight {in_flight}"
+            routes.lingering(),
+            lingering,
+            "still in flight keeps its place"
         );
+        assert_eq!(routes.take_refusal(), None, "not failed: {in_flight}");
+        // Its socket clears: the next duty closes it, and nothing leaks.
+        routes.close_in_flight = 0;
+        routes.close_lingering(&mut tx, 1);
+        assert_eq!(routes.lingering(), 0, "closed");
     }
 }
 
@@ -5250,12 +5253,16 @@ fn a_control_close_failure_counts_for_the_limit() {
     }
 }
 
-/// V1 (#838) on the sender: a control route evicted with frames in flight
-/// is closed again by the duty, with no further control sent: closed, or
-/// counted as a failed close once still in flight; nothing lingers.
+/// D3 (#849 review): a control route evicted with frames in flight keeps
+/// its place across the sender's duties, not counted as failed, while it
+/// is still in flight within `CONTROL_CLOSE_TIMEOUT`; past it, it counts
+/// as a failed close, once, and leaves the cache. One that closes in time
+/// is never failed.
 #[test]
 fn the_duty_closes_an_evicted_control_route_in_flight() {
-    for (in_flight, failed) in [(1u32, 0u64), (2, 1)] {
+    use super::super::control::CONTROL_CLOSE_TIMEOUT;
+
+    for clears in [true, false] {
         let config = AgentConfig {
             control_routes: 1,
             ..AgentConfig::default()
@@ -5270,26 +5277,36 @@ fn the_duty_closes_an_evicted_control_route_in_flight() {
         let _ = sender.send(&mut halves, EndpointId(1), first, &control);
         let slot = sender
             .routes
-            .iter_mut()
-            .find(|slot| slot.endpoint == Some(EndpointId(1)))
+            .iter()
+            .position(|slot| slot.endpoint == Some(EndpointId(1)))
             .unwrap();
-        slot.routes.close_in_flight = in_flight;
+        sender.routes[slot].routes.hold_closes = true;
         // Evicts the first destination's route, in flight.
         let _ = sender.send(&mut halves, EndpointId(1), second, &control);
-        for now in 0..3 {
+        for now in [0, 1, CONTROL_CLOSE_TIMEOUT / 2] {
             let _ = sender.duty(&mut halves, now).unwrap();
+            assert_eq!(sender.routes[slot].routes.lingering(), 1, "kept at {now}");
+            assert_eq!(
+                sender.counters().removed_close_failed,
+                0,
+                "not failed at {now}"
+            );
         }
-        let slot = sender
-            .routes
-            .iter()
-            .find(|slot| slot.endpoint == Some(EndpointId(1)))
-            .unwrap();
-        assert_eq!(slot.routes.lingering(), 0, "nothing lingers");
+        if clears {
+            sender.routes[slot].routes.hold_closes = false;
+        }
+        let _ = sender.duty(&mut halves, CONTROL_CLOSE_TIMEOUT).unwrap();
+        assert_eq!(sender.routes[slot].routes.lingering(), 0, "gone");
         assert_eq!(
             sender.counters().removed_close_failed,
-            failed,
-            "in flight {in_flight}"
+            u64::from(!clears),
+            "failed only past the bound"
         );
+        assert_eq!(
+            sender.routes[slot].routes.close_timeouts,
+            u64::from(!clears)
+        );
+        sender.routes[slot].routes.hold_closes = false;
     }
 }
 
@@ -5320,7 +5337,7 @@ fn a_burst_to_many_destinations_fails_no_close_in_flight() {
         .send(&mut tx, at(41_001), &challenge_control())
         .unwrap();
     // A's eviction, then its reclose at C: both in flight.
-    routes.close_in_flight = 2;
+    routes.close_in_flight = 8;
     routes
         .send(&mut tx, at(41_002), &challenge_control())
         .unwrap();
@@ -5331,8 +5348,9 @@ fn a_burst_to_many_destinations_fails_no_close_in_flight() {
         "C waits"
     );
     assert_eq!(routes.take_refusal(), None, "nothing failed, no limit");
-    // The duty closes A; C goes out.
-    routes.close_lingering(&mut tx);
+    // The duty closes what has closed since; C goes out.
+    routes.close_in_flight = 0;
+    routes.close_lingering(&mut tx, 0);
     assert_eq!(routes.take_refusal(), None);
     routes
         .send(&mut tx, at(41_003), &challenge_control())
@@ -5425,7 +5443,7 @@ fn refused_announces_wait_in_order_and_all_go() {
     assert_eq!(routes.waiting(), waited);
     routes.hold_closes = false;
     for _ in 0..4 {
-        routes.close_lingering(&mut tx);
+        routes.close_lingering(&mut tx, 0);
     }
     assert_eq!(routes.waiting(), 0, "all sent");
     let sent = seen.lock().unwrap().clone();
@@ -5465,7 +5483,7 @@ fn repeated_refused_announces_wait_once_per_destination() {
     assert_eq!(routes.waits_dropped, 0, "nothing dropped");
     routes.hold_closes = false;
     for _ in 0..4 {
-        routes.close_lingering(&mut tx);
+        routes.close_lingering(&mut tx, 0);
     }
     assert_eq!(routes.waiting(), 0, "all sent");
     let mut per: BTreeMap<SocketAddr, usize> = BTreeMap::new();
@@ -5497,7 +5515,7 @@ fn blocking_endpoint() -> (
 /// capacity allocated at creation, and no route is given up as failed to
 /// make room: a further destination is refused `Blocked` instead.
 #[test]
-fn unsent_controls_keep_at_most_max_closing() {
+fn unsent_controls_stay_within_the_capacity() {
     use super::super::control::{ControlRoutes, ControlSendError};
 
     let (mut tx, rx) = blocking_endpoint();

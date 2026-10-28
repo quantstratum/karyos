@@ -5104,7 +5104,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 Half::Tx(tx) if *held == endpoint => Some(tx),
                 _ => None,
             }) {
-                slot.routes.close_lingering(tx);
+                slot.routes.close_lingering(tx, now);
             }
         }
         // The entries still in flight are closed again: closed, they go;
