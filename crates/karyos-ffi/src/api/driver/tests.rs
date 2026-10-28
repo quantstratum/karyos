@@ -110,6 +110,22 @@ fn an_unknown_idle_strategy_or_configuration_is_refused() {
     assert_eq!(create(&options), Err(Status::InvalidArgument.into()));
 }
 
+/// A lane above `max_stream_bytes` (karyos#809) reaches a C host as the
+/// caller's argument with its bytes and the cap, not as an unknown error.
+/// `karyos_driver_options` does not carry the cap yet, so the mapping is
+/// tested here.
+#[test]
+fn a_stream_above_the_cap_is_an_invalid_argument_with_its_bytes_and_the_cap() {
+    let failure = Failure::from(&DriverError::StreamTooLarge {
+        bytes: 3 << 20,
+        max: 1 << 20,
+    });
+    assert_eq!(
+        failure,
+        Failure::with(Status::InvalidArgument, 3 << 20, 1 << 20)
+    );
+}
+
 #[test]
 fn the_defaults_are_the_drivers() {
     let _serial = serial();

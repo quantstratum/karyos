@@ -530,6 +530,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }) {
             return Err(DriverError::CutoverPending { stream: id });
         }
+        let max_bytes = self.config.max_stream_bytes;
         let target = self.active_stream_mut(stream)?;
         if target.cutover.is_some() {
             return Err(DriverError::CutoverPending { stream: target.id });
@@ -572,6 +573,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if maximum >= 1 << 63 {
             return Err(DriverError::PositionsExhausted);
         }
+        crate::embedded::check_lane_bytes(max_bytes, &config, target.conflation.as_ref())?;
         let shape = target
             .conflation
             .map(crate::embedded::conflation_shape)

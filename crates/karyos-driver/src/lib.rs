@@ -68,6 +68,7 @@ pub use clock::{MonotonicClock, SystemClock};
 pub use embedded::{
     AggregateConfig, AggregateHandle, DriverConfig, EmbeddedDriver, FIRST_INCARNATION,
     FailedReason, NotReadyReason, Readiness, StreamConfig, StreamHandle, StreamState,
+    stream_lane_bytes,
 };
 pub use error::{DriverError, TimedNetworkUnsupported, WalkerUnavailable};
 pub use generations::{GenerationInfo, Reconfiguration};

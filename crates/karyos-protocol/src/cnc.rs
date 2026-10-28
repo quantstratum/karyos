@@ -1145,6 +1145,10 @@ pub enum ErrorCode {
     /// a repeated `receiver_id` (karyos#637). Retrying the same roles
     /// never succeeds.
     InvalidRoles,
+    /// A stream lane the driver would create for the command is larger
+    /// than its `max_stream_bytes` (R-CORE-34, karyos#809); nothing was
+    /// created. Retrying the same channel never succeeds.
+    StreamTooLarge,
 }
 
 impl ErrorCode {
@@ -1170,6 +1174,7 @@ impl ErrorCode {
             Self::LaneMismatch => 16,
             Self::StrategyConflict => 17,
             Self::InvalidRoles => 18,
+            Self::StreamTooLarge => 24,
         }
     }
 
@@ -1193,6 +1198,7 @@ impl ErrorCode {
             16 => Self::LaneMismatch,
             17 => Self::StrategyConflict,
             18 => Self::InvalidRoles,
+            24 => Self::StreamTooLarge,
             _ => return None,
         })
     }
@@ -3536,6 +3542,15 @@ mod tests {
         assert_eq!(Command::decode(0x13, &good), Ok(identity));
     }
 
+    /// karyos#809: a lane above `max_stream_bytes` is refused with code 24
+    /// (19 to 23 are karyos#740's rate errors; note
+    /// `karyos/cnc-error-code-reservations`).
+    #[test]
+    fn stream_too_large_is_24() {
+        assert_eq!(ErrorCode::StreamTooLarge.code(), 24);
+        assert_eq!(ErrorCode::from_code(24), Some(ErrorCode::StreamTooLarge));
+    }
+
     /// karyos#637: the roles' refusals keep their wire values.
     #[test]
     fn roles_error_codes_are_17_and_18() {
@@ -4888,7 +4903,7 @@ mod journal_tests {
             assert_eq!(words_of(&out[..length]), [2, 6, word, 7]);
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
-        assert_eq!(ErrorCode::from_code(19), None);
+        assert_eq!(ErrorCode::from_code(1000), None);
     }
 
     /// The operator word is a uid, root's 0 included, or NO_OPERATOR; a
@@ -5076,9 +5091,9 @@ mod journal_tests {
             Response::decode(JOURNAL_READY, &bytes_of(&[1, 2, 3])),
             Err(CncError::WrongLength { .. })
         ));
-        // Error code 19 is not defined.
+        // Error code 1000 is not defined: an unknown code fails the decode.
         assert_eq!(
-            Response::decode(ERROR, &bytes_of(&[1, 2, 19, 0])),
+            Response::decode(ERROR, &bytes_of(&[1, 2, 1000, 0])),
             Err(CncError::Reserved { type_id: ERROR })
         );
     }
@@ -5605,6 +5620,7 @@ mod properties {
                 ErrorCode::LaneMismatch,
                 ErrorCode::StrategyConflict,
                 ErrorCode::InvalidRoles,
+                ErrorCode::StreamTooLarge,
             ][..],
         );
         prop_oneof![

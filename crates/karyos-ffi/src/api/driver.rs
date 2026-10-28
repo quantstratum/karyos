@@ -534,6 +534,12 @@ impl From<&DriverError> for Failure {
             DriverError::TooManyStreams | DriverError::StreamIdsExhausted => {
                 Status::ResourcesUnavailable.into()
             }
+            // A lane above `max_stream_bytes` is refused for the driver's
+            // life: the caller's argument, its bytes and the cap in the
+            // detail.
+            DriverError::StreamTooLarge { bytes, max } => {
+                Self::with(Status::InvalidArgument, *bytes, *max)
+            }
             _ => Status::Unknown.into(),
         }
     }

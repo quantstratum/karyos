@@ -117,6 +117,30 @@ fn the_sizing_report_prints_two_figures_and_exits_without_starting() {
     assert!(report.contains("excluded:"), "{report}");
 }
 
+/// With `--max-stream-bytes` the report adds its bounded figures, which
+/// state their assumption, and no longer excludes added streams (karyos#809);
+/// a declared stream above the cap is refused as a start refuses it.
+#[test]
+fn with_the_stream_cap_the_report_is_bounded() {
+    let output = sizing(&["--max-stream-bytes", "1m"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = String::from_utf8(output.stdout).unwrap();
+    let configured = figure(&report, "configured steady state:");
+    let bounded = figure(&report, "bounded steady state:");
+    let peak = figure(&report, "bounded restart peak:");
+    assert!(configured < bounded && bounded < peak, "{report}");
+    assert!(
+        report.contains("the bounded figures assume no incarnation a guard close replaced"),
+        "{report}"
+    );
+    assert!(
+        !report.contains("streams added after start and Archive replay targets"),
+        "{report}"
+    );
+    let refused = sizing(&["--max-stream-bytes", "4k"]);
+    assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+}
+
 /// With `--archive` the report counts the Archive's two control streams
 /// and excludes replay targets, whose geometry no option bounds.
 #[test]

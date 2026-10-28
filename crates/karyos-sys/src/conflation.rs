@@ -740,20 +740,17 @@ mod owned {
 
         /// Word index of the journal trailer in a region's structure, after
         /// the configuration line and the slots.
-        #[cfg(target_os = "linux")]
         fn trailer_at(&self) -> Option<usize> {
             STRIDE_WORDS.checked_add(self.slots_words)
         }
 
         /// Word index of the journal data area in a region's structure.
-        #[cfg(target_os = "linux")]
         fn data_at(&self) -> Option<usize> {
             self.trailer_at()?.checked_add(TRAILER_WORDS)
         }
 
         /// Bytes of a region's structure: the configuration line, the
         /// slots, the journal trailer and the journal data area.
-        #[cfg(target_os = "linux")]
         fn structure_length(&self) -> Option<usize> {
             self.data_at()?
                 .checked_add(self.journal_words)?
@@ -773,11 +770,11 @@ mod owned {
         }
     }
 
-    #[cfg(target_os = "linux")]
     impl ConflationConfig {
         /// Bytes of the structure of a table region of this configuration
-        /// ([`conflation_in`]); `None` for a configuration it refuses. A
-        /// view compares a region's length with it before mapping it.
+        /// (`conflation_in`, Linux); `None` for a configuration it refuses.
+        /// A view compares a region's length with it before mapping it, and
+        /// a driver's stream cap counts it, on every platform.
         #[must_use]
         pub fn structure_length(&self) -> Option<usize> {
             Geometry::new(self.keys, self.value_capacity, self.journal_capacity)?.structure_length()

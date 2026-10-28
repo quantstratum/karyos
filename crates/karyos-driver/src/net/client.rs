@@ -111,6 +111,9 @@ fn refusal(error: DriverError) -> ErrorCode {
         // A list longer than the membership holds, or a repeated
         // `receiver_id`: invalid roles, which no retry grants.
         DriverError::InvalidRoles => ErrorCode::InvalidRoles,
+        // A lane above `max_stream_bytes`: the channel's geometry, which
+        // no retry changes (karyos#809).
+        DriverError::StreamTooLarge { .. } => ErrorCode::StreamTooLarge,
         _ => ErrorCode::ResourcesUnavailable,
     }
 }
