@@ -282,7 +282,7 @@ const OPS: &[Op] = &[
         "subscription.await_image",
         &["subscription"],
         &["count"],
-        &["images"],
+        &[],
         &["image-wait"],
     ),
     op(

@@ -223,6 +223,7 @@ unsafe extern "C" {
         change: *mut ImageChange,
         has: *mut u32,
     ) -> i32;
+    fn karyos_subscription_image_changes_lost(subscription: u64, lost: *mut u64) -> i32;
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
     fn karyos_client_options_init_sized(options: *mut ClientOptions, size: usize) -> i32;
@@ -1114,6 +1115,14 @@ pub fn subscription_next_image_change(subscription: u64) -> (i32, Option<ImageCh
     let status =
         unsafe { karyos_subscription_next_image_change(subscription, &mut change, &mut has) };
     (status, (has == 1).then_some(change))
+}
+
+/// `karyos_subscription_image_changes_lost`: the status and the count.
+pub fn subscription_image_changes_lost(subscription: u64) -> (i32, u64) {
+    let mut lost = u64::MAX;
+    // SAFETY: a live, aligned `u64`.
+    let status = unsafe { karyos_subscription_image_changes_lost(subscription, &mut lost) };
+    (status, lost)
 }
 
 /// `karyos_subscription_end_state`: the status and the end written.

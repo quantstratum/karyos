@@ -317,7 +317,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `conflated.close` | `conflated` | none | `conflation` |
 | `subscription.poll_to_end` | `subscription`, [`limit` (default 16)] | `delivered` (the count of every poll), `last` | |
 | `subscription.end` | `subscription` | `reason`: `"none"`, `"end_of_stream"`, `"image_retired"`, `"stream_removed"`, `"revoked"`, `"closed_by_overrun"` or `"other"`; `position`; `seal_code` | |
-| `subscription.await_image` | `subscription`, [`count` (default 1)] | `images`: the images the subscription has reported since it was added | `image-wait` |
+| `subscription.await_image` | `subscription`, [`count` (default 1)] | none: `ok` once the subscription has reported `count` images since it was added | `image-wait` |
 | `archive.connect` | `client` | `archive` | `archive-replay` |
 | `archive.replay` | `archive`, `recording`, `target_stream_id`, [`position` (default 0), `length` (default to the recording's end), `rate`: `"full"` (default), `"as_recorded"` or `"scaled"`, `scale_ppm`] | `replay`, `session` | `archive-replay` |
 | `archive.stop_replay` | `archive`, `replay` | none | `archive-replay` |
@@ -464,10 +464,15 @@ first offer or claim.
 `subscription.await_image subscription=$s` waits until `$s` has reported
 `count` images (default 1) since it was added, counting the image changes
 that report an image available (`karyos_subscription_next_image_change`).
-While it waits, the runner serves `$s`'s client, and runs its embedded
-driver when the scenario did not start it. It answers `ok` with `images`,
-the images reported so far, or `status=timeout` when `count` is not
-reached within 10 s. A failing image change status answers that status.
+While it waits, the runner serves every open client of the scenario,
+and runs every embedded driver the scenario did not start, so the
+publisher's side moves as well as the subscriber's. It answers `ok` once
+`count` is reached, with no result: a subscription may report more images
+than it waited for (a reattach, another session). It answers
+`status=timeout` when `count` is not reached within 10 s, and
+`status=events_lost` when the subscription's image change queue dropped
+changes (`karyos_subscription_image_changes_lost`), since a dropped change
+may have been an image. A failing image change call answers its status.
 The runner waits nowhere else: it matches no URI and keys no session.
 
 Each exclusive stream's publication is added at most once in the whole
