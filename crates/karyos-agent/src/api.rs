@@ -154,9 +154,14 @@ pub const CAPABILITIES: [&str; 8] = [
     "trace-buckets",
 ];
 
-/// A `trace-buckets` reply's bytes at most, besides the first bucket,
-/// which is always whole (R-CORE-23): the next bucket that would pass it
-/// is left for the next read, named by `next`.
+/// The byte bound of a `trace-buckets` reply (R-CORE-23). A reply holds
+/// whole buckets only, and always at least the first one asked for, so a
+/// reader always progresses: its size is at most
+/// `max(MAX_BUCKET_REPLY, the first bucket's encoding)`, and a bucket's
+/// encoding is bounded by the window's `max_bucket_bytes` budget (a larger
+/// bucket is never kept). A client sizes its buffer for that maximum. The
+/// next bucket that would pass the bound is left for the next read, named
+/// by `next`.
 pub const MAX_BUCKET_REPLY: usize = 1 << 20;
 /// Buckets one `trace-buckets` request asks for by default, and at most.
 pub const BUCKETS_DEFAULT: usize = 6;

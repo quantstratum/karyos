@@ -506,3 +506,34 @@ fn bucket_refusals_are_typed() {
         r#"{"error":"bucket over budget","number":3}"#
     );
 }
+
+/// R-CORE-23: a bucket larger than the reply bound on its own comes back
+/// whole and alone, with `next` naming the one after it: the reply is at
+/// most `max(MAX_BUCKET_REPLY, one bucket)`.
+#[test]
+fn a_bucket_over_the_reply_bound_comes_back_whole_and_alone() {
+    let read = crate::api::BucketRead {
+        epoch: 7,
+        slice_ns: 10,
+        current: 2,
+        oldest: 0,
+        buckets: (0..2)
+            .map(|number| spread_bucket(number, 16, 20_000))
+            .collect(),
+    };
+    let alone = {
+        let mut text = String::new();
+        trace_bucket(&mut Out(&mut text), &read.buckets[0]);
+        text
+    };
+    assert!(
+        alone.len() > crate::api::MAX_BUCKET_REPLY,
+        "{}",
+        alone.len()
+    );
+    let reply = trace_buckets(&read, crate::api::MAX_BUCKET_REPLY);
+    assert_eq!(reply.matches(r#""number":"#).count(), 1);
+    assert!(reply.contains(&alone), "the bucket is whole");
+    assert!(reply.ends_with(r#""next":1}"#));
+    assert!(reply.len() <= alone.len() + 256);
+}
