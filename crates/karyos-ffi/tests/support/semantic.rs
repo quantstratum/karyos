@@ -58,9 +58,14 @@ struct Object {
     /// An embedded driver created with its network on
     /// (`driver.create_networked`).
     networked: bool,
-    /// A publication on a `karyos:udp` channel, which connects
-    /// asynchronously.
+    /// A publication or a subscription on a `karyos:udp` channel: the
+    /// first connects asynchronously, the second reads images the driver
+    /// announces.
     network: bool,
+    /// The stream id of a publication or a subscription.
+    stream_id: Option<i32>,
+    /// A `karyos:udp` subscription that has reported an image.
+    imaged: bool,
 }
 
 /// The answer of an op: `ok` with its results, or a status name.
@@ -174,6 +179,8 @@ impl Adapter {
             provided: false,
             networked: false,
             network: false,
+            stream_id: None,
+            imaged: false,
         });
         Value::Object(self.objects.len() - 1)
     }
@@ -247,6 +254,58 @@ impl Adapter {
                 "{at}: {total} of {until} after the deadline"
             );
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Before an offer on a `karyos:udp` publication of a provided client
+    /// or of a client of an embedded driver with its network on, waits,
+    /// serving the client,
+    /// until every open `karyos:udp` subscription of that client and stream
+    /// has reported an image (FORMAT.md, Features, `embedded-network`;
+    /// karyos#830). A reader joins an image at its head (SPEC §4, Joining)
+    /// and the publication is connected once the receiver answers (SPEC §4,
+    /// Connection), so an offer before the client attached the image may
+    /// never reach it. Fails at 10 s.
+    fn await_images(&mut self, publication: usize, at: &str) {
+        let object = &self.objects[publication];
+        let (Some(client), Some(stream_id)) = (object.parent, object.stream_id) else {
+            return;
+        };
+        let networked = self.objects[client].provided
+            || self.objects[client]
+                .parent
+                .is_some_and(|driver| self.objects[driver].networked);
+        if !object.network || !networked {
+            return;
+        }
+        let waiting: Vec<usize> = (0..self.objects.len())
+            .filter(|&index| {
+                let other = &self.objects[index];
+                other.kind == Kind::Subscription
+                    && !other.closed
+                    && other.network
+                    && !other.imaged
+                    && other.parent == Some(client)
+                    && other.stream_id == Some(stream_id)
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        for index in waiting {
+            while !self.objects[index].imaged {
+                assert!(
+                    start.elapsed() < UNTIL_DEADLINE,
+                    "{at}: the subscription of stream {stream_id} has no image after the deadline"
+                );
+                let _ = abi::client_poll(self.objects[client].handle);
+                while let (0, Some(change)) =
+                    abi::subscription_next_image_change(self.objects[index].handle)
+                {
+                    if change.available == 1 {
+                        self.objects[index].imaged = true;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
     }
 
@@ -461,6 +520,7 @@ impl Adapter {
                 let publication = self.insert(Kind::Publication, publication, Some(client));
                 if let Value::Object(index) = publication {
                     self.objects[index].network = uri.to_bytes().starts_with(b"karyos:udp");
+                    self.objects[index].stream_id = Some(args.narrow("stream_id", None));
                 }
                 Answer::Ok(results([("publication", publication)]))
             }
@@ -469,6 +529,7 @@ impl Adapter {
                 if let Some(answer) = self.open(publication, Kind::Publication, at) {
                     return answer;
                 }
+                self.await_images(publication, at);
                 let handle = self.objects[publication].handle;
                 let lane = args.narrow("lane", Some(0));
                 let accepted_size = u32::try_from(size_of::<abi::Accepted>()).unwrap();
@@ -498,6 +559,7 @@ impl Adapter {
                 if let Some(answer) = self.open(publication, Kind::Publication, at) {
                     return answer;
                 }
+                self.await_images(publication, at);
                 let handle = self.objects[publication].handle;
                 let lane = args.narrow("lane", Some(0));
                 let accepted_size = u32::try_from(size_of::<abi::Accepted>()).unwrap();
@@ -619,10 +681,12 @@ impl Adapter {
                 assert_eq!(status, 0, "{at}: karyos_subscription_options_init");
                 options.role = args.narrow("role", Some(options.role));
                 options.rejoin = args.narrow("rejoin", Some(options.rejoin));
+                let uri = args.uri();
+                let stream_id = args.narrow("stream_id", None);
                 let (status, subscription) = abi::client_add_subscription_with(
                     self.objects[client].handle,
-                    &args.uri(),
-                    args.narrow("stream_id", None),
+                    &uri,
+                    stream_id,
                     &options,
                     u32::try_from(size_of::<abi::SubscriptionOptions>()).unwrap(),
                 );
@@ -630,6 +694,10 @@ impl Adapter {
                     return Answer::Status(self.name(status, at));
                 }
                 let subscription = self.insert(Kind::Subscription, subscription, Some(client));
+                if let Value::Object(index) = subscription {
+                    self.objects[index].network = uri.to_bytes().starts_with(b"karyos:udp");
+                    self.objects[index].stream_id = Some(stream_id);
+                }
                 Answer::Ok(results([("subscription", subscription)]))
             }
             "subscription.poll" => {
