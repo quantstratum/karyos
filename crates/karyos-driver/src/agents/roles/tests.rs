@@ -5477,3 +5477,115 @@ fn repeated_refused_announces_wait_once_per_destination() {
         "every destination got its ANNOUNCE: {per:?}"
     );
 }
+
+/// An endpoint on a scripted socket whose every send would block, split.
+fn blocking_endpoint() -> (
+    karyos_io::sockets::endpoint::SocketsTx<karyos_io::sockets::scripted::ScriptedSocket>,
+    karyos_io::sockets::endpoint::SocketsRx<karyos_io::sockets::scripted::ScriptedSocket>,
+) {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let endpoint =
+        SocketsEndpoint::open(&loopback(), InstanceId::FIRST, ScriptedSocket::new()).unwrap();
+    endpoint.split().unwrap()
+}
+
+/// #849 (QS-COORDINATOR): with a cache of one, controls that are claimed
+/// but not sent (the socket would block) never leave two entries closing:
+/// the oldest is given up as failed to make room, so at most one closes.
+#[test]
+fn unsent_controls_keep_at_most_max_closing() {
+    use super::super::control::ControlRoutes;
+
+    let (mut tx, rx) = blocking_endpoint();
+    let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    for port in 44_001..44_005 {
+        let _ = routes.send(&mut tx, at(port), &challenge_control());
+        assert!(routes.lingering() <= 1, "{} closing", routes.lingering());
+    }
+    let refusal = routes.take_refusal().map(|(_, refusal)| refusal);
+    assert!(
+        refusal.unwrap_or_default().close_failed,
+        "the oldest given up"
+    );
+    // The endpoint's reset drops what would not close.
+    let mut endpoint = karyos_io::sockets::endpoint::SocketsEndpoint::join(tx, rx).unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+}
+
+/// #849 (QS-COORDINATOR): ANNOUNCEs waiting for a destination that is
+/// removed, or of a publication that is removed, are purged.
+#[test]
+fn waiting_announces_are_purged_on_removal() {
+    use karyos_protocol::network::Control;
+
+    use super::super::control::ControlRoutes;
+
+    let (mut tx, _seen) = recording_tx();
+    let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
+    let announce = Control::SetupAnnounce(karyos_protocol::network::SetupAnnounce {
+        alias: alias(),
+        identity: identity(),
+        term: TermParams {
+            term_length: 65_536,
+            initial_term_id: 9,
+            mtu: 1408,
+        },
+        lane_count: 1,
+    });
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    for port in 45_001..45_006 {
+        let _ = routes.send_or_wait(&mut tx, at(port), &announce).unwrap();
+    }
+    let waiting = routes.waiting();
+    assert!(waiting >= 2, "some wait: {waiting}");
+    let Control::SetupAnnounce(setup) = announce else {
+        unreachable!()
+    };
+    routes.purge_announces(setup.alias, Some(at(45_005)));
+    assert_eq!(routes.waiting(), waiting - 1, "the removed destination's");
+    routes.purge_announces(setup.alias, None);
+    assert_eq!(routes.waiting(), 0, "the removed publication's");
+}
+
+/// #849 (QS-COORDINATOR): a control other than an ANNOUNCE refused while
+/// every cached route is closing is dropped and counted by kind, never
+/// silently.
+#[test]
+fn a_blocked_control_is_counted_by_kind() {
+    let config = AgentConfig {
+        control_routes: 1,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let control = challenge_control();
+    let at = |port| SocketAddr::from(([10, 0, 0, 8], port));
+    let _ = sender.send(&mut halves, EndpointId(1), at(5000), &control);
+    sender
+        .routes
+        .iter_mut()
+        .find(|slot| slot.endpoint == Some(EndpointId(1)))
+        .unwrap()
+        .routes
+        .hold_closes = true;
+    for port in 5001..5005 {
+        let _ = sender.send(&mut halves, EndpointId(1), at(port), &control);
+    }
+    assert!(
+        sender.counters().blocked_other >= 1,
+        "{:?}",
+        sender.counters()
+    );
+}

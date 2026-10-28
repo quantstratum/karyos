@@ -15,3 +15,10 @@
   it in place, within room allocated at creation (`publications` × 16
   per endpoint), so none is dropped. The new `controls_waiting` sender
   counter counts them.
+  Any other control refused then is dropped and counted by kind
+  (`blocked_status`, `blocked_naks`, `blocked_setup_answers`,
+  `blocked_other`): SMs and NAKs are sent again periodically, and a
+  SETUP answer is solicited again by its peer. A destination removed,
+  or a publication removed, purges the ANNOUNCEs waiting for it. With
+  `control_routes = 1`, at most one route is closing: the oldest one is
+  given up as failed when another needs to close.

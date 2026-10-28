@@ -464,7 +464,25 @@ impl ControlRoutes {
                 self.entries.swap_remove(index);
             }
             Closed::InFlight => {
-                if let Some(entry) = self.entries.get_mut(index) {
+                // At most `max` closing: those closed since make room, else
+                // the oldest closing one is given up as failed, its grace
+                // spent, so this one can close.
+                if self.closing_count() >= self.max {
+                    self.reclose_closed(tx);
+                }
+                if self.closing_count() >= self.max
+                    && let Some(oldest) = self
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, entry)| entry.closing)
+                        .min_by_key(|(_, entry)| entry.used)
+                        .map(|(at, _)| at)
+                {
+                    self.entries.swap_remove(oldest);
+                    self.refusal.close_failed = true;
+                }
+                if let Some(entry) = self.entries.iter_mut().find(|entry| entry.queue == queue) {
                     entry.closing = true;
                 }
             }
@@ -499,6 +517,10 @@ impl ControlRoutes {
         self.send_waiting(tx);
     }
 
+    fn closing_count(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.closing).count()
+    }
+
     /// Closes again the closing entries that have closed since, keeping
     /// the others for the duty: none counts as failed here, so a burst of
     /// sends cannot use up their grace.
@@ -511,6 +533,20 @@ impl ControlRoutes {
                 index += 1;
             }
         }
+    }
+
+    /// Drops the ANNOUNCEs of `alias` waiting, to `destination` only when
+    /// given: a destination removed, or the publication removed, announces
+    /// nothing stale (#849).
+    pub fn purge_announces(
+        &mut self,
+        alias: karyos_protocol::network::Alias,
+        destination: Option<SocketAddr>,
+    ) {
+        self.waiting.retain(|(address, control)| {
+            !(matches!(control, Control::SetupAnnounce(announce) if announce.alias == alias)
+                && destination.is_none_or(|destination| destination == *address))
+        });
     }
 
     /// Sends the controls waiting, in order, until one is blocked again.

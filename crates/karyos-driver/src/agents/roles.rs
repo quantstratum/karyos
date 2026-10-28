@@ -396,6 +396,16 @@ pub struct SenderCounters {
     /// ANNOUNCEs that waited for a control route of their endpoint to
     /// finish closing, sent in order at the next send or duty (#838).
     pub controls_waiting: u64,
+    /// Controls dropped because every cached control route of their
+    /// endpoint was closing (#849), by kind: SMs, NAKs, SETUP answers, and
+    /// the others (RTTM, PATH_HB, RSP_SETUP, ERR). Only an ANNOUNCE waits.
+    pub blocked_status: u64,
+    /// See [`SenderCounters::blocked_status`].
+    pub blocked_naks: u64,
+    /// See [`SenderCounters::blocked_status`].
+    pub blocked_setup_answers: u64,
+    /// See [`SenderCounters::blocked_status`].
+    pub blocked_other: u64,
     /// Removed publications' entries closed again at the next duty because
     /// a queue still had frames in flight (#838).
     pub removed_close_deferred: u64,
@@ -4918,6 +4928,13 @@ impl<T: StreamTerms> SenderRole<T> {
                     break 'publications;
                 }
                 outbound.removal_reported(removal.destination, now);
+                // No ANNOUNCE to it waits any more.
+                for slot in &mut self.routes {
+                    if slot.endpoint == Some(endpoint) {
+                        slot.routes
+                            .purge_announces(alias, Some(removal.destination));
+                    }
+                }
                 // Its route and queues go to the close list now, so the
                 // next cycle's commands, served before its duty, find the
                 // slot free; that duty closes them before it opens anything.
@@ -5001,6 +5018,11 @@ impl<T: StreamTerms> SenderRole<T> {
             Some(outbound) => {
                 for path in outbound.route_endpoints() {
                     let _ = self.sessions.remove(path, alias);
+                    for slot in &mut self.routes {
+                        if slot.endpoint == Some(path) {
+                            slot.routes.purge_announces(alias, None);
+                        }
+                    }
                 }
                 self.bindings.retain(|binding| {
                     !(outbound.serves(binding.endpoint) && binding.alias == alias)
@@ -5008,6 +5030,11 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             None => {
                 let _ = self.sessions.remove(endpoint, alias);
+                for slot in &mut self.routes {
+                    if slot.endpoint == Some(endpoint) {
+                        slot.routes.purge_announces(alias, None);
+                    }
+                }
                 self.bindings
                     .retain(|binding| (binding.endpoint, binding.alias) != (endpoint, alias));
             }
@@ -5410,6 +5437,20 @@ impl<T: StreamTerms> SenderRole<T> {
             Err(ControlSendError::Uncertain) => {
                 self.count(|c| &mut c.send_failures);
                 Sent::Uncertain
+            }
+            // Every cached route closing: an ANNOUNCE waited above; any
+            // other control is dropped and counted by kind (#849): SMs and
+            // NAKs are sent again periodically, a SETUP answer is solicited
+            // again by its peer.
+            Err(ControlSendError::Blocked) => {
+                self.count(|c| &mut c.send_failures);
+                match control {
+                    Control::Status(_) => self.count(|c| &mut c.blocked_status),
+                    Control::Nak(_) => self.count(|c| &mut c.blocked_naks),
+                    Control::SetupAnswer(_) => self.count(|c| &mut c.blocked_setup_answers),
+                    _ => self.count(|c| &mut c.blocked_other),
+                }
+                Sent::NotSubmitted
             }
             Err(_) => {
                 self.count(|c| &mut c.send_failures);
