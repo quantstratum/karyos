@@ -4670,3 +4670,198 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
         "the old queue and route"
     );
 }
+
+/// An endpoint `id` whose socket answers its first sends with `first`,
+/// then takes every later one; its header-only DATA frames and its DATA sends are
+/// recorded as [`header_only_endpoint`]'s.
+fn scripted_endpoint(
+    id: u32,
+    first: &[karyos_io::sockets::ops::SendResult],
+) -> (
+    super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
+    Headers,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let data = Arc::new(AtomicUsize::new(0));
+    let (seen, sent) = (Arc::clone(&frames), Arc::clone(&data));
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            let length = i32::from_le_bytes(datagram[..4].try_into().unwrap());
+            if datagram.len() == 32 && length == 32 {
+                seen.lock().unwrap().push((
+                    u32::from_le_bytes(datagram[20..24].try_into().unwrap()),
+                    i32::from_le_bytes(datagram[8..12].try_into().unwrap()),
+                    datagram[5],
+                ));
+            } else if length > 32 {
+                sent.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }));
+    for result in first {
+        observer.push_send(*result);
+    }
+    for _ in 0..512 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let instance = InstanceId::new(NonZeroU32::new(id).unwrap());
+    let endpoint = SocketsEndpoint::open(&loopback(), instance, socket).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    (super::super::Half::Tx(Box::new(tx)), frames, data)
+}
+
+/// A routed publication on endpoints 1 and 2, bound on both, its first
+/// message sent at 2..6: the sender, the log, the halves, and each
+/// endpoint's header-only frames and DATA sends.
+#[allow(clippy::type_complexity)]
+fn routed_lane(
+    second: &[karyos_io::sockets::ops::SendResult],
+) -> (
+    super::SenderRole,
+    super::super::data::testing::TestLog,
+    Vec<(
+        EndpointId,
+        super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
+    )>,
+    [Headers; 2],
+    [std::sync::Arc<std::sync::atomic::AtomicUsize>; 2],
+) {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let config = AgentConfig {
+        path_heartbeat_interval: AgentConfig::default()
+            .sender_heartbeat_interval
+            .saturating_mul(1000),
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
+    let (event, mut log) = add_routed(&mut sender);
+    assert!(matches!(event, Some(AgentEvent::PublicationAdded { .. })));
+    let (one, frames_one, data_one) = scripted_endpoint(1, &[]);
+    let (two, frames_two, data_two) = scripted_endpoint(2, second);
+    let mut halves = vec![(EndpointId(1), one), (EndpointId(2), two)];
+    for (endpoint, at) in [(1, "10.0.0.2:4000"), (2, "10.0.0.3:4000")] {
+        let _ = at;
+        let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+        sender.bind(EndpointId(endpoint), receiver, &sm_answer([7, 8], 0), 0);
+        sender.status(EndpointId(endpoint), receiver, &sm_status([7, 8], 0), 1);
+    }
+    let _ = log.publications[0]
+        .append(&[1; 1000], AppendOptions::default())
+        .unwrap();
+    for now in 2..6 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    (
+        sender,
+        log,
+        halves,
+        [frames_one, frames_two],
+        [data_one, data_two],
+    )
+}
+
+/// G1 (#842): a routed lane with DATA flowing on its routes sends no idle
+/// heartbeat, however long it runs; once the DATA stops, one interval on,
+/// each route gets one.
+#[test]
+fn a_routed_lane_with_data_flowing_sends_no_heartbeat() {
+    use std::sync::atomic::Ordering;
+
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, data) = routed_lane(&[]);
+    let mut now = 6;
+    for _ in 0..8 {
+        now += interval / 2;
+        let _ = log.publications[0]
+            .append(&[2; 1000], AppendOptions::default())
+            .unwrap();
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    assert_eq!(
+        (
+            data[0].load(Ordering::Relaxed),
+            data[1].load(Ordering::Relaxed)
+        ),
+        (9, 9),
+        "DATA on both routes"
+    );
+    assert_eq!(sender.counters().heartbeats_sent, 0, "busy routes");
+    assert!(frames[0].lock().unwrap().is_empty() && frames[1].lock().unwrap().is_empty());
+    let _ = sender.duty(&mut halves, now + interval).unwrap();
+    assert_eq!(sender.counters().heartbeats_sent, 2, "one per route");
+}
+
+/// G2 (#842): route 2 is slow (its socket would block) and holds copies
+/// route 1 sent long ago: no route gets a heartbeat while any route holds
+/// a copy, so none announces a position a held copy would still bring.
+/// When route 2 then faults, its copies are returned in that serve (it
+/// waits for its endpoint's reset holding none, and an unreliable lane
+/// does not send them again): route 1's heartbeat then announces only
+/// what route 1 sent, and no route holds anything past it.
+#[test]
+fn held_copies_on_a_route_hold_back_every_heartbeat() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let ok = SendResult::Sent {
+        sent: 1,
+        error: None,
+    };
+    let blocked = SendResult::Error(Errno::AGAIN);
+    let (mut sender, mut log, mut halves, frames, data) = routed_lane(&[
+        ok,
+        blocked,
+        blocked,
+        blocked,
+        SendResult::Error(Errno::BADF),
+    ]);
+    for byte in [2, 3] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    for step in 0..=2 {
+        let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
+        let held = sender.publications[0].routed_pending(0, 1);
+        assert!(held > 0, "route 2 holds its copies at step {step}");
+        assert!(
+            frames[0].lock().unwrap().is_empty(),
+            "no heartbeat on route 1 at step {step}"
+        );
+    }
+    assert_eq!(
+        data[0].load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "route 1 sent all three"
+    );
+    // The fault: route 2's copies are returned, none is held.
+    let _ = sender.duty(&mut halves, 6 + 3 * interval).unwrap();
+    assert!(sender.publications[0].needs_reset(), "route 2 faulted");
+    assert_eq!(sender.publications[0].routed_pending(0, 1), 0);
+    let _ = sender.duty(&mut halves, 6 + 4 * interval).unwrap();
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(
+        beats.iter().all(|(_, offset, _)| *offset == 3 * 1056),
+        "at what route 1 sent: {beats:?}"
+    );
+    assert!(frames[1].lock().unwrap().is_empty(), "none on route 2");
+}

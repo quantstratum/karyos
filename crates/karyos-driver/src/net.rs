@@ -1475,6 +1475,20 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// The sources whose idle heartbeat past the lost tail arrived at the
+    /// receiver (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(crate) fn receiver_tail_heartbeat_sources(&self) -> usize {
+        match &self.agents {
+            Agents::Shared(agents) => agents.receiver.tail_heartbeat_sources(),
+            _ => 0,
+        }
+    }
+
     /// Holds back the attach of the conflated views built from now on, as
     /// if their feeders attached late (tests).
     #[cfg(test)]

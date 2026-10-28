@@ -3444,16 +3444,14 @@ fn a_tail_lost_on_every_path_is_one_local_gap() {
     }
     let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
     assert_eq!(receiver.gaps_sealed, 1, "{receiver:?}");
-    assert!(
-        a.net
-            .as_ref()
-            .unwrap()
-            .sender_counters()
-            .unwrap()
-            .heartbeats_sent
-            >= 2,
-        "heartbeats on both paths"
-    );
+    // Each path's heartbeat past the tail reached B (G3, #842 review).
+    if b.network_path_counters().1 == 0 {
+        assert_eq!(
+            b.net.as_ref().unwrap().receiver_tail_heartbeat_sources(),
+            2,
+            "a heartbeat on both paths"
+        );
+    }
 }
 
 /// karyos#834: the same tail on a reliable two-path lane is NAKed and

@@ -361,8 +361,8 @@ pub struct SenderCounters {
     /// Controls sent.
     pub sent: u64,
     /// Idle heartbeats submitted: header-only DATA frames of established
-    /// single-path lanes that sent nothing for `sender_heartbeat_interval`
-    /// (SPEC §6).
+    /// lanes that sent nothing for `sender_heartbeat_interval` (SPEC §6),
+    /// one per route of a redundant-path lane, each counted.
     pub heartbeats_sent: u64,
     /// Queues and routes of removed publications, and of retired
     /// destinations of a multi-destination publication, the sender closed
@@ -511,6 +511,21 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
         Some(next) => *value = next,
         None => *overflowed = true,
     }
+}
+
+/// Test only: the frame length and term offset of the DATA frame `bytes`
+/// starts with, from its header (word 0, then the term offset at bytes 8
+/// to 12); `None` for another frame type or a short datagram.
+#[cfg(test)]
+fn drop_tail_frame(bytes: &[u8]) -> Option<(i32, u32)> {
+    use karyos_sys::frame::{FrameType, Word0};
+
+    let word0 = Word0::unpack(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)).ok()?;
+    if FrameType::try_from_code(word0.frame_type_code()).ok()? != FrameType::Data {
+        return None;
+    }
+    let offset = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+    Some((word0.frame_length(), offset))
 }
 
 /// Test only: a tail's first transmission lost (`ReceiverRole::drop_tail`):
@@ -2277,6 +2292,17 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.drop_tail = Some((term_offset, one_source, None, [None; 4]));
     }
 
+    /// The sources whose idle heartbeat past the lost tail arrived (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(super) fn tail_heartbeat_sources(&self) -> usize {
+        self.drop_tail
+            .map_or(0, |(_, _, _, done)| done.iter().flatten().count())
+    }
+
     /// Whether the path queues are allocated (tests).
     #[cfg(test)]
     pub(super) fn has_path_queues(&self) -> bool {
@@ -3891,23 +3917,14 @@ impl<T: StreamTerms> Intake<'_, T> {
             if self.role.drop_data.contains(&seen) {
                 return;
             }
-            // A frame with a payload at or past the offset: its header's
-            // length is above 32, its term offset at bytes 4 to 8.
+            // A DATA frame at or past the offset, decoded from its header:
+            // word 0 (length, flags, type), then the term offset.
             if let Some((offset, one_source, chosen, mut done)) = self.role.drop_tail
-                && let (Some(length), Some(at)) = (
-                    bytes
-                        .get(..4)
-                        .and_then(|word| word.try_into().ok())
-                        .map(i32::from_le_bytes),
-                    bytes
-                        .get(4..8)
-                        .and_then(|word| word.try_into().ok())
-                        .map(u32::from_le_bytes),
-                )
+                && let Some((length, at)) = drop_tail_frame(bytes)
                 && at >= offset
                 && !done.contains(&Some(source))
             {
-                if length <= 32 {
+                if length <= karyos_sys::frame::HEADER_LENGTH as i32 {
                     // The source's idle heartbeat: its tail was sent.
                     if let Some(slot) = done.iter_mut().find(|slot| slot.is_none()) {
                         *slot = Some(source);
