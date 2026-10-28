@@ -1,4 +1,4 @@
-abi_version=0.1.3
+abi_version=0.1.4
 struct karyos_detail size=24 align=8
   size offset=0 size=4
   reserved offset=4 size=4
@@ -16,7 +16,7 @@ struct karyos_accepted size=16 align=8
   size offset=0 size=4
   lane offset=4 size=4
   position offset=8 size=8
-struct karyos_driver_options size=64 align=8
+struct karyos_driver_options size=72 align=8
   size offset=0 size=4
   max_clients offset=4 size=4
   max_streams offset=8 size=4
@@ -29,6 +29,8 @@ struct karyos_driver_options size=64 align=8
   client_liveness_timeout_ns offset=40 size=8
   cutover_deadline_ns offset=48 size=8
   startup_timeout_ns offset=56 size=8
+  network offset=64 size=4
+  reserved0 offset=68 size=4
 struct karyos_readiness size=24 align=8
   size offset=0 size=4
   state offset=4 size=4
@@ -144,7 +146,7 @@ struct karyos_subscription_end size=24 align=8
   seal_code offset=16 size=8
 const KARYOS_ABI_VERSION_MAJOR=0
 const KARYOS_ABI_VERSION_MINOR=1
-const KARYOS_ABI_VERSION_PATCH=3
+const KARYOS_ABI_VERSION_PATCH=4
 const KARYOS_NULL_HANDLE=0
 const KARYOS_MAX_CLIENTS=64
 const KARYOS_MAX_PUBLICATIONS=4096
@@ -212,6 +214,8 @@ const KARYOS_IDLE_BUSY_SPIN=0
 const KARYOS_IDLE_YIELD=1
 const KARYOS_IDLE_SLEEP=2
 const KARYOS_IDLE_YIELD_THEN_SLEEP=3
+const KARYOS_NETWORK_OFF=0
+const KARYOS_NETWORK_ON=1
 const KARYOS_READINESS_STARTING=1
 const KARYOS_READINESS_READY=2
 const KARYOS_READINESS_RECOVERING=3
