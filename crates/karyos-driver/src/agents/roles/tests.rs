@@ -5100,3 +5100,338 @@ fn a_close_in_flight_gets_one_more_duty() {
         sender.close_in_flight = 0;
     }
 }
+
+/// Y2 (#838): a control route refused for the endpoint's route limit, or a
+/// control queue for its queue limit, is reported with its epoch; an
+/// evicted entry in flight is closed at the next use, and counts as a
+/// failed close only when it is still in flight then.
+#[test]
+fn control_routes_report_limits_and_failed_closes() {
+    use karyos_io::backend::{Authority, InstanceId, TxQueueConfig};
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::control::{ControlRefusal, ControlRoutes};
+
+    let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
+    let open = |routes: u16, queues: u16| {
+        let socket = ScriptedSocket::new();
+        for _ in 0..8 {
+            socket.push_send(karyos_io::sockets::ops::SendResult::Sent {
+                sent: 1,
+                error: None,
+            });
+        }
+        let mut config = loopback();
+        config.max_routes = std::num::NonZeroU16::new(routes).unwrap();
+        config.max_queues = std::num::NonZeroU16::new(queues).unwrap();
+        let endpoint = SocketsEndpoint::open(&config, InstanceId::FIRST, socket).unwrap();
+        endpoint.split().unwrap().0
+    };
+    // The route table full.
+    for queue_limit in [false, true] {
+        let mut tx = if queue_limit { open(2, 1) } else { open(1, 1) };
+        let route = tx.add_route(at(41_009)).unwrap();
+        let _keeper = tx
+            .open_queue(TxQueueConfig {
+                authority: Authority::FIRST,
+                route,
+                max_pending: std::num::NonZeroU16::MIN,
+            })
+            .unwrap();
+        let mut routes = ControlRoutes::new(2);
+        assert!(
+            routes
+                .send(&mut tx, at(41_001), &challenge_control())
+                .is_err()
+        );
+        let epoch = tx.capabilities().epoch;
+        assert_eq!(
+            routes.take_refusal(),
+            Some((
+                epoch,
+                ControlRefusal {
+                    limited: true,
+                    close_failed: false
+                }
+            )),
+            "queue limit {queue_limit}"
+        );
+        assert_eq!(routes.take_refusal(), None, "taken");
+    }
+    // An eviction in flight, then a burst of sends: none of them marks it
+    // failed. The duty closes it again, with no further send: closed, or
+    // failed when still in flight; either way nothing is left lingering.
+    for (in_flight, close_failed) in [(1u32, false), (2, true)] {
+        let mut tx = open(4, 4);
+        let mut routes = ControlRoutes::new(1);
+        routes
+            .send(&mut tx, at(41_001), &challenge_control())
+            .unwrap();
+        routes.close_in_flight = in_flight;
+        routes
+            .send(&mut tx, at(41_002), &challenge_control())
+            .unwrap();
+        for _ in 0..3 {
+            routes
+                .send(&mut tx, at(41_002), &challenge_control())
+                .unwrap();
+        }
+        assert_eq!(routes.take_refusal(), None, "not failed before the duty");
+        routes.close_lingering(&mut tx);
+        assert_eq!(routes.lingering(), 0, "nothing leaks");
+        let refusal = routes.take_refusal().map(|(_, refusal)| refusal);
+        assert_eq!(
+            refusal.unwrap_or_default().close_failed,
+            close_failed,
+            "in flight {in_flight}"
+        );
+    }
+}
+
+/// Y2 (#838) on the sender: a control route that would not close in the
+/// epoch, then a control refused for the endpoint's limit, asks for its
+/// reset; the limit alone, or a failed close of another epoch, does not.
+#[test]
+fn a_control_close_failure_counts_for_the_limit() {
+    use super::super::control::ControlRefusal;
+
+    for (close_failed, same_epoch, expected) in
+        [(true, true, 1usize), (false, true, 0), (true, false, 0)]
+    {
+        let (mut sender, _receiver) =
+            super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+        let (half, _frames, _data, _rx) = header_only_endpoint();
+        let mut halves: Halves = vec![(EndpointId(1), half)];
+        let super::super::Half::Tx(tx) = &halves[0].1 else {
+            panic!("a TX half");
+        };
+        let epoch = tx.capabilities().epoch;
+        let slot = &mut sender.routes[0];
+        slot.endpoint = Some(EndpointId(1));
+        if close_failed {
+            slot.routes.refuse(
+                epoch,
+                ControlRefusal {
+                    limited: false,
+                    close_failed: true,
+                },
+            );
+        }
+        let _ = sender.duty(&mut halves, 0).unwrap();
+        let limited_in = if same_epoch {
+            epoch
+        } else {
+            karyos_io::backend::BackendEpoch::new(epoch.get().checked_add(1).unwrap())
+        };
+        sender.routes[0].routes.refuse(
+            limited_in,
+            ControlRefusal {
+                limited: true,
+                close_failed: false,
+            },
+        );
+        let mut asked = 0usize;
+        for now in 1..4 {
+            let _ = sender.duty(&mut halves, now).unwrap();
+            sender.request_resets(|endpoint, _| {
+                asked += usize::from(endpoint == EndpointId(1));
+                true
+            });
+        }
+        assert_eq!(
+            asked, expected,
+            "close failed {close_failed}, same epoch {same_epoch}"
+        );
+        assert_eq!(
+            sender.counters().removed_close_failed,
+            u64::from(close_failed)
+        );
+    }
+}
+
+/// V1 (#838) on the sender: a control route evicted with frames in flight
+/// is closed again by the duty, with no further control sent: closed, or
+/// counted as a failed close once still in flight; nothing lingers.
+#[test]
+fn the_duty_closes_an_evicted_control_route_in_flight() {
+    for (in_flight, failed) in [(1u32, 0u64), (2, 1)] {
+        let config = AgentConfig {
+            control_routes: 1,
+            ..AgentConfig::default()
+        };
+        let (mut sender, _receiver) =
+            super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+        let (half, _frames, _data, _rx) = header_only_endpoint();
+        let mut halves: Halves = vec![(EndpointId(1), half)];
+        let control = challenge_control();
+        let first: SocketAddr = "10.0.0.8:5000".parse().unwrap();
+        let second: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+        let _ = sender.send(&mut halves, EndpointId(1), first, &control);
+        let slot = sender
+            .routes
+            .iter_mut()
+            .find(|slot| slot.endpoint == Some(EndpointId(1)))
+            .unwrap();
+        slot.routes.close_in_flight = in_flight;
+        // Evicts the first destination's route, in flight.
+        let _ = sender.send(&mut halves, EndpointId(1), second, &control);
+        for now in 0..3 {
+            let _ = sender.duty(&mut halves, now).unwrap();
+        }
+        let slot = sender
+            .routes
+            .iter()
+            .find(|slot| slot.endpoint == Some(EndpointId(1)))
+            .unwrap();
+        assert_eq!(slot.routes.lingering(), 0, "nothing lingers");
+        assert_eq!(
+            sender.counters().removed_close_failed,
+            failed,
+            "in flight {in_flight}"
+        );
+    }
+}
+
+/// #838 review: a burst to more distinct destinations than the cache and
+/// its in-flight list hold marks no close failed: with the list full of
+/// entries still in flight, a further destination's send is refused until
+/// the duty closes them, and then goes out.
+#[test]
+fn a_burst_to_many_destinations_fails_no_close_in_flight() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::control::ControlRoutes;
+
+    let socket = ScriptedSocket::new();
+    for _ in 0..8 {
+        socket.push_send(karyos_io::sockets::ops::SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (mut tx, _rx) = endpoint.split().unwrap();
+    let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
+    let mut routes = ControlRoutes::new(1);
+    routes
+        .send(&mut tx, at(41_001), &challenge_control())
+        .unwrap();
+    // A's eviction, then its reclose at C: both in flight.
+    routes.close_in_flight = 2;
+    routes
+        .send(&mut tx, at(41_002), &challenge_control())
+        .unwrap();
+    assert!(
+        routes
+            .send(&mut tx, at(41_003), &challenge_control())
+            .is_err(),
+        "C waits"
+    );
+    assert_eq!(routes.take_refusal(), None, "nothing failed, no limit");
+    // The duty closes A; C goes out.
+    routes.close_lingering(&mut tx);
+    assert_eq!(routes.take_refusal(), None);
+    routes
+        .send(&mut tx, at(41_003), &challenge_control())
+        .unwrap();
+    assert_eq!(routes.cached(), [at(41_003)]);
+}
+
+/// An endpoint on a scripted socket that takes every send, recording each
+/// datagram's destination in order.
+fn recording_tx() -> (
+    karyos_io::sockets::endpoint::SocketsTx<karyos_io::sockets::scripted::ScriptedSocket>,
+    std::sync::Arc<std::sync::Mutex<Vec<SocketAddr>>>,
+) {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let socket = ScriptedSocket::new();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = std::sync::Arc::clone(&seen);
+    socket
+        .observer()
+        .set_send_hook(Box::new(move |route, datagrams| {
+            for _ in datagrams {
+                log.lock().unwrap().push(route.address());
+            }
+        }));
+    for _ in 0..256 {
+        socket.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    (endpoint.split().unwrap().0, seen)
+}
+
+/// C1 (#838 review): entries evicted with frames in flight, by the cache
+/// or by a failed claim or send, never grow the cache past the capacity
+/// allocated at creation: once it is full of entries still closing, a
+/// further destination is blocked, not added.
+#[test]
+fn closing_control_routes_stay_within_their_capacity() {
+    use super::super::control::{ControlRoutes, ControlSendError};
+
+    let (mut tx, _seen) = recording_tx();
+    let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
+    let mut routes = ControlRoutes::new(1);
+    let (_, capacity) = routes.entries();
+    routes
+        .send(&mut tx, at(41_001), &challenge_control())
+        .unwrap();
+    routes.hold_closes = true;
+    let mut blocked = 0;
+    for port in 41_002..41_010 {
+        if routes.send(&mut tx, at(port), &challenge_control()) == Err(ControlSendError::Blocked) {
+            blocked += 1;
+        }
+        let (len, now) = routes.entries();
+        assert!(len <= capacity, "{len} entries in {capacity}");
+        assert_eq!(now, capacity, "no reallocation");
+    }
+    assert!(blocked > 0, "full of closing entries: blocked");
+    assert_eq!(routes.take_refusal(), None, "nothing failed, no limit");
+}
+
+/// C2 (#838 review): ANNOUNCEs to sixteen destinations through a cache of
+/// one, every eviction still in flight: those refused wait in order, and
+/// at the following duties every destination gets its ANNOUNCE, in order,
+/// none twice.
+#[test]
+fn refused_announces_wait_in_order_and_all_go() {
+    use super::super::control::ControlRoutes;
+
+    let (mut tx, seen) = recording_tx();
+    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 42_000 + index));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    let mut waited = 0;
+    for index in 1..=16 {
+        if !routes
+            .send_or_wait(&mut tx, at(index), &challenge_control())
+            .unwrap()
+        {
+            waited += 1;
+        }
+    }
+    assert!(waited > 0, "some waited");
+    assert_eq!(routes.waiting(), waited);
+    routes.hold_closes = false;
+    for _ in 0..4 {
+        routes.close_lingering(&mut tx);
+    }
+    assert_eq!(routes.waiting(), 0, "all sent");
+    let sent = seen.lock().unwrap().clone();
+    assert_eq!(
+        sent,
+        (1..=16).map(at).collect::<Vec<_>>(),
+        "in order, once each"
+    );
+}

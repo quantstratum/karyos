@@ -267,6 +267,9 @@ pub enum ControlSendError {
     /// Its exposure is unknown: the backend reported a result outside its
     /// documented range (it may have left).
     Uncertain,
+    /// Every cached route is still closing with frames in flight: the
+    /// control waits for the duty that closes them (#838).
+    Blocked,
 }
 
 /// One cached control destination.
@@ -276,6 +279,10 @@ struct Destination {
     route: RouteId,
     queue: TxQueueId,
     used: u64,
+    /// Evicted with frames in flight: it sends nothing more, keeps its
+    /// place in the cache, and is closed again at the sender's next duty
+    /// before it counts as failed (#838).
+    closing: bool,
 }
 
 /// The control routes of one endpoint's TX half, for one backend epoch.
@@ -288,7 +295,46 @@ pub struct ControlRoutes {
     /// A logical clock for least-recently-used eviction.
     tick: u64,
     report: TxReport,
+    /// Controls refused while every cached route was closing, in order:
+    /// sent before any later one, at the next send or duty (#838). Bounded
+    /// at creation; one past it is dropped and counted.
+    waiting: std::collections::VecDeque<(SocketAddr, Control)>,
+    /// Controls dropped with the waiting queue full.
+    pub(crate) waits_dropped: u64,
+    /// What this epoch refused or failed to close, until the sender takes
+    /// it ([`ControlRoutes::take_refusal`]).
+    refusal: ControlRefusal,
+    /// Test only: the next closes to report in flight.
+    #[cfg(test)]
+    pub(crate) close_in_flight: u32,
+    /// Test only: every close reports in flight while set.
+    #[cfg(test)]
+    pub(crate) hold_closes: bool,
 }
+
+/// What an endpoint's control routes hit in its current epoch (#838): a
+/// route or queue refused for the endpoint's limit, and a close that did
+/// not complete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ControlRefusal {
+    /// A route or queue was refused for the endpoint's limit.
+    pub limited: bool,
+    /// A live route or queue did not close.
+    pub close_failed: bool,
+}
+
+/// How a control entry's close went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    Done,
+    /// Its queue still has frames in flight.
+    InFlight,
+    Failed,
+}
+
+/// Room in the waiting queue past one control per cached route: a
+/// multi-destination publication's ANNOUNCE round.
+const WAITING_EXTRA: usize = super::data::MAX_DESTINATIONS;
 
 /// Datagrams one control queue holds: controls are sent at once.
 const CONTROL_QUEUE_DEPTH: u16 = 4;
@@ -299,11 +345,19 @@ impl ControlRoutes {
     pub fn new(max: usize) -> Self {
         let max = max.max(1);
         Self {
-            entries: Vec::with_capacity(max),
+            // At most `max` open entries, and as many closing.
+            entries: Vec::with_capacity(max.saturating_mul(2)),
             max,
             epoch: None,
             tick: 0,
             report: TxReport::new(),
+            waiting: std::collections::VecDeque::with_capacity(max.saturating_add(WAITING_EXTRA)),
+            waits_dropped: 0,
+            refusal: ControlRefusal::default(),
+            #[cfg(test)]
+            close_in_flight: 0,
+            #[cfg(test)]
+            hold_closes: false,
         }
     }
 
@@ -311,24 +365,170 @@ impl ControlRoutes {
     /// endpoint handed back, or a half of a new epoch.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.waiting.clear();
         self.epoch = None;
+        self.refusal = ControlRefusal::default();
+    }
+
+    /// Test only: the entries evicted in flight, not closed yet.
+    #[cfg(test)]
+    pub(crate) fn lingering(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.closing).count()
+    }
+
+    /// Test only: the cache's entries, open and closing, and the capacity
+    /// allocated for them.
+    #[cfg(test)]
+    pub(crate) fn entries(&self) -> (usize, usize) {
+        (self.entries.len(), self.entries.capacity())
+    }
+
+    /// Test only: the controls waiting.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting.len()
+    }
+
+    /// Test only: records `refusal` as this cache's, in `epoch`.
+    #[cfg(test)]
+    pub(crate) fn refuse(&mut self, epoch: BackendEpoch, refusal: ControlRefusal) {
+        self.epoch = Some(epoch);
+        self.refusal.limited |= refusal.limited;
+        self.refusal.close_failed |= refusal.close_failed;
+    }
+
+    /// What this epoch's control routes refused or failed to close since
+    /// the last call, which clears it, with that epoch.
+    pub fn take_refusal(&mut self) -> Option<(BackendEpoch, ControlRefusal)> {
+        let refusal = std::mem::take(&mut self.refusal);
+        self.epoch
+            .filter(|_| refusal != ControlRefusal::default())
+            .map(|epoch| (epoch, refusal))
     }
 
     /// The cached destinations, oldest use first (tests).
     #[cfg(test)]
     pub(crate) fn cached(&self) -> Vec<SocketAddr> {
-        let mut entries = self.entries.clone();
+        let mut entries: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.closing)
+            .copied()
+            .collect();
         entries.sort_by_key(|entry| entry.used);
         entries.iter().map(|entry| entry.address).collect()
     }
 
-    /// Drops the entry of `queue` from `tx` and the cache.
+    /// Drops the entry of `queue` from `tx` and the cache; one with frames
+    /// in flight stays, closing, until the next duty.
     fn evict<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, queue: TxQueueId) {
-        if let Some(index) = self.entries.iter().position(|entry| entry.queue == queue) {
-            let old = self.entries.swap_remove(index);
-            let _ = tx.close_queue(old.queue, &mut self.report);
-            while self.report.pop_front().is_some() {}
-            let _ = tx.remove_route(old.route);
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.queue == queue && !entry.closing)
+        else {
+            return;
+        };
+        let Some(old) = self.entries.get(index).copied() else {
+            return;
+        };
+        match self.close(tx, old) {
+            Closed::Done => {
+                self.entries.swap_remove(index);
+            }
+            Closed::InFlight => {
+                if let Some(entry) = self.entries.get_mut(index) {
+                    entry.closing = true;
+                }
+            }
+            Closed::Failed => {
+                self.entries.swap_remove(index);
+                self.refusal.close_failed = true;
+            }
+        }
+    }
+
+    /// The sender's duty: closes again the entries evicted with frames in
+    /// flight (each cycle, however many controls it sends), what still
+    /// does not close having failed, then sends the controls waiting, in
+    /// order. A half of another epoch dropped them in its reset.
+    pub fn close_lingering<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        if self.epoch != Some(tx.capabilities().epoch) {
+            self.entries.clear();
+            self.waiting.clear();
+            return;
+        }
+        let mut index = 0;
+        while let Some(old) = self.entries.get(index).copied() {
+            if !old.closing {
+                index += 1;
+                continue;
+            }
+            if self.close(tx, old) != Closed::Done {
+                self.refusal.close_failed = true;
+            }
+            self.entries.swap_remove(index);
+        }
+        self.send_waiting(tx);
+    }
+
+    /// Closes again the closing entries that have closed since, keeping
+    /// the others for the duty: none counts as failed here, so a burst of
+    /// sends cannot use up their grace.
+    fn reclose_closed<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        let mut index = 0;
+        while let Some(old) = self.entries.get(index).copied() {
+            if old.closing && self.close(tx, old) == Closed::Done {
+                self.entries.swap_remove(index);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Sends the controls waiting, in order, until one is blocked again.
+    fn send_waiting<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        while let Some((address, control)) = self.waiting.pop_front() {
+            if self.send_now(tx, address, &control) == Err(ControlSendError::Blocked) {
+                self.waiting.push_front((address, control));
+                return;
+            }
+        }
+    }
+
+    /// Closes `old`'s queue, then its route. A handle already gone counts
+    /// as closed.
+    fn close<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, old: Destination) -> Closed {
+        use karyos_io::backend::{QueueError, RouteError};
+
+        #[cfg(test)]
+        if self.hold_closes {
+            return Closed::InFlight;
+        }
+        #[cfg(test)]
+        if self.close_in_flight > 0 {
+            self.close_in_flight -= 1;
+            return Closed::InFlight;
+        }
+        loop {
+            match tx.close_queue(old.queue, &mut self.report) {
+                Ok(outcome) => {
+                    let returned = outcome.returned;
+                    while self.report.pop_front().is_some() {}
+                    if !outcome.more {
+                        break;
+                    }
+                    if returned == 0 {
+                        return Closed::InFlight;
+                    }
+                }
+                Err(QueueError::UnknownQueue) => break,
+                Err(_) => return Closed::Failed,
+            }
+        }
+        match tx.remove_route(old.route) {
+            Ok(()) | Err(RouteError::Unknown) => Closed::Done,
+            Err(_) => Closed::Failed,
         }
     }
 
@@ -344,7 +544,9 @@ impl ControlRoutes {
         let epoch = tx.capabilities().epoch;
         if self.epoch != Some(epoch) {
             self.entries.clear();
+            self.waiting.clear();
             self.epoch = Some(epoch);
+            self.refusal = ControlRefusal::default();
         }
         // A u64 use clock does not wrap in practice; if it ever would, the
         // ages start over.
@@ -361,28 +563,62 @@ impl ControlRoutes {
         if let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|entry| entry.address == address)
+            .find(|entry| entry.address == address && !entry.closing)
         {
             entry.used = tick;
             return Ok(entry.queue);
         }
-        if self.entries.len() >= self.max
-            && let Some(oldest) = self
+        // At most `max` open entries and as many closing, within the
+        // capacity allocated at creation. With `max` open, the least
+        // recently used makes room, closed or closing; the closing ones
+        // that closed since make room too. With no room, the control
+        // waits (neither a failed close nor a limit).
+        let closing =
+            |entries: &[Destination]| entries.iter().filter(|entry| entry.closing).count();
+        if closing(&self.entries) >= self.max {
+            self.reclose_closed(tx);
+        }
+        let open = self.entries.len() - closing(&self.entries);
+        if open >= self.max {
+            if closing(&self.entries) >= self.max {
+                return Err(ControlSendError::Blocked);
+            }
+            if let Some(oldest) = self
                 .entries
                 .iter()
+                .filter(|entry| !entry.closing)
                 .min_by_key(|entry| entry.used)
                 .map(|entry| entry.queue)
-        {
-            self.evict(tx, oldest);
+            {
+                self.evict(tx, oldest);
+            }
         }
-        let route = tx.add_route(address).map_err(|_| ControlSendError::Route)?;
+        if self.entries.len() >= self.entries.capacity() {
+            self.reclose_closed(tx);
+            if self.entries.len() >= self.entries.capacity() {
+                return Err(ControlSendError::Blocked);
+            }
+        }
+        let route = tx.add_route(address).map_err(|error| {
+            if error == karyos_io::backend::RouteError::RouteLimit {
+                self.refusal.limited = true;
+            }
+            ControlSendError::Route
+        })?;
         let queue = tx
             .open_queue(TxQueueConfig {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::new(CONTROL_QUEUE_DEPTH).unwrap_or(NonZeroU16::MIN),
             })
-            .map_err(|_| {
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    karyos_io::backend::QueueError::QueueLimit
+                        | karyos_io::backend::QueueError::OverCommitted { .. }
+                ) {
+                    self.refusal.limited = true;
+                }
                 let _ = tx.remove_route(route);
                 ControlSendError::Route
             })?;
@@ -391,6 +627,7 @@ impl ControlRoutes {
             route,
             queue,
             used: tick,
+            closing: false,
         });
         Ok(queue)
     }
@@ -413,6 +650,50 @@ impl ControlRoutes {
     /// The [`ControlSendError`] reason; nothing waits for a later cycle,
     /// and the destination's entry is evicted.
     pub fn send<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        control: &Control,
+    ) -> Result<(), ControlSendError> {
+        self.send_now(tx, address, control)
+    }
+
+    /// [`ControlRoutes::send`], except that a control refused because
+    /// every cached route is closing waits, in order behind those already
+    /// waiting, and goes at the next send or duty (#838): every
+    /// destination gets it. `Ok(false)` when it waits; one past the
+    /// waiting queue's room is dropped and counted, `Blocked`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlRoutes::send`].
+    pub fn send_or_wait<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        control: &Control,
+    ) -> Result<bool, ControlSendError> {
+        self.send_waiting(tx);
+        let result = if self.waiting.is_empty() {
+            self.send_now(tx, address, control)
+        } else {
+            Err(ControlSendError::Blocked)
+        };
+        match result {
+            Ok(()) => Ok(true),
+            Err(ControlSendError::Blocked) if self.waiting.len() < self.waiting.capacity() => {
+                self.waiting.push_back((address, *control));
+                Ok(false)
+            }
+            Err(ControlSendError::Blocked) => {
+                self.waits_dropped = self.waits_dropped.saturating_add(1);
+                Err(ControlSendError::Blocked)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn send_now<O: SocketOps>(
         &mut self,
         tx: &mut SocketsTx<O>,
         address: SocketAddr,

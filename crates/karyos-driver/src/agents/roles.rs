@@ -393,6 +393,9 @@ pub struct SenderCounters {
     /// Endpoints with a failed close not recorded, with no room for them
     /// (never, by its capacity): their limit then resets nothing.
     pub close_failures_full: u64,
+    /// ANNOUNCEs that waited for a control route of their endpoint to
+    /// finish closing, sent in order at the next send or duty (#838).
+    pub controls_waiting: u64,
     /// Removed publications' entries closed again at the next duty because
     /// a queue still had frames in flight (#838).
     pub removed_close_deferred: u64,
@@ -5044,6 +5047,22 @@ impl<T: StreamTerms> SenderRole<T> {
                 _ => false,
             })
         });
+        // The control routes evicted with frames in flight, once per duty,
+        // then the controls waiting for them.
+        for index in 0..self.routes.len() {
+            let Some(slot) = self.routes.get_mut(index) else {
+                break;
+            };
+            let Some(endpoint) = slot.endpoint else {
+                continue;
+            };
+            if let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
+                Half::Tx(tx) if *held == endpoint => Some(tx),
+                _ => None,
+            }) {
+                slot.routes.close_lingering(tx);
+            }
+        }
         // The entries still in flight are closed again: closed, they go;
         // a close error, or the time bound in flight, fails them; else they
         // wait for the next duty.
@@ -5120,11 +5139,29 @@ impl<T: StreamTerms> SenderRole<T> {
     }
 
     /// The endpoints that refused a route or a queue for their limit this
-    /// cycle, on any open path: one that failed a close in
+    /// cycle, on any open path or control route: one that failed a close in
     /// the epoch it refused in has its reset asked for, once per epoch.
     /// Without a failed close the refusal is an ordinary limit and resets
     /// nothing.
     fn reset_limited(&mut self) {
+        // The control routes' failed closes and limits count as the
+        // publications' do.
+        for index in 0..self.routes.len() {
+            let Some(slot) = self.routes.get_mut(index) else {
+                break;
+            };
+            let (Some(endpoint), Some((epoch, refusal))) =
+                (slot.endpoint, slot.routes.take_refusal())
+            else {
+                continue;
+            };
+            if refusal.close_failed {
+                self.close_failed(endpoint, epoch);
+            }
+            if refusal.limited {
+                self.limit_refused(endpoint, epoch);
+            }
+        }
         for index in 0..self.publications.len() {
             let Some(outbound) = self.publications.get_mut(index) else {
                 break;
@@ -5306,6 +5343,30 @@ impl<T: StreamTerms> SenderRole<T> {
         destination: SocketAddr,
         control: &Control,
     ) -> Sent {
+        self.send_with(halves, endpoint, destination, control, false)
+    }
+
+    /// [`SenderRole::send`] of a control that must reach its destination
+    /// (an ANNOUNCE): refused while every cached route of the endpoint is
+    /// closing, it waits in order and goes at the next send or duty (#838).
+    fn send_or_wait<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        destination: SocketAddr,
+        control: &Control,
+    ) -> Sent {
+        self.send_with(halves, endpoint, destination, control, true)
+    }
+
+    fn send_with<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        destination: SocketAddr,
+        control: &Control,
+        wait: bool,
+    ) -> Sent {
         let tx = halves.iter_mut().find_map(|(held, half)| match half {
             Half::Tx(tx) if *held == endpoint => Some(tx),
             _ => None,
@@ -5326,8 +5387,17 @@ impl<T: StreamTerms> SenderRole<T> {
             return Sent::NotSubmitted;
         };
         slot.endpoint = Some(endpoint);
-        match slot.routes.send(tx, destination, control) {
-            Ok(()) => {
+        let result = if wait {
+            slot.routes.send_or_wait(tx, destination, control)
+        } else {
+            slot.routes.send(tx, destination, control).map(|()| true)
+        };
+        match result {
+            Ok(false) => {
+                self.count(|c| &mut c.controls_waiting);
+                Sent::NotSubmitted
+            }
+            Ok(true) => {
                 self.count(|c| &mut c.sent);
                 Sent::Submitted
             }
@@ -5542,7 +5612,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     Some(targets) => {
                         for address in targets.into_iter().flatten() {
                             work = work.checked_add(1).ok_or(overflow.clone())?;
-                            let _ = self.send(
+                            let _ = self.send_or_wait(
                                 halves,
                                 endpoint,
                                 address,
@@ -5552,7 +5622,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     }
                     None => {
                         work = work.checked_add(1).ok_or(overflow.clone())?;
-                        let _ = self.send(
+                        let _ = self.send_or_wait(
                             halves,
                             endpoint,
                             destination,
