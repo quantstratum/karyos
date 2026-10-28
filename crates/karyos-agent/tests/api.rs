@@ -523,3 +523,51 @@ fn trace_buckets_are_served_over_the_socket() {
         "{\"error\":\"bad arguments\",\"request\":\"trace-buckets\"}\n"
     );
 }
+
+/// R-CORE-13: `trace-export` over the socket: a page of the attached
+/// driver's mirror, with its instance as the epoch; a cursor of another
+/// instance gets the typed refusal; an unknown directory, the guard
+/// operations' answer.
+#[test]
+fn trace_export_is_served_over_the_socket() {
+    let _serial = serial();
+    let (driver, mut agent, dir) = attached("export");
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let epoch = format!("{:032x}", driver.instance().unwrap());
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!(
+            "KARYOS-AGENT 1 trace-export {} 0 16 {epoch}\n",
+            dir.join("driver").display()
+        ),
+    );
+    assert_eq!(served, [Served::TraceExport]);
+    assert!(
+        answer.starts_with(&format!(
+            r#"{{"epoch":"{epoch}","from":0,"lost":[],"records":["#
+        )),
+        "{answer}"
+    );
+    let other = format!("{:032x}", driver.instance().unwrap() ^ 1);
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!(
+            "KARYOS-AGENT 1 trace-export {} 0 16 {other}\n",
+            dir.join("driver").display()
+        ),
+    );
+    assert_eq!(served, [Served::TraceExport]);
+    assert_eq!(
+        answer,
+        format!("{{\"error\":\"epoch changed\",\"epoch\":\"{epoch}\"}}\n")
+    );
+    let (_, served) = ask(
+        &mut server,
+        &mut agent,
+        "KARYOS-AGENT 1 trace-export /nowhere 0\n",
+    );
+    assert_eq!(served, [Served::Refused]);
+}

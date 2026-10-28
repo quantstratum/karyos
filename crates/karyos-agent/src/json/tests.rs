@@ -384,7 +384,8 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "catalog",
             "trace-window",
             "limits",
-            "trace-buckets"
+            "trace-buckets",
+            "trace-export"
         ]
     );
     let known = Capability {
@@ -549,5 +550,111 @@ fn bucket_refusals_are_typed() {
     assert_eq!(
         bucket_refusal(&BucketRefusal::OverBudget { number: 3 }),
         r#"{"error":"bucket over budget","number":3}"#
+    );
+}
+
+/// R-CORE-23: a bucket larger than the reply bound on its own comes back
+/// whole and alone, with `next` naming the one after it: the reply is at
+/// most `max(MAX_BUCKET_REPLY, one bucket)`.
+#[test]
+fn a_bucket_over_the_reply_bound_comes_back_whole_and_alone() {
+    let read = crate::api::BucketRead {
+        epoch: 7,
+        slice_ns: 10,
+        current: 2,
+        oldest: 0,
+        buckets: (0..2)
+            .map(|number| spread_bucket(number, 16, 20_000))
+            .collect(),
+    };
+    let alone = {
+        let mut text = String::new();
+        trace_bucket(&mut Out(&mut text), &read.buckets[0]);
+        text
+    };
+    assert!(
+        alone.len() > crate::api::MAX_BUCKET_REPLY,
+        "{}",
+        alone.len()
+    );
+    let reply = trace_buckets(&read, crate::api::MAX_BUCKET_REPLY);
+    assert_eq!(reply.matches(r#""number":"#).count(), 1);
+    assert!(reply.contains(&alone), "the bucket is whole");
+    assert!(reply.ends_with(r#""next":1}"#));
+    assert!(reply.len() <= alone.len() + 256);
+}
+
+fn export_page(records: u64) -> crate::api::ExportPage {
+    use crate::api::{ExportJournal, ExportLoss, ExportPage, ExportRecord};
+
+    ExportPage {
+        epoch: 0xab,
+        from: 2,
+        lost: vec![ExportLoss { first: 2, last: 4 }],
+        records: (5..5 + records)
+            .map(|seq| ExportRecord {
+                seq,
+                journal: 10,
+                sequence: seq,
+                payload: vec![seq; 26],
+            })
+            .collect(),
+        next: 5 + records,
+        head: 5 + records,
+        journals: vec![ExportJournal::Unknown { journal: 10 }],
+    }
+}
+
+/// R-CORE-13: a page states its loss first, then whole records, `next`,
+/// the head and the journals; past the bound it stops at a whole record,
+/// and `next` names the first one left out.
+#[test]
+fn an_export_page_stops_at_a_whole_record_within_its_bound() {
+    let page = export_page(3);
+    let whole = trace_export(&page, usize::MAX);
+    assert!(
+        whole.starts_with(
+            r#"{"epoch":"000000000000000000000000000000ab","from":2,"lost":[{"first":2,"last":4}],"records":[{"seq":5,"journal":10,"sequence":5,"payload":[5,"#
+        ),
+        "{whole}"
+    );
+    assert!(
+        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}]}"#),
+        "{whole}"
+    );
+    let one = whole.matches(r#"{"seq":"#).count();
+    assert_eq!(one, 3);
+    // A bound below one record still returns that record, whole.
+    let tiny = trace_export(&page, 10);
+    assert_eq!(tiny.matches(r#"{"seq":"#).count(), 1);
+    assert!(tiny.contains(r#""next":6,"#), "{tiny}");
+    // A bound of two records leaves the third.
+    let record = (whole.len() - tiny.len()) / 2;
+    let two = trace_export(&page, 256 + 2 * record + 4);
+    assert_eq!(two.matches(r#"{"seq":"#).count(), 2, "{two}");
+    assert!(two.contains(r#""next":7,"#), "{two}");
+}
+
+/// R-CORE-13: a page of the most records one request may ask for stays
+/// within the reply bound.
+#[test]
+fn a_full_export_page_stays_within_the_bound() {
+    let records = u64::try_from(crate::api::EXPORT_MAX).unwrap();
+    let reply = trace_export(&export_page(records), crate::api::MAX_EXPORT_REPLY);
+    assert!(
+        reply.len() <= crate::api::MAX_EXPORT_REPLY + 300,
+        "{}",
+        reply.len()
+    );
+    assert!(reply.matches(r#"{"seq":"#).count() < crate::api::EXPORT_MAX);
+}
+
+/// R-CORE-13: a cursor of another driver instance is refused, typed, with
+/// this instance.
+#[test]
+fn export_refusals_are_typed() {
+    assert_eq!(
+        export_refusal(&crate::api::ExportRefusal::EpochChanged { epoch: 0xab }),
+        r#"{"error":"epoch changed","epoch":"000000000000000000000000000000ab"}"#
     );
 }

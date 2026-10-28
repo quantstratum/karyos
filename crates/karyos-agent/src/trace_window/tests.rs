@@ -231,7 +231,7 @@ fn a_second_publish_of_a_message_is_counted() {
     assert_eq!(window.view(1).1.duplicates, 1);
 }
 
-mod mirror {
+pub(crate) mod mirror {
     //! Against an embedded driver's trace mirror.
 
     use karyos_client::{ClientConductor, ClientJournal, ConductorError, Outcome};
@@ -284,16 +284,16 @@ mod mirror {
 
     /// A driver of `config` with one stream, a publisher journal and a
     /// subscriber journal, as writers.
-    struct Traced {
-        driver: EmbeddedDriver,
-        publication: PublicationId,
-        driver_id: [u64; 2],
-        publisher: TraceWriter,
-        subscriber: TraceWriter,
+    pub(crate) struct Traced {
+        pub(crate) driver: EmbeddedDriver,
+        pub(crate) publication: PublicationId,
+        pub(crate) driver_id: [u64; 2],
+        pub(crate) publisher: TraceWriter,
+        pub(crate) subscriber: TraceWriter,
         _conductor: ClientConductor,
     }
 
-    fn traced(config: DriverConfig) -> Traced {
+    pub(crate) fn traced(config: DriverConfig) -> Traced {
         let mut driver = EmbeddedDriver::with_config(config).unwrap();
         let stream = driver
             .add_stream(StreamConfig {
@@ -364,7 +364,12 @@ mod mirror {
     }
 
     /// Writes `point` of the message at `position` to `writer`.
-    fn write(writer: &mut TraceWriter, publication: PublicationId, point: Point, position: u64) {
+    pub(crate) fn write(
+        writer: &mut TraceWriter,
+        publication: PublicationId,
+        point: Point,
+        position: u64,
+    ) {
         let observed = HostMonotonicClock::new(1).now();
         let mut traced = record(point, position, observed.time);
         traced.publication = publication;

@@ -143,7 +143,7 @@ pub enum CapabilityState {
 
 /// The capability names of API v1, a closed list: a later agent may add
 /// names, and a client ignores the ones it does not know.
-pub const CAPABILITIES: [&str; 8] = [
+pub const CAPABILITIES: [&str; 9] = [
     "view",
     "guard-close",
     "guard-reopen",
@@ -152,6 +152,7 @@ pub const CAPABILITIES: [&str; 8] = [
     "trace-window",
     "limits",
     "trace-buckets",
+    "trace-export",
 ];
 
 /// The byte bound of a `trace-buckets` reply (R-CORE-23). A reply holds
@@ -178,6 +179,17 @@ pub const LANE_HEADER_REPLY: usize = 512;
 pub const BUCKETS_DEFAULT: usize = 6;
 /// The most buckets one request may ask for.
 pub const BUCKETS_MAX: usize = 60;
+
+/// The byte bound of a `trace-export` reply (R-CORE-13), as
+/// [`MAX_BUCKET_REPLY`]'s: whole records only, and always at least the
+/// first one, so a reply is at most `max(MAX_EXPORT_REPLY, the first
+/// record's encoding)` besides its loss and journals; a record past it is
+/// left for the next read, named by `next`.
+pub const MAX_EXPORT_REPLY: usize = 1 << 20;
+/// Records one `trace-export` request asks for by default.
+pub const EXPORT_DEFAULT: usize = 1024;
+/// The most records one request may ask for: the work of one read.
+pub const EXPORT_MAX: usize = 16_384;
 
 /// The operations journal of the agent's guard operations (M10b; the
 /// gap analysis's new owner item 7, decided as item 51(7) of the
@@ -846,4 +858,83 @@ impl BucketCursor {
     pub const fn new(number: u64, lane: usize) -> Self {
         Self { number, lane }
     }
+}
+
+/// One raw trace record of the driver's mirror (R-CORE-13): its mirror
+/// sequence, the journal it was drained from, its sequence there and its
+/// payload words, whole.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExportRecord {
+    /// Its mirror ring sequence: the cursor.
+    pub seq: u64,
+    /// The journal it was drained from.
+    pub journal: u64,
+    /// Its sequence in that journal.
+    pub sequence: u64,
+    /// Its payload words (a `karyos-trace` record for a client journal).
+    pub payload: Vec<u64>,
+}
+
+/// Mirror sequences `first..=last` an export never delivers: overwritten
+/// before they were read (R-CORE-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExportLoss {
+    /// The first lost sequence.
+    pub first: u64,
+    /// The last lost sequence.
+    pub last: u64,
+}
+
+/// A journal a page's records name, as the table showed it when the page
+/// was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExportJournal {
+    /// In the table: its entry, with its clock provenance, time namespace
+    /// and drop ranges.
+    Live(Box<karyos_sys::trace_mirror::JournalEntry>),
+    /// Recycled from the table, still in the recycle log.
+    Recycled(Box<karyos_sys::trace_mirror::RecycledJournal>),
+    /// In neither: recycled and gone from the log too, or busy on every
+    /// attempt.
+    Unknown {
+        /// Its number.
+        journal: u64,
+    },
+}
+
+/// One page of a trace export (R-CORE-13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExportPage {
+    /// The driver instance the sequences belong to: the cursor's epoch.
+    pub epoch: u128,
+    /// The sequence asked for.
+    pub from: u64,
+    /// What was lost between `from` and the first record, or within the
+    /// page, oldest first.
+    pub lost: Vec<ExportLoss>,
+    /// The records, in sequence order, with no duplicate.
+    pub records: Vec<ExportRecord>,
+    /// The sequence to ask for next.
+    pub next: u64,
+    /// The sequence the mirror will give its next record: `next` equal to
+    /// it means the reader is up to date.
+    pub head: u64,
+    /// The journals the records name, by number.
+    pub journals: Vec<ExportJournal>,
+}
+
+/// Why an export read is refused (R-CORE-13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExportRefusal {
+    /// The cursor belongs to another driver instance, whose sequences are
+    /// not this one's: the reader starts again from 0.
+    EpochChanged {
+        /// This driver instance.
+        epoch: u128,
+    },
 }

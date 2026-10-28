@@ -24,6 +24,7 @@ use crate::api::{
     GuardEntry, JournalView, Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
 };
 use crate::api::{BucketLane, BucketRead, BucketRefusal, TraceBucket};
+use crate::api::{ExportJournal, ExportPage, ExportRefusal};
 
 /// A JSON value being written into a string.
 struct Out<'a>(&'a mut String);
@@ -773,6 +774,145 @@ fn bucket_lane(out: &mut Out<'_>, lane: &BucketLane) {
                 fields.number("above", side.above);
                 fields.number("below", side.below);
             });
+        }
+    });
+}
+
+/// A `trace-export` page (R-CORE-13): the driver instance as `epoch` (32
+/// lowercase hex digits, as `instance`), the sequence asked for, the lost
+/// ranges first, then whole records in order, the next sequence to ask
+/// for, the ring's head, and the journals the records name. Past
+/// `max_bytes` (the first record aside, which is always whole) the rest is
+/// left out and `next` is the first record left out.
+#[must_use]
+pub fn trace_export(page: &ExportPage, max_bytes: usize) -> String {
+    let mut encoded = Vec::with_capacity(page.records.len());
+    let mut used = 256usize;
+    let mut next = page.next;
+    for record in &page.records {
+        let mut text = String::new();
+        Out(&mut text).object(|fields| {
+            fields.number("seq", record.seq);
+            fields.number("journal", record.journal);
+            fields.number("sequence", record.sequence);
+            fields
+                .key("payload")
+                .array(&record.payload, |out, word| out.number(*word));
+        });
+        let after = used.saturating_add(text.len()).saturating_add(1);
+        if !encoded.is_empty() && after > max_bytes {
+            next = record.seq;
+            break;
+        }
+        used = after;
+        encoded.push(text);
+    }
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.string("epoch", &format!("{:032x}", page.epoch));
+        fields.number("from", page.from);
+        fields.key("lost").array(&page.lost, |out, loss| {
+            out.object(|fields| {
+                fields.number("first", loss.first);
+                fields.number("last", loss.last);
+            });
+        });
+        fields
+            .key("records")
+            .array(&encoded, |out, record| out.raw(record));
+        fields.number("next", next);
+        fields.number("head", page.head);
+        fields
+            .key("journals")
+            .array(&page.journals, |out, journal| export_journal(out, journal));
+    });
+    text
+}
+
+/// A refused `trace-export` read, typed (R-CORE-13).
+#[must_use]
+pub fn export_refusal(refusal: &ExportRefusal) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match *refusal {
+        ExportRefusal::EpochChanged { epoch } => {
+            fields.string("error", "epoch changed");
+            fields.string("epoch", &format!("{epoch:032x}"));
+        }
+    });
+    text
+}
+
+fn export_journal(out: &mut Out<'_>, journal: &ExportJournal) {
+    use karyos_sys::trace_mirror::{JournalKind, JournalState, TimeNamespace};
+
+    let state = |state: JournalState| match state {
+        JournalState::Open => "open",
+        JournalState::Closed => "closed",
+        JournalState::WriterLost => "writer_lost",
+    };
+    out.object(|fields| match journal {
+        ExportJournal::Live(entry) => {
+            fields.number("journal", entry.journal);
+            fields.string("table", "live");
+            fields.number("client", entry.client);
+            fields.string("state", state(entry.state));
+            fields.string(
+                "kind",
+                match entry.kind {
+                    JournalKind::Subscriber => "subscriber",
+                    JournalKind::Publisher => "publisher",
+                    JournalKind::NetworkSender => "network_sender",
+                    JournalKind::NetworkReceiver => "network_receiver",
+                },
+            );
+            fields.number("registration", entry.registration);
+            fields.number("stream", entry.stream);
+            fields.number("lane", u64::from(entry.lane.get()));
+            fields.number("incarnation", entry.incarnation);
+            fields.string(
+                "time_namespace",
+                match entry.time_namespace {
+                    TimeNamespace::Unknown => "unknown",
+                    TimeNamespace::Same => "same",
+                    TimeNamespace::Different => "different",
+                },
+            );
+            fields.number("provenance", entry.provenance);
+            fields.number("payload_words", entry.payload_words);
+            fields.number("sequence", entry.sequence);
+            fields.number("attempted", entry.attempted);
+            fields.number("stored", entry.stored);
+            fields.number("mirrored", entry.mirrored);
+            fields
+                .key("lost_before")
+                .option(entry.lost_before, |out, value| out.number(value));
+            fields.number("unstable", entry.unstable);
+            fields.key("drops").array(entry.ranges(), |out, range| {
+                out.object(|fields| {
+                    fields.number("first", range.first);
+                    fields.number("last", range.last);
+                    fields.number("first_time", range.first_time);
+                    fields.number("last_time", range.last_time);
+                    fields.number("clock", range.clock);
+                    fields.number("epoch", range.epoch);
+                });
+            });
+        }
+        ExportJournal::Recycled(entry) => {
+            fields.number("journal", entry.journal);
+            fields.string("table", "recycled");
+            fields.string("state", state(entry.state));
+            fields.number("stream", entry.stream);
+            fields.number("lane", u64::from(entry.lane.get()));
+            fields.number("incarnation", entry.incarnation);
+            fields
+                .key("boundary")
+                .option(entry.boundary, |out, value| out.number(value));
+            fields.number("sequence", entry.sequence);
+        }
+        ExportJournal::Unknown { journal } => {
+            fields.number("journal", *journal);
+            fields.string("table", "unknown");
         }
     });
 }

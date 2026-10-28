@@ -706,5 +706,45 @@ fn test_agent_a_new_instance_restarts_every_series() {
             .client_counters
             .iter()
             .all(|counter| counter.changed_ns.is_none())
+
+/// R-CORE-13: the export's epoch is the driver instance, so a cursor
+/// survives the agent's restart (the agent keeps none) and is refused,
+/// with the new instance, after the driver's.
+#[test]
+fn an_export_cursor_survives_the_agent_and_not_the_driver() {
+    use karyos_agent::api::ExportRefusal;
+
+    let _serial = serial();
+    let dir = dir("export");
+    let mut driver = driver(&dir, DriverConfig::default(), 2);
+    let mut agent = agent(&[&dir]);
+    refresh_serving(&mut driver, &mut agent);
+    let page = agent.trace_export(&dir, 0, 16, None).unwrap().unwrap();
+    assert_eq!(Some(page.epoch), agent.view().drivers[0].instance);
+    assert_eq!(Some(page.epoch), driver.instance());
+    assert!(page.lost.is_empty());
+    let cursor = (page.epoch, page.next);
+    // A new agent: the same cursor is served, from where it was.
+    drop(agent);
+    let mut agent = self::agent(&[&dir]);
+    refresh_serving(&mut driver, &mut agent);
+    let page = agent
+        .trace_export(&dir, cursor.1, 16, Some(cursor.0))
+        .unwrap()
+        .unwrap();
+    assert_eq!((page.epoch, page.from), cursor);
+    assert!(page.lost.is_empty());
+    // A new driver: the cursor is refused, with the new instance.
+    drop(driver);
+    agent.refresh();
+    let mut driver = self::driver(&dir, DriverConfig::default(), 2);
+    refresh_serving(&mut driver, &mut agent);
+    assert_eq!(
+        agent
+            .trace_export(&dir, cursor.1, 16, Some(cursor.0))
+            .unwrap(),
+        Err(ExportRefusal::EpochChanged {
+            epoch: driver.instance().unwrap()
+        })
     );
 }

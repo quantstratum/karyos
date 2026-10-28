@@ -276,6 +276,8 @@ pub enum Served {
     Capabilities,
     /// Closed trace buckets, or the window's refusal (R-CORE-23).
     TraceBuckets,
+    /// Raw trace records, or the export's refusal (R-CORE-13).
+    TraceExport,
     /// A refusal: a uid without a role, a version not served, or a
     /// request not understood.
     Refused,
@@ -465,6 +467,22 @@ impl Server {
                 Ok(Err(refusal)) => (json::bucket_refusal(&refusal), Served::Refused),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
+            (
+                Some(_),
+                Request::TraceExport {
+                    dir,
+                    from,
+                    count,
+                    epoch,
+                },
+            ) => match agent.trace_export(Path::new(dir), from, count, epoch) {
+                Ok(Ok(page)) => (
+                    json::trace_export(&page, crate::api::MAX_EXPORT_REPLY),
+                    Served::TraceExport,
+                ),
+                Ok(Err(refusal)) => (json::export_refusal(&refusal), Served::TraceExport),
+                Err(answer) => (json::guard_answer(&answer), Served::Refused),
+            },
             (Some(_), Request::Version) => (
                 json::error("unsupported version", Some(&[API_VERSION])),
                 Served::Refused,
@@ -520,6 +538,12 @@ enum Request<'a> {
         from: crate::api::BucketCursor,
         count: usize,
         epoch: Option<u64>,
+    },
+    TraceExport {
+        dir: &'a str,
+        from: u64,
+        count: usize,
+        epoch: Option<u128>,
     },
     /// A well-formed request of another version.
     Version,
@@ -627,6 +651,38 @@ fn request(rest: &str) -> Option<Request<'_>> {
             })();
             Some(parsed.unwrap_or(Request::BadArguments("trace-buckets")))
         }
+        // `trace-export DIR FROM [COUNT [EPOCH]]` (R-CORE-13): EPOCH is
+        // the driver instance, 32 hex digits; a count of 0 or above
+        // EXPORT_MAX is a bad argument.
+        "trace-export" => {
+            let mut fields = arguments.split(' ');
+            let parsed = (|| {
+                let dir = fields.next().filter(|dir| !dir.is_empty())?;
+                let from = number(fields.next()?)?;
+                let count = match fields.next() {
+                    None => crate::api::EXPORT_DEFAULT,
+                    Some(word) => usize::try_from(number(word)?)
+                        .ok()
+                        .filter(|count| (1..=crate::api::EXPORT_MAX).contains(count))?,
+                };
+                let epoch = match fields.next() {
+                    None => None,
+                    Some(word)
+                        if word.len() == 32 && word.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                    {
+                        Some(u128::from_str_radix(word, 16).ok()?)
+                    }
+                    Some(_) => return None,
+                };
+                fields.next().is_none().then_some(Request::TraceExport {
+                    dir,
+                    from,
+                    count,
+                    epoch,
+                })
+            })();
+            Some(parsed.unwrap_or(Request::BadArguments("trace-export")))
+        }
         _ => None,
     }
 }
@@ -691,6 +747,48 @@ mod tests {
             assert_eq!(
                 parse(&format!("KARYOS-AGENT 1 {bad}\n")),
                 Request::BadArguments("trace-buckets"),
+                "{bad}"
+            );
+        }
+    }
+
+    /// R-CORE-13: `trace-export DIR FROM [COUNT [EPOCH]]`, EPOCH the
+    /// driver instance in 32 hex digits; a count of 0 or above the
+    /// maximum, an epoch of another form, or one more argument is its own
+    /// bad-arguments error.
+    #[test]
+    fn trace_export_parses_with_its_bounds() {
+        let export = |dir, from, count, epoch| Request::TraceExport {
+            dir,
+            from,
+            count,
+            epoch,
+        };
+        let epoch = "000000000000000000000000000000ff";
+        assert_eq!(
+            parse("KARYOS-AGENT 1 trace-export /run/k 4\n"),
+            export("/run/k", 4, crate::api::EXPORT_DEFAULT, None)
+        );
+        assert_eq!(
+            parse(&format!(
+                "KARYOS-AGENT 1 trace-export /run/k 4 16384 {epoch}\n"
+            )),
+            export("/run/k", 4, 16_384, Some(0xff))
+        );
+        for bad in [
+            "trace-export",
+            "trace-export /run/k",
+            "trace-export /run/k x",
+            "trace-export /run/k 4 0",
+            "trace-export /run/k 4 16385",
+            "trace-export /run/k 4 6 ff",
+            "trace-export /run/k 4 6 +0000000000000000000000000000ff",
+            "trace-export /run/k 4 6 000000000000000000000000000000fg",
+            "trace-export /run/k 4 6 000000000000000000000000000000ff 8",
+        ] {
+            assert_eq!(
+                parse(&format!("KARYOS-AGENT 1 {bad}\n")),
+                Request::BadArguments("trace-export"),
                 "{bad}"
             );
         }

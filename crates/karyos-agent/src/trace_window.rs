@@ -754,4 +754,4 @@ fn count(value: &mut u64, by: u64) {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -250,6 +250,44 @@ fn term_copies(c: &mut Criterion) {
     term_read(c, "shared", shared_lane);
 }
 
+/// One `trace-export` page of the most records a request may ask for
+/// (R-CORE-13), from a full mirror: the scan and copy, then the scan,
+/// copy and reply encoding at the reply bound.
+fn trace_export_page(c: &mut Criterion) {
+    use karyos_agent::api::{EXPORT_MAX, MAX_EXPORT_REPLY};
+    use karyos_sys::trace_mirror::{JournalEntry, JournalKind, trace_mirror};
+
+    let mut mirror = trace_mirror(4, 4, EXPORT_MAX).unwrap_or_else(|_| std::process::abort());
+    let entry = JournalEntry::open(10, 1, JournalKind::Publisher, 26, 16);
+    let _ = mirror.write_entry(0, Some(&entry));
+    let payload = [u64::MAX / 3; 26];
+    for sequence in 0..u64::try_from(EXPORT_MAX).unwrap_or(u64::MAX) {
+        let _ = mirror.append(10, sequence, &payload);
+    }
+    let reader = mirror.reader();
+    let mut group = c.benchmark_group("trace export");
+    let _ = group.bench_function("page 16384", |b| {
+        b.iter(|| {
+            black_box(karyos_agent::trace_export::export(
+                &reader,
+                1,
+                0,
+                EXPORT_MAX,
+                Some(1),
+            ))
+        });
+    });
+    let _ = group.bench_function("page 16384 encoded", |b| {
+        b.iter(|| {
+            if let Ok(page) = karyos_agent::trace_export::export(&reader, 1, 0, EXPORT_MAX, Some(1))
+            {
+                black_box(karyos_agent::json::trace_export(&page, MAX_EXPORT_REPLY));
+            }
+        });
+    });
+    group.finish();
+}
+
 // criterion 0.7's `criterion_group!` generates an undocumented public
 // function, which the workspace `missing_docs` lint would reject.
 #[allow(
@@ -257,8 +295,14 @@ fn term_copies(c: &mut Criterion) {
     reason = "criterion_group! generates an undocumented pub fn"
 )]
 mod group {
-    use super::{conflation_write_poll, term_copies, trace_decisions};
-    criterion::criterion_group!(benches, conflation_write_poll, trace_decisions, term_copies);
+    use super::{conflation_write_poll, term_copies, trace_decisions, trace_export_page};
+    criterion::criterion_group!(
+        benches,
+        conflation_write_poll,
+        trace_decisions,
+        term_copies,
+        trace_export_page
+    );
 }
 use group::benches;
 criterion_main!(benches);

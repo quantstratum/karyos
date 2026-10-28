@@ -90,7 +90,7 @@ use std::sync::Arc;
 use crate::atomic_view::{HeapWords, WORD_BYTES};
 use crate::diag::Store;
 use crate::diag_ring::{
-    Appended, Bounds, FIELDS, RingReader, RingWriter, STRIDE_WORDS, Scan, ring_words, scan,
+    Appended, Bounds, FIELDS, RingReader, RingWriter, STRIDE_WORDS, Scan, ring_words, scan_at_most,
 };
 use crate::error::SysError;
 use crate::frame::Lane;
@@ -1248,7 +1248,18 @@ impl TraceMirrorReader {
     /// delivering each retained observation record in order. A record whose
     /// length word exceeds [`MAX_MIRROR_PAYLOAD`] is delivered with the
     /// payload cut to it.
-    pub fn scan(&self, cursor: &mut u64, mut deliver: impl FnMut(MirrorRecord<'_>)) -> Scan {
+    pub fn scan(&self, cursor: &mut u64, deliver: impl FnMut(MirrorRecord<'_>)) -> Scan {
+        self.scan_at_most(cursor, u64::MAX, deliver)
+    }
+
+    /// [`TraceMirrorReader::scan`], delivering at most `max` records (see
+    /// [`crate::diag_ring::scan_at_most`]).
+    pub fn scan_at_most(
+        &self,
+        cursor: &mut u64,
+        max: u64,
+        mut deliver: impl FnMut(MirrorRecord<'_>),
+    ) -> Scan {
         let Some(reader) = self.ring_reader() else {
             return Scan {
                 overwritten: 0,
@@ -1257,7 +1268,7 @@ impl TraceMirrorReader {
             };
         };
         let mut buffer = [0u64; MIRROR_RECORD_WORDS - FIELDS];
-        scan(&reader, cursor, &mut buffer, |seq, fields| {
+        scan_at_most(&reader, cursor, &mut buffer, max, |seq, fields| {
             let field = |index: usize| fields.get(index).copied().unwrap_or(0);
             let length = usize::try_from(field(2))
                 .unwrap_or(MAX_MIRROR_PAYLOAD)
