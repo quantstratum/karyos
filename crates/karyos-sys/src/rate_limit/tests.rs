@@ -231,3 +231,74 @@ proptest! {
         prop_assert_eq!(split.message_tokens(), whole.message_tokens());
     }
 }
+
+/// R-CORE-21: the transition table. Each of the four dimensions (message
+/// rate and burst, byte rate and burst) alone, then every pair with one
+/// tighter and the other looser, then the byte limit added and removed.
+#[test]
+fn only_a_change_tighter_in_every_dimension_is_a_tightening() {
+    use crate::rate_limit::Transition;
+
+    let base = policy(100, 10, Some((10_000, 2_000)));
+    let with = |dimension: usize, by: i64| {
+        let mut values = [100u64, 10, 10_000, 2_000];
+        values[dimension] = values[dimension].checked_add_signed(by).unwrap();
+        policy(values[0], values[1], Some((values[2], values[3])))
+    };
+    assert_eq!(base.transition(&base), Transition::Unchanged);
+    for dimension in 0..4 {
+        assert_eq!(
+            base.transition(&with(dimension, -1)),
+            Transition::Tightening,
+            "{dimension}"
+        );
+        assert_eq!(
+            base.transition(&with(dimension, 1)),
+            Transition::Other,
+            "{dimension}"
+        );
+    }
+    // Every pair: one tighter, the other looser, is never a tightening.
+    for tighter in 0..4 {
+        for looser in 0..4 {
+            if tighter == looser {
+                continue;
+            }
+            let mut values = [100u64, 10, 10_000, 2_000];
+            values[tighter] -= 1;
+            values[looser] += 1;
+            let next = policy(values[0], values[1], Some((values[2], values[3])));
+            assert_eq!(
+                base.transition(&next),
+                Transition::Other,
+                "{tighter} {looser}"
+            );
+        }
+    }
+    // Every dimension tighter at once.
+    assert_eq!(
+        base.transition(&policy(99, 9, Some((9_999, 1_999)))),
+        Transition::Tightening
+    );
+    let messages_only = policy(100, 10, None);
+    // A byte limit added takes away only; removed, it only gives.
+    assert_eq!(messages_only.transition(&base), Transition::Tightening);
+    assert_eq!(base.transition(&messages_only), Transition::Other);
+    // Added, with the messages loosened: mixed.
+    assert_eq!(policy(99, 10, None).transition(&base), Transition::Other);
+}
+
+/// R-CORE-21: the control reserve is a floor on the message rate and burst.
+#[test]
+fn a_policy_keeps_its_reserve_only_at_or_above_it() {
+    use crate::rate_limit::Rate;
+
+    let reserve = Rate {
+        per_second: 10,
+        burst: 2,
+    };
+    assert!(policy(10, 2, None).keeps(&reserve));
+    assert!(policy(50, 5, Some((1, 1))).keeps(&reserve));
+    assert!(!policy(9, 5, None).keeps(&reserve));
+    assert!(!policy(50, 1, None).keeps(&reserve));
+}

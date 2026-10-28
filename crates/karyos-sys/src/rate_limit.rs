@@ -90,6 +90,72 @@ impl RatePolicy {
     }
 }
 
+/// What a change from one policy to another is (R-CORE-21;
+/// `quantstratum-docs: karyos/design/guards-and-abort.md`, Rate limit
+/// transitions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transition {
+    /// Provably tighter: no rate or burst grows and at least one shrinks,
+    /// over messages and bytes; a byte limit added counts as tighter.
+    Tightening,
+    /// The same policy.
+    Unchanged,
+    /// Anything else: a loosening, a mixed change, or a byte limit
+    /// removed. Never taken as a tightening (fail closed).
+    Other,
+}
+
+impl RatePolicy {
+    /// What changing from `self` to `next` is (R-CORE-21). Only a change in
+    /// which every dimension stays or shrinks, and one shrinks, is a
+    /// [`Transition::Tightening`]: a change that tightens one dimension and
+    /// loosens another is [`Transition::Other`].
+    #[must_use]
+    pub const fn transition(&self, next: &Self) -> Transition {
+        // Per dimension: -1 tighter, 0 the same, 1 looser.
+        const fn order(old: u64, new: u64) -> i8 {
+            if new < old {
+                -1
+            } else if new == old {
+                0
+            } else {
+                1
+            }
+        }
+        let (bytes_rate, bytes_burst, added, removed) = match (self.bytes, next.bytes) {
+            (None, None) => (0, 0, false, false),
+            // A byte limit added only takes away; removed, it only gives.
+            (None, Some(_)) => (0, 0, true, false),
+            (Some(_), None) => (0, 0, false, true),
+            (Some(old), Some(new)) => (
+                order(old.per_second, new.per_second),
+                order(old.burst, new.burst),
+                false,
+                false,
+            ),
+        };
+        let messages_rate = order(self.messages.per_second, next.messages.per_second);
+        let messages_burst = order(self.messages.burst, next.messages.burst);
+        let tighter =
+            added || messages_rate < 0 || messages_burst < 0 || bytes_rate < 0 || bytes_burst < 0;
+        let looser =
+            removed || messages_rate > 0 || messages_burst > 0 || bytes_rate > 0 || bytes_burst > 0;
+        match (tighter, looser) {
+            (true, false) => Transition::Tightening,
+            (false, false) => Transition::Unchanged,
+            _ => Transition::Other,
+        }
+    }
+
+    /// Whether `self` keeps at least `reserve`, the least message rate and
+    /// burst a member needs for its cancellations and resolutions
+    /// (R-CORE-21's control reserve).
+    #[must_use]
+    pub const fn keeps(&self, reserve: &Rate) -> bool {
+        self.messages.per_second >= reserve.per_second && self.messages.burst >= reserve.burst
+    }
+}
+
 /// One token bucket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Bucket {
