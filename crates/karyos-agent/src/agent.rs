@@ -81,7 +81,8 @@ impl AgentConfig {
     /// looks nothing up.
     #[must_use]
     pub fn with_agent_id(mut self, id: String) -> Self {
-        self.agent_id = Some(id);
+        // The same rule as `--agent-id`; an id outside it is not taken.
+        self.agent_id = valid_agent_id(&id).then_some(id);
         self
     }
 
@@ -128,6 +129,16 @@ impl AgentConfig {
         self.archives.push((dir, catalog));
         self
     }
+}
+
+/// Whether `id` is an agent id `--agent-id` takes: 1 to 64 bytes of
+/// letters, digits, `.`, `_`, `:`, `/` and `-` (R-CORE-24).
+#[must_use]
+pub fn valid_agent_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte))
 }
 
 /// One watched driver.
@@ -411,10 +422,17 @@ impl Agent {
     ) -> Vec<crate::api::Capability> {
         use crate::api::{CAPABILITIES, Capability, CapabilityState};
 
-        let journal = match (&self.config.journal, &self.journal) {
-            (None, _) => Some("not_configured"),
-            (Some(_), None) => Some("journal_unavailable"),
-            (Some(_), Some(_)) => None,
+        // Reopens need a journal that records; an acknowledgement also
+        // serves the unknown interval of a journal that could not open.
+        let (reopen_off, acknowledge_off) = match (&self.config.journal, &self.journal) {
+            (None, _) => (Some("not_configured"), Some("not_configured")),
+            // Could not open: only its unknown interval can be acknowledged.
+            (Some(_), None) => (Some("journal_unavailable"), None),
+            // Opened, then an append failed: it refuses every append.
+            (Some(_), Some(journal)) if journal.unavailable() => {
+                (Some("journal_unavailable"), Some("journal_unavailable"))
+            }
+            (Some(_), Some(_)) => (None, None),
         };
         let catalog = self.drivers.iter().any(|driver| driver.catalog.is_some());
         CAPABILITIES
@@ -422,15 +440,13 @@ impl Agent {
             .map(|&name| {
                 let (unavailable, permitted) = match name {
                     "guard-close" => (None, close),
-                    "guard-reopen" => (journal, reopen),
-                    // A journal that could not open still takes the
-                    // acknowledgement of its unknown interval.
-                    "gap-ack" => (
-                        journal.filter(|reason| *reason == "not_configured"),
-                        acknowledge,
-                    ),
+                    "guard-reopen" => (reopen_off, reopen),
+                    "gap-ack" => (acknowledge_off, acknowledge),
                     "catalog" => ((!catalog).then_some("not_configured"), true),
-                    _ => (None, true),
+                    // Served to every role, always.
+                    "view" | "trace-window" | "limits" => (None, true),
+                    // A name added to CAPABILITIES must be classified here.
+                    _ => (Some("not_configured"), true),
                 };
                 let state = match (unavailable, permitted) {
                     (Some(reason), _) => CapabilityState::Unavailable { reason },

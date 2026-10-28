@@ -162,3 +162,50 @@ fn a_journal_that_cannot_open_is_an_alert_until_acknowledged() {
     drop(agent);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// R-CORE-24, QS-REVIEWER on #795: a journal that opened and then failed an
+/// append refuses reopens and acknowledgements, so `capabilities` reports
+/// both unavailable (`journal_unavailable`), whatever the role, rather than
+/// served and then refused.
+#[test]
+fn a_journal_down_at_run_time_makes_reopen_and_gap_ack_unavailable() {
+    use crate::api::CapabilityState;
+
+    let dir = std::env::temp_dir().join(format!("karyos-agent-caps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut agent = Agent::new(AgentConfig::new(Vec::new()).with_journal(dir.join("journal")));
+    let state = |agent: &Agent, name: &str| {
+        agent
+            .capabilities(true, true, true)
+            .into_iter()
+            .find(|capability| capability.name == name)
+            .unwrap()
+            .state
+    };
+    assert_eq!(state(&agent, "guard-reopen"), CapabilityState::Served);
+    assert_eq!(state(&agent, "gap-ack"), CapabilityState::Served);
+    agent.journal.as_mut().unwrap().break_recorder();
+    let down = CapabilityState::Unavailable {
+        reason: "journal_unavailable",
+    };
+    assert_eq!(state(&agent, "guard-reopen"), down);
+    assert_eq!(state(&agent, "gap-ack"), down);
+    assert_eq!(state(&agent, "guard-close"), CapabilityState::Served);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// R-CORE-24: `with_agent_id` takes only what `--agent-id` takes.
+#[test]
+fn an_agent_id_outside_the_rule_is_not_taken() {
+    let id = |given: &str| {
+        Agent::new(AgentConfig::new(Vec::new()).with_agent_id(given.to_owned()))
+            .view()
+            .agent
+            .id
+    };
+    assert_eq!(id("ns/pod-0").as_deref(), Some("ns/pod-0"));
+    assert_eq!(id(""), None);
+    assert_eq!(id("has space"), None);
+    assert_eq!(id(&"x".repeat(65)), None);
+}

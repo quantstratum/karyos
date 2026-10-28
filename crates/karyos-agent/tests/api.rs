@@ -149,7 +149,7 @@ fn capabilities_tell_unavailable_from_forbidden() {
         let mut server =
             Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), role)])).unwrap();
         let (answer, served) = ask(&mut server, agent, "KARYOS-AGENT 1 capabilities\n");
-        assert_eq!(served, [Served::View]);
+        assert_eq!(served, [Served::Capabilities]);
         answer
     };
     // No journal and no Archive configured.

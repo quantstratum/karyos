@@ -26,7 +26,10 @@
 //!   (M10b; a `DIR` holds no space); `gap-ack POSITION`, an
 //!   administrator's acknowledgement of the journal's unknown interval;
 //!   `limits [DIMENSION=VALUE ...]`, the negotiation of the bounds below
-//!   (R-CORE-38).
+//!   (R-CORE-38); `capabilities`, each capability of the closed v1 list
+//!   served, unavailable in this deployment or forbidden for the peer's
+//!   role (R-CORE-24). A request this agent knows with arguments it does
+//!   not take is `{"error":"bad arguments","request":NAME}`.
 //! - **Bounds.** Each connection is served on the calling thread with
 //!   [`IO_TIMEOUT`] on its reads and writes, so a slow client delays the
 //!   others by that much at most.
@@ -269,6 +272,8 @@ pub enum Served {
     Operated,
     /// The limits, negotiated or reported.
     Limits,
+    /// The capabilities, for the caller's role (R-CORE-24).
+    Capabilities,
     /// A refusal: a uid without a role, a version not served, or a
     /// request not understood.
     Refused,
@@ -392,7 +397,7 @@ impl Server {
                     role.may_reopen(),
                     role.may_acknowledge(),
                 )),
-                Served::View,
+                Served::Capabilities,
             ),
             (Some(_), Request::BadArguments(request)) => {
                 (json::bad_arguments(request), Served::Refused)

@@ -86,4 +86,4 @@ pub mod operations;
 pub mod server;
 
 #[cfg(target_os = "linux")]
-pub use agent::{Agent, AgentConfig, DEFAULT_ATTACH_TIMEOUT, DEFAULT_HISTORY};
+pub use agent::{Agent, AgentConfig, DEFAULT_ATTACH_TIMEOUT, DEFAULT_HISTORY, valid_agent_id};

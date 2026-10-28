@@ -31,7 +31,9 @@ example namespace/pod; the agent looks no name up. Linux only.
 A request is one line: KARYOS-AGENT 1 view, or
 KARYOS-AGENT 1 guard-close DIR GUARD [REASON] (operator, risk-officer),
 KARYOS-AGENT 1 guard-reopen DIR GUARD EPOCH [REASON] (risk-officer,
-administrator), KARYOS-AGENT 1 gap-ack POSITION (administrator).
+administrator), KARYOS-AGENT 1 gap-ack POSITION (administrator),
+KARYOS-AGENT 1 limits [DIMENSION=VALUE ...], or KARYOS-AGENT 1 capabilities
+(each capability served, unavailable here or forbidden for the role).
 ";
 
 /// The default refresh period.
@@ -78,11 +80,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
             "--api-dir" if api_dir.is_none() => api_dir = Some(PathBuf::from(value)),
             "--journal" if journal.is_none() => journal = Some(PathBuf::from(value)),
             "--agent-id" if agent_id.is_none() => {
-                let valid = (1..=64).contains(&value.len())
-                    && value
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"._:/-".contains(&byte));
-                if !valid {
+                if !crate::agent::valid_agent_id(value) {
                     return None;
                 }
                 agent_id = Some(value.clone());
