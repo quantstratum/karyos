@@ -35,5 +35,5 @@ for artifact in "$dir"/*.tar.gz; do
         --output-signature "$artifact.sig" "$artifact"
     cosign verify-blob --insecure-ignore-tlog --key "$KARYOS_RELEASE_PUBKEY" \
         --signature "$artifact.sig" "$artifact"
+    echo "signed and verified: ${artifact##*/}"
 done
-echo "signed and verified: $(cd "$dir" && ls ./*.tar.gz | tr '\n' ' ')"

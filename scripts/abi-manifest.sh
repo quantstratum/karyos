@@ -19,7 +19,7 @@ header="${1:-$root/crates/karyos-ffi/include/karyos.h}"
 cc="${CC:-cc}"
 
 fail() {
-    echo "abi-manifest: $*" >&2
+    printf '%s\n' "abi-manifest: $*" >&2
     exit 1
 }
 
@@ -54,24 +54,24 @@ grep -oE '^#define KARYOS_[A-Z0-9_]+ [-(0-9][^/]*' "$header" |
     awk '{print $2}' | grep -v '^KARYOS_H$' >"$work/constants" || true
 
 {
-    echo '#include <stdalign.h>'
-    echo '#include <stddef.h>'
-    echo '#include <stdio.h>'
-    echo "#include \"$header\""
-    echo 'int main(void) {'
-    echo '    printf("abi_version=%d.%d.%d\n", KARYOS_ABI_VERSION_MAJOR, KARYOS_ABI_VERSION_MINOR, KARYOS_ABI_VERSION_PATCH);'
-    echo "    printf(\"target=$triple\\n\");"
+    printf '%s\n' '#include <stdalign.h>'
+    printf '%s\n' '#include <stddef.h>'
+    printf '%s\n' '#include <stdio.h>'
+    printf '%s\n' "#include \"$header\""
+    printf '%s\n' 'int main(void) {'
+    printf '%s\n' '    printf("abi_version=%d.%d.%d\n", KARYOS_ABI_VERSION_MAJOR, KARYOS_ABI_VERSION_MINOR, KARYOS_ABI_VERSION_PATCH);'
+    printf '%s\n' "    printf(\"target=$triple\\n\");"
     while read -r name fields; do
-        echo "    printf(\"struct $name size=%zu align=%zu\\n\", sizeof($name), alignof($name));"
+        printf '%s\n' "    printf(\"struct $name size=%zu align=%zu\\n\", sizeof($name), alignof($name));"
         for field in $fields; do
-            echo "    printf(\"  $field offset=%zu size=%zu\\n\", offsetof($name, $field), sizeof((($name *)0)->$field));"
+            printf '%s\n' "    printf(\"  $field offset=%zu size=%zu\\n\", offsetof($name, $field), sizeof((($name *)0)->$field));"
         done
     done <"$work/structs"
     while read -r constant; do
-        echo "    printf(\"const $constant=%lld\\n\", (long long)($constant));"
+        printf '%s\n' "    printf(\"const $constant=%lld\\n\", (long long)($constant));"
     done <"$work/constants"
-    echo '    return 0;'
-    echo '}'
+    printf '%s\n' '    return 0;'
+    printf '%s\n' '}'
 } >"$probe"
 
 "$cc" -std=c11 -Wall -Werror -o "$work/probe" "$probe" ||
