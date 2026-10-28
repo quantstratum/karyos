@@ -191,6 +191,10 @@ struct SessionState {
     /// A send failed: nothing more is sent, and the driver releases what
     /// is charged at this process's exit proof.
     broken: bool,
+    /// Fetches whose manifest did not arrive within the timeout: when it
+    /// arrives, before a later fetch's reply, it is discarded, its regions
+    /// drained and their exports detached (karyos#851).
+    abandoned: Vec<u64>,
 }
 
 impl Session {
@@ -739,6 +743,7 @@ pub fn attach_with(
                     next_fetch: 1,
                     live: Vec::new(),
                     broken: false,
+                    abandoned: Vec::new(),
                 }),
                 links: Mutex::new(Vec::new()),
             });
@@ -1867,6 +1872,10 @@ struct FetchedDescriptor {
     binding: Vec<(Record, OwnedFd)>,
 }
 
+/// Fetches abandoned at once at most: past it, a timeout leaves the
+/// session out of step (karyos#851).
+const MAX_ABANDONED: usize = 16;
+
 /// Sends `Fetch { key }` and receives its `Manifest` and one `Region` per
 /// record: the manifest must answer this fetch, with `key` and
 /// `registration`, and carry one record of `kind`, followed for a log
@@ -1893,10 +1902,51 @@ fn fetch_descriptor(
         fetch
     };
     send(&session.socket, &Message::Fetch { fetch, key }, None)?;
-    // A manifest that does not arrive (the socket timeout, plan 166) may
-    // still come: the session is out of step, as for any message of no
-    // fetch of ours, and the next fetch is refused rather than misread.
-    let manifest = receive(&session.socket).inspect_err(|_| session.state().broken = true)?;
+    let manifest = loop {
+        let received = match receive(&session.socket) {
+            Ok(received) => received,
+            Err(error) => {
+                // A manifest that did not arrive in time may still come:
+                // the fetch is abandoned, and its reply drained when it
+                // does (karyos#851). Any other failure leaves the session
+                // out of step.
+                let mut state = session.state();
+                if matches!(error, AttachError::Timeout) && state.abandoned.len() < MAX_ABANDONED {
+                    state.abandoned.push(fetch);
+                } else {
+                    state.broken = true;
+                }
+                return Err(error);
+            }
+        };
+        // A reply to an abandoned fetch, late: discarded, its regions
+        // drained and their exports detached, and the wait goes on.
+        let late = match &received.0 {
+            Message::Manifest { fetch: got, .. } | Message::Refused { fetch: got, .. } => {
+                let mut state = session.state();
+                let at = state
+                    .abandoned
+                    .iter()
+                    .position(|abandoned| abandoned == got);
+                at.map(|at| state.abandoned.swap_remove(at)).is_some()
+            }
+            _ => false,
+        };
+        if !late {
+            break received;
+        }
+        if let (
+            Message::Manifest {
+                fetch: got,
+                records,
+                ..
+            },
+            None,
+        ) = &received
+        {
+            abort(session, *got, records);
+        }
+    };
     let (records, stream_registration, incarnation, base) = match manifest {
         (Message::Refused { fetch: got, code }, None) if got == fetch => {
             return Err(AttachError::Refused { code });
@@ -1954,12 +2004,13 @@ fn fetch_descriptor(
             )) if got == fetch && at == index => fd,
             _ => {
                 // Out of step: the descriptors that arrived are closed and
-                // their exports detached.
-                session.state().broken = true;
+                // their exports detached, then the session is broken (a
+                // broken session detaches nothing).
                 for (part, fd) in records.iter().zip(fds) {
                     drop(fd);
                     session.detach(part.export);
                 }
+                session.state().broken = true;
                 return match received {
                     Err(error) => Err(error),
                     Ok(_) => Err(AttachError::Protocol),
@@ -2072,6 +2123,7 @@ mod tests {
                 next_fetch: 1,
                 live: Vec::new(),
                 broken: false,
+                abandoned: Vec::new(),
             }),
             links: Mutex::new(Vec::new()),
         });
@@ -2103,6 +2155,43 @@ mod tests {
         stream_id: 3,
         session_id: 1,
     };
+
+    /// karyos#851: a fetch whose manifest does not arrive within the
+    /// timeout is abandoned, not the session: its reply, arriving late,
+    /// is drained at the next fetch, which then reads its own reply.
+    #[test]
+    fn a_late_reply_to_an_abandoned_fetch_is_drained() {
+        let (ours, peer) = ipc::seqpacket_pair().unwrap();
+        ipc::set_timeouts(ours.as_fd(), Duration::from_millis(20)).unwrap();
+        let session = Session {
+            instance: 1,
+            socket: ours,
+            fetching: Mutex::new(()),
+            state: Mutex::new(SessionState {
+                next_fetch: 1,
+                live: Vec::new(),
+                broken: false,
+                abandoned: Vec::new(),
+            }),
+            links: Mutex::new(Vec::new()),
+        };
+        // No reply in time: abandoned, the session still in step.
+        assert!(matches!(
+            fetch_descriptor(&session, 7, 7, WireKind::LogBuffer),
+            Err(AttachError::Timeout)
+        ));
+        assert_eq!(session.state().abandoned, [1]);
+        assert!(!session.state().broken);
+        // The late reply to fetch 1, then fetch 2's own.
+        send(&peer, &Message::Refused { fetch: 1, code: 6 }, None).unwrap();
+        send(&peer, &Message::Refused { fetch: 2, code: 7 }, None).unwrap();
+        assert!(matches!(
+            fetch_descriptor(&session, 8, 8, WireKind::LogBuffer),
+            Err(AttachError::Refused { code: 7 })
+        ));
+        assert!(session.state().abandoned.is_empty());
+        assert!(!session.state().broken);
+    }
 
     /// A lost driver closes every link, so a remote handle waiting at a
     /// seal that marks a successor ends instead of waiting for ever: the

@@ -1092,7 +1092,7 @@ mod remote {
         paused.hold();
         assert!(matches!(
             karyos_client::ipc::attach_with(&dir, call, call, 4).err(),
-            Some(_)
+            Some(karyos_client::ipc::AttachError::Timeout)
         ));
         let resume = paused.clone();
         let resumer = std::thread::spawn(move || {

@@ -294,9 +294,11 @@ impl ContextBuilder {
     }
 
     /// The longest wait per message of `Client::connect`'s attach, apart
-    /// from a control call's ([`Self::timeout`] by default): a client whose
-    /// calls time out fast need not attach as fast. Once attached, the
-    /// session's fetches of a grant's regions wait the call timeout.
+    /// from a control call's ([`Self::timeout`] by default): the connection
+    /// (a full listen backlog retried for it) and the bootstrap. A client
+    /// whose calls time out fast need not attach as fast. Once attached,
+    /// every message on the session's socket, a fetch of a grant's
+    /// regions, a `Detach` or the final `Leave`, waits the call timeout.
     #[must_use]
     pub fn attach_timeout(mut self, timeout: Duration) -> Self {
         self.attach_timeout = Some(timeout);
@@ -322,8 +324,8 @@ impl ContextBuilder {
     ///
     /// # Errors
     ///
-    /// [`ClientError::InvalidContext`] for a zero timeout, pending bound or
-    /// image bound.
+    /// [`ClientError::InvalidContext`] for a zero timeout or attach
+    /// timeout, pending bound or image bound.
     pub fn build(self) -> Result<Context, ClientError> {
         let mut context = self.context;
         context.attach_timeout = self.attach_timeout.unwrap_or(context.timeout);
