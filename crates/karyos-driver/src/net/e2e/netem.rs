@@ -542,6 +542,22 @@ fn ip(args: &[&str]) {
 #[test]
 #[ignore = "runs under scripts/netem-test.sh"]
 fn n6_a_reliable_multicast_group_delivers_exactly_once_to_each_subscriber() {
+    multicast_group("N6", false);
+}
+
+/// N6 with one subscriber joining only after the publisher has offered its
+/// first 1000 messages, which is what a lost SOLICIT under loss can
+/// amount to (karyos#790): it still reads the stream from its join on,
+/// exactly once and in order.
+#[test]
+#[ignore = "runs under scripts/netem-test.sh"]
+fn n6_a_late_multicast_subscriber_reads_the_stream_from_its_join() {
+    multicast_group("N6 late", true);
+}
+
+/// N6's run: two subscribers of one reliable multicast group, the first
+/// subscribing after the first 1000 messages when `late`.
+fn multicast_group(label: &str, late: bool) {
     super::super::netem::require_netem();
     let _route = MulticastOnLoopback::route();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 9)), free_port());
@@ -558,8 +574,9 @@ fn n6_a_reliable_multicast_group_delivers_exactly_once_to_each_subscriber() {
         driver(ThreadingMode::Shared),
         driver(ThreadingMode::Shared),
     );
-    for subscriber in [&mut b, &mut c] {
-        let _ = subscriber.add_network_subscription(10, &channel).unwrap();
+    let _ = c.add_network_subscription(10, &channel).unwrap();
+    if !late {
+        let _ = b.add_network_subscription(10, &channel).unwrap();
     }
     let publication = a
         .add_network_publication(aggregate(10, 3, 1), &channel)
@@ -567,9 +584,9 @@ fn n6_a_reliable_multicast_group_delivers_exactly_once_to_each_subscriber() {
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
         .unwrap();
-    let count = 1000u32;
+    let mut count = 1000u32;
     let mut sent = 0u32;
-    let offer = |lane: &mut karyos_client::ClientPublication<_>, sent: &mut u32| {
+    let offer = |lane: &mut karyos_client::ClientPublication<_>, sent: &mut u32, count: u32| {
         while *sent < count {
             let mut payload = [0u8; 1000];
             payload[..4].copy_from_slice(&sent.to_le_bytes());
@@ -579,10 +596,17 @@ fn n6_a_reliable_multicast_group_delivers_exactly_once_to_each_subscriber() {
             }
         }
     };
+    if late {
+        pump(&mut [&mut a, &mut b, &mut c], |_| {
+            offer(&mut lane, &mut sent, count);
+            sent == count
+        });
+        let _ = b.add_network_subscription(10, &channel).unwrap();
+    }
     // Publishing while both images come up.
     let mut images = (None, None);
     pump(&mut [&mut a, &mut b, &mut c], |drivers| {
-        offer(&mut lane, &mut sent);
+        offer(&mut lane, &mut sent, count);
         images = (
             drivers[1].network_image(10, 3),
             drivers[2].network_image(10, 3),
@@ -592,13 +616,22 @@ fn n6_a_reliable_multicast_group_delivers_exactly_once_to_each_subscriber() {
     let (Some(first), Some(second)) = images else {
         unreachable!("pumped until both exist");
     };
+    // A subscriber that missed the SETUP binds through a SOLICIT, and a
+    // lost SOLICIT or challenge is retried only after the setup timeout and
+    // its holdoff (1 s each by default). Under netem loss that can take
+    // longer than the publisher takes to offer every message, and an image
+    // installed after the last message joins at the head with nothing left
+    // to read (karyos#790). So the run goes on for `TAIL` messages past the
+    // later of the two installs: every subscriber reads some of the stream.
+    const TAIL: u32 = 500;
+    count = count.max(sent.saturating_add(TAIL));
     let mut readers = [
         b.subscribe_aggregate(&first, Role::Required).unwrap(),
         c.subscribe_aggregate(&second, Role::Required).unwrap(),
     ];
     let mut seen: [Vec<u32>; 2] = [Vec::new(), Vec::new()];
     pump(&mut [&mut a, &mut b, &mut c], |_| {
-        offer(&mut lane, &mut sent);
+        offer(&mut lane, &mut sent, count);
         for (reader, seen) in readers.iter_mut().zip(seen.iter_mut()) {
             let _ = reader.poll(
                 |bytes, _, _| seen.push(u32::from_le_bytes(bytes[..4].try_into().unwrap())),
@@ -607,6 +640,15 @@ fn n6_a_reliable_multicast_group_delivers_exactly_once_to_each_subscriber() {
         }
         seen.iter().all(|seen| seen.last() == Some(&(count - 1)))
     });
+    // Every subscriber read at least the tail past the later install,
+    // however late it joined.
+    for (subscriber, seen) in seen.iter().enumerate() {
+        assert!(
+            seen.len() >= TAIL as usize,
+            "subscriber {subscriber} read {} messages, fewer than the {TAIL} past the joins",
+            seen.len()
+        );
+    }
     // From each subscriber's first message on: every one, once, in order.
     for (subscriber, seen) in seen.iter().enumerate() {
         let from = seen[0];
@@ -632,7 +674,7 @@ fn n6_a_reliable_multicast_group_delivers_exactly_once_to_each_subscriber() {
     let repairs = a.net.as_ref().unwrap().sender_counters().unwrap().repairs;
     let joins = seen.each_ref().map(|seen| seen[0]);
     println!(
-        "N6: {count} offered, subscribers from {joins:?}, in order; NAKs {naks:?}, {repairs} repairs"
+        "{label}: {count} offered, subscribers from {joins:?}, in order; NAKs {naks:?}, {repairs} repairs"
     );
     assert!(
         naks.iter().all(|naks| *naks > 0) && repairs > 0,
