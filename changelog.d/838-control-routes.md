@@ -10,5 +10,8 @@
   controls cannot use up that grace. At most `control_routes` routes are
   open and as many closing, within the capacity allocated at creation.
   An ANNOUNCE refused while every cached route is closing waits in order
-  and goes at the next send or duty, so every destination gets it; the
-  new `controls_waiting` sender counter counts them.
+  and goes at the next send or duty, so every destination gets it: at
+  most one waits per destination and publication, a later one replacing
+  it in place, within room allocated at creation (`publications` × 16
+  per endpoint), so none is dropped. The new `controls_waiting` sender
+  counter counts them.

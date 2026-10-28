@@ -5435,3 +5435,45 @@ fn refused_announces_wait_in_order_and_all_go() {
         "in order, once each"
     );
 }
+
+/// C2 (#838, QS-COORDINATOR): ANNOUNCE rounds to sixteen destinations
+/// refused cycle after cycle never overflow the waiting room: one waits
+/// per destination, the latest replacing the earlier, nothing is dropped,
+/// and once the routes close every destination gets its ANNOUNCE.
+#[test]
+fn repeated_refused_announces_wait_once_per_destination() {
+    use std::collections::BTreeMap;
+
+    use super::super::control::ControlRoutes;
+
+    let (mut tx, seen) = recording_tx();
+    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 43_000 + index));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    for _round in 0..5 {
+        for index in 1..=16 {
+            let _ = routes
+                .send_or_wait(&mut tx, at(index), &challenge_control())
+                .unwrap();
+        }
+        assert!(
+            routes.waiting() <= 16,
+            "one per destination: {}",
+            routes.waiting()
+        );
+    }
+    assert_eq!(routes.waits_dropped, 0, "nothing dropped");
+    routes.hold_closes = false;
+    for _ in 0..4 {
+        routes.close_lingering(&mut tx);
+    }
+    assert_eq!(routes.waiting(), 0, "all sent");
+    let mut per: BTreeMap<SocketAddr, usize> = BTreeMap::new();
+    for address in seen.lock().unwrap().iter() {
+        *per.entry(*address).or_default() += 1;
+    }
+    assert!(
+        (1..=16).all(|index| per.get(&at(index)).is_some_and(|count| *count >= 1)),
+        "every destination got its ANNOUNCE: {per:?}"
+    );
+}

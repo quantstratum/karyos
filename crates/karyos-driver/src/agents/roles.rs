@@ -1680,7 +1680,13 @@ pub(super) fn roles<T: StreamTerms>(
     let routes = (0..config.max_endpoints)
         .map(|_| RouteSlot {
             endpoint: None,
-            routes: ControlRoutes::new(config.control_routes),
+            // One ANNOUNCE waiting per publication and destination at most.
+            routes: ControlRoutes::with_waiting(
+                config.control_routes,
+                config
+                    .publications
+                    .saturating_mul(super::data::MAX_DESTINATIONS),
+            ),
         })
         .collect();
     Ok((

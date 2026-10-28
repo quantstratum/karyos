@@ -296,8 +296,10 @@ pub struct ControlRoutes {
     tick: u64,
     report: TxReport,
     /// Controls refused while every cached route was closing, in order:
-    /// sent before any later one, at the next send or duty (#838). Bounded
-    /// at creation; one past it is dropped and counted.
+    /// sent before any later one, at the next send or duty (#838). At most
+    /// one per destination and kind (and alias, for an ANNOUNCE): a later
+    /// one replaces it in place, so the room allocated at creation for
+    /// every such key is never exceeded and nothing waits forever.
     waiting: std::collections::VecDeque<(SocketAddr, Control)>,
     /// Controls dropped with the waiting queue full.
     pub(crate) waits_dropped: u64,
@@ -332,17 +334,42 @@ enum Closed {
     Failed,
 }
 
-/// Room in the waiting queue past one control per cached route: a
-/// multi-destination publication's ANNOUNCE round.
+/// The default room in the waiting queue: one publication's ANNOUNCE to
+/// each of its destinations.
 const WAITING_EXTRA: usize = super::data::MAX_DESTINATIONS;
+
+/// What a waiting control is unique by, with its destination: its kind,
+/// and an ANNOUNCE's alias (each publication announces itself).
+fn wait_key(
+    control: &Control,
+) -> (
+    karyos_protocol::network::ControlKind,
+    Option<karyos_protocol::network::Alias>,
+) {
+    let alias = match control {
+        Control::SetupAnnounce(announce) => Some(announce.alias),
+        _ => None,
+    };
+    (control.kind(), alias)
+}
 
 /// Datagrams one control queue holds: controls are sent at once.
 const CONTROL_QUEUE_DEPTH: u16 = 4;
 
 impl ControlRoutes {
-    /// At most `max` cached destinations (at least 1); allocated here.
+    /// At most `max` cached destinations (at least 1), and room for the
+    /// ANNOUNCEs of one publication's destinations waiting; allocated
+    /// here.
     #[must_use]
     pub fn new(max: usize) -> Self {
+        Self::with_waiting(max, WAITING_EXTRA)
+    }
+
+    /// At most `max` cached destinations (at least 1), and room for
+    /// `waiting` controls waiting, one per destination, kind and alias
+    /// ([`ControlRoutes::send_or_wait`]); allocated here.
+    #[must_use]
+    pub fn with_waiting(max: usize, waiting: usize) -> Self {
         let max = max.max(1);
         Self {
             // At most `max` open entries, and as many closing.
@@ -351,7 +378,7 @@ impl ControlRoutes {
             epoch: None,
             tick: 0,
             report: TxReport::new(),
-            waiting: std::collections::VecDeque::with_capacity(max.saturating_add(WAITING_EXTRA)),
+            waiting: std::collections::VecDeque::with_capacity(waiting.max(1)),
             waits_dropped: 0,
             refusal: ControlRefusal::default(),
             #[cfg(test)]
@@ -681,11 +708,21 @@ impl ControlRoutes {
         };
         match result {
             Ok(()) => Ok(true),
-            Err(ControlSendError::Blocked) if self.waiting.len() < self.waiting.capacity() => {
-                self.waiting.push_back((address, *control));
-                Ok(false)
-            }
             Err(ControlSendError::Blocked) => {
+                let key = wait_key(control);
+                if let Some(slot) = self
+                    .waiting
+                    .iter_mut()
+                    .find(|(at, waiting)| *at == address && wait_key(waiting) == key)
+                {
+                    // The latest replaces the earlier, in its place.
+                    slot.1 = *control;
+                    return Ok(false);
+                }
+                if self.waiting.len() < self.waiting.capacity() {
+                    self.waiting.push_back((address, *control));
+                    return Ok(false);
+                }
                 self.waits_dropped = self.waits_dropped.saturating_add(1);
                 Err(ControlSendError::Blocked)
             }
