@@ -882,7 +882,7 @@ impl<T: StreamTerms> Outbound<T> {
 
     /// [`Outbound::nak`] for a NAK that arrived on route `route` (0 on one
     /// path). A multi-destination publication has no single repair path
-    /// and drops it: its NAKs go through [`Outbound::nak_at`]. One from a `validated` receiver id is recorded to absorb its
+    /// and drops it: its NAKs go through `Outbound::nak_at`. One from a `validated` receiver id is recorded to absorb its
     /// copies on other routes (RP-11); one whose receiver id is not
     /// validated yet takes no part in absorption.
     pub fn nak_on(
