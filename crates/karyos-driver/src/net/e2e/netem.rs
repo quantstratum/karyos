@@ -523,8 +523,20 @@ impl MulticastOnLoopback {
         // Built first, so a failed second call still undoes the first.
         let route = Self(guard);
         ip(&["link", "set", "lo", "multicast", "on"]);
-        // `replace`: a route left by an aborted run is no error.
-        ip(&["route", "replace", "239.255.0.0/16", "dev", "lo"]);
+        // A route left on `lo` by an aborted run is no error; one the host
+        // set elsewhere is never replaced.
+        let added = ip_status(&["route", "add", "239.255.0.0/16", "dev", "lo"])
+            .is_some_and(|status| status.success());
+        if !added {
+            let shown = std::process::Command::new("ip")
+                .args(["route", "show", "239.255.0.0/16"])
+                .output()
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&shown.stdout).contains("dev lo"),
+                "239.255.0.0/16 is routed elsewhere on this host"
+            );
+        }
         route
     }
 }
