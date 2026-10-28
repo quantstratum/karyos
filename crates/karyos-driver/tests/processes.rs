@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use karyos_client::ipc::{RemoteClient, attach};
@@ -108,7 +109,19 @@ fn driver_with(dir: &Path, config: DriverConfig) -> IpcDriver {
 /// A child process, killed when the test ends however it ends, with its
 /// scenario and its stderr: a child's panic goes to its stderr, which a
 /// failing test prints, so a child that stops reporting shows its cause.
-struct Guard(Child, String, Arc<Mutex<String>>);
+/// The last field is the thread draining its stderr.
+struct Guard(Child, String, Arc<Mutex<String>>, Option<JoinHandle<()>>);
+
+impl Guard {
+    /// Waits for the thread draining the child's stderr, which closes the
+    /// pipe when it sees the end: a child that has exited then holds no
+    /// descriptor of this process (karyos#804).
+    fn drained(&mut self) {
+        if let Some(thread) = self.3.take() {
+            let _ = thread.join();
+        }
+    }
+}
 
 impl Drop for Guard {
     #[expect(
@@ -141,7 +154,7 @@ fn spawn(scenario: &str, dir: &Path) -> (Guard, Receiver<String>) {
     let stderr = child.stderr.take().unwrap();
     let errors = Arc::new(Mutex::new(String::new()));
     let kept = Arc::clone(&errors);
-    std::thread::spawn(move || {
+    let drain = std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             let mut kept = kept.lock().unwrap_or_else(PoisonError::into_inner);
             kept.push_str(&line);
@@ -158,7 +171,10 @@ fn spawn(scenario: &str, dir: &Path) -> (Guard, Receiver<String>) {
             }
         }
     });
-    (Guard(child, scenario.to_string(), errors), receiver)
+    (
+        Guard(child, scenario.to_string(), errors, Some(drain)),
+        receiver,
+    )
 }
 
 /// Runs duty cycles until the child reports `expected`, or until `limit`.
@@ -263,6 +279,25 @@ fn open_descriptors() -> usize {
     std::fs::read_dir("/proc/self/fd").unwrap().count()
 }
 
+/// Each open descriptor and its target, for a failure to name what
+/// changed (karyos#804).
+fn descriptor_list() -> Vec<String> {
+    let mut fds: Vec<String> = std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let target = std::fs::read_link(entry.path()).ok()?;
+            Some(format!(
+                "{}={}",
+                entry.file_name().to_string_lossy(),
+                target.display()
+            ))
+        })
+        .collect();
+    fds.sort();
+    fds
+}
+
 /// A publisher process and a subscriber process exchange a sequence
 /// through the stream's shared region: the subscriber gets every message,
 /// in order and with its payload, and both detach and leave.
@@ -335,14 +370,20 @@ fn descriptor_driver(dir: &Path) {
     assert!(warm.0.wait().unwrap().success());
     // Its stdout reader thread closes the pipe at EOF, asynchronously; the
     // thread drops its sender only after the pipe, so a disconnected
-    // channel proves the pipe is closed before the count.
+    // channel proves the pipe is closed before the count. Its stderr is
+    // drained by a thread of its own, which closes that pipe at EOF just
+    // as asynchronously: without waiting for it, the count could include
+    // the pipe, which then closed during the rounds (karyos#804).
     while reports.recv().is_ok() {}
+    warm.drained();
     let before = open_descriptors();
+    let before_list = descriptor_list();
     let (mut client, reports) = spawn("subscribe-many", dir);
     serve_until_report(&mut driver, &reports, "rounds done");
     serve_until(&mut driver, |driver| driver.clients() == 0);
     release(&mut client.0);
     assert!(client.0.wait().unwrap().success());
+    client.drained();
     // The reader thread of the client's stdout closes its pipe once it
     // sees the end: let it finish.
     let start = Instant::now();
@@ -352,8 +393,17 @@ fn descriptor_driver(dir: &Path) {
         after = open_descriptors();
     }
     if after != before || counter(&driver, "grants detached") != 1 + ROUNDS {
+        let after_list = descriptor_list();
+        let gone: Vec<_> = before_list
+            .iter()
+            .filter(|fd| !after_list.contains(fd))
+            .collect();
+        let new: Vec<_> = after_list
+            .iter()
+            .filter(|fd| !before_list.contains(fd))
+            .collect();
         report(&format!(
-            "descriptors before {before} after {after}, detached {}, ended {}, exported {}, faulty {}, timed out {}",
+            "gone {gone:?} new {new:?} descriptors before {before} after {after}, detached {}, ended {}, exported {}, faulty {}, timed out {}",
             counter(&driver, "grants detached"),
             counter(&driver, "grants ended"),
             counter(&driver, "grants exported"),
