@@ -416,10 +416,11 @@ impl core::fmt::Debug for PolicySlot {
 }
 
 impl PolicySlot {
-    /// Applies a newer published policy to `limiter` at `now`. An unchanged
-    /// sequence word is one Acquire load; a torn read waits for the next
-    /// call.
-    fn refresh(&mut self, limiter: &mut RateLimiter, now: u64) {
+    /// Applies a newer published policy to `limiter` at `now`, creating it
+    /// for a gate built with no rate (a rateless lane's publication getting
+    /// one). An unchanged sequence word is one Acquire load; a torn read
+    /// waits for the next call.
+    fn refresh(&mut self, limiter: &mut Option<RateLimiter>, now: u64) {
         use karyos_sys::rate_policy_slot::{SEQUENCE, SlotRead, try_read_sequenced};
 
         if self.words.load_acquire(SEQUENCE) == Some(self.sequence) {
@@ -431,7 +432,10 @@ impl PolicySlot {
         if let SlotRead::Policy { version, policy } = read
             && version > self.version
         {
-            limiter.set_policy(policy, now);
+            match limiter {
+                Some(limiter) => limiter.set_policy(policy, now),
+                None => *limiter = Some(RateLimiter::new(policy, now)),
+            }
             self.version = version;
         }
         if let Some(sequence) = sequence {
@@ -703,8 +707,8 @@ impl GuardGate {
     /// One load decides that nothing changed; a publication in progress is
     /// read at the next call.
     pub fn set_now(&mut self, now: u64) {
-        if let (Some(slot), Some(limiter)) = (&mut self.policy, &mut self.limiter) {
-            slot.refresh(limiter, now);
+        if let Some(slot) = &mut self.policy {
+            slot.refresh(&mut self.limiter, now);
         }
         if let Some(limiter) = &mut self.limiter {
             limiter.refill_at(now);

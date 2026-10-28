@@ -1988,18 +1988,28 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let count = u64::try_from(freed.len()).unwrap_or(u64::MAX);
             // The feeder counters go with their stream, and a publication's
             // rate policy with its last lane (registrations are never
-            // reused, so a kept one would only grow the map).
+            // reused, so a kept one would only grow the map): one pass over
+            // the lanes left, each looked up among the freed registrations.
+            let mut gone: Vec<_> = Vec::with_capacity(freed.len());
             for stream in freed {
-                let registration = stream.aggregate.registration;
+                gone.push(stream.aggregate.registration);
                 if let Some(counters) = stream.feeder_counters {
                     counters.free(&mut self.counters);
                 }
-                if !self
-                    .streams
-                    .iter()
-                    .any(|lane| lane.aggregate.registration == registration)
+            }
+            gone.sort_unstable();
+            gone.dedup();
+            let mut kept = vec![false; gone.len()];
+            for lane in &self.streams {
+                if let Ok(index) = gone.binary_search(&lane.aggregate.registration)
+                    && let Some(kept) = kept.get_mut(index)
                 {
-                    let _ = self.rate_policies.remove(&registration);
+                    *kept = true;
+                }
+            }
+            for (registration, kept) in gone.iter().zip(kept) {
+                if !kept {
+                    let _ = self.rate_policies.remove(registration);
                 }
             }
             self.counters.add(Event::StreamsFreed, count);
@@ -2522,10 +2532,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ///
     /// # Errors
     ///
-    /// As [`Self::change_rate_policy`]; a guarded lane's refusal, a lane at
-    /// another version than `expected` included, is
-    /// [`DriverError::RateChangeOnLane`], naming the lane, and refuses the
-    /// change on every lane.
+    /// As [`Self::change_rate_policy`]. The version, the transition and the
+    /// policy's validity are the publication's: their refusals name no
+    /// lane. A guarded lane whose control reserve the policy would cross is
+    /// [`DriverError::RateChangeOnLane`] with `ReserveCrossed`, naming the
+    /// lane, and refuses the change on every lane.
     pub fn change_aggregate_rate_policy(
         &mut self,
         aggregate: &AggregateHandle,

@@ -378,6 +378,62 @@ fn an_aggregate_change_publishes_its_gate_slot_once() {
     ));
 }
 
+/// Follow-up 6 of the #814 review: the first lane guarded with a rate
+/// gives the policy to the rateless lanes guarded before it, and their
+/// shared gate slot is published once, at version 1.
+#[test]
+fn the_first_rate_publishes_the_rateless_lanes_gate_slot_once() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+    use karyos_sys::rate_policy_slot::{SEQUENCE, SLOT_WORDS, SlotRead, try_read};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = driver
+        .add_aggregate(AggregateConfig {
+            stream: stream(2),
+            quanta: vec![u64::from(DEFAULT_MTU) * 4; 3],
+        })
+        .unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 100,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    let lanes: Vec<StreamHandle> = aggregate.streams().collect();
+    // Two lanes guarded with no rate, sharing one slot.
+    let slot = Arc::new(crate::shared_words::Words::heap(SLOT_WORDS));
+    for (index, lane) in lanes[..2].iter().enumerate() {
+        driver.guard_stream(*lane, guard, 4, None).unwrap();
+        let guarded = driver.stream(*lane).unwrap().guarded.as_mut().unwrap();
+        if index == 0 {
+            guarded.set_gate_slot(Arc::clone(&slot));
+        } else {
+            guarded.keep_gate_slot(Arc::clone(&slot));
+        }
+    }
+    let sequence = |slot: &crate::shared_words::Words| {
+        slot.words()[SEQUENCE].load(std::sync::atomic::Ordering::Acquire)
+    };
+    let before = sequence(&slot);
+    driver
+        .guard_stream(
+            lanes[2],
+            guard,
+            4,
+            Some(crate::guards::GuardRate::publication(policy)),
+        )
+        .unwrap();
+    // One publication for both lanes: the sequence word moves by 2.
+    assert_eq!(sequence(&slot), before + 2);
+    let words = slot.words();
+    assert!(matches!(
+        try_read(&words, 0),
+        SlotRead::Policy { version: 1, policy: published } if published == policy
+    ));
+}
+
 /// Re-review of #814: a change named on a lane whose aggregate cannot be
 /// assembled (a lane missing from the table, which the API never leaves)
 /// is refused with the lookup's error and audited for every guard of the
@@ -474,6 +530,54 @@ fn a_publications_rate_policy_goes_with_its_last_lane() {
         driver.free_retired_streams();
         assert!(driver.rate_policies.is_empty(), "round {round}");
     }
+}
+
+/// Follow-up 7 of the #814 review: with one lane of a removed publication
+/// freed and another still retiring (a lease held), the stored policy
+/// stays; it goes when the last lane is freed.
+#[test]
+fn a_publications_rate_policy_stays_while_a_lane_is_retiring() {
+    use karyos_client::link::{Lease, LeaseEnd};
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 100,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    let aggregate = driver
+        .add_aggregate(AggregateConfig {
+            stream: stream(2),
+            quanta: vec![u64::from(DEFAULT_MTU) * 4; 2],
+        })
+        .unwrap();
+    for lane in aggregate.streams() {
+        driver
+            .guard_stream(
+                lane,
+                guard,
+                4,
+                Some(crate::guards::GuardRate::publication(policy)),
+            )
+            .unwrap();
+    }
+    let kept = aggregate.streams().nth(1).unwrap();
+    let lease = Lease::acquire(
+        &driver.stream(kept).unwrap().leases,
+        &Arc::new(LeaseEnd::default()),
+    );
+    driver.remove_aggregate(&aggregate).unwrap();
+    driver.free_retired_streams();
+    assert_eq!(driver.streams.len(), 1, "one lane freed, one retiring");
+    assert_eq!(driver.rate_policies.len(), 1);
+    drop(lease);
+    driver.free_retired_streams();
+    assert!(driver.streams.is_empty());
+    assert!(driver.rate_policies.is_empty());
 }
 
 /// QS-COORDINATOR, ACS 33899: with every lane the driver can hold guarded

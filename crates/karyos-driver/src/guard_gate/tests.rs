@@ -1045,6 +1045,37 @@ fn the_gate_applies_a_newer_published_policy_at_its_next_serve() {
     );
 }
 
+/// R-CORE-21, follow-up 1 of the #814 review: a gate built with no rate
+/// (a rateless lane's) creates its bucket from the first policy published
+/// to its slot, full at the new burst as a gate built with it would be,
+/// and takes later changes as any other gate.
+#[test]
+fn a_rateless_gate_adopts_a_published_policy() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, None);
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (0, None)
+    );
+    publish(slot.words(), 0, 1, &rate(5, 3));
+    f.gate.set_now(1);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (1, Some(3))
+    );
+    publish(slot.words(), 0, 2, &rate(1, 1));
+    f.gate.set_now(2);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (2, Some(1))
+    );
+}
+
 /// Words that complete a publication of version 3 right after the first
 /// plain load of the sequence word once `armed` returns: the load that
 /// validates a read, so the read is whole and the publication lands
