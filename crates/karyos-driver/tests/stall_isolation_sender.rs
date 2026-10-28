@@ -346,8 +346,18 @@ fn test_stall_isolation_a_paused_claim_holds_the_in_order_sender_until_its_deadl
     let (mut sent, mut received) = (0u32, 0u32);
     let mut held: Option<(u32, Instant)> = None;
     let mut freed = None;
+    // The offers accepted before the publisher was held, and when the last
+    // of them was: what a failure reports (karyos#832).
+    let mut last_accepted: Option<(u32, Instant)> = None;
     for _ in 0..400_000 {
-        if sent < messages {
+        // Until the publisher is held, offers go in one burst, with no duty
+        // cycle or sleep between them: the window fills within microseconds
+        // of the claim, so the claim's 50 ms deadline cannot pass first,
+        // however loaded the host (karyos#832; SPEC §13, "Stall isolation
+        // and capacity"). Then one offer a cycle.
+        let mut burst = true;
+        while burst && sent < messages {
+            burst = held.is_none();
             let mut payload = [0u8; PAYLOAD];
             payload[..4].copy_from_slice(&sent.to_le_bytes());
             match running.offer(&payload).unwrap() {
@@ -356,13 +366,17 @@ fn test_stall_isolation_a_paused_claim_holds_the_in_order_sender_until_its_deadl
                         freed = Some(Instant::now());
                     }
                     sent += 1;
+                    if held.is_none() {
+                        last_accepted = Some((sent, Instant::now()));
+                    }
                 }
                 ConcurrentOfferOutcome::BackPressured => {
                     if held.is_none() {
                         held = Some((sent, Instant::now()));
                     }
                 }
-                ConcurrentOfferOutcome::AdminAction => {}
+                // Not a refusal of the window: retried on the next cycle.
+                ConcurrentOfferOutcome::AdminAction => burst = false,
                 other => panic!("message {sent}: {other:?}"),
             }
         }
@@ -384,7 +398,14 @@ fn test_stall_isolation_a_paused_claim_holds_the_in_order_sender_until_its_deadl
         }
         std::thread::sleep(Duration::from_micros(50));
     }
-    let (at, since) = held.expect("the paused claim never held the publisher");
+    let Some((at, since)) = held else {
+        let (count, last) =
+            last_accepted.map_or((0, Duration::ZERO), |(count, at)| (count, at - claimed));
+        panic!(
+            "the paused claim never held the publisher: {count} offers accepted, the last {last:?} \
+             after the claim, for a deadline of {DEADLINE:?}"
+        );
+    };
     let freed = freed.expect("the publisher was never freed");
     // Held at its window: the claim's block (64 bytes and a 32-byte
     // header), then the messages behind it, 1056 bytes each.
