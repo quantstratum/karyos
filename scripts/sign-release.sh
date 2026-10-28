@@ -28,7 +28,11 @@ fail() {
     fail "no KARYOS_RELEASE_PUBKEY: each signature is verified with the public key"
 command -v cosign >/dev/null 2>&1 || fail "cosign is not installed"
 [ -f "$dir/SHA256SUMS" ] || fail "$dir is not a release directory (no SHA256SUMS)"
-(cd "$dir" && shasum -a 256 -c SHA256SUMS) || fail "the artifacts do not match SHA256SUMS"
+if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$dir" && sha256sum -c SHA256SUMS) || fail "the artifacts do not match SHA256SUMS"
+else
+    (cd "$dir" && shasum -a 256 -c SHA256SUMS) || fail "the artifacts do not match SHA256SUMS"
+fi
 
 for artifact in "$dir"/*.tar.gz; do
     cosign sign-blob --yes --tlog-upload=false --key "$KARYOS_RELEASE_KEY" \

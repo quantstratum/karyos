@@ -75,7 +75,17 @@ contents=karyosd
 excludes=libkaryos
 EOF
 
-# A deterministic gzip'd tar of directory $2 named $1.
+# `sha256sum`'s output for the files given (GNU coreutils, or shasum).
+sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$@"
+    else
+        shasum -a 256 "$@"
+    fi
+}
+
+# A deterministic gzip'd tar of directory $2 named $1, with GNU tar or
+# bsdtar (their owner and time options differ).
 archive() {
     local name="$1" dir="$2"
     find "$dir" -exec touch -h -d "@$epoch" {} + 2>/dev/null ||
@@ -83,8 +93,13 @@ archive() {
     (
         cd "$(dirname "$dir")"
         find "$(basename "$dir")" -print | LC_ALL=C sort >"$work/$name.list"
-        COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --uname '' --gname '' \
-            --no-recursion -cf - -T "$work/$name.list"
+        if tar --version 2>/dev/null | grep -q 'GNU tar'; then
+            tar --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
+                --no-recursion -cf - -T "$work/$name.list"
+        else
+            COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --uname '' --gname '' \
+                --no-recursion -cf - -T "$work/$name.list"
+        fi
     ) | gzip -n -9 >"$work/out/$name.tar.gz"
 }
 
@@ -94,7 +109,7 @@ archive "$lib_name" "$work/$lib_name"
 archive "$daemon_name" "$work/$daemon_name"
 (
     cd "$work/out"
-    shasum -a 256 "$lib_name.tar.gz" "$daemon_name.tar.gz" >SHA256SUMS
+    sha256 "$lib_name.tar.gz" "$daemon_name.tar.gz" >SHA256SUMS
 )
 
 # Neither artifact holds the other.

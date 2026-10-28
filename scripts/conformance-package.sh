@@ -26,7 +26,11 @@ fail() {
 dir="$(cd "$(dirname "$tarball")" && pwd)"
 name="$(basename "$tarball")"
 [ -f "$dir/SHA256SUMS" ] || fail "no SHA256SUMS beside $tarball"
-digest="$(shasum -a 256 "$tarball" | cut -d ' ' -f 1)"
+if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum "$tarball" | cut -d ' ' -f 1)"
+else
+    digest="$(shasum -a 256 "$tarball" | cut -d ' ' -f 1)"
+fi
 grep -qx "$digest  $name" "$dir/SHA256SUMS" ||
     fail "$name does not match SHA256SUMS"
 work="$(mktemp -d)"
