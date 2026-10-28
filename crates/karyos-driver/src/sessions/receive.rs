@@ -386,6 +386,10 @@ pub struct ReceiveSessions {
     boot_id: [u64; 2],
     slots: Vec<Slot>,
     counters: SessionCounters,
+    /// Every reason a control was ignored, in order (tests: the bind-time
+    /// measurement, karyos#805).
+    #[cfg(test)]
+    pub(crate) ignored: Vec<Ignored>,
     /// The images' path bindings (redundant-paths.md sections 2 and 3).
     paths: PathBindings,
     /// Keys whose solicit entry ended without a binding, and until when no
@@ -443,6 +447,8 @@ impl ReceiveSessions {
                 config.max_images
             ],
             counters: SessionCounters::default(),
+            #[cfg(test)]
+            ignored: Vec::new(),
             paths,
             holdoffs: Vec::with_capacity(config.max_pending_challenges),
         })
@@ -469,6 +475,8 @@ impl ReceiveSessions {
 
     fn ignore(&mut self, reason: Ignored) -> Ignored {
         self.counters.bump(|c| &mut c.dropped);
+        #[cfg(test)]
+        self.ignored.push(reason);
         reason
     }
 

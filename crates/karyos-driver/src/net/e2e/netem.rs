@@ -504,10 +504,10 @@ fn n5_two_reliable_lanes_each_deliver_exactly_once_in_order() {
 /// Multicast groups in 239.255.0.0/16 carried by the loopback, which the
 /// job shapes: `lo` takes multicast and a route of the range. Without it a
 /// group's datagrams leave by the default route, unshaped. Undone on drop.
-struct MulticastOnLoopback;
+pub(super) struct MulticastOnLoopback;
 
 impl MulticastOnLoopback {
-    fn route() -> Self {
+    pub(super) fn route() -> Self {
         ip(&["link", "set", "lo", "multicast", "on"]);
         ip(&["route", "add", "239.255.0.0/16", "dev", "lo"]);
         Self
