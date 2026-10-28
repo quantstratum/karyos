@@ -3185,3 +3185,68 @@ fn an_older_driver_options_struct_has_no_network_and_a_bad_value_is_refused() {
         assert_eq!(driver, 0, "nothing created");
     }
 }
+
+// R-CORE-34's stream cap over the C ABI (karyos#818; ABI 0.1.5).
+
+/// A driver whose options carry `max_stream_bytes`, and the default
+/// stream's `karyos_driver_add_stream`: the status and the detail.
+fn capped_add_stream(max_stream_bytes: u64) -> (i32, Detail) {
+    let mut options = default_driver_options();
+    options.max_stream_bytes = max_stream_bytes;
+    let mut driver = 0;
+    // SAFETY: live, aligned pointers; no detail.
+    let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    let mut stream = core::mem::MaybeUninit::<StreamOptions>::zeroed();
+    // SAFETY: a live, aligned, writable `StreamOptions`.
+    let status = unsafe {
+        karyos_stream_options_init_sized(stream.as_mut_ptr(), size_of::<StreamOptions>())
+    };
+    assert_eq!(status, Status::Ok.code());
+    // SAFETY: `karyos_stream_options_init` wrote every field.
+    let mut stream = unsafe { stream.assume_init() };
+    stream.stream_id = 818;
+    let mut detail = Detail {
+        size: size_of_u32::<Detail>(),
+        reserved: 7,
+        code: 7,
+        value: 7,
+    };
+    // SAFETY: live, aligned pointers and a sized detail.
+    let status = unsafe { karyos_driver_add_stream(driver, &stream, &mut detail) };
+    assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+    (status, detail)
+}
+
+/// A stream above the cap is `KARYOS_E_INVALID_ARGUMENT` with the lane's
+/// bytes in `code` and the cap in `value`; a cap of exactly those bytes
+/// admits the same stream, so `code` is the lane's size, not a bound.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_stream_above_the_options_cap_is_refused_with_its_bytes_and_the_cap() {
+    let (status, detail) = capped_add_stream(1);
+    assert_eq!(status, Status::InvalidArgument.code());
+    assert_eq!(detail.value, 1, "the cap");
+    let bytes = detail.code;
+    assert!(bytes > 1, "the lane's bytes");
+    let (status, detail) = capped_add_stream(bytes - 1);
+    assert_eq!(status, Status::InvalidArgument.code());
+    assert_eq!((detail.code, detail.value), (bytes, bytes - 1));
+    assert_eq!(capped_add_stream(bytes).0, Status::Ok.code(), "at the cap");
+}
+
+/// ABI 0.1.4's 72-byte struct ends before `max_stream_bytes`: no cap,
+/// whatever lies past it.
+#[test]
+fn an_older_driver_options_struct_has_no_stream_cap() {
+    let mut given = default_driver_options();
+    given.max_stream_bytes = 1;
+    given.size = 72;
+    // SAFETY: a live, aligned `DriverOptions` whose size is set.
+    let read = unsafe { read_sized(&given, DRIVER_OPTIONS_SIZE_0_1, default_driver_options()) };
+    assert_eq!(read.unwrap().max_stream_bytes, 0);
+    given.size = size_of_u32::<DriverOptions>();
+    // SAFETY: as above.
+    let read = unsafe { read_sized(&given, DRIVER_OPTIONS_SIZE_0_1, default_driver_options()) };
+    assert_eq!(read.unwrap().max_stream_bytes, 1);
+}

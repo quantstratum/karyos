@@ -1,0 +1,26 @@
+# An embedded driver created with a stream cap (karyos#818; ABI 0.1.5):
+# karyos_driver_options.max_stream_bytes bounds the bytes one stream lane
+# takes, its log buffer region plus its conflation table's. A stream above
+# it is refused with invalid_argument, and nothing is added; with a cap
+# above the stream, the same stream is added. A runner without
+# stream-cap, or with a library below 0.1.5, skips it.
+format 2
+id op.stream.cap
+abi 0.1
+covers "stream cap"
+since B1
+feature embedded-driver
+feature stream-cap
+
+op driver.create_capped max_stream_bytes=1
+expect ok driver=$tight
+op driver.add_stream driver=$tight stream_id=818
+expect status=invalid_argument
+op driver.close driver=$tight
+expect ok
+op driver.create_capped max_stream_bytes=1099511627776
+expect ok driver=$wide
+op driver.add_stream driver=$wide stream_id=818
+expect ok
+op driver.close driver=$wide
+expect ok

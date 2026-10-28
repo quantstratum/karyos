@@ -34,3 +34,4 @@ remote driver: op.remote.conflated op.remote.outcomes
 driver readiness: driver.readiness.invoker driver.readiness.threaded
 # Not a §13 row: an embedded driver's network over the C ABI (karyos#735).
 embedded network: op.embedded.network
+stream cap: op.stream.cap

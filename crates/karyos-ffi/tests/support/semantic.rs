@@ -326,11 +326,11 @@ impl Adapter {
                     (status, _) => Answer::Status(self.name(status, at)),
                 }
             }
-            "driver.create" | "driver.create_networked" => {
-                let (status, driver) = if op == "driver.create" {
-                    abi::driver_create()
-                } else {
-                    abi::driver_create_networked()
+            "driver.create" | "driver.create_networked" | "driver.create_capped" => {
+                let (status, driver) = match op {
+                    "driver.create" => abi::driver_create(),
+                    "driver.create_networked" => abi::driver_create_networked(),
+                    _ => abi::driver_create_capped(args.narrow("max_stream_bytes", None)),
                 };
                 if status != 0 {
                     return Answer::Status(self.name(status, at));

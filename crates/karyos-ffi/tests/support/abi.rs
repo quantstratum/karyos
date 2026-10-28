@@ -43,6 +43,7 @@ pub struct DriverOptions {
     pub startup_timeout_ns: u64,
     pub network: u32,
     pub reserved0: u32,
+    pub max_stream_bytes: u64,
 }
 
 /// `karyos_readiness` (ABI 0.1.3).
@@ -1198,6 +1199,17 @@ pub fn driver_create_networked() -> (i32, u64) {
     let (status, mut options) = driver_options();
     assert_eq!(status, 0);
     options.network = 1;
+    let (status, driver, _) = driver_create_with(&options);
+    (status, driver)
+}
+
+/// `karyos_driver_create` with the options of `karyos_driver_options_init`
+/// and `max_stream_bytes` set (ABI 0.1.5, karyos#818): the status and
+/// the driver.
+pub fn driver_create_capped(max_stream_bytes: u64) -> (i32, u64) {
+    let (status, mut options) = driver_options();
+    assert_eq!(status, 0);
+    options.max_stream_bytes = max_stream_bytes;
     let (status, driver, _) = driver_create_with(&options);
     (status, driver)
 }

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 /*
- * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.4.
+ * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.5.
  *
  * Written by hand until cbindgen is admitted; a test in karyos-ffi checks
  * it against the Rust source (quantstratum-docs:
@@ -101,7 +101,7 @@ extern "C" {
 
 #define KARYOS_ABI_VERSION_MAJOR 0
 #define KARYOS_ABI_VERSION_MINOR 1
-#define KARYOS_ABI_VERSION_PATCH 4
+#define KARYOS_ABI_VERSION_PATCH 5
 
 /** No handle names an object with this value. */
 #define KARYOS_NULL_HANDLE 0
@@ -488,6 +488,14 @@ typedef struct karyos_driver_options {
     uint32_t network;
     /* Must be zero; a later version may give it a meaning. */
     uint32_t reserved0;
+    /*
+     * The most bytes one stream lane may take, its log buffer region plus
+     * its conflation table's (ABI 0.1.5). 0, the default and an older
+     * struct's, sets no cap. A stream above it is refused by
+     * karyos_driver_add_stream, and a client's karyos:udp publication by
+     * KARYOS_E_REFUSED, detail code 24.
+     */
+    uint64_t max_stream_bytes;
 } karyos_driver_options;
 
 /**
@@ -1203,9 +1211,8 @@ static inline int32_t karyos_stream_options_init(
  * driver's close. A failure adds nothing and fills detail (may be null): a
  * duplicate stream id is KARYOS_E_INVALID_ARGUMENT with the stream id in
  * code and the session id in value. A stream above the driver's
- * max_stream_bytes would be KARYOS_E_INVALID_ARGUMENT with the stream's
- * bytes in code and the cap in value; karyos_driver_options cannot set
- * the cap yet (karyos#818), so no embedded driver refuses one today.
+ * max_stream_bytes is KARYOS_E_INVALID_ARGUMENT with the stream's bytes
+ * in code and the cap in value.
  */
 int32_t karyos_driver_add_stream(uint64_t driver, const karyos_stream_options *options,
                                  karyos_detail *detail);

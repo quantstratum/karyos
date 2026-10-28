@@ -216,6 +216,7 @@ offers. The features are:
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
 | `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded, plain and timed network streams, and a loopback endpoint `$loopback_uri` (Remote driver, below; Linux only) |
+| `stream-cap` | An embedded driver with a stream cap: `driver.create_capped` (`karyos_driver_options.max_stream_bytes`, ABI 0.1.5) |
 | `tai-clock` | `clock.now` of the TAI domain, which some platforms lack |
 
 A new feature is added here; a feature name not in this table is a
@@ -290,6 +291,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `clock.now` | `domain`: `"monotonic"` or `"tai"` | `now` | `tai-clock` for `"tai"` |
 | `driver.create` | none | `driver` | `embedded-driver` |
 | `driver.create_networked` | none: the options of `karyos_driver_options_init` with `network` set to `KARYOS_NETWORK_ON` | `driver` | `embedded-driver`, `embedded-network` |
+| `driver.create_capped` | `max_stream_bytes`: the options of `karyos_driver_options_init` with `max_stream_bytes` set | `driver` | `embedded-driver`, `stream-cap` |
 | `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none | `embedded-driver` |
 | `driver.start` | `driver`, [`idle_strategy`: `"busy_spin"`, `"yield"`, `"sleep"` or `"yield_then_sleep"`, default `"yield_then_sleep"`, the ABI's declared default; `idle_sleep_ns`] | none | `embedded-driver` |
 | `driver.do_work` | `driver` | `work` | `embedded-driver` |
@@ -573,7 +575,9 @@ accepts exactly the 0.y the suite targets, with at least its minimum
 fails the run.
 
 A feature may need a later ABI than the suite: `embedded-network` needs
-0.1.4, which adds `karyos_driver_options.network` (karyos#735). A runner
+0.1.4, which adds `karyos_driver_options.network` (karyos#735), and
+`stream-cap` needs 0.1.5, which adds `karyos_driver_options.max_stream_bytes`
+(karyos#818). A runner
 offers such a feature only on a library at its floor or later, and
 declares it absent otherwise; the rest of the suite runs as before.
 

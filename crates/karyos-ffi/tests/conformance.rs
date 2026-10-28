@@ -43,7 +43,8 @@ const MINIMUM_ABI: [u32; 3] = [0, 1, 3];
 /// later, and declares it absent otherwise, so the rest of the suite still
 /// runs. `embedded-network` needs 0.1.4's `karyos_driver_options.network`
 /// (karyos#735).
-const FEATURE_ABI: [(&str, [u32; 3]); 1] = [("embedded-network", [0, 1, 4])];
+const FEATURE_ABI: [(&str, [u32; 3]); 2] =
+    [("embedded-network", [0, 1, 4]), ("stream-cap", [0, 1, 5])];
 
 /// Whether a library of ABI `library` has what `feature` needs: its
 /// floor in [`FEATURE_ABI`], or the suite's.
@@ -92,7 +93,7 @@ fn test_port() -> u16 {
 const STEPS: [&str; 6] = ["B0", "B1", "B2", "B3", "B4", "B5"];
 
 /// The features a format 2 scenario may need (FORMAT.md, Features).
-const FEATURES: [&str; 10] = [
+const FEATURES: [&str; 11] = [
     "archive-replay",
     "claim-retry",
     "concurrent-publication",
@@ -102,6 +103,7 @@ const FEATURES: [&str; 10] = [
     "guarded-publication",
     "incompatible-driver",
     "remote-driver",
+    "stream-cap",
     "tai-clock",
 ];
 
@@ -182,6 +184,14 @@ const OPS: &[Op] = &[
         &[],
         &["driver"],
         &["embedded-driver", "embedded-network"],
+    ),
+    // An embedded driver with a stream cap (karyos#818; ABI 0.1.5).
+    op(
+        "driver.create_capped",
+        &["max_stream_bytes"],
+        &[],
+        &["driver"],
+        &["embedded-driver", "stream-cap"],
     ),
     op(
         "driver.add_stream",
@@ -2556,6 +2566,8 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert!(suite_runs_on([0, 1, 4]));
     assert!(!feature_runs_on("embedded-network", [0, 1, 3]));
     assert!(feature_runs_on("embedded-network", [0, 1, 4]));
+    assert!(!feature_runs_on("stream-cap", [0, 1, 4]));
+    assert!(feature_runs_on("stream-cap", [0, 1, 5]));
     assert!(feature_runs_on("conflation", [0, 1, 3]));
     assert!(suite_runs_on([0, 1, 7]));
     assert!(!suite_runs_on([0, 2, 0]));
@@ -2574,13 +2586,14 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
             "guarded-publication",
             "incompatible-driver",
             "remote-driver",
+            "stream-cap",
             "tai-clock",
         ],
     );
     assert_eq!(
         b1.declaration(),
         "step B1 offers embedded-driver absent archive-replay claim-retry concurrent-publication \
-         conflation embedded-network guarded-publication incompatible-driver remote-driver tai-clock"
+         conflation embedded-network guarded-publication incompatible-driver remote-driver stream-cap tai-clock"
     );
     assert_eq!(
         run(&scenario((0, 1), Some(3), None), (0, 1), &b1),
