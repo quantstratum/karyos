@@ -40,7 +40,8 @@
     serves it once in that epoch; with its command ring full it is
     counted refused once and tried again at most once per endpoint
     interval (`standing_retries`); an agent gone, or a new epoch, drops
-    it. Other reset requests are dropped then, as before,
+    it (`standing_dropped`). An ordinary request refused meanwhile leaves
+    it kept. Other reset requests are dropped then, as before,
     and asked again by their owner while the need holds. Without a
     failed close in the epoch the limit is an ordinary refusal and
     resets nothing. With the

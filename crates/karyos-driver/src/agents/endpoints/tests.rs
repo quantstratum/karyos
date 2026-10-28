@@ -819,12 +819,10 @@ fn a_standing_request_the_ring_refuses_is_retried_paced() {
     }
     let counters = endpoints.counters();
     assert_eq!(counters.resets_refused, 1, "refused once");
-    assert!(
-        counters.standing_retries <= 3,
-        "paced: {}",
-        counters.standing_retries
+    assert_eq!(
+        counters.standing_retries, 2,
+        "once per interval, at 11 s and 12 s"
     );
-    assert!(counters.standing_retries >= 1, "tried again");
     // Room again: served at the next try, once.
     drop(held);
     let events = poll_at(&mut endpoints, &mut agents, &links, 20 * SEC);
@@ -857,4 +855,67 @@ fn a_standing_request_refused_for_good_is_dropped() {
     assert_eq!(counters.resets, 0);
     assert_eq!(counters.resets_refused, 1);
     assert_eq!(counters.standing_retries, 0, "dropped");
+    assert_eq!(counters.standing_dropped, 1, "counted");
+}
+
+/// #838 (S1): an ordinary request the command ring refuses leaves a kept
+/// standing request as it is: counted, and the standing one is still
+/// served once the ring has room.
+#[test]
+fn a_refused_ordinary_request_keeps_the_standing_one() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    settle(&mut agents, &links, &mut endpoints, 1);
+    let mut held = Vec::new();
+    while let Ok(prepared) = links.sender.prepare() {
+        held.push(prepared);
+    }
+    let epoch = epoch_of(&endpoints, id);
+    endpoints.requested(&links, id, Some(epoch), 10 * SEC);
+    endpoints.requested(&links, id, None, 10 * SEC);
+    assert_eq!(endpoints.counters().resets_refused, 2, "each counted");
+    drop(held);
+    let events = poll_at(&mut endpoints, &mut agents, &links, 11 * SEC);
+    assert!(
+        matches!(events.as_slice(), [EndpointEvent::Reopened { endpoint, .. }] if *endpoint == id),
+        "the standing one is served: {events:?}"
+    );
+}
+
+/// #838: a standing request kept while its endpoint's reset is in flight
+/// is of the old epoch; the reopen moves the endpoint on, and the next
+/// poll drops it uncounted, so it never reaches the table's checks.
+#[test]
+fn a_standing_request_kept_through_a_reset_is_dropped_at_the_reopen() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    settle(&mut agents, &links, &mut endpoints, 1);
+    let old = epoch_of(&endpoints, id);
+    endpoints.reset(&links, id).unwrap();
+    // Not active: kept for the old epoch.
+    endpoints.requested(&links, id, Some(old), 10 * SEC);
+    let ignored = endpoints.counters().requests_ignored;
+    let events = poll_at(&mut endpoints, &mut agents, &links, 10 * SEC);
+    assert!(
+        matches!(events.as_slice(), [EndpointEvent::Reopened { .. }]),
+        "{events:?}"
+    );
+    assert_ne!(epoch_of(&endpoints, id), old);
+    assert!(poll_at(&mut endpoints, &mut agents, &links, 20 * SEC).is_empty());
+    let counters = endpoints.counters();
+    assert_eq!(counters.resets, 0, "no requested reset");
+    assert_eq!(
+        counters.requests_ignored, ignored,
+        "dropped by the poll, uncounted"
+    );
 }
