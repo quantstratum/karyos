@@ -308,12 +308,16 @@ pub struct ReceiverCounters {
     pub nak_route_faults: u64,
     /// ERR NAK_REPLY controls for no installed image.
     pub nak_replies_unbound: u64,
+    /// A reliable image's hole the receive owner could not compute, a
+    /// data hole (`first_hole`) or a heartbeat's tail (`heartbeat_tail`):
+    /// a corrupt owner state or a mark off a frame boundary; no NAK for
+    /// it. An unreliable image's skip duty reports these as its own error.
+    /// A defect counter, read through the receiver's counters, not a CnC
+    /// cell.
+    pub hole_query_errors: u64,
     /// Images closed by repair: a range proven unrecoverable under
     /// `on_unrecoverable = close`, or `GapCannotResume`.
     pub images_closed_unrecoverable: u64,
-    /// A heartbeat's tail the receive owner could not compute (a corrupt
-    /// owner state): no NAK for it.
-    pub heartbeat_tail_errors: u64,
     /// Images closed by `GapCannotResume` (a floor beyond the window).
     pub images_closed_cannot_resume: u64,
     /// Images closed by a protocol fault (`range_invalid_limit`
@@ -1243,7 +1247,7 @@ fn tail_hole<T: StreamTerms>(
         match heartbeat_mark(image, lane, at).map(|mark| image.owner.heartbeat_tail(lane, mark)) {
             Some(Ok(tail)) => tail,
             Some(Err(_)) => {
-                tally(counters, |c| &mut c.heartbeat_tail_errors);
+                tally(counters, |c| &mut c.hole_query_errors);
                 None
             }
             None => None,
@@ -3072,12 +3076,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
             if !image.reliable {
                 continue;
             }
-            let first = image
-                .owner
-                .first_hole(lane)
-                .ok()
-                .flatten()
-                .map(|(start, length)| Hole { start, length });
+            let first = match image.owner.first_hole(lane) {
+                Ok(hole) => hole.map(|(start, length)| Hole { start, length }),
+                Err(_) => {
+                    tally(counters, |c| &mut c.hole_query_errors);
+                    None
+                }
+            };
             // A covered hole ends any tail wait: a later tail waits its RTT
             // afresh.
             if first.is_some()

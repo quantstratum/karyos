@@ -817,6 +817,7 @@ fn a_tail_across_a_term_end_is_sealed_per_term() {
     let seals = sealed_by(&mut skip, &mut owner, MS);
     assert_eq!(seals.first(), Some(&(TERM - 128, 128)), "{seals:?}");
     assert_eq!(seals.get(1), Some(&(TERM, 128)), "{seals:?}");
+    assert_eq!(seals.len(), 2, "exactly two seals: {seals:?}");
     assert!(seals.iter().all(|(position, extent)| {
         position / TERM == (position + u64::from(*extent) - 1) / TERM
     }));
@@ -909,4 +910,16 @@ fn parts_past_their_capacity_extend_the_newest() {
     parts.resolve(200);
     assert_eq!(parts.first(), Some((3 * MS, 300)));
     assert_eq!(parts.held().len(), super::PARTS - 2);
+}
+
+/// #821 point 1: on an unreliable channel a data hole's part is seen up
+/// to the heartbeat's mark too, so the tail above the data reaches its
+/// deadline with the hole: at MS both are sealed, not the hole alone.
+#[test]
+fn a_tail_above_a_data_hole_ages_from_the_mark() {
+    let (_buffer, mut owner) = with_hole();
+    let mut skip = policy_of(SkipConfig::unreliable());
+    skip.revealed(Lane::ZERO, 320);
+    assert!(sealed_by(&mut skip, &mut owner, 0).is_empty());
+    assert_eq!(sealed_by(&mut skip, &mut owner, MS), [(64, 64), (192, 128)]);
 }

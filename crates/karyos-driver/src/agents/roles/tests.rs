@@ -4732,8 +4732,7 @@ fn an_unreliable_tail_is_sealed_up_to_the_terminal_bound() {
     for now in [10_000_000_000u64, 20_000_000_000, 30_000_000_000] {
         receiver.repair(0, now).unwrap();
     }
-    let sealed = receiver.counters().gaps_sealed;
-    assert!(sealed >= 1, "the tail is sealed: {sealed}");
+    assert_eq!(receiver.counters().gaps_sealed, 1, "one seal, the tail");
     let owner = &receiver.images[0].owner;
     assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), None);
     assert_eq!(
@@ -4741,4 +4740,21 @@ fn an_unreliable_tail_is_sealed_up_to_the_terminal_bound() {
         Some(1024),
         "not past the bound"
     );
+}
+
+/// #821 point 5: a reliable image's tail query the receive owner rejects
+/// (here a mark off a frame boundary) is counted in `hole_query_errors`,
+/// not dropped silently; no hole is NAKed for it.
+#[test]
+fn a_rejected_tail_query_is_counted() {
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, _params) = installed_image();
+    image.heartbeat_marks[0] = Some(100);
+    let mut counters = super::ReceiverCounters::default();
+    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000, &mut counters).is_none());
+    assert_eq!(counters.hole_query_errors, 1);
+    image.heartbeat_marks[0] = Some(4096);
+    let _ = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000, &mut counters);
+    assert_eq!(counters.hole_query_errors, 1, "an aligned mark is no error");
 }

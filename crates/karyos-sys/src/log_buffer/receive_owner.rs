@@ -525,9 +525,14 @@ impl<T: TermBytes> ReceiveOwner<T> {
     /// ([`ReceiveOwner::first_hole`] names that hole). A reliable image
     /// NAKs it, an unreliable one seals it at its deadline.
     ///
+    /// `mark` is a frame boundary (a heartbeat's offset is checked aligned
+    /// when parsed, an EOS bound is a frame end), so the hole is frame
+    /// aligned.
+    ///
     /// # Errors
     ///
     /// [`ReceiveError::Foreign`] for a lane the image does not have,
+    /// [`ReceiveError::InvalidGap`] for a `mark` off a frame boundary,
     /// [`ReceiveError::Sys`] for a position outside the incarnation.
     pub fn heartbeat_tail(
         &self,
@@ -538,6 +543,13 @@ impl<T: TermBytes> ReceiveOwner<T> {
             .lanes
             .get(usize::from(lane.get()))
             .ok_or(ReceiveError::Foreign)?;
+        if !mark.is_multiple_of(u64::from(FRAME_ALIGNMENT)) {
+            return Err(ReceiveError::InvalidGap {
+                lane,
+                position: mark,
+                extent: 0,
+            });
+        }
         Ok(owner.heartbeat_tail(mark)?)
     }
 
@@ -964,10 +976,6 @@ impl<T: TermBytes> LaneOwner<T> {
         // `term_length`.
         let room = self.buffer.term_length - offset;
         let extent = u32::try_from(mark - self.rebuild).map_or(room, |extent| extent.min(room));
-        debug_assert!(
-            offset.is_multiple_of(FRAME_ALIGNMENT) && extent.is_multiple_of(FRAME_ALIGNMENT),
-            "a tail hole is frame aligned"
-        );
         Ok(Some((self.rebuild, extent)))
     }
 
