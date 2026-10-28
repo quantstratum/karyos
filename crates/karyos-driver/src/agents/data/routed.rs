@@ -314,8 +314,11 @@ fn held(routed: &Routed, lane: usize, route: usize) -> usize {
 /// half away in a reset), bounds every route's heartbeat at the position
 /// of its first held copy: a heartbeat never announces a position a held
 /// copy would still bring, and still reveals what lies below it. A route
-/// that left or is returning (RP-9) bounds nothing: what it holds is
-/// dropped or sent again on its return.
+/// that left or is returning (RP-9) bounds nothing: a left route forgets
+/// its copies, and a returning one is not live until its first submit,
+/// so the receiver does not wait on it. The exclusion is defensive: the
+/// bound reads each copy's own position, not the route's frontier, so a
+/// frontier stale from before a leave cannot reach it either.
 fn idle_routes(
     routed: &mut Routed,
     lane: usize,
