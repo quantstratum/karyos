@@ -436,3 +436,42 @@ fn a_change_on_an_aggregate_with_a_lane_gone_is_audited_for_every_guard() {
         .collect();
     assert_eq!(audit, [(a.id(), 1, 1), (b.id(), 1, 1)]);
 }
+
+/// Re-review V2 of #814: a publication's stored rate policy goes with its
+/// last lane, so creating and removing publications never grows it.
+#[test]
+fn a_publications_rate_policy_goes_with_its_last_lane() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 100,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    for round in 0..3 {
+        let aggregate = driver
+            .add_aggregate(AggregateConfig {
+                stream: stream(2 + round),
+                quanta: vec![u64::from(DEFAULT_MTU) * 4; 2],
+            })
+            .unwrap();
+        for lane in aggregate.streams() {
+            driver
+                .guard_stream(
+                    lane,
+                    guard,
+                    4,
+                    Some(crate::guards::GuardRate::publication(policy)),
+                )
+                .unwrap();
+        }
+        assert_eq!(driver.rate_policies.len(), 1);
+        driver.remove_aggregate(&aggregate).unwrap();
+        driver.free_retired_streams();
+        assert!(driver.rate_policies.is_empty(), "round {round}");
+    }
+}

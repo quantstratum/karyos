@@ -243,15 +243,6 @@ pub enum LaneRefusal {
 }
 
 impl LaneRefusal {
-    /// The refusal of `error`, a rate change's, if it is one.
-    pub(crate) fn of(error: &DriverError) -> Option<Self> {
-        match error {
-            DriverError::RateChange(change) => Some(Self::Change(*change)),
-            DriverError::InvalidRatePolicy(invalid) => Some(Self::Invalid(*invalid)),
-            _ => None,
-        }
-    }
-
     /// The error it stands for, without its lane.
     pub(crate) const fn error(self) -> DriverError {
         match self {

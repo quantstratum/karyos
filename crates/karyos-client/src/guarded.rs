@@ -110,10 +110,20 @@ pub struct GuardBinding {
     reserved: u64,
     released: u64,
     rate: Option<RateCopy>,
-    /// A remote handle whose published policy was being written at bind:
-    /// the clock to create its copy with on the first call that reads the
-    /// slot whole.
-    pending_rate: Option<fn() -> u64>,
+    /// A handle with no copy that watches its ring for a policy (R-CORE-21):
+    /// the clock to create the copy with, and the slot's sequence word when
+    /// last read whole (`None` while a publication was in progress). A
+    /// policy published later, a rateless lane's publication getting one,
+    /// gives the handle its copy at its next call.
+    pending_rate: Option<RateWatch>,
+}
+
+/// A handle's watch of its ring for a published policy: the clock to make
+/// its copy with, and the slot's sequence word when last read whole.
+#[derive(Debug, Clone, Copy)]
+struct RateWatch {
+    clock: fn() -> u64,
+    seen: Option<u64>,
 }
 
 /// The handle's copy of its publication's message bucket: an early
@@ -218,17 +228,18 @@ impl GuardBinding {
     }
 
     /// [`Self::with_rate`] from the policy the driver published in the
-    /// outcome ring, if any (R-CORE-21): how a handle of another process
-    /// gets its copy, the grant carrying no policy. A ring with none
-    /// published leaves the handle without a copy, as before; the sender
-    /// gate stays authoritative. One being published on every attempt
-    /// leaves the copy to the handle's first call that reads it whole, so
-    /// a busy slot never leaves a policy's handle unlimited for good.
+    /// outcome ring, if any (R-CORE-21): how a handle gets its copy when
+    /// the grant carries no policy, a remote one's or a rateless lane's.
+    /// With none published yet, the handle watches the ring: its sequence
+    /// word, one Acquire load a call, and takes a policy published later at
+    /// its next call; the sender gate stays authoritative.
     #[must_use]
     pub fn with_published_rate(mut self, clock: fn() -> u64) -> Self {
         // A publication in progress is short: a few reads see it whole.
         for _ in 0..8 {
-            if self.adopt_published(clock) || self.pending_rate.is_none() {
+            if self.adopt_published(clock)
+                || self.pending_rate.is_some_and(|watch| watch.seen.is_some())
+            {
                 return self;
             }
             core::hint::spin_loop();
@@ -237,21 +248,21 @@ impl GuardBinding {
     }
 
     /// One read of the published policy for a handle without a copy:
-    /// `true` with the copy made from it; `false` with `pending_rate`
-    /// cleared when none is published, or set to `clock` when the read was
-    /// busy.
+    /// `true` with the copy made from it; `false` with the handle watching
+    /// the ring, at the sequence it read whole (none published) or at none
+    /// (a publication in progress).
     fn adopt_published(&mut self, clock: fn() -> u64) -> bool {
         match try_read_sequenced(&*self.ring, OUTCOME_SLOT) {
             (SlotRead::Policy { version, policy }, sequence) => {
                 self.set_rate(policy, clock, version, sequence);
                 true
             }
-            (SlotRead::Unpublished, _) => {
-                self.pending_rate = None;
+            (SlotRead::Unpublished, seen) => {
+                self.pending_rate = Some(RateWatch { clock, seen });
                 false
             }
             (SlotRead::Busy, _) => {
-                self.pending_rate = Some(clock);
+                self.pending_rate = Some(RateWatch { clock, seen: None });
                 false
             }
         }
@@ -272,8 +283,12 @@ impl GuardBinding {
     /// next call whether or not its bucket ran out; a read that finds a
     /// publication in progress keeps the copy as it is until the next call.
     pub(crate) fn rate_admits(&mut self) -> bool {
-        if let Some(clock) = self.pending_rate {
-            let _ = self.adopt_published(clock);
+        // A handle without a copy reads the slot again only when its
+        // sequence word moved.
+        if let Some(watch) = self.pending_rate
+            && self.ring.load_acquire(OUTCOME_SLOT + SEQUENCE) != watch.seen
+        {
+            let _ = self.adopt_published(watch.clock);
         }
         let Some(copy) = self.rate.as_mut() else {
             return true;

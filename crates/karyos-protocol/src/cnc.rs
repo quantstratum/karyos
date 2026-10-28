@@ -5667,7 +5667,13 @@ mod properties {
                 ErrorCode::LaneMismatch,
                 ErrorCode::StrategyConflict,
                 ErrorCode::InvalidRoles,
+                ErrorCode::RateVersionMismatch,
+                ErrorCode::RateNotATightening,
+                ErrorCode::RateReserveCrossed,
+                ErrorCode::RateNotSet,
+                ErrorCode::RateInvalidPolicy,
                 ErrorCode::StreamTooLarge,
+                ErrorCode::RatePolicyConflict,
             ][..],
         );
         prop_oneof![

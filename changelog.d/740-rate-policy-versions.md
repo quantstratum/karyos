@@ -20,6 +20,13 @@
     a change changes it. The first lane guarded with a rate gives the
     policy, at version 1, to the lanes guarded before without one, each
     audited from no rate (version 0).
+    A handle with no copy (a rateless lane's, a remote one's before a
+    policy) watches its ring's slot and takes a policy published later
+    at its next call; the gate's slot is published with it. A lane guarded
+    without a rate on a publication with a policy is audited from no rate
+    to its version. A publication's stored policy goes with its last lane.
+    The transition and the policy's validity are the publication's and
+    name no lane; only a lane's reserve does.
     A retiring lane, guarded or not, refuses a change as retiring.
     Unguarded lanes are left as they are. Refusals are `DriverError::RateChange` (`VersionMismatch`,
     `NotATightening`, `ReserveCrossed`, `NoRate`) and

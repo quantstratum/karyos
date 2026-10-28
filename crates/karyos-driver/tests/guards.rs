@@ -1344,3 +1344,75 @@ fn a_retiring_unguarded_lane_is_retiring() {
         Err(DriverError::StreamRetiring { .. })
     ));
 }
+
+/// Re-review V1 of #814: a handle issued on a lane guarded without a rate
+/// is limited once its publication gets a policy, at its next calls, not
+/// only audited: it watches its ring for the policy.
+#[test]
+fn a_handle_of_a_rateless_lane_is_limited_once_a_policy_comes() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = two_lanes(&mut driver, 2);
+    let guard = driver.add_guard("orders").unwrap();
+    driver
+        .guard_stream(lane_of(&aggregate, 0), guard, 4, None)
+        .unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut publication = driver.publication(lane_of(&aggregate, 0)).unwrap();
+    // No policy: not rate limited.
+    for _ in 0..1 {
+        assert!(matches!(
+            publication.offer(b"a").unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    // Lane 1 brings one message a second, a burst of one, to both lanes.
+    driver
+        .guard_stream(
+            lane_of(&aggregate, 1),
+            guard,
+            4,
+            Some(per_second(1, 1, None)),
+        )
+        .unwrap();
+    assert!(matches!(
+        publication.offer(b"b").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    assert_eq!(publication.offer(b"c").unwrap(), OfferOutcome::RateLimited);
+}
+
+/// Re-review of #814: a lane guarded without a rate on a publication that
+/// has a policy takes it at its version, audited from no rate.
+#[test]
+fn a_later_rateless_lane_is_audited_at_the_publications_version() {
+    use karyos_driver::RateAuthority;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = two_lanes(&mut driver, 2);
+    let (a, b) = (
+        driver.add_guard("a").unwrap(),
+        driver.add_guard("b").unwrap(),
+    );
+    driver
+        .guard_stream(
+            lane_of(&aggregate, 0),
+            a,
+            4,
+            Some(per_second(100, 10, None)),
+        )
+        .unwrap();
+    assert_eq!(
+        driver.change_aggregate_rate_policy(
+            &aggregate,
+            1,
+            per_second(80, 10, None).policy,
+            (RateAuthority::Administrator, 1)
+        ),
+        Ok(2)
+    );
+    driver
+        .guard_stream(lane_of(&aggregate, 1), b, 4, None)
+        .unwrap();
+    let last = *driver.guard_audit().records.last().unwrap();
+    assert_eq!((last.guard, last.before, last.after), (b.id(), 0, 2));
+}
