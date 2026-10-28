@@ -1466,6 +1466,8 @@ mod linger;
 
 mod netem;
 
+mod bind_time;
+
 mod trace;
 
 mod timed;

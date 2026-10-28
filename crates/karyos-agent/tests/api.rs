@@ -163,7 +163,8 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"gap-ack","state":"unavailable","reason":"not_configured"},"#,
             r#"{"name":"catalog","state":"unavailable","reason":"not_configured"},"#,
             r#"{"name":"trace-window","state":"served","reason":null},"#,
-            r#"{"name":"limits","state":"served","reason":null},{"name":"trace-buckets","state":"served","reason":null}]}"#,
+            r#"{"name":"limits","state":"served","reason":null},{"name":"trace-buckets","state":"served","reason":null},"#,
+            r#"{"name":"trace-export","state":"served","reason":null}]}"#,
             "\n"
         )
     );
@@ -273,7 +274,9 @@ fn a_client_negotiates_the_limits() {
     let all = concat!(
         r#"{"limits":{"read.request_bytes":{"value":256,"negotiable":true},"#,
         r#""read.timeout_ms":{"value":100,"negotiable":false},"#,
+        r#""read.deadline_ms":{"value":250,"negotiable":false},"#,
         r#""write.timeout_ms":{"value":100,"negotiable":false},"#,
+        r#""write.deadline_ms":{"value":250,"negotiable":false},"#,
         r#""write.response_bytes":{"value":null},"#,
         r#""connection.accepts_per_poll":{"value":16,"negotiable":false},"#,
         r#""connection.requests":{"value":1,"negotiable":false}}}"#,
@@ -522,4 +525,82 @@ fn trace_buckets_are_served_over_the_socket() {
         answer,
         "{\"error\":\"bad arguments\",\"request\":\"trace-buckets\"}\n"
     );
+}
+
+/// R-CORE-13: `trace-export` over the socket: a page of the attached
+/// driver's mirror, with its instance as the epoch; a cursor of another
+/// instance gets the typed refusal; an unknown directory, the guard
+/// operations' answer.
+#[test]
+fn trace_export_is_served_over_the_socket() {
+    let _serial = serial();
+    let (driver, mut agent, dir) = attached("export");
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let epoch = format!("{:032x}", driver.instance().unwrap());
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!(
+            "KARYOS-AGENT 1 trace-export {} 0 16 {epoch}\n",
+            dir.join("driver").display()
+        ),
+    );
+    assert_eq!(served, [Served::TraceExport]);
+    assert!(
+        answer.starts_with(&format!(
+            r#"{{"epoch":"{epoch}","from":0,"lost":[],"records":["#
+        )),
+        "{answer}"
+    );
+    let other = format!("{:032x}", driver.instance().unwrap() ^ 1);
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!(
+            "KARYOS-AGENT 1 trace-export {} 0 16 {other}\n",
+            dir.join("driver").display()
+        ),
+    );
+    assert_eq!(served, [Served::Refused]);
+    assert_eq!(
+        answer,
+        format!("{{\"error\":\"epoch changed\",\"epoch\":\"{epoch}\"}}\n")
+    );
+    let (_, served) = ask(
+        &mut server,
+        &mut agent,
+        "KARYOS-AGENT 1 trace-export /nowhere 0\n",
+    );
+    assert_eq!(served, [Served::Refused]);
+}
+
+/// QS-COORDINATOR, ACS 33663 (F2): a client that sends half a request
+/// and stops is dropped, unanswered and counted, and the poll comes back
+/// within the read deadline.
+#[test]
+fn a_half_request_is_dropped_within_the_read_deadline() {
+    use karyos_agent::server::{IO_TIMEOUT, READ_DEADLINE};
+
+    let _serial = serial();
+    let (_driver, mut agent, dir) = attached("half");
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let mut client = UnixStream::connect(server.path()).unwrap();
+    client.write_all(b"KARYOS-AGENT 1 vi").unwrap();
+    let start = Instant::now();
+    let mut served = Vec::new();
+    while served.is_empty() {
+        served = server.poll(&mut agent).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5), "never served");
+    }
+    assert!(
+        start.elapsed() < READ_DEADLINE + IO_TIMEOUT * 2,
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(served, [Served::Dropped]);
+    let mut answer = Vec::new();
+    client.read_to_end(&mut answer).unwrap();
+    assert!(answer.is_empty());
 }

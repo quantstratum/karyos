@@ -262,6 +262,7 @@ version = "0.1.0-alpha.2"
 dependencies = [
  "criterion",
  "karyos",
+ "karyos-agent",
  "karyos-archive",
  "karyos-bench",
  "karyos-client",

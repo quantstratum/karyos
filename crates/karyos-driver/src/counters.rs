@@ -149,7 +149,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 68] = [
+const LABELS: [(u64, &str); 73] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -218,6 +218,11 @@ const LABELS: [(u64, &str); 68] = [
     (TYPE_EVENTS, "guard audit records dropped"),
     (TYPE_EVENTS, "schedule violations"),
     (TYPE_EVENTS, "schedule violations dropped"),
+    (TYPE_EVENTS, "grants released at exit"),
+    (TYPE_EVENTS, "fetches dropped at exit"),
+    (TYPE_EVENTS, "admission messages dropped at exit"),
+    (TYPE_EVENTS, "admission messages not sent at exit"),
+    (TYPE_EVENTS, "clients closed before their exit"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -400,9 +405,50 @@ pub(crate) enum Event {
     /// karyos/design/timed-tx.md`, section 11, TT-6).
     ScheduleViolations,
     /// Schedule violation reports dropped: past their bound, or naming a
-    /// publication, lane or incarnation no longer live. Last, so no other
-    /// counter's id moves.
+    /// publication, lane or incarnation no longer live.
     ScheduleViolationsDropped,
+    /// Grants whose descriptor left and that a remote client did not
+    /// detach: its exit proof (or its `Leave`) ended them, after its queued
+    /// messages were drained. A faulty client is retired without a drain,
+    /// so its grants count here too. `GrantsDetached` counts a `Detach`
+    /// (karyos#827).
+    GrantsReleasedAtExit,
+    /// `Fetch` messages found queued after a client's exit proof, or after
+    /// a close before it: not served, since they would create state for a
+    /// dead client. "Clients closed before their exit" tells the cases
+    /// apart.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    FetchesDroppedAtExit,
+    /// Other admission messages left after a client's exit proof: a
+    /// `Detach` naming no detachable export, undecodable, carrying a
+    /// descriptor, a receive error, or still queued at the drain's bound
+    /// (counted once).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    AdmissionMessagesDroppedAtExit,
+    /// Admission messages queued for a client when its exit was proven, or
+    /// when its socket closed before it, dropped unsent.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    OutboundDroppedAtExit,
+    /// Remote clients whose socket closed (end of file, `EPIPE` or
+    /// `ECONNRESET`, the end of file confirmed by `POLLRDHUP`) before their
+    /// exit proof: drained, then retired like a faulty client but not
+    /// counted as one, since a dying process closes its socket first
+    /// (karyos#827). One with no exit proof within `fetch_deadline` is
+    /// then counted in `ClientsFaulty` as well. Last, so no other counter's id moves.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    ClientsClosedBeforeExit,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -692,6 +738,20 @@ mod tests {
             (
                 Event::ScheduleViolationsDropped,
                 "schedule violations dropped",
+            ),
+            (Event::GrantsReleasedAtExit, "grants released at exit"),
+            (Event::FetchesDroppedAtExit, "fetches dropped at exit"),
+            (
+                Event::AdmissionMessagesDroppedAtExit,
+                "admission messages dropped at exit",
+            ),
+            (
+                Event::OutboundDroppedAtExit,
+                "admission messages not sent at exit",
+            ),
+            (
+                Event::ClientsClosedBeforeExit,
+                "clients closed before their exit",
             ),
         ];
         assert_eq!(events.len(), LABELS.len());

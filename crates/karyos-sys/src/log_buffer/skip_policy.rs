@@ -376,7 +376,9 @@ impl SkipPolicy {
     /// G1): on an unreliable channel, a tail from the covered end to `mark`
     /// that no frame revealed is a hole like any other. A higher mark adds
     /// a part with its own deadline; a lower one (a terminal bound
-    /// recorded since) shortens what may be sealed.
+    /// recorded since) shortens what may be sealed. `mark` is a frame
+    /// boundary, as a heartbeat's offset and an EOS bound are; the tail
+    /// query rejects one that is not.
     pub fn revealed(&mut self, lane: Lane, mark: u64) {
         if let Some(state) = self.lanes.get_mut(usize::from(lane.get())) {
             state.mark = mark;
@@ -559,9 +561,15 @@ impl SkipPolicy {
         for _ in 0..SEALS_PER_DUTY {
             // The extent maps are read again before each seal: only what is
             // still uncovered is sealed, up to the next committed extent.
-            // A tail hole is seen up to the heartbeat's mark.
+            // A hole is seen up to the covered end, and on an unreliable
+            // channel up to the heartbeat's mark too: a tail above a data
+            // hole ages from when the mark showed it.
+            let mark = if config.reliable { 0 } else { state.mark };
             let (hole, seen) = match owner.first_hole(lane)? {
-                Some(hole) => (Some(hole), owner.high_water(lane)),
+                Some(hole) => (
+                    Some(hole),
+                    owner.high_water(lane).map(|high| high.max(mark)),
+                ),
                 None if !config.reliable => {
                     (owner.heartbeat_tail(lane, state.mark)?, Some(state.mark))
                 }
@@ -572,13 +580,11 @@ impl SkipPolicy {
                 return Ok(());
             };
             state.parts.resolve(position);
-            state.parts.seen(
-                seen.unwrap_or(position.saturating_add(u64::from(extent))),
-                now,
-            );
-            let Some((detected, part_end)) = state.parts.first() else {
-                return Ok(());
-            };
+            let seen = seen.unwrap_or(position.saturating_add(u64::from(extent)));
+            state.parts.seen(seen, now);
+            // `seen` just recorded a part at or past the hole: the fallback
+            // mirrors it.
+            let (detected, part_end) = state.parts.first().unwrap_or((now, seen));
             // Only the part detected then is due: what lies above it was
             // seen later and waits for its own deadline.
             let extent = u32::try_from(part_end.saturating_sub(position))

@@ -231,3 +231,110 @@ proptest! {
         prop_assert_eq!(split.message_tokens(), whole.message_tokens());
     }
 }
+
+/// R-CORE-21: the transition table. Each of the four dimensions (message
+/// rate and burst, byte rate and burst) alone, then every pair with one
+/// tighter and the other looser, then the byte limit added and removed.
+#[test]
+fn only_a_change_tighter_in_every_dimension_is_a_tightening() {
+    use crate::rate_limit::Transition;
+
+    let base = policy(100, 10, Some((10_000, 2_000)));
+    let with = |dimension: usize, by: i64| {
+        let mut values = [100u64, 10, 10_000, 2_000];
+        values[dimension] = values[dimension].checked_add_signed(by).unwrap();
+        policy(values[0], values[1], Some((values[2], values[3])))
+    };
+    assert_eq!(base.transition(&base), Transition::Unchanged);
+    for dimension in 0..4 {
+        assert_eq!(
+            base.transition(&with(dimension, -1)),
+            Transition::Tightening,
+            "{dimension}"
+        );
+        assert_eq!(
+            base.transition(&with(dimension, 1)),
+            Transition::Other,
+            "{dimension}"
+        );
+    }
+    // Every pair: one tighter, the other looser, is never a tightening.
+    for tighter in 0..4 {
+        for looser in 0..4 {
+            if tighter == looser {
+                continue;
+            }
+            let mut values = [100u64, 10, 10_000, 2_000];
+            values[tighter] -= 1;
+            values[looser] += 1;
+            let next = policy(values[0], values[1], Some((values[2], values[3])));
+            assert_eq!(
+                base.transition(&next),
+                Transition::Other,
+                "{tighter} {looser}"
+            );
+        }
+    }
+    // Every dimension tighter at once.
+    assert_eq!(
+        base.transition(&policy(99, 9, Some((9_999, 1_999)))),
+        Transition::Tightening
+    );
+    let messages_only = policy(100, 10, None);
+    // A byte limit added takes away only; removed, it only gives.
+    assert_eq!(messages_only.transition(&base), Transition::Tightening);
+    assert_eq!(base.transition(&messages_only), Transition::Other);
+    // Added, with the messages loosened: mixed.
+    assert_eq!(policy(99, 10, None).transition(&base), Transition::Other);
+}
+
+/// R-CORE-21: the control reserve is a floor on the message rate and
+/// burst, and on a byte limit's, at `frame` bytes a reserved message
+/// (review B4 of #814: a byte bucket of 1 B/s held back every datagram).
+#[test]
+fn a_policy_keeps_its_reserve_only_at_or_above_it() {
+    use crate::rate_limit::Rate;
+
+    let reserve = Rate {
+        per_second: 10,
+        burst: 2,
+    };
+    assert!(policy(10, 2, None).keeps(&reserve, 1500));
+    assert!(!policy(9, 5, None).keeps(&reserve, 1500));
+    assert!(!policy(50, 1, None).keeps(&reserve, 1500));
+    // Bytes: 10 and 2 messages of 1500 bytes.
+    assert!(policy(50, 5, Some((15_000, 3000))).keeps(&reserve, 1500));
+    assert!(!policy(50, 5, Some((1, 1500))).keeps(&reserve, 1500));
+    assert!(!policy(50, 5, Some((15_000, 2999))).keeps(&reserve, 1500));
+    assert!(!policy(50, 5, Some((14_999, 3000))).keeps(&reserve, 1500));
+}
+
+/// R-CORE-21: a new policy earns the old rates up to the change, then
+/// clamps each level to its new burst and never raises it; a byte limit
+/// added starts empty and earns at its own rate.
+#[test]
+fn a_policy_change_clamps_and_never_grants_tokens() {
+    use crate::rate_limit::RateLimiter;
+
+    let mut limiter = RateLimiter::new(policy(10, 8, None), 0);
+    for _ in 0..6 {
+        assert!(limiter.try_admit(100, true));
+    }
+    assert_eq!(limiter.message_tokens(), 2);
+    // 0.1 s at the old 10/s earns one token, then the tighter burst of 2
+    // clamps the 3 held.
+    limiter.set_policy(policy(5, 2, Some((1_000, 500))), 100_000_000);
+    assert_eq!(limiter.message_tokens(), 2);
+    assert_eq!(limiter.byte_tokens(), Some(0));
+    assert!(
+        !limiter.try_admit(100, true),
+        "the new byte limit starts empty"
+    );
+    // A looser policy does not refill either: the level stays.
+    limiter.set_policy(policy(100, 50, None), 100_000_000);
+    assert_eq!(limiter.message_tokens(), 2);
+    assert_eq!(limiter.byte_tokens(), None);
+    // Then it earns at the new rate: 0.1 s at 100/s.
+    limiter.refill_at(200_000_000);
+    assert_eq!(limiter.message_tokens(), 12);
+}

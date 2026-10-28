@@ -1001,3 +1001,236 @@ fn a_contradiction_makes_the_lane_unknown_and_finishes_it() {
     assert_eq!(frontier.read(lane(0)), faulted);
     assert_eq!(frontier.read(lane(1)).0, Final::Open);
 }
+
+/// R-CORE-21: the gate applies a newer policy the driver published at its
+/// next `set_now`, earning the old rate up to then and clamping its level
+/// to the new burst; an older or equal version, or a publication in
+/// progress, changes nothing.
+#[test]
+fn the_gate_applies_a_newer_published_policy_at_its_next_serve() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, Some(rate(10, 8)));
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (0, Some(8))
+    );
+    publish(slot.words(), 0, 2, &rate(5, 3));
+    f.gate.set_now(1);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (2, Some(3))
+    );
+    // Not newer: ignored.
+    publish(slot.words(), 0, 2, &rate(1, 1));
+    f.gate.set_now(2);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (2, Some(3))
+    );
+    // A publication in progress (an odd sequence) waits for the next call.
+    publish(slot.words(), 0, 3, &rate(1, 1));
+    slot.words()[0].fetch_add(1, Ordering::Relaxed);
+    f.gate.set_now(3);
+    assert_eq!(f.gate.policy_version(), 2);
+    slot.words()[0].fetch_add(1, Ordering::Relaxed);
+    f.gate.set_now(4);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (3, Some(1))
+    );
+}
+
+/// R-CORE-21, follow-up 1 of the #814 review: a gate built with no rate
+/// (a rateless lane's) creates its bucket from the first policy published
+/// to its slot, empty (a policy taken at run time never grants tokens,
+/// decided 2026-10-28 by QS-COORDINATOR), and takes later changes as any
+/// other gate.
+#[test]
+fn a_rateless_gate_adopts_a_published_policy() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, None);
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (0, None)
+    );
+    publish(slot.words(), 0, 1, &rate(5, 3));
+    f.gate.set_now(1);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (1, Some(0))
+    );
+    // It earns from the adoption on.
+    f.gate.set_now(1 + 1_000_000_000);
+    assert_eq!(f.gate.message_tokens(), Some(3));
+    publish(slot.words(), 0, 2, &rate(1, 1));
+    f.gate.set_now(2 + 1_000_000_000);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (2, Some(1))
+    );
+}
+
+/// Z1 of the #841 review: positions a gate with no rate let through took
+/// no tokens: once it adopts a policy they are exempt, exposed again on
+/// any route without a charge, and returning them gives nothing back.
+#[test]
+fn a_rateless_gates_positions_are_never_refunded_after_adoption() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, None);
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    let early: Vec<_> = (0..2).map(|_| f.stage(0)).collect();
+    let mut tokens: Vec<_> = early.iter().map(|(token, _, _)| *token).collect();
+    assert_eq!(check(&mut f.gate, 0, &tokens), permit(2));
+    publish(slot.words(), 0, 1, &rate(1, 2));
+    f.gate.set_now(0);
+    assert_eq!(f.gate.message_tokens(), Some(0), "adopted empty");
+    // Two seconds fill the burst of 2.
+    f.gate.set_now(2_000_000_000);
+    assert_eq!(f.gate.message_tokens(), Some(2));
+    // Exposed again with two new ones: the early two are exempt, the new
+    // two take the burst.
+    tokens.extend((0..2).map(|_| f.stage(0).0));
+    assert_eq!(check(&mut f.gate, 0, &tokens), permit(4));
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    // The early two come back unsent: nothing is refunded, as nothing was
+    // taken for them.
+    for (_, _, staged) in early {
+        f.gate.left(0, staged, Left::Returned);
+    }
+    assert_eq!(f.gate.message_tokens(), Some(0), "nothing refunded");
+    assert_eq!(f.gate.counts().faults, 0);
+}
+
+/// Z2 and A1 of the #841 review: a published policy the gate refuses (a
+/// byte burst below its largest datagram, which the driver never
+/// publishes) is counted, and the gate fails closed: it limits with the
+/// stricter of it and the policy in force, here a byte bucket no frame
+/// fits, so the lane is held until a valid version.
+#[test]
+fn a_policy_the_gate_refuses_is_applied_as_the_stricter() {
+    use karyos_sys::rate_limit::Rate;
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, Some(rate(10, 8)));
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    let small = RatePolicy {
+        messages: Rate {
+            per_second: 20,
+            burst: 20,
+        },
+        bytes: Some(Rate {
+            per_second: 1000,
+            burst: u64::from(MAX_FRAME) - 1,
+        }),
+    };
+    publish(slot.words(), 0, 1, &small);
+    f.gate.set_now(1);
+    assert_eq!(f.gate.policy_version(), 1);
+    assert_eq!(f.gate.counts().policies_refused, 1);
+    // The stricter of each: 10 messages a second, a burst of 8 (the level
+    // kept), and the refused byte bucket, which no frame fits.
+    assert_eq!(f.gate.message_tokens(), Some(8));
+    // The largest datagram: more bytes than the refused burst holds.
+    let (token, _, _) = f.stage_with(0, MAX_FRAME, 1, None);
+    f.gate.set_now(10_000_000_000);
+    assert!(!f.gate.admits(0), "held");
+    assert_eq!(check(&mut f.gate, 0, &[token]), GateDecision::Deny);
+    // Read once: the next serve does not count it again.
+    assert_eq!(f.gate.counts().policies_refused, 1);
+    // A valid version releases it.
+    publish(slot.words(), 0, 2, &rate(1, 1));
+    f.gate.set_now(10_000_000_001);
+    assert_eq!(f.gate.policy_version(), 2);
+    assert_eq!(check(&mut f.gate, 0, &[token]), permit(1));
+}
+
+/// The coordinator's decision on the #841 review: a reincarnation's gate
+/// starts its bucket empty, so reincarnating never buys a new burst.
+#[test]
+fn a_reincarnations_gate_starts_empty() {
+    let mut f = Fixture::new(1, Some(rate(1, 4)));
+    assert_eq!(f.gate.message_tokens(), Some(4));
+    f.gate.empty_bucket(0);
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    f.gate.set_now(2_000_000_000);
+    assert_eq!(f.gate.message_tokens(), Some(2), "it earns from then on");
+}
+
+/// Words that complete a publication of version 3 right after the first
+/// plain load of the sequence word once `armed` returns: the load that
+/// validates a read, so the read is whole and the publication lands
+/// between it and anything the reader does next.
+#[derive(Debug)]
+struct RacingSlot {
+    words: HeapWords,
+    loads: AtomicU64,
+    armed: core::sync::atomic::AtomicBool,
+}
+
+impl LoadWords for RacingSlot {
+    fn load(&self, index: usize) -> Option<u64> {
+        let value = self.words.load(index);
+        if index == 0
+            && self.armed.load(Ordering::Relaxed)
+            && self.loads.fetch_add(1, Ordering::Relaxed) == 0
+        {
+            self.armed.store(false, Ordering::Relaxed);
+            karyos_sys::rate_policy_slot::publish(self.words.words(), 0, 3, &rate(1, 1));
+        }
+        value
+    }
+
+    fn load_acquire(&self, index: usize) -> Option<u64> {
+        self.words.load_acquire(index)
+    }
+
+    fn len(&self) -> usize {
+        self.words.len()
+    }
+}
+
+/// R-CORE-21, review B2 of #814: a publication that completes right after
+/// the gate read the slot is applied at the next serve, never recorded as
+/// seen and lost.
+#[test]
+fn a_publication_completed_during_a_read_is_not_lost() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, Some(rate(10, 8)));
+    let slot = Arc::new(RacingSlot {
+        words: HeapWords::zeroed(SLOT_WORDS),
+        loads: AtomicU64::new(0),
+        armed: core::sync::atomic::AtomicBool::new(false),
+    });
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    publish(slot.words.words(), 0, 2, &rate(5, 3));
+    slot.armed.store(true, Ordering::Relaxed);
+    f.gate.set_now(1);
+    assert_eq!(f.gate.policy_version(), 2);
+    // Version 3 completed right after that read: a gate that loaded the
+    // sequence again there would take it as seen and keep version 2 for
+    // good. This one applies it at the next serve.
+    f.gate.set_now(2);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (3, Some(1))
+    );
+}

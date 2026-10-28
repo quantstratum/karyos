@@ -202,10 +202,31 @@ pub struct SubscriptionEnd {
     pub seal_code: u64,
 }
 
+/// `karyos_image_change` (ABI 0.1.1, with its end fields).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImageChange {
+    pub size: u32,
+    pub session_id: i32,
+    pub image_id: u64,
+    pub lane: u32,
+    pub available: u32,
+    pub end_reason: u32,
+    pub reserved: u32,
+    pub end_position: u64,
+    pub seal_code: u64,
+}
+
 // From a released package's libkaryos under `--cfg karyos_package`
 // (scripts/conformance-package.sh); from the crate's rlib otherwise.
 #[cfg_attr(karyos_package, link(name = "karyos"))]
 unsafe extern "C" {
+    fn karyos_subscription_next_image_change(
+        subscription: u64,
+        change: *mut ImageChange,
+        has: *mut u32,
+    ) -> i32;
+    fn karyos_subscription_image_changes_lost(subscription: u64, lost: *mut u64) -> i32;
     fn karyos_abi_version(major: *mut u32, minor: *mut u32, patch: *mut u32) -> i32;
     safe fn karyos_status_message(status: i32) -> *const c_char;
     fn karyos_client_options_init_sized(options: *mut ClientOptions, size: usize) -> i32;
@@ -1083,6 +1104,28 @@ pub fn client_add_replay_subscription(client: u64, stream_id: i32, session_id: i
         )
     };
     (status, subscription)
+}
+
+/// `karyos_subscription_next_image_change`: the status and the oldest
+/// queued image change, if one is queued.
+pub fn subscription_next_image_change(subscription: u64) -> (i32, Option<ImageChange>) {
+    let mut change = ImageChange {
+        size: struct_size::<ImageChange>(),
+        ..ImageChange::default()
+    };
+    let mut has = 0u32;
+    // SAFETY: a live, aligned struct of its stated size and a live `u32`.
+    let status =
+        unsafe { karyos_subscription_next_image_change(subscription, &mut change, &mut has) };
+    (status, (has == 1).then_some(change))
+}
+
+/// `karyos_subscription_image_changes_lost`: the status and the count.
+pub fn subscription_image_changes_lost(subscription: u64) -> (i32, u64) {
+    let mut lost = u64::MAX;
+    // SAFETY: a live, aligned `u64`.
+    let status = unsafe { karyos_subscription_image_changes_lost(subscription, &mut lost) };
+    (status, lost)
 }
 
 /// `karyos_subscription_end_state`: the status and the end written.

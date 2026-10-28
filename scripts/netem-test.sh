@@ -11,7 +11,8 @@
 # Usage: scripts/netem-test.sh [cargo test arguments...]
 # Default: the ignored tests of karyos-driver whose path names `netem`
 # (net::netem and the end-to-end net::e2e::netem), one at a time.
-# KARYOS_NETEM sets the netem profile (default below).
+# KARYOS_NETEM sets the netem profile (default below). KARYOS_NETEM_MEASURE,
+# passed through, enables the measurements (`net::e2e::bind_time`).
 #
 # The tests require KARYOS_NETEM_ACTIVE=1, which this script sets only once
 # netem is in place, and the run fails if no netem test ran.
@@ -47,6 +48,7 @@ exec docker run --rm \
     -v karyos-linux-cargo:/usr/local/cargo/registry \
     -e CARGO_TARGET_DIR=/target \
     -e KARYOS_NETEM_PROFILE="$profile" \
+    -e KARYOS_NETEM_MEASURE="${KARYOS_NETEM_MEASURE:-}" \
     -w /work \
     "$image" \
     sh -c '
