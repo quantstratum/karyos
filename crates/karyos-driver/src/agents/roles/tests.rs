@@ -4331,3 +4331,51 @@ fn a_removed_publication_with_no_half_closes_nothing() {
     let _ = sender.duty(&mut halves, 5).unwrap();
     assert_eq!(sender.counters().removed_closed, 0, "nothing waited");
 }
+
+/// Plan 157, QS-COORDINATOR's option A on #829: a removed destination is
+/// retired as a removed publication is, through the close list. An item
+/// still pending in its queue (committed, never flushed) comes back as
+/// `QueueClosed` and is counted in `removed_returned`, and the queue and
+/// route close.
+#[test]
+fn a_retired_destinations_pending_items_return_queue_closed() {
+    use karyos_io::backend::{
+        Authority, Commit, SenderToken, TxBackend, TxFrame, TxOptions, TxQueueConfig,
+    };
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let queue = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::new(4).unwrap(),
+        })
+        .unwrap();
+    let frame = tx.claim_tx(queue, 32).unwrap();
+    let _ticket = frame
+        .commit(Commit {
+            len: 32,
+            token: SenderToken::new(1),
+            options: TxOptions::none(),
+        })
+        .unwrap();
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(queue);
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: tx.capabilities().epoch,
+        route,
+        queues,
+    });
+    sender.close_removed(&mut halves);
+    let counters = sender.counters();
+    assert_eq!(counters.removed_returned, 1, "{counters:?}");
+    assert_eq!(counters.removed_closed, 2, "the queue and the route");
+}

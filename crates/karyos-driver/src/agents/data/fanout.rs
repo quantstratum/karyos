@@ -93,7 +93,7 @@ pub enum DestinationChange {
     Quarantined,
     /// Refused: the publication has [`MAX_DESTINATIONS`] destinations,
     /// counting those removed whose removal is not reported yet: it is
-    /// reported once drained, and retired in that cycle.
+    /// reported at once, and retired at its report.
     Full,
     /// Refused: the publication is being removed.
     Removing,
@@ -152,8 +152,6 @@ pub(super) struct Target {
     removed: Option<(RemovalReason, u64)>,
     /// Its removal was reported to the conductor.
     reported: bool,
-    /// What its queues held at its removal was dropped.
-    cancelled: bool,
     /// Consecutive send faults (MD-12), failed opens of its own included.
     faults: u8,
     /// When its last failed open counted as a fault: at most once per
@@ -210,7 +208,6 @@ impl Target {
             counters: TargetCounters::default(),
             removed: None,
             reported: false,
-            cancelled: false,
             faults: 0,
             open_fault_at: None,
             open_tried: None,
@@ -445,21 +442,17 @@ impl Fanout {
             .all(|target| target.live || target.removed.is_some())
     }
 
-    /// Retires the removed targets drained and reported (design 3.7): their
-    /// route and queues, opened in `epoch` (the publication's open epoch;
-    /// another epoch dropped them), go to `retired` for the sender to
-    /// close, their slot is freed, and their address is kept for its
-    /// quarantine (MD-14). A target whose route and queues find no room in
-    /// `retired` is not retired yet: it keeps its slot and nothing leaks
-    /// (counted once in the third result). Returns the targets retired, the
-    /// quarantine records forgotten to make room, and the retirements
-    /// deferred.
-    fn retire(
-        &mut self,
-        endpoint: crate::agents::EndpointId,
-        epoch: Option<BackendEpoch>,
-        now: u64,
-    ) -> (u64, u64, u64) {
+    /// Retires the removed targets reported (design 3.7), as a removed
+    /// publication's are: their route and queues go to `retired`, for the
+    /// sender's close list, which returns their pending items as
+    /// `QueueClosed` (counted in `removed_returned`), closes the queues and
+    /// the route, and skips another epoch's handles. Their slot is freed,
+    /// and their address is kept for its quarantine (MD-14). A target
+    /// whose route and queues find no room in `retired` is not retired yet:
+    /// it keeps its slot and nothing leaks (counted once in the third
+    /// result). Returns the targets retired, the quarantine records
+    /// forgotten to make room, and the retirements deferred.
+    fn retire(&mut self, endpoint: crate::agents::EndpointId, now: u64) -> (u64, u64, u64) {
         let mut retired = 0u64;
         let mut forgotten = 0u64;
         let mut deferred = 0u64;
@@ -471,10 +464,11 @@ impl Fanout {
             let Some(target) = fanout.targets.get_mut(index) else {
                 continue;
             };
-            if !(target.removed.is_some() && target.cancelled && target.reported) {
+            if !(target.removed.is_some() && target.reported) {
                 continue;
             }
-            let holds = target.route.is_some() && target.opened.is_some_and(|at| Some(at) == epoch);
+            // Any epoch: the close list skips another epoch's handles.
+            let holds = target.route.is_some() && target.opened.is_some();
             if holds && !room {
                 if !target.retire_deferred {
                     target.retire_deferred = true;
@@ -489,10 +483,8 @@ impl Fanout {
                 }
             }
             // Its route and queues go to the sender's closing list, which
-            // closes them whole (`close_removed`); another epoch dropped them.
-            if let (Some(opened), Some(route)) =
-                (target.opened.filter(|at| Some(*at) == epoch), target.route)
-            {
+            // closes them whole (`close_removed`).
+            if let (Some(opened), Some(route)) = (target.opened, target.route) {
                 let mut queues = [None; OPENED_QUEUES];
                 for (slot, queue) in queues.iter_mut().zip(&target.queues) {
                     *slot = Some(*queue);
@@ -917,61 +909,11 @@ impl<T: StreamTerms> Outbound<T> {
             let Some(target) = fanout.targets.get_mut(at) else {
                 continue;
             };
-            // A removed target is never served again: what its queues and
-            // its sender held is dropped once. One not open yet waits for
-            // its open.
+            // A removed target is never served again: it was retired at its
+            // report, its route and queues closed as a removed
+            // publication's (design 3.7). One not open yet waits for its
+            // open.
             if target.removed.is_some() {
-                if !target.cancelled {
-                    // Its member stops counting for the strategy edge now,
-                    // not at its liveness expiry (design 3.7): under `min` a
-                    // removed destination never holds the others.
-                    if let Some(membership) = self.membership.as_deref_mut() {
-                        let _ = membership.release_source(target.address, now);
-                    }
-                    // Cancelled only once every lane's cancel succeeded and
-                    // its queue holds nothing pending: a cancel refused (a
-                    // reset, a report not empty) or stopped short is tried
-                    // again at the next serve, and the target keeps its
-                    // slot meanwhile.
-                    let mut complete = true;
-                    for lane in 0..target.queues.len() {
-                        let mut gate = TargetGate {
-                            lanes: &mut target.lanes,
-                            held: true,
-                            edges: target.edges,
-                        };
-                        let cancelled = target.sender.cancel(tx, lane, &mut gate).is_ok();
-                        let queue = target.queues.get(lane).copied();
-                        let empty = cancelled
-                            && queue.is_some_and(|queue| {
-                                let outcome = tx.cancel_pending(queue, &mut self.report);
-                                let none_left = matches!(
-                                    outcome,
-                                    Ok(outcome) if !outcome.more && outcome.returned == 0
-                                );
-                                while self.report.pop_front().is_some() {}
-                                none_left
-                            });
-                        if !empty {
-                            complete = false;
-                            continue;
-                        }
-                        // What the backend no longer holds as pending
-                        // leaves the sender's records too.
-                        if let Some(queue) = queue {
-                            target.sender.reopen(lane, queue);
-                        }
-                    }
-                    if complete {
-                        for track in &mut target.lanes {
-                            track.staged.clear();
-                        }
-                    }
-                    if !complete {
-                        self.counters.bump(|c| &mut c.cancels_retried, 1);
-                    }
-                    target.cancelled = complete;
-                }
                 continue;
             }
             if target.opened != Some(epoch) {
@@ -1488,10 +1430,6 @@ fn remove_target(target: &mut Target, reason: RemovalReason, now: u64) {
     }
     target.removed = Some((reason, now));
     target.live = false;
-    // A target never opened holds nothing to cancel: its removal can be
-    // reported, and it retired, without a serve (a publication not yet
-    // established is not served).
-    target.cancelled = target.opened.is_none();
     target.reported = false;
 }
 
@@ -1509,11 +1447,9 @@ impl<T: StreamTerms> Outbound<T> {
     pub(crate) fn removal_unreported(&self) -> Option<DestinationRemoval> {
         self.fanout.as_deref().and_then(|fanout| {
             fanout.targets.iter().find_map(|target| {
-                // Reported once drained (cancelled, or never opened); its
-                // report retires it in the same cycle.
-                let (reason, _) = target
-                    .removed
-                    .filter(|_| !target.reported && target.cancelled)?;
+                // Reported at once, whatever the publication's or the
+                // queues' state; its report retires it in the same cycle.
+                let (reason, _) = target.removed.filter(|_| !target.reported)?;
                 Some(DestinationRemoval {
                     destination: target.address,
                     reason,
@@ -1523,8 +1459,8 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Records `destination`'s removal as reported at `now`, and retires
-    /// it in the same cycle: its removal is reported only once drained, so
-    /// a move retried after the report finds its slot free.
+    /// it in the same cycle, so a move retried after the report finds its
+    /// slot free.
     pub(crate) fn removal_reported(&mut self, destination: SocketAddr, now: u64) {
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return;
@@ -1536,17 +1472,13 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Retires what was reported and fits the retired list, counting it:
-    /// at a report, and after a drain made room for a deferred one. The
-    /// epoch is the publication's open epoch: after an endpoint reset not
-    /// served yet, the old epoch's handles still go to the close list,
-    /// which refuses them as stale, and take a place there until the next
-    /// drain.
+    /// at a report, and after a drain made room for a deferred one.
     fn retire_reported(&mut self, now: u64) {
-        let (endpoint, epoch) = (self.endpoint, self.opened);
+        let endpoint = self.endpoint;
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return;
         };
-        let (retired, forgotten, deferred) = fanout.retire(endpoint, epoch, now);
+        let (retired, forgotten, deferred) = fanout.retire(endpoint, now);
         self.counters.bump(|c| &mut c.destinations_retired, retired);
         self.counters
             .bump(|c| &mut c.quarantine_forgotten, forgotten);
@@ -1837,7 +1769,7 @@ impl<T: StreamTerms> Outbound<T> {
                     return DestinationChange::Quarantined;
                 }
                 // A removed target holds its slot until it retires, in the
-                // cycle its removal is reported (once drained): a move
+                // cycle its removal is reported: a move
                 // retried after the removal shows in
                 // `network_removed_destinations` finds the slot free. While
                 // the conductor's ring is full nothing is reported and
@@ -2002,8 +1934,8 @@ mod tests {
         endpoint.split().unwrap().0
     }
 
-    /// Removes `destination`, and marks it cancelled as the serve's cancel
-    /// does once its queues hold nothing.
+    /// Removes the opened `destination`; returns the allocations the
+    /// removal made.
     fn remove_drained(outbound: &mut Outbound, destination: SocketAddr) -> u64 {
         let (change, allocations) = karyos_sys::alloc_count::count_allocations(|| {
             outbound.change_destination(destination, false, 0, 0)
@@ -2016,8 +1948,6 @@ mod tests {
             .find(|target| target.address == destination)
             .unwrap();
         assert!(target.opened.is_some(), "an opened target");
-        assert!(!target.cancelled, "an opened target waits for its cancel");
-        target.cancelled = true;
         allocations
     }
 
@@ -2088,9 +2018,8 @@ mod tests {
     }
 
     /// Review B1 and C1 of #829: once a removal is reported (which it is
-    /// only once drained), it is retired in that cycle, so a move at
-    /// capacity right after the report is `Added`; a destination never
-    /// opened is drained at its removal, with no serve.
+    /// at once, whatever its state), it is retired in that cycle, so a
+    /// move at capacity right after the report is `Added`.
     #[test]
     fn an_addition_after_the_removal_is_reported_finds_the_slot_free() {
         let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
@@ -2106,20 +2035,12 @@ mod tests {
             DestinationChange::Full
         );
         let _ = outbound.change_destination(address(4001), false, 0, 0);
-        assert_eq!(outbound.removal_unreported(), None, "not drained yet");
         assert_eq!(
             outbound.change_destination(address(4100), true, 0, 0),
             DestinationChange::Full,
-            "the removed target holds its slot"
+            "the removed target holds its slot until its report"
         );
-        // Drained: its removal is reported and retired in that cycle.
-        let fanout = outbound.fanout.as_deref_mut().unwrap();
-        fanout
-            .targets
-            .iter_mut()
-            .find(|t| t.address == address(4001))
-            .unwrap()
-            .cancelled = true;
+        // Its removal is reported at once, opened or not, and retired then.
         let removal = outbound.removal_unreported().unwrap();
         assert_eq!(removal.destination, address(4001));
         outbound.removal_reported(removal.destination, 0);
@@ -2129,15 +2050,62 @@ mod tests {
             "retired in the cycle of its report"
         );
         assert_eq!(
+            outbound.fanout.as_deref().unwrap().retired.len(),
+            1,
+            "its route and queues go to the close list"
+        );
+        assert_eq!(
             outbound.change_destination(address(4100), true, 0, 0),
             DestinationChange::Added
         );
-        // The new one was never opened: its removal is drained at once.
-        let _ = outbound.change_destination(address(4100), false, 0, 0);
-        let removal = outbound.removal_unreported().unwrap();
-        assert_eq!(removal.destination, address(4100), "no serve needed");
+    }
+
+    /// Review E1 of #829: a destination opened in an epoch an endpoint
+    /// reset has since replaced is reported and retired at once; its stale
+    /// handles go to the close list, which skips them. A move then finds
+    /// its slot.
+    #[test]
+    fn a_removal_after_a_reset_frees_its_slot() {
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut tx = roomy_tx();
+        let mut outbound = fanned(address(4000));
+        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+            let _ = outbound.change_destination(address(4000 + port), true, 0, 0);
+        }
+        let _ = outbound.open_targets(&mut tx, 0);
+        // A reset moved the endpoint on: the publication's handles are of
+        // the old epoch, and nothing served it since.
+        let stale = BackendEpoch::FIRST.next().unwrap();
+        outbound.opened = Some(stale);
+        let _ = outbound.change_destination(address(4003), false, 0, 0);
+        let removal = outbound.removal_unreported().expect("reported at once");
         outbound.removal_reported(removal.destination, 0);
-        assert_eq!(outbound.counters().destinations_retired, 2);
+        assert_eq!(
+            outbound.change_destination(address(4100), true, 0, 0),
+            DestinationChange::Added
+        );
+    }
+
+    /// Review E2 of #829: an opened destination removed while its
+    /// publication is not served (its receivers gone) is reported and
+    /// retired at once, so a move to another destination is no deadlock.
+    #[test]
+    fn a_removal_on_an_unserved_publication_frees_its_slot() {
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut tx = roomy_tx();
+        let mut outbound = fanned(address(4000));
+        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+            let _ = outbound.change_destination(address(4000 + port), true, 0, 0);
+        }
+        // Opened once, then never served again.
+        let _ = outbound.open_targets(&mut tx, 0);
+        assert!(remove_drained(&mut outbound, address(4005)) == 0);
+        let removal = outbound.removal_unreported().expect("no serve needed");
+        outbound.removal_reported(removal.destination, 0);
+        assert_eq!(
+            outbound.change_destination(address(4100), true, 0, 0),
+            DestinationChange::Added
+        );
     }
 
     /// Review C1 of #829 (a regression at `18869058`): a publication not
