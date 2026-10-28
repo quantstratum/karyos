@@ -781,31 +781,51 @@ fn bucket_lane(out: &mut Out<'_>, lane: &BucketLane) {
 /// A `trace-export` page (R-CORE-13): the driver instance as `epoch` (32
 /// lowercase hex digits, as `instance`), the sequence asked for, the lost
 /// ranges first, then whole records in order, the next sequence to ask
-/// for, the ring's head, and the journals the records name. Past
-/// `max_bytes` (the first record aside, which is always whole) the rest is
-/// left out and `next` is the first record left out.
+/// for, the ring's head, and the journals the records here name. Each
+/// record counts in `max_bytes` with its journal the first time one names
+/// it; past the bound (the first record aside, which is always here, with
+/// its journal) the rest is left out and `next` is the first record left
+/// out. So a reply is at most `max_bytes` plus one record and one journal
+/// ([`crate::api::MAX_RECORD_REPLY`], [`crate::api::MAX_JOURNAL_REPLY`]).
 #[must_use]
 pub fn trace_export(page: &ExportPage, max_bytes: usize) -> String {
-    let mut encoded = Vec::with_capacity(page.records.len());
-    let mut used = 256usize;
+    let journal_of = |number: u64| {
+        page.journals.iter().find(|journal| match journal {
+            ExportJournal::Live(entry) => entry.journal == number,
+            ExportJournal::Recycled(entry) => entry.journal == number,
+            ExportJournal::Unknown { journal } => *journal == number,
+        })
+    };
+    let mut records = Vec::with_capacity(page.records.len());
+    let mut journals: Vec<String> = Vec::new();
+    let mut named = std::collections::BTreeSet::new();
+    let mut used = EXPORT_REPLY_OVERHEAD;
     let mut next = page.next;
     for record in &page.records {
         let mut text = String::new();
-        Out(&mut text).object(|fields| {
-            fields.number("seq", record.seq);
-            fields.number("journal", record.journal);
-            fields.number("sequence", record.sequence);
-            fields
-                .key("payload")
-                .array(&record.payload, |out, word| out.number(*word));
-        });
-        let after = used.saturating_add(text.len()).saturating_add(1);
-        if !encoded.is_empty() && after > max_bytes {
+        export_record(&mut Out(&mut text), record);
+        let mut journal = None;
+        if !named.contains(&record.journal)
+            && let Some(found) = journal_of(record.journal)
+        {
+            let mut text = String::new();
+            export_journal(&mut Out(&mut text), found);
+            journal = Some(text);
+        }
+        let size = text
+            .len()
+            .saturating_add(journal.as_ref().map_or(0, String::len))
+            .saturating_add(2);
+        if !records.is_empty() && used.saturating_add(size) > max_bytes {
             next = record.seq;
             break;
         }
-        used = after;
-        encoded.push(text);
+        used = used.saturating_add(size);
+        records.push(text);
+        if let Some(journal) = journal {
+            let _ = named.insert(record.journal);
+            journals.push(journal);
+        }
     }
     let mut text = String::new();
     Out(&mut text).object(|fields| {
@@ -819,14 +839,29 @@ pub fn trace_export(page: &ExportPage, max_bytes: usize) -> String {
         });
         fields
             .key("records")
-            .array(&encoded, |out, record| out.raw(record));
+            .array(&records, |out, record| out.raw(record));
         fields.number("next", next);
         fields.number("head", page.head);
         fields
             .key("journals")
-            .array(&page.journals, |out, journal| export_journal(out, journal));
+            .array(&journals, |out, journal| out.raw(journal));
     });
     text
+}
+
+/// The bytes of a `trace-export` reply besides its records and journals:
+/// its fields and at most a few lost ranges.
+const EXPORT_REPLY_OVERHEAD: usize = 512;
+
+fn export_record(out: &mut Out<'_>, record: &crate::api::ExportRecord) {
+    out.object(|fields| {
+        fields.number("seq", record.seq);
+        fields.number("journal", record.journal);
+        fields.number("sequence", record.sequence);
+        fields
+            .key("payload")
+            .array(&record.payload, |out, word| out.number(*word));
+    });
 }
 
 /// A refused `trace-export` read, typed (R-CORE-13).

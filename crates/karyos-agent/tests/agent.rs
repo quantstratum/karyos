@@ -706,6 +706,8 @@ fn test_agent_a_new_instance_restarts_every_series() {
             .client_counters
             .iter()
             .all(|counter| counter.changed_ns.is_none())
+    );
+}
 
 /// R-CORE-13: the export's epoch is the driver instance, so a cursor
 /// survives the agent's restart (the agent keeps none) and is refused,

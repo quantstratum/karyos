@@ -181,11 +181,22 @@ pub const BUCKETS_DEFAULT: usize = 6;
 pub const BUCKETS_MAX: usize = 60;
 
 /// The byte bound of a `trace-export` reply (R-CORE-13), as
-/// [`MAX_BUCKET_REPLY`]'s: whole records only, and always at least the
-/// first one, so a reply is at most `max(MAX_EXPORT_REPLY, the first
-/// record's encoding)` besides its loss and journals; a record past it is
-/// left for the next read, named by `next`.
+/// [`MAX_BUCKET_REPLY`]'s: whole records only, each counted with its
+/// journal the first time one names it, and always at least the first
+/// record, so a reply is at most `MAX_EXPORT_REPLY` plus one record and one
+/// journal, [`MAX_RECORD_REPLY`] and [`MAX_JOURNAL_REPLY`] at most. A
+/// record past it is left for the next read, named by `next`. A client
+/// sizes its buffer for the sum.
 pub const MAX_EXPORT_REPLY: usize = 1 << 20;
+/// The largest encoding of one exported record: its fields, at most 128
+/// bytes with their three numbers of up to 20 digits, and its payload of
+/// at most `MAX_MIRROR_PAYLOAD` (27) words of up to 20 digits and a
+/// separator each: `128 + 27 x 21`, 695 bytes.
+pub const MAX_RECORD_REPLY: usize = 128 + karyos_sys::trace_mirror::MAX_MIRROR_PAYLOAD * 21;
+/// The largest encoding of one exported journal: its fields, at most 1024
+/// bytes, and its drop ranges, at most `MIRROR_RANGES` (8) of at most 160
+/// bytes each: `1024 + 8 x 160`, 2304 bytes.
+pub const MAX_JOURNAL_REPLY: usize = 1024 + karyos_sys::trace_mirror::MIRROR_RANGES * 160;
 /// Records one `trace-export` request asks for by default.
 pub const EXPORT_DEFAULT: usize = 1024;
 /// The most records one request may ask for: the work of one read.

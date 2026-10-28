@@ -12,7 +12,10 @@
   new epoch. A cursor behind retention, or a record overwritten during the
   read, is never refused or delivered torn: the page states the lost
   sequences first, in `lost`. At most 16 384 records per request (default
-  1024), and a reply stops at a whole record within 1 MiB.
+  1024). A reply holds whole records, each counted with its journal the
+  first time one names it, within 1 MiB plus one record and one journal
+  (`MAX_RECORD_REPLY`, 695 bytes; `MAX_JOURNAL_REPLY`, 2304 bytes); it
+  names only the journals of the records it holds.
   `capabilities` lists `trace-export`.
 - `karyos_sys::diag_ring::scan_at_most` and
   `TraceMirrorReader::scan_at_most`: a ring scan that delivers at most a
