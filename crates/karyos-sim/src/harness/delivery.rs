@@ -389,8 +389,13 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         let Some((core, log)) = self.running.as_mut() else {
             return;
         };
+        // A message schema 2 refuses (a zero client or epoch, a command too
+        // long) is never proposed, and is not answered.
+        let Ok(payload) = envelope.to_vec() else {
+            return;
+        };
         let mut view = LogView::new(log);
-        let refused = match Proposer::new(core, &mut view).propose(envelope.to_vec()) {
+        let refused = match Proposer::new(core, &mut view).propose(payload) {
             Ok(()) => {
                 if let Some(key) = pending_of(&envelope) {
                     let _ = self.pending.insert(key, taker);
@@ -491,9 +496,8 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         let mut view = LogView::new(log);
         for envelope in due {
             if let Envelope::TimerFired { timer, deadline } = envelope
-                && Proposer::new(core, &mut view)
-                    .propose(envelope.to_vec())
-                    .is_ok()
+                && let Ok(payload) = envelope.to_vec()
+                && Proposer::new(core, &mut view).propose(payload).is_ok()
             {
                 let _ = self.fired.insert((timer, deadline));
             }
@@ -530,11 +534,15 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         if self.halted.is_some() {
             return;
         }
-        // A core's own configuration entry, as the service's change.
+        // A core's own configuration entry, as the service's change. One
+        // that schema 2 cannot carry stays as it is, and stops the
+        // container at it on every replica.
         let translated;
-        let entry = if (self.configurations)(&entry.payload) {
+        let entry = if (self.configurations)(&entry.payload)
+            && let Ok(payload) = Envelope::Configuration(&entry.payload).to_vec()
+        {
             translated = Entry {
-                payload: Envelope::Configuration(&entry.payload).to_vec(),
+                payload,
                 ..entry.clone()
             };
             &translated
