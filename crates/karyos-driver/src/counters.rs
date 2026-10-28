@@ -413,8 +413,10 @@ pub(crate) enum Event {
     /// so its grants count here too. `GrantsDetached` counts a `Detach`
     /// (karyos#827).
     GrantsReleasedAtExit,
-    /// `Fetch` messages found queued after a client's exit proof: not
-    /// served, since they would create state for a dead client.
+    /// `Fetch` messages found queued after a client's exit proof, or after
+    /// a close before it: not served, since they would create state for a
+    /// dead client. "Clients closed before their exit" tells the cases
+    /// apart.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "admission is served only on Linux")
@@ -429,17 +431,19 @@ pub(crate) enum Event {
         allow(dead_code, reason = "admission is served only on Linux")
     )]
     AdmissionMessagesDroppedAtExit,
-    /// Admission messages queued for a client when its exit was proven,
-    /// dropped unsent.
+    /// Admission messages queued for a client when its exit was proven, or
+    /// when its socket closed before it, dropped unsent.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "admission is served only on Linux")
     )]
     OutboundDroppedAtExit,
     /// Remote clients whose socket closed (end of file, `EPIPE` or
-    /// `ECONNRESET`) before their exit proof: drained, then retired like a
-    /// faulty client but not counted as one, since a dying process closes
-    /// its socket first (karyos#827). Last, so no other counter's id moves.
+    /// `ECONNRESET`, the end of file confirmed by `POLLRDHUP`) before their
+    /// exit proof: drained, then retired like a faulty client but not
+    /// counted as one, since a dying process closes its socket first
+    /// (karyos#827). One with no exit proof within `fetch_deadline` is
+    /// then counted in `ClientsFaulty` as well. Last, so no other counter's id moves.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "admission is served only on Linux")

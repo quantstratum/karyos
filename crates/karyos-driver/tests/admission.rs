@@ -2453,3 +2453,64 @@ fn child_exits_with_a_reply_unread() {
     std::mem::forget(client);
     std::process::exit(0);
 }
+
+/// karyos#827 (QS-COORDINATOR, 2026-10-28): a live client that shuts its
+/// socket down without exiting is retired as closed, not as faulty, and
+/// its slot stays charged. With no exit proof within `fetch_deadline`, it
+/// counts as faulty, once, and its slot is still held: closing and
+/// reconnecting frees no slot. A 0-byte datagram is told apart from such a
+/// close by `POLLRDHUP`.
+#[test]
+fn a_live_client_that_closes_is_faulty_after_the_fetch_deadline() {
+    let dir = dir("closed-alive");
+    let clock = ManualClock::default();
+    let mut driver = driver(&dir, Box::new(clock.clone()));
+    // This process stays alive: its own pidfd never reads exited.
+    let socket = ipc::connect(&dir, Duration::from_millis(20)).unwrap();
+    let own = own_pidfd();
+    let hello = encode(&Message::Hello { version: VERSION });
+    assert_eq!(
+        ipc::send(socket.as_fd(), &hello, Some(own.as_fd())).unwrap(),
+        Sent::Sent
+    );
+    let start = Instant::now();
+    while driver.clients() != 1 {
+        assert!(start.elapsed() < Duration::from_secs(5), "not admitted");
+        let _ = driver.do_work().unwrap();
+    }
+    let faulty = counter(&driver, "clients faulty");
+    ipc::shutdown_write(socket.as_fd()).unwrap();
+    let start = Instant::now();
+    while counter(&driver, "clients closed before their exit") != 1 {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the close was not seen"
+        );
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        counter(&driver, "clients faulty"),
+        faulty,
+        "faulty at the close"
+    );
+    assert_eq!(driver.clients(), 1, "the slot was freed at the close");
+    // Past the fetch deadline (100 ticks here) with no exit proof.
+    let _ = clock.now.fetch_add(101, Ordering::Relaxed);
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(counter(&driver, "clients faulty"), faulty + 1);
+    assert_eq!(
+        driver.clients(),
+        1,
+        "the slot was freed without an exit proof"
+    );
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        counter(&driver, "clients faulty"),
+        faulty + 1,
+        "counted twice"
+    );
+}

@@ -210,6 +210,10 @@ struct Tool {
 struct Retiring<T: StreamTerms> {
     pidfd: PidFd,
     link: Arc<ClientLink<T>>,
+    /// Since when it has been closed without an exit proof, when it was
+    /// retired as closed rather than faulty (karyos#827): past
+    /// `fetch_deadline` it counts as faulty, once.
+    closed_since: Option<u64>,
 }
 
 /// What happened to a remote client in one step.
@@ -657,6 +661,7 @@ impl<T: StreamTerms> Admission<T> {
                     self.retiring.push(Retiring {
                         pidfd: remote.pidfd,
                         link: remote.link,
+                        closed_since: None,
                     });
                     work.add(1);
                 }
@@ -668,13 +673,27 @@ impl<T: StreamTerms> Admission<T> {
         // Exit proofs of retired clients; an admitted client's is checked
         // before it is served, above.
         let before = self.retiring.len();
-        self.retiring.retain(|retiring| {
-            let exited = retiring.pidfd.exited().unwrap_or(false);
-            if exited {
+        let mut index = 0;
+        while let Some(retiring) = self.retiring.get_mut(index) {
+            if retiring.pidfd.exited().unwrap_or(false) {
                 retiring.link.mark_closed();
+                let _ = self.retiring.swap_remove(index);
+                continue;
             }
-            !exited
-        });
+            // A client closed with no exit proof within `fetch_deadline`
+            // is a live process that closed its socket: faulty, once, its
+            // slot still charged until its exit proof (QS-COORDINATOR,
+            // 2026-10-28). A dying process's pidfd reads exited within
+            // microseconds of its socket's close.
+            if let Some(since) = retiring.closed_since
+                && age_ns(*now.get_or_insert_with(|| driver.clock.now()), since)
+                    >= self.config.fetch_deadline
+            {
+                driver.counters.add(Event::ClientsFaulty, 1);
+                retiring.closed_since = None;
+            }
+            index += 1;
+        }
         work.add_items(before - self.retiring.len());
         work.done()
     }
@@ -1017,9 +1036,11 @@ impl<T: StreamTerms> Admission<T> {
             }
             // A descriptor on a message that takes none, a closed socket or
             // a receive error.
-            Ok(Recv::PeerClosed) => Step::Gone,
+            // The end of the connection, confirmed by `POLLRDHUP`; a
+            // 0-byte datagram from a live client is a protocol error.
+            Ok(Recv::PeerClosed) if ipc::peer_hung_up(remote.socket.as_fd()) => Step::Gone,
             Err(error) if ipc::peer_gone(&error) => Step::Gone,
-            Ok(Recv::Message(_)) | Err(_) => Step::Retire,
+            Ok(Recv::Message(_) | Recv::PeerClosed) | Err(_) => Step::Retire,
         }
     }
 
@@ -1063,6 +1084,7 @@ impl<T: StreamTerms> Admission<T> {
             self.retiring.push(Retiring {
                 pidfd: remote.pidfd,
                 link: remote.link,
+                closed_since: Some(driver.clock.now()),
             });
         }
         work.add_items(served.saturating_add(1));
@@ -1091,7 +1113,18 @@ impl<T: StreamTerms> Admission<T> {
         for _ in 0..EXIT_DRAIN_DATAGRAMS {
             let received = match ipc::recv(remote.socket.as_fd(), &mut buffer) {
                 Ok(Recv::Message(received)) => received,
-                Ok(Recv::WouldBlock | Recv::PeerClosed) => return served,
+                Ok(Recv::WouldBlock) => return served,
+                Ok(Recv::PeerClosed) if ipc::peer_hung_up(remote.socket.as_fd()) => {
+                    return served;
+                }
+                // A 0-byte datagram: dropped and counted, and the drain
+                // goes on.
+                Ok(Recv::PeerClosed) => {
+                    driver
+                        .counters
+                        .add(Event::AdmissionMessagesDroppedAtExit, 1);
+                    continue;
+                }
                 // A dying client that left a reply unread sets the socket's
                 // error (`ECONNRESET`), reported once and before any
                 // datagram: nothing was taken, and the drain goes on.

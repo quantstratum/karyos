@@ -845,6 +845,26 @@ pub fn readable(socket: BorrowedFd<'_>) -> Result<bool, SysError> {
         }))
 }
 
+/// Whether `socket`'s peer has shut its sending side down or closed
+/// (`POLLRDHUP` or `POLLHUP`), checked without waiting: how a 0-byte read
+/// is told apart from a 0-byte datagram a live peer sent (karyos#827).
+/// A failed `poll` reads as not hung up.
+#[must_use]
+pub fn peer_hung_up(socket: BorrowedFd<'_>) -> bool {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut fds = [PollFd::new(&socket, PollFlags::RDHUP)];
+    let zero = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    poll(&mut fds, Some(&zero)).is_ok_and(|ready| {
+        ready > 0
+            && fds
+                .iter()
+                .any(|fd| fd.revents().intersects(PollFlags::RDHUP | PollFlags::HUP))
+    })
+}
+
 /// Test hooks over raw descriptors (feature `test-hooks`): probes that the
 /// kernel refuses write access to a region's memory.
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1101,6 +1121,18 @@ pub fn peer_gone(error: &SysError) -> bool {
 /// Returns [`SysError::Os`] when the call fails.
 pub fn shutdown_read(socket: BorrowedFd<'_>) -> Result<(), SysError> {
     rustix::net::shutdown(socket, rustix::net::Shutdown::Read).map_err(os("shutdown"))
+}
+
+/// Shuts the sending side of `socket` down while the descriptor stays
+/// open, so its peer reads the end of the connection from a live process:
+/// how a test stands for a client that closes without exiting
+/// (karyos#827).
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when the call fails.
+pub fn shutdown_write(socket: BorrowedFd<'_>) -> Result<(), SysError> {
+    rustix::net::shutdown(socket, rustix::net::Shutdown::Write).map_err(os("shutdown"))
 }
 
 /// Connects to the driver's admission socket in `dir` (client side,

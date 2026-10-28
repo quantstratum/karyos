@@ -12,12 +12,15 @@
     before its exit is visible (Linux closes a dying process's
     descriptors first) is drained the same way, then retired, not as
     faulty, its slot charged until its exit proof: the new counter
-    "clients closed before their exit". Only a protocol error retires a
-    client as faulty.
+    "clients closed before their exit". The end of file is confirmed with
+    `POLLRDHUP`, so a 0-byte datagram from a live client stays a protocol
+    error. A closed client with no exit proof within `fetch_deadline` then
+    counts as faulty, and its slot stays charged until its exit proof.
   - The drain reads at most 1024 datagrams, the driver's own bound, and
     at most 8 exited clients are drained in one admission step.
   - Messages queued for the exited client are dropped unsent.
   - New driver counters: "grants released at exit" (grants whose
     descriptor left and that the exit ended), "fetches dropped at exit",
     "admission messages dropped at exit" and "admission messages not sent
-    at exit".
+    at exit" (each at exit or at a close before it), and "clients closed
+    before their exit".
