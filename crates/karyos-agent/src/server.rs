@@ -32,7 +32,8 @@
 //!   not take is `{"error":"bad arguments","request":NAME}`.
 //! - **Bounds.** Each connection is served on the calling thread with
 //!   [`IO_TIMEOUT`] on its reads and each write, and [`WRITE_DEADLINE`] on
-//!   writing its whole reply: a client that reads a large reply too slowly
+//!   writing its whole reply, checked after every write; one poll starts
+//!   connections for [`POLL_BUDGET`] at most: a client that reads a large reply too slowly
 //!   gets it cut short, never the polling thread held for longer, and the
 //!   connection closed. A reply without a final newline, followed by EOF,
 //!   is incomplete and is discarded; the reader retries with the same
@@ -79,9 +80,13 @@ pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
 /// The time a whole reply may take to write: past it, the reply is cut
 /// short and the connection closed (`Served::Dropped`).
 pub const WRITE_DEADLINE: Duration = Duration::from_millis(250);
-/// The bytes of one write of a reply, so the deadline is checked between
-/// them.
+/// The bytes of one write of a reply at most.
 const WRITE_CHUNK: usize = 64 << 10;
+/// The time one [`Server::poll`] starts connections in: one started
+/// before it may still take [`IO_TIMEOUT`] to read and [`WRITE_DEADLINE`]
+/// to answer, so a poll lasts at most `POLL_BUDGET + IO_TIMEOUT +
+/// WRITE_DEADLINE`, 850 ms, however many clients wait.
+pub const POLL_BUDGET: Duration = Duration::from_millis(500);
 /// Connections one [`Server::poll`] serves at most; the rest wait for the
 /// next poll, so a burst of clients cannot hold the polling thread.
 pub const MAX_ACCEPTS: usize = 16;
@@ -375,8 +380,11 @@ impl Server {
     ///
     /// The operating system's error when `accept` fails.
     pub fn poll(&mut self, agent: &mut Agent) -> Result<Vec<Served>, ServeError> {
+        let start = std::time::Instant::now();
         let mut served = Vec::new();
-        while served.len() < MAX_ACCEPTS {
+        // At most MAX_ACCEPTS connections, and none started past the
+        // poll's budget: the rest wait for the next poll.
+        while served.len() < MAX_ACCEPTS && start.elapsed() < POLL_BUDGET {
             match self.listener.accept() {
                 Ok((stream, _)) => served.push(self.serve(stream, agent)),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -495,7 +503,7 @@ impl Server {
                     json::trace_export(&page, crate::api::MAX_EXPORT_REPLY),
                     Served::TraceExport,
                 ),
-                Ok(Err(refusal)) => (json::export_refusal(&refusal), Served::TraceExport),
+                Ok(Err(refusal)) => (json::export_refusal(&refusal), Served::Refused),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
             (Some(_), Request::Version) => (
@@ -517,12 +525,15 @@ impl Server {
     }
 }
 
-/// Writes `reply` to `stream` within `deadline` in all, in chunks of
-/// [`WRITE_CHUNK`], each under the time left (at most [`IO_TIMEOUT`]);
-/// `false` when it failed or the deadline passed.
+/// Writes `reply` to `stream` within `deadline` in all: one `write` at a
+/// time, each under the time left (at most [`IO_TIMEOUT`]), the deadline
+/// checked again after every one, so a client that reads a little at a
+/// time cannot stretch it; `false` when a write failed or the deadline
+/// passed.
 fn write_within(stream: &mut UnixStream, reply: &[u8], deadline: Duration) -> bool {
     let start = std::time::Instant::now();
-    for chunk in reply.chunks(WRITE_CHUNK) {
+    let mut rest = reply;
+    while !rest.is_empty() {
         let left = deadline.saturating_sub(start.elapsed());
         if left.is_zero()
             || stream
@@ -531,11 +542,13 @@ fn write_within(stream: &mut UnixStream, reply: &[u8], deadline: Duration) -> bo
         {
             return false;
         }
-        if stream.write_all(chunk).is_err() {
-            return false;
+        let chunk = rest.get(..WRITE_CHUNK.min(rest.len())).unwrap_or(rest);
+        match stream.write(chunk) {
+            Ok(0) | Err(_) => return false,
+            Ok(written) => rest = rest.get(written..).unwrap_or(&[]),
         }
     }
-    stream.flush().is_ok()
+    start.elapsed() <= deadline && stream.flush().is_ok()
 }
 
 impl Drop for Server {
@@ -885,6 +898,33 @@ mod tests {
         assert!(write_within(&mut writer, &reply, WRITE_DEADLINE));
         drop(writer);
         assert_eq!(read.join().unwrap(), reply);
+    }
+
+    /// Review B1 of #826: a client that reads a few KiB at a time, often
+    /// enough for each write to progress, still cannot stretch a reply past
+    /// its deadline: it is checked after every write.
+    #[test]
+    fn a_trickling_reader_cannot_stretch_the_deadline() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let trickle = std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            let mut total = 0;
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                total += read;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            total
+        });
+        let reply = vec![b'z'; 64 << 20];
+        let start = std::time::Instant::now();
+        assert!(!write_within(&mut writer, &reply, WRITE_DEADLINE));
+        let took = start.elapsed();
+        assert!(took < WRITE_DEADLINE + IO_TIMEOUT, "{took:?}");
+        writer.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(trickle.join().unwrap() < reply.len());
     }
 
     /// R-CORE-38: a dimension this agent does not know is refused by

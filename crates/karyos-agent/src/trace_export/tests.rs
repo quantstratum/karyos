@@ -14,6 +14,17 @@ use karyos_sys::trace_mirror::{
 
 use super::*;
 
+/// [`export`] with no byte bound.
+fn read_page(
+    mirror: &karyos_sys::trace_mirror::TraceMirrorReader,
+    epoch: u128,
+    from: u64,
+    count: usize,
+    asked: Option<u128>,
+) -> Result<ExportPage, ExportRefusal> {
+    export(mirror, epoch, from, count, asked, usize::MAX)
+}
+
 const EPOCH: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
 
 /// A mirror of 4 table entries, 4 log entries and `capacity` records, with
@@ -48,7 +59,7 @@ fn pages_resume_with_no_duplicate_and_no_gap() {
     let mut seen = Vec::new();
     loop {
         // A fresh reader each page: the agent keeps nothing per cursor.
-        let page = export(&mirror.reader(), EPOCH, cursor, 3, Some(EPOCH)).unwrap();
+        let page = read_page(&mirror.reader(), EPOCH, cursor, 3, Some(EPOCH)).unwrap();
         assert!(page.lost.is_empty(), "{:?}", page.lost);
         assert!(page.records.len() <= 3);
         seen.extend(seqs(&page));
@@ -60,7 +71,7 @@ fn pages_resume_with_no_duplicate_and_no_gap() {
     }
     assert_eq!(seen, (0..10).collect::<Vec<_>>());
     // The records are whole, with their journal sequence.
-    let page = export(&reader, EPOCH, 4, 1, None).unwrap();
+    let page = read_page(&reader, EPOCH, 4, 1, None).unwrap();
     let record = &page.records[0];
     assert_eq!(
         (record.journal, record.sequence, record.payload.as_slice()),
@@ -75,12 +86,12 @@ fn pages_resume_with_no_duplicate_and_no_gap() {
 fn a_cursor_behind_retention_reports_the_lost_range() {
     let mut mirror = mirror(4);
     append(&mut mirror, 0..10);
-    let page = export(&mirror.reader(), EPOCH, 1, 16, Some(EPOCH)).unwrap();
+    let page = read_page(&mirror.reader(), EPOCH, 1, 16, Some(EPOCH)).unwrap();
     assert_eq!(page.lost, vec![ExportLoss { first: 1, last: 5 }]);
     assert_eq!(seqs(&page), vec![6, 7, 8, 9]);
     assert_eq!((page.from, page.next, page.head), (1, 10, 10));
     // Up to date: nothing lost, nothing new.
-    let page = export(&mirror.reader(), EPOCH, 10, 16, Some(EPOCH)).unwrap();
+    let page = read_page(&mirror.reader(), EPOCH, 10, 16, Some(EPOCH)).unwrap();
     assert!(page.lost.is_empty() && page.records.is_empty());
     assert_eq!(page.next, 10);
 }
@@ -93,12 +104,12 @@ fn another_instance_is_refused_with_this_one() {
     append(&mut mirror, 0..2);
     let reader = mirror.reader();
     assert_eq!(
-        export(&reader, EPOCH, 1, 4, Some(EPOCH + 1)),
+        read_page(&reader, EPOCH, 1, 4, Some(EPOCH + 1)),
         Err(ExportRefusal::EpochChanged { epoch: EPOCH })
     );
-    assert_eq!(export(&reader, EPOCH, 0, 4, None).unwrap().epoch, EPOCH);
+    assert_eq!(read_page(&reader, EPOCH, 0, 4, None).unwrap().epoch, EPOCH);
     assert_eq!(
-        export(&reader, EPOCH, 0, 4, Some(EPOCH))
+        read_page(&reader, EPOCH, 0, 4, Some(EPOCH))
             .unwrap()
             .records
             .len(),
@@ -129,7 +140,7 @@ fn a_page_names_its_journals() {
     for journal in [10, 11, 12, 10] {
         let _ = mirror.append(journal, 0, &[0, 0]).unwrap();
     }
-    let page = export(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
+    let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
     assert_eq!(page.journals.len(), 3, "{:?}", page.journals);
     assert!(matches!(&page.journals[0], ExportJournal::Live(entry) if entry.journal == 10));
     assert_eq!(
@@ -151,7 +162,7 @@ fn a_concurrent_writer_never_tears_a_record() {
     let mut cursor = 0;
     let (mut delivered, mut lost) = (0u64, 0u64);
     loop {
-        let page = export(&reader, EPOCH, cursor, 16, Some(EPOCH)).unwrap();
+        let page = read_page(&reader, EPOCH, cursor, 16, Some(EPOCH)).unwrap();
         let mut expect = cursor;
         for loss in &page.lost {
             assert!(loss.first >= expect && loss.last >= loss.first, "{loss:?}");
@@ -206,7 +217,7 @@ mod mirror {
             let _ = first.driver.do_work().unwrap();
         }
         let instance = epoch(&first.driver);
-        let page = export(&first.driver.trace_mirror(), instance, 0, 16, None).unwrap();
+        let page = read_page(&first.driver.trace_mirror(), instance, 0, 16, None).unwrap();
         assert_eq!(page.records.len(), 2, "{page:?}");
         for record in &page.records {
             let words = <&[u64; RECORD_WORDS]>::try_from(record.payload.as_slice()).unwrap();
@@ -228,7 +239,7 @@ mod mirror {
         // Another driver is another instance: the cursor is refused.
         let other = traced(DriverConfig::default());
         assert_eq!(
-            export(
+            read_page(
                 &other.driver.trace_mirror(),
                 epoch(&other.driver),
                 page.next,
@@ -240,4 +251,88 @@ mod mirror {
             })
         );
     }
+}
+
+/// Review B2 of #826: a cursor beyond the ring's next sequence is refused
+/// with the ring's head, never served as caught up; the head is the
+/// ring's, not the cursor.
+#[test]
+fn a_cursor_ahead_of_the_ring_is_refused() {
+    let mut mirror = mirror(16);
+    append(&mut mirror, 0..10);
+    assert_eq!(
+        read_page(&mirror.reader(), EPOCH, 5000, 16, None),
+        Err(ExportRefusal::Ahead { head: 10 })
+    );
+    let page = read_page(&mirror.reader(), EPOCH, 10, 16, None).unwrap();
+    assert_eq!((page.next, page.head), (10, 10));
+}
+
+/// Review B3 of #826: a journal whose table entry is busy on every attempt
+/// cannot be named, so the page ends before its first record, which the
+/// next read delivers once the entry reads.
+#[test]
+fn a_busy_journal_entry_ends_the_page_before_its_records() {
+    let mut mirror = mirror(16);
+    let other = JournalEntry::open(11, 1, JournalKind::Publisher, 2, 16);
+    assert!(mirror.write_entry(1, Some(&other)));
+    for (seq, journal) in [(0, 10), (1, 11), (2, 10)] {
+        let _ = mirror.append(journal, seq, &[seq, !seq]).unwrap();
+    }
+    assert!(mirror.hold_entry(1, true));
+    let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
+    assert_eq!(seqs(&page), [0]);
+    assert_eq!(page.next, 1);
+    assert!(
+        page.journals
+            .iter()
+            .all(|journal| !matches!(journal, ExportJournal::Unknown { .. }))
+    );
+    assert!(mirror.hold_entry(1, false));
+    let page = read_page(&mirror.reader(), EPOCH, 1, 16, None).unwrap();
+    assert_eq!(seqs(&page), [1, 2]);
+    assert_eq!(page.journals.len(), 2);
+}
+
+/// Review B4 of #826: a record whose length word passes the payload bound
+/// is malformed: never delivered, stated as lost when it starts the page,
+/// and ending the page before it otherwise.
+#[test]
+fn a_malformed_record_is_lost_not_delivered() {
+    use karyos_sys::trace_mirror::MAX_MIRROR_PAYLOAD;
+
+    let mut mirror = mirror(16);
+    let long = u64::try_from(MAX_MIRROR_PAYLOAD).unwrap() + 1;
+    let _ = mirror.append_with_length(10, 0, &[0, 0], long).unwrap();
+    append(&mut mirror, 1..3);
+    let _ = mirror.append_with_length(10, 3, &[3, 3], long).unwrap();
+    append(&mut mirror, 4..5);
+    let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
+    assert_eq!(page.lost, vec![ExportLoss { first: 0, last: 0 }]);
+    assert_eq!(seqs(&page), [1, 2]);
+    assert_eq!(page.next, 3);
+    let page = read_page(&mirror.reader(), EPOCH, 3, 16, None).unwrap();
+    assert_eq!(page.lost, vec![ExportLoss { first: 3, last: 3 }]);
+    assert_eq!(seqs(&page), [4]);
+}
+
+/// Review of #826: the read is bounded by bytes, so a page of a small
+/// bound holds few records, `next` naming the first left out, and the
+/// count is clamped to `EXPORT_MAX` whatever the caller asks.
+#[test]
+fn the_read_is_bounded_by_bytes_and_count() {
+    let mut mirror = mirror(64);
+    append(&mut mirror, 0..40);
+    let reader = mirror.reader();
+    let page = export(&reader, EPOCH, 0, usize::MAX, None, 1).unwrap();
+    assert_eq!(seqs(&page), [0]);
+    assert_eq!(page.next, 1);
+    let bound = crate::json::EXPORT_REPLY_OVERHEAD
+        + crate::api::MAX_JOURNAL_REPLY
+        + 5 * crate::json::export_record_len(&page.records[0]);
+    let page = export(&reader, EPOCH, 0, usize::MAX, None, bound).unwrap();
+    assert_eq!(page.records.len(), 5);
+    assert_eq!(page.next, 5);
+    let page = export(&reader, EPOCH, 0, usize::MAX, None, usize::MAX).unwrap();
+    assert_eq!(page.records.len(), 40);
 }

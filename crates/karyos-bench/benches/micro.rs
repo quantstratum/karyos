@@ -250,9 +250,9 @@ fn term_copies(c: &mut Criterion) {
     term_read(c, "shared", shared_lane);
 }
 
-/// One `trace-export` page of the most records a request may ask for
-/// (R-CORE-13), from a full mirror: the scan and copy, then the scan,
-/// copy and reply encoding at the reply bound.
+/// The cost of a `trace-export` page (R-CORE-13), from a full mirror: the
+/// scan and copy of the most records a request may ask for with no byte
+/// bound, then a page as served, within the 1 MiB bound, encoded.
 fn trace_export_page(c: &mut Criterion) {
     use karyos_agent::api::{EXPORT_MAX, MAX_EXPORT_REPLY};
     use karyos_sys::trace_mirror::{JournalEntry, JournalKind, trace_mirror};
@@ -266,7 +266,7 @@ fn trace_export_page(c: &mut Criterion) {
     }
     let reader = mirror.reader();
     let mut group = c.benchmark_group("trace export");
-    let _ = group.bench_function("page 16384", |b| {
+    let _ = group.bench_function("16384 records, no byte bound", |b| {
         b.iter(|| {
             black_box(karyos_agent::trace_export::export(
                 &reader,
@@ -274,13 +274,20 @@ fn trace_export_page(c: &mut Criterion) {
                 0,
                 EXPORT_MAX,
                 Some(1),
+                usize::MAX,
             ))
         });
     });
-    let _ = group.bench_function("page 16384 encoded", |b| {
+    let _ = group.bench_function("a page within 1 MiB, encoded", |b| {
         b.iter(|| {
-            if let Ok(page) = karyos_agent::trace_export::export(&reader, 1, 0, EXPORT_MAX, Some(1))
-            {
+            if let Ok(page) = karyos_agent::trace_export::export(
+                &reader,
+                1,
+                0,
+                EXPORT_MAX,
+                Some(1),
+                MAX_EXPORT_REPLY,
+            ) {
                 black_box(karyos_agent::json::trace_export(&page, MAX_EXPORT_REPLY));
             }
         });

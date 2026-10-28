@@ -14,8 +14,15 @@
   sequences first, in `lost`. At most 16 384 records per request (default
   1024). A reply holds whole records, each counted with its journal the
   first time one names it, within 1 MiB plus one record and one journal
-  (`MAX_RECORD_REPLY`, 695 bytes; `MAX_JOURNAL_REPLY`, 2304 bytes); it
-  names only the journals of the records it holds.
+  (`MAX_RECORD_REPLY`, 695 bytes; `MAX_JOURNAL_REPLY`, 2560 bytes), the
+  read itself bounded by those bytes and the count clamped to 16 384; it
+  names only the journals of the records it holds. A cursor beyond the
+  ring is refused (`cursor ahead`, with the ring's head), as is a read
+  that finds the ring's bounds busy (`mirror busy`); the head is always
+  the ring's. A record whose journal entry stays busy ends the page
+  before it, and a malformed record (a length past the payload bound,
+  `MirrorRecord::truncated`) is never delivered: it is lost when it
+  starts a page and ends the page otherwise.
   `capabilities` lists `trace-export`.
 - `karyos_sys::diag_ring::scan_at_most` and
   `TraceMirrorReader::scan_at_most`: a ring scan that delivers at most a
@@ -25,6 +32,8 @@
   page of it, so a reader never counts it twice; no page holds a bucket's
   header without a lane.
 - The API socket writes each reply within `WRITE_DEADLINE` (250 ms) in
-  all, in 64 KiB writes: a reply a client reads too slowly is cut short,
-  without its final newline, never holding the polling thread longer.
-  `limits` answers it as `write.deadline_ms`.
+  all, checked after every write: a reply a client reads too slowly is
+  cut short, and the connection closed, so it ends at EOF without its
+  final newline. `limits` answers it as `write.deadline_ms`. One poll
+  starts connections for `POLL_BUDGET` (500 ms) at most. Refusals of
+  `trace-export` are served as refusals.

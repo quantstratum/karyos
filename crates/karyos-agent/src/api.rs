@@ -194,9 +194,10 @@ pub const MAX_EXPORT_REPLY: usize = 1 << 20;
 /// separator each: `128 + 27 x 21`, 695 bytes.
 pub const MAX_RECORD_REPLY: usize = 128 + karyos_sys::trace_mirror::MAX_MIRROR_PAYLOAD * 21;
 /// The largest encoding of one exported journal: its fields, at most 1024
-/// bytes, and its drop ranges, at most `MIRROR_RANGES` (8) of at most 160
-/// bytes each: `1024 + 8 x 160`, 2304 bytes.
-pub const MAX_JOURNAL_REPLY: usize = 1024 + karyos_sys::trace_mirror::MIRROR_RANGES * 160;
+/// bytes, and its drop ranges, at most `MIRROR_RANGES` (8) of at most 192
+/// bytes each (six numbers of up to 20 digits, their keys, 184 bytes):
+/// `1024 + 8 x 192`, 2560 bytes.
+pub const MAX_JOURNAL_REPLY: usize = 1024 + karyos_sys::trace_mirror::MIRROR_RANGES * 192;
 /// Records one `trace-export` request asks for by default.
 pub const EXPORT_DEFAULT: usize = 1024;
 /// The most records one request may ask for: the work of one read.
@@ -951,4 +952,12 @@ pub enum ExportRefusal {
         /// This driver instance.
         epoch: u128,
     },
+    /// The cursor is beyond the ring's next sequence: not this instance's
+    /// sequences, or a reader's error. It is never served as caught up.
+    Ahead {
+        /// The ring's next sequence.
+        head: u64,
+    },
+    /// The ring's bounds were being written on every attempt: retry.
+    Busy,
 }

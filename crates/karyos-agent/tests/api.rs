@@ -561,7 +561,7 @@ fn trace_export_is_served_over_the_socket() {
             dir.join("driver").display()
         ),
     );
-    assert_eq!(served, [Served::TraceExport]);
+    assert_eq!(served, [Served::Refused]);
     assert_eq!(
         answer,
         format!("{{\"error\":\"epoch changed\",\"epoch\":\"{epoch}\"}}\n")

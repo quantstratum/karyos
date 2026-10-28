@@ -852,8 +852,17 @@ pub fn trace_export(page: &ExportPage, max_bytes: usize) -> String {
 }
 
 /// The bytes of a `trace-export` reply besides its records and journals:
-/// its fields and at most a few lost ranges.
-const EXPORT_REPLY_OVERHEAD: usize = 512;
+/// its fields, 256 bytes at most, and its lost ranges, at most
+/// `MAX_LOST_RANGES` of at most 48 bytes each.
+pub(crate) const EXPORT_REPLY_OVERHEAD: usize = 256 + crate::trace_export::MAX_LOST_RANGES * 48;
+
+/// The bytes `record`'s encoding takes in a page, with its separator.
+#[must_use]
+pub(crate) fn export_record_len(record: &crate::api::ExportRecord) -> usize {
+    let mut text = String::new();
+    export_record(&mut Out(&mut text), record);
+    text.len().saturating_add(1)
+}
 
 fn export_record(out: &mut Out<'_>, record: &crate::api::ExportRecord) {
     out.object(|fields| {
@@ -875,6 +884,11 @@ pub fn export_refusal(refusal: &ExportRefusal) -> String {
             fields.string("error", "epoch changed");
             fields.string("epoch", &format!("{epoch:032x}"));
         }
+        ExportRefusal::Ahead { head } => {
+            fields.string("error", "cursor ahead");
+            fields.number("head", head);
+        }
+        ExportRefusal::Busy => fields.string("error", "mirror busy"),
     });
     text
 }

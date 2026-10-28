@@ -787,6 +787,9 @@ pub struct MirrorRecord<'a> {
     pub sequence: u64,
     /// Its payload words.
     pub payload: &'a [u64],
+    /// Its length word passed [`MAX_MIRROR_PAYLOAD`]: `payload` is cut to
+    /// it, so the record is malformed, not whole.
+    pub truncated: bool,
 }
 
 /// The sizes of a mirror of `entries` table entries, `log` recycle log
@@ -963,6 +966,44 @@ impl TraceMirror {
         let mut fields = [0u64; MIRROR_RECORD_WORDS - FIELDS];
         let (head, tail) = fields.split_at_mut(3);
         head.copy_from_slice(&[journal, sequence, payload.len() as u64]);
+        for (word, value) in tail.iter_mut().zip(payload) {
+            *word = *value;
+        }
+        self.ring()?.append(&fields)
+    }
+
+    /// Test hook: holds table entry `index` mid-write (its seqlock odd)
+    /// when `held`, so every read of it is busy; `false` releases it. A
+    /// dependent crate's test of a busy entry.
+    #[cfg(feature = "test-hooks")]
+    pub fn hold_entry(&mut self, index: usize, held: bool) -> bool {
+        let Some(version) = slot_start(self.geometry.table, index, self.entries, ENTRY_WORDS)
+            .and_then(|start| self.store.words().get(start))
+        else {
+            return false;
+        };
+        let now = version.load(Ordering::Relaxed);
+        let odd = now % 2 == 1;
+        if odd != held {
+            version.store(now.wrapping_add(1), Ordering::Release);
+        }
+        true
+    }
+
+    /// Test hook: appends a record whose length word is `length` whatever
+    /// `payload` holds, as a broken writer would; a dependent crate's test
+    /// of a malformed record.
+    #[cfg(feature = "test-hooks")]
+    pub fn append_with_length(
+        &mut self,
+        journal: u64,
+        sequence: u64,
+        payload: &[u64],
+        length: u64,
+    ) -> Option<Appended> {
+        let mut fields = [0u64; MIRROR_RECORD_WORDS - FIELDS];
+        let (head, tail) = fields.split_at_mut(3);
+        head.copy_from_slice(&[journal, sequence, length]);
         for (word, value) in tail.iter_mut().zip(payload) {
             *word = *value;
         }
@@ -1247,7 +1288,7 @@ impl TraceMirrorReader {
     /// Scans the ring from `cursor` (see [`crate::diag_ring::scan`]),
     /// delivering each retained observation record in order. A record whose
     /// length word exceeds [`MAX_MIRROR_PAYLOAD`] is delivered with the
-    /// payload cut to it.
+    /// payload cut to it and marked `truncated`.
     pub fn scan(&self, cursor: &mut u64, deliver: impl FnMut(MirrorRecord<'_>)) -> Scan {
         self.scan_at_most(cursor, u64::MAX, deliver)
     }
@@ -1270,14 +1311,14 @@ impl TraceMirrorReader {
         let mut buffer = [0u64; MIRROR_RECORD_WORDS - FIELDS];
         scan_at_most(&reader, cursor, &mut buffer, max, |seq, fields| {
             let field = |index: usize| fields.get(index).copied().unwrap_or(0);
-            let length = usize::try_from(field(2))
-                .unwrap_or(MAX_MIRROR_PAYLOAD)
-                .min(MAX_MIRROR_PAYLOAD);
+            let written = usize::try_from(field(2)).unwrap_or(usize::MAX);
+            let length = written.min(MAX_MIRROR_PAYLOAD);
             deliver(MirrorRecord {
                 seq,
                 journal: field(0),
                 sequence: field(1),
                 payload: fields.get(3..3 + length).unwrap_or(&[]),
+                truncated: written > MAX_MIRROR_PAYLOAD,
             });
         })
     }

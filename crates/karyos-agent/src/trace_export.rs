@@ -39,103 +39,203 @@ use karyos_sys::trace_mirror::{EntryRead, LogRead, TraceMirrorReader};
 use crate::api::{ExportJournal, ExportLoss, ExportPage, ExportRecord, ExportRefusal};
 
 /// Overwrites within one page retried at most before the page ends.
-const OVERWRITE_RETRIES: usize = 4;
+pub(crate) const OVERWRITE_RETRIES: usize = 4;
+/// Lost ranges one page states at most: the cursor's own and one per
+/// overwrite retry, and a malformed record at the start of the page.
+pub(crate) const MAX_LOST_RANGES: usize = OVERWRITE_RETRIES + 2;
+/// Reads of the ring's bounds, or of a table or log entry, retried while
+/// a publication is in progress.
+const BUSY_RETRIES: usize = 16;
 
-/// Up to `count` records of `mirror`, of driver instance `epoch`, from
-/// sequence `from` on; `asked` is the epoch of the reader's cursor, if it
-/// has one.
+/// Up to `count` records (at most [`crate::api::EXPORT_MAX`]) of
+/// `mirror`, of driver instance `epoch`, from sequence `from` on, in a
+/// reply of at most `max_bytes` plus one record and one journal; `asked` is
+/// the epoch of the reader's cursor, if it has one.
+///
+/// The read stops where the page must end: at the byte bound, before a
+/// record overwritten under it, before a malformed record (one is stated
+/// as lost instead when it is the first), and before the first record
+/// whose journal's table entry could not be read; `next` names where.
 ///
 /// # Errors
 ///
-/// [`ExportRefusal::EpochChanged`] when `asked` is another instance.
+/// [`ExportRefusal::EpochChanged`] when `asked` is another instance;
+/// [`ExportRefusal::Ahead`] for a cursor beyond the ring's next sequence;
+/// [`ExportRefusal::Busy`] when the ring's bounds could not be read.
 pub fn export(
     mirror: &TraceMirrorReader,
     epoch: u128,
     from: u64,
     count: usize,
     asked: Option<u128>,
+    max_bytes: usize,
 ) -> Result<ExportPage, ExportRefusal> {
     if asked.is_some_and(|asked| asked != epoch) {
         return Err(ExportRefusal::EpochChanged { epoch });
     }
+    let bounds = (0..BUSY_RETRIES)
+        .find_map(|_| mirror.bounds())
+        .ok_or(ExportRefusal::Busy)?;
+    // A cursor past what the ring has given: another instance's, or a
+    // reader's error. Never served as caught up.
+    if from > bounds.next {
+        return Err(ExportRefusal::Ahead { head: bounds.next });
+    }
+    let count = count.min(crate::api::EXPORT_MAX);
     let mut cursor = from;
-    let mut lost = Vec::new();
+    let mut lost: Vec<ExportLoss> = Vec::new();
     let mut records: Vec<ExportRecord> = Vec::new();
-    let max = u64::try_from(count).unwrap_or(u64::MAX);
+    let mut named = BTreeSet::new();
+    let mut used = crate::json::EXPORT_REPLY_OVERHEAD;
+    let mut stop = None;
+    let note = |lost: &mut Vec<ExportLoss>, first: u64, last: u64| match lost.last_mut() {
+        Some(previous) if previous.last.saturating_add(1) == first => previous.last = last,
+        _ => lost.push(ExportLoss { first, last }),
+    };
     for _ in 0..=OVERWRITE_RETRIES {
         let before = cursor;
-        let left = max.saturating_sub(u64::try_from(records.len()).unwrap_or(u64::MAX));
+        let left = u64::try_from(count.saturating_sub(records.len())).unwrap_or(u64::MAX);
         let scan = mirror.scan_at_most(&mut cursor, left, |record| {
-            records.push(ExportRecord {
+            if stop.is_some() {
+                return;
+            }
+            // A malformed record is never delivered: lost when it is the
+            // first, else the page ends before it.
+            if record.truncated {
+                if records.is_empty() {
+                    note(&mut lost, record.seq, record.seq);
+                } else {
+                    stop = Some(record.seq);
+                }
+                return;
+            }
+            let exported = ExportRecord {
                 seq: record.seq,
                 journal: record.journal,
                 sequence: record.sequence,
                 payload: record.payload.to_vec(),
-            });
+            };
+            let journal = if named.contains(&record.journal) {
+                0
+            } else {
+                crate::api::MAX_JOURNAL_REPLY
+            };
+            let size = crate::json::export_record_len(&exported).saturating_add(journal);
+            if !records.is_empty() && used.saturating_add(size) > max_bytes {
+                stop = Some(record.seq);
+                return;
+            }
+            used = used.saturating_add(size);
+            let _ = named.insert(record.journal);
+            records.push(exported);
         });
         if scan.overwritten > 0 {
-            lost.push(ExportLoss {
-                first: before,
-                last: before + scan.overwritten - 1,
-            });
+            note(&mut lost, before, before + scan.overwritten - 1);
         }
         // Overwritten under the reader: the next scan's boundary proves
         // it and states it as lost, in this page while it has no record
         // yet (the loss comes first), else in the next one.
-        if scan.stopped != Some(karyos_sys::diag_ring::ScanStop::Overwritten) || !records.is_empty()
+        if stop.is_some()
+            || scan.stopped != Some(karyos_sys::diag_ring::ScanStop::Overwritten)
+            || !records.is_empty()
         {
             break;
         }
     }
-    let head = mirror
-        .bounds()
-        .map_or(cursor, |bounds| bounds.next.max(cursor));
+    let mut next = stop.unwrap_or(cursor);
+    let (journals, unread) = journals(mirror, &records);
+    // A record whose journal could not be read would not be decodable:
+    // the page ends before the first one.
+    if let Some(at) = records
+        .iter()
+        .position(|record| unread.contains(&record.journal))
+    {
+        next = records.get(at).map_or(next, |record| record.seq);
+        records.truncate(at);
+    }
+    let kept: BTreeSet<u64> = records.iter().map(|record| record.journal).collect();
+    let journals = journals
+        .into_iter()
+        .filter(|journal| kept.contains(&journal_number(journal)))
+        .collect();
+    // The head is the ring's, read again after the page, never the cursor.
+    let head = (0..BUSY_RETRIES)
+        .find_map(|_| mirror.bounds())
+        .map_or(bounds.next, |now| now.next);
     Ok(ExportPage {
         epoch,
         from,
         lost,
-        journals: journals(mirror, &records),
         records,
-        next: cursor,
+        next,
         head,
+        journals,
     })
 }
 
-/// The journals `records` name, from the table, then the recycle log.
-fn journals(mirror: &TraceMirrorReader, records: &[ExportRecord]) -> Vec<ExportJournal> {
+/// The number of `journal`.
+fn journal_number(journal: &ExportJournal) -> u64 {
+    match journal {
+        ExportJournal::Live(entry) => entry.journal,
+        ExportJournal::Recycled(entry) => entry.journal,
+        ExportJournal::Unknown { journal } => *journal,
+    }
+}
+
+/// The journals `records` name, from the table, then the recycle log, and
+/// those that could not be read: a table or log entry busy on every
+/// attempt may have been any of them, so a journal found in neither is
+/// unknown only when every entry was read.
+fn journals(
+    mirror: &TraceMirrorReader,
+    records: &[ExportRecord],
+) -> (Vec<ExportJournal>, BTreeSet<u64>) {
     let mut wanted: BTreeSet<u64> = records.iter().map(|record| record.journal).collect();
     let mut found = Vec::with_capacity(wanted.len());
+    let mut busy = false;
     for index in 0..mirror.entries() {
         if wanted.is_empty() {
             break;
         }
-        if let EntryRead::Entry(entry) = mirror.entry(index)
-            && wanted.remove(&entry.journal)
-        {
-            found.push(ExportJournal::Live(Box::new(entry)));
+        let read = (0..BUSY_RETRIES)
+            .map(|_| mirror.entry(index))
+            .find(|read| !matches!(read, EntryRead::Busy))
+            .unwrap_or(EntryRead::Busy);
+        match read {
+            EntryRead::Entry(entry) if wanted.remove(&entry.journal) => {
+                found.push(ExportJournal::Live(Box::new(entry)));
+            }
+            EntryRead::Busy => busy = true,
+            _ => {}
         }
     }
     for index in 0..mirror.log_entries() {
         if wanted.is_empty() {
             break;
         }
-        if let LogRead::Entry(entry) = mirror.log_entry(index)
-            && wanted.remove(&entry.journal)
-        {
-            found.push(ExportJournal::Recycled(Box::new(entry)));
+        let read = (0..BUSY_RETRIES)
+            .map(|_| mirror.log_entry(index))
+            .find(|read| !matches!(read, LogRead::Busy))
+            .unwrap_or(LogRead::Busy);
+        match read {
+            LogRead::Entry(entry) if wanted.remove(&entry.journal) => {
+                found.push(ExportJournal::Recycled(Box::new(entry)));
+            }
+            LogRead::Busy => busy = true,
+            _ => {}
         }
+    }
+    if busy {
+        found.sort_by_key(journal_number);
+        return (found, wanted);
     }
     found.extend(
         wanted
             .into_iter()
             .map(|journal| ExportJournal::Unknown { journal }),
     );
-    found.sort_by_key(|journal| match journal {
-        ExportJournal::Live(entry) => entry.journal,
-        ExportJournal::Recycled(entry) => entry.journal,
-        ExportJournal::Unknown { journal } => *journal,
-    });
-    found
+    found.sort_by_key(journal_number);
+    (found, BTreeSet::new())
 }
 
 #[cfg(test)]
