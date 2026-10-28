@@ -393,6 +393,10 @@ pub(super) struct Routed {
     /// it alone holds, never sent).
     #[cfg(test)]
     leave_now: Option<usize>,
+    /// Per route, a reopen in a new epoch that fails (tests: a route
+    /// whose half is back but whose open is refused).
+    #[cfg(test)]
+    fail_open: [bool; MAX_ROUTES],
     routes: Vec<RouteSlot>,
     tracks: Vec<RoutedTrack>,
     /// The frame read once per datagram before its copies.
@@ -418,6 +422,8 @@ impl Routed {
         Ok(Self {
             sender,
             policy: PathPolicy::default(),
+            #[cfg(test)]
+            fail_open: [false; MAX_ROUTES],
             #[cfg(test)]
             withhold: [0; MAX_ROUTES],
             #[cfg(test)]
@@ -842,6 +848,18 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         }
     }
 
+    /// Path `route`'s open in a new epoch fails while `fail` (tests).
+    #[cfg(test)]
+    pub(crate) fn fail_route_open(&mut self, route: usize, fail: bool) {
+        if let Some(slot) = self
+            .routed
+            .as_deref_mut()
+            .and_then(|routed| routed.fail_open.get_mut(route))
+        {
+            *slot = fail;
+        }
+    }
+
     /// A left path waits `backoff` before it returns (tests).
     #[cfg(test)]
     pub(crate) fn set_path_backoff(&mut self, backoff: u64) {
@@ -1177,6 +1195,11 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             let epoch = tx.capabilities().epoch;
             if slot.opened == Some(epoch) {
                 open = true;
+                continue;
+            }
+            #[cfg(test)]
+            if routed.fail_open.get(index).copied().unwrap_or(false) {
+                self.counters.bump(|c| &mut c.route_failures, 1);
                 continue;
             }
             let Ok(route) = tx.add_route(slot.destination) else {

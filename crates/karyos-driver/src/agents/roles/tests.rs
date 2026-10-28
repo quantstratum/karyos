@@ -5143,3 +5143,66 @@ fn a_route_whose_half_is_away_bounds_nothing() {
     }
     assert_eq!(sender.publications[0].first_held(0, 1), None, "sent");
 }
+
+/// L2 pin 3 (#842 review): route 2 holds a copy, its endpoint is reset
+/// into a new epoch, and its half comes back, but its reopen in that epoch
+/// fails: the copy it still lists is of the old epoch, never sent, so it
+/// bounds nothing, and route 1's heartbeat moves on to its own position.
+#[test]
+fn a_route_back_in_a_new_epoch_but_not_reopened_bounds_nothing() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, _data, rx_two) =
+        routed_lane(&[SendResult::Error(Errno::AGAIN)]);
+    for byte in [2, 3] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = sender.duty(&mut halves, 6).unwrap();
+    assert!(
+        sender.publications[0].first_held(0, 1).is_some(),
+        "route 2 holds"
+    );
+    // Its endpoint's reset: a new epoch, in which its open fails.
+    let (_, half) = halves.pop().unwrap();
+    let super::super::Half::Tx(tx) = half else {
+        panic!("a TX half");
+    };
+    let mut endpoint = karyos_io::sockets::endpoint::SocketsEndpoint::join(*tx, rx_two).unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+    let _ = endpoint.reopen(&loopback()).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    sender.publications[0].fail_route_open(1, true);
+    halves.push((EndpointId(2), super::super::Half::Tx(Box::new(tx))));
+    frames[0].lock().unwrap().clear();
+    for step in 1..=3 {
+        let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
+    }
+    assert!(
+        sender.publications[0].first_held(0, 1).is_some(),
+        "route 2 still lists its old epoch's copy"
+    );
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(!beats.is_empty(), "route 1 heartbeats");
+    assert!(
+        beats.iter().all(|(_, offset, _)| *offset == 3 * 1056),
+        "at route 1's own position: {beats:?}"
+    );
+    // Its open succeeds: the old copies go with the reopen.
+    sender.publications[0].fail_route_open(1, false);
+    let mut now = 6 + 4 * interval;
+    while (0..2).any(|route| sender.publications[0].routed_pending(0, route) > 0)
+        && now < 6 + 64 * interval
+    {
+        let _ = sender.duty(&mut halves, now).unwrap();
+        now += interval;
+    }
+    assert_eq!(sender.publications[0].first_held(0, 1), None, "gone");
+}
