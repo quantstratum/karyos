@@ -478,6 +478,8 @@ fn trace_counts(out: &mut Out<'_>, counts: &TraceCounts) {
             ("aged_out", counts.aged_out),
             ("mirror_overwritten", counts.mirror_overwritten),
             ("pending", counts.pending),
+            ("buckets_evicted", counts.buckets_evicted),
+            ("buckets_over_budget", counts.buckets_over_budget),
         ] {
             fields.number(key, value);
         }

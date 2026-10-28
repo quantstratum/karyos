@@ -436,3 +436,178 @@ mod mirror {
         );
     }
 }
+
+/// One matched pair of message `position`, made by a scan at `now`: the
+/// slice is closed first, as `scan` does.
+fn pair(window: &mut TraceWindow, position: u64, now: u64) {
+    window.close_slices(now);
+    window.observe(PUBLISHER, &record(Point::Publish, position, 1000), now);
+    window.observe(
+        SUBSCRIBER,
+        &record(Point::SubscriberPoll, position, 1500),
+        now,
+    );
+}
+
+/// The available pairs of every lane of `buckets`.
+fn available(buckets: &[crate::api::TraceBucket]) -> Vec<u64> {
+    buckets
+        .iter()
+        .map(|bucket| bucket.lanes.iter().map(|lane| lane.counts.available).sum())
+        .collect()
+}
+
+/// R-CORE-23: consecutive buckets share no pair. Pairs made in slices 0,
+/// 1 and 3 (none in 2) are in exactly one bucket each, the empty slice is
+/// an empty bucket, and the counts add up to the pairs made; the slice
+/// still current is no bucket yet.
+#[test]
+fn consecutive_buckets_share_no_pair_and_add_up() {
+    let mut window = window(64);
+    let mut position = 0;
+    for (now, pairs) in [(1, 3u64), (12, 2), (35, 4)] {
+        for _ in 0..pairs {
+            pair(&mut window, position, now);
+            position += 1;
+        }
+    }
+    window.close_slices(41);
+    let read = window.buckets(0, 10, None).unwrap();
+    assert_eq!(read.current, 4);
+    assert_eq!(read.slice_ns, 10);
+    assert_eq!(
+        read.buckets.iter().map(|b| b.number).collect::<Vec<_>>(),
+        [0, 1, 2, 3]
+    );
+    assert_eq!(available(&read.buckets), [3, 2, 0, 4]);
+    assert_eq!(available(&read.buckets).iter().sum::<u64>(), position);
+    // Merged, the buckets give one histogram of every pair.
+    let like = Histogram::new(DIGITS, HIGHEST, 1).unwrap();
+    let mut merged = Histogram::new(DIGITS, HIGHEST, 1).unwrap();
+    for lane in read.buckets.iter().flat_map(|b| &b.lanes) {
+        merged
+            .merge(&Histogram::from_counts(&lane.counts, &like).unwrap())
+            .unwrap();
+    }
+    assert_eq!(merged.available(), position);
+    assert!(read.buckets.iter().all(|bucket| !bucket.incomplete));
+    // The rolling view is unchanged: it still merges the last window.
+    assert_eq!(lane(&window, 41).available, 9);
+}
+
+/// R-CORE-23: what is lost while a slice is current makes its bucket
+/// incomplete, with the loss named; never a clean bucket.
+#[test]
+fn a_bucket_that_lost_pairs_is_incomplete_with_its_reason() {
+    // Two pending keys: the first pair's, which stays pending, and one more.
+    let mut window = window(2);
+    pair(&mut window, 0, 1);
+    window.close_slices(12);
+    window.observe(PUBLISHER, &record(Point::Publish, 5, 1000), 12);
+    // Past the pending bound of one.
+    window.observe(PUBLISHER, &record(Point::Publish, 6, 1000), 12);
+    window.close_slices(25);
+    let read = window.buckets(0, 10, None).unwrap();
+    assert!(!read.buckets[0].incomplete);
+    assert!(read.buckets[1].incomplete);
+    assert_eq!(read.buckets[1].loss.pending_dropped, 1);
+}
+
+/// R-CORE-23: reading consumes nothing. A second reader reads the same
+/// buckets, and a reader that crashed after reading reads the same bucket
+/// again; a cursor of another run is refused, never served as a
+/// continuation.
+#[test]
+fn readers_share_buckets_and_a_crashed_reader_reads_again() {
+    let mut window = window(64);
+    pair(&mut window, 0, 1);
+    pair(&mut window, 1, 12);
+    window.close_slices(25);
+    let first = window.buckets(0, 10, Some(window.epoch())).unwrap();
+    let second = window.buckets(0, 10, None).unwrap();
+    assert_eq!(first.buckets, second.buckets);
+    // Crashed after reading bucket 0: it asks for 0 again.
+    let again = window.buckets(0, 1, Some(first.epoch)).unwrap();
+    assert_eq!(again.buckets[..], first.buckets[..1]);
+    // A cursor from another run.
+    let restarted = self::window(64);
+    assert!(matches!(
+        restarted.buckets(1, 1, Some(first.epoch)),
+        Err(BucketRefusal::EpochChanged { .. })
+    ));
+}
+
+/// R-CORE-23 (E3): the retained buckets never hold more than the budget;
+/// the oldest is evicted first, and a read of it is refused as expired.
+/// A bucket larger than the whole budget is not kept, evicts nothing, and
+/// a read of its number is refused as over budget.
+#[test]
+fn the_bucket_budget_holds_and_refuses_with_its_reason() {
+    let budget = 2_000;
+    let mut window = TraceWindow::new(
+        WindowConfig::default()
+            .with_window(60, 6)
+            .with_bounds(8, 64, 4, 4)
+            .with_bucket_budget(budget),
+        [1, 2],
+    );
+    window.journal(PUBLISHER, Some(HOST), 0);
+    window.journal(SUBSCRIBER, Some(HOST), 0);
+    let mut position = 0;
+    for slice in 0..40u64 {
+        pair(&mut window, position, slice * 10 + 1);
+        position += 1;
+        assert!(window.bucket_bytes() <= budget, "{}", window.bucket_bytes());
+    }
+    window.close_slices(401);
+    let (_, counts) = window.view(401);
+    assert!(counts.buckets_evicted > 0);
+    assert!(matches!(
+        window.buckets(0, 1, None),
+        Err(BucketRefusal::Expired { .. })
+    ));
+    let read = window.buckets(0, 1, None).err().unwrap();
+    let BucketRefusal::Expired { oldest } = read else {
+        panic!("{read:?}");
+    };
+    assert_eq!(
+        window.buckets(oldest, 1, None).unwrap().buckets[0].number,
+        oldest
+    );
+    // A budget below one bucket: nothing is kept or evicted for it.
+    let mut tiny = TraceWindow::new(
+        WindowConfig::default()
+            .with_window(60, 6)
+            .with_bounds(8, 64, 4, 4)
+            .with_bucket_budget(100),
+        [1, 2],
+    );
+    tiny.journal(PUBLISHER, Some(HOST), 0);
+    tiny.journal(SUBSCRIBER, Some(HOST), 0);
+    pair(&mut tiny, 0, 1);
+    tiny.close_slices(12);
+    assert_eq!(tiny.bucket_bytes(), 0);
+    assert_eq!(
+        tiny.buckets(0, 1, None).err(),
+        Some(BucketRefusal::OverBudget { number: 0 })
+    );
+    let (_, counts) = tiny.view(12);
+    assert_eq!((counts.buckets_over_budget, counts.buckets_evicted), (1, 0));
+}
+
+/// R-CORE-23: a view longer than the window, assembled from buckets. An
+/// hour of 10-second slices is 360 buckets; here 30 slices of a 6-slice
+/// window give every pair once, which the rolling view (6 slices) cannot.
+#[test]
+fn a_view_longer_than_the_window_is_assembled_from_buckets() {
+    let mut window = window(256);
+    for slice in 0..30u64 {
+        pair(&mut window, slice, slice * 10 + 1);
+    }
+    window.close_slices(301);
+    let read = window.buckets(0, 30, None).unwrap();
+    assert_eq!(read.buckets.len(), 30);
+    assert_eq!(available(&read.buckets).iter().sum::<u64>(), 30);
+    // The rolling view holds only its last window: slices 25 to 29.
+    assert_eq!(lane(&window, 301).available, 5);
+}

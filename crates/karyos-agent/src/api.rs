@@ -643,6 +643,42 @@ pub struct TraceCounts {
     pub mirror_overwritten: u64,
     /// Messages pending now.
     pub pending: u64,
+    /// Closed buckets evicted, oldest first, to keep within the budget
+    /// (R-CORE-23).
+    pub buckets_evicted: u64,
+    /// Closed buckets larger than the whole budget, never kept.
+    pub buckets_over_budget: u64,
+}
+
+/// One closed slice of the trace window, a disjoint bucket (R-CORE-23):
+/// no pair in it is in any other bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceBucket {
+    /// Its slice number.
+    pub number: u64,
+    /// Its span of the agent's time, `[start_ns, end_ns)`.
+    pub start_ns: u64,
+    /// The end of its span.
+    pub end_ns: u64,
+    /// Each lane with pairs in it.
+    pub lanes: Vec<BucketLane>,
+    /// What was lost while it was current.
+    pub loss: crate::trace_window::Loss,
+    /// It lost something, or a lane's count overflowed: no clean quantile.
+    pub incomplete: bool,
+}
+
+/// One lane's histogram in a bucket, as mergeable counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketLane {
+    /// The publication's stream registration.
+    pub stream: u64,
+    /// Its incarnation.
+    pub incarnation: u64,
+    /// The lane.
+    pub lane: u8,
+    /// The histogram's counts (`karyos_trace::Histogram::from_counts`).
+    pub counts: karyos_trace::HistogramCounts,
 }
 
 /// One dimension `limits` answers (R-CORE-38).
