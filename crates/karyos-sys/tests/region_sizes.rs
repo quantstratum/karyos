@@ -110,15 +110,11 @@ fn every_region_kind_is_created_at_its_extracted_size() {
         );
     }
     for config in [
+        ConflationConfig::new(5, 20, 1024),
+        ConflationConfig::new(4096, 256, 1 << 16),
         ConflationConfig {
-            keys: 5,
-            value_capacity: 20,
-            journal_capacity: 1024,
-        },
-        ConflationConfig {
-            keys: 4096,
-            value_capacity: 256,
-            journal_capacity: 1 << 16,
+            refresh: true,
+            ..ConflationConfig::new(4096, 256, 1 << 16)
         },
     ] {
         let writer = karyos_sys::conflation::conflation_in(

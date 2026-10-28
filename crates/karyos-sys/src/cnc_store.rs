@@ -43,8 +43,6 @@ pub(crate) struct RingStore {
     max_extent: u64,
 }
 
-/// The geometry every owned ring has: a power-of-two `capacity` of at least
-/// `min_capacity` bytes, and a largest record extent of `capacity / 8`.
 /// Bytes of a ring region's structure: the configuration line, the
 /// trailer and the data of `capacity` bytes (R-CORE-34); `None` for a
 /// capacity or trailer a ring refuses.
@@ -63,6 +61,8 @@ pub(crate) fn ring_structure_length(
         .checked_mul(crate::atomic_view::WORD_BYTES)
 }
 
+/// The geometry every owned ring has: a power-of-two `capacity` of at least
+/// `min_capacity` bytes, and a largest record extent of `capacity / 8`.
 fn geometry(capacity: usize, min_capacity: usize) -> Option<(usize, u64)> {
     if capacity < min_capacity || !capacity.is_power_of_two() {
         return None;

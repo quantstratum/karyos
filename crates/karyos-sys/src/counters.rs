@@ -809,11 +809,8 @@ mod owned {
         }
         let [capacity, rest @ ..] = config;
         let capacity = usize::try_from(capacity).map_err(|_| invalid)?;
-        let structure_length = structure_words(capacity)
-            .and_then(|words| words.checked_mul(crate::atomic_view::WORD_BYTES));
-        if capacity == 0
-            || rest.iter().any(|word| *word != 0)
-            || structure_length != Some(record.structure_length)
+        if rest.iter().any(|word| *word != 0)
+            || structure_length(capacity) != Some(record.structure_length)
         {
             return Err(invalid);
         }

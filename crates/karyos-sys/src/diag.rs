@@ -160,8 +160,7 @@ fn read_only_store(
         .load_acquire(0)
         .and_then(|capacity| usize::try_from(capacity).ok())
         .ok_or(invalid)?;
-    let length = ring_words(capacity, record_words).and_then(|words| words.checked_mul(WORD_BYTES));
-    if capacity == 0 || length != Some(record.structure_length) {
+    if structure_length(capacity, record_words) != Some(record.structure_length) {
         return Err(invalid);
     }
     Ok(Store::ReadOnly(region))

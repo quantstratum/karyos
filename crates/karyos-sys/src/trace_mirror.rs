@@ -1125,10 +1125,10 @@ impl TraceMirrorReader {
         else {
             return Err(invalid);
         };
-        let geometry = geometry(entries, log, capacity).ok_or(invalid)?;
-        if geometry.total.checked_mul(WORD_BYTES) != Some(record.structure_length) {
+        if structure_length(entries, log, capacity) != Some(record.structure_length) {
             return Err(invalid);
         }
+        let geometry = geometry(entries, log, capacity).ok_or(invalid)?;
         Ok(Self {
             store: Arc::new(Store::ReadOnly(region)),
             entries,
