@@ -3925,7 +3925,12 @@ impl<T: StreamTerms> Intake<'_, T> {
                 && !done.contains(&Some(source))
             {
                 if length <= karyos_sys::frame::HEADER_LENGTH as i32 {
-                    // The source's idle heartbeat: its tail was sent.
+                    // The source's idle heartbeat past the offset: its
+                    // tail was sent. One at the offset shows nothing of it.
+                    if at == offset {
+                        self.data_once(source, alias, bytes);
+                        return;
+                    }
                     if let Some(slot) = done.iter_mut().find(|slot| slot.is_none()) {
                         *slot = Some(source);
                     }

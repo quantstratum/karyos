@@ -56,8 +56,10 @@ impl SenderGate for HeaderGate {
 }
 
 impl<T: StreamTerms> Outbound<T> {
-    /// The idle heartbeats due at `now`: each lane idle for `interval`,
-    /// with nothing staged or pending, sends one at its next position.
+    /// The idle heartbeats due at `now` of a single-path or
+    /// multi-destination publication (a routed one has
+    /// `serve_routed_heartbeats`): each lane idle for `interval`, with
+    /// nothing staged or pending, sends one at its next position.
     /// None while the publication is removed (its EOS replaces them).
     /// Returns the heartbeats submitted; `None` only if their count
     /// overflowed, which at most four lanes cannot.

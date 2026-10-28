@@ -4671,16 +4671,18 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
     );
 }
 
-/// An endpoint `id` whose socket answers its first sends with `first`,
-/// then takes every later one; its header-only DATA frames and its DATA sends are
+/// An endpoint `id` whose socket takes its first `oks` sends, answers the
+/// next ones with `first`, then takes every later one; its header-only DATA frames and its DATA sends are
 /// recorded as [`header_only_endpoint`]'s.
 fn scripted_endpoint(
     id: u32,
     first: &[karyos_io::sockets::ops::SendResult],
+    oks: usize,
 ) -> (
     super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
     Headers,
     std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    karyos_io::sockets::scripted::ScriptedSocket,
 ) {
     use std::num::NonZeroU32;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4710,6 +4712,12 @@ fn scripted_endpoint(
             }
         }
     }));
+    for _ in 0..oks {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
     for result in first {
         observer.push_send(*result);
     }
@@ -4722,8 +4730,11 @@ fn scripted_endpoint(
     let instance = InstanceId::new(NonZeroU32::new(id).unwrap());
     let endpoint = SocketsEndpoint::open(&loopback(), instance, socket).unwrap();
     let (tx, _rx) = endpoint.split().unwrap();
-    (super::super::Half::Tx(Box::new(tx)), frames, data)
+    (super::super::Half::Tx(Box::new(tx)), frames, data, observer)
 }
+
+/// The sends endpoint 2 makes in [`routed_lane`]'s setup.
+const ROUTED_SETUP_SENDS: usize = 1;
 
 /// A routed publication on endpoints 1 and 2, bound on both, its first
 /// message sent at 2..6: the sender, the log, the halves, and each
@@ -4752,8 +4763,9 @@ fn routed_lane(
     let (mut sender, _receiver) = super::roles(&config).unwrap();
     let (event, mut log) = add_routed(&mut sender);
     assert!(matches!(event, Some(AgentEvent::PublicationAdded { .. })));
-    let (one, frames_one, data_one) = scripted_endpoint(1, &[]);
-    let (two, frames_two, data_two) = scripted_endpoint(2, second);
+    let (one, frames_one, data_one, _) = scripted_endpoint(1, &[], 0);
+    // Route 2's script starts after the sends of this setup.
+    let (two, frames_two, data_two, observer) = scripted_endpoint(2, second, ROUTED_SETUP_SENDS);
     let mut halves = vec![(EndpointId(1), one), (EndpointId(2), two)];
     for (endpoint, at) in [(1, "10.0.0.2:4000"), (2, "10.0.0.3:4000")] {
         let _ = at;
@@ -4767,6 +4779,11 @@ fn routed_lane(
     for now in 2..6 {
         let _ = sender.duty(&mut halves, now).unwrap();
     }
+    assert_eq!(
+        observer.send_calls(),
+        ROUTED_SETUP_SENDS as u64,
+        "route 2's script lines up"
+    );
     (
         sender,
         log,
@@ -4810,30 +4827,20 @@ fn a_routed_lane_with_data_flowing_sends_no_heartbeat() {
 }
 
 /// G2 (#842): route 2 is slow (its socket would block) and holds copies
-/// route 1 sent long ago: no route gets a heartbeat while any route holds
-/// a copy, so none announces a position a held copy would still bring.
-/// When route 2 then faults, its copies are returned in that serve (it
-/// waits for its endpoint's reset holding none, and an unreliable lane
-/// does not send them again): route 1's heartbeat then announces only
-/// what route 1 sent, and no route holds anything past it.
+/// route 1 sent long ago: route 1's heartbeats stop at route 2's frontier,
+/// so none announces a position a held copy would still bring. When route
+/// 2 then faults, its copies are returned in that serve (it waits for its
+/// endpoint's reset holding none, and an unreliable lane does not send
+/// them again): route 1's heartbeat then announces what route 1 sent.
 #[test]
 fn held_copies_on_a_route_hold_back_every_heartbeat() {
     use karyos_io::sockets::ops::{Errno, SendResult};
     use karyos_sys::log_buffer::AppendOptions;
 
     let interval = AgentConfig::default().sender_heartbeat_interval;
-    let ok = SendResult::Sent {
-        sent: 1,
-        error: None,
-    };
     let blocked = SendResult::Error(Errno::AGAIN);
-    let (mut sender, mut log, mut halves, frames, data) = routed_lane(&[
-        ok,
-        blocked,
-        blocked,
-        blocked,
-        SendResult::Error(Errno::BADF),
-    ]);
+    let (mut sender, mut log, mut halves, frames, data) =
+        routed_lane(&[blocked, blocked, blocked, SendResult::Error(Errno::BADF)]);
     for byte in [2, 3] {
         let _ = log.publications[0]
             .append(&[byte; 1000], AppendOptions::default())
@@ -4843,9 +4850,14 @@ fn held_copies_on_a_route_hold_back_every_heartbeat() {
         let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
         let held = sender.publications[0].routed_pending(0, 1);
         assert!(held > 0, "route 2 holds its copies at step {step}");
+        let frontier = sender.publications[0].route_frontier(0, 1).unwrap();
         assert!(
-            frames[0].lock().unwrap().is_empty(),
-            "no heartbeat on route 1 at step {step}"
+            frames[0]
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, offset, _)| u64::try_from(*offset).unwrap() <= frontier),
+            "route 1 stops at route 2's frontier {frontier} at step {step}"
         );
     }
     assert_eq!(
@@ -4859,9 +4871,60 @@ fn held_copies_on_a_route_hold_back_every_heartbeat() {
     assert_eq!(sender.publications[0].routed_pending(0, 1), 0);
     let _ = sender.duty(&mut halves, 6 + 4 * interval).unwrap();
     let beats = frames[0].lock().unwrap().clone();
-    assert!(
-        beats.iter().all(|(_, offset, _)| *offset == 3 * 1056),
-        "at what route 1 sent: {beats:?}"
+    assert_eq!(
+        beats.last().map(|(_, offset, _)| *offset),
+        Some(3 * 1056),
+        "then at what route 1 sent: {beats:?}"
     );
     assert!(frames[1].lock().unwrap().is_empty(), "none on route 2");
+}
+
+/// H1 (#842 review): route 2's socket would block, then its half goes away
+/// in a reset, so it holds its copies until it reopens. Route
+/// 1 still heartbeats each interval, at route 2's frontier: it never
+/// announces a position a held copy would still bring, and still reveals
+/// what lies below it, so a lost tail there is not hidden for good.
+#[test]
+fn a_route_holding_copies_bounds_the_others_heartbeats() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, _data) =
+        routed_lane(&[SendResult::Error(Errno::AGAIN)]);
+    for byte in [2, 3] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = sender.duty(&mut halves, 6).unwrap();
+    assert!(sender.publications[0].routed_pending(0, 1) > 0, "blocked");
+    // Endpoint 2 goes into a reset: its half is away.
+    let away = halves.pop().unwrap();
+    for step in 1..=4 {
+        let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
+        assert!(
+            sender.publications[0].routed_pending(0, 1) > 0,
+            "route 2 holds its copies at step {step}"
+        );
+    }
+    let frontier = sender.publications[0].route_frontier(0, 1).unwrap();
+    assert!(frontier < 3 * 1056, "route 2 is behind: {frontier}");
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(
+        beats.len() >= 2,
+        "route 1 heartbeats each interval: {beats:?}"
+    );
+    assert!(
+        beats
+            .iter()
+            .all(|(_, offset, _)| u64::try_from(*offset).unwrap() == frontier),
+        "at route 2's frontier {frontier}, not past it: {beats:?}"
+    );
+    // Back: route 2 sends what it held, and the halves drop clean.
+    halves.push(away);
+    for step in 5..=8 {
+        let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
+    }
+    assert_eq!(sender.publications[0].routed_pending(0, 1), 0, "sent");
 }

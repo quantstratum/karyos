@@ -293,47 +293,60 @@ pub(super) struct RoutedTrack {
     idle_since: [Option<u64>; MAX_ROUTES],
 }
 
+/// The copies `route` holds for `lane`, pending or staged: copies it has
+/// not submitted.
+fn held(routed: &Routed, lane: usize, route: usize) -> usize {
+    routed.sender.pending(lane, route).unwrap_or(0)
+        + routed
+            .tracks
+            .get(lane)
+            .and_then(|track| track.staged.get(route))
+            .map_or(0, VecDeque::len)
+}
+
 /// The routes on which `lane` is due an idle heartbeat at `now` (SPEC §6;
-/// #842), restarting each route's wait while it is busy. A route is idle
-/// when the lane sent no DATA and no heartbeat on it for `interval` and
-/// holds no copy for it. While any route holds a copy for the lane,
-/// sending or waiting for a reset, no route gets one: a heartbeat
-/// announces only positions every route sent, so an unreliable receiver
-/// never seals what a held copy would still bring.
+/// #842), and the position none may announce past. A sending route is
+/// idle when the lane sent it no DATA and no heartbeat for `interval` and
+/// it holds no copy of the lane; its wait restarts while it is busy, and
+/// a route that cannot send waits afresh once it can. A route holding
+/// copies, sending or not (a refused retry, a half away in a reset),
+/// bounds every route's heartbeat at its frontier, its first copy not
+/// submitted: a heartbeat never announces a position a held copy would
+/// still bring, and still reveals what lies below it.
 fn idle_routes(
     routed: &mut Routed,
     lane: usize,
     sending: &[bool; MAX_ROUTES],
     now: u64,
     interval: u64,
-) -> [bool; MAX_ROUTES] {
+) -> ([bool; MAX_ROUTES], Option<u64>) {
     let mut due = [false; MAX_ROUTES];
     let routes = routed.routes.len();
-    let held: [bool; MAX_ROUTES] = std::array::from_fn(|route| {
-        route < routes
-            && (routed.sender.pending(lane, route).unwrap_or(0) > 0
-                || routed
-                    .tracks
-                    .get(lane)
-                    .and_then(|track| track.staged.get(route))
-                    .is_some_and(|staged| !staged.is_empty()))
-    });
+    let holds: [bool; MAX_ROUTES] =
+        std::array::from_fn(|route| route < routes && held(routed, lane, route) > 0);
     let Some(track) = routed.tracks.get_mut(lane) else {
-        return due;
+        return (due, None);
     };
-    let blocked = held.contains(&true);
+    let bound = track
+        .sent_p
+        .iter()
+        .zip(&holds)
+        .filter(|(_, holds)| **holds)
+        .map(|(frontier, _)| *frontier)
+        .min();
     for (route, (idle, slot)) in track.idle_since.iter_mut().zip(&mut due).enumerate() {
         if sending.get(route) != Some(&true) {
+            *idle = None;
             continue;
         }
-        if held.get(route) == Some(&true) {
+        if holds.get(route) == Some(&true) {
             *idle = Some(now);
             continue;
         }
         let since = *idle.get_or_insert(now);
-        *slot = !blocked && now.checked_sub(since).is_some_and(|age| age >= interval);
+        *slot = now.checked_sub(since).is_some_and(|age| age >= interval);
     }
-    due
+    (due, bound)
 }
 
 /// One to [`MAX_ROUTES`] routes, each on its own endpoint: each route's TX
@@ -812,6 +825,16 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         }
     }
 
+    /// `route`'s frontier on lane `lane`: past the last frame it submitted
+    /// or skipped (tests).
+    #[cfg(test)]
+    pub(crate) fn route_frontier(&self, lane: usize, route: usize) -> Option<u64> {
+        self.routed
+            .as_deref()
+            .and_then(|routed| routed.tracks.get(lane))
+            .and_then(|track| track.sent_p.get(route).copied())
+    }
+
     /// Lane `lane`'s sent frontier (tests).
     #[cfg(test)]
     pub(crate) fn sent_high(&self, lane: usize) -> Option<u64> {
@@ -937,10 +960,10 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     }
 
     /// The idle heartbeats of a routed publication due at `now` (SPEC §6,
-    /// karyos#834): each lane idle for `interval`, with nothing staged or
-    /// pending on any route that can send, sends a header-only DATA frame
-    /// at its next position on every such route, as a single-path lane
-    /// does on its one. PATH_HB still keeps each path's binding live
+    /// karyos#834): a lane sends a header-only DATA frame on each route
+    /// that can send and was idle for `interval` ([`idle_routes`]), at its
+    /// next position, or at the frontier of a route that holds copies of
+    /// it when that is lower, as a single-path lane does on its one. PATH_HB still keeps each path's binding live
     /// (RP-3); this frame is what tells an image where the lane stands, so
     /// a tail lost on every path shows. None while the publication is
     /// removed (its EOS replaces them). Returns the frames submitted.
@@ -959,14 +982,16 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             let Some(position) = self.readers.get(lane).map(|reader| reader.position()) else {
                 continue;
             };
-            // The routes whose lane is idle long enough for a heartbeat.
-            let Some(due) = self
+            // The routes whose lane is idle long enough for a heartbeat,
+            // and the position a held copy bounds them at.
+            let Some((due, bound)) = self
                 .routed
                 .as_deref_mut()
                 .map(|routed| idle_routes(routed, lane, &sending, now, interval))
             else {
                 break;
             };
+            let position = bound.map_or(position, |bound| position.min(bound));
             if !due.contains(&true)
                 || self
                     .guard
@@ -1012,14 +1037,9 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// The copies `route` holds for `lane`, pending or staged (tests).
     #[cfg(test)]
     pub(crate) fn routed_pending(&self, lane: usize, route: usize) -> usize {
-        self.routed.as_deref().map_or(0, |routed| {
-            routed.sender.pending(lane, route).unwrap_or(0)
-                + routed
-                    .tracks
-                    .get(lane)
-                    .and_then(|track| track.staged.get(route))
-                    .map_or(0, VecDeque::len)
-        })
+        self.routed
+            .as_deref()
+            .map_or(0, |routed| held(routed, lane, route))
     }
 
     /// Sends `lane`'s EOS at `seal` on every `sending` route's lane queue.
