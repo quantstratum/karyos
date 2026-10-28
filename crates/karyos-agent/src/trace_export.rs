@@ -43,12 +43,14 @@
 //!   and one over the log, the busy entries of each retried for
 //!   `BUSY_BUDGET` (1 ms), which each part may overrun by one yield and
 //!   one more read of its busy entries.
-//! - **The trade-off of a stuck entry.** Once an entry stays busy past
-//!   its wait, every record of the page's first journal goes out
-//!   uncalibrated, those the entry would have calibrated had it come free
-//!   included; the next page waits again. The agent keeps no memory of a
+//! - **The trade-off of a stuck entry.** When the entry of the page's
+//!   first record's journal stays busy past its wait, every record of that
+//!   journal in the page goes out uncalibrated, those the entry would have
+//!   calibrated had it come free included. The agent keeps no memory of a
 //!   stuck entry across requests (that needs the entry's version word in
-//!   the reader API), so with one stuck, each request waits its 1 ms.
+//!   the reader API), so each request whose records name a journal not
+//!   found while an entry is stuck waits for it again: about 1 ms for the
+//!   table, then up to 1 ms for the log.
 
 use std::collections::BTreeSet;
 
