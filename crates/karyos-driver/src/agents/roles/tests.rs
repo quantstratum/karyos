@@ -5493,25 +5493,29 @@ fn blocking_endpoint() -> (
 }
 
 /// #849 (QS-COORDINATOR): with a cache of one, controls that are claimed
-/// but not sent (the socket would block) never leave two entries closing:
-/// the oldest is given up as failed to make room, so at most one closes.
+/// but not sent (the socket would block) never grow the cache past the
+/// capacity allocated at creation, and no route is given up as failed to
+/// make room: a further destination is refused `Blocked` instead.
 #[test]
 fn unsent_controls_keep_at_most_max_closing() {
-    use super::super::control::ControlRoutes;
+    use super::super::control::{ControlRoutes, ControlSendError};
 
     let (mut tx, rx) = blocking_endpoint();
     let at = |port| SocketAddr::from(([127, 0, 0, 1], port));
     let mut routes = ControlRoutes::new(1);
+    let (_, capacity) = routes.entries();
     routes.hold_closes = true;
-    for port in 44_001..44_005 {
-        let _ = routes.send(&mut tx, at(port), &challenge_control());
-        assert!(routes.lingering() <= 1, "{} closing", routes.lingering());
+    let mut blocked = 0;
+    for port in 44_001..44_006 {
+        if routes.send(&mut tx, at(port), &challenge_control()) == Err(ControlSendError::Blocked) {
+            blocked += 1;
+        }
+        let (len, now) = routes.entries();
+        assert!(len <= capacity, "{len} entries in {capacity}");
+        assert_eq!(now, capacity, "no reallocation");
     }
-    let refusal = routes.take_refusal().map(|(_, refusal)| refusal);
-    assert!(
-        refusal.unwrap_or_default().close_failed,
-        "the oldest given up"
-    );
+    assert!(blocked > 0, "full: blocked");
+    assert_eq!(routes.take_refusal(), None, "no close failed, no limit");
     // The endpoint's reset drops what would not close.
     let mut endpoint = karyos_io::sockets::endpoint::SocketsEndpoint::join(tx, rx).unwrap();
     let mut report = karyos_io::backend::TxReport::new();

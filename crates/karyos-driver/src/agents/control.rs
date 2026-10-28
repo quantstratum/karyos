@@ -464,24 +464,11 @@ impl ControlRoutes {
                 self.entries.swap_remove(index);
             }
             Closed::InFlight => {
-                // At most `max` closing: those closed since make room, else
-                // the oldest closing one is given up as failed, its grace
-                // spent, so this one can close.
-                if self.closing_count() >= self.max {
-                    self.reclose_closed(tx);
-                }
-                if self.closing_count() >= self.max
-                    && let Some(oldest) = self
-                        .entries
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, entry)| entry.closing)
-                        .min_by_key(|(_, entry)| entry.used)
-                        .map(|(at, _)| at)
-                {
-                    self.entries.swap_remove(oldest);
-                    self.refusal.close_failed = true;
-                }
+                // It keeps its place until the next duty closes it. The
+                // cache never grows: open and closing together stay within
+                // the capacity allocated at creation (`queue` refuses a new
+                // destination as `Blocked` when full), and no route is ever
+                // given up as failed to make room (QS-COORDINATOR on #849).
                 if let Some(entry) = self.entries.iter_mut().find(|entry| entry.queue == queue) {
                     entry.closing = true;
                 }
@@ -515,10 +502,6 @@ impl ControlRoutes {
             self.entries.swap_remove(index);
         }
         self.send_waiting(tx);
-    }
-
-    fn closing_count(&self) -> usize {
-        self.entries.iter().filter(|entry| entry.closing).count()
     }
 
     /// Closes again the closing entries that have closed since, keeping

@@ -19,6 +19,7 @@
   (`blocked_status`, `blocked_naks`, `blocked_setup_answers`,
   `blocked_other`): SMs and NAKs are sent again periodically, and a
   SETUP answer is solicited again by its peer. A destination removed,
-  or a publication removed, purges the ANNOUNCEs waiting for it. With
-  `control_routes = 1`, at most one route is closing: the oldest one is
-  given up as failed when another needs to close.
+  or a publication removed, purges the ANNOUNCEs waiting for it. Open and
+  closing routes together stay within twice `control_routes`, allocated
+  at creation: a further destination is refused then, and no route is
+  ever given up as failed to make room.
