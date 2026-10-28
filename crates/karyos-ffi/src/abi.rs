@@ -22,7 +22,7 @@ pub(crate) const ABI_VERSION_MAJOR: u32 = 0;
 /// The ABI version's minor number (`KARYOS_ABI_VERSION_MINOR`).
 pub(crate) const ABI_VERSION_MINOR: u32 = 1;
 /// The ABI version's patch number (`KARYOS_ABI_VERSION_PATCH`).
-pub(crate) const ABI_VERSION_PATCH: u32 = 3;
+pub(crate) const ABI_VERSION_PATCH: u32 = 4;
 
 /// Whether `out` can take a `T`: not null and aligned. It cannot tell a
 /// dangling pointer; the caller's contract excludes one.
@@ -2038,6 +2038,13 @@ pub struct DriverOptions {
     /// How long the host has to call `karyos_driver_startup_complete`, in
     /// nanoseconds (ABI 0.1.3; 30 s for an older caller's struct).
     pub startup_timeout_ns: u64,
+    /// `KARYOS_NETWORK_OFF` (0) or `KARYOS_NETWORK_ON` (1, ABI 0.1.4): the
+    /// driver's network agents with their default configuration, so its
+    /// clients create `karyos:udp` channels. Off for an older caller's
+    /// struct.
+    pub network: u32,
+    /// Must be zero; a later version may give it a meaning.
+    pub reserved0: u32,
 }
 
 /// The size of `karyos_driver_options` in the first ABI version that has
@@ -2061,6 +2068,13 @@ fn default_driver_options() -> DriverOptions {
         client_liveness_timeout_ns: defaults.client_liveness_timeout_ns,
         cutover_deadline_ns: defaults.cutover_deadline_ns,
         startup_timeout_ns: defaults.startup_timeout_ns,
+        // The driver's default, as every other field.
+        network: if defaults.network {
+            driver::NETWORK_ON
+        } else {
+            driver::NETWORK_OFF
+        },
+        reserved0: 0,
     }
 }
 
@@ -2140,10 +2154,15 @@ pub unsafe extern "C" fn karyos_driver_create(
                 Ok(raw) => raw,
                 Err(status) => return status,
             };
-        // A later minor may give it a meaning: refused, not ignored.
-        if raw.reserved != 0 {
+        // A later minor may give them a meaning: refused, not ignored.
+        if raw.reserved != 0 || raw.reserved0 != 0 {
             return Status::InvalidArgument;
         }
+        let network = match raw.network {
+            driver::NETWORK_OFF => false,
+            driver::NETWORK_ON => true,
+            _ => return Status::InvalidArgument,
+        };
         let options = driver::Options {
             max_clients: raw.max_clients,
             max_streams: raw.max_streams,
@@ -2155,6 +2174,7 @@ pub unsafe extern "C" fn karyos_driver_create(
             client_liveness_timeout_ns: raw.client_liveness_timeout_ns,
             cutover_deadline_ns: raw.cutover_deadline_ns,
             startup_timeout_ns: raw.startup_timeout_ns,
+            network,
         };
         match driver::create(&options) {
             Ok(handle) => {

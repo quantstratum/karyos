@@ -32,3 +32,5 @@ remote driver: op.remote.conflated op.remote.outcomes
 # Not a §13 row: a driver's readiness over the C ABI (R-CORE-35,
 # karyos#794), on its caller's thread and on its own.
 driver readiness: driver.readiness.invoker driver.readiness.threaded
+# Not a §13 row: an embedded driver's network over the C ABI (karyos#735).
+embedded network: op.embedded.network

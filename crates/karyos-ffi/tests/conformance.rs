@@ -30,9 +30,25 @@ use support::{abi, semantic, sha256};
 const FORMATS: [&str; 2] = ["1", "2"];
 
 /// The lowest ABI version this suite needs (FORMAT.md, Versions): 0.1.3,
-/// whose readiness calls two scenarios make (karyos#794), after 0.1.2's
-/// roles calls (karyos#637).
+/// whose readiness calls it uses (karyos#794), after 0.1.2's roles calls
+/// (karyos#637).
 const MINIMUM_ABI: [u32; 3] = [0, 1, 3];
+
+/// The features that need a later ABI than the suite's (FORMAT.md,
+/// Versions): a runner offers one only on a library at its floor or
+/// later, and declares it absent otherwise, so the rest of the suite still
+/// runs. `embedded-network` needs 0.1.4's `karyos_driver_options.network`
+/// (karyos#735).
+const FEATURE_ABI: [(&str, [u32; 3]); 1] = [("embedded-network", [0, 1, 4])];
+
+/// Whether a library of ABI `library` has what `feature` needs: its
+/// floor in [`FEATURE_ABI`], or the suite's.
+fn feature_runs_on(feature: &str, library: [u32; 3]) -> bool {
+    FEATURE_ABI
+        .iter()
+        .find(|(name, _)| *name == feature)
+        .is_none_or(|(_, floor)| library >= *floor)
+}
 
 /// Whether a library of ABI `library` can run this suite (FORMAT.md,
 /// Versions): before 1.0 exactly the suite's 0.y, at least its 0.y.z;
@@ -47,17 +63,38 @@ fn suite_runs_on(library: [u32; 3]) -> bool {
     same && library >= MINIMUM_ABI
 }
 
+/// A loopback UDP port no socket holds now, picked below every ephemeral
+/// range (Linux 32768 to 60999, macOS 49152 to 65535), so no bind to port
+/// 0 can take it before the driver binds it (karyos#520). As karyos-driver's
+/// `test_ports`: a process starts at its own offset and walks the range,
+/// skipping ports it cannot bind.
+fn test_port() -> u16 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    const FIRST: u32 = 20_000;
+    const COUNT: u32 = 12_000;
+    let start = std::process::id().wrapping_mul(2_654_435_761) % COUNT;
+    loop {
+        let taken = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(taken < COUNT, "no free test port left in the range");
+        let port = u16::try_from(FIRST + (start + taken) % COUNT).unwrap();
+        if std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            return port;
+        }
+    }
+}
+
 /// The binding SPECs' delivery steps a format 2 `since` names, in order
 /// (FORMAT.md, Format 2).
 const STEPS: [&str; 6] = ["B0", "B1", "B2", "B3", "B4", "B5"];
 
 /// The features a format 2 scenario may need (FORMAT.md, Features).
-const FEATURES: [&str; 9] = [
+const FEATURES: [&str; 10] = [
     "archive-replay",
     "claim-retry",
     "concurrent-publication",
     "conflation",
     "embedded-driver",
+    "embedded-network",
     "guarded-publication",
     "incompatible-driver",
     "remote-driver",
@@ -134,6 +171,14 @@ const OPS: &[Op] = &[
     ),
     op("clock.now", &["domain"], &[], &["now"], &[]),
     op("driver.create", &[], &[], &["driver"], EMBEDDED),
+    // An embedded driver with its network on (karyos#735).
+    op(
+        "driver.create_networked",
+        &[],
+        &[],
+        &["driver"],
+        &["embedded-driver", "embedded-network"],
+    ),
     op(
         "driver.add_stream",
         &["driver", "stream_id"],
@@ -1776,6 +1821,14 @@ fn run(
     if semantic && !scenario.features.contains("embedded-driver") {
         variables.insert("driver".to_owned(), adapter.provided_driver());
     }
+    if scenario.features.contains("embedded-network") {
+        // A free loopback port for the scenario's own network channel.
+        let port = test_port();
+        variables.insert(
+            "network_uri".to_owned(),
+            Value::Text(format!("karyos:udp?endpoint=127.0.0.1:{port}")),
+        );
+    }
     if scenario.features.contains("remote-driver") {
         let provided = runner
             .archive
@@ -2079,6 +2132,12 @@ fn every_scenario_passes_at_the_library_abi_version() {
     // The run's identities come first (FORMAT.md, Pinning).
     println!("{}", pinning([major, minor, patch]));
     let runner = Runner::reference_with_archive();
+    for feature in &runner.offered {
+        assert!(
+            feature_runs_on(feature, [major, minor, patch]),
+            "`{feature}` is offered below its ABI floor (FORMAT.md, Versions)"
+        );
+    }
     println!("{}", runner.declaration());
     let scenarios = scenarios();
     assert!(!scenarios.is_empty());
@@ -2470,11 +2529,16 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert!(runs((1, 3), (1, 3)));
     assert!(!runs((1, 4), (1, 3)));
     assert!(!runs((2, 0), (1, 3)));
-    // The suite as a whole needs 0.1.3 or a later 0.1.z (the readiness
-    // calls, karyos#794).
+    // The suite as a whole needs 0.1.3 or a later 0.1.z; the embedded
+    // network alone needs 0.1.4 (karyos#735), so a 0.1.3 binding declares
+    // it absent and runs the rest.
     assert!(!suite_runs_on([0, 1, 0]));
     assert!(!suite_runs_on([0, 1, 2]));
     assert!(suite_runs_on([0, 1, 3]));
+    assert!(suite_runs_on([0, 1, 4]));
+    assert!(!feature_runs_on("embedded-network", [0, 1, 3]));
+    assert!(feature_runs_on("embedded-network", [0, 1, 4]));
+    assert!(feature_runs_on("conflation", [0, 1, 3]));
     assert!(suite_runs_on([0, 1, 7]));
     assert!(!suite_runs_on([0, 2, 0]));
     assert!(!suite_runs_on([0, 0, 9]));
@@ -2488,6 +2552,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
             "claim-retry",
             "concurrent-publication",
             "conflation",
+            "embedded-network",
             "guarded-publication",
             "incompatible-driver",
             "remote-driver",
@@ -2497,7 +2562,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert_eq!(
         b1.declaration(),
         "step B1 offers embedded-driver absent archive-replay claim-retry concurrent-publication \
-         conflation guarded-publication incompatible-driver remote-driver tai-clock"
+         conflation embedded-network guarded-publication incompatible-driver remote-driver tai-clock"
     );
     assert_eq!(
         run(&scenario((0, 1), Some(3), None), (0, 1), &b1),
@@ -2748,11 +2813,7 @@ mod archive_host {
     pub(crate) fn provide() -> Option<Provided> {
         let karyosd = linux::Karyosd::start();
         let (client, recording, end) = karyosd.seed();
-        let port = std::net::UdpSocket::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = super::test_port();
         Some(Provided {
             client,
             recording,

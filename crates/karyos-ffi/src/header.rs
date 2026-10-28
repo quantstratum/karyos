@@ -454,6 +454,18 @@ fn the_parsers_read_what_they_are_given() {
     );
 }
 
+/// `karyos_driver_options.network`'s values are the library's (karyos#735).
+#[test]
+fn the_header_states_the_network_constants() {
+    use crate::api::driver;
+    let defines = header_defines();
+    assert_eq!(
+        defines["KARYOS_NETWORK_OFF"],
+        i64::from(driver::NETWORK_OFF)
+    );
+    assert_eq!(defines["KARYOS_NETWORK_ON"], i64::from(driver::NETWORK_ON));
+}
+
 /// The readiness codes are the admission protocol's probe codes, so a
 /// host and a probe read the same values (R-CORE-35).
 #[test]

@@ -55,6 +55,12 @@ struct Object {
     /// The runner's, not the scenario's: its close only ends its use in
     /// the scenario.
     provided: bool,
+    /// An embedded driver created with its network on
+    /// (`driver.create_networked`).
+    networked: bool,
+    /// A publication on a `karyos:udp` channel, which connects
+    /// asynchronously.
+    network: bool,
 }
 
 /// The answer of an op: `ok` with its results, or a status name.
@@ -166,6 +172,8 @@ impl Adapter {
             parent,
             closed: false,
             provided: false,
+            networked: false,
+            network: false,
         });
         Value::Object(self.objects.len() - 1)
     }
@@ -244,19 +252,32 @@ impl Adapter {
 
     /// Runs `offer` on `publication`. On a remote publication (its client is
     /// a provided one, `$remote_client` or `$archive_client`; FORMAT.md,
-    /// Remote driver) a `back_pressured` or
-    /// `admin_action` answer is retried, serving the client, until the
-    /// offer answers anything else or 10 s pass: the driver serves the
-    /// remote client in another process, so its first offers may wait.
+    /// Remote driver), or a `karyos:udp` one of a client of an embedded driver with its
+    /// network on (FORMAT.md, Features, `embedded-network`), a
+    /// `back_pressured`, `admin_action` or `not_connected` answer is
+    /// retried, serving the client, until the offer answers anything else
+    /// or 10 s pass: such a publication connects asynchronously, so its
+    /// first offers may wait.
     fn offer_remote<T>(
         &self,
         publication: usize,
         mut offer: impl FnMut() -> (i32, T),
         at: &str,
     ) -> (i32, T) {
+        // A provided client's, or a network publication of a client of an
+        // embedded driver with its network on: those connect
+        // asynchronously. Its IPC publications answer at once.
+        let network = self.objects[publication].network;
         let client = self.objects[publication]
             .parent
-            .filter(|parent| self.objects[*parent].provided)
+            .filter(|parent| {
+                let object = &self.objects[*parent];
+                object.provided
+                    || (network
+                        && object
+                            .parent
+                            .is_some_and(|driver| self.objects[driver].networked))
+            })
             .map(|parent| self.objects[parent].handle);
         let start = std::time::Instant::now();
         loop {
@@ -305,15 +326,20 @@ impl Adapter {
                     (status, _) => Answer::Status(self.name(status, at)),
                 }
             }
-            "driver.create" => {
-                let (status, driver) = abi::driver_create();
+            "driver.create" | "driver.create_networked" => {
+                let (status, driver) = if op == "driver.create" {
+                    abi::driver_create()
+                } else {
+                    abi::driver_create_networked()
+                };
                 if status != 0 {
                     return Answer::Status(self.name(status, at));
                 }
-                Answer::Ok(results([(
-                    "driver",
-                    self.insert(Kind::Driver, driver, None),
-                )]))
+                let created = self.insert(Kind::Driver, driver, None);
+                if let Value::Object(index) = created {
+                    self.objects[index].networked = op == "driver.create_networked";
+                }
+                Answer::Ok(results([("driver", created)]))
             }
             "client.connect" => {
                 // A client of the driver behind `dir`'s admission socket
@@ -433,6 +459,9 @@ impl Adapter {
                     return Answer::Status(self.name(status, at));
                 }
                 let publication = self.insert(Kind::Publication, publication, Some(client));
+                if let Value::Object(index) = publication {
+                    self.objects[index].network = uri.to_bytes().starts_with(b"karyos:udp");
+                }
                 Answer::Ok(results([("publication", publication)]))
             }
             "publication.offer" => {

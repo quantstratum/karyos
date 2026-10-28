@@ -212,6 +212,7 @@ offers. The features are:
 | `concurrent-publication` | `publication.add_concurrent` |
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
+| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner picks for the scenario, outside the ephemeral range. As for a remote publication, the runner retries an offer of such a driver's client on a `karyos:udp` channel that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
 | `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded, plain and timed network streams, and a loopback endpoint `$loopback_uri` (Remote driver, below; Linux only) |
@@ -288,6 +289,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `library.version` | none | `major`, `minor`, `patch` | |
 | `clock.now` | `domain`: `"monotonic"` or `"tai"` | `now` | `tai-clock` for `"tai"` |
 | `driver.create` | none | `driver` | `embedded-driver` |
+| `driver.create_networked` | none: the options of `karyos_driver_options_init` with `network` set to `KARYOS_NETWORK_ON` | `driver` | `embedded-driver`, `embedded-network` |
 | `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none | `embedded-driver` |
 | `driver.start` | `driver`, [`idle_strategy`: `"busy_spin"`, `"yield"`, `"sleep"` or `"yield_then_sleep"`, default `"yield_then_sleep"`, the ABI's declared default; `idle_sleep_ns`] | none | `embedded-driver` |
 | `driver.do_work` | `driver` | `work` | `embedded-driver` |
@@ -561,6 +563,11 @@ karyos#794): before 1.0 a runner
 accepts exactly the 0.y the suite targets, with at least its minimum
 0.y.z, and checks it once, before any scenario; a library outside it
 fails the run.
+
+A feature may need a later ABI than the suite: `embedded-network` needs
+0.1.4, which adds `karyos_driver_options.network` (karyos#735). A runner
+offers such a feature only on a library at its floor or later, and
+declares it absent otherwise; the rest of the suite runs as before.
 
 A runner then compares each scenario's `abi` with the library's. A
 scenario runs when the major versions are equal and:

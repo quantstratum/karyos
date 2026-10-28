@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 /*
- * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.3.
+ * karyos.h: the C ABI of Karyos (libkaryos), ABI version 0.1.4.
  *
  * Written by hand until cbindgen is admitted; a test in karyos-ffi checks
  * it against the Rust source (quantstratum-docs:
@@ -101,7 +101,7 @@ extern "C" {
 
 #define KARYOS_ABI_VERSION_MAJOR 0
 #define KARYOS_ABI_VERSION_MINOR 1
-#define KARYOS_ABI_VERSION_PATCH 3
+#define KARYOS_ABI_VERSION_PATCH 4
 
 /** No handle names an object with this value. */
 #define KARYOS_NULL_HANDLE 0
@@ -266,6 +266,21 @@ extern "C" {
 #define KARYOS_IDLE_YIELD 1
 #define KARYOS_IDLE_SLEEP 2
 #define KARYOS_IDLE_YIELD_THEN_SLEEP 3
+
+/**
+ * An embedded driver's network (karyos_driver_options.network, ABI
+ * 0.1.4). ON runs the driver's network agents with their default
+ * configuration, on their own threads, so its clients create karyos:udp
+ * publications and subscriptions; OFF, the default and an older struct's,
+ * serves karyos:ipc only. Only on and off are exposed: the agents' rings
+ * and session limits, the threading mode, the image template, the stream
+ * defaults, the NAK control groups, the per-client limit, timed network
+ * streams and the idle image timeout keep their defaults. That list is
+ * the one karyosd --network documents (quantstratum-docs:
+ * karyos/design/observability-and-tools.md, Binaries).
+ */
+#define KARYOS_NETWORK_OFF 0
+#define KARYOS_NETWORK_ON 1
 
 /**
  * A driver's readiness (R-CORE-35, karyos_driver_readiness), with the
@@ -468,6 +483,11 @@ typedef struct karyos_driver_options {
      * 30 s.
      */
     uint64_t startup_timeout_ns;
+    /* KARYOS_NETWORK_OFF or KARYOS_NETWORK_ON (ABI 0.1.4); off for an
+       older struct. Any other value is KARYOS_E_INVALID_ARGUMENT. */
+    uint32_t network;
+    /* Must be zero; a later version may give it a meaning. */
+    uint32_t reserved0;
 } karyos_driver_options;
 
 /**
@@ -626,6 +646,9 @@ int32_t karyos_client_close(uint64_t client);
 /**
  * Adds the exclusive publication of stream_id on the channel uri
  * (karyos:ipc or karyos:udp) to the client and writes its handle. A
+ * karyos:udp channel needs a driver that runs its network: an embedded
+ * one created with KARYOS_NETWORK_ON, or karyosd --network on; otherwise
+ * it is refused (KARYOS_E_UNSUPPORTED_CHANNEL). A
  * control call: it waits for the driver up to the client's timeout and
  * holds the client handle meanwhile. A failure opens nothing and fills
  * detail (may be null). A guarded stream's publication binds its guard
@@ -896,7 +919,9 @@ int32_t karyos_client_add_conflated_subscription(uint64_t client,
 
 /**
  * Adds the subscription of stream_id on the channel uri (karyos:ipc or
- * karyos:udp) to the client and writes its handle. A control call: it
+ * karyos:udp) to the client and writes its handle; karyos:udp needs a
+ * driver that runs its network, as for karyos_client_add_publication. A
+ * control call: it
  * waits for the driver up to the client's timeout and holds the client
  * handle meanwhile. A failure opens nothing and fills detail (may be
  * null).
