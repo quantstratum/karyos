@@ -40,6 +40,18 @@ pub struct DriverOptions {
     pub heartbeat_interval_ns: u64,
     pub client_liveness_timeout_ns: u64,
     pub cutover_deadline_ns: u64,
+    pub startup_timeout_ns: u64,
+}
+
+/// `karyos_readiness` (ABI 0.1.3).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Readiness {
+    pub size: u32,
+    pub state: u32,
+    pub reason: u32,
+    pub reserved: u32,
+    pub uptime_ns: u64,
 }
 
 /// `karyos_stream_options`.
@@ -208,6 +220,8 @@ unsafe extern "C" {
     fn karyos_driver_do_work(driver: u64, work: *mut u32) -> i32;
     safe fn karyos_driver_start(driver: u64, idle_strategy: u32, idle_sleep_ns: u64) -> i32;
     safe fn karyos_driver_stop(driver: u64) -> i32;
+    fn karyos_driver_startup_complete(driver: u64, complete: *mut u32) -> i32;
+    fn karyos_driver_readiness(driver: u64, out: *mut Readiness) -> i32;
     fn karyos_driver_connect(driver: u64, client: *mut u64, detail: *mut Detail) -> i32;
     safe fn karyos_driver_close(driver: u64) -> i32;
     fn karyos_stream_options_init_sized(options: *mut StreamOptions, size: usize) -> i32;
@@ -1179,6 +1193,36 @@ pub fn driver_do_work(driver: u64) -> (i32, u32) {
     // SAFETY: a live, aligned `u32`.
     let status = unsafe { karyos_driver_do_work(driver, &mut work) };
     (status, work)
+}
+
+/// `karyos_driver_startup_complete`: the status and what it wrote.
+pub fn driver_startup_complete(driver: u64) -> (i32, u32) {
+    let mut complete = u32::MAX;
+    // SAFETY: a live, aligned `u32`.
+    let status = unsafe { karyos_driver_startup_complete(driver, &mut complete) };
+    (status, complete)
+}
+
+/// `karyos_driver_readiness` into a `karyos_readiness` sized as `size`:
+/// the status and the struct, whose unwritten bytes hold the sentinel.
+pub fn driver_readiness_sized(driver: u64, size: u32) -> (i32, SizedStruct<Readiness>) {
+    let mut out = SizedStruct::new(None, size);
+    // SAFETY: a struct of at least `size` writable bytes, aligned.
+    let status = unsafe { karyos_driver_readiness(driver, out.as_mut_ptr()) };
+    (status, out)
+}
+
+/// `karyos_readiness`'s state, reason and reserved word, when the library
+/// wrote them.
+pub fn readiness_fields(out: &SizedStruct<Readiness>) -> Option<(u32, u32, u32)> {
+    let state = out.written::<4>(4)?;
+    let reason = out.written::<4>(8)?;
+    let reserved = out.written::<4>(12)?;
+    Some((
+        u32::from_ne_bytes(state),
+        u32::from_ne_bytes(reason),
+        u32::from_ne_bytes(reserved),
+    ))
 }
 
 /// `karyos_driver_start`.

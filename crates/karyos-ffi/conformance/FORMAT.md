@@ -100,6 +100,8 @@ The arguments and results of each function are those of the header:
 | `karyos_driver_create` | `size`, `reserved`: the options of `karyos_driver_options_init`, with `reserved` set when given | status, `driver` |
 | `karyos_driver_start` | `driver` (required), `idle_strategy` (default `KARYOS_IDLE_YIELD_THEN_SLEEP`, 3, the ABI's declared default), `idle_sleep_ns` (default 0) | status |
 | `karyos_driver_stop` | `driver` (required) | status |
+| `karyos_driver_startup_complete` | `driver` (required) | status, `complete` |
+| `karyos_driver_readiness` | `driver` (required), `size`: a `karyos_readiness` output | status, `state`, `reason`, `reserved` (when written), `tail` |
 | `karyos_driver_add_stream` | `driver` and `stream_id` (required), `allow_unconnected`, `schedule_capacity`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`, `publication_mode`, `publishers`, `size`: the options of `karyos_stream_options_init` otherwise | status |
 | `karyos_driver_subscribe_conflated` | `driver` and `stream_id` (required) | status, `conflated` (on `KARYOS_OK`) |
 | `karyos_conflated_poll` | `conflated` (required), `key_budget` (default 1): a handler that counts the values | status, `delivered` (the count written, checked against the handler's calls) |
@@ -153,7 +155,7 @@ out, it is the size of the struct in the header the runner reads.
   size and its header's size, plus 16 bytes, and fills every byte the
   struct does not set with the sentinel `0xA5`: the tail past its
   header's size, and every field but the size of an output struct
-  (`karyos_detail`, `karyos_accepted`).
+  (`karyos_detail`, `karyos_accepted`, `karyos_readiness`).
 - An input struct carries the values the defaults or the other arguments
   give it, then the sentinel.
 - An output field is written when it no longer holds the sentinel; only
@@ -163,7 +165,7 @@ out, it is the size of the struct in the header the runner reads.
   nothing written. A field written with a value whose bytes are all
   `0xA5` reads as unwritten: no 0.1.0 output field holds such a value in
   practice, but a runner cannot tell it apart.
-- `tail` (`karyos_accepted`) and `detail_tail` (`karyos_detail`) are
+- `tail` (`karyos_accepted`, `karyos_readiness`) and `detail_tail` (`karyos_detail`) are
   `"intact"` when every byte past the header's size still holds the
   sentinel, `"changed"` otherwise.
 
@@ -550,10 +552,12 @@ A scenario fails, and is reported as failed, on any of these:
 
 The ABI version is independent of the workspace version. A runner calls
 `karyos_abi_version` first, before any other call. This suite needs ABI
-0.1.2 or a later 0.1.z (0.1.2 adds the roles calls,
+0.1.3 or a later 0.1.z (0.1.2 adds the roles calls,
 `karyos_client_add_publication_with_roles` and
 `karyos_client_add_subscription_as`, and
-`karyos_publication_network_admission`, karyos#637): before 1.0 a runner
+`karyos_publication_network_admission`, karyos#637; 0.1.3 adds
+`karyos_driver_startup_complete` and `karyos_driver_readiness`,
+karyos#794): before 1.0 a runner
 accepts exactly the 0.y the suite targets, with at least its minimum
 0.y.z, and checks it once, before any scenario; a library outside it
 fails the run.

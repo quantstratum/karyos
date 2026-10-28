@@ -69,7 +69,7 @@ use std::sync::Arc;
 use karyos_client::link::ClientLink;
 use karyos_protocol::admission::{
     Capability, MAX_MESSAGE_LENGTH, Message, Record, RegionKind as WireKind, VERSION,
-    hello_version, probe, probe_hello_version, refusal, tool_hello_version,
+    hello_version, probe_hello_version, refusal, tool_hello_version,
 };
 use karyos_sys::command_ring::RingConsumer;
 use karyos_sys::host_clock::age_ns;
@@ -819,22 +819,7 @@ impl<T: StreamTerms> Admission<T> {
             return reject(driver, socket, refusal::LIMIT, "probe limit");
         }
         self.probes += 1;
-        let (state, reason) = match driver.readiness() {
-            crate::embedded::Readiness::Starting => (probe::STARTING, probe::NONE),
-            crate::embedded::Readiness::Ready => (probe::READY, probe::NONE),
-            crate::embedded::Readiness::Recovering => (probe::RECOVERING, probe::NONE),
-            crate::embedded::Readiness::NotReady(why) => (
-                probe::NOT_READY,
-                match why {
-                    crate::embedded::NotReadyReason::NotAdmitting => probe::NOT_ADMITTING,
-                    crate::embedded::NotReadyReason::Full => probe::FULL,
-                    crate::embedded::NotReadyReason::Terminal => probe::TERMINAL,
-                },
-            ),
-            crate::embedded::Readiness::Failed(crate::embedded::FailedReason::StartupDeadline) => {
-                (probe::FAILED, probe::STARTUP_DEADLINE)
-            }
-        };
+        let (state, reason) = driver.readiness().wire();
         let answer = Message::ProbeState {
             state,
             reason,

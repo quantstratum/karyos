@@ -34,6 +34,7 @@ fn c_struct(rust: &str) -> &'static str {
         "ClientOptions" => "karyos_client_options",
         "Detail" => "karyos_detail",
         "Accepted" => "karyos_accepted",
+        "ReadinessOut" => "karyos_readiness",
         "DriverOptions" => "karyos_driver_options",
         "StreamOptions" => "karyos_stream_options",
         "MessageInfo" => "karyos_message_info",
@@ -67,6 +68,7 @@ fn c_type(rust: &str) -> String {
         "*mut ClientOptions" => "karyos_client_options *",
         "*mut Detail" => "karyos_detail *",
         "*mut Accepted" => "karyos_accepted *",
+        "*mut ReadinessOut" => "karyos_readiness *",
         "*mut *mut u8" => "uint8_t **",
         "*const DriverOptions" => "const karyos_driver_options *",
         "*mut DriverOptions" => "karyos_driver_options *",
@@ -450,6 +452,35 @@ fn the_parsers_read_what_they_are_given() {
         split_name(" uint32_t *major"),
         ("uint32_t *".to_owned(), "major".to_owned())
     );
+}
+
+/// The readiness codes are the admission protocol's probe codes, so a
+/// host and a probe read the same values (R-CORE-35).
+#[test]
+fn the_header_states_the_readiness_constants() {
+    use karyos_protocol::admission::probe;
+    let defines = header_defines();
+    let codes = [
+        ("KARYOS_READINESS_STARTING", probe::STARTING),
+        ("KARYOS_READINESS_READY", probe::READY),
+        ("KARYOS_READINESS_RECOVERING", probe::RECOVERING),
+        ("KARYOS_READINESS_NOT_READY", probe::NOT_READY),
+        ("KARYOS_READINESS_FAILED", probe::FAILED),
+        ("KARYOS_READINESS_REASON_NONE", probe::NONE),
+        (
+            "KARYOS_READINESS_REASON_NOT_ADMITTING",
+            probe::NOT_ADMITTING,
+        ),
+        ("KARYOS_READINESS_REASON_FULL", probe::FULL),
+        ("KARYOS_READINESS_REASON_TERMINAL", probe::TERMINAL),
+        (
+            "KARYOS_READINESS_REASON_STARTUP_DEADLINE",
+            probe::STARTUP_DEADLINE,
+        ),
+    ];
+    for (name, code) in codes {
+        assert_eq!(defines[name], i64::try_from(code).unwrap(), "{name}");
+    }
 }
 
 #[test]
