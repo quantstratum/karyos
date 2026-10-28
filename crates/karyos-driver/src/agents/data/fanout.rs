@@ -967,6 +967,9 @@ impl<T: StreamTerms> Outbound<T> {
                             track.staged.clear();
                         }
                     }
+                    if !complete {
+                        self.counters.bump(|c| &mut c.cancels_retried, 1);
+                    }
                     target.cancelled = complete;
                 }
                 continue;
@@ -2135,6 +2138,37 @@ mod tests {
         assert_eq!(removal.destination, address(4100), "no serve needed");
         outbound.removal_reported(removal.destination, 0);
         assert_eq!(outbound.counters().destinations_retired, 2);
+    }
+
+    /// Review C1 of #829 (a regression at `18869058`): a publication not
+    /// established has nothing to drain, so a removal before its
+    /// establishment is reported in that cycle, and a move at capacity
+    /// right after it is `Added`.
+    #[test]
+    fn a_removal_before_establishment_frees_its_slot_at_once() {
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        // Never served: none of its destinations opened.
+        let mut outbound = fanned(address(4000));
+        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+            let change = outbound.change_destination(address(4000 + port), true, 0, 0);
+            assert_eq!(change, DestinationChange::Added);
+        }
+        assert_eq!(
+            outbound.change_destination(address(4100), true, 0, 0),
+            DestinationChange::Full
+        );
+        assert_eq!(
+            outbound.change_destination(address(4001), false, 0, 0),
+            DestinationChange::Removed
+        );
+        let removal = outbound
+            .removal_unreported()
+            .expect("reported in this cycle");
+        outbound.removal_reported(removal.destination, 0);
+        assert_eq!(
+            outbound.change_destination(address(4100), true, 0, 0),
+            DestinationChange::Added
+        );
     }
 
     /// Review C3 of #829: with the close list full, retired routes and

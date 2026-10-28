@@ -276,6 +276,9 @@ pub struct OutboundCounters {
     /// the destination (they are in `route_failures` or `queue_failures`
     /// too).
     pub endpoint_limits: u64,
+    /// Removed destinations' cancels refused or stopped short, each retried
+    /// at the next serve (the destination keeps its slot meanwhile).
+    pub cancels_retried: u64,
     /// Removed destinations whose retirement waited for room in the
     /// retired list, each counted once: they kept their slot meanwhile.
     pub retire_deferred: u64,
