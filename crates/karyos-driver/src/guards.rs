@@ -231,15 +231,15 @@ pub enum RateAuthority {
 }
 
 /// Why one lane of an aggregate refused a rate policy change (R-CORE-21).
+/// Only a lane's control reserve is its own: the transition, the version
+/// and the policy's validity are the publication's and name no lane, so
+/// the one refusal built is `Change(RateChangeError::ReserveCrossed)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum LaneRefusal {
     /// The change's own refusal on that lane.
     #[error(transparent)]
     Change(RateChangeError),
-    /// The policy that lane refuses.
-    #[error(transparent)]
-    Invalid(karyos_sys::rate_limit::RatePolicyError),
 }
 
 impl LaneRefusal {
@@ -247,7 +247,6 @@ impl LaneRefusal {
     pub(crate) const fn error(self) -> DriverError {
         match self {
             Self::Change(change) => DriverError::RateChange(change),
-            Self::Invalid(invalid) => DriverError::InvalidRatePolicy(invalid),
         }
     }
 }

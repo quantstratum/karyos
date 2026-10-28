@@ -686,6 +686,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 slot
             }
         };
+        // The gate starts from the publication's policy in force, a change
+        // or a policy given to its rateless lanes included, not the one it
+        // was guarded with (R-CORE-21).
+        let rate = handle
+            .streams()
+            .find_map(|stream| self.stream_ref(stream).ok()?.guarded.as_ref()?.rate);
         // The gate reads word 0: the guard's word in the guard words.
         let (words, index) = self.guards.view(guard.guard)?;
         let word = Arc::new(crate::shared_words::WordAt::new(words, index))
@@ -709,7 +715,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 word,
                 cell,
                 epoch,
-                rate: guard.rate.map(|rate| rate.policy),
+                rate,
+                full: !guarded,
                 policy: Some(slot as Arc<dyn karyos_client::SharedWords>),
                 frontier,
             },

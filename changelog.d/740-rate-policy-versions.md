@@ -9,10 +9,12 @@
     in messages and, for a byte limit, in reserve messages of the largest
     frame (each reserved message counted as a full frame). A change on one
     lane of an aggregate of several lanes is a change of the aggregate:
-    its guarded lanes, each weighed with its own policy, version and
-    reserve, take it together or not at all, and each guard audits it;
-    a lane's refusal is `DriverError::RateChangeOnLane`, naming the lane
-    (`LaneRefusal`), with the refusal's own CnC code. A publication has one
+    its guarded lanes take it together or not at all, and each guard
+    audits it. The version, the transition and the policy's validity are
+    the publication's; each lane is weighed only against its own reserve,
+    and a lane whose reserve the policy would cross is
+    `DriverError::RateChangeOnLane` with `ReserveCrossed`, naming the lane
+    (`LaneRefusal::Change`), with the refusal's own CnC code. A publication has one
     policy and one version, kept by the driver for its aggregate: a lane
     guarded with no rate takes it, one guarded with the same policy joins
     at its version, and one guarded with another policy is refused and
@@ -22,11 +24,9 @@
     audited from no rate (version 0).
     A handle with no copy (a rateless lane's, a remote one's before a
     policy) watches its ring's slot and takes a policy published later
-    at its next call; the gate's slot is published with it. A lane guarded
+    at its next call, its copy starting empty; the gate's slot is published with it. A lane guarded
     without a rate on a publication with a policy is audited from no rate
     to its version. A publication's stored policy goes with its last lane.
-    The transition and the policy's validity are the publication's and
-    name no lane; only a lane's reserve does.
     A retiring lane, guarded or not, refuses a change as retiring.
     Unguarded lanes are left as they are. Refusals are `DriverError::RateChange` (`VersionMismatch`,
     `NotATightening`, `ReserveCrossed`, `NoRate`) and
