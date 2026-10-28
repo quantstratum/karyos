@@ -2073,7 +2073,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
         });
     }
 
-    /// The reasons the receive sessions ignored controls, in order (tests).
+    /// How often each reason made the receive sessions ignore a control
+    /// (tests).
     #[cfg(test)]
     pub(crate) fn ignored_controls(&self) -> crate::sessions::receive::IgnoredCounts {
         self.sessions.ignored_counts()

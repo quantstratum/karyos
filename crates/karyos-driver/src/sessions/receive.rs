@@ -222,6 +222,9 @@ pub enum ReadyOutcome {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct IgnoredCounts {
     entries: [Option<(Ignored, u64)>; 32],
+    /// Ignores of a reason past the 32 the array holds (never: there are
+    /// fewer reasons), counted rather than dropped.
+    others: u64,
 }
 
 #[cfg(test)]
@@ -240,6 +243,12 @@ impl IgnoredCounts {
                 Some(_) => {}
             }
         }
+        self.others = self.others.saturating_add(1);
+    }
+
+    /// Ignores of a reason the array had no room for.
+    pub(crate) const fn others(&self) -> u64 {
+        self.others
     }
 
     /// The reasons seen, with their counts.

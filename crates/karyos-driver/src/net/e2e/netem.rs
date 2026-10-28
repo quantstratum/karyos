@@ -520,9 +520,12 @@ impl MulticastOnLoopback {
         let guard = ROUTE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Built first, so a failed second call still undoes the first.
+        let route = Self(guard);
         ip(&["link", "set", "lo", "multicast", "on"]);
-        ip(&["route", "add", "239.255.0.0/16", "dev", "lo"]);
-        Self(guard)
+        // `replace`: a route left by an aborted run is no error.
+        ip(&["route", "replace", "239.255.0.0/16", "dev", "lo"]);
+        route
     }
 }
 

@@ -1331,7 +1331,8 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
         self.role.session_counters()
     }
 
-    /// The reasons the receive sessions ignored controls, in order (tests).
+    /// How often each reason made the receive sessions ignore a control
+    /// (tests).
     #[cfg(test)]
     pub(crate) fn ignored_controls(&self) -> crate::sessions::receive::IgnoredCounts {
         self.role.ignored_controls()
