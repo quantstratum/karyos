@@ -1149,6 +1149,17 @@ pub enum ErrorCode {
     /// than its `max_stream_bytes` (R-CORE-34, karyos#809); nothing was
     /// created. Retrying the same channel never succeeds.
     StreamTooLarge,
+    /// A rate policy change named another version than the stream's
+    /// (R-CORE-21, karyos#740).
+    RateVersionMismatch,
+    /// A rate policy change on the safety path is not a provable
+    /// tightening (R-CORE-21).
+    RateNotATightening,
+    /// A rate policy change goes below the stream's control reserve
+    /// (R-CORE-21).
+    RateReserveCrossed,
+    /// A rate policy change on a stream with no rate policy (R-CORE-21).
+    RateNotSet,
 }
 
 impl ErrorCode {
@@ -1175,6 +1186,10 @@ impl ErrorCode {
             Self::StrategyConflict => 17,
             Self::InvalidRoles => 18,
             Self::StreamTooLarge => 24,
+            Self::RateVersionMismatch => 19,
+            Self::RateNotATightening => 20,
+            Self::RateReserveCrossed => 21,
+            Self::RateNotSet => 22,
         }
     }
 
@@ -1199,6 +1214,10 @@ impl ErrorCode {
             17 => Self::StrategyConflict,
             18 => Self::InvalidRoles,
             24 => Self::StreamTooLarge,
+            19 => Self::RateVersionMismatch,
+            20 => Self::RateNotATightening,
+            21 => Self::RateReserveCrossed,
+            22 => Self::RateNotSet,
             _ => return None,
         })
     }
@@ -3549,6 +3568,22 @@ mod tests {
     fn stream_too_large_is_24() {
         assert_eq!(ErrorCode::StreamTooLarge.code(), 24);
         assert_eq!(ErrorCode::from_code(24), Some(ErrorCode::StreamTooLarge));
+    }
+
+    /// karyos#740: the rate policy change's refusals keep their wire
+    /// values, added in place under admission `VERSION` 3 before a release
+    /// published it, as `InvalidRoles` was.
+    #[test]
+    fn rate_change_error_codes_are_19_to_22() {
+        for (code, word) in [
+            (ErrorCode::RateVersionMismatch, 19),
+            (ErrorCode::RateNotATightening, 20),
+            (ErrorCode::RateReserveCrossed, 21),
+            (ErrorCode::RateNotSet, 22),
+        ] {
+            assert_eq!(code.code(), word);
+            assert_eq!(ErrorCode::from_code(word), Some(code));
+        }
     }
 
     /// karyos#637: the roles' refusals keep their wire values.

@@ -826,6 +826,11 @@ struct Incarnation {
     guard: crate::guards::GuardHandle,
     messages: u64,
     rate: Option<karyos_sys::rate_limit::RatePolicy>,
+    /// The rate policy's version and control reserve, kept across the
+    /// incarnation (R-CORE-21).
+    rate_version: u64,
+    reserve: Option<karyos_sys::rate_limit::Rate>,
+    gate_slot: Option<Arc<crate::shared_words::Words>>,
 }
 
 /// A prepared incarnation's log, not installed yet.
@@ -2254,6 +2259,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Some(crate::guards::GuardRate {
                 scope: crate::guards::RateScope::Publication,
                 policy,
+                reserve,
             }) => {
                 // Every datagram fits the MTU (aggregate-lanes.md), so a byte
                 // burst that holds the MTU holds whatever a route's sender
@@ -2262,7 +2268,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 policy
                     .validate(frame)
                     .map_err(DriverError::InvalidRatePolicy)?;
-                Some(policy)
+                if reserve.is_some_and(|reserve| !policy.keeps(&reserve)) {
+                    return Err(DriverError::RateChange(
+                        crate::guards::RateChangeError::ReserveCrossed,
+                    ));
+                }
+                Some((policy, reserve))
             }
             Some(crate::guards::GuardRate { scope, .. }) => {
                 return Err(DriverError::RateScopeUnsupported { scope });
@@ -2298,9 +2309,155 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let scratch = usize::try_from(found.buffer.max_message_length())
             .map_err(|_| DriverError::InvalidConfig)?;
         found.guarded = Some(crate::guard_streams::GuardedStream::new(
-            guard, messages, rate, walker, scratch,
+            guard,
+            messages,
+            (
+                rate.map(|(policy, _)| policy),
+                rate.and_then(|(_, reserve)| reserve),
+            ),
+            walker,
+            scratch,
         ));
         Ok(())
+    }
+
+    /// Changes the rate policy of `stream`, guarded with a rate, from
+    /// version `expected` to `policy` under `authority`, with the caller's
+    /// `operation` id for the audit (R-CORE-21; `quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, Rate limits). Returns the new
+    /// version, or the current one when `policy` is unchanged.
+    ///
+    /// The safety path takes only a provable tightening
+    /// ([`karyos_sys::rate_limit::Transition::Tightening`]); an
+    /// administrator takes any valid policy. No policy goes below the
+    /// stream's control reserve. The change binds at once: every bound
+    /// handle's outcome ring publishes it, read on the handle's slow path,
+    /// and a guarded network publication's sender gate reads it at its next
+    /// serve. Each bucket keeps its level, clamped to the new burst: a
+    /// change never grants tokens.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::InvalidRatePolicy`] for a policy its stream refuses;
+    /// [`DriverError::RateChange`] with `NoRate` (a stream without a rate
+    /// policy), `VersionMismatch`, `NotATightening` and `ReserveCrossed`;
+    /// the stream lookup's errors. Every call on a guarded stream, refused
+    /// or not, is audited.
+    pub fn change_rate_policy(
+        &mut self,
+        stream: StreamHandle,
+        expected: u64,
+        policy: karyos_sys::rate_limit::RatePolicy,
+        by: (crate::guards::RateAuthority, u64),
+    ) -> Result<u64, DriverError> {
+        self.change_rate_in(&[stream], expected, policy, by)
+    }
+
+    /// [`Self::change_rate_policy`] for a guarded aggregate, a network
+    /// publication's lanes among them: every lane stream changes together,
+    /// and its sender gate reads the change at its next serve.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::change_rate_policy`]; `VersionMismatch` too when the
+    /// lanes' versions differ, which a change through this call never
+    /// makes.
+    pub fn change_aggregate_rate_policy(
+        &mut self,
+        aggregate: &AggregateHandle,
+        expected: u64,
+        policy: karyos_sys::rate_limit::RatePolicy,
+        by: (crate::guards::RateAuthority, u64),
+    ) -> Result<u64, DriverError> {
+        let streams: Vec<StreamHandle> = aggregate.streams().collect();
+        self.change_rate_in(&streams, expected, policy, by)
+    }
+
+    /// Changes the rate policy of `streams` together, audited once.
+    fn change_rate_in(
+        &mut self,
+        streams: &[StreamHandle],
+        expected: u64,
+        policy: karyos_sys::rate_limit::RatePolicy,
+        (authority, operation): (crate::guards::RateAuthority, u64),
+    ) -> Result<u64, DriverError> {
+        use crate::guards::{RateAuthority, RateChangeError};
+        use karyos_sys::rate_limit::Transition;
+
+        let now = self.clock.now();
+        // Every stream's guard, rate, version and reserve; all alike.
+        let mut state = None;
+        let mut frame = u64::MAX;
+        for stream in streams {
+            let found = self.active_stream(*stream)?;
+            frame = frame.min(u64::from(found.config.mtu));
+            let Some(guarded) = found.guarded.as_ref() else {
+                return Err(DriverError::RateChange(RateChangeError::NoRate));
+            };
+            let this = (
+                guarded.guard,
+                guarded.rate,
+                guarded.rate_version,
+                guarded.reserve,
+            );
+            match state {
+                None => state = Some(this),
+                Some((_, _, version, _)) if version != this.2 => {
+                    return Err(DriverError::RateChange(RateChangeError::VersionMismatch {
+                        expected,
+                        current: this.2,
+                    }));
+                }
+                Some(_) => {}
+            }
+        }
+        let Some((guard, rate, current, reserve)) = state else {
+            return Err(DriverError::RateChange(RateChangeError::NoRate));
+        };
+        let decided = (|| {
+            let old = rate.ok_or(DriverError::RateChange(RateChangeError::NoRate))?;
+            policy
+                .validate(frame)
+                .map_err(DriverError::InvalidRatePolicy)?;
+            if expected != current {
+                return Err(DriverError::RateChange(RateChangeError::VersionMismatch {
+                    expected,
+                    current,
+                }));
+            }
+            let transition = old.transition(&policy);
+            if transition == Transition::Unchanged {
+                return Ok(current);
+            }
+            if authority == RateAuthority::Safety && transition != Transition::Tightening {
+                return Err(DriverError::RateChange(RateChangeError::NotATightening));
+            }
+            if reserve.is_some_and(|reserve| !policy.keeps(&reserve)) {
+                return Err(DriverError::RateChange(RateChangeError::ReserveCrossed));
+            }
+            // Versions count accepted changes; 2^64 of them never happen.
+            current.checked_add(1).ok_or(DriverError::RateChange(
+                RateChangeError::VersionMismatch { expected, current },
+            ))
+        })();
+        if let Ok(next) = decided
+            && next != current
+        {
+            for stream in streams {
+                if let Some(guarded) = self.active_stream(*stream)?.guarded.as_mut() {
+                    guarded.set_rate(policy, next);
+                }
+            }
+        }
+        let after = decided.as_ref().map_or(current, |version| *version);
+        self.guards.audit_rate(
+            guard,
+            (current, after),
+            (operation, crate::guards::Requester::InProcess, authority),
+            decided.as_ref().map(|_| ()),
+            now,
+        );
+        decided
     }
 
     /// Reports a corrupt guard word in the error log (G2); other guard
@@ -3111,6 +3268,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guard: guarded.guard,
             messages: guarded.messages,
             rate: guarded.rate,
+            rate_version: guarded.rate_version,
+            reserve: guarded.reserve,
+            gate_slot: guarded.gate_slot().cloned(),
         }))
     }
 
@@ -3150,13 +3310,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         fresh: Fresh<T>,
     ) -> Result<(), DriverError> {
         let found = self.stream(handle)?;
-        let guarded = crate::guard_streams::GuardedStream::new(
+        let mut guarded = crate::guard_streams::GuardedStream::new(
             plan.guard,
             plan.messages,
-            plan.rate,
+            (plan.rate, plan.reserve),
             fresh.walker,
             fresh.scratch,
         );
+        if let Some(slot) = plan.gate_slot {
+            guarded.set_gate_slot(slot);
+        }
+        if let Some(policy) = plan.rate {
+            guarded.set_rate(policy, plan.rate_version);
+        }
         if let Some(old) = found.guarded.replace(guarded) {
             found.replaced.push(Replaced {
                 incarnation: found.incarnation,

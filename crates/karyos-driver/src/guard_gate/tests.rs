@@ -1001,3 +1001,46 @@ fn a_contradiction_makes_the_lane_unknown_and_finishes_it() {
     assert_eq!(frontier.read(lane(0)), faulted);
     assert_eq!(frontier.read(lane(1)).0, Final::Open);
 }
+
+/// R-CORE-21: the gate applies a newer policy the driver published at its
+/// next `set_now`, earning the old rate up to then and clamping its level
+/// to the new burst; an older or equal version, or a publication in
+/// progress, changes nothing.
+#[test]
+fn the_gate_applies_a_newer_published_policy_at_its_next_serve() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, Some(rate(10, 8)));
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_now(0);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (0, Some(8))
+    );
+    publish(slot.words(), 0, 2, &rate(5, 3));
+    f.gate.set_now(1);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (2, Some(3))
+    );
+    // Not newer: ignored.
+    publish(slot.words(), 0, 2, &rate(1, 1));
+    f.gate.set_now(2);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (2, Some(3))
+    );
+    // A publication in progress (an odd sequence) waits for the next call.
+    publish(slot.words(), 0, 3, &rate(1, 1));
+    slot.words()[0].fetch_add(1, Ordering::Relaxed);
+    f.gate.set_now(3);
+    assert_eq!(f.gate.policy_version(), 2);
+    slot.words()[0].fetch_add(1, Ordering::Relaxed);
+    f.gate.set_now(4);
+    assert_eq!(
+        (f.gate.policy_version(), f.gate.message_tokens()),
+        (3, Some(1))
+    );
+}

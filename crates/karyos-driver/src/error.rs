@@ -274,6 +274,9 @@ pub enum DriverError {
     /// burst below the stream's largest frame.
     #[error(transparent)]
     InvalidRatePolicy(karyos_sys::rate_limit::RatePolicyError),
+    /// A rate policy change was refused (R-CORE-21).
+    #[error(transparent)]
+    RateChange(crate::guards::RateChangeError),
     /// Every sender slot of the guards' owner is taken
     /// (`DriverConfig::max_guard_senders`).
     #[error("too many guard senders")]

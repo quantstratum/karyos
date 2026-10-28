@@ -649,6 +649,30 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let _ = lane;
             self.guard_stream(stream, guard.guard, guard.messages, guard.rate)?;
         }
+        // The gate reads the policy its lanes publish (R-CORE-21): one slot
+        // for the publication, kept across its incarnations.
+        let slot = handle.streams().next().and_then(|stream| {
+            self.stream(stream)
+                .ok()?
+                .guarded
+                .as_ref()?
+                .gate_slot()
+                .cloned()
+        });
+        let slot = match slot {
+            Some(slot) => slot,
+            None => {
+                let slot = Arc::new(crate::shared_words::Words::heap(
+                    karyos_sys::rate_policy_slot::SLOT_WORDS,
+                ));
+                for stream in handle.streams() {
+                    if let Some(guarded) = self.stream(stream)?.guarded.as_mut() {
+                        guarded.set_gate_slot(Arc::clone(&slot));
+                    }
+                }
+                slot
+            }
+        };
         // The gate reads word 0: the guard's word in the guard words.
         let (words, index) = self.guards.view(guard.guard)?;
         let word = Arc::new(crate::shared_words::WordAt::new(words, index))
@@ -673,6 +697,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 cell,
                 epoch,
                 rate: guard.rate.map(|rate| rate.policy),
+                policy: Some(slot as Arc<dyn karyos_client::SharedWords>),
                 frontier,
             },
             id,

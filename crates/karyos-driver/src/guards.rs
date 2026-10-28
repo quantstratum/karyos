@@ -81,6 +81,7 @@ pub enum Requester {
 
 /// What a transition did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuditOutcome {
     /// The guard closed at the word after.
     Closed,
@@ -90,6 +91,12 @@ pub enum AuditOutcome {
     Reopened,
     /// The transition was refused with this code.
     Refused(ErrorCode),
+    /// A guarded stream's rate policy changed (R-CORE-21): the record's
+    /// `before` and `after` are the policy versions.
+    RateChanged {
+        /// Who changed it.
+        authority: RateAuthority,
+    },
 }
 
 /// One record of the audit ring.
@@ -165,13 +172,79 @@ impl core::fmt::Display for RateScope {
     }
 }
 
-/// A guarded stream's rate limit: its scope and its token buckets.
+/// A guarded stream's rate limit: its scope, its token buckets and its
+/// control reserve. Built with [`GuardRate::publication`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GuardRate {
     /// What the limit applies to.
     pub scope: RateScope,
     /// The buckets' rates and bursts.
     pub policy: karyos_sys::rate_limit::RatePolicy,
+    /// The least message rate and burst the publisher needs for its
+    /// cancellations and resolutions (R-CORE-21): no tightening under
+    /// [`RateAuthority::Safety`] goes below it. `None`: no floor.
+    pub reserve: Option<karyos_sys::rate_limit::Rate>,
+}
+
+impl GuardRate {
+    /// `policy` over the publication, with no reserve.
+    #[must_use]
+    pub const fn publication(policy: karyos_sys::rate_limit::RatePolicy) -> Self {
+        Self::scoped(RateScope::Publication, policy)
+    }
+
+    /// `policy` over `scope`, with no reserve; only
+    /// [`RateScope::Publication`] is supported yet.
+    #[must_use]
+    pub const fn scoped(scope: RateScope, policy: karyos_sys::rate_limit::RatePolicy) -> Self {
+        Self {
+            scope,
+            policy,
+            reserve: None,
+        }
+    }
+
+    /// The same, with `reserve` as its control reserve.
+    #[must_use]
+    pub const fn with_reserve(mut self, reserve: karyos_sys::rate_limit::Rate) -> Self {
+        self.reserve = Some(reserve);
+        self
+    }
+}
+
+/// Who changes a guarded stream's rate policy (R-CORE-21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RateAuthority {
+    /// The safety path (operators, risk officers): only a proven tightening
+    /// that keeps the reserve.
+    Safety,
+    /// An administrator: any valid policy.
+    Administrator,
+}
+
+/// Why a rate policy change was refused (R-CORE-21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RateChangeError {
+    /// The stream's policy is at another version than the one expected.
+    #[error("the rate policy is at version {current}, not {expected}")]
+    VersionMismatch {
+        /// The version the caller expected.
+        expected: u64,
+        /// The stream's version.
+        current: u64,
+    },
+    /// The safety path takes only a provable tightening.
+    #[error("the safety path takes only a tightening of the rate policy")]
+    NotATightening,
+    /// The policy goes below the stream's control reserve.
+    #[error("the rate policy goes below the stream's control reserve")]
+    ReserveCrossed,
+    /// The stream has no rate policy to change.
+    #[error("the stream has no rate policy")]
+    NoRate,
 }
 
 /// The guard registry and audit ring of one driver.
@@ -330,6 +403,36 @@ impl Guards {
         self.entry(handle.guard).ok_or(DriverError::UnknownGuard)
     }
 
+    /// Records a rate policy change of a stream guarded by `handle`
+    /// (R-CORE-21): from version `before` to `after` under `authority`, or
+    /// refused with `error`. `parameters` is the authority's code (1
+    /// safety, 2 administrator).
+    pub(crate) fn audit_rate(
+        &mut self,
+        handle: GuardHandle,
+        (before, after): (u64, u64),
+        (operation, requester, authority): (u64, Requester, RateAuthority),
+        result: Result<(), &DriverError>,
+        time: u64,
+    ) {
+        let parameters = match authority {
+            RateAuthority::Safety => 1,
+            RateAuthority::Administrator => 2,
+        };
+        let outcome = match result {
+            Ok(()) => AuditOutcome::RateChanged { authority },
+            Err(error) => refused(error),
+        };
+        self.record(
+            time,
+            handle.guard,
+            before,
+            after,
+            (operation, requester, parameters),
+            outcome,
+        );
+    }
+
     /// The guard words and the guard's index in them, for the handles,
     /// gates and outcome rings bound to it.
     pub(crate) fn view(&self, handle: GuardHandle) -> Result<(Arc<Words>, usize), DriverError> {
@@ -478,6 +581,7 @@ impl Guards {
             AuditOutcome::AlreadyClosed => (2, 0),
             AuditOutcome::Reopened => (3, 0),
             AuditOutcome::Refused(code) => (4, u16::try_from(code.code()).unwrap_or(u16::MAX)),
+            AuditOutcome::RateChanged { .. } => (5, 0),
         };
         // A ring whose sequences are exhausted keeps what it has and counts
         // the record dropped; the driver's own audit below still records.
@@ -651,6 +755,12 @@ pub(crate) fn error_code(error: &DriverError) -> ErrorCode {
     match error {
         DriverError::Guard(GuardError::NotClosedAt { .. }) => ErrorCode::GuardNotClosedAt,
         DriverError::Guard(GuardError::Exhausted) => ErrorCode::GuardExhausted,
+        DriverError::RateChange(RateChangeError::VersionMismatch { .. }) => {
+            ErrorCode::RateVersionMismatch
+        }
+        DriverError::RateChange(RateChangeError::NotATightening) => ErrorCode::RateNotATightening,
+        DriverError::RateChange(RateChangeError::ReserveCrossed) => ErrorCode::RateReserveCrossed,
+        DriverError::RateChange(RateChangeError::NoRate) => ErrorCode::RateNotSet,
         // A corrupt word is a broken invariant, reported as unknown to
         // the requester; the guard stays closed.
         _ => ErrorCode::UnknownGuard,

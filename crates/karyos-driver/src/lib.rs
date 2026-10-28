@@ -72,6 +72,9 @@ pub use embedded::{
 };
 pub use error::{DriverError, TimedNetworkUnsupported, WalkerUnavailable};
 pub use generations::{GenerationInfo, Reconfiguration};
-pub use guards::{Audit, AuditOutcome, AuditRecord, GuardHandle, GuardRate, RateScope, Requester};
+pub use guards::{
+    Audit, AuditOutcome, AuditRecord, GuardHandle, GuardRate, RateAuthority, RateChangeError,
+    RateScope, Requester,
+};
 pub use karyos_client::ConflatedSubscription;
 pub use karyos_sys::log_buffer::{LossPolicy, SealReason, SealState};

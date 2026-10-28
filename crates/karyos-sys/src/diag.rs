@@ -669,7 +669,11 @@ pub struct GuardAuditRecord {
     pub requester_kind: u8,
     /// The client id for a client or an operator's client, else 0.
     pub requester: u64,
-    /// What happened: 1 closed, 2 already closed, 3 reopened, 4 refused.
+    /// What happened: 1 closed, 2 already closed, 3 reopened, 4 refused,
+    /// 5 a guarded stream's rate policy changed (R-CORE-21, `before` and
+    /// `after` its versions, `parameters` 1 safety or 2 administrator).
+    /// A reader passes any other value through as it is: an outcome a
+    /// later driver adds reads as unknown, never as a corrupt record.
     pub outcome: u8,
     /// The control error code of a refusal, else 0.
     pub refusal: u16,
@@ -880,6 +884,37 @@ mod tests {
             .scan(&mut cursor, |seq, record| read.push((seq, record)));
         assert_eq!(read, [(1, record(2)), (2, record(3))]);
         assert_eq!(scan.overwritten, 1);
+    }
+
+    /// R-CORE-21: a rate change record (outcome 5) and an outcome no
+    /// reader knows read back as written: the ring neither refuses nor
+    /// reinterprets them.
+    #[test]
+    fn guard_audit_outcomes_read_back_as_written() {
+        let mut ring = guard_audit(4).unwrap();
+        let record = |outcome| GuardAuditRecord {
+            time: 1,
+            driver_time: 2,
+            guard: 3,
+            before: 1,
+            after: 2,
+            operation: 4,
+            requester_kind: 0,
+            requester: 0,
+            outcome,
+            refusal: 0,
+            operator: 0,
+            parameters: 1,
+        };
+        for outcome in [5, u8::MAX] {
+            assert!(ring.record(&record(outcome)).is_some());
+        }
+        let mut cursor = 0;
+        let mut read = Vec::new();
+        let _ = ring
+            .reader()
+            .scan(&mut cursor, |_, record| read.push(record));
+        assert_eq!(read, [record(5), record(u8::MAX)]);
     }
 
     #[test]

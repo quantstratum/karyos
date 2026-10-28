@@ -572,16 +572,13 @@ fn guard_stream_names_the_walkers_missing_cell() {
 }
 
 fn per_second(messages: u64, burst: u64, bytes: Option<(u64, u64)>) -> GuardRate {
-    GuardRate {
-        scope: RateScope::Publication,
-        policy: RatePolicy {
-            messages: Rate {
-                per_second: messages,
-                burst,
-            },
-            bytes: bytes.map(|(per_second, burst)| Rate { per_second, burst }),
+    GuardRate::publication(RatePolicy {
+        messages: Rate {
+            per_second: messages,
+            burst,
         },
-    }
+        bytes: bytes.map(|(per_second, burst)| Rate { per_second, burst }),
+    })
 }
 
 /// G-e3 (GC-5): only the publication scope is supported, and a policy is
@@ -597,10 +594,7 @@ fn guard_stream_validates_its_rate_limit() {
         RateScope::Account,
         RateScope::Destination,
     ] {
-        let rate = GuardRate {
-            scope,
-            ..per_second(10, 1, None)
-        };
+        let rate = GuardRate::scoped(scope, per_second(10, 1, None).policy);
         assert_eq!(
             driver.guard_stream(handle, guard, 4, Some(rate)),
             Err(DriverError::RateScopeUnsupported { scope })
@@ -678,4 +672,162 @@ fn a_rate_limited_handle_refuses_past_its_burst() {
         ));
     }
     assert_eq!(fresh.offer(b"f").unwrap(), OfferOutcome::RateLimited);
+}
+
+/// R-CORE-21: a guarded stream's rate policy changes by version (compare
+/// and set). The safety path takes only a tightening that keeps the
+/// control reserve; an administrator takes any valid policy above it.
+/// Every call is audited with the versions before and after, and a
+/// refusal changes nothing.
+#[test]
+fn a_rate_policy_changes_by_version_under_its_authority() {
+    use karyos_driver::{AuditOutcome, RateAuthority, RateChangeError};
+    use karyos_protocol::cnc::ErrorCode;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
+    let guard = driver.add_guard("orders").unwrap();
+    let reserve = Rate {
+        per_second: 5,
+        burst: 2,
+    };
+    // A reserve the policy itself crosses is refused when guarding.
+    assert_eq!(
+        driver.guard_stream(
+            handle,
+            guard,
+            4,
+            Some(per_second(4, 2, None).with_reserve(reserve))
+        ),
+        Err(DriverError::RateChange(RateChangeError::ReserveCrossed))
+    );
+    driver
+        .guard_stream(
+            handle,
+            guard,
+            4,
+            Some(per_second(100, 10, None).with_reserve(reserve)),
+        )
+        .unwrap();
+    let safety = |operation| (RateAuthority::Safety, operation);
+    let admin = |operation| (RateAuthority::Administrator, operation);
+    let change = |driver: &mut EmbeddedDriver, expected, policy: GuardRate, by| {
+        driver.change_rate_policy(handle, expected, policy.policy, by)
+    };
+    // Version 1 at guarding; a tightening on the safety path makes 2.
+    assert_eq!(
+        change(&mut driver, 1, per_second(50, 10, None), safety(1)),
+        Ok(2)
+    );
+    // A stale version is refused.
+    assert_eq!(
+        change(&mut driver, 1, per_second(40, 10, None), safety(2)),
+        Err(DriverError::RateChange(RateChangeError::VersionMismatch {
+            expected: 1,
+            current: 2
+        }))
+    );
+    // A loosening, or a mixed change, is not the safety path's.
+    assert_eq!(
+        change(&mut driver, 2, per_second(60, 10, None), safety(3)),
+        Err(DriverError::RateChange(RateChangeError::NotATightening))
+    );
+    assert_eq!(
+        change(&mut driver, 2, per_second(40, 20, None), safety(4)),
+        Err(DriverError::RateChange(RateChangeError::NotATightening))
+    );
+    // A tightening below the reserve is refused whatever the authority.
+    assert_eq!(
+        change(&mut driver, 2, per_second(4, 10, None), safety(5)),
+        Err(DriverError::RateChange(RateChangeError::ReserveCrossed))
+    );
+    assert_eq!(
+        change(&mut driver, 2, per_second(50, 1, None), admin(6)),
+        Err(DriverError::RateChange(RateChangeError::ReserveCrossed))
+    );
+    // An administrator loosens; an unchanged policy keeps the version.
+    assert_eq!(
+        change(&mut driver, 2, per_second(200, 20, None), admin(7)),
+        Ok(3)
+    );
+    assert_eq!(
+        change(&mut driver, 3, per_second(200, 20, None), safety(8)),
+        Ok(3)
+    );
+    let audit: Vec<_> = driver
+        .guard_audit()
+        .records
+        .iter()
+        .map(|record| {
+            (
+                record.operation,
+                record.before,
+                record.after,
+                record.outcome,
+            )
+        })
+        .collect();
+    let refused = |code| AuditOutcome::Refused(code);
+    let changed = |authority| AuditOutcome::RateChanged { authority };
+    assert_eq!(
+        audit,
+        [
+            (1, 1, 2, changed(RateAuthority::Safety)),
+            (2, 2, 2, refused(ErrorCode::RateVersionMismatch)),
+            (3, 2, 2, refused(ErrorCode::RateNotATightening)),
+            (4, 2, 2, refused(ErrorCode::RateNotATightening)),
+            (5, 2, 2, refused(ErrorCode::RateReserveCrossed)),
+            (6, 2, 2, refused(ErrorCode::RateReserveCrossed)),
+            (7, 2, 3, changed(RateAuthority::Administrator)),
+            (8, 3, 3, changed(RateAuthority::Safety)),
+        ]
+    );
+    // A stream guarded without a rate has none to change.
+    let other = stream(&mut driver, 3, PublicationMode::Exclusive, true);
+    driver.guard_stream(other, guard, 4, None).unwrap();
+    assert_eq!(
+        driver.change_rate_policy(other, 0, per_second(1, 1, None).policy, admin(9)),
+        Err(DriverError::RateChange(RateChangeError::NoRate))
+    );
+}
+
+/// R-CORE-21: a change binds the handles already issued: a spent handle
+/// reads the published policy on its slow path and earns at the new rate.
+#[test]
+fn a_rate_policy_change_reaches_an_issued_handle() {
+    use karyos_driver::RateAuthority;
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
+    let guard = driver.add_guard("orders").unwrap();
+    // One message a second, a burst of one: no refill between the offers.
+    driver
+        .guard_stream(handle, guard, 4, Some(per_second(1, 1, None)))
+        .unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut publication = driver.publication(handle).unwrap();
+    assert!(matches!(
+        publication.offer(b"a").unwrap(),
+        OfferOutcome::Accepted { .. }
+    ));
+    assert_eq!(publication.offer(b"b").unwrap(), OfferOutcome::RateLimited);
+    // A million a second: the handle earns a token within microseconds.
+    assert_eq!(
+        driver.change_rate_policy(
+            handle,
+            1,
+            per_second(1_000_000, 1, None).policy,
+            (RateAuthority::Administrator, 1),
+        ),
+        Ok(2)
+    );
+    let start = std::time::Instant::now();
+    let accepted = loop {
+        match publication.offer(b"b").unwrap() {
+            OfferOutcome::Accepted { .. } => break true,
+            OfferOutcome::RateLimited if start.elapsed().as_millis() < 500 => {}
+            _ => break false,
+        }
+    };
+    assert!(accepted, "the handle applied the new policy");
 }
