@@ -50,6 +50,8 @@
 //! sequence plus one, are `ValueOutOfRange`.
 
 #[cfg(test)]
+mod golden;
+#[cfg(test)]
 mod tests;
 
 use karyos_codec::{CodecError, Decoder, ENVELOPE_LENGTH, Encoder, Template, VAR_HEADER_LENGTH};
