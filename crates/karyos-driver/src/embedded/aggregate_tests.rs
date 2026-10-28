@@ -377,3 +377,62 @@ fn an_aggregate_change_publishes_its_gate_slot_once() {
         SlotRead::Policy { version: 2, policy: published } if published == policy(50)
     ));
 }
+
+/// Re-review of #814: a change named on a lane whose aggregate cannot be
+/// assembled (a lane missing from the table, which the API never leaves)
+/// is refused with the lookup's error and audited for every guard of the
+/// lanes still there.
+#[test]
+fn a_change_on_an_aggregate_with_a_lane_gone_is_audited_for_every_guard() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let aggregate = driver
+        .add_aggregate(AggregateConfig {
+            stream: stream(2),
+            quanta: vec![u64::from(DEFAULT_MTU) * 4; 3],
+        })
+        .unwrap();
+    let policy = |per_second| RatePolicy {
+        messages: Rate {
+            per_second,
+            burst: 10,
+        },
+        bytes: None,
+    };
+    let lanes: Vec<StreamHandle> = aggregate.streams().collect();
+    let (a, b) = (
+        driver.add_guard("a").unwrap(),
+        driver.add_guard("b").unwrap(),
+    );
+    for (lane, guard) in [(lanes[0], a), (lanes[1], b)] {
+        driver
+            .guard_stream(
+                lane,
+                guard,
+                4,
+                Some(crate::guards::GuardRate::publication(policy(100))),
+            )
+            .unwrap();
+    }
+    // Lane 2 leaves the table under the aggregate.
+    driver.streams.retain(|lane| lane.id != lanes[2].stream);
+    let refused = driver.change_rate_policy(
+        lanes[0],
+        1,
+        policy(50),
+        (crate::guards::RateAuthority::Safety, 9),
+    );
+    assert!(
+        matches!(refused, Err(DriverError::UnknownStream { .. })),
+        "{refused:?}"
+    );
+    let audit: Vec<_> = driver
+        .guard_audit()
+        .records
+        .iter()
+        .filter(|record| record.operation == 9)
+        .map(|record| (record.guard, record.before, record.after))
+        .collect();
+    assert_eq!(audit, [(a.id(), 1, 1), (b.id(), 1, 1)]);
+}
