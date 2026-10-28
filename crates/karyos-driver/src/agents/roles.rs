@@ -311,6 +311,9 @@ pub struct ReceiverCounters {
     /// Images closed by repair: a range proven unrecoverable under
     /// `on_unrecoverable = close`, or `GapCannotResume`.
     pub images_closed_unrecoverable: u64,
+    /// A heartbeat's tail the receive owner could not compute (a corrupt
+    /// owner state): no NAK for it.
+    pub heartbeat_tail_errors: u64,
     /// Images closed by `GapCannotResume` (a floor beyond the window).
     pub images_closed_cannot_resume: u64,
     /// Images closed by a protocol fault (`range_invalid_limit`
@@ -1232,11 +1235,19 @@ fn tail_hole<T: StreamTerms>(
     lane: Lane,
     at: usize,
     now: u64,
+    counters: &mut ReceiverCounters,
 ) -> Option<Hole> {
     use crate::repair::loss::RttSource;
 
-    let tail = heartbeat_mark(image, lane, at)
-        .and_then(|mark| image.owner.heartbeat_tail(lane, mark).ok().flatten());
+    let tail =
+        match heartbeat_mark(image, lane, at).map(|mark| image.owner.heartbeat_tail(lane, mark)) {
+            Some(Ok(tail)) => tail,
+            Some(Err(_)) => {
+                tally(counters, |c| &mut c.heartbeat_tail_errors);
+                None
+            }
+            None => None,
+        };
     let Some((start, length)) = tail else {
         if let Some(since) = image.tail_since.get_mut(at) {
             *since = None;
@@ -3074,7 +3085,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             {
                 *since = None;
             }
-            let hole = first.or_else(|| tail_hole(image, lane, at, now));
+            let hole = first.or_else(|| tail_hole(image, lane, at, now, counters));
             if let Observation::Unrecoverable {
                 hole,
                 lowest_retained,
@@ -3203,8 +3214,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
             // An unreliable tail no frame revealed is sealed at its
             // deadline (SPEC §6, G1), up to the clamped mark.
             if !image.reliable {
-                for (at, lane) in (0..image.heartbeat_marks.len())
-                    .filter_map(|at| Some((at, Lane::try_new(u8::try_from(at).ok()?).ok()?)))
+                for (at, lane) in (0..image.lane_count)
+                    .filter_map(|at| Some((usize::from(at), Lane::try_new(at).ok()?)))
                 {
                     if let Some(mark) = heartbeat_mark(image, lane, at) {
                         image.skip.revealed(lane, mark);

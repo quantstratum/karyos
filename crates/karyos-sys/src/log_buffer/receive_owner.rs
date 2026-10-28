@@ -964,6 +964,10 @@ impl<T: TermBytes> LaneOwner<T> {
         // `term_length`.
         let room = self.buffer.term_length - offset;
         let extent = u32::try_from(mark - self.rebuild).map_or(room, |extent| extent.min(room));
+        debug_assert!(
+            offset.is_multiple_of(FRAME_ALIGNMENT) && extent.is_multiple_of(FRAME_ALIGNMENT),
+            "a tail hole is frame aligned"
+        );
         Ok(Some((self.rebuild, extent)))
     }
 

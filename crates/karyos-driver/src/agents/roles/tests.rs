@@ -3749,8 +3749,24 @@ fn the_heartbeat_mark_and_a_tail_nak_stop_at_the_terminal_bound() {
         super::HeartbeatClass::Stationary,
         "capped at the bound"
     );
-    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
-    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert!(
+        super::tail_hole(
+            &mut image,
+            Lane::ZERO,
+            0,
+            1,
+            &mut super::ReceiverCounters::default()
+        )
+        .is_none()
+    );
+    let hole = super::tail_hole(
+        &mut image,
+        Lane::ZERO,
+        0,
+        10_000_000_000,
+        &mut super::ReceiverCounters::default(),
+    )
+    .unwrap();
     assert_eq!((hole.start, hole.length), (0, 96));
 }
 
@@ -3874,8 +3890,24 @@ fn a_bound_below_the_heartbeat_mark_caps_the_tail_nak() {
         super::record_terminal(&mut image, Lane::ZERO, 96),
         super::Terminal::Recorded
     );
-    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
-    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert!(
+        super::tail_hole(
+            &mut image,
+            Lane::ZERO,
+            0,
+            1,
+            &mut super::ReceiverCounters::default()
+        )
+        .is_none()
+    );
+    let hole = super::tail_hole(
+        &mut image,
+        Lane::ZERO,
+        0,
+        10_000_000_000,
+        &mut super::ReceiverCounters::default(),
+    )
+    .unwrap();
     assert_eq!((hole.start, hole.length), (0, 96));
 }
 
@@ -4665,5 +4697,48 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
         sender.counters().removed_closed,
         2,
         "the old queue and route"
+    );
+}
+
+/// #821 point 3: an unreliable image's duty feeds the skip policy each
+/// lane's heartbeat mark clamped to the terminal bound, so a tail no
+/// frame revealed is sealed at its deadline up to the bound and no
+/// further.
+#[test]
+fn an_unreliable_tail_is_sealed_up_to_the_terminal_bound() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::log_buffer::SkipConfig;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image_with(SkipConfig::unreliable());
+    image.reliable = false;
+    commit_frame(&mut image, &params, 0, 32);
+    let bytes = data_frame(4096, 0, false);
+    let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+    let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+        panic!("not a heartbeat");
+    };
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Fresh
+    );
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 1024),
+        super::Terminal::Recorded
+    );
+    let (_sender, mut receiver) = repairing(image);
+    receiver.repair(0, 1).unwrap();
+    assert_eq!(receiver.counters().gaps_sealed, 0, "before its deadline");
+    for now in [10_000_000_000u64, 20_000_000_000, 30_000_000_000] {
+        receiver.repair(0, now).unwrap();
+    }
+    let sealed = receiver.counters().gaps_sealed;
+    assert!(sealed >= 1, "the tail is sealed: {sealed}");
+    let owner = &receiver.images[0].owner;
+    assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), None);
+    assert_eq!(
+        owner.high_water(Lane::ZERO),
+        Some(1024),
+        "not past the bound"
     );
 }

@@ -816,6 +816,7 @@ fn a_tail_across_a_term_end_is_sealed_per_term() {
     assert!(sealed_by(&mut skip, &mut owner, 0).is_empty());
     let seals = sealed_by(&mut skip, &mut owner, MS);
     assert_eq!(seals.first(), Some(&(TERM - 128, 128)), "{seals:?}");
+    assert_eq!(seals.get(1), Some(&(TERM, 128)), "{seals:?}");
     assert!(seals.iter().all(|(position, extent)| {
         position / TERM == (position + u64::from(*extent) - 1) / TERM
     }));
@@ -882,4 +883,30 @@ fn a_reliable_tail_is_never_sealed() {
         sealed_by(&mut unreliable, &mut control, 10 * MS),
         [(64, 128)]
     );
+}
+
+/// Past `PARTS` revealed parts the newest one is extended and takes the
+/// later detection time, so it is sealed late, never early; the older
+/// parts keep their own times.
+#[test]
+fn parts_past_their_capacity_extend_the_newest() {
+    let mut parts = super::Parts::default();
+    let total = super::PARTS as u64 + 3;
+    for at in 1..=total {
+        parts.seen(at * 100, at * MS);
+    }
+    let held = parts.held();
+    assert_eq!(held.len(), super::PARTS);
+    for (index, (detected, end)) in held.iter().take(super::PARTS - 1).enumerate() {
+        let at = index as u64 + 1;
+        assert_eq!((*detected, *end), (at * MS, at * 100), "part {index}");
+    }
+    assert_eq!(held.last(), Some(&(total * MS, total * 100)), "the newest");
+    // Seen no further: nothing changes.
+    parts.seen(total * 100, (total + 1) * MS);
+    assert_eq!(parts.held().last(), Some(&(total * MS, total * 100)));
+    // Resolved past the first two: they go, the rest keep their times.
+    parts.resolve(200);
+    assert_eq!(parts.first(), Some((3 * MS, 300)));
+    assert_eq!(parts.held().len(), super::PARTS - 2);
 }
