@@ -378,6 +378,9 @@ pub struct SenderCounters {
     /// endpoint's next reset drops them). A retired destination's are
     /// carried over instead (`OutboundCounters::close_deferred`).
     pub removed_unrecorded: u64,
+    /// Entries of the close list whose endpoint's TX half was not held at
+    /// a duty, kept for the next one (each counted per duty it waits).
+    pub removed_waiting: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -4780,7 +4783,8 @@ impl<T: StreamTerms> SenderRole<T> {
     /// multi-destination publication removed and did not report yet, after
     /// expiring its member, so it stops counting for the strategy edge
     /// (design 4.5; MD-7, MD-12). One the ring refused is posted again next
-    /// cycle.
+    /// cycle. A posted report retires the destination and hands its route
+    /// and queues to the close list (design 3.7).
     pub(super) fn report_removals<O: SocketOps>(
         &mut self,
         mut post: impl FnMut(AgentEvent<O, T>) -> bool,
@@ -4788,6 +4792,14 @@ impl<T: StreamTerms> SenderRole<T> {
         let now = (self.clock)();
         for outbound in &mut self.publications {
             while let Some(removal) = outbound.removal_unreported() {
+                // Its member stops counting for the strategy edge before
+                // the report is posted: with the conductor's ring full, a
+                // slow member must not keep holding the publisher (#630).
+                // Releasing it again on a retry is harmless: its SMs are
+                // dropped once it is removed.
+                if let Some(membership) = outbound.membership_mut() {
+                    let _ = membership.release_source(removal.destination, now);
+                }
                 let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
                 let Some(identity) = self.sessions.identity(endpoint, alias) else {
                     break;
@@ -4801,12 +4813,11 @@ impl<T: StreamTerms> SenderRole<T> {
                 if !post(event) {
                     return;
                 }
-                // Its member expires once, with the report: a retry while
-                // the ring is full never expires it again.
-                if let Some(membership) = outbound.membership_mut() {
-                    let _ = membership.release_source(removal.destination, now);
-                }
                 outbound.removal_reported(removal.destination, now);
+                // Its route and queues go to the close list now, so the
+                // next cycle's commands, served before its duty, find the
+                // slot free; that duty closes them before it opens anything.
+                outbound.drain_retired(&mut self.closing);
             }
         }
     }
@@ -4926,13 +4937,26 @@ impl<T: StreamTerms> SenderRole<T> {
     /// the same epoch. An endpoint whose half it does not hold, or now in
     /// another epoch, dropped them already (a reset or a retirement).
     fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
-        while let Some(opened) = self.closing.pop() {
+        // What waits for its endpoint's TX half (handed back this cycle)
+        // stays, counted once per cycle, for the next duty: its route and
+        // queues are never lost. Taking the list keeps its capacity.
+        let mut closing = std::mem::take(&mut self.closing);
+        let mut kept = 0usize;
+        let mut at = 0usize;
+        while at < closing.len() {
+            let Some(opened) = closing.get(at).copied() else {
+                break;
+            };
             let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
                 Half::Tx(tx) if *held == opened.endpoint => Some(tx),
                 _ => None,
             }) else {
+                closing.swap(kept, at);
+                kept += 1;
+                at += 1;
                 continue;
             };
+            at += 1;
             if tx.capabilities().epoch != opened.epoch {
                 continue;
             }
@@ -4957,6 +4981,11 @@ impl<T: StreamTerms> SenderRole<T> {
                 self.count(|c| &mut c.removed_closed);
             }
         }
+        closing.truncate(kept);
+        for _ in 0..kept {
+            self.count(|c| &mut c.removed_waiting);
+        }
+        self.closing = closing;
     }
 
     /// Frees the route slots of endpoints the agent no longer holds: their

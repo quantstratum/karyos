@@ -516,8 +516,18 @@ impl Fanout {
                 now.checked_sub(*removed_at)
                     .is_none_or(|age| age < quarantine)
             });
+            // The record removed earliest goes first: retirement order may
+            // differ from removal order.
             if fanout.quarantined.len() >= MAX_DESTINATIONS {
-                let _ = fanout.quarantined.pop_front();
+                let earliest = fanout
+                    .quarantined
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, removed_at))| *removed_at)
+                    .map(|(at, _)| at);
+                if let Some(at) = earliest {
+                    let _ = fanout.quarantined.remove(at);
+                }
                 forgotten = forgotten.saturating_add(1);
             }
             let removed_at = target.removed.map_or(now, |(_, time)| time);
@@ -714,6 +724,12 @@ impl<T: StreamTerms> Outbound<T> {
     /// target is never opened again, and one that fails to open is retried
     /// at the next call without holding the others (it gets nothing until
     /// it opens; a required one bounds the publisher meanwhile).
+    /// [`Outbound::open_targets`], for tests outside this module.
+    #[cfg(test)]
+    pub(crate) fn open_destinations<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, now: u64) {
+        let _ = self.open_targets(tx, now);
+    }
+
     fn open_targets<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, now: u64) -> bool {
         let epoch = tx.capabilities().epoch;
         let Some(fanout) = self.fanout.as_deref_mut() else {
@@ -1768,10 +1784,10 @@ impl<T: StreamTerms> Outbound<T> {
                 if fanout.quarantined(destination, now, quarantine) {
                     return DestinationChange::Quarantined;
                 }
-                // A removed target holds its slot until it retires, in the
-                // cycle its removal is reported: a move
-                // retried after the removal shows in
-                // `network_removed_destinations` finds the slot free. While
+                // A removed target holds its slot until its route and queues
+                // pass to the close list, at its report: a move retried
+                // after the removal shows in `network_removed_destinations`
+                // finds the slot free. While
                 // the conductor's ring is full nothing is reported and
                 // nothing retires, so churn never grows the targets, their
                 // flags or the retired list past their capacity.
@@ -2135,7 +2151,13 @@ mod tests {
             DestinationChange::Removed
         );
         outbound.removal_reported(address(4001), 5_100);
+        assert_eq!(outbound.counters().destinations_retired, 1, "at its report");
         outbound.drain_retired(&mut Vec::with_capacity(MAX_DESTINATIONS));
+        assert_eq!(
+            outbound.counters().destinations_retired,
+            1,
+            "the drain retires nothing"
+        );
         assert_eq!(
             outbound.change_destination(address(4001), true, 5_999, quarantine),
             DestinationChange::Quarantined
@@ -2198,6 +2220,41 @@ mod tests {
             outbound.change_destination(address(4100), true, 0, 0),
             DestinationChange::Added
         );
+    }
+
+    /// Should-fix of #829: with the quarantine full, the record removed
+    /// earliest makes room, whatever the order records were added in.
+    #[test]
+    fn a_full_quarantine_forgets_the_earliest_removal() {
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut outbound = fanned(address(4000));
+        let _ = outbound.change_destination(address(4001), true, 0, 0);
+        let fanout = outbound.fanout.as_deref_mut().unwrap();
+        fanout.quarantine = 1_000_000;
+        // Sixteen records, the earliest removal (at 10) added last.
+        for index in 0..15u16 {
+            fanout
+                .quarantined
+                .push_back((address(5000 + index), 100 + u64::from(index)));
+        }
+        fanout.quarantined.push_back((address(5100), 10));
+        let _ = outbound.change_destination(address(4001), false, 500, 1_000_000);
+        outbound.removal_reported(address(4001), 500);
+        let fanout = outbound.fanout.as_deref().unwrap();
+        assert!(
+            !fanout
+                .quarantined
+                .iter()
+                .any(|(at, _)| *at == address(5100)),
+            "the earliest removal is forgotten"
+        );
+        assert!(
+            fanout
+                .quarantined
+                .iter()
+                .any(|(at, _)| *at == address(5000))
+        );
+        assert_eq!(outbound.counters().quarantine_forgotten, 1);
     }
 
     /// Review C3 and should-fix 5 of #829: with the close list full,

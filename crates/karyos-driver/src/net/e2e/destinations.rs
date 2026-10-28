@@ -676,12 +676,11 @@ fn twenty_moves_neither_fill_the_table_nor_leak() {
 
 /// Plan 157, point 2: a move at `MAX_DESTINATIONS` answers `Full` while
 /// the removed destination holds its slot, and once its removal shows in
-/// `network_removed_destinations` (it is reported at once, retired at the
-/// report, and its route and queues closed at the next duty, before that
-/// duty serves commands), the move retried is added. It checks the public contract end to end in both
-/// threading modes; the timing it relies on (an addition retires what was
-/// reported) is guarded by the unit test
-/// `an_addition_after_the_removal_is_reported_finds_the_slot_free`, and
+/// `network_removed_destinations` (it is reported in the cycle of the
+/// removal, which hands its route and queues to the close list), the move
+/// retried is added. It checks the public contract end to end in both
+/// threading modes; the cycle order it relies on is guarded by the sender
+/// test `a_move_right_after_the_report_is_added_in_the_cycle_order`, and
 /// the bound by the unit churn test.
 #[test]
 fn a_move_at_capacity_waits_for_the_removal_to_retire() {

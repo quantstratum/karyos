@@ -26,7 +26,11 @@
     drain allocate nothing; only an accepted addition does. When the
     close list has no room, retired routes and queues are carried over to
     the next duty, counted once each (`close_deferred`), and keep their
-    slots: nothing is dropped.
+    slots: nothing is dropped. The report hands them to the close list
+    itself, so the next cycle's commands, served before its duty, find
+    the slot free. A close whose endpoint's TX half is not held at a duty
+    waits for a later one (`removed_waiting`) instead of being lost. With
+    the quarantine full, the record removed earliest makes room.
   - A route table, queue entries or TX slots that other publications
     filled (`RouteLimit`, `QueueLimit`, `OverCommitted`) no longer count
     as the destination's own fault, so an optional destination is not
