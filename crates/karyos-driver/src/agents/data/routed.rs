@@ -311,30 +311,44 @@ fn held(routed: &Routed, lane: usize, route: usize) -> usize {
 /// it holds no copy of the lane; its wait restarts while it is busy, and
 /// a route that cannot send waits afresh once it can. Any route holding a
 /// copy of the lane bounds every route's heartbeat at that copy's
-/// position: sending or not, live, returning (it stages before its first
-/// submit, RP-9), or left with its half away (the copies it could not
-/// cancel go on its return in the same epoch). A heartbeat so never
+/// position: sending or not, live, or returning (it stages before its
+/// first submit, RP-9). A route that left with its half away does not:
+/// its half comes back only in a new epoch, which drops the copies, or
+/// never, and either way they are not sent. A heartbeat so never
 /// announces a position a held copy would still bring, and still reveals
 /// what lies below it. The bound reads each copy's own position, never a
 /// route's frontier, so nothing stale reaches it. While a route holds a
 /// copy for long (its socket full, its endpoint in a reset), a tail lost
 /// above that copy is revealed only once the copy goes: the copy may
-/// still fill it.
+/// still fill it; a copy held by a socket that keeps refusing (EAGAIN)
+/// has no time limit of its own, the route's path policy removes it
+/// from the live set.
 fn idle_routes(
     routed: &mut Routed,
     lane: usize,
-    sending: &[bool; MAX_ROUTES],
+    (sending, present): (&[bool; MAX_ROUTES], &[bool; MAX_ROUTES]),
     now: u64,
     interval: u64,
 ) -> ([bool; MAX_ROUTES], Option<u64>) {
     let mut due = [false; MAX_ROUTES];
+    // A route that left with its half away bounds nothing: its reset
+    // reopens in a new epoch, which drops its copies, and if the reset
+    // fails it never sends them (QS-COORDINATOR on #842).
+    let counts: [bool; MAX_ROUTES] = std::array::from_fn(|route| {
+        routed
+            .routes
+            .get(route)
+            .is_some_and(|slot| !slot.left || present.get(route) == Some(&true))
+    });
     let Some(track) = routed.tracks.get_mut(lane) else {
         return (due, None);
     };
     let bound = track
         .staged
         .iter()
-        .filter_map(|copies| copies.front().map(|(_, start, _)| *start))
+        .zip(&counts)
+        .filter(|(_, counts)| **counts)
+        .filter_map(|(copies, _)| copies.front().map(|(_, start, _)| *start))
         .min();
     for (route, (idle, slot)) in track.idle_since.iter_mut().zip(&mut due).enumerate() {
         if sending.get(route) != Some(&true) {
@@ -1012,6 +1026,17 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             return Some(0);
         }
         let sending = self.sending_routes(halves);
+        // The routes whose TX half the agent holds now.
+        let present: [bool; MAX_ROUTES] = std::array::from_fn(|index| {
+            self.routed
+                .as_deref()
+                .and_then(|routed| routed.routes.get(index))
+                .is_some_and(|route| {
+                    halves
+                        .iter()
+                        .any(|(held, half)| *held == route.endpoint && matches!(half, Half::Tx(_)))
+                })
+        });
         let mut sent = 0u32;
         for lane in 0..self.readers.len() {
             let Some(position) = self.readers.get(lane).map(|reader| reader.position()) else {
@@ -1022,7 +1047,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             let Some((due, bound)) = self
                 .routed
                 .as_deref_mut()
-                .map(|routed| idle_routes(routed, lane, &sending, now, interval))
+                .map(|routed| idle_routes(routed, lane, (&sending, &present), now, interval))
             else {
                 break;
             };

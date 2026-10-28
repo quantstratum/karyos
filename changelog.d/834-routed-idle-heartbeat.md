@@ -4,8 +4,8 @@
   heartbeat on every path that can send (karyos#834), as a single-path
   lane does on its one. Each path waits a whole interval after its own
   last DATA or heartbeat, and while any path holds a copy of the lane (its
-  socket full, its endpoint in a reset, or returning or left with copies
-  it could not cancel) every path's heartbeat stops at that copy's
+  socket full, or returning to the live set; a path that left with its
+  endpoint's half away bounds nothing, as it sends nothing) every path's heartbeat stops at that copy's
   position: it never announces a position a held copy would still bring,
   and still reveals a tail lost below it. A tail above a copy held for
   long is revealed once the copy goes. PATH_HB still keeps each path's
