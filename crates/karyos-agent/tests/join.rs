@@ -289,7 +289,9 @@ fn a_registrar_writes_and_a_collector_joins_against_the_right_version() {
     // The view of API v1 carries nothing of the registry.
     let (view, _) = ask(viewer, &mut agent, "KARYOS-AGENT 1 view\n");
     assert!(view.starts_with("{\"version\":1,\"drivers\":["), "{view}");
-    assert!(!view.contains("join"), "{view}");
+    for key in ["\"join", "\"registered\":", "\"generation\":"] {
+        assert!(!view.contains(key), "{view}");
+    }
 }
 
 /// Each bound and each malformed request is refused by name over the
@@ -327,8 +329,14 @@ fn registry_requests_are_refused_by_bound_and_shape() {
             "{\"error\":\"above bound\",\"dimension\":\"join.key_bytes\",\"bound\":64}\n"
                 .to_owned(),
         ),
+        // One byte past the bound, newline included: all of it is read,
+        // so the agent's close resets nothing before the answer.
         (
-            put(&format!("point p n={}", "v ".repeat(600))),
+            {
+                let head = put("point p n=");
+                let head = head.trim_end_matches('\n');
+                format!("{head}{}\n", "v".repeat(1025 - head.len() - 1))
+            },
             "{\"error\":\"above bound\",\"dimension\":\"join.request_bytes\",\"bound\":1024}\n"
                 .to_owned(),
         ),
