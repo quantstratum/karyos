@@ -6,8 +6,8 @@
   `StreamTooLarge` (karyos#824).
 - A client's network publication above the cap is refused with CnC code
   24 and the lane's bytes in the detail; a C client reads them in
-  `detail.value`.
+  `detail.value` (karyos#824).
 - `stream_lane_bytes` is `None` for a conflation table that a stream
   refuses, and the sizing report refuses such a stream as an invalid
-  conflation configuration, with or without the cap. Without the cap the
-  report's text is unchanged.
+  conflation configuration, with or without the cap. For every stream it
+  accepts, the report's text without the cap is unchanged (karyos#824).

@@ -2508,9 +2508,47 @@ fn child_exits_with_a_reply_unread() {
     std::process::exit(0);
 }
 
+/// The #831 review, points 1 and 7: the drain of a client found gone reads
+/// a 0-byte datagram queued before its close as a datagram, not as the end
+/// of the stream, so the `Detach` behind it is still served. The client
+/// shuts its receiving side, so the reply to its `Fetch` fails with
+/// `EPIPE` (the driver finds it gone), then queues a 0-byte datagram and a
+/// `Detach`, and shuts its sending side.
+#[test]
+fn a_zero_byte_datagram_before_a_close_does_not_hide_a_detach() {
+    let dir = dir("zero-before-close");
+    let mut driver = system_driver(&dir);
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let (client, export, fd) = fetched_subscription(&mut driver, &dir);
+    drop(fd);
+    let socket = client.admission_socket().unwrap();
+    ipc::shutdown_read(socket).unwrap();
+    // A fetch of no grant: its refusal is the reply that cannot be sent.
+    let fetch = encode(&Message::Fetch { fetch: 2, key: 999 });
+    assert_eq!(ipc::send(socket, &fetch, None).unwrap(), Sent::Sent);
+    // A 0-byte datagram, which `ipc::send` refuses, through a duplicate of
+    // the socket.
+    let raw = std::os::unix::net::UnixDatagram::from(socket.try_clone_to_owned().unwrap());
+    assert_eq!(raw.send(&[]).unwrap(), 0);
+    let detach = encode(&Message::Detach { export });
+    assert_eq!(ipc::send(socket, &detach, None).unwrap(), Sent::Sent);
+    ipc::shutdown_write(socket).unwrap();
+    serve_until(&mut driver, |driver| {
+        counter(driver, "clients closed before their exit") == 1
+    });
+    assert_eq!(
+        counter(&driver, "grants detached"),
+        1,
+        "the Detach was hidden"
+    );
+    assert_eq!(counter(&driver, "admission messages dropped at exit"), 1);
+    drop(raw);
+    drop(client);
+}
+
 /// karyos#827 (QS-COORDINATOR, 2026-10-28): a live client that shuts its
 /// socket down without exiting is retired as closed, not as faulty, and
-/// its slot stays charged. With no exit proof within `fetch_deadline`, it
+/// its slot stays charged. With no exit proof within its bound (1 s), it
 /// counts as faulty, once, and its slot is still held: closing and
 /// reconnecting frees no slot. A 0-byte datagram is told apart from such a
 /// close by `POLLRDHUP`.
@@ -2548,8 +2586,9 @@ fn a_live_client_that_closes_is_faulty_after_the_fetch_deadline() {
         "faulty at the close"
     );
     assert_eq!(driver.clients(), 1, "the slot was freed at the close");
-    // Past the fetch deadline (100 ticks here) with no exit proof.
-    let _ = clock.now.fetch_add(101, Ordering::Relaxed);
+    // Past the exit proof's bound (1 s, its own since the #831 review's
+    // point 3; the fetch deadline is 100 ticks here) with no exit proof.
+    let _ = clock.now.fetch_add(1_000_000_001, Ordering::Relaxed);
     for _ in 0..3 {
         let _ = driver.do_work().unwrap();
     }

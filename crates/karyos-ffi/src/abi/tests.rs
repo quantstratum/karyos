@@ -3117,17 +3117,20 @@ fn refuses_udp(client: u64) {
     };
     assert_eq!(status, Status::UnsupportedChannel.code(), "subscription");
     let mut publication = 0;
-    // SAFETY: a live C string, a live `u64`, no detail.
+    let mut detail = Detail {
+        size: size_of_u32::<Detail>(),
+        reserved: 7,
+        code: 7,
+        value: 7,
+    };
+    // SAFETY: a live C string, a live `u64`, a live detail of its size.
     let status = unsafe {
-        karyos_client_add_publication(
-            client,
-            uri.as_ptr(),
-            9,
-            &mut publication,
-            core::ptr::null_mut(),
-        )
+        karyos_client_add_publication(client, uri.as_ptr(), 9, &mut publication, &mut detail)
     };
     assert_eq!(status, Status::UnsupportedChannel.code(), "publication");
+    // The #837 review, point 2: `code` is 0 and `value` the driver's detail
+    // of CnC code 13, here the stream id (karyos.h).
+    assert_eq!((detail.code, detail.value), (0, 9));
 }
 
 #[test]

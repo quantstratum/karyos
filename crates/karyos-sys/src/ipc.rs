@@ -848,7 +848,7 @@ pub fn readable(socket: BorrowedFd<'_>) -> Result<bool, SysError> {
 /// Whether `socket`'s peer has shut its sending side down or closed
 /// (`POLLRDHUP` or `POLLHUP`), checked without waiting: how a 0-byte read
 /// is told apart from a 0-byte datagram a live peer sent (karyos#827).
-/// A failed `poll` reads as not hung up.
+/// A failed `poll` reads as hung up.
 #[must_use]
 pub fn peer_hung_up(socket: BorrowedFd<'_>) -> bool {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -857,7 +857,10 @@ pub fn peer_hung_up(socket: BorrowedFd<'_>) -> bool {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    poll(&mut fds, Some(&zero)).is_ok_and(|ready| {
+    // A failed poll reads as hung up (the #831 review, point 2): the
+    // caller saw end of file, which is then taken as the peer's close, never
+    // as up to a budget of empty datagrams from a live peer.
+    poll(&mut fds, Some(&zero)).map_or(true, |ready| {
         ready > 0
             && fds
                 .iter()
