@@ -2,12 +2,14 @@
 
 //! Focused microbenchmarks for the keyed table, the trace sampling hook,
 //! the term byte copies of each backing, and a rate-limited send's charge
-//! with and without the published policy check.
+//! with and without the published policy check, and an application trace
+//! point's record against a driver point's.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_main};
+use karyos_protocol::journal::Stamp;
 use karyos_protocol::trace_hook::{PublicationIdentity, PublishContext, TraceHook};
 use karyos_sys::conflation::{Budget, conflation};
 use karyos_sys::frame::Lane;
@@ -19,7 +21,9 @@ use karyos_sys::sizing::{DEFAULT_MTU, TermLength};
 use karyos_sys::term::TermId;
 use karyos_sys::term_bytes::TermBytes;
 use karyos_trace::{
-    BufferedIds, MonotonicClock, ObserverId, OsRandom, Sampling, TraceAgent, trace_journal,
+    ApplicationContext, ApplicationPoint, BufferedIds, Metadata, MonotonicClock, ObservedTime,
+    ObserverId, OsRandom, Point, PublicationId, Sampling, TraceAgent, TraceIds, TraceRecord, Value,
+    trace_journal,
 };
 
 fn conflation_write_poll(c: &mut Criterion) {
@@ -346,6 +350,89 @@ fn trace_export_page(c: &mut Criterion) {
     group.finish();
 }
 
+/// An application point's record (R-CORE-1, karyos#722) against a
+/// `Publish` record: each appends one record and the collector takes it
+/// back, so the journal never fills and both pay the same take.
+fn trace_application_point(c: &mut Criterion) {
+    let observer = ObserverId {
+        driver: [1, 2],
+        journal: 1,
+    };
+    let publish = TraceRecord {
+        point: Point::Publish,
+        publication: PublicationId {
+            driver: [1, 2],
+            registration: 1,
+            stream_id: 1,
+            session_id: 1,
+            incarnation: 1,
+        },
+        lane: 0,
+        position: 0,
+        ids: TraceIds {
+            trace_id: [3, 4],
+            span_id: 5,
+            parent_span_id: 0,
+            message_id: 6,
+        },
+        observed: ObservedTime::default(),
+        subscriber: None,
+        packet: None,
+        network: None,
+        root: false,
+    };
+    let stamp = Stamp {
+        time: 0,
+        clock: 1,
+        epoch: 0,
+    };
+    let mut group = c.benchmark_group("trace record");
+    group.bench_function("publish", |b| {
+        let (mut writer, mut collector) =
+            trace_journal(64, 2, observer, 1).unwrap_or_else(|_| std::process::abort());
+        b.iter(|| {
+            black_box(writer.record(black_box(&publish), stamp).ok());
+            black_box(collector.take());
+        });
+    });
+    let context = ApplicationContext {
+        publication: publish.publication,
+        lane: publish.lane,
+        position: publish.position,
+        ids: publish.ids,
+        observed: publish.observed,
+    };
+    let point = ApplicationPoint::new(1, 7).unwrap_or_else(|_| std::process::abort());
+    for (name, values) in [
+        ("application, no metadata", &[][..]),
+        (
+            "application, four values",
+            &[
+                Value::U64(1),
+                Value::I64(-1),
+                Value::from_f64(0.5),
+                Value::Tag(*b"fill\0\0\0\0"),
+            ][..],
+        ),
+    ] {
+        group.bench_function(name, |b| {
+            let (writer, mut collector) =
+                trace_journal(64, 2, observer, 1).unwrap_or_else(|_| std::process::abort());
+            let mut writer = writer.for_client(7);
+            b.iter(|| {
+                let metadata = Metadata::new(black_box(values)).unwrap_or_default();
+                black_box(
+                    point
+                        .observe(&mut writer, black_box(&context), metadata, stamp)
+                        .ok(),
+                );
+                black_box(collector.take());
+            });
+        });
+    }
+    group.finish();
+}
+
 // criterion 0.7's `criterion_group!` generates an undocumented public
 // function, which the workspace `missing_docs` lint would reject.
 #[allow(
@@ -354,7 +441,8 @@ fn trace_export_page(c: &mut Criterion) {
 )]
 mod group {
     use super::{
-        conflation_write_poll, rate_serve, term_copies, trace_decisions, trace_export_page,
+        conflation_write_poll, rate_serve, term_copies, trace_application_point, trace_decisions,
+        trace_export_page,
     };
     criterion::criterion_group!(
         benches,
@@ -362,6 +450,7 @@ mod group {
         trace_decisions,
         term_copies,
         trace_export_page,
+        trace_application_point,
         rate_serve
     );
 }

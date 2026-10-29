@@ -44,6 +44,18 @@ pub enum TraceError {
     /// another point or in an older version.
     #[error("network path does not match the observation point")]
     NetworkPath,
+    /// An application point's id is zero.
+    #[error("an application point's id is zero")]
+    PointId,
+    /// An application observation's metadata is out of bounds: more than
+    /// four values, an unknown type, a tag that is not graphic ASCII
+    /// zero-padded, a value past the count, or a reserved bit set.
+    #[error("application point metadata is invalid")]
+    Metadata,
+    /// An application point recorded into a journal of another client than
+    /// the one that registered it; nothing was appended.
+    #[error("the trace point belongs to another client than the journal")]
+    ForeignPoint,
     /// The `root` flag is set on a point other than `Publish`.
     #[error("the root flag is set on a point other than Publish")]
     Root,
