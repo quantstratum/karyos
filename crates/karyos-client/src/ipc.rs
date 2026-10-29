@@ -809,7 +809,8 @@ impl RemoteClient {
     /// which detaches its export, and this ends the publication or
     /// subscription itself, as a release of the taken handle would.
     /// Whether the removal was submitted.
-    pub(crate) fn remove_abandoned(&mut self, fetchable: &crate::conductor::Fetchable) -> bool {
+    #[doc(hidden)]
+    pub fn remove_abandoned(&mut self, fetchable: &crate::conductor::Fetchable) -> bool {
         let registration = fetchable.registration;
         let Ok(conductor) = self.conductor_mut() else {
             return false;

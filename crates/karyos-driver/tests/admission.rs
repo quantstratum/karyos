@@ -1109,6 +1109,84 @@ fn a_leave_with_an_abandoned_fetch_is_not_a_fault() {
     drop(client);
 }
 
+/// karyos#851 (QS-COORDINATOR, team bus message 35171): when the take of
+/// a late grant times out and the client removes the registration, the
+/// driver ends the grant once the client drains the abandoned fetch's
+/// reply and detaches its export: nothing stays held. The take times out
+/// because the driver serves nothing while it waits.
+#[test]
+fn an_abandoned_take_ends_its_grant_once_drained() {
+    let dir = dir("abandoned-take");
+    let mut driver = system_driver(&dir);
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let mut client = std::thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            karyos_client::ipc::attach_with(
+                &dir,
+                Duration::from_secs(5),
+                Duration::from_millis(20),
+                16,
+            )
+        });
+        while !handle.is_finished() {
+            let _ = driver.do_work().unwrap();
+            std::thread::yield_now();
+        }
+        handle.join().unwrap()
+    })
+    .unwrap();
+    let _ = client
+        .add_subscription(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            SubscriberRole::Required,
+        )
+        .unwrap();
+    let mut fetchable = None;
+    let start = Instant::now();
+    while fetchable.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no grant");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| {
+            if let Outcome::Fetchable(grant) = completion.outcome {
+                fetchable = Some(grant);
+            }
+        });
+    }
+    let fetchable = fetchable.unwrap();
+    // The driver serves nothing: the take's fetch times out, abandoned.
+    assert!(matches!(
+        client.take_subscription(&fetchable),
+        Err(AttachError::Timeout)
+    ));
+    assert!(client.remove_abandoned(&fetchable));
+    let ended = counter(&driver, "grants ended");
+    // The driver serves the fetch (its regions sent) and the removal: the
+    // grant was sent, so it is held until its Detach.
+    for _ in 0..64 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(
+        counter(&driver, "grants ended"),
+        ended,
+        "ended before its Detach"
+    );
+    // The client's next poll drains the reply and detaches the export.
+    let start = Instant::now();
+    while counter(&driver, "grants ended") == ended {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the grant stayed held"
+        );
+        client.drain_abandoned();
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(counter(&driver, "grants detached"), 1);
+    drop(client);
+}
+
 /// Serves the driver while `client` runs on another thread; returns its
 /// result once it finished.
 fn serve_while<R: Send>(driver: &mut IpcDriver, client: impl FnOnce() -> R + Send) -> R {
