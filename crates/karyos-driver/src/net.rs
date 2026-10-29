@@ -421,6 +421,9 @@ struct NetSubscription {
     /// The endpoint joined to the data group's NAK control group, if the
     /// table names one and its join succeeded (RC-15).
     control: Option<EndpointId>,
+    /// The driver's unicast control endpoint of the key's family, held by
+    /// a multicast key: its SOLICITs leave from there (plan 164).
+    solicit: Option<EndpointId>,
     /// The receiver identity every handle of this key shares (MC-1).
     identity: Option<crate::membership::ReceiverIdentity>,
     /// The conflated lane and the view's table configuration every handle
@@ -720,6 +723,8 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// Control group joins that failed: those keys run without peer
     /// suppression input (RC-15).
     control_join_failures: u64,
+    /// Unicast control endpoints that could not open (plan 164).
+    solicit_endpoint_failures: u64,
     /// Whether the backend isolates redundant path sockets.
     paths_isolated: bool,
     /// Channels with `paths` refused because they cannot be isolated.
@@ -829,6 +834,7 @@ impl<T: StreamTerms> Network<T> {
             guard_deregister_failures: 0,
             control_groups: config.nak_control_groups,
             control_join_failures: 0,
+            solicit_endpoint_failures: 0,
             paths_isolated: <OsSocket as karyos_io::sockets::ops::SocketOps>::isolates_paths(),
             paths_refused: 0,
             path_failures: 0,
@@ -1005,6 +1011,11 @@ impl<T: StreamTerms> Network<T> {
             (true, Some(config)) => self.hold_control_group(bind, config),
             _ => None,
         };
+        // A multicast key sends its SOLICITs from the driver's unicast
+        // control endpoint of its family (network-control-schemas.md §6.3,
+        // plan 164): one per driver and family, held by every multicast key
+        // and closed with the last.
+        let solicit = multicast.and_then(|_| self.hold_solicit_endpoint(bind));
         let posted = self
             .links
             .receiver
@@ -1018,11 +1029,15 @@ impl<T: StreamTerms> Network<T> {
                 control_group: control,
                 identity,
                 conflated: conflated.map(|(lane, _)| lane),
+                solicit_from: solicit,
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
             if let Some((control, _)) = control {
                 release(&mut self.send_endpoints, control);
+            }
+            if let Some(solicit) = solicit {
+                release(&mut self.send_endpoints, solicit);
             }
             return Err(DriverError::NetworkBusy);
         }
@@ -1067,6 +1082,7 @@ impl<T: StreamTerms> Network<T> {
                     control_group: None,
                     identity,
                     conflated: conflated.map(|(lane, _)| lane),
+                    solicit_from: solicit,
                 });
             if posted.is_err() {
                 release(&mut self.send_endpoints, path);
@@ -1080,6 +1096,7 @@ impl<T: StreamTerms> Network<T> {
             stream_id,
             reliable,
             control: control.map(|(control, _)| control),
+            solicit,
             identity,
             conflated,
             later: held,
@@ -1168,6 +1185,49 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// The driver's unicast control endpoint of `bind`'s address family,
+    /// bound to the unspecified address on an ephemeral port: opened on
+    /// first use, one more key holds it (plan 164). `None` when it cannot
+    /// open (counted): the key's SOLICITs then leave from its own endpoint.
+    fn hold_solicit_endpoint(&mut self, bind: SocketAddr) -> Option<EndpointId> {
+        let any = match bind {
+            SocketAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            SocketAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        };
+        match self.hold_endpoint(SocketAddr::new(any, 0), None) {
+            Ok(endpoint) => Some(endpoint),
+            Err(_) => {
+                if let Some(count) = self.solicit_endpoint_failures.checked_add(1) {
+                    self.solicit_endpoint_failures = count;
+                }
+                None
+            }
+        }
+    }
+
+    /// The driver's unicast control endpoints that send SOLICITs (plan
+    /// 164), with their bound addresses: port and family. Empty with no
+    /// multicast subscription.
+    pub(crate) fn solicit_endpoints(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        let mut held: [Option<EndpointId>; 2] = [None; 2];
+        for entry in &self.subscriptions {
+            if let Some(solicit) = entry.solicit
+                && !held.contains(&Some(solicit))
+                && let Some(slot) = held.iter_mut().find(|slot| slot.is_none())
+            {
+                *slot = Some(solicit);
+            }
+        }
+        held.into_iter()
+            .flatten()
+            .filter_map(|endpoint| self.endpoints.local_address(endpoint))
+    }
+
+    /// Unicast control endpoints that could not open (plan 164).
+    pub(crate) fn solicit_endpoint_failures(&self) -> u64 {
+        self.solicit_endpoint_failures
+    }
+
     /// Stops `subscription`: its images retire and its endpoints, every
     /// path's, are released (control path). `false` when it is unknown.
     ///
@@ -1227,6 +1287,9 @@ impl<T: StreamTerms> Network<T> {
                 let entry = self.subscriptions.swap_remove(index);
                 if let Some(control) = entry.control {
                     release(&mut self.send_endpoints, control);
+                }
+                if let Some(solicit) = entry.solicit {
+                    release(&mut self.send_endpoints, solicit);
                 }
                 for path in entry.later.into_iter().flatten() {
                     release(&mut self.send_endpoints, path);
