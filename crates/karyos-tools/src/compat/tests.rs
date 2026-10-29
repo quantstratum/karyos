@@ -330,3 +330,75 @@ fn the_subcommand_exits_by_outcome() {
     );
     assert!(String::from_utf8_lossy(&err).contains("no column"));
 }
+
+mod properties {
+    use proptest::prelude::*;
+
+    use super::super::{Json, MAX_DEPTH, escape, parse};
+
+    /// A JSON value within the reader's depth, its object keys unique.
+    fn value() -> impl Strategy<Value = Json> {
+        let leaf = prop_oneof![
+            Just(Json::Null),
+            any::<bool>().prop_map(Json::Bool),
+            any::<u64>().prop_map(Json::Integer),
+            any::<String>().prop_map(Json::String),
+        ];
+        // One level for the outer object, the rest below it.
+        leaf.prop_recursive(u32::try_from(MAX_DEPTH - 1).unwrap(), 64, 6, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..6).prop_map(Json::Array),
+                prop::collection::btree_map(any::<String>(), inner, 0..6)
+                    .prop_map(|fields| Json::Object(fields.into_iter().collect())),
+            ]
+        })
+    }
+
+    /// `json` as text, written independently of the reader.
+    fn text(json: &Json) -> String {
+        match json {
+            Json::Null => "null".to_owned(),
+            Json::Bool(value) => value.to_string(),
+            Json::Integer(value) => value.to_string(),
+            Json::String(value) => format!("\"{}\"", escape(value)),
+            Json::Array(items) => {
+                format!("[{}]", items.iter().map(text).collect::<Vec<_>>().join(","))
+            }
+            Json::Object(fields) => format!(
+                "{{{}}}",
+                fields
+                    .iter()
+                    .map(|(key, value)| format!("\"{}\":{}", escape(key), text(value)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        }
+    }
+
+    proptest! {
+        /// Any bounded text, read as untrusted input, is a value or a
+        /// typed error, never a panic.
+        #[test]
+        fn arbitrary_text_never_panics(input in "\\PC{0,4096}") {
+            let _ = parse(&input);
+        }
+
+        /// Text made of JSON's own characters, which reaches deeper into
+        /// the reader than arbitrary text does, never panics either.
+        #[test]
+        fn json_like_text_never_panics(input in r#"[\[\]{}",:0-9a-z\\ .eE+-]{0,2048}"#) {
+            let _ = parse(&input);
+        }
+
+        /// A generated object within the bounds reads back as itself.
+        #[test]
+        fn a_generated_object_round_trips(
+            fields in prop::collection::btree_map(any::<String>(), value(), 0..6)
+        ) {
+            let json = Json::Object(fields.into_iter().collect());
+            let written = text(&json);
+            prop_assume!(written.len() <= super::super::MAX_BYTES);
+            prop_assert_eq!(parse(&written), Ok(json));
+        }
+    }
+}

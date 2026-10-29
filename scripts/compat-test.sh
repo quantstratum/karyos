@@ -123,16 +123,34 @@ check() { # <surface> <from side> <to side> <observed outcome> <detail>
     printf '%-10s %-14s -> %-14s %-12s %s  [%s]\n' "$1" "$(name "$2")" "$(name "$3")" "$4" "$verdict" "$5"
 }
 
+# What an attach line observed: only the typed version refusal is a
+# refusal; any other failure (I/O, a timeout, no driver) is a misbehaviour,
+# which no matrix entry expects.
+attach_outcome() { # <probe line>
+    case "$1" in
+        "attach ok") echo interoperate ;;
+        "attach incompatible "*) echo refuse ;;
+        *) echo misbehave ;;
+    esac
+}
+
+# The classification itself, against a directory with no driver: it must
+# not pass for a refusal.
+line="$(probe new attach /tmp/no-driver-here)"
+if [ "$(attach_outcome "$line")" = misbehave ]; then
+    printf '%-10s %-31s %-12s %s  [%s]\n' admission "no driver (negative check)" misbehave ok "$line"
+else
+    printf '%-10s %-31s %-12s %s  [%s]\n' admission "no driver (negative check)" \
+        "$(attach_outcome "$line")" "MISMATCH (expected misbehave)" "$line"
+    failures=$((failures + 1))
+fi
+
 # Admission: a client of one build attaching to the other's driver.
 for pair in "new old" "old new"; do
     read -r a b <<<"$pair"
     set -- "$a" "$b"
     line="$(probe "$1" attach "/tmp/d-$2")"
-    case "$line" in
-        "attach ok") check admission "$1" "$2" interoperate "$line" ;;
-        "attach refused"*) check admission "$1" "$2" refuse "$line" ;;
-        *) check admission "$1" "$2" unknown "$line" ;;
-    esac
+    check admission "$1" "$2" "$(attach_outcome "$line")" "$line"
 done
 
 # Frame: a publication on one build's driver, a subscription on the

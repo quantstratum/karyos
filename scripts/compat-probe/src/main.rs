@@ -6,7 +6,11 @@
 //! another. It prints one line, `<mode> <outcome> <detail>`, and exits 0;
 //! the script compares the outcome with the matrix.
 //!
-//! - `attach <dir>`: `ok`, or `refused <error>`.
+//! - `attach <dir>`: `ok`; `incompatible <error>` for the typed version
+//!   refusal (`AttachError::IncompatibleVersion`) and nothing else; or
+//!   `error <error>` for any other failure (an I/O error, a timeout, a
+//!   missing directory), which the script counts as a failure, never as a
+//!   refusal.
 //! - `pub <dir> <port> <count> <seconds>`: offers `count` messages of
 //!   8 bytes (the index, little endian) on `karyos:udp`, then stays
 //!   `seconds` so the receiver can read them.
@@ -29,6 +33,18 @@ fn context(dir: &str) -> Context {
         .unwrap()
 }
 
+/// The probe's word for a failed connect: `incompatible` only for the
+/// typed version refusal, matched on its debug form so that one source
+/// builds against either release's facade.
+fn failure(error: &impl std::fmt::Debug) -> String {
+    let text = format!("{error:?}");
+    if text.starts_with("Attach(IncompatibleVersion") {
+        format!("incompatible {text}")
+    } else {
+        format!("error {text}")
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let arg = |at: usize| args.get(at).map(String::as_str).unwrap_or_default();
@@ -36,12 +52,12 @@ fn main() {
     match arg(0) {
         "attach" => match Client::connect(context(arg(1))) {
             Ok(_) => println!("attach ok"),
-            Err(error) => println!("attach refused {error:?}"),
+            Err(error) => println!("attach {}", failure(&error)),
         },
         "pub" => {
             let mut client = match Client::connect(context(arg(1))) {
                 Ok(client) => client,
-                Err(error) => return println!("pub refused {error:?}"),
+                Err(error) => return println!("pub {}", failure(&error)),
             };
             let uri = format!("karyos:udp?endpoint=127.0.0.1:{}|interface=127.0.0.1", arg(2));
             let mut publication = client
@@ -67,7 +83,7 @@ fn main() {
         "sub" => {
             let mut client = match Client::connect(context(arg(1))) {
                 Ok(client) => client,
-                Err(error) => return println!("sub refused {error:?}"),
+                Err(error) => return println!("sub {}", failure(&error)),
             };
             let uri = format!("karyos:udp?endpoint=127.0.0.1:{}", arg(2));
             let mut reading = client

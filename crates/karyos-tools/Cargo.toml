@@ -30,6 +30,8 @@ toml.workspace = true
 
 [dev-dependencies]
 karyos-agent.workspace = true
+# The compat JSON reader's properties (ADR-0062; ADR-0033, dev only).
+proptest.workspace = true
 
 [features]
 # Test-kit binaries (`karyos-admission-stub`), never in the product build.

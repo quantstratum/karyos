@@ -411,6 +411,7 @@ dependencies = [
  "karyos-sim",
  "karyos-sys",
  "karyos-trace",
+ "proptest",
  "serde",
  "signal-hook",
  "toml",
