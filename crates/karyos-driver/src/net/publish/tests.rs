@@ -260,7 +260,7 @@ fn a_network_publication_refuses_a_cutover() {
 }
 
 /// karyos#859: a publication its endpoint could never open is refused at
-/// the add, never accepted and silent. One endpoint's 256 TX slots hold the
+/// the add, never accepted and silent. An endpoint of 256 TX slots holds the
 /// control reserve (8 routes of 4 slots) and 24 reliable single-lane
 /// publications of 9 slots each (a lane queue of 8 and a repair queue of
 /// 1): the 25th is refused with the limit, the capacity and what it would
@@ -271,7 +271,20 @@ fn a_network_publication_refuses_a_cutover() {
 fn a_publication_its_endpoint_cannot_hold_is_refused() {
     use crate::error::EndpointLimit;
 
-    let mut driver = driver();
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.endpoint_tables = crate::net::EndpointTables {
+        tx_slots: std::num::NonZeroU16::new(256).unwrap(),
+        max_queues: std::num::NonZeroU16::new(64).unwrap(),
+        max_routes: std::num::NonZeroU16::new(64).unwrap(),
+    };
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap();
     let socket = receiver();
     let destination = Destination::Unicast(socket.local_addr().unwrap());
     let mut held = Vec::new();
