@@ -4890,6 +4890,7 @@ impl<T: StreamTerms> SenderRole<T> {
                         alias,
                         registration,
                         destination,
+                        add,
                         outcome,
                     },
                 ));

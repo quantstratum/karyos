@@ -862,6 +862,9 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         registration: u64,
         /// The destination.
         destination: std::net::SocketAddr,
+        /// Whether it was an addition (karyos#859: an answer is matched to
+        /// its change by both).
+        add: bool,
         /// What became of it.
         outcome: data::DestinationChange,
     },

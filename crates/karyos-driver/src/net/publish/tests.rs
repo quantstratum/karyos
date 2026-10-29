@@ -403,6 +403,59 @@ fn a_destination_its_endpoint_cannot_hold_is_refused() {
     ));
 }
 
+/// karyos#859: an answer is matched to its change by destination and
+/// kind. A removal of an absent destination and an addition of it, posted
+/// back to back, answer `Absent` and `Added`: the `Absent` gives back
+/// nothing, so the added destination keeps its room and a publication
+/// that would pass the endpoint's 256 slots is still refused.
+#[test]
+fn an_absent_removal_keeps_the_room_of_an_addition_of_the_same_destination() {
+    use crate::agents::data::DestinationChange;
+
+    let mut driver = driver();
+    let sockets = [receiver(), receiver()];
+    let destination = Destination::Unicast(sockets[0].local_addr().unwrap());
+    for stream in 0..22 {
+        let _ = driver
+            .add_network_publication(aggregate(100 + stream, 1), &channel(destination.clone()))
+            .unwrap();
+    }
+    let fanout = driver
+        .add_network_publication(
+            aggregate(300, 1),
+            &channel(Destination::MultiDestination {
+                destinations: vec![sockets[0].local_addr().unwrap()],
+                control: None,
+                mode: karyos_protocol::channel::ControlMode::Manual,
+            }),
+        )
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&fanout) == Some(NetworkPublicationState::Active)
+    });
+    let added = sockets[1].local_addr().unwrap();
+    driver.remove_network_destination(&fanout, added).unwrap();
+    driver.add_network_destination(&fanout, added).unwrap();
+    let mut answers = Vec::new();
+    until(&mut driver, |driver| {
+        answers.extend(driver.take_network_destination_changes(&fanout));
+        answers.len() == 2
+    });
+    assert_eq!(
+        answers,
+        [
+            (added, DestinationChange::Absent),
+            (added, DestinationChange::Added)
+        ]
+    );
+    // 32 + 22 * 9 + 2 * 9 = 248 of 256 slots: one more publication of 9
+    // does not fit.
+    assert!(matches!(
+        driver.add_network_publication(aggregate(200, 1), &channel(destination)),
+        Err(DriverError::EndpointCapacity { .. })
+    ));
+}
+
 /// The network publications and stale aliases held at once are bounded by
 /// `AgentConfig::publications`: a publication beyond it is refused, and
 /// removals never overflow the stale-alias queue.

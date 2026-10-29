@@ -3146,6 +3146,7 @@ fn publication_answer<T: StreamTerms>(
             alias,
             registration,
             destination,
+            add,
             outcome,
         } => {
             if let Some(entry) = find(publications, endpoint, alias, registration)
@@ -3156,7 +3157,7 @@ fn publication_answer<T: StreamTerms>(
                 if let Some(at) = entry
                     .adds_pending
                     .iter()
-                    .position(|pending| *pending == destination)
+                    .position(|pending| add && *pending == destination)
                 {
                     let _ = entry.adds_pending.swap_remove(at);
                     if outcome != crate::agents::data::DestinationChange::Added
