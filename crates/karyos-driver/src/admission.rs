@@ -220,6 +220,9 @@ struct Retiring<T: StreamTerms> {
 enum Step {
     Keep,
     Leave,
+    /// A leave with a fetch outstanding: clean, but what was exported
+    /// stays charged until the exit proof (karyos#851).
+    LeaveCharged,
     Retire,
     /// Its socket closed (end of file, `EPIPE` or `ECONNRESET`), or a
     /// `Fetch` came after its exit: it is drained as exited (karyos#827).
@@ -654,6 +657,17 @@ impl<T: StreamTerms> Admission<T> {
                     remote.link.mark_closed();
                     work.add(1);
                 }
+                Step::LeaveCharged => {
+                    let remote = self.remotes.swap_remove(index);
+                    Self::fail_open(driver, &remote);
+                    driver.retire_leaving_client(remote.client);
+                    self.retiring.push(Retiring {
+                        pidfd: remote.pidfd,
+                        link: remote.link,
+                        closed_since: None,
+                    });
+                    work.add(1);
+                }
                 Step::Retire => {
                     let remote = self.remotes.swap_remove(index);
                     Self::fail_open(driver, &remote);
@@ -1021,6 +1035,13 @@ impl<T: StreamTerms> Admission<T> {
                     {
                         Step::Leave
                     }
+                    // A Leave with a fetch outstanding (one the client
+                    // abandoned, or exports it has not detached) is a clean
+                    // leave, never a fault (QS-COORDINATOR, karyos#851):
+                    // the client stops being served, but what was exported
+                    // stays charged until its exit proof, as it may still
+                    // be mapped.
+                    Some(Message::Leave) => Step::LeaveCharged,
                     // Never served once the client's exit is proven: it
                     // would send a region to a dead client (karyos#827).
                     Some(Message::Fetch { .. }) if remote.pidfd.exited().unwrap_or(false) => {
