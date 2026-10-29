@@ -17,6 +17,10 @@ use karyos_tools::trace::{EXIT_ATTACH, EXIT_USAGE, run};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
 fn main() -> ExitCode {
+    // R-CORE-33: `--versions` before anything else, touching no driver.
+    if let Some(code) = karyos_tools::versions::intercept(std::env::args_os().skip(1)) {
+        return code;
+    }
     let options = match args::parse(std::env::args_os().skip(1)) {
         Ok(Command::Run(options)) => options,
         Ok(Command::Help) => {

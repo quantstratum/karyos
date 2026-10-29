@@ -38,6 +38,7 @@ pub mod roles;
 pub mod sizing;
 pub mod term;
 pub mod trace_hook;
+pub mod versions;
 
 pub use error::{LayoutError, ProtocolError};
 

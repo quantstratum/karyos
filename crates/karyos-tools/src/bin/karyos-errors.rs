@@ -19,6 +19,10 @@ use karyos_tools::errors;
 const EXIT_ERROR: u8 = 2;
 
 fn main() -> ExitCode {
+    // R-CORE-33: `--versions` before anything else, touching no driver.
+    if let Some(code) = karyos_tools::versions::intercept(std::env::args_os().skip(1)) {
+        return code;
+    }
     match args::parse_tool(std::env::args_os().skip(1), errors::FOLLOW) {
         Ok(Some(options)) => run(&options),
         Ok(None) => {

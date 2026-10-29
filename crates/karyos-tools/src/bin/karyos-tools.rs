@@ -27,6 +27,10 @@ Usage: karyos-tools replay diff ...   (see karyos-tools replay diff --help)
 const DIFF: &str = "karyos-tools replay diff";
 
 fn main() -> ExitCode {
+    // R-CORE-33: `--versions` before anything else, touching no driver.
+    if let Some(code) = karyos_tools::versions::intercept(std::env::args_os().skip(1)) {
+        return code;
+    }
     let mut args = std::env::args_os().skip(1);
     let (command, sub) = (args.next(), args.next());
     match (text(command.as_ref()), text(sub.as_ref())) {
