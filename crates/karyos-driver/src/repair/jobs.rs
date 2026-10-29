@@ -51,6 +51,9 @@ pub enum Domain {
         /// Its membership generation.
         generation: u64,
     },
+    /// No requester: a sender-initiated catch-up of one destination after
+    /// its endpoint reset (MD-20, karyos#802). It answers no ERR.
+    CatchUp,
 }
 
 /// A job's coalescing key.
@@ -339,6 +342,61 @@ impl Jobs {
         let generation = slot.generation;
         // At its end the order stays: later jobs tie, served by slot, and
         // the sticky flag shows it.
+        match order.checked_add(1) {
+            Some(next) => self.next_order = next,
+            None => self.counts.overflowed = true,
+        }
+        self.counts.bump(|c| &mut c.created);
+        Joined::Created(job_ref(at, generation))
+    }
+
+    /// A sender-initiated catch-up job over `length` bytes of `lane` from
+    /// `start` (MD-20, karyos#802): no admission, no requester and no ERR,
+    /// in a free slot of the table like any job, so it counts against the
+    /// destination's share. An identical pending catch-up is joined.
+    pub fn create_catch_up(&mut self, lane: u8, start: u64, length: u32) -> Joined {
+        let key = JobKey {
+            lane,
+            start,
+            length,
+            domain: Domain::CatchUp,
+        };
+        if let Some((at, slot)) = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.job.is_some_and(|job| job.key == key))
+        {
+            return Joined::Joined(job_ref(at, slot.generation));
+        }
+        let free = self.slots.iter_mut().enumerate().find_map(|(at, slot)| {
+            if slot.retired || slot.job.is_some() {
+                return None;
+            }
+            match slot.generation.checked_add(1) {
+                Some(next) => {
+                    slot.generation = next;
+                    Some((at, slot))
+                }
+                None => {
+                    slot.retired = true;
+                    None
+                }
+            }
+        });
+        let Some((at, slot)) = free else {
+            self.counts.bump(|c| &mut c.full);
+            return Joined::Full;
+        };
+        let order = self.next_order;
+        slot.requesters.clear();
+        slot.routes.clear();
+        slot.job = Some(Job {
+            key,
+            cursor: key.start,
+            order,
+        });
+        let generation = slot.generation;
         match order.checked_add(1) {
             Some(next) => self.next_order = next,
             None => self.counts.overflowed = true,
