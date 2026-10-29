@@ -1222,6 +1222,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             return false;
         };
         let mut open = false;
+        let mut limit = None;
         // The routes that can send, as this pass starts: opened and not
         // waiting for a reset.
         let mut live = [false; MAX_ROUTES];
@@ -1258,6 +1259,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     if error == karyos_io::backend::RouteError::RouteLimit {
                         self.counters.bump(|c| &mut c.endpoint_limits, 1);
                         super::note_limited(&mut self.limited, slot.endpoint, epoch);
+                        limit = Some((epoch, crate::error::EndpointLimit::Routes));
                     }
                     continue;
                 }
@@ -1280,6 +1282,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                         if super::fanout::queue_limit(error) {
                             self.counters.bump(|c| &mut c.endpoint_limits, 1);
                             super::note_limited(&mut self.limited, slot.endpoint, epoch);
+                            limit = Some((epoch, super::endpoint_limit(error)));
                         }
                         for queue in slot.queues.iter().take(lane) {
                             let _ = tx.close_queue(*queue, &mut self.report);
@@ -1361,6 +1364,22 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             slot.needs_reset = false;
             slot.reset_requested = None;
             open = true;
+        }
+        // A route with a half left unopened this pass: its limit holds.
+        let unopened = self.routed.as_deref().is_some_and(|routed| {
+            routed.routes.iter().any(|slot| {
+                halves.iter().any(|(held, half)| match half {
+                    Half::Tx(tx) => {
+                        *held == slot.endpoint && slot.opened != Some(tx.capabilities().epoch)
+                    }
+                    Half::Rx(_) => false,
+                })
+            })
+        });
+        if let Some((epoch, limit)) = limit {
+            self.note_limit(epoch, limit);
+        } else if open && !unopened {
+            self.note_opened();
         }
         open
     }

@@ -416,6 +416,12 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     open_tried: Option<(BackendEpoch, u64)>,
     /// The spacing of its failed opens (`setup_interval`).
     open_spacing: u64,
+    /// The endpoint limit that refused its open in this epoch, once
+    /// reported (karyos#859): reported once per epoch, cleared at the open.
+    limit_state: Option<(BackendEpoch, crate::error::EndpointLimit)>,
+    /// A change of `limit_state` not yet posted: `Some(Some(limit))` a limit,
+    /// `Some(None)` its open.
+    limit_unreported: Option<Option<crate::error::EndpointLimit>>,
     /// Its removal linger, once removing (driver-network-agents.md §7).
     removal: Option<Box<removal::Removal>>,
     /// A timed publication's schedule ([`Outbound::set_timed`]).
@@ -640,6 +646,8 @@ impl<T: StreamTerms> Outbound<T> {
             idle_since: [None; 4],
             open_tried: None,
             open_spacing: 0,
+            limit_state: None,
+            limit_unreported: None,
             removal: None,
             timed: None,
             cells: None,
@@ -1230,6 +1238,7 @@ impl<T: StreamTerms> Outbound<T> {
                 if error == karyos_io::backend::RouteError::RouteLimit {
                     self.counters.bump(|c| &mut c.endpoint_limits, 1);
                     note_limited(&mut self.limited, self.endpoint, epoch);
+                    self.note_limit(epoch, crate::error::EndpointLimit::Routes);
                 }
                 return false;
             }
@@ -1249,6 +1258,7 @@ impl<T: StreamTerms> Outbound<T> {
                     if fanout::queue_limit(error) {
                         self.counters.bump(|c| &mut c.endpoint_limits, 1);
                         note_limited(&mut self.limited, self.endpoint, epoch);
+                        self.note_limit(epoch, endpoint_limit(error));
                     }
                     self.counters.bump(|c| &mut c.queue_failures, 1);
                     for queue in self.queues.iter().take(lane) {
@@ -1356,6 +1366,7 @@ impl<T: StreamTerms> Outbound<T> {
             }
         }
         self.opened = Some(epoch);
+        self.note_opened();
         self.route = Some(route);
         self.needs_reset = false;
         self.reset_requested = None;
@@ -1812,6 +1823,34 @@ impl<T: StreamTerms> Outbound<T> {
     /// limit since the last call, which clears them.
     pub(crate) fn take_limited(&mut self) -> Limited {
         std::mem::take(&mut self.limited)
+    }
+
+    /// Its open was refused for `limit` in `epoch`: reported once per epoch
+    /// (karyos#859).
+    pub(super) fn note_limit(&mut self, epoch: BackendEpoch, limit: crate::error::EndpointLimit) {
+        if self.limit_state.is_some_and(|(held, _)| held == epoch) {
+            return;
+        }
+        self.limit_state = Some((epoch, limit));
+        self.limit_unreported = Some(Some(limit));
+    }
+
+    /// It opened: a reported limit ends, and that is reported.
+    pub(super) fn note_opened(&mut self) {
+        if self.limit_state.take().is_some() {
+            self.limit_unreported = Some(None);
+        }
+    }
+
+    /// Its limit change not yet posted: `Some(Some(limit))` a limit,
+    /// `Some(None)` the open that ended it (karyos#859).
+    pub(crate) fn limit_unreported(&self) -> Option<Option<crate::error::EndpointLimit>> {
+        self.limit_unreported
+    }
+
+    /// Its limit change was posted.
+    pub(crate) fn limit_reported(&mut self) {
+        self.limit_unreported = None;
     }
 
     /// Whether the endpoint needs a reset before this publication can send
@@ -2499,6 +2538,18 @@ const _: () = assert!(
 /// The endpoints that refused a route or a queue for their limit, each
 /// with the epoch it refused in.
 pub(crate) type Limited = [Option<(EndpointId, BackendEpoch)>; MAX_ROUTES];
+
+/// The endpoint limit a queue refusal names (karyos#859).
+pub(super) const fn endpoint_limit(
+    error: karyos_io::backend::QueueError,
+) -> crate::error::EndpointLimit {
+    match error {
+        karyos_io::backend::QueueError::OverCommitted { .. } => {
+            crate::error::EndpointLimit::TxSlots
+        }
+        _ => crate::error::EndpointLimit::Queues,
+    }
+}
 
 /// Records in `limited` that `endpoint` refused a route or a queue for its
 /// limit in `epoch` (`RouteLimit`, `QueueLimit` or `OverCommitted`): on

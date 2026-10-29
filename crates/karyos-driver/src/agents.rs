@@ -981,6 +981,21 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// The agent.
         agent: AgentKind,
     },
+    /// Posted unsolicited into a free slot, and again each cycle until
+    /// posted (karyos#859): a publication's open was refused for an endpoint
+    /// limit (`limit`, once per epoch, at the first refusal), or it opened
+    /// after one (`None`). The driver shows it as
+    /// `NetworkPublicationState::Limited` until it opens.
+    PublicationLimit {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
+        registration: u64,
+        /// The limit that refused it, or `None` once it opened.
+        limit: Option<crate::error::EndpointLimit>,
+    },
     /// An agent asks for an endpoint reset: on the sender, a publication on
     /// `endpoint` needs one before it can send again
     /// (`Outbound::needs_reset`), or a route or queue it refused for its
@@ -1523,6 +1538,7 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         // A schedule violation's report, likewise.
         role.report_violations(|event| events.try_post(event).is_ok());
         role.report_removals(|event| events.try_post(event).is_ok());
+        role.report_limits(|event| events.try_post(event).is_ok());
         served
             .checked_add(work)
             .ok_or(AgentError::CountOverflow(AgentKind::Sender))

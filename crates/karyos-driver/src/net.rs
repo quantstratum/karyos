@@ -281,6 +281,10 @@ pub enum NetworkPublicationState {
     Refused,
     /// Being removed: its data path has not come back yet.
     Removing,
+    /// Accepted, but its sender cannot open its routes or queues on its
+    /// endpoint: the endpoint limit that refused it (karyos#859). It sends
+    /// nothing until it opens; it is retried every `setup_interval`.
+    Limited(crate::error::EndpointLimit),
     /// Between incarnations after a guard reopen
     /// ([`EmbeddedDriver::publication`](crate::EmbeddedDriver::publication)):
     /// the old incarnation's session is being removed, or its alias waits
@@ -321,6 +325,8 @@ struct NetPublication {
     /// What it takes of each endpoint it sends on (karyos#859), held until
     /// its entry goes, when its removal has ended.
     demand: Vec<(EndpointId, TxDemand)>,
+    /// The endpoint limit its sender reported, until it opened.
+    limited: Option<EndpointLimit>,
     /// Its open sender journals to close before `RemovePublication`, in the
     /// same ring (P2.12 step 3): `(lane, journal number)`.
     trace_closes: Vec<(Lane, u64)>,
@@ -1833,6 +1839,7 @@ impl<T: StreamTerms> Network<T> {
             traced,
             lanes,
             demand,
+            limited: None,
             trace_closes: Vec::new(),
             channel: Some(channel),
             reincarnating: false,
@@ -2236,7 +2243,12 @@ impl<T: StreamTerms> Network<T> {
         self.publications
             .iter()
             .find(|entry| entry.registration == registration)
-            .map(|entry| entry.state)
+            .map(|entry| match (entry.state, entry.limited) {
+                (NetworkPublicationState::Active, Some(limit)) => {
+                    NetworkPublicationState::Limited(limit)
+                }
+                (state, _) => state,
+            })
     }
 
     /// One conductor cycle of network work at the network clock's reading:
@@ -3031,6 +3043,19 @@ fn publication_answer<T: StreamTerms>(
                     let _ = entry.destination_changes.pop_front();
                 }
                 entry.destination_changes.push_back((destination, outcome));
+            }
+        }
+        // Its sender's endpoint limit, until it opens (karyos#859).
+        AgentEvent::PublicationLimit {
+            endpoint,
+            alias,
+            registration,
+            limit,
+        } => {
+            if let Some(entry) = find(publications, endpoint, alias, registration)
+                .and_then(|index| publications.get_mut(index))
+            {
+                entry.limited = limit;
             }
         }
         // A destination its sender removed: kept with the publication, the

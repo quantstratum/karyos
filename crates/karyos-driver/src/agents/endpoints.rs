@@ -778,6 +778,7 @@ impl<O: SocketOps> Endpoints<O> {
             | AgentEvent::SenderSessionDrained { .. }
             | AgentEvent::ScheduleViolated { .. }
             | AgentEvent::DestinationRemoved { .. }
+            | AgentEvent::PublicationLimit { .. }
             | AgentEvent::DestinationChanged { .. }
             | AgentEvent::Configured { .. }
             | AgentEvent::NetworkTraceSet { .. }
