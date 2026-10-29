@@ -253,7 +253,6 @@ impl Rig {
                 control_group,
                 identity: setup.identity,
                 conflated: setup.conflated,
-                solicit_from: None,
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
@@ -372,7 +371,6 @@ impl Rig {
                     control_group: None,
                     identity: setup.identity,
                     conflated: setup.conflated,
-                    solicit_from: None,
                 })
                 .unwrap();
         }
@@ -540,7 +538,6 @@ impl Rig {
                 control_group: None,
                 identity: setup.identity,
                 conflated: setup.conflated,
-                solicit_from: None,
             })
             .unwrap();
         self.round(true);

@@ -168,7 +168,6 @@ fn add_publication(
             control_group: None,
             identity: None,
             conflated: None,
-            solicit_from: None,
         })
         .unwrap();
     let (outbound, log) = outbound(a, destination);
@@ -768,7 +767,6 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
             control_group: None,
             identity: None,
             conflated: None,
-            solicit_from: None,
         };
         assert!(matches!(
             role.command(command),
@@ -5358,59 +5356,4 @@ fn the_receiver_duty_retries_an_unanswered_solicit() {
         .unwrap();
     assert_eq!(take().len(), 1, "the second, 100 ms on");
     assert_eq!(receiver.session_counters().solicit_retries, 2);
-}
-
-/// Plan 164 (X): a subscription mapped to the driver's unicast control
-/// endpoint sends its SOLICITs, the first and the retries, from there, to
-/// the DATA's source; unmapped, from the DATA's own endpoint.
-#[test]
-fn solicits_leave_from_the_control_endpoint() {
-    const MS: u64 = 1_000_000;
-
-    let (sender, mut receiver) = super::roles(&AgentConfig::default()).unwrap();
-    let (sessions, _link) = event_ring();
-    receiver
-        .subscriptions
-        .push((EndpointId(1), 6, 1 << 20, true, true));
-    receiver
-        .solicit_from
-        .push((EndpointId(1), 6, EndpointId(9)));
-    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    let bytes = [0u8; 32];
-    let from = || {
-        let mut endpoints = Vec::new();
-        while let Ok(Some(item)) = sender.from_receiver.try_take() {
-            if let super::ControlItem::Outgoing {
-                endpoint,
-                destination,
-                control: Control::Solicit(_),
-                ..
-            } = item
-            {
-                assert_eq!(destination, source);
-                endpoints.push(endpoint);
-            }
-        }
-        endpoints
-    };
-    receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 1);
-    assert_eq!(from(), [EndpointId(9)], "the first");
-    let _ = receiver
-        .duty::<OsSocket>(&mut [], &sessions, 50 * MS + 1)
-        .unwrap();
-    assert_eq!(from(), [EndpointId(9)], "the retry");
-    // Unmapped: from the DATA's endpoint, as before.
-    receiver.solicit_from.clear();
-    receiver.inject_data(
-        &sessions,
-        EndpointId(1),
-        source,
-        Alias {
-            session_id: 51,
-            stream_id: 6,
-        },
-        &bytes,
-        60 * MS,
-    );
-    assert_eq!(from(), [EndpointId(1)]);
 }
