@@ -321,7 +321,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `conflated.close` | `conflated` | none | `conflation` |
 | `subscription.poll_to_end` | `subscription`, [`limit` (default 16)] | `delivered` (the count of every poll), `last` | |
 | `subscription.end` | `subscription` | `reason`: `"none"`, `"end_of_stream"`, `"image_retired"`, `"stream_removed"`, `"revoked"`, `"closed_by_overrun"` or `"other"`; `position`; `seal_code` | |
-| `subscription.await_image` | `subscription`, [`count` (default 1)] | none: `ok` once the subscription has reported `count` images since it was added | `image-wait` |
+| `subscription.await_image` | `subscription`, [`count` (default 1)] | none: `ok` once the subscription has reported `count` images since it was added; `events_lost` or `timeout` otherwise, in the order of `subscription.await_image` below | `image-wait` |
 | `archive.connect` | `client` | `archive` | `archive-replay` |
 | `archive.replay` | `archive`, `recording`, `target_stream_id`, [`position` (default 0), `length` (default to the recording's end), `rate`: `"full"` (default), `"as_recorded"` or `"scaled"`, `scale_ppm`] | `replay`, `session` | `archive-replay` |
 | `archive.stop_replay` | `archive`, `replay` | none | `archive-replay` |
@@ -476,7 +476,25 @@ than it waited for (a reattach, another session). It answers
 `status=timeout` when `count` is not reached within 10 s, and
 `status=events_lost` when the subscription's image change queue dropped
 changes (`karyos_subscription_image_changes_lost`), since a dropped change
-may have been an image. A failing image change call answers its status.
+may have been an image. That lost count is cumulative since the
+subscription was added, not since the op started.
+
+Each round reads the pending image changes with
+`karyos_subscription_next_image_change`, then answers the first of these
+that holds, in this order:
+
+1. that call failed: its status;
+2. `count` is reached: `ok`, even when changes were also dropped, since
+   the images it counted were reported;
+3. only now, with `count` not reached, the runner calls
+   `karyos_subscription_image_changes_lost`. If that call fails, it
+   answers its status;
+4. the lost count is above 0: `events_lost`;
+5. the deadline has passed: `timeout`.
+
+So `ok` wins over a failing lost call and over `events_lost`, which wins
+over `timeout`. A runner that reaches `count` does not call the lost
+function in that round.
 The runner waits nowhere else: it matches no URI and keys no session.
 
 Each exclusive stream's publication is added at most once in the whole
