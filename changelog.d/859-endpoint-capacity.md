@@ -19,21 +19,3 @@
 - A refused open of a publication's route or queues counts in
   `endpoint_limits` for an endpoint limit and is tried again
   `setup_interval` later, not every cycle.
-
-### Added
-
-- `NetworkConfig::endpoint_tables` (`EndpointTables`) sizes each
-  endpoint the driver opens: TX slots, queues and routes (defaults 256,
-  64, 64).
-- `NetworkPublicationState::Limited(EndpointLimit)`: accepted, but its
-  sender's open is refused for an endpoint limit; it sends nothing until
-  it opens. The sender reports it with `AgentEvent::PublicationLimit`,
-  once per epoch, and its end at the open.
-- `SocketsTx::commitment` (`TxCommitment`): what a TX half has open.
-
-### Changed
-
-- API: `NetworkPublicationState` is not `#[non_exhaustive]`, so its new
-  `Limited` variant breaks an exhaustive `match` in client code, and
-  `NetworkConfig` gains a public field, which breaks a struct literal
-  without `..NetworkConfig::default()`.
