@@ -1265,6 +1265,19 @@ pub fn driver_do_work(driver: u64) -> (i32, u32) {
     (status, work)
 }
 
+// The test kit's fault hook (`include/karyos_test_hooks.h`): only in a
+// library built with the feature `test-hooks`, never in a package.
+#[cfg(all(feature = "test-hooks", not(karyos_package)))]
+unsafe extern "C" {
+    safe fn karyos_test_panic_next_duty_cycle(driver: u64) -> i32;
+}
+
+/// `karyos_test_panic_next_duty_cycle`: the status.
+#[cfg(all(feature = "test-hooks", not(karyos_package)))]
+pub fn test_panic_next_duty_cycle(driver: u64) -> i32 {
+    karyos_test_panic_next_duty_cycle(driver)
+}
+
 /// `karyos_driver_startup_complete`: the status and what it wrote.
 pub fn driver_startup_complete(driver: u64) -> (i32, u32) {
     let mut complete = u32::MAX;

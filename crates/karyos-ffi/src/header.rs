@@ -347,6 +347,24 @@ fn the_header_declares_every_exported_function_with_its_types() {
     assert_eq!(header_functions(), rust);
 }
 
+/// The test kit's fault hook stays apart from the C ABI: `karyos.h` and
+/// `abi.rs` name no `karyos_test_` symbol, and the hook's own header
+/// declares exactly the one function `test_hooks.rs` exports, with its
+/// types.
+#[test]
+fn the_fault_hook_is_declared_apart_from_karyos_h() {
+    const HOOKS_HEADER: &str = include_str!("../include/karyos_test_hooks.h");
+    const HOOKS: &str = include_str!("test_hooks.rs");
+    assert!(!HEADER.contains("karyos_test_"));
+    assert!(!ABI.contains("karyos_test_"));
+    assert_eq!(HOOKS.matches("extern \"C\" fn ").count(), 1);
+    assert!(
+        HOOKS.contains("pub extern \"C\" fn karyos_test_panic_next_duty_cycle(driver: u64) -> i32 {")
+    );
+    assert_eq!(HOOKS_HEADER.matches("karyos_test_").count(), 1);
+    assert!(HOOKS_HEADER.contains("int32_t karyos_test_panic_next_duty_cycle(uint64_t driver);"));
+}
+
 #[test]
 fn the_header_declares_every_callback_type_with_its_parameters() {
     let rust = rust_handlers();

@@ -213,6 +213,7 @@ offers. The features are:
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
 | `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner picks for the scenario, outside the ephemeral range. As for a remote publication, the runner retries an offer of such a driver's client on a `karyos:udp` channel that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously. |
+| `fault-hook` | The test kit's fault hook, `karyos_test_panic_next_duty_cycle` (Fault hook, below): a library built for the test kit only |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
 | `image-wait` | `subscription.await_image`, a network subscription's wait for its images (Remote driver) |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
@@ -299,6 +300,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `driver.start` | `driver`, [`idle_strategy`: `"busy_spin"`, `"yield"`, `"sleep"` or `"yield_then_sleep"`, default `"yield_then_sleep"`, the ABI's declared default; `idle_sleep_ns`] | none | `embedded-driver` |
 | `driver.do_work` | `driver` | `work` | `embedded-driver` |
 | `driver.subscribe_conflated` | `driver`, `stream_id` | `conflated` | `embedded-driver`, `conflation` |
+| `driver.fault_panic` | `driver`: its next `driver.do_work` panics inside the library (Fault hook) | none | `embedded-driver`, `fault-hook` |
 | `driver.close` | `driver` | none | `embedded-driver` |
 | `client.connect` | `driver`, or `dir`: an admission directory, a string (Incompatible driver) | `client` | |
 | `client.poll` | `client` | `served` | |
@@ -551,6 +553,22 @@ stubs after the scenarios. Linux only, as the admission socket is; a
 runner elsewhere, or one without the provisioning, declares the feature
 absent.
 
+### Fault hook
+
+No call of the C ABI can make libkaryos panic, so the panic row of §13
+("panic poisons the handle and does not unwind") needs a library built
+for the test kit: karyos-ffi with its feature `test-hooks`, which
+exports `karyos_test_panic_next_duty_cycle(uint64_t driver)`, declared
+in `include/karyos_test_hooks.h` and never in `karyos.h`. It makes the
+next `karyos_driver_do_work` on that driver panic while it holds the
+driver. No release builds the feature: `make test-hooks-absent-check`,
+part of pre-push, fails when the release library exports a
+`karyos_test_` symbol or carries the hook's code. A runner offers
+`fault-hook` only when its library exports the hook, and declares it
+absent otherwise; the reference runner offers it under `--features
+test-hooks` (the Linux gate's `--all-features`) and never against a
+package.
+
 ### Bounds
 
 A runner refuses, as a failure, a scenario file over 64 KiB, a line
@@ -681,14 +699,28 @@ in scenarios:
 
 ```text
 <row name>: <scenario id> [<scenario id> ...]
-<row name>: pending <batch or reason>
+<row name>: pending issue <N> <reason>
+<row name>: outside <reason and the test that covers it>
 ```
 
 The row name is the text before the first `:`, trimmed, not empty and
-without `#`; rows are unique. After the `:` comes either one or more
-scenario ids separated by whitespace, or `pending` followed by the
-batch of ffi-gap-analysis.md (or the reason) that will cover the row.
-A row lists scenarios of either format and layer.
+without `#`; rows are unique. After the `:` comes one of:
+
+- one or more scenario ids separated by whitespace;
+- `pending issue <N>` and a reason: no scenario covers the row yet, and
+  quantstratum/karyos issue N is what closes it. A `pending` row without
+  an issue number and a reason is a failure (a `#` reference would start
+  a comment, so the number stands alone);
+- `outside` and a reason: a test of karyos-ffi covers the row for good,
+  and no portable runner can, so no scenario ever will; the reason names
+  that test.
+
+A row lists scenarios of either format and layer. A scenario's row is
+the one its `covers` header names. Its `feature` headers are a separate
+axis, what the scenario needs to run, and a check over this file
+compares rows with `covers`, never with features: three scenarios need
+`remote-driver` while the remote driver row lists two, because the
+third, `publication.timed.offer`, covers typed status codes.
 
 Scenario ids are stable: a scenario keeps its id when it changes, and
 an id once used is never given to another scenario.

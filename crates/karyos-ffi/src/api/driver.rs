@@ -601,12 +601,42 @@ pub(crate) fn create(options: &Options) -> Result<Handle, Failure> {
 /// [`Status::Internal`] for a lost one, the table's errors, and the duty
 /// cycle's.
 pub(crate) fn do_work(driver: Handle) -> Result<u32, Failure> {
-    with_slot(driver, |slot| match &mut slot.mode {
+    with_slot(driver, |slot| {
+        #[cfg(feature = "test-hooks")]
+        if PANIC_NEXT_DUTY_CYCLE
+            .compare_exchange(driver.raw(), 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            std::panic::resume_unwind(Box::new("the fault hook's panic"));
+        }
+        match &mut slot.mode {
         Mode::Invoker(driver) => driver.do_work().map_err(|error| Failure::from(&error)),
         Mode::Threaded(threaded) if threaded.shared.is_poisoned() => Err(Status::Internal.into()),
         Mode::Threaded(_) => Err(Status::Busy.into()),
         Mode::Lost => Err(Status::Internal.into()),
+        }
     })?
+}
+
+/// The driver whose next duty cycle a caller runs panics while it holds
+/// the driver, or 0 for none (`karyos_test_panic_next_duty_cycle`, the
+/// test kit's fault hook): the panic poisons the driver and its clients
+/// as any panic there does. One handle, so that no other driver's cycle
+/// takes it.
+#[cfg(feature = "test-hooks")]
+pub(crate) static PANIC_NEXT_DUTY_CYCLE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Arms the fault hook for `driver`'s next duty cycle.
+///
+/// # Errors
+///
+/// The table's errors for a handle that names no open driver.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn panic_next_duty_cycle(driver: Handle) -> Result<(), Status> {
+    drivers().with(driver, |_| ())?;
+    PANIC_NEXT_DUTY_CYCLE.store(driver.raw(), Ordering::Release);
+    Ok(())
 }
 
 /// Moves an invoker-mode driver to a thread of its own.

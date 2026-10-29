@@ -263,6 +263,17 @@ impl Adapter {
             .unwrap_or_else(|| panic!("{at}: status {code} is not in the header"))
     }
 
+    /// `driver.fault_panic` through the test kit's fault hook, which only
+    /// a library built with the feature `test-hooks` has; the reference
+    /// runner declares `fault-hook` absent without it, so no scenario gets
+    /// here then.
+    fn fault_panic(&self, driver: u64, at: &str) -> Answer {
+        #[cfg(all(feature = "test-hooks", not(karyos_package)))]
+        return self.plain(abi::test_panic_next_duty_cycle(driver), at);
+        #[cfg(not(all(feature = "test-hooks", not(karyos_package))))]
+        panic!("{at}: driver {driver:#x}: this library has no fault hook");
+    }
+
     /// The answer to a C status with no results.
     fn plain(&self, code: i32, at: &str) -> Answer {
         if code == 0 {
@@ -544,6 +555,13 @@ impl Adapter {
                 }
                 let (status, work) = abi::driver_do_work(self.objects[driver].handle);
                 self.counted(status, "work", work, at)
+            }
+            "driver.fault_panic" => {
+                let driver = args.object("driver");
+                if let Some(answer) = self.open(driver, Kind::Driver, at) {
+                    return answer;
+                }
+                self.fault_panic(self.objects[driver].handle, at)
             }
             "driver.subscribe_conflated" => {
                 let driver = args.object("driver");
