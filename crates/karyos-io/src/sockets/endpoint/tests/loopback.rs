@@ -657,21 +657,45 @@ fn multicast_loopback_on_the_default_interface() {
     let mut receiver_b = multicast_node(SocketAddr::from((group_b, port)), group_b, true).unwrap();
     let mut looped = multicast_node(any, group_a, true).unwrap();
     let mut quiet = multicast_node(any, group_a, false).unwrap();
+    let skipped = multicast_loopback(
+        &mut receiver_a,
+        &mut receiver_b,
+        &mut looped,
+        &mut quiet,
+        destination,
+    );
+    // Every node shuts down, on a skip too: a TX half dropped with an item
+    // queued discards it (karyos#880).
+    for node in [receiver_a, receiver_b, looped, quiet] {
+        node.shutdown();
+    }
+    if let Some(reason) = skipped {
+        skip(&reason);
+    }
+}
+
+/// The checks of [`multicast_loopback_on_the_default_interface`], returning
+/// why the host skips them, if it does.
+fn multicast_loopback(
+    receiver_a: &mut Node,
+    receiver_b: &mut Node,
+    looped: &mut Node,
+    quiet: &mut Node,
+    destination: SocketAddr,
+) -> Option<String> {
     let looped_queue = looped.queue_to(destination);
     let quiet_queue = quiet.queue_to(destination);
 
     let (outcome, _) = looped.send(looped_queue, &[b"to group a"]);
     if outcome.submitted != 1 {
-        skip(&format!(
+        return Some(format!(
             "multicast send on the default interface: {outcome:?}"
         ));
-        return;
     }
     let mut at_a = Recorder::default();
     receive(&mut receiver_a.rx, &mut at_a, 1);
     if at_a.datagrams.is_empty() {
-        skip("multicast loop delivered nothing on this host");
-        return;
+        return Some("multicast loop delivered nothing on this host".to_owned());
     }
     assert_eq!(at_a.datagrams.len(), 1);
     let (bytes, source) = at_a.datagrams.remove(0);
@@ -698,8 +722,5 @@ fn multicast_loopback_on_the_default_interface() {
     assert_eq!(outcome.stop, RxStop::WouldBlock);
     assert_eq!(after.datagrams.len(), 1);
     assert_eq!(after.datagrams[0].0, b"marker");
-
-    for node in [receiver_a, receiver_b, looped, quiet] {
-        node.shutdown();
-    }
+    None
 }

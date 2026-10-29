@@ -53,12 +53,13 @@ use crate::backend::{
 };
 
 /// Pending items discarded by a TX half dropped outside unwinding
-/// (decision S-19), over the process. A driver bug: debug builds assert.
+/// (decision S-19), over the process. A driver bug, counted and never a
+/// panic (karyos#880).
 static TX_DISCARDED_ON_DROP: AtomicU64 = AtomicU64::new(0);
 
 /// Pending items discarded by TX halves dropped outside unwinding, over the
 /// process: the `tx_discarded_on_drop` counter of section 7.4. Nonzero only
-/// after a driver bug; debug builds assert at the drop instead.
+/// after a driver bug.
 #[must_use]
 pub fn tx_discarded_on_drop() -> u64 {
     TX_DISCARDED_ON_DROP.load(Ordering::Relaxed)
