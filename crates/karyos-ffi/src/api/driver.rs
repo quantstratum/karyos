@@ -601,12 +601,106 @@ pub(crate) fn create(options: &Options) -> Result<Handle, Failure> {
 /// [`Status::Internal`] for a lost one, the table's errors, and the duty
 /// cycle's.
 pub(crate) fn do_work(driver: Handle) -> Result<u32, Failure> {
-    with_slot(driver, |slot| match &mut slot.mode {
-        Mode::Invoker(driver) => driver.do_work().map_err(|error| Failure::from(&error)),
-        Mode::Threaded(threaded) if threaded.shared.is_poisoned() => Err(Status::Internal.into()),
-        Mode::Threaded(_) => Err(Status::Busy.into()),
-        Mode::Lost => Err(Status::Internal.into()),
+    with_slot(driver, |slot| {
+        #[cfg(feature = "test-hooks")]
+        if take_fault(driver.raw()) {
+            std::panic::resume_unwind(Box::new("the fault hook's panic"));
+        }
+        match &mut slot.mode {
+            Mode::Invoker(driver) => driver.do_work().map_err(|error| Failure::from(&error)),
+            Mode::Threaded(threaded) if threaded.shared.is_poisoned() => {
+                Err(Status::Internal.into())
+            }
+            Mode::Threaded(_) => Err(Status::Busy.into()),
+            Mode::Lost => Err(Status::Internal.into()),
+        }
     })?
+}
+
+/// Drivers armed by the test kit's fault hook at most at once.
+#[cfg(feature = "test-hooks")]
+pub(crate) const MAX_ARMED: usize = 16;
+
+/// The drivers whose next duty cycle panics while it holds the driver, its
+/// caller's or its thread's, one handle per slot, 0 for a free one
+/// (`karyos_test_panic_next_duty_cycle`, the test kit's fault hook): the
+/// panic poisons the driver and its clients as any panic there does. A
+/// slot per driver, so that arming one never cancels another's fault
+/// (karyos#883 review).
+#[cfg(feature = "test-hooks")]
+static ARMED: [std::sync::atomic::AtomicU64; MAX_ARMED] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_ARMED];
+
+/// Arms `driver`'s fault: already armed, it stays so once. Two arms of
+/// one driver at the same instant, on two threads, may take two slots: the
+/// check and the claim are not one step. Its first cycle takes one fault
+/// and its close frees every slot it holds; harmless in the test kit,
+/// which arms from one thread.
+///
+/// # Errors
+///
+/// [`Status::ResourcesUnavailable`] when [`MAX_ARMED`] other drivers are
+/// armed.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn arm_fault(driver: u64) -> Result<(), Status> {
+    if ARMED
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) == driver)
+    {
+        return Ok(());
+    }
+    ARMED
+        .iter()
+        .any(|slot| {
+            slot.compare_exchange(0, driver, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+        .then_some(())
+        .ok_or(Status::ResourcesUnavailable)
+}
+
+/// Takes `driver`'s fault if it is armed: whether it was.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn take_fault(driver: u64) -> bool {
+    driver != 0
+        && ARMED.iter().any(|slot| {
+            slot.compare_exchange(driver, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+}
+
+/// How long the fault hook waits for a driver's thread to take its panic.
+#[cfg(feature = "test-hooks")]
+const FAULT_WAIT: Duration = Duration::from_secs(10);
+
+/// Arms the fault hook for `driver`'s next duty cycle. For a driver on its
+/// own thread, it returns once that thread's cycle has panicked and the
+/// driver is lost, so the caller's next call sees the poison.
+///
+/// # Errors
+///
+/// The table's errors for a handle that names no open driver,
+/// [`Status::ResourcesUnavailable`] when [`MAX_ARMED`] other drivers are
+/// armed, and [`Status::Timeout`] when the thread took no cycle within
+/// [`FAULT_WAIT`] (the hook is disarmed).
+#[cfg(feature = "test-hooks")]
+pub(crate) fn panic_next_duty_cycle(driver: Handle) -> Result<(), Status> {
+    let threaded = drivers().with(driver, |slot| {
+        matches!(slot.mode, Mode::Threaded(_)).then(|| slot.state.clone())
+    })?;
+    arm_fault(driver.raw())?;
+    let Some(state) = threaded else {
+        return Ok(());
+    };
+    let start = std::time::Instant::now();
+    while state.usable().is_ok() {
+        if start.elapsed() > FAULT_WAIT {
+            let _ = take_fault(driver.raw());
+            return Err(Status::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
 }
 
 /// Moves an invoker-mode driver to a thread of its own.
@@ -649,6 +743,8 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
             #[cfg(test)]
             let cycles = Arc::clone(&cycles);
             let state = slot.state.clone();
+            #[cfg(feature = "test-hooks")]
+            let raw = driver.raw();
             std::thread::Builder::new()
                 .name("karyos-driver".to_owned())
                 .spawn(move || {
@@ -660,6 +756,8 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
                         state,
                         #[cfg(test)]
                         &cycles,
+                        #[cfg(feature = "test-hooks")]
+                        raw,
                     );
                 })
         };
@@ -701,6 +799,7 @@ fn run(
     idle: Idle,
     state: DriverState,
     #[cfg(test)] cycles: &Waited,
+    #[cfg(feature = "test-hooks")] handle: u64,
 ) {
     let watch = Watch(state);
     let mut backoff = YieldThenSleep::default();
@@ -711,6 +810,10 @@ fn run(
                 watch.0.lose();
                 return;
             };
+            #[cfg(feature = "test-hooks")]
+            if take_fault(handle) {
+                std::panic::resume_unwind(Box::new("the fault hook's panic"));
+            }
             // A duty cycle's error is not fatal: the next one runs.
             driver.do_work().unwrap_or(0)
         };
@@ -900,6 +1003,9 @@ pub(crate) fn readiness(driver: Handle) -> Result<(Readiness, u64), Status> {
 /// As [`Table::remove`].
 pub(crate) fn close(driver: Handle) -> Result<(), Status> {
     let closed = drivers().remove(driver)?;
+    // A closed driver's armed fault frees its slot (test kit only).
+    #[cfg(feature = "test-hooks")]
+    while take_fault(driver.raw()) {}
     closed.state.close();
     // Dropping it joins its thread.
     drop(closed);

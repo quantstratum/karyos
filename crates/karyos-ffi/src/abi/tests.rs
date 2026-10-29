@@ -1989,6 +1989,8 @@ fn an_image_change_is_written_by_the_callers_size() {
 mod archive;
 mod concurrent;
 mod conflated;
+#[cfg(feature = "test-hooks")]
+mod fault_hook;
 mod outcomes;
 mod rejoin;
 mod replay;

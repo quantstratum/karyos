@@ -93,13 +93,14 @@ fn test_port() -> u16 {
 const STEPS: [&str; 6] = ["B0", "B1", "B2", "B3", "B4", "B5"];
 
 /// The features a format 2 scenario may need (FORMAT.md, Features).
-const FEATURES: [&str; 12] = [
+const FEATURES: [&str; 13] = [
     "archive-replay",
     "claim-retry",
     "concurrent-publication",
     "conflation",
     "embedded-driver",
     "embedded-network",
+    "fault-hook",
     "guarded-publication",
     "image-wait",
     "incompatible-driver",
@@ -215,6 +216,15 @@ const OPS: &[Op] = &[
         &[],
         &["conflated"],
         &["embedded-driver", "conflation"],
+    ),
+    // The test kit's fault hook: the driver's next duty cycle panics
+    // (FORMAT.md, Fault hook).
+    op(
+        "driver.fault_panic",
+        &["driver"],
+        &[],
+        &[],
+        &["embedded-driver", "fault-hook"],
     ),
     op("driver.close", &["driver"], &[], &[], EMBEDDED),
     // A provided driver's client, or one connected to `dir`'s admission
@@ -1735,21 +1745,20 @@ impl Runner {
     /// The reference runner: every step, and every feature but a TAI clock
     /// where the library has none (Linux only).
     fn reference() -> Self {
-        let absent: &[&'static str] = if cfg!(target_os = "linux") {
-            &["archive-replay", "incompatible-driver", "remote-driver"]
-        } else {
-            &[
-                "archive-replay",
-                "incompatible-driver",
-                "remote-driver",
-                "tai-clock",
-            ]
-        };
+        let mut absent = vec!["archive-replay", "incompatible-driver", "remote-driver"];
+        if !cfg!(target_os = "linux") {
+            absent.push("tai-clock");
+        }
+        // The fault hook is in the library only with the feature
+        // `test-hooks`, and never in a package (FORMAT.md, Fault hook).
+        if !cfg!(all(feature = "test-hooks", not(karyos_package))) {
+            absent.push("fault-hook");
+        }
         let offered: Vec<&'static str> = FEATURES
             .into_iter()
             .filter(|feature| !absent.contains(feature))
             .collect();
-        Self::new(STEPS.len() - 1, &offered, absent)
+        Self::new(STEPS.len() - 1, &offered, &absent)
     }
 
     /// The reference runner with what `archive-replay` needs, on Linux,
@@ -2086,8 +2095,22 @@ fn scenarios() -> Vec<Scenario> {
     files.iter().map(|file| parse(file)).collect()
 }
 
-/// The coverage map: each row's scenario ids, or `None` while pending.
+/// The coverage map: each row's scenario ids, or `None` while pending or
+/// outside a portable runner's reach.
 type Index = BTreeMap<String, Option<Vec<String>>>;
+
+/// Whether `covered`, the text after a row's `:`, is a `pending` row that
+/// names the issue that closes it, `pending issue <N> <reason>` (FORMAT.md,
+/// Index). The issue is quantstratum/karyos's; `#` would start a comment.
+fn pending_names_an_issue(covered: &str) -> bool {
+    let mut words = covered.split_whitespace();
+    words.next() == Some("pending")
+        && words.next() == Some("issue")
+        && words
+            .next()
+            .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+        && words.next().is_some()
+}
 
 /// Parses `index.txt` (FORMAT.md, Index).
 fn parse_index(text: &str) -> Result<Index, String> {
@@ -2105,14 +2128,20 @@ fn parse_index(text: &str) -> Result<Index, String> {
         if row.is_empty() {
             return Err(format!("index.txt:{at}: empty row name"));
         }
-        let ids = match covered.strip_prefix("pending") {
-            Some(batch) if batch.starts_with(char::is_whitespace) && !batch.trim().is_empty() => {
-                None
+        let first = covered.split_whitespace().next();
+        let ids = match first {
+            Some("pending") if pending_names_an_issue(covered) => None,
+            Some("pending") => {
+                return Err(format!(
+                    "index.txt:{at}: `pending` names no issue (`pending issue <N> <reason>`)"
+                ));
             }
-            _ if covered.is_empty() => {
-                return Err(format!("index.txt:{at}: no ids and not pending"));
-            }
-            _ => Some(covered.split_whitespace().map(str::to_owned).collect()),
+            // Covered by a test a portable runner cannot be: the reason
+            // and the test follow.
+            Some("outside") if covered.split_whitespace().nth(1).is_some() => None,
+            Some("outside") => return Err(format!("index.txt:{at}: `outside` with no reason")),
+            Some(_) => Some(covered.split_whitespace().map(str::to_owned).collect()),
+            None => return Err(format!("index.txt:{at}: no ids and not pending")),
         };
         if rows.insert(row.to_owned(), ids).is_some() {
             return Err(format!("index.txt:{at}: row `{row}` repeated"));
@@ -2202,6 +2231,9 @@ fn every_scenario_passes_at_the_library_abi_version() {
                 ]
                 .contains(&feature.as_str())
                     && !cfg!(target_os = "linux") => {}
+            // The fault hook only with the feature `test-hooks`.
+            Outcome::Unsupported(feature)
+                if feature == "fault-hook" && runner.absent.contains("fault-hook") => {}
             other => panic!("{}: {other}", scenario.id),
         }
     }
@@ -2229,22 +2261,37 @@ fn the_index_check_refuses_a_map_that_lies() {
         ("b".to_owned(), "row b".to_owned()),
     ];
     let check = |text: &str| parse_index(text).and_then(|index| check_index(&scenarios, &index));
-    assert_eq!(check("row a: a\nrow b: b\nrow c: pending F4\n"), Ok(()));
+    assert_eq!(
+        check("row a: a\nrow b: b\nrow c: pending issue 700 the first released header\n"),
+        Ok(())
+    );
+    assert_eq!(
+        check("row a: a\nrow b: b\nrow c: outside no portable runner; src/x.rs a_test\n"),
+        Ok(())
+    );
     for lie in [
         // A row listing a scenario that covers another row (the probe of
         // the #469 review).
         "row a: a\nrow b: b\nrow c: a\n",
         "row a: a b\nrow b: b\n",
         // A scenario its row does not list, or with no row at all.
-        "row a: a\nrow b: pending F4\n",
+        "row a: a\nrow b: pending issue 700 the first released header\n",
+        "row a: a\nrow b: outside no portable runner\n",
         "row a: a\n",
         // An unknown id, a repeated row, a row with nothing after `:`,
-        // `pending` with no batch, a line without `:`.
+        // `pending` with no batch, a line without `:`; `pending` without
+        // an issue, or with an issue and no reason, or a `#` reference,
+        // which the comment cuts; `outside` with no reason.
         "row a: a z\nrow b: b\n",
         "row a: a\nrow a: a\nrow b: b\n",
         "row a: a\nrow b: b\nrow c:\n",
         "row a: a\nrow b: b\nrow c: pending\n",
         "row a: a\nrow b: b\nrow c\n",
+        "row a: a\nrow b: b\nrow c: pending F4\n",
+        "row a: a\nrow b: b\nrow c: pending issue 700\n",
+        "row a: a\nrow b: b\nrow c: pending issue 7x0 the header\n",
+        "row a: a\nrow b: b\nrow c: pending quantstratum/karyos#700 the header\n",
+        "row a: a\nrow b: b\nrow c: outside\n",
     ] {
         assert!(check(lie).is_err(), "accepted:\n{lie}");
     }
@@ -2598,6 +2645,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
             "concurrent-publication",
             "conflation",
             "embedded-network",
+            "fault-hook",
             "guarded-publication",
             "image-wait",
             "incompatible-driver",
@@ -2609,7 +2657,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert_eq!(
         b1.declaration(),
         "step B1 offers embedded-driver absent archive-replay claim-retry concurrent-publication \
-         conflation embedded-network guarded-publication image-wait incompatible-driver \
+         conflation embedded-network fault-hook guarded-publication image-wait incompatible-driver \
          remote-driver stream-cap tai-clock"
     );
     assert_eq!(

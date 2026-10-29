@@ -27,6 +27,13 @@ karyos-driver.workspace = true
 karyos-protocol.workspace = true
 karyos-sys.workspace = true
 
+[features]
+# The conformance test kit's fault hook (`include/karyos_test_hooks.h`):
+# a duty cycle that panics, for the panic row of the suite. Never in a
+# product build; `make test-hooks-absent-check` proves the release
+# library has none of it.
+test-hooks = []
+
 [dev-dependencies]
 # The production Archive host (H2, H2b) for a gap recovered through a real
 # Archive over the C ABI (#549): tests only, never a normal edge, so the

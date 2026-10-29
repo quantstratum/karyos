@@ -1,0 +1,86 @@
+# A panic inside libkaryos poisons the handle it held and its dependants,
+# and does not unwind into the caller (SPEC.md §10.2; karyos#699). The
+# test kit's fault hook makes one driver's thread panic in its next duty
+# cycle: every later use of the driver, of its client and of the client's
+# subscription and publication answers internal, until each is closed. The
+# process goes on, and a second driver, its client and its publication,
+# which the panic never touched, still work. A third driver, run by its
+# caller, panics inside the caller's own call, which answers internal
+# instead of unwinding. A runner whose library has
+# no fault hook (any product build) declares fault-hook absent.
+format 2
+id op.panic.poisons
+abi 0.1
+covers "panic poisons the handle and does not unwind"
+since B1
+feature embedded-driver
+feature fault-hook
+
+op driver.create
+expect ok driver=$hurt
+op driver.add_stream driver=$hurt stream_id=3
+expect ok
+op driver.start driver=$hurt
+expect ok
+op client.connect driver=$hurt
+expect ok client=$client
+op subscription.add client=$client stream_id=3
+expect ok subscription=$subscription
+op publication.add client=$client stream_id=3
+expect ok publication=$publication
+op driver.create
+expect ok driver=$whole
+op driver.add_stream driver=$whole stream_id=3
+expect ok
+op driver.start driver=$whole
+expect ok
+op client.connect driver=$whole
+expect ok client=$other
+op subscription.add client=$other stream_id=3
+expect ok subscription=$reader
+op publication.add client=$other stream_id=3
+expect ok publication=$writer
+op driver.fault_panic driver=$hurt
+expect ok
+op driver.do_work driver=$hurt
+expect status=internal
+op driver.do_work driver=$hurt
+expect status=internal
+op client.poll client=$client
+expect status=internal
+op publication.offer publication=$publication payload="after"
+expect status=internal
+op subscription.poll subscription=$subscription
+expect status=internal
+op driver.do_work driver=$whole
+expect status=busy
+op publication.offer publication=$writer payload="untouched"
+expect ok
+op subscription.close subscription=$subscription
+expect ok
+op publication.close publication=$publication
+expect ok
+op client.close client=$client
+expect ok
+op driver.close driver=$hurt
+expect ok
+op subscription.close subscription=$reader
+expect ok
+op publication.close publication=$writer
+expect ok
+op client.close client=$other
+expect ok
+op driver.close driver=$whole
+expect ok
+# A panic inside a call of the caller's, its own karyos_driver_do_work:
+# the call answers internal instead of unwinding, and so does the next.
+op driver.create
+expect ok driver=$invoked
+op driver.fault_panic driver=$invoked
+expect ok
+op driver.do_work driver=$invoked
+expect status=internal
+op driver.do_work driver=$invoked
+expect status=internal
+op driver.close driver=$invoked
+expect ok

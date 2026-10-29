@@ -1,8 +1,15 @@
 # The §13 contract rows of the C ABI (SPEC.md §13, "C ABI boundary" and
-# "Binding conformance") and the scenarios that cover them. One row per
-# line: the row's name, then `:`, then the scenario ids that cover it, or
-# `pending` and the batch of quantstratum-docs:
-# karyos/design/ffi-gap-analysis.md that brings them.
+# "Binding conformance") and the scenarios that cover them (FORMAT.md,
+# Index). One row per line: the row's name, then `:`, then one of
+# - the scenario ids that cover it;
+# - `pending issue <N>` and the reason: not yet covered, until
+#   quantstratum/karyos issue N closes it;
+# - `outside` and the reason: covered for good by a test of this crate
+#   that no portable runner can be, named after the reason.
+# A scenario's row is the one its `covers` header names, never its
+# `feature` headers: those say what a scenario needs to run, a separate
+# axis (three scenarios need remote-driver, and the remote driver row
+# lists two; publication.timed.offer covers typed status codes).
 
 abi version: abi.version op.library.version
 typed status codes: abi.version.null status.text handle.wrong.kind publication.typed.statuses publication.timed.offer stream.schedule.refused subscription.options.typed.statuses offer.options.typed.statuses conflated.typed.statuses archive.typed.statuses publication.concurrent outcomes.typed.statuses conflated.client.view op.publication.concurrent op.outcomes publication.roles.typed.statuses subscription.as.typed.statuses publication.admission.typed.statuses
@@ -11,9 +18,9 @@ double close: handle.double.close claim.double.commit op.double.close op.conflat
 older protocol version refused at admission: op.connect.refused op.connect.other.version
 reentrant poll: subscription.poll.reentrant
 bounded poll stops on callback failure: subscription.poll.bounded
-kept fragment pointer never refers to a shared mapping: pending a runner that can see the library's mappings, which a portable one cannot; src/abi/tests.rs a_subscription_delivers_each_message_from_its_private_copy covers it
-panic poisons the handle and does not unwind: pending a fault hook, since no call can make libkaryos panic and the ABI exports none (DESIGN); the Rust tests of boundary.rs, the handle tables' poison and api/driver cover it
-older minor ABI client against a newer library: pending the ABI manifest test of the first released header
+kept fragment pointer never refers to a shared mapping: outside only a runner that sees the library's mappings can check it, and a portable one cannot; src/abi/tests.rs a_subscription_delivers_each_message_from_its_private_copy covers it
+panic poisons the handle and does not unwind: op.panic.poisons
+older minor ABI client against a newer library: pending issue 700 the ABI manifest test needs the first released header and its struct manifest, which 0.1.0-alpha.2 did not publish
 # Not a §13 row of its own: the size rule of SPEC.md §10.2 that both halves
 # of minor compatibility rest on. karyos_accepted's sizes need an
 # accepted offer: a subscriber, on a stream without allow_unconnected.
