@@ -64,6 +64,7 @@ fn the_hook_refuses_a_handle_that_names_no_driver() {
 /// review's reproduction: arming B no longer cancels A's), and arming one
 /// twice is one fault.
 #[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn each_armed_driver_takes_its_own_fault() {
     let _serial = serial();
     let (a, b) = (invoker(), invoker());
