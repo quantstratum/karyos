@@ -2195,6 +2195,109 @@ mod tests {
         assert!(!session.state().broken);
     }
 
+    /// A session over one end of a seqpacket pair whose fetches time out
+    /// after `timeout`, and the peer, which answers as the driver would.
+    fn timed_session(timeout: Duration) -> (Session, OwnedFd) {
+        let (ours, peer) = ipc::seqpacket_pair().unwrap();
+        ipc::set_timeouts(ours.as_fd(), timeout).unwrap();
+        ipc::set_timeouts(peer.as_fd(), Duration::from_secs(5)).unwrap();
+        let session = Session {
+            instance: 1,
+            socket: ours,
+            fetching: Mutex::new(()),
+            state: Mutex::new(SessionState {
+                next_fetch: 1,
+                live: Vec::new(),
+                broken: false,
+                abandoned: Vec::new(),
+            }),
+            links: Mutex::new(Vec::new()),
+        };
+        (session, peer)
+    }
+
+    /// karyos#851: a late manifest of an abandoned fetch, with its regions,
+    /// is drained at the next fetch: each descriptor closed and each
+    /// export detached, so nothing stays charged, and the next fetch reads
+    /// its own reply.
+    #[test]
+    fn a_late_manifest_with_regions_is_drained_and_detached() {
+        let (session, peer) = timed_session(Duration::from_millis(20));
+        assert!(matches!(
+            fetch_descriptor(&session, 7, 7, WireKind::LogBuffer),
+            Err(AttachError::Timeout)
+        ));
+        let record = |export| Record {
+            region: 9,
+            export,
+            kind: WireKind::LogBuffer,
+            layout: 1,
+            structure_length: 4096,
+            generation: 2,
+            stream_id: 2,
+            session_id: 1,
+            lane: 0,
+            capability: Capability::None,
+            allow_unconnected: false,
+        };
+        let manifest = Message::Manifest {
+            fetch: 1,
+            key: 7,
+            registration: 7,
+            stream_registration: 7,
+            incarnation: 1,
+            base: 0,
+            records: vec![record(11), record(12)],
+        };
+        send(&peer, &manifest, None).unwrap();
+        for index in 0..2 {
+            let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+            send(&peer, &Message::Region { fetch: 1, index }, Some(&fd)).unwrap();
+        }
+        send(&peer, &Message::Refused { fetch: 2, code: 7 }, None).unwrap();
+        assert!(matches!(
+            fetch_descriptor(&session, 8, 8, WireKind::LogBuffer),
+            Err(AttachError::Refused { code: 7 })
+        ));
+        assert!(session.state().abandoned.is_empty());
+        assert!(!session.state().broken);
+        assert!(session.state().live.is_empty(), "every export detached");
+        // The driver saw both fetches, then a Detach per drained export.
+        let mut seen = Vec::new();
+        while seen.len() < 4 {
+            seen.push(receive(&peer).unwrap().0);
+        }
+        assert_eq!(
+            seen,
+            [
+                Message::Fetch { fetch: 1, key: 7 },
+                Message::Fetch { fetch: 2, key: 8 },
+                Message::Detach { export: 11 },
+                Message::Detach { export: 12 },
+            ]
+        );
+    }
+
+    /// karyos#851: at most `MAX_ABANDONED` fetches are abandoned at once;
+    /// the next that times out leaves the session out of step.
+    #[test]
+    fn a_full_abandoned_list_breaks_the_session() {
+        let (session, _peer) = timed_session(Duration::from_millis(2));
+        for key in 1..=u64::try_from(MAX_ABANDONED).unwrap() {
+            assert!(matches!(
+                fetch_descriptor(&session, key, key, WireKind::LogBuffer),
+                Err(AttachError::Timeout)
+            ));
+        }
+        assert_eq!(session.state().abandoned.len(), MAX_ABANDONED);
+        assert!(!session.state().broken);
+        assert!(matches!(
+            fetch_descriptor(&session, 99, 99, WireKind::LogBuffer),
+            Err(AttachError::Timeout)
+        ));
+        assert!(session.state().broken);
+    }
+
     /// A lost driver closes every link, so a remote handle waiting at a
     /// seal that marks a successor ends instead of waiting for ever: the
     /// bound of the wait.
