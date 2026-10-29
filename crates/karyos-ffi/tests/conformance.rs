@@ -3130,10 +3130,54 @@ fn the_runner_keeps_its_karyosd_client_served_between_scenarios() {
     assert_eq!(status, closed, "unserved for {gap:?}, yet kept");
 }
 
+/// karyos#830 (the #854 review, P2): `subscription.await_image`'s
+/// precedence for each pair of conditions holding in the same round, as
+/// FORMAT.md writes it: a failing image change call, `count` reached, a
+/// failing lost call, changes lost, the deadline passed. The lost call is
+/// made only when `count` is not reached.
+#[test]
+fn await_image_answers_in_formats_order() {
+    use semantic::{Round, await_image_round};
+
+    const FAIL: i32 = -7;
+    const LOST_FAIL: i32 = -9;
+    let never = || -> (i32, u64) { panic!("the lost call is made only below count") };
+    // A failing change call wins over everything.
+    assert_eq!(
+        await_image_round(Err(FAIL), true, never, true),
+        Round::Status(FAIL)
+    );
+    assert_eq!(
+        await_image_round(Err(FAIL), false, never, true),
+        Round::Status(FAIL)
+    );
+    // `count` reached wins over a lost count, a failing lost call and the
+    // deadline: the lost call is not made.
+    assert_eq!(await_image_round(Ok(()), true, never, true), Round::Ok);
+    // Below count: a failing lost call, then changes lost, then the
+    // deadline.
+    assert_eq!(
+        await_image_round(Ok(()), false, || (LOST_FAIL, 3), true),
+        Round::Status(LOST_FAIL)
+    );
+    assert_eq!(
+        await_image_round(Ok(()), false, || (0, 1), true),
+        Round::EventsLost
+    );
+    assert_eq!(
+        await_image_round(Ok(()), false, || (0, 0), true),
+        Round::Timeout
+    );
+    assert_eq!(
+        await_image_round(Ok(()), false, || (0, 0), false),
+        Round::Wait
+    );
+}
+
 /// karyos#830: `subscription.await_image` answers the status of a failing
 /// `karyos_subscription_next_image_change`, as FORMAT.md says, and does not
 /// panic. The subscription's handle is closed behind the adapter, so the
-/// call answers that the handle is invalid.
+/// call answers `closed` (`KARYOS_E_CLOSED`), pinned.
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn await_image_answers_a_failing_image_change_status() {
@@ -3171,7 +3215,7 @@ fn await_image_answers_a_failing_image_change_status() {
         "test",
     );
     assert!(
-        matches!(&answer, semantic::Answer::Status(status) if status != "timeout"),
+        matches!(&answer, semantic::Answer::Status(status) if status == "closed"),
         "{answer:?}"
     );
     adapter.close_all();
