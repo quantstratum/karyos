@@ -98,17 +98,20 @@ pub struct NetworkConfig {
     /// (`EmbeddedDriver::network_owned_refusals`).
     pub max_owned_per_client: usize,
     /// The tables of each endpoint the driver opens (karyos#859): its TX
-    /// slots, queues and routes. A publication its endpoint cannot hold is
-    /// refused at the add (`DriverError::EndpointCapacity`).
+    /// slots, queues and routes ([`EndpointTables`]). A publication its
+    /// endpoint cannot hold is refused at the add
+    /// (`DriverError::EndpointCapacity`).
     pub endpoint_tables: EndpointTables,
 }
 
 /// The tables of a network endpoint (karyos#859): what its publications
-/// and the sender's control routes share. The defaults are the sockets
-/// backend's provisional ones (256 TX slots, 64 queues, 64 routes). A
-/// reliable single-lane publication takes 9 slots, 2 queues and a route;
-/// each endpoint keeps `AgentConfig::control_routes` routes and queues of 4
-/// slots for the control routes.
+/// and the sender's control routes share. By default 1024 TX slots, 256
+/// queues and 128 routes: about 110 reliable single-lane publications per
+/// endpoint, about 1.4 MiB of TX pool (1408-byte datagrams). A reliable
+/// single-lane publication takes 9 slots, 2 queues and a route; each
+/// endpoint keeps `AgentConfig::control_routes` routes and queues of 4
+/// slots for the control routes. Decided 2026-10-29 by QS-COORDINATOR
+/// under owner delegation (plan 168's sizing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointTables {
     /// TX slots, 1 to 4096.
@@ -121,13 +124,10 @@ pub struct EndpointTables {
 
 impl Default for EndpointTables {
     fn default() -> Self {
-        use karyos_io::sockets::endpoint::{
-            DEFAULT_MAX_QUEUES, DEFAULT_MAX_ROUTES, DEFAULT_TX_SLOTS,
-        };
         Self {
-            tx_slots: DEFAULT_TX_SLOTS,
-            max_queues: DEFAULT_MAX_QUEUES,
-            max_routes: DEFAULT_MAX_ROUTES,
+            tx_slots: std::num::NonZeroU16::new(1024).unwrap_or(std::num::NonZeroU16::MIN),
+            max_queues: std::num::NonZeroU16::new(256).unwrap_or(std::num::NonZeroU16::MIN),
+            max_routes: std::num::NonZeroU16::new(128).unwrap_or(std::num::NonZeroU16::MIN),
         }
     }
 }

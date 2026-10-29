@@ -3321,13 +3321,16 @@ fn a_network_publication_above_the_options_cap_is_refused_with_code_24() {
 
 /// karyos#859: a karyos:udp publication its endpoint cannot hold is
 /// refused, code 4 (resources unavailable), with the limit, the endpoint's
-/// capacity and what it would take in `value`: publications on one endpoint
-/// are added until one is refused for its 256 TX slots.
+/// capacity and what it would take in `value`: four-lane publications (33
+/// TX slots each) on one endpoint are added until one is refused for its
+/// 1024 TX slots.
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_network_publication_its_endpoint_cannot_hold_is_refused_with_its_limit() {
     let mut options = default_driver_options();
     options.network = api::driver::NETWORK_ON;
+    // Room for 40 four-lane publications' lanes.
+    options.max_streams = 256;
     let mut driver = 0;
     // SAFETY: live, aligned pointers; no detail.
     let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
@@ -3350,8 +3353,11 @@ fn a_network_publication_its_endpoint_cannot_hold_is_refused_with_its_limit() {
         client: clients[0],
         ..Opened::default()
     };
-    let uri =
-        std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{}", test_port())).unwrap();
+    let uri = std::ffi::CString::new(format!(
+        "karyos:udp?endpoint=127.0.0.1:{}|lanes=4",
+        test_port()
+    ))
+    .unwrap();
     let mut refused = None;
     for stream in 900..940 {
         let client = clients[usize::try_from(stream - 900).unwrap() / 10];
@@ -3381,6 +3387,6 @@ fn a_network_publication_its_endpoint_cannot_hold_is_refused_with_its_limit() {
     assert_eq!(status, Status::Refused.code());
     assert_eq!(code, 4, "resources unavailable");
     assert_eq!(value >> 56, 1, "TX slots");
-    assert_eq!((value >> 32) & 0x00FF_FFFF, 256, "the endpoint's capacity");
-    assert!(value & 0xFFFF_FFFF > 256, "what it would take: {value:#x}");
+    assert_eq!((value >> 32) & 0x00FF_FFFF, 1024, "the endpoint's capacity");
+    assert!(value & 0xFFFF_FFFF > 1024, "what it would take: {value:#x}");
 }
