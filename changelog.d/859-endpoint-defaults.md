@@ -7,3 +7,8 @@
   2026-10-29 by QS-COORDINATOR under owner delegation: 24 publications
   per endpoint was too low for the core, and 1.4 MiB per endpoint is
   acceptable on a server. `NetworkConfig::endpoint_tables` sets them.
+  The driver's own caps now bind first for single-lane publications:
+  `AgentConfig::publications` (64 network publications) and
+  `max_streams` (64 local streams, one per lane); an endpoint's tables
+  bind first only for multi-lane ones (a four-lane reliable publication
+  takes 33 slots, 30 per endpoint).
