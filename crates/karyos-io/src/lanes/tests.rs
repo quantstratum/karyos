@@ -749,6 +749,47 @@ fn a_returned_head_is_dropped_and_the_next_one_served() {
     assert_eq!(gate.last_left, Some((0, fake::ticket(2), Left::Submitted)));
 }
 
+/// R-CORE-44: a backend that resolves neighbours itself returns a frame
+/// whose next hop is unresolved, or whose neighbour table is full, with
+/// that reason: the entry comes back intact (its ticket, token and
+/// length), it is not service, and the lane's next head is served.
+#[test]
+fn a_head_returned_for_its_neighbour_is_dropped_and_the_next_one_served() {
+    const SUBMITTED: TxItemOutcome = TxItemOutcome::Submitted {
+        release: crate::backend::Release::AtSubmission,
+    };
+    for reason in [
+        crate::backend::ReturnReason::NeighbourUnresolved,
+        crate::backend::ReturnReason::NeighbourTableFull,
+    ] {
+        let (mut sender, mut backend) = faked(vec![
+            (
+                Some((TxItemOutcome::Returned { reason }, fake::ticket(0))),
+                FlushStop::Exposed,
+            ),
+            (Some((SUBMITTED, fake::ticket(2))), FlushStop::Exposed),
+        ]);
+        let mut gate = Gate::default();
+        let report = serve_faked_with(&mut sender, &mut backend, &mut gate);
+        assert_eq!(report.drr.lanes[0].served_bytes, 64, "{reason:?}");
+        assert_eq!(report.drr.lanes[0].failed, 1, "{reason:?}");
+        assert_eq!(sender.pending(0), Some(0), "{reason:?}");
+        assert_eq!(gate.left, [1, 1, 0], "{reason:?}");
+    }
+    // The report entry a backend writes carries the frame back whole.
+    let mut report = TxReport::new();
+    let returned = crate::backend::TxEntry {
+        ticket: fake::ticket(4),
+        token: SenderToken::new(7),
+        len: 1200,
+        outcome: TxItemOutcome::Returned {
+            reason: crate::backend::ReturnReason::NeighbourUnresolved,
+        },
+    };
+    report.writer().unwrap().push(returned).unwrap();
+    assert_eq!(report.pop_front(), Some(returned));
+}
+
 /// An endpoint resetting or retired (`Queue(NotActive)`) stops the call as
 /// backpressure and reports it.
 #[test]
