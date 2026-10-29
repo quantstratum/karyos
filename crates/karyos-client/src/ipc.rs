@@ -469,7 +469,12 @@ impl BindingFds {
     /// them: the ring and the guard words read-only, the cell writable. The
     /// ring's header names the guard's index and the admission epoch, which
     /// must be open and fall within the guard words.
-    fn bind(self, instance: u128, lanes: u8) -> Result<GuardBinding, AttachError> {
+    fn bind(
+        self,
+        instance: u128,
+        lanes: u8,
+        incarnation: u64,
+    ) -> Result<GuardBinding, AttachError> {
         let read_only = |part: BindingFd| -> Result<MappedWords, AttachError> {
             let expected = fetched_region(instance, &part.record)?;
             let region = ReadOnlyRegion::attach(part.fd, expected, SealProfile::DriverOnly)?;
@@ -491,6 +496,13 @@ impl BindingFds {
         )
         .map_err(|_| AttachError::Protocol)?;
         let index = usize::try_from(binding.guard_index).map_err(|_| AttachError::Protocol)?;
+        // When a reincarnation began, which the driver wrote before the
+        // grant (0: the first incarnation, or unknown).
+        let reincarnated = karyos_sys::load_words::LoadWords::load_acquire(
+            &ring,
+            karyos_sys::outcome_ring::REINCARNATED_AT,
+        )
+        .unwrap_or(0);
         GuardBinding::new(
             Arc::new(guards),
             index,
@@ -500,10 +512,24 @@ impl BindingFds {
             lanes,
             binding.messages,
         )
-        .map(|bound| bound.with_published_rate(karyos_sys::host_clock::host_monotonic_ns))
+        .map(|bound| {
+            // Past the first incarnation, a reincarnation: its copy starts
+            // empty at the time the driver wrote (0, unknown: now), as its
+            // gate did (R-CORE-21).
+            let bound = if incarnation > FIRST_INCARNATION {
+                bound.reincarnated_at(reincarnated)
+            } else {
+                bound
+            };
+            bound.with_published_rate(karyos_sys::host_clock::host_monotonic_ns)
+        })
         .map_err(|_| AttachError::Protocol)
     }
 }
+
+/// A publication's first incarnation (the driver's `FIRST_INCARNATION`):
+/// a grant of a later one binds to a reincarnation.
+const FIRST_INCARNATION: u64 = 1;
 
 /// One received message, with its descriptor.
 pub(crate) fn receive(socket: &OwnedFd) -> Result<(Message, Option<OwnedFd>), AttachError> {
@@ -1443,7 +1469,7 @@ impl RemoteClient {
                 .checked_add(1)
                 .ok_or(AttachError::Protocol)?;
             let guard = match fetched.binding.take() {
-                Some(binding) => Some(binding.bind(instance, lanes)?),
+                Some(binding) => Some(binding.bind(instance, lanes, fetched.incarnation)?),
                 None => None,
             };
             let inner = prepare_publication(fetched, export)?

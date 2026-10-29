@@ -95,14 +95,15 @@
 //! keyed by its stream's registration (key0; lane, kind and participant
 //! 0) and written the same way by its agent. Publication: `network frames
 //! sent`, `network bytes sent`, `network retransmits`, `network naks
-//! received`. Image: `network naks sent`, `network losses`, `network
+//! received`, `network admission` (a gauge) and `network rate policies
+//! refused`. Image: `network naks sent`, `network losses`, `network
 //! repaired`. They are allocated all or none with the publication, or
 //! once the image is installed and exposed; when the region has no room
 //! for the whole group, `counters unavailable` counts one and the stream
 //! runs without cells, never retried. They are freed when the publication
 //! is removed, the image retires or the network closes; cells still in
 //! flight to the receiver at the close are left pending release, which
-//! the allocator reuses. Size the region for 4 cells per network
+//! the allocator reuses. Size the region for 6 cells per network
 //! publication and 3 per image on top of the rest.
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,
@@ -150,7 +151,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 69] = [
+const LABELS: [(u64, &str); 74] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -219,6 +220,11 @@ const LABELS: [(u64, &str); 69] = [
     (TYPE_EVENTS, "guard audit records dropped"),
     (TYPE_EVENTS, "schedule violations"),
     (TYPE_EVENTS, "schedule violations dropped"),
+    (TYPE_EVENTS, "grants released at exit"),
+    (TYPE_EVENTS, "fetches dropped at exit"),
+    (TYPE_EVENTS, "admission messages dropped at exit"),
+    (TYPE_EVENTS, "admission messages not sent at exit"),
+    (TYPE_EVENTS, "clients closed before their exit"),
     (TYPE_EVENTS, "fetches abandoned at leave"),
 ];
 
@@ -404,6 +410,48 @@ pub(crate) enum Event {
     /// Schedule violation reports dropped: past their bound, or naming a
     /// publication, lane or incarnation no longer live.
     ScheduleViolationsDropped,
+    /// Grants whose descriptor left and that a remote client did not
+    /// detach: its exit proof (or its `Leave`) ended them, after its queued
+    /// messages were drained. A faulty client is retired without a drain,
+    /// so its grants count here too. `GrantsDetached` counts a `Detach`
+    /// (karyos#827).
+    GrantsReleasedAtExit,
+    /// `Fetch` messages found queued after a client's exit proof, or after
+    /// a close before it: not served, since they would create state for a
+    /// dead client. "Clients closed before their exit" tells the cases
+    /// apart.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    FetchesDroppedAtExit,
+    /// Other admission messages left after a client's exit proof: a
+    /// `Detach` naming no detachable export, undecodable, carrying a
+    /// descriptor, a receive error, or still queued at the drain's bound
+    /// (counted once).
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    AdmissionMessagesDroppedAtExit,
+    /// Admission messages queued for a client when its exit was proven, or
+    /// when its socket closed before it, dropped unsent.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    OutboundDroppedAtExit,
+    /// Remote clients whose socket closed (end of file, `EPIPE` or
+    /// `ECONNRESET`, the end of file confirmed by `POLLRDHUP`) before their
+    /// exit proof: drained, then retired like a faulty client but not
+    /// counted as one, since a dying process closes its socket first
+    /// (karyos#827). One with no exit proof within `fetch_deadline` is
+    /// then counted in `ClientsFaulty` as well.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "admission is served only on Linux")
+    )]
+    ClientsClosedBeforeExit,
     /// Remote clients that left with a fetch outstanding: a fetch whose
     /// reply they abandoned, or exports not detached. A clean leave, not a
     /// fault; what was exported stays charged until the exit proof
@@ -702,6 +750,20 @@ mod tests {
             (
                 Event::ScheduleViolationsDropped,
                 "schedule violations dropped",
+            ),
+            (Event::GrantsReleasedAtExit, "grants released at exit"),
+            (Event::FetchesDroppedAtExit, "fetches dropped at exit"),
+            (
+                Event::AdmissionMessagesDroppedAtExit,
+                "admission messages dropped at exit",
+            ),
+            (
+                Event::OutboundDroppedAtExit,
+                "admission messages not sent at exit",
+            ),
+            (
+                Event::ClientsClosedBeforeExit,
+                "clients closed before their exit",
             ),
             (Event::FetchesAbandonedAtLeave, "fetches abandoned at leave"),
         ];

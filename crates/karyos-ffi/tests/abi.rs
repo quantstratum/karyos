@@ -13,11 +13,12 @@ mod support {
 
 use support::abi;
 
-/// 0.1.4: the embedded driver's network (karyos#735) on 0.1.3's readiness
-/// calls (karyos#794) and 0.1.2's roles calls (karyos#637).
+/// 0.1.5: the driver options' stream cap (karyos#818) on 0.1.4's embedded
+/// network (karyos#735), 0.1.3's readiness calls (karyos#794) and 0.1.2's
+/// roles calls (karyos#637).
 #[test]
-fn the_abi_version_is_0_1_4() {
-    assert_eq!(abi::abi_version(), (0, [0, 1, 4]));
+fn the_abi_version_is_0_1_5() {
+    assert_eq!(abi::abi_version(), (0, [0, 1, 5]));
 }
 
 #[test]
@@ -68,6 +69,11 @@ fn the_replay_wrappers_pass_their_pointers() {
     );
     let (status, end) = abi::subscription_end_state(0);
     assert_eq!((status, end.reason, end.position), (INVALID_HANDLE, 0, 0));
+    // karyos#830: the image change's sized struct and `has` pointer.
+    let (status, change) = abi::subscription_next_image_change(0);
+    assert_eq!(status, INVALID_HANDLE);
+    assert!(change.is_none());
+    assert_eq!(abi::subscription_image_changes_lost(0).0, INVALID_HANDLE);
     let (status, kept) = abi::archive_recordings(0, 0, 4);
     assert_eq!(status, INVALID_HANDLE);
     assert!(kept.is_empty());
