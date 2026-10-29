@@ -603,10 +603,7 @@ pub(crate) fn create(options: &Options) -> Result<Handle, Failure> {
 pub(crate) fn do_work(driver: Handle) -> Result<u32, Failure> {
     with_slot(driver, |slot| {
         #[cfg(feature = "test-hooks")]
-        if PANIC_NEXT_DUTY_CYCLE
-            .compare_exchange(driver.raw(), 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
+        if take_fault(driver.raw()) {
             std::panic::resume_unwind(Box::new("the fault hook's panic"));
         }
         match &mut slot.mode {
@@ -620,14 +617,53 @@ pub(crate) fn do_work(driver: Handle) -> Result<u32, Failure> {
     })?
 }
 
-/// The driver whose next duty cycle panics while it holds the driver, its
-/// caller's or its thread's, or 0 for none
-/// (`karyos_test_panic_next_duty_cycle`, the test kit's fault hook): the
-/// panic poisons the driver and its clients as any panic there does. One
-/// handle, so that no other driver's cycle takes it.
+/// Drivers armed by the test kit's fault hook at most at once.
 #[cfg(feature = "test-hooks")]
-pub(crate) static PANIC_NEXT_DUTY_CYCLE: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub(crate) const MAX_ARMED: usize = 16;
+
+/// The drivers whose next duty cycle panics while it holds the driver, its
+/// caller's or its thread's, one handle per slot, 0 for a free one
+/// (`karyos_test_panic_next_duty_cycle`, the test kit's fault hook): the
+/// panic poisons the driver and its clients as any panic there does. A
+/// slot per driver, so that arming one never cancels another's fault
+/// (karyos#883 review).
+#[cfg(feature = "test-hooks")]
+static ARMED: [std::sync::atomic::AtomicU64; MAX_ARMED] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; MAX_ARMED];
+
+/// Arms `driver`'s fault: already armed, it stays so once.
+///
+/// # Errors
+///
+/// [`Status::ResourcesUnavailable`] when [`MAX_ARMED`] other drivers are
+/// armed.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn arm_fault(driver: u64) -> Result<(), Status> {
+    if ARMED
+        .iter()
+        .any(|slot| slot.load(Ordering::Acquire) == driver)
+    {
+        return Ok(());
+    }
+    ARMED
+        .iter()
+        .any(|slot| {
+            slot.compare_exchange(0, driver, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+        .then_some(())
+        .ok_or(Status::ResourcesUnavailable)
+}
+
+/// Takes `driver`'s fault if it is armed: whether it was.
+#[cfg(feature = "test-hooks")]
+pub(crate) fn take_fault(driver: u64) -> bool {
+    driver != 0
+        && ARMED.iter().any(|slot| {
+            slot.compare_exchange(driver, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+}
 
 /// How long the fault hook waits for a driver's thread to take its panic.
 #[cfg(feature = "test-hooks")]
@@ -639,27 +675,23 @@ const FAULT_WAIT: Duration = Duration::from_secs(10);
 ///
 /// # Errors
 ///
-/// The table's errors for a handle that names no open driver, and
-/// [`Status::Timeout`] when the thread took no cycle within
+/// The table's errors for a handle that names no open driver,
+/// [`Status::ResourcesUnavailable`] when [`MAX_ARMED`] other drivers are
+/// armed, and [`Status::Timeout`] when the thread took no cycle within
 /// [`FAULT_WAIT`] (the hook is disarmed).
 #[cfg(feature = "test-hooks")]
 pub(crate) fn panic_next_duty_cycle(driver: Handle) -> Result<(), Status> {
     let threaded = drivers().with(driver, |slot| {
         matches!(slot.mode, Mode::Threaded(_)).then(|| slot.state.clone())
     })?;
-    PANIC_NEXT_DUTY_CYCLE.store(driver.raw(), Ordering::Release);
+    arm_fault(driver.raw())?;
     let Some(state) = threaded else {
         return Ok(());
     };
     let start = std::time::Instant::now();
     while state.usable().is_ok() {
         if start.elapsed() > FAULT_WAIT {
-            let _ = PANIC_NEXT_DUTY_CYCLE.compare_exchange(
-                driver.raw(),
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            let _ = take_fault(driver.raw());
             return Err(Status::Timeout);
         }
         std::thread::sleep(Duration::from_millis(1));
@@ -775,10 +807,7 @@ fn run(
                 return;
             };
             #[cfg(feature = "test-hooks")]
-            if PANIC_NEXT_DUTY_CYCLE
-                .compare_exchange(handle, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
+            if take_fault(handle) {
                 std::panic::resume_unwind(Box::new("the fault hook's panic"));
             }
             // A duty cycle's error is not fatal: the next one runs.

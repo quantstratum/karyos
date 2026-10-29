@@ -23,8 +23,11 @@ extern "C" {
  * KARYOS_E_INTERNAL, or, for a driver on its own thread, that thread's
  * next cycle, which this call waits for (up to 10 s, then
  * KARYOS_E_TIMEOUT, disarmed). Either way the driver and every client it
- * connected then answer KARYOS_E_INTERNAL until closed. Returns
- * KARYOS_OK, or the handle's error for one that names no open driver.
+ * connected then answer KARYOS_E_INTERNAL until closed. Each driver's
+ * fault is its own: arming another never cancels it, and arming one twice
+ * is one fault. Returns KARYOS_OK, the handle's error for one that names
+ * no open driver, or KARYOS_E_RESOURCES_UNAVAILABLE while 16 other
+ * drivers are armed.
  */
 int32_t karyos_test_panic_next_duty_cycle(uint64_t driver);
 

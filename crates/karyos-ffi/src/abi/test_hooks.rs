@@ -18,8 +18,11 @@ use crate::status::Status;
 /// driver and every client it connected then answer `KARYOS_E_INTERNAL`
 /// until closed.
 ///
+/// Each driver's fault is its own: arming another never cancels it.
+///
 /// Returns `KARYOS_OK`, the handle's error for one that names no open
-/// driver, or `KARYOS_E_TIMEOUT` when a driver's thread took no cycle in
+/// driver, `KARYOS_E_RESOURCES_UNAVAILABLE` while 16 other drivers are
+/// armed, or `KARYOS_E_TIMEOUT` when a driver's thread took no cycle in
 /// time.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_test_panic_next_duty_cycle(driver: u64) -> i32 {
