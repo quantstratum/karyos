@@ -829,14 +829,27 @@ fn control_group_attempt() -> Result<bool, crate::error::DriverError> {
         driver.net.as_ref().unwrap().receiver_multicast(reliable),
         Some(true)
     );
-    assert_eq!(held, before + 2 - usize::try_from(failed).unwrap());
-    // Its own data group, whose table entry it does not join.
+    // Its data and control group endpoints, and the driver's SOLICIT
+    // endpoint (plan 164).
+    let solicit = driver.network_solicit_endpoints().len();
+    assert_eq!(solicit, 1, "one SOLICIT endpoint for IPv4");
+    assert_eq!(
+        held,
+        before + 2 + solicit - usize::try_from(failed).unwrap()
+    );
+    // Its own data group, whose table entry it does not join; the SOLICIT
+    // endpoint is shared.
     let unreliable = driver.add_network_subscription(7, &multicast(other_group, false))?;
     assert_eq!(driver.network_held_endpoints(), held + 1);
+    assert_eq!(driver.network_solicit_endpoints().len(), 1, "shared");
     assert_eq!(driver.network_control_join_failures(), failed);
     assert!(driver.remove_network_subscription(unreliable).unwrap());
     assert!(driver.remove_network_subscription(reliable).unwrap());
     assert_eq!(driver.network_held_endpoints(), before);
+    assert!(
+        driver.network_solicit_endpoints().is_empty(),
+        "closed with the last"
+    );
     Ok(true)
 }
 
@@ -919,12 +932,14 @@ fn a_subscription_holds_an_endpoint_per_path() {
             std::io::stderr(),
             "SKIPPED the second path of a_subscription_holds_an_endpoint_per_path: its join failed on this host"
         );
-        assert_eq!(driver.network_held_endpoints(), 1);
+        // Its first path and the SOLICIT endpoint (plan 164).
+        assert_eq!(driver.network_held_endpoints(), 2);
         assert!(driver.remove_network_subscription(subscription).unwrap());
         assert_eq!(driver.network_held_endpoints(), 0);
         return;
     }
-    assert_eq!(driver.network_held_endpoints(), 2);
+    // Both paths and the SOLICIT endpoint (plan 164).
+    assert_eq!(driver.network_held_endpoints(), 3);
     assert!(driver.remove_network_subscription(subscription).unwrap());
     assert_eq!(driver.network_held_endpoints(), 0);
 }
@@ -958,7 +973,11 @@ fn every_path_of_a_subscription_carries_its_identity() {
         let _ = driver.do_work().unwrap();
     }
     let identities = driver.net.as_ref().unwrap().path_identities(6);
-    assert_eq!(identities.len(), driver.network_held_endpoints());
+    // One per path: the SOLICIT endpoint holds no receiver entry.
+    assert_eq!(
+        identities.len(),
+        driver.network_held_endpoints() - driver.network_solicit_endpoints().len()
+    );
     assert!(!identities.is_empty());
     assert!(
         identities.iter().all(|held| *held == Some(identity(77, 5))),
@@ -1126,6 +1145,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         stream_id,
         reliable: true,
         control: None,
+        solicit: None,
         later: paths,
         later_routes: [None; crate::net::LATER_PATHS],
         identity: None,
@@ -1210,7 +1230,8 @@ fn a_later_path_aliasing_the_first_is_skipped() {
         return;
     };
     assert_eq!(driver.network_path_counters().1, 1);
-    assert_eq!(driver.network_held_endpoints(), 1);
+    // The first path and the SOLICIT endpoint (plan 164).
+    assert_eq!(driver.network_held_endpoints(), 2);
 }
 
 /// #312 review: a new key's later paths count toward the mirror's room:
@@ -2108,4 +2129,40 @@ fn a_dropped_network_subscription_removes_its_images() {
     drop(rig.reading.take());
     rig.until(false, &|rig| rig.registrations() == 0);
     rig.ends_with_none_swept();
+}
+
+/// Plan 169: the driver's SOLICIT endpoint is never a data endpoint. A
+/// publication with no interface binds the unspecified address on port
+/// 0, the same address as the SOLICIT endpoint, and still holds an
+/// endpoint of its own: the SOLICITs do not leave from it, nor share its
+/// resets and tables.
+#[test]
+fn a_default_interface_publication_does_not_share_the_solicit_endpoint() {
+    let mut driver = driver(ThreadingMode::Shared);
+    let sink = UdpSocket::bind(SocketAddr::new(LOOPBACK, 0)).unwrap();
+    let _publication = driver
+        .add_network_publication(
+            aggregate(10, 1, 1),
+            &UdpConfig {
+                interface: None,
+                ..channel(sink.local_addr().unwrap())
+            },
+        )
+        .unwrap();
+    assert_eq!(driver.network_held_endpoints(), 1);
+    let group = SocketAddr::from(([239, 7, 9, 1], free_port()));
+    let multicast = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        ..channel(group)
+    };
+    // A host without multicast on its default interface cannot join the
+    // group: nothing to check there.
+    if driver.add_network_subscription(6, &multicast).is_err() {
+        return;
+    }
+    let solicit = driver.network_solicit_endpoints();
+    assert_eq!(solicit.len(), 1, "{solicit:?}");
+    // The publication's, the subscription's and the SOLICIT endpoint.
+    assert_eq!(driver.network_held_endpoints(), 3);
 }

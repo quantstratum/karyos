@@ -523,6 +523,14 @@ fn m150_a_late_unreliable_multicast_subscriber_binds() {
 /// joiner's source endpoint, one `setup_answer_rate` bucket (20 a second,
 /// burst 20) at the publisher; those beyond it bind at a later retry.
 fn measure_one_driver(label: &str, reliable: bool, count: usize, streams: usize) {
+    measure_drivers(label, reliable, count, streams, 1);
+}
+
+/// [`measure_one_driver`] with `drivers` fresh joiner drivers per round,
+/// each joining every stream at once (plan 169): on one host they share
+/// the group port, and without a per-driver SOLICIT endpoint they are one
+/// source to the publisher's `setup_answer_rate`.
+fn measure_drivers(label: &str, reliable: bool, count: usize, streams: usize, drivers: usize) {
     let _route = MulticastOnLoopback::route();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 12)), free_port());
     let channel = UdpConfig {
@@ -591,75 +599,88 @@ fn measure_one_driver(label: &str, reliable: bool, count: usize, streams: usize)
     }
     let mut joins: Vec<Join> = Vec::with_capacity(count);
     while joins.len() < count {
-        let mut joiner = driver(ThreadingMode::Shared);
+        let mut joiners: Vec<_> = (0..drivers)
+            .map(|_| driver(ThreadingMode::Shared))
+            .collect();
         let subscribed = Instant::now();
-        for &stream in &ids {
-            let _ = joiner.add_network_subscription(stream, &channel).unwrap();
+        for joiner in &mut joiners {
+            for &stream in &ids {
+                let _ = joiner.add_network_subscription(stream, &channel).unwrap();
+            }
         }
-        let mut bound = vec![false; streams];
+        let mut bound = vec![vec![false; streams]; drivers];
         let mut tick = Instant::now();
         loop {
             if std::env::var("KARYOS_BIND_TIMELINE").is_ok_and(|value| !value.is_empty())
                 && tick.elapsed() >= Duration::from_secs(1)
             {
                 tick = Instant::now();
-                let sessions = shared(&mut joiner).receiver.session_counters();
-                let own = joiner.net.as_ref().unwrap().receiver_counters().unwrap();
-                println!(
-                    "bind_time timeline {:.1} s: bound {} | data_unbound {} rate_limited {} | solicits {} retries {} answered {} expired {} withdrawn {} dropped {}",
-                    subscribed.elapsed().as_secs_f64(),
-                    bound.iter().filter(|done| **done).count(),
-                    own.data_unbound,
-                    own.rsp_setup_rate_limited,
-                    sessions.solicits,
-                    sessions.solicit_retries,
-                    sessions.solicits_answered,
-                    sessions.solicits_expired,
-                    sessions.solicits_withdrawn,
-                    sessions.dropped,
-                );
+                for (index, joiner) in joiners.iter_mut().enumerate() {
+                    let sessions = shared(joiner).receiver.session_counters();
+                    let own = joiner.net.as_ref().unwrap().receiver_counters().unwrap();
+                    println!(
+                        "bind_time timeline {:.1} s driver {index}: bound {} | data_unbound {} rate_limited {} | solicits {} retries {} answered {} expired {} withdrawn {} dropped {}",
+                        subscribed.elapsed().as_secs_f64(),
+                        bound[index].iter().filter(|done| **done).count(),
+                        own.data_unbound,
+                        own.rsp_setup_rate_limited,
+                        sessions.solicits,
+                        sessions.solicit_retries,
+                        sessions.solicits_answered,
+                        sessions.solicits_expired,
+                        sessions.solicits_withdrawn,
+                        sessions.dropped,
+                    );
+                }
             }
             offer(&mut lanes);
-            for driver in [&mut a, &mut anchor, &mut joiner] {
+            for driver in [&mut a, &mut anchor] {
                 let _ = driver.do_work().unwrap();
+            }
+            for joiner in &mut joiners {
+                let _ = joiner.do_work().unwrap();
             }
             for reader in &mut readers {
                 let _ = reader.poll(|_, _, _| {}, BUDGET);
             }
             let now = Instant::now();
-            for (index, &stream) in ids.iter().enumerate() {
-                if !bound[index] && joiner.network_image(stream, 3).is_some() {
-                    bound[index] = true;
-                    joins.push(Join {
-                        bind: Some(now.duration_since(subscribed)),
-                        subscribe: now.duration_since(subscribed),
-                        solicits: 0,
-                        expired: 0,
-                        censored: false,
-                    });
+            for (joiner, bound) in joiners.iter().zip(bound.iter_mut()) {
+                for (index, &stream) in ids.iter().enumerate() {
+                    if !bound[index] && joiner.network_image(stream, 3).is_some() {
+                        bound[index] = true;
+                        joins.push(Join {
+                            bind: Some(now.duration_since(subscribed)),
+                            subscribe: now.duration_since(subscribed),
+                            solicits: 0,
+                            expired: 0,
+                            censored: false,
+                        });
+                    }
                 }
             }
             let censored = now.duration_since(subscribed) >= JOIN_LIMIT;
-            if bound.iter().all(|done| *done) || censored {
-                let sessions = shared(&mut joiner).receiver.session_counters();
-                let ignored = shared(&mut joiner).receiver.ignored_controls();
-                let reasons: Vec<_> = ignored.seen().collect();
-                let own = joiner.net.as_ref().unwrap().receiver_counters().unwrap();
-                println!(
-                    "bind_time {label} round: solicits {} retries {} refused {} expired {} \
-                     | joiner rsp_setup_rate_limited {} rsp_setup_total_limited {} rsp_setup_destinations_full {} \
-                     ring_full_rsp_setup {} | ignored {reasons:?}",
-                    sessions.solicits,
-                    sessions.solicit_retries,
-                    sessions.solicit_retries_refused,
-                    sessions.solicits_expired,
-                    own.rsp_setup_rate_limited,
-                    own.rsp_setup_total_limited,
-                    own.rsp_setup_destinations_full,
-                    own.ring_full_rsp_setup,
-                );
+            if bound.iter().flatten().all(|done| *done) || censored {
+                for joiner in &mut joiners {
+                    let sessions = shared(joiner).receiver.session_counters();
+                    let ignored = shared(joiner).receiver.ignored_controls();
+                    let reasons: Vec<_> = ignored.seen().collect();
+                    let own = joiner.net.as_ref().unwrap().receiver_counters().unwrap();
+                    println!(
+                        "bind_time {label} round: solicits {} retries {} refused {} expired {} \
+                         | joiner rsp_setup_rate_limited {} rsp_setup_total_limited {} rsp_setup_destinations_full {} \
+                         ring_full_rsp_setup {} | ignored {reasons:?}",
+                        sessions.solicits,
+                        sessions.solicit_retries,
+                        sessions.solicit_retries_refused,
+                        sessions.solicits_expired,
+                        own.rsp_setup_rate_limited,
+                        own.rsp_setup_total_limited,
+                        own.rsp_setup_destinations_full,
+                        own.ring_full_rsp_setup,
+                    );
+                }
                 if censored {
-                    let missing = bound.iter().filter(|done| !**done).count();
+                    let missing = bound.iter().flatten().filter(|done| !**done).count();
                     for _ in 0..missing {
                         joins.push(Join {
                             bind: Some(now.duration_since(subscribed)),
@@ -704,6 +725,23 @@ fn sized_publisher(streams: usize) -> crate::embedded::EmbeddedDriver {
 #[ignore = "a measurement: scripts/netem-test.sh with KARYOS_NETEM_MEASURE"]
 fn m164_simultaneous_joins_on_one_driver() {
     measure_one_driver("one driver", true, joins(), streams());
+}
+
+/// The joiner drivers of one round: `KARYOS_BIND_DRIVERS`, or 4.
+fn drivers() -> usize {
+    std::env::var("KARYOS_BIND_DRIVERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(4)
+}
+
+/// Plan 169: `KARYOS_BIND_DRIVERS` joiner drivers on one host, each
+/// joining `KARYOS_BIND_STREAMS` reliable streams at once.
+#[test]
+#[ignore = "a measurement: scripts/netem-test.sh with KARYOS_NETEM_MEASURE"]
+fn m169_simultaneous_joins_on_several_drivers() {
+    measure_drivers("several drivers", true, joins(), streams(), drivers());
 }
 
 /// The quantile helpers on a known sample.

@@ -13,8 +13,8 @@
 # (net::netem and the end-to-end net::e2e::netem), one at a time.
 # KARYOS_NETEM sets the netem profile (default below). KARYOS_NETEM_MEASURE,
 # passed through, enables the measurements (`net::e2e::bind_time`), and
-# KARYOS_BIND_JOIN_GAP_MS, KARYOS_BIND_STREAMS and KARYOS_BIND_TIMELINE,
-# passed through too, shape them.
+# KARYOS_BIND_JOIN_GAP_MS, KARYOS_BIND_STREAMS, KARYOS_BIND_DRIVERS and
+# KARYOS_BIND_TIMELINE, passed through too, shape them.
 #
 # The tests require KARYOS_NETEM_ACTIVE=1, which this script sets only once
 # netem is in place, and the run fails if no netem test ran.
@@ -53,6 +53,7 @@ exec docker run --rm \
     -e KARYOS_NETEM_MEASURE="${KARYOS_NETEM_MEASURE:-}" \
     -e KARYOS_BIND_JOIN_GAP_MS="${KARYOS_BIND_JOIN_GAP_MS:-}" \
     -e KARYOS_BIND_STREAMS="${KARYOS_BIND_STREAMS:-}" \
+    -e KARYOS_BIND_DRIVERS="${KARYOS_BIND_DRIVERS:-}" \
     -e KARYOS_BIND_TIMELINE="${KARYOS_BIND_TIMELINE:-}" \
     -w /work \
     "$image" \

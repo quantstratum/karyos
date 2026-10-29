@@ -237,6 +237,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map_or(0, crate::net::Network::control_join_failures)
     }
 
+    /// The driver's unicast control endpoints that send SOLICITs, one per
+    /// address family with a multicast subscription (network-control-
+    /// schemas.md §6.3, plan 164): their bound addresses, port and family.
+    #[must_use]
+    pub fn network_solicit_endpoints(&self) -> Vec<std::net::SocketAddr> {
+        self.net
+            .as_ref()
+            .map(|net| net.solicit_endpoints().collect())
+            .unwrap_or_default()
+    }
+
+    /// Unicast control endpoints for SOLICITs that could not open: those
+    /// subscriptions send theirs from their own endpoint (plan 164).
+    #[must_use]
+    pub fn network_solicit_endpoint_failures(&self) -> u64 {
+        self.net
+            .as_ref()
+            .map_or(0, crate::net::Network::solicit_endpoint_failures)
+    }
+
     /// Channels with `paths` refused because their sockets cannot be
     /// isolated (owner item 12), and later paths of subscriptions that
     /// could not be held.
