@@ -8,7 +8,7 @@
 //! ```toml
 //! [io]
 //! backend = "sockets"            # sockets | io_uring | af_xdp | ef_vi | dpdk
-//! require = ["kernel-stamps"]    # a missing required capability stops startup
+//! require = ["kernel-stamps"]    # an endpoint lacking one fails to open
 //!
 //! [io.sockets]
 //! tx_slots = 1024
@@ -588,7 +588,9 @@ impl IoConfig {
         &self.backend
     }
 
-    /// The capabilities that must be active, or startup fails.
+    /// The capabilities every endpoint must have active: an endpoint that
+    /// lacks one fails to open, at startup or at the first add that opens
+    /// it.
     #[must_use]
     pub fn require(&self) -> &[String] {
         self.require.as_deref().unwrap_or_default()
