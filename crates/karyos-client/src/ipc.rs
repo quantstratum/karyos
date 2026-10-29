@@ -2134,29 +2134,28 @@ fn drain_late(
     received: (Message, Option<OwnedFd>),
 ) -> Result<(), (Message, Option<OwnedFd>)> {
     let mut state = session.state();
-    let found = |abandoned: &[Abandoned], fetch: u64| {
-        abandoned.iter().position(|entry| entry.fetch == fetch)
+    // The entry of `fetch`, if it waits for regions (`regions`) or not.
+    let found = |abandoned: &[Abandoned], fetch: u64, regions: bool| {
+        abandoned
+            .iter()
+            .position(|entry| entry.fetch == fetch && entry.remaining.is_some() == regions)
     };
     let detach = match &received {
         (Message::Refused { fetch, .. }, None) => {
-            let Some(at) = found(&state.abandoned, *fetch)
-                .filter(|at| state.abandoned[*at].remaining.is_none())
-            else {
+            let Some(at) = found(&state.abandoned, *fetch, false) else {
                 return Err(received);
             };
             state.abandoned.swap_remove(at);
             None
         }
         (Message::Manifest { fetch, records, .. }, None) => {
-            let Some(at) = found(&state.abandoned, *fetch)
-                .filter(|at| state.abandoned[*at].remaining.is_none())
-            else {
+            let Some(at) = found(&state.abandoned, *fetch, false) else {
                 return Err(received);
             };
             if records.is_empty() {
                 state.abandoned.swap_remove(at);
-            } else {
-                state.abandoned[at].remaining = Some(
+            } else if let Some(entry) = state.abandoned.get_mut(at) {
+                entry.remaining = Some(
                     (0u64..)
                         .zip(records.iter())
                         .map(|(index, record)| (index, record.export))
@@ -2166,22 +2165,22 @@ fn drain_late(
             None
         }
         (Message::Region { fetch, index }, Some(_)) => {
-            let Some(at) = found(&state.abandoned, *fetch) else {
+            let Some(at) = found(&state.abandoned, *fetch, true) else {
                 return Err(received);
             };
-            let next = state.abandoned[at]
-                .remaining
-                .as_ref()
-                .and_then(|left| left.front().copied());
-            let Some((expected, export)) = next.filter(|(expected, _)| expected == index) else {
+            let Some(left) = state
+                .abandoned
+                .get_mut(at)
+                .and_then(|entry| entry.remaining.as_mut())
+            else {
                 return Err(received);
             };
-            let _ = expected;
-            if let Some(left) = state.abandoned[at].remaining.as_mut() {
-                let _ = left.pop_front();
-                if left.is_empty() {
-                    state.abandoned.swap_remove(at);
-                }
+            let Some(&(_, export)) = left.front().filter(|(expected, _)| expected == index) else {
+                return Err(received);
+            };
+            let _ = left.pop_front();
+            if left.is_empty() {
+                state.abandoned.swap_remove(at);
             }
             state.live.push(export);
             Some(export)
