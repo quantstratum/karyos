@@ -1518,6 +1518,21 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// The message tokens of each publication's sender gate, in the
+    /// sender's order (tests, Shared mode only).
+    #[cfg(test)]
+    pub(crate) fn gate_message_tokens(&self) -> Vec<Option<u64>> {
+        let mut tokens = Vec::new();
+        if let Agents::Shared(agents) = &self.agents {
+            let mut index = 0;
+            while let Some(gate) = agents.sender.gate_message_tokens(index) {
+                tokens.push(gate);
+                index += 1;
+            }
+        }
+        tokens
+    }
+
     /// Distinct network subscription keys held, for tests.
     #[cfg(test)]
     pub(crate) fn subscription_count(&self) -> usize {
