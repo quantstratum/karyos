@@ -371,3 +371,78 @@ fn a_remote_handle_follows_a_rate_policy_change() {
     serve_until(&mut driver, |driver| driver.clients() == 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The #852 review (decided 2026-10-28 by QS-COORDINATOR) across
+/// processes: a remote handle bound to a reincarnation reads when it began
+/// from its ring (`outcome_ring::REINCARNATED_AT`) and starts its copy
+/// empty then: bound at once, empty; bound 50 ms after, the burst, as the
+/// reincarnation's gate.
+#[test]
+fn a_remote_handle_of_a_reincarnation_earns_since_it_began() {
+    use karyos_driver::GuardRate;
+    use karyos_sys::guard::Closed;
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let dir = dir("reincarnated");
+    let mut driver = driver(&dir);
+    let stream = driver.add_stream(stream_config()).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    // A thousand a second, a burst of two: 50 ms earns the burst, a few
+    // microseconds nothing.
+    driver
+        .guard_stream(
+            stream,
+            guard,
+            4,
+            Some(GuardRate::publication(RatePolicy {
+                messages: Rate {
+                    per_second: 1_000,
+                    burst: 2,
+                },
+                bytes: None,
+            })),
+        )
+        .unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let client = attach_serving(&mut driver, &dir).unwrap();
+    // Takes a publication of the stream: its rate copy's tokens.
+    let take = |client: RemoteClient| {
+        let mut client = client;
+        let _ = client.add_publication(KEY, true).unwrap();
+        let mut fetchable = None;
+        let start = Instant::now();
+        while fetchable.is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+            let _ = client.poll(usize::MAX, |completion| match completion.outcome {
+                Outcome::Fetchable(grant) => fetchable = Some(grant),
+                other => panic!("expected a fetchable grant, got {other:?}"),
+            });
+        }
+        let publication = client.take_publication(&fetchable.unwrap()).unwrap();
+        let tokens = publication.guard().unwrap().rate_tokens();
+        (client, publication, tokens)
+    };
+    let (client, first, tokens) = serve_while(&mut driver, move || take(client));
+    assert_eq!(tokens, Some(2), "the first incarnation starts full");
+    // Reincarnated (close, drop, reopen); bound at once: empty.
+    assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
+    drop(first);
+    let _ = driver.do_work().unwrap();
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let (client, second, tokens) = serve_while(&mut driver, move || take(client));
+    assert!(matches!(tokens, Some(0 | 1)), "{tokens:?}");
+    // Reincarnated again, stamped 50 ms before it happens: the burst.
+    assert_eq!(driver.close_guard(guard, 4), Ok(Closed::Now { epoch: 5 }));
+    drop(second);
+    let _ = driver.do_work().unwrap();
+    driver
+        .backdate_next_reincarnation(stream, 50_000_000)
+        .unwrap();
+    assert_eq!(driver.reopen_guard(guard, 5, 5), Ok(6));
+    let (client, third, tokens) = serve_while(&mut driver, move || take(client));
+    assert_eq!(tokens, Some(2));
+    drop(third);
+    drop(client);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

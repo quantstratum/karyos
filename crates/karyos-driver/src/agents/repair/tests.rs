@@ -428,6 +428,52 @@ fn open_guard() -> Arc<karyos_client::HeapWords> {
     word
 }
 
+/// #841 review, point 1, and #852's: a guard spec of a reincarnation
+/// (`empty_since`) builds the sender gate as if empty when it began and
+/// refilled to the guard's `now`, and the first incarnation's (`None`) with
+/// a full bucket, so reincarnating buys no new burst.
+#[test]
+fn a_reincarnations_spec_builds_an_empty_gate() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 1,
+            burst: 4,
+        },
+        bytes: None,
+    };
+    for (empty_since, now, tokens) in [
+        (None, 0, 4),
+        (Some(0), 0, 0),
+        // Begun 2 s before the guard command: 2 tokens earned since.
+        (Some(1_000_000_000), 3_000_000_000, 2),
+    ] {
+        let mut rig = Rig::new(&RepairConfig::default());
+        let word = open_guard();
+        rig.path
+            .guard(
+                super::super::data::GuardSpec {
+                    word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                    cell: Arc::new(AppliedEpoch::new()),
+                    epoch: 2,
+                    empty_since,
+                    rate: Some(policy),
+                    policy: None,
+                    frontier: Default::default(),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            rig.path.guard_gate().unwrap().message_tokens(),
+            Some(tokens),
+            "empty since {empty_since:?}, now {now}"
+        );
+    }
+}
+
 /// A guarded network publication runs the local close only (O-11, GC-6):
 /// until the close it sends as before; after it, nothing at all leaves the
 /// sender, first sends and repairs alike, no control is sent, and its
@@ -446,6 +492,7 @@ fn a_guard_close_stops_every_submission() {
                 word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
                 cell: Arc::clone(&cell),
                 epoch: 2,
+                empty_since: None,
                 rate: None,
                 policy: None,
                 frontier: Default::default(),
@@ -566,6 +613,7 @@ fn guarded(
                 word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
                 cell: Arc::clone(&cell),
                 epoch: 2,
+                empty_since: None,
                 rate: None,
                 policy: None,
                 frontier: Default::default(),
@@ -666,6 +714,7 @@ fn guard_spec(
             word: Arc::clone(word) as Arc<dyn karyos_client::SharedWords>,
             cell: Arc::clone(&cell),
             epoch: 2,
+            empty_since: None,
             rate,
             policy: None,
             frontier: Default::default(),

@@ -92,10 +92,9 @@ pub enum DestinationChange {
     /// Refused: it was removed less than its quarantine ago (MD-14).
     Quarantined,
     /// Refused: the publication has [`MAX_DESTINATIONS`] destinations,
-    /// counting those removed whose route and queues have not left for the
-    /// sender's close list yet: a removal is reported at once, retired at
-    /// its report, and its route and queues go to the close list then (or
-    /// at a later duty, `close_deferred`, when that list is full).
+    /// counting those removed whose removal is not reported yet: a removal
+    /// is reported at once, retired at its report, and its route and queues
+    /// go to the close list then.
     Full,
     /// Refused: the publication is being removed.
     Removing,
@@ -281,9 +280,6 @@ pub(super) struct Fanout {
     ipv4: bool,
     /// Retired targets' routes and queues, for the sender to close.
     retired: Vec<Opened>,
-    /// The entries of `retired` already counted as carried over to the
-    /// next duty (`close_deferred`), the oldest ones.
-    carried: usize,
 }
 
 /// The gate of one target's first sends: every candidate is permitted,
@@ -381,7 +377,6 @@ impl Fanout {
             open_spacing: 0,
             ipv4,
             retired: Vec::with_capacity(MAX_DESTINATIONS),
-            carried: 0,
             targets,
             pending: vec![None; lanes],
             joins: vec![0; lanes],
@@ -447,9 +442,10 @@ impl Fanout {
     /// dropped), go to `retired`, for the sender's close list, which
     /// returns their pending items as `QueueClosed` (counted in
     /// `removed_returned`) and closes the queues and the route. They leave
-    /// `targets`, and their address is kept for its quarantine (MD-14,
-    /// from `now`). Returns the targets retired and the quarantine records
-    /// forgotten to make room.
+    /// `targets`, and their address is kept for its quarantine (MD-14),
+    /// counted from its removal; `now` expires the records past theirs.
+    /// Returns the targets retired and the quarantine records forgotten to
+    /// make room.
     fn retire(
         &mut self,
         endpoint: crate::agents::EndpointId,
@@ -519,8 +515,11 @@ impl Fanout {
             // The record removed earliest goes first, the incoming one
             // included: retirement order may differ from removal order.
             let removed_at = target.removed.map_or(now, |(_, time)| time);
-            let mut keep = true;
-            if fanout.quarantined.len() >= MAX_DESTINATIONS {
+            // A record already past its quarantine is not kept.
+            let mut keep = now
+                .checked_sub(removed_at)
+                .is_none_or(|age| age < quarantine);
+            if keep && fanout.quarantined.len() >= MAX_DESTINATIONS {
                 let earliest = fanout
                     .quarantined
                     .iter()
@@ -746,6 +745,8 @@ impl<T: StreamTerms> Outbound<T> {
         let spacing = fanout.open_spacing;
         let (mut route_failures, mut queue_failures, mut removed) = (0u64, 0u64, 0u64);
         let mut limits = 0u64;
+        let mut limited = false;
+        let endpoint = self.endpoint;
         for target in &mut fanout.targets {
             if target.opened == Some(epoch) || target.removed.is_some() {
                 continue;
@@ -764,6 +765,7 @@ impl<T: StreamTerms> Outbound<T> {
                     route_failures = route_failures.saturating_add(1);
                     if error == karyos_io::backend::RouteError::RouteLimit {
                         limits = limits.saturating_add(1);
+                        limited = true;
                     }
                     if open_failed(target, route_own(error), (now, spacing)) {
                         removed = removed.saturating_add(1);
@@ -812,6 +814,7 @@ impl<T: StreamTerms> Outbound<T> {
                 queue_failures = queue_failures.saturating_add(1);
                 if queue_limit(error) {
                     limits = limits.saturating_add(1);
+                    limited = true;
                 }
                 continue;
             }
@@ -838,6 +841,9 @@ impl<T: StreamTerms> Outbound<T> {
             .bump(|c| &mut c.queue_failures, queue_failures);
         self.counters.bump(|c| &mut c.removed_fault, removed);
         self.counters.bump(|c| &mut c.endpoint_limits, limits);
+        if limited {
+            super::note_limited(&mut self.limited, endpoint, epoch);
+        }
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return false;
         };
@@ -1438,7 +1444,7 @@ const fn route_own(error: karyos_io::backend::RouteError) -> bool {
 /// failure is the destination's own; the others are not limits either: a
 /// reset (`NotActive`, `NeedsReset`), identities exhausted, a report not
 /// empty, or a stale handle.
-const fn queue_limit(error: karyos_io::backend::QueueError) -> bool {
+pub(super) const fn queue_limit(error: karyos_io::backend::QueueError) -> bool {
     use karyos_io::backend::QueueError;
     matches!(
         error,
@@ -1522,23 +1528,22 @@ impl<T: StreamTerms> Outbound<T> {
 
     /// Hands the routes and queues of retired destinations to `closing`,
     /// the sender's list of what removed publications left, which closes
-    /// each whole (design 3.7). The list has a fixed capacity: what does
-    /// not fit waits for the next duty (`close_deferred`).
-    pub(crate) fn drain_retired(&mut self, closing: &mut Vec<Opened>) {
+    /// each whole (design 3.7). The list empties at every duty and has room
+    /// for every publication's routes and destinations twice over, so
+    /// everything fits. Returns what did not (never): it waits in the
+    /// publication for a later duty, and the caller counts it.
+    pub(crate) fn drain_retired(&mut self, closing: &mut Vec<Opened>) -> u64 {
         let Some(fanout) = self.fanout.as_deref_mut() else {
-            return;
+            return 0;
         };
-        // Within the close list's fixed capacity: what finds no room stays
-        // for the next duty, never dropped, and each entry is counted once
-        // when it is first carried over.
+        debug_assert!(
+            closing.capacity().saturating_sub(closing.len()) >= fanout.retired.len(),
+            "the close list has room for every retired destination"
+        );
         let room = closing.capacity().saturating_sub(closing.len());
         let taken = room.min(fanout.retired.len());
         closing.extend(fanout.retired.drain(..taken));
-        let counted = fanout.carried.saturating_sub(taken);
-        let left = fanout.retired.len();
-        let new = u64::try_from(left.saturating_sub(counted)).unwrap_or(u64::MAX);
-        fanout.carried = left;
-        self.counters.bump(|c| &mut c.close_deferred, new);
+        u64::try_from(fanout.retired.len()).unwrap_or(u64::MAX)
     }
 
     /// The repair jobs every destination's table holds, summed (tests).
@@ -2149,6 +2154,8 @@ mod tests {
         let _ = outbound.change_destination(address(4001), true, 0, 0);
         let _ = outbound.open_targets(&mut tx, 0);
         let quarantine = 1_000;
+        // The sender sets both from `receiver_timeout`.
+        outbound.set_destination_timing(quarantine, 0);
         assert_eq!(
             outbound.change_destination(address(4001), false, 5_000, quarantine),
             DestinationChange::Removed
@@ -2282,12 +2289,29 @@ mod tests {
         assert_eq!(outbound.counters().quarantine_forgotten, 1);
     }
 
-    /// Review C3 and should-fix 5 of #829: with the close list full,
-    /// retired routes and queues are carried over, never dropped, and
-    /// counted once; their slots stay held until they leave, so a new
-    /// destination never opens beside an old route still open.
+    /// The follow-up of #829's review, point 5: an incoming record already
+    /// past its quarantine is not kept, and not counted as forgotten.
     #[test]
-    fn a_full_close_list_defers_and_holds_the_slots() {
+    fn an_expired_incoming_record_is_not_kept() {
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut outbound = fanned(address(4000));
+        let _ = outbound.change_destination(address(4001), true, 0, 0);
+        outbound.set_destination_timing(100, 0);
+        let _ = outbound.change_destination(address(4001), false, 0, 100);
+        outbound.removal_reported(address(4001), 1_000);
+        let fanout = outbound.fanout.as_deref().unwrap();
+        assert!(fanout.quarantined.is_empty());
+        assert_eq!(outbound.counters().quarantine_forgotten, 0);
+        assert_eq!(outbound.counters().destinations_retired, 1);
+    }
+
+    /// Review C3 and should-fix 5 of #829: retired routes and queues hold
+    /// their slots until they leave for the close list, so a new
+    /// destination never opens beside an old route still open; the drain
+    /// takes every one (the follow-up of #829's review: the list always
+    /// has room, so nothing is carried over).
+    #[test]
+    fn retired_routes_hold_their_slots_until_the_drain() {
         let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
         let mut tx = roomy_tx();
         let mut outbound = fanned(address(4000));
@@ -2295,28 +2319,20 @@ mod tests {
             let _ = outbound.change_destination(address(4000 + port), true, 0, 0);
         }
         let _ = outbound.open_targets(&mut tx, 0);
-        let mut no_room = Vec::new();
         for port in 0..u16::try_from(MAX_DESTINATIONS).unwrap() {
             let _ = remove_opened(&mut outbound, address(4000 + port));
             outbound.removal_reported(address(4000 + port), 0);
-            outbound.drain_retired(&mut no_room);
         }
-        let counters = outbound.counters();
-        assert_eq!(counters.destinations_retired, 16);
-        assert_eq!(counters.close_deferred, 16, "each carried over once");
-        outbound.drain_retired(&mut no_room);
-        assert_eq!(outbound.counters().close_deferred, 16, "not counted again");
+        assert_eq!(outbound.counters().destinations_retired, 16);
         assert!(outbound.fanout.as_deref().unwrap().targets.is_empty());
         assert_eq!(
             outbound.change_destination(address(4100), true, 0, 0),
             DestinationChange::Full,
-            "the old routes are still open"
+            "the old routes have not left yet"
         );
-        // Room: every carried entry goes, nothing dropped, and the slots
-        // are free.
         let mut closing = Vec::with_capacity(2 * MAX_DESTINATIONS);
         outbound.drain_retired(&mut closing);
-        assert_eq!(closing.len(), MAX_DESTINATIONS, "nothing dropped");
+        assert_eq!(closing.len(), MAX_DESTINATIONS, "every one taken");
         assert_eq!(
             outbound.change_destination(address(4100), true, 0, 0),
             DestinationChange::Added

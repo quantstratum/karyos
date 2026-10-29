@@ -397,16 +397,15 @@ fn a_stuck_entry_is_delivered_uncalibrated_not_lost() {
     let _ = mirror.append(11, 2, &[2, !2]).unwrap();
     assert!(mirror.hold_entry(1, true));
     let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
-    // Journal 11's leading run (record 0) goes out uncalibrated; the page
-    // ends at its next record (2), which the next read retries.
-    assert_eq!(seqs(&page), [0, 1]);
-    assert_eq!(page.next, 2);
+    // Journal 11's records (0 and 2) go out uncalibrated, in one page.
+    assert_eq!(seqs(&page), [0, 1, 2]);
+    assert_eq!(page.next, 3);
     assert!(page.lost.is_empty());
     assert!(
         page.journals
             .contains(&ExportJournal::Unreadable { journal: 11 })
     );
-    assert_eq!(page.unreadable_records, 1);
+    assert_eq!(page.unreadable_records, 2);
 }
 
 /// QS-COORDINATOR, ACS 33663 (F1): across pages cut by bytes and by a busy
@@ -463,15 +462,21 @@ fn mirror_hold(mirror: &mut TraceMirror, held: bool) -> bool {
 
 /// Re-review U2 of #826: against a writer that keeps appending to a small
 /// ring, pages of the most records a request may ask for (several batches
-/// each, lapped mid-page by the writer) deliver or lose every sequence
+/// each, which the writer may lap mid-page; that a mid-page lap ends the
+/// page is `a_page_lapped_after_its_first_records_ends_there`'s, made
+/// deterministic there) deliver or lose every sequence
 /// exactly once, every loss below its page's `next`, and every record
 /// whole.
 #[test]
 fn full_count_pages_against_a_writer_cover_every_sequence_once() {
     const WRITTEN: u64 = 300_000;
+    // Written past the ring's capacity before the first read, so the
+    // first page has a loss to state whatever the threads' timing.
+    const AHEAD: u64 = 1_000;
     let mut mirror = mirror(64);
+    append(&mut mirror, 0..AHEAD);
     let reader = mirror.reader();
-    let writer = std::thread::spawn(move || append(&mut mirror, 0..WRITTEN));
+    let writer = std::thread::spawn(move || append(&mut mirror, AHEAD..WRITTEN));
     let mut seen = vec![0u8; usize::try_from(WRITTEN).unwrap()];
     let mut lost = 0u64;
     let mut cursor = 0;
@@ -501,8 +506,8 @@ fn full_count_pages_against_a_writer_cover_every_sequence_once() {
     }
     writer.join().unwrap();
     assert!(seen.iter().all(|count| *count == 1));
-    // The writer outran the reader: some of it was lost, stated so.
-    assert!(lost > 0);
+    // The records written ahead of the reader were lost, stated so.
+    assert!(lost >= AHEAD - 64);
 }
 
 /// Re-review U2 of #826: a full page, the most records of the largest
@@ -735,12 +740,12 @@ fn a_page_ends_at_the_overwritten_ranges_it_can_state() {
     assert_eq!(page.next, 300);
 }
 
-/// QS-COORDINATOR, ACS 33989 (W2): with journal A busy past the wait and
-/// first in the page, and journal B readable, only A's leading run goes
-/// out unreadable; B's records are calibrated, and the page ends at A's
-/// next record.
+/// QS-COORDINATOR, ACS 33989 (W2), and point 1 of the #826 review: with
+/// journal A busy past the wait and first in the page, and journal B
+/// readable, A's records go out unreadable, all of them in the page, so a
+/// stuck entry never splits pages into runs; B's records are calibrated.
 #[test]
-fn only_the_busy_first_journals_run_is_unreadable() {
+fn only_the_busy_first_journals_records_are_unreadable() {
     let mut mirror = mirror(16);
     let a = JournalEntry::open(11, 1, JournalKind::Publisher, 2, 16);
     assert!(mirror.write_entry(1, Some(&a)));
@@ -750,11 +755,174 @@ fn only_the_busy_first_journals_run_is_unreadable() {
     }
     assert!(mirror.hold_entry(1, true));
     let page = read_page(&mirror.reader(), EPOCH, 0, 16, None).unwrap();
-    assert_eq!(seqs(&page), [0, 1, 2, 3]);
-    assert_eq!(page.next, 4);
-    assert_eq!(page.unreadable_records, 2);
+    assert_eq!(seqs(&page), [0, 1, 2, 3, 4, 5]);
+    assert_eq!(page.next, 6);
+    assert_eq!(page.unreadable_records, 3);
     assert!(matches!(
         &page.journals[..],
         [ExportJournal::Live(b), ExportJournal::Unreadable { journal: 11 }] if b.journal == 10
     ));
+}
+
+/// Point 7 of the #826 review: lapped again between batches while the page
+/// has no record yet (every record malformed), a page states one
+/// overwritten range per lap up to its cap, and ends at the last.
+#[test]
+fn a_page_stops_at_its_cap_across_several_laps() {
+    use karyos_sys::trace_mirror::MAX_MIRROR_PAYLOAD;
+
+    fn malformed(mirror: &mut TraceMirror, range: std::ops::Range<u64>) {
+        let long = u64::try_from(MAX_MIRROR_PAYLOAD).unwrap() + 1;
+        for seq in range {
+            let _ = mirror.append_with_length(10, seq, &[seq], long).unwrap();
+        }
+    }
+    for cap in [2usize, 3] {
+        let mirror = std::rc::Rc::new(std::cell::RefCell::new(mirror(64)));
+        malformed(&mut mirror.borrow_mut(), 0..100);
+        let reader = mirror.borrow().reader();
+        let writer = std::rc::Rc::clone(&mirror);
+        let mut written = 100;
+        BETWEEN_BATCHES.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                malformed(&mut writer.borrow_mut(), written..written + 100);
+                written += 100;
+            }));
+        });
+        let page = export_within(
+            &reader,
+            (EPOCH, None),
+            0,
+            1_000,
+            usize::MAX,
+            Waits {
+                busy_budget: BUSY_BUDGET,
+                max_lost_ranges: cap,
+            },
+        );
+        BETWEEN_BATCHES.with(|hook| *hook.borrow_mut() = None);
+        let page = page.unwrap();
+        let overwritten = page
+            .lost
+            .iter()
+            .filter(|loss| loss.reason == LossReason::Overwritten)
+            .count();
+        assert_eq!(overwritten, cap, "{:?}", page.lost);
+        assert!(page.records.is_empty());
+        assert!(page.lost.iter().all(|loss| loss.last < page.next));
+    }
+}
+
+/// Points 2 and 4 of the #826 review: with a table entry stuck for the
+/// whole of the table's wait, a recycle log entry busy for less than the
+/// log's own wait is still waited out, and the journal it holds is found
+/// there, calibrated. The log entry is released from inside the log's wait
+/// (a hook), so the test needs no sleep: under one budget shared with the
+/// table, that wait would never run. Each part retries its busy entries
+/// at least once, so the hook runs whatever the clock says.
+#[test]
+fn the_log_waits_with_its_own_budget_after_a_stuck_table() {
+    let mirror = std::rc::Rc::new(std::cell::RefCell::new(mirror(16)));
+    let stuck = JournalEntry::open(12, 1, JournalKind::Publisher, 2, 16);
+    assert!(mirror.borrow_mut().write_entry(1, Some(&stuck)));
+    let gone = RecycledJournal {
+        journal: 11,
+        stream: 3,
+        lane: Lane::ZERO,
+        incarnation: 1,
+        state: JournalState::Closed,
+        boundary: Some(64),
+        pairs: [NotedPublisher {
+            journal: 0,
+            attempted: 0,
+        }; MAX_RECYCLE_PAIRS],
+        pair_count: 0,
+        sequence: 2,
+    };
+    assert!(mirror.borrow_mut().write_log(0, Some(&gone)));
+    let _ = mirror.borrow_mut().append(11, 0, &[0, !0]).unwrap();
+    assert!(mirror.borrow_mut().hold_entry(1, true));
+    assert!(mirror.borrow_mut().hold_log(0, true));
+    let reader = mirror.borrow().reader();
+    let writer = std::rc::Rc::clone(&mirror);
+    DURING_LOG_WAIT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            assert!(writer.borrow_mut().hold_log(0, false));
+        }));
+    });
+    let page = export_within(
+        &reader,
+        (EPOCH, None),
+        0,
+        16,
+        usize::MAX,
+        Waits {
+            busy_budget: std::time::Duration::ZERO,
+            max_lost_ranges: MAX_LOST_RANGES,
+        },
+    );
+    DURING_LOG_WAIT.with(|hook| *hook.borrow_mut() = None);
+    let page = page.unwrap();
+    assert_eq!(seqs(&page), [0]);
+    assert_eq!(page.journals, [ExportJournal::Recycled(Box::new(gone))]);
+    assert_eq!(page.unreadable_records, 0);
+}
+
+/// The #845 review: the log's wait has a budget of its own, not only the
+/// one retry every part gets. With the table's entry stuck for the whole of
+/// its 200 ms, a log entry released at the log's second retry is still
+/// found; under one budget shared with the table, the log would get its one
+/// retry and no second.
+#[test]
+fn the_log_has_a_budget_of_its_own_past_the_first_retry() {
+    let mirror = std::rc::Rc::new(std::cell::RefCell::new(mirror(16)));
+    let stuck = JournalEntry::open(12, 1, JournalKind::Publisher, 2, 16);
+    assert!(mirror.borrow_mut().write_entry(1, Some(&stuck)));
+    let gone = RecycledJournal {
+        journal: 11,
+        stream: 3,
+        lane: Lane::ZERO,
+        incarnation: 1,
+        state: JournalState::Closed,
+        boundary: Some(64),
+        pairs: [NotedPublisher {
+            journal: 0,
+            attempted: 0,
+        }; MAX_RECYCLE_PAIRS],
+        pair_count: 0,
+        sequence: 2,
+    };
+    assert!(mirror.borrow_mut().write_log(0, Some(&gone)));
+    let _ = mirror.borrow_mut().append(11, 0, &[0, !0]).unwrap();
+    assert!(mirror.borrow_mut().hold_entry(1, true));
+    assert!(mirror.borrow_mut().hold_log(0, true));
+    let reader = mirror.borrow().reader();
+    let writer = std::rc::Rc::clone(&mirror);
+    let mut retries = 0;
+    DURING_LOG_WAIT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // Released at the log's second retry: past the one every part
+            // gets, so only a budget of the log's own reaches it.
+            retries += 1;
+            if retries == 2 {
+                assert!(writer.borrow_mut().hold_log(0, false));
+            }
+        }));
+    });
+    let page = export_within(
+        &reader,
+        (EPOCH, None),
+        0,
+        16,
+        usize::MAX,
+        Waits {
+            busy_budget: std::time::Duration::from_millis(200),
+            max_lost_ranges: MAX_LOST_RANGES,
+        },
+    );
+    DURING_LOG_WAIT.with(|hook| *hook.borrow_mut() = None);
+    let page = page.unwrap();
+    assert_eq!(seqs(&page), [0]);
+    assert_eq!(page.journals, [ExportJournal::Recycled(Box::new(gone))]);
+    assert_eq!(page.unreadable_records, 0);
 }

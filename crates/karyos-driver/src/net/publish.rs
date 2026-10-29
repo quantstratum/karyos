@@ -686,6 +686,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 slot
             }
         };
+        // The gate starts from the publication's policy in force, a change
+        // or a policy given to its rateless lanes included, not the one it
+        // was guarded with (R-CORE-21).
+        let rate = handle
+            .streams()
+            .find_map(|stream| self.stream_ref(stream).ok()?.guarded.as_ref()?.rate);
         // The gate reads word 0: the guard's word in the guard words.
         let (words, index) = self.guards.view(guard.guard)?;
         let word = Arc::new(crate::shared_words::WordAt::new(words, index))
@@ -703,13 +709,29 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 guarded.submit_through(Arc::clone(&frontier), lane);
             }
         }
+        // A reincarnation's gate starts empty when it began, the time its
+        // handles' rings carry too (R-CORE-21); 0, unknown, is now. A
+        // network publication's lanes reincarnate together, in one step
+        // (`reincarnate_network`), so its first lane's time is every lane's.
+        let empty_since = guarded.then(|| {
+            handle
+                .streams()
+                .find_map(|stream| {
+                    self.stream_ref(stream)
+                        .ok()
+                        .map(|found| found.reincarnated_at)
+                })
+                .filter(|at| *at != 0)
+                .unwrap_or_else(karyos_sys::host_clock::host_monotonic_ns)
+        });
         let (id, cell) = self.register_guard_sender(guard.guard)?;
         Ok(Some((
             GuardSpec {
                 word,
                 cell,
                 epoch,
-                rate: guard.rate.map(|rate| rate.policy),
+                rate,
+                empty_since,
                 policy: Some(slot as Arc<dyn karyos_client::SharedWords>),
                 frontier,
             },

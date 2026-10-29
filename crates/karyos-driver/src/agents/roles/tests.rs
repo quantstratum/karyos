@@ -1430,28 +1430,28 @@ fn a_reset_request_is_repeated_at_its_cadence() {
     let mut sender = sm_sender();
     let mut asked = Vec::new();
     sender.cycle = 10;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
     assert!(asked.is_empty(), "nothing needs a reset");
     sender.publications[0].force_needs_reset();
     // The ring is full: counted, not recorded.
-    sender.request_resets(|_| false);
+    sender.request_resets(|_, _| false);
     sender.cycle = 11;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
     assert_eq!(asked, [EndpointId(1)]);
     sender.cycle = 11 + RESET_REQUEST_CYCLES - 1;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
     assert_eq!(asked.len(), 1);
     sender.cycle = 11 + RESET_REQUEST_CYCLES;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
@@ -2230,6 +2230,7 @@ fn a_guard_close_applies_without_a_tx_half() {
                 word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
                 cell: Arc::clone(&cell),
                 epoch: 2,
+                empty_since: None,
                 rate: None,
                 policy: None,
                 frontier: Default::default(),
@@ -2808,7 +2809,7 @@ fn a_route_fault_asks_for_a_reset_at_its_cadence() {
     let mut asked = Vec::new();
     let mut ask = |receiver: &mut super::ReceiverRole, cycle| {
         receiver.cycle = cycle;
-        receiver.request_resets(|endpoint| {
+        receiver.request_resets(|endpoint, _| {
             asked.push((cycle, endpoint));
             true
         });
@@ -2834,7 +2835,7 @@ fn a_route_fault_asks_for_a_reset_at_its_cadence() {
     receiver.fault_naks(slot, &nak);
     let mut later = Vec::new();
     receiver.cycle = 11 + RESET_REQUEST_CYCLES;
-    receiver.request_resets(|endpoint| {
+    receiver.request_resets(|endpoint, _| {
         later.push(endpoint);
         true
     });
@@ -2947,6 +2948,7 @@ fn an_unestablished_guarded_publication_applies_a_close() {
             word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
             cell: Arc::clone(&cell),
             epoch: 2,
+            empty_since: None,
             rate: None,
             policy: None,
             frontier: Default::default(),
@@ -3518,7 +3520,13 @@ fn a_refused_path_heartbeat_is_tried_next_cycle() {
     use super::super::Half;
 
     let interval = AgentConfig::default().path_heartbeat_interval;
-    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    // The lane's idle DATA heartbeat (karyos#834) is kept out of the way:
+    // the refusal is meant for the PATH_HB.
+    let config = AgentConfig {
+        sender_heartbeat_interval: interval.saturating_mul(1000),
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
     let routes = [
         (EndpointId(1), "10.0.0.2:4000".parse().unwrap()),
         (EndpointId(2), "10.0.0.3:4000".parse().unwrap()),
@@ -3749,8 +3757,24 @@ fn the_heartbeat_mark_and_a_tail_nak_stop_at_the_terminal_bound() {
         super::HeartbeatClass::Stationary,
         "capped at the bound"
     );
-    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
-    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert!(
+        super::tail_hole(
+            &mut image,
+            Lane::ZERO,
+            0,
+            1,
+            &mut super::ReceiverCounters::default()
+        )
+        .is_none()
+    );
+    let hole = super::tail_hole(
+        &mut image,
+        Lane::ZERO,
+        0,
+        10_000_000_000,
+        &mut super::ReceiverCounters::default(),
+    )
+    .unwrap();
     assert_eq!((hole.start, hole.length), (0, 96));
 }
 
@@ -3874,8 +3898,24 @@ fn a_bound_below_the_heartbeat_mark_caps_the_tail_nak() {
         super::record_terminal(&mut image, Lane::ZERO, 96),
         super::Terminal::Recorded
     );
-    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
-    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert!(
+        super::tail_hole(
+            &mut image,
+            Lane::ZERO,
+            0,
+            1,
+            &mut super::ReceiverCounters::default()
+        )
+        .is_none()
+    );
+    let hole = super::tail_hole(
+        &mut image,
+        Lane::ZERO,
+        0,
+        10_000_000_000,
+        &mut super::ReceiverCounters::default(),
+    )
+    .unwrap();
     assert_eq!((hole.start, hole.length), (0, 96));
 }
 
@@ -4092,6 +4132,7 @@ fn a_guard_closed_lane_sends_no_heartbeat() {
             word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
+            empty_since: None,
             rate: None,
             policy: None,
             frontier: Default::default(),
@@ -4377,7 +4418,7 @@ fn a_retired_destinations_pending_items_return_queue_closed() {
         route,
         queues,
     });
-    sender.close_removed(&mut halves);
+    sender.close_removed(&mut halves, 0);
     let counters = sender.counters();
     assert_eq!(counters.removed_returned, 1, "{counters:?}");
     assert_eq!(counters.removed_closed, 2, "the queue and the route");
@@ -4474,8 +4515,8 @@ fn a_move_right_after_the_report_is_added_in_the_cycle_order() {
 }
 
 /// Review J1 of #829: an entry of the close list whose endpoint's TX half
-/// is not held at its duty is dropped and counted once: that half comes
-/// back only in a new epoch, whose reset drops the handles, or never.
+/// is not held at its duty is dropped and counted once: that half is in a
+/// reset, which drops the handles, or retired.
 #[test]
 fn a_close_without_its_tx_half_is_dropped_once() {
     use karyos_io::backend::{Authority, TxQueueConfig};
@@ -4505,10 +4546,11 @@ fn a_close_without_its_tx_half_is_dropped_once() {
     });
     // A duty that does not hold endpoint 1's half.
     let mut none: Halves = Vec::new();
-    sender.close_removed(&mut none);
+    sender.close_removed(&mut none, 0);
     assert!(sender.closing.is_empty(), "dropped");
     assert_eq!(sender.counters().removed_dropped, 1);
-    sender.close_removed(&mut halves);
+    // The next duty, holding the half, has nothing of it left.
+    sender.close_removed(&mut halves, 0);
     assert_eq!(sender.counters().removed_dropped, 1, "once");
     assert_eq!(sender.counters().removed_closed, 0);
 }
@@ -4666,4 +4708,1177 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
         2,
         "the old queue and route"
     );
+}
+
+/// #821 point 3: an unreliable image's duty feeds the skip policy each
+/// lane's heartbeat mark clamped to the terminal bound, so a tail no
+/// frame revealed is sealed at its deadline up to the bound and no
+/// further.
+#[test]
+fn an_unreliable_tail_is_sealed_up_to_the_terminal_bound() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::log_buffer::SkipConfig;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image_with(SkipConfig::unreliable());
+    image.reliable = false;
+    commit_frame(&mut image, &params, 0, 32);
+    let bytes = data_frame(4096, 0, false);
+    let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+    let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+        panic!("not a heartbeat");
+    };
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Fresh
+    );
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 1024),
+        super::Terminal::Recorded
+    );
+    let (_sender, mut receiver) = repairing(image);
+    receiver.repair(0, 1).unwrap();
+    assert_eq!(receiver.counters().gaps_sealed, 0, "before its deadline");
+    for now in [10_000_000_000u64, 20_000_000_000, 30_000_000_000] {
+        receiver.repair(0, now).unwrap();
+    }
+    assert_eq!(receiver.counters().gaps_sealed, 1, "one seal, the tail");
+    let owner = &receiver.images[0].owner;
+    assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), None);
+    assert_eq!(
+        owner.high_water(Lane::ZERO),
+        Some(1024),
+        "not past the bound"
+    );
+}
+
+/// #821 point 5: a reliable image's tail query the receive owner rejects
+/// (here a mark off a frame boundary) is counted in `hole_query_errors`,
+/// not dropped silently; no hole is NAKed for it.
+#[test]
+fn a_rejected_tail_query_is_counted() {
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, _params) = installed_image();
+    image.heartbeat_marks[0] = Some(100);
+    let mut counters = super::ReceiverCounters::default();
+    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000, &mut counters).is_none());
+    assert_eq!(counters.hole_query_errors, 1);
+    image.heartbeat_marks[0] = Some(4096);
+    let _ = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000, &mut counters);
+    assert_eq!(counters.hole_query_errors, 1, "an aligned mark is no error");
+}
+
+/// The sends endpoint 2 makes in [`routed_lane`]'s setup.
+const ROUTED_SETUP_SENDS: usize = 1;
+
+/// An endpoint `id` whose socket takes its first `oks` sends, answers the
+/// next ones with `first`, then takes every later one; its header-only DATA frames and its DATA sends are
+/// recorded as [`header_only_endpoint`]'s.
+fn scripted_endpoint(
+    id: u32,
+    first: &[karyos_io::sockets::ops::SendResult],
+    oks: usize,
+) -> (
+    super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
+    Headers,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    karyos_io::sockets::scripted::ScriptedSocket,
+    karyos_io::sockets::endpoint::SocketsRx<karyos_io::sockets::scripted::ScriptedSocket>,
+) {
+    use std::num::NonZeroU32;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::SendResult;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let data = Arc::new(AtomicUsize::new(0));
+    let (seen, sent) = (Arc::clone(&frames), Arc::clone(&data));
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            let length = i32::from_le_bytes(datagram[..4].try_into().unwrap());
+            if datagram.len() == 32 && length == 32 {
+                seen.lock().unwrap().push((
+                    u32::from_le_bytes(datagram[20..24].try_into().unwrap()),
+                    i32::from_le_bytes(datagram[8..12].try_into().unwrap()),
+                    datagram[5],
+                ));
+            } else if length > 32 {
+                sent.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }));
+    for _ in 0..oks {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    for result in first {
+        observer.push_send(*result);
+    }
+    for _ in 0..512 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let instance = InstanceId::new(NonZeroU32::new(id).unwrap());
+    let endpoint = SocketsEndpoint::open(&loopback(), instance, socket).unwrap();
+    let (tx, rx) = endpoint.split().unwrap();
+    (
+        super::super::Half::Tx(Box::new(tx)),
+        frames,
+        data,
+        observer,
+        rx,
+    )
+}
+
+/// A routed publication on endpoints 1 and 2, bound on both, its first
+/// message sent at 2..6: the sender, the log, the halves, and each
+/// endpoint's header-only frames and DATA sends.
+#[allow(clippy::type_complexity)]
+fn routed_lane(
+    second: &[karyos_io::sockets::ops::SendResult],
+) -> (
+    super::SenderRole,
+    super::super::data::testing::TestLog,
+    Vec<(
+        EndpointId,
+        super::super::Half<karyos_io::sockets::scripted::ScriptedSocket>,
+    )>,
+    [Headers; 2],
+    [std::sync::Arc<std::sync::atomic::AtomicUsize>; 2],
+    karyos_io::sockets::endpoint::SocketsRx<karyos_io::sockets::scripted::ScriptedSocket>,
+) {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let config = AgentConfig {
+        path_heartbeat_interval: AgentConfig::default()
+            .sender_heartbeat_interval
+            .saturating_mul(1000),
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
+    let (event, mut log) = add_routed(&mut sender);
+    assert!(matches!(event, Some(AgentEvent::PublicationAdded { .. })));
+    let (one, frames_one, data_one, _, _) = scripted_endpoint(1, &[], 0);
+    // Route 2's script starts after the sends of this setup.
+    let (two, frames_two, data_two, observer, rx_two) =
+        scripted_endpoint(2, second, ROUTED_SETUP_SENDS);
+    let mut halves = vec![(EndpointId(1), one), (EndpointId(2), two)];
+    for (endpoint, at) in [(1, "10.0.0.2:4000"), (2, "10.0.0.3:4000")] {
+        let _ = at;
+        let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+        sender.bind(EndpointId(endpoint), receiver, &sm_answer([7, 8], 0), 0);
+        sender.status(EndpointId(endpoint), receiver, &sm_status([7, 8], 0), 1);
+    }
+    let _ = log.publications[0]
+        .append(&[1; 1000], AppendOptions::default())
+        .unwrap();
+    for now in 2..6 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    assert_eq!(
+        observer.send_calls(),
+        ROUTED_SETUP_SENDS as u64,
+        "route 2's script lines up"
+    );
+    (
+        sender,
+        log,
+        halves,
+        [frames_one, frames_two],
+        [data_one, data_two],
+        rx_two,
+    )
+}
+
+/// G1 (#842): a routed lane with DATA flowing on its routes sends no idle
+/// heartbeat, however long it runs; once the DATA stops, one interval on,
+/// each route gets one.
+#[test]
+fn a_routed_lane_with_data_flowing_sends_no_heartbeat() {
+    use std::sync::atomic::Ordering;
+
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, data, _rx_two) = routed_lane(&[]);
+    let mut now = 6;
+    for _ in 0..8 {
+        now += interval / 2;
+        let _ = log.publications[0]
+            .append(&[2; 1000], AppendOptions::default())
+            .unwrap();
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    assert_eq!(
+        (
+            data[0].load(Ordering::Relaxed),
+            data[1].load(Ordering::Relaxed)
+        ),
+        (9, 9),
+        "DATA on both routes"
+    );
+    assert_eq!(sender.counters().heartbeats_sent, 0, "busy routes");
+    assert!(frames[0].lock().unwrap().is_empty() && frames[1].lock().unwrap().is_empty());
+    let _ = sender.duty(&mut halves, now + interval).unwrap();
+    assert_eq!(sender.counters().heartbeats_sent, 2, "one per route");
+}
+
+/// G2 (#842): route 2 is slow (its socket would block) and holds copies
+/// route 1 sent long ago: route 1's heartbeats stop at route 2's frontier,
+/// so none announces a position a held copy would still bring. When route
+/// 2 then faults, its copies are returned in that serve (it waits for its
+/// endpoint's reset holding none, and an unreliable lane does not send
+/// them again): route 1's heartbeat then announces what route 1 sent.
+#[test]
+fn held_copies_on_a_route_hold_back_every_heartbeat() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let blocked = SendResult::Error(Errno::AGAIN);
+    let (mut sender, mut log, mut halves, frames, data, _rx_two) =
+        routed_lane(&[blocked, blocked, blocked, SendResult::Error(Errno::BADF)]);
+    for byte in [2, 3] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    for step in 0..=2 {
+        let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
+        let held = sender.publications[0].routed_pending(0, 1);
+        assert!(held > 0, "route 2 holds its copies at step {step}");
+        let held_from = sender.publications[0].first_held(0, 1).unwrap();
+        assert!(
+            frames[0]
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, offset, _)| u64::try_from(*offset).unwrap() == held_from),
+            "route 1 stops at route 2's first held copy {held_from} at step {step}"
+        );
+    }
+    assert!(
+        !frames[0].lock().unwrap().is_empty(),
+        "route 1 heartbeats while route 2 holds"
+    );
+    assert_eq!(
+        data[0].load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "route 1 sent all three"
+    );
+    // The fault: route 2's copies are returned, none is held.
+    let _ = sender.duty(&mut halves, 6 + 3 * interval).unwrap();
+    assert!(sender.publications[0].needs_reset(), "route 2 faulted");
+    assert_eq!(sender.publications[0].routed_pending(0, 1), 0);
+    let _ = sender.duty(&mut halves, 6 + 4 * interval).unwrap();
+    let beats = frames[0].lock().unwrap().clone();
+    assert_eq!(
+        beats.last().map(|(_, offset, _)| *offset),
+        Some(3 * 1056),
+        "then at what route 1 sent: {beats:?}"
+    );
+    assert!(frames[1].lock().unwrap().is_empty(), "none on route 2");
+}
+
+/// H1/K1 (#842 review): route 2's socket would block, so it holds its
+/// copies, its half still held; the next messages find no room on it and
+/// it skips them (RP-8), so its frontier passes its held copies. Route 1
+/// still heartbeats each interval, at route 2's first held copy: it never
+/// announces a position that copy would still bring, and still reveals
+/// what lies below it.
+#[test]
+fn a_route_holding_copies_bounds_the_others_heartbeats() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, _data, _rx_two) =
+        routed_lane(&[SendResult::Error(Errno::AGAIN); 8]);
+    for byte in [2, 3] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = sender.duty(&mut halves, 6).unwrap();
+    let held_from = sender.publications[0].first_held(0, 1).expect("blocked");
+    sender.publications[0].withhold_route(1, 2);
+    for byte in [4, 5] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = sender.duty(&mut halves, 7).unwrap();
+    for step in 1..=4 {
+        let _ = sender.duty(&mut halves, 7 + step * interval).unwrap();
+        assert_eq!(
+            sender.publications[0].first_held(0, 1),
+            Some(held_from),
+            "route 2 holds its copies at step {step}"
+        );
+    }
+    let frontier = sender.publications[0].route_frontier(0, 1).unwrap();
+    assert!(frontier > held_from, "route 2 skipped past its held copies");
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(
+        beats.len() >= 2,
+        "route 1 heartbeats each interval: {beats:?}"
+    );
+    assert!(
+        beats
+            .iter()
+            .all(|(_, offset, _)| u64::try_from(*offset).unwrap() == held_from),
+        "at route 2's first held copy {held_from}, not past it: {beats:?}"
+    );
+    // Its socket takes again: the copies go, and the halves drop clean.
+    let mut now = 7 + 5 * interval;
+    while sender.publications[0].first_held(0, 1).is_some() && now < 7 + 64 * interval {
+        let _ = sender.duty(&mut halves, now).unwrap();
+        now += interval;
+    }
+    assert_eq!(sender.publications[0].first_held(0, 1), None, "sent");
+}
+
+/// K3 (#842 review): route 2 leaves, comes back (returning, RP-9), stages
+/// the next copy and is refused (its socket full) before its first submit:
+/// route 1's heartbeat stops at that copy, which route 2 still brings.
+#[test]
+fn a_returning_route_holding_a_copy_bounds_the_heartbeat() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, _data, _rx_two) =
+        routed_lane(&[SendResult::Error(Errno::AGAIN); 8]);
+    sender.publications[0].leave_before_serve(1);
+    let _ = sender.duty(&mut halves, 6).unwrap();
+    assert_eq!(
+        sender.publications[0].route_state(1),
+        Some((true, false)),
+        "left"
+    );
+    // Past any backoff, a message's serve brings route 2 back, returning;
+    // the next one it stages and its socket refuses.
+    let back = 6 + 50_000_000;
+    let _ = log.publications[0]
+        .append(&[2; 1000], AppendOptions::default())
+        .unwrap();
+    let _ = sender.duty(&mut halves, back).unwrap();
+    assert_eq!(
+        sender.publications[0].route_state(1),
+        Some((false, true)),
+        "returning"
+    );
+    let _ = log.publications[0]
+        .append(&[3; 1000], AppendOptions::default())
+        .unwrap();
+    let _ = sender.duty(&mut halves, back + 1).unwrap();
+    let held = sender.publications[0]
+        .first_held(0, 1)
+        .expect("route 2 holds its copy");
+    assert_eq!(
+        sender.publications[0].route_state(1),
+        Some((false, true)),
+        "still returning"
+    );
+    frames[0].lock().unwrap().clear();
+    for step in 1..=3 {
+        let _ = sender
+            .duty(&mut halves, back + 1 + step * interval)
+            .unwrap();
+    }
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(!beats.is_empty(), "route 1 heartbeats");
+    assert!(
+        beats
+            .iter()
+            .all(|(_, offset, _)| u64::try_from(*offset).unwrap() == held),
+        "at route 2's held copy {held}: {beats:?}"
+    );
+    // Its socket takes again: the copy goes, and the halves drop clean.
+    let mut now = back + 4 * interval;
+    while sender.publications[0].first_held(0, 1).is_some() && now < back + 64 * interval {
+        now += interval;
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    assert_eq!(sender.publications[0].first_held(0, 1), None, "sent");
+}
+
+/// L1 (#842, QS-COORDINATOR): route 2 holds a copy, its half goes away
+/// in a reset that does not complete, and it leaves the live set: it can
+/// send nothing, so it bounds nothing, and route 1's heartbeat moves on to
+/// its own next position. Back, route 2 sends what it kept.
+#[test]
+fn a_left_route_with_its_half_away_bounds_nothing() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, _data, rx_two) =
+        routed_lane(&[SendResult::Error(Errno::AGAIN)]);
+    for byte in [2, 3] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = sender.duty(&mut halves, 6).unwrap();
+    assert!(
+        sender.publications[0].first_held(0, 1).is_some(),
+        "route 2 holds"
+    );
+    let away = halves.pop().unwrap();
+    // Out for a second, past the heartbeats below.
+    let backoff = 1_000_000_000;
+    sender.publications[0].set_path_backoff(backoff);
+    sender.publications[0].leave_before_serve(1);
+    let _ = sender.duty(&mut halves, 7).unwrap();
+    assert_eq!(
+        sender.publications[0].route_state(1).map(|(left, _)| left),
+        Some(true),
+        "left"
+    );
+    for step in 1..=3 {
+        let _ = sender.duty(&mut halves, 7 + step * interval).unwrap();
+    }
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(!beats.is_empty(), "route 1 heartbeats");
+    assert!(
+        beats.iter().all(|(_, offset, _)| *offset == 3 * 1056),
+        "at route 1's own position: {beats:?}"
+    );
+    assert!(
+        sender.publications[0].first_held(0, 1).is_some(),
+        "route 2 still holds its copy"
+    );
+    // Its endpoint's reset completes: back in a new epoch, the copy is
+    // dropped, and the halves drop clean.
+    let super::super::Half::Tx(tx) = away.1 else {
+        panic!("a TX half");
+    };
+    let mut endpoint = karyos_io::sockets::endpoint::SocketsEndpoint::join(*tx, rx_two).unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+    let _ = endpoint.reopen(&loopback()).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    halves.push((EndpointId(2), super::super::Half::Tx(Box::new(tx))));
+    let back = 7 + 4 * interval;
+    let _ = sender.duty(&mut halves, back).unwrap();
+    assert_eq!(
+        sender.publications[0].first_held(0, 1),
+        None,
+        "dropped with the old epoch"
+    );
+    // What the new epoch staged goes out before the halves drop.
+    let mut now = back;
+    while (0..2).any(|route| sender.publications[0].routed_pending(0, route) > 0)
+        && now < back + 64 * interval
+    {
+        now += interval;
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+}
+
+/// L2 (#842 review): route 2 holds a copy and its half goes away, as in a
+/// reset of its shared endpoint for another publication, while it stays
+/// in the live set: it can send nothing, so it bounds nothing, and route
+/// 1's heartbeat moves on to its own next position.
+#[test]
+fn a_route_whose_half_is_away_bounds_nothing() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, _data, _rx_two) =
+        routed_lane(&[SendResult::Error(Errno::AGAIN)]);
+    for byte in [2, 3] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = sender.duty(&mut halves, 6).unwrap();
+    assert!(
+        sender.publications[0].first_held(0, 1).is_some(),
+        "route 2 holds"
+    );
+    let away = halves.pop().unwrap();
+    for step in 1..=3 {
+        let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
+    }
+    assert_eq!(
+        sender.publications[0].route_state(1).map(|(left, _)| left),
+        Some(false),
+        "not left"
+    );
+    assert!(
+        sender.publications[0].first_held(0, 1).is_some(),
+        "still holds"
+    );
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(!beats.is_empty(), "route 1 heartbeats");
+    assert!(
+        beats.iter().all(|(_, offset, _)| *offset == 3 * 1056),
+        "at route 1's own position: {beats:?}"
+    );
+    // Back in the same epoch (this test's shortcut): it sends its copy.
+    halves.push(away);
+    let mut now = 6 + 4 * interval;
+    while sender.publications[0].first_held(0, 1).is_some() && now < 6 + 64 * interval {
+        let _ = sender.duty(&mut halves, now).unwrap();
+        now += interval;
+    }
+    assert_eq!(sender.publications[0].first_held(0, 1), None, "sent");
+}
+
+/// L2 pin 3 (#842 review): route 2 holds a copy, its endpoint is reset
+/// into a new epoch, and its half comes back, but its reopen in that epoch
+/// fails: the copy it still lists is of the old epoch, never sent, so it
+/// bounds nothing, and route 1's heartbeat moves on to its own position.
+#[test]
+fn a_route_back_in_a_new_epoch_but_not_reopened_bounds_nothing() {
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let interval = AgentConfig::default().sender_heartbeat_interval;
+    let (mut sender, mut log, mut halves, frames, _data, rx_two) =
+        routed_lane(&[SendResult::Error(Errno::AGAIN)]);
+    for byte in [2, 3] {
+        let _ = log.publications[0]
+            .append(&[byte; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = sender.duty(&mut halves, 6).unwrap();
+    assert!(
+        sender.publications[0].first_held(0, 1).is_some(),
+        "route 2 holds"
+    );
+    // Its endpoint's reset: a new epoch, in which its open fails.
+    let (_, half) = halves.pop().unwrap();
+    let super::super::Half::Tx(tx) = half else {
+        panic!("a TX half");
+    };
+    let mut endpoint = karyos_io::sockets::endpoint::SocketsEndpoint::join(*tx, rx_two).unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+    let _ = endpoint.reopen(&loopback()).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    sender.publications[0].fail_route_open(1, true);
+    halves.push((EndpointId(2), super::super::Half::Tx(Box::new(tx))));
+    frames[0].lock().unwrap().clear();
+    for step in 1..=3 {
+        let _ = sender.duty(&mut halves, 6 + step * interval).unwrap();
+    }
+    assert!(
+        sender.publications[0].first_held(0, 1).is_some(),
+        "route 2 still lists its old epoch's copy"
+    );
+    let beats = frames[0].lock().unwrap().clone();
+    assert!(!beats.is_empty(), "route 1 heartbeats");
+    assert!(
+        beats.iter().all(|(_, offset, _)| *offset == 3 * 1056),
+        "at route 1's own position: {beats:?}"
+    );
+    // Its open succeeds: the old copies go with the reopen.
+    sender.publications[0].fail_route_open(1, false);
+    let mut now = 6 + 4 * interval;
+    while (0..2).any(|route| sender.publications[0].routed_pending(0, route) > 0)
+        && now < 6 + 64 * interval
+    {
+        let _ = sender.duty(&mut halves, now).unwrap();
+        now += interval;
+    }
+    assert_eq!(sender.publications[0].first_held(0, 1), None, "gone");
+}
+
+/// The follow-up of #829's review, point 2, and QS-COORDINATOR's T1 rule
+/// on #838: an entry whose live route stays in use (a queue on it would not
+/// close) is counted failed once per entry, and a single route's failure
+/// never resets the shared endpoint.
+#[test]
+fn a_route_in_use_counts_once_and_resets_nothing() {
+    use karyos_io::backend::{Authority, TxQueueConfig};
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let open = |tx: &mut Box<karyos_io::sockets::endpoint::SocketsTx<_>>| {
+        tx.open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap()
+    };
+    // A queue that stays open on the route, and a stale one in the entry.
+    let _held = open(tx);
+    let stale = open(tx);
+    let mut report = karyos_io::backend::TxReport::new();
+    let _ = tx.close_queue(stale, &mut report);
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(stale);
+    let entry = super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: tx.capabilities().epoch,
+        route,
+        queues,
+    };
+    sender.closing.push(entry);
+    sender.closing.push(entry);
+    sender.close_removed(&mut halves, 0);
+    let counters = sender.counters();
+    assert_eq!(
+        counters.removed_close_failed, 2,
+        "once per entry: {counters:?}"
+    );
+    let mut asked = 0;
+    sender.request_resets(|_, _| {
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 0, "a route's failure resets nothing");
+}
+
+/// Review T1 of #838 (QS-COORDINATOR's rule): an entry whose handles are
+/// already gone (its queue and route unknown to a healthy shared
+/// endpoint) counts as closed, and no reset is asked for.
+#[test]
+fn a_close_of_handles_already_gone_asks_no_reset() {
+    use karyos_io::backend::{Authority, TxQueueConfig, TxReport};
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let queue = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap();
+    let _ = tx.close_queue(queue, &mut TxReport::new());
+    let _ = tx.remove_route(route);
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(queue);
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: tx.capabilities().epoch,
+        route,
+        queues,
+    });
+    sender.close_removed(&mut halves, 0);
+    let counters = sender.counters();
+    assert_eq!(counters.removed_close_failed, 0, "{counters:?}");
+    assert_eq!(
+        counters.removed_closed, 2,
+        "a queue and a route already gone"
+    );
+    let mut asked = 0;
+    sender.request_resets(|_, _| {
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 0, "nothing held, nothing to reset");
+}
+
+/// The follow-up of #829's review, point 3: an entry of an older epoch
+/// than its endpoint's half (the endpoint was reset since) is dropped and
+/// counted.
+#[test]
+fn an_entry_of_another_epoch_is_dropped_and_counted() {
+    use karyos_io::backend::{InstanceId, TxReport};
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+    let endpoint =
+        SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new()).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let older = tx.capabilities().epoch;
+    let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    let _ = endpoint.reopen(&config).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    assert!(tx.capabilities().epoch > older);
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: older,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    });
+    sender.close_removed(&mut halves, 0);
+    let counters = sender.counters();
+    assert_eq!(counters.removed_dropped, 1, "{counters:?}");
+    assert_eq!(
+        (counters.removed_closed, counters.removed_close_failed),
+        (0, 0)
+    );
+}
+
+fn route_limit_after(failed_close: bool, routed: bool) -> (usize, bool) {
+    limit_after(LimitCase {
+        failed_close,
+        routed,
+        cycles: 10,
+        ..LimitCase::default()
+    })
+}
+
+/// Runs `case` against an endpoint whose one route (or one queue) a keeper
+/// holds: how many resets of endpoint 1 were asked for, and whether the
+/// publication opens once the reset is served.
+fn limit_after(case: LimitCase) -> (usize, bool) {
+    let LimitCase {
+        failed_close,
+        routed,
+        fanout,
+        queue_limit,
+        cycles,
+    } = case;
+    use karyos_io::backend::{Authority, InstanceId, TxQueueConfig, TxReport};
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(64).unwrap());
+    let mut config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+    if queue_limit {
+        config.max_routes = std::num::NonZeroU16::new(2).unwrap();
+        config.max_queues = std::num::NonZeroU16::MIN;
+    } else {
+        config.max_routes = std::num::NonZeroU16::MIN;
+    }
+    let (mut tx, rx) = SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new())
+        .unwrap()
+        .split()
+        .unwrap();
+    // The endpoint's one route, kept in use.
+    let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+    let _keeper = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap();
+    let epoch = tx.capabilities().epoch;
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    if routed {
+        let (half, _frames, _data, _rx) = header_only_endpoint();
+        halves.push((EndpointId(2), half));
+    }
+    if failed_close {
+        sender.closing.push(super::super::data::Opened {
+            endpoint: EndpointId(1),
+            epoch,
+            route,
+            queues: [None; super::super::data::OPENED_QUEUES],
+        });
+    }
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let term = publication(EndpointId(1)).term;
+    let (path, _log) = if routed {
+        super::super::data::testing::outbound_routed(
+            &[(EndpointId(1), receiver), (EndpointId(2), receiver)],
+            alias(),
+            term,
+            1,
+            false,
+        )
+    } else {
+        let (mut path, log) =
+            super::super::data::testing::outbound(EndpointId(1), alias(), receiver, term, 1, false);
+        if fanout {
+            path.set_destinations(&[receiver], &[], Some(true)).unwrap();
+        }
+        (path, log)
+    };
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    for (endpoint, _) in &halves {
+        sender.bind(*endpoint, receiver, &sm_answer([7, 8], 0), 0);
+        sender.status(*endpoint, receiver, &sm_status([7, 8], 0), 1);
+    }
+    let mut asked = 0usize;
+    let end = 2 + cycles;
+    for now in 2..end {
+        let _ = sender.duty(&mut halves, now).unwrap();
+        sender.request_resets(|endpoint, standing| {
+            if endpoint == EndpointId(1) {
+                asked += 1;
+            }
+            assert_eq!(standing, Some(epoch), "tagged with its epoch");
+            true
+        });
+    }
+    let failures = |sender: &super::SenderRole<karyos_sys::term_bytes::HeapTerms>| {
+        let counters = sender.publications[0].counters();
+        if queue_limit {
+            counters.queue_failures
+        } else {
+            counters.route_failures
+        }
+    };
+    let refused = failures(&sender);
+    assert!(refused >= 1, "refused: {refused}");
+    if failed_close {
+        assert_eq!(sender.counters().removed_close_failed, 1, "counted once");
+    }
+    if asked == 0 {
+        return (asked, false);
+    }
+    // The reset, served: endpoint 1 comes back in a new epoch, its route
+    // table empty.
+    let at = halves
+        .iter()
+        .position(|(endpoint, _)| *endpoint == EndpointId(1))
+        .unwrap();
+    let super::super::Half::Tx(tx) = halves.remove(at).1 else {
+        panic!("a TX half");
+    };
+    let mut endpoint = SocketsEndpoint::join(*tx, rx).unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    let _ = endpoint.reopen(&config).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    halves.insert(at, (EndpointId(1), super::super::Half::Tx(Box::new(tx))));
+    let before = failures(&sender);
+    // Past any open spacing of a multi-destination target.
+    for now in [
+        end,
+        end + 1,
+        end + 1_000_000_000_000,
+        end + 1_000_000_000_001,
+    ] {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    let opened = failures(&sender) == before;
+    (asked, opened)
+}
+
+/// (a), (c), (d): a failed close, then a single-destination publication
+/// refused for the route limit on every serve: one reset of the epoch is
+/// asked for, the failed close counted once, and the route opens after it.
+#[test]
+fn a_route_limit_after_a_failed_close_asks_one_reset() {
+    let (asked, opened) = route_limit_after(true, false);
+    assert_eq!(asked, 1, "once per epoch");
+    assert!(opened, "the route opens after the reset");
+}
+
+/// (a) over redundant paths: the routed publication's refused route asks
+/// for its endpoint's one reset, and opens after it.
+#[test]
+fn a_routed_route_limit_after_a_failed_close_asks_one_reset() {
+    let (asked, opened) = route_limit_after(true, true);
+    assert_eq!(asked, 1, "once per epoch");
+    assert!(opened, "the route opens after the reset");
+}
+
+/// (b): the route limit with no failed close in the epoch is an ordinary
+/// refusal and resets nothing.
+#[test]
+fn a_route_limit_without_a_failed_close_resets_nothing() {
+    assert_eq!(route_limit_after(false, false).0, 0);
+    assert_eq!(route_limit_after(false, true).0, 0);
+}
+
+/// #838: however long the limit holds, the sender asks for the epoch's
+/// reset once; a deferral is the endpoint table's to serve
+/// (`a_deferred_request_is_served_when_its_interval_ends`).
+#[test]
+fn the_sender_asks_one_reset_per_epoch() {
+    let cycles = 2 * super::super::data::RESET_REQUEST_CYCLES + 4;
+    let (asked, opened) = limit_after(LimitCase {
+        failed_close: true,
+        cycles,
+        ..LimitCase::default()
+    });
+    assert_eq!(asked, 1, "once per epoch");
+    assert!(opened, "the route opens after the reset");
+}
+
+/// Y2 (#838): a queue refused for the endpoint's queue limit after a
+/// failed close asks for the reset, as a refused route does.
+#[test]
+fn a_queue_limit_after_a_failed_close_asks_one_reset() {
+    let (asked, opened) = limit_after(LimitCase {
+        failed_close: true,
+        queue_limit: true,
+        cycles: 10,
+        ..LimitCase::default()
+    });
+    assert_eq!(asked, 1);
+    assert!(opened, "the queues open after the reset");
+    let (asked, _) = limit_after(LimitCase {
+        queue_limit: true,
+        cycles: 10,
+        ..LimitCase::default()
+    });
+    assert_eq!(asked, 0, "an ordinary queue limit resets nothing");
+}
+
+/// (a) on a multi-destination path: its refused route asks for the reset.
+#[test]
+fn a_fanout_route_limit_after_a_failed_close_asks_one_reset() {
+    let (asked, opened) = limit_after(LimitCase {
+        failed_close: true,
+        fanout: true,
+        cycles: 10,
+        ..LimitCase::default()
+    });
+    assert_eq!(asked, 1);
+    assert!(opened, "the target opens after the reset");
+}
+
+/// Y3 (#838; QS-COORDINATOR 34443): a removed entry whose queue still has
+/// frames in flight is closed again at each duty and is not counted as
+/// failed while it is within `CLOSE_IN_FLIGHT_TIMEOUT`; closed then, no
+/// reset follows. Still in flight past the bound, it counts once.
+#[test]
+fn a_close_in_flight_fails_only_past_the_bound() {
+    use super::super::CLOSE_IN_FLIGHT_TIMEOUT;
+
+    for (in_flight, failed) in [(3u32, 0u64), (u32::MAX, 1)] {
+        let (mut sender, _receiver) =
+            super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+        let (half, _frames, _data, _rx) = header_only_endpoint();
+        let mut halves: Halves = vec![(EndpointId(1), half)];
+        let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+            panic!("a TX half");
+        };
+        let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+        let epoch = tx.capabilities().epoch;
+        sender.closing.push(super::super::data::Opened {
+            endpoint: EndpointId(1),
+            epoch,
+            route,
+            queues: [None; super::super::data::OPENED_QUEUES],
+        });
+        sender.close_in_flight = in_flight;
+        // Duties within the bound: in flight, never failed.
+        for now in [0, 1, 2, CLOSE_IN_FLIGHT_TIMEOUT / 2] {
+            let _ = sender.duty(&mut halves, now).unwrap();
+            assert_eq!(
+                sender.counters().removed_close_failed,
+                0,
+                "within the bound at {now}"
+            );
+        }
+        let _ = sender.duty(&mut halves, CLOSE_IN_FLIGHT_TIMEOUT).unwrap();
+        let counters = sender.counters();
+        assert_eq!(counters.removed_close_deferred, 1, "deferred once");
+        assert_eq!(
+            counters.removed_close_failed, failed,
+            "in flight {in_flight}"
+        );
+        assert_eq!(counters.removed_close_timeouts, failed, "past the bound");
+        assert_eq!(counters.removed_closed, 1 - failed, "the route closed");
+    }
+}
+
+/// #838 (QS-COORDINATOR): more removed entries in flight than
+/// `closing_again` holds are never failed for want of room: the ones past
+/// its capacity stay in the close list for the next duty, counted.
+#[test]
+fn a_full_closing_again_fails_nothing() {
+    let config = AgentConfig {
+        publications: 1,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+    let epoch = tx.capabilities().epoch;
+    let entry = super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    };
+    let room = sender.closing_again.capacity();
+    sender.close_in_flight = u32::MAX;
+    // One duty fills `closing_again` with entries still in flight.
+    for _ in 0..room {
+        sender.closing.push(entry);
+    }
+    let _ = sender.duty(&mut halves, 0).unwrap();
+    assert_eq!(sender.closing_again.len(), room, "full");
+    // A later removal finds no room: kept in the close list, not failed.
+    sender.closing.push(entry);
+    let _ = sender.duty(&mut halves, 1).unwrap();
+    let counters = sender.counters();
+    assert_eq!(counters.removed_close_deferred as usize, room);
+    assert_eq!(
+        counters.removed_close_failed, 0,
+        "no failure for want of room"
+    );
+    assert_eq!(
+        counters.removed_close_overflow, 1,
+        "the overflow is counted"
+    );
+    assert_eq!(sender.closing.len(), 1, "kept for the next duty");
+    sender.close_in_flight = 0;
+    sender.closing.clear();
+    sender.closing_again.clear();
+}
+
+/// #838 review: an entry in flight whose re-close then fails with a real
+/// close error (its route still in use) counts as failed at once, not at
+/// the time bound.
+#[test]
+fn a_real_error_at_the_re_close_fails_at_once() {
+    use karyos_io::backend::{Authority, TxQueueConfig};
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+    // A queue the entry does not list keeps the route in use.
+    let _keeper = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap();
+    let epoch = tx.capabilities().epoch;
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    });
+    sender.close_in_flight = 1;
+    let _ = sender.duty(&mut halves, 0).unwrap();
+    assert_eq!(
+        sender.counters().removed_close_deferred,
+        1,
+        "in flight first"
+    );
+    assert_eq!(sender.counters().removed_close_failed, 0);
+    let _ = sender.duty(&mut halves, 1).unwrap();
+    let counters = sender.counters();
+    assert_eq!(counters.removed_close_failed, 1, "failed at the next duty");
+    assert_eq!(counters.removed_close_timeouts, 0, "not by the bound");
+}
+
+/// #838 review (E1): with `closing_again` full and the overflow waiting in
+/// the close list, another full share of removals still finds room in it,
+/// so nothing goes unrecorded.
+#[test]
+fn the_close_list_has_room_past_a_full_wait_list() {
+    let config = AgentConfig {
+        publications: 1,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+    let epoch = tx.capabilities().epoch;
+    let entry = super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    };
+    let share = sender.closing_again.capacity();
+    sender.close_in_flight = u32::MAX;
+    // A share fills `closing_again`, a second waits in the close list.
+    for _ in 0..share {
+        sender.closing.push(entry);
+    }
+    let _ = sender.duty(&mut halves, 0).unwrap();
+    for _ in 0..share {
+        sender.closing.push(entry);
+    }
+    let _ = sender.duty(&mut halves, 1).unwrap();
+    assert_eq!(sender.closing.len(), share, "the overflow waits");
+    // A third share of removals still fits.
+    assert!(
+        sender.closing.capacity() - sender.closing.len() >= share,
+        "room for another share: {} of {}",
+        sender.closing.len(),
+        sender.closing.capacity()
+    );
+    assert_eq!(sender.counters().removed_unrecorded, 0);
+    sender.close_in_flight = 0;
+    sender.closing.clear();
+    sender.closing_again.clear();
+}
+
+/// QS-COORDINATOR on #838 (ACS 34198): an endpoint of one route, holding
+/// it with a route of its own (a queue on it stays open); with
+/// `failed_close`, that route's close was tried and failed. A publication
+/// (single-destination, or `routed` over that endpoint and another) is
+/// then refused its route for the limit on every serve. Returns the resets
+/// asked for over several cycles, and whether the publication's route
+/// opened after the reset was served (or `false` without one).
+/// A [`limit_after`] case.
+#[derive(Clone, Copy, Default)]
+struct LimitCase {
+    /// A removed entry fails to close first.
+    failed_close: bool,
+    /// The publication is routed over two endpoints.
+    routed: bool,
+    /// The publication sends to its receiver as a multi-destination one.
+    fanout: bool,
+    /// The endpoint's queue table is full instead of its route table.
+    queue_limit: bool,
+    /// Cycles run before the reset is served.
+    cycles: u64,
 }

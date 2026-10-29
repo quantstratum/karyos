@@ -1029,9 +1029,12 @@ fn a_detach_ends_an_exported_grant_and_then_leave_is_accepted() {
     drop(client);
 }
 
-/// `Leave` with an export left, and `Detach` of an export the client does
-/// not own, are protocol errors: the client is retired and its exported
-/// grant stays charged until the exit proof.
+/// `Leave` with an export left (a fetch the client abandoned, or a grant
+/// it did not detach) is a clean leave, counted in `fetches abandoned at
+/// leave`, never a fault (QS-COORDINATOR, karyos#851); `Detach` of an
+/// export the client does not own is a protocol error. Either way the
+/// client is no longer served and its exported grant stays charged until
+/// the exit proof.
 #[test]
 fn leave_with_an_export_left_and_a_foreign_detach_retire_the_client() {
     for message in [Message::Leave, Message::Detach { export: 1 << 40 }] {
@@ -1051,8 +1054,59 @@ fn leave_with_an_export_left_and_a_foreign_detach_retire_the_client() {
         }
         assert_eq!(driver.clients(), 1);
         assert_eq!(counter(&driver, "grants ended"), 0);
+        let leave = matches!(message, Message::Leave);
+        assert_eq!(counter(&driver, "clients faulty"), u64::from(!leave));
+        assert_eq!(
+            counter(&driver, "fetches abandoned at leave"),
+            u64::from(leave)
+        );
         drop(client);
     }
+}
+
+/// karyos#851 (decided 2026-10-28 by QS-COORDINATOR): a client that
+/// fetched and left without reading the reply (a fetch it abandoned) leaves
+/// cleanly: `clients faulty` stays 0 and `fetches abandoned at leave`
+/// counts one; what the fetch exported stays charged until the exit proof.
+#[test]
+fn a_leave_with_an_abandoned_fetch_is_not_a_fault() {
+    let dir = dir("abandoned-leave");
+    let mut driver = system_driver(&dir);
+    let _stream = driver.add_stream(shared_stream_config()).unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let _ = client
+        .add_subscription(
+            StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            SubscriberRole::Required,
+        )
+        .unwrap();
+    let mut done: Vec<Completion> = Vec::new();
+    let start = Instant::now();
+    while done.is_empty() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+        let _ = driver.do_work().unwrap();
+        let _ = client.poll(usize::MAX, |completion| done.push(completion));
+    }
+    let socket = client.admission_socket().unwrap();
+    // The fetch, then a Leave before its reply is read.
+    let fetch = encode(&Message::Fetch { fetch: 1, key: 1 });
+    assert_eq!(ipc::send(socket, &fetch, None).unwrap(), Sent::Sent);
+    let leave = encode(&Message::Leave);
+    assert_eq!(ipc::send(socket, &leave, None).unwrap(), Sent::Sent);
+    serve_until(&mut driver, |driver| {
+        counter(driver, "fetches abandoned at leave") == 1
+    });
+    assert_eq!(counter(&driver, "clients faulty"), 0);
+    // This process lives on: the slot and the grant stay charged.
+    for _ in 0..4 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(driver.clients(), 1);
+    assert_eq!(counter(&driver, "grants ended"), 0);
+    drop(client);
 }
 
 /// Serves the driver while `client` runs on another thread; returns its

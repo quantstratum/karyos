@@ -12,8 +12,9 @@
 //! instead of waiting for liveness to retire the image. A removal's EOS
 //! (`removal`) is the same frame with the EOS flag, and replaces the idle
 //! heartbeat while the publication is removed. A lane whose guard does not
-//! admit it sends neither (GC-6). Routed publications send PATH_HB instead
-//! (redundant-paths.md RP-3).
+//! admit it sends neither (GC-6). A routed publication's lane sends the
+//! same frame on every path that can send (karyos#834), and PATH_HB keeps
+//! each path's binding live (redundant-paths.md RP-3).
 
 use std::num::NonZeroU16;
 
@@ -55,8 +56,10 @@ impl SenderGate for HeaderGate {
 }
 
 impl<T: StreamTerms> Outbound<T> {
-    /// The idle heartbeats due at `now`: each lane idle for `interval`,
-    /// with nothing staged or pending, sends one at its next position.
+    /// The idle heartbeats due at `now` of a single-path or
+    /// multi-destination publication (a routed one has
+    /// `serve_routed_heartbeats`): each lane idle for `interval`, with
+    /// nothing staged or pending, sends one at its next position.
     /// None while the publication is removed (its EOS replaces them).
     /// Returns the heartbeats submitted; `None` only if their count
     /// overflowed, which at most four lanes cannot.
