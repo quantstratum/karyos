@@ -27,6 +27,11 @@ pub const RECORD_VERSION: u8 = 3;
 /// version 1 (`quantstratum-docs: karyos/design/trace-records.md`, "Root
 /// flag", ACS 13936). Its network points carry no path.
 pub const RECORD_VERSION_2: u8 = 2;
+/// Layout version 4, written only on an application point (code 9,
+/// `quantstratum-docs: karyos/design/trace-records.md`, "Layout version 4",
+/// karyos#722): words 16 to 21 carry the point id and its metadata. Driver
+/// points keep version 3, so a reader of layout 3 still decodes them.
+pub const RECORD_VERSION_4: u8 = 4;
 /// The oldest layout version still decoded: version 1, whose bit 56 was
 /// reserved, decodes with `root` false.
 pub const RECORD_VERSION_1: u8 = 1;
@@ -37,6 +42,130 @@ const ROOT_BIT: u64 = 1 << 56;
 const RESERVED_BITS: u64 = !0xFF_FFFF & !ROOT_BIT;
 /// Highest lane (SPEC.md §7.4: four lanes).
 pub const MAX_LANE: u8 = 3;
+/// Wire code of an application point.
+const APPLICATION_CODE: u8 = 9;
+/// Most metadata values an application observation carries.
+pub const MAX_METADATA: usize = 4;
+/// Word 16 bits an application point leaves reserved: 19..32 and 48..64.
+const POINT_RESERVED_BITS: u64 = !(0x7_FFFF | (0xFFFF << 32));
+
+/// One typed metadata value of an application observation, one word on the
+/// wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Value {
+    /// An unsigned integer.
+    U64(u64),
+    /// A signed integer (two's complement on the wire).
+    I64(i64),
+    /// The IEEE 754 bits of an `f64`, kept as bits so the record stays
+    /// `Eq`; [`Value::from_f64`] and [`Value::as_f64`] convert.
+    F64(u64),
+    /// Up to 8 graphic ASCII bytes, zero-padded on the right.
+    Tag([u8; 8]),
+}
+
+impl Value {
+    /// An `f64` value.
+    #[must_use]
+    pub const fn from_f64(value: f64) -> Self {
+        Self::F64(value.to_bits())
+    }
+
+    /// The `f64` of an [`Value::F64`].
+    #[must_use]
+    pub const fn as_f64(self) -> Option<f64> {
+        match self {
+            Self::F64(bits) => Some(f64::from_bits(bits)),
+            _ => None,
+        }
+    }
+
+    /// The wire type (1..=4) and word.
+    const fn wire(self) -> (u64, u64) {
+        match self {
+            Self::U64(value) => (1, value),
+            Self::I64(value) => (2, value as u64),
+            Self::F64(bits) => (3, bits),
+            Self::Tag(bytes) => (4, u64::from_le_bytes(bytes)),
+        }
+    }
+
+    /// The value of a wire type and word, if both are valid.
+    fn from_wire(kind: u64, word: u64) -> Option<Self> {
+        let value = match kind {
+            1 => Self::U64(word),
+            2 => Self::I64(word as i64),
+            3 => Self::F64(word),
+            4 => Self::Tag(word.to_le_bytes()),
+            _ => return None,
+        };
+        value.is_valid().then_some(value)
+    }
+
+    /// A tag holds graphic ASCII bytes, then zero padding only.
+    fn is_valid(self) -> bool {
+        match self {
+            Self::Tag(bytes) => {
+                let used = bytes.iter().take_while(|byte| **byte != 0).count();
+                bytes.iter().enumerate().all(|(at, byte)| {
+                    if at < used {
+                        byte.is_ascii_graphic()
+                    } else {
+                        *byte == 0
+                    }
+                })
+            }
+            _ => true,
+        }
+    }
+}
+
+/// The metadata of an application observation: at most [`MAX_METADATA`]
+/// typed values, a bound of the layout, so the record never grows. Fixed
+/// size: building it allocates nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Metadata {
+    values: [Option<Value>; MAX_METADATA],
+}
+
+impl Metadata {
+    /// No values.
+    pub const NONE: Self = Self {
+        values: [None; MAX_METADATA],
+    };
+
+    /// The metadata of `values`, in order.
+    ///
+    /// # Errors
+    ///
+    /// [`TraceError::Metadata`] for more than [`MAX_METADATA`] values or a
+    /// tag that is not graphic ASCII, zero-padded.
+    pub fn new(values: &[Value]) -> Result<Self, TraceError> {
+        if values.len() > MAX_METADATA || values.iter().any(|value| !value.is_valid()) {
+            return Err(TraceError::Metadata);
+        }
+        let mut metadata = Self::NONE;
+        for (slot, value) in metadata.values.iter_mut().zip(values) {
+            *slot = Some(*value);
+        }
+        Ok(metadata)
+    }
+
+    /// The values, in order.
+    pub fn values(&self) -> impl Iterator<Item = Value> + '_ {
+        self.values.iter().map_while(|value| *value)
+    }
+
+    /// Whether every value is valid and the values come first, as `new`
+    /// builds them.
+    fn is_valid(&self) -> bool {
+        let count = self.values().count();
+        self.values.iter().enumerate().all(|(at, value)| {
+            value.is_some() == (at < count) && value.is_none_or(|v| v.is_valid())
+        })
+    }
+}
 
 /// Where an observation was taken. Each point names what it measures: none
 /// stands for ring submission time on the wire.
@@ -59,10 +188,19 @@ pub enum Point {
     HardwareTx,
     /// NIC hardware receive stamp.
     HardwareRx,
+    /// An application's own named point (layout version 4): `id` is the
+    /// nonzero id the driver assigned at registration, `metadata` the
+    /// observation's typed values.
+    Application {
+        /// The registered point id, nonzero.
+        id: u16,
+        /// The observation's metadata.
+        metadata: Metadata,
+    },
 }
 
 impl Point {
-    /// Wire code (1..=8).
+    /// Wire code (1..=9).
     #[must_use]
     pub const fn code(self) -> u8 {
         match self {
@@ -74,10 +212,13 @@ impl Point {
             Self::KernelRx => 6,
             Self::HardwareTx => 7,
             Self::HardwareRx => 8,
+            Self::Application { .. } => APPLICATION_CODE,
         }
     }
 
-    /// The point of a wire code.
+    /// The driver point of a wire code (1..=8). An application point
+    /// (code 9) carries its id and metadata in the record, so it is decoded
+    /// with the record, not from its code.
     ///
     /// # Errors
     ///
@@ -105,6 +246,23 @@ impl Point {
             self,
             Self::KernelTx | Self::KernelRx | Self::HardwareTx | Self::HardwareRx
         )
+    }
+
+    /// Whether an application recorded the observation (layout version 4).
+    #[must_use]
+    pub const fn is_application(self) -> bool {
+        matches!(self, Self::Application { .. })
+    }
+
+    /// The layout version a record of this point is written in: version 4
+    /// for an application point, version 3 for a driver point.
+    #[must_use]
+    pub const fn version(self) -> u8 {
+        if self.is_application() {
+            RECORD_VERSION_4
+        } else {
+            RECORD_VERSION
+        }
     }
 
     /// Whether a driver agent records the observation per frame and path,
@@ -245,10 +403,11 @@ impl TraceRecord {
     /// # Errors
     ///
     /// [`TraceError::Lane`], [`TraceError::Subscriber`],
-    /// [`TraceError::Packet`], [`TraceError::NetworkPath`] and
-    /// [`TraceError::Root`].
+    /// [`TraceError::Packet`], [`TraceError::NetworkPath`],
+    /// [`TraceError::Root`], and on an application point
+    /// [`TraceError::PointId`] and [`TraceError::Metadata`].
     pub fn validate(&self) -> Result<(), TraceError> {
-        self.validate_as(RECORD_VERSION)
+        self.validate_as(self.point.version())
     }
 
     /// As [`TraceRecord::validate`], for a record of layout `version`.
@@ -258,6 +417,19 @@ impl TraceRecord {
         }
         if self.root && self.point != Point::Publish {
             return Err(TraceError::Root);
+        }
+        // Version 4 is written only on application points, and an
+        // application point only in version 4.
+        if (version == RECORD_VERSION_4) != self.point.is_application() {
+            return Err(TraceError::Version { version });
+        }
+        if let Point::Application { id, metadata } = self.point {
+            if id == 0 {
+                return Err(TraceError::PointId);
+            }
+            if !metadata.is_valid() {
+                return Err(TraceError::Metadata);
+            }
         }
         let polls = self.point == Point::SubscriberPoll;
         let subscriber_valid = match self.subscriber {
@@ -274,7 +446,7 @@ impl TraceRecord {
         if !packet_valid {
             return Err(TraceError::Packet);
         }
-        let carries_path = version >= RECORD_VERSION && self.point.is_network_level();
+        let carries_path = version == RECORD_VERSION && self.point.is_network_level();
         let network_valid = match self.network {
             Some(network) => {
                 carries_path && (self.point == Point::SenderPickup || network.attempt == 0)
@@ -304,8 +476,8 @@ impl TraceRecord {
             (None, Some(n)) => (0, join(n.path, n.attempt)),
             (None, None) => (0, 0),
         };
-        Ok([
-            u64::from(RECORD_VERSION)
+        let mut words = [
+            u64::from(self.point.version())
                 | (u64::from(self.point.code()) << 8)
                 | (u64::from(self.lane) << 16)
                 | if self.root { ROOT_BIT } else { 0 },
@@ -333,7 +505,50 @@ impl TraceRecord {
             subscriber.2,
             packet.0,
             packet.1,
-        ])
+        ];
+        // An application point has no subscriber, packet or path, so words
+        // 16 to 21 carry its id and metadata instead (word 21 stays zero).
+        if let Point::Application { id, metadata } = self.point {
+            let mut head = u64::from(id);
+            let mut count = 0u64;
+            if let Some(values) = words.get_mut(17..21) {
+                for (slot, value) in values.iter_mut().zip(metadata.values()) {
+                    let (kind, word) = value.wire();
+                    head |= kind << (32 + 4 * count);
+                    *slot = word;
+                    count += 1;
+                }
+            }
+            if let Some(word) = words.get_mut(16) {
+                *word = head | (count << 16);
+            }
+        }
+        Ok(words)
+    }
+
+    /// The application point of a version 4 record's words 16 to 21.
+    fn application(words: [u64; 6]) -> Result<Point, TraceError> {
+        let [head, values @ .., last] = words;
+        if head & POINT_RESERVED_BITS != 0 || last != 0 {
+            return Err(TraceError::Metadata);
+        }
+        let count = ((head >> 16) & 0x7) as usize;
+        if count > MAX_METADATA {
+            return Err(TraceError::Metadata);
+        }
+        let mut metadata = Metadata::NONE;
+        for (at, (slot, word)) in metadata.values.iter_mut().zip(values).enumerate() {
+            let kind = (head >> (32 + 4 * at)) & 0xF;
+            if at < count {
+                *slot = Some(Value::from_wire(kind, word).ok_or(TraceError::Metadata)?);
+            } else if kind != 0 || word != 0 {
+                return Err(TraceError::Metadata);
+            }
+        }
+        Ok(Point::Application {
+            id: head as u16,
+            metadata,
+        })
     }
 
     /// Decodes and checks a record of layout version 3, 2 (whose network
@@ -371,7 +586,7 @@ impl TraceRecord {
             path_attempt,
         ] = *words;
         let version = head as u8;
-        if !(RECORD_VERSION_1..=RECORD_VERSION).contains(&version) {
+        if !(RECORD_VERSION_1..=RECORD_VERSION_4).contains(&version) {
             return Err(TraceError::Version { version });
         }
         let root = head & ROOT_BIT != 0;
@@ -379,40 +594,51 @@ impl TraceRecord {
         if head & RESERVED_BITS != 0 || (root && version == RECORD_VERSION_1) {
             return Err(TraceError::ReservedBits);
         }
-        let point = Point::from_code((head >> 8) as u8)?;
-        let (stream_id, session_id) = halves(stream_session);
-        let subscriber_words = [
+        let code = (head >> 8) as u8;
+        let transport = [
             subscriber_driver_low,
             subscriber_driver_high,
             subscriber,
             subscriber_incarnation,
+            packet,
+            path_attempt,
         ];
-        let subscriber = subscriber_words
-            .iter()
-            .any(|word| *word != 0)
-            .then_some(SubscriberId {
-                driver: [subscriber_driver_low, subscriber_driver_high],
-                registration: subscriber,
-                incarnation: subscriber_incarnation,
-            });
-        let (packet, network) = if version >= RECORD_VERSION && point.is_network_level() {
-            // Version 3: word 21 is the path, and the packet word is zero.
-            if packet != 0 {
-                return Err(TraceError::NetworkPath);
-            }
-            let (path, attempt) = halves(path_attempt);
-            (None, Some(NetworkPath { path, attempt }))
+        let (point, subscriber, packet, network) = if code == APPLICATION_CODE
+            && version == RECORD_VERSION_4
+        {
+            // Words 16 to 21 carry the point and its metadata.
+            (Self::application(transport)?, None, None, None)
         } else {
-            let packet = (packet != 0 || path_attempt != 0).then(|| {
-                let (path, attempt) = halves(path_attempt);
-                PacketId {
-                    packet,
-                    path,
-                    attempt,
+            let point = Point::from_code(code)?;
+            let subscriber = transport[..4]
+                .iter()
+                .any(|word| *word != 0)
+                .then_some(SubscriberId {
+                    driver: [subscriber_driver_low, subscriber_driver_high],
+                    registration: subscriber,
+                    incarnation: subscriber_incarnation,
+                });
+            let (packet, network) = if version == RECORD_VERSION && point.is_network_level() {
+                // Version 3: word 21 is the path, and the packet word is zero.
+                if packet != 0 {
+                    return Err(TraceError::NetworkPath);
                 }
-            });
-            (packet, None)
+                let (path, attempt) = halves(path_attempt);
+                (None, Some(NetworkPath { path, attempt }))
+            } else {
+                let packet = (packet != 0 || path_attempt != 0).then(|| {
+                    let (path, attempt) = halves(path_attempt);
+                    PacketId {
+                        packet,
+                        path,
+                        attempt,
+                    }
+                });
+                (packet, None)
+            };
+            (point, subscriber, packet, network)
         };
+        let (stream_id, session_id) = halves(stream_session);
         let record = Self {
             point,
             publication: PublicationId {
@@ -899,5 +1125,190 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An application point of `values`, on the sample's frame.
+    fn application(id: u16, values: &[Value]) -> TraceRecord {
+        TraceRecord {
+            point: Point::Application {
+                id,
+                metadata: Metadata::new(values).unwrap(),
+            },
+            subscriber: None,
+            packet: None,
+            network: None,
+            root: false,
+            ..sample(Point::Publish)
+        }
+    }
+
+    /// Layout version 4: zero to four values of every type round trip, and
+    /// driver points keep version 3.
+    #[test]
+    fn application_points_round_trip_in_version_4() {
+        let values = [
+            Value::U64(u64::MAX),
+            Value::I64(-5),
+            Value::from_f64(-0.25),
+            Value::Tag(*b"venue-01"),
+        ];
+        for count in 0..=MAX_METADATA {
+            let record = application(u16::MAX, &values[..count]);
+            let words = record.encode().unwrap();
+            assert_eq!(words[0] & 0xFF, 4, "{count} values");
+            assert_eq!(TraceRecord::decode(&words), Ok(record), "{count} values");
+        }
+        let empty_tag = application(1, &[Value::Tag([0; 8])]);
+        assert_eq!(
+            TraceRecord::decode(&empty_tag.encode().unwrap()),
+            Ok(empty_tag)
+        );
+        assert_eq!(Value::from_f64(1.5).as_f64(), Some(1.5));
+        assert_eq!(Value::U64(1).as_f64(), None);
+        for point in POINTS {
+            assert_eq!(sample(point).encode().unwrap()[0] & 0xFF, 3, "{point:?}");
+        }
+    }
+
+    /// Golden layout of words 16 to 21 on an application point.
+    #[test]
+    fn golden_application_layout() {
+        let record = application(
+            0x0102,
+            &[
+                Value::U64(0x11),
+                Value::I64(-1),
+                Value::Tag(*b"ab\0\0\0\0\0\0"),
+            ],
+        );
+        let words = record.encode().unwrap();
+        assert_eq!(words[0], 0x0003_0904, "version 4, point 9, lane 3");
+        // Id 0x0102, count 3, types 1, 2 and 4 in bits 32..44.
+        assert_eq!(words[16], 0x0000_0421_0003_0102);
+        assert_eq!(words[17..22], [0x11, u64::MAX, 0x6261, 0, 0]);
+        assert_eq!(TraceRecord::decode(&words), Ok(record));
+        assert_eq!(
+            Point::Application {
+                id: 1,
+                metadata: Metadata::NONE
+            }
+            .code(),
+            9
+        );
+    }
+
+    /// Bounded metadata: refused when built, on encode and on decode.
+    #[test]
+    fn application_metadata_is_bounded_on_both_sides() {
+        let five = [Value::U64(0); 5];
+        assert_eq!(Metadata::new(&five), Err(TraceError::Metadata));
+        for tag in [*b"a b\0\0\0\0\0", *b"a\0b\0\0\0\0\0", *b"\xffabc\0\0\0\0"] {
+            assert_eq!(Metadata::new(&[Value::Tag(tag)]), Err(TraceError::Metadata));
+        }
+        let zero = TraceRecord {
+            point: Point::Application {
+                id: 0,
+                metadata: Metadata::NONE,
+            },
+            ..application(1, &[])
+        };
+        assert_eq!(zero.encode(), Err(TraceError::PointId));
+        // A bad tag smuggled past `new` is refused on encode too.
+        let mut smuggled = Metadata::NONE;
+        smuggled.values[0] = Some(Value::Tag(*b"\x01\0\0\0\0\0\0\0"));
+        let bad = TraceRecord {
+            point: Point::Application {
+                id: 1,
+                metadata: smuggled,
+            },
+            ..application(1, &[])
+        };
+        assert_eq!(bad.encode(), Err(TraceError::Metadata));
+        let mut gap = Metadata::NONE;
+        gap.values[1] = Some(Value::U64(1));
+        let gapped = TraceRecord {
+            point: Point::Application {
+                id: 1,
+                metadata: gap,
+            },
+            ..application(1, &[])
+        };
+        assert_eq!(gapped.encode(), Err(TraceError::Metadata));
+
+        let good = application(9, &[Value::U64(1), Value::U64(2)])
+            .encode()
+            .unwrap();
+        let refused = |change: &dyn Fn(&mut [u64; OBSERVATION_WORDS])| {
+            let mut words = good;
+            change(&mut words);
+            TraceRecord::decode(&words)
+        };
+        // Count 5; an unknown type; a value past the count; its type past
+        // the count; a reserved bit of word 16; word 21; a zero id.
+        assert_eq!(
+            refused(&|w| w[16] = (w[16] & !(0x7 << 16)) | (5 << 16)),
+            Err(TraceError::Metadata)
+        );
+        assert_eq!(
+            refused(&|w| w[16] = (w[16] & !(0xF << 32)) | (5 << 32)),
+            Err(TraceError::Metadata)
+        );
+        assert_eq!(refused(&|w| w[19] = 1), Err(TraceError::Metadata));
+        assert_eq!(refused(&|w| w[16] |= 1 << 40), Err(TraceError::Metadata));
+        assert_eq!(refused(&|w| w[16] |= 1 << 20), Err(TraceError::Metadata));
+        assert_eq!(refused(&|w| w[16] |= 1 << 63), Err(TraceError::Metadata));
+        assert_eq!(refused(&|w| w[21] = 1), Err(TraceError::Metadata));
+        assert_eq!(refused(&|w| w[16] &= !0xFFFF), Err(TraceError::PointId));
+        // A tag word that is not graphic ASCII.
+        let tag = application(9, &[Value::Tag(*b"ok\0\0\0\0\0\0")])
+            .encode()
+            .unwrap();
+        let mut bad_tag = tag;
+        bad_tag[17] = 0x7F;
+        assert_eq!(TraceRecord::decode(&bad_tag), Err(TraceError::Metadata));
+    }
+
+    /// Version 4 only on code 9, and code 9 only in version 4: a layout 3
+    /// reader refuses the application records and keeps the driver ones.
+    #[test]
+    fn version_4_and_code_9_go_together() {
+        let words = application(2, &[Value::U64(1)]).encode().unwrap();
+        for version in [RECORD_VERSION_1, RECORD_VERSION_2, RECORD_VERSION] {
+            let mut old = words;
+            old[0] = (old[0] & !0xFF) | u64::from(version);
+            assert_eq!(
+                TraceRecord::decode(&old),
+                Err(TraceError::UnknownPoint { code: 9 }),
+                "version {version}"
+            );
+        }
+        for point in POINTS {
+            let mut v4 = sample(point).encode().unwrap();
+            v4[0] = (v4[0] & !0xFF) | u64::from(RECORD_VERSION_4);
+            assert_eq!(
+                TraceRecord::decode(&v4),
+                Err(TraceError::Version { version: 4 }),
+                "{point:?}"
+            );
+        }
+        // An application point has no subscriber, packet, path or root.
+        let base = application(2, &[]);
+        let subscriber = TraceRecord {
+            subscriber: sample(Point::SubscriberPoll).subscriber,
+            ..base
+        };
+        assert_eq!(subscriber.encode(), Err(TraceError::Subscriber));
+        let packet = TraceRecord {
+            packet: sample(Point::KernelTx).packet,
+            ..base
+        };
+        assert_eq!(packet.encode(), Err(TraceError::Packet));
+        let network = TraceRecord {
+            network: sample(Point::SenderPickup).network,
+            ..base
+        };
+        assert_eq!(network.encode(), Err(TraceError::NetworkPath));
+        let root = TraceRecord { root: true, ..base };
+        assert_eq!(root.encode(), Err(TraceError::Root));
     }
 }

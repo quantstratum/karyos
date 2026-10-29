@@ -14,5 +14,9 @@ publish.workspace = true
 karyos-protocol.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The counting allocator of the no-allocation test.
+karyos-sys = { workspace = true, features = ["test-hooks"] }
+
 [lints]
 workspace = true

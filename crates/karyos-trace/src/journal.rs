@@ -11,7 +11,10 @@ use karyos_protocol::journal::{
 };
 
 use crate::error::TraceError;
-use crate::record::{RECORD_WORDS, TraceRecord, decode_record, encode_record};
+use crate::record::{
+    Metadata, ObservedTime, Point, PublicationId, RECORD_WORDS, TraceIds, TraceRecord,
+    decode_record, encode_record,
+};
 
 /// The observer that owns a trace journal: the observing driver instance,
 /// which need not be the publication's, and the journal within it. Clock
@@ -49,6 +52,7 @@ pub fn trace_journal(
             observer,
             collection_clock,
             last_epoch: None,
+            client: None,
         },
         TraceCollector { consumer, observer },
     ))
@@ -83,6 +87,7 @@ pub fn trace_writer(
         observer,
         collection_clock,
         last_epoch: None,
+        client: None,
     })
 }
 
@@ -93,6 +98,7 @@ pub struct TraceWriter {
     observer: ObserverId,
     collection_clock: u64,
     last_epoch: Option<u64>,
+    client: Option<u64>,
 }
 
 impl TraceWriter {
@@ -100,6 +106,21 @@ impl TraceWriter {
     #[must_use]
     pub fn observer(&self) -> ObserverId {
         self.observer
+    }
+
+    /// The writer of a journal the driver created for `client`, so the
+    /// client's [`ApplicationPoint`]s can record into it
+    /// (`quantstratum-docs: karyos/design/trace-records.md`, "Point names").
+    #[must_use]
+    pub fn for_client(mut self, client: u64) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// The client whose journal this is, if given.
+    #[must_use]
+    pub fn client(&self) -> Option<u64> {
+        self.client
     }
 
     /// Encodes and appends `record`. `collected` is this writer's own
@@ -137,6 +158,10 @@ impl TraceWriter {
 
 /// What [`TraceCollector::take`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a record is taken by value on the collector's path; boxing it would allocate per record"
+)]
 pub enum Collected {
     /// A decoded record.
     Record {
@@ -221,12 +246,101 @@ impl TraceCollector {
     }
 }
 
+/// An application's named trace point (R-CORE-1, `quantstratum-docs:
+/// karyos/design/trace-records.md`, "Point names"): the id the driver
+/// assigned when `client` registered it. It records only into that
+/// client's journals, the client the export names it under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ApplicationPoint {
+    id: u16,
+    client: u64,
+}
+
+/// What an application observation is about: the frame and message it
+/// joins, and when it was observed. Words 1 to 15 of the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ApplicationContext {
+    /// The publication.
+    pub publication: PublicationId,
+    /// Lane, 0..=[`MAX_LANE`](crate::record::MAX_LANE).
+    pub lane: u8,
+    /// Frame position in its lane.
+    pub position: u64,
+    /// Trace identity of the message, zero where it carries none.
+    pub ids: TraceIds,
+    /// When it was observed.
+    pub observed: ObservedTime,
+}
+
+impl ApplicationPoint {
+    /// The point `id` that the driver assigned to `client`.
+    ///
+    /// # Errors
+    ///
+    /// [`TraceError::PointId`] for id 0.
+    pub const fn new(id: u16, client: u64) -> Result<Self, TraceError> {
+        if id == 0 {
+            return Err(TraceError::PointId);
+        }
+        Ok(Self { id, client })
+    }
+
+    /// The point id.
+    #[must_use]
+    pub const fn id(&self) -> u16 {
+        self.id
+    }
+
+    /// The client that registered it.
+    #[must_use]
+    pub const fn client(&self) -> u64 {
+        self.client
+    }
+
+    /// Records one observation of this point into `writer`'s journal, as
+    /// [`TraceWriter::record`] does: one append, no allocation, no call
+    /// into the driver.
+    ///
+    /// # Errors
+    ///
+    /// [`TraceError::ForeignPoint`] when `writer` is not a journal of this
+    /// point's client, before a sequence is taken, and the errors of
+    /// [`TraceWriter::record`].
+    pub fn observe(
+        &self,
+        writer: &mut TraceWriter,
+        context: &ApplicationContext,
+        metadata: Metadata,
+        collected: Stamp,
+    ) -> Result<Append, TraceError> {
+        if writer.client != Some(self.client) {
+            return Err(TraceError::ForeignPoint);
+        }
+        let record = TraceRecord {
+            point: Point::Application {
+                id: self.id,
+                metadata,
+            },
+            publication: context.publication,
+            lane: context.lane,
+            position: context.position,
+            ids: context.ids,
+            observed: context.observed,
+            subscriber: None,
+            packet: None,
+            network: None,
+            root: false,
+        };
+        writer.record(&record, collected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use karyos_protocol::journal::{DropRange, record_journal};
 
     use super::*;
-    use crate::record::{ObservedTime, Point, PublicationId, TraceIds};
+    use crate::record::{ObservedTime, Point, PublicationId, TraceIds, Value};
 
     const OBSERVER: ObserverId = ObserverId {
         driver: [3, 4],
@@ -386,6 +500,59 @@ mod tests {
             Err(TraceError::Lane { lane: 9 })
         );
         assert_eq!(collector.losses().attempted, 0);
+    }
+
+    fn context(position: u64) -> ApplicationContext {
+        let sample = record(position, 40);
+        ApplicationContext {
+            publication: sample.publication,
+            lane: sample.lane,
+            position,
+            ids: sample.ids,
+            observed: sample.observed,
+        }
+    }
+
+    /// An application point records into its client's journal as a
+    /// version 4 record the collector decodes back.
+    #[test]
+    fn an_application_point_records_into_its_clients_journal() {
+        let (writer, mut collector) = trace_journal(4, 2, OBSERVER, 1).unwrap();
+        let mut writer = writer.for_client(12);
+        assert_eq!(writer.client(), Some(12));
+        let point = ApplicationPoint::new(3, 12).unwrap();
+        let metadata = Metadata::new(&[Value::U64(5), Value::Tag(*b"risk\0\0\0\0")]).unwrap();
+        assert_eq!(
+            point.observe(&mut writer, &context(64), metadata, stamp(41)),
+            Ok(Append::Stored { sequence: 0 })
+        );
+        let Collected::Record { record: got, .. } = collector.take() else {
+            panic!("expected a record");
+        };
+        assert_eq!(got.point, Point::Application { id: 3, metadata });
+        assert_eq!((got.position, got.ids), (64, context(64).ids));
+        assert_eq!(ApplicationPoint::new(0, 12), Err(TraceError::PointId));
+    }
+
+    /// A point records only into a journal of its own client: another
+    /// client's writer, or one whose client is not known, is refused before
+    /// a sequence is taken.
+    #[test]
+    fn a_point_of_another_client_is_refused_before_a_sequence() {
+        let point = ApplicationPoint::new(1, 7).unwrap();
+        for client in [None, Some(8)] {
+            let (writer, mut collector) = trace_journal(4, 2, OBSERVER, 1).unwrap();
+            let mut writer = match client {
+                Some(client) => writer.for_client(client),
+                None => writer,
+            };
+            assert_eq!(
+                point.observe(&mut writer, &context(0), Metadata::NONE, stamp(1)),
+                Err(TraceError::ForeignPoint)
+            );
+            assert_eq!(collector.losses().attempted, 0);
+            assert_eq!(collector.take(), Collected::Empty);
+        }
     }
 
     /// Stored 0, dropped 1 and 2, malformed stored 3, valid 4: the corrupt

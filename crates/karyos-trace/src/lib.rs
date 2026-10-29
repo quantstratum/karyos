@@ -42,13 +42,14 @@ pub use error::TraceError;
 pub use histogram::{Histogram, HistogramCounts, HistogramError, Quantile, SideCounts};
 pub use ids::{BufferedIds, OsRandom, RandomSource};
 pub use journal::{
-    Collected, ObserverId, TraceCollector, TraceWriter, trace_journal, trace_writer,
+    ApplicationContext, ApplicationPoint, Collected, ObserverId, TraceCollector, TraceWriter,
+    trace_journal, trace_writer,
 };
 pub use network_agent::{NetworkCounter, NetworkCounts, NetworkTraceAgent};
 pub use record::{
-    MAX_LANE, NetworkPath, OBSERVATION_WORDS, ObservedTime, PacketId, Point, PublicationId,
-    RECORD_VERSION, RECORD_VERSION_1, RECORD_VERSION_2, RECORD_WORDS, SubscriberId, TraceIds,
-    TraceRecord, decode_record, encode_record,
+    MAX_LANE, MAX_METADATA, Metadata, NetworkPath, OBSERVATION_WORDS, ObservedTime, PacketId,
+    Point, PublicationId, RECORD_VERSION, RECORD_VERSION_1, RECORD_VERSION_2, RECORD_VERSION_4,
+    RECORD_WORDS, SubscriberId, TraceIds, TraceRecord, Value, decode_record, encode_record,
 };
 pub use report::{
     HeldMessage, HistogramConfig, JournalClock, JournalId, PublicationKey, PublicationSummary,
