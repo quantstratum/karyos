@@ -338,7 +338,10 @@ impl Registry {
         let now = entry.versions.back().map_or(now, |last| {
             now.max(last.valid_to.unwrap_or(last.valid_from))
         });
-        let number = entry.versions.back().map_or(1, |last| last.number + 1);
+        let number = entry
+            .versions
+            .back()
+            .map_or(1, |last| last.number.saturating_add(1));
         if let Some(last) = entry.versions.back_mut()
             && last.valid_to.is_none()
         {
@@ -346,7 +349,7 @@ impl Registry {
         }
         if entry.versions.len() == MAX_VERSIONS {
             entry.versions.pop_front();
-            entry.history_dropped += 1;
+            entry.history_dropped = entry.history_dropped.saturating_add(1);
         }
         entry.versions.push_back(Version {
             number,
@@ -446,21 +449,21 @@ impl Registry {
         match oldest {
             Some(id) => {
                 self.entries.remove(&id);
-                self.evicted += 1;
+                self.evicted = self.evicted.saturating_add(1);
                 Ok(())
             }
             None => Err(Refusal::Above {
                 dimension,
-                bound: u64::try_from(bound).unwrap_or(u64::MAX),
+                bound: bound as u64,
             }),
         }
     }
 }
 
-/// Checks a key: a stream's is a wire stream id (`i32`, decimal), any
+/// Checks a key (karyos#736): a stream's is a wire stream id (`i32`, decimal), any
 /// other's a label of 1 to [`MAX_KEY_BYTES`] bytes without space or
 /// control characters.
-fn check_key(kind: Kind, key: &str) -> Result<(), Refusal> {
+pub(crate) fn check_key(kind: Kind, key: &str) -> Result<(), Refusal> {
     if key.len() > MAX_KEY_BYTES {
         return Err(Refusal::Above {
             dimension: "join.key_bytes",

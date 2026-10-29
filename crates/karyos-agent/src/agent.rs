@@ -510,6 +510,7 @@ impl Agent {
     ) -> Result<registry::Read<'a>, JoinError> {
         let index = self.driver_index(dir)?;
         let driver = self.drivers.get(index).ok_or(JoinError::UnknownDriver)?;
+        registry::check_key(kind, key).map_err(JoinError::Refused)?;
         Ok(registry::Read {
             generation: self.registry.generation(),
             since_ns: self.registry.since_ns(),
