@@ -383,6 +383,14 @@ fn tool_hellos_that_break_the_profile_are_refused() {
         raw_hello(&mut driver, &dir, &future, None),
         refused(refusal::INCOMPATIBLE_VERSION)
     );
+    // An alpha.2 tool (admission version 2) is refused too, so it never
+    // maps the guard audit ring, whose outcome 5 (a rate change, karyos#740)
+    // it does not know.
+    let alpha2 = encode(&Message::ToolHello { version: 2 });
+    assert_eq!(
+        raw_hello(&mut driver, &dir, &alpha2, None),
+        refused(refusal::INCOMPATIBLE_VERSION)
+    );
     let hello = encode(&Message::ToolHello { version: VERSION });
     let pidfd = PidFd::of_self().unwrap();
     assert_eq!(
@@ -396,7 +404,7 @@ fn tool_hellos_that_break_the_profile_are_refused() {
         refused(refusal::PROFILE)
     );
     assert_eq!(driver.tools(), 0);
-    assert_eq!(hello_rejections(&driver, refusal::INCOMPATIBLE_VERSION), 1);
+    assert_eq!(hello_rejections(&driver, refusal::INCOMPATIBLE_VERSION), 2);
     assert_eq!(hello_rejections(&driver, refusal::PROFILE), 2);
 }
 

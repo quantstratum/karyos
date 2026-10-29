@@ -311,6 +311,19 @@ pub fn scan<L: Fn(usize) -> Option<u64>>(
     reader: &RingReader<L>,
     cursor: &mut u64,
     buffer: &mut [u64],
+    deliver: impl FnMut(u64, &[u64]),
+) -> Scan {
+    scan_at_most(reader, cursor, buffer, u64::MAX, deliver)
+}
+
+/// [`scan`], delivering at most `max` records: the cursor stays on the
+/// first one left, which is not read, so the work of one call is bounded
+/// by `max` and not by the ring's capacity.
+pub fn scan_at_most<L: Fn(usize) -> Option<u64>>(
+    reader: &RingReader<L>,
+    cursor: &mut u64,
+    buffer: &mut [u64],
+    max: u64,
     mut deliver: impl FnMut(u64, &[u64]),
 ) -> Scan {
     let mut result = Scan {
@@ -327,7 +340,7 @@ pub fn scan<L: Fn(usize) -> Option<u64>>(
         *cursor = bounds.first;
     }
     let fields = reader.fields().min(buffer.len());
-    while *cursor < bounds.next {
+    while *cursor < bounds.next && result.delivered < max {
         match reader.read(*cursor, buffer) {
             SlotRead::Record => {
                 deliver(*cursor, buffer.get(..fields).unwrap_or(&[]));
@@ -406,6 +419,37 @@ mod tests {
         assert_eq!(scan.overwritten, 2, "3 and 4 were overwritten unseen");
         assert_eq!(seen, vec![(5, 105), (6, 106), (7, 107), (8, 108)]);
         assert_eq!(cursor, 9);
+    }
+
+    /// A bounded scan reads no further than its bound: the cursor stays
+    /// on the first record left, and the next scan delivers it.
+    #[test]
+    fn a_bounded_scan_stops_at_its_bound() {
+        let heap = ring(8, 16);
+        let mut writer = RingWriter::create(heap.words().as_slice(), 8, 16).unwrap();
+        let reader = reader(&heap, 16);
+        for value in 0..5u64 {
+            let _ = writer.append(&[100 + value]).unwrap();
+        }
+        let mut buffer = [0u64; 16];
+        let mut cursor = 0;
+        let mut seen = Vec::new();
+        let scan = scan_at_most(&reader, &mut cursor, &mut buffer, 2, |seq, _| {
+            seen.push(seq)
+        });
+        assert_eq!(
+            (seen.as_slice(), cursor, scan.delivered),
+            (&[0, 1][..], 2, 2)
+        );
+        assert_eq!(scan.stopped, None);
+        let scan = scan_at_most(&reader, &mut cursor, &mut buffer, 0, |seq, _| {
+            seen.push(seq)
+        });
+        assert_eq!((cursor, scan.delivered), (2, 0));
+        let _ = scan_at_most(&reader, &mut cursor, &mut buffer, 9, |seq, _| {
+            seen.push(seq)
+        });
+        assert_eq!((seen, cursor), (vec![0, 1, 2, 3, 4], 5));
     }
 
     #[test]

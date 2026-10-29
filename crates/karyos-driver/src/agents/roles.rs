@@ -308,6 +308,13 @@ pub struct ReceiverCounters {
     pub nak_route_faults: u64,
     /// ERR NAK_REPLY controls for no installed image.
     pub nak_replies_unbound: u64,
+    /// A reliable image's hole the receive owner could not compute, a
+    /// data hole (`first_hole`) or a heartbeat's tail (`heartbeat_tail`):
+    /// a corrupt owner state or a mark off a frame boundary; no NAK for
+    /// it. An unreliable image's skip duty reports these as its own error.
+    /// A defect counter, read through the receiver's counters, not a CnC
+    /// cell.
+    pub hole_query_errors: u64,
     /// Images closed by repair: a range proven unrecoverable under
     /// `on_unrecoverable = close`, or `GapCannotResume`.
     pub images_closed_unrecoverable: u64,
@@ -384,8 +391,9 @@ pub struct SenderCounters {
     pub removed_dropped: u64,
     /// Entries of the close list (a route and its queues) with a live
     /// handle the endpoint would not close, each counted once; a handle
-    /// already gone counts as closed, and one with frames in flight gets
-    /// one more duty first. When the endpoint then refuses a route or a
+    /// already gone counts as closed, and one with frames in flight is
+    /// closed again at each duty, failing only on a close error or after
+    /// [`super::CLOSE_IN_FLIGHT_TIMEOUT`]. When the endpoint then refuses a route or a
     /// queue for its limit in the same epoch, its reset is asked for once,
     /// tagged with that epoch (the endpoint table keeps it and serves it in
     /// that epoch): the new epoch drops them.
@@ -415,6 +423,9 @@ pub struct SenderCounters {
     /// Of those, the ones still in flight after
     /// [`super::CLOSE_IN_FLIGHT_TIMEOUT`]: counted as failed closes.
     pub removed_close_timeouts: u64,
+    /// Duties at which an entry in flight found `closing_again` full and
+    /// stayed in the close list for the next duty: never a failure.
+    pub removed_close_overflow: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -562,7 +573,8 @@ struct EndpointCloses {
 enum EntryClosed {
     /// Every handle closed, or was gone already.
     Done,
-    /// A queue still has frames in flight: tried once more next duty.
+    /// A queue still has frames in flight: closed again at each duty, up
+    /// to [`super::CLOSE_IN_FLIGHT_TIMEOUT`].
     InFlight,
     /// A live handle did not close.
     Failed,
@@ -1299,11 +1311,19 @@ fn tail_hole<T: StreamTerms>(
     lane: Lane,
     at: usize,
     now: u64,
+    counters: &mut ReceiverCounters,
 ) -> Option<Hole> {
     use crate::repair::loss::RttSource;
 
-    let tail = heartbeat_mark(image, lane, at)
-        .and_then(|mark| image.owner.heartbeat_tail(lane, mark).ok().flatten());
+    let tail =
+        match heartbeat_mark(image, lane, at).map(|mark| image.owner.heartbeat_tail(lane, mark)) {
+            Some(Ok(tail)) => tail,
+            Some(Err(_)) => {
+                tally(counters, |c| &mut c.hole_query_errors);
+                None
+            }
+            None => None,
+        };
     let Some((start, length)) = tail else {
         if let Some(since) = image.tail_since.get_mut(at) {
             *since = None;
@@ -2184,6 +2204,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 })
             })
         });
+    }
+
+    /// How often each reason made the receive sessions ignore a control
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn ignored_controls(&self) -> crate::sessions::receive::IgnoredCounts {
+        self.sessions.ignored_counts()
     }
 
     /// The session table's counters.
@@ -3158,12 +3185,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
             if !image.reliable {
                 continue;
             }
-            let first = image
-                .owner
-                .first_hole(lane)
-                .ok()
-                .flatten()
-                .map(|(start, length)| Hole { start, length });
+            let first = match image.owner.first_hole(lane) {
+                Ok(hole) => hole.map(|(start, length)| Hole { start, length }),
+                Err(_) => {
+                    tally(counters, |c| &mut c.hole_query_errors);
+                    None
+                }
+            };
             // A covered hole ends any tail wait: a later tail waits its RTT
             // afresh.
             if first.is_some()
@@ -3171,7 +3199,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             {
                 *since = None;
             }
-            let hole = first.or_else(|| tail_hole(image, lane, at, now));
+            let hole = first.or_else(|| tail_hole(image, lane, at, now, counters));
             if let Observation::Unrecoverable {
                 hole,
                 lowest_retained,
@@ -3300,8 +3328,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
             // An unreliable tail no frame revealed is sealed at its
             // deadline (SPEC §6, G1), up to the clamped mark.
             if !image.reliable {
-                for (at, lane) in (0..image.heartbeat_marks.len())
-                    .filter_map(|at| Some((at, Lane::try_new(u8::try_from(at).ok()?).ok()?)))
+                for (at, lane) in (0..image.lane_count)
+                    .filter_map(|at| Some((usize::from(at), Lane::try_new(at).ok()?)))
                 {
                     if let Some(mark) = heartbeat_mark(image, lane, at) {
                         image.skip.revealed(lane, mark);
@@ -5113,7 +5141,8 @@ impl<T: StreamTerms> SenderRole<T> {
         let mut index = 0;
         while let Some((mut opened, since)) = self.closing_again.get(index).copied() {
             let outcome = self.close_entry(halves, &mut opened);
-            let late = now < since || age_ns(now, since) >= super::CLOSE_IN_FLIGHT_TIMEOUT;
+            // A clock behind `since` counts as no time elapsed (`age_ns`).
+            let late = age_ns(now, since) >= super::CLOSE_IN_FLIGHT_TIMEOUT;
             match outcome {
                 EntryClosed::Done => {
                     self.closing_again.swap_remove(index);
@@ -5133,18 +5162,35 @@ impl<T: StreamTerms> SenderRole<T> {
                 }
             }
         }
-        while let Some(mut opened) = self.closing.pop() {
+        // New entries: closed, they go; in flight, they wait in
+        // `closing_again`; a close error fails them, once, and the endpoint
+        // is reset when what did not close holds it at its limit. With
+        // `closing_again` full (it holds every route a removal can leave,
+        // so only removals faster than one bound can fill it), an entry in
+        // flight stays in the close list for the next duty, counted, never
+        // failed for want of room.
+        let mut index = 0;
+        while let Some(mut opened) = self.closing.get(index).copied() {
             match self.close_entry(halves, &mut opened) {
-                EntryClosed::Done => {}
+                EntryClosed::Done => {
+                    self.closing.swap_remove(index);
+                }
                 EntryClosed::InFlight
                     if self.closing_again.len() < self.closing_again.capacity() =>
                 {
                     self.count(|c| &mut c.removed_close_deferred);
+                    self.closing.swap_remove(index);
                     self.closing_again.push((opened, now));
                 }
-                // Once per entry, no retry: the endpoint is reset when
-                // what did not close holds it at its limit.
-                EntryClosed::InFlight | EntryClosed::Failed => {
+                EntryClosed::InFlight => {
+                    self.count(|c| &mut c.removed_close_overflow);
+                    if let Some(slot) = self.closing.get_mut(index) {
+                        *slot = opened;
+                    }
+                    index += 1;
+                }
+                EntryClosed::Failed => {
+                    self.closing.swap_remove(index);
                     self.close_failed(opened.endpoint, opened.epoch);
                 }
             }

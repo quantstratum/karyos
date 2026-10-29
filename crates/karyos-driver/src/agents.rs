@@ -176,7 +176,10 @@ pub const MAX_PATH_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 /// failed close (#838, #849; QS-COORDINATOR): a kernel backend shows no
 /// progress on frames it holds until it sends them, possibly over many
 /// cycles, so a cycle count would fail closes that are only slow. Past
-/// this, the endpoint's standing reset frees what is left.
+/// this, the endpoint's standing reset frees what is left. In
+/// nanoseconds of the driver clock. Its cost: each entry still in flight
+/// is closed again once per sender duty for at most this long, one
+/// `close_queue` per queue and one `remove_route` call each, no syscall.
 pub const CLOSE_IN_FLIGHT_TIMEOUT: u64 = 1_000_000_000;
 
 /// The bytes the receiver's path queues allocate for `config`; `None` past
@@ -1204,7 +1207,7 @@ pub(crate) const SENDER_CELLS: [&str; 5] = [
 /// M2b), keyed by its stream's registration: datagrams and their bytes
 /// staged for sending (PAD and ABORTED records included), repair
 /// datagrams submitted, and NAKs received.
-pub(crate) const PUBLICATION_CELLS: [&str; 5] = [
+pub(crate) const PUBLICATION_CELLS: [&str; 6] = [
     "network frames sent",
     "network bytes sent",
     "network retransmits",
@@ -1213,6 +1216,10 @@ pub(crate) const PUBLICATION_CELLS: [&str; 5] = [
     // sender's first cycle, then 1 open, 2 not joined, 3 lost required
     // (karyos#637).
     "network admission",
+    // Rate policies its guard's sender gate refused (R-CORE-21): never
+    // reached while the driver validates first, so a non-zero value is a
+    // broken invariant, visible to the agent.
+    "network rate policies refused",
 ];
 
 /// A network image's counters in the CnC (M2b), keyed by its stream's
@@ -1341,6 +1348,20 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
     #[cfg(test)]
     pub(crate) fn reclaimed_tombstones(&self) -> usize {
         self.role.reclaimed_tombstones()
+    }
+
+    /// The receive sessions' counters: SOLICITs, challenges, installs
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn session_counters(&self) -> crate::sessions::receive::SessionCounters {
+        self.role.session_counters()
+    }
+
+    /// How often each reason made the receive sessions ignore a control
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn ignored_controls(&self) -> crate::sessions::receive::IgnoredCounts {
+        self.role.ignored_controls()
     }
 
     /// Whether `alias` is published on `endpoint` (tests).
@@ -1497,6 +1518,12 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
     #[must_use]
     pub fn counters(&self) -> roles::SenderCounters {
         self.role.counters()
+    }
+
+    /// The send sessions' counters: answers and their rate drops (tests).
+    #[cfg(test)]
+    pub(crate) fn session_counters(&self) -> crate::sessions::send::SendCounters {
+        self.role.session_counters()
     }
 
     /// Whether the agent stopped: its flag was set or its conductor is

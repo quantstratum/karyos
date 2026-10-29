@@ -20,6 +20,8 @@ thiserror.workspace = true
 
 [dev-dependencies]
 karyos-driver.workspace = true
+# A busy table entry and a malformed record in the export's tests.
+karyos-sys = { workspace = true, features = ["test-hooks"] }
 
 [lints]
 workspace = true

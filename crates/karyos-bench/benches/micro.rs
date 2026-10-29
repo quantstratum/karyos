@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Focused microbenchmarks for the keyed table, the trace sampling hook and
-//! the term byte copies of each backing.
+//! Focused microbenchmarks for the keyed table, the trace sampling hook,
+//! the term byte copies of each backing, and a rate-limited send's charge
+//! with and without the published policy check.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
@@ -243,11 +244,106 @@ fn shared_lane() -> LogBuffer<karyos_sys::term_bytes::SharedTerms> {
     LogBuffer::new_shared(term_lane()).unwrap_or_else(|_| std::process::abort())
 }
 
+/// R-CORE-21 (karyos#740): one sender gate serve's rate work, a refill and
+/// a datagram's charge, alone and after the published policy check the gate
+/// adds to each serve (one Acquire load of an unchanged sequence word). The
+/// PR states the difference against its 5% bound.
+fn rate_serve(c: &mut Criterion) {
+    use karyos_sys::rate_limit::{Rate, RateLimiter, RatePolicy};
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, SlotRead, publish, try_read};
+    use karyos_sys::sync::{AtomicU64, Ordering};
+
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: u64::MAX / 4,
+            burst: u64::MAX / 4,
+        },
+        bytes: Some(Rate {
+            per_second: u64::MAX / 4,
+            burst: u64::MAX / 4,
+        }),
+    };
+    let mut group = c.benchmark_group("rate serve");
+    let mut now = 0u64;
+    let mut limiter = RateLimiter::new(policy, 0);
+    group.bench_function("refill and charge", |b| {
+        b.iter(|| {
+            now = now.wrapping_add(1_000);
+            limiter.refill_at(black_box(now));
+            black_box(limiter.try_admit_datagram(black_box(1_200), 1))
+        });
+    });
+    let words: Vec<AtomicU64> = (0..SLOT_WORDS).map(|_| AtomicU64::new(0)).collect();
+    publish(&words, 0, 1, &policy);
+    let seen = words.first().map_or(0, |word| word.load(Ordering::Relaxed));
+    let view: &[AtomicU64] = &words;
+    let mut limiter = RateLimiter::new(policy, 0);
+    group.bench_function("policy check, refill and charge", |b| {
+        b.iter(|| {
+            now = now.wrapping_add(1_000);
+            let sequence = words.first().map(|word| word.load(Ordering::Acquire));
+            if sequence != Some(black_box(seen))
+                && let SlotRead::Policy { policy, .. } = try_read(&view, 0)
+            {
+                limiter.set_policy(policy, now);
+            }
+            limiter.refill_at(black_box(now));
+            black_box(limiter.try_admit_datagram(black_box(1_200), 1))
+        });
+    });
+    group.finish();
+}
+
 fn term_copies(c: &mut Criterion) {
     term_write(c, "heap", heap_lane);
     term_write(c, "shared", shared_lane);
     term_read(c, "heap", heap_lane);
     term_read(c, "shared", shared_lane);
+}
+
+/// The cost of a `trace-export` page (R-CORE-13), from a full mirror: the
+/// scan and copy of the most records a request may ask for with no byte
+/// bound, then a page as served, within the 1 MiB bound, encoded.
+fn trace_export_page(c: &mut Criterion) {
+    use karyos_agent::api::{EXPORT_MAX, MAX_EXPORT_REPLY};
+    use karyos_sys::trace_mirror::{JournalEntry, JournalKind, trace_mirror};
+
+    let mut mirror = trace_mirror(4, 4, EXPORT_MAX).unwrap_or_else(|_| std::process::abort());
+    let entry = JournalEntry::open(10, 1, JournalKind::Publisher, 26, 16);
+    let _ = mirror.write_entry(0, Some(&entry));
+    let payload = [u64::MAX / 3; 26];
+    for sequence in 0..u64::try_from(EXPORT_MAX).unwrap_or(u64::MAX) {
+        let _ = mirror.append(10, sequence, &payload);
+    }
+    let reader = mirror.reader();
+    let mut group = c.benchmark_group("trace export");
+    let _ = group.bench_function("16384 records, no byte bound", |b| {
+        b.iter(|| {
+            black_box(karyos_agent::trace_export::export(
+                &reader,
+                1,
+                0,
+                EXPORT_MAX,
+                Some(1),
+                usize::MAX,
+            ))
+        });
+    });
+    let _ = group.bench_function("a page within 1 MiB, encoded", |b| {
+        b.iter(|| {
+            if let Ok(page) = karyos_agent::trace_export::export(
+                &reader,
+                1,
+                0,
+                EXPORT_MAX,
+                Some(1),
+                MAX_EXPORT_REPLY,
+            ) {
+                black_box(karyos_agent::json::trace_export(&page));
+            }
+        });
+    });
+    group.finish();
 }
 
 // criterion 0.7's `criterion_group!` generates an undocumented public
@@ -257,8 +353,17 @@ fn term_copies(c: &mut Criterion) {
     reason = "criterion_group! generates an undocumented pub fn"
 )]
 mod group {
-    use super::{conflation_write_poll, term_copies, trace_decisions};
-    criterion::criterion_group!(benches, conflation_write_poll, trace_decisions, term_copies);
+    use super::{
+        conflation_write_poll, rate_serve, term_copies, trace_decisions, trace_export_page,
+    };
+    criterion::criterion_group!(
+        benches,
+        conflation_write_poll,
+        trace_decisions,
+        term_copies,
+        trace_export_page,
+        rate_serve
+    );
 }
 use group::benches;
 criterion_main!(benches);

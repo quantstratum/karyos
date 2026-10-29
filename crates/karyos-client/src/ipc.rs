@@ -494,6 +494,7 @@ impl BindingFds {
             lanes,
             binding.messages,
         )
+        .map(|bound| bound.with_published_rate(karyos_sys::host_clock::host_monotonic_ns))
         .map_err(|_| AttachError::Protocol)
     }
 }

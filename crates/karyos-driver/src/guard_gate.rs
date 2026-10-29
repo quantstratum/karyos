@@ -173,6 +173,7 @@ pub enum AbortCause {
 
 /// What a gate counted, for the driver's counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct GateCounts {
     /// Exposure checks run.
     pub checks: u64,
@@ -192,6 +193,10 @@ pub struct GateCounts {
     pub corrupt: u64,
     /// Counts that would have overflowed and kept their last value.
     pub overflows: u64,
+    /// Published rate policies the gate refused (a zero rate, or a byte
+    /// burst below its largest datagram), each applied as the stricter of
+    /// it and the policy in force (R-CORE-21).
+    pub policies_refused: u64,
 }
 
 /// Adds one to `count`; at its end it keeps its value and `overflows`
@@ -227,6 +232,9 @@ struct Charge {
     holders: usize,
     /// Its tokens are reserved.
     charged: bool,
+    /// Let through while the gate had no rate: never charged, so never
+    /// refunded, nor charged for a later copy once a policy is adopted.
+    exempt: bool,
     /// A copy left submitted or unknown: the tokens stay.
     sent: bool,
     /// A copy left submitted: a backend took it.
@@ -397,6 +405,101 @@ fn resolve(state: &mut State) -> u64 {
     frontier.resolved
 }
 
+/// The stricter of `a` and `b`, bucket by bucket: the lower rate and the
+/// lower burst, and a byte bucket if either has one (R-CORE-21).
+fn stricter(a: &RatePolicy, b: &RatePolicy) -> RatePolicy {
+    use karyos_sys::rate_limit::Rate;
+
+    let min = |a: Rate, b: Rate| Rate {
+        per_second: a.per_second.min(b.per_second),
+        burst: a.burst.min(b.burst),
+    };
+    RatePolicy {
+        messages: min(a.messages, b.messages),
+        bytes: match (a.bytes, b.bytes) {
+            (Some(a), Some(b)) => Some(min(a, b)),
+            (one, None) | (None, one) => one,
+        },
+    }
+}
+
+/// A gate's view of its publication's policy slot.
+struct PolicySlot {
+    words: Arc<dyn SharedWords>,
+    /// The slot's sequence word when it was last read whole.
+    sequence: u64,
+    /// The policy version applied.
+    version: u64,
+}
+
+impl core::fmt::Debug for PolicySlot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PolicySlot")
+            .field("sequence", &self.sequence)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PolicySlot {
+    /// Applies a newer published policy to `limiter` at `now`, creating it
+    /// empty for a gate built with no rate (a rateless lane's publication
+    /// getting one): a policy taken at run time never grants tokens. An unchanged sequence word is one Acquire load; a torn read
+    /// waits for the next call.
+    /// A policy the gate's largest datagram refuses (a byte burst below
+    /// it) is not applied, as a gate is never built with one, and counted
+    /// in `counts.policies_refused`.
+    fn refresh(
+        &mut self,
+        limiter: &mut Option<RateLimiter>,
+        max_datagram: u64,
+        counts: &mut GateCounts,
+        now: u64,
+    ) {
+        use karyos_sys::rate_policy_slot::{SEQUENCE, SlotRead, try_read_sequenced};
+
+        if self.words.load_acquire(SEQUENCE) == Some(self.sequence) {
+            return;
+        }
+        // The sequence the read validated, never one loaded after it: a
+        // publication completed in between must still look new.
+        let (read, sequence) = try_read_sequenced(&*self.words, 0);
+        if let SlotRead::Policy { version, policy } = read
+            && version > self.version
+        {
+            if policy.validate(max_datagram).is_err() {
+                // Fail closed: the driver validates against the same bound,
+                // so this is never reached from it; were it, the gate limits
+                // with the stricter of the policy in force and the one
+                // refused, never the looser, counted for the agent
+                // (`network rate policies refused`). A refused policy with
+                // no policy in force holds the lanes as it would.
+                bump(&mut counts.policies_refused, &mut counts.overflows);
+                let stricter = limiter
+                    .as_ref()
+                    .map_or(policy, |held| stricter(&held.policy(), &policy));
+                match limiter {
+                    Some(limiter) => limiter.set_policy(stricter, now),
+                    None => *limiter = Some(RateLimiter::empty(stricter, now)),
+                }
+                self.version = version;
+                if let Some(sequence) = sequence {
+                    self.sequence = sequence;
+                }
+                return;
+            }
+            match limiter {
+                Some(limiter) => limiter.set_policy(policy, now),
+                None => *limiter = Some(RateLimiter::empty(policy, now)),
+            }
+            self.version = version;
+        }
+        if let Some(sequence) = sequence {
+            self.sequence = sequence;
+        }
+    }
+}
+
 /// The gate of one guard over one lane sender's lanes.
 #[derive(Debug)]
 pub struct GuardGate {
@@ -405,6 +508,12 @@ pub struct GuardGate {
     lanes: Vec<State>,
     /// The publication's bucket, shared by its lanes.
     limiter: Option<RateLimiter>,
+    /// The largest datagram the routes build: a policy's byte burst is
+    /// validated against it.
+    max_datagram: u64,
+    /// Where the driver publishes a changed policy (R-CORE-21), the
+    /// sequence word last read whole there, and the version applied.
+    policy: Option<PolicySlot>,
     /// The lane the sender is flushing, from [`LaneGate::flushing`].
     flushing: Option<usize>,
     /// The epoch last published to the cell.
@@ -523,6 +632,8 @@ impl GuardGate {
             cell,
             lanes,
             limiter: rate.map(|policy| RateLimiter::new(policy, now)),
+            max_datagram,
+            policy: None,
             flushing: None,
             applied: 0,
             published_in_flight: 0,
@@ -650,11 +761,49 @@ impl GuardGate {
     }
 
     /// Refills the bucket from the clock time `now`, before a serve call.
-    /// A backward step earns nothing.
+    /// A backward step earns nothing. A newer policy the driver published
+    /// is applied first (R-CORE-21): the bucket earns the old rates up to
+    /// `now`, then takes the new ones, its level clamped and never raised.
+    /// A gate built with no rate creates its bucket, empty, from the first
+    /// policy published. A policy the gate refuses (a zero rate, or a byte
+    /// burst below its largest datagram) is counted
+    /// (`GateCounts::policies_refused`), and the gate limits with the
+    /// stricter of it and the policy in force. One
+    /// load decides that nothing changed; a publication in progress is
+    /// read at the next call.
     pub fn set_now(&mut self, now: u64) {
+        if let Some(slot) = &mut self.policy {
+            slot.refresh(&mut self.limiter, self.max_datagram, &mut self.counts, now);
+        }
         if let Some(limiter) = &mut self.limiter {
             limiter.refill_at(now);
         }
+    }
+
+    /// Empties its bucket at `now`, keeping its policy: a reincarnation's
+    /// gate, which never buys a new burst (R-CORE-21).
+    pub fn empty_bucket(&mut self, now: u64) {
+        if let Some(limiter) = &mut self.limiter {
+            *limiter = RateLimiter::empty(limiter.policy(), now);
+        }
+    }
+
+    /// Reads the publication's rate policy changes from `slot`, at word 0
+    /// (`karyos_sys::rate_policy_slot`), from the next [`Self::set_now`].
+    pub fn set_policy_slot(&mut self, slot: Arc<dyn SharedWords>) {
+        self.policy = Some(PolicySlot {
+            words: slot,
+            sequence: 0,
+            version: 0,
+        });
+    }
+
+    /// The version of the published rate policy the gate applies: 0 for
+    /// the policy it was built with, or for none; a version it refused is
+    /// never this.
+    #[must_use]
+    pub fn policy_version(&self) -> u64 {
+        self.policy.as_ref().map_or(0, |slot| slot.version)
     }
 
     /// Records a datagram committed to `lane`'s queue, at its tail, in both
@@ -953,6 +1102,7 @@ impl State {
                 head,
                 holders: 1,
                 charged: false,
+                exempt: false,
                 sent: false,
                 submitted: false,
                 maybe_sent: false,
@@ -1019,15 +1169,21 @@ impl SenderGate for GuardGate {
                 mismatch = true;
                 break;
             };
-            if !charge.charged {
-                let paid = limiter.as_mut().is_none_or(|limiter| {
-                    limiter.try_admit_datagram(charge.head.length, charge.head.messages)
-                });
-                if !paid {
-                    held = true;
-                    break;
+            if !(charge.charged || charge.exempt) {
+                // Charged only when a bucket took its tokens: a position a
+                // gate with no rate let through is exempt, never refunded
+                // into a bucket it adopts later nor charged for another
+                // route's copy (R-CORE-21).
+                match limiter.as_mut() {
+                    None => charge.exempt = true,
+                    Some(limiter) => {
+                        if !limiter.try_admit_datagram(charge.head.length, charge.head.messages) {
+                            held = true;
+                            break;
+                        }
+                        charge.charged = true;
+                    }
                 }
-                charge.charged = true;
             }
             entry.exposed = true;
             let Some(next) = permitted.checked_add(1) else {
@@ -1069,6 +1225,7 @@ impl LaneGate for GuardGate {
             return true;
         };
         let affordable = charge.charged
+            || charge.exempt
             || self.limiter.as_ref().is_none_or(|limiter| {
                 limiter.admits_datagram(charge.head.length, charge.head.messages)
             });
