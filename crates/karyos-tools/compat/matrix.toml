@@ -41,20 +41,22 @@ config = 1
 # Admission: a driver admits only its own protocol version
 # (crates/karyos-ffi/tests/connect.rs; conformance op.connect.other.version).
 # Observed by scripts/compat-test.sh at 8e38dce9: the refusal does not
-# name the driver's version across these releases (driver: None).
+# name the driver's version across these releases (driver: None), because
+# the admission Refused message has no version field, on main too:
+# karyos#879.
 [[entry]]
 surface = "admission"
 from = "main"
 to = "0.1.0-alpha.2"
 outcome = "refuse"
-reason = "IncompatibleVersion: the 0.1.0-alpha.2 driver refuses protocol 3 (observed: AttachError::IncompatibleVersion { driver: None })"
+reason = "IncompatibleVersion: the 0.1.0-alpha.2 driver refuses protocol 3 (observed: AttachError::IncompatibleVersion { driver: None }; the refusal carries no version, karyos#879)"
 
 [[entry]]
 surface = "admission"
 from = "0.1.0-alpha.2"
 to = "main"
 outcome = "refuse"
-reason = "IncompatibleVersion: the main driver refuses protocol 2 (observed: AttachError::IncompatibleVersion { driver: None })"
+reason = "IncompatibleVersion: the main driver refuses protocol 2 (observed: AttachError::IncompatibleVersion { driver: None }; the refusal carries no version, karyos#879)"
 
 # Frame: the same frame version, 1, on both sides, which is not enough by
 # itself (R-CORE-36). Observed by scripts/compat-test.sh at 8e38dce9: a
