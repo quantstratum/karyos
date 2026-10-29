@@ -102,7 +102,9 @@ pub const MAX_ACCEPTS: usize = 16;
 /// downwards: no bound is raised. The `trace.*` dimensions are the
 /// driver's application trace point bounds (R-CORE-1): the ids an instance
 /// assigns, a protocol constant, and the per-client bounds at the
-/// driver's defaults.
+/// driver's built-in defaults: the CnC does not expose a driver's
+/// configured values, so a `karyosd` started with others is not reflected
+/// (a follow-up).
 pub const LIMITS: [Limit; 11] = [
     Limit {
         name: "read.request_bytes",
