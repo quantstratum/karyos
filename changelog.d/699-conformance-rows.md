@@ -4,10 +4,11 @@
   libkaryos built for the test kit (karyos-ffi feature `test-hooks`)
   exports `karyos_test_panic_next_duty_cycle`, declared in
   `include/karyos_test_hooks.h` and never in `karyos.h`, and the new
-  scenario `op.panic.poisons` (feature `fault-hook`) shows a panic inside
-  the library poisoning its driver, the driver's client and that
-  client's subscription and publication, while a second driver and its
-  objects still work. `make test-hooks-absent-check`, part of pre-push,
+  scenario `op.panic.poisons` (feature `fault-hook`) shows a panic on a
+  driver's thread poisoning the driver, its client and that client's
+  subscription and publication while a second driver and its objects
+  still work, and a panic inside a caller's own `karyos_driver_do_work`
+  answering `KARYOS_E_INTERNAL` instead of unwinding. `make test-hooks-absent-check`, part of pre-push,
   fails when the release library exports the hook or carries its code.
   `conformance/index.txt` rows are now scenario ids, `pending issue <N>`
   with a reason, or `outside` with a reason for a row no portable runner

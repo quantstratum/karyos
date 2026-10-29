@@ -18,11 +18,13 @@ extern "C" {
 #endif
 
 /*
- * Makes the next karyos_driver_do_work on `driver` panic inside libkaryos
- * while it holds the driver: that call returns KARYOS_E_INTERNAL, and the
- * driver and every client it connected answer KARYOS_E_INTERNAL until
- * closed. Returns KARYOS_OK, or the handle's error for one that names no
- * open driver.
+ * Makes `driver`'s next duty cycle panic inside libkaryos while it holds
+ * the driver: its caller's next karyos_driver_do_work, which returns
+ * KARYOS_E_INTERNAL, or, for a driver on its own thread, that thread's
+ * next cycle, which this call waits for (up to 10 s, then
+ * KARYOS_E_TIMEOUT, disarmed). Either way the driver and every client it
+ * connected then answer KARYOS_E_INTERNAL until closed. Returns
+ * KARYOS_OK, or the handle's error for one that names no open driver.
  */
 int32_t karyos_test_panic_next_duty_cycle(uint64_t driver);
 

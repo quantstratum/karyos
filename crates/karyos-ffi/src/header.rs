@@ -359,7 +359,9 @@ fn the_fault_hook_is_declared_apart_from_karyos_h() {
     assert!(!ABI.contains("karyos_test_"));
     assert_eq!(HOOKS.matches("extern \"C\" fn ").count(), 1);
     assert!(
-        HOOKS.contains("pub extern \"C\" fn karyos_test_panic_next_duty_cycle(driver: u64) -> i32 {")
+        HOOKS.contains(
+            "pub extern \"C\" fn karyos_test_panic_next_duty_cycle(driver: u64) -> i32 {"
+        )
     );
     assert_eq!(HOOKS_HEADER.matches("karyos_test_").count(), 1);
     assert!(HOOKS_HEADER.contains("int32_t karyos_test_panic_next_duty_cycle(uint64_t driver);"));

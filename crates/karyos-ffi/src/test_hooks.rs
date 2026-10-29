@@ -12,16 +12,21 @@ use crate::boundary::guard;
 use crate::handles::Handle;
 use crate::status::Status;
 
-/// Makes the next `karyos_driver_do_work` on `driver` panic while it holds
-/// the driver: that call returns `KARYOS_E_INTERNAL`, and the driver and
-/// every client it connected answer `KARYOS_E_INTERNAL` until closed.
+/// Makes `driver`'s next duty cycle panic while it holds the driver: its
+/// caller's next `karyos_driver_do_work`, or its thread's next cycle,
+/// which this call waits for (`driver::panic_next_duty_cycle`). The
+/// driver and every client it connected then answer `KARYOS_E_INTERNAL`
+/// until closed.
 ///
-/// Returns `KARYOS_OK`, or the handle's error for one that names no open
-/// driver.
+/// Returns `KARYOS_OK`, the handle's error for one that names no open
+/// driver, or `KARYOS_E_TIMEOUT` when a driver's thread took no cycle in
+/// time.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_test_panic_next_duty_cycle(driver: u64) -> i32 {
-    guard(|| match driver::panic_next_duty_cycle(Handle::from_raw(driver)) {
-        Ok(()) => Status::Ok,
-        Err(status) => status,
-    })
+    guard(
+        || match driver::panic_next_duty_cycle(Handle::from_raw(driver)) {
+            Ok(()) => Status::Ok,
+            Err(status) => status,
+        },
+    )
 }

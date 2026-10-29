@@ -610,32 +610,60 @@ pub(crate) fn do_work(driver: Handle) -> Result<u32, Failure> {
             std::panic::resume_unwind(Box::new("the fault hook's panic"));
         }
         match &mut slot.mode {
-        Mode::Invoker(driver) => driver.do_work().map_err(|error| Failure::from(&error)),
-        Mode::Threaded(threaded) if threaded.shared.is_poisoned() => Err(Status::Internal.into()),
-        Mode::Threaded(_) => Err(Status::Busy.into()),
-        Mode::Lost => Err(Status::Internal.into()),
+            Mode::Invoker(driver) => driver.do_work().map_err(|error| Failure::from(&error)),
+            Mode::Threaded(threaded) if threaded.shared.is_poisoned() => {
+                Err(Status::Internal.into())
+            }
+            Mode::Threaded(_) => Err(Status::Busy.into()),
+            Mode::Lost => Err(Status::Internal.into()),
         }
     })?
 }
 
-/// The driver whose next duty cycle a caller runs panics while it holds
-/// the driver, or 0 for none (`karyos_test_panic_next_duty_cycle`, the
-/// test kit's fault hook): the panic poisons the driver and its clients
-/// as any panic there does. One handle, so that no other driver's cycle
-/// takes it.
+/// The driver whose next duty cycle panics while it holds the driver, its
+/// caller's or its thread's, or 0 for none
+/// (`karyos_test_panic_next_duty_cycle`, the test kit's fault hook): the
+/// panic poisons the driver and its clients as any panic there does. One
+/// handle, so that no other driver's cycle takes it.
 #[cfg(feature = "test-hooks")]
 pub(crate) static PANIC_NEXT_DUTY_CYCLE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Arms the fault hook for `driver`'s next duty cycle.
+/// How long the fault hook waits for a driver's thread to take its panic.
+#[cfg(feature = "test-hooks")]
+const FAULT_WAIT: Duration = Duration::from_secs(10);
+
+/// Arms the fault hook for `driver`'s next duty cycle. For a driver on its
+/// own thread, it returns once that thread's cycle has panicked and the
+/// driver is lost, so the caller's next call sees the poison.
 ///
 /// # Errors
 ///
-/// The table's errors for a handle that names no open driver.
+/// The table's errors for a handle that names no open driver, and
+/// [`Status::Timeout`] when the thread took no cycle within
+/// [`FAULT_WAIT`] (the hook is disarmed).
 #[cfg(feature = "test-hooks")]
 pub(crate) fn panic_next_duty_cycle(driver: Handle) -> Result<(), Status> {
-    drivers().with(driver, |_| ())?;
+    let threaded = drivers().with(driver, |slot| {
+        matches!(slot.mode, Mode::Threaded(_)).then(|| slot.state.clone())
+    })?;
     PANIC_NEXT_DUTY_CYCLE.store(driver.raw(), Ordering::Release);
+    let Some(state) = threaded else {
+        return Ok(());
+    };
+    let start = std::time::Instant::now();
+    while state.usable().is_ok() {
+        if start.elapsed() > FAULT_WAIT {
+            let _ = PANIC_NEXT_DUTY_CYCLE.compare_exchange(
+                driver.raw(),
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return Err(Status::Timeout);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
     Ok(())
 }
 
@@ -679,6 +707,8 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
             #[cfg(test)]
             let cycles = Arc::clone(&cycles);
             let state = slot.state.clone();
+            #[cfg(feature = "test-hooks")]
+            let raw = driver.raw();
             std::thread::Builder::new()
                 .name("karyos-driver".to_owned())
                 .spawn(move || {
@@ -688,6 +718,8 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
                         &waiting,
                         idle,
                         state,
+                        #[cfg(feature = "test-hooks")]
+                        raw,
                         #[cfg(test)]
                         &cycles,
                     );
@@ -731,6 +763,7 @@ fn run(
     idle: Idle,
     state: DriverState,
     #[cfg(test)] cycles: &Waited,
+    #[cfg(feature = "test-hooks")] handle: u64,
 ) {
     let watch = Watch(state);
     let mut backoff = YieldThenSleep::default();
@@ -741,6 +774,13 @@ fn run(
                 watch.0.lose();
                 return;
             };
+            #[cfg(feature = "test-hooks")]
+            if PANIC_NEXT_DUTY_CYCLE
+                .compare_exchange(handle, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                std::panic::resume_unwind(Box::new("the fault hook's panic"));
+            }
             // A duty cycle's error is not fatal: the next one runs.
             driver.do_work().unwrap_or(0)
         };
