@@ -10,3 +10,5 @@
   Measured on Linux netem, 200 late joins: the p99 bind time is 53 ms at
   2% loss, 153 ms at 10% and 353 ms at 20% (about 2 s, 4 s and 8 s
   before), and back-to-back joins show no 2 s steps (p99 153 ms).
+  At an RTT of about 200 ms and 2% loss a join takes about one RTT
+  (median 201 ms, p99 251 ms).

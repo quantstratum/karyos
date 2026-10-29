@@ -7,15 +7,15 @@
 //! karyos/design/network-control-schemas.md` §6.3); a lost SOLICIT or
 //! answer costs `setup_challenge_timeout` plus `solicit_holdoff` before the
 //! next. Since plan 164 an unanswered SOLICIT is retried at 50 ms,
-//! doubling, from the joiner driver's unicast control endpoint. Each join's
+//! doubling, with its entry's nonce. Each join's
 //! time from its first unbound DATA to its image's install is recorded
 //! with the SOLICITs it took, the retries included.
 //!
 //! `KARYOS_BIND_JOIN_GAP_MS` sets the gap before each join (default 60;
 //! 0 is the unspaced run). `m164_simultaneous_joins_on_one_driver` joins
 //! `KARYOS_BIND_STREAMS` streams (default 50) at once on one driver, whose
-//! SOLICITs share its control endpoint and so one `setup_answer_rate`
-//! bucket at the publisher (§7.4, the known limit), for
+//! SOLICITs share one source endpoint and so one `setup_answer_rate`
+//! bucket at the publisher (§7.4; plan 168), for
 //! `KARYOS_NETEM_MEASURE` joins in all.
 //!
 //! Runs under `scripts/netem-test.sh` with `KARYOS_NETEM_MEASURE` set to
@@ -25,6 +25,10 @@
 //! KARYOS_NETEM_MEASURE=200 KARYOS_NETEM='limit 100000 loss 2% reorder 10% 50% delay 1ms duplicate 1%' \
 //!     scripts/netem-test.sh -p karyos-driver --lib --locked bind_time -- --ignored --test-threads=1 --nocapture
 //! ```
+//!
+//! The record (plan 164) also runs `delay 100ms` with `loss 2%`, an RTT of
+//! about 200 ms, above the 50 ms first wait: a retry keeps its entry's
+//! nonce, so the first ANSWER still binds and a join takes about one RTT.
 //!
 //! Its module path does not name `netem`, so the default netem run (the N
 //! suite, a release gate) never includes it. Without `KARYOS_NETEM_MEASURE`
@@ -516,7 +520,7 @@ fn m150_a_late_unreliable_multicast_subscriber_binds() {
 /// Plan 164's known limit, measured: `streams()` publications on one
 /// group, joined at once by one fresh driver per round, until
 /// `KARYOS_NETEM_MEASURE` joins are recorded. Their SOLICITs share the
-/// joiner's control endpoint, one `setup_answer_rate` bucket (20 a second,
+/// joiner's source endpoint, one `setup_answer_rate` bucket (20 a second,
 /// burst 20) at the publisher; those beyond it bind at a later retry.
 fn measure_one_driver(label: &str, reliable: bool, count: usize, streams: usize) {
     let _route = MulticastOnLoopback::route();
