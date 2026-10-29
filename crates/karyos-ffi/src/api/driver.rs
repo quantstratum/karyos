@@ -84,6 +84,9 @@ pub(crate) struct Options {
     /// Whether the driver runs its network agents, with
     /// `NetworkConfig::default()`.
     pub(crate) network: bool,
+    /// The most bytes one stream lane may take
+    /// (`DriverConfig::max_stream_bytes`, R-CORE-34); 0 for no cap.
+    pub(crate) max_stream_bytes: u64,
 }
 
 /// `KARYOS_NETWORK_OFF`: no network agents; `karyos:ipc` only.
@@ -109,6 +112,7 @@ impl Options {
             cutover_deadline_ns: config.cutover_deadline,
             startup_timeout_ns: config.startup_timeout,
             network: config.network.is_some(),
+            max_stream_bytes: config.max_stream_bytes.unwrap_or(0),
         }
     }
 
@@ -129,6 +133,9 @@ impl Options {
             network: self
                 .network
                 .then(karyos_driver::net::NetworkConfig::default),
+            // 0 is no cap: `Some(0)`, which the driver refuses, is never
+            // asked for (karyos#818).
+            max_stream_bytes: (self.max_stream_bytes != 0).then_some(self.max_stream_bytes),
             ..DriverConfig::default()
         })
     }

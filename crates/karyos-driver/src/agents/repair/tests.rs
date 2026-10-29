@@ -428,6 +428,46 @@ fn open_guard() -> Arc<karyos_client::HeapWords> {
     word
 }
 
+/// #841 review, point 1: a guard spec of a reincarnation (`full: false`)
+/// builds the sender gate with an empty bucket, and the first incarnation's
+/// (`full: true`) with a full one, so reincarnating buys no new burst.
+#[test]
+fn a_reincarnations_spec_builds_an_empty_gate() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 1,
+            burst: 4,
+        },
+        bytes: None,
+    };
+    for (full, tokens) in [(true, 4), (false, 0)] {
+        let mut rig = Rig::new(&RepairConfig::default());
+        let word = open_guard();
+        rig.path
+            .guard(
+                super::super::data::GuardSpec {
+                    word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                    cell: Arc::new(AppliedEpoch::new()),
+                    epoch: 2,
+                    full,
+                    rate: Some(policy),
+                    policy: None,
+                    frontier: Default::default(),
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            rig.path.guard_gate().unwrap().message_tokens(),
+            Some(tokens),
+            "full: {full}"
+        );
+    }
+}
+
 /// A guarded network publication runs the local close only (O-11, GC-6):
 /// until the close it sends as before; after it, nothing at all leaves the
 /// sender, first sends and repairs alike, no control is sent, and its
