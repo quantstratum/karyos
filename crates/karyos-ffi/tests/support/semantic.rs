@@ -9,7 +9,7 @@
 //! staged state across the retryable statuses.
 
 use std::collections::BTreeMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 
 use super::abi;
 use crate::Value;
@@ -58,9 +58,14 @@ struct Object {
     /// An embedded driver created with its network on
     /// (`driver.create_networked`).
     networked: bool,
-    /// A publication on a `karyos:udp` channel, which connects
-    /// asynchronously.
+    /// A publication or a subscription on a `karyos:udp` channel: the
+    /// first connects asynchronously, the second reads images the driver
+    /// announces.
     network: bool,
+    /// A subscription's images reported so far (`subscription.await_image`).
+    images: u32,
+    /// An embedded driver its scenario started (`driver.start`).
+    started: bool,
 }
 
 /// The answer of an op: `ok` with its results, or a status name.
@@ -134,7 +139,20 @@ impl Adapter {
         }
         // The ABI's declared default idle strategy, yield then sleep.
         assert_eq!(abi::driver_start(driver, 3, 0), 0, "the provided driver");
-        self.insert(Kind::Driver, driver, None)
+        let driver = self.insert(Kind::Driver, driver, None);
+        if let Value::Object(index) = driver {
+            self.objects[index].started = true;
+        }
+        driver
+    }
+
+    /// The C handle of an object a step answered, for a runner test that
+    /// acts on it behind the adapter's back.
+    pub fn handle_of(&self, value: &Value) -> Option<u64> {
+        match value {
+            Value::Object(index) => self.objects.get(*index).map(|object| object.handle),
+            _ => None,
+        }
     }
 
     /// Closes the objects a scenario left open, children first, so the
@@ -174,6 +192,8 @@ impl Adapter {
             provided: false,
             networked: false,
             network: false,
+            images: 0,
+            started: false,
         });
         Value::Object(self.objects.len() - 1)
     }
@@ -250,6 +270,64 @@ impl Adapter {
         }
     }
 
+    /// Records whether `object` is on a `karyos:udp` channel.
+    fn channel(&mut self, object: usize, uri: &CStr) {
+        self.objects[object].network = uri.to_bytes().starts_with(b"karyos:udp");
+    }
+
+    /// Whether `publication` connects asynchronously: a provided client's,
+    /// or a `karyos:udp` one of a client of an embedded driver with its
+    /// network on (FORMAT.md, Remote driver).
+    fn connects_async(&self, publication: usize) -> Option<usize> {
+        let object = &self.objects[publication];
+        object.parent.filter(|&client| {
+            let client = &self.objects[client];
+            client.provided
+                || (object.network
+                    && client
+                        .parent
+                        .is_some_and(|driver| self.objects[driver].networked))
+        })
+    }
+
+    /// Takes the queued image changes of `subscription` into its count;
+    /// a failing status fails the step.
+    /// Takes the queued image changes of `subscription` into its count: the
+    /// failing status of `karyos_subscription_next_image_change`, if any.
+    fn take_image_changes(&mut self, subscription: usize) -> Result<(), i32> {
+        loop {
+            match abi::subscription_next_image_change(self.objects[subscription].handle) {
+                (0, Some(change)) => {
+                    if change.available == 1 {
+                        self.objects[subscription].images += 1;
+                    }
+                }
+                (0, None) => return Ok(()),
+                (status, _) => return Err(status),
+            }
+        }
+    }
+
+    /// Serves every open client, and runs every open embedded driver its
+    /// scenario did not start: what a wait needs from the publisher's side
+    /// as much as the subscriber's (`subscription.await_image`).
+    fn serve_everything(&self) {
+        for object in &self.objects {
+            if object.closed {
+                continue;
+            }
+            match object.kind {
+                Kind::Driver if !object.started => {
+                    let _ = abi::driver_do_work(object.handle);
+                }
+                Kind::Client => {
+                    let _ = abi::client_poll(object.handle);
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Runs `offer` on `publication`. On a remote publication (its client is
     /// a provided one, `$remote_client` or `$archive_client`; FORMAT.md,
     /// Remote driver), or a `karyos:udp` one of a client of an embedded driver with its
@@ -264,21 +342,10 @@ impl Adapter {
         mut offer: impl FnMut() -> (i32, T),
         at: &str,
     ) -> (i32, T) {
-        // A provided client's, or a network publication of a client of an
-        // embedded driver with its network on: those connect
-        // asynchronously. Its IPC publications answer at once.
-        let network = self.objects[publication].network;
-        let client = self.objects[publication]
-            .parent
-            .filter(|parent| {
-                let object = &self.objects[*parent];
-                object.provided
-                    || (network
-                        && object
-                            .parent
-                            .is_some_and(|driver| self.objects[driver].networked))
-            })
-            .map(|parent| self.objects[parent].handle);
+        // Its IPC publications answer at once.
+        let client = self
+            .connects_async(publication)
+            .map(|client| self.objects[client].handle);
         let start = std::time::Instant::now();
         loop {
             let (status, value) = offer();
@@ -326,11 +393,14 @@ impl Adapter {
                     (status, _) => Answer::Status(self.name(status, at)),
                 }
             }
-            "driver.create" | "driver.create_networked" => {
-                let (status, driver) = if op == "driver.create" {
-                    abi::driver_create()
-                } else {
-                    abi::driver_create_networked()
+            "driver.create" | "driver.create_networked" | "driver.create_capped" => {
+                let (status, driver) = match op {
+                    "driver.create" => abi::driver_create(),
+                    "driver.create_networked" => abi::driver_create_networked(),
+                    "driver.create_capped" => {
+                        abi::driver_create_capped(args.narrow("max_stream_bytes", None))
+                    }
+                    other => unreachable!("{at}: {other} is no driver.create op"),
                 };
                 if status != 0 {
                     return Answer::Status(self.name(status, at));
@@ -389,8 +459,19 @@ impl Adapter {
                     "conflation_journal_capacity",
                     Some(options.conflation_journal_capacity),
                 );
-                let (status, _) = abi::driver_add_stream(self.objects[driver].handle, &options);
-                self.plain(status, at)
+                let (status, detail) =
+                    abi::driver_add_stream(self.objects[driver].handle, &options);
+                if status == 0 {
+                    return self.plain(status, at);
+                }
+                // A refusal carries its detail (FORMAT.md, Ops; karyos#818).
+                Answer::StatusWith(
+                    self.name(status, at),
+                    results([
+                        ("code", Value::Integer(i128::from(detail.code))),
+                        ("value", Value::Integer(i128::from(detail.value))),
+                    ]),
+                )
             }
             "driver.start" => {
                 let driver = args.object("driver");
@@ -406,10 +487,11 @@ impl Adapter {
                     other => panic!("{at}: `idle_strategy` {other:?} is no idle strategy"),
                 };
                 let sleep = args.narrow("idle_sleep_ns", Some(0));
-                self.plain(
-                    abi::driver_start(self.objects[driver].handle, idle, sleep),
-                    at,
-                )
+                let status = abi::driver_start(self.objects[driver].handle, idle, sleep);
+                if status == 0 {
+                    self.objects[driver].started = true;
+                }
+                self.plain(status, at)
             }
             "driver.do_work" => {
                 let driver = args.object("driver");
@@ -448,10 +530,11 @@ impl Adapter {
                     return answer;
                 }
                 let uri = args.uri();
+                let stream_id = args.narrow("stream_id", None);
                 let (status, publication, _) = abi::client_add_publication_of(
                     self.objects[client].handle,
                     &uri,
-                    args.narrow("stream_id", None),
+                    stream_id,
                     u32::try_from(size_of::<abi::Detail>()).unwrap(),
                     op == "publication.add_concurrent",
                 );
@@ -460,7 +543,7 @@ impl Adapter {
                 }
                 let publication = self.insert(Kind::Publication, publication, Some(client));
                 if let Value::Object(index) = publication {
-                    self.objects[index].network = uri.to_bytes().starts_with(b"karyos:udp");
+                    self.channel(index, &uri);
                 }
                 Answer::Ok(results([("publication", publication)]))
             }
@@ -619,10 +702,12 @@ impl Adapter {
                 assert_eq!(status, 0, "{at}: karyos_subscription_options_init");
                 options.role = args.narrow("role", Some(options.role));
                 options.rejoin = args.narrow("rejoin", Some(options.rejoin));
+                let uri = args.uri();
+                let stream_id = args.narrow("stream_id", None);
                 let (status, subscription) = abi::client_add_subscription_with(
                     self.objects[client].handle,
-                    &args.uri(),
-                    args.narrow("stream_id", None),
+                    &uri,
+                    stream_id,
                     &options,
                     u32::try_from(size_of::<abi::SubscriptionOptions>()).unwrap(),
                 );
@@ -630,7 +715,43 @@ impl Adapter {
                     return Answer::Status(self.name(status, at));
                 }
                 let subscription = self.insert(Kind::Subscription, subscription, Some(client));
+                if let Value::Object(index) = subscription {
+                    self.channel(index, &uri);
+                }
                 Answer::Ok(results([("subscription", subscription)]))
+            }
+            // Waits, serving the subscription's client, until it has reported
+            // `count` images since it was added (FORMAT.md, Ops; karyos#830).
+            "subscription.await_image" => {
+                let subscription = args.object("subscription");
+                if let Some(answer) = self.open(subscription, Kind::Subscription, at) {
+                    return answer;
+                }
+                let count: u32 = args.narrow("count", Some(1));
+                let start = std::time::Instant::now();
+                loop {
+                    if let Err(status) = self.take_image_changes(subscription) {
+                        return Answer::Status(self.name(status, at));
+                    }
+                    if self.objects[subscription].images >= count {
+                        return Answer::Ok(BTreeMap::new());
+                    }
+                    // A change dropped from a full queue may have been an
+                    // image: the count can no longer be trusted.
+                    let (status, lost) =
+                        abi::subscription_image_changes_lost(self.objects[subscription].handle);
+                    if status != 0 {
+                        return Answer::Status(self.name(status, at));
+                    }
+                    if lost > 0 {
+                        return Answer::Status("events_lost".to_owned());
+                    }
+                    if start.elapsed() >= UNTIL_DEADLINE {
+                        return Answer::Status("timeout".to_owned());
+                    }
+                    self.serve_everything();
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
             "subscription.poll" => {
                 let subscription = args.object("subscription");

@@ -308,6 +308,13 @@ pub struct ReceiverCounters {
     pub nak_route_faults: u64,
     /// ERR NAK_REPLY controls for no installed image.
     pub nak_replies_unbound: u64,
+    /// A reliable image's hole the receive owner could not compute, a
+    /// data hole (`first_hole`) or a heartbeat's tail (`heartbeat_tail`):
+    /// a corrupt owner state or a mark off a frame boundary; no NAK for
+    /// it. An unreliable image's skip duty reports these as its own error.
+    /// A defect counter, read through the receiver's counters, not a CnC
+    /// cell.
+    pub hole_query_errors: u64,
     /// Images closed by repair: a range proven unrecoverable under
     /// `on_unrecoverable = close`, or `GapCannotResume`.
     pub images_closed_unrecoverable: u64,
@@ -1276,11 +1283,19 @@ fn tail_hole<T: StreamTerms>(
     lane: Lane,
     at: usize,
     now: u64,
+    counters: &mut ReceiverCounters,
 ) -> Option<Hole> {
     use crate::repair::loss::RttSource;
 
-    let tail = heartbeat_mark(image, lane, at)
-        .and_then(|mark| image.owner.heartbeat_tail(lane, mark).ok().flatten());
+    let tail =
+        match heartbeat_mark(image, lane, at).map(|mark| image.owner.heartbeat_tail(lane, mark)) {
+            Some(Ok(tail)) => tail,
+            Some(Err(_)) => {
+                tally(counters, |c| &mut c.hole_query_errors);
+                None
+            }
+            None => None,
+        };
     let Some((start, length)) = tail else {
         if let Some(since) = image.tail_since.get_mut(at) {
             *since = None;
@@ -3137,12 +3152,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
             if !image.reliable {
                 continue;
             }
-            let first = image
-                .owner
-                .first_hole(lane)
-                .ok()
-                .flatten()
-                .map(|(start, length)| Hole { start, length });
+            let first = match image.owner.first_hole(lane) {
+                Ok(hole) => hole.map(|(start, length)| Hole { start, length }),
+                Err(_) => {
+                    tally(counters, |c| &mut c.hole_query_errors);
+                    None
+                }
+            };
             // A covered hole ends any tail wait: a later tail waits its RTT
             // afresh.
             if first.is_some()
@@ -3150,7 +3166,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             {
                 *since = None;
             }
-            let hole = first.or_else(|| tail_hole(image, lane, at, now));
+            let hole = first.or_else(|| tail_hole(image, lane, at, now, counters));
             if let Observation::Unrecoverable {
                 hole,
                 lowest_retained,
@@ -3279,8 +3295,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
             // An unreliable tail no frame revealed is sealed at its
             // deadline (SPEC §6, G1), up to the clamped mark.
             if !image.reliable {
-                for (at, lane) in (0..image.heartbeat_marks.len())
-                    .filter_map(|at| Some((at, Lane::try_new(u8::try_from(at).ok()?).ok()?)))
+                for (at, lane) in (0..image.lane_count)
+                    .filter_map(|at| Some((usize::from(at), Lane::try_new(at).ok()?)))
                 {
                     if let Some(mark) = heartbeat_mark(image, lane, at) {
                         image.skip.revealed(lane, mark);

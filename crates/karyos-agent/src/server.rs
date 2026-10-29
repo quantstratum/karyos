@@ -31,8 +31,13 @@
 //!   role (R-CORE-24). A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
 //! - **Bounds.** Each connection is served on the calling thread with
-//!   [`IO_TIMEOUT`] on its reads and writes, so a slow client delays the
-//!   others by that much at most.
+//!   [`IO_TIMEOUT`] on its reads and each write, and [`WRITE_DEADLINE`] on
+//!   writing its whole reply, checked after every write; one poll starts
+//!   connections for [`POLL_BUDGET`] at most: a client that reads a large reply too slowly
+//!   gets it cut short, never the polling thread held for longer, and the
+//!   connection closed. A reply without a final newline, followed by EOF,
+//!   is incomplete and is discarded; the reader retries with the same
+//!   cursor, as reading consumes nothing.
 //! - **Limits (R-CORE-38).** `limits` answers every dimension of [`LIMITS`]
 //!   with one of three answers, never "unknown": `{"value":N,
 //!   "negotiable":true}`, a bound a client may propose within;
@@ -55,7 +60,7 @@
 //!   sizes of R-CORE-13 and R-CORE-14, enters [`LIMITS`] as a new entry,
 //!   negotiable or not, and a v1 client that does not name it is unaffected.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -72,6 +77,22 @@ pub const PROTOCOL: &str = "KARYOS-AGENT";
 pub const MAX_REQUEST: usize = 256;
 /// The read and write timeout of each connection.
 pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
+/// The time a whole reply may take to write: past it, the reply is cut
+/// short and the connection closed (`Served::Dropped`).
+pub const WRITE_DEADLINE: Duration = Duration::from_millis(250);
+/// The time a whole request may take to read: past it, the connection is
+/// dropped unanswered.
+pub const READ_DEADLINE: Duration = Duration::from_millis(250);
+/// The bytes of one write of a reply at most.
+const WRITE_CHUNK: usize = 64 << 10;
+/// The time one [`Server::poll`] starts connections in. One started before
+/// it may still take [`READ_DEADLINE`] to read and [`WRITE_DEADLINE`] to
+/// answer, besides the work of building its answer (an export page is
+/// bounded by its count and bytes, and waits for busy journal entries 1 ms
+/// at most), so a poll's waiting on clients is at
+/// most `POLL_BUDGET + READ_DEADLINE + WRITE_DEADLINE`, 1 s, however many
+/// clients wait.
+pub const POLL_BUDGET: Duration = Duration::from_millis(500);
 /// Connections one [`Server::poll`] serves at most; the rest wait for the
 /// next poll, so a burst of clients cannot hold the polling thread.
 pub const MAX_ACCEPTS: usize = 16;
@@ -79,7 +100,7 @@ pub const MAX_ACCEPTS: usize = 16;
 /// The dimensions `limits` answers, their bounds being the constants
 /// above. Only `read.request_bytes` is negotiable in v1, and only
 /// downwards: no bound is raised.
-pub const LIMITS: [Limit; 6] = [
+pub const LIMITS: [Limit; 8] = [
     Limit {
         name: "read.request_bytes",
         bound: Some(MAX_REQUEST as u64),
@@ -91,8 +112,18 @@ pub const LIMITS: [Limit; 6] = [
         negotiable: false,
     },
     Limit {
+        name: "read.deadline_ms",
+        bound: Some(READ_DEADLINE.as_millis() as u64),
+        negotiable: false,
+    },
+    Limit {
         name: "write.timeout_ms",
         bound: Some(IO_TIMEOUT.as_millis() as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "write.deadline_ms",
+        bound: Some(WRITE_DEADLINE.as_millis() as u64),
         negotiable: false,
     },
     Limit {
@@ -276,6 +307,8 @@ pub enum Served {
     Capabilities,
     /// Closed trace buckets, or the window's refusal (R-CORE-23).
     TraceBuckets,
+    /// Raw trace records, or the export's refusal (R-CORE-13).
+    TraceExport,
     /// A refusal: a uid without a role, a version not served, or a
     /// request not understood.
     Refused,
@@ -358,8 +391,11 @@ impl Server {
     ///
     /// The operating system's error when `accept` fails.
     pub fn poll(&mut self, agent: &mut Agent) -> Result<Vec<Served>, ServeError> {
+        let start = std::time::Instant::now();
         let mut served = Vec::new();
-        while served.len() < MAX_ACCEPTS {
+        // At most MAX_ACCEPTS connections, and none started past the
+        // poll's budget: the rest wait for the next poll.
+        while served.len() < MAX_ACCEPTS && start.elapsed() < POLL_BUDGET {
             match self.listener.accept() {
                 Ok((stream, _)) => served.push(self.serve(stream, agent)),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -465,6 +501,19 @@ impl Server {
                 Ok(Err(refusal)) => (json::bucket_refusal(&refusal), Served::Refused),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
+            (
+                Some(_),
+                Request::TraceExport {
+                    dir,
+                    from,
+                    count,
+                    epoch,
+                },
+            ) => match agent.trace_export(Path::new(dir), from, count, epoch) {
+                Ok(Ok(page)) => (json::trace_export(&page), Served::TraceExport),
+                Ok(Err(refusal)) => (json::export_refusal(&refusal), Served::Refused),
+                Err(answer) => (json::guard_answer(&answer), Served::Refused),
+            },
             (Some(_), Request::Version) => (
                 json::error("unsupported version", Some(&[API_VERSION])),
                 Served::Refused,
@@ -472,15 +521,45 @@ impl Server {
             (Some(_), Request::Bad) => (json::error("bad request", None), Served::Refused),
         };
         let mut stream = stream;
-        let written = stream
-            .write_all(answer.as_bytes())
-            .and_then(|()| stream.write_all(b"\n"))
-            .and_then(|()| stream.flush());
-        if written.is_err() {
+        let mut reply = answer.into_bytes();
+        reply.push(b'\n');
+        if !write_within(&mut stream, &reply, WRITE_DEADLINE) {
+            // Closed at once, both ways: the cut reply ends at EOF, and
+            // nothing is ever written after it on this connection.
+            let _ = stream.shutdown(std::net::Shutdown::Both);
             return Served::Dropped;
         }
         served
     }
+}
+
+/// Writes `reply` to `stream` within `deadline` in all: one `write` at a
+/// time, each under the time left (at most [`IO_TIMEOUT`]), the deadline
+/// checked again after every one, so a client that reads a little at a
+/// time cannot stretch it; `false` when a write failed or the deadline
+/// passed.
+fn write_within(stream: &mut UnixStream, reply: &[u8], deadline: Duration) -> bool {
+    let start = std::time::Instant::now();
+    let mut rest = reply;
+    while !rest.is_empty() {
+        let left = deadline.saturating_sub(start.elapsed());
+        if left.is_zero()
+            || stream
+                .set_write_timeout(Some(left.min(IO_TIMEOUT)))
+                .is_err()
+        {
+            return false;
+        }
+        let chunk = rest.get(..WRITE_CHUNK.min(rest.len())).unwrap_or(rest);
+        match stream.write(chunk) {
+            Ok(written) if written > 0 => rest = rest.get(written..).unwrap_or(&[]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Ok(_) | Err(_) => return false,
+        }
+    }
+    // Written whole: served, even if the last write ended past the
+    // deadline.
+    stream.flush().is_ok()
 }
 
 impl Drop for Server {
@@ -521,6 +600,12 @@ enum Request<'a> {
         count: usize,
         epoch: Option<u64>,
     },
+    TraceExport {
+        dir: &'a str,
+        from: u64,
+        count: usize,
+        epoch: Option<u128>,
+    },
     /// A well-formed request of another version.
     Version,
     Bad,
@@ -529,13 +614,35 @@ enum Request<'a> {
 /// Reads one request line, up to [`MAX_REQUEST`] bytes; `None` when the
 /// client sent none in time or closed first.
 fn read_request(stream: &UnixStream) -> Option<String> {
-    let limit = u64::try_from(MAX_REQUEST).ok()?.checked_add(1)?;
-    let mut reader = BufReader::new(stream.take(limit));
-    let mut line = String::new();
-    match reader.read_line(&mut line) {
-        Ok(0) | Err(_) => None,
-        Ok(_) => Some(line),
+    let start = std::time::Instant::now();
+    let limit = MAX_REQUEST.checked_add(1)?;
+    let mut stream = stream;
+    let mut line = Vec::with_capacity(limit);
+    let mut buffer = [0u8; MAX_REQUEST + 1];
+    // Within READ_DEADLINE in all: each read gets the time left, so a
+    // client sending a byte at a time cannot hold the polling thread.
+    while !line.contains(&b'\n') && line.len() < limit {
+        let left = READ_DEADLINE.saturating_sub(start.elapsed());
+        if left.is_zero() || stream.set_read_timeout(Some(left.min(IO_TIMEOUT))).is_err() {
+            return None;
+        }
+        let want = limit.saturating_sub(line.len());
+        match stream.read(buffer.get_mut(..want)?) {
+            Ok(0) => break,
+            Ok(read) => line.extend_from_slice(buffer.get(..read)?),
+            // A signal is not the client's doing: read again, within the
+            // same deadline.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
     }
+    if let Some(end) = line.iter().position(|byte| *byte == b'\n') {
+        line.truncate(end + 1);
+    }
+    if line.is_empty() {
+        return None;
+    }
+    String::from_utf8(line).ok()
 }
 
 /// `KARYOS-AGENT <version> <request> [arguments]`, with or without its
@@ -627,6 +734,38 @@ fn request(rest: &str) -> Option<Request<'_>> {
             })();
             Some(parsed.unwrap_or(Request::BadArguments("trace-buckets")))
         }
+        // `trace-export DIR FROM [COUNT [EPOCH]]` (R-CORE-13): EPOCH is
+        // the driver instance, 32 hex digits; a count of 0 or above
+        // EXPORT_MAX is a bad argument.
+        "trace-export" => {
+            let mut fields = arguments.split(' ');
+            let parsed = (|| {
+                let dir = fields.next().filter(|dir| !dir.is_empty())?;
+                let from = number(fields.next()?)?;
+                let count = match fields.next() {
+                    None => crate::api::EXPORT_DEFAULT,
+                    Some(word) => usize::try_from(number(word)?)
+                        .ok()
+                        .filter(|count| (1..=crate::api::EXPORT_MAX).contains(count))?,
+                };
+                let epoch = match fields.next() {
+                    None => None,
+                    Some(word)
+                        if word.len() == 32 && word.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                    {
+                        Some(u128::from_str_radix(word, 16).ok()?)
+                    }
+                    Some(_) => return None,
+                };
+                fields.next().is_none().then_some(Request::TraceExport {
+                    dir,
+                    from,
+                    count,
+                    epoch,
+                })
+            })();
+            Some(parsed.unwrap_or(Request::BadArguments("trace-export")))
+        }
         _ => None,
     }
 }
@@ -694,6 +833,165 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// R-CORE-13: `trace-export DIR FROM [COUNT [EPOCH]]`, EPOCH the
+    /// driver instance in 32 hex digits; a count of 0 or above the
+    /// maximum, an epoch of another form, or one more argument is its own
+    /// bad-arguments error.
+    #[test]
+    fn trace_export_parses_with_its_bounds() {
+        let export = |dir, from, count, epoch| Request::TraceExport {
+            dir,
+            from,
+            count,
+            epoch,
+        };
+        let epoch = "000000000000000000000000000000ff";
+        assert_eq!(
+            parse("KARYOS-AGENT 1 trace-export /run/k 4\n"),
+            export("/run/k", 4, crate::api::EXPORT_DEFAULT, None)
+        );
+        assert_eq!(
+            parse(&format!(
+                "KARYOS-AGENT 1 trace-export /run/k 4 16384 {epoch}\n"
+            )),
+            export("/run/k", 4, 16_384, Some(0xff))
+        );
+        for bad in [
+            "trace-export",
+            "trace-export /run/k",
+            "trace-export /run/k x",
+            "trace-export /run/k 4 0",
+            "trace-export /run/k 4 16385",
+            "trace-export /run/k 4 6 ff",
+            "trace-export /run/k 4 6 +0000000000000000000000000000ff",
+            "trace-export /run/k 4 6 000000000000000000000000000000fg",
+            "trace-export /run/k 4 6 000000000000000000000000000000ff 8",
+        ] {
+            assert_eq!(
+                parse(&format!("KARYOS-AGENT 1 {bad}\n")),
+                Request::BadArguments("trace-export"),
+                "{bad}"
+            );
+        }
+    }
+
+    /// A reply that a client reads too slowly is cut short at the write
+    /// deadline, never holding the polling thread for longer, and the
+    /// connection closed: the client reads part of it with no final
+    /// newline, then EOF, and discards it. Its retry with the same cursor
+    /// gets the same buckets, whole (review of #817, QS-COORDINATOR, ACS
+    /// 33400 and 33440).
+    #[test]
+    fn a_reply_cut_at_its_deadline_ends_at_eof_and_a_retry_gets_it_whole() {
+        let mut window = crate::trace_window::TraceWindow::new(
+            crate::WindowConfig::default().with_window(60, 6),
+            [1, 2],
+        );
+        let mirror = karyos_sys::trace_mirror::trace_mirror(4, 4, 4).unwrap();
+        window.scan(&mirror.reader(), 1);
+        window.scan(&mirror.reader(), 25);
+        let cursor = crate::api::BucketCursor::new(0, 0);
+        let first = window
+            .buckets(cursor, 6, None, crate::api::MAX_BUCKET_REPLY)
+            .unwrap();
+        // The reply, padded past any socket buffer so a peer that does not
+        // read blocks the write.
+        let mut reply = json::trace_buckets(&first).into_bytes();
+        reply.resize(16 << 20, b' ');
+        reply.push(b'\n');
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let start = std::time::Instant::now();
+        assert!(!write_within(&mut writer, &reply, WRITE_DEADLINE));
+        assert!(
+            start.elapsed() < WRITE_DEADLINE + IO_TIMEOUT * 2,
+            "{:?}",
+            start.elapsed()
+        );
+        // As `serve` does after a cut.
+        writer.shutdown(std::net::Shutdown::Both).unwrap();
+        let mut cut = Vec::new();
+        reader.read_to_end(&mut cut).unwrap();
+        assert!(!cut.is_empty() && cut.len() < reply.len(), "{}", cut.len());
+        assert_ne!(cut.last(), Some(&b'\n'), "a cut reply has no final newline");
+        // The retry, with the same cursor, read whole.
+        let again = window
+            .buckets(cursor, 6, None, crate::api::MAX_BUCKET_REPLY)
+            .unwrap();
+        assert_eq!(again.buckets, first.buckets);
+        let mut reply = json::trace_buckets(&again).into_bytes();
+        reply.push(b'\n');
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let read = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            reader.read_to_end(&mut all).unwrap();
+            all
+        });
+        assert!(write_within(&mut writer, &reply, WRITE_DEADLINE));
+        drop(writer);
+        assert_eq!(read.join().unwrap(), reply);
+    }
+
+    /// Review B1 of #826: a client that reads a few KiB at a time, often
+    /// enough for each write to progress, still cannot stretch a reply past
+    /// its deadline: it is checked after every write.
+    #[test]
+    fn a_trickling_reader_cannot_stretch_the_deadline() {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let trickle = std::thread::spawn(move || {
+            let mut buffer = [0u8; 4096];
+            let mut total = 0;
+            while let Ok(read) = reader.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+                total += read;
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            total
+        });
+        let reply = vec![b'z'; 64 << 20];
+        let start = std::time::Instant::now();
+        assert!(!write_within(&mut writer, &reply, WRITE_DEADLINE));
+        let took = start.elapsed();
+        // The deadline plus the one write it cut short, with a write's
+        // timeout of slack for a loaded machine's scheduling: a trickling
+        // reader once held it for seconds.
+        assert!(took < WRITE_DEADLINE + IO_TIMEOUT * 2, "{took:?}");
+        writer.shutdown(std::net::Shutdown::Both).unwrap();
+        assert!(trickle.join().unwrap() < reply.len());
+    }
+
+    /// Re-review F2 of #826: a client sending a request a byte at a time,
+    /// just under each read's timeout, cannot hold the polling thread past
+    /// the read deadline; a whole request is read.
+    #[test]
+    fn a_request_is_read_within_its_deadline() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let trickle = std::thread::spawn(move || {
+            for byte in b"KARYOS-AGENT 1 view\n" {
+                if writer.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(read_request(&reader), None);
+        assert!(
+            start.elapsed() < READ_DEADLINE + IO_TIMEOUT * 2,
+            "{:?}",
+            start.elapsed()
+        );
+        drop(reader);
+        trickle.join().unwrap();
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        writer.write_all(b"KARYOS-AGENT 1 view\nextra").unwrap();
+        assert_eq!(
+            read_request(&reader).as_deref(),
+            Some("KARYOS-AGENT 1 view\n")
+        );
     }
 
     /// R-CORE-38: a dimension this agent does not know is refused by
@@ -810,10 +1108,12 @@ mod tests {
         assert_eq!(negotiate(&LIMITS, "read.request_bytes=100"), Ok(lowered));
         assert_eq!(bounds[0], Some(256));
         assert_eq!(bounds[1], Some(100));
-        assert_eq!(bounds[2], Some(100));
-        assert_eq!(bounds[3], None);
-        assert_eq!(bounds[4], Some(16));
-        assert_eq!(bounds[5], Some(1));
+        assert_eq!(bounds[2], Some(250));
+        assert_eq!(bounds[3], Some(100));
+        assert_eq!(bounds[4], Some(250));
+        assert_eq!(bounds[5], None);
+        assert_eq!(bounds[6], Some(16));
+        assert_eq!(bounds[7], Some(1));
     }
 
     /// R-CORE-38: a proposal above a bound is refused with that limit;
@@ -822,11 +1122,11 @@ mod tests {
     fn a_proposal_above_a_bound_is_refused_with_the_bound() {
         assert_eq!(
             negotiate(&LIMITS, "write.timeout_ms=101"),
-            Err(Refusal::Above(LIMITS[2]))
+            Err(Refusal::Above(LIMITS[3]))
         );
         assert_eq!(
             negotiate(&LIMITS, "read.request_bytes=256 connection.requests=2"),
-            Err(Refusal::Above(LIMITS[5]))
+            Err(Refusal::Above(LIMITS[7]))
         );
         for bad in [
             "read.timeout_ms",

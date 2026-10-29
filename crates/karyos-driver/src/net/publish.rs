@@ -654,6 +654,44 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let _ = lane;
             self.guard_stream(stream, guard.guard, guard.messages, guard.rate)?;
         }
+        // The gate reads the policy its lanes publish (R-CORE-21): one slot
+        // for the publication, kept across its incarnations.
+        let slot = handle.streams().next().and_then(|stream| {
+            self.stream(stream)
+                .ok()?
+                .guarded
+                .as_ref()?
+                .gate_slot()
+                .cloned()
+        });
+        let slot = match slot {
+            Some(slot) => slot,
+            None => {
+                let slot = Arc::new(crate::shared_words::Words::heap(
+                    karyos_sys::rate_policy_slot::SLOT_WORDS,
+                ));
+                // Published once, by the first guarded lane; the others
+                // keep the same slot.
+                let mut published = false;
+                for stream in handle.streams() {
+                    if let Some(guarded) = self.stream(stream)?.guarded.as_mut() {
+                        if published {
+                            guarded.keep_gate_slot(Arc::clone(&slot));
+                        } else {
+                            guarded.set_gate_slot(Arc::clone(&slot));
+                            published = true;
+                        }
+                    }
+                }
+                slot
+            }
+        };
+        // The gate starts from the publication's policy in force, a change
+        // or a policy given to its rateless lanes included, not the one it
+        // was guarded with (R-CORE-21).
+        let rate = handle
+            .streams()
+            .find_map(|stream| self.stream_ref(stream).ok()?.guarded.as_ref()?.rate);
         // The gate reads word 0: the guard's word in the guard words.
         let (words, index) = self.guards.view(guard.guard)?;
         let word = Arc::new(crate::shared_words::WordAt::new(words, index))
@@ -677,7 +715,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 word,
                 cell,
                 epoch,
-                rate: guard.rate.map(|rate| rate.policy),
+                rate,
+                full: !guarded,
+                policy: Some(slot as Arc<dyn karyos_client::SharedWords>),
                 frontier,
             },
             id,

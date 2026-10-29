@@ -231,7 +231,7 @@ fn a_second_publish_of_a_message_is_counted() {
     assert_eq!(window.view(1).1.duplicates, 1);
 }
 
-mod mirror {
+pub(crate) mod mirror {
     //! Against an embedded driver's trace mirror.
 
     use karyos_client::{ClientConductor, ClientJournal, ConductorError, Outcome};
@@ -284,16 +284,16 @@ mod mirror {
 
     /// A driver of `config` with one stream, a publisher journal and a
     /// subscriber journal, as writers.
-    struct Traced {
-        driver: EmbeddedDriver,
-        publication: PublicationId,
-        driver_id: [u64; 2],
-        publisher: TraceWriter,
-        subscriber: TraceWriter,
+    pub(crate) struct Traced {
+        pub(crate) driver: EmbeddedDriver,
+        pub(crate) publication: PublicationId,
+        pub(crate) driver_id: [u64; 2],
+        pub(crate) publisher: TraceWriter,
+        pub(crate) subscriber: TraceWriter,
         _conductor: ClientConductor,
     }
 
-    fn traced(config: DriverConfig) -> Traced {
+    pub(crate) fn traced(config: DriverConfig) -> Traced {
         let mut driver = EmbeddedDriver::with_config(config).unwrap();
         let stream = driver
             .add_stream(StreamConfig {
@@ -364,7 +364,12 @@ mod mirror {
     }
 
     /// Writes `point` of the message at `position` to `writer`.
-    fn write(writer: &mut TraceWriter, publication: PublicationId, point: Point, position: u64) {
+    pub(crate) fn write(
+        writer: &mut TraceWriter,
+        publication: PublicationId,
+        point: Point,
+        position: u64,
+    ) {
         let observed = HostMonotonicClock::new(1).now();
         let mut traced = record(point, position, observed.time);
         traced.publication = publication;
@@ -467,7 +472,7 @@ mod mirror {
         let read = read(&window, 0, 2, None).unwrap();
         assert!(!read.buckets[0].incomplete, "{:?}", read.buckets[0]);
         assert!(read.buckets[1].incomplete);
-        assert_eq!(read.buckets[1].loss.mirror_overwritten, 2);
+        assert_eq!(read.buckets[1].loss.unwrap().mirror_overwritten, 2);
     }
 }
 
@@ -544,7 +549,7 @@ fn a_bucket_that_lost_pairs_is_incomplete_with_its_reason() {
     let read = read(&window, 0, 10, None).unwrap();
     assert!(!read.buckets[0].incomplete);
     assert!(read.buckets[1].incomplete);
-    assert_eq!(read.buckets[1].loss.pending_dropped, 1);
+    assert_eq!(read.buckets[1].loss.unwrap().pending_dropped, 1);
 }
 
 /// R-CORE-23: reading consumes nothing. A second reader reads the same
@@ -765,9 +770,9 @@ fn an_unknown_journal_or_a_malformed_record_makes_its_bucket_incomplete() {
     let read = read(&window, 0, 10, None).unwrap();
     assert!(!read.buckets[0].incomplete);
     assert!(read.buckets[1].incomplete);
-    assert_eq!(read.buckets[1].loss.unknown_journal, 1);
+    assert_eq!(read.buckets[1].loss.unwrap().unknown_journal, 1);
     assert!(read.buckets[2].incomplete);
-    assert_eq!(read.buckets[2].loss.malformed, 1);
+    assert_eq!(read.buckets[2].loss.unwrap().malformed, 1);
 }
 
 /// Up to `count` buckets of `window` from number `from`, lane 0, with no
@@ -797,10 +802,11 @@ fn pair_on(window: &mut TraceWindow, registration: u64, position: u64, now: u64)
     );
 }
 
-/// R-CORE-23, paging by lane (QS-COORDINATOR, ACS 33179): a bucket
-/// larger than the reply bound comes in pages of whole lanes, each reply
-/// within the bound plus one lane; `next` names the bucket and the lane,
-/// and the pages hold every lane once.
+/// R-CORE-23, paging by lane (QS-COORDINATOR, ACS 33179 and 33400): a
+/// bucket larger than the reply bound comes in pages of whole lanes, each
+/// reply within the bound plus one lane; `next` names the bucket and the
+/// lane, and the pages hold every lane once. No page holds a bucket's
+/// header alone, and its loss is on its first page only.
 #[test]
 fn a_bucket_over_the_bound_is_read_in_pages_of_lanes() {
     let mut window = TraceWindow::new(
@@ -831,6 +837,9 @@ fn a_bucket_over_the_bound_is_read_in_pages_of_lanes() {
         assert!(text.len() <= bound + lane_bytes, "{} > {bound}", text.len());
         for bucket in &page.buckets {
             assert_eq!(bucket.lanes_total, if bucket.number == 0 { 6 } else { 1 });
+            // Never a header alone; the loss on the first page only.
+            assert!(!bucket.lanes.is_empty(), "{bucket:?}");
+            assert_eq!(bucket.loss.is_some(), bucket.first_lane == 0, "{bucket:?}");
             for (offset, lane) in bucket.lanes.iter().enumerate() {
                 lanes.push((bucket.number, bucket.first_lane + offset, lane.stream));
             }

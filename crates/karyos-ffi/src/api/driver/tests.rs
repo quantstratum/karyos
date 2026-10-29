@@ -112,8 +112,8 @@ fn an_unknown_idle_strategy_or_configuration_is_refused() {
 
 /// A lane above `max_stream_bytes` (karyos#809) reaches a C host as the
 /// caller's argument with its bytes and the cap, not as an unknown error.
-/// `karyos_driver_options` does not carry the cap yet, so the mapping is
-/// tested here.
+/// `abi::tests::a_stream_above_the_options_cap_is_refused_with_its_bytes_and_the_cap`
+/// covers it through `karyos_driver_options.max_stream_bytes` (karyos#818).
 #[test]
 fn a_stream_above_the_cap_is_an_invalid_argument_with_its_bytes_and_the_cap() {
     let failure = Failure::from(&DriverError::StreamTooLarge {

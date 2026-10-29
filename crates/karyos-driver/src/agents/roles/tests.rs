@@ -2230,7 +2230,9 @@ fn a_guard_close_applies_without_a_tx_half() {
                 word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
                 cell: Arc::clone(&cell),
                 epoch: 2,
+                full: true,
                 rate: None,
+                policy: None,
                 frontier: Default::default(),
             },
             0,
@@ -2946,7 +2948,9 @@ fn an_unestablished_guarded_publication_applies_a_close() {
             word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
             cell: Arc::clone(&cell),
             epoch: 2,
+            full: true,
             rate: None,
+            policy: None,
             frontier: Default::default(),
         }),
         roles: None,
@@ -3753,8 +3757,24 @@ fn the_heartbeat_mark_and_a_tail_nak_stop_at_the_terminal_bound() {
         super::HeartbeatClass::Stationary,
         "capped at the bound"
     );
-    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
-    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert!(
+        super::tail_hole(
+            &mut image,
+            Lane::ZERO,
+            0,
+            1,
+            &mut super::ReceiverCounters::default()
+        )
+        .is_none()
+    );
+    let hole = super::tail_hole(
+        &mut image,
+        Lane::ZERO,
+        0,
+        10_000_000_000,
+        &mut super::ReceiverCounters::default(),
+    )
+    .unwrap();
     assert_eq!((hole.start, hole.length), (0, 96));
 }
 
@@ -3878,8 +3898,24 @@ fn a_bound_below_the_heartbeat_mark_caps_the_tail_nak() {
         super::record_terminal(&mut image, Lane::ZERO, 96),
         super::Terminal::Recorded
     );
-    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 1).is_none());
-    let hole = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000).unwrap();
+    assert!(
+        super::tail_hole(
+            &mut image,
+            Lane::ZERO,
+            0,
+            1,
+            &mut super::ReceiverCounters::default()
+        )
+        .is_none()
+    );
+    let hole = super::tail_hole(
+        &mut image,
+        Lane::ZERO,
+        0,
+        10_000_000_000,
+        &mut super::ReceiverCounters::default(),
+    )
+    .unwrap();
     assert_eq!((hole.start, hole.length), (0, 96));
 }
 
@@ -4096,7 +4132,9 @@ fn a_guard_closed_lane_sends_no_heartbeat() {
             word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
             cell: Arc::new(AppliedEpoch::new()),
             epoch: 2,
+            full: true,
             rate: None,
+            policy: None,
             frontier: Default::default(),
         }),
         roles: None,
@@ -4671,6 +4709,68 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
     );
 }
 
+/// #821 point 3: an unreliable image's duty feeds the skip policy each
+/// lane's heartbeat mark clamped to the terminal bound, so a tail no
+/// frame revealed is sealed at its deadline up to the bound and no
+/// further.
+#[test]
+fn an_unreliable_tail_is_sealed_up_to_the_terminal_bound() {
+    use karyos_protocol::frame::Lane;
+    use karyos_sys::log_buffer::SkipConfig;
+    use karyos_sys::receive::{Item, ValidatedDatagram};
+
+    let (mut image, params) = installed_image_with(SkipConfig::unreliable());
+    image.reliable = false;
+    commit_frame(&mut image, &params, 0, 32);
+    let bytes = data_frame(4096, 0, false);
+    let datagram = ValidatedDatagram::parse(&bytes, &params).unwrap();
+    let Some(Item::Heartbeat(heartbeat)) = datagram.items().next() else {
+        panic!("not a heartbeat");
+    };
+    assert_eq!(
+        super::classify_heartbeat(&mut image, &heartbeat),
+        super::HeartbeatClass::Fresh
+    );
+    assert_eq!(
+        super::record_terminal(&mut image, Lane::ZERO, 1024),
+        super::Terminal::Recorded
+    );
+    let (_sender, mut receiver) = repairing(image);
+    receiver.repair(0, 1).unwrap();
+    assert_eq!(receiver.counters().gaps_sealed, 0, "before its deadline");
+    for now in [10_000_000_000u64, 20_000_000_000, 30_000_000_000] {
+        receiver.repair(0, now).unwrap();
+    }
+    assert_eq!(receiver.counters().gaps_sealed, 1, "one seal, the tail");
+    let owner = &receiver.images[0].owner;
+    assert_eq!(owner.first_hole(Lane::ZERO).unwrap(), None);
+    assert_eq!(
+        owner.high_water(Lane::ZERO),
+        Some(1024),
+        "not past the bound"
+    );
+}
+
+/// #821 point 5: a reliable image's tail query the receive owner rejects
+/// (here a mark off a frame boundary) is counted in `hole_query_errors`,
+/// not dropped silently; no hole is NAKed for it.
+#[test]
+fn a_rejected_tail_query_is_counted() {
+    use karyos_protocol::frame::Lane;
+
+    let (mut image, _params) = installed_image();
+    image.heartbeat_marks[0] = Some(100);
+    let mut counters = super::ReceiverCounters::default();
+    assert!(super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000, &mut counters).is_none());
+    assert_eq!(counters.hole_query_errors, 1);
+    image.heartbeat_marks[0] = Some(4096);
+    let _ = super::tail_hole(&mut image, Lane::ZERO, 0, 10_000_000_000, &mut counters);
+    assert_eq!(counters.hole_query_errors, 1, "an aligned mark is no error");
+}
+
+/// The sends endpoint 2 makes in [`routed_lane`]'s setup.
+const ROUTED_SETUP_SENDS: usize = 1;
+
 /// An endpoint `id` whose socket takes its first `oks` sends, answers the
 /// next ones with `first`, then takes every later one; its header-only DATA frames and its DATA sends are
 /// recorded as [`header_only_endpoint`]'s.
@@ -4739,9 +4839,6 @@ fn scripted_endpoint(
         rx,
     )
 }
-
-/// The sends endpoint 2 makes in [`routed_lane`]'s setup.
-const ROUTED_SETUP_SENDS: usize = 1;
 
 /// A routed publication on endpoints 1 and 2, bound on both, its first
 /// message sent at 2..6: the sender, the log, the halves, and each

@@ -212,10 +212,12 @@ offers. The features are:
 | `concurrent-publication` | `publication.add_concurrent` |
 | `conflation` | The conflated views: `driver.subscribe_conflated`, `conflated.*` |
 | `embedded-driver` | A driver the scenario creates: `driver.*` |
-| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner picks for the scenario, outside the ephemeral range. As for a remote publication, the runner retries an offer of such a driver's client on a `karyos:udp` channel that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously |
+| `embedded-network` | An embedded driver with its network on (`driver.create_networked`, `KARYOS_NETWORK_ON`, ABI 0.1.4), and a loopback endpoint `$network_uri`: `karyos:udp?endpoint=127.0.0.1:<p>`, a free port `p` the runner picks for the scenario, outside the ephemeral range. As for a remote publication, the runner retries an offer of such a driver's client on a `karyos:udp` channel that answers `back_pressured`, `admin_action` or `not_connected`, serving the client, for up to 10 s, since its network publication connects asynchronously. |
 | `guarded-publication` | The outcome stream: `publication.poll_outcomes` |
+| `image-wait` | `subscription.await_image`, a network subscription's wait for its images (Remote driver) |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
 | `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded, plain and timed network streams, and a loopback endpoint `$loopback_uri` (Remote driver, below; Linux only) |
+| `stream-cap` | An embedded driver with a stream cap: `driver.create_capped` (`karyos_driver_options.max_stream_bytes`, ABI 0.1.5) |
 | `tai-clock` | `clock.now` of the TAI domain, which some platforms lack |
 
 A new feature is added here; a feature name not in this table is a
@@ -237,7 +239,7 @@ An `op` is followed by an `expect` that starts with its outcome:
 - `ok`, then the results it checks as `name=value`;
 - `status=<name>`: a failure, named by its header status in lower case
   without `KARYOS_E_` (`not_connected`, `claim_outstanding`, `closed`),
-  with no results but one exception below. A binding maps its own
+  with no results but two exceptions below. A binding maps its own
   results to these names through the one mapping it already has
   (BIND-S1); the class follows the header's range, and whether the
   binding returns or raises it is the binding's own policy. A name the
@@ -247,7 +249,9 @@ An `op` is followed by an `expect` that starts with its outcome:
   Archive's response code (1 an error, such as a host's refusal; 2 an
   unknown recording; 3 an unknown replay; 4 an invalid request; 5 an
   unsupported schema), so a refusal for one reason cannot pass for
-  another.
+  another. And after any status, `driver.add_stream` may check `code` and
+  `value`, its `karyos_detail` (karyos#818): above a driver's stream cap,
+  the lane's bytes and the cap.
 
 A result checked as `name>=value` (format 2, either layer) holds an
 integer at least `value`; `value` is a literal or a bound variable.
@@ -290,7 +294,8 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `clock.now` | `domain`: `"monotonic"` or `"tai"` | `now` | `tai-clock` for `"tai"` |
 | `driver.create` | none | `driver` | `embedded-driver` |
 | `driver.create_networked` | none: the options of `karyos_driver_options_init` with `network` set to `KARYOS_NETWORK_ON` | `driver` | `embedded-driver`, `embedded-network` |
-| `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none | `embedded-driver` |
+| `driver.create_capped` | `max_stream_bytes`: the options of `karyos_driver_options_init` with `max_stream_bytes` set | `driver` | `embedded-driver`, `stream-cap` |
+| `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none; on a failure, `code` and `value` of its `karyos_detail` beside the status | `embedded-driver` |
 | `driver.start` | `driver`, [`idle_strategy`: `"busy_spin"`, `"yield"`, `"sleep"` or `"yield_then_sleep"`, default `"yield_then_sleep"`, the ABI's declared default; `idle_sleep_ns`] | none | `embedded-driver` |
 | `driver.do_work` | `driver` | `work` | `embedded-driver` |
 | `driver.subscribe_conflated` | `driver`, `stream_id` | `conflated` | `embedded-driver`, `conflation` |
@@ -316,6 +321,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `conflated.close` | `conflated` | none | `conflation` |
 | `subscription.poll_to_end` | `subscription`, [`limit` (default 16)] | `delivered` (the count of every poll), `last` | |
 | `subscription.end` | `subscription` | `reason`: `"none"`, `"end_of_stream"`, `"image_retired"`, `"stream_removed"`, `"revoked"`, `"closed_by_overrun"` or `"other"`; `position`; `seal_code` | |
+| `subscription.await_image` | `subscription`, [`count` (default 1)] | none: `ok` once the subscription has reported `count` images since it was added | `image-wait` |
 | `archive.connect` | `client` | `archive` | `archive-replay` |
 | `archive.replay` | `archive`, `recording`, `target_stream_id`, [`position` (default 0), `length` (default to the recording's end), `rate`: `"full"` (default), `"as_recorded"` or `"scaled"`, `scale_ppm`] | `replay`, `session` | `archive-replay` |
 | `archive.stop_replay` | `archive`, `replay` | none | `archive-replay` |
@@ -450,6 +456,29 @@ anything slow (the incompatible driver's stubs), so the client is silent
 for one scenario at most (karyos#820). A scenario that does not use the
 client must take less than karyosd's client liveness timeout (10 s).
 
+A reader joins an image at its head (SPEC §4, "Monotonic limits and
+joining"), and a network publication is connected once its receiver's
+status messages are live (SPEC §4, "Connection"), before the client that
+subscribed has attached the image. A message offered before that image is
+attached may never reach the subscription (karyos#830). A scenario that
+needs it to declares the wait itself: `subscription.await_image`
+(feature `image-wait`), after the publication is added and before its
+first offer or claim.
+
+`subscription.await_image subscription=$s` waits until `$s` has reported
+`count` images (default 1) since it was added, counting the image changes
+that report an image available (`karyos_subscription_next_image_change`).
+While it waits, the runner serves every open client of the scenario,
+and runs every embedded driver the scenario did not start, so the
+publisher's side moves as well as the subscriber's. It answers `ok` once
+`count` is reached, with no result: a subscription may report more images
+than it waited for (a reattach, another session). It answers
+`status=timeout` when `count` is not reached within 10 s, and
+`status=events_lost` when the subscription's image change queue dropped
+changes (`karyos_subscription_image_changes_lost`), since a dropped change
+may have been an image. A failing image change call answers its status.
+The runner waits nowhere else: it matches no URI and keys no session.
+
 Each exclusive stream's publication is added at most once in the whole
 suite run, since karyosd serves every scenario: a remote publication is
 released asynchronously after its close, so a later `publication.add`
@@ -573,7 +602,9 @@ accepts exactly the 0.y the suite targets, with at least its minimum
 fails the run.
 
 A feature may need a later ABI than the suite: `embedded-network` needs
-0.1.4, which adds `karyos_driver_options.network` (karyos#735). A runner
+0.1.4, which adds `karyos_driver_options.network` (karyos#735), and
+`stream-cap` needs 0.1.5, which adds `karyos_driver_options.max_stream_bytes`
+(karyos#818). A runner
 offers such a feature only on a library at its floor or later, and
 declares it absent otherwise; the rest of the suite runs as before.
 
