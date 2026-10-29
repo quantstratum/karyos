@@ -343,11 +343,6 @@ impl LaneGate for TargetGate<'_> {
 }
 
 impl Fanout {
-    /// Per destination it has now, whether it has a repair queue.
-    pub(super) fn target_repairs(&self) -> impl Iterator<Item = bool> + '_ {
-        self.targets.iter().map(|target| target.repair.is_some())
-    }
-
     /// Names through `post` each live destination due a PATH_HB: it
     /// submitted nothing for `interval` ns at `now` (RP-3, karyos#859);
     /// its wait starts at the first look. `post` says whether it took it.

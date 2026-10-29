@@ -122,6 +122,16 @@ impl TxDemand {
             slots: self.slots.saturating_add(other.slots),
         }
     }
+
+    /// What is left of it once `other` is given back.
+    #[must_use]
+    pub fn minus(self, other: Self) -> Self {
+        Self {
+            routes: self.routes.saturating_sub(other.routes),
+            queues: self.queues.saturating_sub(other.queues),
+            slots: self.slots.saturating_sub(other.slots),
+        }
+    }
 }
 
 /// The gate of data traffic until phase 7: every candidate is permitted.

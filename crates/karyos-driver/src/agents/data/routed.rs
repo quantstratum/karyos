@@ -718,24 +718,40 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// per destination it has now.
     #[must_use]
     pub fn tx_demand(&self) -> Vec<(EndpointId, TxDemand)> {
-        let lanes = u32::try_from(self.readers.len()).unwrap_or(u32::MAX);
-        let per_route = |repair: bool| TxDemand {
-            routes: 1,
-            queues: lanes.saturating_add(u32::from(repair)),
-            slots: lanes
-                .saturating_mul(u32::from(STAGED_PER_LANE))
-                .saturating_add(u32::from(repair)),
-        };
-        let route = per_route(self.reliable);
+        let route = self.route_demand(self.reliable);
         if let Some(fanout) = self.fanout.as_deref() {
             let total = fanout
-                .target_repairs()
+                .addresses()
                 .fold(TxDemand::default(), |sum, _| sum.plus(route));
             return vec![(self.endpoint, total)];
         }
         self.route_endpoints()
             .map(|endpoint| (endpoint, route))
             .collect()
+    }
+
+    /// What one more destination of a multi-destination publication takes
+    /// of its endpoint once open (karyos#859): a route with its lane
+    /// queues and, if reliable, a repair queue. `None` for one whose paths
+    /// are fixed.
+    #[must_use]
+    pub fn destination_demand(&self) -> Option<TxDemand> {
+        self.fanout
+            .as_deref()
+            .map(|_| self.route_demand(self.reliable))
+    }
+
+    /// What one route takes: its lane queues of `STAGED_PER_LANE` slots
+    /// and, with `repair`, a repair queue of one slot.
+    fn route_demand(&self, repair: bool) -> TxDemand {
+        let lanes = u32::try_from(self.readers.len()).unwrap_or(u32::MAX);
+        TxDemand {
+            routes: 1,
+            queues: lanes.saturating_add(u32::from(repair)),
+            slots: lanes
+                .saturating_mul(u32::from(STAGED_PER_LANE))
+                .saturating_add(u32::from(repair)),
+        }
     }
 
     /// The endpoints of its paths, the founding one first; one for a

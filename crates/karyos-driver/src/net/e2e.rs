@@ -4255,7 +4255,7 @@ fn the_endpoint_accounting_matches_its_use_through_adds_removals_and_a_reset() {
     }
     let streams: Vec<i32> = (13..18).chain([20, 21]).collect();
     pump(&mut [&mut a, &mut b], |drivers| images(drivers, &streams));
-    let expected = |a: &mut EmbeddedDriver| {
+    let expected = |a: &mut EmbeddedDriver, endpoint| {
         let reserved = a
             .net
             .as_ref()
@@ -4272,23 +4272,66 @@ fn the_endpoint_accounting_matches_its_use_through_adds_removals_and_a_reset() {
             reserved.slots + control * u32::from(crate::agents::control::CONTROL_QUEUE_DEPTH),
         )
     };
-    let used = |a: &mut EmbeddedDriver| {
+    let used = |a: &mut EmbeddedDriver, endpoint| {
         let used = shared(a).sender.tx_commitment(endpoint).unwrap();
         (used.routes, used.queues, used.slots)
     };
-    // Every publication opens; then the two agree.
-    for _ in 0..20_000 {
-        let _ = a.do_work().unwrap();
-        let _ = b.do_work().unwrap();
-        if used(&mut a) == expected(&mut a) {
-            break;
+    // Every endpoint's routes and queues open or close; then the two agree.
+    let agree = |drivers: &mut [&mut EmbeddedDriver]| {
+        let endpoints: Vec<_> = drivers[0]
+            .net
+            .as_ref()
+            .unwrap()
+            .reserved()
+            .into_iter()
+            .map(|(endpoint, _)| endpoint)
+            .collect();
+        for _ in 0..20_000 {
+            for driver in drivers.iter_mut() {
+                let _ = driver.do_work().unwrap();
+            }
+            if endpoints
+                .iter()
+                .all(|&endpoint| used(drivers[0], endpoint) == expected(drivers[0], endpoint))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
         }
-        std::thread::sleep(std::time::Duration::from_micros(100));
-    }
-    let (routes, queues, slots) = used(&mut a);
-    assert_eq!((routes, queues, slots), expected(&mut a));
+        for &endpoint in &endpoints {
+            assert_eq!(used(drivers[0], endpoint), expected(drivers[0], endpoint));
+        }
+    };
+    agree(&mut [&mut a, &mut b]);
+    let (routes, queues, slots) = used(&mut a, endpoint);
     assert!(
         routes >= 7 && queues >= 7 && slots >= 7 * 8,
         "{routes} {queues} {slots}"
     );
+    // A reliable multi-destination publication, then a destination added
+    // and one removed at run time: each holds a route, its lane queue and
+    // a repair queue while it is a destination.
+    let (mut receivers, addresses) = destinations::receivers_on(2, true);
+    let fanout = a
+        .add_network_publication(
+            aggregate(10, 1, 1),
+            &destinations::destinations(&addresses[..1], true),
+        )
+        .unwrap();
+    let [c, d] = &mut receivers[..] else {
+        unreachable!()
+    };
+    pump(&mut [&mut a, &mut b, c, d], |drivers| {
+        drivers[2].network_image(10, 1).is_some()
+    });
+    a.add_network_destination(&fanout, addresses[1]).unwrap();
+    pump(&mut [&mut a, &mut b, c, d], |drivers| {
+        drivers[3].network_image(10, 1).is_some()
+    });
+    agree(&mut [&mut a, &mut b, c, d]);
+    a.remove_network_destination(&fanout, addresses[0]).unwrap();
+    pump(&mut [&mut a, &mut b, c, d], |drivers| {
+        !drivers[0].network_removed_destinations(&fanout).is_empty()
+    });
+    agree(&mut [&mut a, &mut b, c, d]);
 }

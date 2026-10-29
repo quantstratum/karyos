@@ -359,6 +359,12 @@ struct NetPublication {
     /// What it takes of each endpoint it sends on (karyos#859), held until
     /// its entry goes, when its removal has ended.
     demand: Vec<(EndpointId, TxDemand)>,
+    /// What one destination added at run time takes of its endpoint, for
+    /// a multi-destination publication (karyos#859).
+    per_destination: Option<TxDemand>,
+    /// The run-time destination additions posted and not answered yet:
+    /// each holds `per_destination` in `demand` until its answer.
+    adds_pending: Vec<std::net::SocketAddr>,
     /// The endpoint limit its sender reported, until it opened.
     limited: Option<EndpointLimit>,
     /// Its open sender journals to close before `RemovePublication`, in the
@@ -1806,6 +1812,7 @@ impl<T: StreamTerms> Network<T> {
         // reserve, or it could never open and would send nothing
         // (karyos#859).
         let demand = outbound.tx_demand();
+        let per_destination = outbound.destination_demand();
         for &(path, need) in &demand {
             self.endpoint_room(path, need)?;
         }
@@ -1879,6 +1886,8 @@ impl<T: StreamTerms> Network<T> {
             traced,
             lanes,
             demand,
+            per_destination,
+            adds_pending: Vec::with_capacity(crate::agents::data::MAX_DESTINATIONS),
             limited: None,
             trace_closes: Vec::new(),
             channel: Some(channel),
@@ -2208,21 +2217,46 @@ impl<T: StreamTerms> Network<T> {
     /// # Errors
     ///
     /// [`DriverError::InvalidConfig`] for no such active publication;
-    /// [`DriverError::NetworkBusy`] when the sender's ring is full.
+    /// [`DriverError::EndpointCapacity`] for an addition its endpoint
+    /// cannot hold with what it holds and the additions not answered yet
+    /// (karyos#859); [`DriverError::NetworkBusy`] when the sender's ring is
+    /// full or [`MAX_DESTINATIONS`](crate::agents::data::MAX_DESTINATIONS)
+    /// additions wait for their answer.
     pub(crate) fn change_destination(
         &mut self,
         registration: u64,
         destination: std::net::SocketAddr,
         add: bool,
     ) -> Result<(), DriverError> {
-        let (endpoint, alias) = self
+        let index = self
             .publications
             .iter()
-            .find(|entry| {
+            .position(|entry| {
                 entry.registration == registration && entry.state == NetworkPublicationState::Active
             })
-            .map(|entry| (entry.endpoint, entry.alias))
             .ok_or(DriverError::InvalidConfig)?;
+        let (endpoint, alias, per_destination, waiting) = self
+            .publications
+            .get(index)
+            .map(|entry| {
+                (
+                    entry.endpoint,
+                    entry.alias,
+                    entry.per_destination,
+                    entry.adds_pending.len(),
+                )
+            })
+            .ok_or(DriverError::InvalidConfig)?;
+        // An addition takes a route, its queues and slots once it opens:
+        // checked here as at the add, and held from the post to its answer
+        // so that additions in flight count too.
+        let hold = per_destination.filter(|_| add);
+        if let Some(need) = hold {
+            if waiting >= crate::agents::data::MAX_DESTINATIONS {
+                return Err(DriverError::NetworkBusy);
+            }
+            self.endpoint_room(endpoint, need)?;
+        }
         self.links
             .sender
             .post(|reply| AgentCommand::ChangeDestination {
@@ -2233,7 +2267,12 @@ impl<T: StreamTerms> Network<T> {
                 destination,
                 add,
             })
-            .map_err(|_| DriverError::NetworkBusy)
+            .map_err(|_| DriverError::NetworkBusy)?;
+        if let (Some(need), Some(entry)) = (hold, self.publications.get_mut(index)) {
+            entry.adds_pending.push(destination);
+            entry.hold(endpoint, need, true);
+        }
+        Ok(())
     }
 
     /// The answers to the run-time destination changes of the network
@@ -2928,6 +2967,20 @@ impl NetPublication {
         core::iter::once(self.endpoint).chain(self.later.into_iter().flatten())
     }
 
+    /// Takes `need` more of `endpoint` into its demand (`take`), or gives
+    /// it back (karyos#859).
+    fn hold(&mut self, endpoint: EndpointId, need: TxDemand, take: bool) {
+        if let Some((_, held)) = self.demand.iter_mut().find(|(path, _)| *path == endpoint) {
+            *held = if take {
+                held.plus(need)
+            } else {
+                held.minus(need)
+            };
+        } else if take {
+            self.demand.push((endpoint, need));
+        }
+    }
+
     /// Releases its guard sender, once: the sender refused or returned it,
     /// or the agents stopped or failed. With `gate_stopped` its gate never
     /// runs again, so each lane it did not finish is superseded, once; a
@@ -3098,6 +3151,20 @@ fn publication_answer<T: StreamTerms>(
             if let Some(entry) = find(publications, endpoint, alias, registration)
                 .and_then(|index| publications.get_mut(index))
             {
+                // An addition refused gives back what its post held; one
+                // added keeps it until its removal is reported (karyos#859).
+                if let Some(at) = entry
+                    .adds_pending
+                    .iter()
+                    .position(|pending| *pending == destination)
+                {
+                    let _ = entry.adds_pending.swap_remove(at);
+                    if outcome != crate::agents::data::DestinationChange::Added
+                        && let Some(need) = entry.per_destination
+                    {
+                        entry.hold(endpoint, need, false);
+                    }
+                }
                 if entry.destination_changes.len() >= crate::agents::data::MAX_DESTINATIONS {
                     let _ = entry.destination_changes.pop_front();
                 }
@@ -3128,6 +3195,11 @@ fn publication_answer<T: StreamTerms>(
             if let Some(entry) = find(publications, endpoint, alias, registration)
                 .and_then(|index| publications.get_mut(index))
             {
+                // Its route and queues pass to the close list at this
+                // report (karyos#859).
+                if let Some(need) = entry.per_destination {
+                    entry.hold(endpoint, need, false);
+                }
                 if entry.removed_destinations.len() >= crate::agents::data::MAX_DESTINATIONS {
                     let _ = entry.removed_destinations.pop_front();
                     entry.removals_overwritten = entry.removals_overwritten.saturating_add(1);

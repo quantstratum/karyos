@@ -565,8 +565,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// [`DriverError::NetworkUnavailable`], [`DriverError::InvalidConfig`]
-    /// for no such active network publication, [`DriverError::NetworkBusy`]
-    /// when the sender's ring is full (nothing changes; retry).
+    /// for no such active network publication,
+    /// [`DriverError::EndpointCapacity`] when its endpoint cannot hold one
+    /// more route with its queues, counting the additions not answered yet
+    /// (karyos#859; retryable once room is freed),
+    /// [`DriverError::NetworkBusy`] when the sender's ring is full or
+    /// [`MAX_DESTINATIONS`] additions wait for their answer (nothing
+    /// changes; retry).
     pub fn add_network_destination(
         &mut self,
         aggregate: &AggregateHandle,

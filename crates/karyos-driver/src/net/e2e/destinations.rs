@@ -26,7 +26,7 @@ use crate::error::DriverError;
 use crate::membership::{PublicationRoles, Strategy};
 
 /// A manual multi-destination channel to `destinations`.
-fn destinations(destinations: &[SocketAddr], reliable: bool) -> UdpConfig {
+pub(super) fn destinations(destinations: &[SocketAddr], reliable: bool) -> UdpConfig {
     UdpConfig {
         destination: Destination::MultiDestination {
             destinations: destinations.to_vec(),
@@ -48,7 +48,7 @@ fn receivers(count: usize) -> (Vec<EmbeddedDriver>, Vec<SocketAddr>) {
 }
 
 /// [`receivers`] on reliable or unreliable subscriptions.
-fn receivers_on(count: usize, reliable: bool) -> (Vec<EmbeddedDriver>, Vec<SocketAddr>) {
+pub(super) fn receivers_on(count: usize, reliable: bool) -> (Vec<EmbeddedDriver>, Vec<SocketAddr>) {
     let mut drivers = Vec::with_capacity(count);
     let mut addresses = Vec::with_capacity(count);
     for _ in 0..count {
