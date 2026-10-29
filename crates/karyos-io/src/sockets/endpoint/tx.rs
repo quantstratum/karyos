@@ -1400,7 +1400,7 @@ impl Drop for SocketsFrame<'_> {
 }
 
 /// What a TX half's open routes and queues take of its tables
-/// ([`SocketsTx::commitment`]).
+/// ([`SocketsTx::commitment`](super::SocketsTx::commitment)).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TxCommitment {
     /// Open routes.
