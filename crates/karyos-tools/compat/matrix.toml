@@ -1,0 +1,158 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The wire compatibility matrix (R-CORE-36, karyos#732; quantstratum-docs:
+# karyos/design/versions.md, "Compatibility"). Columns are versions tuples
+# as `--versions` reports them; an entry is an ordered pair of columns and
+# one surface (the roles are in `karyos_tools::compat::SURFACES`). A pair
+# of the same column interoperates; a surface one side lacks is absent.
+# `karyos-tools compat FROM TO` decides a pair from this file.
+#
+# Each new release adds its column, renames `main`'s values to it when they
+# are the release's, and adds the entries its two-build gate observed
+# (scripts/compat-test.sh). A test fails when this build's tuple is not the
+# `main` column.
+
+schema = "karyos-compat"
+schema_version = 1
+
+[[column]]
+name = "0.1.0-alpha.2"
+[column.versions]
+admission = 2
+frame = 1
+c_abi = "0.1.1"
+archive_control = 1
+group_record = 1
+capture_contract = 1
+
+[[column]]
+name = "main"
+[column.versions]
+admission = 3
+frame = 1
+c_abi = "0.1.5"
+archive_control = 1
+cluster_log = 1
+group_record = 1
+capture_contract = 1
+archive_durable = 1
+config = 1
+
+# Admission: a driver admits only its own protocol version
+# (crates/karyos-ffi/tests/connect.rs; conformance op.connect.other.version).
+# Observed by scripts/compat-test.sh (its run, head and command:
+# RELEASING.md, the wire compatibility matrix row): the refusal does not
+# name the driver's version across these releases (driver: None), because
+# the admission Refused message has no version field, on main too:
+# karyos#879.
+[[entry]]
+surface = "admission"
+from = "main"
+to = "0.1.0-alpha.2"
+outcome = "refuse"
+reason = "IncompatibleVersion: the 0.1.0-alpha.2 driver refuses protocol 3 (observed: AttachError::IncompatibleVersion { driver: None }; the refusal carries no version, karyos#879)"
+
+[[entry]]
+surface = "admission"
+from = "0.1.0-alpha.2"
+to = "main"
+outcome = "refuse"
+reason = "IncompatibleVersion: the main driver refuses protocol 2 (observed: AttachError::IncompatibleVersion { driver: None }; the refusal carries no version, karyos#879)"
+
+# Frame: the same frame version, 1, on both sides, which is not enough by
+# itself (R-CORE-36). Observed by scripts/compat-test.sh (its run, head
+# and command: RELEASING.md, the wire compatibility matrix row): a
+# karyos:udp publication on one release's karyosd and a subscription on
+# the other's, on loopback, 200 messages received whole and in order, in
+# each direction.
+[[entry]]
+surface = "frame"
+from = "main"
+to = "0.1.0-alpha.2"
+outcome = "interoperate"
+reason = "observed by scripts/compat-test.sh: a main sender and a 0.1.0-alpha.2 receiver, 200 of 200 in order"
+
+[[entry]]
+surface = "frame"
+from = "0.1.0-alpha.2"
+to = "main"
+outcome = "interoperate"
+reason = "observed by scripts/compat-test.sh: a 0.1.0-alpha.2 sender and a main receiver, 200 of 200 in order"
+
+# C ABI: owner item 48, exact 0.y and a library patch at least the
+# header's. From is the header a client was compiled against, to the
+# library it runs on. Observed by scripts/compat-test.sh (as above;
+# scripts/compat-probe/c_abi.c): a client of one tree's karyos.h linked
+# against the other tree's libkaryos applies the header's rule, and the
+# one it accepts runs a driver through the calls both releases share.
+[[entry]]
+surface = "c_abi"
+from = "0.1.0-alpha.2"
+to = "main"
+outcome = "interoperate"
+reason = "observed by scripts/compat-test.sh: a 0.1.1 header's client on the 0.1.5 library accepts it (same 0.1 line, patch 5 >= 1) and runs a driver"
+
+[[entry]]
+surface = "c_abi"
+from = "main"
+to = "0.1.0-alpha.2"
+outcome = "refuse"
+reason = "observed by scripts/compat-test.sh: a 0.1.5 header's client on the 0.1.1 library refuses it at karyos_abi_version (patch 1 < 5)"
+
+# The Archive's control messages are reached only through an attached
+# client, which admission refuses for this pair.
+[[entry]]
+surface = "archive_control"
+from = "main"
+to = "0.1.0-alpha.2"
+outcome = "not_covered"
+reason = "reached only through admission, which refuses this pair"
+
+[[entry]]
+surface = "archive_control"
+from = "0.1.0-alpha.2"
+to = "main"
+outcome = "not_covered"
+reason = "reached only through admission, which refuses this pair"
+
+# Recordings on disk: the same schema versions, never read across these
+# builds by a test.
+[[entry]]
+surface = "group_record"
+from = "0.1.0-alpha.2"
+to = "main"
+outcome = "not_covered"
+reason = "group records written by 0.1.0-alpha.2 and read by main are not tested"
+
+[[entry]]
+surface = "group_record"
+from = "main"
+to = "0.1.0-alpha.2"
+outcome = "not_covered"
+reason = "group records written by main and read by 0.1.0-alpha.2 are not tested"
+
+[[entry]]
+surface = "capture_contract"
+from = "0.1.0-alpha.2"
+to = "main"
+outcome = "not_covered"
+reason = "group journals captured by 0.1.0-alpha.2 and read by main are not tested"
+
+[[entry]]
+surface = "capture_contract"
+from = "main"
+to = "0.1.0-alpha.2"
+outcome = "not_covered"
+reason = "group journals captured by main and read by 0.1.0-alpha.2 are not tested"
+
+[[not_covered]]
+case = "0.1.0-alpha.1"
+reason = "no column: admission protocol 1 was withdrawn by 0.1.0-alpha.2, and the release had no versions output to key a column on"
+
+[[not_covered]]
+case = "a main snapshot other than the one this file was written at"
+reason = "an unreleased schema can change before its release; only the tuple of the main column is judged"
+
+[[not_covered]]
+case = "Windows"
+reason = "no Karyos build runs on Windows"
