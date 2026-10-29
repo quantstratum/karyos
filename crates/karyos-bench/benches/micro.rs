@@ -325,6 +325,7 @@ fn trace_export_page(c: &mut Criterion) {
         b.iter(|| {
             black_box(karyos_agent::trace_export::export(
                 &reader,
+                None,
                 1,
                 0,
                 EXPORT_MAX,
@@ -337,6 +338,7 @@ fn trace_export_page(c: &mut Criterion) {
         b.iter(|| {
             if let Ok(page) = karyos_agent::trace_export::export(
                 &reader,
+                None,
                 1,
                 0,
                 EXPORT_MAX,

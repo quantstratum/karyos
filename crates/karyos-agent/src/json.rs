@@ -814,6 +814,17 @@ pub fn trace_export(page: &ExportPage) -> String {
         fields
             .key("journals")
             .array(&page.journals, |out, journal| export_journal(out, journal));
+        fields.key("points").array(&page.points, |out, point| {
+            out.object(|fields| {
+                fields.number("id", u64::from(point.id));
+                fields
+                    .key("label")
+                    .option(point.label.as_deref(), Out::string);
+                fields
+                    .key("client")
+                    .option(point.client, |out, client| out.number(client));
+            });
+        });
         fields.number("unknown_records", page.unknown_records);
         fields.number("unreadable_records", page.unreadable_records);
     });

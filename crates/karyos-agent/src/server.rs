@@ -99,8 +99,13 @@ pub const MAX_ACCEPTS: usize = 16;
 
 /// The dimensions `limits` answers, their bounds being the constants
 /// above. Only `read.request_bytes` is negotiable in v1, and only
-/// downwards: no bound is raised.
-pub const LIMITS: [Limit; 8] = [
+/// downwards: no bound is raised. The `trace.*` dimensions are the
+/// driver's application trace point bounds (R-CORE-1): the ids an instance
+/// assigns, a protocol constant, and the per-client bounds at the
+/// driver's built-in defaults: the CnC does not expose a driver's
+/// configured values, so a `karyosd` started with others is not reflected
+/// (a follow-up).
+pub const LIMITS: [Limit; 11] = [
     Limit {
         name: "read.request_bytes",
         bound: Some(MAX_REQUEST as u64),
@@ -139,6 +144,21 @@ pub const LIMITS: [Limit; 8] = [
     Limit {
         name: "connection.requests",
         bound: Some(1),
+        negotiable: false,
+    },
+    Limit {
+        name: "trace.point_ids",
+        bound: Some(u16::MAX as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "trace.points_per_client",
+        bound: Some(16),
+        negotiable: false,
+    },
+    Limit {
+        name: "trace.point_registrations_per_client",
+        bound: Some(256),
         negotiable: false,
     },
 ];

@@ -23,7 +23,7 @@ fn read_page(
     count: usize,
     asked: Option<u128>,
 ) -> Result<ExportPage, ExportRefusal> {
-    export(mirror, epoch, from, count, asked, usize::MAX)
+    export(mirror, None, epoch, from, count, asked, usize::MAX)
 }
 
 const EPOCH: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
@@ -338,16 +338,16 @@ fn the_read_is_bounded_by_bytes_and_count() {
     let mut mirror = mirror(64);
     append(&mut mirror, 0..40);
     let reader = mirror.reader();
-    let page = export(&reader, EPOCH, 0, usize::MAX, None, 1).unwrap();
+    let page = export(&reader, None, EPOCH, 0, usize::MAX, None, 1).unwrap();
     assert_eq!(seqs(&page), [0]);
     assert_eq!(page.next, 1);
     let bound = crate::json::EXPORT_REPLY_OVERHEAD
         + crate::api::MAX_JOURNAL_REPLY
         + 5 * crate::json::export_record_len(&page.records[0]);
-    let page = export(&reader, EPOCH, 0, usize::MAX, None, bound).unwrap();
+    let page = export(&reader, None, EPOCH, 0, usize::MAX, None, bound).unwrap();
     assert_eq!(page.records.len(), 5);
     assert_eq!(page.next, 5);
-    let page = export(&reader, EPOCH, 0, usize::MAX, None, usize::MAX).unwrap();
+    let page = export(&reader, None, EPOCH, 0, usize::MAX, None, usize::MAX).unwrap();
     assert_eq!(page.records.len(), 40);
 }
 
@@ -436,7 +436,7 @@ fn every_sequence_is_delivered_or_lost_exactly_once() {
     while cursor < 40 {
         // The busy entry holds for the first pages only.
         assert!(mirror_hold(&mut mirror, pages < 3));
-        let page = export(&reader, EPOCH, cursor, usize::MAX, None, bound).unwrap();
+        let page = export(&reader, None, EPOCH, cursor, usize::MAX, None, bound).unwrap();
         for loss in &page.lost {
             assert!(loss.last < page.next, "{loss:?} past {}", page.next);
             for seq in loss.first..=loss.last {
@@ -483,6 +483,7 @@ fn full_count_pages_against_a_writer_cover_every_sequence_once() {
     while cursor < WRITTEN {
         let page = export(
             &reader,
+            None,
             EPOCH,
             cursor,
             crate::api::EXPORT_MAX,
@@ -526,6 +527,7 @@ fn a_full_page_stays_within_the_reply_bound() {
     }
     let page = export(
         &mirror.reader(),
+        None,
         EPOCH,
         0,
         EXPORT_MAX,
@@ -563,6 +565,7 @@ fn a_transient_busy_entry_is_waited_for() {
     });
     let page = export_within(
         &reader,
+        None,
         (EPOCH, None),
         0,
         16,
@@ -604,10 +607,10 @@ fn a_page_fills_exactly_at_its_bound() {
     let bound = crate::json::EXPORT_REPLY_OVERHEAD
         + crate::api::MAX_JOURNAL_REPLY
         + lens.iter().sum::<usize>();
-    let page = export(&reader, EPOCH, 0, 16, None, bound).unwrap();
+    let page = export(&reader, None, EPOCH, 0, 16, None, bound).unwrap();
     assert_eq!(seqs(&page), [0, 1, 2, 3, 4]);
     assert_eq!(page.next, 5);
-    let page = export(&reader, EPOCH, 0, 16, None, bound - 1).unwrap();
+    let page = export(&reader, None, EPOCH, 0, 16, None, bound - 1).unwrap();
     assert_eq!(seqs(&page), [0, 1, 2, 3]);
     assert_eq!(page.next, 4);
 }
@@ -686,6 +689,7 @@ fn a_journal_recycled_during_the_wait_is_found_in_the_log() {
     });
     let page = export_within(
         &reader,
+        None,
         (EPOCH, None),
         0,
         16,
@@ -724,12 +728,13 @@ fn a_page_ends_at_the_overwritten_ranges_it_can_state() {
         max_lost_ranges,
     };
     // One range allowed: the page ends after the batch that stated it.
-    let page = export_within(&reader, (EPOCH, None), 0, 200, usize::MAX, waits(1)).unwrap();
+    let page = export_within(&reader, None, (EPOCH, None), 0, 200, usize::MAX, waits(1)).unwrap();
     assert_eq!(page.lost.len(), 1);
     assert_eq!(page.next, 172 + 64);
     // The default allows it to go on to its count.
     let page = export_within(
         &reader,
+        None,
         (EPOCH, None),
         0,
         200,
@@ -791,6 +796,7 @@ fn a_page_stops_at_its_cap_across_several_laps() {
         });
         let page = export_within(
             &reader,
+            None,
             (EPOCH, None),
             0,
             1_000,
@@ -852,6 +858,7 @@ fn the_log_waits_with_its_own_budget_after_a_stuck_table() {
     });
     let page = export_within(
         &reader,
+        None,
         (EPOCH, None),
         0,
         16,
@@ -911,6 +918,7 @@ fn the_log_has_a_budget_of_its_own_past_the_first_retry() {
     });
     let page = export_within(
         &reader,
+        None,
         (EPOCH, None),
         0,
         16,
@@ -925,4 +933,202 @@ fn the_log_has_a_budget_of_its_own_past_the_first_retry() {
     assert_eq!(seqs(&page), [0]);
     assert_eq!(page.journals, [ExportJournal::Recycled(Box::new(gone))]);
     assert_eq!(page.unreadable_records, 0);
+}
+
+/// An application point's payload (layout version 4, code 9): word 0 and
+/// word 16 as the karyos-trace encoder writes them, the rest zero.
+fn application_payload(id: u16) -> [u64; 25] {
+    let mut payload = [0u64; 25];
+    payload[0] = 4 | (9 << 8);
+    payload[16] = u64::from(id);
+    payload
+}
+
+/// A client counters region holding trace point cells: label, client, id.
+fn point_cells(
+    cells: &[(&str, u64, u16)],
+) -> (karyos_sys::counters::CountersManager, CountersReader) {
+    let (mut manager, reader, _) = karyos_sys::counters::client_counters(8).unwrap();
+    for (label, client, id) in cells {
+        let keys = karyos_sys::counters::CounterKeys {
+            stream: 0,
+            lane: 0,
+            kind: karyos_sys::counters::KIND_CLIENT,
+            participant: *client,
+        };
+        // The capability is dropped at once; its cell stays allocated,
+        // pending release, as a reader sees it.
+        let counter = manager
+            .allocate_valued_where(TYPE_TRACE_POINT, label, keys, u64::from(*id), |_| true)
+            .unwrap();
+        std::mem::forget(counter);
+    }
+    (manager, reader)
+}
+
+/// R-CORE-1: a page names the application points its records reference,
+/// once each, from the single cell of the records' client holding the id;
+/// a released or unknown id, an id claimed by two cells, and a cell of
+/// another client stay unnamed, never misattributed. Driver records name
+/// no point.
+#[test]
+fn a_page_names_the_application_points_its_records_reference() {
+    let mut mirror = mirror(16);
+    // Journal 10 is client 1's.
+    for (sequence, id) in [(0, 1u16), (1, 1), (2, 2), (3, 3), (4, 4)] {
+        let _ = mirror
+            .append(10, sequence, &application_payload(id))
+            .unwrap();
+    }
+    let _ = mirror.append(10, 5, &[5, !5]).unwrap();
+    let (_manager, cells) = point_cells(&[
+        ("order \"received\" \\ é", 1, 1),
+        // Id 2 claimed twice.
+        ("first", 1, 2),
+        ("second", 1, 2),
+        // Id 3 is another client's.
+        ("theirs", 7, 3),
+    ]);
+    let page = export(
+        &mirror.reader(),
+        Some(&cells),
+        EPOCH,
+        0,
+        16,
+        None,
+        usize::MAX,
+    )
+    .unwrap();
+    assert_eq!(page.records.len(), 6);
+    let named = |id: u16, label: Option<&str>, client: Option<u64>| ExportPoint {
+        id,
+        label: label.map(str::to_owned),
+        client,
+    };
+    assert_eq!(
+        page.points,
+        vec![
+            named(1, Some("order \"received\" \\ é"), Some(1)),
+            named(2, None, None),
+            named(3, None, None),
+            // Id 4 has no cell: released, or never seen.
+            named(4, None, None),
+        ]
+    );
+    // The label is escaped in the reply.
+    let reply = crate::json::trace_export(&page);
+    assert!(
+        reply.contains(r#""points":[{"id":1,"label":"order \"received\" \\ é","client":1},{"id":2,"label":null,"client":null}"#),
+        "{reply}"
+    );
+    // Without the region, every point goes out unnamed.
+    let page = export(&mirror.reader(), None, EPOCH, 0, 16, None, usize::MAX).unwrap();
+    assert!(page.points.iter().all(|point| point.label.is_none()));
+    // A page of driver records names none.
+    let page = export(
+        &mirror.reader(),
+        Some(&cells),
+        EPOCH,
+        5,
+        16,
+        None,
+        usize::MAX,
+    )
+    .unwrap();
+    assert!(page.points.is_empty());
+}
+
+/// R-CORE-1: a point counts in the byte bound the first time a record
+/// references it, at `MAX_POINT_REPLY`, so a reply stays within the bound
+/// plus one record, one journal and one point.
+#[test]
+fn a_point_counts_once_in_the_byte_bound() {
+    let mut mirror = mirror(16);
+    for sequence in 0..4 {
+        let id = u16::try_from(sequence + 1).unwrap();
+        let _ = mirror
+            .append(10, sequence, &application_payload(id))
+            .unwrap();
+    }
+    let record = crate::json::export_record_len_of(0, 10, 0, &application_payload(1));
+    // Room for the overhead, the journal, two records and one point.
+    let bound = crate::json::EXPORT_REPLY_OVERHEAD
+        + crate::api::MAX_JOURNAL_REPLY
+        + 2 * record
+        + crate::api::MAX_POINT_REPLY;
+    let page = export(&mirror.reader(), None, EPOCH, 0, 16, None, bound).unwrap();
+    // The second record brings a second point, which no longer fits.
+    assert_eq!(seqs(&page), vec![0]);
+    assert_eq!(page.next, 1);
+    // A label of 64 bytes, each escaped to two, fits the point's share.
+    let longest = "\"".repeat(64);
+    let (_manager, cells) = point_cells(&[(longest.as_str(), 1, 1)]);
+    let page = export(
+        &mirror.reader(),
+        Some(&cells),
+        EPOCH,
+        0,
+        1,
+        None,
+        usize::MAX,
+    )
+    .unwrap();
+    let reply = crate::json::trace_export(&page);
+    let empty = crate::json::trace_export(&ExportPage {
+        points: Vec::new(),
+        ..page.clone()
+    });
+    assert!(
+        reply.len() - empty.len() <= crate::api::MAX_POINT_REPLY,
+        "{reply}"
+    );
+}
+
+/// Review of #867: a record in a recycled or unknown journal has no client
+/// to check, so the id it references goes unnamed even when one cell holds
+/// it, also when another record of the id is in a live journal of the
+/// cell's client: a client that wrote another client's id into its own
+/// journal is never named after it once that journal is recycled.
+#[test]
+fn a_point_referenced_from_a_journal_with_no_client_is_unnamed() {
+    let mut mirror = mirror(16);
+    let recycled = RecycledJournal {
+        journal: 11,
+        stream: 3,
+        lane: Lane::ZERO,
+        incarnation: 1,
+        state: JournalState::Closed,
+        boundary: Some(64),
+        pairs: [NotedPublisher {
+            journal: 0,
+            attempted: 0,
+        }; MAX_RECYCLE_PAIRS],
+        pair_count: 0,
+        sequence: 2,
+    };
+    assert!(mirror.write_log(0, Some(&recycled)));
+    // Id 5 only from the recycled journal 11; id 6 from live journal 10
+    // (client 1) and from unknown journal 12; id 7 from journal 10 alone.
+    for (journal, sequence, id) in [(11, 0, 5u16), (10, 0, 6), (12, 0, 6), (10, 1, 7)] {
+        let _ = mirror
+            .append(journal, sequence, &application_payload(id))
+            .unwrap();
+    }
+    let (_manager, cells) = point_cells(&[("five", 1, 5), ("six", 1, 6), ("seven", 1, 7)]);
+    let page = export(
+        &mirror.reader(),
+        Some(&cells),
+        EPOCH,
+        0,
+        16,
+        None,
+        usize::MAX,
+    )
+    .unwrap();
+    let names: Vec<(u16, Option<&str>)> = page
+        .points
+        .iter()
+        .map(|point| (point.id, point.label.as_deref()))
+        .collect();
+    assert_eq!(names, vec![(5, None), (6, None), (7, Some("seven"))]);
 }

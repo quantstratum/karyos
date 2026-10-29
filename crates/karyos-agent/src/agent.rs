@@ -278,6 +278,7 @@ impl Agent {
         };
         Ok(crate::trace_export::export(
             tool.trace_mirror(),
+            Some(tool.client_counters()),
             instance,
             from,
             count,

@@ -198,6 +198,11 @@ pub const MAX_RECORD_REPLY: usize = 128 + karyos_sys::trace_mirror::MAX_MIRROR_P
 /// bytes each (six numbers of up to 20 digits, their keys, 184 bytes):
 /// `1024 + 8 x 192`, 2560 bytes.
 pub const MAX_JOURNAL_REPLY: usize = 1024 + karyos_sys::trace_mirror::MIRROR_RANGES * 192;
+/// The largest encoding of one exported application point (R-CORE-1):
+/// its fields, at most 128 bytes, and a label of up to 64 bytes, each
+/// possibly escaped to two (a point's label holds no control character):
+/// 384 bytes with room to spare.
+pub const MAX_POINT_REPLY: usize = 384;
 /// Records one `trace-export` request asks for by default.
 pub const EXPORT_DEFAULT: usize = 1024;
 /// The most records one request may ask for: the work of one read.
@@ -940,6 +945,22 @@ pub enum ExportJournal {
     },
 }
 
+/// An application trace point a page's records reference (R-CORE-1), as
+/// the client counters region showed it when the page was read: its label
+/// and client, or neither when no single live cell of the records' client
+/// names the id (released, never seen, or claimed twice). Ids are never
+/// reused within the instance, so an unnamed point is never another's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExportPoint {
+    /// The point id.
+    pub id: u16,
+    /// Its label, when named.
+    pub label: Option<String>,
+    /// The client that registered it, when named.
+    pub client: Option<u64>,
+}
+
 /// One page of a trace export (R-CORE-13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -960,6 +981,8 @@ pub struct ExportPage {
     pub head: u64,
     /// The journals the records name, by number.
     pub journals: Vec<ExportJournal>,
+    /// The application points the records reference, by id (R-CORE-1).
+    pub points: Vec<ExportPoint>,
     /// The records whose journal is `unknown` (recycled and gone from the
     /// log too): they are delivered, without their calibration.
     pub unknown_records: u64,
