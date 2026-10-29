@@ -40,7 +40,8 @@ config = 1
 
 # Admission: a driver admits only its own protocol version
 # (crates/karyos-ffi/tests/connect.rs; conformance op.connect.other.version).
-# Observed by scripts/compat-test.sh at 8e38dce9: the refusal does not
+# Observed by scripts/compat-test.sh (its run, head and command:
+# RELEASING.md, the wire compatibility matrix row): the refusal does not
 # name the driver's version across these releases (driver: None), because
 # the admission Refused message has no version field, on main too:
 # karyos#879.
@@ -59,7 +60,8 @@ outcome = "refuse"
 reason = "IncompatibleVersion: the main driver refuses protocol 2 (observed: AttachError::IncompatibleVersion { driver: None }; the refusal carries no version, karyos#879)"
 
 # Frame: the same frame version, 1, on both sides, which is not enough by
-# itself (R-CORE-36). Observed by scripts/compat-test.sh at 8e38dce9: a
+# itself (R-CORE-36). Observed by scripts/compat-test.sh (its run, head
+# and command: RELEASING.md, the wire compatibility matrix row): a
 # karyos:udp publication on one release's karyosd and a subscription on
 # the other's, on loopback, 200 messages received whole and in order, in
 # each direction.
@@ -78,20 +80,24 @@ outcome = "interoperate"
 reason = "observed by scripts/compat-test.sh: a 0.1.0-alpha.2 sender and a main receiver, 200 of 200 in order"
 
 # C ABI: owner item 48, exact 0.y and a library patch at least the
-# header's.
+# header's. From is the header a client was compiled against, to the
+# library it runs on. Observed by scripts/compat-test.sh (as above;
+# scripts/compat-probe/c_abi.c): a client of one tree's karyos.h linked
+# against the other tree's libkaryos applies the header's rule, and the
+# one it accepts runs a driver through the calls both releases share.
 [[entry]]
 surface = "c_abi"
 from = "0.1.0-alpha.2"
 to = "main"
 outcome = "interoperate"
-reason = "exact-0y-min-patch: a 0.1.1 header on a 0.1.5 library (same 0.1 line, library patch 5 >= 1)"
+reason = "observed by scripts/compat-test.sh: a 0.1.1 header's client on the 0.1.5 library accepts it (same 0.1 line, patch 5 >= 1) and runs a driver"
 
 [[entry]]
 surface = "c_abi"
 from = "main"
 to = "0.1.0-alpha.2"
 outcome = "refuse"
-reason = "exact-0y-min-patch: a 0.1.5 header on a 0.1.1 library (library patch 1 < 5); a binding refuses it at load"
+reason = "observed by scripts/compat-test.sh: a 0.1.5 header's client on the 0.1.1 library refuses it at karyos_abi_version (patch 1 < 5)"
 
 # The Archive's control messages are reached only through an attached
 # client, which admission refuses for this pair.

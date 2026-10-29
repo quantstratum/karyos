@@ -300,14 +300,20 @@ impl Reader<'_> {
                         b'r' => '\r',
                         b't' => '\t',
                         b'u' => {
-                            let mut code = 0u32;
-                            for _ in 0..4 {
-                                let digit = char::from(self.next()?)
-                                    .to_digit(16)
-                                    .ok_or(CompatError::BadEscape)?;
-                                code = code * 16 + digit;
-                            }
-                            // A surrogate half alone is not a character.
+                            let code = self.hex4()?;
+                            // A high surrogate takes the low one of its
+                            // pair from the next escape; either half alone
+                            // is not a character.
+                            let code = if (0xD800..0xDC00).contains(&code) {
+                                self.expect(b"\\u").map_err(|_| CompatError::BadEscape)?;
+                                let low = self.hex4()?;
+                                if !(0xDC00..0xE000).contains(&low) {
+                                    return Err(CompatError::BadEscape);
+                                }
+                                0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                            } else {
+                                code
+                            };
                             char::from_u32(code).ok_or(CompatError::BadEscape)?
                         }
                         _ => return Err(CompatError::BadEscape),
@@ -319,6 +325,18 @@ impl Reader<'_> {
                 byte => out.push(byte),
             }
         }
+    }
+
+    /// The four hex digits of a `\u` escape.
+    fn hex4(&mut self) -> Result<u32, CompatError> {
+        let mut code = 0u32;
+        for _ in 0..4 {
+            let digit = char::from(self.next()?)
+                .to_digit(16)
+                .ok_or(CompatError::BadEscape)?;
+            code = code * 16 + digit;
+        }
+        Ok(code)
     }
 
     fn integer(&mut self) -> Result<u64, CompatError> {
@@ -543,8 +561,8 @@ pub fn matrix() -> Result<Matrix, CompatError> {
     Matrix::read(MATRIX)
 }
 
-/// The fields of a versions object the matrix knows, by path.
-const KNOWN: [&str; 8] = [
+/// The top-level fields of a versions object the matrix knows.
+const KNOWN: [&str; 9] = [
     "schema",
     "schema_version",
     "core",
@@ -553,16 +571,45 @@ const KNOWN: [&str; 8] = [
     "wire",
     "config",
     "backends",
+    "features",
 ];
 
-/// One side of a pair: its tuple, and the fields the matrix does not know.
+/// The objects of a versions object: each one's keys, and the id of the
+/// rule its versions are compared under, which this matrix's entries
+/// assume (`None` for an object without a rule).
+const OBJECTS: [(&str, &[&str], Option<&str>); 5] = [
+    ("core", &["release"], None),
+    ("protocol", &["admission", "frame", "rule"], Some("exact")),
+    ("c_abi", &["version", "rule"], Some("exact-0y-min-patch")),
+    (
+        "wire",
+        &[
+            "frame",
+            "archive_control",
+            "cluster_log",
+            "group_record",
+            "capture_contract",
+            "archive_durable",
+            "rule",
+        ],
+        Some("exact"),
+    ),
+    ("config", &["schema_version", "rule"], Some("exact")),
+];
+
+/// The keys of each entry of `backends`.
+const BACKEND_KEYS: [&str; 2] = ["name", "compiled"];
+
+/// One side of a pair: its tuple, and what in it the matrix does not know.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Side {
     /// The versions tuple.
     pub tuple: Tuple,
-    /// Top-level fields beyond the ones the matrix knows (`features` is
-    /// known and ignored): additive fields of a newer `--versions`, which
-    /// make the pair not covered.
+    /// What the matrix does not know, by path: a field at any depth beyond
+    /// the known ones (`protocol.new_surface`), a rule other than the one
+    /// its entries assume (`c_abi.rule=semver`), a missing rule, or
+    /// another schema version. Any of them makes the pair not covered:
+    /// the decision fails closed, never interoperate by a guess.
     pub unknown: Vec<String>,
 }
 
@@ -571,7 +618,8 @@ pub struct Side {
 /// # Errors
 ///
 /// The reader's errors, and [`CompatError::Schema`] for another schema, a
-/// missing field or a field of the wrong type.
+/// missing field, a field of the wrong type, or a `wire.frame` other than
+/// `protocol.frame`.
 pub fn side(text: &str) -> Result<Side, CompatError> {
     let json = parse(text)?;
     let schema = |what: &str| CompatError::Schema(what.to_owned());
@@ -581,10 +629,61 @@ pub fn side(text: &str) -> Result<Side, CompatError> {
     if json.get("schema") != Some(&Json::String(crate::versions::SCHEMA.to_owned())) {
         return Err(schema("schema"));
     }
-    if json.get("schema_version")
-        != Some(&Json::Integer(u64::from(crate::versions::SCHEMA_VERSION)))
-    {
-        return Err(schema("schema_version"));
+    match json.get("schema_version") {
+        Some(Json::Integer(version)) if *version == u64::from(crate::versions::SCHEMA_VERSION) => {}
+        // Another version of the schema: nothing in it is read by a guess.
+        Some(Json::Integer(version)) => {
+            return Ok(Side {
+                tuple: Tuple::default(),
+                unknown: vec![format!("schema_version={version}")],
+            });
+        }
+        _ => return Err(schema("schema_version")),
+    }
+    let mut unknown: Vec<String> = fields
+        .iter()
+        .map(|(name, _)| name)
+        .filter(|name| !KNOWN.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    for (name, keys, rule) in OBJECTS {
+        let Some(object) = json.get(name) else {
+            continue;
+        };
+        let Json::Object(members) = object else {
+            return Err(schema(name));
+        };
+        unknown.extend(
+            members
+                .iter()
+                .filter(|(key, _)| !keys.contains(&key.as_str()))
+                .map(|(key, _)| format!("{name}.{key}")),
+        );
+        if let Some(expected) = rule {
+            match object.get("rule") {
+                Some(Json::String(id)) if id == expected => {}
+                Some(Json::String(id)) => unknown.push(format!("{name}.rule={id}")),
+                None => unknown.push(format!("{name}.rule missing")),
+                Some(_) => return Err(schema(&format!("{name}.rule"))),
+            }
+        }
+    }
+    match json.get("backends") {
+        None => {}
+        Some(Json::Array(backends)) => {
+            for (index, backend) in backends.iter().enumerate() {
+                let Json::Object(members) = backend else {
+                    return Err(schema("backends"));
+                };
+                unknown.extend(
+                    members
+                        .iter()
+                        .filter(|(key, _)| !BACKEND_KEYS.contains(&key.as_str()))
+                        .map(|(key, _)| format!("backends[{index}].{key}")),
+                );
+            }
+        }
+        Some(_) => return Err(schema("backends")),
     }
     let integer = |path: [&str; 2]| match json.get(path[0]).and_then(|object| object.get(path[1])) {
         Some(Json::Integer(value)) => Ok(Some(*value)),
@@ -596,9 +695,17 @@ pub fn side(text: &str) -> Result<Side, CompatError> {
         None => None,
         Some(_) => return Err(schema("c_abi.version")),
     };
+    let frame = integer(["protocol", "frame"])?;
+    // The wire object repeats the frame version: one value, or the object
+    // contradicts itself.
+    if let Some(wire_frame) = integer(["wire", "frame"])? {
+        if Some(wire_frame) != frame {
+            return Err(schema("wire.frame differs from protocol.frame"));
+        }
+    }
     let tuple = Tuple {
         admission: integer(["protocol", "admission"])?,
-        frame: integer(["protocol", "frame"])?,
+        frame,
         c_abi,
         archive_control: integer(["wire", "archive_control"])?,
         cluster_log: integer(["wire", "cluster_log"])?,
@@ -607,12 +714,6 @@ pub fn side(text: &str) -> Result<Side, CompatError> {
         archive_durable: integer(["wire", "archive_durable"])?,
         config: integer(["config", "schema_version"])?,
     };
-    let unknown = fields
-        .iter()
-        .map(|(name, _)| name)
-        .filter(|name| !KNOWN.contains(&name.as_str()) && *name != "features")
-        .cloned()
-        .collect();
     Ok(Side { tuple, unknown })
 }
 

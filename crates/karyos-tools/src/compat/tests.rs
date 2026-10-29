@@ -112,6 +112,76 @@ fn an_unknown_tuple_or_field_is_not_covered() {
     assert_eq!(decide(&matrix, &newer, &main).outcome, Outcome::NotCovered);
 }
 
+/// The decision fails closed at every depth: a field inside an object, a
+/// rule other than the one the matrix's entries assume, a missing rule,
+/// a backend's new key or another schema version makes the pair not
+/// covered (exit 2), and names what it did not know by path; this
+/// build's own object has nothing unknown at any depth.
+#[test]
+fn an_unknown_nested_field_or_rule_is_not_covered() {
+    let matrix = matrix().unwrap();
+    let main = this_side();
+    assert!(main.unknown.is_empty(), "{:?}", main.unknown);
+    let own = crate::versions::current().json();
+    let rows: [(&str, &str, &str); 7] = [
+        (
+            "\"protocol\":{",
+            "\"protocol\":{\"new_surface\":1,",
+            "protocol.new_surface",
+        ),
+        ("\"wire\":{", "\"wire\":{\"telemetry\":1,", "wire.telemetry"),
+        (
+            "\"config\":{",
+            "\"config\":{\"profile\":\"x\",",
+            "config.profile",
+        ),
+        ("\"core\":{", "\"core\":{\"build\":\"x\",", "core.build"),
+        (
+            "\"rule\":\"exact-0y-min-patch\"",
+            "\"rule\":\"semver\"",
+            "c_abi.rule=semver",
+        ),
+        (",\"rule\":\"exact-0y-min-patch\"", "", "c_abi.rule missing"),
+        (
+            "\"compiled\":true",
+            "\"compiled\":true,\"queue\":2",
+            "backends[0].queue",
+        ),
+    ];
+    for (from, to, path) in rows {
+        assert!(own.contains(from), "{from}");
+        let changed = side(&own.replacen(from, to, 1)).unwrap();
+        assert_eq!(changed.unknown, vec![path.to_owned()], "{path}");
+        let decision = decide(&matrix, &changed, &main);
+        assert_eq!(decision.outcome, Outcome::NotCovered, "{path}");
+        assert_eq!(decision.exit(), EXIT_NOT_COVERED, "{path}");
+        assert!(
+            decision
+                .surfaces
+                .iter()
+                .all(|surface| surface.outcome == Outcome::NotCovered),
+            "{path}"
+        );
+    }
+    // Another schema version is read no further.
+    let next = side(&own.replacen("\"schema_version\":1", "\"schema_version\":2", 1)).unwrap();
+    assert_eq!(next.unknown, vec!["schema_version=2".to_owned()]);
+    assert_eq!(decide(&matrix, &main, &next).exit(), EXIT_NOT_COVERED);
+}
+
+/// The frame version appears twice, in `protocol` and in `wire`: an
+/// object whose two disagree is refused as a schema error.
+#[test]
+fn a_wire_frame_other_than_the_protocol_frame_is_refused() {
+    let own = crate::versions::current().json();
+    let tuple = this_build();
+    let frame = tuple.frame.unwrap();
+    let from = format!("\"wire\":{{\"frame\":{frame}");
+    assert!(own.contains(&from));
+    let other = own.replacen(&from, &format!("\"wire\":{{\"frame\":{}", frame + 1), 1);
+    assert!(matches!(side(&other), Err(CompatError::Schema(_))));
+}
+
 /// Each error class of the reader, typed.
 #[test]
 fn each_reader_error_is_typed() {
@@ -138,6 +208,21 @@ fn each_reader_error_is_typed() {
     for (text, expected) in rows {
         assert_eq!(parse(text), Err(expected.clone()), "{text}");
     }
+    // A surrogate pair is one character; a high half without its low
+    // one, or before another high one, is not.
+    assert_eq!(
+        parse(r#"{"a":"\ud83d\ude00"}"#),
+        Ok(Json::Object(vec![(
+            "a".to_owned(),
+            Json::String("\u{1F600}".to_owned())
+        )]))
+    );
+    assert_eq!(
+        parse(r#"{"a":"\ud83d\ud83d"}"#),
+        Err(CompatError::BadEscape)
+    );
+    assert_eq!(parse(r#"{"a":"\ud83dx"}"#), Err(CompatError::BadEscape));
+    assert_eq!(parse(r#"{"a":"\ude00"}"#), Err(CompatError::BadEscape));
     assert_eq!(parse(r#"{"a":1.5}"#), Err(CompatError::Number));
     assert_eq!(parse(r#"{"a":01}"#), Err(CompatError::Number));
     assert!(matches!(parse("{a:1}"), Err(CompatError::Syntax(_))));
@@ -160,8 +245,11 @@ fn another_schema_is_refused() {
     for text in [
         "[]",
         r#"{"schema":"other","schema_version":1}"#,
-        r#"{"schema":"karyos-versions","schema_version":2}"#,
-        r#"{"schema":"karyos-versions","schema_version":1,"protocol":{"admission":"3"}}"#,
+        r#"{"schema":"karyos-versions","schema_version":"1"}"#,
+        r#"{"schema":"karyos-versions","schema_version":1,"protocol":{"admission":"3","rule":"exact"}}"#,
+        r#"{"schema":"karyos-versions","schema_version":1,"protocol":3}"#,
+        r#"{"schema":"karyos-versions","schema_version":1,"protocol":{"rule":3}}"#,
+        r#"{"schema":"karyos-versions","schema_version":1,"backends":[1]}"#,
     ] {
         assert!(matches!(side(text), Err(CompatError::Schema(_))), "{text}");
     }

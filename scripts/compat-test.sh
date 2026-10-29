@@ -17,6 +17,10 @@
 #   frame      a karyos:udp publication on one build's karyosd and a
 #              subscription on the other's, on loopback (the same frame
 #              version on both: R-CORE-36's case)
+#   c_abi      a C client compiled against one build's karyos.h and
+#              linked against the other's libkaryos
+#              (scripts/compat-probe/c_abi.c): the header's version rule,
+#              then a driver through the calls both share
 # A case whose observation differs from the matrix fails the run. An entry
 # the matrix leaves not_covered prints what was observed, so it can be
 # recorded.
@@ -56,6 +60,8 @@ echo "new $(git -C /new rev-parse HEAD 2>/dev/null || echo '?') old $(git -C /ol
 build() { # <side>
     CARGO_TARGET_DIR="/target/$1" cargo build -q --release --locked \
         --manifest-path "/$1/Cargo.toml" -p karyos-tools --bin karyosd
+    CARGO_TARGET_DIR="/target/$1" cargo build -q --release --locked \
+        --manifest-path "/$1/Cargo.toml" -p karyos-ffi --lib
     # The probe, against this side's facade, pinned by its lockfile.
     local probe="/tmp/probe-$1"
     rm -rf "$probe" && mkdir -p "$probe/src"
@@ -155,6 +161,22 @@ for pair in "new new" "old old" "new old" "old new"; do
     else
         check frame "$1" "$2" "$outcome" "$publish; $line"
     fi
+done
+
+# C ABI: a client of one build's header on the other build's library.
+for pair in "new old" "old new"; do
+    read -r a b <<<"$pair"
+    set -- "$a" "$b"
+    client="/tmp/c-abi-$1-on-$2"
+    cc -std=c11 -Wall -Werror -I"/$1/crates/karyos-ffi/include" \
+        /new/scripts/compat-probe/c_abi.c -o "$client" \
+        -L"/target/$2/release" -lkaryos_ffi -Wl,-rpath,"/target/$2/release"
+    line="$("$client")"
+    case "$line" in
+        "c_abi ok "*) check c_abi "$1" "$2" interoperate "$line" ;;
+        "c_abi refused "*) check c_abi "$1" "$2" refuse "$line" ;;
+        *) check c_abi "$1" "$2" misbehave "$line" ;;
+    esac
 done
 
 echo "compat-test: $failures failure(s)"
