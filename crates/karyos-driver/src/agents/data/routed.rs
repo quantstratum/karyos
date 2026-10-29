@@ -39,7 +39,9 @@ use karyos_sys::log_buffer::{ReadError, ReadOrigin, ReadOutcome};
 use super::super::repair::RouteRepairCounts;
 use super::super::{AgentError, AgentKind, EndpointId, Half};
 use super::removal::{EosSent, RemovalStep};
-use super::{Limit, Outbound, OutboundError, STAGED_PER_LANE, align_frame, messages_started};
+use super::{
+    Limit, Outbound, OutboundError, STAGED_PER_LANE, TxDemand, align_frame, messages_started,
+};
 use crate::guard_gate::{GateHead, GuardGate};
 use crate::repair::scheduler::RepairBudget;
 
@@ -248,6 +250,9 @@ pub(super) struct RouteSlot {
     reset_requested: Option<u64>,
     /// When it last submitted DATA or a PATH_HB was posted on it.
     last_sent: Option<u64>,
+    /// When its last open failed and in which epoch: the next try waits
+    /// `open_spacing` (karyos#859).
+    open_tried: Option<(BackendEpoch, u64)>,
     /// Its window of selected and skipped bytes (RP-8).
     window: PathWindow,
     /// It skipped something in the window: `Degraded`.
@@ -439,6 +444,7 @@ impl Routed {
                     needs_reset: false,
                     reset_requested: None,
                     last_sent: None,
+                    open_tried: None,
                     window: PathWindow::default(),
                     degraded: false,
                     left: false,
@@ -702,6 +708,50 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     #[must_use]
     pub fn is_routed(&self) -> bool {
         self.routed.is_some()
+    }
+
+    /// What it takes of each endpoint it sends on, once open (karyos#859):
+    /// per route, its lane queues of `STAGED_PER_LANE` slots each and, if
+    /// reliable, a repair queue of one slot (the sender enables repairs on
+    /// a reliable publication when it takes it, R4). A publication on one path has
+    /// one route, a routed one one per path, a multi-destination one one
+    /// per destination it has now.
+    #[must_use]
+    pub fn tx_demand(&self) -> Vec<(EndpointId, TxDemand)> {
+        let route = self.route_demand(self.reliable);
+        if let Some(fanout) = self.fanout.as_deref() {
+            let total = fanout
+                .addresses()
+                .fold(TxDemand::default(), |sum, _| sum.plus(route));
+            return vec![(self.endpoint, total)];
+        }
+        self.route_endpoints()
+            .map(|endpoint| (endpoint, route))
+            .collect()
+    }
+
+    /// What one more destination of a multi-destination publication takes
+    /// of its endpoint once open (karyos#859): a route with its lane
+    /// queues and, if reliable, a repair queue. `None` for one whose paths
+    /// are fixed.
+    #[must_use]
+    pub fn destination_demand(&self) -> Option<TxDemand> {
+        self.fanout
+            .as_deref()
+            .map(|_| self.route_demand(self.reliable))
+    }
+
+    /// What one route takes: its lane queues of `STAGED_PER_LANE` slots
+    /// and, with `repair`, a repair queue of one slot.
+    fn route_demand(&self, repair: bool) -> TxDemand {
+        let lanes = u32::try_from(self.readers.len()).unwrap_or(u32::MAX);
+        TxDemand {
+            routes: 1,
+            queues: lanes.saturating_add(u32::from(repair)),
+            slots: lanes
+                .saturating_mul(u32::from(STAGED_PER_LANE))
+                .saturating_add(u32::from(repair)),
+        }
     }
 
     /// The endpoints of its paths, the founding one first; one for a
@@ -1208,13 +1258,22 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         self.routed.as_deref().map(Routed::sender)
     }
 
-    /// Opens each route's queues on its endpoint, when its epoch is new.
-    /// Returns whether at least one route is open.
-    fn open_routes<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) -> bool {
+    /// Opens each route's queues on its endpoint, when its epoch is new. A
+    /// route whose open failed tries again `open_spacing` later in the same
+    /// epoch, and one refused for an endpoint limit counts in
+    /// `endpoint_limits` (karyos#859). Returns whether at least one route
+    /// is open.
+    fn open_routes<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+    ) -> bool {
+        let spacing = self.open_spacing;
         let Some(routed) = self.routed.as_deref_mut() else {
             return false;
         };
         let mut open = false;
+        let mut limit = None;
         // The routes that can send, as this pass starts: opened and not
         // waiting for a reset.
         let mut live = [false; MAX_ROUTES];
@@ -1233,6 +1292,11 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 open = true;
                 continue;
             }
+            if slot.open_tried.is_some_and(|(tried, at)| {
+                tried == epoch && now.checked_sub(at).is_none_or(|age| age < spacing)
+            }) {
+                continue;
+            }
             #[cfg(test)]
             if routed.fail_open.get(index).copied().unwrap_or(false) {
                 self.counters.bump(|c| &mut c.route_failures, 1);
@@ -1241,9 +1305,12 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             let route = match tx.add_route(slot.destination) {
                 Ok(route) => route,
                 Err(error) => {
+                    slot.open_tried = Some((epoch, now));
                     self.counters.bump(|c| &mut c.route_failures, 1);
                     if error == karyos_io::backend::RouteError::RouteLimit {
+                        self.counters.bump(|c| &mut c.endpoint_limits, 1);
                         super::note_limited(&mut self.limited, slot.endpoint, epoch);
+                        limit = Some((epoch, crate::error::EndpointLimit::Routes));
                     }
                     continue;
                 }
@@ -1261,9 +1328,12 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                         }
                     }
                     Err(error) => {
+                        slot.open_tried = Some((epoch, now));
                         self.counters.bump(|c| &mut c.queue_failures, 1);
                         if super::fanout::queue_limit(error) {
+                            self.counters.bump(|c| &mut c.endpoint_limits, 1);
                             super::note_limited(&mut self.limited, slot.endpoint, epoch);
+                            limit = Some((epoch, super::endpoint_limit(error)));
                         }
                         for queue in slot.queues.iter().take(lane) {
                             let _ = tx.close_queue(*queue, &mut self.report);
@@ -1345,6 +1415,22 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             slot.needs_reset = false;
             slot.reset_requested = None;
             open = true;
+        }
+        // A route with a half left unopened this pass: its limit holds.
+        let unopened = self.routed.as_deref().is_some_and(|routed| {
+            routed.routes.iter().any(|slot| {
+                halves.iter().any(|(held, half)| match half {
+                    Half::Tx(tx) => {
+                        *held == slot.endpoint && slot.opened != Some(tx.capabilities().epoch)
+                    }
+                    Half::Rx(_) => false,
+                })
+            })
+        });
+        if let Some((epoch, limit)) = limit {
+            self.note_limit(epoch, limit);
+        } else if open && !unopened {
+            self.note_opened();
         }
         open
     }
@@ -1606,7 +1692,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         now: u64,
     ) -> Result<u32, AgentError> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
-        if !self.open_routes(halves) {
+        if !self.open_routes(halves, now) {
             // No route this cycle, but a guard close still applies.
             self.guard_tick(now);
             return Ok(0);

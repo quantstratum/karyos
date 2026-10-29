@@ -124,6 +124,11 @@ fn refusal(error: &DriverError) -> ErrorCode {
 fn refusal_detail(error: &DriverError, detail: u64) -> u64 {
     match error {
         DriverError::StreamTooLarge { bytes, .. } => *bytes,
+        DriverError::EndpointCapacity {
+            limit,
+            capacity,
+            needed,
+        } => limit.detail(*capacity, *needed),
         _ => detail,
     }
 }

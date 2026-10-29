@@ -106,6 +106,20 @@ pub enum DriverError {
     /// added, active or being removed).
     #[error("too many network publications")]
     NetworkPublicationsFull,
+    /// An endpoint the publication would send on cannot hold it: with what
+    /// its other publications hold and the control reserve, `needed`
+    /// passes the endpoint's `capacity` of `limit` (karyos#859). A client
+    /// that asks by channel URI sees `ErrorCode::ResourcesUnavailable`,
+    /// with the detail word [`EndpointLimit::detail`].
+    #[error("endpoint {limit:?}: {needed} needed, {capacity} held")]
+    EndpointCapacity {
+        /// The limit passed.
+        limit: EndpointLimit,
+        /// The endpoint's capacity of it.
+        capacity: u32,
+        /// What it would take with this publication.
+        needed: u32,
+    },
     /// `AgentConfig::subscriptions` distinct network subscriptions are
     /// held: the receiver's table is full.
     #[error("too many network subscriptions")]
@@ -442,4 +456,27 @@ pub enum DriverError {
     /// A lower layer failed.
     #[error(transparent)]
     Sys(#[from] SysError),
+}
+
+/// An endpoint limit a publication may pass (karyos#859).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointLimit {
+    /// TX slots (`tx_slots`).
+    TxSlots = 1,
+    /// TX queues (`max_queues`).
+    Queues = 2,
+    /// Routes (`max_routes`).
+    Routes = 3,
+}
+
+impl EndpointLimit {
+    /// The detail word of its refusal: the limit in the top byte, the
+    /// capacity in the next three bytes (saturated), what it would take in
+    /// the low four.
+    #[must_use]
+    pub fn detail(self, capacity: u32, needed: u32) -> u64 {
+        (u64::from(self as u8) << 56)
+            | (u64::from(capacity.min(0x00FF_FFFF)) << 32)
+            | u64::from(needed)
+    }
 }

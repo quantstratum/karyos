@@ -259,6 +259,203 @@ fn a_network_publication_refuses_a_cutover() {
     );
 }
 
+/// karyos#859: a publication its endpoint could never open is refused at
+/// the add, never accepted and silent. One endpoint's 256 TX slots hold the
+/// control reserve (8 routes of 4 slots) and 24 reliable single-lane
+/// publications of 9 slots each (a lane queue of 8 and a repair queue of
+/// 1): the 25th is refused with the limit, the capacity and what it would
+/// take.
+/// A removal's room is free once it has ended: an add refused during it is
+/// accepted after.
+#[test]
+fn a_publication_its_endpoint_cannot_hold_is_refused() {
+    use crate::error::EndpointLimit;
+
+    let mut driver = driver();
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let mut held = Vec::new();
+    for stream in 0..24 {
+        held.push(
+            driver
+                .add_network_publication(aggregate(100 + stream, 1), &channel(destination.clone()))
+                .unwrap(),
+        );
+    }
+    let refused = driver.add_network_publication(aggregate(200, 1), &channel(destination.clone()));
+    assert_eq!(
+        refused,
+        Err(DriverError::EndpointCapacity {
+            limit: EndpointLimit::TxSlots,
+            capacity: 256,
+            needed: 32 + 25 * 9,
+        })
+    );
+    // A refused add leaves nothing behind: the same stream again at once is
+    // refused for capacity again, never `DuplicateStream`.
+    assert!(matches!(
+        driver.add_network_publication(aggregate(200, 1), &channel(destination.clone())),
+        Err(DriverError::EndpointCapacity { .. })
+    ));
+    assert_eq!(
+        EndpointLimit::TxSlots.detail(256, 257),
+        (1 << 56) | (256 << 32) | 257,
+        "the detail word"
+    );
+    // A removal frees its room when it ends, not when it is asked: an add
+    // in between is refused, retryable, and the same add is accepted once
+    // the removal has ended.
+    let first = held.remove(0);
+    driver.remove_aggregate(&first).unwrap();
+    assert!(matches!(
+        driver.add_network_publication(aggregate(201, 1), &channel(destination.clone())),
+        Err(DriverError::EndpointCapacity { .. })
+    ));
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&first).is_none()
+    });
+    let _ = driver
+        .add_network_publication(aggregate(201, 1), &channel(destination))
+        .unwrap();
+}
+
+/// karyos#859: a destination added at run time takes a route and its
+/// queues of the endpoint like one at the add, so an addition the endpoint
+/// cannot hold is refused and one in flight counts. 23 reliable
+/// single-lane publications and a reliable multi-destination one with one
+/// destination hold 32 + 24 * 9 slots: a second destination would take 257
+/// of 256. Once a publication's removal has ended, it is taken, and an
+/// addition the sender refuses gives its room back at its answer.
+#[test]
+fn a_destination_its_endpoint_cannot_hold_is_refused() {
+    use crate::agents::data::DestinationChange;
+    use crate::error::EndpointLimit;
+
+    let mut driver = driver();
+    let sockets = [receiver(), receiver()];
+    let destination = Destination::Unicast(sockets[0].local_addr().unwrap());
+    let mut held = Vec::new();
+    for stream in 0..23 {
+        held.push(
+            driver
+                .add_network_publication(aggregate(100 + stream, 1), &channel(destination.clone()))
+                .unwrap(),
+        );
+    }
+    let fanout = driver
+        .add_network_publication(
+            aggregate(300, 1),
+            &channel(Destination::MultiDestination {
+                destinations: vec![sockets[0].local_addr().unwrap()],
+                control: None,
+                mode: karyos_protocol::channel::ControlMode::Manual,
+            }),
+        )
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&fanout) == Some(NetworkPublicationState::Active)
+    });
+    let added = sockets[1].local_addr().unwrap();
+    assert_eq!(
+        driver.add_network_destination(&fanout, added),
+        Err(DriverError::EndpointCapacity {
+            limit: EndpointLimit::TxSlots,
+            capacity: 256,
+            needed: 32 + 25 * 9,
+        })
+    );
+    let first = held.remove(0);
+    driver.remove_aggregate(&first).unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&first).is_none()
+    });
+    driver.add_network_destination(&fanout, added).unwrap();
+    // The addition in flight holds its room: a publication is refused.
+    assert!(matches!(
+        driver.add_network_publication(aggregate(200, 1), &channel(destination.clone())),
+        Err(DriverError::EndpointCapacity { .. })
+    ));
+    let answered = |driver: &mut EmbeddedDriver| {
+        let mut answers = Vec::new();
+        until(driver, |driver| {
+            answers = driver.take_network_destination_changes(&fanout);
+            !answers.is_empty()
+        });
+        answers
+    };
+    assert_eq!(answered(&mut driver), [(added, DestinationChange::Added)]);
+    // An addition refused by the sender gives its room back at its
+    // answer: with one more removal ended, a destination already there is
+    // held and refused, then one publication fits and a second does not.
+    let second = held.remove(0);
+    driver.remove_aggregate(&second).unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&second).is_none()
+    });
+    driver.add_network_destination(&fanout, added).unwrap();
+    assert_eq!(answered(&mut driver), [(added, DestinationChange::Present)]);
+    let _ = driver
+        .add_network_publication(aggregate(200, 1), &channel(destination.clone()))
+        .unwrap();
+    assert!(matches!(
+        driver.add_network_publication(aggregate(201, 1), &channel(destination)),
+        Err(DriverError::EndpointCapacity { .. })
+    ));
+}
+
+/// karyos#859: an answer is matched to its change by destination and
+/// kind. A removal of an absent destination and an addition of it, posted
+/// back to back, answer `Absent` and `Added`: the `Absent` gives back
+/// nothing, so the added destination keeps its room and a publication
+/// that would pass the endpoint's 256 slots is still refused.
+#[test]
+fn an_absent_removal_keeps_the_room_of_an_addition_of_the_same_destination() {
+    use crate::agents::data::DestinationChange;
+
+    let mut driver = driver();
+    let sockets = [receiver(), receiver()];
+    let destination = Destination::Unicast(sockets[0].local_addr().unwrap());
+    for stream in 0..22 {
+        let _ = driver
+            .add_network_publication(aggregate(100 + stream, 1), &channel(destination.clone()))
+            .unwrap();
+    }
+    let fanout = driver
+        .add_network_publication(
+            aggregate(300, 1),
+            &channel(Destination::MultiDestination {
+                destinations: vec![sockets[0].local_addr().unwrap()],
+                control: None,
+                mode: karyos_protocol::channel::ControlMode::Manual,
+            }),
+        )
+        .unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&fanout) == Some(NetworkPublicationState::Active)
+    });
+    let added = sockets[1].local_addr().unwrap();
+    driver.remove_network_destination(&fanout, added).unwrap();
+    driver.add_network_destination(&fanout, added).unwrap();
+    let mut answers = Vec::new();
+    until(&mut driver, |driver| {
+        answers.extend(driver.take_network_destination_changes(&fanout));
+        answers.len() == 2
+    });
+    assert_eq!(
+        answers,
+        [
+            (added, DestinationChange::Absent),
+            (added, DestinationChange::Added)
+        ]
+    );
+    // 32 + 22 * 9 + 2 * 9 = 248 of 256 slots: one more publication of 9
+    // does not fit.
+    assert!(matches!(
+        driver.add_network_publication(aggregate(200, 1), &channel(destination)),
+        Err(DriverError::EndpointCapacity { .. })
+    ));
+}
+
 /// The network publications and stale aliases held at once are bounded by
 /// `AgentConfig::publications`: a publication beyond it is refused, and
 /// removals never overflow the stale-alias queue.

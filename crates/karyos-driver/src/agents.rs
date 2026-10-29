@@ -862,6 +862,9 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
         registration: u64,
         /// The destination.
         destination: std::net::SocketAddr,
+        /// Whether it was an addition (karyos#859: an answer is matched to
+        /// its change by both).
+        add: bool,
         /// What became of it.
         outcome: data::DestinationChange,
     },
@@ -981,6 +984,21 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
     Unsupported {
         /// The agent.
         agent: AgentKind,
+    },
+    /// Posted unsolicited into a free slot, and again each cycle until
+    /// posted (karyos#859): a publication's open was refused for an endpoint
+    /// limit (`limit`, once per epoch, at the first refusal), or it opened
+    /// after one (`None`). The driver shows it as
+    /// `NetworkPublicationState::Limited` until it opens.
+    PublicationLimit {
+        /// The endpoint.
+        endpoint: EndpointId,
+        /// Its alias.
+        alias: karyos_protocol::network::Alias,
+        /// Its registration.
+        registration: u64,
+        /// The limit that refused it, or `None` once it opened.
+        limit: Option<crate::error::EndpointLimit>,
     },
     /// An agent asks for an endpoint reset: on the sender, a publication on
     /// `endpoint` needs one before it can send again
@@ -1431,6 +1449,25 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         })
     }
 
+    /// What its TX half on `endpoint` has open now (tests, karyos#859).
+    #[cfg(test)]
+    pub(crate) fn tx_commitment(
+        &self,
+        endpoint: EndpointId,
+    ) -> Option<karyos_io::sockets::endpoint::TxCommitment> {
+        self.core.halves.iter().find_map(|(held, half)| match half {
+            Half::Tx(tx) if *held == endpoint => Some(tx.commitment()),
+            _ => None,
+        })
+    }
+
+    /// Its control routes open and closing on `endpoint` (tests,
+    /// karyos#859).
+    #[cfg(test)]
+    pub(crate) fn control_entries(&self, endpoint: EndpointId) -> usize {
+        self.role.control_entries(endpoint)
+    }
+
     /// The counters of its `index`-th publication's data path (tests).
     #[cfg(test)]
     pub(crate) fn outbound_counters(&self, index: usize) -> Option<data::OutboundCounters> {
@@ -1524,6 +1561,7 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         // A schedule violation's report, likewise.
         role.report_violations(|event| events.try_post(event).is_ok());
         role.report_removals(|event| events.try_post(event).is_ok());
+        role.report_limits(|event| events.try_post(event).is_ok());
         served
             .checked_add(work)
             .ok_or(AgentError::CountOverflow(AgentKind::Sender))

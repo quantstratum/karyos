@@ -231,10 +231,6 @@ impl QueueTable {
     }
 
     /// Slots not committed to an open queue.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by the sockets endpoint from P2.3 S2")
-    )]
     pub(crate) fn uncommitted(&self) -> u32 {
         self.uncommitted
     }

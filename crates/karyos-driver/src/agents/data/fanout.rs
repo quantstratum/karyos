@@ -1565,6 +1565,7 @@ impl<T: StreamTerms> Outbound<T> {
     /// Its destinations' quarantine (MD-14) and the spacing of counted
     /// open failures (`setup_interval`), from the sender's settings.
     pub(crate) fn set_destination_timing(&mut self, quarantine: u64, setup_interval: u64) {
+        self.open_spacing = setup_interval;
         if let Some(fanout) = self.fanout.as_deref_mut() {
             fanout.quarantine = quarantine;
             fanout.open_spacing = setup_interval;

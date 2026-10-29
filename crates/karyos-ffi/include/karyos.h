@@ -670,7 +670,14 @@ int32_t karyos_client_close(uint64_t client);
  * max_stream_bytes (karyos_driver_options or karyosd --max-stream-bytes)
  * is KARYOS_E_REFUSED,
  * detail code 24 with the lane's bytes in value; no retry of the same
- * uri succeeds. A channel the driver does not serve (CnC code 13) is
+ * uri succeeds. A karyos:udp publication its endpoint cannot hold
+ * (karyos#859) is KARYOS_E_REFUSED, detail code 4 (resources
+ * unavailable), with detail.value = limit << 56 | capacity << 32 |
+ * needed: limit 1 for TX slots, 2 for queues, 3 for routes; capacity the
+ * endpoint's (24 bits, saturated); needed what it would take with this
+ * publication. A retry can succeed once a removal on that endpoint has
+ * ended, which frees its room. A channel
+ * the driver does not serve (CnC code 13) is
  * KARYOS_E_UNSUPPORTED_CHANNEL, with 0 in detail.code and the driver's
  * detail in detail.value, the stream id.
  */

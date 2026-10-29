@@ -4890,6 +4890,7 @@ impl<T: StreamTerms> SenderRole<T> {
                         alias,
                         registration,
                         destination,
+                        add,
                         outcome,
                     },
                 ));
@@ -5090,6 +5091,42 @@ impl<T: StreamTerms> SenderRole<T> {
     /// (design 4.5; MD-7, MD-12). One the ring refused is posted again next
     /// cycle. A posted report retires the destination and hands its route
     /// and queues to the close list (design 3.7).
+    /// Its control routes on `endpoint`, open and closing (tests).
+    #[cfg(test)]
+    pub(super) fn control_entries(&self, endpoint: EndpointId) -> usize {
+        self.routes
+            .iter()
+            .find(|slot| slot.endpoint == Some(endpoint))
+            .map_or(0, |slot| slot.routes.entries().0)
+    }
+
+    /// Posts each publication's endpoint limit change through `post`
+    /// (karyos#859); one `post` refuses leaves the rest for the next cycle.
+    pub(super) fn report_limits<O: SocketOps>(
+        &mut self,
+        mut post: impl FnMut(AgentEvent<O, T>) -> bool,
+    ) {
+        for outbound in &mut self.publications {
+            let Some(limit) = outbound.limit_unreported() else {
+                continue;
+            };
+            let (endpoint, alias) = (outbound.endpoint(), outbound.alias());
+            let Some(identity) = self.sessions.identity(endpoint, alias) else {
+                continue;
+            };
+            let event = AgentEvent::PublicationLimit {
+                endpoint,
+                alias,
+                registration: identity.registration_id,
+                limit,
+            };
+            if !post(event) {
+                return;
+            }
+            outbound.limit_reported();
+        }
+    }
+
     pub(super) fn report_removals<O: SocketOps>(
         &mut self,
         mut post: impl FnMut(AgentEvent<O, T>) -> bool,

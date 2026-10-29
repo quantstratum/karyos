@@ -195,6 +195,16 @@ pub(super) struct TxCore {
 }
 
 impl TxCore {
+    /// What its open routes and queues take now (karyos#859).
+    pub(super) fn commitment(&self) -> TxCommitment {
+        let queues = self.ledger.queues();
+        TxCommitment {
+            routes: u32::try_from(self.routes.iter().count()).unwrap_or(u32::MAX),
+            queues: u32::try_from(queues.iter().count()).unwrap_or(u32::MAX),
+            slots: u32::from(self.config.tx_slots.get()).saturating_sub(queues.uncommitted()),
+        }
+    }
+
     /// Allocates the pool, its metadata and the tables for a validated
     /// configuration.
     ///
@@ -1387,4 +1397,16 @@ impl Drop for SocketsFrame<'_> {
             debug_assert!(released, "a dropped frame held a claim");
         }
     }
+}
+
+/// What a TX half's open routes and queues take of its tables
+/// ([`SocketsTx::commitment`](super::SocketsTx::commitment)).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxCommitment {
+    /// Open routes.
+    pub routes: u32,
+    /// Open queues.
+    pub queues: u32,
+    /// Slots committed to open queues: their `max_pending`, summed.
+    pub slots: u32,
 }

@@ -6505,3 +6505,117 @@ struct LimitCase {
     /// Cycles run before the reset is served.
     cycles: u64,
 }
+
+/// karyos#859: a publication whose endpoint has no room for its queues
+/// (here 4 TX slots, its lane queue takes 8) counts the failed open once
+/// as an endpoint limit and tries again `setup_interval` later, not every
+/// cycle.
+#[test]
+fn a_refused_open_counts_an_endpoint_limit_and_waits_its_spacing() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let config = AgentConfig::default();
+    let spacing = config.setup_interval;
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(8).unwrap());
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let term = publication(EndpointId(1)).term;
+    let (outbound, _log) =
+        super::super::data::testing::outbound(EndpointId(1), alias(), receiver, term, 1, false);
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound,
+        guard: None,
+        roles: None,
+    });
+    let mut endpoint = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+    endpoint.tx_slots = std::num::NonZeroU16::new(4).unwrap();
+    let (tx, _rx) = SocketsEndpoint::open(&endpoint, InstanceId::FIRST, ScriptedSocket::new())
+        .unwrap()
+        .split()
+        .unwrap();
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
+    // Many cycles within one spacing: one try.
+    for now in 2..2 + 100 {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    let counters = sender.publications[0].counters();
+    assert_eq!(counters.queue_failures, 1, "{counters:?}");
+    assert_eq!(counters.endpoint_limits, 1, "{counters:?}");
+    // A spacing later: the next try.
+    let _ = sender.duty(&mut halves, 2 + spacing).unwrap();
+    let counters = sender.publications[0].counters();
+    assert_eq!(counters.queue_failures, 2, "{counters:?}");
+    assert_eq!(counters.endpoint_limits, 2, "{counters:?}");
+}
+
+/// karyos#859: the limit is reported once per epoch, at the first refused
+/// open (`PublicationLimit` with the limit), and its end once, at the open
+/// (`None`); repeated refusals in the epoch post nothing more.
+#[test]
+fn a_limited_open_is_reported_once_and_ends_at_the_open() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use crate::error::EndpointLimit;
+
+    let config = AgentConfig::default();
+    let spacing = config.setup_interval;
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(8).unwrap());
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let term = publication(EndpointId(1)).term;
+    let (outbound, _log) =
+        super::super::data::testing::outbound(EndpointId(1), alias(), receiver, term, 1, false);
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound,
+        guard: None,
+        roles: None,
+    });
+    let half = |slots: u16, instance: u32| {
+        let mut endpoint = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+        endpoint.tx_slots = std::num::NonZeroU16::new(slots).unwrap();
+        let instance = InstanceId::new(std::num::NonZeroU32::new(instance).unwrap());
+        let (tx, _rx) = SocketsEndpoint::open(&endpoint, instance, ScriptedSocket::new())
+            .unwrap()
+            .split()
+            .unwrap();
+        super::super::Half::Tx(Box::new(tx))
+    };
+    let mut halves: Halves = vec![(EndpointId(1), half(4, 1))];
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
+    let mut reported = Vec::new();
+    let mut run = |sender: &mut super::SenderRole, halves: &mut Halves, now: u64| {
+        let _ = sender.duty(halves, now).unwrap();
+        sender.report_limits(|event: AgentEvent<OsSocket>| {
+            if let AgentEvent::PublicationLimit { limit, .. } = event {
+                reported.push(limit);
+            }
+            true
+        });
+    };
+    // Refused at 2 and again a spacing later, in one epoch: one report.
+    run(&mut sender, &mut halves, 2);
+    run(&mut sender, &mut halves, 2 + spacing);
+    run(&mut sender, &mut halves, 2 + 2 * spacing);
+    assert_eq!(sender.publications[0].counters().endpoint_limits, 3);
+    // Room on its endpoint (a larger one in its place) at the next try: it
+    // opens, and that is reported once.
+    halves[0].1 = half(256, 2);
+    run(&mut sender, &mut halves, 2 + 3 * spacing);
+    run(&mut sender, &mut halves, 3 + 3 * spacing);
+    assert_eq!(reported, vec![Some(EndpointLimit::TxSlots), None]);
+}

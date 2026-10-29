@@ -3318,3 +3318,69 @@ fn a_network_publication_above_the_options_cap_is_refused_with_code_24() {
     assert_eq!(detail.code, 24, "StreamTooLarge");
     assert!(detail.value > 1, "the lane's bytes: {}", detail.value);
 }
+
+/// karyos#859: a karyos:udp publication its endpoint cannot hold is
+/// refused, code 4 (resources unavailable), with the limit, the endpoint's
+/// capacity and what it would take in `value`: publications on one endpoint
+/// are added until one is refused for its 256 TX slots.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_network_publication_its_endpoint_cannot_hold_is_refused_with_its_limit() {
+    let mut options = default_driver_options();
+    options.network = api::driver::NETWORK_ON;
+    let mut driver = 0;
+    // SAFETY: live, aligned pointers; no detail.
+    let status = unsafe { karyos_driver_create(&options, &mut driver, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    assert_eq!(
+        karyos_driver_start(driver, crate::api::client::IDLE_YIELD, 0),
+        Status::Ok.code()
+    );
+    // A client holds at most 16 network publications: one client per 10.
+    let mut clients = Vec::new();
+    for _ in 0..4 {
+        let mut client = 0;
+        // SAFETY: a live, aligned `u64`; no detail.
+        let status = unsafe { karyos_driver_connect(driver, &mut client, core::ptr::null_mut()) };
+        assert_eq!(status, Status::Ok.code());
+        clients.push(client);
+    }
+    let _opened = Opened {
+        driver,
+        client: clients[0],
+        ..Opened::default()
+    };
+    let uri =
+        std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{}", test_port())).unwrap();
+    let mut refused = None;
+    for stream in 900..940 {
+        let client = clients[usize::try_from(stream - 900).unwrap() / 10];
+        let mut publication = 0;
+        let mut detail = Detail {
+            size: size_of_u32::<Detail>(),
+            reserved: 0,
+            code: 0,
+            value: 0,
+        };
+        // SAFETY: a live C string, a live `u64` and a sized detail.
+        let status = unsafe {
+            karyos_client_add_publication(
+                client,
+                uri.as_ptr(),
+                stream,
+                &mut publication,
+                &mut detail,
+            )
+        };
+        if status != Status::Ok.code() {
+            refused = Some((status, detail.code, detail.value));
+            break;
+        }
+    }
+    let (status, code, value) = refused.expect("one publication too many is refused");
+    assert_eq!(status, Status::Refused.code());
+    assert_eq!(code, 4, "resources unavailable");
+    assert_eq!(value >> 56, 1, "TX slots");
+    assert_eq!((value >> 32) & 0x00FF_FFFF, 256, "the endpoint's capacity");
+    assert!(value & 0xFFFF_FFFF > 256, "what it would take: {value:#x}");
+}
