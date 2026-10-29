@@ -2241,6 +2241,61 @@ mod tests {
         assert_eq!(client.take_events().count(), 0);
     }
 
+    /// karyos#819: an `Error` whose code this peer does not define (from a
+    /// newer driver) completes the pending request at once as a refusal,
+    /// with its wire code and detail kept: not a skipped response that
+    /// leaves the request to time out.
+    #[test]
+    fn an_unknown_refusal_code_completes_the_request_as_a_refusal() {
+        let mut transmitter = broadcast(4096).unwrap();
+        let (producer, _consumer) = command_ring(1024).unwrap();
+        let link = Arc::new(ClientLink::<karyos_sys::term_bytes::HeapTerms>::new());
+        let owner = Owner {
+            driver: 1,
+            client: 1,
+        };
+        let mut client = ClientConductor::new(owner, producer, transmitter.receiver(), link, 4);
+        let sequence = client
+            .add_subscription(
+                StreamKey {
+                    stream_id: 2,
+                    session_id: 1,
+                },
+                SubscriberRole::Required,
+            )
+            .unwrap();
+        // Encoded with a defined code, then given one this peer lacks: a
+        // driver never encodes `Unknown`.
+        let known = Response::Error {
+            request: RequestId {
+                client: 1,
+                sequence,
+            },
+            code: ErrorCode::ResourcesUnavailable,
+            detail: 7,
+        };
+        let mut payload = [0u8; karyos_protocol::cnc::MAX_RESPONSE_LENGTH];
+        let length = known.encode(&mut payload).unwrap();
+        payload[16..24].copy_from_slice(&1000u64.to_le_bytes());
+        let _ = transmitter
+            .transmit(known.type_id(), &payload[..length])
+            .unwrap();
+        let mut outcomes = Vec::new();
+        let _ = client.poll(usize::MAX, |completion| {
+            outcomes.push((completion.sequence, completion.outcome));
+        });
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [(found, Outcome::Refused {
+                    code,
+                    detail: 7,
+                })] if *found == sequence && code.code() == 1000 && !code.is_defined()
+            ),
+            "{outcomes:?}"
+        );
+    }
+
     /// An image's IPv6 source keeps its scope id from the driver's
     /// `ImageAvailable` to the client's events, and an `ImageAvailable` in
     /// the layout before the address alignment (IPv4 in the high word) is

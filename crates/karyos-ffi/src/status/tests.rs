@@ -164,6 +164,16 @@ fn failures_carry_their_detail() {
         (refused.code, refused.value),
         (ErrorCode::LaneMismatch.code(), 2)
     );
+    // A code this peer does not define (karyos#819): KARYOS_E_REFUSED with
+    // the raw wire code, as for any refusal.
+    let unknown = Failure::from(&ClientError::Refused {
+        code: ErrorCode::from_wire(1000).unwrap(),
+        detail: 7,
+    });
+    assert_eq!(
+        (unknown.status, unknown.code, unknown.value),
+        (Status::Refused, 1000, 7)
+    );
     let os = Failure::from(&SysError::Os {
         operation: "mmap",
         errno: 12,
