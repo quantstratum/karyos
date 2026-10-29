@@ -61,8 +61,10 @@ pub struct Versions {
     pub capture_contract: u16,
     /// The Archive durability schema (schema 4) version.
     pub archive_durable: u16,
+    /// The `karyosd` configuration file schema version.
+    pub config: u32,
     /// The backends the core knows, compiled or not.
-    pub backends: [Backend; 3],
+    pub backends: [Backend; 5],
     /// The cargo features of this crate enabled in the build.
     pub features: &'static [&'static str],
 }
@@ -84,6 +86,7 @@ pub fn current() -> Versions {
         group_record: karyos_archive::group::record::VERSION,
         capture_contract: karyos_archive::group::record::CONTRACT_VERSION,
         archive_durable: karyos_archive::durable::VERSION,
+        config: crate::config::SCHEMA_VERSION,
         backends: [
             // The sockets backend is Linux only.
             Backend {
@@ -97,6 +100,15 @@ pub fn current() -> Versions {
             },
             Backend {
                 name: "af_xdp",
+                compiled: false,
+            },
+            // Native backends, built by `karyosd-native` only (ADR-0050).
+            Backend {
+                name: "ef_vi",
+                compiled: false,
+            },
+            Backend {
+                name: "dpdk",
                 compiled: false,
             },
         ],
@@ -122,6 +134,7 @@ impl Versions {
                 r#""protocol":{{"admission":{},"frame":{},"rule":"exact"}},"#,
                 r#""c_abi":{{"version":"{}.{}.{}","rule":"exact-0y-min-patch"}},"#,
                 r#""wire":{{"frame":{},"archive_control":{},"cluster_log":{},"group_record":{},"capture_contract":{},"archive_durable":{},"rule":"exact"}},"#,
+                r#""config":{{"schema_version":{},"rule":"exact"}},"#,
                 r#""backends":["#
             ),
             SCHEMA,
@@ -138,6 +151,7 @@ impl Versions {
             self.group_record,
             self.capture_contract,
             self.archive_durable,
+            self.config,
         );
         for (index, backend) in self.backends.iter().enumerate() {
             let separator = if index == 0 { "" } else { "," };
@@ -214,6 +228,7 @@ mod tests {
             karyos_archive::group::record::CONTRACT_VERSION
         );
         assert_eq!(versions.archive_durable, karyos_archive::durable::VERSION);
+        assert_eq!(versions.config, crate::config::SCHEMA_VERSION);
     }
 
     /// The C ABI version is the header's, as the package script reads it.
@@ -248,6 +263,9 @@ mod tests {
             r#""rule":"exact-0y-min-patch""#,
             r#"{"name":"io_uring","compiled":false}"#,
             r#"{"name":"af_xdp","compiled":false}"#,
+            r#"{"name":"ef_vi","compiled":false}"#,
+            r#"{"name":"dpdk","compiled":false}"#,
+            r#""config":{"schema_version":1,"rule":"exact"}"#,
         ] {
             assert!(json.contains(field), "{field} in {json}");
         }
