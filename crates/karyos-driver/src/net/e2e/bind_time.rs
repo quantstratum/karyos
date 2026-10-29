@@ -6,8 +6,17 @@
 //! SOLICIT its first unbound DATA sends (`quantstratum-docs:
 //! karyos/design/network-control-schemas.md` §6.3); a lost SOLICIT or
 //! answer costs `setup_challenge_timeout` plus `solicit_holdoff` before the
-//! next. Each join's time from its first unbound DATA to its image's
-//! install is recorded with the SOLICITs it took.
+//! next. Since plan 164 an unanswered SOLICIT is retried at 50 ms,
+//! doubling, from the joiner driver's unicast control endpoint. Each join's
+//! time from its first unbound DATA to its image's install is recorded
+//! with the SOLICITs it took, the retries included.
+//!
+//! `KARYOS_BIND_JOIN_GAP_MS` sets the gap before each join (default 60;
+//! 0 is the unspaced run). `m164_simultaneous_joins_on_one_driver` joins
+//! `KARYOS_BIND_STREAMS` streams (default 50) at once on one driver, whose
+//! SOLICITs share its control endpoint and so one `setup_answer_rate`
+//! bucket at the publisher (§7.4, the known limit), for
+//! `KARYOS_NETEM_MEASURE` joins in all.
 //!
 //! Runs under `scripts/netem-test.sh` with `KARYOS_NETEM_MEASURE` set to
 //! the number of joins, and the profile in `KARYOS_NETEM`:
@@ -54,6 +63,23 @@ const PACE: Duration = Duration::from_millis(1);
 /// network-control-schemas.md §7.4). Joins 60 ms apart stay under it, so
 /// only loss makes a join solicit again.
 const JOIN_GAP: Duration = Duration::from_millis(60);
+
+/// The gap before each join: `KARYOS_BIND_JOIN_GAP_MS`, or [`JOIN_GAP`].
+fn join_gap() -> Duration {
+    std::env::var("KARYOS_BIND_JOIN_GAP_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or(JOIN_GAP, Duration::from_millis)
+}
+
+/// The streams joined at once on one driver: `KARYOS_BIND_STREAMS`, or 50.
+fn streams() -> usize {
+    std::env::var("KARYOS_BIND_STREAMS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| *count > 0)
+        .unwrap_or(50)
+}
 
 /// One join: from its first unbound DATA to the install (`None` when no
 /// unbound DATA came before it), from the subscription to the install, the
@@ -250,7 +276,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
     let mut joins: Vec<Join> = Vec::with_capacity(count);
     for _ in 0..count {
         let gap = Instant::now();
-        while gap.elapsed() < JOIN_GAP {
+        while gap.elapsed() < join_gap() {
             offer(&mut lane);
             for driver in [&mut a, &mut anchor] {
                 let _ = driver.do_work().unwrap();
@@ -283,7 +309,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
             }
             if joiner.network_image(10, 3).is_some() {
                 let sessions = shared(&mut joiner).receiver.session_counters();
-                if sessions.solicits > 1 {
+                if sessions.solicits + sessions.solicit_retries > 1 {
                     diagnose(
                         &mut joiner,
                         &a,
@@ -295,7 +321,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
                 joins.push(Join {
                     bind: unbound_at.map(|at| now.duration_since(at)),
                     subscribe: now.duration_since(subscribed),
-                    solicits: sessions.solicits,
+                    solicits: sessions.solicits + sessions.solicit_retries,
                     expired: sessions.solicits_expired,
                     censored: false,
                 });
@@ -309,7 +335,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
                 joins.push(Join {
                     bind,
                     subscribe: now.duration_since(subscribed),
-                    solicits: sessions.solicits,
+                    solicits: sessions.solicits + sessions.solicit_retries,
                     expired: sessions.solicits_expired,
                     censored: true,
                 });
@@ -485,6 +511,142 @@ fn m150_a_late_reliable_multicast_subscriber_binds() {
 #[ignore = "a measurement: scripts/netem-test.sh with KARYOS_NETEM_MEASURE"]
 fn m150_a_late_unreliable_multicast_subscriber_binds() {
     measure("unreliable", false, joins());
+}
+
+/// Plan 164's known limit, measured: `streams()` publications on one
+/// group, joined at once by one fresh driver per round, until
+/// `KARYOS_NETEM_MEASURE` joins are recorded. Their SOLICITs share the
+/// joiner's control endpoint, one `setup_answer_rate` bucket (20 a second,
+/// burst 20) at the publisher; those beyond it bind at a later retry.
+fn measure_one_driver(label: &str, reliable: bool, count: usize, streams: usize) {
+    let _route = MulticastOnLoopback::route();
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 12)), free_port());
+    let channel = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: Vec::new(),
+        reliable,
+        flow_control: Some(FlowControl::Max),
+        security: Security::Trusted,
+    };
+    let ids: Vec<i32> = (0..streams)
+        .map(|index| 100 + i32::try_from(index).unwrap())
+        .collect();
+    let (mut a, mut anchor) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let mut lanes = Vec::with_capacity(streams);
+    for &stream in &ids {
+        let _ = anchor.add_network_subscription(stream, &channel).unwrap();
+        let publication = a
+            .add_network_publication(aggregate(stream, 3, 1), &channel)
+            .unwrap();
+        lanes.push(
+            a.publication(publication.lane(Lane::ZERO).unwrap())
+                .unwrap(),
+        );
+    }
+    let mut sent = 0u32;
+    let mut last_offer = Instant::now();
+    let mut next = 0usize;
+    let mut offer = |lanes: &mut Vec<karyos_client::ClientPublication<_>>| {
+        if last_offer.elapsed() >= PACE {
+            let mut payload = [0u8; 100];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            let index = next % lanes.len();
+            next = next.wrapping_add(1);
+            if matches!(
+                lanes[index].offer(&payload).unwrap(),
+                OfferOutcome::Accepted { .. }
+            ) {
+                sent += 1;
+                last_offer = Instant::now();
+            }
+        }
+    };
+    let started = Instant::now();
+    let mut readers = Vec::with_capacity(streams);
+    for &stream in &ids {
+        let image = loop {
+            offer(&mut lanes);
+            for driver in [&mut a, &mut anchor] {
+                let _ = driver.do_work().unwrap();
+            }
+            if let Some(image) = anchor.network_image(stream, 3) {
+                break image;
+            }
+            assert!(
+                started.elapsed() < JOIN_LIMIT,
+                "the anchor never bound {stream}"
+            );
+            std::thread::sleep(Duration::from_micros(100));
+        };
+        readers.push(anchor.subscribe_aggregate(&image, Role::Required).unwrap());
+    }
+    let mut joins: Vec<Join> = Vec::with_capacity(count);
+    while joins.len() < count {
+        let mut joiner = driver(ThreadingMode::Shared);
+        let subscribed = Instant::now();
+        for &stream in &ids {
+            let _ = joiner.add_network_subscription(stream, &channel).unwrap();
+        }
+        let mut bound = vec![false; streams];
+        loop {
+            offer(&mut lanes);
+            for driver in [&mut a, &mut anchor, &mut joiner] {
+                let _ = driver.do_work().unwrap();
+            }
+            for reader in &mut readers {
+                let _ = reader.poll(|_, _, _| {}, BUDGET);
+            }
+            let now = Instant::now();
+            for (index, &stream) in ids.iter().enumerate() {
+                if !bound[index] && joiner.network_image(stream, 3).is_some() {
+                    bound[index] = true;
+                    joins.push(Join {
+                        bind: Some(now.duration_since(subscribed)),
+                        subscribe: now.duration_since(subscribed),
+                        solicits: 0,
+                        expired: 0,
+                        censored: false,
+                    });
+                }
+            }
+            let censored = now.duration_since(subscribed) >= JOIN_LIMIT;
+            if bound.iter().all(|done| *done) || censored {
+                let sessions = shared(&mut joiner).receiver.session_counters();
+                println!(
+                    "bind_time {label} round: solicits {} retries {} refused {} stale {} expired {}",
+                    sessions.solicits,
+                    sessions.solicit_retries,
+                    sessions.solicit_retries_refused,
+                    sessions.solicit_stale_answers,
+                    sessions.solicits_expired,
+                );
+                if censored {
+                    let missing = bound.iter().filter(|done| !**done).count();
+                    for _ in 0..missing {
+                        joins.push(Join {
+                            bind: Some(now.duration_since(subscribed)),
+                            subscribe: now.duration_since(subscribed),
+                            solicits: 0,
+                            expired: 0,
+                            censored: true,
+                        });
+                    }
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+    publisher_line(&mut a, label);
+    report(label, &joins, sent, None);
+}
+
+/// Plan 164: `KARYOS_BIND_STREAMS` reliable joins at once on one driver.
+#[test]
+#[ignore = "a measurement: scripts/netem-test.sh with KARYOS_NETEM_MEASURE"]
+fn m164_simultaneous_joins_on_one_driver() {
+    measure_one_driver("one driver", true, joins(), streams());
 }
 
 /// The quantile helpers on a known sample.
