@@ -6359,6 +6359,18 @@ impl<T: StreamTerms> SenderRole<T> {
             held.joins = answer.joins;
             held.answered_at = now;
             held.last_sm = None;
+            // Its adoptions start over too: an image reinstalled at an
+            // adopted source has a new receiver id, which its next SM
+            // brings. Each keeps its SM source and its consumption.
+            let parent = held.id;
+            for adopted in self
+                .bindings
+                .iter_mut()
+                .filter(|binding| binding.parent == Some(parent))
+            {
+                adopted.former = adopted.receiver_id.or(adopted.former);
+                adopted.receiver_id = None;
+            }
             return;
         }
         if !self.make_room(now) {
@@ -6916,6 +6928,9 @@ impl<T: StreamTerms> SenderRole<T> {
         {
             return Some(SmBinding::Learn(index));
         }
+        // The receiver's first ANSWER-created binding is the parent: one
+        // solicited from two sources has two, and every adoption counts
+        // against the first, so the bound holds per parent.
         let Some(parent) = self
             .bindings
             .iter()

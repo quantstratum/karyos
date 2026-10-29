@@ -992,6 +992,50 @@ fn a_binding_learns_its_sm_source_from_its_first_sm() {
     assert_eq!(sender.counters().bindings_adopted, 1);
 }
 
+/// Plan 169 (codex's finding on #876): a fresh ANSWER starts the
+/// receiver's adoptions over too. An image reinstalled at an adopted
+/// source has a new receiver id; its next SM is accepted, the binding
+/// keeping its SM source and its consumption.
+#[test]
+fn a_fresh_answer_lets_an_adopted_image_bind_its_new_receiver_id() {
+    use karyos_protocol::network::SetupAnswer;
+
+    let control: SocketAddr = "10.0.0.9:6000".parse().unwrap();
+    let a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let b: SocketAddr = "10.0.0.9:5001".parse().unwrap();
+    let (mut sender, status) = answered_from(control);
+    let endpoint = EndpointId(1);
+    sender.status(endpoint, a, &status(1, &lane(4096)), 1);
+    sender.status(endpoint, b, &status(2, &lane(8192)), 2);
+    assert_eq!(sender.counters().sm_accepted, 2);
+    // A fresh ANSWER to the same receiver (a reinstall).
+    let answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(endpoint).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    sender.bind(endpoint, control, &answer, 3);
+    sender.status(endpoint, a, &status(1, &lane(4096)), 4);
+    // The image at B is reinstalled: a new receiver id.
+    sender.status(endpoint, b, &status(3, &lane(8192)), 5);
+    let counters = sender.counters();
+    assert_eq!((counters.sm_accepted, counters.sm_mismatch), (4, 0));
+    let adopted = sender
+        .bindings
+        .iter()
+        .find(|binding| binding.parent.is_some())
+        .unwrap();
+    assert_eq!(adopted.sm_source, Some(b));
+    assert_eq!(adopted.receiver_id, Some(3));
+    assert_eq!(adopted.lanes.unwrap().as_slice()[0].consumption, 8192);
+    assert_eq!(sender.bindings.len(), 2);
+}
+
 /// Plan 169: a binding an ANSWER created adopts at most `MAX_PATHS - 1`
 /// further SM sources, so a receiver that sends SMs from more sources than
 /// that holds `MAX_PATHS` bindings at most; the rest are refused, counted,
