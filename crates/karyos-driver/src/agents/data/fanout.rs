@@ -162,6 +162,16 @@ pub(crate) fn destination_share(
     Ok(shared)
 }
 
+/// A destination's address, lane 0 catch-up, `high` and repair counts
+/// (tests of MD-20).
+#[cfg(test)]
+pub(crate) type CatchUpView = (
+    SocketAddr,
+    Option<(u64, u64)>,
+    u64,
+    Option<crate::agents::repair::RepairCounts>,
+);
+
 /// One target's lane: its staged heads, in order, and what left.
 #[derive(Debug)]
 struct TargetLane {
@@ -1710,6 +1720,30 @@ impl<T: StreamTerms> Outbound<T> {
                 .map(|repair| repair.parts().1.capacity())
                 .sum()
         })
+    }
+
+    /// Each destination's lane 0 catch-up, `high` and repair counts
+    /// (tests of MD-20).
+    #[cfg(test)]
+    pub(crate) fn destination_catch_ups(&self) -> Vec<CatchUpView> {
+        self.fanout
+            .as_deref()
+            .map(|fanout| {
+                fanout
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        let lane = target.lanes.first();
+                        (
+                            target.address,
+                            lane.and_then(|lane| lane.catch_up),
+                            lane.map_or(0, |lane| lane.high),
+                            target.repair.as_deref().map(|repair| repair.counts()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Each destination's counters (tests).
