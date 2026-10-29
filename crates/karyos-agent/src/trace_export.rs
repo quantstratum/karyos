@@ -399,8 +399,10 @@ fn application_point(payload: &[u64]) -> Option<u16> {
 
 /// The application points `records` reference, by id, named from the
 /// client counters region: a point is named only by the single live trace
-/// point cell holding its id, and only when that cell's client is the
-/// client of every live journal whose records reference the id. Clients
+/// point cell holding its id, and only when every record referencing the
+/// id is in a live journal of that cell's client. A record in a recycled,
+/// unknown or unreadable journal has no client to check, so its id goes
+/// unnamed. Clients
 /// can write their cells, so two cells claiming one id, or a cell of
 /// another client than the records', leave the point unnamed rather than
 /// misattributed.
@@ -411,20 +413,29 @@ fn name_points(
     records: &[ExportRecord],
     journals: &[ExportJournal],
 ) -> Vec<ExportPoint> {
-    // Each referenced id with the clients of the live journals its records
-    // are in.
-    let mut referenced: std::collections::BTreeMap<u16, BTreeSet<u64>> = Default::default();
+    // Each referenced id with the clients of the journals its records are
+    // in; `None` once one of them is not a live journal.
+    let mut referenced: std::collections::BTreeMap<u16, Option<BTreeSet<u64>>> = Default::default();
     for record in records {
         let Some(id) = application_point(&record.payload) else {
             continue;
         };
-        let clients = referenced.entry(id).or_default();
-        if let Some(ExportJournal::Live(entry)) = journals
+        let live = match journals
             .binary_search_by_key(&record.journal, journal_number)
             .ok()
             .and_then(|at| journals.get(at))
         {
-            let _ = clients.insert(entry.client);
+            Some(ExportJournal::Live(entry)) => Some(entry.client),
+            _ => None,
+        };
+        let clients = referenced
+            .entry(id)
+            .or_insert_with(|| Some(BTreeSet::new()));
+        match (clients.as_mut(), live) {
+            (Some(clients), Some(client)) => {
+                let _ = clients.insert(client);
+            }
+            _ => *clients = None,
         }
     }
     if referenced.is_empty() {
@@ -457,8 +468,8 @@ fn name_points(
             let named = match cells.get(&id).map(Vec::as_slice) {
                 Some([(label, client)])
                     if clients
-                        .iter()
-                        .all(|journal_client| journal_client == client) =>
+                        .as_ref()
+                        .is_some_and(|clients| clients.iter().all(|owner| owner == client)) =>
                 {
                     Some((label.clone(), *client))
                 }

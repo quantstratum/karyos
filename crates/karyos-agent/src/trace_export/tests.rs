@@ -1083,3 +1083,52 @@ fn a_point_counts_once_in_the_byte_bound() {
         "{reply}"
     );
 }
+
+/// Review of #867: a record in a recycled or unknown journal has no client
+/// to check, so the id it references goes unnamed even when one cell holds
+/// it, also when another record of the id is in a live journal of the
+/// cell's client: a client that wrote another client's id into its own
+/// journal is never named after it once that journal is recycled.
+#[test]
+fn a_point_referenced_from_a_journal_with_no_client_is_unnamed() {
+    let mut mirror = mirror(16);
+    let recycled = RecycledJournal {
+        journal: 11,
+        stream: 3,
+        lane: Lane::ZERO,
+        incarnation: 1,
+        state: JournalState::Closed,
+        boundary: Some(64),
+        pairs: [NotedPublisher {
+            journal: 0,
+            attempted: 0,
+        }; MAX_RECYCLE_PAIRS],
+        pair_count: 0,
+        sequence: 2,
+    };
+    assert!(mirror.write_log(0, Some(&recycled)));
+    // Id 5 only from the recycled journal 11; id 6 from live journal 10
+    // (client 1) and from unknown journal 12; id 7 from journal 10 alone.
+    for (journal, sequence, id) in [(11, 0, 5u16), (10, 0, 6), (12, 0, 6), (10, 1, 7)] {
+        let _ = mirror
+            .append(journal, sequence, &application_payload(id))
+            .unwrap();
+    }
+    let (_manager, cells) = point_cells(&[("five", 1, 5), ("six", 1, 6), ("seven", 1, 7)]);
+    let page = export(
+        &mirror.reader(),
+        Some(&cells),
+        EPOCH,
+        0,
+        16,
+        None,
+        usize::MAX,
+    )
+    .unwrap();
+    let names: Vec<(u16, Option<&str>)> = page
+        .points
+        .iter()
+        .map(|point| (point.id, point.label.as_deref()))
+        .collect();
+    assert_eq!(names, vec![(5, None), (6, None), (7, Some("seven"))]);
+}
