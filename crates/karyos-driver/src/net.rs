@@ -97,6 +97,39 @@ pub struct NetworkConfig {
     /// another is refused with `ResourcesUnavailable` and counted
     /// (`EmbeddedDriver::network_owned_refusals`).
     pub max_owned_per_client: usize,
+    /// The tables of each endpoint the driver opens (karyos#859): its TX
+    /// slots, queues and routes. A publication its endpoint cannot hold is
+    /// refused at the add (`DriverError::EndpointCapacity`).
+    pub endpoint_tables: EndpointTables,
+}
+
+/// The tables of a network endpoint (karyos#859): what its publications
+/// and the sender's control routes share. The defaults are the sockets
+/// backend's provisional ones (256 TX slots, 64 queues, 64 routes). A
+/// reliable single-lane publication takes 9 slots, 2 queues and a route;
+/// each endpoint keeps `AgentConfig::control_routes` routes and queues of 4
+/// slots for the control routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointTables {
+    /// TX slots, 1 to 4096.
+    pub tx_slots: std::num::NonZeroU16,
+    /// TX queues, 1 to 1024.
+    pub max_queues: std::num::NonZeroU16,
+    /// Routes, 1 to 1024.
+    pub max_routes: std::num::NonZeroU16,
+}
+
+impl Default for EndpointTables {
+    fn default() -> Self {
+        use karyos_io::sockets::endpoint::{
+            DEFAULT_MAX_QUEUES, DEFAULT_MAX_ROUTES, DEFAULT_TX_SLOTS,
+        };
+        Self {
+            tx_slots: DEFAULT_TX_SLOTS,
+            max_queues: DEFAULT_MAX_QUEUES,
+            max_routes: DEFAULT_MAX_ROUTES,
+        }
+    }
 }
 
 impl Default for NetworkConfig {
@@ -108,6 +141,7 @@ impl Default for NetworkConfig {
             stream_defaults: NetworkStreamDefaults::default(),
             nak_control_groups: [None; MAX_CONTROL_GROUPS],
             max_owned_per_client: 16,
+            endpoint_tables: EndpointTables::default(),
         }
     }
 }
@@ -703,6 +737,8 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     stale_aliases: Vec<(EndpointId, Alias)>,
     /// Network publications and stale aliases held at once.
     capacity: usize,
+    /// The tables of each endpoint it opens.
+    endpoint_tables: EndpointTables,
     /// What each send endpoint keeps for the sender's control routes
     /// (karyos#859): `control_routes` routes and queues of
     /// `CONTROL_QUEUE_DEPTH` slots each.
@@ -822,6 +858,7 @@ impl<T: StreamTerms> Network<T> {
             reopened: 0,
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
+            endpoint_tables: config.endpoint_tables,
             control_reserve: {
                 let routes = u32::try_from(config.agents.control_routes).unwrap_or(u32::MAX);
                 TxDemand {
@@ -903,6 +940,9 @@ impl<T: StreamTerms> Network<T> {
         }
         let mut config = SocketsConfig::new(bind);
         config.multicast = multicast;
+        config.tx_slots = self.endpoint_tables.tx_slots;
+        config.max_queues = self.endpoint_tables.max_queues;
+        config.max_routes = self.endpoint_tables.max_routes;
         let capacity = TxDemand {
             routes: u32::from(config.max_routes.get()),
             queues: u32::from(config.max_queues.get()),

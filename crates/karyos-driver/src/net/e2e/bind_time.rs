@@ -536,7 +536,11 @@ fn measure_one_driver(label: &str, reliable: bool, count: usize, streams: usize)
     let ids: Vec<i32> = (0..streams)
         .map(|index| 100 + i32::try_from(index).unwrap())
         .collect();
-    let (mut a, mut anchor) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    // The publisher's endpoint holds every stream (karyos#859): per reliable
+    // single-lane publication 9 slots, 2 queues and a route, with the
+    // control reserve of 8 routes and queues of 4 slots.
+    let mut a = sized_publisher(streams);
+    let mut anchor = driver(ThreadingMode::Shared);
     let mut lanes = Vec::with_capacity(streams);
     for &stream in &ids {
         let _ = anchor.add_network_subscription(stream, &channel).unwrap();
@@ -673,6 +677,26 @@ fn measure_one_driver(label: &str, reliable: bool, count: usize, streams: usize)
     }
     publisher_line(&mut a, label);
     report(label, &joins, sent, None);
+}
+
+/// A publisher whose endpoint holds `streams` reliable single-lane
+/// publications (karyos#859).
+fn sized_publisher(streams: usize) -> crate::embedded::EmbeddedDriver {
+    let count = u16::try_from(streams).unwrap();
+    let tables = crate::net::EndpointTables {
+        tx_slots: std::num::NonZeroU16::new(32 + 9 * count).unwrap(),
+        max_queues: std::num::NonZeroU16::new(8 + 2 * count).unwrap(),
+        max_routes: std::num::NonZeroU16::new(8 + count).unwrap(),
+    };
+    crate::embedded::EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+        network: Some(crate::net::NetworkConfig {
+            threading: ThreadingMode::Shared,
+            endpoint_tables: tables,
+            ..crate::net::NetworkConfig::default()
+        }),
+        ..crate::embedded::DriverConfig::default()
+    })
+    .unwrap()
 }
 
 /// Plan 164: `KARYOS_BIND_STREAMS` reliable joins at once on one driver.
