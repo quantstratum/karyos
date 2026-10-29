@@ -534,6 +534,53 @@ mod tests {
         assert_eq!(ApplicationPoint::new(0, 12), Err(TraceError::PointId));
     }
 
+    /// R-CORE-1 (karyos#722): a dropped application record is a journal
+    /// record like any other: its sequence is taken and counted in the
+    /// journal's drop range and loss counters, never reused, and the
+    /// collector reports the gap before the next record.
+    #[test]
+    fn a_dropped_application_record_is_counted_and_its_sequence_not_reused() {
+        let (writer, mut collector) = trace_journal(2, 2, OBSERVER, 1).unwrap();
+        let mut writer = writer.for_client(5);
+        let point = ApplicationPoint::new(9, 5).unwrap();
+        let metadata = Metadata::new(&[Value::U64(1)]).unwrap();
+        let mut observe =
+            |position, time| point.observe(&mut writer, &context(position), metadata, stamp(time));
+        assert_eq!(observe(0, 1), Ok(Append::Stored { sequence: 0 }));
+        assert_eq!(observe(32, 2), Ok(Append::Stored { sequence: 1 }));
+        // The ring holds two: the third is dropped, with its sequence.
+        assert_eq!(observe(64, 3), Ok(Append::Dropped { sequence: 2 }));
+        let losses = collector.losses();
+        assert_eq!((losses.attempted, losses.stored), (3, 2));
+        assert_eq!(
+            losses
+                .ranges
+                .iter()
+                .map(|range| (range.first, range.last))
+                .collect::<Vec<_>>(),
+            vec![(2, 2)]
+        );
+        // Drained, the journal takes the next record under a new sequence.
+        for expected in [0, 1] {
+            assert!(matches!(
+                collector.take(),
+                Collected::Record { sequence, gap: None, .. } if sequence == expected
+            ));
+        }
+        assert_eq!(observe(96, 4), Ok(Append::Stored { sequence: 3 }));
+        let Collected::Record {
+            sequence,
+            gap,
+            record,
+            ..
+        } = collector.take()
+        else {
+            panic!("expected a record");
+        };
+        assert_eq!((sequence, gap), (3, Some((2, 3))));
+        assert!(record.point.is_application());
+    }
+
     /// A point records only into a journal of its own client: another
     /// client's writer, or one whose client is not known, is refused before
     /// a sequence is taken.
