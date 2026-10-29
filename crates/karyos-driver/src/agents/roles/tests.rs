@@ -782,10 +782,11 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
 }
 
 /// The sender accepts an SM only from a receiver it answered on that
-/// endpoint (source, receiver boot id), with the answered identity, the
+/// endpoint (receiver boot id), with the answered identity, the
 /// publication's lane count and, after the first, the same receiver id;
 /// consumption never moves back; a new answer to the tuple starts the
-/// binding over.
+/// binding over. An SM from another source with the bound boot id adopts
+/// a binding of its own (plan 169).
 #[test]
 fn the_sender_validates_sms_against_its_bindings() {
     use karyos_protocol::network::{LaneStatus, Receiver, SetupAnswer, StatusMessage};
@@ -829,9 +830,8 @@ fn the_sender_validates_sms_against_its_bindings() {
         incarnation: 2,
         ..identity()
     };
-    let spoofer: SocketAddr = "10.0.0.66:5000".parse().unwrap();
-    // Another source, another boot id, another endpoint: unbound.
-    sender.status(endpoint, spoofer, &status([7, 8], 1, identity(), &at(0)), 1);
+    let other_source: SocketAddr = "10.0.0.66:5000".parse().unwrap();
+    // Another boot id, another endpoint: unbound.
     sender.status(
         endpoint,
         receiver,
@@ -868,6 +868,18 @@ fn the_sender_validates_sms_against_its_bindings() {
     );
     let held = sender.bindings[0].lanes.unwrap();
     assert_eq!(held.as_slice()[0].consumption, 4096);
+    // Another source with the bound boot id: an adopted binding of its own.
+    sender.status(
+        endpoint,
+        other_source,
+        &status([7, 8], 1, identity(), &at(0)),
+        3,
+    );
+    assert_eq!(sender.counters().bindings_adopted, 1);
+    assert_eq!(
+        sender.bindings[0].lanes.unwrap().as_slice()[0].consumption,
+        4096
+    );
     // Another receiver id: mismatch, until a new answer starts it over (a
     // reinstalled image).
     sender.status(
@@ -891,7 +903,129 @@ fn the_sender_validates_sms_against_its_bindings() {
             counters.sm_accepted,
             counters.sm_stale
         ),
-        (4, 2, 3, 1)
+        (3, 2, 4, 1)
+    );
+}
+
+/// A sender with one publication on `EndpointId(1)` and its receiver
+/// answered from `solicited` with boot id `[7, 8]` (plan 169).
+fn answered_from(
+    solicited: SocketAddr,
+) -> (
+    super::SenderRole,
+    impl Fn(u64, &[karyos_protocol::network::LaneStatus]) -> karyos_protocol::network::StatusMessage,
+) {
+    use karyos_protocol::network::{Receiver, SetupAnswer, StatusMessage};
+
+    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let endpoint = EndpointId(1);
+    sender.sessions.add(publication(endpoint)).unwrap();
+    let group: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+    let (path, _log) = outbound(endpoint, group);
+    sender.publications.push(path);
+    let answer = SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(endpoint).term,
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [9, 9],
+        },
+        joins: Lanes::new(&[0]).unwrap(),
+    };
+    sender.bind(endpoint, solicited, &answer, 0);
+    let status = |receiver_id, lanes: &[karyos_protocol::network::LaneStatus]| StatusMessage {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id,
+        },
+        group_tag: 0,
+        lanes: Lanes::new(lanes).unwrap(),
+    };
+    (sender, status)
+}
+
+fn lane(consumption: u64) -> [karyos_protocol::network::LaneStatus; 1] {
+    [karyos_protocol::network::LaneStatus {
+        consumption,
+        window: 32_768,
+    }]
+}
+
+/// Plan 169 (network-control-schemas.md §6.3): a receiver answered at its
+/// SOLICIT's source (the driver's control endpoint) is bound by its first
+/// SM's source (a path's receive endpoint), which then never changes; its
+/// NAKs and RTTMs match on it. An SM of a boot id no binding has stays
+/// unbound and creates nothing, and a mismatched SM neither sets a source
+/// nor adopts.
+#[test]
+fn a_binding_learns_its_sm_source_from_its_first_sm() {
+    let control: SocketAddr = "10.0.0.9:6000".parse().unwrap();
+    let path: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let (mut sender, status) = answered_from(control);
+    let endpoint = EndpointId(1);
+    // A mismatched SM (two lanes) sets no source and adopts nothing.
+    sender.status(endpoint, path, &status(1, &[lane(0)[0]; 2]), 1);
+    assert_eq!(sender.bindings[0].sm_source, None);
+    assert_eq!(sender.counters().sm_mismatch, 1);
+    // The first SM from the path's endpoint binds it there.
+    sender.status(endpoint, path, &status(1, &lane(4096)), 2);
+    assert_eq!(sender.counters().sm_accepted, 1);
+    assert_eq!(sender.bindings[0].sm_source, Some(path));
+    assert_eq!(sender.bindings[0].source(), path);
+    assert_eq!(sender.sessions.counters().established, 1);
+    // An SM of another boot id: unbound, nothing created.
+    let mut stranger = status(1, &lane(0));
+    stranger.receiver.receiver_boot_id = [1, 1];
+    sender.status(endpoint, path, &stranger, 3);
+    assert_eq!(sender.counters().sm_unbound, 1);
+    assert_eq!(sender.bindings.len(), 1);
+    // The SM source stays: another source adopts a binding of its own.
+    let second: SocketAddr = "10.0.0.9:5001".parse().unwrap();
+    sender.status(endpoint, second, &status(2, &lane(0)), 4);
+    assert_eq!(sender.bindings[0].sm_source, Some(path));
+    assert_eq!(sender.bindings.len(), 2);
+    assert_eq!(sender.bindings[1].sm_source, Some(second));
+    assert_eq!(sender.bindings[1].parent, Some(sender.bindings[0].id));
+    assert_eq!(sender.counters().bindings_adopted, 1);
+}
+
+/// Plan 169: a binding an ANSWER created adopts at most `MAX_PATHS - 1`
+/// further SM sources, so a receiver that sends SMs from more sources than
+/// that holds `MAX_PATHS` bindings at most; the rest are refused, counted,
+/// and leave no state. When the parent expires, its adoptions go with it.
+#[test]
+fn adoptions_are_bounded_and_go_with_their_parent() {
+    use karyos_protocol::channel::MAX_PATHS;
+
+    let control: SocketAddr = "10.0.0.9:6000".parse().unwrap();
+    let (mut sender, status) = answered_from(control);
+    let endpoint = EndpointId(1);
+    let port = |n: usize| SocketAddr::new([10, 0, 0, 9].into(), 5000 + u16::try_from(n).unwrap());
+    for n in 0..MAX_PATHS + 2 {
+        sender.status(endpoint, port(n), &status(1, &lane(0)), 1);
+    }
+    let counters = sender.counters();
+    assert_eq!(sender.bindings.len(), MAX_PATHS);
+    assert_eq!(
+        counters.bindings_adopted,
+        u64::try_from(MAX_PATHS - 1).unwrap()
+    );
+    assert_eq!(counters.bindings_adoption_refused, 2);
+    assert_eq!(counters.sm_accepted, u64::try_from(MAX_PATHS).unwrap());
+    // The adoptions keep sending; the parent's source falls silent past
+    // `image_liveness_timeout`: it expires, and its adoptions with it.
+    let timeout = AgentConfig::default().image_liveness_timeout;
+    for n in 1..MAX_PATHS {
+        sender.status(endpoint, port(n), &status(1, &lane(0)), timeout);
+    }
+    sender.expire_bindings(timeout + 1);
+    assert!(sender.bindings.is_empty(), "{:?}", sender.bindings);
+    assert_eq!(
+        sender.counters().bindings_expired,
+        u64::try_from(MAX_PATHS).unwrap()
     );
 }
 

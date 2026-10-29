@@ -457,6 +457,13 @@ pub struct SenderCounters {
     /// Answered receivers not recorded: the binding table was full of
     /// confirmed bindings.
     pub bindings_full: u64,
+    /// SMs from a second source of a bound receiver (sender endpoint,
+    /// alias, boot id and incarnation) that adopted a binding of their own
+    /// (plan 169).
+    pub bindings_adopted: u64,
+    /// SMs from a further source of a bound receiver refused: its binding
+    /// has `MAX_ADOPTIONS` adoptions already. They leave no state.
+    pub bindings_adoption_refused: u64,
     /// Publications whose endpoint needs a reset before they can send again
     /// (a gauge, recomputed each cycle); each asks the endpoint table for
     /// it (`AgentEvent::ResetRequested`).
@@ -526,10 +533,19 @@ pub struct SenderCounters {
 /// A receiver this sender answered: where its SMs may come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReceiverBinding {
+    /// Its number, unique in the sender's life: what its adoptions name.
+    id: u64,
+    /// The binding an ANSWER created that this one was adopted for, or
+    /// `None` for one an ANSWER created (network-control-schemas.md §6.3).
+    parent: Option<u64>,
     endpoint: EndpointId,
     alias: Alias,
-    /// The challenge's source, normalized.
-    source: SocketAddr,
+    /// The challenge's source, normalized: what a new answer to the same
+    /// receiver matches.
+    solicited_from: SocketAddr,
+    /// The source of its first accepted SM, normalized: set once, never
+    /// changed; its NAKs, ERRs and RTTMs match and reply on it (plan 169).
+    sm_source: Option<SocketAddr>,
     /// The receiver boot id of the challenge block.
     boot_id: [u64; 2],
     /// The publication incarnation answered.
@@ -548,6 +564,31 @@ struct ReceiverBinding {
     /// When it last sent an accepted SM: `None` while unconfirmed.
     last_sm: Option<u64>,
 }
+
+/// Which binding an SM belongs to ([`SenderRole::sm_binding`]).
+#[derive(Debug, Clone, Copy)]
+enum SmBinding {
+    /// The binding at this index, whose SM source is the SM's.
+    Bound(usize),
+    /// The binding at this index, which has no SM source yet.
+    Learn(usize),
+    /// A new binding to adopt for the ANSWER-created one at this index.
+    Adopt(usize),
+}
+
+impl ReceiverBinding {
+    /// Where its SMs, NAKs and RTTMs come from and its replies go: its
+    /// first SM's source, or until then its challenge's.
+    fn source(&self) -> SocketAddr {
+        self.sm_source.unwrap_or(self.solicited_from)
+    }
+}
+
+/// The SM sources a binding an ANSWER created may adopt besides its own:
+/// it and its adoptions cover at most one source per redundant path of a
+/// channel, so one receiver cannot fill the table with bindings nothing
+/// evicts (network-control-schemas.md §6.3, plan 169).
+const MAX_ADOPTIONS: usize = karyos_protocol::channel::MAX_PATHS - 1;
 
 fn bump(value: &mut u64, overflowed: &mut bool) {
     match value.checked_add(1) {
@@ -1641,6 +1682,8 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     /// creation).
     bindings: Vec<ReceiverBinding>,
     max_bindings: usize,
+    /// The next binding's [`ReceiverBinding::id`].
+    next_binding: u64,
     /// An unconfirmed binding lives this long (`setup_challenge_timeout`).
     unconfirmed_timeout: u64,
     /// A confirmed binding lives this long without an SM
@@ -1816,6 +1859,7 @@ pub(super) fn roles<T: StreamTerms>(
             path_policy: config.path_policy,
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
+            next_binding: 0,
             unconfirmed_timeout: config.sessions.setup_challenge_timeout,
             confirmed_timeout: config.image_liveness_timeout,
             cycle: 0,
@@ -6257,7 +6301,7 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             // A destination a multi-destination publication removed bounds
             // nothing more (karyos#630).
-            if !outbound.sends_to(binding.source) {
+            if !outbound.sends_to(binding.source()) {
                 continue;
             }
             let positions = least.get_or_insert([u64::MAX; 4]);
@@ -6278,18 +6322,57 @@ impl<T: StreamTerms> SenderRole<T> {
     }
 
     /// Records the receiver `answer` goes to: its challenge's `source` on
-    /// `endpoint` and its boot id, where its SMs must come from.
+    /// `endpoint` and its boot id. Its SMs then come from any source with
+    /// that boot id and incarnation; the first sets the binding's SM source
+    /// ([`Self::status`]).
     ///
     /// A new answer to a known tuple starts it over: unconfirmed, with no
-    /// receiver id or status, so a reinstalled image binds again. A full
-    /// table evicts its oldest unconfirmed binding first; one full of
-    /// confirmed bindings refuses and counts.
+    /// receiver id or status, so a reinstalled image binds again; its SM
+    /// source and its adoptions stay. A full table evicts its oldest
+    /// unconfirmed binding first; one full of confirmed bindings refuses
+    /// and counts.
     fn bind(&mut self, endpoint: EndpointId, source: SocketAddr, answer: &SetupAnswer, now: u64) {
         self.expire_bindings(now);
-        let binding = ReceiverBinding {
+        let tuple = |held: &ReceiverBinding| {
+            (
+                held.parent,
+                held.endpoint,
+                held.alias,
+                held.solicited_from,
+                held.boot_id,
+                held.identity,
+            )
+        };
+        let wanted = (
+            None,
+            endpoint,
+            answer.alias,
+            normalized(source),
+            answer.challenge.receiver_boot_id,
+            answer.identity,
+        );
+        if let Some(held) = self.bindings.iter_mut().find(|held| tuple(held) == wanted) {
+            // The same receiver again: its consumption never moves back,
+            // and the receiver id it had is remembered for the next SM.
+            held.former = held.receiver_id.or(held.former);
+            held.receiver_id = None;
+            held.joins = answer.joins;
+            held.answered_at = now;
+            held.last_sm = None;
+            return;
+        }
+        if !self.make_room(now) {
+            return;
+        }
+        let id = self.next_binding;
+        self.next_binding = id.wrapping_add(1);
+        self.bindings.push(ReceiverBinding {
+            id,
+            parent: None,
             endpoint,
             alias: answer.alias,
-            source: normalized(source),
+            solicited_from: normalized(source),
+            sm_source: None,
             boot_id: answer.challenge.receiver_boot_id,
             identity: answer.identity,
             receiver_id: None,
@@ -6298,80 +6381,80 @@ impl<T: StreamTerms> SenderRole<T> {
             joins: answer.joins,
             answered_at: now,
             last_sm: None,
-        };
-        let tuple = |held: &ReceiverBinding| {
-            (
-                held.endpoint,
-                held.alias,
-                held.source,
-                held.boot_id,
-                held.identity,
-            )
-        };
-        if let Some(held) = self
+        });
+    }
+
+    /// Whether the table has room for one more binding: a full one evicts
+    /// its oldest unconfirmed binding, with its adoptions, and counts; one
+    /// full of confirmed bindings refuses and counts `bindings_full`.
+    fn make_room(&mut self, now: u64) -> bool {
+        if self.bindings.len() < self.max_bindings {
+            return true;
+        }
+        let oldest = self
             .bindings
-            .iter_mut()
-            .find(|held| tuple(held) == tuple(&binding))
-        {
-            // The same receiver again: its consumption never moves back,
-            // and the receiver id it had is remembered for the next SM.
-            let lanes = held.lanes;
-            let former = held.receiver_id.or(held.former);
-            *held = ReceiverBinding {
-                lanes,
-                former,
-                ..binding
-            };
+            .iter()
+            .enumerate()
+            .filter(|(_, held)| held.last_sm.is_none())
+            .min_by_key(|(_, held)| held.answered_at)
+            .map(|(index, _)| index);
+        let Some(index) = oldest else {
+            self.count(|c| &mut c.bindings_full);
+            return false;
+        };
+        self.count(|c| &mut c.bindings_evicted);
+        self.remove_binding(index, now, |c| &mut c.bindings_evicted);
+        true
+    }
+
+    /// Removes the binding at `index` and, for one an ANSWER created, its
+    /// adoptions, each counted with `field`: an adoption never outlives
+    /// the binding it was adopted for (plan 169). Each one's membership
+    /// ends with it (ACS 15648).
+    fn remove_binding(
+        &mut self,
+        index: usize,
+        now: u64,
+        field: fn(&mut SenderCounters) -> &mut u64,
+    ) {
+        if index >= self.bindings.len() {
             return;
         }
-        if self.bindings.len() >= self.max_bindings {
-            let oldest = self
-                .bindings
-                .iter()
-                .enumerate()
-                .filter(|(_, held)| held.last_sm.is_none())
-                .min_by_key(|(_, held)| held.answered_at)
-                .map(|(index, _)| index);
-            let Some(index) = oldest else {
-                self.count(|c| &mut c.bindings_full);
-                return;
-            };
-            let evicted = self.bindings.swap_remove(index);
-            self.count(|c| &mut c.bindings_evicted);
-            // A reset row keeps its former receiver id until its next SM:
-            // that membership ends with the row (ACS 15648).
-            if let Some(receiver_id) = evicted.receiver_id.or(evicted.former) {
-                self.binding_gone(&evicted, receiver_id, now);
+        let removed = self.bindings.swap_remove(index);
+        // A reset row keeps its former receiver id until its next SM: that
+        // membership ends with the row (ACS 15648).
+        if let Some(receiver_id) = removed.receiver_id.or(removed.former) {
+            self.binding_gone(&removed, receiver_id, now);
+        }
+        if removed.parent.is_some() {
+            return;
+        }
+        while let Some(child) = self
+            .bindings
+            .iter()
+            .position(|held| held.parent == Some(removed.id))
+        {
+            self.count(field);
+            let child = self.bindings.swap_remove(child);
+            if let Some(receiver_id) = child.receiver_id.or(child.former) {
+                self.binding_gone(&child, receiver_id, now);
             }
         }
-        self.bindings.push(binding);
     }
 
     /// Removes the bindings past their lifetime at `now`: an unconfirmed
     /// one after `setup_challenge_timeout`, a confirmed one with no SM for
-    /// `image_liveness_timeout` (its image is retired by then).
+    /// `image_liveness_timeout` (its image is retired by then), each with
+    /// its adoptions.
     fn expire_bindings(&mut self, now: u64) {
         let (unconfirmed, confirmed) = (self.unconfirmed_timeout, self.confirmed_timeout);
-        let mut index = 0usize;
-        while let Some(binding) = self.bindings.get(index) {
-            let live = match binding.last_sm {
-                None => age_ns(now, binding.answered_at) < unconfirmed,
-                Some(last) => age_ns(now, last) < confirmed,
-            };
-            if live {
-                let Some(next) = index.checked_add(1) else {
-                    break;
-                };
-                index = next;
-                continue;
-            }
-            let binding = self.bindings.swap_remove(index);
+        let expired = |binding: &ReceiverBinding| match binding.last_sm {
+            None => age_ns(now, binding.answered_at) >= unconfirmed,
+            Some(last) => age_ns(now, last) >= confirmed,
+        };
+        while let Some(index) = self.bindings.iter().position(expired) {
             self.count(|c| &mut c.bindings_expired);
-            // Synchronously, at the removal (ACS 15648); a reset row that
-            // expires before its next SM ends its former receiver's.
-            if let Some(receiver_id) = binding.receiver_id.or(binding.former) {
-                self.binding_gone(&binding, receiver_id, now);
-            }
+            self.remove_binding(index, now, |c| &mut c.bindings_expired);
         }
     }
 
@@ -6382,7 +6465,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let key = SmKey {
             endpoint: binding.endpoint,
             alias: binding.alias,
-            source: binding.source,
+            source: binding.source(),
             identity: binding.identity,
             receiver: Receiver {
                 receiver_boot_id: binding.boot_id,
@@ -6418,7 +6501,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let Some(binding) = self.bindings.iter().find(|binding| {
             binding.endpoint == endpoint
                 && binding.alias == request.alias
-                && binding.source == normal
+                && binding.source() == normal
                 && binding.boot_id == request.receiver.receiver_boot_id
                 && binding.identity == request.identity
         }) else {
@@ -6474,7 +6557,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let bound = self.bindings.iter().any(|binding| {
             binding.endpoint == endpoint
                 && binding.alias == nak.alias
-                && binding.source == normal
+                && binding.source() == normal
                 && binding.boot_id == nak.receiver.receiver_boot_id
                 && binding.identity == nak.identity
                 && binding
@@ -6494,7 +6577,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let validated = self.bindings.iter().any(|binding| {
             binding.endpoint == endpoint
                 && binding.alias == nak.alias
-                && binding.source == normal
+                && binding.source() == normal
                 && binding.boot_id == nak.receiver.receiver_boot_id
                 && binding.identity == nak.identity
                 && binding.receiver_id == Some(nak.receiver.receiver_id)
@@ -6643,7 +6726,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     && binding.boot_id == reply.receiver.receiver_boot_id
                     && binding.receiver_id == Some(reply.receiver.receiver_id)
             })
-            .map(|binding| binding.source);
+            .map(ReceiverBinding::source);
         match destination {
             Some(destination) => {
                 if self
@@ -6705,26 +6788,40 @@ impl<T: StreamTerms> SenderRole<T> {
         }
         // The incarnation is part of the binding: an earlier incarnation's
         // row from the same receiver never shadows the current one.
-        let found = self.bindings.iter_mut().find(|binding| {
-            binding.endpoint == endpoint
-                && binding.alias == status.alias
-                && binding.source == source
-                && binding.boot_id == status.receiver.receiver_boot_id
-                && binding.identity == status.identity
-        });
-        let Some(binding) = found else {
-            self.count(|c| &mut c.sm_unbound);
+        let Some(found) = self.sm_binding(endpoint, source, status) else {
             return;
         };
-        let matches = binding.identity == status.identity
-            && lane_count == Some(status.lanes.count())
-            && binding
-                .receiver_id
-                .is_none_or(|id| id == status.receiver.receiver_id);
+        // The SM is checked against its binding (an adoption has no
+        // receiver id yet) before it sets a source or adopts anything.
+        let receiver_id = match found {
+            SmBinding::Bound(index) | SmBinding::Learn(index) => self
+                .bindings
+                .get(index)
+                .and_then(|binding| binding.receiver_id),
+            SmBinding::Adopt(_) => None,
+        };
+        let matches = lane_count == Some(status.lanes.count())
+            && receiver_id.is_none_or(|id| id == status.receiver.receiver_id);
         if !matches {
             self.count(|c| &mut c.sm_mismatch);
             return;
         }
+        let index = match found {
+            SmBinding::Bound(index) => index,
+            SmBinding::Learn(index) => {
+                if let Some(binding) = self.bindings.get_mut(index) {
+                    binding.sm_source = Some(source);
+                }
+                index
+            }
+            SmBinding::Adopt(parent) => match self.adopt(parent, source, now) {
+                Some(index) => index,
+                None => return,
+            },
+        };
+        let Some(binding) = self.bindings.get_mut(index) else {
+            return;
+        };
         // A reset binding whose next SM names another receiver: the former
         // one's membership ends first (ACS 15648).
         let gone = match (binding.receiver_id, binding.former.take()) {
@@ -6783,6 +6880,91 @@ impl<T: StreamTerms> SenderRole<T> {
         {
             let _ = membership.status(&key, status, now);
         }
+    }
+
+    /// Which binding an SM from `source` on `endpoint` belongs to (plan
+    /// 169, network-control-schemas.md §6.3), deciding nothing yet: one of
+    /// the receiver (sender endpoint, alias, boot id and incarnation) whose
+    /// SM source is `source`; else one with no SM source yet, which would
+    /// take `source`; else an adoption for the receiver's ANSWER-created
+    /// binding, at most [`MAX_ADOPTIONS`] of them. An SM of a receiver with
+    /// no binding counts `sm_unbound`, one past the adoptions
+    /// `bindings_adoption_refused`.
+    fn sm_binding(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        status: &StatusMessage,
+    ) -> Option<SmBinding> {
+        let receiver = |binding: &ReceiverBinding| {
+            binding.endpoint == endpoint
+                && binding.alias == status.alias
+                && binding.boot_id == status.receiver.receiver_boot_id
+                && binding.identity == status.identity
+        };
+        if let Some(index) = self
+            .bindings
+            .iter()
+            .position(|binding| receiver(binding) && binding.sm_source == Some(source))
+        {
+            return Some(SmBinding::Bound(index));
+        }
+        if let Some(index) = self
+            .bindings
+            .iter()
+            .position(|binding| receiver(binding) && binding.sm_source.is_none())
+        {
+            return Some(SmBinding::Learn(index));
+        }
+        let Some(parent) = self
+            .bindings
+            .iter()
+            .position(|binding| receiver(binding) && binding.parent.is_none())
+        else {
+            self.count(|c| &mut c.sm_unbound);
+            return None;
+        };
+        let id = self.bindings.get(parent).map(|binding| binding.id);
+        let adopted = self
+            .bindings
+            .iter()
+            .filter(|binding| binding.parent.is_some() && binding.parent == id)
+            .count();
+        if adopted >= MAX_ADOPTIONS {
+            self.count(|c| &mut c.bindings_adoption_refused);
+            return None;
+        }
+        Some(SmBinding::Adopt(parent))
+    }
+
+    /// Adopts a binding for the receiver of the ANSWER-created binding at
+    /// `parent` with SM source `source`, returning its index: in the
+    /// bounded table, evicting as an answer does. Nothing is adopted if
+    /// there is no room, or if the eviction took the parent (an unconfirmed
+    /// one).
+    fn adopt(&mut self, parent: usize, source: SocketAddr, now: u64) -> Option<usize> {
+        let parent = *self.bindings.get(parent)?;
+        if !self.make_room(now) {
+            return None;
+        }
+        if !self.bindings.iter().any(|binding| binding.id == parent.id) {
+            self.count(|c| &mut c.sm_unbound);
+            return None;
+        }
+        let id = self.next_binding;
+        self.next_binding = id.wrapping_add(1);
+        self.bindings.push(ReceiverBinding {
+            id,
+            parent: Some(parent.id),
+            sm_source: Some(source),
+            receiver_id: None,
+            former: None,
+            lanes: None,
+            last_sm: None,
+            ..parent
+        });
+        self.count(|c| &mut c.bindings_adopted);
+        self.bindings.len().checked_sub(1)
     }
 
     /// The SETUP ANSWER to a received control, and where it goes: §7.3 and
