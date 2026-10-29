@@ -1156,7 +1156,7 @@ fn an_idle_multi_destination_publication_keeps_each_path() {
     let mut receivers = Vec::new();
     let mut addresses = Vec::new();
     for _ in 0..2 {
-        let mut receiver = driver_with(ThreadingMode::Shared, agents.clone());
+        let mut receiver = driver_with(ThreadingMode::Shared, agents);
         let _ = receiver
             .add_network_subscription(10, &channel(ANY_PORT, true))
             .unwrap();
