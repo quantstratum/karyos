@@ -14,27 +14,45 @@
     in its queues come back as `QueueClosed` and are counted in
     `removed_returned` and `removed_closed` (both now cover retired
     destinations too). Handles of an epoch older than the publication's
-    died with that epoch and are dropped. Its slot is held until its
-    route and queues leave for the close list, which the next duty
-    closes before it serves commands, so a new destination never opens
-    beside an old route. While the conductor's event ring was full,
-    remove and add churn grew the per-destination state past
-    `MAX_DESTINATIONS` and allocated on the duty path; an addition now
-    answers `Full` instead, and a move at capacity retried after the
-    removal shows in `network_removed_destinations` finds the slot free.
-    A removal, a refused addition, a report with its retirement and the
-    drain allocate nothing; only an accepted addition does. When the
-    close list has no room, retired routes and queues are carried over to
-    the next duty, counted once each (`close_deferred`), and keep their
-    slots: nothing is dropped. The report hands them to the close list
-    itself, so the next cycle's commands, served before its duty, find
-    the slot free. A close whose endpoint's TX half is not held at its
-    duty is dropped and counted once (`removed_dropped`): that half comes
-    back only in a new epoch, whose reset drops the handles, or never. A
-    queue or route the endpoint refuses to close is counted
-    (`removed_close_failed`) and left to its next reset. With the
-    quarantine full, the record removed earliest makes room, the incoming
-    one included.
+    died with that epoch and are dropped. The report hands its route and
+    queues to the close list, which frees its slot for the next cycle's
+    commands; that cycle's duty closes them before it opens any new
+    route or queue, so a new destination never opens beside an old
+    route. While the conductor's event ring was full, remove and add
+    churn grew the per-destination state past `MAX_DESTINATIONS` and
+    allocated on the duty path; an addition now answers `Full` instead,
+    and a move at capacity retried after the removal shows in
+    `network_removed_destinations` finds the slot free. A removal, a
+    refused addition, a report with its retirement and the drain allocate
+    nothing; only an accepted addition does. A close entry whose
+    endpoint's TX half is not held at its duty (the half is in a reset,
+    which drops the handles, or retired), or is of another epoch, is
+    dropped and counted once (`removed_dropped`); a handle already gone
+    counts as closed. An entry whose queue still has frames in flight is
+    closed again at each duty (`removed_close_deferred`) and counts as
+    failed only on a close error or after `CLOSE_IN_FLIGHT_TIMEOUT` (1 s)
+    in flight (`removed_close_timeouts`): a kernel backend shows no
+    progress on frames it holds, so a cycle count would fail closes that
+    are only slow. One that finds no room to wait stays in the close
+    list for the next duty (`removed_close_overflow`), never failed; one
+    with a live handle the endpoint will not close is counted once
+    (`removed_close_failed`). When that endpoint then refuses a route or
+    a queue for its limit (`RouteLimit`, `QueueLimit`, `OverCommitted`),
+    on any open path, in the same epoch, its reset is asked for once,
+    tagged with that epoch; the served reset starts a new epoch, which
+    drops what did not close. The endpoint table keeps this standing
+    request while the endpoint is not active or within its interval, and
+    serves it once in that epoch; with its command ring full it is
+    counted refused once and tried again at most once per endpoint
+    interval (`standing_retries`); an agent gone, or a new epoch, drops
+    it (`standing_dropped`). An ordinary request refused meanwhile leaves
+    it kept. Other reset requests are dropped then, as before,
+    and asked again by their owner while the need holds. Without a
+    failed close in the epoch the limit is an ordinary refusal and
+    resets nothing. With the
+    quarantine full, the record removed earliest makes room, the
+    incoming one included; an incoming record already past its
+    quarantine is not kept.
   - A route table, queue entries or TX slots that other publications
     filled (`RouteLimit`, `QueueLimit`, `OverCommitted`) no longer count
     as the destination's own fault, so an optional destination is not
