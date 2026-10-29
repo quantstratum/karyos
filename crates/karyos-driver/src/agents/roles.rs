@@ -5090,6 +5090,15 @@ impl<T: StreamTerms> SenderRole<T> {
     /// (design 4.5; MD-7, MD-12). One the ring refused is posted again next
     /// cycle. A posted report retires the destination and hands its route
     /// and queues to the close list (design 3.7).
+    /// Its control routes on `endpoint`, open and closing (tests).
+    #[cfg(test)]
+    pub(super) fn control_entries(&self, endpoint: EndpointId) -> usize {
+        self.routes
+            .iter()
+            .find(|slot| slot.endpoint == Some(endpoint))
+            .map_or(0, |slot| slot.routes.entries().0)
+    }
+
     /// Posts each publication's endpoint limit change through `post`
     /// (karyos#859); one `post` refuses leaves the rest for the next cycle.
     pub(super) fn report_limits<O: SocketOps>(

@@ -261,10 +261,12 @@ fn a_network_publication_refuses_a_cutover() {
 
 /// karyos#859: a publication its endpoint could never open is refused at
 /// the add, never accepted and silent. One endpoint's 256 TX slots hold the
-/// control reserve (8 routes of 4 slots) and 28 single-lane unicast
-/// publications of 8 slots each (a lane queue of 8; no repair queue): the
-/// 29th is refused with the limit, the capacity and what it would take.
-/// Once a removal has ended its room is free again.
+/// control reserve (8 routes of 4 slots) and 24 reliable single-lane
+/// publications of 9 slots each (a lane queue of 8 and a repair queue of
+/// 1): the 25th is refused with the limit, the capacity and what it would
+/// take.
+/// A removal's room is free once it has ended: an add refused during it is
+/// accepted after.
 #[test]
 fn a_publication_its_endpoint_cannot_hold_is_refused() {
     use crate::error::EndpointLimit;
@@ -273,7 +275,7 @@ fn a_publication_its_endpoint_cannot_hold_is_refused() {
     let socket = receiver();
     let destination = Destination::Unicast(socket.local_addr().unwrap());
     let mut held = Vec::new();
-    for stream in 0..28 {
+    for stream in 0..24 {
         held.push(
             driver
                 .add_network_publication(aggregate(100 + stream, 1), &channel(destination.clone()))
@@ -286,7 +288,7 @@ fn a_publication_its_endpoint_cannot_hold_is_refused() {
         Err(DriverError::EndpointCapacity {
             limit: EndpointLimit::TxSlots,
             capacity: 256,
-            needed: 32 + 29 * 8,
+            needed: 32 + 25 * 9,
         })
     );
     assert_eq!(
@@ -294,13 +296,21 @@ fn a_publication_its_endpoint_cannot_hold_is_refused() {
         (1 << 56) | (256 << 32) | 257,
         "the detail word"
     );
+    // A removal frees its room when it ends, not when it is asked: an add
+    // in between is refused, retryable, and accepted once it has ended. (A
+    // refused add's own stream key stays held for a few cycles,
+    // `DuplicateStream`; the retry uses another.)
     let first = held.remove(0);
     driver.remove_aggregate(&first).unwrap();
+    assert!(matches!(
+        driver.add_network_publication(aggregate(201, 1), &channel(destination.clone())),
+        Err(DriverError::EndpointCapacity { .. })
+    ));
     until(&mut driver, |driver| {
         driver.network_publication_state(&first).is_none()
     });
     let _ = driver
-        .add_network_publication(aggregate(200, 1), &channel(destination))
+        .add_network_publication(aggregate(202, 1), &channel(destination))
         .unwrap();
 }
 

@@ -2743,6 +2743,25 @@ impl<T: StreamTerms> Network<T> {
         &self.links
     }
 
+    /// What its publications hold of each send endpoint, by the driver's
+    /// accounting (tests, karyos#859): `(endpoint, demand)` per endpoint
+    /// held.
+    #[cfg(test)]
+    pub(crate) fn reserved(&self) -> Vec<(EndpointId, TxDemand)> {
+        self.send_endpoints
+            .iter()
+            .map(|entry| {
+                let held = self
+                    .publications
+                    .iter()
+                    .flat_map(|publication| publication.demand.iter())
+                    .filter(|(held, _)| *held == entry.endpoint)
+                    .fold(TxDemand::default(), |sum, (_, demand)| sum.plus(*demand));
+                (entry.endpoint, held)
+            })
+            .collect()
+    }
+
     /// The endpoint table, for tests.
     #[cfg(test)]
     pub(crate) fn endpoints_mut(&mut self) -> (&mut Endpoints<OsSocket>, &AgentLinks<OsSocket, T>) {

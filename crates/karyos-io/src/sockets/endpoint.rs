@@ -40,7 +40,7 @@ pub use config::{
     MAX_TX_SLOTS, MIN_DATAGRAM, Membership, MulticastConfig, ObservationPoints, Platform,
     Protection, QueueAssignment, SOCKETS_MAX_BATCH, SocketsConfig,
 };
-pub use tx::{RouteInfo, SocketsFrame};
+pub use tx::{RouteInfo, SocketsFrame, TxCommitment};
 
 use self::rx::RxCore;
 use self::tx::TxCore;
@@ -507,6 +507,13 @@ impl<O: SocketOps> fmt::Debug for SocketsTx<O> {
 }
 
 impl<O: SocketOps> SocketsTx<O> {
+    /// What its open routes and queues take now: routes, queues and the
+    /// slots committed to them (karyos#859). Read only; nothing allocates.
+    #[must_use]
+    pub fn commitment(&self) -> TxCommitment {
+        self.core.commitment()
+    }
+
     /// Adds a route to `destination`, measuring its MTU (3.8, 4.5).
     ///
     /// # Errors

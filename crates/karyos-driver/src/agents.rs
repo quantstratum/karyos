@@ -1445,6 +1445,25 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         })
     }
 
+    /// What its TX half on `endpoint` has open now (tests, karyos#859).
+    #[cfg(test)]
+    pub(crate) fn tx_commitment(
+        &self,
+        endpoint: EndpointId,
+    ) -> Option<karyos_io::sockets::endpoint::TxCommitment> {
+        self.core.halves.iter().find_map(|(held, half)| match half {
+            Half::Tx(tx) if *held == endpoint => Some(tx.commitment()),
+            _ => None,
+        })
+    }
+
+    /// Its control routes open and closing on `endpoint` (tests,
+    /// karyos#859).
+    #[cfg(test)]
+    pub(crate) fn control_entries(&self, endpoint: EndpointId) -> usize {
+        self.role.control_entries(endpoint)
+    }
+
     /// The counters of its `index`-th publication's data path (tests).
     #[cfg(test)]
     pub(crate) fn outbound_counters(&self, index: usize) -> Option<data::OutboundCounters> {

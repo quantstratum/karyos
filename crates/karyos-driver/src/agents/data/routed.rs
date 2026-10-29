@@ -711,8 +711,9 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     }
 
     /// What it takes of each endpoint it sends on, once open (karyos#859):
-    /// per route, its lane queues of `STAGED_PER_LANE` slots each and, with
-    /// repairs, a repair queue of one slot. A publication on one path has
+    /// per route, its lane queues of `STAGED_PER_LANE` slots each and, if
+    /// reliable, a repair queue of one slot (the sender enables repairs on
+    /// a reliable publication when it takes it, R4). A publication on one path has
     /// one route, a routed one one per path, a multi-destination one one
     /// per destination it has now.
     #[must_use]
@@ -725,15 +726,13 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 .saturating_mul(u32::from(STAGED_PER_LANE))
                 .saturating_add(u32::from(repair)),
         };
+        let route = per_route(self.reliable);
         if let Some(fanout) = self.fanout.as_deref() {
             let total = fanout
                 .target_repairs()
-                .fold(TxDemand::default(), |sum, repair| {
-                    sum.plus(per_route(repair))
-                });
+                .fold(TxDemand::default(), |sum, _| sum.plus(route));
             return vec![(self.endpoint, total)];
         }
-        let route = per_route(self.repair.is_some());
         self.route_endpoints()
             .map(|endpoint| (endpoint, route))
             .collect()

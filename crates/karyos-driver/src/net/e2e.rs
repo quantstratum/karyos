@@ -4199,3 +4199,93 @@ fn a_publication_crosses_the_term_id_wrap() {
 }
 
 mod destinations;
+
+/// karyos#859: the driver's accounting of what publications hold of a
+/// send endpoint matches what the endpoint has open, through adds,
+/// removals and a reset: at the end the endpoint's routes, queues and
+/// committed slots are exactly the publications' demand plus its control
+/// routes, with no drift.
+#[test]
+fn the_endpoint_accounting_matches_its_use_through_adds_removals_and_a_reset() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let mut publications = Vec::new();
+    let add = |a: &mut EmbeddedDriver, b: &mut EmbeddedDriver, stream: i32| {
+        let _ = b
+            .add_network_subscription(stream, &channel(ANY_PORT, true))
+            .unwrap();
+        let address = bound(b, stream);
+        a.add_network_publication(aggregate(stream, 1, 1), &channel(address, true))
+            .unwrap()
+    };
+    for stream in 10..18 {
+        publications.push((stream, add(&mut a, &mut b, stream)));
+    }
+    let images = |drivers: &mut [&mut EmbeddedDriver], streams: &[i32]| {
+        streams
+            .iter()
+            .all(|stream| drivers[1].network_image(*stream, 1).is_some())
+    };
+    let streams: Vec<i32> = (10..18).collect();
+    pump(&mut [&mut a, &mut b], |drivers| images(drivers, &streams));
+    // Three removals, to their end.
+    for (_, handle) in publications.drain(..3) {
+        a.remove_aggregate(&handle).unwrap();
+    }
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0]
+            .net
+            .as_ref()
+            .unwrap()
+            .reserved()
+            .iter()
+            .all(|(_, held)| held.routes == 5)
+    });
+    // A reset of the endpoint, then two more adds.
+    let endpoint = a.net.as_ref().unwrap().reserved()[0].0;
+    {
+        let net = a.net.as_mut().unwrap();
+        let (endpoints, links) = net.endpoints_mut();
+        endpoints.reset(links, endpoint).unwrap();
+    }
+    for stream in [20, 21] {
+        publications.push((stream, add(&mut a, &mut b, stream)));
+    }
+    let streams: Vec<i32> = (13..18).chain([20, 21]).collect();
+    pump(&mut [&mut a, &mut b], |drivers| images(drivers, &streams));
+    let expected = |a: &mut EmbeddedDriver| {
+        let reserved = a
+            .net
+            .as_ref()
+            .unwrap()
+            .reserved()
+            .into_iter()
+            .find(|(held, _)| *held == endpoint)
+            .unwrap()
+            .1;
+        let control = u32::try_from(shared(a).sender.control_entries(endpoint)).unwrap();
+        (
+            reserved.routes + control,
+            reserved.queues + control,
+            reserved.slots + control * u32::from(crate::agents::control::CONTROL_QUEUE_DEPTH),
+        )
+    };
+    let used = |a: &mut EmbeddedDriver| {
+        let used = shared(a).sender.tx_commitment(endpoint).unwrap();
+        (used.routes, used.queues, used.slots)
+    };
+    // Every publication opens; then the two agree.
+    for _ in 0..20_000 {
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+        if used(&mut a) == expected(&mut a) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+    let (routes, queues, slots) = used(&mut a);
+    assert_eq!((routes, queues, slots), expected(&mut a));
+    assert!(
+        routes >= 7 && queues >= 7 && slots >= 7 * 8,
+        "{routes} {queues} {slots}"
+    );
+}
