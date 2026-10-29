@@ -698,10 +698,10 @@ pub fn side(text: &str) -> Result<Side, CompatError> {
     let frame = integer(["protocol", "frame"])?;
     // The wire object repeats the frame version: one value, or the object
     // contradicts itself.
-    if let Some(wire_frame) = integer(["wire", "frame"])? {
-        if Some(wire_frame) != frame {
-            return Err(schema("wire.frame differs from protocol.frame"));
-        }
+    if let Some(wire_frame) = integer(["wire", "frame"])?
+        && Some(wire_frame) != frame
+    {
+        return Err(schema("wire.frame differs from protocol.frame"));
     }
     let tuple = Tuple {
         admission: integer(["protocol", "admission"])?,
