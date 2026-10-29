@@ -75,6 +75,24 @@ fn channel(destination: Destination) -> UdpConfig {
     }
 }
 
+/// A driver whose endpoints have 256 TX slots, 64 queues and 64 routes.
+fn small_endpoints() -> EmbeddedDriver {
+    let mut network = NetworkConfig {
+        threading: ThreadingMode::Shared,
+        ..NetworkConfig::default()
+    };
+    network.endpoint_tables = crate::net::EndpointTables {
+        tx_slots: std::num::NonZeroU16::new(256).unwrap(),
+        max_queues: std::num::NonZeroU16::new(64).unwrap(),
+        max_routes: std::num::NonZeroU16::new(64).unwrap(),
+    };
+    EmbeddedDriver::with_config(DriverConfig {
+        network: Some(network),
+        ..DriverConfig::default()
+    })
+    .unwrap()
+}
+
 /// A receiving socket on loopback that the test reads.
 fn receiver() -> UdpSocket {
     let socket = UdpSocket::bind(SocketAddr::new(LOOPBACK, 0)).unwrap();
@@ -271,20 +289,7 @@ fn a_network_publication_refuses_a_cutover() {
 fn a_publication_its_endpoint_cannot_hold_is_refused() {
     use crate::error::EndpointLimit;
 
-    let mut network = NetworkConfig {
-        threading: ThreadingMode::Shared,
-        ..NetworkConfig::default()
-    };
-    network.endpoint_tables = crate::net::EndpointTables {
-        tx_slots: std::num::NonZeroU16::new(256).unwrap(),
-        max_queues: std::num::NonZeroU16::new(64).unwrap(),
-        max_routes: std::num::NonZeroU16::new(64).unwrap(),
-    };
-    let mut driver = EmbeddedDriver::with_config(DriverConfig {
-        network: Some(network),
-        ..DriverConfig::default()
-    })
-    .unwrap();
+    let mut driver = small_endpoints();
     let socket = receiver();
     let destination = Destination::Unicast(socket.local_addr().unwrap());
     let mut held = Vec::new();
@@ -344,7 +349,7 @@ fn a_destination_its_endpoint_cannot_hold_is_refused() {
     use crate::agents::data::DestinationChange;
     use crate::error::EndpointLimit;
 
-    let mut driver = driver();
+    let mut driver = small_endpoints();
     let sockets = [receiver(), receiver()];
     let destination = Destination::Unicast(sockets[0].local_addr().unwrap());
     let mut held = Vec::new();
