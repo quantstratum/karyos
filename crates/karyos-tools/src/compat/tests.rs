@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: Apache-2.0
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "test helpers, as ADR-0007 allows in tests"
+)]
+
+use super::*;
+
+fn this_side() -> Side {
+    side(&crate::versions::current().json()).unwrap()
+}
+
+/// The embedded matrix is valid, and this build's tuple is its `main`
+/// column: a version that changes without its column fails here.
+#[test]
+fn the_matrix_is_valid_and_main_is_this_build() {
+    let matrix = matrix().unwrap();
+    assert_eq!(
+        matrix.column("main").map(|column| &column.tuple),
+        Some(&this_build()),
+        "update compat/matrix.toml's main column for this build's versions"
+    );
+}
+
+/// A round trip of this build's own `--versions`: read back, its tuple is
+/// this build's and nothing in it is unknown.
+#[test]
+fn this_builds_versions_read_back() {
+    let side = this_side();
+    assert_eq!(side.tuple, this_build());
+    assert!(side.unknown.is_empty(), "{:?}", side.unknown);
+}
+
+/// Every entry of the matrix decides as written, and a pair of one column
+/// interoperates on every surface both sides have.
+#[test]
+fn every_entry_decides_as_written() {
+    let matrix = matrix().unwrap();
+    let side_of_column = |name: &str| side_of(&matrix, &format!("column:{name}")).unwrap();
+    for entry in &matrix.entries {
+        let decision = decide(
+            &matrix,
+            &side_of_column(&entry.from),
+            &side_of_column(&entry.to),
+        );
+        let surface = decision
+            .surfaces
+            .iter()
+            .find(|surface| surface.surface == entry.surface)
+            .unwrap();
+        assert_eq!(
+            (surface.outcome, surface.reason.as_str()),
+            (entry.outcome, entry.reason.as_str()),
+            "{entry:?}"
+        );
+    }
+    for column in &matrix.columns {
+        let side = side_of_column(&column.name);
+        let decision = decide(&matrix, &side, &side);
+        assert_eq!(decision.outcome, Outcome::Interoperate, "{}", column.name);
+        assert_eq!(decision.exit(), EXIT_INTEROPERATE);
+    }
+}
+
+/// The criterion of R-CORE-36: an equal frame version with another
+/// admission version is in the matrix with its real outcome, a refusal.
+#[test]
+fn an_equal_frame_version_is_not_enough() {
+    let matrix = matrix().unwrap();
+    let main = side_of(&matrix, "column:main").unwrap();
+    let alpha2 = side_of(&matrix, "column:0.1.0-alpha.2").unwrap();
+    assert_eq!(main.tuple.frame, alpha2.tuple.frame);
+    let decision = decide(&matrix, &main, &alpha2);
+    assert_eq!(decision.outcome, Outcome::Refuse);
+    assert_eq!(decision.exit(), EXIT_REFUSE);
+    let admission = &decision.surfaces[0];
+    assert_eq!(
+        (admission.surface, admission.outcome),
+        ("admission", Outcome::Refuse)
+    );
+    // A surface only main has is absent from the pair, not a refusal.
+    let durable = decision
+        .surfaces
+        .iter()
+        .find(|surface| surface.surface == "archive_durable")
+        .unwrap();
+    assert_eq!(durable.outcome, Outcome::Absent);
+}
+
+/// A tuple without a column, or a field the matrix does not know, is not
+/// covered, never decided by a guess.
+#[test]
+fn an_unknown_tuple_or_field_is_not_covered() {
+    let matrix = matrix().unwrap();
+    let main = this_side();
+    let mut future = main.clone();
+    future.tuple.admission = Some(4);
+    let decision = decide(&matrix, &future, &main);
+    assert_eq!(decision.outcome, Outcome::NotCovered);
+    assert_eq!(decision.exit(), EXIT_NOT_COVERED);
+    assert_eq!(decision.from, None);
+
+    let with_field = crate::versions::current().json().replacen(
+        "\"features\"",
+        "\"telemetry\":{\"v\":1},\"features\"",
+        1,
+    );
+    let newer = side(&with_field).unwrap();
+    assert_eq!(newer.unknown, vec!["telemetry".to_owned()]);
+    assert_eq!(decide(&matrix, &newer, &main).outcome, Outcome::NotCovered);
+}
+
+/// Each error class of the reader, typed.
+#[test]
+fn each_reader_error_is_typed() {
+    let deep = format!(
+        "{}1{}",
+        "[".repeat(MAX_DEPTH + 1),
+        "]".repeat(MAX_DEPTH + 1)
+    );
+    let large = format!("\"{}\"", "x".repeat(MAX_BYTES));
+    let rows: [(&str, CompatError); 9] = [
+        (r#"{"schema":"karyos-versions""#, CompatError::Truncated),
+        (r#"{"a":"\q"}"#, CompatError::BadEscape),
+        (r#"{"a":"\ud800"}"#, CompatError::BadEscape),
+        (
+            r#"{"a":1,"a":2}"#,
+            CompatError::DuplicateKey("a".to_owned()),
+        ),
+        (&deep, CompatError::TooDeep),
+        (&large, CompatError::TooLarge),
+        (r#"{"a":18446744073709551616}"#, CompatError::Number),
+        (r#"{"a":1} x"#, CompatError::Trailing),
+        (r#"{"a":-1}"#, CompatError::Number),
+    ];
+    for (text, expected) in rows {
+        assert_eq!(parse(text), Err(expected.clone()), "{text}");
+    }
+    assert_eq!(parse(r#"{"a":1.5}"#), Err(CompatError::Number));
+    assert_eq!(parse(r#"{"a":01}"#), Err(CompatError::Number));
+    assert!(matches!(parse("{a:1}"), Err(CompatError::Syntax(_))));
+    // At the depth limit, and the largest integer, are read.
+    let at_limit = format!("{}1{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+    assert!(parse(&at_limit).is_ok());
+    assert_eq!(
+        parse(r#"{"a":18446744073709551615,"b":"é\n"}"#),
+        Ok(Json::Object(vec![
+            ("a".to_owned(), Json::Integer(u64::MAX)),
+            ("b".to_owned(), Json::String("é\n".to_owned())),
+        ]))
+    );
+}
+
+/// Valid JSON that is not a karyos-versions object of this version is a
+/// schema error.
+#[test]
+fn another_schema_is_refused() {
+    for text in [
+        "[]",
+        r#"{"schema":"other","schema_version":1}"#,
+        r#"{"schema":"karyos-versions","schema_version":2}"#,
+        r#"{"schema":"karyos-versions","schema_version":1,"protocol":{"admission":"3"}}"#,
+    ] {
+        assert!(matches!(side(text), Err(CompatError::Schema(_))), "{text}");
+    }
+}
+
+/// Unknown fields in the matrix file are refused, as is a matrix that
+/// names an unknown column or repeats an entry.
+#[test]
+fn an_invalid_matrix_is_refused() {
+    let head = "schema = \"karyos-compat\"\nschema_version = 1\n";
+    let column = "[[column]]\nname = \"a\"\n[column.versions]\nadmission = 1\n";
+    for text in [
+        format!("{head}{column}extra = 1\n"),
+        format!("{head}[[column]]\nname = \"a\"\n[column.versions]\nadmission = 1\nbogus = 2\n"),
+        format!(
+            "{head}{column}[[entry]]\nsurface = \"admission\"\nfrom = \"a\"\nto = \"b\"\noutcome = \"refuse\"\nreason = \"r\"\n"
+        ),
+        format!(
+            "{head}{column}{}",
+            column.replace("admission = 1", "admission = 2")
+        ),
+        "schema = \"other\"\nschema_version = 1\n".to_owned(),
+    ] {
+        assert!(
+            matches!(Matrix::read(&text), Err(CompatError::Matrix(_))),
+            "{text}"
+        );
+    }
+    assert!(matches!(
+        side_of(&matrix().unwrap(), "column:nope"),
+        Err(CompatError::UnknownColumn(_))
+    ));
+}
+
+/// The decision object names its schema, both columns and every surface.
+#[test]
+fn the_decision_is_one_json_object() {
+    let matrix = matrix().unwrap();
+    let main = this_side();
+    let json = decide(&matrix, &main, &main).json();
+    assert!(
+        json.starts_with(r#"{"schema":"karyos-compat-decision","schema_version":1,"from":"main","to":"main","outcome":"interoperate","#),
+        "{json}"
+    );
+    assert_eq!(json.lines().count(), 1);
+    // The decider's own output reads back as JSON.
+    assert!(parse(&json).is_ok());
+    for (surface, _) in SURFACES {
+        assert!(
+            json.contains(&format!("\"surface\":\"{surface}\"")),
+            "{surface}"
+        );
+    }
+}
+
+/// The subcommand: a decision with its exit status, and a typed error
+/// (status 3) for an input it cannot read.
+#[test]
+fn the_subcommand_exits_by_outcome() {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let status = run(["column:main", "column:main"], &mut out, &mut err);
+    assert_eq!(status, EXIT_INTEROPERATE);
+    assert!(String::from_utf8_lossy(&out).contains("\"outcome\":\"interoperate\""));
+    out.clear();
+    assert_eq!(
+        run(["column:main", "column:0.1.0-alpha.2"], &mut out, &mut err),
+        EXIT_REFUSE
+    );
+    assert_eq!(run(["column:main"], &mut out, &mut err), EXIT_ERROR);
+    assert_eq!(
+        run(["column:main", "/nonexistent.json"], &mut out, &mut err),
+        EXIT_ERROR
+    );
+    assert_eq!(
+        run(["column:main", "column:nope"], &mut out, &mut err),
+        EXIT_ERROR
+    );
+    assert!(String::from_utf8_lossy(&err).contains("no column"));
+}
