@@ -1430,28 +1430,28 @@ fn a_reset_request_is_repeated_at_its_cadence() {
     let mut sender = sm_sender();
     let mut asked = Vec::new();
     sender.cycle = 10;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
     assert!(asked.is_empty(), "nothing needs a reset");
     sender.publications[0].force_needs_reset();
     // The ring is full: counted, not recorded.
-    sender.request_resets(|_| false);
+    sender.request_resets(|_, _| false);
     sender.cycle = 11;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
     assert_eq!(asked, [EndpointId(1)]);
     sender.cycle = 11 + RESET_REQUEST_CYCLES - 1;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
     assert_eq!(asked.len(), 1);
     sender.cycle = 11 + RESET_REQUEST_CYCLES;
-    sender.request_resets(|endpoint| {
+    sender.request_resets(|endpoint, _| {
         asked.push(endpoint);
         true
     });
@@ -2809,7 +2809,7 @@ fn a_route_fault_asks_for_a_reset_at_its_cadence() {
     let mut asked = Vec::new();
     let mut ask = |receiver: &mut super::ReceiverRole, cycle| {
         receiver.cycle = cycle;
-        receiver.request_resets(|endpoint| {
+        receiver.request_resets(|endpoint, _| {
             asked.push((cycle, endpoint));
             true
         });
@@ -2835,7 +2835,7 @@ fn a_route_fault_asks_for_a_reset_at_its_cadence() {
     receiver.fault_naks(slot, &nak);
     let mut later = Vec::new();
     receiver.cycle = 11 + RESET_REQUEST_CYCLES;
-    receiver.request_resets(|endpoint| {
+    receiver.request_resets(|endpoint, _| {
         later.push(endpoint);
         true
     });
@@ -4418,7 +4418,7 @@ fn a_retired_destinations_pending_items_return_queue_closed() {
         route,
         queues,
     });
-    sender.close_removed(&mut halves);
+    sender.close_removed(&mut halves, 0);
     let counters = sender.counters();
     assert_eq!(counters.removed_returned, 1, "{counters:?}");
     assert_eq!(counters.removed_closed, 2, "the queue and the route");
@@ -4515,8 +4515,8 @@ fn a_move_right_after_the_report_is_added_in_the_cycle_order() {
 }
 
 /// Review J1 of #829: an entry of the close list whose endpoint's TX half
-/// is not held at its duty is dropped and counted once: that half comes
-/// back only in a new epoch, whose reset drops the handles, or never.
+/// is not held at its duty is dropped and counted once: that half is in a
+/// reset, which drops the handles, or retired.
 #[test]
 fn a_close_without_its_tx_half_is_dropped_once() {
     use karyos_io::backend::{Authority, TxQueueConfig};
@@ -4546,10 +4546,11 @@ fn a_close_without_its_tx_half_is_dropped_once() {
     });
     // A duty that does not hold endpoint 1's half.
     let mut none: Halves = Vec::new();
-    sender.close_removed(&mut none);
+    sender.close_removed(&mut none, 0);
     assert!(sender.closing.is_empty(), "dropped");
     assert_eq!(sender.counters().removed_dropped, 1);
-    sender.close_removed(&mut halves);
+    // The next duty, holding the half, has nothing of it left.
+    sender.close_removed(&mut halves, 0);
     assert_eq!(sender.counters().removed_dropped, 1, "once");
     assert_eq!(sender.counters().removed_closed, 0);
 }
@@ -5356,4 +5357,582 @@ fn the_receiver_duty_retries_an_unanswered_solicit() {
         .unwrap();
     assert_eq!(take().len(), 1, "the second, 100 ms on");
     assert_eq!(receiver.session_counters().solicit_retries, 2);
+}
+
+/// The follow-up of #829's review, point 2, and QS-COORDINATOR's T1 rule
+/// on #838: an entry whose live route stays in use (a queue on it would not
+/// close) is counted failed once per entry, and a single route's failure
+/// never resets the shared endpoint.
+#[test]
+fn a_route_in_use_counts_once_and_resets_nothing() {
+    use karyos_io::backend::{Authority, TxQueueConfig};
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let open = |tx: &mut Box<karyos_io::sockets::endpoint::SocketsTx<_>>| {
+        tx.open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap()
+    };
+    // A queue that stays open on the route, and a stale one in the entry.
+    let _held = open(tx);
+    let stale = open(tx);
+    let mut report = karyos_io::backend::TxReport::new();
+    let _ = tx.close_queue(stale, &mut report);
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(stale);
+    let entry = super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: tx.capabilities().epoch,
+        route,
+        queues,
+    };
+    sender.closing.push(entry);
+    sender.closing.push(entry);
+    sender.close_removed(&mut halves, 0);
+    let counters = sender.counters();
+    assert_eq!(
+        counters.removed_close_failed, 2,
+        "once per entry: {counters:?}"
+    );
+    let mut asked = 0;
+    sender.request_resets(|_, _| {
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 0, "a route's failure resets nothing");
+}
+
+/// Review T1 of #838 (QS-COORDINATOR's rule): an entry whose handles are
+/// already gone (its queue and route unknown to a healthy shared
+/// endpoint) counts as closed, and no reset is asked for.
+#[test]
+fn a_close_of_handles_already_gone_asks_no_reset() {
+    use karyos_io::backend::{Authority, TxQueueConfig, TxReport};
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let queue = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap();
+    let _ = tx.close_queue(queue, &mut TxReport::new());
+    let _ = tx.remove_route(route);
+    let mut queues = [None; super::super::data::OPENED_QUEUES];
+    queues[0] = Some(queue);
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: tx.capabilities().epoch,
+        route,
+        queues,
+    });
+    sender.close_removed(&mut halves, 0);
+    let counters = sender.counters();
+    assert_eq!(counters.removed_close_failed, 0, "{counters:?}");
+    assert_eq!(
+        counters.removed_closed, 2,
+        "a queue and a route already gone"
+    );
+    let mut asked = 0;
+    sender.request_resets(|_, _| {
+        asked += 1;
+        true
+    });
+    assert_eq!(asked, 0, "nothing held, nothing to reset");
+}
+
+/// The follow-up of #829's review, point 3: an entry of an older epoch
+/// than its endpoint's half (the endpoint was reset since) is dropped and
+/// counted.
+#[test]
+fn an_entry_of_another_epoch_is_dropped_and_counted() {
+    use karyos_io::backend::{InstanceId, TxReport};
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+    let endpoint =
+        SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new()).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let route = tx.add_route("10.0.0.9:5000".parse().unwrap()).unwrap();
+    let older = tx.capabilities().epoch;
+    let mut endpoint = SocketsEndpoint::join(tx, rx).unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    let _ = endpoint.reopen(&config).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    assert!(tx.capabilities().epoch > older);
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch: older,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    });
+    sender.close_removed(&mut halves, 0);
+    let counters = sender.counters();
+    assert_eq!(counters.removed_dropped, 1, "{counters:?}");
+    assert_eq!(
+        (counters.removed_closed, counters.removed_close_failed),
+        (0, 0)
+    );
+}
+
+fn route_limit_after(failed_close: bool, routed: bool) -> (usize, bool) {
+    limit_after(LimitCase {
+        failed_close,
+        routed,
+        cycles: 10,
+        ..LimitCase::default()
+    })
+}
+
+/// Runs `case` against an endpoint whose one route (or one queue) a keeper
+/// holds: how many resets of endpoint 1 were asked for, and whether the
+/// publication opens once the reset is served.
+fn limit_after(case: LimitCase) -> (usize, bool) {
+    let LimitCase {
+        failed_close,
+        routed,
+        fanout,
+        queue_limit,
+        cycles,
+    } = case;
+    use karyos_io::backend::{Authority, InstanceId, TxQueueConfig, TxReport};
+    use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (replies, _keep) =
+        super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(64).unwrap());
+    let mut config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
+    if queue_limit {
+        config.max_routes = std::num::NonZeroU16::new(2).unwrap();
+        config.max_queues = std::num::NonZeroU16::MIN;
+    } else {
+        config.max_routes = std::num::NonZeroU16::MIN;
+    }
+    let (mut tx, rx) = SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new())
+        .unwrap()
+        .split()
+        .unwrap();
+    // The endpoint's one route, kept in use.
+    let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+    let _keeper = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap();
+    let epoch = tx.capabilities().epoch;
+    let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
+    if routed {
+        let (half, _frames, _data, _rx) = header_only_endpoint();
+        halves.push((EndpointId(2), half));
+    }
+    if failed_close {
+        sender.closing.push(super::super::data::Opened {
+            endpoint: EndpointId(1),
+            epoch,
+            route,
+            queues: [None; super::super::data::OPENED_QUEUES],
+        });
+    }
+    let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let term = publication(EndpointId(1)).term;
+    let (path, _log) = if routed {
+        super::super::data::testing::outbound_routed(
+            &[(EndpointId(1), receiver), (EndpointId(2), receiver)],
+            alias(),
+            term,
+            1,
+            false,
+        )
+    } else {
+        let (mut path, log) =
+            super::super::data::testing::outbound(EndpointId(1), alias(), receiver, term, 1, false);
+        if fanout {
+            path.set_destinations(&[receiver], &[], Some(true)).unwrap();
+        }
+        (path, log)
+    };
+    let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication: publication(EndpointId(1)),
+        outbound: path,
+        guard: None,
+        roles: None,
+    });
+    for (endpoint, _) in &halves {
+        sender.bind(*endpoint, receiver, &sm_answer([7, 8], 0), 0);
+        sender.status(*endpoint, receiver, &sm_status([7, 8], 0), 1);
+    }
+    let mut asked = 0usize;
+    let end = 2 + cycles;
+    for now in 2..end {
+        let _ = sender.duty(&mut halves, now).unwrap();
+        sender.request_resets(|endpoint, standing| {
+            if endpoint == EndpointId(1) {
+                asked += 1;
+            }
+            assert_eq!(standing, Some(epoch), "tagged with its epoch");
+            true
+        });
+    }
+    let failures = |sender: &super::SenderRole<karyos_sys::term_bytes::HeapTerms>| {
+        let counters = sender.publications[0].counters();
+        if queue_limit {
+            counters.queue_failures
+        } else {
+            counters.route_failures
+        }
+    };
+    let refused = failures(&sender);
+    assert!(refused >= 1, "refused: {refused}");
+    if failed_close {
+        assert_eq!(sender.counters().removed_close_failed, 1, "counted once");
+    }
+    if asked == 0 {
+        return (asked, false);
+    }
+    // The reset, served: endpoint 1 comes back in a new epoch, its route
+    // table empty.
+    let at = halves
+        .iter()
+        .position(|(endpoint, _)| *endpoint == EndpointId(1))
+        .unwrap();
+    let super::super::Half::Tx(tx) = halves.remove(at).1 else {
+        panic!("a TX half");
+    };
+    let mut endpoint = SocketsEndpoint::join(*tx, rx).unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    let _ = endpoint.reopen(&config).unwrap();
+    let (tx, _rx) = endpoint.split().unwrap();
+    halves.insert(at, (EndpointId(1), super::super::Half::Tx(Box::new(tx))));
+    let before = failures(&sender);
+    // Past any open spacing of a multi-destination target.
+    for now in [
+        end,
+        end + 1,
+        end + 1_000_000_000_000,
+        end + 1_000_000_000_001,
+    ] {
+        let _ = sender.duty(&mut halves, now).unwrap();
+    }
+    let opened = failures(&sender) == before;
+    (asked, opened)
+}
+
+/// (a), (c), (d): a failed close, then a single-destination publication
+/// refused for the route limit on every serve: one reset of the epoch is
+/// asked for, the failed close counted once, and the route opens after it.
+#[test]
+fn a_route_limit_after_a_failed_close_asks_one_reset() {
+    let (asked, opened) = route_limit_after(true, false);
+    assert_eq!(asked, 1, "once per epoch");
+    assert!(opened, "the route opens after the reset");
+}
+
+/// (a) over redundant paths: the routed publication's refused route asks
+/// for its endpoint's one reset, and opens after it.
+#[test]
+fn a_routed_route_limit_after_a_failed_close_asks_one_reset() {
+    let (asked, opened) = route_limit_after(true, true);
+    assert_eq!(asked, 1, "once per epoch");
+    assert!(opened, "the route opens after the reset");
+}
+
+/// (b): the route limit with no failed close in the epoch is an ordinary
+/// refusal and resets nothing.
+#[test]
+fn a_route_limit_without_a_failed_close_resets_nothing() {
+    assert_eq!(route_limit_after(false, false).0, 0);
+    assert_eq!(route_limit_after(false, true).0, 0);
+}
+
+/// #838: however long the limit holds, the sender asks for the epoch's
+/// reset once; a deferral is the endpoint table's to serve
+/// (`a_deferred_request_is_served_when_its_interval_ends`).
+#[test]
+fn the_sender_asks_one_reset_per_epoch() {
+    let cycles = 2 * super::super::data::RESET_REQUEST_CYCLES + 4;
+    let (asked, opened) = limit_after(LimitCase {
+        failed_close: true,
+        cycles,
+        ..LimitCase::default()
+    });
+    assert_eq!(asked, 1, "once per epoch");
+    assert!(opened, "the route opens after the reset");
+}
+
+/// Y2 (#838): a queue refused for the endpoint's queue limit after a
+/// failed close asks for the reset, as a refused route does.
+#[test]
+fn a_queue_limit_after_a_failed_close_asks_one_reset() {
+    let (asked, opened) = limit_after(LimitCase {
+        failed_close: true,
+        queue_limit: true,
+        cycles: 10,
+        ..LimitCase::default()
+    });
+    assert_eq!(asked, 1);
+    assert!(opened, "the queues open after the reset");
+    let (asked, _) = limit_after(LimitCase {
+        queue_limit: true,
+        cycles: 10,
+        ..LimitCase::default()
+    });
+    assert_eq!(asked, 0, "an ordinary queue limit resets nothing");
+}
+
+/// (a) on a multi-destination path: its refused route asks for the reset.
+#[test]
+fn a_fanout_route_limit_after_a_failed_close_asks_one_reset() {
+    let (asked, opened) = limit_after(LimitCase {
+        failed_close: true,
+        fanout: true,
+        cycles: 10,
+        ..LimitCase::default()
+    });
+    assert_eq!(asked, 1);
+    assert!(opened, "the target opens after the reset");
+}
+
+/// Y3 (#838; QS-COORDINATOR 34443): a removed entry whose queue still has
+/// frames in flight is closed again at each duty and is not counted as
+/// failed while it is within `CLOSE_IN_FLIGHT_TIMEOUT`; closed then, no
+/// reset follows. Still in flight past the bound, it counts once.
+#[test]
+fn a_close_in_flight_fails_only_past_the_bound() {
+    use super::super::CLOSE_IN_FLIGHT_TIMEOUT;
+
+    for (in_flight, failed) in [(3u32, 0u64), (u32::MAX, 1)] {
+        let (mut sender, _receiver) =
+            super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+        let (half, _frames, _data, _rx) = header_only_endpoint();
+        let mut halves: Halves = vec![(EndpointId(1), half)];
+        let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+            panic!("a TX half");
+        };
+        let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+        let epoch = tx.capabilities().epoch;
+        sender.closing.push(super::super::data::Opened {
+            endpoint: EndpointId(1),
+            epoch,
+            route,
+            queues: [None; super::super::data::OPENED_QUEUES],
+        });
+        sender.close_in_flight = in_flight;
+        // Duties within the bound: in flight, never failed.
+        for now in [0, 1, 2, CLOSE_IN_FLIGHT_TIMEOUT / 2] {
+            let _ = sender.duty(&mut halves, now).unwrap();
+            assert_eq!(
+                sender.counters().removed_close_failed,
+                0,
+                "within the bound at {now}"
+            );
+        }
+        let _ = sender.duty(&mut halves, CLOSE_IN_FLIGHT_TIMEOUT).unwrap();
+        let counters = sender.counters();
+        assert_eq!(counters.removed_close_deferred, 1, "deferred once");
+        assert_eq!(
+            counters.removed_close_failed, failed,
+            "in flight {in_flight}"
+        );
+        assert_eq!(counters.removed_close_timeouts, failed, "past the bound");
+        assert_eq!(counters.removed_closed, 1 - failed, "the route closed");
+    }
+}
+
+/// #838 (QS-COORDINATOR): more removed entries in flight than
+/// `closing_again` holds are never failed for want of room: the ones past
+/// its capacity stay in the close list for the next duty, counted.
+#[test]
+fn a_full_closing_again_fails_nothing() {
+    let config = AgentConfig {
+        publications: 1,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+    let epoch = tx.capabilities().epoch;
+    let entry = super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    };
+    let room = sender.closing_again.capacity();
+    sender.close_in_flight = u32::MAX;
+    // One duty fills `closing_again` with entries still in flight.
+    for _ in 0..room {
+        sender.closing.push(entry);
+    }
+    let _ = sender.duty(&mut halves, 0).unwrap();
+    assert_eq!(sender.closing_again.len(), room, "full");
+    // A later removal finds no room: kept in the close list, not failed.
+    sender.closing.push(entry);
+    let _ = sender.duty(&mut halves, 1).unwrap();
+    let counters = sender.counters();
+    assert_eq!(counters.removed_close_deferred as usize, room);
+    assert_eq!(
+        counters.removed_close_failed, 0,
+        "no failure for want of room"
+    );
+    assert_eq!(
+        counters.removed_close_overflow, 1,
+        "the overflow is counted"
+    );
+    assert_eq!(sender.closing.len(), 1, "kept for the next duty");
+    sender.close_in_flight = 0;
+    sender.closing.clear();
+    sender.closing_again.clear();
+}
+
+/// #838 review: an entry in flight whose re-close then fails with a real
+/// close error (its route still in use) counts as failed at once, not at
+/// the time bound.
+#[test]
+fn a_real_error_at_the_re_close_fails_at_once() {
+    use karyos_io::backend::{Authority, TxQueueConfig};
+
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+    // A queue the entry does not list keeps the route in use.
+    let _keeper = tx
+        .open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: std::num::NonZeroU16::MIN,
+        })
+        .unwrap();
+    let epoch = tx.capabilities().epoch;
+    sender.closing.push(super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    });
+    sender.close_in_flight = 1;
+    let _ = sender.duty(&mut halves, 0).unwrap();
+    assert_eq!(
+        sender.counters().removed_close_deferred,
+        1,
+        "in flight first"
+    );
+    assert_eq!(sender.counters().removed_close_failed, 0);
+    let _ = sender.duty(&mut halves, 1).unwrap();
+    let counters = sender.counters();
+    assert_eq!(counters.removed_close_failed, 1, "failed at the next duty");
+    assert_eq!(counters.removed_close_timeouts, 0, "not by the bound");
+}
+
+/// #838 review (E1): with `closing_again` full and the overflow waiting in
+/// the close list, another full share of removals still finds room in it,
+/// so nothing goes unrecorded.
+#[test]
+fn the_close_list_has_room_past_a_full_wait_list() {
+    let config = AgentConfig {
+        publications: 1,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+    let epoch = tx.capabilities().epoch;
+    let entry = super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    };
+    let share = sender.closing_again.capacity();
+    sender.close_in_flight = u32::MAX;
+    // A share fills `closing_again`, a second waits in the close list.
+    for _ in 0..share {
+        sender.closing.push(entry);
+    }
+    let _ = sender.duty(&mut halves, 0).unwrap();
+    for _ in 0..share {
+        sender.closing.push(entry);
+    }
+    let _ = sender.duty(&mut halves, 1).unwrap();
+    assert_eq!(sender.closing.len(), share, "the overflow waits");
+    // A third share of removals still fits.
+    assert!(
+        sender.closing.capacity() - sender.closing.len() >= share,
+        "room for another share: {} of {}",
+        sender.closing.len(),
+        sender.closing.capacity()
+    );
+    assert_eq!(sender.counters().removed_unrecorded, 0);
+    sender.close_in_flight = 0;
+    sender.closing.clear();
+    sender.closing_again.clear();
+}
+
+/// QS-COORDINATOR on #838 (ACS 34198): an endpoint of one route, holding
+/// it with a route of its own (a queue on it stays open); with
+/// `failed_close`, that route's close was tried and failed. A publication
+/// (single-destination, or `routed` over that endpoint and another) is
+/// then refused its route for the limit on every serve. Returns the resets
+/// asked for over several cycles, and whether the publication's route
+/// opened after the reset was served (or `false` without one).
+/// A [`limit_after`] case.
+#[derive(Clone, Copy, Default)]
+struct LimitCase {
+    /// A removed entry fails to close first.
+    failed_close: bool,
+    /// The publication is routed over two endpoints.
+    routed: bool,
+    /// The publication sends to its receiver as a multi-destination one.
+    fanout: bool,
+    /// The endpoint's queue table is full instead of its route table.
+    queue_limit: bool,
+    /// Cycles run before the reset is served.
+    cycles: u64,
 }

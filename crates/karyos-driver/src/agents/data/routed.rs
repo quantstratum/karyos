@@ -1202,9 +1202,15 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 self.counters.bump(|c| &mut c.route_failures, 1);
                 continue;
             }
-            let Ok(route) = tx.add_route(slot.destination) else {
-                self.counters.bump(|c| &mut c.route_failures, 1);
-                continue;
+            let route = match tx.add_route(slot.destination) {
+                Ok(route) => route,
+                Err(error) => {
+                    self.counters.bump(|c| &mut c.route_failures, 1);
+                    if error == karyos_io::backend::RouteError::RouteLimit {
+                        super::note_limited(&mut self.limited, slot.endpoint, epoch);
+                    }
+                    continue;
+                }
             };
             let mut ok = true;
             for lane in 0..slot.queues.len() {
@@ -1218,8 +1224,11 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                             *held = queue;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.counters.bump(|c| &mut c.queue_failures, 1);
+                        if super::fanout::queue_limit(error) {
+                            super::note_limited(&mut self.limited, slot.endpoint, epoch);
+                        }
                         for queue in slot.queues.iter().take(lane) {
                             let _ = tx.close_queue(*queue, &mut self.report);
                             while self.report.pop_front().is_some() {}
