@@ -52,7 +52,27 @@
 //! [`embedded`] holds the low-level API the driver, the benchmarks and
 //! the simulator use: the client conductor and the per-lane handles with
 //! their outcome enums. The Archive and Cluster APIs do not exist yet.
+//!
+//! # Versions
+//!
+//! [`CORE_VERSION`] is the core release this facade was built from, and
+//! [`PROTOCOL_VERSION`] the admission protocol version its client
+//! announces to a driver (R-CORE-33, karyos#752). They are the values the
+//! C ABI publishes as `KARYOS_PROTOCOL_VERSION` and a `libkaryos`
+//! package's manifest as `core_version` and `protocol_version`, readable
+//! at run time without the C ABI:
+//!
+//! ```
+//! let release: &str = karyos::CORE_VERSION;
+//! let protocol: u64 = karyos::PROTOCOL_VERSION;
+//! assert!(!release.is_empty() && protocol > 0);
+//! ```
 
+/// The core release this facade was built from: the workspace version,
+/// such as `0.1.0-alpha.2` (R-CORE-33, karyos#752).
+pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub use karyos_client::PROTOCOL_VERSION;
 pub use karyos_client::{
     Accepted, Claim, Client, ClientError, ConflatedBudget, ConflatedLimits, ConflatedOptions,
     ConflatedSubscription, ConflatedValue, Connection, Context, ContextBuilder, Freshness,

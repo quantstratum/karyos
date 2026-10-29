@@ -68,6 +68,14 @@ pub use generation::{GenerationLink, LinkStatus, Next, Successor};
 pub use guarded::{ConsumedCell, GuardBinding, HeapWords, SharedWords};
 pub use journal::{ClientJournal, FetchableJournal};
 pub use karyos_protocol::cnc::{NetworkAdmission, StreamId, SubscriberRole};
+
+/// The admission protocol version this client announces in its `Hello`
+/// (karyos#752, R-CORE-33): a driver of another version refuses the attach
+/// with `AttachError::IncompatibleVersion`, naming its own. Written out,
+/// not aliased, so a protocol change has to update the public value on
+/// purpose; it is asserted equal at compile time.
+pub const PROTOCOL_VERSION: u64 = 3;
+const _: () = assert!(PROTOCOL_VERSION == karyos_protocol::admission::VERSION);
 pub use karyos_protocol::roles::{PublicationRoles, ReceiverIdentity, Strategy};
 /// The publication identity a replay and a live merge name (merge module).
 pub use karyos_protocol::trace_hook::PublicationIdentity;

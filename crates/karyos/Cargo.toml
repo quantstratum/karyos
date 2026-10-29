@@ -16,5 +16,9 @@ karyos-archive.workspace = true
 karyos-cluster.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The versions test compares the facade's with the protocol's.
+karyos-protocol.workspace = true
+
 [lints]
 workspace = true
