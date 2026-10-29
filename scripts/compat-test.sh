@@ -119,7 +119,8 @@ check() { # <surface> <from side> <to side> <observed outcome> <detail>
 
 # Admission: a client of one build attaching to the other's driver.
 for pair in "new old" "old new"; do
-    set -- $pair
+    read -r a b <<<"$pair"
+    set -- "$a" "$b"
     line="$(probe "$1" attach "/tmp/d-$2")"
     case "$line" in
         "attach ok") check admission "$1" "$2" interoperate "$line" ;;
@@ -133,7 +134,8 @@ done
 # as the control.
 port=40500
 for pair in "new new" "old old" "new old" "old new"; do
-    set -- $pair
+    read -r a b <<<"$pair"
+    set -- "$a" "$b"
     port=$((port + 1))
     probe "$2" sub "/tmp/d-$2" "$port" 200 20 >"/tmp/sub-$port" &
     sub=$!
