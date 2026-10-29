@@ -560,6 +560,18 @@ impl From<&DriverError> for Failure {
             DriverError::StreamTooLarge { bytes, max } => {
                 Self::with(Status::InvalidArgument, *bytes, *max)
             }
+            // An endpoint that cannot hold the publication (karyos#859):
+            // retryable once a removal ends; the limit, the endpoint's
+            // capacity and what it would take in the value.
+            DriverError::EndpointCapacity {
+                limit,
+                capacity,
+                needed,
+            } => Self::with(
+                Status::ResourcesUnavailable,
+                0,
+                limit.detail(*capacity, *needed),
+            ),
             _ => Status::Unknown.into(),
         }
     }
