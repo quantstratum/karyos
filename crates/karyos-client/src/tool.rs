@@ -157,12 +157,17 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, Staged), AttachError> {
             (instance, records)
         }
         (
-            Message::Refused {
+            refused @ Message::Refused {
                 code: refusal::INCOMPATIBLE_VERSION,
                 ..
             },
             None,
-        ) => return Err(AttachError::IncompatibleVersion { driver: None }),
+        ) => {
+            // The driver's version, when it states it (karyos#879).
+            return Err(AttachError::IncompatibleVersion {
+                driver: refused.refuser_version().map(core::num::NonZeroU64::get),
+            });
+        }
         (Message::Refused { code, .. }, None) => return Err(AttachError::Refused { code }),
         _ => return Err(AttachError::Protocol),
     };

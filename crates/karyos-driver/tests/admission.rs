@@ -326,7 +326,15 @@ fn hellos_that_break_the_profile_are_refused() {
     let dir = dir("hello");
     let mut driver = system_driver(&dir);
     let hello = encode(&Message::Hello { version: VERSION });
-    let refused = |code| Some(Message::Refused { fetch: 0, code });
+    // A version refusal states this driver's version (karyos#879).
+    let refused = |code| {
+        Some(match core::num::NonZeroU64::new(VERSION) {
+            Some(version) if code == refusal::INCOMPATIBLE_VERSION => {
+                Message::incompatible_version(version)
+            }
+            _ => Message::Refused { fetch: 0, code },
+        })
+    };
     // No descriptor.
     assert_eq!(
         raw_hello(&mut driver, &dir, &hello, None),

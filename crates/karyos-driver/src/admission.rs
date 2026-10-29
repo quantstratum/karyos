@@ -384,8 +384,16 @@ fn reject<T: StreamTerms>(driver: &mut EmbeddedDriver<T>, socket: &OwnedFd, code
 }
 
 /// Sends one refusal on a connection that is then closed; best effort.
+/// A refusal of another protocol version states this driver's
+/// [`VERSION`] (karyos#879).
 fn refuse(socket: &OwnedFd, code: u64) {
-    if let Some(bytes) = encode(&Message::Refused { fetch: 0, code }) {
+    let message = match core::num::NonZeroU64::new(VERSION) {
+        Some(version) if code == refusal::INCOMPATIBLE_VERSION => {
+            Message::incompatible_version(version)
+        }
+        _ => Message::Refused { fetch: 0, code },
+    };
+    if let Some(bytes) = encode(&message) {
         let _ = ipc::send(socket.as_fd(), &bytes, None);
     }
 }

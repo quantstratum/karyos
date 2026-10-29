@@ -96,17 +96,26 @@ fn fake_driver(dir: &Path, answer: &Message) -> (i32, u64, abi::Detail) {
 #[test]
 fn a_driver_that_refuses_the_version_is_incompatible() {
     let _serial = serial();
-    let dir = dir("refused");
+    let refused_dir = dir("refused");
     let refused = Message::Refused {
         fetch: 0,
         code: refusal::INCOMPATIBLE_VERSION,
     };
-    let (status, client, detail) = fake_driver(&dir, &refused);
+    let (status, client, detail) = fake_driver(&refused_dir, &refused);
     assert_eq!(status, INCOMPATIBLE_DRIVER);
     assert_eq!(client, 0);
-    // A refusal names no driver version.
+    // A refusal that states no version (0.1.0-alpha.2 and earlier) names
+    // none.
     assert_eq!((detail.code, detail.value), (0, 0));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&refused_dir);
+    // One that states it (karyos#879) gives it in detail->value.
+    let stating_dir = dir("refused-stating");
+    let stating = Message::incompatible_version(core::num::NonZeroU64::new(9).unwrap());
+    let (status, client, detail) = fake_driver(&stating_dir, &stating);
+    assert_eq!(status, INCOMPATIBLE_DRIVER);
+    assert_eq!(client, 0);
+    assert_eq!((detail.code, detail.value), (0, 9));
+    let _ = std::fs::remove_dir_all(&stating_dir);
 }
 
 #[test]

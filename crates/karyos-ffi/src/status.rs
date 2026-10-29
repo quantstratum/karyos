@@ -277,8 +277,9 @@ impl From<&karyos_client::ipc::AttachError> for Failure {
         use karyos_client::ipc::AttachError;
         match error {
             AttachError::Refused { code } => Self::with(Status::AdmissionRefused, *code, 0),
-            // The driver's version when it admitted the client at another
-            // one; zero, never a version, when it refused.
+            // The driver's version: announced when it admitted the client
+            // at another one, or stated in its refusal (karyos#879); zero,
+            // never a version, when a refusing driver states none.
             AttachError::IncompatibleVersion { driver } => {
                 Self::with(Status::IncompatibleDriver, 0, driver.unwrap_or(0))
             }

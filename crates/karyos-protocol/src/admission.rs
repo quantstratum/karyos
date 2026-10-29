@@ -25,7 +25,7 @@
 //! | `0x81` | `Admitted` | instance (low, high); protocol version; client id; record count; records |
 //! | `0x82` | `Manifest` | fetch id; hand-over key; registration; stream registration; incarnation; base; record count; records |
 //! | `0x83` | `Region` | fetch id; record index |
-//! | `0x84` | `Refused` | fetch id or 0; code (nonzero) |
+//! | `0x84` | `Refused` | word 1 by code (below); code (nonzero) |
 //! | `0x85` | `ToolAdmitted` | instance (low, high); protocol version; record count; records (capability none) |
 //! | `0x86` | `ProbeState` | state ([`probe`]); reason ([`probe`]); nanoseconds since the driver started |
 //!
@@ -70,6 +70,19 @@
 //! layout are fixed for every version, so a driver can read the version of
 //! any `Hello` with [`hello_version`] and refuse it in a form every client
 //! can decode.
+//!
+//! **Word 1 of `Refused`, by code** (karyos#879, decided 2026-10-29 by
+//! QS-COORDINATOR under owner delegation). For
+//! [`refusal::INCOMPATIBLE_VERSION`], the answer to a `Hello`,
+//! `ToolHello` or `ProbeHello`, it is the refuser's protocol version, or 0
+//! when the refuser does not state it (0.1.0-alpha.2 and earlier); read it
+//! with [`Message::refuser_version`], built with
+//! [`Message::incompatible_version`]. For every other code it is the
+//! fetch id refused, or 0 for a refusal of the bootstrap or a hello. The
+//! layout and its length are unchanged, so every decoder of every
+//! version reads the refusal as before; one that ignores word 1 (every
+//! client of 0.1.0-alpha.2) still classifies it as an incompatible
+//! version. A new code states its word 1 here.
 //!
 //! **Layout changes within a version.** Before the first release, a layout
 //! change keeps [`VERSION`] and changes encoder and decoder together, as the
@@ -665,7 +678,10 @@ pub enum Message {
     },
     /// A refusal.
     Refused {
-        /// The fetch id refused, or 0.
+        /// Word 1, whose meaning depends on `code` (module docs): the fetch
+        /// id refused or 0, or for [`refusal::INCOMPATIBLE_VERSION`] the
+        /// refuser's protocol version or 0. Read the version with
+        /// [`Message::refuser_version`], never this field.
         fetch: u64,
         /// Why (nonzero).
         code: u64,
@@ -802,6 +818,31 @@ fn guarded_grant(records: &[Record]) -> bool {
 }
 
 impl Message {
+    /// The refusal of a `Hello` of another protocol version, stating the
+    /// refuser's `version` in word 1 (karyos#879).
+    #[must_use]
+    pub const fn incompatible_version(version: core::num::NonZeroU64) -> Self {
+        Self::Refused {
+            fetch: version.get(),
+            code: refusal::INCOMPATIBLE_VERSION,
+        }
+    }
+
+    /// The protocol version a refusal of [`refusal::INCOMPATIBLE_VERSION`]
+    /// states for its refuser, or `None`: for another message, another
+    /// code (whose word 1 is a fetch id), or a refuser that states none
+    /// (word 1 zero).
+    #[must_use]
+    pub const fn refuser_version(&self) -> Option<core::num::NonZeroU64> {
+        match self {
+            Self::Refused {
+                fetch,
+                code: refusal::INCOMPATIBLE_VERSION,
+            } => core::num::NonZeroU64::new(*fetch),
+            _ => None,
+        }
+    }
+
     /// The words of the message.
     ///
     /// # Errors
@@ -1102,6 +1143,41 @@ mod tests {
             capability,
             allow_unconnected: false,
         }
+    }
+
+    /// karyos#879: an INCOMPATIBLE_VERSION refusal states the refuser's
+    /// version in word 1, in the fixed three-word layout every decoder
+    /// reads; zero states none. Word 1 of any other refusal is a fetch id
+    /// and is never read as a version.
+    #[test]
+    fn a_version_refusal_states_the_refusers_version_and_a_fetch_refusal_does_not() {
+        let three = core::num::NonZeroU64::new(3).unwrap();
+        let refusal = Message::incompatible_version(three);
+        round_trip(&refusal);
+        let mut out = [0u8; MAX_MESSAGE_LENGTH];
+        let len = refusal.encode(&mut out).unwrap();
+        assert_eq!(len, 24, "the fixed layout: type, word 1, code");
+        assert_eq!(
+            Message::decode(&out[..len]).unwrap().refuser_version(),
+            Some(three)
+        );
+        let unstated = Message::Refused {
+            fetch: 0,
+            code: refusal::INCOMPATIBLE_VERSION,
+        };
+        assert_eq!(unstated.refuser_version(), None);
+        for code in [
+            refusal::PROFILE,
+            refusal::LIMIT,
+            refusal::RESOURCES,
+            refusal::UNKNOWN_KEY,
+            refusal::SHUTTING_DOWN,
+            99,
+        ] {
+            let fetch = Message::Refused { fetch: 3, code };
+            assert_eq!(fetch.refuser_version(), None, "code {code}");
+        }
+        assert_eq!(Message::Leave.refuser_version(), None);
     }
 
     fn round_trip(message: &Message) {
