@@ -5,7 +5,10 @@
 //! "Per-stream positions").
 //!
 //! Each stream lane has a cell for the publication limit, the head and the
-//! retention floor, and each attached subscriber a cell for its position.
+//! retention floor, one for its wire stream id and one counting the
+//! embedding program's publications on it (karyos#885); each attached
+//! subscriber a cell for its position, and each client publication a cell
+//! naming its client (karyos#885).
 //! Cells are allocated, set and released only inside a pass, between its
 //! odd and its even `positions epoch`, so a tool that reads a consistent
 //! pass also reads a consistent membership. Membership is recomputed in the
@@ -23,9 +26,14 @@
 //! pass, so a reader that outlives it sees that change at an odd epoch.
 
 use karyos_client::LinkStatus;
-use karyos_sys::counters::{Counter, CounterKeys, KIND_NONE, KIND_SUBSCRIBER};
+use karyos_sys::counters::{
+    Counter, CounterKeys, KIND_NONE, KIND_PUBLICATION, KIND_SUBSCRIBER,
+    LABEL_EMBEDDED_PUBLICATIONS, LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, TYPE_GAUGE,
+    wire_stream_id_value,
+};
 use karyos_sys::host_clock::age_ns;
 
+use crate::commands::Registration;
 use crate::counters::{DriverCounters, Event, TYPE_POSITION};
 use crate::embedded::{Stream, StreamTerms};
 use crate::generations::MemberKind;
@@ -60,6 +68,17 @@ struct SubscriberCells {
     position: Option<Counter>,
 }
 
+/// The cell of one client publication (karyos#885).
+#[derive(Debug)]
+struct PublicationCell {
+    /// The publication's registration id: the cell's participant.
+    registration: u64,
+    /// The client that registered it: the cell's value.
+    client: u64,
+    /// Its cell; `None` while no cell was free.
+    cell: Option<Counter>,
+}
+
 /// The cells of one stream lane.
 #[derive(Debug)]
 struct StreamCells {
@@ -69,10 +88,16 @@ struct StreamCells {
     registration: u64,
     /// The stream's lane.
     lane: u8,
+    /// The lane's wire `stream_id`, the value of its `wire` cell.
+    stream_id: i32,
     limit: Option<Counter>,
     head: Option<Counter>,
     floor: Option<Counter>,
+    wire: Option<Counter>,
+    /// The count of the embedding program's publications on the lane.
+    embedded: Option<Counter>,
     subscribers: Vec<SubscriberCells>,
+    publications: Vec<PublicationCell>,
 }
 
 /// The sampling state: the epoch, when the last pass ran and the cells
@@ -98,23 +123,37 @@ struct PassAllocator<'a> {
 }
 
 impl PassAllocator<'_> {
-    /// A cell for a new member; a refusal counts in `counters unavailable`.
+    /// A position cell for a new member; a refusal counts in `counters
+    /// unavailable`.
     fn new_cell(&mut self, label: &str, keys: CounterKeys) -> Option<Counter> {
+        self.new_typed(TYPE_POSITION, label, keys)
+    }
+
+    /// A cell of `type_id` for a new member; a refusal counts in `counters
+    /// unavailable`.
+    fn new_typed(&mut self, type_id: u64, label: &str, keys: CounterKeys) -> Option<Counter> {
         if self.exhausted {
             self.counters.count_unavailable();
             return None;
         }
-        let counter = self.counters.allocate_keyed(TYPE_POSITION, label, keys);
+        let counter = self.counters.allocate_keyed(type_id, label, keys);
         self.exhausted = counter.is_none();
         counter
     }
 
-    /// A cell for a member refused in an earlier pass, not counted again.
+    /// A position cell for a member refused in an earlier pass, not counted
+    /// again.
     fn retry(&mut self, label: &str, keys: CounterKeys) -> Option<Counter> {
+        self.retry_typed(TYPE_POSITION, label, keys)
+    }
+
+    /// A cell of `type_id` for a member refused in an earlier pass, not
+    /// counted again.
+    fn retry_typed(&mut self, type_id: u64, label: &str, keys: CounterKeys) -> Option<Counter> {
         if self.exhausted {
             return None;
         }
-        let counter = self.counters.retry_keyed(TYPE_POSITION, label, keys);
+        let counter = self.counters.retry_keyed(type_id, label, keys);
         self.exhausted = counter.is_none();
         counter
     }
@@ -144,17 +183,20 @@ impl Positions {
     ///
     /// Every departed cell, of any stream, is released before any cell is
     /// allocated, so a member that leaves one stream frees its cell for a
-    /// member that joins another in the same pass.
+    /// member that joins another in the same pass. `registrations` are the
+    /// driver's, whose publications have cells (karyos#885).
     pub(crate) fn sample<T: StreamTerms>(
         &mut self,
         now: u64,
         counters: &mut DriverCounters,
         streams: &[Stream<T>],
+        registrations: &[Registration],
     ) {
         self.last = Some(now);
         let (odd, even) = next_epochs(self.epoch);
         counters.begin_pass(odd);
-        // Releases: removed streams, then departed subscribers. Positions
+        // Releases: removed streams, then departed subscribers and
+        // publications. Positions
         // are loaded here, before each stream's floor, head and limit below:
         // each only grows, so within a pass no position exceeds the head.
         self.streams.retain_mut(|cells| {
@@ -173,6 +215,7 @@ impl Positions {
                 .find(|cells| cells.stream == stream.id)
             {
                 cells.release_departed(counters, attached);
+                cells.release_departed_publications(counters, registrations);
             }
         }
         // Allocations and values.
@@ -195,6 +238,7 @@ impl Positions {
                         stream.id,
                         stream.aggregate.registration,
                         lane,
+                        stream.stream_id,
                     ));
                     self.streams.len() - 1
                 }
@@ -203,6 +247,8 @@ impl Positions {
                 continue;
             };
             cells.admit(&mut allocator, attached);
+            cells.admit_publications(&mut allocator, registrations);
+            set(cells.embedded.as_ref(), stream.host_publications());
             for (subscriber, attached) in cells.subscribers.iter().zip(attached) {
                 overflowed |= !set_checked(subscriber.position.as_ref(), attached.position);
             }
@@ -329,16 +375,88 @@ impl StreamCells {
         stream: u64,
         registration: u64,
         lane: u8,
+        stream_id: i32,
     ) -> Self {
         let keys = Self::keys(registration, lane);
-        Self {
+        let cells = Self {
             stream,
             registration,
             lane,
+            stream_id,
             limit: allocator.new_cell("stream limit", keys),
             head: allocator.new_cell("stream head", keys),
             floor: allocator.new_cell("stream floor", keys),
+            wire: allocator.new_typed(TYPE_GAUGE, LABEL_STREAM_WIRE_ID, keys),
+            embedded: allocator.new_typed(TYPE_GAUGE, LABEL_EMBEDDED_PUBLICATIONS, keys),
             subscribers: Vec::new(),
+            publications: Vec::new(),
+        };
+        set(cells.wire.as_ref(), wire_stream_id_value(stream_id));
+        cells
+    }
+
+    /// Releases the cells of publications no longer registered on this
+    /// lane (karyos#885).
+    fn release_departed_publications(
+        &mut self,
+        counters: &mut DriverCounters,
+        registrations: &[Registration],
+    ) {
+        let stream = self.stream;
+        self.publications.retain_mut(|held| {
+            let present = registrations.iter().any(|registration| {
+                registration.is_publication()
+                    && registration.stream() == stream
+                    && registration.id() == held.registration
+            });
+            if !present && let Some(counter) = held.cell.take() {
+                counters.free(counter);
+            }
+            present
+        });
+    }
+
+    /// Gives each client publication of this lane a cell, after
+    /// [`release_departed_publications`](Self::release_departed_publications),
+    /// in the order of `registrations`, and retries cells refused in an
+    /// earlier pass (counted once, when first refused).
+    fn admit_publications(
+        &mut self,
+        allocator: &mut PassAllocator<'_>,
+        registrations: &[Registration],
+    ) {
+        let mut held = core::mem::take(&mut self.publications);
+        for registration in registrations
+            .iter()
+            .filter(|registration| registration.is_publication())
+            .filter(|registration| registration.stream() == self.stream)
+        {
+            let keys = CounterKeys {
+                stream: self.registration,
+                lane: self.lane,
+                kind: KIND_PUBLICATION,
+                participant: registration.id(),
+            };
+            let publication = match held
+                .iter()
+                .position(|cell| cell.registration == registration.id())
+            {
+                Some(index) => {
+                    let mut publication = held.swap_remove(index);
+                    if publication.cell.is_none() {
+                        publication.cell =
+                            allocator.retry_typed(TYPE_GAUGE, LABEL_PUBLICATION, keys);
+                    }
+                    publication
+                }
+                None => PublicationCell {
+                    registration: registration.id(),
+                    client: registration.client(),
+                    cell: allocator.new_typed(TYPE_GAUGE, LABEL_PUBLICATION, keys),
+                },
+            };
+            set(publication.cell.as_ref(), publication.client);
+            self.publications.push(publication);
         }
     }
 
@@ -370,6 +488,13 @@ impl StreamCells {
                 *counter = allocator.retry(label, keys);
             }
         }
+        if self.wire.is_none() {
+            self.wire = allocator.retry_typed(TYPE_GAUGE, LABEL_STREAM_WIRE_ID, keys);
+            set(self.wire.as_ref(), wire_stream_id_value(self.stream_id));
+        }
+        if self.embedded.is_none() {
+            self.embedded = allocator.retry_typed(TYPE_GAUGE, LABEL_EMBEDDED_PUBLICATIONS, keys);
+        }
         let mut held = core::mem::take(&mut self.subscribers);
         for now in attached {
             let cells = match held.iter().position(|cells| cells.matches(now)) {
@@ -387,11 +512,22 @@ impl StreamCells {
     }
 
     fn release(&mut self, counters: &mut DriverCounters) {
-        for counter in [self.limit.take(), self.head.take(), self.floor.take()]
-            .into_iter()
-            .flatten()
+        for counter in [
+            self.limit.take(),
+            self.head.take(),
+            self.floor.take(),
+            self.wire.take(),
+            self.embedded.take(),
+        ]
+        .into_iter()
+        .flatten()
         {
             counters.free(counter);
+        }
+        for publication in self.publications.drain(..) {
+            if let Some(counter) = publication.cell {
+                counters.free(counter);
+            }
         }
         for cells in self.subscribers.drain(..) {
             if let Some(counter) = cells.position {
@@ -473,7 +609,9 @@ fn set_checked(counter: Option<&Counter>, value: Option<u64>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use karyos_sys::counters::{CellRead, CounterMetadata};
+    use karyos_client::Outcome;
+    use karyos_protocol::cnc::StreamKey;
+    use karyos_sys::counters::{CellRead, CounterMetadata, wire_stream_id};
     use karyos_sys::frame::Lane;
     use karyos_sys::log_buffer::{LogBufferConfig, LossPolicy, PublicationMode, Role};
     use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
@@ -562,7 +700,7 @@ mod tests {
     /// at its last value, and the pass counts one counter overflow.
     #[test]
     fn a_position_that_does_not_fit_keeps_its_cell_and_counts_an_overflow() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _reader = driver.subscribe(handle, Role::Required).unwrap();
         let mut writer = driver.publication(handle).unwrap();
@@ -597,7 +735,7 @@ mod tests {
     /// the first duty cycle, then moves with each one, never back.
     #[test]
     fn the_driver_records_its_pid_start_and_duty_time() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         assert_eq!(fixed(&driver, "driver pid"), u64::from(std::process::id()));
         let started = fixed(&driver, "driver started at");
         assert_ne!(started, 0);
@@ -613,7 +751,7 @@ mod tests {
 
     #[test]
     fn a_pass_samples_the_conductor_readings() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _reader = driver.subscribe(handle, Role::Required).unwrap();
         let mut writer = driver.publication(handle).unwrap();
@@ -671,7 +809,7 @@ mod tests {
 
     #[test]
     fn positions_continue_across_a_mapping_cutover() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let mut writer = driver.publication(handle).unwrap();
         let _ = writer.offer(b"one").unwrap();
@@ -706,7 +844,7 @@ mod tests {
 
     #[test]
     fn a_subscriber_that_has_not_moved_reports_its_predecessor_position() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let mut reader = driver.subscribe(handle, Role::Required).unwrap();
         let mut writer = driver.publication(handle).unwrap();
@@ -758,7 +896,7 @@ mod tests {
     /// predecessor cell only, not the successor cell reserved for it.
     #[test]
     fn a_recording_that_has_not_moved_reports_its_predecessor_position() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _recording = driver.recording_reader(handle, Role::Optional).unwrap();
         let mut writer = driver.publication(handle).unwrap();
@@ -792,7 +930,7 @@ mod tests {
 
     #[test]
     fn membership_changes_only_inside_a_pass() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _ = driver.do_work().unwrap();
         let epoch = fixed(&driver, "positions epoch");
@@ -819,7 +957,7 @@ mod tests {
         // Room for both streams' cells and one subscriber cell (REVIEWER-02's
         // repro, #108): streams are sampled in order, the earlier one gains a
         // subscriber while the later one loses its own in the same pass.
-        let mut driver = driver(FIXED_COUNTERS + 7);
+        let mut driver = driver(FIXED_COUNTERS + 11);
         let earlier = driver.add_stream(stream_config(2)).unwrap();
         let later = driver.add_stream(stream_config(3)).unwrap();
         let leaving = driver.subscribe(later, Role::Optional).unwrap();
@@ -845,7 +983,7 @@ mod tests {
     fn refusals_after_exhaustion_are_counted_without_rescanning() {
         // Room for the stream's cells only: every subscriber is refused,
         // each counted once, and later passes add no count.
-        let mut driver = driver(FIXED_COUNTERS + 3);
+        let mut driver = driver(FIXED_COUNTERS + 5);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _first = driver.subscribe(handle, Role::Required).unwrap();
         let _second = driver.subscribe(handle, Role::Optional).unwrap();
@@ -859,7 +997,7 @@ mod tests {
 
     #[test]
     fn dropping_the_driver_releases_cells_in_a_final_pass() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let _reader = driver.subscribe(handle, Role::Optional).unwrap();
         let _ = driver.do_work().unwrap();
@@ -889,8 +1027,8 @@ mod tests {
 
     #[test]
     fn a_replacement_subscriber_reuses_the_released_cell() {
-        // Room for the three stream cells and one subscriber cell.
-        let mut driver = driver(FIXED_COUNTERS + 4);
+        // Room for the five stream cells and one subscriber cell.
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let first = driver.subscribe(handle, Role::Optional).unwrap();
         let _ = driver.do_work().unwrap();
@@ -907,7 +1045,7 @@ mod tests {
     #[test]
     fn a_refused_cell_is_retried_and_counted_once() {
         // Room for two streams' cells and nothing more.
-        let mut driver = driver(FIXED_COUNTERS + 6);
+        let mut driver = driver(FIXED_COUNTERS + 10);
         // Streams are sampled in order: the later one's subscriber finds
         // no cell.
         let removed = driver.add_stream(stream_config(2)).unwrap();
@@ -928,7 +1066,7 @@ mod tests {
 
     #[test]
     fn cells_carry_the_stream_lane() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let mut config = stream_config(2);
         config.buffer.lane = Lane::try_new(3).unwrap();
         let handle = driver.add_stream(config).unwrap();
@@ -946,7 +1084,7 @@ mod tests {
         assert_eq!(next_epochs(u64::MAX - 1), (u64::MAX, 2));
         // An odd epoch is never stored, but the wrap from it skips 0 too.
         assert_eq!(next_epochs(u64::MAX), (1, 2));
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         driver.positions.set_epoch(u64::MAX - 1);
         let _ = driver.do_work().unwrap();
         assert_eq!(fixed(&driver, "positions epoch"), 2);
@@ -954,7 +1092,7 @@ mod tests {
 
     #[test]
     fn cells_are_released_with_the_subscriber_and_the_stream() {
-        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut driver = driver(FIXED_COUNTERS + 6);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let reader = driver.subscribe(handle, Role::Optional).unwrap();
         let _ = driver.do_work().unwrap();
@@ -986,8 +1124,9 @@ mod tests {
         let _ = writer.offer(b"one").unwrap();
         let _ = driver.do_work().unwrap();
         assert_eq!(positions(&driver).len(), 2);
-        // The floor and the subscriber found no cell.
-        assert_eq!(fixed(&driver, "counters unavailable"), 2);
+        // The floor, the wire id, the embedded count and the subscriber
+        // found no cell.
+        assert_eq!(fixed(&driver, "counters unavailable"), 4);
         assert_eq!(position(&driver, "stream floor"), None);
         assert_eq!(fixed(&driver, "positions epoch"), 2);
     }
@@ -1019,8 +1158,10 @@ mod tests {
     /// its label.
     #[test]
     fn readers_of_a_replaced_incarnation_are_sampled() {
-        // Five spare cells, and one for the guard's word gauge (M4).
-        let mut driver = driver(FIXED_COUNTERS + 6);
+        // One cell for the guard's word gauge (M4), six for its ack cells
+        // (allocated together, before the first pass) and seven for the
+        // stream's five and the two readers'.
+        let mut driver = driver(FIXED_COUNTERS + 14);
         let handle = driver.add_stream(stream_config(2)).unwrap();
         let guard = driver.add_guard("orders").unwrap();
         driver.guard_stream(handle, guard, 4, None).unwrap();
@@ -1052,5 +1193,237 @@ mod tests {
             .find(|(label, _)| label.starts_with("subscriber position incarnation 2"))
             .unwrap();
         assert_eq!((old.1, fresh.1), (0, base), "{sampled:?}");
+    }
+
+    /// Every allocated cell labelled `label`: metadata and value.
+    fn labelled(driver: &EmbeddedDriver, label: &str) -> Vec<(CounterMetadata, u64)> {
+        let reader = driver.counters();
+        (0..reader.capacity())
+            .filter_map(|index| match reader.read(index) {
+                CellRead::Allocated {
+                    metadata, value, ..
+                } if metadata.label() == label.as_bytes() => Some((metadata, value)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The values of every lane's `embedded publications` gauge.
+    fn embedded(driver: &EmbeddedDriver) -> Vec<u64> {
+        labelled(driver, LABEL_EMBEDDED_PUBLICATIONS)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect()
+    }
+
+    /// karyos#885: a lane's `embedded publications` gauge counts the
+    /// embedding program's live publication handles, a pending cutover's
+    /// included, while their successors are prepared, and drops when the
+    /// handle does.
+    #[test]
+    fn embedded_publications_count_the_programs_handles_across_a_cutover() {
+        let mut driver = driver(FIXED_COUNTERS + 5);
+        let handle = driver.add_stream(stream_config(2)).unwrap();
+        let mut writer = driver.publication(handle).unwrap();
+        let _ = writer.offer(b"one").unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(embedded(&driver), [1]);
+        let _ = driver
+            .reconfigure_stream(
+                handle,
+                crate::Reconfiguration {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH * 2).unwrap(),
+                    spare_slots: 5,
+                },
+            )
+            .unwrap();
+        assert!(
+            driver.streams[0]
+                .cutover
+                .as_ref()
+                .is_some_and(crate::generations::Cutover::is_pending)
+        );
+        // A pass while the cutover is pending: the handle is in its
+        // snapshot, not the lane's members.
+        driver.positions.sample(
+            karyos_sys::host_clock::host_monotonic_ns(),
+            &mut driver.counters,
+            &driver.streams,
+            &driver.registrations,
+        );
+        assert_eq!(embedded(&driver), [1]);
+        // The writer moves to the successor and is still counted once.
+        let _ = writer.offer(b"two").unwrap();
+        let _ = driver.do_work().unwrap();
+        let _ = writer.offer(b"two").unwrap();
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(embedded(&driver), [1]);
+        drop(writer);
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(embedded(&driver), [0]);
+    }
+
+    /// The publication, exclusive or concurrent, a client's completed
+    /// request gives.
+    fn take_publication(
+        driver: &mut EmbeddedDriver,
+        client: &mut karyos_client::ClientConductor,
+    ) -> Outcome {
+        let _ = driver.do_work().unwrap();
+        let mut publication = None;
+        let _ = client.poll(usize::MAX, |completion| {
+            if matches!(
+                completion.outcome,
+                Outcome::Publication(_) | Outcome::ConcurrentPublication(_)
+            ) {
+                publication = Some(completion.outcome);
+            }
+        });
+        publication.unwrap()
+    }
+
+    /// karyos#885: a lane's wire id cell is a gauge with the lane's stream
+    /// keys whose value reads back as the lane's `stream_id`, a negative one
+    /// included, and it goes with the stream.
+    #[test]
+    fn a_lanes_wire_id_cell_holds_its_stream_id_and_goes_with_the_stream() {
+        let mut driver = driver(FIXED_COUNTERS + 5);
+        let mut config = stream_config(-42);
+        config.buffer.lane = Lane::try_new(2).unwrap();
+        let handle = driver.add_stream(config).unwrap();
+        let _ = driver.do_work().unwrap();
+        let held = labelled(&driver, LABEL_STREAM_WIRE_ID);
+        assert_eq!(held.len(), 1);
+        let (metadata, value) = held[0];
+        assert_eq!(metadata.type_id, TYPE_GAUGE);
+        assert_eq!(
+            metadata.keys,
+            CounterKeys {
+                stream: driver.streams[0].aggregate.registration,
+                lane: 2,
+                kind: KIND_NONE,
+                participant: 0,
+            }
+        );
+        assert_eq!(wire_stream_id(value), Some(-42));
+        assert_eq!(fixed(&driver, "counters unavailable"), 0);
+        driver.remove_stream(handle).unwrap();
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        assert!(driver.streams.is_empty());
+        assert!(labelled(&driver, LABEL_STREAM_WIRE_ID).is_empty());
+    }
+
+    /// karyos#885: each client publication of a lane has a cell keyed to
+    /// the publication's registration whose value is its client; the
+    /// embedding program's own handle has none; a removed publication's
+    /// cell is released.
+    #[test]
+    fn each_client_publication_has_a_cell_naming_its_client() {
+        let mut driver = driver(DriverConfig::default().counters_capacity);
+        let mut config = stream_config(5);
+        config.buffer.spare_slots = 8;
+        config.buffer.publication = PublicationMode::Concurrent {
+            publishers: 4,
+            allow_non_lse: true,
+        };
+        let _handle = driver.add_stream(config).unwrap();
+        let key = StreamKey {
+            stream_id: 5,
+            session_id: 1,
+        };
+        let mut first = driver.connect().unwrap();
+        let _ = first.add_concurrent_publication(key, true).unwrap();
+        let first_publication = take_publication(&mut driver, &mut first);
+        let mut second = driver.connect().unwrap();
+        let _ = second.add_concurrent_publication(key, true).unwrap();
+        let _second_publication = take_publication(&mut driver, &mut second);
+        let own = driver.concurrent_publication(_handle).unwrap();
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        let mut held = labelled(&driver, LABEL_PUBLICATION);
+        held.sort_by_key(|(_, client)| *client);
+        let clients: Vec<u64> = held.iter().map(|(_, client)| *client).collect();
+        assert_eq!(clients, [first.owner().client, second.owner().client]);
+        let stream = driver.streams[0].aggregate.registration;
+        let registrations: Vec<u64> = driver
+            .registrations
+            .iter()
+            .filter(|registration| registration.is_publication())
+            .map(Registration::id)
+            .collect();
+        for (metadata, _) in &held {
+            assert_eq!(metadata.type_id, TYPE_GAUGE);
+            assert_eq!(
+                (metadata.keys.stream, metadata.keys.lane, metadata.keys.kind),
+                (stream, 0, KIND_PUBLICATION)
+            );
+            assert!(registrations.contains(&metadata.keys.participant));
+        }
+        assert_ne!(held[0].0.keys.participant, held[1].0.keys.participant);
+        // The driver's own handle is counted on the lane instead.
+        assert_eq!(embedded(&driver), [1]);
+        drop(own);
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(embedded(&driver), [0]);
+        // The first client's publication goes: its cell goes with it.
+        drop(first_publication);
+        for _ in 0..4 {
+            driver.positions.force_due();
+            let _ = driver.do_work().unwrap();
+            let _ = first.poll(usize::MAX, |_| {});
+        }
+        let held = labelled(&driver, LABEL_PUBLICATION);
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].1, second.owner().client);
+        assert_eq!(fixed(&driver, "counters unavailable"), 0);
+    }
+
+    /// karyos#885: at the default limits, every stream in use, each with
+    /// a client publication and its most subscribers, finds a cell for
+    /// every position, wire id and publication.
+    #[test]
+    fn the_default_region_holds_every_cell_at_the_default_limits() {
+        let defaults = DriverConfig::default();
+        let mut driver = driver(defaults.counters_capacity);
+        let mut client = driver.connect().unwrap();
+        let mut held = Vec::new();
+        let mut readers_held = Vec::new();
+        for index in 0..defaults.max_streams {
+            let stream_id = i32::try_from(index).unwrap() + 10;
+            // Room in the slots for a publication and every subscriber.
+            let mut config = stream_config(stream_id);
+            config.buffer.spare_slots = 8;
+            let readers = config.buffer.max_subscribers;
+            let handle = driver.add_stream(config).unwrap();
+            let key = StreamKey {
+                stream_id,
+                session_id: 1,
+            };
+            let _ = client.add_publication(key, true).unwrap();
+            held.push(take_publication(&mut driver, &mut client));
+            for _ in 0..readers {
+                readers_held.push(driver.subscribe(handle, Role::Optional).unwrap());
+            }
+        }
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(fixed(&driver, "counters unavailable"), 0);
+        assert_eq!(
+            labelled(&driver, LABEL_STREAM_WIRE_ID).len(),
+            defaults.max_streams
+        );
+        assert_eq!(
+            labelled(&driver, LABEL_PUBLICATION).len(),
+            defaults.max_streams
+        );
+        assert_eq!(
+            subscribers(&driver).len(),
+            defaults.max_streams * usize::from(stream_config(0).buffer.max_subscribers)
+        );
+        drop((held, readers_held));
     }
 }

@@ -51,6 +51,25 @@ pub struct GenerationInfo {
 pub(crate) struct Member<T: StreamTerms> {
     pub(crate) link: Weak<GenerationLink<T>>,
     pub(crate) kind: MemberKind,
+    /// Whether the embedding program holds it, through the driver's own
+    /// API (`EmbeddedDriver::publication` and its kin), not a client:
+    /// such a publication has no registration, and is counted in its
+    /// lane's `embedded publications` gauge (karyos#885). Kept across
+    /// cutovers.
+    pub(crate) host: bool,
+}
+
+impl<T: StreamTerms> Member<T> {
+    /// Whether it is a live publication handle of the embedding program:
+    /// held, not fenced, exclusive or concurrent.
+    pub(crate) fn is_live_host_publication(&self) -> bool {
+        self.host
+            && matches!(self.kind, MemberKind::Exclusive | MemberKind::Concurrent)
+            && self
+                .link
+                .upgrade()
+                .is_some_and(|link| link.status() != LinkStatus::Fenced)
+    }
 }
 
 /// What a member holds on the current mapping.
@@ -127,6 +146,15 @@ struct ProgressLease {
 impl<T: StreamTerms> Cutover<T> {
     pub(crate) fn is_pending(&self) -> bool {
         matches!(self, Self::Pending(_))
+    }
+
+    /// The handles a pending cutover holds while their successors are
+    /// prepared; none once it is open.
+    pub(crate) fn pending_members(&self) -> &[Member<T>] {
+        match self {
+            Self::Pending(pending) => &pending.snapshot,
+            Self::Open { .. } => &[],
+        }
     }
 
     /// The stream is removed: every handle still waiting is fenced, and a
@@ -312,7 +340,7 @@ impl<T: StreamTerms> Stream<T> {
                 }),
             };
             match issued {
-                Ok(Some(entry)) => prepared.push((link, entry)),
+                Ok(Some(entry)) => prepared.push((link, entry, member.host)),
                 // The successor has the predecessor's capacity: a refusal
                 // is a broken invariant.
                 Ok(None) => {
@@ -340,7 +368,7 @@ impl<T: StreamTerms> Stream<T> {
         // Effect: nothing below fails.
         let mut offers = Vec::with_capacity(prepared.len());
         let mut members = Vec::with_capacity(prepared.len());
-        for (link, (capability, kind, lease)) in prepared {
+        for (link, (capability, kind, lease), host) in prepared {
             match link.offer(base, capability) {
                 Ok(()) => {
                     offers.push(Offer {
@@ -351,6 +379,7 @@ impl<T: StreamTerms> Stream<T> {
                     members.push(Member {
                         link: Arc::downgrade(&link),
                         kind,
+                        host,
                     });
                 }
                 Err(Successor::Publication(inner)) => self.spare = Some(inner),
