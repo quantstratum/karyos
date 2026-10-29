@@ -1462,6 +1462,33 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// Loses the receiver's DATA with a payload at or past `term_offset`
+    /// of the first term, from every path or from one (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(crate) fn drop_receiver_tail(&mut self, term_offset: u32, one_source: bool) {
+        if let Agents::Shared(agents) = &mut self.agents {
+            agents.receiver.drop_tail(term_offset, one_source);
+        }
+    }
+
+    /// The sources whose idle heartbeat past the lost tail arrived at the
+    /// receiver (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(crate) fn receiver_tail_heartbeat_sources(&self) -> usize {
+        match &self.agents {
+            Agents::Shared(agents) => agents.receiver.tail_heartbeat_sources(),
+            _ => 0,
+        }
+    }
+
     /// Holds back the attach of the conflated views built from now on, as
     /// if their feeders attached late (tests).
     #[cfg(test)]
