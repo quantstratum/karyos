@@ -2784,7 +2784,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// The stream lookup's errors.
-    #[cfg(feature = "test-hooks")]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn backdate_next_reincarnation(
         &mut self,

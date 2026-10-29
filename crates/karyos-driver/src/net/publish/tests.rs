@@ -2027,7 +2027,7 @@ fn a_reincarnation_starts_its_gate_and_handle_empty() {
         bytes: None,
     });
     let mut driver = reincarnating_driver(20_000_000, 64);
-    let (_handle, _guard, _epoch, lane, _socket) =
+    let (_handle, guard, epoch, lane, _socket) =
         waiting_reincarnation_with(&mut driver, Some(rate));
     let mut taken = None;
     until(&mut driver, |driver| match driver.publication(lane) {
@@ -2049,6 +2049,64 @@ fn a_reincarnation_starts_its_gate_and_handle_empty() {
             .any(|tokens| tokens.is_some_and(|tokens| tokens < 4))
             && !gates.contains(&Some(4))
     });
+    // The #855 review: the gate starts from the stream's reincarnation
+    // time, not from when its agent takes the guard. At ten a second, a
+    // second reincarnation stamped 400 ms before it happens has earned the
+    // burst of 4, on the gate as on the handle, as soon as the gate is
+    // built; stamped when its agent took the guard, the gate would hold
+    // nothing then.
+    assert_eq!(
+        driver.change_rate_policy(
+            lane,
+            1,
+            RatePolicy {
+                messages: Rate {
+                    per_second: 10,
+                    burst: 4,
+                },
+                bytes: None,
+            },
+            (crate::guards::RateAuthority::Administrator, 1),
+        ),
+        Ok(2)
+    );
+    let karyos_sys::guard::Closed::Now { epoch } = driver.close_guard(guard, epoch).unwrap() else {
+        panic!("not closed");
+    };
+    drop(publication);
+    until(&mut driver, |driver| {
+        driver.seal_reason(lane) == Ok(Some(karyos_sys::log_buffer::SealReason::GuardClosed))
+    });
+    // The process's host clock is past 400 ms before the stamp.
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    driver
+        .backdate_next_reincarnation(lane, 400_000_000)
+        .unwrap();
+    let _ = driver.reopen_guard(guard, epoch, epoch).unwrap();
+    let mut again = None;
+    until(&mut driver, |driver| match driver.publication(lane) {
+        Err(DriverError::GuardSealed { .. } | DriverError::QuarantinedAlias { .. }) => false,
+        other => {
+            again = Some(other);
+            true
+        }
+    });
+    let again = again.unwrap().unwrap();
+    assert_eq!(again.guard().unwrap().rate_tokens(), Some(4));
+    // The gate as soon as its sender holds it: the burst already.
+    let mut first = None;
+    until(&mut driver, |driver| {
+        first = driver
+            .net
+            .as_ref()
+            .unwrap()
+            .gate_message_tokens()
+            .into_iter()
+            .flatten()
+            .next();
+        first.is_some()
+    });
+    assert_eq!(first, Some(4));
 }
 
 /// P2.11 PR1: what a timed network publication's software route does

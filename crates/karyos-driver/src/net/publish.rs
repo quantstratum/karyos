@@ -710,7 +710,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
         }
         // A reincarnation's gate starts empty when it began, the time its
-        // handles' rings carry too (R-CORE-21); 0, unknown, is now.
+        // handles' rings carry too (R-CORE-21); 0, unknown, is now. A
+        // network publication's lanes reincarnate together, in one step
+        // (`reincarnate_network`), so its first lane's time is every lane's.
         let empty_since = guarded.then(|| {
             handle
                 .streams()
