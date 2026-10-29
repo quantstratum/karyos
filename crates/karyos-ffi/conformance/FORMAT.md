@@ -217,6 +217,7 @@ offers. The features are:
 | `image-wait` | `subscription.await_image`, a network subscription's wait for its images (Remote driver) |
 | `incompatible-driver` | Two admission directories the runner provides, `$refusing_dir` and `$other_version_dir`, whose drivers refuse the client's protocol version or admit it at another (Incompatible driver, below; Linux only) |
 | `remote-driver` | A client of a driver in another process the runner provides, `$remote_client`, with its conflated, guarded, plain and timed network streams, and a loopback endpoint `$loopback_uri` (Remote driver, below; Linux only) |
+| `stream-cap` | An embedded driver with a stream cap: `driver.create_capped` (`karyos_driver_options.max_stream_bytes`, ABI 0.1.5) |
 | `tai-clock` | `clock.now` of the TAI domain, which some platforms lack |
 
 A new feature is added here; a feature name not in this table is a
@@ -238,7 +239,7 @@ An `op` is followed by an `expect` that starts with its outcome:
 - `ok`, then the results it checks as `name=value`;
 - `status=<name>`: a failure, named by its header status in lower case
   without `KARYOS_E_` (`not_connected`, `claim_outstanding`, `closed`),
-  with no results but one exception below. A binding maps its own
+  with no results but two exceptions below. A binding maps its own
   results to these names through the one mapping it already has
   (BIND-S1); the class follows the header's range, and whether the
   binding returns or raises it is the binding's own policy. A name the
@@ -248,7 +249,9 @@ An `op` is followed by an `expect` that starts with its outcome:
   Archive's response code (1 an error, such as a host's refusal; 2 an
   unknown recording; 3 an unknown replay; 4 an invalid request; 5 an
   unsupported schema), so a refusal for one reason cannot pass for
-  another.
+  another. And after any status, `driver.add_stream` may check `code` and
+  `value`, its `karyos_detail` (karyos#818): above a driver's stream cap,
+  the lane's bytes and the cap.
 
 A result checked as `name>=value` (format 2, either layer) holds an
 integer at least `value`; `value` is a literal or a bound variable.
@@ -291,7 +294,8 @@ gives a message as in Calls. `->` lists the results of `ok`.
 | `clock.now` | `domain`: `"monotonic"` or `"tai"` | `now` | `tai-clock` for `"tai"` |
 | `driver.create` | none | `driver` | `embedded-driver` |
 | `driver.create_networked` | none: the options of `karyos_driver_options_init` with `network` set to `KARYOS_NETWORK_ON` | `driver` | `embedded-driver`, `embedded-network` |
-| `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none | `embedded-driver` |
+| `driver.create_capped` | `max_stream_bytes`: the options of `karyos_driver_options_init` with `max_stream_bytes` set | `driver` | `embedded-driver`, `stream-cap` |
+| `driver.add_stream` | `driver`, `stream_id`, [`allow_unconnected`, `publication_mode`, `publishers`, `spare_slots`, `term_length`, `conflation_keys`, `conflation_value_capacity`, `conflation_journal_capacity`]: the stream options otherwise | none; on a failure, `code` and `value` of its `karyos_detail` beside the status | `embedded-driver` |
 | `driver.start` | `driver`, [`idle_strategy`: `"busy_spin"`, `"yield"`, `"sleep"` or `"yield_then_sleep"`, default `"yield_then_sleep"`, the ABI's declared default; `idle_sleep_ns`] | none | `embedded-driver` |
 | `driver.do_work` | `driver` | `work` | `embedded-driver` |
 | `driver.subscribe_conflated` | `driver`, `stream_id` | `conflated` | `embedded-driver`, `conflation` |
@@ -598,7 +602,9 @@ accepts exactly the 0.y the suite targets, with at least its minimum
 fails the run.
 
 A feature may need a later ABI than the suite: `embedded-network` needs
-0.1.4, which adds `karyos_driver_options.network` (karyos#735). A runner
+0.1.4, which adds `karyos_driver_options.network` (karyos#735), and
+`stream-cap` needs 0.1.5, which adds `karyos_driver_options.max_stream_bytes`
+(karyos#818). A runner
 offers such a feature only on a library at its floor or later, and
 declares it absent otherwise; the rest of the suite runs as before.
 
