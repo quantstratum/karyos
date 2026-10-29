@@ -220,10 +220,12 @@ pub struct AgentConfig {
     /// (driver-network-agents.md §7).
     pub path_heartbeat_interval: u64,
     /// `sender_heartbeat_interval` in ns (default 100 ms; SPEC §6: idle
-    /// senders emit heartbeats): a lane of an established single-path
-    /// publication that sent no DATA for this long sends a header-only
-    /// DATA frame at its next position, and again every interval while
-    /// idle, so a receiver learns of a lost tail and NAKs it. At least 1
+    /// senders emit heartbeats): a lane of an established publication that
+    /// sent no DATA for this long sends a header-only DATA frame at its
+    /// next position, and again every interval while idle, so a receiver
+    /// learns of a lost tail and NAKs it. Over redundant paths each route
+    /// waits on its own DATA, and no route sends one while any route holds
+    /// a copy of the lane (karyos#834). At least 1
     /// and at most half of `image_liveness_timeout`, this driver's own; a
     /// remote receiver's liveness is that receiver's configuration.
     pub sender_heartbeat_interval: u64,
@@ -1416,6 +1418,18 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.outbound(index)?.sent_high(lane)
     }
 
+    /// The message tokens of its `index`-th publication's sender gate:
+    /// `None` past its publications, `Some(None)` with no rated gate
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn gate_message_tokens(&self, index: usize) -> Option<Option<u64>> {
+        self.role.outbound(index).map(|outbound| {
+            outbound
+                .guard_gate()
+                .and_then(crate::guard_gate::GuardGate::message_tokens)
+        })
+    }
+
     /// The counters of its `index`-th publication's data path (tests).
     #[cfg(test)]
     pub(crate) fn outbound_counters(&self, index: usize) -> Option<data::OutboundCounters> {
@@ -1540,6 +1554,27 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
     #[cfg(test)]
     pub(crate) fn drop_data(&mut self, nth: &[u64]) {
         self.role.drop_data(nth);
+    }
+
+    /// Loses the receiver's DATA with a payload at or past `term_offset`
+    /// of the first term, from every source or from one (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(crate) fn drop_tail(&mut self, term_offset: u32, one_source: bool) {
+        self.role.drop_tail(term_offset, one_source);
+    }
+
+    /// The sources whose idle heartbeat past the lost tail arrived (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(crate) fn tail_heartbeat_sources(&self) -> usize {
+        self.role.tail_heartbeat_sources()
     }
 
     /// After a stop: the halves of `Attach` commands the agent never read

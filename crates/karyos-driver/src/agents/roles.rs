@@ -368,8 +368,8 @@ pub struct SenderCounters {
     /// Controls sent.
     pub sent: u64,
     /// Idle heartbeats submitted: header-only DATA frames of established
-    /// single-path lanes that sent nothing for `sender_heartbeat_interval`
-    /// (SPEC §6).
+    /// lanes that sent nothing for `sender_heartbeat_interval` (SPEC §6),
+    /// one per route of a redundant-path lane, each counted.
     pub heartbeats_sent: u64,
     /// Queues and routes of removed publications, and of retired
     /// destinations of a multi-destination publication, the sender closed
@@ -592,6 +592,42 @@ enum CloseReset {
     Asked,
 }
 
+/// Test only: the frame length, term offset and term id of the DATA frame
+/// `bytes` starts with, from its header (word 0, the term offset at bytes 8
+/// to 12, the term id at 20 to 24); `None` for another frame type or a
+/// short datagram.
+#[cfg(test)]
+fn drop_tail_frame(bytes: &[u8]) -> Option<(i32, u32, u32)> {
+    use karyos_sys::frame::{FrameType, Word0};
+
+    let word0 = Word0::unpack(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)).ok()?;
+    if FrameType::try_from_code(word0.frame_type_code()).ok()? != FrameType::Data {
+        return None;
+    }
+    let offset = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+    let term = u32::from_le_bytes(bytes.get(20..24)?.try_into().ok()?);
+    Some((word0.frame_length(), offset, term))
+}
+
+/// Test only: a tail's first transmission lost (`ReceiverRole::drop_tail`):
+/// what it lost and from which sources its heartbeat showed all of it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct DropTail {
+    /// The term offset the tail starts at.
+    offset: u32,
+    /// Whether it is lost from one source only.
+    one_source: bool,
+    /// That source, once chosen.
+    chosen: Option<SocketAddr>,
+    /// The end of the frames lost so far.
+    end: u32,
+    /// The term they are in: the first lost frame's.
+    term: Option<u32>,
+    /// The sources whose idle heartbeat at or past `end` arrived.
+    done: [Option<SocketAddr>; 4],
+}
+
 /// The receiver agent's network state.
 #[derive(Debug)]
 pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
@@ -606,6 +642,14 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// that duplicates).
     #[cfg(test)]
     repeat_data_from: Option<u64>,
+    /// Test only: a tail's first transmission lost: DATA datagrams with a
+    /// payload at or past this term offset of the first term are lost
+    /// from a source until that source's idle heartbeat at or past it
+    /// arrives (so repairs after it pass), on every source or on the first
+    /// such datagram's source only (a tail lost on one path). Heartbeats
+    /// always arrive. The sources: the chosen one, and those done.
+    #[cfg(test)]
+    drop_tail: Option<DropTail>,
     /// Test only: every NAK handed to the sender.
     #[cfg(test)]
     posted_naks: Vec<Nak>,
@@ -1789,6 +1833,8 @@ pub(super) fn roles<T: StreamTerms>(
             #[cfg(test)]
             repeat_data_from: None,
             #[cfg(test)]
+            drop_tail: None,
+            #[cfg(test)]
             posted_naks: Vec::new(),
             #[cfg(test)]
             posted_challenges: Vec::new(),
@@ -2372,6 +2418,36 @@ impl<T: StreamTerms> ReceiverRole<T> {
     pub(super) fn drop_data(&mut self, nth: &[u64]) {
         self.drop_data = nth.to_vec();
         self.data_seen = 0;
+    }
+
+    /// Loses every DATA datagram with a payload at or past `term_offset`
+    /// of the first term: from every source, or from the first such
+    /// datagram's source only when `one_source` (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(super) fn drop_tail(&mut self, term_offset: u32, one_source: bool) {
+        self.drop_tail = Some(DropTail {
+            offset: term_offset,
+            one_source,
+            chosen: None,
+            end: term_offset,
+            term: None,
+            done: [None; 4],
+        });
+    }
+
+    /// The sources whose idle heartbeat past the lost tail arrived (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(super) fn tail_heartbeat_sources(&self) -> usize {
+        self.drop_tail
+            .map_or(0, |tail| tail.done.iter().flatten().count())
     }
 
     /// Whether the path queues are allocated (tests).
@@ -3991,6 +4067,39 @@ impl<T: StreamTerms> Intake<'_, T> {
             }
             if self.role.drop_data.contains(&seen) {
                 return;
+            }
+            // A DATA frame at or past the offset, decoded from its header:
+            // word 0 (length, flags, type), then the term offset. A frame
+            // with a payload is lost (from its source alone when
+            // `one_source`); a header-only one at or past the end of what
+            // was lost is the source's heartbeat showing the whole tail.
+            // A negative length (padding) or another term is not the tail.
+            if let Some(mut tail) = self.role.drop_tail
+                && let Some((length, at, term)) = drop_tail_frame(bytes)
+                && let Ok(length) = u32::try_from(length)
+                && at >= tail.offset
+                && tail.term.is_none_or(|lost| lost == term)
+                && !tail.done.contains(&Some(source))
+            {
+                if length <= karyos_sys::frame::HEADER_LENGTH {
+                    if tail.end > tail.offset
+                        && at >= tail.end
+                        && let Some(slot) = tail.done.iter_mut().find(|slot| slot.is_none())
+                    {
+                        *slot = Some(source);
+                        self.role.drop_tail = Some(tail);
+                    }
+                } else if !tail.one_source || tail.chosen.is_none_or(|chosen| chosen == source) {
+                    // The whole datagram is lost, every frame it carries.
+                    let end = u32::try_from(bytes.len())
+                        .ok()
+                        .and_then(|len| at.checked_add(len));
+                    tail.chosen = Some(source);
+                    tail.term = Some(term);
+                    tail.end = end.map_or(tail.end, |end| tail.end.max(end));
+                    self.role.drop_tail = Some(tail);
+                    return;
+                }
             }
             if self.role.repeat_data_from.is_some_and(|from| seen >= from) {
                 self.data_once(source, alias, bytes);
@@ -5781,7 +5890,17 @@ impl<T: StreamTerms> SenderRole<T> {
                     now,
                 )?;
                 work = work.checked_add(served).ok_or(overflow.clone())?;
-                if outbound.needs_reset() {
+                // An idle lane's heartbeat on every live path (SPEC §6,
+                // karyos#834).
+                let beats = outbound
+                    .serve_routed_heartbeats(halves, now, self.sender_heartbeat_interval)
+                    .ok_or(overflow.clone())?;
+                work = work.checked_add(beats).ok_or(overflow.clone())?;
+                let needs_reset = outbound.needs_reset();
+                for _ in 0..beats {
+                    self.count(|c| &mut c.heartbeats_sent);
+                }
+                if needs_reset {
                     needing_reset = needing_reset.checked_add(1).ok_or(overflow.clone())?;
                 }
                 continue;
