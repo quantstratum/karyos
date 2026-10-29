@@ -13,6 +13,9 @@
   reliable single-lane publications; before, the 25th and later ones
   were accepted and sent nothing, and a late subscriber could not bind
   them (the 19 s of plan 168).
+- A refused network publication add leaves nothing behind: its stream
+  key is free in the same cycle, so the same add retried at once is never
+  `DuplicateStream` (it was for a few cycles).
 - A refused open of a publication's route or queues counts in
   `endpoint_limits` for an endpoint limit and is tried again
   `setup_interval` later, not every cycle.

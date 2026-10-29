@@ -291,15 +291,20 @@ fn a_publication_its_endpoint_cannot_hold_is_refused() {
             needed: 32 + 25 * 9,
         })
     );
+    // A refused add leaves nothing behind: the same stream again at once is
+    // refused for capacity again, never `DuplicateStream`.
+    assert!(matches!(
+        driver.add_network_publication(aggregate(200, 1), &channel(destination.clone())),
+        Err(DriverError::EndpointCapacity { .. })
+    ));
     assert_eq!(
         EndpointLimit::TxSlots.detail(256, 257),
         (1 << 56) | (256 << 32) | 257,
         "the detail word"
     );
     // A removal frees its room when it ends, not when it is asked: an add
-    // in between is refused, retryable, and accepted once it has ended. (A
-    // refused add's own stream key stays held for a few cycles,
-    // `DuplicateStream`; the retry uses another.)
+    // in between is refused, retryable, and the same add is accepted once
+    // the removal has ended.
     let first = held.remove(0);
     driver.remove_aggregate(&first).unwrap();
     assert!(matches!(
@@ -310,7 +315,7 @@ fn a_publication_its_endpoint_cannot_hold_is_refused() {
         driver.network_publication_state(&first).is_none()
     });
     let _ = driver
-        .add_network_publication(aggregate(202, 1), &channel(destination))
+        .add_network_publication(aggregate(201, 1), &channel(destination))
         .unwrap();
 }
 

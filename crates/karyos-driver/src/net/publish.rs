@@ -352,6 +352,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.add_network(config, channel, guard, None, Some((schedule, None)), &[])
     }
 
+    /// Undoes an add refused before its handle was returned
+    /// (karyos#859): its lanes are removed and freed at once, as no client,
+    /// lease or sender holds them, so the same key can be added again in
+    /// this cycle; a retry after `ResourcesUnavailable` never meets
+    /// `DuplicateStream`.
+    fn discard_refused(&mut self, handle: &AggregateHandle) {
+        let _ = self.remove_aggregate(handle);
+        self.free_retired_streams();
+    }
+
     /// [`EmbeddedDriver::add_timed_network_publication`] whose lanes check
     /// offers against `clock`, as
     /// [`EmbeddedDriver::schedule_stream_with_clock`] does for a stream: a
@@ -462,7 +472,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if let Some(options) = timed
             && let Err(error) = self.time_lanes(&handle, options, clock)
         {
-            let _ = self.remove_aggregate(&handle);
+            self.discard_refused(&handle);
             return Err(error);
         }
         let channel = SenderChannel {
@@ -477,7 +487,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         };
         let added = self.attach_sender(&handle, channel, FIRST_INCARNATION, false);
         if let Err(error) = added {
-            let _ = self.remove_aggregate(&handle);
+            self.discard_refused(&handle);
             return Err(error);
         }
         Ok(handle)
