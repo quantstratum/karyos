@@ -251,6 +251,11 @@ fn a_network_subscription_polls_its_images_in_turn() {
             StreamId::new(8),
         )
         .unwrap();
+    // The witness proves something about `reading` because both read the
+    // same images: a driver keeps one image per publication session and
+    // stream, which every subscription of the channel attaches to (its
+    // log buffer), so the messages the witness read are in the buffers
+    // `reading` polls.
     let mut witness = subscriber
         .add_subscription(
             &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
