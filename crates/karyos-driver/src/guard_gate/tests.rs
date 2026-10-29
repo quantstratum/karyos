@@ -1161,12 +1161,13 @@ fn a_policy_the_gate_refuses_is_applied_as_the_stricter() {
 }
 
 /// The coordinator's decision on the #841 review: a reincarnation's gate
-/// starts its bucket empty, so reincarnating never buys a new burst.
+/// starts its bucket empty when the reincarnation began, so reincarnating
+/// never buys a new burst; it has earned since (#852's review).
 #[test]
 fn a_reincarnations_gate_starts_empty() {
     let mut f = Fixture::new(1, Some(rate(1, 4)));
     assert_eq!(f.gate.message_tokens(), Some(4));
-    f.gate.empty_bucket(0);
+    f.gate.empty_bucket_since(0, 0);
     assert_eq!(f.gate.message_tokens(), Some(0));
     f.gate.set_now(2_000_000_000);
     assert_eq!(f.gate.message_tokens(), Some(2), "it earns from then on");

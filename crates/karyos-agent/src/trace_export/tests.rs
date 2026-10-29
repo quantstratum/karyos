@@ -867,3 +867,62 @@ fn the_log_waits_with_its_own_budget_after_a_stuck_table() {
     assert_eq!(page.journals, [ExportJournal::Recycled(Box::new(gone))]);
     assert_eq!(page.unreadable_records, 0);
 }
+
+/// The #845 review: the log's wait has a budget of its own, not only the
+/// one retry every part gets. With the table's entry stuck for the whole of
+/// its 200 ms, a log entry released at the log's second retry is still
+/// found; under one budget shared with the table, the log would get its one
+/// retry and no second.
+#[test]
+fn the_log_has_a_budget_of_its_own_past_the_first_retry() {
+    let mirror = std::rc::Rc::new(std::cell::RefCell::new(mirror(16)));
+    let stuck = JournalEntry::open(12, 1, JournalKind::Publisher, 2, 16);
+    assert!(mirror.borrow_mut().write_entry(1, Some(&stuck)));
+    let gone = RecycledJournal {
+        journal: 11,
+        stream: 3,
+        lane: Lane::ZERO,
+        incarnation: 1,
+        state: JournalState::Closed,
+        boundary: Some(64),
+        pairs: [NotedPublisher {
+            journal: 0,
+            attempted: 0,
+        }; MAX_RECYCLE_PAIRS],
+        pair_count: 0,
+        sequence: 2,
+    };
+    assert!(mirror.borrow_mut().write_log(0, Some(&gone)));
+    let _ = mirror.borrow_mut().append(11, 0, &[0, !0]).unwrap();
+    assert!(mirror.borrow_mut().hold_entry(1, true));
+    assert!(mirror.borrow_mut().hold_log(0, true));
+    let reader = mirror.borrow().reader();
+    let writer = std::rc::Rc::clone(&mirror);
+    let mut retries = 0;
+    DURING_LOG_WAIT.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            // Released at the log's second retry: past the one every part
+            // gets, so only a budget of the log's own reaches it.
+            retries += 1;
+            if retries == 2 {
+                assert!(writer.borrow_mut().hold_log(0, false));
+            }
+        }));
+    });
+    let page = export_within(
+        &reader,
+        (EPOCH, None),
+        0,
+        16,
+        usize::MAX,
+        Waits {
+            busy_budget: std::time::Duration::from_millis(200),
+            max_lost_ranges: MAX_LOST_RANGES,
+        },
+    );
+    DURING_LOG_WAIT.with(|hook| *hook.borrow_mut() = None);
+    let page = page.unwrap();
+    assert_eq!(seqs(&page), [0]);
+    assert_eq!(page.journals, [ExportJournal::Recycled(Box::new(gone))]);
+    assert_eq!(page.unreadable_records, 0);
+}

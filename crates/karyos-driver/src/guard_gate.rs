@@ -777,11 +777,16 @@ impl GuardGate {
         }
     }
 
-    /// Empties its bucket at `now`, keeping its policy: a reincarnation's
-    /// gate, which never buys a new burst (R-CORE-21).
-    pub fn empty_bucket(&mut self, now: u64) {
+    /// Its bucket as if empty at `since` and refilled to `now`, keeping its
+    /// policy: a reincarnation's gate, which never buys a new burst and has
+    /// earned what its handles' copies have since the reincarnation began
+    /// (R-CORE-21). A `since` past `now` earns nothing until `now` passes
+    /// it.
+    pub fn empty_bucket_since(&mut self, since: u64, now: u64) {
         if let Some(limiter) = &mut self.limiter {
-            *limiter = RateLimiter::empty(limiter.policy(), now);
+            let mut empty = RateLimiter::empty(limiter.policy(), since);
+            empty.refill_at(now);
+            *limiter = empty;
         }
     }
 

@@ -74,16 +74,24 @@ const EPOCH: usize = 5;
 /// first incarnation, or unknown (a driver that predates the word, which
 /// was reserved and zero). The handle's rate copy starts empty at that
 /// time, as the reincarnation's sender gate did (R-CORE-21, karyos#852). It
-/// is shared memory of one host, so the clock is the reader's too. Words 6
-/// to 12 are the policy slot (`crate::rate_policy_slot::OUTCOME_SLOT`).
+/// is shared memory of one host, so the clock is the reader's too, unless
+/// the reader runs in another time namespace (Linux `time_namespaces(7)`),
+/// whose `CLOCK_MONOTONIC` is offset: its handle's copy then starts at
+/// another level, never above the burst, and the sender gate stays the
+/// authority. Words 6 to 12 are the policy slot
+/// (`crate::rate_policy_slot::OUTCOME_SLOT`).
 pub const REINCARNATED_AT: usize = 13;
 const _: () = assert!(
     crate::rate_policy_slot::OUTCOME_SLOT + crate::rate_policy_slot::SLOT_WORDS <= REINCARNATED_AT
         && REINCARNATED_AT < HEADER_WORDS
 );
 
-/// Writes `at` as the ring's [`REINCARNATED_AT`] word, before the ring is
-/// granted (the grant orders it before the client's read).
+/// Writes `at` as the ring's [`REINCARNATED_AT`] word, Relaxed, before the
+/// ring is granted. What orders it before the handle's read: for a remote
+/// client, the `Manifest` and `Region` messages on the admission socket,
+/// sent after the store and received before the client maps the region
+/// (a socket send and receive synchronise); in process, the handle is made
+/// from the ring on the same thread, after the store.
 pub fn set_reincarnated_at(ring: &[AtomicU64], at: u64) {
     if let Some(cell) = ring.get(REINCARNATED_AT) {
         cell.store(at, Ordering::Relaxed);
