@@ -20,6 +20,8 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `signal-hook` | 0.4.5 | crates.io | default features off (no `channel`, `iterator` or `extended-siginfo`); only the safe `signal_hook::flag::register` is used | runtime, `karyos-tools` only (the `karyosd` binary: `SIGTERM` and `SIGINT` set a flag) | all | MIT OR Apache-2.0 | owner decision ACS 13810 (2026-10-16), under ADR-0033 |
 | `tracing` | 0.1.44 | crates.io | default features off (no `std` request, no `attributes` proc macro) | runtime, `karyos-tools` only (control-path logs of `karyosd`, SPEC.md §11) | all | MIT | owner approved phase 1 on 2026-10-15 (Q25, ACS 11869, issue #40); exact resolution owner decision ACS 13810 (2026-10-16), under ADR-0033 |
 | `tracing-subscriber` | 0.3.23 | crates.io | default features off; `fmt`, `std` (no `ansi`, `env-filter`, `regex`, `tracing-log`, `smallvec`) | runtime, `karyos-tools` only (the subscriber the `karyosd` binary installs; no library installs one) | all | MIT | owner decision ACS 13810 (2026-10-16), under ADR-0033 |
+| `serde` | 1.0.229 | crates.io | default features off; `std`, `derive` | runtime, `karyos-tools` only (the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711) |
+| `toml` | 1.1.8+spec-1.1.0 | crates.io | default features off; `std`, `serde`, `parse` (no `display`: nothing is written) | runtime, `karyos-tools` only (parses the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711) |
 
 `criterion` is pinned to `=0.7.0`. The owner admitted the criterion family
 (Q25), and ADR-0033 allows a compliant exact resolution within an admitted
@@ -46,6 +48,22 @@ list for `tracing-subscriber` is the union with `loom`'s request
 (`ansi`, `env-filter`, `tracing-log` and others); a normal build of
 `karyos-tools` enables only `alloc`, `fmt`, `registry`, `sharded-slab`,
 `std` and `thread_local` (`cargo tree -e normal,features`).
+
+`serde` and `toml` are dependencies of `karyos-tools` only, so no library
+crate of the core gains them; `karyos_tools::config` re-exports both, so
+a backend outside the core (`karyosd-native`) derives its configuration
+table against these versions, and a major version of either is a
+breaking change of `karyos-tools` (coordinator decision ACS 35711,
+2026-10-29). Their transitive crates, admitted under the same decision and
+ADR-0033, are `serde_core` 1.0.229 and `serde_derive` 1.0.229 (proc macro;
+MIT OR Apache-2.0) under `serde`; and `serde_spanned` 1.1.2,
+`toml_datetime` 1.1.2+spec-1.1.0, `toml_parser` 1.1.5+spec-1.1.0 (MIT OR
+Apache-2.0) and `winnow` 1.0.4 (MIT) under `toml`. `serde_derive`'s
+`proc-macro2`, `quote`, `syn` and `unicode-ident` were already in the
+lockfile through `thiserror`. `serde` and `serde_core` have build scripts,
+reviewed by hand at 1.0.229: each writes a generated module into `OUT_DIR`
+and emits `cfg` flags from `rustc --version`; neither compiles C nor links
+anything.
 
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
 absent from every normal and release build and from the graph shipped to

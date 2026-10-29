@@ -474,6 +474,42 @@ fn an_absent_removal_keeps_the_room_of_an_addition_of_the_same_destination() {
     ));
 }
 
+/// R-CORE-43: `NetworkConfig::require` reaches every endpoint the driver
+/// opens. Hardware timestamps are never active on loopback, so requiring
+/// them fails the endpoint's open and the add; with nothing required the
+/// same add is taken.
+#[test]
+fn a_required_capability_the_endpoint_lacks_fails_its_open() {
+    use karyos_io::backend::Capability;
+    use karyos_io::sockets::endpoint::CapabilitySet;
+
+    let with = |require| {
+        let mut network = NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        };
+        network.require = require;
+        EmbeddedDriver::with_config(DriverConfig {
+            network: Some(network),
+            ..DriverConfig::default()
+        })
+        .unwrap()
+    };
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let mut required = with(CapabilitySet::EMPTY.with(Capability::HardwareStamps));
+    assert_eq!(
+        required
+            .add_network_publication(aggregate(10, 1), &channel(destination.clone()))
+            .map(|_| ()),
+        Err(DriverError::NetworkEndpoint)
+    );
+    let mut plain = with(CapabilitySet::EMPTY);
+    let _ = plain
+        .add_network_publication(aggregate(10, 1), &channel(destination))
+        .unwrap();
+}
+
 /// The network publications and stale aliases held at once are bounded by
 /// `AgentConfig::publications`: a publication beyond it is refused, and
 /// removals never overflow the stale-alias queue.

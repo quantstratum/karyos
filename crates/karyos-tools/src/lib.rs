@@ -29,6 +29,7 @@ pub mod archive;
 pub mod args;
 pub mod capability_log;
 pub mod catalog;
+pub mod config;
 pub mod daemon;
 #[cfg(target_os = "linux")]
 pub mod daemon_archive;

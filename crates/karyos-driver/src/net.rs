@@ -47,7 +47,7 @@ use karyos_sys::frame::Lane;
 use std::net::{IpAddr, SocketAddr};
 
 use karyos_io::sockets::OsSocket;
-use karyos_io::sockets::endpoint::{InterfaceSel, MulticastConfig, SocketsConfig};
+use karyos_io::sockets::endpoint::{CapabilitySet, InterfaceSel, MulticastConfig, SocketsConfig};
 
 pub use control_group::{ControlGroup, ControlGroups, MAX_CONTROL_GROUPS};
 use karyos_protocol::network::Alias;
@@ -102,6 +102,10 @@ pub struct NetworkConfig {
     /// endpoint cannot hold is refused at the add
     /// (`DriverError::EndpointCapacity`).
     pub endpoint_tables: EndpointTables,
+    /// The capabilities every endpoint the driver opens must have active
+    /// (`[io] require`, R-CORE-43): an endpoint missing one fails to open
+    /// (`DriverError::NetworkEndpoint`). Empty by default.
+    pub require: CapabilitySet,
 }
 
 /// The tables of a network endpoint (karyos#859): what its publications
@@ -142,6 +146,7 @@ impl Default for NetworkConfig {
             nak_control_groups: [None; MAX_CONTROL_GROUPS],
             max_owned_per_client: 16,
             endpoint_tables: EndpointTables::default(),
+            require: CapabilitySet::EMPTY,
         }
     }
 }
@@ -745,6 +750,8 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     capacity: usize,
     /// The tables of each endpoint it opens.
     endpoint_tables: EndpointTables,
+    /// The capabilities each endpoint it opens must have active.
+    require: CapabilitySet,
     /// What each send endpoint keeps for the sender's control routes
     /// (karyos#859): `control_routes` routes and queues of
     /// `CONTROL_QUEUE_DEPTH` slots each.
@@ -865,6 +872,7 @@ impl<T: StreamTerms> Network<T> {
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
             endpoint_tables: config.endpoint_tables,
+            require: config.require,
             control_reserve: {
                 let routes = u32::try_from(config.agents.control_routes).unwrap_or(u32::MAX);
                 TxDemand {
@@ -949,6 +957,7 @@ impl<T: StreamTerms> Network<T> {
         config.tx_slots = self.endpoint_tables.tx_slots;
         config.max_queues = self.endpoint_tables.max_queues;
         config.max_routes = self.endpoint_tables.max_routes;
+        config.require = self.require;
         let capacity = TxDemand {
             routes: u32::from(config.max_routes.get()),
             queues: u32::from(config.max_queues.get()),
