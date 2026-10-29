@@ -430,7 +430,7 @@ fn a_destination_its_endpoint_cannot_hold_is_refused() {
 fn an_absent_removal_keeps_the_room_of_an_addition_of_the_same_destination() {
     use crate::agents::data::DestinationChange;
 
-    let mut driver = driver();
+    let mut driver = small_endpoints();
     let sockets = [receiver(), receiver()];
     let destination = Destination::Unicast(sockets[0].local_addr().unwrap());
     for stream in 0..22 {
