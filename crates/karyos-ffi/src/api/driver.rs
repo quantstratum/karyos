@@ -718,10 +718,10 @@ pub(crate) fn start(driver: Handle, idle: Idle) -> Result<(), Failure> {
                         &waiting,
                         idle,
                         state,
-                        #[cfg(feature = "test-hooks")]
-                        raw,
                         #[cfg(test)]
                         &cycles,
+                        #[cfg(feature = "test-hooks")]
+                        raw,
                     );
                 })
         };

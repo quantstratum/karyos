@@ -4,13 +4,18 @@
 //! (SPEC.md §10.2; ADR-0053). Each function catches unwinding, checks each
 //! pointer (null, alignment) before any use and hands safe values to the
 //! safe modules. `include/karyos.h` declares every symbol; a test checks
-//! the two agree.
+//! the two agree. The test kit's fault hook (`test_hooks`, feature
+//! `test-hooks`) is declared apart, in `include/karyos_test_hooks.h`.
 
 use core::ffi::{CStr, c_char, c_void};
 use std::panic::catch_unwind;
 use std::path::PathBuf;
 
 use crate::api;
+
+/// The conformance test kit's fault hook, never in a product build.
+#[cfg(feature = "test-hooks")]
+mod test_hooks;
 use crate::api::client;
 use crate::api::driver;
 use crate::boundary::{drop_payload, guard};

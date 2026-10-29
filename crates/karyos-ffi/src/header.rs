@@ -347,16 +347,16 @@ fn the_header_declares_every_exported_function_with_its_types() {
     assert_eq!(header_functions(), rust);
 }
 
-/// The test kit's fault hook stays apart from the C ABI: `karyos.h` and
-/// `abi.rs` name no `karyos_test_` symbol, and the hook's own header
-/// declares exactly the one function `test_hooks.rs` exports, with its
+/// The test kit's fault hook stays apart from the C ABI: `karyos.h` names
+/// no `karyos_test_` symbol and `abi.rs` exports none, and the hook's own header
+/// declares exactly the one function `abi/test_hooks.rs` exports, with its
 /// types.
 #[test]
 fn the_fault_hook_is_declared_apart_from_karyos_h() {
     const HOOKS_HEADER: &str = include_str!("../include/karyos_test_hooks.h");
-    const HOOKS: &str = include_str!("test_hooks.rs");
+    const HOOKS: &str = include_str!("abi/test_hooks.rs");
     assert!(!HEADER.contains("karyos_test_"));
-    assert!(!ABI.contains("karyos_test_"));
+    assert!(!ABI.contains("fn karyos_test_"));
     assert_eq!(HOOKS.matches("extern \"C\" fn ").count(), 1);
     assert!(
         HOOKS.contains(

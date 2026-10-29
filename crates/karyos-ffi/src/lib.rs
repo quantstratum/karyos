@@ -31,12 +31,6 @@ mod boundary;
 )]
 mod handles;
 mod status;
-#[cfg(feature = "test-hooks")]
-#[expect(
-    unsafe_code,
-    reason = "the test kit's fault hook is an exported symbol (ADR-0053)"
-)]
-mod test_hooks;
 mod threads;
 
 #[cfg(test)]
