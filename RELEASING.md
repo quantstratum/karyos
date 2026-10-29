@@ -65,7 +65,7 @@ The gates the 0.1.0-alpha.2 Evidence table records, and `make loom-full`:
 | The network impairment suite | `scripts/netem-test.sh` | Docker with `--cap-add NET_ADMIN`, Linux |
 | The C library package | `make libkaryos`, `make libkaryos-static-check`, `make libkaryos-copies-check` | macOS arm64 |
 | The binding conformance suite | `scripts/linux-test.sh -p karyos-ffi --all-features --locked --test conformance` | Docker, Linux |
-| The wire compatibility matrix | `scripts/compat-test.sh <worktree of the previous release tag>` (R-CORE-36, karyos#732): the previous release's builds and this head's run against each other, every outcome compared with `crates/karyos-tools/compat/matrix.toml`; the release adds its own column to the matrix first. First run at karyos#878 (head d67f6be6, v0.1.0-alpha.2 against main, aarch64, kernel 6.8: 0 failures) | Docker, Linux |
+| The wire compatibility matrix | `scripts/compat-test.sh <worktree of the previous release tag>` (R-CORE-36, karyos#732): the previous release's builds and this head's run against each other, every outcome compared with `crates/karyos-tools/compat/matrix.toml`; the release adds its own column to the matrix first. Run 2026-10-29 at karyos#878 head 620292fa: `KARYOS_COMPAT_TARGET=karyos-compat-target-pr732 scripts/compat-test.sh <worktree of v0.1.0-alpha.2>`, Docker rust:1.99, aarch64, kernel 6.8, admission, frame and c_abi in both directions: 0 failures | Docker, Linux |
 
 `MIRI_TOOLCHAIN` is the nightly pinned in the `Makefile`; the row names
 it, with the Miri version.
