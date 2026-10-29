@@ -404,6 +404,8 @@ fn application_point(payload: &[u64]) -> Option<u16> {
 /// can write their cells, so two cells claiming one id, or a cell of
 /// another client than the records', leave the point unnamed rather than
 /// misattributed.
+/// A client can still misname its own points by rewriting its cell's
+/// value: naming from a driver-written copy of the ids is karyos#869.
 fn name_points(
     points: Option<&CountersReader>,
     records: &[ExportRecord],
