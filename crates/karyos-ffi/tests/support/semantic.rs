@@ -77,6 +77,50 @@ pub enum Answer {
     StatusWith(String, BTreeMap<String, Value>),
 }
 
+/// What one round of `subscription.await_image` answers (FORMAT.md,
+/// `subscription.await_image`; karyos#830).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Round {
+    /// A failing image change call's status.
+    Status(i32),
+    Ok,
+    EventsLost,
+    Timeout,
+    /// Nothing holds yet: serve and read again.
+    Wait,
+}
+
+/// One round of `subscription.await_image`, in FORMAT.md's order: a
+/// failing `karyos_subscription_next_image_change` (`changes`) answers its
+/// status; `count` reached answers `ok`, even when changes were dropped;
+/// only then is `karyos_subscription_image_changes_lost` called (`lost`):
+/// its failing status, then a cumulative lost count above 0
+/// (`events_lost`); last, the deadline (`timeout`). The runner and its
+/// precedence test share this one function.
+pub fn await_image_round(
+    changes: Result<(), i32>,
+    reached: bool,
+    lost: impl FnOnce() -> (i32, u64),
+    deadline_passed: bool,
+) -> Round {
+    if let Err(status) = changes {
+        return Round::Status(status);
+    }
+    if reached {
+        return Round::Ok;
+    }
+    match lost() {
+        (0, 0) => {}
+        (0, _) => return Round::EventsLost,
+        (status, _) => return Round::Status(status),
+    }
+    if deadline_passed {
+        Round::Timeout
+    } else {
+        Round::Wait
+    }
+}
+
 /// The statuses a commit answers while its claim stays staged
 /// (`karyos_claim_commit`; BIND-S3).
 const RETRYABLE: [&str; 5] = [
@@ -290,10 +334,10 @@ impl Adapter {
         })
     }
 
-    /// Takes the queued image changes of `subscription` into its count;
-    /// a failing status fails the step.
-    /// Takes the queued image changes of `subscription` into its count: the
-    /// failing status of `karyos_subscription_next_image_change`, if any.
+    /// Takes the queued image changes of `subscription` into its count,
+    /// returning the failing status of
+    /// `karyos_subscription_next_image_change`, if any, for the op to
+    /// answer.
     fn take_image_changes(&mut self, subscription: usize) -> Result<(), i32> {
         loop {
             match abi::subscription_next_image_change(self.objects[subscription].handle) {
@@ -730,24 +774,21 @@ impl Adapter {
                 let count: u32 = args.narrow("count", Some(1));
                 let start = std::time::Instant::now();
                 loop {
-                    if let Err(status) = self.take_image_changes(subscription) {
-                        return Answer::Status(self.name(status, at));
-                    }
-                    if self.objects[subscription].images >= count {
-                        return Answer::Ok(BTreeMap::new());
-                    }
-                    // A change dropped from a full queue may have been an
-                    // image: the count can no longer be trusted.
-                    let (status, lost) =
-                        abi::subscription_image_changes_lost(self.objects[subscription].handle);
-                    if status != 0 {
-                        return Answer::Status(self.name(status, at));
-                    }
-                    if lost > 0 {
-                        return Answer::Status("events_lost".to_owned());
-                    }
-                    if start.elapsed() >= UNTIL_DEADLINE {
-                        return Answer::Status("timeout".to_owned());
+                    let changes = self.take_image_changes(subscription);
+                    let images = self.objects[subscription].images;
+                    let handle = self.objects[subscription].handle;
+                    let round = await_image_round(
+                        changes,
+                        images >= count,
+                        || abi::subscription_image_changes_lost(handle),
+                        start.elapsed() >= UNTIL_DEADLINE,
+                    );
+                    match round {
+                        Round::Status(status) => return Answer::Status(self.name(status, at)),
+                        Round::Ok => return Answer::Ok(BTreeMap::new()),
+                        Round::EventsLost => return Answer::Status("events_lost".to_owned()),
+                        Round::Timeout => return Answer::Status("timeout".to_owned()),
+                        Round::Wait => {}
                     }
                     self.serve_everything();
                     std::thread::sleep(std::time::Duration::from_millis(1));

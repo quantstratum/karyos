@@ -422,10 +422,13 @@ pub struct GuardSpec {
     pub epoch: u64,
     /// The publication's rate policy.
     pub rate: Option<karyos_sys::rate_limit::RatePolicy>,
-    /// Whether the gate's bucket starts full: only for the publication's
-    /// first incarnation. A reincarnation starts it empty, so it never buys
-    /// a new burst (R-CORE-21, decided 2026-10-28 by QS-COORDINATOR).
-    pub full: bool,
+    /// When the gate's bucket was empty: `None` for the publication's first
+    /// incarnation, whose bucket starts full; for a reincarnation, the time
+    /// it began on the network's clock (host monotonic nanoseconds,
+    /// `Stream::reincarnated_at`), from which it has earned, so it never
+    /// buys a new burst and agrees with its handles' copies (R-CORE-21,
+    /// decided 2026-10-28 by QS-COORDINATOR).
+    pub empty_since: Option<u64>,
     /// Where the driver publishes a changed rate policy
     /// (`karyos_sys::rate_policy_slot`, at word 0), which the gate reads at
     /// each serve (R-CORE-21); `None`: the policy never changes.
@@ -813,8 +816,8 @@ impl<T: StreamTerms> Outbound<T> {
             )?,
         };
         let mut gate = gate;
-        if !spec.full {
-            gate.empty_bucket(now);
+        if let Some(since) = spec.empty_since {
+            gate.empty_bucket_since(since, now);
         }
         gate.set_frontier(frontier);
         if let Some(slot) = spec.policy {

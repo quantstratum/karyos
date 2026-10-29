@@ -17,7 +17,12 @@ karyos-protocol.workspace = true
 karyos-sys.workspace = true
 thiserror.workspace = true
 
+[features]
+# Hooks only tests use: hidden API, never in a release build (karyos#852).
+test-hooks = []
+
 [dev-dependencies]
+karyos-driver = { path = ".", features = ["test-hooks"] }
 karyos-io = { workspace = true, features = ["test-hooks"] }
 karyos-sys = { workspace = true, features = ["test-hooks"] }
 

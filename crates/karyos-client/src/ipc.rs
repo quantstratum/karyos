@@ -150,7 +150,9 @@ pub struct RemoteClient {
 /// The socket, the fetch counter and the live exports of one client
 /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, The client,
 /// Session). The last reference sends `Leave` if every export was
-/// detached; its control sends block at most the attach timeout and are
+/// detached (a fetch it abandoned does not hold it: the driver takes such a
+/// `Leave` as clean, karyos#851); its control sends block at most the
+/// session's timeout (`attach_with`'s `timeout`, the call timeout) and are
 /// made only from `Drop`, `close` and the `take_*` calls.
 #[derive(Debug)]
 struct Session {
@@ -191,6 +193,10 @@ struct SessionState {
     /// A send failed: nothing more is sent, and the driver releases what
     /// is charged at this process's exit proof.
     broken: bool,
+    /// Fetches whose manifest did not arrive within the timeout: when it
+    /// arrives, before a later fetch's reply, it is discarded, its regions
+    /// drained and their exports detached (karyos#851).
+    abandoned: Vec<u64>,
 }
 
 impl Session {
@@ -689,7 +695,23 @@ pub fn attach(
     timeout: Duration,
     max_pending: usize,
 ) -> Result<RemoteClient, AttachError> {
-    let socket = ipc::connect(dir, timeout)?;
+    attach_with(dir, timeout, timeout, max_pending)
+}
+
+/// [`attach`] waiting at most `attach_timeout` for each message of the
+/// attach, then `timeout` for each message of the session: every later
+/// fetch of a grant's regions (karyos#851).
+///
+/// # Errors
+///
+/// As [`attach`].
+pub fn attach_with(
+    dir: &Path,
+    attach_timeout: Duration,
+    timeout: Duration,
+    max_pending: usize,
+) -> Result<RemoteClient, AttachError> {
+    let socket = ipc::connect(dir, attach_timeout)?;
     let pidfd = PidFd::of_self()?;
     // `PidFd` keeps its descriptor private; pass a duplicate.
     let pidfd_fd = pidfd.as_fd().try_clone_to_owned().map_err(|error| {
@@ -731,6 +753,12 @@ pub fn attach(
         .with_counters(cells);
         Ok((instance, client, conductor, counters))
     });
+    // Attached: the session's fetches wait the call timeout, not the
+    // attach's.
+    let built = built.and_then(|built| {
+        ipc::set_timeouts(socket.as_fd(), timeout)?;
+        Ok(built)
+    });
     match built {
         Ok((instance, client, mut conductor, counters)) => {
             let losses = conductor.loss_report_queue();
@@ -743,6 +771,7 @@ pub fn attach(
                     next_fetch: 1,
                     live: Vec::new(),
                     broken: false,
+                    abandoned: Vec::new(),
                 }),
                 links: Mutex::new(Vec::new()),
             });
@@ -1240,7 +1269,7 @@ impl RemoteClient {
     /// region, attaches it writable after the region checks, checks its
     /// geometry against the sizes requested and returns its writer, whose
     /// drop unmaps the region and sends the grant's `Detach`. Blocks at most
-    /// the attach timeout per message.
+    /// the session's timeout per message.
     ///
     /// # Errors
     ///
@@ -1277,7 +1306,7 @@ impl RemoteClient {
     /// (the driver-only seal profile) and requires the configuration of
     /// the table, then returns a view that polls with `budget` and whose
     /// drop unmaps the table and sends the grant's `Detach`. Blocks at most
-    /// the attach timeout per message.
+    /// the session's timeout per message.
     ///
     /// # Errors
     ///
@@ -1343,7 +1372,7 @@ impl RemoteClient {
     /// then serves the cutovers of the handles taken: it fetches and
     /// prepares their successors, closes the fenced ones and drops what
     /// moved handles left behind (the control path; it may block on the
-    /// admission socket for the attach timeout per message). A moved
+    /// admission socket for the session's timeout per message). A moved
     /// handle's predecessor stays charged in the driver's ledger until this
     /// poll detaches it: a client at its export bound whose predecessor is
     /// still charged gets no successor at the next cutover and is fenced
@@ -1408,7 +1437,7 @@ impl RemoteClient {
 
     /// Takes the exclusive publication of a [`Fetchable`] grant: fetches
     /// it, checks it against the request and adopts it. Blocks at most the
-    /// attach timeout per message.
+    /// session's timeout per message.
     ///
     /// # Errors
     ///
@@ -1871,6 +1900,10 @@ struct FetchedDescriptor {
     binding: Vec<(Record, OwnedFd)>,
 }
 
+/// Fetches abandoned at once at most: past it, a timeout leaves the
+/// session out of step (karyos#851).
+const MAX_ABANDONED: usize = 16;
+
 /// Sends `Fetch { key }` and receives its `Manifest` and one `Region` per
 /// record: the manifest must answer this fetch, with `key` and
 /// `registration`, and carry one record of `kind`, followed for a log
@@ -1897,7 +1930,52 @@ fn fetch_descriptor(
         fetch
     };
     send(&session.socket, &Message::Fetch { fetch, key }, None)?;
-    let (records, stream_registration, incarnation, base) = match receive(&session.socket)? {
+    let manifest = loop {
+        let received = match receive(&session.socket) {
+            Ok(received) => received,
+            Err(error) => {
+                // A manifest that did not arrive in time may still come:
+                // the fetch is abandoned, and its reply drained when it
+                // does (karyos#851). Any other failure leaves the session
+                // out of step.
+                let mut state = session.state();
+                if matches!(error, AttachError::Timeout) && state.abandoned.len() < MAX_ABANDONED {
+                    state.abandoned.push(fetch);
+                } else {
+                    state.broken = true;
+                }
+                return Err(error);
+            }
+        };
+        // A reply to an abandoned fetch, late: discarded, its regions
+        // drained and their exports detached, and the wait goes on.
+        let late = match &received.0 {
+            Message::Manifest { fetch: got, .. } | Message::Refused { fetch: got, .. } => {
+                let mut state = session.state();
+                let at = state
+                    .abandoned
+                    .iter()
+                    .position(|abandoned| abandoned == got);
+                at.map(|at| state.abandoned.swap_remove(at)).is_some()
+            }
+            _ => false,
+        };
+        if !late {
+            break received;
+        }
+        if let (
+            Message::Manifest {
+                fetch: got,
+                records,
+                ..
+            },
+            None,
+        ) = &received
+        {
+            abort(session, *got, records);
+        }
+    };
+    let (records, stream_registration, incarnation, base) = match manifest {
         (Message::Refused { fetch: got, code }, None) if got == fetch => {
             return Err(AttachError::Refused { code });
         }
@@ -1954,12 +2032,13 @@ fn fetch_descriptor(
             )) if got == fetch && at == index => fd,
             _ => {
                 // Out of step: the descriptors that arrived are closed and
-                // their exports detached.
-                session.state().broken = true;
+                // their exports detached, then the session is broken (a
+                // broken session detaches nothing).
                 for (part, fd) in records.iter().zip(fds) {
                     drop(fd);
                     session.detach(part.export);
                 }
+                session.state().broken = true;
                 return match received {
                     Err(error) => Err(error),
                     Ok(_) => Err(AttachError::Protocol),
@@ -2072,6 +2151,7 @@ mod tests {
                 next_fetch: 1,
                 live: Vec::new(),
                 broken: false,
+                abandoned: Vec::new(),
             }),
             links: Mutex::new(Vec::new()),
         });
@@ -2103,6 +2183,146 @@ mod tests {
         stream_id: 3,
         session_id: 1,
     };
+
+    /// karyos#851: a fetch whose manifest does not arrive within the
+    /// timeout is abandoned, not the session: its reply, arriving late,
+    /// is drained at the next fetch, which then reads its own reply.
+    #[test]
+    fn a_late_reply_to_an_abandoned_fetch_is_drained() {
+        let (ours, peer) = ipc::seqpacket_pair().unwrap();
+        ipc::set_timeouts(ours.as_fd(), Duration::from_millis(20)).unwrap();
+        let session = Session {
+            instance: 1,
+            socket: ours,
+            fetching: Mutex::new(()),
+            state: Mutex::new(SessionState {
+                next_fetch: 1,
+                live: Vec::new(),
+                broken: false,
+                abandoned: Vec::new(),
+            }),
+            links: Mutex::new(Vec::new()),
+        };
+        // No reply in time: abandoned, the session still in step.
+        assert!(matches!(
+            fetch_descriptor(&session, 7, 7, WireKind::LogBuffer),
+            Err(AttachError::Timeout)
+        ));
+        assert_eq!(session.state().abandoned, [1]);
+        assert!(!session.state().broken);
+        // The late reply to fetch 1, then fetch 2's own.
+        send(&peer, &Message::Refused { fetch: 1, code: 6 }, None).unwrap();
+        send(&peer, &Message::Refused { fetch: 2, code: 7 }, None).unwrap();
+        assert!(matches!(
+            fetch_descriptor(&session, 8, 8, WireKind::LogBuffer),
+            Err(AttachError::Refused { code: 7 })
+        ));
+        assert!(session.state().abandoned.is_empty());
+        assert!(!session.state().broken);
+    }
+
+    /// A session over one end of a seqpacket pair whose fetches time out
+    /// after `timeout`, and the peer, which answers as the driver would.
+    fn timed_session(timeout: Duration) -> (Session, OwnedFd) {
+        let (ours, peer) = ipc::seqpacket_pair().unwrap();
+        ipc::set_timeouts(ours.as_fd(), timeout).unwrap();
+        ipc::set_timeouts(peer.as_fd(), Duration::from_secs(5)).unwrap();
+        let session = Session {
+            instance: 1,
+            socket: ours,
+            fetching: Mutex::new(()),
+            state: Mutex::new(SessionState {
+                next_fetch: 1,
+                live: Vec::new(),
+                broken: false,
+                abandoned: Vec::new(),
+            }),
+            links: Mutex::new(Vec::new()),
+        };
+        (session, peer)
+    }
+
+    /// karyos#851: a late manifest of an abandoned fetch, with its regions,
+    /// is drained at the next fetch: each descriptor closed and each
+    /// export detached, so nothing stays charged, and the next fetch reads
+    /// its own reply.
+    #[test]
+    fn a_late_manifest_with_regions_is_drained_and_detached() {
+        let (session, peer) = timed_session(Duration::from_millis(20));
+        assert!(matches!(
+            fetch_descriptor(&session, 7, 7, WireKind::LogBuffer),
+            Err(AttachError::Timeout)
+        ));
+        let record = |export| Record {
+            region: 9,
+            export,
+            kind: WireKind::LogBuffer,
+            layout: 1,
+            structure_length: 4096,
+            generation: 2,
+            stream_id: 2,
+            session_id: 1,
+            lane: 0,
+            capability: Capability::None,
+            allow_unconnected: false,
+        };
+        let manifest = Message::Manifest {
+            fetch: 1,
+            key: 7,
+            registration: 7,
+            stream_registration: 7,
+            incarnation: 1,
+            base: 0,
+            records: vec![record(11), record(12)],
+        };
+        send(&peer, &manifest, None).unwrap();
+        for index in 0..2 {
+            let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+            send(&peer, &Message::Region { fetch: 1, index }, Some(&fd)).unwrap();
+        }
+        send(&peer, &Message::Refused { fetch: 2, code: 7 }, None).unwrap();
+        assert!(matches!(
+            fetch_descriptor(&session, 8, 8, WireKind::LogBuffer),
+            Err(AttachError::Refused { code: 7 })
+        ));
+        assert!(session.state().abandoned.is_empty());
+        assert!(!session.state().broken);
+        assert!(session.state().live.is_empty(), "every export detached");
+        // The driver saw both fetches, then a Detach per drained export.
+        let mut seen = Vec::new();
+        while seen.len() < 4 {
+            seen.push(receive(&peer).unwrap().0);
+        }
+        assert_eq!(
+            seen,
+            [
+                Message::Fetch { fetch: 1, key: 7 },
+                Message::Fetch { fetch: 2, key: 8 },
+                Message::Detach { export: 11 },
+                Message::Detach { export: 12 },
+            ]
+        );
+    }
+
+    /// karyos#851: at most `MAX_ABANDONED` fetches are abandoned at once;
+    /// the next that times out leaves the session out of step.
+    #[test]
+    fn a_full_abandoned_list_breaks_the_session() {
+        let (session, _peer) = timed_session(Duration::from_millis(2));
+        for key in 1..=u64::try_from(MAX_ABANDONED).unwrap() {
+            assert!(matches!(
+                fetch_descriptor(&session, key, key, WireKind::LogBuffer),
+                Err(AttachError::Timeout)
+            ));
+        }
+        assert_eq!(session.state().abandoned.len(), MAX_ABANDONED);
+        assert!(!session.state().broken);
+        assert!(matches!(
+            fetch_descriptor(&session, 99, 99, WireKind::LogBuffer),
+            Err(AttachError::Timeout)
+        ));
+        assert!(session.state().broken);
+    }
 
     /// A lost driver closes every link, so a remote handle waiting at a
     /// seal that marks a successor ends instead of waiting for ever: the

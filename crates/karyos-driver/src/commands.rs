@@ -262,6 +262,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(id)
     }
 
+    /// Stops serving a remote client that left with a fetch outstanding
+    /// (karyos#851): as a faulty one, its sent grants charged until its
+    /// exit proof, but counted in `FetchesAbandonedAtLeave`, not as a
+    /// fault.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn retire_leaving_client(&mut self, client: u64) {
+        if let Some(index) = self.clients.iter().position(|slot| slot.id == client) {
+            self.stop_serving(index, Event::FetchesAbandonedAtLeave);
+        }
+    }
+
     /// Stops serving client `client` (see `retire_faulty`), keeping its
     /// slot until its link is closed.
     #[cfg(target_os = "linux")]
@@ -790,6 +801,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             if matches!(response, Response::Error { .. }) {
                 self.counters.add(Event::CommandsRefused, 1);
             }
+            // A driver sends only the refusal codes it defines; a peer reads
+            // any other as `ErrorCode::Unknown` (karyos#819). Only the
+            // decoder builds `Unknown`, so this check, run in debug builds
+            // only, catches a response relayed from a decoded one.
+            debug_assert!(
+                !matches!(response, Response::Error { code, .. } if !code.is_defined()),
+                "an undefined refusal code"
+            );
             let mut out = [0u8; MAX_RESPONSE_LENGTH];
             let sent = response
                 .encode(&mut out)

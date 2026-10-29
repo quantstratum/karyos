@@ -201,6 +201,7 @@ pub struct Context {
     dir: Option<PathBuf>,
     idle: IdleStrategy,
     timeout: Duration,
+    attach_timeout: Duration,
     max_pending: usize,
     max_images: usize,
 }
@@ -214,9 +215,13 @@ impl Context {
                 dir: None,
                 idle: IdleStrategy::YieldThenSleep,
                 timeout: DEFAULT_TIMEOUT,
+                // Resolved by `ContextBuilder::build`, from the builder's
+                // own or the call timeout.
+                attach_timeout: DEFAULT_TIMEOUT,
                 max_pending: DEFAULT_MAX_PENDING,
                 max_images: DEFAULT_MAX_IMAGES,
             },
+            attach_timeout: None,
         }
     }
 
@@ -232,10 +237,20 @@ impl Context {
         self.idle
     }
 
-    /// The longest wait of a control call.
+    /// The longest wait of a control call, and, for a remote client, of
+    /// each message on its session's socket once attached (a fetch, a
+    /// `Detach`, the final `Leave`).
     #[must_use]
     pub fn timeout(&self) -> Duration {
         self.timeout
+    }
+
+    /// The longest wait per message of `Client::connect`'s attach; the
+    /// session's fetches then wait [`Self::timeout`]. The control call
+    /// timeout unless set apart.
+    #[must_use]
+    pub fn attach_timeout(&self) -> Duration {
+        self.attach_timeout
     }
 
     /// The most images a network subscription attaches at once.
@@ -255,6 +270,8 @@ impl Context {
 #[derive(Debug, Clone)]
 pub struct ContextBuilder {
     context: Context,
+    /// The attach timeout set apart from the control call timeout.
+    attach_timeout: Option<Duration>,
 }
 
 impl ContextBuilder {
@@ -273,10 +290,24 @@ impl ContextBuilder {
         self
     }
 
-    /// The longest wait of a control call ([`DEFAULT_TIMEOUT`] by default).
+    /// The longest wait of a control call ([`DEFAULT_TIMEOUT`] by default),
+    /// and, for a remote client, of each message on its session's socket
+    /// once attached; the attach waits [`Self::attach_timeout`].
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.context.timeout = timeout;
+        self
+    }
+
+    /// The longest wait per message of `Client::connect`'s attach, apart
+    /// from a control call's ([`Self::timeout`] by default): the connection
+    /// (a full listen backlog retried for it) and the bootstrap. A client
+    /// whose calls time out fast need not attach as fast. Once attached,
+    /// every message on the session's socket, a fetch of a grant's
+    /// regions, a `Detach` or the final `Leave`, waits the call timeout.
+    #[must_use]
+    pub fn attach_timeout(mut self, timeout: Duration) -> Self {
+        self.attach_timeout = Some(timeout);
         self
     }
 
@@ -299,13 +330,19 @@ impl ContextBuilder {
     ///
     /// # Errors
     ///
-    /// [`ClientError::InvalidContext`] for a zero timeout, pending bound or
-    /// image bound.
+    /// [`ClientError::InvalidContext`] for a zero timeout or attach
+    /// timeout, pending bound or image bound.
     pub fn build(self) -> Result<Context, ClientError> {
-        let context = self.context;
+        let mut context = self.context;
+        context.attach_timeout = self.attach_timeout.unwrap_or(context.timeout);
         if context.timeout.is_zero() {
             return Err(ClientError::InvalidContext {
                 reason: "the timeout is zero",
+            });
+        }
+        if context.attach_timeout.is_zero() {
+            return Err(ClientError::InvalidContext {
+                reason: "the attach timeout is zero",
             });
         }
         if context.max_pending == 0 {
@@ -1230,14 +1267,20 @@ pub struct Client<C: Connection> {
 #[cfg(target_os = "linux")]
 impl Client<crate::ipc::RemoteClient> {
     /// Attaches to the driver whose admission socket is in the context's
-    /// directory, waiting at most the context's timeout per message.
+    /// directory, waiting at most the context's attach timeout per message
+    /// of the attach, then its timeout per message of every later fetch.
     ///
     /// # Errors
     ///
     /// [`ClientError::NoDirectory`], `ClientError::Attach`.
     pub fn connect(context: Context) -> Result<Self, ClientError> {
         let dir = context.dir.as_deref().ok_or(ClientError::NoDirectory)?;
-        let remote = crate::ipc::attach(dir, context.timeout, context.max_pending)?;
+        let remote = crate::ipc::attach_with(
+            dir,
+            context.attach_timeout,
+            context.timeout,
+            context.max_pending,
+        )?;
         Ok(Self::new(remote, context))
     }
 }
@@ -2660,6 +2703,43 @@ impl<T: TermBytes> Images<T> {
 mod tests {
     use super::*;
     use karyos_sys::frame::Lane;
+
+    /// Plan 166: the attach timeout is the control call timeout unless set
+    /// apart, set before or after it, and a zero one is refused as a zero
+    /// timeout is.
+    #[test]
+    fn the_attach_timeout_defaults_to_the_timeout() {
+        let fast = Duration::from_millis(50);
+        let context = Context::builder().timeout(fast).build().unwrap();
+        assert_eq!(context.attach_timeout(), fast);
+        for context in [
+            Context::builder()
+                .timeout(fast)
+                .attach_timeout(DEFAULT_TIMEOUT),
+            Context::builder()
+                .attach_timeout(DEFAULT_TIMEOUT)
+                .timeout(fast),
+        ] {
+            let context = context.build().unwrap();
+            assert_eq!(
+                (context.timeout(), context.attach_timeout()),
+                (fast, DEFAULT_TIMEOUT)
+            );
+        }
+        // Equal contexts compare equal, however they were built.
+        assert_eq!(
+            Context::builder().timeout(fast).build().unwrap(),
+            Context::builder()
+                .timeout(fast)
+                .attach_timeout(fast)
+                .build()
+                .unwrap()
+        );
+        assert!(matches!(
+            Context::builder().attach_timeout(Duration::ZERO).build(),
+            Err(ClientError::InvalidContext { .. })
+        ));
+    }
 
     /// `YieldThenSleep` yields for 64 consecutive idle waits and sleeps
     /// 1 ms from the 65th, as the driver's agents do (ADR-0066); the other

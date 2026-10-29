@@ -2777,16 +2777,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.add_local_stream(config, false)
     }
 
-    /// [`EmbeddedDriver::add_stream`] whose schedule ring, if any, is
-    /// taken: the caller consumes and releases the stream's schedule ring
-    /// itself (a simulator's `ScheduleConsumer`); without that, the lane
-    /// takes `schedule_capacity` offers and then back pressures for good.
-    /// Not for applications: `add_stream`, the client facade, karyosd and
-    /// the C ABI keep refusing a ring (owner item 65).
-    ///
-    /// # Errors
-    ///
-    /// As [`EmbeddedDriver::add_stream`], but for the schedule ring.
     /// Tests: stamps `stream`'s next reincarnation `by_ns` nanoseconds
     /// earlier than it happens, as if it had begun then, for its handles'
     /// rate copies (R-CORE-21).
@@ -2794,6 +2784,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// # Errors
     ///
     /// The stream lookup's errors.
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn backdate_next_reincarnation(
         &mut self,
@@ -2804,6 +2795,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(())
     }
 
+    /// [`EmbeddedDriver::add_stream`] whose schedule ring, if any, is
+    /// taken: the caller consumes and releases the stream's schedule ring
+    /// itself (a simulator's `ScheduleConsumer`); without that, the lane
+    /// takes `schedule_capacity` offers and then back pressures for good.
+    /// Not for applications: `add_stream`, the client facade, karyosd and
+    /// the C ABI keep refusing a ring (owner item 65).
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_stream`], but for the schedule ring.
     #[doc(hidden)]
     pub fn add_stream_with_external_schedule(
         &mut self,
