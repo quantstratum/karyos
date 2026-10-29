@@ -1196,7 +1196,14 @@ mod remote {
             );
             match client.add_exclusive_publication(&uri(port()), StreamId::new(8)) {
                 Ok(publication) => granted = Some(publication),
-                Err(ClientError::Refused { .. } | ClientError::Timeout) => {
+                // Refused while the late grant is released, or timed out
+                // under load: the request's own 50 ms, or its fetch's
+                // (plan 166, karyos#851).
+                Err(
+                    ClientError::Refused { .. }
+                    | ClientError::Timeout
+                    | ClientError::Attach(karyos_client::ipc::AttachError::Timeout),
+                ) => {
                     let _ = client.poll();
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -1249,7 +1256,14 @@ mod remote {
             );
             match client.add_subscription("karyos:ipc", StreamId::new(3)) {
                 Ok(subscription) => granted = Some(subscription),
-                Err(ClientError::Refused { .. } | ClientError::Timeout) => {
+                // Refused while the late grant is released, or timed out
+                // under load: the request's own 50 ms, or its fetch's
+                // (plan 166, karyos#851).
+                Err(
+                    ClientError::Refused { .. }
+                    | ClientError::Timeout
+                    | ClientError::Attach(karyos_client::ipc::AttachError::Timeout),
+                ) => {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(error) => panic!("{error}"),
@@ -1399,7 +1413,14 @@ mod remote {
             );
             match client.add_conflated_subscription("karyos:ipc", StreamId::new(5)) {
                 Ok(view) => granted = Some(view),
-                Err(ClientError::Refused { .. } | ClientError::Timeout) => {
+                // Refused while the late grant is released, or timed out
+                // under load: the request's own 50 ms, or its fetch's
+                // (plan 166, karyos#851).
+                Err(
+                    ClientError::Refused { .. }
+                    | ClientError::Timeout
+                    | ClientError::Attach(karyos_client::ipc::AttachError::Timeout),
+                ) => {
                     let _ = client.poll();
                     std::thread::sleep(Duration::from_millis(5));
                 }
