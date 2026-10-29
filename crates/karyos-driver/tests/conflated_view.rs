@@ -194,16 +194,10 @@ fn offer_keyed(
 fn latest(reader: &mut ConflationReader) -> Vec<(u32, Vec<u8>)> {
     let mut seen: Vec<(u32, Vec<u8>)> = Vec::new();
     for _ in 0..100 {
-        let report = reader.poll_changed(
-            Budget {
-                keys: 16,
-                retries: 4,
-            },
-            |key, _, value, _| {
-                seen.retain(|(seen, _)| *seen != key);
-                seen.push((key, value.to_vec()));
-            },
-        );
+        let report = reader.poll_changed(Budget::new(16, 4), |key, _, value, _| {
+            seen.retain(|(seen, _)| *seen != key);
+            seen.push((key, value.to_vec()));
+        });
         if report.journal_drained && report.pending == 0 && !report.scanning {
             break;
         }
@@ -316,13 +310,7 @@ fn a_fetched_conflated_view_reads_the_table_read_only() {
     drop(publication);
     driver.remove_stream(stream).unwrap();
     let _ = driver.do_work().unwrap();
-    let report = view.poll_changed(
-        Budget {
-            keys: 16,
-            retries: 4,
-        },
-        |_, _, _, _| {},
-    );
+    let report = view.poll_changed(Budget::new(16, 4), |_, _, _, _| {});
     assert!(report.closed);
     // The view unmapped the table: then it detaches, which ends the grant.
     drop(view);
@@ -399,13 +387,7 @@ fn a_conflated_view_survives_a_cutover() {
     }
     assert!(
         !view
-            .poll_changed(
-                Budget {
-                    keys: 16,
-                    retries: 4
-                },
-                |_, _, _, _| {}
-            )
+            .poll_changed(Budget::new(16, 4), |_, _, _, _| {})
             .closed
     );
     assert_eq!(counter(&driver, "grants reserved"), 1);
@@ -653,10 +635,7 @@ type Change = fn(&mut FetchableConflated, &mut ConflatedLimits);
 /// What a failed take must report.
 type Expected = fn(&AttachError) -> bool;
 
-const BUDGET: Budget = Budget {
-    keys: 16,
-    retries: 4,
-};
+const BUDGET: Budget = Budget::new(16, 4);
 
 /// Runs `client` on another thread while this one runs duty cycles.
 fn serve_while<R: Send>(driver: &mut IpcDriver, client: impl FnOnce() -> R + Send) -> R {

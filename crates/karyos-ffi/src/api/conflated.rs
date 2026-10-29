@@ -152,10 +152,7 @@ pub(crate) fn poll(
                     .usable()
                     .map_err(|status| (Failure::from(status), 0))?;
             }
-            let budget = Budget {
-                keys: key_budget,
-                retries: entry.retries,
-            };
+            let budget = Budget::new(key_budget, entry.retries);
             let mut delivered = 0u32;
             let polled = entry.view.poll_changed_with(budget, |key, value| {
                 handler(

@@ -244,10 +244,7 @@ pub struct ConflatedOptions {
 impl Default for ConflatedOptions {
     fn default() -> Self {
         Self {
-            budget: Budget {
-                keys: 1024,
-                retries: 3,
-            },
+            budget: Budget::new(1024, 3),
             limits: ConflatedLimits::default(),
         }
     }
@@ -417,26 +414,14 @@ mod tests {
     #[test]
     fn a_view_reports_its_table_config() {
         let writer = conflation(2, 8, 1024).unwrap();
-        let subscription = ConflatedSubscription::new(
-            writer.reader(),
-            Budget {
-                keys: 1,
-                retries: 1,
-            },
-        );
+        let subscription = ConflatedSubscription::new(writer.reader(), Budget::new(1, 1));
         assert_eq!(subscription.config(), writer.config());
     }
 
     #[test]
     fn poll_changed_uses_the_subscription_budget() {
         let mut writer = conflation(2, 8, 1024).unwrap();
-        let mut subscription = ConflatedSubscription::new(
-            writer.reader(),
-            Budget {
-                keys: 2,
-                retries: 2,
-            },
-        );
+        let mut subscription = ConflatedSubscription::new(writer.reader(), Budget::new(2, 2));
         writer.write(1, b"value").unwrap();
         let mut seen = Vec::new();
 
@@ -455,13 +440,7 @@ mod tests {
     #[test]
     fn the_reader_side_counts_add_up_over_polls() {
         let mut writer = conflation(4, 8, 1024).unwrap();
-        let mut subscription = ConflatedSubscription::new(
-            writer.reader(),
-            Budget {
-                keys: 1,
-                retries: 1,
-            },
-        );
+        let mut subscription = ConflatedSubscription::new(writer.reader(), Budget::new(1, 1));
         for key in 0..3 {
             writer.write(key, b"v").unwrap();
         }
@@ -483,26 +462,14 @@ mod tests {
     #[test]
     fn poll_changed_with_uses_its_budget_and_reports_versions() {
         let mut writer = conflation(3, 8, 1024).unwrap();
-        let mut subscription = ConflatedSubscription::new(
-            writer.reader(),
-            Budget {
-                keys: 0,
-                retries: 0,
-            },
-        );
+        let mut subscription = ConflatedSubscription::new(writer.reader(), Budget::new(0, 0));
         let version = writer.write(2, b"new").unwrap();
         let mut seen = Vec::new();
 
         let report = subscription
-            .poll_changed_with(
-                Budget {
-                    keys: 3,
-                    retries: 1,
-                },
-                |key, value| {
-                    seen.push((key, value.version(), value.payload().to_vec()));
-                },
-            )
+            .poll_changed_with(Budget::new(3, 1), |key, value| {
+                seen.push((key, value.version(), value.payload().to_vec()));
+            })
             .unwrap();
 
         assert_eq!(report.delivered, 1);
@@ -518,13 +485,7 @@ mod tests {
         use karyos_sys::freshness::FreshnessLink;
 
         let mut writer = conflation_fresh(2, 8, 1024, FreshnessLink::new()).unwrap();
-        let mut view = ConflatedSubscription::new(
-            writer.reader(),
-            Budget {
-                keys: 4,
-                retries: 2,
-            },
-        );
+        let mut view = ConflatedSubscription::new(writer.reader(), Budget::new(4, 2));
         let _ = writer.write_at(0, b"a", 0).unwrap();
         writer.passed(32);
         let mut seen = Vec::new();
@@ -575,13 +536,7 @@ mod tests {
             ),
         ] {
             let mut writer = conflation_fresh(2, 8, 1024, FreshnessLink::new()).unwrap();
-            let mut view = ConflatedSubscription::new(
-                writer.reader(),
-                Budget {
-                    keys: 4,
-                    retries: 2,
-                },
-            );
+            let mut view = ConflatedSubscription::new(writer.reader(), Budget::new(4, 2));
             let _ = writer.write_at(1, b"v", 0).unwrap();
             assert!(view.poll_changed(|_, _| {}).is_ok());
             assert!(writer.publish_terminal(16, 48, reason));

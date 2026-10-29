@@ -227,15 +227,9 @@ fn a_conflated_stream_crosses_the_term_id_wrap() {
     assert!(consumed > 3 * u64::from(MIN_TERM_LENGTH));
     let mut latest = Vec::new();
     let _ = conflated
-        .poll_changed_with(
-            Budget {
-                keys: 8,
-                retries: 3,
-            },
-            |key, value| {
-                latest.push((key, u64::from_le_bytes(value.payload().try_into().unwrap())));
-            },
-        )
+        .poll_changed_with(Budget::new(8, 3), |key, value| {
+            latest.push((key, u64::from_le_bytes(value.payload().try_into().unwrap())));
+        })
         .unwrap();
     latest.sort_unstable();
     let expected: Vec<(u32, u64)> = (count - 4..count)

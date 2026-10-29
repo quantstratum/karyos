@@ -2031,14 +2031,28 @@ mod owned {
         }
     }
 
-    /// Bounds of one poll.
+    /// Bounds of one poll, built with [`Budget::new`]: a later bound is
+    /// added with a default, so the struct is `#[non_exhaustive]`.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[non_exhaustive]
     pub struct Budget {
         /// Most journal records read, slots swept and keys served, each.
         /// Zero makes the poll do nothing.
         pub keys: u32,
         /// Read attempts per served key; zero counts as one.
         pub retries: u32,
+    }
+
+    impl Budget {
+        /// At most `keys` journal records read, slots swept and keys served
+        /// per poll, each, and `retries` read attempts per served key. Both
+        /// are valid at 0: `keys` 0 makes every poll a no-op that delivers
+        /// nothing (as the C ABI's `key_budget` 0 does), and `retries` 0
+        /// counts as one attempt.
+        #[must_use]
+        pub const fn new(keys: u32, retries: u32) -> Self {
+            Self { keys, retries }
+        }
     }
     /// What one poll did.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
