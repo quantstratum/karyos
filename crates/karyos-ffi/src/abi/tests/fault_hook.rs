@@ -83,6 +83,11 @@ fn each_armed_driver_takes_its_own_fault() {
     for driver in [a, b, c] {
         assert_eq!(karyos_driver_close(driver), Status::Ok.code());
     }
+    // A driver closed while armed frees its slot.
+    let d = invoker();
+    assert_eq!(karyos_test_panic_next_duty_cycle(d), Status::Ok.code());
+    assert_eq!(karyos_driver_close(d), Status::Ok.code());
+    assert!(!crate::api::driver::take_fault(d), "disarmed at its close");
 }
 
 /// The slots are bounded: past [`MAX_ARMED`] distinct drivers an arm is

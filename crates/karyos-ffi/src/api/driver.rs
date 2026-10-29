@@ -631,7 +631,11 @@ pub(crate) const MAX_ARMED: usize = 16;
 static ARMED: [std::sync::atomic::AtomicU64; MAX_ARMED] =
     [const { std::sync::atomic::AtomicU64::new(0) }; MAX_ARMED];
 
-/// Arms `driver`'s fault: already armed, it stays so once.
+/// Arms `driver`'s fault: already armed, it stays so once. Two arms of
+/// one driver at the same instant, on two threads, may take two slots: the
+/// check and the claim are not one step. Its first cycle takes one fault
+/// and its close frees both; harmless in the test kit, which arms from one
+/// thread.
 ///
 /// # Errors
 ///
@@ -999,6 +1003,9 @@ pub(crate) fn readiness(driver: Handle) -> Result<(Readiness, u64), Status> {
 /// As [`Table::remove`].
 pub(crate) fn close(driver: Handle) -> Result<(), Status> {
     let closed = drivers().remove(driver)?;
+    // A closed driver's armed fault frees its slot (test kit only).
+    #[cfg(feature = "test-hooks")]
+    let _ = take_fault(driver.raw());
     closed.state.close();
     // Dropping it joins its thread.
     drop(closed);
