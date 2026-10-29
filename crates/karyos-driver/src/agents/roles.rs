@@ -687,6 +687,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// at most one per key, allocated at start): their images name the
     /// configured `receiver_id` and declare its `group_tag`.
     identities: Vec<(EndpointId, i32, crate::membership::ReceiverIdentity)>,
+    /// Per subscription key, the endpoint its SOLICITs leave from (plan
+    /// 164), allocated at creation.
+    solicit_from: Vec<(EndpointId, i32, EndpointId)>,
     /// The conflated lane of subscribed keys (conflated-network-images.md
     /// (a); at most one per key, allocated at start): their images gate
     /// that lane's seals.
@@ -1858,6 +1861,7 @@ pub(super) fn roles<T: StreamTerms>(
             group_budget: config.group_nak_budget,
             group_start: 0,
             identities: Vec::with_capacity(config.subscriptions),
+            solicit_from: Vec::with_capacity(config.subscriptions),
             conflated: Vec::with_capacity(config.subscriptions),
             barrier_ack_timeout: config.barrier_ack_timeout,
             unsubscribed: false,
@@ -1962,6 +1966,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 control_group,
                 identity,
                 conflated,
+                solicit_from,
             } => {
                 let held = self
                     .subscriptions
@@ -1996,6 +2001,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
                         // Likewise its conflated lane.
                         if let Some(lane) = conflated {
                             self.conflated.push((endpoint, stream_id, lane));
+                        }
+                        // And the endpoint its SOLICITs leave from.
+                        if let Some(from) = solicit_from {
+                            self.solicit_from.push((endpoint, stream_id, from));
                         }
                         true
                     }
@@ -2037,6 +2046,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     self.identities
                         .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
                     self.conflated
+                        .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
+                    self.solicit_from
                         .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
                     self.unsubscribed = true;
                 }
@@ -3832,7 +3843,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 sessions,
                 work: 0,
             };
-            if intake.challenge(key.source, Control::Solicit(solicit)) {
+            let from = intake.solicit_endpoint(&key);
+            if intake.challenge_from(from, key.source, Control::Solicit(solicit)) {
                 self.sessions.solicit_retried(&key, now);
                 sent = sent.saturating_add(1);
             } else {
@@ -4436,6 +4448,27 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// Sends `challenge` toward `source` if §7.3 and §7.4 allow it.
     /// Returns whether it was handed to the sender.
     fn challenge(&mut self, source: SocketAddr, control: Control) -> bool {
+        let endpoint = self.endpoint;
+        self.challenge_from(endpoint, source, control)
+    }
+
+    /// The endpoint `key`'s SOLICITs leave from: its subscription's
+    /// unicast control endpoint (plan 164), or the key's own endpoint.
+    fn solicit_endpoint(&self, key: &BindingKey) -> EndpointId {
+        self.role
+            .solicit_from
+            .iter()
+            .find(|(held, stream, _)| (*held, *stream) == (key.endpoint, key.alias.stream_id))
+            .map_or(key.endpoint, |(.., from)| *from)
+    }
+
+    /// [`Intake::challenge`], sent from `endpoint`.
+    fn challenge_from(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        control: Control,
+    ) -> bool {
         // §7.3: an RSP_SETUP goes only to the trigger's validated source
         // endpoint, through the socket it arrived on.
         if !answerable(source) {
@@ -4459,9 +4492,9 @@ impl<T: StreamTerms> Intake<'_, T> {
             return false;
         }
         #[cfg(test)]
-        self.role.posted_challenges.push((self.endpoint, control));
+        self.role.posted_challenges.push((endpoint, control));
         self.forward(ControlItem::Outgoing {
-            endpoint: self.endpoint,
+            endpoint,
             destination: source,
             control,
             guard: None,
@@ -4507,7 +4540,8 @@ impl<T: StreamTerms> Intake<'_, T> {
         if let SolicitOutcome::Solicit(solicit) =
             role.sessions.solicit(key, self.now, &mut role.nonces)
         {
-            if self.challenge(key.source, Control::Solicit(solicit)) {
+            let from = self.solicit_endpoint(&key);
+            if self.challenge_from(from, key.source, Control::Solicit(solicit)) {
                 self.role.sessions.solicit_sent();
             } else {
                 // The first SOLICIT never went out (a rate or the ring

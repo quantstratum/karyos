@@ -591,6 +591,12 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// lane's seals through the view's barrier mailbox. `None`: no
         /// view, the seals as before.
         conflated: Option<karyos_sys::frame::Lane>,
+        /// The driver's unicast control endpoint of the endpoint's address
+        /// family, which sends this subscription's SOLICITs
+        /// (network-control-schemas.md §6.3, plan 164), so each driver has
+        /// its own `setup_answer_rate` bucket at the publisher. `None`: they
+        /// leave from `endpoint`, as before.
+        solicit_from: Option<EndpointId>,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer
