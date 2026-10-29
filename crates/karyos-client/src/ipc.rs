@@ -150,7 +150,9 @@ pub struct RemoteClient {
 /// The socket, the fetch counter and the live exports of one client
 /// (`quantstratum-docs: karyos/design/ipc-data-path.md`, The client,
 /// Session). The last reference sends `Leave` if every export was
-/// detached; its control sends block at most the attach timeout and are
+/// detached (a fetch it abandoned does not hold it: the driver takes such a
+/// `Leave` as clean, karyos#851); its control sends block at most the
+/// session's timeout (`attach_with`'s `timeout`, the call timeout) and are
 /// made only from `Drop`, `close` and the `take_*` calls.
 #[derive(Debug)]
 struct Session {
@@ -1241,7 +1243,7 @@ impl RemoteClient {
     /// region, attaches it writable after the region checks, checks its
     /// geometry against the sizes requested and returns its writer, whose
     /// drop unmaps the region and sends the grant's `Detach`. Blocks at most
-    /// the attach timeout per message.
+    /// the session's timeout per message.
     ///
     /// # Errors
     ///
@@ -1278,7 +1280,7 @@ impl RemoteClient {
     /// (the driver-only seal profile) and requires the configuration of
     /// the table, then returns a view that polls with `budget` and whose
     /// drop unmaps the table and sends the grant's `Detach`. Blocks at most
-    /// the attach timeout per message.
+    /// the session's timeout per message.
     ///
     /// # Errors
     ///
@@ -1344,7 +1346,7 @@ impl RemoteClient {
     /// then serves the cutovers of the handles taken: it fetches and
     /// prepares their successors, closes the fenced ones and drops what
     /// moved handles left behind (the control path; it may block on the
-    /// admission socket for the attach timeout per message). A moved
+    /// admission socket for the session's timeout per message). A moved
     /// handle's predecessor stays charged in the driver's ledger until this
     /// poll detaches it: a client at its export bound whose predecessor is
     /// still charged gets no successor at the next cutover and is fenced
@@ -1409,7 +1411,7 @@ impl RemoteClient {
 
     /// Takes the exclusive publication of a [`Fetchable`] grant: fetches
     /// it, checks it against the request and adopts it. Blocks at most the
-    /// attach timeout per message.
+    /// session's timeout per message.
     ///
     /// # Errors
     ///

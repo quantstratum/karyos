@@ -213,6 +213,9 @@ struct Retiring<T: StreamTerms> {
 enum Step {
     Keep,
     Leave,
+    /// A leave with a fetch outstanding: clean, but what was exported
+    /// stays charged until the exit proof (karyos#851).
+    LeaveCharged,
     Retire,
 }
 
@@ -595,6 +598,16 @@ impl<T: StreamTerms> Admission<T> {
                     remote.link.mark_closed();
                     work.add(1);
                 }
+                Step::LeaveCharged => {
+                    let remote = self.remotes.swap_remove(index);
+                    Self::fail_open(driver, &remote);
+                    driver.retire_leaving_client(remote.client);
+                    self.retiring.push(Retiring {
+                        pidfd: remote.pidfd,
+                        link: remote.link,
+                    });
+                    work.add(1);
+                }
                 Step::Retire => {
                     let remote = self.remotes.swap_remove(index);
                     Self::fail_open(driver, &remote);
@@ -953,6 +966,13 @@ impl<T: StreamTerms> Admission<T> {
                     {
                         Step::Leave
                     }
+                    // A Leave with a fetch outstanding (one the client
+                    // abandoned, or exports it has not detached) is a clean
+                    // leave, never a fault (QS-COORDINATOR, karyos#851):
+                    // the client stops being served, but what was exported
+                    // stays charged until its exit proof, as it may still
+                    // be mapped.
+                    Ok(Message::Leave) => Step::LeaveCharged,
                     Ok(Message::Fetch { fetch, key }) => {
                         Self::fetch(remote, driver, config, fetch, key)
                     }

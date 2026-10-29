@@ -215,6 +215,8 @@ impl Context {
                 dir: None,
                 idle: IdleStrategy::YieldThenSleep,
                 timeout: DEFAULT_TIMEOUT,
+                // Resolved by `ContextBuilder::build`, from the builder's
+                // own or the call timeout.
                 attach_timeout: DEFAULT_TIMEOUT,
                 max_pending: DEFAULT_MAX_PENDING,
                 max_images: DEFAULT_MAX_IMAGES,
@@ -235,7 +237,9 @@ impl Context {
         self.idle
     }
 
-    /// The longest wait of a control call.
+    /// The longest wait of a control call, and, for a remote client, of
+    /// each message on its session's socket once attached (a fetch, a
+    /// `Detach`, the final `Leave`).
     #[must_use]
     pub fn timeout(&self) -> Duration {
         self.timeout
@@ -286,7 +290,9 @@ impl ContextBuilder {
         self
     }
 
-    /// The longest wait of a control call ([`DEFAULT_TIMEOUT`] by default).
+    /// The longest wait of a control call ([`DEFAULT_TIMEOUT`] by default),
+    /// and, for a remote client, of each message on its session's socket
+    /// once attached; the attach waits [`Self::attach_timeout`].
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
         self.context.timeout = timeout;
