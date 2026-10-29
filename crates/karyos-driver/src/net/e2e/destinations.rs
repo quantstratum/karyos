@@ -1150,6 +1150,11 @@ fn a_reliable_reset_catches_each_destination_up_in_order() {
     }
     assert_eq!(seen, [256, 256]);
     assert!(a.network_removed_destinations(&publication).is_empty());
+    // That nothing below a reset's position goes twice to a destination
+    // that had it is shown frame by frame at driver level
+    // (`agents::data::tests::a_reset_resends_only_what_each_destination_lacks`):
+    // here receivers drop copies, and the per-destination repair counts
+    // also carry NAK repairs for loopback loss, so no count would tell it.
 }
 
 /// karyos#859: an idle multi-destination publication sends each

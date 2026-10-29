@@ -16,6 +16,10 @@
     no ERR. A full share leaves the catch-up waiting to be tried again, and
     a part below the retention floor is counted lost
     (`catch_ups`, `catch_ups_full`, `catch_up_lost` in the repair counts).
+    Nothing else changes for that part: the receiver NAKs the gap, gets
+    the usual ERR `RangeUnavailable` and applies its gap policy, as for any
+    NAK below the floor. The rewind it replaces never went below the floor
+    either.
   - **The tables:** the ERR linger entries, the job linger entries and the
     step 8 replies are now shared out per destination as the job table is,
     `value / max_destinations`. A value below one entry per destination is

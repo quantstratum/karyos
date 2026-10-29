@@ -184,7 +184,9 @@ struct TargetLane {
     /// Where the first head returned unsent in this epoch began (its
     /// `high` then): a later submitted head raises `high` past it, so a
     /// catch-up after a reset starts here, not at `high` (MD-20,
-    /// karyos#802).
+    /// karyos#802). A head of an earlier epoch reported after the reopen
+    /// matches no staged ticket, as the reopen cleared them, so it never
+    /// records one.
     hole: Option<u64>,
     /// A catch-up range waiting for a job in the destination's share.
     catch_up: Option<(u64, u64)>,
@@ -2146,6 +2148,64 @@ mod tests {
         holed.catch_up_after_reset(7_000);
         assert_eq!(holed.catch_up, Some((2_000, 7_000)));
         assert_eq!(holed.catch_up_to, 7_000);
+    }
+
+    /// karyos#890 review: an outcome of a head staged before a reset that
+    /// is reported after the reopen (which clears the lane's staged heads)
+    /// matches no staged ticket: it marks the lane `mismatched` and never
+    /// records a `hole`, so no stale hole starts a later catch-up early.
+    #[test]
+    fn a_heads_outcome_after_the_reopen_records_no_hole() {
+        use karyos_io::backend::{Commit, TxOptions};
+        let mut tx = roomy_tx();
+        let route = tx.add_route("127.0.0.1:7001".parse().unwrap()).unwrap();
+        let queue = tx
+            .open_queue(TxQueueConfig {
+                authority: Authority::FIRST,
+                route,
+                max_pending: NonZeroU16::MIN,
+            })
+            .unwrap();
+        let frame = tx.claim_tx(queue, 1408).unwrap();
+        let ticket = frame
+            .commit(Commit {
+                len: 64,
+                token: SenderToken::new(1),
+                options: TxOptions::none(),
+            })
+            .unwrap();
+        let staged = Staged {
+            ticket,
+            charge: 64,
+            len: 64,
+        };
+        let mut lanes = [lane_at(1_000)];
+        lanes[0].staged.push_back((ticket, 2_000));
+        // The reopen clears what was staged, as `open_targets` does.
+        lanes[0].staged.clear();
+        let mut gate = TargetGate {
+            lanes: &mut lanes,
+            held: false,
+            edges: [u64::MAX; 4],
+        };
+        gate.left(0, staged, Left::Returned);
+        assert_eq!(
+            (lanes[0].hole, lanes[0].mismatched, lanes[0].high),
+            (None, true, 1_000)
+        );
+        // Staged in the same epoch, the same outcome records its hole.
+        let mut lanes = [lane_at(1_000)];
+        lanes[0].staged.push_back((ticket, 2_000));
+        let mut gate = TargetGate {
+            lanes: &mut lanes,
+            held: false,
+            edges: [u64::MAX; 4],
+        };
+        gate.left(0, staged, Left::Returned);
+        assert_eq!((lanes[0].hole, lanes[0].mismatched), (Some(1_000), false));
+        // The committed item is never sent: a TX half dropped with it
+        // pending asserts, so the test lets it go.
+        std::mem::forget(tx);
     }
 
     /// The shares (MD-8, karyos#802): each table a destination's repair
