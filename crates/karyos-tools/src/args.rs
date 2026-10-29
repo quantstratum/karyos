@@ -26,6 +26,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use karyos_driver::DriverConfig;
+
+use crate::config::{ConfigError, IoBackend, IoConfig, IoSchema, SocketsBackend};
 use karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE;
 use karyos_sys::sizing::DEFAULT_MTU;
 
@@ -35,6 +37,15 @@ karyosd: runs one dedicated Karyos driver (IPC mode, Linux).
 
 Usage: karyosd --dir <path> [options]
        karyosd --sizing-report [options]
+
+Configuration:
+  --config <path>                   a configuration file: the [io] table and its backend
+                                    tables (TOML); the options below override it
+  --io-backend <name>               the I/O backend, overriding [io] backend; this driver
+                                    has sockets [sockets]
+  --io-require <capability>         a capability that must be active, or startup fails;
+                                    any use replaces [io] require; repeatable
+                                    The io configuration needs --network on.
 
 Admission:
   --dir <path>                      private directory of the admission socket (required)
@@ -330,6 +341,11 @@ pub struct Options {
     pub log_level: LogLevel,
     /// The Archive agent, when `--archive` is given.
     pub archive: Option<ArchiveOptions>,
+    /// The I/O configuration: the file of `--config` with `--io-backend`
+    /// and `--io-require` over it, checked against the schema the binary
+    /// registered ([`parse_with`]). A backend's table is read from it with
+    /// [`IoConfig::table`].
+    pub io: IoConfig,
 }
 
 impl Options {
@@ -366,6 +382,7 @@ impl Options {
             shutdown_linger: DEFAULT_SHUTDOWN_LINGER,
             log_level: LogLevel::Info,
             archive: None,
+            io: IoConfig::default(),
         }
     }
 }
@@ -404,6 +421,8 @@ pub enum ArgsError {
         /// Why it does not parse.
         error: karyos_protocol::channel::DurationError,
     },
+    /// The configuration file, or the io options over it, were refused.
+    Config(ConfigError),
 }
 
 impl fmt::Display for ArgsError {
@@ -421,6 +440,7 @@ impl fmt::Display for ArgsError {
                 value,
                 error,
             } => write!(f, "invalid duration {value:?} for {option}: {error}"),
+            Self::Config(error) => write!(f, "configuration: {error}"),
         }
     }
 }
@@ -438,7 +458,22 @@ pub fn parse<I>(args: I) -> Result<Command, ArgsError>
 where
     I: IntoIterator<Item = OsString>,
 {
+    parse_with(args, &IoSchema::core())
+}
+
+/// [`parse`] with the I/O backends of `schema`: a driver binary built with
+/// other backends (`karyosd-native`) passes the schema it registered them
+/// in, and reads their tables from [`Options::io`] (R-CORE-43).
+///
+/// # Errors
+///
+/// As [`parse`].
+pub fn parse_with<I>(args: I, schema: &IoSchema) -> Result<Command, ArgsError>
+where
+    I: IntoIterator<Item = OsString>,
+{
     let mut options = Options::new(PathBuf::new());
+    let mut io = IoOptions::default();
     let mut dir = None;
     let mut archive = Archive::default();
     let mut sizing = false;
@@ -470,6 +505,10 @@ where
             archive.dir = Some(PathBuf::from(value));
             continue;
         }
+        if option == "--config" {
+            io.file = Some(PathBuf::from(value));
+            continue;
+        }
         let value = value
             .into_string()
             .map_err(|value| ArgsError::InvalidValue {
@@ -488,6 +527,14 @@ where
             continue;
         }
         let applied = match option {
+            "--io-backend" => {
+                io.backend = Some(value.clone());
+                Some(())
+            }
+            "--io-require" => {
+                io.require.get_or_insert_with(Vec::new).push(value.clone());
+                Some(())
+            }
             "--archive-control" => control(&value).map(|control| archive.control = Some(control)),
             "--record" => record(&value).map(|record| archive.records.push(record)),
             "--archive-min-free" => size(&value).map(|size| archive.min_free = Some(size)),
@@ -506,6 +553,7 @@ where
     configured(&options)?;
     timed_networks(&mut options)?;
     idle_image_timeout(&mut options)?;
+    io_config(&mut options, schema, io).map_err(ArgsError::Config)?;
     options.archive = archive.finish()?;
     if sizing {
         return Ok(Command::SizingReport(Box::new(options)));
@@ -513,8 +561,78 @@ where
     Ok(Command::Run(Box::new(options)))
 }
 
+/// The io options as given, applied once the arguments are parsed.
+#[derive(Default)]
+struct IoOptions {
+    /// `--config`.
+    file: Option<PathBuf>,
+    /// `--io-backend`.
+    backend: Option<String>,
+    /// Every `--io-require`, in order.
+    require: Option<Vec<String>>,
+}
+
+/// Reads `--config`, applies `--io-backend` and `--io-require` over it and
+/// checks the result against `schema`. A configuration beyond the defaults
+/// needs `--network on`. With the sockets backend selected, its table sets
+/// the endpoint tables and `require` the capabilities every endpoint needs.
+fn io_config(options: &mut Options, schema: &IoSchema, io: IoOptions) -> Result<(), ConfigError> {
+    let mut config = match &io.file {
+        Some(path) => schema.read(path)?,
+        None => IoConfig::default(),
+    };
+    if let Some(backend) = io.backend {
+        config.set_backend(backend);
+    }
+    if let Some(require) = io.require {
+        config.set_require(require);
+    }
+    schema.check(&config)?;
+    if config.is_configured() {
+        let network = options
+            .driver
+            .network
+            .as_mut()
+            .ok_or(ConfigError::NetworkOff)?;
+        if config.backend() == <SocketsBackend as IoBackend>::NAME {
+            sockets(network, &config);
+        }
+    }
+    options.io = config;
+    Ok(())
+}
+
+/// Applies the sockets backend's table and `require` to `network`.
+fn sockets(network: &mut karyos_driver::net::NetworkConfig, config: &IoConfig) {
+    use std::num::NonZeroU16;
+
+    if let Some(table) = config.table::<SocketsBackend>() {
+        let tables = &mut network.endpoint_tables;
+        for (value, field) in [
+            (table.tx_slots, &mut tables.tx_slots),
+            (table.max_queues, &mut tables.max_queues),
+            (table.max_routes, &mut tables.max_routes),
+        ] {
+            if let Some(value) = value.and_then(NonZeroU16::new) {
+                *field = value;
+            }
+        }
+    }
+    network.require = config
+        .require()
+        .iter()
+        .filter_map(|name| crate::config::sockets_capability(name))
+        .fold(
+            karyos_io::sockets::endpoint::CapabilitySet::EMPTY,
+            |set, capability| set.with(capability),
+        );
+}
+
 /// Every option that takes a value.
 const OPTIONS: &[&str] = &[
+    "--config",
+    "--io-backend",
+    "--io-require",
     "--dir",
     "--max-pending-hellos",
     "--hello-timeout",
@@ -1637,6 +1755,184 @@ mod tests {
         );
         // A table and a guard may name the same stream.
         assert!(with(&["--conflation", "10:1:4:16:4k", "--guard", "a:10:1:4"]).is_ok());
+    }
+
+    /// A configuration file named for `test` in the temporary directory.
+    fn config_file(test: &str, text: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("karyosd-{test}-{}.toml", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn the_config_file_sizes_the_endpoints_and_requires_their_capabilities() {
+        use karyos_io::backend::Capability;
+        use karyos_io::sockets::endpoint::CapabilitySet;
+
+        let path = config_file(
+            "sizes",
+            "[io]\nrequire = [\"gso\"]\n[io.sockets]\ntx_slots = 512\nmax_routes = 32\n",
+        );
+        let file = path.to_str().unwrap();
+        let parsed = options(&["--dir", "d", "--network", "on", "--config", file]);
+        let network = parsed.driver.network.unwrap();
+        assert_eq!(network.endpoint_tables.tx_slots.get(), 512);
+        assert_eq!(
+            network.endpoint_tables.max_queues,
+            karyos_driver::net::EndpointTables::default().max_queues
+        );
+        assert_eq!(network.endpoint_tables.max_routes.get(), 32);
+        assert_eq!(network.require, CapabilitySet::EMPTY.with(Capability::Gso));
+        assert_eq!(parsed.io.require(), ["gso"]);
+        // The command line overrides the file: any --io-require replaces
+        // its list.
+        let parsed = options(&[
+            "--dir",
+            "d",
+            "--network",
+            "on",
+            "--config",
+            file,
+            "--io-require",
+            "path-mtu",
+            "--io-require",
+            "dont-fragment",
+        ]);
+        assert_eq!(
+            parsed.driver.network.unwrap().require,
+            CapabilitySet::EMPTY
+                .with(Capability::PathMtu)
+                .with(Capability::DontFragment)
+        );
+        assert_eq!(
+            run(&[
+                "--dir",
+                "d",
+                "--network",
+                "on",
+                "--config",
+                file,
+                "--io-backend",
+                "dpdk"
+            ]),
+            Err(ArgsError::Config(ConfigError::UnsupportedBackend {
+                name: "dpdk".to_owned(),
+                reason: crate::config::Unsupported::NativeOnly,
+                available: vec!["sockets"],
+            }))
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn the_io_configuration_needs_the_network() {
+        let path = config_file("network", "[io.sockets]\ntx_slots = 64\n");
+        let file = path.to_str().unwrap();
+        assert_eq!(
+            run(&["--dir", "d", "--config", file]),
+            Err(ArgsError::Config(ConfigError::NetworkOff))
+        );
+        assert_eq!(
+            run(&["--dir", "d", "--io-require", "gso"]),
+            Err(ArgsError::Config(ConfigError::NetworkOff))
+        );
+        // A file that configures nothing beyond the defaults is accepted.
+        let empty = config_file("empty", "");
+        let parsed = options(&["--dir", "d", "--config", empty.to_str().unwrap()]);
+        assert_eq!(parsed, Options::new(PathBuf::from("d")));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(empty).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_or_invalid_config_file_is_refused() {
+        assert!(matches!(
+            run(&[
+                "--dir",
+                "d",
+                "--network",
+                "on",
+                "--config",
+                "/nonexistent/karyosd.toml"
+            ]),
+            Err(ArgsError::Config(ConfigError::Read { .. }))
+        ));
+        let path = config_file("invalid", "[net]\n");
+        assert_eq!(
+            run(&[
+                "--dir",
+                "d",
+                "--network",
+                "on",
+                "--config",
+                path.to_str().unwrap()
+            ]),
+            Err(ArgsError::Config(ConfigError::UnknownKey {
+                key: "net".to_owned()
+            }))
+        );
+        assert!(
+            ArgsError::Config(ConfigError::NetworkOff)
+                .to_string()
+                .contains("--network on")
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A binary built with other backends passes its schema, and reads its
+    /// tables from the parsed options.
+    #[test]
+    fn a_registered_backend_is_selected_through_parse_with() {
+        use crate::config::{IoBackend, TableError};
+
+        struct Nic;
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct NicTable {
+            queues: u16,
+        }
+        impl IoBackend for Nic {
+            const NAME: &'static str = "nic";
+            type Table = NicTable;
+            fn validate(_: &NicTable) -> Result<(), TableError> {
+                Ok(())
+            }
+            fn capabilities() -> &'static [&'static str] {
+                &[]
+            }
+        }
+
+        let mut schema = IoSchema::core();
+        schema.register::<Nic>().unwrap();
+        let path = config_file("nic", "[io]\nbackend = \"nic\"\n[io.nic]\nqueues = 4\n");
+        let args = [
+            "--dir",
+            "d",
+            "--network",
+            "on",
+            "--config",
+            path.to_str().unwrap(),
+        ];
+        let Command::Run(parsed) = parse_with(args.iter().map(OsString::from), &schema).unwrap()
+        else {
+            panic!("expected options");
+        };
+        assert_eq!(parsed.io.backend(), "nic");
+        assert_eq!(parsed.io.table::<Nic>(), Some(&NicTable { queues: 4 }));
+        // Not the sockets backend: its defaults stay.
+        assert_eq!(
+            parsed.driver.network.unwrap().endpoint_tables,
+            karyos_driver::net::EndpointTables::default()
+        );
+        // The core schema refuses the same file, at the table it does not
+        // know.
+        assert_eq!(
+            run(&args),
+            Err(ArgsError::Config(ConfigError::UnknownKey {
+                key: "io.nic".to_owned()
+            }))
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }
 

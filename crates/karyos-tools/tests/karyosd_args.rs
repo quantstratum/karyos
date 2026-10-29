@@ -26,3 +26,23 @@ fn karyosd_exits_2_on_a_configuration_error_and_0_on_help() {
             .contains("--shutdown-linger")
     );
 }
+
+/// R-CORE-43: `karyosd --config` reads the `[io]` table and refuses a
+/// backend this build does not have, in one line with exit status 2;
+/// sockets stays selectable.
+#[test]
+fn karyosd_refuses_an_unsupported_io_backend_from_its_config_file() {
+    let path = std::env::temp_dir().join(format!("karyosd-args-{}.toml", std::process::id()));
+    std::fs::write(&path, "[io]\nbackend = \"dpdk\"\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_karyosd"))
+        .args(["--dir", "/nonexistent", "--network", "on", "--config"])
+        .arg(&path)
+        .output()
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(stderr.contains("\"dpdk\" needs karyosd-native"), "{stderr}");
+    assert!(stderr.contains("this driver has sockets"), "{stderr}");
+}
