@@ -1189,88 +1189,91 @@ impl UnknownCode {
     }
 }
 
-impl ErrorCode {
-    /// The code's wire value, as the `Refused` completion carries it.
-    #[must_use]
-    pub const fn code(self) -> u64 {
-        match self {
-            Self::PublicationTaken => 1,
-            Self::UnknownStream => 2,
-            Self::UnknownRegistration => 3,
-            Self::ResourcesUnavailable => 4,
-            Self::IdentitiesExhausted => 5,
-            Self::InvalidPublicationMode => 6,
-            Self::TraceJournalsExhausted => 7,
-            Self::UnknownGuard => 8,
-            Self::GuardNotClosedAt => 9,
-            Self::GuardExhausted => 10,
-            Self::NotAuthorized => 11,
-            Self::InvalidChannel => 12,
-            Self::UnsupportedChannel => 13,
-            Self::ReliabilityMismatch => 14,
-            Self::ReceiverIdentityMismatch => 15,
-            Self::LaneMismatch => 16,
-            Self::StrategyConflict => 17,
-            Self::InvalidRoles => 18,
-            Self::StreamTooLarge => 24,
-            Self::RateVersionMismatch => 19,
-            Self::RateNotATightening => 20,
-            Self::RateReserveCrossed => 21,
-            Self::RateNotSet => 22,
-            Self::RateInvalidPolicy => 23,
-            Self::RatePolicyConflict => 25,
-            Self::Unknown(code) => code.0,
+/// The defined refusal codes, one row each (karyos#819): `code()`,
+/// [`ErrorCode::from_wire`] and [`ErrorCode::ALL`] are generated from this
+/// one list, so a variant missing from it does not compile (`code()`'s
+/// match is exhaustive), and one in it decodes from its own code at once.
+/// A repeated code fails as an unreachable pattern.
+macro_rules! error_code_table {
+    ($($variant:ident = $code:literal,)+) => {
+        impl ErrorCode {
+            /// Every defined code, in table order.
+            pub const ALL: [Self; [$($code),+].len()] = [$(Self::$variant),+];
+
+            /// The code's wire value, as the `Refused` completion carries
+            /// it.
+            #[must_use]
+            pub const fn code(self) -> u64 {
+                match self {
+                    $(Self::$variant => $code,)+
+                    Self::Unknown(code) => code.0,
+                }
+            }
+
+            /// The code a peer reads for wire value `code`: a defined one,
+            /// [`ErrorCode::Unknown`] for any other value, and `None` for
+            /// the reserved 0 and `u64::MAX` (an agent journals the latter
+            /// as no answer).
+            #[must_use]
+            pub const fn from_wire(code: u64) -> Option<Self> {
+                Some(match code {
+                    $($code => Self::$variant,)+
+                    0 | u64::MAX => return None,
+                    other => Self::Unknown(UnknownCode(other)),
+                })
+            }
         }
-    }
+    };
+}
+
+error_code_table! {
+    PublicationTaken = 1,
+    UnknownStream = 2,
+    UnknownRegistration = 3,
+    ResourcesUnavailable = 4,
+    IdentitiesExhausted = 5,
+    InvalidPublicationMode = 6,
+    TraceJournalsExhausted = 7,
+    UnknownGuard = 8,
+    GuardNotClosedAt = 9,
+    GuardExhausted = 10,
+    NotAuthorized = 11,
+    InvalidChannel = 12,
+    UnsupportedChannel = 13,
+    ReliabilityMismatch = 14,
+    ReceiverIdentityMismatch = 15,
+    LaneMismatch = 16,
+    StrategyConflict = 17,
+    InvalidRoles = 18,
+    RateVersionMismatch = 19,
+    RateNotATightening = 20,
+    RateReserveCrossed = 21,
+    RateNotSet = 22,
+    RateInvalidPolicy = 23,
+    StreamTooLarge = 24,
+    RatePolicyConflict = 25,
+}
+
+impl ErrorCode {
+    /// The highest defined code, derived from [`ErrorCode::ALL`].
+    pub const HIGHEST: u64 = {
+        let mut highest = 0;
+        let mut rest: &[Self] = &Self::ALL;
+        while let [first, others @ ..] = rest {
+            let code = first.code();
+            if code > highest {
+                highest = code;
+            }
+            rest = others;
+        }
+        highest
+    };
 
     /// Whether this peer defines the code: every variant but
     /// [`ErrorCode::Unknown`].
     #[must_use]
     pub const fn is_defined(self) -> bool {
         !matches!(self, Self::Unknown(_))
-    }
-
-    /// The code of wire value `code`: a defined one, [`ErrorCode::Unknown`]
-    /// for any other nonzero value (karyos#819), and `None` for 0, which
-    /// is reserved.
-    const fn from_code(code: u64) -> Option<Self> {
-        Some(match code {
-            1 => Self::PublicationTaken,
-            2 => Self::UnknownStream,
-            3 => Self::UnknownRegistration,
-            4 => Self::ResourcesUnavailable,
-            5 => Self::IdentitiesExhausted,
-            6 => Self::InvalidPublicationMode,
-            7 => Self::TraceJournalsExhausted,
-            8 => Self::UnknownGuard,
-            9 => Self::GuardNotClosedAt,
-            10 => Self::GuardExhausted,
-            11 => Self::NotAuthorized,
-            12 => Self::InvalidChannel,
-            13 => Self::UnsupportedChannel,
-            14 => Self::ReliabilityMismatch,
-            15 => Self::ReceiverIdentityMismatch,
-            16 => Self::LaneMismatch,
-            17 => Self::StrategyConflict,
-            18 => Self::InvalidRoles,
-            24 => Self::StreamTooLarge,
-            19 => Self::RateVersionMismatch,
-            20 => Self::RateNotATightening,
-            21 => Self::RateReserveCrossed,
-            22 => Self::RateNotSet,
-            23 => Self::RateInvalidPolicy,
-            25 => Self::RatePolicyConflict,
-            0 => return None,
-            other => Self::Unknown(UnknownCode(other)),
-        })
-    }
-
-    /// The code a peer reads for wire value `code`: a defined one,
-    /// [`ErrorCode::Unknown`] for any other nonzero value, and `None` for
-    /// the reserved 0.
-    #[must_use]
-    pub const fn from_wire(code: u64) -> Option<Self> {
-        Self::from_code(code)
     }
 }
 
@@ -2538,7 +2541,7 @@ impl Response {
             }
             ERROR => {
                 let [client, sequence, code, detail] = read_words::<4>(type_id, bytes)?;
-                let code = ErrorCode::from_code(code).ok_or(CncError::Reserved { type_id })?;
+                let code = ErrorCode::from_wire(code).ok_or(CncError::Reserved { type_id })?;
                 Ok(Self::Error {
                     request: RequestId { client, sequence },
                     code,
@@ -3618,7 +3621,7 @@ mod tests {
     #[test]
     fn stream_too_large_is_24() {
         assert_eq!(ErrorCode::StreamTooLarge.code(), 24);
-        assert_eq!(ErrorCode::from_code(24), Some(ErrorCode::StreamTooLarge));
+        assert_eq!(ErrorCode::from_wire(24), Some(ErrorCode::StreamTooLarge));
     }
 
     /// karyos#740: the rate policy change's refusals keep their wire
@@ -3635,7 +3638,7 @@ mod tests {
             (ErrorCode::RatePolicyConflict, 25),
         ] {
             assert_eq!(code.code(), word);
-            assert_eq!(ErrorCode::from_code(word), Some(code));
+            assert_eq!(ErrorCode::from_wire(word), Some(code));
         }
     }
 
@@ -3647,7 +3650,7 @@ mod tests {
             (ErrorCode::InvalidRoles, 18),
         ] {
             assert_eq!(code.code(), word);
-            assert_eq!(ErrorCode::from_code(word), Some(code));
+            assert_eq!(ErrorCode::from_wire(word), Some(code));
         }
     }
 
@@ -4992,51 +4995,58 @@ mod journal_tests {
             assert_eq!(Response::decode(ERROR, &out[..length]), Ok(refused));
         }
         assert_eq!(ErrorCode::from_wire(1000).map(ErrorCode::code), Some(1000));
-        assert_eq!(ErrorCode::from_code(0), None);
+        assert_eq!(ErrorCode::from_wire(0), None);
     }
 
-    /// karyos#819: every wire value up to the highest defined code decodes
-    /// to a defined variant that encodes back to it, so a missing
-    /// `from_code` arm fails here instead of turning a defined code into
-    /// `Unknown`. The match has no wildcard: a new variant does not compile
-    /// until it is placed in this table's range.
+    /// karyos#819: an `Error` response whose code this peer does not define
+    /// (1000) decodes as a refusal, `ErrorCode::Unknown`, its code and
+    /// detail kept, and re-encodes to its own bytes.
+    #[test]
+    fn an_undefined_refusal_code_decodes_as_unknown() {
+        let bytes = bytes_of(&[2, 6, 1000, 7]);
+        let decoded = Response::decode(ERROR, &bytes).unwrap();
+        let Response::Error {
+            request,
+            code,
+            detail,
+        } = decoded
+        else {
+            panic!("not an error: {decoded:?}");
+        };
+        assert_eq!((code.code(), code.is_defined(), detail), (1000, false, 7));
+        let mut out = [0u8; MAX_RESPONSE_LENGTH];
+        let length = Response::Error {
+            request,
+            code,
+            detail,
+        }
+        .encode(&mut out)
+        .unwrap();
+        assert_eq!(&out[..length], &bytes[..]);
+    }
+
+    /// karyos#819: every defined code (`ErrorCode::ALL`, generated with
+    /// `code()` and `from_wire` from one table) decodes from its own wire
+    /// value to itself; every value from 1 to `HIGHEST` is defined; the
+    /// next is `Unknown`; 0 and `u64::MAX` are reserved.
     #[test]
     fn every_defined_code_round_trips_to_its_variant() {
-        const HIGHEST: u64 = 25;
-        for word in 1..=HIGHEST {
-            let code = ErrorCode::from_code(word).unwrap();
-            assert!(code.is_defined(), "code {word} decodes as Unknown");
-            assert_eq!(code.code(), word);
-            match code {
-                ErrorCode::Unknown(_) => unreachable!(),
-                ErrorCode::PublicationTaken
-                | ErrorCode::UnknownStream
-                | ErrorCode::UnknownRegistration
-                | ErrorCode::ResourcesUnavailable
-                | ErrorCode::IdentitiesExhausted
-                | ErrorCode::InvalidPublicationMode
-                | ErrorCode::TraceJournalsExhausted
-                | ErrorCode::UnknownGuard
-                | ErrorCode::GuardNotClosedAt
-                | ErrorCode::GuardExhausted
-                | ErrorCode::NotAuthorized
-                | ErrorCode::InvalidChannel
-                | ErrorCode::UnsupportedChannel
-                | ErrorCode::ReliabilityMismatch
-                | ErrorCode::ReceiverIdentityMismatch
-                | ErrorCode::LaneMismatch
-                | ErrorCode::StrategyConflict
-                | ErrorCode::InvalidRoles
-                | ErrorCode::RateVersionMismatch
-                | ErrorCode::RateNotATightening
-                | ErrorCode::RateReserveCrossed
-                | ErrorCode::RateNotSet
-                | ErrorCode::RateInvalidPolicy
-                | ErrorCode::StreamTooLarge
-                | ErrorCode::RatePolicyConflict => {}
-            }
+        assert_eq!(
+            ErrorCode::ALL.len(),
+            usize::try_from(ErrorCode::HIGHEST).unwrap()
+        );
+        for code in ErrorCode::ALL {
+            assert!(code.is_defined());
+            assert_eq!(ErrorCode::from_wire(code.code()), Some(code), "{code:?}");
         }
-        assert!(!ErrorCode::from_code(HIGHEST + 1).unwrap().is_defined());
+        for word in 1..=ErrorCode::HIGHEST {
+            assert!(ErrorCode::from_wire(word).unwrap().is_defined(), "{word}");
+        }
+        let next = ErrorCode::from_wire(ErrorCode::HIGHEST + 1).unwrap();
+        assert!(!next.is_defined());
+        assert_eq!(next.code(), ErrorCode::HIGHEST + 1);
+        assert_eq!(ErrorCode::from_wire(0), None);
+        assert_eq!(ErrorCode::from_wire(u64::MAX), None);
     }
 
     /// The operator word is a uid, root's 0 included, or NO_OPERATOR; a
@@ -5781,7 +5791,12 @@ mod properties {
         );
         let code = prop_oneof![
             defined,
-            (26..u64::MAX).prop_map(|word| ErrorCode::from_wire(word).unwrap()),
+            // The codes just past the defined ones, most likely to be the
+            // next ones defined, and the whole undefined range below the
+            // reserved u64::MAX.
+            ((ErrorCode::HIGHEST + 1)..=64).prop_map(|word| ErrorCode::from_wire(word).unwrap()),
+            ((ErrorCode::HIGHEST + 1)..u64::MAX)
+                .prop_map(|word| ErrorCode::from_wire(word).unwrap()),
         ];
         prop_oneof![
             (request(), any::<(u64, u64)>()).prop_map(|(request, (registration, key))| {

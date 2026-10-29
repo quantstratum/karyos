@@ -376,7 +376,9 @@ extern "C" {
 #define KARYOS_E_TOO_MANY_PENDING 302
 /** the driver did not answer in time */
 #define KARYOS_E_TIMEOUT 303
-/** the driver refused the request */
+/** the driver refused the request; detail.code is its refusal code, which
+ * may be one this library does not list (a newer driver's): treat it as a
+ * refusal all the same */
 #define KARYOS_E_REFUSED 304
 /** the driver does not serve this channel */
 #define KARYOS_E_UNSUPPORTED_CHANNEL 305
@@ -404,7 +406,8 @@ extern "C" {
 typedef struct karyos_detail {
     uint32_t size;
     uint32_t reserved;
-    /* A code the status defines, such as the driver's refusal code. */
+    /* A code the status defines, such as the driver's refusal code (with
+     * KARYOS_E_REFUSED, possibly a code this header does not list). */
     uint64_t code;
     /* A value the status defines, such as a length, a version or errno. */
     uint64_t value;
