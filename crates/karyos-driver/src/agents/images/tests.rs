@@ -160,6 +160,9 @@ struct Rig {
     /// The network trace events the agents answered (P2.12 step 3).
     trace_events: Vec<crate::agents::AgentEvent<OsSocket>>,
     now: u64,
+    /// The sender agent no longer runs: its publisher is silent, no DATA
+    /// and no heartbeat of any kind.
+    sender_stopped: bool,
 }
 
 impl Rig {
@@ -198,6 +201,7 @@ impl Rig {
             events: Vec::new(),
             now: 0,
             trace_events: Vec::new(),
+            sender_stopped: false,
         };
         let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
         let a = rig
@@ -325,6 +329,7 @@ impl Rig {
             events: Vec::new(),
             now: 0,
             trace_events: Vec::new(),
+            sender_stopped: false,
         };
         let loopback = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
         let mut open = || {
@@ -416,7 +421,11 @@ impl Rig {
                 let _ = conductor.duty_cycle().unwrap();
             }
         }
-        self.agents.do_work(self.now).unwrap();
+        if self.sender_stopped {
+            self.agents.receiver.do_work(self.now).unwrap();
+        } else {
+            self.agents.do_work(self.now).unwrap();
+        }
         let trace_events = &mut self.trace_events;
         self.endpoints.poll(
             &self.links,
@@ -3973,7 +3982,9 @@ fn a_later_path_of_another_identity_binds_nothing() {
 }
 
 /// #307 review, §8 liveness: with every path silent the last one is lost
-/// and the image follows image liveness: it retires.
+/// and the image follows image liveness: it retires. The publisher stops
+/// (its sender no longer runs): one that still sends rebinds a lost path
+/// through a SOLICIT (plan 164; see the test after this one).
 #[test]
 fn losing_the_last_path_retires_the_image() {
     let setup = Setup {
@@ -3984,6 +3995,7 @@ fn losing_the_last_path_retires_the_image() {
     let slot = established(&mut rig);
     let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
     rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.sender_stopped = true;
     for _ in 0..30 {
         rig.now += 1_000_000_000;
         for _ in 0..3 {
@@ -3994,6 +4006,56 @@ fn losing_the_last_path_retires_the_image() {
         }
     }
     assert!(!rig.agents.receiver.role.has_image(slot));
+}
+
+/// Plan 164: a publisher that still sends after its paths are lost (no
+/// PATH_HB refreshes them) rebinds them through a SOLICIT each time,
+/// within the retry window, whose ANSWER binds though a retry is due
+/// first: through 30 s and every loss, the image lives on.
+#[test]
+fn a_live_publisher_rebinds_its_lost_paths_through_a_solicit() {
+    let setup = Setup {
+        reliable: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    let mut lost_at = None;
+    let mut losses = 0u32;
+    for second in 1..=30u64 {
+        rig.now += 1_000_000_000;
+        for _ in 0..3 {
+            rig.round(true);
+        }
+        assert!(
+            rig.agents.receiver.role.has_image(slot),
+            "retired at {second} s"
+        );
+        let paths = rig.agents.receiver.role.live_paths(slot);
+        match lost_at {
+            None if paths == 0 => {
+                lost_at = Some(second);
+                losses += 1;
+            }
+            // Within the retry window (2 × `setup_challenge_timeout`).
+            Some(at) if paths > 0 => {
+                assert!(second - at <= 2, "lost at {at} s, rebound at {second} s");
+                lost_at = None;
+            }
+            _ => {}
+        }
+    }
+    assert!(losses >= 2, "{losses} losses");
+    assert!(
+        rig.agents
+            .receiver
+            .role
+            .session_counters()
+            .solicits_answered
+            >= 2
+    );
 }
 
 /// C3 (conflated-network-images.md (b)): a conflated lane whose view's

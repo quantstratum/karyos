@@ -5305,6 +5305,60 @@ fn a_route_back_in_a_new_epoch_but_not_reopened_bounds_nothing() {
     assert_eq!(sender.publications[0].first_held(0, 1), None, "gone");
 }
 
+/// Plan 164: the receiver's duty retries an unanswered SOLICIT with a
+/// the entry's nonce after 50 ms, then 100 ms later, to the same source; DATA
+/// in between sends none.
+#[test]
+fn the_receiver_duty_retries_an_unanswered_solicit() {
+    const MS: u64 = 1_000_000;
+
+    let (sender, mut receiver) = super::roles(&AgentConfig::default()).unwrap();
+    let (sessions, _link) = event_ring();
+    receiver
+        .subscriptions
+        .push((EndpointId(1), 6, 1 << 20, true, false));
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let bytes = [0u8; 32];
+    let take = || {
+        let mut nonces = Vec::new();
+        while let Ok(Some(item)) = sender.from_receiver.try_take() {
+            if let super::ControlItem::Outgoing {
+                destination,
+                control: Control::Solicit(solicit),
+                ..
+            } = item
+            {
+                assert_eq!(destination, source);
+                nonces.push(solicit.challenge.nonce);
+            }
+        }
+        nonces
+    };
+    receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 1);
+    let first = take();
+    assert_eq!(first.len(), 1);
+    receiver.inject_data(&sessions, EndpointId(1), source, alias(), &bytes, 10 * MS);
+    let _ = receiver
+        .duty::<OsSocket>(&mut [], &sessions, 49 * MS)
+        .unwrap();
+    assert!(take().is_empty(), "not before 50 ms, DATA sends none");
+    let _ = receiver
+        .duty::<OsSocket>(&mut [], &sessions, 50 * MS + 1)
+        .unwrap();
+    let second = take();
+    assert_eq!(second.len(), 1, "the first retry");
+    assert_eq!(second, first, "the entry's nonce");
+    let _ = receiver
+        .duty::<OsSocket>(&mut [], &sessions, 149 * MS)
+        .unwrap();
+    assert!(take().is_empty());
+    let _ = receiver
+        .duty::<OsSocket>(&mut [], &sessions, 151 * MS)
+        .unwrap();
+    assert_eq!(take().len(), 1, "the second, 100 ms on");
+    assert_eq!(receiver.session_counters().solicit_retries, 2);
+}
+
 /// The follow-up of #829's review, point 2, and QS-COORDINATOR's T1 rule
 /// on #838: an entry whose live route stays in use (a queue on it would not
 /// close) is counted failed once per entry, and a single route's failure

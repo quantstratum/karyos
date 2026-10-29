@@ -674,6 +674,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     trace: super::net_trace::ReceiverTrace,
     sessions: ReceiveSessions,
     nonces: OsNonces,
+    /// The solicit entries due a retry this duty (plan 164), allocated at
+    /// creation: `max_pending_challenges`.
+    solicit_due: Vec<crate::sessions::receive::BindingKey>,
     to_sender: RingSender<ControlItem>,
     budget: Budget,
     /// Subscribed streams: endpoint, stream, largest image term length,
@@ -1845,6 +1848,7 @@ pub(super) fn roles<T: StreamTerms>(
             rx_epochs: Vec::with_capacity(config.max_endpoints),
             max_endpoints: config.max_endpoints,
             cycle: 0,
+            solicit_due: Vec::with_capacity(config.sessions.max_pending_challenges),
             sessions,
             nonces: OsNonces,
             to_sender,
@@ -3713,6 +3717,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
         });
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         work = work
+            .checked_add(self.retry_solicits(sessions, now))
+            .ok_or(overflow.clone())?;
+        work = work
             .checked_add(self.image_timers(sessions, now)?)
             .ok_or(overflow.clone())?;
         for (endpoint, half) in halves.iter() {
@@ -3802,6 +3809,38 @@ impl<T: StreamTerms> ReceiverRole<T> {
             queues.release_idle();
         }
         served
+    }
+
+    /// Retries the solicit entries whose ANSWER has not come
+    /// (network-control-schemas.md §6.3, plan 164): each with its entry's
+    /// nonce, through the RSP_SETUP limits of §7.4 like a first SOLICIT. A
+    /// retry they refuse is not an attempt and waits for the next step.
+    /// Returns the retries sent. Nothing allocates.
+    fn retry_solicits(&mut self, sessions: &SessionEnd<T>, now: u64) -> u32 {
+        let mut due = std::mem::take(&mut self.solicit_due);
+        due.clear();
+        self.sessions.due_solicits(now, &mut due);
+        let mut sent = 0u32;
+        for key in due.drain(..) {
+            let Some(solicit) = self.sessions.retry_solicit(&key) else {
+                continue;
+            };
+            let mut intake = Intake {
+                endpoint: key.endpoint,
+                now,
+                role: self,
+                sessions,
+                work: 0,
+            };
+            if intake.challenge(key.source, Control::Solicit(solicit)) {
+                self.sessions.solicit_retried(&key, now);
+                sent = sent.saturating_add(1);
+            } else {
+                self.sessions.solicit_refused(&key, now);
+            }
+        }
+        self.solicit_due = due;
+        sent
     }
 
     /// Whether `endpoint` is joined to a subscription's NAK control group.
@@ -4471,9 +4510,10 @@ impl<T: StreamTerms> Intake<'_, T> {
             if self.challenge(key.source, Control::Solicit(solicit)) {
                 self.role.sessions.solicit_sent();
             } else {
-                // Never sent (a rate or the ring refused it): a SOLICIT is
-                // never resent, so the entry goes, with no holdoff, and the
-                // next DATA asks again under the limits.
+                // The first SOLICIT never went out (a rate or the ring
+                // refused it): the entry goes, with no holdoff, and the next
+                // DATA asks again under the limits. Only a sent SOLICIT is
+                // retried (plan 164).
                 self.role.sessions.withdraw_solicit(&key);
             }
         }

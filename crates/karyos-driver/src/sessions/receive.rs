@@ -88,6 +88,16 @@ pub struct SessionConfig {
     /// (`challenge_resend_interval`, network-control-schemas.md §7.4,
     /// default 50 ms).
     pub challenge_resend_interval: u64,
+    /// The first wait for a SOLICIT's ANSWER before its retry, in ns
+    /// (`solicit_retry_initial`, network-control-schemas.md §6.3 and §7.4,
+    /// default 50 ms): it doubles at each retry up to
+    /// `setup_challenge_timeout`.
+    pub solicit_retry_initial: u64,
+    /// SOLICITs of one entry at most, the first included
+    /// (`solicit_attempts`, default 6). An entry also stops retrying
+    /// `solicit_retry_window`, 2 × `setup_challenge_timeout`, after its
+    /// first SOLICIT.
+    pub solicit_attempts: u8,
     /// Paths of one image (`max_paths`, redundant-paths.md section 5,
     /// default 4), 1 to `super::paths::MAX_PATHS`.
     pub max_paths: u8,
@@ -107,6 +117,8 @@ impl Default for SessionConfig {
             alias_quarantine: 10_000_000_000,
             timer_actions: 64,
             challenge_resend_interval: 50_000_000,
+            solicit_retry_initial: 50_000_000,
+            solicit_attempts: 6,
             max_paths: 4,
             path_liveness_timeout: 10_000_000_000,
         }
@@ -124,6 +136,8 @@ impl SessionConfig {
             || self.max_pending_challenges == 0
             || self.max_pending_per_source == 0
             || self.timer_actions == 0
+            || self.solicit_attempts == 0
+            || self.solicit_retry_initial == 0
         {
             return Err(SessionConfigError("a capacity or budget is zero"));
         }
@@ -173,7 +187,8 @@ pub enum AnnounceOutcome {
 /// (network-control-schemas.md §6.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolicitOutcome {
-    /// Send this SOLICIT, once: the entry is never resent.
+    /// Send this SOLICIT, the entry's first: the receiver's duty retries it
+    /// while no ANSWER comes ([`ReceiveSessions::due_solicits`]).
     Solicit(RspSolicit),
     /// Ignored and counted: the reason.
     Dropped(Ignored),
@@ -328,8 +343,15 @@ pub struct SessionCounters {
     /// SOLICITs sent (an entry whose send was refused is withdrawn and
     /// not counted here).
     pub solicits: u64,
-    /// Solicit entries freed by the timer after expiry.
+    /// Solicit entries freed by the timer, ended without a binding: their
+    /// attempts or their retry window spent (plan 164).
     pub solicits_expired: u64,
+    /// SOLICITs retried with their entry's nonce (network-control-schemas.md
+    /// §6.3, plan 164).
+    pub solicit_retries: u64,
+    /// Retries the RSP_SETUP rates or the control ring refused: not an
+    /// attempt, they wait for the next step.
+    pub solicit_retries_refused: u64,
     /// Solicited answers accepted (an image created or a path bound).
     pub solicits_answered: u64,
     /// Solicit entries withdrawn: never sent, or answered with no command
@@ -398,8 +420,16 @@ enum State {
     /// and, accepted, makes it an answered challenge.
     Solicited {
         key: BindingKey,
+        /// The nonce of every SOLICIT of the entry, its retries included.
         nonce: [u64; 2],
+        /// The first SOLICIT: `solicit_retry_window` runs from here.
         created_at: u64,
+        /// The last SOLICIT sent, or the retry the rates refused.
+        last_sent: u64,
+        /// The wait from `last_sent` before the next retry.
+        wait: u64,
+        /// SOLICITs sent, the first included.
+        attempts: u8,
     },
     Active {
         key: BindingKey,
@@ -726,9 +756,14 @@ impl ReceiveSessions {
             };
             let free = match slot.state {
                 State::Solicited {
-                    key, created_at, ..
+                    key,
+                    created_at,
+                    last_sent,
+                    wait,
+                    attempts,
+                    ..
                 } => {
-                    let expired = age_ns(now, created_at) >= timeout;
+                    let expired = self.solicit_over((created_at, last_sent, wait, attempts), now);
                     if expired {
                         self.counters.bump(|c| &mut c.solicits_expired);
                         self.hold_off(key, now);
@@ -809,9 +844,8 @@ impl ReceiveSessions {
         self.counters.bump(|c| &mut c.solicits);
     }
 
-    /// Frees `key`'s solicit entry with no holdoff: its SOLICIT was never
-    /// sent (an RSP_SETUP limit or the control ring refused it), and it is
-    /// never resent.
+    /// Frees `key`'s solicit entry with no holdoff: its first SOLICIT was
+    /// never sent (an RSP_SETUP limit or the control ring refused it).
     pub fn withdraw_solicit(&mut self, key: &BindingKey) {
         let found = self
             .slots
@@ -823,12 +857,113 @@ impl ReceiveSessions {
         }
     }
 
+    /// Whether a solicit entry has ended without a binding at `now`: its
+    /// attempts spent and the last one's wait over, or its retry window
+    /// (2 × `setup_challenge_timeout`) spent since its first SOLICIT.
+    fn solicit_over(
+        &self,
+        (created_at, last_sent, wait, attempts): (u64, u64, u64, u8),
+        now: u64,
+    ) -> bool {
+        let window = self.config.setup_challenge_timeout.saturating_mul(2);
+        age_ns(now, created_at) >= window
+            || (attempts >= self.config.solicit_attempts && age_ns(now, last_sent) >= wait)
+    }
+
+    /// The keys of solicit entries due a retry at `now` (§6.3, plan 164):
+    /// unanswered, their wait over, attempts and retry window left. Pushed
+    /// into `due` up to its capacity (the caller's, preallocated).
+    pub fn due_solicits(&self, now: u64, due: &mut Vec<BindingKey>) {
+        let window = self.config.setup_challenge_timeout.saturating_mul(2);
+        for slot in &self.slots {
+            if due.len() >= due.capacity() {
+                return;
+            }
+            if let State::Solicited {
+                key,
+                created_at,
+                last_sent,
+                wait,
+                attempts,
+                ..
+            } = slot.state
+                && attempts < self.config.solicit_attempts
+                && age_ns(now, last_sent) >= wait
+                && age_ns(now, created_at) < window
+            {
+                due.push(key);
+            }
+        }
+    }
+
+    /// The retry of `key`'s solicit entry, with the entry's nonce: an
+    /// ANSWER to any of its SOLICITs binds within the retry window, as for
+    /// a resent CHALLENGE (§6.3). `None` with no such entry.
+    pub fn retry_solicit(&self, key: &BindingKey) -> Option<RspSolicit> {
+        let nonce = self.slots.iter().find_map(|slot| match slot.state {
+            State::Solicited {
+                key: held, nonce, ..
+            } if held == *key => Some(nonce),
+            _ => None,
+        })?;
+        Some(RspSolicit {
+            alias: key.alias,
+            challenge: ChallengeBlock {
+                receiver_boot_id: self.boot_id,
+                nonce,
+            },
+        })
+    }
+
+    /// `key`'s retry went out at `now`: the entry counts the attempt and
+    /// doubles its wait up to `setup_challenge_timeout`.
+    pub fn solicit_retried(&mut self, key: &BindingKey, now: u64) {
+        let cap = self.config.setup_challenge_timeout;
+        let found = self
+            .slots
+            .iter_mut()
+            .find(|slot| matches!(slot.state, State::Solicited { key: held, .. } if held == *key));
+        if let Some(slot) = found
+            && let State::Solicited {
+                last_sent,
+                wait,
+                attempts,
+                ..
+            } = &mut slot.state
+        {
+            *last_sent = now;
+            *wait = wait.saturating_mul(2).min(cap);
+            *attempts = attempts.saturating_add(1);
+            self.counters.bump(|c| &mut c.solicit_retries);
+        }
+    }
+
+    /// `key`'s retry was refused at `now` (a rate or the ring): not an
+    /// attempt; it waits for the next step, within the retry window.
+    pub fn solicit_refused(&mut self, key: &BindingKey, now: u64) {
+        let cap = self.config.setup_challenge_timeout;
+        let found = self
+            .slots
+            .iter_mut()
+            .find(|slot| matches!(slot.state, State::Solicited { key: held, .. } if held == *key));
+        if let Some(slot) = found
+            && let State::Solicited {
+                last_sent, wait, ..
+            } = &mut slot.state
+        {
+            *last_sent = now;
+            *wait = wait.saturating_mul(2).min(cap);
+            self.counters.bump(|c| &mut c.solicit_retries_refused);
+        }
+    }
+
     /// DATA, PAD, ABORTED or a heartbeat from `key`, a key with no binding,
     /// on a subscribed stream, at `now` (network-control-schemas.md §6.3):
     /// a solicit entry and one SOLICIT, unless the key is bound, has a
     /// current challenge or solicit entry, or is held off, or the pending
-    /// limits of challenges are reached. A SOLICIT is never resent; DATA
-    /// never replaces a current entry.
+    /// limits of challenges are reached. DATA never replaces a current
+    /// entry or sends another SOLICIT; the duty retries an unanswered one
+    /// (plan 164).
     pub fn solicit(
         &mut self,
         key: BindingKey,
@@ -869,6 +1004,9 @@ impl ReceiveSessions {
                 key,
                 nonce,
                 created_at: now,
+                last_sent: now,
+                wait: self.config.solicit_retry_initial,
+                attempts: 1,
             };
         }
         SolicitOutcome::Solicit(RspSolicit {
@@ -1134,15 +1272,21 @@ impl ReceiveSessions {
             return AnswerOutcome::Dropped(self.ignore(Ignored::NoChallenge));
         };
         if let State::Solicited {
-            nonce, created_at, ..
+            nonce,
+            created_at,
+            last_sent,
+            wait,
+            attempts,
+            ..
         } = slot.state
         {
+            let over = self.solicit_over((created_at, last_sent, wait, attempts), now);
             return self.answer_solicited(
                 index,
                 &slot,
                 key,
                 answer,
-                (nonce, created_at),
+                (nonce, created_at, over),
                 now,
                 reserve,
             );
@@ -1227,7 +1371,7 @@ impl ReceiveSessions {
         slot: &Slot,
         key: BindingKey,
         answer: &SetupAnswer,
-        (nonce, created_at): ([u64; 2], u64),
+        (nonce, created_at, over): ([u64; 2], u64, bool),
         now: u64,
         reserve: impl FnOnce() -> bool,
     ) -> AnswerOutcome {
@@ -1236,7 +1380,7 @@ impl ReceiveSessions {
         if answer.challenge.receiver_boot_id != self.boot_id || answer.challenge.nonce != nonce {
             return AnswerOutcome::Dropped(self.ignore(Ignored::Mismatch));
         }
-        if age_ns(now, created_at) >= self.config.setup_challenge_timeout {
+        if over {
             return AnswerOutcome::Dropped(self.ignore(Ignored::Expired));
         }
         let identity = answer.identity;
