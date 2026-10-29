@@ -2130,3 +2130,39 @@ fn a_dropped_network_subscription_removes_its_images() {
     rig.until(false, &|rig| rig.registrations() == 0);
     rig.ends_with_none_swept();
 }
+
+/// Plan 169: the driver's SOLICIT endpoint is never a data endpoint. A
+/// publication with no interface binds the unspecified address on port
+/// 0, the same address as the SOLICIT endpoint, and still holds an
+/// endpoint of its own: the SOLICITs do not leave from it, nor share its
+/// resets and tables.
+#[test]
+fn a_default_interface_publication_does_not_share_the_solicit_endpoint() {
+    let mut driver = driver(ThreadingMode::Shared);
+    let sink = UdpSocket::bind(SocketAddr::new(LOOPBACK, 0)).unwrap();
+    let _publication = driver
+        .add_network_publication(
+            aggregate(10, 1, 1),
+            &UdpConfig {
+                interface: None,
+                ..channel(sink.local_addr().unwrap())
+            },
+        )
+        .unwrap();
+    assert_eq!(driver.network_held_endpoints(), 1);
+    let group = SocketAddr::from(([239, 7, 9, 1], free_port()));
+    let multicast = UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        ..channel(group)
+    };
+    // A host without multicast on its default interface cannot join the
+    // group: nothing to check there.
+    if driver.add_network_subscription(6, &multicast).is_err() {
+        return;
+    }
+    let solicit = driver.network_solicit_endpoints();
+    assert_eq!(solicit.len(), 1, "{solicit:?}");
+    // The publication's, the subscription's and the SOLICIT endpoint.
+    assert_eq!(driver.network_held_endpoints(), 3);
+}

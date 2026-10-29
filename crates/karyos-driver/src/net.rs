@@ -458,11 +458,25 @@ pub(crate) enum ReincarnationPhase {
 struct SendEndpoint {
     bind: SocketAddr,
     multicast: Option<MulticastConfig>,
+    /// What it is for: a data endpoint and the SOLICIT endpoint of one
+    /// address are never shared (plan 169), so a publication with no
+    /// interface, bound to the unspecified address on port 0, does not
+    /// send the driver's SOLICITs or share their resets and tables.
+    purpose: EndpointPurpose,
     endpoint: EndpointId,
     /// Publications and subscriptions that hold it.
     users: usize,
     /// Its routes, queues and TX slots, fixed at open (karyos#859).
     capacity: TxDemand,
+}
+
+/// What a [`SendEndpoint`] is for, part of its key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndpointPurpose {
+    /// Publications', subscriptions' and control groups' traffic.
+    Data,
+    /// The driver's unicast control endpoint for SOLICITs (plan 169).
+    Solicit,
 }
 
 /// A network subscription of this driver (W3): the receiver holds one
@@ -940,18 +954,27 @@ impl<T: StreamTerms> Network<T> {
         self.hold_endpoint(bind, None)
     }
 
-    /// The endpoint bound to `bind`, joined to `multicast` if any, opened
-    /// on first use; one more user holds it.
+    /// The data endpoint bound to `bind`, joined to `multicast` if any,
+    /// opened on first use; one more user holds it.
     fn hold_endpoint(
         &mut self,
         bind: SocketAddr,
         multicast: Option<MulticastConfig>,
     ) -> Result<EndpointId, DriverError> {
-        if let Some(entry) = self
-            .send_endpoints
-            .iter_mut()
-            .find(|entry| (entry.bind, entry.multicast) == (bind, multicast))
-        {
+        self.hold_for(bind, multicast, EndpointPurpose::Data)
+    }
+
+    /// [`Self::hold_endpoint`] for `purpose`: an entry of another purpose
+    /// at the same address is never shared.
+    fn hold_for(
+        &mut self,
+        bind: SocketAddr,
+        multicast: Option<MulticastConfig>,
+        purpose: EndpointPurpose,
+    ) -> Result<EndpointId, DriverError> {
+        if let Some(entry) = self.send_endpoints.iter_mut().find(|entry| {
+            (entry.bind, entry.multicast, entry.purpose) == (bind, multicast, purpose)
+        }) {
             entry.users = entry
                 .users
                 .checked_add(1)
@@ -976,6 +999,7 @@ impl<T: StreamTerms> Network<T> {
         self.send_endpoints.push(SendEndpoint {
             bind,
             multicast,
+            purpose,
             endpoint,
             users: 1,
             capacity,
@@ -1279,7 +1303,7 @@ impl<T: StreamTerms> Network<T> {
             SocketAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             SocketAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
         };
-        match self.hold_endpoint(SocketAddr::new(any, 0), None) {
+        match self.hold_for(SocketAddr::new(any, 0), None, EndpointPurpose::Solicit) {
             Ok(endpoint) => Some(endpoint),
             Err(_) => {
                 if let Some(count) = self.solicit_endpoint_failures.checked_add(1) {
