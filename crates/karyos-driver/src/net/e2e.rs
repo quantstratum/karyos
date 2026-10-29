@@ -1468,6 +1468,9 @@ mod netem;
 
 mod bind_time;
 
+#[cfg(target_os = "linux")]
+mod idle_paths;
+
 mod trace;
 
 mod timed;

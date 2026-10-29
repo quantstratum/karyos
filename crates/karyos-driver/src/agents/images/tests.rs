@@ -1464,13 +1464,14 @@ fn a_reliable_lane_resends_after_a_reset() {
 /// is kept; afterwards the unbound heartbeats are refused.
 #[test]
 fn a_data_heartbeat_does_not_refresh_its_path() {
-    // The sender's own idle heartbeats wait past the test (SPEC §6), so
-    // only the injected ones count.
+    // The sender's own idle heartbeats (SPEC §6) and PATH_HBs (karyos#859)
+    // wait past the test, so only the injected heartbeats count.
     let (mut rig, b) = Rig::new(Setup {
         tune: Some(|config| {
             config.image_liveness_timeout = 100_000_000_000;
             config.idle_image_timeout = 100_000_000_000;
             config.sender_heartbeat_interval = 50_000_000_000;
+            config.path_heartbeat_interval = 50_000_000_000;
         }),
         ..Setup::default()
     });
@@ -1660,10 +1661,11 @@ fn unbound_data_solicits_a_new_image() {
         ..Setup::default()
     });
     let first = established(&mut rig);
-    // Idle in steps: the image's SMs keep the binding fresh until the
-    // image retires after `idle_image_timeout`.
+    // Idle in steps: the image's SMs keep the binding fresh, and its
+    // PATH_HBs its path (karyos#859), until the image retires after
+    // `idle_image_timeout` and then `image_liveness_timeout`.
     let mut retired = false;
-    for _ in 0..200 {
+    for _ in 0..400 {
         rig.now += 99 * MS;
         rig.round(true);
         if rig
@@ -4008,14 +4010,76 @@ fn losing_the_last_path_retires_the_image() {
     assert!(!rig.agents.receiver.role.has_image(slot));
 }
 
+/// karyos#859: an idle publication on one path sends a PATH_HB each
+/// `path_heartbeat_interval`, so its path stays live through three
+/// `path_liveness_timeout`s (30 s) with no SOLICIT. Without it the path
+/// was lost every 10 s and bound again by SOLICIT.
+#[test]
+fn an_idle_single_path_publication_keeps_its_path() {
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let slot = established(&mut rig);
+    let solicits = rig.agents.receiver.role.session_counters().solicits;
+    for second in 1..=30u64 {
+        for _ in 0..10 {
+            rig.now += 100 * MS;
+            rig.round(true);
+        }
+        assert_eq!(
+            rig.agents.receiver.role.live_paths(slot),
+            1,
+            "path lost at {second} s"
+        );
+    }
+    assert_eq!(
+        rig.agents.receiver.role.session_counters().solicits,
+        solicits
+    );
+    assert!(rig.agents.sender.role.counters().path_heartbeats_sent >= 290);
+    assert!(rig.agents.receiver.role.counters().path_heartbeats >= 290);
+}
+
+/// karyos#859: a path with DATA in every `path_heartbeat_interval` sends
+/// no PATH_HB (RP-3): the DATA is its evidence.
+#[test]
+fn a_single_path_publication_with_data_sends_no_path_heartbeat() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let (mut rig, _b) = Rig::new(Setup {
+        reliable: true,
+        ..Setup::default()
+    });
+    let _slot = established(&mut rig);
+    let before = rig.agents.sender.role.counters().path_heartbeats_sent;
+    for i in 0..100u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 100], AppendOptions::default())
+            .unwrap();
+        for _ in 0..10 {
+            rig.round(true);
+        }
+    }
+    assert!(rig.now >= 1_000 * MS, "a second of rounds");
+    assert_eq!(
+        rig.agents.sender.role.counters().path_heartbeats_sent,
+        before
+    );
+}
+
 /// Plan 164: a publisher that still sends after its paths are lost (no
-/// PATH_HB refreshes them) rebinds them through a SOLICIT each time,
+/// PATH_HB reaches them) rebinds them through a SOLICIT each time,
 /// within the retry window, whose ANSWER binds though a retry is due
 /// first: through 30 s and every loss, the image lives on.
 #[test]
 fn a_live_publisher_rebinds_its_lost_paths_through_a_solicit() {
+    // Its PATH_HBs (karyos#859) wait past the test: its paths are lost at
+    // `path_liveness_timeout` as a publisher's whose PATH_HBs do not arrive.
     let setup = Setup {
         reliable: true,
+        tune: Some(|config| config.path_heartbeat_interval = 100_000_000_000),
         ..Setup::default()
     };
     let (mut rig, _b) = Rig::new(setup.again());

@@ -422,6 +422,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     /// A change of `limit_state` not yet posted: `Some(Some(limit))` a limit,
     /// `Some(None)` its open.
     limit_unreported: Option<Option<crate::error::EndpointLimit>>,
+    /// On one path, when it last submitted DATA or a PATH_HB: its PATH_HB
+    /// is due `path_heartbeat_interval` later (RP-3, karyos#859).
+    path_sent: Option<u64>,
     /// Its removal linger, once removing (driver-network-agents.md §7).
     removal: Option<Box<removal::Removal>>,
     /// A timed publication's schedule ([`Outbound::set_timed`]).
@@ -648,6 +651,7 @@ impl<T: StreamTerms> Outbound<T> {
             open_spacing: 0,
             limit_state: None,
             limit_unreported: None,
+            path_sent: None,
             removal: None,
             timed: None,
             cells: None,
@@ -1584,8 +1588,10 @@ impl<T: StreamTerms> Outbound<T> {
             if let Some(submitted) = track.submitted.take() {
                 self.counters.bump(|c| &mut c.submitted, 1);
                 track.high = track.high.max(submitted);
-                // DATA left: the lane's idle heartbeat waits again.
+                // DATA left: the lane's idle heartbeat waits again, and so
+                // does its path's PATH_HB.
                 *idle = Some(now);
+                self.path_sent = Some(now);
             }
         }
         self.advance_registered(consumption);

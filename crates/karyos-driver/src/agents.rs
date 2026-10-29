@@ -213,9 +213,10 @@ pub struct AgentConfig {
     /// `setup_interval` in ns (default 100 ms).
     pub setup_interval: u64,
     /// `path_heartbeat_interval` in ns (redundant-paths.md RP-3; default
-    /// 100 ms, at least 1): a routed publication's path that submitted no
-    /// DATA for this long sends a PATH_HB, so it stays live at its
-    /// receivers while another path carries the stream. It also paces the
+    /// 100 ms, at least 1): an established publication's path that
+    /// submitted no DATA for this long sends a PATH_HB, so it stays live at
+    /// its receivers while another path carries the stream or none does
+    /// (karyos#859: a publication on one path too). It also paces the
     /// EOS repeats of a removed publication's linger
     /// (driver-network-agents.md §7).
     pub path_heartbeat_interval: u64,
