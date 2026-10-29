@@ -972,3 +972,152 @@ fn export_journal(out: &mut Out<'_>, journal: &ExportJournal) {
         }
     });
 }
+
+/// A registry write's answer (karyos#736): `{"registered":{...}}` or
+/// `{"retired":{...}}`, naming the version.
+#[must_use]
+pub fn join_written(
+    retired: bool,
+    dir: &std::path::Path,
+    kind: crate::registry::Kind,
+    key: &str,
+    version: u64,
+    generation: u64,
+) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields
+            .key(if retired { "retired" } else { "registered" })
+            .object(|fields| {
+                fields.string("driver", &dir.to_string_lossy());
+                fields.string("kind", kind.name());
+                fields.string("key", key);
+                fields.number("version", version);
+                fields.number("generation", generation);
+            });
+    });
+    text
+}
+
+/// A registry request's refusal: past a bound in the shape of
+/// [`above_bound`], a malformed argument as `bad arguments` with what was
+/// wrong, no current entry, or an unknown driver.
+#[must_use]
+pub fn join_refusal(request: &str, error: crate::registry::JoinError) -> String {
+    use crate::registry::{JoinError, Refusal};
+    match error {
+        JoinError::Refused(Refusal::Above { dimension, bound }) => {
+            above_bound(&crate::api::Limit {
+                name: dimension,
+                bound: Some(bound),
+                negotiable: false,
+            })
+        }
+        JoinError::Refused(Refusal::Bad(what)) => {
+            let mut text = String::new();
+            Out(&mut text).object(|fields| {
+                fields.string("error", "bad arguments");
+                fields.string("request", request);
+                fields.string("detail", what);
+            });
+            text
+        }
+        JoinError::Refused(Refusal::NotFound) => error_text("no such entry"),
+        JoinError::UnknownDriver => error_text("unknown driver"),
+    }
+}
+
+/// `{"error": message}`.
+fn error_text(message: &str) -> String {
+    error(message, None)
+}
+
+/// A `join-get` answer: `{"join":{...}}` with the version in force at
+/// `at`, or `null`.
+#[must_use]
+pub fn join_read(read: &crate::registry::Read<'_>) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.key("join").object(|fields| {
+            fields.number("generation", read.generation);
+            fields.number("since_ns", read.since_ns);
+            fields.string("driver", &read.dir.to_string_lossy());
+            fields.string("kind", read.kind.name());
+            fields.string("key", read.key);
+            fields.number("at", read.at);
+            presence(fields, read.presence);
+            fields
+                .key("version")
+                .option(read.entry.and_then(|entry| entry.at(read.at)), join_version);
+            fields.number(
+                "history_dropped",
+                read.entry.map_or(0, |entry| entry.history_dropped),
+            );
+            fields.key("before_history").bool(
+                read.entry
+                    .is_some_and(|entry| entry.before_history(read.at)),
+            );
+        });
+    });
+    text
+}
+
+/// A `join-list` page: `{"join_list":{...}}`.
+#[must_use]
+pub fn join_page(page: &crate::registry::Page<'_>) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.key("join_list").object(|fields| {
+            fields.number("generation", page.generation);
+            fields.number("since_ns", page.since_ns);
+            fields.number("evicted", page.evicted);
+            fields.string("driver", &page.dir.to_string_lossy());
+            fields
+                .key("entries")
+                .array(&page.entries, |out, (entry, seen)| {
+                    out.object(|fields| {
+                        fields.string("kind", entry.kind.name());
+                        fields.string("key", &entry.key);
+                        presence(fields, *seen);
+                        fields.number("history_dropped", entry.history_dropped);
+                        fields
+                            .key("retired_ns")
+                            .option(entry.retired_ns, |out, at| out.number(at));
+                        let versions: Vec<_> = entry.versions.iter().collect();
+                        fields
+                            .key("versions")
+                            .array(&versions, |out, version| join_version(out, version));
+                    });
+                });
+            fields.key("more").bool(page.more);
+        });
+    });
+    text
+}
+
+/// What the agent observes of an identity: `present`, `holders` and
+/// `shared`, each `null` when it cannot tell.
+fn presence(fields: &mut Fields<'_, '_>, seen: crate::registry::Presence) {
+    fields.key("present").option(seen.present, Out::bool);
+    fields
+        .key("holders")
+        .option(seen.holders, |out, holders| out.number(holders));
+    fields.key("shared").option(seen.shared(), Out::bool);
+}
+
+/// One version: its number, uid, validity and attributes as an object.
+fn join_version(out: &mut Out<'_>, version: &crate::registry::Version) {
+    out.object(|fields| {
+        fields.number("number", version.number);
+        fields.number("registered_by", version.registered_by);
+        fields.number("valid_from", version.valid_from);
+        fields
+            .key("valid_to")
+            .option(version.valid_to, |out, to| out.number(to));
+        fields.key("attributes").object(|fields| {
+            for (name, value) in version.attributes() {
+                fields.string(name, value);
+            }
+        });
+    });
+}

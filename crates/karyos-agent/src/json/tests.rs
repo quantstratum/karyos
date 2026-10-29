@@ -385,7 +385,9 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "trace-window",
             "limits",
             "trace-buckets",
-            "trace-export"
+            "trace-export",
+            "join-registry",
+            "join-put"
         ]
     );
     let known = Capability {

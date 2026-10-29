@@ -70,6 +70,7 @@ pub mod json;
     allow(dead_code, reason = "the attach that uses it is Linux only")
 )]
 mod model;
+pub mod registry;
 pub mod trace_export;
 #[cfg_attr(
     not(target_os = "linux"),

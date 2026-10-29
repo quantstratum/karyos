@@ -28,7 +28,12 @@
 //!   `limits [DIMENSION=VALUE ...]`, the negotiation of the bounds below
 //!   (R-CORE-38); `capabilities`, each capability of the closed v1 list
 //!   served, unavailable in this deployment or forbidden for the peer's
-//!   role (R-CORE-24). A request this agent knows with arguments it does
+//!   role (R-CORE-24); the join metadata registry's (karyos#736) `join-put
+//!   DIR KIND KEY NAME=VALUE...` and `join-retire DIR KIND KEY`, for a
+//!   registrar or an administrator, and `join-get DIR KIND KEY [AT_NS]`
+//!   and `join-list DIR [KIND KEY]`, for every role. A `join-put` line may
+//!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
+//!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
 //! - **Bounds.** Each connection is served on the calling thread with
 //!   [`IO_TIMEOUT`] on its reads and each write, and [`WRITE_DEADLINE`] on
@@ -67,14 +72,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::api::{API_VERSION, Limit};
+use crate::registry::{self, JoinError, Kind};
 use crate::{Agent, json};
 
 /// The API socket's name in its directory.
 pub const SOCKET_NAME: &str = "agent.sock";
 /// The first word of every request.
 pub const PROTOCOL: &str = "KARYOS-AGENT";
-/// The longest request line, in bytes.
+/// The longest request line, in bytes, but a `join-put`'s.
 pub const MAX_REQUEST: usize = 256;
+/// The longest `join-put` line, in bytes (karyos#736): an entry's
+/// attributes do not fit [`MAX_REQUEST`].
+pub const MAX_JOIN_REQUEST: usize = 1024;
 /// The read and write timeout of each connection.
 pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
 /// The time a whole reply may take to write: past it, the reply is cut
@@ -99,13 +108,15 @@ pub const MAX_ACCEPTS: usize = 16;
 
 /// The dimensions `limits` answers, their bounds being the constants
 /// above. Only `read.request_bytes` is negotiable in v1, and only
-/// downwards: no bound is raised. The `trace.*` dimensions are the
+/// downwards: no bound is raised. The `join.*` dimensions are the join
+/// metadata registry's (karyos#736): `join.memory_bytes` is the computed
+/// worst case of the memory its entries hold. The `trace.*` dimensions are the
 /// driver's application trace point bounds (R-CORE-1): the ids an instance
 /// assigns, a protocol constant, and the per-client bounds at the
 /// driver's built-in defaults: the CnC does not expose a driver's
 /// configured values, so a `karyosd` started with others is not reflected
 /// (a follow-up).
-pub const LIMITS: [Limit; 11] = [
+pub const LIMITS: [Limit; 21] = [
     Limit {
         name: "read.request_bytes",
         bound: Some(MAX_REQUEST as u64),
@@ -159,6 +170,56 @@ pub const LIMITS: [Limit; 11] = [
     Limit {
         name: "trace.point_registrations_per_client",
         bound: Some(256),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.request_bytes",
+        bound: Some(MAX_JOIN_REQUEST as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.keys",
+        bound: Some(registry::MAX_KEYS as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.keys_per_driver",
+        bound: Some(registry::MAX_KEYS_PER_DRIVER as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.versions_per_key",
+        bound: Some(registry::MAX_VERSIONS as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.attributes_per_entry",
+        bound: Some(registry::MAX_ATTRIBUTES as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.name_bytes",
+        bound: Some(registry::MAX_NAME_BYTES as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.value_bytes",
+        bound: Some(registry::MAX_VALUE_BYTES as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.key_bytes",
+        bound: Some(registry::MAX_KEY_BYTES as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.list_page",
+        bound: Some(registry::LIST_PAGE as u64),
+        negotiable: false,
+    },
+    Limit {
+        name: "join.memory_bytes",
+        bound: Some(registry::MAX_MEMORY_BYTES as u64),
         negotiable: false,
     },
 ];
@@ -240,6 +301,9 @@ pub enum Role {
     RiskOfficer,
     /// Everything, the configuration included.
     Administrator,
+    /// Reads, and writes the join metadata registry, nothing else
+    /// (karyos#736): a product's uid.
+    Registrar,
 }
 
 impl Role {
@@ -264,8 +328,15 @@ impl Role {
         matches!(self, Self::Administrator)
     }
 
-    /// The role named `name`: `viewer`, `operator`, `risk-officer` or
-    /// `administrator`.
+    /// Whether the role may write the join metadata registry: a registrar
+    /// or an administrator (karyos#736).
+    #[must_use]
+    pub const fn may_register(self) -> bool {
+        matches!(self, Self::Registrar | Self::Administrator)
+    }
+
+    /// The role named `name`: `viewer`, `operator`, `risk-officer`,
+    /// `administrator` or `registrar`.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name {
@@ -273,6 +344,7 @@ impl Role {
             "operator" => Self::Operator,
             "risk-officer" => Self::RiskOfficer,
             "administrator" => Self::Administrator,
+            "registrar" => Self::Registrar,
             _ => return None,
         })
     }
@@ -329,6 +401,10 @@ pub enum Served {
     TraceBuckets,
     /// Raw trace records, or the export's refusal (R-CORE-13).
     TraceExport,
+    /// A join registry entry written: put or retired (karyos#736).
+    Registered,
+    /// A join registry read: an entry or a page.
+    Join,
     /// A refusal: a uid without a role, a version not served, or a
     /// request not understood.
     Refused,
@@ -454,6 +530,7 @@ impl Server {
                     role.may_close(),
                     role.may_reopen(),
                     role.may_acknowledge(),
+                    role.may_register(),
                 )),
                 Served::Capabilities,
             ),
@@ -534,6 +611,76 @@ impl Server {
                 Ok(Err(refusal)) => (json::export_refusal(&refusal), Served::Refused),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
+            (
+                Some((uid, role)),
+                Request::JoinPut {
+                    dir,
+                    kind,
+                    key,
+                    attributes,
+                },
+            ) => {
+                if role.may_register() {
+                    match agent.join_put(Path::new(dir), kind, key, attributes, uid) {
+                        Ok(version) => (
+                            json::join_written(
+                                false,
+                                Path::new(dir),
+                                kind,
+                                key,
+                                version,
+                                agent.join_generation(),
+                            ),
+                            Served::Registered,
+                        ),
+                        Err(error) => (json::join_refusal("join-put", error), Served::Refused),
+                    }
+                } else {
+                    forbidden()
+                }
+            }
+            (Some((_, role)), Request::JoinRetire { dir, kind, key }) => {
+                if role.may_register() {
+                    match agent.join_retire(Path::new(dir), kind, key) {
+                        Ok(version) => (
+                            json::join_written(
+                                true,
+                                Path::new(dir),
+                                kind,
+                                key,
+                                version,
+                                agent.join_generation(),
+                            ),
+                            Served::Registered,
+                        ),
+                        Err(error) => (json::join_refusal("join-retire", error), Served::Refused),
+                    }
+                } else {
+                    forbidden()
+                }
+            }
+            (Some(_), Request::JoinGet { dir, kind, key, at }) => {
+                match agent.join_get(Path::new(dir), kind, key, at) {
+                    Ok(read) => (json::join_read(&read), Served::Join),
+                    Err(error) => (json::join_refusal("join-get", error), Served::Refused),
+                }
+            }
+            (Some(_), Request::JoinList { dir, after }) => {
+                match agent.join_list(Path::new(dir), after) {
+                    Ok(page) => (json::join_page(&page), Served::Join),
+                    Err(error) => (json::join_refusal("join-list", error), Served::Refused),
+                }
+            }
+            (Some(_), Request::JoinTooLong) => (
+                json::join_refusal(
+                    "join-put",
+                    JoinError::Refused(registry::Refusal::Above {
+                        dimension: "join.request_bytes",
+                        bound: MAX_JOIN_REQUEST as u64,
+                    }),
+                ),
+                Served::Refused,
+            ),
             (Some(_), Request::Version) => (
                 json::error("unsupported version", Some(&[API_VERSION])),
                 Served::Refused,
@@ -626,19 +773,47 @@ enum Request<'a> {
         count: usize,
         epoch: Option<u128>,
     },
+    /// `join-put DIR KIND KEY NAME=VALUE...` (karyos#736).
+    JoinPut {
+        dir: &'a str,
+        kind: Kind,
+        key: &'a str,
+        attributes: &'a str,
+    },
+    /// `join-retire DIR KIND KEY`.
+    JoinRetire {
+        dir: &'a str,
+        kind: Kind,
+        key: &'a str,
+    },
+    /// `join-get DIR KIND KEY [AT_NS]`.
+    JoinGet {
+        dir: &'a str,
+        kind: Kind,
+        key: &'a str,
+        at: Option<u64>,
+    },
+    /// `join-list DIR [KIND KEY]`, after that key.
+    JoinList {
+        dir: &'a str,
+        after: Option<(Kind, &'a str)>,
+    },
+    /// A `join-put` line longer than [`MAX_JOIN_REQUEST`].
+    JoinTooLong,
     /// A well-formed request of another version.
     Version,
     Bad,
 }
 
-/// Reads one request line, up to [`MAX_REQUEST`] bytes; `None` when the
-/// client sent none in time or closed first.
+/// Reads one request line, up to [`MAX_JOIN_REQUEST`] bytes, the longest
+/// any request may be ([`parse`] holds every other to [`MAX_REQUEST`]);
+/// `None` when the client sent none in time or closed first.
 fn read_request(stream: &UnixStream) -> Option<String> {
     let start = std::time::Instant::now();
-    let limit = MAX_REQUEST.checked_add(1)?;
+    let limit = MAX_JOIN_REQUEST.checked_add(1)?;
     let mut stream = stream;
     let mut line = Vec::with_capacity(limit);
-    let mut buffer = [0u8; MAX_REQUEST + 1];
+    let mut buffer = [0u8; MAX_JOIN_REQUEST + 1];
     // Within READ_DEADLINE in all: each read gets the time left, so a
     // client sending a byte at a time cannot hold the polling thread.
     while !line.contains(&b'\n') && line.len() < limit {
@@ -669,7 +844,15 @@ fn read_request(stream: &UnixStream) -> Option<String> {
 /// newline. A reason is the rest of the line after the last fixed
 /// argument, single spaces kept.
 fn parse(line: &str) -> Request<'_> {
-    if line.len() > MAX_REQUEST {
+    // A `join-put` may be longer than the others, up to its own bound.
+    let join_put = line
+        .split(' ')
+        .nth(2)
+        .is_some_and(|name| name.trim_end_matches(['\n', '\r']) == "join-put");
+    if line.len() > MAX_JOIN_REQUEST && join_put {
+        return Request::JoinTooLong;
+    }
+    if line.len() > MAX_REQUEST && !join_put {
         return Request::Bad;
     }
     let line = line.trim_end_matches(['\n', '\r']);
@@ -682,6 +865,50 @@ fn parse(line: &str) -> Request<'_> {
         Ok(API_VERSION) => request(rest).unwrap_or(Request::Bad),
         Ok(_) => Request::Version,
         Err(_) => Request::Bad,
+    }
+}
+
+/// A join registry request's arguments; `None` when malformed.
+fn join_request<'a>(name: &str, arguments: &'a str) -> Option<Request<'a>> {
+    let mut fields = arguments.splitn(4, ' ');
+    let dir = fields.next().filter(|dir| !dir.is_empty())?;
+    let kind = fields.next().map(Kind::parse);
+    let key = fields.next().filter(|key| !key.is_empty());
+    let rest = fields.next();
+    match name {
+        "join-put" => Some(Request::JoinPut {
+            dir,
+            kind: kind??,
+            key: key?,
+            attributes: rest?,
+        }),
+        "join-retire" => {
+            if rest.is_some() {
+                return None;
+            }
+            Some(Request::JoinRetire {
+                dir,
+                kind: kind??,
+                key: key?,
+            })
+        }
+        "join-get" => Some(Request::JoinGet {
+            dir,
+            kind: kind??,
+            key: key?,
+            at: match rest {
+                None => None,
+                Some(word) => Some(word.parse::<u64>().ok()?),
+            },
+        }),
+        _ => match (kind, key, rest) {
+            (None, None, None) => Some(Request::JoinList { dir, after: None }),
+            (Some(Some(kind)), Some(key), None) => Some(Request::JoinList {
+                dir,
+                after: Some((kind, key)),
+            }),
+            _ => None,
+        },
     }
 }
 
@@ -719,6 +946,16 @@ fn request(rest: &str) -> Option<Request<'_>> {
         "limits" => Some(Request::Limits {
             proposals: arguments,
         }),
+        // The join metadata registry (karyos#736): DIR, a kind and a key,
+        // then a put's attributes, a get's instant or a list's cursor.
+        "join-put" | "join-retire" | "join-get" | "join-list" => {
+            Some(join_request(name, arguments).unwrap_or(match name {
+                "join-put" => Request::BadArguments("join-put"),
+                "join-retire" => Request::BadArguments("join-retire"),
+                "join-get" => Request::BadArguments("join-get"),
+                _ => Request::BadArguments("join-list"),
+            }))
+        }
         "gap-ack" => Some(Request::GapAck {
             position: number(arguments)?,
         }),
@@ -1230,5 +1467,12 @@ mod tests {
         assert_eq!(Role::parse("viewer"), Some(Role::Viewer));
         assert_eq!(Role::parse("risk-officer"), Some(Role::RiskOfficer));
         assert_eq!(Role::parse("root"), None);
+        // The registrar writes the join registry and nothing else
+        // (karyos#736); an administrator may too.
+        let registrar = Role::parse("registrar").unwrap();
+        assert!(registrar.may_register());
+        assert!(!registrar.may_close() && !registrar.may_reopen() && !registrar.may_acknowledge());
+        assert!(Role::Administrator.may_register());
+        assert!(!Role::Viewer.may_register() && !Role::Operator.may_register());
     }
 }
