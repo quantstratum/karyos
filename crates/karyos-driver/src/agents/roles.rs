@@ -5447,8 +5447,8 @@ impl<T: StreamTerms> SenderRole<T> {
     }
 
     /// Sends `control` on `endpoint` to `destination`.
-    /// Sends a PATH_HB on each idle path of every established routed
-    /// publication; returns the count submitted.
+    /// Sends a PATH_HB on each idle path of every established publication,
+    /// on one path or routed (karyos#859); returns the count submitted.
     fn path_heartbeats<O: SocketOps>(
         &mut self,
         halves: &mut [(EndpointId, Half<O>)],
@@ -5462,11 +5462,7 @@ impl<T: StreamTerms> SenderRole<T> {
             };
             let alias = outbound.alias();
             let identity = self.sessions.identity(outbound.endpoint(), alias);
-            let (true, true, Some(identity)) = (
-                outbound.is_routed(),
-                established(&self.sessions, outbound),
-                identity,
-            ) else {
+            let (true, Some(identity)) = (established(&self.sessions, outbound), identity) else {
                 continue;
             };
             let control = Control::PathHeartbeat(PathHeartbeat { alias, identity });
