@@ -354,14 +354,14 @@ pub fn report(
         let (log, raw_table) = stream_regions(stream)?;
         let buffer = pages.round(log)?;
         let table = raw_table.map(|bytes| pages.round(bytes)).transpose()?;
-        // A declared stream above the cap is one `add_stream` refuses; the
-        // lane's bytes are summed only when there is a cap to compare.
-        if let Some(max) = config.max_stream_bytes {
-            let lane = crate::embedded::lane_sum(log, raw_table).ok_or(SizingError::Overflow)?;
-            if lane > max {
-                return Err(SizingError::Invalid("a stream above max_stream_bytes"));
-            }
-        }
+        // A declared stream above the cap is one `add_stream` refuses: the
+        // same check (the #837 review, point 4).
+        crate::embedded::check_lane_bytes(
+            config.max_stream_bytes,
+            &stream.buffer,
+            stream.conflation.as_ref(),
+        )
+        .map_err(|_| SizingError::Invalid("a stream above max_stream_bytes"))?;
         let name = format!(
             "stream {}:{} (declared {index})",
             stream.buffer.stream_id, stream.buffer.session_id

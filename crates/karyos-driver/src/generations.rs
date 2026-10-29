@@ -573,8 +573,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if maximum >= 1 << 63 {
             return Err(DriverError::PositionsExhausted);
         }
-        // The table's shape, then the cap, as in `stage_lane`; the table is
-        // the live stream's, already checked at its creation.
+        // The table's shape and the cap, both checked before anything is
+        // created, as `stage_lane` checks them; the table is the live
+        // stream's, already checked at its creation.
         let shape = target
             .conflation
             .map(crate::embedded::conflation_shape)

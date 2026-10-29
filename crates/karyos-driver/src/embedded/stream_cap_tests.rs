@@ -181,10 +181,16 @@ fn table_region_bytes_refuses_what_conflation_shape_refuses() {
     assert_eq!(stream_lane_bytes(&buffer, Some(&refused)), None);
     let accepted = ConflationConfig::new(1, usize::try_from(u32::MAX).unwrap(), 4096);
     assert!(conflation_shape(accepted).is_ok());
-    // Accepted: sized exactly as its region is.
+    // Accepted: sized exactly as its region is, and the lane is the log
+    // buffer plus the table (the #837 review, point 1).
     let bytes = region_bytes(accepted.structure_length());
     assert!(bytes.is_some(), "an accepted table has a size");
     assert_eq!(table_region_bytes(&accepted), bytes);
+    let log = log_region_bytes(&buffer).unwrap();
+    assert_eq!(
+        stream_lane_bytes(&buffer, Some(&accepted)),
+        Some(log + bytes.unwrap())
+    );
 }
 
 #[test]

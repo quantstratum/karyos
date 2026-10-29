@@ -670,7 +670,9 @@ int32_t karyos_client_close(uint64_t client);
  * max_stream_bytes (karyos_driver_options or karyosd --max-stream-bytes)
  * is KARYOS_E_REFUSED,
  * detail code 24 with the lane's bytes in value; no retry of the same
- * uri succeeds.
+ * uri succeeds. A channel the driver does not serve (CnC code 13) is
+ * KARYOS_E_UNSUPPORTED_CHANNEL, with 0 in detail.code and the driver's
+ * detail in detail.value, the stream id.
  */
 int32_t karyos_client_add_publication(uint64_t client, const char *uri,
                                       int32_t stream_id, uint64_t *publication,

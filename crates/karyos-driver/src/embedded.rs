@@ -6717,13 +6717,6 @@ pub fn stream_lane_bytes(
     conflation: Option<&ConflationConfig>,
 ) -> Option<u64> {
     let (log, table) = lane_regions(buffer, conflation)?;
-    lane_sum(log, table)
-}
-
-/// A lane's bytes from its regions' (R-CORE-34): the one sum behind
-/// [`stream_lane_bytes`] and the sizing report's cap check. `None` past 64
-/// bits.
-pub(crate) fn lane_sum(log: u64, table: Option<u64>) -> Option<u64> {
     log.checked_add(table.unwrap_or(0))
 }
 
