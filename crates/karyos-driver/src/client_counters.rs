@@ -32,7 +32,12 @@ use crate::error::DriverError;
 struct Owned {
     client: u64,
     counter: Counter,
+    /// Whether the cell names a trace point (type id 8).
+    point: bool,
 }
+
+/// The highest application trace point id (R-CORE-1): ids are `u16`.
+const MAX_TRACE_POINT_ID: u32 = u16::MAX as u32;
 
 /// The cells of a removed in-process client with counter handles still
 /// alive: freed once none is.
@@ -52,6 +57,13 @@ pub(crate) enum Refusal {
     Exhausted,
     /// Registration ids or a cell's version would wrap.
     IdentitiesExhausted,
+    /// The client holds `max_trace_points_per_client` trace points.
+    TracePointLimit,
+    /// The client made `max_trace_point_registrations_per_client`
+    /// registrations over its life.
+    TracePointRegistrations,
+    /// The instance assigned every trace point id.
+    TracePointIdsExhausted,
 }
 
 /// The client counters region and who owns each allocated cell.
@@ -63,6 +75,14 @@ pub(crate) struct ClientCounters {
     owned: Vec<Owned>,
     orphans: Vec<Orphans>,
     max_per_client: usize,
+    /// The next trace point id to assign: never reused within the
+    /// instance, past [`MAX_TRACE_POINT_ID`] when all are used.
+    next_point: u32,
+    /// Trace point registrations per client over its life, live or not;
+    /// a client's entry goes with its slot.
+    point_registrations: Vec<(u64, usize)>,
+    max_points_per_client: usize,
+    max_point_registrations: usize,
 }
 
 impl ClientCounters {
@@ -99,7 +119,26 @@ impl ClientCounters {
             owned: Vec::new(),
             orphans: Vec::new(),
             max_per_client,
+            next_point: 1,
+            point_registrations: Vec::new(),
+            max_points_per_client: usize::MAX,
+            max_point_registrations: usize::MAX,
         }
+    }
+
+    /// The same, with the trace point bounds per client: live points and
+    /// registrations over a client's life.
+    #[must_use]
+    pub(crate) fn with_trace_points(mut self, live: usize, registrations: usize) -> Self {
+        self.max_points_per_client = live;
+        self.max_point_registrations = registrations;
+        self
+    }
+
+    /// Sets the next trace point id, to reach exhaustion in tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn set_next_trace_point(&mut self, next: u32) {
+        self.next_point = next;
     }
 
     /// The writer view an in-process client shares.
@@ -144,6 +183,18 @@ impl ClientCounters {
         label: &str,
         keys: CounterKeys,
     ) -> Result<(usize, u64), Refusal> {
+        self.allocate_with(client, type_id, label, keys, 0)
+    }
+
+    /// As [`ClientCounters::allocate`], the cell published with `value`.
+    fn allocate_with(
+        &mut self,
+        client: u64,
+        type_id: u64,
+        label: &str,
+        keys: CounterKeys,
+        value: u64,
+    ) -> Result<(usize, u64), Refusal> {
         if self
             .owned_by(client)
             .is_none_or(|owned| owned >= self.max_per_client)
@@ -165,7 +216,7 @@ impl ClientCounters {
             .collect();
         let counter = self
             .manager
-            .allocate_keyed_where(type_id, label, keys, |index| !held.contains(&index))
+            .allocate_valued_where(type_id, label, keys, value, |index| !held.contains(&index))
             .map_err(|error| match error {
                 CounterError::Exhausted => Refusal::Exhausted,
                 // The protocol bounds labels to the cell's; the remaining
@@ -173,8 +224,67 @@ impl ClientCounters {
                 _ => Refusal::IdentitiesExhausted,
             })?;
         let allocated = (counter.index(), counter.registration_id());
-        self.owned.push(Owned { client, counter });
+        self.owned.push(Owned {
+            client,
+            counter,
+            point: false,
+        });
         Ok(allocated)
+    }
+
+    /// Allocates a trace point's cell for `client` (type id 8, keyed to the
+    /// client): assigns the next id of the instance and publishes it as the
+    /// cell's value with the cell. Returns the cell, the allocation's
+    /// registration and the id. Nothing changes on a refusal, the id
+    /// included.
+    pub(crate) fn allocate_point(
+        &mut self,
+        client: u64,
+        label: &str,
+        keys: CounterKeys,
+    ) -> Result<(usize, u64, u16), Refusal> {
+        let live = self
+            .owned
+            .iter()
+            .filter(|owned| owned.client == client && owned.point)
+            .count();
+        if live >= self.max_points_per_client {
+            return Err(Refusal::TracePointLimit);
+        }
+        let registered = self
+            .point_registrations
+            .iter()
+            .find(|(owner, _)| *owner == client)
+            .map_or(0, |(_, count)| *count);
+        if registered >= self.max_point_registrations {
+            return Err(Refusal::TracePointRegistrations);
+        }
+        let Some(id) = u16::try_from(self.next_point)
+            .ok()
+            .filter(|_| self.next_point <= MAX_TRACE_POINT_ID)
+        else {
+            return Err(Refusal::TracePointIdsExhausted);
+        };
+        let (cell, registration) = self.allocate_with(
+            client,
+            karyos_sys::counters::TYPE_TRACE_POINT,
+            label,
+            keys,
+            u64::from(id),
+        )?;
+        if let Some(owned) = self.owned.last_mut() {
+            owned.point = true;
+        }
+        self.next_point += 1;
+        match self
+            .point_registrations
+            .iter_mut()
+            .find(|(owner, _)| *owner == client)
+        {
+            Some((_, count)) => *count += 1,
+            None => self.point_registrations.push((client, 1)),
+        }
+        Ok((cell, registration, id))
     }
 
     /// Frees `client`'s allocation `registration` in `cell` (its
@@ -198,6 +308,8 @@ impl ClientCounters {
     /// cells now when no counter handle of it is alive in this process,
     /// otherwise once none is ([`ClientCounters::free_orphans`]).
     pub(crate) fn client_removed(&mut self, client: u64, releases: &Arc<CounterReleases>) {
+        self.point_registrations
+            .retain(|(owner, _)| *owner != client);
         let mut counters = Vec::new();
         let mut index = 0;
         while let Some(owned) = self.owned.get(index) {

@@ -22,7 +22,8 @@ use std::fmt::Write as _;
 
 use karyos_sys::counters::{
     CellRead, CounterMetadata, CountersReader, KIND_CLIENT, KIND_PUBLICATION, KIND_SUBSCRIBER,
-    PassRead, TYPE_APPLICATION_EVENT, TYPE_APPLICATION_GAUGE, TYPE_POSITION, read_pass,
+    PassRead, TYPE_APPLICATION_EVENT, TYPE_APPLICATION_GAUGE, TYPE_POSITION, TYPE_TRACE_POINT,
+    read_pass,
 };
 use karyos_sys::host_clock::age_ns;
 
@@ -224,6 +225,11 @@ pub fn report(counters: &CountersReader, client_counters: &CountersReader, now: 
     let mut applications: BTreeMap<u64, Group> = BTreeMap::new();
     for (metadata, value) in read_cells(client_counters) {
         let keys = metadata.keys;
+        // A trace point names records (R-CORE-1); its value is an id, not a
+        // count.
+        if metadata.type_id == TYPE_TRACE_POINT {
+            continue;
+        }
         if matches!(
             metadata.type_id,
             TYPE_APPLICATION_EVENT | TYPE_APPLICATION_GAUGE
@@ -349,6 +355,41 @@ mod tests {
             text.ends_with("client counters:\n  (none)\napplication counters:\n  (none)\n"),
             "{text}"
         );
+    }
+
+    /// R-CORE-1: a trace point's cell names records and holds an id, so
+    /// the report lists it neither among the client's counters nor among
+    /// the application counters.
+    #[test]
+    fn a_trace_point_is_not_listed() {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let mut client = karyos_client::Client::with_conductor(
+            driver.connect().unwrap(),
+            karyos_client::Context::builder()
+                .idle_strategy(karyos_client::IdleStrategy::Sleep(
+                    std::time::Duration::from_micros(100),
+                ))
+                .build()
+                .unwrap(),
+        );
+        let point = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| client.add_trace_point("order received").unwrap());
+            while !handle.is_finished() {
+                let _ = driver.do_work().unwrap();
+            }
+            handle.join().unwrap()
+        });
+        let text = report(
+            &driver.counters(),
+            &driver.client_counters(),
+            host_monotonic_ns(),
+        );
+        assert!(!text.contains("order received"), "{text}");
+        assert!(
+            text.ends_with("client counters:\n  (none)\napplication counters:\n  (none)\n"),
+            "{text}"
+        );
+        drop(point);
     }
 
     /// The sample's age in nanoseconds, as a report prints it.

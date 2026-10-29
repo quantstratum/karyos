@@ -94,6 +94,15 @@ pub enum ClientError {
     /// (R-CORE-3).
     #[error("an application counter of this label and kind is already registered")]
     DuplicateCounter,
+    /// [`Client::add_trace_point`](crate::Client::add_trace_point): this
+    /// client already holds a live trace point of the same label (R-CORE-1).
+    #[error("a trace point of this label is already registered")]
+    DuplicateTracePoint,
+    /// [`Client::add_trace_point`](crate::Client::add_trace_point): the
+    /// label is empty, longer than 64 bytes or holds a control character;
+    /// nothing was requested and nothing is truncated.
+    #[error("the label is empty, too long or holds a control character")]
+    InvalidLabel,
     /// `Client::connect` needs the driver's directory.
     #[error("the context names no driver directory")]
     NoDirectory,

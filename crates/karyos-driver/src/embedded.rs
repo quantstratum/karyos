@@ -257,6 +257,15 @@ pub struct DriverConfig {
     /// Client counter cells one client holds at once; an allocation beyond
     /// it is refused with `ResourcesUnavailable`.
     pub max_counters_per_client: usize,
+    /// Application trace points one client holds at once (R-CORE-1,
+    /// `quantstratum-docs: karyos/design/trace-records.md`, "Point names");
+    /// a registration beyond it is refused with `ResourcesUnavailable`.
+    /// Its cells also count against `max_counters_per_client`.
+    pub max_trace_points_per_client: usize,
+    /// Application trace points one client registers over its life, live
+    /// or dropped: since ids are never reused, it keeps one client from
+    /// using up the instance's ids. Beyond it, `ResourcesUnavailable`.
+    pub max_trace_point_registrations_per_client: usize,
     /// Entries of the trace mirror's journal table (`quantstratum-docs:
     /// karyos/design/trace-journal-region.md`): the open client trace
     /// journals plus the ended ones whose records the mirror's ring still
@@ -364,6 +373,8 @@ impl DriverConfig {
             && self.loss_report_records > 0
             && self.client_counters_capacity > 0
             && self.max_counters_per_client > 0
+            && self.max_trace_points_per_client > 0
+            && self.max_trace_point_registrations_per_client > 0
             && self.max_trace_journals > 0
             && self.trace_recycle_log_entries > 0
             && self.max_trace_journal_bytes > 0
@@ -435,6 +446,8 @@ impl Default for DriverConfig {
             error_dedup_window: 1_000_000_000,
             client_counters_capacity: 1024,
             max_counters_per_client: 64,
+            max_trace_points_per_client: 16,
+            max_trace_point_registrations_per_client: 256,
             max_trace_journals: 64,
             trace_recycle_log_entries: 64,
             // Provisional until the trace overhead numbers of P11.
@@ -1474,7 +1487,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         region,
                         config.client_counters_capacity,
                         config.max_counters_per_client,
-                    )?;
+                    )?
+                    .with_trace_points(
+                        config.max_trace_points_per_client,
+                        config.max_trace_point_registrations_per_client,
+                    );
                     let (_, region) = admission.next_region()?;
                     let mirror = karyos_sys::trace_mirror::trace_mirror_in(
                         instance,
@@ -1499,7 +1516,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     ClientCounters::new(
                         config.client_counters_capacity,
                         config.max_counters_per_client,
-                    )?,
+                    )?
+                    .with_trace_points(
+                        config.max_trace_points_per_client,
+                        config.max_trace_point_registrations_per_client,
+                    ),
                     None,
                     crate::diagnostics::Diagnostics::new(&config)?,
                     heap_mirror(&config)?,
@@ -1514,7 +1535,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 ClientCounters::new(
                     config.client_counters_capacity,
                     config.max_counters_per_client,
-                )?,
+                )?
+                .with_trace_points(
+                    config.max_trace_points_per_client,
+                    config.max_trace_point_registrations_per_client,
+                ),
                 crate::diagnostics::Diagnostics::new(&config)?,
                 heap_mirror(&config)?,
             )
@@ -2775,6 +2800,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// before anything else is validated; it is logged too.
     pub fn add_stream(&mut self, config: StreamConfig) -> Result<StreamHandle, DriverError> {
         self.add_local_stream(config, false)
+    }
+
+    /// Tests: sets the next application trace point id the instance
+    /// assigns, so a test reaches its last id (R-CORE-1) without 65 535
+    /// registrations; past 65 535 every registration is refused.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_next_trace_point(&mut self, next: u32) {
+        self.client_counters.set_next_trace_point(next);
     }
 
     /// Tests: stamps `stream`'s next reincarnation `by_ns` nanoseconds

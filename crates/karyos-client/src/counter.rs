@@ -168,6 +168,11 @@ impl ClientCounterHandle {
         self.inner.set(value);
     }
 
+    /// The cell's value.
+    pub(crate) fn value(&self) -> u64 {
+        self.inner.value()
+    }
+
     /// Releases the cell: consumes the capability, which makes no further
     /// access, and hands the release to the client conductor, which sends
     /// `ReleaseCounter` on its next poll. Same as dropping the handle.
@@ -187,6 +192,56 @@ impl Drop for ClientCounterHandle {
         // that reads 0 after the close flag may free the cell.
         self.releases.live.fetch_sub(1, Ordering::Release);
     }
+}
+
+/// An application's named trace point (R-CORE-1, `quantstratum-docs:
+/// karyos/design/trace-records.md`, "Point names"), registered with
+/// [`Client::add_trace_point`](crate::Client::add_trace_point): the id the
+/// driver assigned, never reused within its instance, and the client it
+/// belongs to. A `karyos-trace` `ApplicationPoint::new(id, client)` records
+/// it into this client's journals. Dropping the handle releases its cell;
+/// the id stays retired.
+#[derive(Debug)]
+pub struct TracePointHandle {
+    counter: ClientCounterHandle,
+    id: u16,
+    client: u64,
+}
+
+impl TracePointHandle {
+    pub(crate) fn new(counter: ClientCounterHandle, id: u16, client: u64) -> Self {
+        Self {
+            counter,
+            id,
+            client,
+        }
+    }
+
+    /// The point id the driver assigned (nonzero).
+    #[must_use]
+    pub fn id(&self) -> u16 {
+        self.id
+    }
+
+    /// The client that registered it, as the driver numbers its clients.
+    #[must_use]
+    pub fn client(&self) -> u64 {
+        self.client
+    }
+
+    /// The point's cell in the client counters region.
+    #[must_use]
+    pub fn cell(&self) -> usize {
+        self.counter.cell()
+    }
+}
+
+/// Whether `label` may name a trace point: 1 to 64 bytes of UTF-8 with no
+/// control character (U+0000 to U+001F, U+007F to U+009F).
+pub(crate) fn valid_point_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= karyos_sys::counters::MAX_LABEL_LENGTH
+        && !label.chars().any(char::is_control)
 }
 
 #[cfg(test)]
