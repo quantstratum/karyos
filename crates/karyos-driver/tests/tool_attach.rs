@@ -374,7 +374,15 @@ fn tool_hellos_that_break_the_profile_are_refused() {
     let _serial = serial();
     let dir = dir("profile");
     let mut driver = driver(&dir, 4);
-    let refused = |code| Some(Message::Refused { fetch: 0, code });
+    // A version refusal states this driver's version (karyos#879).
+    let refused = |code| {
+        Some(match core::num::NonZeroU64::new(VERSION) {
+            Some(version) if code == refusal::INCOMPATIBLE_VERSION => {
+                Message::incompatible_version(version)
+            }
+            _ => Message::Refused { fetch: 0, code },
+        })
+    };
     let mut future = encode(&Message::ToolHello {
         version: VERSION + 1,
     });

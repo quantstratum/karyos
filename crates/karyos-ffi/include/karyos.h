@@ -635,8 +635,9 @@ static inline int32_t karyos_client_options_init(
  * options->dir and writes its handle. The options are copied; a failed
  * connect opens nothing and fills detail (may be null).
  * KARYOS_E_INCOMPATIBLE_DRIVER carries the driver's protocol version in
- * detail->value when it admitted the client at another one, 0 when it
- * refused it. KARYOS_E_UNSUPPORTED where no cross-process client exists
+ * detail->value when it admitted the client at another one, or when its
+ * refusal states it; 0 when a refusing driver states none (0.1.0-alpha.2
+ * and earlier). KARYOS_E_UNSUPPORTED where no cross-process client exists
  * (not Linux).
  */
 int32_t karyos_client_connect(const karyos_client_options *options,

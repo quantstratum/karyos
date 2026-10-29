@@ -178,13 +178,19 @@ fn a_step_answers_four_probes_and_refuses_the_fifth() {
             version: VERSION + 1,
         }),
     );
+    // Refused, stating this driver's version (karyos#879).
+    let refusal = answer(&mut driver, &socket).0;
     assert!(matches!(
-        answer(&mut driver, &socket).0,
+        refusal,
         Message::Refused {
             code: refusal::INCOMPATIBLE_VERSION,
             ..
         }
     ));
+    assert_eq!(
+        refusal.refuser_version().map(core::num::NonZeroU64::get),
+        Some(VERSION)
+    );
 }
 
 /// A directory without a driver is unreachable, not ready.

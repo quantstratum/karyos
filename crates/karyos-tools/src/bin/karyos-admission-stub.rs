@@ -80,9 +80,14 @@ fn run(dir: &std::path::Path, mode: Mode) -> ExitCode {
         }
     }
     let answer = match mode {
-        Mode::Refuse => Message::Refused {
-            fetch: 0,
-            code: refusal::INCOMPATIBLE_VERSION,
+        // As a driver of this core refuses: stating its version
+        // (karyos#879).
+        Mode::Refuse => match core::num::NonZeroU64::new(VERSION) {
+            Some(version) => Message::incompatible_version(version),
+            None => Message::Refused {
+                fetch: 0,
+                code: refusal::INCOMPATIBLE_VERSION,
+            },
         },
         Mode::Version => match VERSION.checked_add(1) {
             Some(version) => Message::Admitted {

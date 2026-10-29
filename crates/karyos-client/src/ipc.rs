@@ -112,7 +112,9 @@ pub enum AttachError {
     /// admitted the client at another.
     #[error("the driver does not run protocol version {VERSION}")]
     IncompatibleVersion {
-        /// The version the driver announced, when it admitted the client.
+        /// The version the driver runs: announced when it admitted the
+        /// client, or stated in its refusal (karyos#879); `None` when a
+        /// refusing driver states none (0.1.0-alpha.2 and earlier).
         driver: Option<u64>,
     },
     /// The driver sent a message out of order, malformed, or with a
@@ -649,12 +651,17 @@ fn bootstrap(socket: &OwnedFd) -> Result<(u128, u64, Staged), AttachError> {
             (instance, client, records)
         }
         (
-            Message::Refused {
+            refused @ Message::Refused {
                 code: refusal::INCOMPATIBLE_VERSION,
                 ..
             },
             None,
-        ) => return Err(AttachError::IncompatibleVersion { driver: None }),
+        ) => {
+            // The driver's version, when it states it (karyos#879).
+            return Err(AttachError::IncompatibleVersion {
+                driver: refused.refuser_version().map(core::num::NonZeroU64::get),
+            });
+        }
         (Message::Refused { code, .. }, None) => return Err(AttachError::Refused { code }),
         _ => return Err(AttachError::Protocol),
     };
