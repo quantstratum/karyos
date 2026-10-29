@@ -19,7 +19,8 @@
 //!   the pod takes a TLS-terminating sidecar or mesh (R-CORE-39,
 //!   karyos#734). An optional bearer [`Token`] (`--token-file`) guards
 //!   scrapes from the other processes of the pod's network namespace: a
-//!   request without it is answered `401`. A request head that is not one
+//!   request for `/metrics` without it is answered `401`; only `/metrics`
+//!   needs it, any other path being `404` or `405` either way. A request head that is not one
 //!   is answered `400`.
 //! - **Attachment** (karyos#734): its own identity as an agent's
 //!   (`karyos_exporter_info`), and per driver its state, instance and
@@ -748,14 +749,24 @@ impl Token {
     /// [`TokenError::Content`] for a token of another length or with a
     /// byte that is not visible ASCII, and the operating system's errors.
     pub fn read(path: &std::path::Path) -> Result<Self, TokenError> {
+        use std::io::Read as _;
+        // One open: the mode is checked on the handle that is read, so a
+        // file swapped or re-chmodded in between is never read unchecked.
+        // A symlink is followed (a Kubernetes secret mount is one), and the
+        // file it names is what is checked.
+        let file = std::fs::File::open(path)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if std::fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+            if file.metadata()?.permissions().mode() & 0o077 != 0 {
                 return Err(TokenError::Mode(path.to_path_buf()));
             }
         }
-        let mut bytes = std::fs::read(path)?;
+        // At most one byte past the longest token and its newline, so a
+        // large file is never read whole.
+        let limit = u64::try_from(MAX_TOKEN + 2).unwrap_or(u64::MAX);
+        let mut bytes = Vec::with_capacity(MAX_TOKEN + 2);
+        file.take(limit).read_to_end(&mut bytes)?;
         if bytes.last() == Some(&b'\n') {
             bytes.pop();
         }

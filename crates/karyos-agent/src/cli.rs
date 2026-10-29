@@ -246,8 +246,9 @@ milliseconds (default 1000). ADDRESS must be a loopback address (127.0.0.1
 or ::1): the exporter has no TLS, so expose it beyond the pod through a
 TLS-terminating sidecar or mesh. --token-file requires every scrape to
 carry Authorization: Bearer with the token in PATH (32 to 256 bytes of
-visible ASCII, the file mode 0600), against the other processes of the
-pod's network namespace. --agent-id names the exporter in its
+visible ASCII, the file mode 0600; a symlink is followed, as a Kubernetes
+secret mount is one), against the other processes of the pod's network
+namespace; only /metrics needs it. --agent-id names the exporter in its
 karyos_exporter_info (1 to 64 bytes of A-Z a-z 0-9 . _ : / -). It takes
 one of each driver's tool slots (max_tools) while attached. No OTLP.
 Linux only.

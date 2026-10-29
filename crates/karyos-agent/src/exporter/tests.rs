@@ -613,6 +613,19 @@ fn a_token_is_bounded_and_read_from_a_private_file() {
         );
         std::fs::write(&path, "short").unwrap();
         assert!(matches!(Token::read(&path), Err(TokenError::Content(_))));
+        // A large file is read only to one byte past the bound, and refused.
+        std::fs::write(&path, vec![b't'; 1 << 20]).unwrap();
+        assert!(matches!(Token::read(&path), Err(TokenError::Content(_))));
+        // A symlink is followed: the file it names is checked and read.
+        std::fs::write(&path, "t".repeat(40)).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(
+            Token::read(&link).unwrap(),
+            Token::new(vec![b't'; 40]).unwrap()
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(matches!(Token::read(&link), Err(TokenError::Mode(_))));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
