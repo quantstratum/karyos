@@ -238,13 +238,19 @@ mod tests {
 /// What `karyos-exporter` prints for a bad command line.
 pub const EXPORTER_USAGE: &str = "\
 usage: karyos-exporter --listen ADDRESS:PORT --driver DIR [--driver DIR]... \
-[--refresh-ms MS]
+[--refresh-ms MS] [--agent-id NAME] [--token-file PATH]
 
 Serves the agent's view of each driver in the Prometheus text format on
 http://ADDRESS:PORT/metrics, reading each driver's CnC as a tool every MS
 milliseconds (default 1000). ADDRESS must be a loopback address (127.0.0.1
-or ::1): the exporter has no TLS and no authentication. It takes one of
-each driver's tool slots (max_tools) while attached. Linux only.
+or ::1): the exporter has no TLS, so expose it beyond the pod through a
+TLS-terminating sidecar or mesh. --token-file requires every scrape to
+carry Authorization: Bearer with the token in PATH (32 to 256 bytes of
+visible ASCII, the file mode 0600), against the other processes of the
+pod's network namespace. --agent-id names the exporter in its
+karyos_exporter_info (1 to 64 bytes of A-Z a-z 0-9 . _ : / -). It takes
+one of each driver's tool slots (max_tools) while attached. No OTLP.
+Linux only.
 ";
 
 /// A parsed `karyos-exporter` command line.
@@ -257,6 +263,11 @@ pub struct ExporterArgs {
     pub drivers: Vec<PathBuf>,
     /// How often the agent reads the drivers.
     pub refresh: Duration,
+    /// The name it reports as its identity (`--agent-id`).
+    pub agent_id: Option<String>,
+    /// The file holding the bearer token every scrape must carry
+    /// (`--token-file`).
+    pub token_file: Option<PathBuf>,
 }
 
 /// Parses `karyos-exporter`'s `args` (without the program name); `None`
@@ -267,10 +278,19 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
     let mut listen = None;
     let mut drivers = Vec::new();
     let mut refresh = DEFAULT_REFRESH;
+    let mut agent_id = None;
+    let mut token_file = None;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
         match flag.as_str() {
+            "--agent-id" if agent_id.is_none() => {
+                if !crate::api::valid_agent_id(value) {
+                    return None;
+                }
+                agent_id = Some(value.clone());
+            }
+            "--token-file" if token_file.is_none() => token_file = Some(PathBuf::from(value)),
             "--listen" if listen.is_none() => {
                 let address: std::net::SocketAddr = value.parse().ok()?;
                 if !address.ip().is_loopback() {
@@ -296,6 +316,8 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
         listen: listen?,
         drivers,
         refresh,
+        agent_id,
+        token_file,
     })
 }
 
@@ -317,6 +339,19 @@ mod exporter_tests {
         assert_eq!(parsed.drivers.len(), 2);
         assert_eq!(parsed.refresh, Duration::from_millis(250));
         assert!(parse_exporter(&args("--listen [::1]:9464 --driver /d")).is_some());
+        // An identity and a token file (karyos#734).
+        let parsed = parse_exporter(&args(
+            "--listen 127.0.0.1:9464 --driver /d --agent-id ns/pod-0 --token-file /run/t",
+        ))
+        .unwrap();
+        assert_eq!(parsed.agent_id.as_deref(), Some("ns/pod-0"));
+        assert_eq!(parsed.token_file, Some(PathBuf::from("/run/t")));
+        assert_eq!(
+            parse_exporter(&args("--listen 127.0.0.1:1 --driver /d"))
+                .unwrap()
+                .token_file,
+            None
+        );
         for refused in [
             "--listen 0.0.0.0:9464 --driver /d",
             "--listen 192.168.1.2:9464 --driver /d",
@@ -326,6 +361,8 @@ mod exporter_tests {
             "--driver /d",
             "--listen 127.0.0.1:1 --listen 127.0.0.1:2 --driver /d",
             "--listen 127.0.0.1:1 --driver /d --refresh-ms 0",
+            "--listen 127.0.0.1:1 --driver /d --agent-id has space",
+            "--listen 127.0.0.1:1 --driver /d --token-file /a --token-file /b",
             "--listen 127.0.0.1:1 --driver /d --role 1=viewer",
         ] {
             assert_eq!(parse_exporter(&args(refused)), None, "{refused}");

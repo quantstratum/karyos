@@ -272,7 +272,8 @@ fn the_exposition_parses_and_each_counter_keeps_its_type() {
         .map(|(labels, _)| label(labels, "bound").unwrap())
         .collect();
     assert_eq!(p90, ["low"]);
-    // Alerts (M9): a count per driver, 0 included, and each one's value.
+    // Alerts (M9): a count per attached driver, 0 included, and each
+    // one's value; a driver not attached has none (karyos#734).
     let firing: BTreeMap<&str, f64> = families["karyos_alerts_firing"]
         .1
         .iter()
@@ -280,7 +281,7 @@ fn the_exposition_parses_and_each_counter_keeps_its_type() {
         .collect();
     assert_eq!(
         firing.values().copied().collect::<Vec<_>>(),
-        [1.0, 0.0],
+        [1.0],
         "{firing:?}"
     );
     let (labels, value) = &families["karyos_alert_value"].1[0];
@@ -429,4 +430,189 @@ fn a_poll_answers_a_bounded_number_of_connections() {
     let second = exporter.poll(String::new).unwrap();
     assert_eq!(second.len(), 4);
     drop(clients);
+}
+
+/// R-CORE-39 (karyos#734): every family written is one of [`FAMILIES`],
+/// with its type, and each family appears once with its HELP and TYPE.
+#[test]
+fn every_family_is_published_with_its_type() {
+    let text = render(&view());
+    let families = parse(&text);
+    let published: BTreeMap<&str, &str> = FAMILIES
+        .iter()
+        .map(|(name, kind, _)| (*name, *kind))
+        .collect();
+    assert_eq!(published.len(), FAMILIES.len(), "a family listed twice");
+    for (name, (kind, _)) in &families {
+        assert_eq!(
+            published.get(name.as_str()),
+            Some(&kind.as_str()),
+            "{name} is not published as a {kind}"
+        );
+    }
+    // The per-cell families keyed by a driver's counter label are the
+    // unstable ones.
+    let unstable: Vec<&str> = FAMILIES
+        .iter()
+        .filter(|(_, _, stability)| *stability == Stability::Unstable)
+        .map(|(name, _, _)| *name)
+        .collect();
+    assert_eq!(
+        unstable,
+        [
+            "karyos_events_total",
+            "karyos_spin_time_ns_total",
+            "karyos_gauge",
+            "karyos_value",
+            "karyos_position",
+            "karyos_timestamp_ns"
+        ]
+    );
+}
+
+/// R-CORE-39 (karyos#734): the exporter's identity and each driver's
+/// attachment are exported; a driver not attached is a state, never a
+/// scrape of zeros or of its last values.
+#[test]
+fn identity_and_attachment_are_exported_and_an_absent_driver_is_a_state() {
+    let mut view = view();
+    view.agent = crate::api::AgentIdentity::new(Some("ns/pod".to_owned()), 42, 7);
+    let text = render(&view);
+    let families = parse(&text);
+    let (labels, value) = &families["karyos_exporter_info"].1[0];
+    assert_eq!(
+        (label(labels, "id"), label(labels, "pid"), *value),
+        (Some("ns/pod"), Some("42"), 1.0)
+    );
+    assert_eq!(families["karyos_exporter_started_ns"].1[0].1, 7.0);
+    let attached = view.drivers[0].dir.display().to_string();
+    let absent = view.drivers[1].dir.display().to_string();
+    let of = |family: &str, dir: &str| -> Vec<(Vec<(String, String)>, f64)> {
+        families
+            .get(family)
+            .map(|(_, samples)| {
+                samples
+                    .iter()
+                    .filter(|(labels, _)| label(labels, "driver") == Some(dir))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert_eq!(of("karyos_driver_up", &attached)[0].1, 1.0);
+    assert_eq!(of("karyos_driver_up", &absent)[0].1, 0.0);
+    let state = |dir: &str| -> Vec<(String, f64)> {
+        of("karyos_driver_state", dir)
+            .into_iter()
+            .map(|(labels, value)| (label(&labels, "state").unwrap().to_owned(), value))
+            .collect()
+    };
+    assert_eq!(
+        state(&attached),
+        [
+            ("attached".to_owned(), 1.0),
+            ("closed".to_owned(), 0.0),
+            ("unavailable".to_owned(), 0.0)
+        ]
+    );
+    assert_eq!(state(&absent).iter().filter(|(_, v)| *v == 1.0).count(), 1);
+    assert_eq!(
+        label(&of("karyos_driver_info", &attached)[0].0, "instance"),
+        Some("00000000000000000000000000000001")
+    );
+    // The absent driver: its state families and its catalog only.
+    let allowed = [
+        "karyos_driver_up",
+        "karyos_driver_state",
+        "karyos_driver_info",
+        "karyos_driver_attaches_total",
+        "karyos_driver_attached_since_ns",
+        "karyos_driver_attached",
+        "karyos_driver_closed",
+        "karyos_archive_recordings",
+        "karyos_archive_listings_total",
+        "karyos_archive_listing_failures_total",
+        "karyos_archive_listed_at_ns",
+    ];
+    for family in families.keys() {
+        if !of(family, &absent).is_empty() {
+            assert!(
+                allowed.contains(&family.as_str()),
+                "{family} for an absent driver"
+            );
+        }
+    }
+}
+
+/// R-CORE-39 (karyos#734): with a token, a scrape without it or with
+/// another is `401` with a Bearer challenge, and with it `200`; a request
+/// head that is not one is `400`.
+#[test]
+fn a_token_guards_every_scrape_and_a_bad_head_is_400() {
+    let token = Token::new(b"0123456789abcdef0123456789abcdef".to_vec()).unwrap();
+    let mut exporter = bind("127.0.0.1:0".parse().unwrap())
+        .unwrap()
+        .with_token(token);
+    let (answer, answered) = exchange(&mut exporter, "GET /metrics HTTP/1.1\r\n\r\n");
+    assert_eq!(answered, [Answered::Unauthorized]);
+    assert!(answer.starts_with("HTTP/1.1 401"), "{answer}");
+    assert!(answer.contains("WWW-Authenticate: Bearer\r\n"), "{answer}");
+    assert!(!answer.contains("karyos_up"), "{answer}");
+    let (answer, answered) = exchange(
+        &mut exporter,
+        "GET /metrics HTTP/1.1\r\nAuthorization: Bearer 0123456789abcdef0123456789abcdeX\r\n\r\n",
+    );
+    assert_eq!(answered, [Answered::Unauthorized], "{answer}");
+    let (answer, answered) = exchange(
+        &mut exporter,
+        "GET /metrics HTTP/1.1\r\nauthorization: bearer 0123456789abcdef0123456789abcdef\r\n\r\n",
+    );
+    assert_eq!(answered, [Answered::Metrics], "{answer}");
+    assert!(answer.ends_with("karyos_up 1\n"), "{answer}");
+    for bad in [
+        "GET /metrics\r\n\r\n",
+        "GET /metrics HTTP/1.1 extra\r\n\r\n",
+        "GET /metrics SPDY/3\r\n\r\n",
+        "\u{7f}\r\n\r\n",
+    ] {
+        let (answer, answered) = exchange(&mut exporter, bad);
+        assert_eq!(answered, [Answered::Refused], "{bad:?}");
+        assert!(answer.starts_with("HTTP/1.1 400"), "{bad:?}: {answer}");
+    }
+}
+
+/// A token is 32 to 256 bytes of visible ASCII, from a file of mode 0600;
+/// its comparison refuses a prefix, an extension and one byte off.
+#[test]
+fn a_token_is_bounded_and_read_from_a_private_file() {
+    assert!(Token::new(vec![b'a'; MIN_TOKEN - 1]).is_none());
+    assert!(Token::new(vec![b'a'; MAX_TOKEN + 1]).is_none());
+    assert!(Token::new(b"0123456789abcdef0123456789abcde f".to_vec()).is_none());
+    let token = Token::new(vec![b'a'; MIN_TOKEN]).unwrap();
+    assert!(token.matches(&[b'a'; MIN_TOKEN]));
+    assert!(!token.matches(&[b'a'; MIN_TOKEN - 1]));
+    assert!(!token.matches(&[b'a'; MIN_TOKEN + 1]));
+    let mut off = vec![b'a'; MIN_TOKEN];
+    off[MIN_TOKEN - 1] = b'b';
+    assert!(!token.matches(&off));
+    assert_eq!(format!("{token:?}"), "Token(..)");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("karyos-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        std::fs::write(&path, format!("{}\n", "t".repeat(40))).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(Token::read(&path), Err(TokenError::Mode(_))));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            Token::read(&path).unwrap(),
+            Token::new(vec![b't'; 40]).unwrap()
+        );
+        std::fs::write(&path, "short").unwrap();
+        assert!(matches!(Token::read(&path), Err(TokenError::Content(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

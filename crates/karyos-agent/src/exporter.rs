@@ -15,9 +15,18 @@
 //!   to a loopback address only ([`bind`] refuses any other), read-only,
 //!   one request per connection with [`IO_TIMEOUT`] on its reads and
 //!   writes. It is off unless the `karyos-exporter` binary is started with
-//!   an address. No TLS and no authentication: loopback is the interim's
-//!   boundary.
-//! - **Alerts** (M9) are `karyos_alerts_firing` per driver, 0 included,
+//!   an address. No TLS: it serves loopback only, and exposing it beyond
+//!   the pod takes a TLS-terminating sidecar or mesh (R-CORE-39,
+//!   karyos#734). An optional bearer [`Token`] (`--token-file`) guards
+//!   scrapes from the other processes of the pod's network namespace: a
+//!   request without it is answered `401`. A request head that is not one
+//!   is answered `400`.
+//! - **Attachment** (karyos#734): its own identity as an agent's
+//!   (`karyos_exporter_info`), and per driver its state, instance and
+//!   attaches. A driver not attached is a state (`karyos_driver_up` 0),
+//!   never a scrape of zeros or of its last values. The families and their
+//!   stability are [`FAMILIES`].
+//! - **Alerts** (M9) are `karyos_alerts_firing` per attached driver, 0 included,
 //!   and each firing alert's `karyos_alert_value` and
 //!   `karyos_alert_since_ns`, labelled by kind, stream, lane and
 //!   participant.
@@ -46,6 +55,87 @@ pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
 /// Connections answered per [`Exporter::poll`] at most, so a burst cannot
 /// hold the agent's refresh.
 pub const MAX_PER_POLL: usize = 16;
+
+/// How far a dashboard may depend on a metric family (R-CORE-39,
+/// karyos#734; quantstratum-docs: karyos/design/observability-and-tools.md,
+/// Exporter metric families).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Stability {
+    /// Its name, type and labels change only with a release note and a
+    /// release in which the old name is still exported.
+    Stable,
+    /// Keyed by a driver's internal counter label, which a release may
+    /// rename: its name and type are stable, its `name` label values are not.
+    Unstable,
+}
+
+/// Every metric family the exporter writes: name, Prometheus type and
+/// stability. A test checks that an exposition holds no other family and
+/// that each keeps its type.
+pub const FAMILIES: [(&str, &str, Stability); 37] = [
+    ("karyos_exporter_info", "gauge", Stability::Stable),
+    ("karyos_exporter_started_ns", "gauge", Stability::Stable),
+    ("karyos_driver_up", "gauge", Stability::Stable),
+    ("karyos_driver_state", "gauge", Stability::Stable),
+    ("karyos_driver_info", "gauge", Stability::Stable),
+    ("karyos_driver_attaches_total", "counter", Stability::Stable),
+    (
+        "karyos_driver_attached_since_ns",
+        "gauge",
+        Stability::Stable,
+    ),
+    ("karyos_driver_attached", "gauge", Stability::Stable),
+    ("karyos_driver_closed", "gauge", Stability::Stable),
+    ("karyos_alerts_firing", "gauge", Stability::Stable),
+    ("karyos_alert_value", "gauge", Stability::Stable),
+    ("karyos_alert_since_ns", "gauge", Stability::Stable),
+    ("karyos_sample_consistent", "gauge", Stability::Stable),
+    ("karyos_sample_age_ns", "gauge", Stability::Stable),
+    ("karyos_lane_position", "gauge", Stability::Stable),
+    ("karyos_lane_headroom", "gauge", Stability::Stable),
+    ("karyos_subscriber_position", "gauge", Stability::Stable),
+    ("karyos_subscriber_lag", "gauge", Stability::Stable),
+    (
+        "karyos_application_events_total",
+        "counter",
+        Stability::Stable,
+    ),
+    ("karyos_application_gauge", "gauge", Stability::Stable),
+    (
+        "karyos_ring_records_read_total",
+        "counter",
+        Stability::Stable,
+    ),
+    (
+        "karyos_ring_records_overwritten_total",
+        "counter",
+        Stability::Stable,
+    ),
+    ("karyos_error_occurrences", "gauge", Stability::Stable),
+    ("karyos_trace_events_total", "counter", Stability::Stable),
+    ("karyos_trace_latency_ns", "gauge", Stability::Stable),
+    ("karyos_trace_pending", "gauge", Stability::Stable),
+    ("karyos_trace_window_pairs", "gauge", Stability::Stable),
+    ("karyos_archive_recordings", "gauge", Stability::Stable),
+    (
+        "karyos_archive_listings_total",
+        "counter",
+        Stability::Stable,
+    ),
+    (
+        "karyos_archive_listing_failures_total",
+        "counter",
+        Stability::Stable,
+    ),
+    ("karyos_archive_listed_at_ns", "gauge", Stability::Stable),
+    ("karyos_events_total", "counter", Stability::Unstable),
+    ("karyos_spin_time_ns_total", "counter", Stability::Unstable),
+    ("karyos_gauge", "gauge", Stability::Unstable),
+    ("karyos_value", "gauge", Stability::Unstable),
+    ("karyos_position", "gauge", Stability::Unstable),
+    ("karyos_timestamp_ns", "gauge", Stability::Unstable),
+];
 
 /// The counter types of the CnC (`karyos_sys::counters`), and the driver's
 /// spin time.
@@ -134,6 +224,25 @@ fn escape(value: &str) -> String {
 #[must_use]
 pub fn render(view: &AgentView) -> String {
     let mut families = Families::default();
+    // Its own identity, as the agent's (R-CORE-24): the exporter is an
+    // agent of its own, attached to each driver as a tool.
+    families.sample(
+        "karyos_exporter_info",
+        "gauge",
+        "The exporter's identity: its --agent-id (empty when none) and pid.",
+        &[
+            ("id", view.agent.id.clone().unwrap_or_default()),
+            ("pid", view.agent.pid.to_string()),
+        ],
+        1,
+    );
+    families.sample(
+        "karyos_exporter_started_ns",
+        "gauge",
+        "Host monotonic nanoseconds at which the exporter started.",
+        &[],
+        view.agent.started_ns,
+    );
     for driver in &view.drivers {
         render_driver(&mut families, driver);
     }
@@ -157,10 +266,65 @@ fn render_driver(families: &mut Families, driver: &DriverView) {
         &base,
         u8::from(driver.state == DriverState::Closed),
     );
-    render_alerts(families, &dir, &driver.alerts);
+    // Attached or not, as a state: an absent driver is never a scrape of
+    // zeros, which a dashboard would read as healthy.
+    let attached = driver.state == DriverState::Attached;
+    families.sample(
+        "karyos_driver_up",
+        "gauge",
+        "Whether the driver is attached and read (1) or not (0); when 0, no other value of the driver is current.",
+        &base,
+        u8::from(attached),
+    );
+    let current = match driver.state {
+        DriverState::Attached => "attached",
+        DriverState::Closed => "closed",
+        DriverState::Unavailable { .. } => "unavailable",
+    };
+    for state in ["attached", "closed", "unavailable"] {
+        families.sample(
+            "karyos_driver_state",
+            "gauge",
+            "The driver's attachment state: 1 for the current one.",
+            &[("driver", dir.clone()), ("state", state.to_owned())],
+            u8::from(state == current),
+        );
+    }
+    if let Some(instance) = driver.instance {
+        families.sample(
+            "karyos_driver_info",
+            "gauge",
+            "The driver instance attached: a restarted driver is a new instance, and its series start over.",
+            &[("driver", dir.clone()), ("instance", format!("{instance:032x}"))],
+            1,
+        );
+    }
+    families.sample(
+        "karyos_driver_attaches_total",
+        "counter",
+        "Attaches to the driver since the exporter started.",
+        &base,
+        driver.attachment.attaches,
+    );
+    if let Some(since) = driver.attachment.since_ns {
+        families.sample(
+            "karyos_driver_attached_since_ns",
+            "gauge",
+            "Host monotonic nanoseconds since which the current attachment holds.",
+            &base,
+            since,
+        );
+    }
+    // The Archive catalog has a connection of its own.
     if let Some(catalog) = &driver.catalog {
         render_catalog(families, &dir, catalog);
     }
+    // Nothing else of a driver not attached: its last values are not
+    // current, and its alerts are not evaluated.
+    if !attached {
+        return;
+    }
+    render_alerts(families, &dir, &driver.alerts);
     if let Some(sample) = &driver.sample {
         families.sample(
             "karyos_sample_consistent",
@@ -511,7 +675,9 @@ fn render_application(families: &mut Families, dir: &str, counter: &Counter) -> 
 #[non_exhaustive]
 pub enum ExportError {
     /// The address is not a loopback address.
-    #[error("{0} is not a loopback address")]
+    #[error(
+        "{0} is not a loopback address: the exporter has no TLS, so it serves loopback only; expose it beyond the pod through a TLS-terminating sidecar or mesh"
+    )]
     NotLoopback(SocketAddr),
     /// The operating system's error.
     #[error(transparent)]
@@ -524,8 +690,12 @@ pub enum ExportError {
 pub enum Answered {
     /// `200` with the exposition.
     Metrics,
-    /// `404` (another path) or `405` (another method).
+    /// `404` (another path), `405` (another method) or `400` (a request
+    /// head that is not one).
     Refused,
+    /// `401`: the exporter has a token, and the request did not carry it
+    /// (karyos#734).
+    Unauthorized,
     /// The client went away, or sent no request head in time.
     Dropped,
 }
@@ -534,6 +704,80 @@ pub enum Answered {
 #[derive(Debug)]
 pub struct Exporter {
     listener: TcpListener,
+    /// The bearer token every scrape must carry, when configured.
+    token: Option<Token>,
+}
+
+/// A scrape token (`--token-file`, karyos#734): 32 to 256 bytes of visible
+/// ASCII, read from a file that only its owner may read or write.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Token(Vec<u8>);
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(..)")
+    }
+}
+
+/// The shortest token, in bytes.
+pub const MIN_TOKEN: usize = 32;
+/// The longest token, in bytes.
+pub const MAX_TOKEN: usize = 256;
+
+/// Why a token file was refused.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TokenError {
+    /// Group or others may read or write it.
+    #[error("{} must be readable and writable by its owner only (mode 0600)", .0.display())]
+    Mode(std::path::PathBuf),
+    /// Not 32 to 256 bytes of visible ASCII, one final newline allowed.
+    #[error("{} must hold 32 to 256 bytes of visible ASCII", .0.display())]
+    Content(std::path::PathBuf),
+    /// The operating system's error.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+impl Token {
+    /// The token in the file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`TokenError::Mode`] when group or others have any access to it,
+    /// [`TokenError::Content`] for a token of another length or with a
+    /// byte that is not visible ASCII, and the operating system's errors.
+    pub fn read(path: &std::path::Path) -> Result<Self, TokenError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+                return Err(TokenError::Mode(path.to_path_buf()));
+            }
+        }
+        let mut bytes = std::fs::read(path)?;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        Self::new(bytes).ok_or_else(|| TokenError::Content(path.to_path_buf()))
+    }
+
+    /// `bytes` as a token, if 32 to 256 bytes of visible ASCII.
+    #[must_use]
+    pub fn new(bytes: Vec<u8>) -> Option<Self> {
+        ((MIN_TOKEN..=MAX_TOKEN).contains(&bytes.len()) && bytes.iter().all(u8::is_ascii_graphic))
+            .then_some(Self(bytes))
+    }
+
+    /// Whether `offered` is this token, in a time that depends on the
+    /// lengths only, never on where the bytes differ.
+    fn matches(&self, offered: &[u8]) -> bool {
+        let mut difference = u8::from(offered.len() != self.0.len());
+        for (index, byte) in self.0.iter().enumerate() {
+            difference |= byte ^ offered.get(index).copied().unwrap_or(0);
+        }
+        difference == 0
+    }
 }
 
 /// Listens on `address`, which must be a loopback address.
@@ -548,10 +792,21 @@ pub fn bind(address: SocketAddr) -> Result<Exporter, ExportError> {
     }
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
-    Ok(Exporter { listener })
+    Ok(Exporter {
+        listener,
+        token: None,
+    })
 }
 
 impl Exporter {
+    /// Requires `token` on every scrape (`Authorization: Bearer`): a
+    /// request without it, or with another, is answered `401`.
+    #[must_use]
+    pub fn with_token(mut self, token: Token) -> Self {
+        self.token = Some(token);
+        self
+    }
+
     /// The address bound.
     ///
     /// # Errors
@@ -571,7 +826,7 @@ impl Exporter {
         let mut answered = Vec::new();
         while answered.len() < MAX_PER_POLL {
             match self.listener.accept() {
-                Ok((stream, _)) => answered.push(answer(stream, &body)),
+                Ok((stream, _)) => answered.push(answer(stream, self.token.as_ref(), &body)),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error.into()),
             }
@@ -581,7 +836,7 @@ impl Exporter {
 }
 
 /// Answers one connection.
-fn answer(stream: TcpStream, body: &impl Fn() -> String) -> Answered {
+fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) -> Answered {
     let ready = stream.set_nonblocking(false).is_ok()
         && stream.set_read_timeout(Some(IO_TIMEOUT)).is_ok()
         && stream.set_write_timeout(Some(IO_TIMEOUT)).is_ok();
@@ -598,24 +853,53 @@ fn answer(stream: TcpStream, body: &impl Fn() -> String) -> Answered {
     }
     // The rest of the head, to its blank line, so the close does not reset
     // the connection over unread bytes; bounded by the same limit.
+    // The token offered, if any: the last `Authorization: Bearer` header.
+    let mut offered: Option<Vec<u8>> = None;
     let mut header = String::new();
     while matches!(reader.read_line(&mut header), Ok(read) if read > 0)
         && !matches!(header.as_str(), "\r\n" | "\n")
     {
+        if let Some((name, value)) = header.split_once(':')
+            && name.trim().eq_ignore_ascii_case("authorization")
+        {
+            let value = value.trim();
+            offered = value
+                .get(..7)
+                .filter(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+                .and_then(|_| value.get(7..))
+                .map(|token| token.trim().as_bytes().to_vec());
+        }
         header.clear();
     }
     let mut words = line.split_whitespace();
-    let (status, answered, content) = match (words.next(), words.next(), words.next()) {
-        (Some("GET"), Some("/metrics"), Some(version)) if version.starts_with("HTTP/1.") => {
+    let request = (words.next(), words.next(), words.next(), words.next());
+    let authorized = token.is_none_or(|token| offered.as_deref().is_some_and(|o| token.matches(o)));
+    let (status, answered, content) = match request {
+        (Some(_), Some(_), Some(version), None) if !version.starts_with("HTTP/1.") => (
+            "400 Bad Request",
+            Answered::Refused,
+            "bad request\n".to_owned(),
+        ),
+        (Some("GET"), Some("/metrics"), Some(_), None) if authorized => {
             ("200 OK", Answered::Metrics, body())
         }
-        (Some("GET"), Some(_), Some(_)) => {
+        (Some("GET"), Some("/metrics"), Some(_), None) => (
+            "401 Unauthorized",
+            Answered::Unauthorized,
+            "a bearer token is required\n".to_owned(),
+        ),
+        (Some("GET"), Some(_), Some(_), None) => {
             ("404 Not Found", Answered::Refused, "not found\n".to_owned())
         }
-        _ => (
+        (Some(_), Some(_), Some(_), None) => (
             "405 Method Not Allowed",
             Answered::Refused,
             "only GET /metrics\n".to_owned(),
+        ),
+        _ => (
+            "400 Bad Request",
+            Answered::Refused,
+            "bad request\n".to_owned(),
         ),
     };
     let content_type = if answered == Answered::Metrics {
@@ -623,8 +907,13 @@ fn answer(stream: TcpStream, body: &impl Fn() -> String) -> Answered {
     } else {
         "text/plain; charset=utf-8"
     };
+    let challenge = if answered == Answered::Unauthorized {
+        "WWW-Authenticate: Bearer\r\n"
+    } else {
+        ""
+    };
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{challenge}Connection: close\r\n\r\n",
         content.len()
     );
     let mut stream = stream;
