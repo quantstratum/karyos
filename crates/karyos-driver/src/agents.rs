@@ -176,7 +176,10 @@ pub const MAX_PATH_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 /// failed close (#838, #849; QS-COORDINATOR): a kernel backend shows no
 /// progress on frames it holds until it sends them, possibly over many
 /// cycles, so a cycle count would fail closes that are only slow. Past
-/// this, the endpoint's standing reset frees what is left.
+/// this, the endpoint's standing reset frees what is left. In
+/// nanoseconds of the driver clock. Its cost: each entry still in flight
+/// is closed again once per sender duty for at most this long, one
+/// `close_queue` per queue and one `remove_route` call each, no syscall.
 pub const CLOSE_IN_FLIGHT_TIMEOUT: u64 = 1_000_000_000;
 
 /// The bytes the receiver's path queues allocate for `config`; `None` past

@@ -33,7 +33,8 @@
     failed only on a close error or after `CLOSE_IN_FLIGHT_TIMEOUT` (1 s)
     in flight (`removed_close_timeouts`): a kernel backend shows no
     progress on frames it holds, so a cycle count would fail closes that
-    are only slow; one
+    are only slow. One that finds no room to wait stays in the close
+    list for the next duty (`removed_close_overflow`), never failed; one
     with a live handle the endpoint will not close is counted once
     (`removed_close_failed`). When that endpoint then refuses a route or
     a queue for its limit (`RouteLimit`, `QueueLimit`, `OverCommitted`),

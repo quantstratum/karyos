@@ -391,8 +391,9 @@ pub struct SenderCounters {
     pub removed_dropped: u64,
     /// Entries of the close list (a route and its queues) with a live
     /// handle the endpoint would not close, each counted once; a handle
-    /// already gone counts as closed, and one with frames in flight gets
-    /// one more duty first. When the endpoint then refuses a route or a
+    /// already gone counts as closed, and one with frames in flight is
+    /// closed again at each duty, failing only on a close error or after
+    /// [`super::CLOSE_IN_FLIGHT_TIMEOUT`]. When the endpoint then refuses a route or a
     /// queue for its limit in the same epoch, its reset is asked for once,
     /// tagged with that epoch (the endpoint table keeps it and serves it in
     /// that epoch): the new epoch drops them.
@@ -406,6 +407,9 @@ pub struct SenderCounters {
     /// Of those, the ones still in flight after
     /// [`super::CLOSE_IN_FLIGHT_TIMEOUT`]: counted as failed closes.
     pub removed_close_timeouts: u64,
+    /// Duties at which an entry in flight found `closing_again` full and
+    /// stayed in the close list for the next duty: never a failure.
+    pub removed_close_overflow: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -553,7 +557,8 @@ struct EndpointCloses {
 enum EntryClosed {
     /// Every handle closed, or was gone already.
     Done,
-    /// A queue still has frames in flight: tried once more next duty.
+    /// A queue still has frames in flight: closed again at each duty, up
+    /// to [`super::CLOSE_IN_FLIGHT_TIMEOUT`].
     InFlight,
     /// A live handle did not close.
     Failed,
@@ -5073,7 +5078,8 @@ impl<T: StreamTerms> SenderRole<T> {
         let mut index = 0;
         while let Some((mut opened, since)) = self.closing_again.get(index).copied() {
             let outcome = self.close_entry(halves, &mut opened);
-            let late = now < since || age_ns(now, since) >= super::CLOSE_IN_FLIGHT_TIMEOUT;
+            // A clock behind `since` counts as no time elapsed (`age_ns`).
+            let late = age_ns(now, since) >= super::CLOSE_IN_FLIGHT_TIMEOUT;
             match outcome {
                 EntryClosed::Done => {
                     self.closing_again.swap_remove(index);
@@ -5093,18 +5099,35 @@ impl<T: StreamTerms> SenderRole<T> {
                 }
             }
         }
-        while let Some(mut opened) = self.closing.pop() {
+        // New entries: closed, they go; in flight, they wait in
+        // `closing_again`; a close error fails them, once, and the endpoint
+        // is reset when what did not close holds it at its limit. With
+        // `closing_again` full (it holds every route a removal can leave,
+        // so only removals faster than one bound can fill it), an entry in
+        // flight stays in the close list for the next duty, counted, never
+        // failed for want of room.
+        let mut index = 0;
+        while let Some(mut opened) = self.closing.get(index).copied() {
             match self.close_entry(halves, &mut opened) {
-                EntryClosed::Done => {}
+                EntryClosed::Done => {
+                    self.closing.swap_remove(index);
+                }
                 EntryClosed::InFlight
                     if self.closing_again.len() < self.closing_again.capacity() =>
                 {
                     self.count(|c| &mut c.removed_close_deferred);
+                    self.closing.swap_remove(index);
                     self.closing_again.push((opened, now));
                 }
-                // Once per entry, no retry: the endpoint is reset when
-                // what did not close holds it at its limit.
-                EntryClosed::InFlight | EntryClosed::Failed => {
+                EntryClosed::InFlight => {
+                    self.count(|c| &mut c.removed_close_overflow);
+                    if let Some(slot) = self.closing.get_mut(index) {
+                        *slot = opened;
+                    }
+                    index += 1;
+                }
+                EntryClosed::Failed => {
+                    self.closing.swap_remove(index);
                     self.close_failed(opened.endpoint, opened.epoch);
                 }
             }
