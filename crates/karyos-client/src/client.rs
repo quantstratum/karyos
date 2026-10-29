@@ -513,6 +513,12 @@ pub trait Connection: sealed::Sealed {
     /// The term storage of its handles.
     type Terms: TermBytes;
 
+    /// Drains, without waiting, what this connection left behind on a
+    /// timeout: a remote client's abandoned fetches (karyos#851). Nothing
+    /// for an in-process conductor.
+    #[doc(hidden)]
+    fn drain_abandoned(&mut self) {}
+
     #[doc(hidden)]
     fn add_network_publication(&mut self, uri: &str, stream_id: i32)
     -> Result<u64, ConductorError>;
@@ -864,6 +870,10 @@ impl sealed::Sealed for crate::ipc::RemoteClient {}
 impl Connection for crate::ipc::RemoteClient {
     type Terms = karyos_sys::term_bytes::SharedTerms;
 
+    fn drain_abandoned(&mut self) {
+        crate::ipc::RemoteClient::drain_abandoned(self);
+    }
+
     fn add_network_publication(
         &mut self,
         uri: &str,
@@ -1051,13 +1061,16 @@ impl Connection for crate::ipc::RemoteClient {
                             let _ = self.release_publication(publication);
                             true
                         }
-                        Err(_) => false,
+                        Err(error) => abandoned(&error) && self.remove_abandoned(&fetchable),
                     }
                 }
                 // Taken and dropped: it detaches its export, and its
                 // registration ends with the client.
                 crate::conductor::Request::ConcurrentPublication { .. } => {
-                    self.take_concurrent_publication(&fetchable).is_ok()
+                    match self.take_concurrent_publication(&fetchable) {
+                        Ok(_) => true,
+                        Err(error) => abandoned(&error) && self.remove_abandoned(&fetchable),
+                    }
                 }
                 crate::conductor::Request::Subscription { .. } => {
                     match self.take_subscription(&fetchable) {
@@ -1066,7 +1079,7 @@ impl Connection for crate::ipc::RemoteClient {
                             let _ = self.release_subscription(subscription);
                             true
                         }
-                        Err(_) => false,
+                        Err(error) => abandoned(&error) && self.remove_abandoned(&fetchable),
                     }
                 }
                 _ => false,
@@ -1086,6 +1099,16 @@ impl Connection for crate::ipc::RemoteClient {
             _ => false,
         }
     }
+}
+
+/// Whether a late grant's take failed only because its fetch timed out: the
+/// fetch is then abandoned, and its reply is drained at the next poll
+/// (`Connection::drain_abandoned`), which detaches what it exported; the
+/// caller removes its registration, so the grant is released all the same
+/// (karyos#851).
+#[cfg(target_os = "linux")]
+fn abandoned(error: &crate::ipc::AttachError) -> bool {
+    matches!(error, crate::ipc::AttachError::Timeout)
 }
 
 /// The error of an outcome that is not the grant asked for.
@@ -1873,6 +1896,7 @@ impl<C: Connection> Client<C> {
     /// Serves the connection once; returns whether anything was served and
     /// the completion of `wanted`, when it arrived.
     fn service(&mut self, wanted: Option<u64>) -> (bool, Option<Found<C::Terms>>) {
+        self.connection.drain_abandoned();
         self.serve_targets();
         let mut completions = core::mem::take(&mut self.completions);
         let mut events = core::mem::take(&mut self.events);

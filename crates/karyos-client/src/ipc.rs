@@ -795,6 +795,37 @@ pub fn attach_with(
 }
 
 impl RemoteClient {
+    /// Drains, without waiting, the replies of fetches this client
+    /// abandoned on a timeout (karyos#851): what they exported is detached
+    /// at once. `Client::poll` calls it.
+    pub fn drain_abandoned(&self) {
+        if let Some(session) = &self.session {
+            drain_abandoned(session);
+        }
+    }
+
+    /// Removes the registration of a late grant whose take timed out
+    /// (karyos#851): its fetch is abandoned and drained at the next poll,
+    /// which detaches its export, and this ends the publication or
+    /// subscription itself, as a release of the taken handle would.
+    /// Whether the removal was submitted.
+    pub(crate) fn remove_abandoned(&mut self, fetchable: &crate::conductor::Fetchable) -> bool {
+        let registration = fetchable.registration;
+        let Ok(conductor) = self.conductor_mut() else {
+            return false;
+        };
+        match fetchable.request {
+            crate::conductor::Request::Publication { .. }
+            | crate::conductor::Request::ConcurrentPublication { .. } => conductor
+                .remove_publication_registration(registration)
+                .is_ok(),
+            crate::conductor::Request::Subscription { .. } => conductor
+                .remove_subscription_registration(registration)
+                .is_ok(),
+            _ => false,
+        }
+    }
+
     /// The admission socket while it is open: the transport of fetches.
     /// Test hook for raw admission messages.
     #[doc(hidden)]
@@ -1949,30 +1980,8 @@ fn fetch_descriptor(
         };
         // A reply to an abandoned fetch, late: discarded, its regions
         // drained and their exports detached, and the wait goes on.
-        let late = match &received.0 {
-            Message::Manifest { fetch: got, .. } | Message::Refused { fetch: got, .. } => {
-                let mut state = session.state();
-                let at = state
-                    .abandoned
-                    .iter()
-                    .position(|abandoned| abandoned == got);
-                at.map(|at| state.abandoned.swap_remove(at)).is_some()
-            }
-            _ => false,
-        };
-        if !late {
+        if !drain_late(session, &received) {
             break received;
-        }
-        if let (
-            Message::Manifest {
-                fetch: got,
-                records,
-                ..
-            },
-            None,
-        ) = &received
-        {
-            abort(session, *got, records);
         }
     };
     let (records, stream_registration, incarnation, base) = match manifest {
@@ -2062,6 +2071,65 @@ fn fetch_descriptor(
         base,
         binding: parts.collect(),
     })
+}
+
+/// Drains `received` when it is the reply to a fetch the session
+/// abandoned (karyos#851): a `Refused` is discarded, a `Manifest`'s regions
+/// are received and closed and their exports detached. Whether it was one.
+fn drain_late(session: &Session, received: &(Message, Option<OwnedFd>)) -> bool {
+    let late = match &received.0 {
+        Message::Manifest { fetch: got, .. } | Message::Refused { fetch: got, .. } => {
+            let mut state = session.state();
+            let at = state
+                .abandoned
+                .iter()
+                .position(|abandoned| abandoned == got);
+            at.map(|at| state.abandoned.swap_remove(at)).is_some()
+        }
+        _ => false,
+    };
+    if late
+        && let (
+            Message::Manifest {
+                fetch: got,
+                records,
+                ..
+            },
+            None,
+        ) = received
+    {
+        abort(session, *got, records);
+    }
+    late
+}
+
+/// Drains, without waiting, the replies of fetches the session abandoned
+/// that have arrived (karyos#851), so what they exported is detached at
+/// the client's next poll instead of at its next fetch. A message that is
+/// not such a reply leaves the session out of step.
+fn drain_abandoned(session: &Session) {
+    let _exchange = session
+        .fetching
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    loop {
+        {
+            let state = session.state();
+            if state.broken || state.abandoned.is_empty() {
+                return;
+            }
+        }
+        if !ipc::readable(session.socket.as_fd()).unwrap_or(false) {
+            return;
+        }
+        match receive(&session.socket) {
+            Ok(received) if drain_late(session, &received) => {}
+            _ => {
+                session.state().broken = true;
+                return;
+            }
+        }
+    }
 }
 
 /// Receives and discards the regions of an aborted fetch, detaching each
@@ -2302,6 +2370,55 @@ mod tests {
                 Message::Detach { export: 12 },
             ]
         );
+    }
+
+    /// karyos#851: the late reply of an abandoned fetch is drained at the
+    /// client's next poll (`drain_abandoned`), with no fetch of its own:
+    /// its exports detached at once, nothing held until a later fetch.
+    #[test]
+    fn an_abandoned_fetch_is_drained_without_a_new_fetch() {
+        let (session, peer) = timed_session(Duration::from_millis(20));
+        assert!(matches!(
+            fetch_descriptor(&session, 7, 7, WireKind::LogBuffer),
+            Err(AttachError::Timeout)
+        ));
+        // Nothing arrived yet: nothing to drain, nothing broken.
+        drain_abandoned(&session);
+        assert_eq!(session.state().abandoned, [1]);
+        let record = Record {
+            region: 9,
+            export: 11,
+            kind: WireKind::LogBuffer,
+            layout: 1,
+            structure_length: 4096,
+            generation: 2,
+            stream_id: 2,
+            session_id: 1,
+            lane: 0,
+            capability: Capability::None,
+            allow_unconnected: false,
+        };
+        let manifest = Message::Manifest {
+            fetch: 1,
+            key: 7,
+            registration: 7,
+            stream_registration: 7,
+            incarnation: 1,
+            base: 0,
+            records: vec![record],
+        };
+        send(&peer, &manifest, None).unwrap();
+        let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        send(&peer, &Message::Region { fetch: 1, index: 0 }, Some(&fd)).unwrap();
+        drain_abandoned(&session);
+        assert!(session.state().abandoned.is_empty());
+        assert!(!session.state().broken);
+        assert!(session.state().live.is_empty());
+        assert_eq!(
+            receive(&peer).unwrap().0,
+            Message::Fetch { fetch: 1, key: 7 }
+        );
+        assert_eq!(receive(&peer).unwrap().0, Message::Detach { export: 11 });
     }
 
     /// karyos#851: at most `MAX_ABANDONED` fetches are abandoned at once;
