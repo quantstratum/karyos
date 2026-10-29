@@ -116,15 +116,22 @@ pub struct GuardBinding {
     /// policy published later, a rateless lane's publication getting one,
     /// gives the handle its copy at its next call.
     pending_rate: Option<RateWatch>,
+    /// How a copy made at bind starts: full, or empty for a reincarnation
+    /// ([`Self::reincarnated_at`]).
+    bind_bucket: Bucket,
 }
 
 /// How a handle's rate copy starts: full when the handle binds to a policy
 /// in force, read whole at bind, as a lane guarded with it; empty when it
-/// takes one later, which never grants tokens (R-CORE-21).
+/// takes one later, which never grants tokens, or binds to a reincarnation,
+/// whose gate starts empty (R-CORE-21).
 #[derive(Debug, Clone, Copy)]
 enum Bucket {
     Full,
     Empty,
+    /// Empty at the reincarnation's start, host monotonic nanoseconds,
+    /// refilled from then on, as its gate.
+    EmptySince(u64),
 }
 
 /// A handle's watch of its ring for a published policy: the clock to make
@@ -186,6 +193,7 @@ impl GuardBinding {
             released: 0,
             rate: None,
             pending_rate: None,
+            bind_bucket: Bucket::Full,
         })
     }
 
@@ -210,7 +218,25 @@ impl GuardBinding {
     /// seal before the copy is asked.
     #[must_use]
     pub fn with_rate(mut self, policy: RatePolicy, clock: fn() -> u64) -> Self {
-        self.set_rate(policy, clock, 0, None, Bucket::Full);
+        self.set_rate(policy, clock, 0, None, self.bind_bucket);
+        self
+    }
+
+    /// Binds to a reincarnation of its publication (an incarnation past the
+    /// first) that began at `at`, host monotonic nanoseconds (the ring's
+    /// `REINCARNATED_AT` word): a rate copy made at bind starts empty at
+    /// `at` and has earned since, as the reincarnation's sender gate has,
+    /// so reincarnating buys no new burst and a handle bound later is not
+    /// stricter than the gate (R-CORE-21). `at` 0 (unknown) starts it
+    /// empty now. Call it before [`Self::with_rate`] or
+    /// [`Self::with_published_rate`]; a copy already made keeps its level.
+    #[must_use]
+    pub fn reincarnated_at(mut self, at: u64) -> Self {
+        self.bind_bucket = if at == 0 {
+            Bucket::Empty
+        } else {
+            Bucket::EmptySince(at)
+        };
         self
     }
 
@@ -231,6 +257,11 @@ impl GuardBinding {
         let limiter = match bucket {
             Bucket::Full => RateLimiter::new(messages, clock()),
             Bucket::Empty => RateLimiter::empty(messages, clock()),
+            Bucket::EmptySince(at) => {
+                let mut limiter = RateLimiter::empty(messages, at);
+                limiter.refill_at(clock());
+                limiter
+            }
         };
         self.rate = Some(RateCopy {
             limiter,
@@ -253,7 +284,7 @@ impl GuardBinding {
     pub fn with_published_rate(mut self, clock: fn() -> u64) -> Self {
         // A publication in progress is short: a few reads see it whole.
         for _ in 0..8 {
-            if self.adopt_published(clock, Bucket::Full)
+            if self.adopt_published(clock, self.bind_bucket)
                 || self.pending_rate.is_some_and(|watch| watch.seen.is_some())
             {
                 return self;

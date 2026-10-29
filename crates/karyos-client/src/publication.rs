@@ -1700,6 +1700,20 @@ mod tests {
             assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
         }
 
+        /// The #852 review: a handle bound to a reincarnation whose start
+        /// is unknown (the ring's word 0, a driver that predates it)
+        /// starts its copy empty, never full.
+        #[test]
+        fn an_unknown_reincarnation_starts_empty() {
+            let (_driver, mut publication) = guarded_by(|binding, _| {
+                binding
+                    .reincarnated_at(0)
+                    .with_rate(messages_per_second(1, 10), now)
+            });
+            assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
+            assert_eq!(publication.offer(b"a").unwrap(), OfferOutcome::RateLimited);
+        }
+
         /// G-e3 (ACS 15347): a claim that will never be sent gives its
         /// token back: dropped, aborted, or aborted by its deadline before
         /// the commit; an accepted commit keeps it.

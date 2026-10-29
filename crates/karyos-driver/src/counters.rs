@@ -26,6 +26,7 @@
 //! | `clients admitted` | event | clients admitted by `connect` |
 //! | `clients retired` | event | admission slots released (close flag observed) |
 //! | `clients faulty` | event | clients retired for a protocol violation, at the first retirement |
+//! | `fetches abandoned at leave` | event | remote clients that left with a fetch outstanding (one it abandoned, or exports not detached): a clean leave, their exports charged until the exit proof (karyos#851) |
 //! | `commands served` | event | commands decoded and executed or refused; malformed records are not commands |
 //! | `commands refused` | event | served commands answered with an `Error` |
 //! | `responses sent` | event | responses written to the broadcast buffer |
@@ -94,14 +95,15 @@
 //! keyed by its stream's registration (key0; lane, kind and participant
 //! 0) and written the same way by its agent. Publication: `network frames
 //! sent`, `network bytes sent`, `network retransmits`, `network naks
-//! received`. Image: `network naks sent`, `network losses`, `network
+//! received`, `network admission` (a gauge) and `network rate policies
+//! refused`. Image: `network naks sent`, `network losses`, `network
 //! repaired`. They are allocated all or none with the publication, or
 //! once the image is installed and exposed; when the region has no room
 //! for the whole group, `counters unavailable` counts one and the stream
 //! runs without cells, never retried. They are freed when the publication
 //! is removed, the image retires or the network closes; cells still in
 //! flight to the receiver at the close are left pending release, which
-//! the allocator reuses. Size the region for 4 cells per network
+//! the allocator reuses. Size the region for 6 cells per network
 //! publication and 3 per image on top of the rest.
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,
@@ -149,7 +151,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 73] = [
+const LABELS: [(u64, &str); 74] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -223,6 +225,7 @@ const LABELS: [(u64, &str); 73] = [
     (TYPE_EVENTS, "admission messages dropped at exit"),
     (TYPE_EVENTS, "admission messages not sent at exit"),
     (TYPE_EVENTS, "clients closed before their exit"),
+    (TYPE_EVENTS, "fetches abandoned at leave"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -443,12 +446,21 @@ pub(crate) enum Event {
     /// exit proof: drained, then retired like a faulty client but not
     /// counted as one, since a dying process closes its socket first
     /// (karyos#827). One with no exit proof within `fetch_deadline` is
-    /// then counted in `ClientsFaulty` as well. Last, so no other counter's id moves.
+    /// then counted in `ClientsFaulty` as well.
     #[cfg_attr(
         not(target_os = "linux"),
         allow(dead_code, reason = "admission is served only on Linux")
     )]
     ClientsClosedBeforeExit,
+    /// Remote clients that left with a fetch outstanding: a fetch whose
+    /// reply they abandoned, or exports not detached. A clean leave, not a
+    /// fault; what was exported stays charged until the exit proof
+    /// (karyos#851). Last, so no other counter's id moves.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "remote clients exist on Linux only")
+    )]
+    FetchesAbandonedAtLeave,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -753,6 +765,7 @@ mod tests {
                 Event::ClientsClosedBeforeExit,
                 "clients closed before their exit",
             ),
+            (Event::FetchesAbandonedAtLeave, "fetches abandoned at leave"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

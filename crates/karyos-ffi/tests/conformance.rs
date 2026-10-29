@@ -42,8 +42,9 @@ const MINIMUM_ABI: [u32; 3] = [0, 1, 3];
 /// Versions): a runner offers one only on a library at its floor or
 /// later, and declares it absent otherwise, so the rest of the suite still
 /// runs. `embedded-network` needs 0.1.4's `karyos_driver_options.network`
-/// (karyos#735).
-const FEATURE_ABI: [(&str, [u32; 3]); 1] = [("embedded-network", [0, 1, 4])];
+/// (karyos#735), and `stream-cap` 0.1.5's `max_stream_bytes` (karyos#818).
+const FEATURE_ABI: [(&str, [u32; 3]); 2] =
+    [("embedded-network", [0, 1, 4]), ("stream-cap", [0, 1, 5])];
 
 /// Whether a library of ABI `library` has what `feature` needs: its
 /// floor in [`FEATURE_ABI`], or the suite's.
@@ -92,7 +93,7 @@ fn test_port() -> u16 {
 const STEPS: [&str; 6] = ["B0", "B1", "B2", "B3", "B4", "B5"];
 
 /// The features a format 2 scenario may need (FORMAT.md, Features).
-const FEATURES: [&str; 11] = [
+const FEATURES: [&str; 12] = [
     "archive-replay",
     "claim-retry",
     "concurrent-publication",
@@ -103,6 +104,7 @@ const FEATURES: [&str; 11] = [
     "image-wait",
     "incompatible-driver",
     "remote-driver",
+    "stream-cap",
     "tai-clock",
 ];
 
@@ -183,6 +185,14 @@ const OPS: &[Op] = &[
         &[],
         &["driver"],
         &["embedded-driver", "embedded-network"],
+    ),
+    // An embedded driver with a stream cap (karyos#818; ABI 0.1.5).
+    op(
+        "driver.create_capped",
+        &["max_stream_bytes"],
+        &[],
+        &["driver"],
+        &["embedded-driver", "stream-cap"],
     ),
     op(
         "driver.add_stream",
@@ -616,12 +626,18 @@ fn check_op(step: &Step, features: &BTreeSet<String>, names: &BTreeSet<String>, 
                 status, "invalid_handle",
                 "{at}: `invalid_handle` is no op outcome"
             );
-            // Only an Archive's refusal carries a result: its code.
+            // Only an Archive's refusal carries a result, its code, and a
+            // stream's refusal its detail (karyos#818).
             let code_only = status == "refused"
                 && ARCHIVE_REFUSALS.contains(&op.name)
                 && step.results.keys().all(|name| name == "code");
+            let detail = op.name == "driver.add_stream"
+                && step
+                    .results
+                    .keys()
+                    .all(|name| name == "code" || name == "value");
             assert!(
-                step.results.is_empty() || code_only,
+                step.results.is_empty() || code_only || detail,
                 "{at}: a status expects no results"
             );
         }
@@ -2565,6 +2581,8 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
     assert!(suite_runs_on([0, 1, 4]));
     assert!(!feature_runs_on("embedded-network", [0, 1, 3]));
     assert!(feature_runs_on("embedded-network", [0, 1, 4]));
+    assert!(!feature_runs_on("stream-cap", [0, 1, 4]));
+    assert!(feature_runs_on("stream-cap", [0, 1, 5]));
     assert!(feature_runs_on("conflation", [0, 1, 3]));
     assert!(suite_runs_on([0, 1, 7]));
     assert!(!suite_runs_on([0, 2, 0]));
@@ -2584,6 +2602,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
             "image-wait",
             "incompatible-driver",
             "remote-driver",
+            "stream-cap",
             "tai-clock",
         ],
     );
@@ -2591,7 +2610,7 @@ fn a_scenario_is_skipped_unsupported_or_later_but_never_passed_by_default() {
         b1.declaration(),
         "step B1 offers embedded-driver absent archive-replay claim-retry concurrent-publication \
          conflation embedded-network guarded-publication image-wait incompatible-driver \
-         remote-driver tai-clock"
+         remote-driver stream-cap tai-clock"
     );
     assert_eq!(
         run(&scenario((0, 1), Some(3), None), (0, 1), &b1),

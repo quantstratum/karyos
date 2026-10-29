@@ -1298,6 +1298,20 @@ fn waiting_reincarnation(
     crate::embedded::StreamHandle,
     UdpSocket,
 ) {
+    waiting_reincarnation_with(driver, None)
+}
+
+/// [`waiting_reincarnation`] of a publication guarded with `rate`.
+fn waiting_reincarnation_with(
+    driver: &mut EmbeddedDriver,
+    rate: Option<crate::guards::GuardRate>,
+) -> (
+    AggregateHandle,
+    crate::guards::GuardHandle,
+    u64,
+    crate::embedded::StreamHandle,
+    UdpSocket,
+) {
     use karyos_sys::guard::Closed;
     use karyos_sys::log_buffer::SealReason;
 
@@ -1315,7 +1329,7 @@ fn waiting_reincarnation(
             NetworkGuard {
                 guard,
                 messages: 2,
-                rate: None,
+                rate,
             },
         )
         .unwrap();
@@ -1995,6 +2009,104 @@ fn a_reincarnation_draws_its_own_initial_term_id() {
             Some(pin) => assert_eq!((first.get(), second.get()), (pin, pin)),
         }
     }
+}
+
+/// #841 review, points 1 and 3: a reincarnation of a publication guarded
+/// with a rate starts its sender gate's bucket empty and its new handle's
+/// copy empty too, where the first incarnation's started full, so
+/// reincarnating buys no new burst and the two agree.
+#[test]
+fn a_reincarnation_starts_its_gate_and_handle_empty() {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let rate = crate::guards::GuardRate::publication(RatePolicy {
+        messages: Rate {
+            per_second: 1,
+            burst: 4,
+        },
+        bytes: None,
+    });
+    let mut driver = reincarnating_driver(20_000_000, 64);
+    let (_handle, guard, epoch, lane, _socket) =
+        waiting_reincarnation_with(&mut driver, Some(rate));
+    let mut taken = None;
+    until(&mut driver, |driver| match driver.publication(lane) {
+        Err(DriverError::QuarantinedAlias { .. }) => false,
+        other => {
+            taken = Some(other);
+            true
+        }
+    });
+    let publication = taken.unwrap().unwrap();
+    assert_eq!(publication.guard().unwrap().rate_tokens(), Some(0));
+    // The reincarnation's gate, once its sender serves it: started empty,
+    // so below the burst of 4 a full one would hold (at one a second, a
+    // loaded run earns a token or so meanwhile, never the burst).
+    until(&mut driver, |driver| {
+        let gates = driver.net.as_ref().unwrap().gate_message_tokens();
+        gates
+            .iter()
+            .any(|tokens| tokens.is_some_and(|tokens| tokens < 4))
+            && !gates.contains(&Some(4))
+    });
+    // The #855 review: the gate starts from the stream's reincarnation
+    // time, not from when its agent takes the guard. At ten a second, a
+    // second reincarnation stamped 400 ms before it happens has earned the
+    // burst of 4, on the gate as on the handle, as soon as the gate is
+    // built; stamped when its agent took the guard, the gate would hold
+    // nothing then.
+    assert_eq!(
+        driver.change_rate_policy(
+            lane,
+            1,
+            RatePolicy {
+                messages: Rate {
+                    per_second: 10,
+                    burst: 4,
+                },
+                bytes: None,
+            },
+            (crate::guards::RateAuthority::Administrator, 1),
+        ),
+        Ok(2)
+    );
+    let karyos_sys::guard::Closed::Now { epoch } = driver.close_guard(guard, epoch).unwrap() else {
+        panic!("not closed");
+    };
+    drop(publication);
+    until(&mut driver, |driver| {
+        driver.seal_reason(lane) == Ok(Some(karyos_sys::log_buffer::SealReason::GuardClosed))
+    });
+    // The process's host clock is past 400 ms before the stamp.
+    std::thread::sleep(std::time::Duration::from_millis(450));
+    driver
+        .backdate_next_reincarnation(lane, 400_000_000)
+        .unwrap();
+    let _ = driver.reopen_guard(guard, epoch, epoch).unwrap();
+    let mut again = None;
+    until(&mut driver, |driver| match driver.publication(lane) {
+        Err(DriverError::GuardSealed { .. } | DriverError::QuarantinedAlias { .. }) => false,
+        other => {
+            again = Some(other);
+            true
+        }
+    });
+    let again = again.unwrap().unwrap();
+    assert_eq!(again.guard().unwrap().rate_tokens(), Some(4));
+    // The gate as soon as its sender holds it: the burst already.
+    let mut first = None;
+    until(&mut driver, |driver| {
+        first = driver
+            .net
+            .as_ref()
+            .unwrap()
+            .gate_message_tokens()
+            .into_iter()
+            .flatten()
+            .next();
+        first.is_some()
+    });
+    assert_eq!(first, Some(4));
 }
 
 /// P2.11 PR1: what a timed network publication's software route does

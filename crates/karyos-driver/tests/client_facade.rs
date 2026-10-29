@@ -232,7 +232,11 @@ fn a_network_subscription_reports_its_bound_address() {
 }
 
 /// Two images are polled in turn under one limit, starting after the
-/// image the last poll ended at, so neither starves.
+/// image the last poll ended at, so neither starves. A second subscription
+/// of the channel witnesses that both images hold every message before the
+/// first is read one at a time (plan 167, karyos#853): under load, an
+/// image's datagrams may arrive after the reads begin, and the first reads
+/// then rightly take the only image with data.
 #[test]
 fn a_network_subscription_polls_its_images_in_turn() {
     let (_a, mut a) = driven(2, None);
@@ -247,6 +251,12 @@ fn a_network_subscription_polls_its_images_in_turn() {
             StreamId::new(8),
         )
         .unwrap();
+    let mut witness = subscriber
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(8),
+        )
+        .unwrap();
     let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1");
     let mut one = first
         .add_exclusive_publication(&uri, StreamId::new(8))
@@ -256,7 +266,8 @@ fn a_network_subscription_polls_its_images_in_turn() {
         .unwrap();
     until(&mut [&mut subscriber, &mut first, &mut second], || {
         let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
-        reading.image_count() == 2
+        let _ = witness.poll(|_, _| {}, MessageLimit::new(0));
+        reading.image_count() == 2 && witness.image_count() == 2
     });
     // Each image holds messages of its publication only.
     let mut offered = [0u32; 2];
@@ -272,8 +283,22 @@ fn a_network_subscription_polls_its_images_in_turn() {
             }
         }
     }
-    // Wait until both images have messages to read, then read one at a
-    // time: the images alternate.
+    // Wait until both images hold every message: the witness reads all
+    // 16, 8 of each publication.
+    let mut witnessed = [0u32; 2];
+    let start = Instant::now();
+    while witnessed != [8, 8] {
+        assert!(start.elapsed() < Duration::from_secs(20), "{witnessed:?}");
+        let _ = (first.poll(), second.poll(), subscriber.poll());
+        let _ = witness
+            .poll(
+                |bytes, _| witnessed[usize::from(bytes[0] == b'2')] += 1,
+                MessageLimit::new(16),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Then read one at a time: the images alternate.
     let mut seen: Vec<u8> = Vec::new();
     let start = Instant::now();
     while seen.len() < 16 {
@@ -1080,6 +1105,36 @@ mod remote {
         ));
     }
 
+    /// Plan 166 (karyos#851): `Client::connect` waits the attach timeout,
+    /// not the control call's: with the driver paused past a 50 ms call
+    /// timeout, a 10 s attach timeout attaches once the driver resumes, and
+    /// one left at 50 ms does not. Once attached, the session's socket waits
+    /// the 50 ms call timeout, so a fetch still expires at 50 ms.
+    #[test]
+    fn connect_waits_the_attach_timeout_and_fetches_the_call_timeout() {
+        let (_driver, dir, paused) = ipc_driver_with("attach-timeout", 1, DriverConfig::default());
+        let call = Duration::from_millis(50);
+        paused.hold();
+        assert!(matches!(
+            karyos_client::ipc::attach_with(&dir, call, call, 4).err(),
+            Some(karyos_client::ipc::AttachError::Timeout)
+        ));
+        let resume = paused.clone();
+        let resumer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            resume.resume();
+        });
+        let remote =
+            karyos_client::ipc::attach_with(&dir, Duration::from_secs(10), call, 4).unwrap();
+        resumer.join().unwrap();
+        let socket = remote.admission_socket().unwrap();
+        assert_eq!(
+            karyos_sys::ipc::receive_timeout(socket).unwrap(),
+            Some(call),
+            "the session's fetches wait the call timeout"
+        );
+    }
+
     /// A remote publication grant that arrives after its request timed out
     /// is taken and removed at once: a `karyos:udp` publication the client
     /// created by URI ends, so with room for one owned network resource
@@ -1102,6 +1157,11 @@ mod remote {
                 .dir(&dir)
                 .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
                 .timeout(Duration::from_millis(50))
+                // 50 ms is for the paused request to time out; the attach
+                // is the setup and waits as a client's would: under load,
+                // 50 ms timed it out (plan 166). The session's fetches keep
+                // the 50 ms.
+                .attach_timeout(karyos_client::DEFAULT_TIMEOUT)
                 .build()
                 .unwrap(),
         )
@@ -1151,6 +1211,11 @@ mod remote {
                 .dir(&dir)
                 .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
                 .timeout(Duration::from_millis(50))
+                // 50 ms is for the paused request to time out; the attach
+                // is the setup and waits as a client's would: under load,
+                // 50 ms timed it out (plan 166). The session's fetches keep
+                // the 50 ms.
+                .attach_timeout(karyos_client::DEFAULT_TIMEOUT)
                 .build()
                 .unwrap(),
         )
@@ -1296,6 +1361,11 @@ mod remote {
                 .dir(&dir)
                 .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
                 .timeout(Duration::from_millis(50))
+                // 50 ms is for the paused request to time out; the attach
+                // is the setup and waits as a client's would: under load,
+                // 50 ms timed it out (plan 166). The session's fetches keep
+                // the 50 ms.
+                .attach_timeout(karyos_client::DEFAULT_TIMEOUT)
                 .build()
                 .unwrap(),
         )

@@ -171,6 +171,17 @@ const CONTROL_FLOOR: usize = 32;
 /// `sessions.max_paths × path_queue_datagrams × MAX_DATAGRAM`.
 pub const MAX_PATH_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 
+/// How long a removed route or queue may stay closing with frames in
+/// flight, from the first duty that found it so, before it counts as a
+/// failed close (#838, #849; QS-COORDINATOR): a kernel backend shows no
+/// progress on frames it holds until it sends them, possibly over many
+/// cycles, so a cycle count would fail closes that are only slow. Past
+/// this, the endpoint's standing reset frees what is left. In
+/// nanoseconds of the driver clock. Its cost: each entry still in flight
+/// is closed again once per sender duty for at most this long, one
+/// `close_queue` per queue and one `remove_route` call each, no syscall.
+pub const CLOSE_IN_FLIGHT_TIMEOUT: u64 = 1_000_000_000;
+
 /// The bytes the receiver's path queues allocate for `config`; `None` past
 /// `usize`.
 pub(crate) fn path_queue_bytes(config: &AgentConfig) -> Option<usize> {
@@ -209,10 +220,12 @@ pub struct AgentConfig {
     /// (driver-network-agents.md §7).
     pub path_heartbeat_interval: u64,
     /// `sender_heartbeat_interval` in ns (default 100 ms; SPEC §6: idle
-    /// senders emit heartbeats): a lane of an established single-path
-    /// publication that sent no DATA for this long sends a header-only
-    /// DATA frame at its next position, and again every interval while
-    /// idle, so a receiver learns of a lost tail and NAKs it. At least 1
+    /// senders emit heartbeats): a lane of an established publication that
+    /// sent no DATA for this long sends a header-only DATA frame at its
+    /// next position, and again every interval while idle, so a receiver
+    /// learns of a lost tail and NAKs it. Over redundant paths each route
+    /// waits on its own DATA, and no route sends one while any route holds
+    /// a copy of the lane (karyos#834). At least 1
     /// and at most half of `image_liveness_timeout`, this driver's own; a
     /// remote receiver's liveness is that receiver's configuration.
     pub sender_heartbeat_interval: u64,
@@ -970,13 +983,24 @@ pub enum AgentEvent<O: SocketOps, T: StreamTerms = HeapTerms> {
     },
     /// An agent asks for an endpoint reset: on the sender, a publication on
     /// `endpoint` needs one before it can send again
-    /// (`Outbound::needs_reset`); on the receiver, a route fault holds an
-    /// image's NAKs (RC-6). Posted unsolicited into a free slot, and again
-    /// every `RESET_REQUEST_CYCLES` cycles while the need holds; the
-    /// endpoint table ignores it unless the endpoint is active.
+    /// (`Outbound::needs_reset`), or a route or queue it refused for its
+    /// limit after a close failed in that epoch (#838); on the receiver, a
+    /// route fault holds an image's NAKs (RC-6). Posted unsolicited into a
+    /// free slot, and again every `RESET_REQUEST_CYCLES` cycles while the
+    /// need holds; the endpoint table ignores it unless the endpoint is
+    /// active, and drops it within the endpoint's interval. A standing
+    /// request (the close failure's) is instead kept, tagged with its
+    /// epoch, and served once in that epoch.
     ResetRequested {
         /// The endpoint.
         endpoint: EndpointId,
+        /// A standing request's epoch (a close that failed in it, #838):
+        /// the table keeps it, while the endpoint is not active or within
+        /// its interval, and serves it once in that epoch; a new epoch drops
+        /// it. The sender asks once per epoch. `None` for the others, which
+        /// the table drops within its interval and their owner asks again
+        /// while the need holds.
+        standing: Option<karyos_io::backend::BackendEpoch>,
     },
 }
 
@@ -1394,6 +1418,18 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.outbound(index)?.sent_high(lane)
     }
 
+    /// The message tokens of its `index`-th publication's sender gate:
+    /// `None` past its publications, `Some(None)` with no rated gate
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn gate_message_tokens(&self, index: usize) -> Option<Option<u64>> {
+        self.role.outbound(index).map(|outbound| {
+            outbound
+                .guard_gate()
+                .and_then(crate::guard_gate::GuardGate::message_tokens)
+        })
+    }
+
     /// The counters of its `index`-th publication's data path (tests).
     #[cfg(test)]
     pub(crate) fn outbound_counters(&self, index: usize) -> Option<data::OutboundCounters> {
@@ -1476,9 +1512,9 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         let work = role.duty(&mut core.halves, now)?;
         // A full ring drops the request; the next cycle asks again.
         let events = &core.events;
-        role.request_resets(|endpoint| {
+        role.request_resets(|endpoint, standing| {
             events
-                .try_post(AgentEvent::ResetRequested { endpoint })
+                .try_post(AgentEvent::ResetRequested { endpoint, standing })
                 .is_ok()
         });
         // A drained publication's report; a full ring asks again next
@@ -1518,6 +1554,27 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
     #[cfg(test)]
     pub(crate) fn drop_data(&mut self, nth: &[u64]) {
         self.role.drop_data(nth);
+    }
+
+    /// Loses the receiver's DATA with a payload at or past `term_offset`
+    /// of the first term, from every source or from one (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(crate) fn drop_tail(&mut self, term_offset: u32, one_source: bool) {
+        self.role.drop_tail(term_offset, one_source);
+    }
+
+    /// The sources whose idle heartbeat past the lost tail arrived (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(crate) fn tail_heartbeat_sources(&self) -> usize {
+        self.role.tail_heartbeat_sources()
     }
 
     /// After a stop: the halves of `Attach` commands the agent never read
@@ -1569,9 +1626,9 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
         // A route fault asks for the endpoint's reset (RC-6); a full ring
         // drops the request and a later cycle asks again.
         let events = &core.events;
-        role.request_resets(|endpoint| {
+        role.request_resets(|endpoint, standing| {
             events
-                .try_post(AgentEvent::ResetRequested { endpoint })
+                .try_post(AgentEvent::ResetRequested { endpoint, standing })
                 .is_ok()
         });
         // Journals a retirement closed reach the conductor with their facts

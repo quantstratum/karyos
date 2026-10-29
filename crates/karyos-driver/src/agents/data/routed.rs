@@ -274,8 +274,9 @@ pub(super) struct RouteSlot {
 /// One lane's staged copies per route, in order, and what left.
 #[derive(Debug)]
 pub(super) struct RoutedTrack {
-    /// Per route: the ticket of each staged copy and the position after it.
-    staged: [VecDeque<(TxTicket, u64)>; MAX_ROUTES],
+    /// Per route: the ticket of each staged copy, its position and the
+    /// position after it.
+    staged: [VecDeque<(TxTicket, u64, u64)>; MAX_ROUTES],
     /// The highest position a submitted copy reached, this call.
     submitted: Option<u64>,
     /// A copy left out of staging order, this call.
@@ -288,6 +289,81 @@ pub(super) struct RoutedTrack {
     /// Per route: its frontier `sent_p`, the position past the last frame
     /// it submitted or skipped (a skipped frame counts as passed, RP-8).
     sent_p: [u64; MAX_ROUTES],
+    /// Per route: since when the lane sent nothing on it, neither DATA nor
+    /// a heartbeat, and held nothing for it (SPEC §6; #842).
+    idle_since: [Option<u64>; MAX_ROUTES],
+}
+
+/// The copies `route` holds for `lane`: staged and not submitted yet
+/// (tests).
+#[cfg(test)]
+fn held(routed: &Routed, lane: usize, route: usize) -> usize {
+    routed
+        .tracks
+        .get(lane)
+        .and_then(|track| track.staged.get(route))
+        .map_or(0, VecDeque::len)
+}
+
+/// The routes on which `lane` is due an idle heartbeat at `now` (SPEC §6;
+/// #842), and the position none may announce past. A sending route is
+/// idle when the lane sent it no DATA and no heartbeat for `interval` and
+/// it holds no copy of the lane; its wait restarts while it is busy, and
+/// a route that cannot send waits afresh once it can. Any route holding a
+/// copy of the lane bounds every route's heartbeat at that copy's
+/// position: sending or not, live, or returning (it stages before its
+/// first submit, RP-9). A route whose TX half is not held at the epoch it
+/// opened in does not: its copies go only with that half, which a reset
+/// replaces with a new epoch's (dropping them), or never gives back. A heartbeat so never
+/// announces a position a held copy would still bring, and still reveals
+/// what lies below it. The bound reads each copy's own position, never a
+/// route's frontier, so nothing stale reaches it. While a route holds a
+/// copy for long (its socket full, its endpoint in a reset), a tail lost
+/// above that copy is revealed only once the copy goes: the copy may
+/// still fill it; a copy held by a socket that keeps refusing (EAGAIN)
+/// has no time limit of its own, the route's path policy removes it
+/// from the live set.
+fn idle_routes(
+    routed: &mut Routed,
+    lane: usize,
+    (sending, present): (&[bool; MAX_ROUTES], &[bool; MAX_ROUTES]),
+    now: u64,
+    interval: u64,
+) -> ([bool; MAX_ROUTES], Option<u64>) {
+    let mut due = [false; MAX_ROUTES];
+    // Only a route whose TX half is held at the epoch it opened in can
+    // still send its copies: a half away (a reset of its endpoint, for
+    // this publication or another on it), or back in a new epoch (its
+    // copies dropped, or a reopen that failed), bounds nothing, whether it
+    // left or not (QS-COORDINATOR and QS-REVIEWER on #842).
+    let counts = *present;
+    let Some(track) = routed.tracks.get_mut(lane) else {
+        return (due, None);
+    };
+    let bound = track
+        .staged
+        .iter()
+        .zip(&counts)
+        .filter(|(_, counts)| **counts)
+        .filter_map(|(copies, _)| copies.front().map(|(_, start, _)| *start))
+        .min();
+    for (route, (idle, slot)) in track.idle_since.iter_mut().zip(&mut due).enumerate() {
+        if sending.get(route) != Some(&true) {
+            *idle = None;
+            continue;
+        }
+        if track
+            .staged
+            .get(route)
+            .is_some_and(|copies| !copies.is_empty())
+        {
+            *idle = Some(now);
+            continue;
+        }
+        let since = *idle.get_or_insert(now);
+        *slot = now.checked_sub(since).is_some_and(|age| age >= interval);
+    }
+    (due, bound)
 }
 
 /// One to [`MAX_ROUTES`] routes, each on its own endpoint: each route's TX
@@ -317,6 +393,10 @@ pub(super) struct Routed {
     /// it alone holds, never sent).
     #[cfg(test)]
     leave_now: Option<usize>,
+    /// Per route, a reopen in a new epoch that fails (tests: a route
+    /// whose half is back but whose open is refused).
+    #[cfg(test)]
+    fail_open: [bool; MAX_ROUTES],
     routes: Vec<RouteSlot>,
     tracks: Vec<RoutedTrack>,
     /// The frame read once per datagram before its copies.
@@ -342,6 +422,8 @@ impl Routed {
         Ok(Self {
             sender,
             policy: PathPolicy::default(),
+            #[cfg(test)]
+            fail_open: [false; MAX_ROUTES],
             #[cfg(test)]
             withhold: [0; MAX_ROUTES],
             #[cfg(test)]
@@ -376,6 +458,7 @@ impl Routed {
                     unknown: [false; MAX_ROUTES],
                     sent: [false; MAX_ROUTES],
                     sent_p: [0; MAX_ROUTES],
+                    idle_since: [None; MAX_ROUTES],
                 })
                 .collect(),
             scratch: vec![0; mtu],
@@ -560,7 +643,7 @@ impl LaneGate for RoutedGate<'_> {
             .iter_mut()
             .enumerate()
             .find_map(|(route, copies)| match copies.front().copied() {
-                Some((ticket, next)) if ticket == staged.ticket => {
+                Some((ticket, _, next)) if ticket == staged.ticket => {
                     copies.pop_front();
                     Some((route, next))
                 }
@@ -765,6 +848,57 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         }
     }
 
+    /// Path `route`'s open in a new epoch fails while `fail` (tests).
+    #[cfg(test)]
+    pub(crate) fn fail_route_open(&mut self, route: usize, fail: bool) {
+        if let Some(slot) = self
+            .routed
+            .as_deref_mut()
+            .and_then(|routed| routed.fail_open.get_mut(route))
+        {
+            *slot = fail;
+        }
+    }
+
+    /// A left path waits `backoff` before it returns (tests).
+    #[cfg(test)]
+    pub(crate) fn set_path_backoff(&mut self, backoff: u64) {
+        if let Some(routed) = self.routed.as_deref_mut() {
+            routed.policy.backoff_initial = backoff;
+            routed.policy.backoff_max = backoff;
+        }
+    }
+
+    /// Whether `route` left, and whether it is returning (tests).
+    #[cfg(test)]
+    pub(crate) fn route_state(&self, route: usize) -> Option<(bool, bool)> {
+        self.routed
+            .as_deref()
+            .and_then(|routed| routed.routes.get(route))
+            .map(|slot| (slot.left, slot.returning))
+    }
+
+    /// The position of `route`'s first copy held for `lane`, staged and not
+    /// submitted (tests).
+    #[cfg(test)]
+    pub(crate) fn first_held(&self, lane: usize, route: usize) -> Option<u64> {
+        self.routed
+            .as_deref()
+            .and_then(|routed| routed.tracks.get(lane))
+            .and_then(|track| track.staged.get(route))
+            .and_then(|copies| copies.front().map(|(_, start, _)| *start))
+    }
+
+    /// `route`'s frontier on lane `lane`: past the last frame it submitted
+    /// or skipped (tests).
+    #[cfg(test)]
+    pub(crate) fn route_frontier(&self, lane: usize, route: usize) -> Option<u64> {
+        self.routed
+            .as_deref()
+            .and_then(|routed| routed.tracks.get(lane))
+            .and_then(|track| track.sent_p.get(route).copied())
+    }
+
     /// Lane `lane`'s sent frontier (tests).
     #[cfg(test)]
     pub(crate) fn sent_high(&self, lane: usize) -> Option<u64> {
@@ -834,25 +968,10 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         halves: &mut [(EndpointId, Half<O>)],
         now: u64,
     ) -> RemovalStep {
-        let Some(routed) = self.routed.as_deref() else {
+        if self.routed.is_none() {
             return RemovalStep::default();
-        };
-        // The routes that can send now, by route.
-        let mut sending = [false; MAX_ROUTES];
-        for (held, half) in halves.iter() {
-            let Half::Tx(tx) = half else {
-                continue;
-            };
-            if let Some(index) = routed
-                .routes
-                .iter()
-                .position(|route| route.endpoint == *held)
-                && routed.repair_live(index, tx.capabilities().epoch)
-                && let Some(slot) = sending.get_mut(index)
-            {
-                *slot = true;
-            }
         }
+        let sending = self.sending_routes(halves);
         self.serve_removal_with(
             now,
             |outbound, lane| outbound.routed_drained_seal(lane, &sending),
@@ -878,6 +997,128 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     && track.staged.get(route).is_none_or(VecDeque::is_empty)
             });
         (idle && high >= seal && reader.position() >= seal).then_some(seal)
+    }
+
+    /// The routes that can send now, by route: those whose endpoint's TX
+    /// half is held, live in its epoch.
+    fn sending_routes<O: SocketOps>(&self, halves: &[(EndpointId, Half<O>)]) -> [bool; MAX_ROUTES] {
+        let mut sending = [false; MAX_ROUTES];
+        let Some(routed) = self.routed.as_deref() else {
+            return sending;
+        };
+        for (held, half) in halves {
+            let Half::Tx(tx) = half else {
+                continue;
+            };
+            if let Some(index) = routed
+                .routes
+                .iter()
+                .position(|route| route.endpoint == *held)
+                && routed.repair_live(index, tx.capabilities().epoch)
+                && let Some(slot) = sending.get_mut(index)
+            {
+                *slot = true;
+            }
+        }
+        sending
+    }
+
+    /// The idle heartbeats of a routed publication due at `now` (SPEC §6,
+    /// karyos#834): a lane sends a header-only DATA frame on each route
+    /// that can send and was idle for `interval` ([`idle_routes`]), at its
+    /// next position, or at the first copy of it any route still holds
+    /// when that is lower, as a single-path lane does on its one. PATH_HB
+    /// still keeps each path's binding live (RP-3); this frame is what tells an image where the lane stands, so
+    /// a tail lost on every path shows. None while the publication is
+    /// removed (its EOS replaces them). Returns the frames submitted.
+    pub(crate) fn serve_routed_heartbeats<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        now: u64,
+        interval: u64,
+    ) -> Option<u32> {
+        if self.removing() || self.routed.is_none() {
+            return Some(0);
+        }
+        let sending = self.sending_routes(halves);
+        // The routes whose TX half the agent holds now, at the epoch the
+        // route opened in: only their copies can still be sent.
+        let present: [bool; MAX_ROUTES] = std::array::from_fn(|index| {
+            self.routed
+                .as_deref()
+                .and_then(|routed| routed.routes.get(index))
+                .is_some_and(|route| {
+                    halves.iter().any(|(held, half)| match half {
+                        Half::Tx(tx) => {
+                            *held == route.endpoint && route.opened == Some(tx.capabilities().epoch)
+                        }
+                        _ => false,
+                    })
+                })
+        });
+        let mut sent = 0u32;
+        for lane in 0..self.readers.len() {
+            let Some(position) = self.readers.get(lane).map(|reader| reader.position()) else {
+                continue;
+            };
+            // The routes whose lane is idle long enough for a heartbeat,
+            // and the position a held copy bounds them at.
+            let Some((due, bound)) = self
+                .routed
+                .as_deref_mut()
+                .map(|routed| idle_routes(routed, lane, (&sending, &present), now, interval))
+            else {
+                break;
+            };
+            let position = bound.map_or(position, |bound| position.min(bound));
+            if !due.contains(&true)
+                || self
+                    .guard
+                    .as_deref_mut()
+                    .is_some_and(|guard| !LaneGate::admits(guard, lane))
+            {
+                continue;
+            }
+            let routed = self.routed.as_deref()?;
+            let mut queues: [Option<(usize, EndpointId, TxQueueId)>; MAX_ROUTES] =
+                [None; MAX_ROUTES];
+            for (index, (slot, route)) in queues.iter_mut().zip(&routed.routes).enumerate() {
+                if due.get(index) == Some(&true) {
+                    *slot = route
+                        .queues
+                        .get(lane)
+                        .map(|queue| (index, route.endpoint, *queue));
+                }
+            }
+            for (index, endpoint, queue) in queues.into_iter().flatten() {
+                let tx = halves.iter_mut().find_map(|(held, half)| match half {
+                    Half::Tx(tx) if *held == endpoint => Some(&mut **tx),
+                    _ => None,
+                });
+                if let Some(tx) = tx
+                    && self.write_heartbeat_on(tx, queue, lane, position, false)
+                {
+                    sent = sent.checked_add(1)?;
+                    if let Some(idle) = self
+                        .routed
+                        .as_deref_mut()
+                        .and_then(|routed| routed.tracks.get_mut(lane))
+                        .and_then(|track| track.idle_since.get_mut(index))
+                    {
+                        *idle = Some(now);
+                    }
+                }
+            }
+        }
+        Some(sent)
+    }
+
+    /// The copies `route` holds for `lane`, pending or staged (tests).
+    #[cfg(test)]
+    pub(crate) fn routed_pending(&self, lane: usize, route: usize) -> usize {
+        self.routed
+            .as_deref()
+            .map_or(0, |routed| held(routed, lane, route))
     }
 
     /// Sends `lane`'s EOS at `seal` on every `sending` route's lane queue.
@@ -956,9 +1197,20 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 open = true;
                 continue;
             }
-            let Ok(route) = tx.add_route(slot.destination) else {
+            #[cfg(test)]
+            if routed.fail_open.get(index).copied().unwrap_or(false) {
                 self.counters.bump(|c| &mut c.route_failures, 1);
                 continue;
+            }
+            let route = match tx.add_route(slot.destination) {
+                Ok(route) => route,
+                Err(error) => {
+                    self.counters.bump(|c| &mut c.route_failures, 1);
+                    if error == karyos_io::backend::RouteError::RouteLimit {
+                        super::note_limited(&mut self.limited, slot.endpoint, epoch);
+                    }
+                    continue;
+                }
             };
             let mut ok = true;
             for lane in 0..slot.queues.len() {
@@ -972,8 +1224,11 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                             *held = queue;
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
                         self.counters.bump(|c| &mut c.queue_failures, 1);
+                        if super::fanout::queue_limit(error) {
+                            super::note_limited(&mut self.limited, slot.endpoint, epoch);
+                        }
                         for queue in slot.queues.iter().take(lane) {
                             let _ = tx.close_queue(*queue, &mut self.report);
                             while self.report.pop_front().is_some() {}
@@ -1236,7 +1491,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                 if let Some(track) = routed.tracks.get_mut(lane)
                     && let Some(held) = track.staged.get_mut(route)
                 {
-                    held.push_back((ticket, next));
+                    held.push_back((ticket, from, next));
                 }
                 copies = copies.checked_add(1).ok_or(overflow.clone())?;
                 if let Some(took) = took.get_mut(route) {
@@ -1546,7 +1801,12 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
             let mut sent = false;
             for track in &mut routed.tracks {
                 if let Some(flag) = track.sent.get_mut(index) {
-                    sent |= std::mem::take(flag);
+                    let lane_sent = std::mem::take(flag);
+                    sent |= lane_sent;
+                    // Any DATA on the route restarts its lane's idle wait.
+                    if lane_sent && let Some(idle) = track.idle_since.get_mut(index) {
+                        *idle = Some(now);
+                    }
                 }
             }
             if sent {

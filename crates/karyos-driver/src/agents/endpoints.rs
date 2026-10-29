@@ -208,6 +208,15 @@ struct Entry<O: SocketOps> {
     /// A request was deferred since the last requested reset: the fault
     /// came back within the interval.
     deferred: bool,
+    /// The epoch of a standing request kept for later: the endpoint not
+    /// active, within its interval, or the command ring full. Served once
+    /// in that epoch, dropped when the epoch changes; the sender asks once
+    /// (#838). Other requests are dropped and asked again by their owner.
+    waiting: Option<karyos_io::backend::BackendEpoch>,
+    /// When the command ring last refused the kept standing request: it is
+    /// tried again one endpoint interval later, never every poll; a clock
+    /// behind it counts as an elapsed interval.
+    refused_at: Option<u64>,
 }
 
 /// The first interval between two requested resets of an endpoint (ns).
@@ -231,8 +240,16 @@ pub struct EndpointCounters {
     /// duplicate while a reset is in flight).
     pub requests_ignored: u64,
     /// Requested resets that could not start ([`Endpoints::reset`]
-    /// failed; the sender asks again).
+    /// failed), each counted once: an ordinary request's owner asks again;
+    /// a standing one is tried again by the table while only the command
+    /// ring is full, and dropped otherwise.
     pub resets_refused: u64,
+    /// Tries of a standing reset request after the command ring refused
+    /// it, at most one per endpoint interval (#838).
+    pub standing_retries: u64,
+    /// Standing reset requests dropped on an error other than a full
+    /// command ring (the agent gone, a broken invariant).
+    pub standing_dropped: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -429,6 +446,8 @@ impl<O: SocketOps> Endpoints<O> {
                     backoff: RESET_BACKOFF_MIN,
                     last_reset: None,
                     deferred: false,
+                    waiting: None,
+                    refused_at: None,
                     state: State::Failing {
                         error: EndpointError::Agent(error.clone()),
                         sender: Fate::Posted,
@@ -447,6 +466,8 @@ impl<O: SocketOps> Endpoints<O> {
             backoff: RESET_BACKOFF_MIN,
             last_reset: None,
             deferred: false,
+            waiting: None,
+            refused_at: None,
         });
         Ok(id)
     }
@@ -471,7 +492,14 @@ impl<O: SocketOps> Endpoints<O> {
         links: &AgentLinks<O, T>,
         endpoint: EndpointId,
     ) -> Result<(), EndpointError> {
-        self.detach(links, endpoint, Purpose::Reset)
+        self.detach(links, endpoint, Purpose::Reset)?;
+        // Any reset serves a deferred request: its new epoch is what the
+        // request asked for.
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint) {
+            entry.waiting = None;
+            entry.refused_at = None;
+        }
+        Ok(())
     }
 
     /// Retires an active endpoint: its halves come back and its socket
@@ -541,13 +569,46 @@ impl<O: SocketOps> Endpoints<O> {
     ) {
         for link in [&links.sender, &links.receiver] {
             while let Some(event) = link.take_event() {
-                if let AgentEvent::ResetRequested { endpoint } = event {
-                    self.requested(links, endpoint, now);
+                if let AgentEvent::ResetRequested { endpoint, standing } = event {
+                    self.requested(links, endpoint, standing, now);
                     continue;
                 }
                 if let Some(event) = self.answer(event) {
                     other(event);
                 }
+            }
+        }
+        // A kept standing request: dropped once its epoch has passed,
+        // served once the endpoint is active and its interval ended.
+        for index in 0..self.entries.len() {
+            let Some(entry) = self.entries.get_mut(index) else {
+                break;
+            };
+            if entry
+                .waiting
+                .is_some_and(|epoch| epoch != entry.capabilities.epoch)
+            {
+                entry.waiting = None;
+                entry.refused_at = None;
+            }
+            let due = entry.waiting.is_some()
+                && entry
+                    .refused_at
+                    .is_none_or(|at| now < at || age_ns(now, at) >= entry.backoff)
+                && matches!(entry.state, State::Active)
+                && entry
+                    .last_reset
+                    .is_none_or(|at| now < at || age_ns(now, at) >= entry.backoff);
+            if due {
+                if entry.refused_at.is_some() {
+                    self.counters.bump(|c| &mut c.standing_retries);
+                }
+                let endpoint = entry.id;
+                let standing = self
+                    .entries
+                    .get_mut(index)
+                    .and_then(|entry| entry.waiting.take());
+                self.serve_request(links, endpoint, standing, now);
             }
         }
         // Backwards, so a removed entry never makes the loop skip another.
@@ -581,24 +642,59 @@ impl<O: SocketOps> Endpoints<O> {
     /// at least its interval old. A request within the interval is
     /// deferred, and the next reset doubles the interval (up to
     /// [`RESET_BACKOFF_MAX`]); a reset after a clean interval starts over
-    /// at [`RESET_BACKOFF_MIN`]. The sender asks again while the need
-    /// holds, so a deferred or refused request is not lost.
+    /// at [`RESET_BACKOFF_MIN`]. A standing request (tagged with its epoch,
+    /// #838) that cannot be served now (the endpoint not active, within its
+    /// interval, or the command ring full) is kept and served by
+    /// [`Endpoints::poll`] once in that epoch; another epoch drops it.
+    /// Other requests are dropped then, and their owner asks again while
+    /// the need holds.
     fn requested<T: StreamTerms>(
         &mut self,
         links: &AgentLinks<O, T>,
         endpoint: EndpointId,
+        standing: Option<karyos_io::backend::BackendEpoch>,
         now: u64,
     ) {
         self.counters.bump(|c| &mut c.reset_requests);
-        let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.id == endpoint)
-            .filter(|entry| matches!(entry.state, State::Active))
-        else {
+        self.serve_request(links, endpoint, standing, now);
+    }
+
+    /// Serves a reset request for `endpoint` at `now`, or defers it; a
+    /// standing one of the entry's epoch is kept when it cannot be served.
+    fn serve_request<T: StreamTerms>(
+        &mut self,
+        links: &AgentLinks<O, T>,
+        endpoint: EndpointId,
+        standing: Option<karyos_io::backend::BackendEpoch>,
+        now: u64,
+    ) {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == endpoint) else {
             self.counters.bump(|c| &mut c.requests_ignored);
             return;
         };
+        // A standing request of an older epoch: that epoch's reset is done.
+        let standing = match standing {
+            Some(epoch) if epoch != entry.capabilities.epoch => {
+                self.counters.bump(|c| &mut c.requests_ignored);
+                return;
+            }
+            standing => standing,
+        };
+        if !matches!(entry.state, State::Active) {
+            match standing {
+                Some(epoch) => {
+                    // A fault while its reset is in flight: the next reset
+                    // doubles the interval, as a deferral does. Not before
+                    // a first reset (the endpoint still opening).
+                    if entry.last_reset.is_some() {
+                        entry.deferred = true;
+                    }
+                    entry.waiting = Some(epoch);
+                }
+                None => self.counters.bump(|c| &mut c.requests_ignored),
+            }
+            return;
+        }
         // A clock behind the last reset (stepped back) counts as an
         // elapsed interval: deferring until it catches up would break the
         // interval's bound.
@@ -607,6 +703,11 @@ impl<O: SocketOps> Endpoints<O> {
             && age_ns(now, at) < entry.backoff
         {
             entry.deferred = true;
+            if let Some(epoch) = standing
+                && entry.waiting.replace(epoch).is_some()
+            {
+                return;
+            }
             self.counters.bump(|c| &mut c.resets_deferred);
             return;
         }
@@ -627,7 +728,33 @@ impl<O: SocketOps> Endpoints<O> {
                 }
                 self.counters.bump(|c| &mut c.resets);
             }
-            Err(_) => self.counters.bump(|c| &mut c.resets_refused),
+            Err(error) => {
+                let busy = matches!(error, EndpointError::Agent(AgentError::Busy(_)));
+                let entry = self.entries.iter_mut().find(|entry| entry.id == endpoint);
+                match (standing, entry) {
+                    // A standing one the command ring was too full for is
+                    // counted once and tried again an interval on.
+                    (Some(epoch), Some(entry)) if busy => {
+                        if entry.refused_at.replace(now).is_none() {
+                            self.counters.bump(|c| &mut c.resets_refused);
+                        }
+                        entry.waiting = Some(epoch);
+                    }
+                    // Any other error (the agent gone, a broken invariant)
+                    // drops it, counted.
+                    (Some(_), entry) => {
+                        if let Some(entry) = entry {
+                            entry.waiting = None;
+                            entry.refused_at = None;
+                        }
+                        self.counters.bump(|c| &mut c.resets_refused);
+                        self.counters.bump(|c| &mut c.standing_dropped);
+                    }
+                    // An ordinary one is counted, and leaves a kept standing
+                    // request as it is; its owner asks again.
+                    (None, _) => self.counters.bump(|c| &mut c.resets_refused),
+                }
+            }
         }
     }
 

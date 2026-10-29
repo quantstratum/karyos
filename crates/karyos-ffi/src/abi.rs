@@ -22,7 +22,7 @@ pub(crate) const ABI_VERSION_MAJOR: u32 = 0;
 /// The ABI version's minor number (`KARYOS_ABI_VERSION_MINOR`).
 pub(crate) const ABI_VERSION_MINOR: u32 = 1;
 /// The ABI version's patch number (`KARYOS_ABI_VERSION_PATCH`).
-pub(crate) const ABI_VERSION_PATCH: u32 = 4;
+pub(crate) const ABI_VERSION_PATCH: u32 = 5;
 
 /// Whether `out` can take a `T`: not null and aligned. It cannot tell a
 /// dangling pointer; the caller's contract excludes one.
@@ -2050,6 +2050,10 @@ pub struct DriverOptions {
     pub network: u32,
     /// Must be zero; a later version may give it a meaning.
     pub reserved0: u32,
+    /// The most bytes one stream lane may take, its log buffer region plus
+    /// its conflation table's (ABI 0.1.5, R-CORE-34); 0, the default and an
+    /// older caller's struct's, sets no cap.
+    pub max_stream_bytes: u64,
 }
 
 /// The size of `karyos_driver_options` in the first ABI version that has
@@ -2080,6 +2084,7 @@ fn default_driver_options() -> DriverOptions {
             driver::NETWORK_OFF
         },
         reserved0: 0,
+        max_stream_bytes: defaults.max_stream_bytes,
     }
 }
 
@@ -2180,6 +2185,7 @@ pub unsafe extern "C" fn karyos_driver_create(
             cutover_deadline_ns: raw.cutover_deadline_ns,
             startup_timeout_ns: raw.startup_timeout_ns,
             network,
+            max_stream_bytes: raw.max_stream_bytes,
         };
         match driver::create(&options) {
             Ok(handle) => {
@@ -2486,10 +2492,9 @@ pub unsafe extern "C" fn karyos_stream_options_init_sized(
 /// copied. On failure nothing is added, and `detail` receives the
 /// failure's detail (a duplicate stream id: `KARYOS_E_INVALID_ARGUMENT`
 /// with the stream id in `code` and the session id in `value`). A stream
-/// above the driver's `max_stream_bytes` would be
-/// `KARYOS_E_INVALID_ARGUMENT` with its bytes in `code` and the cap in
-/// `value`, but `karyos_driver_options` cannot set the cap yet
-/// (karyos#818).
+/// above the driver's `max_stream_bytes` (`karyos_driver_options`, ABI
+/// 0.1.5) is `KARYOS_E_INVALID_ARGUMENT` with its bytes in `code` and the
+/// cap in `value`.
 ///
 /// # Safety
 ///

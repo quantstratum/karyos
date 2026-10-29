@@ -709,6 +709,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 guarded.submit_through(Arc::clone(&frontier), lane);
             }
         }
+        // A reincarnation's gate starts empty when it began, the time its
+        // handles' rings carry too (R-CORE-21); 0, unknown, is now. A
+        // network publication's lanes reincarnate together, in one step
+        // (`reincarnate_network`), so its first lane's time is every lane's.
+        let empty_since = guarded.then(|| {
+            handle
+                .streams()
+                .find_map(|stream| {
+                    self.stream_ref(stream)
+                        .ok()
+                        .map(|found| found.reincarnated_at)
+                })
+                .filter(|at| *at != 0)
+                .unwrap_or_else(karyos_sys::host_clock::host_monotonic_ns)
+        });
         let (id, cell) = self.register_guard_sender(guard.guard)?;
         Ok(Some((
             GuardSpec {
@@ -716,7 +731,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 cell,
                 epoch,
                 rate,
-                full: !guarded,
+                empty_since,
                 policy: Some(slot as Arc<dyn karyos_client::SharedWords>),
                 frontier,
             },

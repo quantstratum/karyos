@@ -308,6 +308,13 @@ pub struct ReceiverCounters {
     pub nak_route_faults: u64,
     /// ERR NAK_REPLY controls for no installed image.
     pub nak_replies_unbound: u64,
+    /// A reliable image's hole the receive owner could not compute, a
+    /// data hole (`first_hole`) or a heartbeat's tail (`heartbeat_tail`):
+    /// a corrupt owner state or a mark off a frame boundary; no NAK for
+    /// it. An unreliable image's skip duty reports these as its own error.
+    /// A defect counter, read through the receiver's counters, not a CnC
+    /// cell.
+    pub hole_query_errors: u64,
     /// Images closed by repair: a range proven unrecoverable under
     /// `on_unrecoverable = close`, or `GapCannotResume`.
     pub images_closed_unrecoverable: u64,
@@ -361,8 +368,8 @@ pub struct SenderCounters {
     /// Controls sent.
     pub sent: u64,
     /// Idle heartbeats submitted: header-only DATA frames of established
-    /// single-path lanes that sent nothing for `sender_heartbeat_interval`
-    /// (SPEC §6).
+    /// lanes that sent nothing for `sender_heartbeat_interval` (SPEC §6),
+    /// one per route of a redundant-path lane, each counted.
     pub heartbeats_sent: u64,
     /// Queues and routes of removed publications, and of retired
     /// destinations of a multi-destination publication, the sender closed
@@ -373,18 +380,36 @@ pub struct SenderCounters {
     /// Items still pending in those queues when they closed, returned
     /// with `QueueClosed`.
     pub removed_returned: u64,
-    /// Removed publications' routes or queues not recorded for closing:
-    /// the preallocated close list was full (never, by construction; their
-    /// endpoint's next reset drops them). A retired destination's are
-    /// carried over instead (`OutboundCounters::close_deferred`).
+    /// Removed publications' routes or queues, or retired destinations',
+    /// not recorded for closing: the preallocated close list was full
+    /// (never, by construction; their endpoint's next reset drops them, and
+    /// a retired destination's wait in the publication for a later duty).
     pub removed_unrecorded: u64,
-    /// Entries of the close list whose endpoint's TX half was not held at
-    /// their duty: it comes back only in a new epoch, whose reset drops
-    /// them, or never. Dropped, each counted once.
+    /// Entries of the close list dropped at their duty, each counted once:
+    /// their endpoint's TX half was not held (in a reset, which drops them,
+    /// or retired) or was in another epoch (whose reset dropped them).
     pub removed_dropped: u64,
-    /// Queues or routes of the close list the endpoint refused to close,
-    /// or that returned nothing while not done: left to its next reset.
+    /// Entries of the close list (a route and its queues) with a live
+    /// handle the endpoint would not close, each counted once; a handle
+    /// already gone counts as closed, and one with frames in flight is
+    /// closed again at each duty, failing only on a close error or after
+    /// [`super::CLOSE_IN_FLIGHT_TIMEOUT`]. When the endpoint then refuses a route or a
+    /// queue for its limit in the same epoch, its reset is asked for once,
+    /// tagged with that epoch (the endpoint table keeps it and serves it in
+    /// that epoch): the new epoch drops them.
     pub removed_close_failed: u64,
+    /// Endpoints with a failed close not recorded, with no room for them
+    /// (never, by its capacity): their limit then resets nothing.
+    pub close_failures_full: u64,
+    /// Removed publications' entries closed again at the next duty because
+    /// a queue still had frames in flight (#838).
+    pub removed_close_deferred: u64,
+    /// Of those, the ones still in flight after
+    /// [`super::CLOSE_IN_FLIGHT_TIMEOUT`]: counted as failed closes.
+    pub removed_close_timeouts: u64,
+    /// Duties at which an entry in flight found `closing_again` full and
+    /// stayed in the close list for the next duty: never a failure.
+    pub removed_close_overflow: u64,
     /// EOS frames a removed publication's lanes submitted at their seals
     /// (driver-network-agents.md §7), repeats included.
     pub eos_sent: u64,
@@ -428,7 +453,9 @@ pub struct SenderCounters {
     /// SMs whose consumption is below one already reported (replayed or
     /// reordered): the higher value is kept.
     pub sm_stale: u64,
-    /// Reset requests posted to the endpoint table.
+    /// Reset requests posted to the endpoint table: a publication's route
+    /// fault, and an endpoint at its route or queue limit after a failed
+    /// close in that epoch.
     pub reset_requests: u64,
     /// Reset requests not posted: the event ring was full.
     pub reset_requests_full: u64,
@@ -513,6 +540,78 @@ fn bump(value: &mut u64, overflowed: &mut bool) {
     }
 }
 
+/// An endpoint that failed to close something in its current epoch: when
+/// one of its routes or queues is then refused for its limit, what did not
+/// close may be what holds it there, so its reset is asked for, once per
+/// epoch: the endpoint table keeps a deferred request and serves it when
+/// its interval ends (QS-COORDINATOR on #838). A new epoch starts afresh.
+#[derive(Debug, Clone, Copy)]
+struct EndpointCloses {
+    endpoint: EndpointId,
+    epoch: karyos_io::backend::BackendEpoch,
+    reset: CloseReset,
+}
+
+/// How a removed publication's entry closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryClosed {
+    /// Every handle closed, or was gone already.
+    Done,
+    /// A queue still has frames in flight: closed again at each duty, up
+    /// to [`super::CLOSE_IN_FLIGHT_TIMEOUT`].
+    InFlight,
+    /// A live handle did not close.
+    Failed,
+}
+
+/// Where an [`EndpointCloses`]' reset stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseReset {
+    /// No limit refused yet.
+    Idle,
+    /// A limit was refused: the reset is to be asked for.
+    Due,
+    /// Asked for in this epoch, once: the endpoint table keeps it and
+    /// serves it in that epoch.
+    Asked,
+}
+
+/// Test only: the frame length, term offset and term id of the DATA frame
+/// `bytes` starts with, from its header (word 0, the term offset at bytes 8
+/// to 12, the term id at 20 to 24); `None` for another frame type or a
+/// short datagram.
+#[cfg(test)]
+fn drop_tail_frame(bytes: &[u8]) -> Option<(i32, u32, u32)> {
+    use karyos_sys::frame::{FrameType, Word0};
+
+    let word0 = Word0::unpack(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)).ok()?;
+    if FrameType::try_from_code(word0.frame_type_code()).ok()? != FrameType::Data {
+        return None;
+    }
+    let offset = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+    let term = u32::from_le_bytes(bytes.get(20..24)?.try_into().ok()?);
+    Some((word0.frame_length(), offset, term))
+}
+
+/// Test only: a tail's first transmission lost (`ReceiverRole::drop_tail`):
+/// what it lost and from which sources its heartbeat showed all of it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+struct DropTail {
+    /// The term offset the tail starts at.
+    offset: u32,
+    /// Whether it is lost from one source only.
+    one_source: bool,
+    /// That source, once chosen.
+    chosen: Option<SocketAddr>,
+    /// The end of the frames lost so far.
+    end: u32,
+    /// The term they are in: the first lost frame's.
+    term: Option<u32>,
+    /// The sources whose idle heartbeat at or past `end` arrived.
+    done: [Option<SocketAddr>; 4],
+}
+
 /// The receiver agent's network state.
 #[derive(Debug)]
 pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
@@ -527,6 +626,14 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// that duplicates).
     #[cfg(test)]
     repeat_data_from: Option<u64>,
+    /// Test only: a tail's first transmission lost: DATA datagrams with a
+    /// payload at or past this term offset of the first term are lost
+    /// from a source until that source's idle heartbeat at or past it
+    /// arrives (so repairs after it pass), on every source or on the first
+    /// such datagram's source only (a tail lost on one path). Heartbeats
+    /// always arrive. The sources: the chosen one, and those done.
+    #[cfg(test)]
+    drop_tail: Option<DropTail>,
     /// Test only: every NAK handed to the sender.
     #[cfg(test)]
     posted_naks: Vec<Nak>,
@@ -1232,11 +1339,19 @@ fn tail_hole<T: StreamTerms>(
     lane: Lane,
     at: usize,
     now: u64,
+    counters: &mut ReceiverCounters,
 ) -> Option<Hole> {
     use crate::repair::loss::RttSource;
 
-    let tail = heartbeat_mark(image, lane, at)
-        .and_then(|mark| image.owner.heartbeat_tail(lane, mark).ok().flatten());
+    let tail =
+        match heartbeat_mark(image, lane, at).map(|mark| image.owner.heartbeat_tail(lane, mark)) {
+            Some(Ok(tail)) => tail,
+            Some(Err(_)) => {
+                tally(counters, |c| &mut c.hole_query_errors);
+                None
+            }
+            None => None,
+        };
     let Some((start, length)) = tail else {
         if let Some(since) = image.tail_since.get_mut(at) {
             *since = None;
@@ -1482,6 +1597,20 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     /// with the TX halves (allocated at creation: `publications` routes'
     /// worth, the most removals can leave).
     closing: Vec<super::data::Opened>,
+    /// Endpoints a close failed on, whose reset the sender asks for: the
+    /// reset drops what would not close, which nothing else frees.
+    close_failures: Vec<EndpointCloses>,
+    /// Removed publications' entries whose queues still had frames in
+    /// flight, with the duty that first found them so: closed again at each
+    /// duty until they close, fail with a close error, or outlive
+    /// [`super::CLOSE_IN_FLIGHT_TIMEOUT`] (allocated at creation, as
+    /// `closing`).
+    closing_again: Vec<(super::data::Opened, u64)>,
+    /// Test only: the next closes of removed entries to report in flight,
+    /// before touching any handle (the sockets backend has no such state
+    /// a driver test can reach).
+    #[cfg(test)]
+    close_in_flight: u32,
     /// Report storage for those closes (allocated at creation).
     close_report: karyos_io::backend::TxReport,
     /// When a routed publication's path leaves the live set (RP-8).
@@ -1627,8 +1756,23 @@ pub(super) fn roles<T: StreamTerms>(
             sender_heartbeat_interval: config.sender_heartbeat_interval,
             setup_interval: config.setup_interval,
             // Per publication: its routes, or its destinations and those
-            // retired since the last drain, which a removal closes too.
+            // retired since the last drain, which a removal closes too; and
+            // as many again for the entries in flight that wait here when
+            // `closing_again` is full (#838), so a removal always finds
+            // room.
             closing: Vec::with_capacity(
+                config
+                    .publications
+                    .checked_mul(
+                        karyos_io::lanes::routes::MAX_ROUTES
+                            .saturating_add(super::data::MAX_DESTINATIONS.saturating_mul(2)),
+                    )
+                    .and_then(|share| share.checked_mul(2))
+                    .ok_or(AgentError::InvalidConfig("publications too large"))?,
+            ),
+            #[cfg(test)]
+            close_in_flight: 0,
+            closing_again: Vec::with_capacity(
                 config
                     .publications
                     .checked_mul(
@@ -1638,6 +1782,9 @@ pub(super) fn roles<T: StreamTerms>(
                     .ok_or(AgentError::InvalidConfig("publications too large"))?,
             ),
             close_report: karyos_io::backend::TxReport::new(),
+            // One record per held endpoint: another epoch's is dropped.
+            close_failures: Vec::with_capacity(config.max_endpoints),
+
             path_policy: config.path_policy,
             bindings: Vec::with_capacity(config.receiver_bindings),
             max_bindings: config.receiver_bindings,
@@ -1663,6 +1810,8 @@ pub(super) fn roles<T: StreamTerms>(
             data_seen: 0,
             #[cfg(test)]
             repeat_data_from: None,
+            #[cfg(test)]
+            drop_tail: None,
             #[cfg(test)]
             posted_naks: Vec::new(),
             #[cfg(test)]
@@ -2247,6 +2396,36 @@ impl<T: StreamTerms> ReceiverRole<T> {
     pub(super) fn drop_data(&mut self, nth: &[u64]) {
         self.drop_data = nth.to_vec();
         self.data_seen = 0;
+    }
+
+    /// Loses every DATA datagram with a payload at or past `term_offset`
+    /// of the first term: from every source, or from the first such
+    /// datagram's source only when `one_source` (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(super) fn drop_tail(&mut self, term_offset: u32, one_source: bool) {
+        self.drop_tail = Some(DropTail {
+            offset: term_offset,
+            one_source,
+            chosen: None,
+            end: term_offset,
+            term: None,
+            done: [None; 4],
+        });
+    }
+
+    /// The sources whose idle heartbeat past the lost tail arrived (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "its tests need two real paths, on Linux")
+    )]
+    pub(super) fn tail_heartbeat_sources(&self) -> usize {
+        self.drop_tail
+            .map_or(0, |tail| tail.done.iter().flatten().count())
     }
 
     /// Whether the path queues are allocated (tests).
@@ -2897,7 +3076,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// (RC-6), through `post` (which returns whether the request was
     /// posted): at most once per `RESET_REQUEST_CYCLES` per image while the
     /// fault holds; the reset's new epoch resolves it. Nothing allocates.
-    pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
+    pub(super) fn request_resets(
+        &mut self,
+        mut post: impl FnMut(EndpointId, Option<karyos_io::backend::BackendEpoch>) -> bool,
+    ) {
         let cycle = self.cycle;
         let Self {
             images,
@@ -2925,7 +3107,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 if key == image.key || !route.faulted || !due_at(route.reset_requested) {
                     continue;
                 }
-                if post(key.endpoint) {
+                if post(key.endpoint, None) {
                     route.reset_requested = Some(cycle);
                     tally(counters, |c| &mut c.reset_requests);
                 } else {
@@ -2945,7 +3127,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             if !due {
                 continue;
             }
-            if post(image.key.endpoint) {
+            if post(image.key.endpoint, None) {
                 image.reset_requested = Some(cycle);
                 tally(counters, |c| &mut c.reset_requests);
             } else {
@@ -3061,12 +3243,13 @@ impl<T: StreamTerms> ReceiverRole<T> {
             if !image.reliable {
                 continue;
             }
-            let first = image
-                .owner
-                .first_hole(lane)
-                .ok()
-                .flatten()
-                .map(|(start, length)| Hole { start, length });
+            let first = match image.owner.first_hole(lane) {
+                Ok(hole) => hole.map(|(start, length)| Hole { start, length }),
+                Err(_) => {
+                    tally(counters, |c| &mut c.hole_query_errors);
+                    None
+                }
+            };
             // A covered hole ends any tail wait: a later tail waits its RTT
             // afresh.
             if first.is_some()
@@ -3074,7 +3257,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             {
                 *since = None;
             }
-            let hole = first.or_else(|| tail_hole(image, lane, at, now));
+            let hole = first.or_else(|| tail_hole(image, lane, at, now, counters));
             if let Observation::Unrecoverable {
                 hole,
                 lowest_retained,
@@ -3203,8 +3386,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
             // An unreliable tail no frame revealed is sealed at its
             // deadline (SPEC §6, G1), up to the clamped mark.
             if !image.reliable {
-                for (at, lane) in (0..image.heartbeat_marks.len())
-                    .filter_map(|at| Some((at, Lane::try_new(u8::try_from(at).ok()?).ok()?)))
+                for (at, lane) in (0..image.lane_count)
+                    .filter_map(|at| Some((usize::from(at), Lane::try_new(at).ok()?)))
                 {
                     if let Some(mark) = heartbeat_mark(image, lane, at) {
                         image.skip.revealed(lane, mark);
@@ -3862,6 +4045,39 @@ impl<T: StreamTerms> Intake<'_, T> {
             }
             if self.role.drop_data.contains(&seen) {
                 return;
+            }
+            // A DATA frame at or past the offset, decoded from its header:
+            // word 0 (length, flags, type), then the term offset. A frame
+            // with a payload is lost (from its source alone when
+            // `one_source`); a header-only one at or past the end of what
+            // was lost is the source's heartbeat showing the whole tail.
+            // A negative length (padding) or another term is not the tail.
+            if let Some(mut tail) = self.role.drop_tail
+                && let Some((length, at, term)) = drop_tail_frame(bytes)
+                && let Ok(length) = u32::try_from(length)
+                && at >= tail.offset
+                && tail.term.is_none_or(|lost| lost == term)
+                && !tail.done.contains(&Some(source))
+            {
+                if length <= karyos_sys::frame::HEADER_LENGTH {
+                    if tail.end > tail.offset
+                        && at >= tail.end
+                        && let Some(slot) = tail.done.iter_mut().find(|slot| slot.is_none())
+                    {
+                        *slot = Some(source);
+                        self.role.drop_tail = Some(tail);
+                    }
+                } else if !tail.one_source || tail.chosen.is_none_or(|chosen| chosen == source) {
+                    // The whole datagram is lost, every frame it carries.
+                    let end = u32::try_from(bytes.len())
+                        .ok()
+                        .and_then(|len| at.checked_add(len));
+                    tail.chosen = Some(source);
+                    tail.term = Some(term);
+                    tail.end = end.map_or(tail.end, |end| tail.end.max(end));
+                    self.role.drop_tail = Some(tail);
+                    return;
+                }
             }
             if self.role.repeat_data_from.is_some_and(|from| seen >= from) {
                 self.data_once(source, alias, bytes);
@@ -4809,7 +5025,8 @@ impl<T: StreamTerms> SenderRole<T> {
         mut post: impl FnMut(AgentEvent<O, T>) -> bool,
     ) {
         let now = (self.clock)();
-        for outbound in &mut self.publications {
+        let mut unrecorded = 0u64;
+        'publications: for outbound in &mut self.publications {
             while let Some(removal) = outbound.removal_unreported() {
                 // Its member stops counting for the strategy edge before
                 // the report is posted: with the conductor's ring full, a
@@ -4830,14 +5047,18 @@ impl<T: StreamTerms> SenderRole<T> {
                     removal,
                 };
                 if !post(event) {
-                    return;
+                    break 'publications;
                 }
                 outbound.removal_reported(removal.destination, now);
                 // Its route and queues go to the close list now, so the
                 // next cycle's commands, served before its duty, find the
                 // slot free; that duty closes them before it opens anything.
-                outbound.drain_retired(&mut self.closing);
+                let left = outbound.drain_retired(&mut self.closing);
+                unrecorded = unrecorded.saturating_add(left);
             }
+        }
+        for _ in 0..unrecorded {
+            self.count(|c| &mut c.removed_unrecorded);
         }
     }
 
@@ -4955,54 +5176,218 @@ impl<T: StreamTerms> SenderRole<T> {
     /// [`SenderRole::remove`]), on each endpoint whose TX half it holds in
     /// the same epoch. An endpoint whose half it does not hold, or now in
     /// another epoch, dropped them already (a reset or a retirement).
-    fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)]) {
-        while let Some(opened) = self.closing.pop() {
-            // A half not held now comes back only in a new epoch, whose
-            // reset drops these handles, or never (retired): dropped and
-            // counted, so the list never fills with what cannot close.
-            let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
-                Half::Tx(tx) if *held == opened.endpoint => Some(tx),
-                _ => None,
-            }) else {
-                self.count(|c| &mut c.removed_dropped);
+    fn close_removed<O: SocketOps>(&mut self, halves: &mut [(EndpointId, Half<O>)], now: u64) {
+        // An endpoint whose half is gone (in a reset, or retired) or back
+        // in another epoch starts afresh.
+        self.close_failures.retain(|record| {
+            halves.iter().any(|(held, half)| match half {
+                Half::Tx(tx) => *held == record.endpoint && tx.capabilities().epoch == record.epoch,
+                _ => false,
+            })
+        });
+        // The entries still in flight are closed again: closed, they go;
+        // a close error, or the time bound in flight, fails them; else they
+        // wait for the next duty.
+        let mut index = 0;
+        while let Some((mut opened, since)) = self.closing_again.get(index).copied() {
+            let outcome = self.close_entry(halves, &mut opened);
+            // A clock behind `since` counts as no time elapsed (`age_ns`).
+            let late = age_ns(now, since) >= super::CLOSE_IN_FLIGHT_TIMEOUT;
+            match outcome {
+                EntryClosed::Done => {
+                    self.closing_again.swap_remove(index);
+                }
+                EntryClosed::InFlight if !late => {
+                    if let Some(slot) = self.closing_again.get_mut(index) {
+                        slot.0 = opened;
+                    }
+                    index += 1;
+                }
+                EntryClosed::InFlight | EntryClosed::Failed => {
+                    if outcome == EntryClosed::InFlight {
+                        self.count(|c| &mut c.removed_close_timeouts);
+                    }
+                    self.closing_again.swap_remove(index);
+                    self.close_failed(opened.endpoint, opened.epoch);
+                }
+            }
+        }
+        // New entries: closed, they go; in flight, they wait in
+        // `closing_again`; a close error fails them, once, and the endpoint
+        // is reset when what did not close holds it at its limit. With
+        // `closing_again` full (it holds every route a removal can leave,
+        // so only removals faster than one bound can fill it), an entry in
+        // flight stays in the close list for the next duty, counted, never
+        // failed for want of room.
+        let mut index = 0;
+        while let Some(mut opened) = self.closing.get(index).copied() {
+            match self.close_entry(halves, &mut opened) {
+                EntryClosed::Done => {
+                    self.closing.swap_remove(index);
+                }
+                EntryClosed::InFlight
+                    if self.closing_again.len() < self.closing_again.capacity() =>
+                {
+                    self.count(|c| &mut c.removed_close_deferred);
+                    self.closing.swap_remove(index);
+                    self.closing_again.push((opened, now));
+                }
+                EntryClosed::InFlight => {
+                    self.count(|c| &mut c.removed_close_overflow);
+                    if let Some(slot) = self.closing.get_mut(index) {
+                        *slot = opened;
+                    }
+                    index += 1;
+                }
+                EntryClosed::Failed => {
+                    self.closing.swap_remove(index);
+                    self.close_failed(opened.endpoint, opened.epoch);
+                }
+            }
+        }
+    }
+
+    /// Records that a live route or queue of `endpoint` did not close in
+    /// `epoch`.
+    fn close_failed(&mut self, endpoint: EndpointId, epoch: karyos_io::backend::BackendEpoch) {
+        self.count(|c| &mut c.removed_close_failed);
+        self.note_close_failure(endpoint, epoch);
+    }
+
+    /// Keeps `endpoint`'s record of a close failure in `epoch`, once.
+    fn note_close_failure(
+        &mut self,
+        endpoint: EndpointId,
+        epoch: karyos_io::backend::BackendEpoch,
+    ) {
+        let known = self
+            .close_failures
+            .iter()
+            .any(|record| record.endpoint == endpoint && record.epoch == epoch);
+        if known {
+            return;
+        }
+        if self.close_failures.len() < self.close_failures.capacity() {
+            self.close_failures.push(EndpointCloses {
+                endpoint,
+                epoch,
+                reset: CloseReset::Idle,
+            });
+        } else {
+            self.count(|c| &mut c.close_failures_full);
+        }
+    }
+
+    /// The endpoints that refused a route or a queue for their limit this
+    /// cycle, on any open path: one that failed a close in
+    /// the epoch it refused in has its reset asked for, once per epoch.
+    /// Without a failed close the refusal is an ordinary limit and resets
+    /// nothing.
+    fn reset_limited(&mut self) {
+        for index in 0..self.publications.len() {
+            let Some(outbound) = self.publications.get_mut(index) else {
+                break;
+            };
+            for (endpoint, epoch) in outbound.take_limited().into_iter().flatten() {
+                self.limit_refused(endpoint, epoch);
+            }
+        }
+    }
+
+    /// `endpoint` refused a route or a queue for its limit in `epoch`.
+    fn limit_refused(&mut self, endpoint: EndpointId, epoch: karyos_io::backend::BackendEpoch) {
+        if let Some(record) = self
+            .close_failures
+            .iter_mut()
+            .find(|record| record.endpoint == endpoint && record.epoch == epoch)
+            && record.reset == CloseReset::Idle
+        {
+            record.reset = CloseReset::Due;
+        }
+    }
+
+    /// Closes `opened` whole, clearing each queue that closed from it.
+    fn close_entry<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        opened: &mut super::data::Opened,
+    ) -> EntryClosed {
+        #[cfg(test)]
+        if self.close_in_flight > 0 {
+            self.close_in_flight -= 1;
+            return EntryClosed::InFlight;
+        }
+        use karyos_io::backend::{QueueError, RouteError};
+
+        // A half not held now is in a reset or retired: the reset, done or
+        // to come, drops these handles, and a retired half never comes
+        // back. Dropped and counted, so nothing waits on what cannot close.
+        let Some(tx) = halves.iter_mut().find_map(|(held, half)| match half {
+            Half::Tx(tx) if *held == opened.endpoint => Some(tx),
+            _ => None,
+        }) else {
+            self.count(|c| &mut c.removed_dropped);
+            return EntryClosed::Done;
+        };
+        // An older epoch's handles died with its reset (an entry is never
+        // of a later epoch than its half).
+        let epoch = tx.capabilities().epoch;
+        if epoch != opened.epoch {
+            debug_assert!(opened.epoch < epoch, "an entry of a later epoch");
+            self.count(|c| &mut c.removed_dropped);
+            return EntryClosed::Done;
+        }
+        // A handle already gone counts as closed. Failed: a live handle did
+        // not close. In flight: a queue still has frames the kernel holds.
+        let (mut failed, mut in_flight) = (false, false);
+        for held in &mut opened.queues {
+            let Some(queue) = *held else {
                 continue;
             };
-            if tx.capabilities().epoch != opened.epoch {
-                continue;
-            }
-            for queue in opened.queues.into_iter().flatten() {
-                // A full report leaves items pending: emptied and called
-                // again until none remains, each call returning at least
-                // one, so the queue's depth bounds the loop. A refusal or a
-                // call that returns nothing is counted: the endpoint's next
-                // reset drops the queue.
-                loop {
-                    match tx.close_queue(queue, &mut self.close_report) {
-                        Ok(outcome) => {
-                            while self.close_report.pop_front().is_some() {
-                                self.count(|c| &mut c.removed_returned);
-                            }
-                            if !outcome.more {
-                                self.count(|c| &mut c.removed_closed);
-                                break;
-                            }
-                            if outcome.returned == 0 {
-                                self.count(|c| &mut c.removed_close_failed);
-                                break;
-                            }
+            // A full report leaves items pending: emptied and called again
+            // until none remains, each call returning at least one, so the
+            // queue's depth bounds the loop.
+            loop {
+                match tx.close_queue(queue, &mut self.close_report) {
+                    Ok(outcome) => {
+                        while self.close_report.pop_front().is_some() {
+                            self.count(|c| &mut c.removed_returned);
                         }
-                        Err(_) => {
-                            self.count(|c| &mut c.removed_close_failed);
+                        if !outcome.more {
+                            self.count(|c| &mut c.removed_closed);
+                            *held = None;
+                            break;
+                        }
+                        if outcome.returned == 0 {
+                            in_flight = true;
                             break;
                         }
                     }
+                    Err(QueueError::UnknownQueue) => {
+                        self.count(|c| &mut c.removed_closed);
+                        *held = None;
+                        break;
+                    }
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
                 }
             }
-            if tx.remove_route(opened.route).is_ok() {
+        }
+        if failed {
+            return EntryClosed::Failed;
+        }
+        // The route goes once its queues have: an open one still uses it.
+        if in_flight {
+            return EntryClosed::InFlight;
+        }
+        match tx.remove_route(opened.route) {
+            Ok(()) | Err(RouteError::Unknown) => {
                 self.count(|c| &mut c.removed_closed);
-            } else {
-                self.count(|c| &mut c.removed_close_failed);
+                EntryClosed::Done
             }
+            Err(_) => EntryClosed::Failed,
         }
     }
 
@@ -5157,10 +5542,14 @@ impl<T: StreamTerms> SenderRole<T> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         self.cycle = self.cycle.checked_add(1).ok_or(overflow.clone())?;
         self.prune(halves);
+        let mut unrecorded = 0u64;
         for outbound in &mut self.publications {
-            outbound.drain_retired(&mut self.closing);
+            unrecorded = unrecorded.saturating_add(outbound.drain_retired(&mut self.closing));
         }
-        self.close_removed(halves);
+        for _ in 0..unrecorded {
+            self.count(|c| &mut c.removed_unrecorded);
+        }
+        self.close_removed(halves, now);
         self.naks_this_cycle = 0;
         // Bindings past their lifetime go even when nothing arrives.
         self.expire_bindings(now);
@@ -5370,7 +5759,17 @@ impl<T: StreamTerms> SenderRole<T> {
                     now,
                 )?;
                 work = work.checked_add(served).ok_or(overflow.clone())?;
-                if outbound.needs_reset() {
+                // An idle lane's heartbeat on every live path (SPEC §6,
+                // karyos#834).
+                let beats = outbound
+                    .serve_routed_heartbeats(halves, now, self.sender_heartbeat_interval)
+                    .ok_or(overflow.clone())?;
+                work = work.checked_add(beats).ok_or(overflow.clone())?;
+                let needs_reset = outbound.needs_reset();
+                for _ in 0..beats {
+                    self.count(|c| &mut c.heartbeats_sent);
+                }
+                if needs_reset {
                     needing_reset = needing_reset.checked_add(1).ok_or(overflow.clone())?;
                 }
                 continue;
@@ -5415,6 +5814,9 @@ impl<T: StreamTerms> SenderRole<T> {
             }
         }
         self.counters.needs_reset = needing_reset;
+        // An endpoint refused a route for its limit after a failed close:
+        // its reset of the epoch.
+        self.reset_limited();
         // Removing publications: each lane drained to its seal sends its
         // EOS, then the linger runs (driver-network-agents.md §7).
         work = work
@@ -5495,14 +5897,39 @@ impl<T: StreamTerms> SenderRole<T> {
     /// publication, so `N` publications on one endpoint post up to `N`
     /// requests per period; the endpoint table resets once and ignores the
     /// others while the reset is in flight. Nothing allocates.
-    pub(super) fn request_resets(&mut self, mut post: impl FnMut(EndpointId) -> bool) {
+    pub(super) fn request_resets(
+        &mut self,
+        mut post: impl FnMut(EndpointId, Option<karyos_io::backend::BackendEpoch>) -> bool,
+    ) {
         let cycle = self.cycle;
+        // An endpoint a failed close may hold at its limit: its one reset of
+        // the epoch, a standing request the table keeps; asked again next
+        // cycle only when the event ring was full.
+        let (mut posted, mut refused) = (0u64, 0u64);
+        for record in &mut self.close_failures {
+            if record.reset != CloseReset::Due {
+                continue;
+            }
+            if post(record.endpoint, Some(record.epoch)) {
+                record.reset = CloseReset::Asked;
+                posted = posted.saturating_add(1);
+            } else {
+                refused = refused.saturating_add(1);
+            }
+        }
+        for _ in 0..posted {
+            self.count(|c| &mut c.reset_requests);
+        }
+        for _ in 0..refused {
+            self.count(|c| &mut c.reset_requests_full);
+        }
         for index in 0..self.publications.len() {
             let Some(outbound) = self.publications.get_mut(index) else {
                 break;
             };
             // Over redundant paths, each route's endpoint on its own.
-            let (posted, refused) = outbound.post_reset_requests(cycle, &mut post);
+            let (posted, refused) =
+                outbound.post_reset_requests(cycle, &mut |endpoint| post(endpoint, None));
             for _ in 0..posted {
                 self.count(|c| &mut c.reset_requests);
             }
