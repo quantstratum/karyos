@@ -20,6 +20,7 @@ use crate::catalog::{CatalogConfig, CatalogWatch};
 use crate::journal::{Gap, GapReason, Journal, JournalError, UNOPENED_POSITION};
 use crate::model::{self, Cell, Follower};
 use crate::operations::{self, GuardAnswer};
+use crate::registry::{self, JoinError, Kind, Registry};
 use crate::trace_window::{TraceWindow, WindowConfig};
 
 /// Attempts at a consistent sampling pass before the values are reported
@@ -171,6 +172,8 @@ pub struct Agent {
     next_operation: u64,
     /// When it started (R-CORE-24).
     started_ns: u64,
+    /// The join metadata registry (karyos#736), in memory.
+    registry: Registry,
 }
 
 impl Agent {
@@ -229,6 +232,7 @@ impl Agent {
             // Ids from the agent's start time: unique across restarts.
             next_operation: host_monotonic_ns().max(1),
             started_ns: start,
+            registry: Registry::new(start),
         }
     }
 
@@ -443,6 +447,107 @@ impl Agent {
         }
     }
 
+    /// The join registry's generation (karyos#736).
+    #[must_use]
+    pub const fn join_generation(&self) -> u64 {
+        self.registry.generation()
+    }
+
+    /// The index of the driver in `dir`.
+    fn driver_index(&self, dir: &Path) -> Result<usize, JoinError> {
+        self.drivers
+            .iter()
+            .position(|driver| driver.dir == dir)
+            .ok_or(JoinError::UnknownDriver)
+    }
+
+    /// Puts a new version of the driver in `dir`'s `kind` `key` with
+    /// `attributes`, for `uid` (karyos#736); its number.
+    ///
+    /// # Errors
+    ///
+    /// [`JoinError::UnknownDriver`], or the registry's refusal.
+    pub fn join_put(
+        &mut self,
+        dir: &Path,
+        kind: Kind,
+        key: &str,
+        attributes: &str,
+        uid: u32,
+    ) -> Result<u64, JoinError> {
+        let driver = self.driver_index(dir)?;
+        self.registry
+            .put(driver, kind, key, attributes, uid, host_monotonic_ns())
+            .map_err(JoinError::Refused)
+    }
+
+    /// Ends the current version of the driver in `dir`'s `kind` `key`; its
+    /// number.
+    ///
+    /// # Errors
+    ///
+    /// [`JoinError::UnknownDriver`], or the registry's refusal.
+    pub fn join_retire(&mut self, dir: &Path, kind: Kind, key: &str) -> Result<u64, JoinError> {
+        let driver = self.driver_index(dir)?;
+        self.registry
+            .retire(driver, kind, key, host_monotonic_ns())
+            .map_err(JoinError::Refused)
+    }
+
+    /// The version of the driver in `dir`'s `kind` `key` in force at `at`
+    /// (host `CLOCK_MONOTONIC` nanoseconds, now when `None`), with what
+    /// the agent observes of the identity now.
+    ///
+    /// # Errors
+    ///
+    /// [`JoinError::UnknownDriver`], or a malformed key.
+    pub fn join_get<'a>(
+        &'a self,
+        dir: &'a Path,
+        kind: Kind,
+        key: &'a str,
+        at: Option<u64>,
+    ) -> Result<registry::Read<'a>, JoinError> {
+        let index = self.driver_index(dir)?;
+        let driver = self.drivers.get(index).ok_or(JoinError::UnknownDriver)?;
+        Ok(registry::Read {
+            generation: self.registry.generation(),
+            since_ns: self.registry.since_ns(),
+            dir,
+            kind,
+            key,
+            at: at.unwrap_or_else(host_monotonic_ns),
+            entry: self.registry.get(index, kind, key),
+            presence: driver.presence(kind, key),
+        })
+    }
+
+    /// A page of the driver in `dir`'s entries, after `after` when given.
+    ///
+    /// # Errors
+    ///
+    /// [`JoinError::UnknownDriver`].
+    pub fn join_list<'a>(
+        &'a self,
+        dir: &'a Path,
+        after: Option<(Kind, &str)>,
+    ) -> Result<registry::Page<'a>, JoinError> {
+        let index = self.driver_index(dir)?;
+        let driver = self.drivers.get(index).ok_or(JoinError::UnknownDriver)?;
+        let (entries, more) = self.registry.list(index, after);
+        Ok(registry::Page {
+            generation: self.registry.generation(),
+            since_ns: self.registry.since_ns(),
+            evicted: self.registry.evicted(),
+            dir,
+            entries: entries
+                .into_iter()
+                .map(|entry| (entry, driver.presence(entry.kind, &entry.key)))
+                .collect(),
+            more,
+        })
+    }
+
     /// What the agent knows, as API v1.
     #[must_use]
     pub fn view(&self) -> AgentView {
@@ -459,8 +564,9 @@ impl Agent {
     }
 
     /// Its capabilities for a caller who may close guards (`close`),
-    /// reopen them (`reopen`) and acknowledge the journal's unknown
-    /// interval (`acknowledge`), in [`crate::api::CAPABILITIES`] order
+    /// reopen them (`reopen`), acknowledge the journal's unknown interval
+    /// (`acknowledge`) and write the join registry (`register`,
+    /// karyos#736), in [`crate::api::CAPABILITIES`] order
     /// (R-CORE-24). What this deployment does not offer is `Unavailable`,
     /// whatever the role; what it offers but the role does not allow is
     /// `Forbidden`.
@@ -470,6 +576,7 @@ impl Agent {
         close: bool,
         reopen: bool,
         acknowledge: bool,
+        register: bool,
     ) -> Vec<crate::api::Capability> {
         use crate::api::{CAPABILITIES, Capability, CapabilityState};
 
@@ -495,9 +602,9 @@ impl Agent {
                     "gap-ack" => (acknowledge_off, acknowledge),
                     "catalog" => ((!catalog).then_some("not_configured"), true),
                     // Served to every role, always.
-                    "view" | "trace-window" | "limits" | "trace-buckets" | "trace-export" => {
-                        (None, true)
-                    }
+                    "view" | "trace-window" | "limits" | "trace-buckets" | "trace-export"
+                    | "join-registry" => (None, true),
+                    "join-put" => (None, register),
                     // A name added to CAPABILITIES must be classified here.
                     _ => (Some("not_configured"), true),
                 };
@@ -513,6 +620,35 @@ impl Agent {
 }
 
 impl Driver {
+    /// What the agent observes now of the identity `kind` `key` in this
+    /// driver (karyos#736): for a trace point or an application counter,
+    /// whether a client cell of that type and label exists and how many;
+    /// for a stream, nothing, as no cell carries a wire stream id; and
+    /// nothing while not attached.
+    fn presence(&self, kind: Kind, key: &str) -> registry::Presence {
+        let types: &[u64] = match kind {
+            Kind::Stream => return registry::Presence::default(),
+            Kind::Point => &[karyos_sys::counters::TYPE_TRACE_POINT],
+            Kind::Counter => &[
+                karyos_sys::counters::TYPE_APPLICATION_EVENT,
+                karyos_sys::counters::TYPE_APPLICATION_GAUGE,
+            ],
+        };
+        if self.tool.is_none() {
+            return registry::Presence::default();
+        }
+        let holders = self
+            .client_counters
+            .iter()
+            .filter(|counter| types.contains(&counter.type_id) && counter.label == key)
+            .count();
+        let holders = u64::try_from(holders).unwrap_or(u64::MAX);
+        registry::Presence {
+            present: Some(holders > 0),
+            holders: Some(holders),
+        }
+    }
+
     fn refresh(&mut self, timeout: Duration, trace: WindowConfig, rules: &AlertRules) {
         if self.tool.is_none() {
             match attach_tool(&self.dir, timeout) {

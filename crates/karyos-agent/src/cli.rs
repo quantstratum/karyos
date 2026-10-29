@@ -13,8 +13,8 @@ usage: karyos-agent --api-dir DIR --driver DIR [--driver DIR]... \
 [--journal DIR] [--agent-id NAME]
 
 Serves API v1 (JSON) on DIR/agent.sock to the uids given a role (viewer,
-operator, risk-officer, administrator), reading each driver's CnC as a
-tool every MS milliseconds (default 1000). A uid takes one role. Alerts:
+operator, risk-officer, administrator, registrar), reading each driver's
+CnC as a tool every MS milliseconds (default 1000). A uid takes one role. Alerts:
 a subscriber lagging N bytes or more (default 8 MiB) for N consecutive
 refreshes (default 3); losses, cleared after N quiet refreshes (default
 10); a guard close that senders have not applied past the driver's
@@ -32,8 +32,12 @@ A request is one line: KARYOS-AGENT 1 view, or
 KARYOS-AGENT 1 guard-close DIR GUARD [REASON] (operator, risk-officer),
 KARYOS-AGENT 1 guard-reopen DIR GUARD EPOCH [REASON] (risk-officer,
 administrator), KARYOS-AGENT 1 gap-ack POSITION (administrator),
-KARYOS-AGENT 1 limits [DIMENSION=VALUE ...], or KARYOS-AGENT 1 capabilities
-(each capability served, unavailable here or forbidden for the role).
+KARYOS-AGENT 1 limits [DIMENSION=VALUE ...], KARYOS-AGENT 1 capabilities
+(each capability served, unavailable here or forbidden for the role), or
+the join metadata registry's KARYOS-AGENT 1 join-put DIR KIND KEY
+NAME=VALUE... and join-retire DIR KIND KEY (registrar, administrator),
+join-get DIR KIND KEY [AT_NS] and join-list DIR [KIND KEY], KIND being
+stream, point or counter.
 ";
 
 /// The default refresh period.
@@ -90,7 +94,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
                 let (uid, role) = value.split_once('=')?;
                 if !matches!(
                     role,
-                    "viewer" | "operator" | "risk-officer" | "administrator"
+                    "viewer" | "operator" | "risk-officer" | "administrator" | "registrar"
                 ) {
                     return None;
                 }

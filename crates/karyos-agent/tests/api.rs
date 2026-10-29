@@ -164,7 +164,9 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"catalog","state":"unavailable","reason":"not_configured"},"#,
             r#"{"name":"trace-window","state":"served","reason":null},"#,
             r#"{"name":"limits","state":"served","reason":null},{"name":"trace-buckets","state":"served","reason":null},"#,
-            r#"{"name":"trace-export","state":"served","reason":null}]}"#,
+            r#"{"name":"trace-export","state":"served","reason":null},"#,
+            r#"{"name":"join-registry","state":"served","reason":null},"#,
+            r#"{"name":"join-put","state":"forbidden","reason":"role"}]}"#,
             "\n"
         )
     );
@@ -210,7 +212,7 @@ fn a_configured_journal_and_catalog_are_served_by_role() {
                 ),
             ),
     );
-    let caps = agent.capabilities(false, false, false);
+    let caps = agent.capabilities(false, false, false, false);
     let state = |name: &str| {
         caps.iter()
             .find(|capability| capability.name == name)
@@ -282,7 +284,17 @@ fn a_client_negotiates_the_limits() {
         r#""connection.requests":{"value":1,"negotiable":false},"#,
         r#""trace.point_ids":{"value":65535,"negotiable":false},"#,
         r#""trace.points_per_client":{"value":16,"negotiable":false},"#,
-        r#""trace.point_registrations_per_client":{"value":256,"negotiable":false}}}"#,
+        r#""trace.point_registrations_per_client":{"value":256,"negotiable":false},"#,
+        r#""join.request_bytes":{"value":1024,"negotiable":false},"#,
+        r#""join.keys":{"value":1024,"negotiable":false},"#,
+        r#""join.keys_per_driver":{"value":1024,"negotiable":false},"#,
+        r#""join.versions_per_key":{"value":4,"negotiable":false},"#,
+        r#""join.attributes_per_entry":{"value":16,"negotiable":false},"#,
+        r#""join.name_bytes":{"value":32,"negotiable":false},"#,
+        r#""join.value_bytes":{"value":64,"negotiable":false},"#,
+        r#""join.key_bytes":{"value":64,"negotiable":false},"#,
+        r#""join.list_page":{"value":64,"negotiable":false},"#,
+        r#""join.memory_bytes":{"value":6864896,"negotiable":false}}}"#,
         "\n"
     );
     let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 limits\n");
