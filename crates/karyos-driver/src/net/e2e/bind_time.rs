@@ -589,7 +589,28 @@ fn measure_one_driver(label: &str, reliable: bool, count: usize, streams: usize)
             let _ = joiner.add_network_subscription(stream, &channel).unwrap();
         }
         let mut bound = vec![false; streams];
+        let mut tick = Instant::now();
         loop {
+            if std::env::var("KARYOS_BIND_TIMELINE").is_ok_and(|value| !value.is_empty())
+                && tick.elapsed() >= Duration::from_secs(1)
+            {
+                tick = Instant::now();
+                let sessions = shared(&mut joiner).receiver.session_counters();
+                let own = joiner.net.as_ref().unwrap().receiver_counters().unwrap();
+                println!(
+                    "bind_time timeline {:.1} s: bound {} | data_unbound {} rate_limited {} | solicits {} retries {} answered {} expired {} withdrawn {} dropped {}",
+                    subscribed.elapsed().as_secs_f64(),
+                    bound.iter().filter(|done| **done).count(),
+                    own.data_unbound,
+                    own.rsp_setup_rate_limited,
+                    sessions.solicits,
+                    sessions.solicit_retries,
+                    sessions.solicits_answered,
+                    sessions.solicits_expired,
+                    sessions.solicits_withdrawn,
+                    sessions.dropped,
+                );
+            }
             offer(&mut lanes);
             for driver in [&mut a, &mut anchor, &mut joiner] {
                 let _ = driver.do_work().unwrap();
@@ -613,13 +634,22 @@ fn measure_one_driver(label: &str, reliable: bool, count: usize, streams: usize)
             let censored = now.duration_since(subscribed) >= JOIN_LIMIT;
             if bound.iter().all(|done| *done) || censored {
                 let sessions = shared(&mut joiner).receiver.session_counters();
+                let ignored = shared(&mut joiner).receiver.ignored_controls();
+                let reasons: Vec<_> = ignored.seen().collect();
+                let own = joiner.net.as_ref().unwrap().receiver_counters().unwrap();
                 println!(
-                    "bind_time {label} round: solicits {} retries {} refused {} stale {} expired {}",
+                    "bind_time {label} round: solicits {} retries {} refused {} stale {} expired {} \
+                     | joiner rsp_setup_rate_limited {} rsp_setup_total_limited {} rsp_setup_destinations_full {} \
+                     ring_full_rsp_setup {} | ignored {reasons:?}",
                     sessions.solicits,
                     sessions.solicit_retries,
                     sessions.solicit_retries_refused,
                     sessions.solicit_stale_answers,
                     sessions.solicits_expired,
+                    own.rsp_setup_rate_limited,
+                    own.rsp_setup_total_limited,
+                    own.rsp_setup_destinations_full,
+                    own.ring_full_rsp_setup,
                 );
                 if censored {
                     let missing = bound.iter().filter(|done| !**done).count();
