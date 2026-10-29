@@ -352,6 +352,22 @@ fn application_counters_have_their_own_families_and_escaped_names() {
     }
 }
 
+/// R-CORE-1: a trace point's cell is a name whose value is an id, not a
+/// metric: the exposition leaves it out entirely.
+#[test]
+fn a_trace_point_is_not_exported_as_a_sample() {
+    let mut with_point = view();
+    with_point.drivers[0].client_counters.push(Counter {
+        cell_registration: 0,
+        read_ns: 0,
+        changed_ns: None,
+        kind: karyos_sys::counters::KIND_CLIENT,
+        participant: 12,
+        ..counter("order received", karyos_sys::counters::TYPE_TRACE_POINT, 3)
+    });
+    assert_eq!(render(&with_point), render(&view()));
+}
+
 #[test]
 fn only_a_loopback_address_is_bound() {
     for address in ["0.0.0.0:0", "10.0.0.1:0", "[::]:0"] {

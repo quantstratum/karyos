@@ -1167,6 +1167,11 @@ pub enum ErrorCode {
     /// A lane guarded with a rate other than its publication's policy
     /// (R-CORE-21): only a policy change changes it.
     RatePolicyConflict,
+    /// The driver instance has assigned every application trace point id
+    /// (R-CORE-1): ids are never reused within the instance.
+    TracePointIdsExhausted,
+    /// The label is empty, too long or holds a control character.
+    InvalidLabel,
     /// A refusal code this peer does not define, read from a newer driver
     /// (karyos#819): a refusal all the same, with its wire value and its
     /// detail kept. It encodes to its own wire value, so a decoded
@@ -1252,6 +1257,8 @@ error_code_table! {
     RateInvalidPolicy = 23,
     StreamTooLarge = 24,
     RatePolicyConflict = 25,
+    TracePointIdsExhausted = 26,
+    InvalidLabel = 27,
 }
 
 impl ErrorCode {
@@ -3642,6 +3649,19 @@ mod tests {
         }
     }
 
+    /// karyos#722: application trace points' refusals are 26 and 27 (note
+    /// `karyos/cnc-error-code-reservations`).
+    #[test]
+    fn trace_point_error_codes_are_26_and_27() {
+        for (code, word) in [
+            (ErrorCode::TracePointIdsExhausted, 26),
+            (ErrorCode::InvalidLabel, 27),
+        ] {
+            assert_eq!(code.code(), word);
+            assert_eq!(ErrorCode::from_wire(word), Some(code));
+        }
+    }
+
     /// karyos#637: the roles' refusals keep their wire values.
     #[test]
     fn roles_error_codes_are_17_and_18() {
@@ -5787,6 +5807,8 @@ mod properties {
                 ErrorCode::RateInvalidPolicy,
                 ErrorCode::StreamTooLarge,
                 ErrorCode::RatePolicyConflict,
+                ErrorCode::TracePointIdsExhausted,
+                ErrorCode::InvalidLabel,
             ][..],
         );
         let code = prop_oneof![

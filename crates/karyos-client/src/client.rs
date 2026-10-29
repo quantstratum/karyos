@@ -84,7 +84,7 @@ use crate::conductor::{
     ClientConductor, Completion, ConductorError, ConductorPoll, EVENT_QUEUE, Outcome,
 };
 use crate::conflated_subscription::{ConflatedOptions, ConflatedSubscription};
-use crate::counter::{ClientCounterHandle, CounterKind};
+use crate::counter::{ClientCounterHandle, CounterKind, TracePointHandle};
 use crate::error::ClientError;
 use crate::publication::ClientPublication;
 use crate::subscription::{
@@ -667,6 +667,10 @@ pub trait Connection: sealed::Sealed {
         participant: u64,
     ) -> Result<u64, ConductorError>;
 
+    /// The client id the driver assigned to this connection.
+    #[doc(hidden)]
+    fn client_id(&self) -> u64;
+
     /// Releases what a late answer granted; whether it granted anything.
     #[doc(hidden)]
     fn release(&mut self, outcome: Outcome) -> bool;
@@ -836,6 +840,10 @@ impl Connection for ClientConductor {
         participant: u64,
     ) -> Result<u64, ConductorError> {
         ClientConductor::allocate_counter(self, type_id, label, stream, participant)
+    }
+
+    fn client_id(&self) -> u64 {
+        self.owner().client
     }
 
     fn conflated_subscription(
@@ -1032,6 +1040,10 @@ impl Connection for crate::ipc::RemoteClient {
         participant: u64,
     ) -> Result<u64, ConductorError> {
         crate::ipc::RemoteClient::allocate_counter(self, type_id, label, stream, participant)
+    }
+
+    fn client_id(&self) -> u64 {
+        crate::ipc::RemoteClient::client(self)
     }
 
     fn conflated_subscription(
@@ -1281,6 +1293,9 @@ pub struct Client<C: Connection> {
     /// while its handle is (R-CORE-3); at most `max_counters_per_client`
     /// once the dead are pruned.
     applications: Vec<(String, CounterKind, Weak<()>)>,
+    /// The trace points registered, by label, each alive while its handle
+    /// is (R-CORE-1).
+    points: Vec<(String, Weak<()>)>,
     /// The replay-target subscribers made by [`Client::replay_targets`].
     targets: Vec<Arc<Mutex<targets::Target<C::Terms>>>>,
     /// Their requests in flight.
@@ -1338,6 +1353,7 @@ impl<C: Connection> Client<C> {
             events: Vec::new(),
             adding: None,
             applications: Vec::new(),
+            points: Vec::new(),
             targets: Vec::new(),
             target_asks: Vec::new(),
         }
@@ -1856,6 +1872,65 @@ impl<C: Connection> Client<C> {
                     self.applications
                         .push((label.to_owned(), kind, Arc::downgrade(&name)));
                     Ok(handle.named(name))
+                }
+                other => Err(refusal(&other)),
+            },
+            Found::Network(..) => Err(ClientError::Unknown),
+        }
+    }
+
+    /// Registers an application trace point named `label` (R-CORE-1,
+    /// `quantstratum-docs: karyos/design/trace-records.md`, "Point
+    /// names"): a cell of the driver's client counters region of type id 8,
+    /// whose value is the id the driver assigns, never reused within its
+    /// instance. Records carry the id; the agent's trace export names it
+    /// with `label` and this client.
+    ///
+    /// The bounds are the driver's: `max_trace_points_per_client` live
+    /// points (16 by default), `max_trace_point_registrations_per_client`
+    /// over this client's life (256), and `max_counters_per_client`, whose
+    /// cells the points share.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::InvalidLabel`] for a label that is empty, longer than
+    /// 64 bytes or holds a control character, and
+    /// [`ClientError::DuplicateTracePoint`] when this client holds a live
+    /// point of the same label, both before anything is requested;
+    /// [`ClientError::Refused`] with `ErrorCode::ResourcesUnavailable` past
+    /// a bound or with no free cell, and with
+    /// `ErrorCode::TracePointIdsExhausted` once the instance assigned every
+    /// id; [`ClientError::Timeout`], and the [`ClientError::Conductor`]
+    /// errors.
+    pub fn add_trace_point(&mut self, label: &str) -> Result<TracePointHandle, ClientError> {
+        if !crate::counter::valid_point_label(label) {
+            return Err(ClientError::InvalidLabel);
+        }
+        self.points.retain(|(_, name)| name.strong_count() > 0);
+        if self.points.iter().any(|(held, _)| held == label) {
+            return Err(ClientError::DuplicateTracePoint);
+        }
+        let sequence = self.connection.allocate_counter(
+            karyos_sys::counters::TYPE_TRACE_POINT,
+            label,
+            0,
+            0,
+        )?;
+        match self.wait(sequence)? {
+            Found::Outcome(outcome) => match *outcome {
+                Outcome::Counter(handle) => {
+                    // The driver published the id with the cell, before
+                    // its answer.
+                    let Some(id) = u16::try_from(handle.value()).ok().filter(|id| *id != 0) else {
+                        return Err(ClientError::Unknown);
+                    };
+                    let name = Arc::new(());
+                    self.points.push((label.to_owned(), Arc::downgrade(&name)));
+                    Ok(TracePointHandle::new(
+                        handle.named(name),
+                        id,
+                        self.connection.client_id(),
+                    ))
                 }
                 other => Err(refusal(&other)),
             },

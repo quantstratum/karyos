@@ -27,6 +27,7 @@
 //! | `clients retired` | event | admission slots released (close flag observed) |
 //! | `clients faulty` | event | clients retired for a protocol violation, at the first retirement |
 //! | `fetches abandoned at leave` | event | remote clients that left with a fetch outstanding (one it abandoned, or exports not detached): a clean leave, their exports charged until the exit proof (karyos#851) |
+//! | `trace point ids exhausted` | event | trace point registrations refused because the instance assigned every id (R-CORE-1, karyos#722) |
 //! | `commands served` | event | commands decoded and executed or refused; malformed records are not commands |
 //! | `commands refused` | event | served commands answered with an `Error` |
 //! | `responses sent` | event | responses written to the broadcast buffer |
@@ -151,7 +152,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 74] = [
+const LABELS: [(u64, &str); 75] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -226,6 +227,7 @@ const LABELS: [(u64, &str); 74] = [
     (TYPE_EVENTS, "admission messages not sent at exit"),
     (TYPE_EVENTS, "clients closed before their exit"),
     (TYPE_EVENTS, "fetches abandoned at leave"),
+    (TYPE_EVENTS, "trace point ids exhausted"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -461,6 +463,10 @@ pub(crate) enum Event {
         allow(dead_code, reason = "remote clients exist on Linux only")
     )]
     FetchesAbandonedAtLeave,
+    /// Trace point registrations refused with `TracePointIdsExhausted`:
+    /// the instance assigned every id, which is never reused (R-CORE-1,
+    /// karyos#722). Last, so no other counter's id moves.
+    TracePointIdsExhausted,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -766,6 +772,7 @@ mod tests {
                 "clients closed before their exit",
             ),
             (Event::FetchesAbandonedAtLeave, "fetches abandoned at leave"),
+            (Event::TracePointIdsExhausted, "trace point ids exhausted"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

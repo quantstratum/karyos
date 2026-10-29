@@ -56,6 +56,7 @@ const TYPE_POSITION: u64 = 4;
 const TYPE_TIMESTAMP: u64 = 5;
 const TYPE_APPLICATION_EVENT: u64 = karyos_sys::counters::TYPE_APPLICATION_EVENT;
 const TYPE_APPLICATION_GAUGE: u64 = karyos_sys::counters::TYPE_APPLICATION_GAUGE;
+const TYPE_TRACE_POINT: u64 = karyos_sys::counters::TYPE_TRACE_POINT;
 
 /// One metric family: its type, help and sample lines.
 struct Family {
@@ -235,6 +236,11 @@ fn render_driver(families: &mut Families, driver: &DriverView) {
         }
     }
     for counter in &driver.client_counters {
+        // A trace point's cell is a name, not a metric (R-CORE-1): its
+        // value is an id, so it is never exported as a sample.
+        if counter.type_id == TYPE_TRACE_POINT {
+            continue;
+        }
         if !render_application(families, &dir, counter) {
             render_counter(families, &dir, "client", counter);
         }

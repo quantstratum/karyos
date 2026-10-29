@@ -68,6 +68,11 @@ pub const TYPE_APPLICATION_EVENT: u64 = 6;
 /// Counter type: an application's gauge, registered with
 /// `Client::add_counter` (R-CORE-3).
 pub const TYPE_APPLICATION_GAUGE: u64 = 7;
+/// Counter type: an application's named trace point, registered with
+/// `Client::add_trace_point` (R-CORE-1): the label is the point's name and
+/// the value the id the driver assigned, written before the cell is
+/// published and never changed.
+pub const TYPE_TRACE_POINT: u64 = 8;
 
 /// Participant kind in `key1` bits 15 to 8: none.
 pub const KIND_NONE: u8 = 0;
@@ -279,7 +284,22 @@ impl<'a> CellWords<'a> {
     /// Returns [`CounterError::IdentitiesExhausted`] when the version would
     /// wrap; the cell is unchanged.
     pub fn allocate(&self, metadata: &CounterMetadata) -> Result<(), CounterError> {
-        self.write(STATE_ALLOCATED, Some(metadata))
+        self.allocate_with(metadata, 0)
+    }
+
+    /// As [`CellWords::allocate`], with `value` in place of 0, stored under
+    /// the same seqlock write, so a reader never sees the cell allocated
+    /// without it.
+    ///
+    /// # Errors
+    ///
+    /// As [`CellWords::allocate`].
+    pub fn allocate_with(
+        &self,
+        metadata: &CounterMetadata,
+        value: u64,
+    ) -> Result<(), CounterError> {
+        self.write(STATE_ALLOCATED, Some(metadata), value)
     }
 
     /// Returns the cell to `FREE` under the seqlock. Only the allocator
@@ -289,10 +309,15 @@ impl<'a> CellWords<'a> {
     ///
     /// As [`CellWords::allocate`].
     pub fn free(&self) -> Result<(), CounterError> {
-        self.write(STATE_FREE, None)
+        self.write(STATE_FREE, None, 0)
     }
 
-    fn write(&self, state: u64, metadata: Option<&CounterMetadata>) -> Result<(), CounterError> {
+    fn write(
+        &self,
+        state: u64,
+        metadata: Option<&CounterMetadata>,
+        value: u64,
+    ) -> Result<(), CounterError> {
         let Some(version) = self.word(META_VERSION) else {
             return Ok(());
         };
@@ -329,7 +354,7 @@ impl<'a> CellWords<'a> {
         }
         // A swap, not a store: the reset heads the release sequence that
         // later increments extend.
-        let _ = self.value.swap(0, Ordering::Relaxed);
+        let _ = self.value.swap(value, Ordering::Relaxed);
         store(META_STATE, state);
         version.store(even, Ordering::Release);
         Ok(())
@@ -866,6 +891,23 @@ mod owned {
             keys: super::CounterKeys,
             eligible: impl Fn(usize) -> bool,
         ) -> Result<Counter, CounterError> {
+            self.allocate_valued_where(type_id, label, keys, 0, eligible)
+        }
+
+        /// Allocates as [`CountersManager::allocate_keyed_where`], the cell
+        /// published with `value` in place of 0 (a trace point's id).
+        ///
+        /// # Errors
+        ///
+        /// As [`CountersManager::allocate`].
+        pub fn allocate_valued_where(
+            &mut self,
+            type_id: u64,
+            label: &str,
+            keys: super::CounterKeys,
+            value: u64,
+            eligible: impl Fn(usize) -> bool,
+        ) -> Result<Counter, CounterError> {
             let next = self
                 .next_registration
                 .checked_add(1)
@@ -881,7 +923,7 @@ mod owned {
                 })
                 .ok_or(CounterError::Exhausted)?;
             let cell = self.region.cell(index).ok_or(CounterError::Exhausted)?;
-            cell.allocate(&metadata)?;
+            cell.allocate_with(&metadata, value)?;
             self.next_registration = next;
             Ok(Counter {
                 region: Arc::clone(&self.region),
@@ -1186,6 +1228,15 @@ mod owned {
             if let Some(cell) = self.region.cell(self.index) {
                 cell.set(value);
             }
+        }
+
+        /// The value (Relaxed): for a trace point, the id the driver
+        /// published with the cell before answering the allocation.
+        #[must_use]
+        pub fn value(&self) -> u64 {
+            self.region
+                .cell(self.index)
+                .map_or(0, |cell| cell.load_value())
         }
     }
 }

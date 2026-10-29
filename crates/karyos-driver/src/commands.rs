@@ -1940,10 +1940,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 participant,
             }
         };
-        match self
-            .client_counters
-            .allocate(client, type_id, label.as_str(), keys)
-        {
+        let allocated = if type_id == karyos_sys::counters::TYPE_TRACE_POINT {
+            // A trace point is the client's (R-CORE-1): keyed to no stream
+            // or participant, its label a printable name.
+            if stream != 0 {
+                return refuse(ErrorCode::UnknownStream, stream);
+            }
+            if participant != 0 {
+                return refuse(ErrorCode::UnknownRegistration, participant);
+            }
+            let name = label.as_str();
+            if name.is_empty() || name.chars().any(char::is_control) {
+                return refuse(ErrorCode::InvalidLabel, 0);
+            }
+            self.client_counters
+                .allocate_point(client, name, keys)
+                .map(|(cell, registration, _)| (cell, registration))
+        } else {
+            self.client_counters
+                .allocate(client, type_id, label.as_str(), keys)
+        };
+        match allocated {
             Ok((cell, registration)) => Response::CounterAllocated {
                 request,
                 cell: cell as u64,
@@ -1955,6 +1972,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     Refusal::ClientLimit => (1, "client counter limit reached"),
                     Refusal::Exhausted => (2, "no free client counter cell"),
                     Refusal::IdentitiesExhausted => (3, "counter identities exhausted"),
+                    Refusal::TracePointLimit => (4, "client trace point limit reached"),
+                    Refusal::TracePointRegistrations => {
+                        (5, "client trace point registrations exhausted")
+                    }
+                    Refusal::TracePointIdsExhausted => (6, "trace point ids exhausted"),
                 };
                 self.diagnostics.error(
                     &mut self.counters,
@@ -1969,6 +1991,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         refuse(ErrorCode::ResourcesUnavailable, 0)
                     }
                     Refusal::IdentitiesExhausted => refuse(ErrorCode::IdentitiesExhausted, 0),
+                    Refusal::TracePointLimit | Refusal::TracePointRegistrations => {
+                        refuse(ErrorCode::ResourcesUnavailable, 0)
+                    }
+                    Refusal::TracePointIdsExhausted => {
+                        self.counters.add(Event::TracePointIdsExhausted, 1);
+                        refuse(ErrorCode::TracePointIdsExhausted, 0)
+                    }
                 }
             }
         }
@@ -4325,6 +4354,50 @@ mod tests {
             stream,
             participant,
         }
+    }
+
+    /// R-CORE-1: the driver checks a trace point's label again, so a
+    /// client that skips its own check cannot store an empty name or one
+    /// with a control character; nor key a point to a stream or a
+    /// participant. A valid one is published with its id as its value.
+    #[test]
+    fn the_driver_refuses_a_hostile_trace_point_label() {
+        let (mut driver, _stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (_client, mut producer, _link) = raw_client(&mut driver);
+        let point = |sequence, label: &str, stream, participant| Command::AllocateCounter {
+            sequence,
+            type_id: karyos_sys::counters::TYPE_TRACE_POINT,
+            label: CounterLabel::new(label).unwrap(),
+            stream,
+            participant,
+        };
+        let cases = [
+            (point(1, "", 0, 0), ErrorCode::InvalidLabel),
+            (point(2, "bell\u{7}", 0, 0), ErrorCode::InvalidLabel),
+            (point(3, "next\u{85}line", 0, 0), ErrorCode::InvalidLabel),
+            (point(4, "keyed", 9, 0), ErrorCode::UnknownStream),
+            (point(5, "keyed", 0, 9), ErrorCode::UnknownRegistration),
+        ];
+        for (command, expected) in cases {
+            write(&mut producer, command);
+            let _ = driver.do_work().unwrap();
+            match responses(&mut observer)[..] {
+                [Response::Error { code, .. }] => assert_eq!(code, expected),
+                ref other => panic!("expected one Error, got {other:?}"),
+            }
+        }
+        write(&mut producer, point(6, "fine \"quoted\"", 0, 0));
+        let _ = driver.do_work().unwrap();
+        let [ref answer] = responses(&mut observer)[..] else {
+            panic!("expected one response");
+        };
+        let (cell, _) = allocated(answer);
+        let karyos_sys::counters::CellRead::Allocated { value, .. } = client_cell(&driver, cell)
+        else {
+            panic!("not allocated");
+        };
+        assert_eq!(value, 1, "the first id of the instance");
     }
 
     fn client_cell(driver: &EmbeddedDriver, cell: u64) -> karyos_sys::counters::CellRead {
