@@ -738,8 +738,15 @@ pub enum PendingCause {
     Failed(BackendFailure),
 }
 
-/// Why an item was returned without exposure.
+/// Why an item was returned without exposure: never handed to the
+/// device, its slot free again and its frame the caller's, intact.
+///
+/// `#[non_exhaustive]` (karyos#770): the backend contract types have no
+/// stable contract version yet (R-CORE-26), so a backend contract may add
+/// reasons; a consumer handles a reason it does not know as any return,
+/// never as an exposure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReturnReason {
     /// `cancel_pending`.
     Cancelled,
@@ -747,6 +754,15 @@ pub enum ReturnReason {
     QueueClosed,
     /// `reset` or `retire`.
     Reset,
+    /// A flush of a backend that resolves neighbours itself (a native
+    /// backend in exclusive mode) found the item's next hop unresolved and
+    /// returned it rather than hold it or send it unaddressed (R-CORE-44).
+    /// The kernel resolves neighbours for sockets, which never return it.
+    NeighbourUnresolved,
+    /// As [`ReturnReason::NeighbourUnresolved`], with no room in the
+    /// backend's neighbour table to start resolving the next hop
+    /// (R-CORE-44).
+    NeighbourTableFull,
 }
 
 /// The result of one flush.
