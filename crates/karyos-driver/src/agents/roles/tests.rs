@@ -5854,3 +5854,52 @@ fn a_draining_publication_purges_its_waiting_announces() {
     assert_eq!(sender.routes[slot].routes.waiting(), 0, "purged");
     sender.routes[slot].routes.hold_closes = false;
 }
+
+/// #838 review (E1): with `closing_again` full and the overflow waiting in
+/// the close list, another full share of removals still finds room in it,
+/// so nothing goes unrecorded.
+#[test]
+fn the_close_list_has_room_past_a_full_wait_list() {
+    let config = AgentConfig {
+        publications: 1,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) =
+        super::roles::<karyos_sys::term_bytes::HeapTerms>(&config).unwrap();
+    let (half, _frames, _data, _rx) = header_only_endpoint();
+    let mut halves: Halves = vec![(EndpointId(1), half)];
+    let super::super::Half::Tx(tx) = &mut halves[0].1 else {
+        panic!("a TX half");
+    };
+    let route = tx.add_route("10.0.0.8:5000".parse().unwrap()).unwrap();
+    let epoch = tx.capabilities().epoch;
+    let entry = super::super::data::Opened {
+        endpoint: EndpointId(1),
+        epoch,
+        route,
+        queues: [None; super::super::data::OPENED_QUEUES],
+    };
+    let share = sender.closing_again.capacity();
+    sender.close_in_flight = u32::MAX;
+    // A share fills `closing_again`, a second waits in the close list.
+    for _ in 0..share {
+        sender.closing.push(entry);
+    }
+    let _ = sender.duty(&mut halves, 0).unwrap();
+    for _ in 0..share {
+        sender.closing.push(entry);
+    }
+    let _ = sender.duty(&mut halves, 1).unwrap();
+    assert_eq!(sender.closing.len(), share, "the overflow waits");
+    // A third share of removals still fits.
+    assert!(
+        sender.closing.capacity() - sender.closing.len() >= share,
+        "room for another share: {} of {}",
+        sender.closing.len(),
+        sender.closing.capacity()
+    );
+    assert_eq!(sender.counters().removed_unrecorded, 0);
+    sender.close_in_flight = 0;
+    sender.closing.clear();
+    sender.closing_again.clear();
+}

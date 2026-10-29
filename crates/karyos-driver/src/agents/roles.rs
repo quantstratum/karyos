@@ -1734,7 +1734,10 @@ pub(super) fn roles<T: StreamTerms>(
             sender_heartbeat_interval: config.sender_heartbeat_interval,
             setup_interval: config.setup_interval,
             // Per publication: its routes, or its destinations and those
-            // retired since the last drain, which a removal closes too.
+            // retired since the last drain, which a removal closes too; and
+            // as many again for the entries in flight that wait here when
+            // `closing_again` is full (#838), so a removal always finds
+            // room.
             closing: Vec::with_capacity(
                 config
                     .publications
@@ -1742,6 +1745,7 @@ pub(super) fn roles<T: StreamTerms>(
                         karyos_io::lanes::routes::MAX_ROUTES
                             .saturating_add(super::data::MAX_DESTINATIONS.saturating_mul(2)),
                     )
+                    .and_then(|share| share.checked_mul(2))
                     .ok_or(AgentError::InvalidConfig("publications too large"))?,
             ),
             #[cfg(test)]
