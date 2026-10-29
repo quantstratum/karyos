@@ -232,7 +232,11 @@ fn a_network_subscription_reports_its_bound_address() {
 }
 
 /// Two images are polled in turn under one limit, starting after the
-/// image the last poll ended at, so neither starves.
+/// image the last poll ended at, so neither starves. A second subscription
+/// of the channel witnesses that both images hold every message before the
+/// first is read one at a time (plan 167, karyos#853): under load, an
+/// image's datagrams may arrive after the reads begin, and the first reads
+/// then rightly take the only image with data.
 #[test]
 fn a_network_subscription_polls_its_images_in_turn() {
     let (_a, mut a) = driven(2, None);
@@ -247,6 +251,12 @@ fn a_network_subscription_polls_its_images_in_turn() {
             StreamId::new(8),
         )
         .unwrap();
+    let mut witness = subscriber
+        .add_subscription(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(8),
+        )
+        .unwrap();
     let uri = format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1");
     let mut one = first
         .add_exclusive_publication(&uri, StreamId::new(8))
@@ -256,7 +266,8 @@ fn a_network_subscription_polls_its_images_in_turn() {
         .unwrap();
     until(&mut [&mut subscriber, &mut first, &mut second], || {
         let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
-        reading.image_count() == 2
+        let _ = witness.poll(|_, _| {}, MessageLimit::new(0));
+        reading.image_count() == 2 && witness.image_count() == 2
     });
     // Each image holds messages of its publication only.
     let mut offered = [0u32; 2];
@@ -272,8 +283,22 @@ fn a_network_subscription_polls_its_images_in_turn() {
             }
         }
     }
-    // Wait until both images have messages to read, then read one at a
-    // time: the images alternate.
+    // Wait until both images hold every message: the witness reads all
+    // 16, 8 of each publication.
+    let mut witnessed = [0u32; 2];
+    let start = Instant::now();
+    while witnessed != [8, 8] {
+        assert!(start.elapsed() < Duration::from_secs(20), "{witnessed:?}");
+        let _ = (first.poll(), second.poll(), subscriber.poll());
+        let _ = witness
+            .poll(
+                |bytes, _| witnessed[usize::from(bytes[0] == b'2')] += 1,
+                MessageLimit::new(16),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Then read one at a time: the images alternate.
     let mut seen: Vec<u8> = Vec::new();
     let start = Instant::now();
     while seen.len() < 16 {
