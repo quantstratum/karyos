@@ -259,6 +259,51 @@ fn a_network_publication_refuses_a_cutover() {
     );
 }
 
+/// karyos#859: a publication its endpoint could never open is refused at
+/// the add, never accepted and silent. One endpoint's 256 TX slots hold the
+/// control reserve (8 routes of 4 slots) and 28 single-lane unicast
+/// publications of 8 slots each (a lane queue of 8; no repair queue): the
+/// 29th is refused with the limit, the capacity and what it would take.
+/// Once a removal has ended its room is free again.
+#[test]
+fn a_publication_its_endpoint_cannot_hold_is_refused() {
+    use crate::error::EndpointLimit;
+
+    let mut driver = driver();
+    let socket = receiver();
+    let destination = Destination::Unicast(socket.local_addr().unwrap());
+    let mut held = Vec::new();
+    for stream in 0..28 {
+        held.push(
+            driver
+                .add_network_publication(aggregate(100 + stream, 1), &channel(destination.clone()))
+                .unwrap(),
+        );
+    }
+    let refused = driver.add_network_publication(aggregate(200, 1), &channel(destination.clone()));
+    assert_eq!(
+        refused,
+        Err(DriverError::EndpointCapacity {
+            limit: EndpointLimit::TxSlots,
+            capacity: 256,
+            needed: 32 + 29 * 8,
+        })
+    );
+    assert_eq!(
+        EndpointLimit::TxSlots.detail(256, 257),
+        (1 << 56) | (256 << 32) | 257,
+        "the detail word"
+    );
+    let first = held.remove(0);
+    driver.remove_aggregate(&first).unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&first).is_none()
+    });
+    let _ = driver
+        .add_network_publication(aggregate(200, 1), &channel(destination))
+        .unwrap();
+}
+
 /// The network publications and stale aliases held at once are bounded by
 /// `AgentConfig::publications`: a publication beyond it is refused, and
 /// removals never overflow the stale-alias queue.

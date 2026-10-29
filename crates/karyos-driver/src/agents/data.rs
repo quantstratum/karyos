@@ -100,6 +100,30 @@ pub type LaneReader<T = HeapTerms> = SenderRead<Arc<LogBuffer<T>>>;
 /// Datagrams staged per lane queue at once.
 const STAGED_PER_LANE: u16 = 8;
 
+/// What a publication takes of one TX endpoint once its routes and queues
+/// are open (karyos#859): routes, queues and pending slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TxDemand {
+    /// Routes.
+    pub routes: u32,
+    /// Queues.
+    pub queues: u32,
+    /// Pending slots (`max_pending` summed over its queues).
+    pub slots: u32,
+}
+
+impl TxDemand {
+    /// The sum of two demands.
+    #[must_use]
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            routes: self.routes.saturating_add(other.routes),
+            queues: self.queues.saturating_add(other.queues),
+            slots: self.slots.saturating_add(other.slots),
+        }
+    }
+}
+
 /// The gate of data traffic until phase 7: every candidate is permitted.
 /// It records, per lane, the position each submitted head reached.
 struct DataGate<'a> {
@@ -271,10 +295,10 @@ pub struct OutboundCounters {
     pub queue_failures: u64,
     /// Route setup failures.
     pub route_failures: u64,
-    /// Failed opens of a destination for an endpoint-wide limit (its route
-    /// table, queue entries or TX slots full), which never count against
-    /// the destination (they are in `route_failures` or `queue_failures`
-    /// too).
+    /// Failed opens for an endpoint-wide limit (its route table, queue
+    /// entries or TX slots full), of a destination or of the publication's
+    /// own path (karyos#859), which never count against the destination
+    /// (they are in `route_failures` or `queue_failures` too).
     pub endpoint_limits: u64,
     /// Send faults reported for a lane's head.
     pub send_faults: u64,
@@ -387,6 +411,11 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     /// Per lane, since when it submitted no DATA nor heartbeat: its idle
     /// heartbeat is due `sender_heartbeat_interval` later (SPEC §6).
     idle_since: [Option<u64>; 4],
+    /// On one path, when its last open failed and in which epoch: the next
+    /// try waits `open_spacing` (karyos#859), not every cycle.
+    open_tried: Option<(BackendEpoch, u64)>,
+    /// The spacing of its failed opens (`setup_interval`).
+    open_spacing: u64,
     /// Its removal linger, once removing (driver-network-agents.md §7).
     removal: Option<Box<removal::Removal>>,
     /// A timed publication's schedule ([`Outbound::set_timed`]).
@@ -609,6 +638,8 @@ impl<T: StreamTerms> Outbound<T> {
             fanout: None,
             route: None,
             idle_since: [None; 4],
+            open_tried: None,
+            open_spacing: 0,
             removal: None,
             timed: None,
             cells: None,
@@ -987,7 +1018,7 @@ impl<T: StreamTerms> Outbound<T> {
         // live route (RP-11).
         let open = match self.routed.as_deref() {
             Some(routed) => routed.repair_live(0, tx.capabilities().epoch),
-            None => self.open(tx),
+            None => self.open(tx, now),
         };
         if !open {
             return 0;
@@ -1176,17 +1207,28 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Opens the route and the lane queues on `tx` for its current epoch,
-    /// once per epoch; a new epoch drops what the old one staged.
-    fn open<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) -> bool {
+    /// once per epoch; a new epoch drops what the old one staged. A failed
+    /// open is tried again `open_spacing` later in the same epoch, not every
+    /// cycle, and one refused for an endpoint limit counts in
+    /// `endpoint_limits` (karyos#859).
+    fn open<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, now: u64) -> bool {
         let epoch = tx.capabilities().epoch;
         if self.opened == Some(epoch) {
             return true;
         }
+        let spacing = self.open_spacing;
+        if self.open_tried.is_some_and(|(tried, at)| {
+            tried == epoch && now.checked_sub(at).is_none_or(|age| age < spacing)
+        }) {
+            return false;
+        }
         let route = match tx.add_route(self.destination) {
             Ok(route) => route,
             Err(error) => {
+                self.open_tried = Some((epoch, now));
                 self.counters.bump(|c| &mut c.route_failures, 1);
                 if error == karyos_io::backend::RouteError::RouteLimit {
+                    self.counters.bump(|c| &mut c.endpoint_limits, 1);
                     note_limited(&mut self.limited, self.endpoint, epoch);
                 }
                 return false;
@@ -1203,7 +1245,9 @@ impl<T: StreamTerms> Outbound<T> {
             let opened = match opened {
                 Ok(opened) => opened,
                 Err(error) => {
+                    self.open_tried = Some((epoch, now));
                     if fanout::queue_limit(error) {
+                        self.counters.bump(|c| &mut c.endpoint_limits, 1);
                         note_limited(&mut self.limited, self.endpoint, epoch);
                     }
                     self.counters.bump(|c| &mut c.queue_failures, 1);
@@ -1472,7 +1516,7 @@ impl<T: StreamTerms> Outbound<T> {
             return self.serve_fanout(tx, budget, consumption, now);
         }
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
-        if !self.open(tx) {
+        if !self.open(tx, now) {
             // No queues this cycle, but a guard close still applies.
             self.guard_tick(now);
             return Ok(0);

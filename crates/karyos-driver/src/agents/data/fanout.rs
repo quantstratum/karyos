@@ -339,6 +339,11 @@ impl LaneGate for TargetGate<'_> {
 }
 
 impl Fanout {
+    /// Per destination it has now, whether it has a repair queue.
+    pub(super) fn target_repairs(&self) -> impl Iterator<Item = bool> + '_ {
+        self.targets.iter().map(|target| target.repair.is_some())
+    }
+
     /// The fan-out toward `destinations`, of which `required` are required,
     /// with `lanes` lanes of datagrams of at most `mtu` bytes served under
     /// `drr`, each lane starting at `joins[lane]`.
@@ -1520,6 +1525,7 @@ impl<T: StreamTerms> Outbound<T> {
     /// Its destinations' quarantine (MD-14) and the spacing of counted
     /// open failures (`setup_interval`), from the sender's settings.
     pub(crate) fn set_destination_timing(&mut self, quarantine: u64, setup_interval: u64) {
+        self.open_spacing = setup_interval;
         if let Some(fanout) = self.fanout.as_deref_mut() {
             fanout.quarantine = quarantine;
             fanout.open_spacing = setup_interval;

@@ -371,7 +371,7 @@ fn wait_key(
 }
 
 /// Datagrams one control queue holds: controls are sent at once.
-const CONTROL_QUEUE_DEPTH: u16 = 4;
+pub(crate) const CONTROL_QUEUE_DEPTH: u16 = 4;
 
 impl ControlRoutes {
     /// At most `max` cached destinations (at least 1), and room for the

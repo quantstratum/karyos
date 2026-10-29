@@ -52,7 +52,7 @@ use karyos_io::sockets::endpoint::{InterfaceSel, MulticastConfig, SocketsConfig}
 pub use control_group::{ControlGroup, ControlGroups, MAX_CONTROL_GROUPS};
 use karyos_protocol::network::Alias;
 
-use crate::agents::data::Outbound;
+use crate::agents::data::{Outbound, TxDemand};
 use crate::agents::{AgentCommand, AgentEvent, EndpointId};
 use crate::sessions::send::Publication;
 
@@ -65,7 +65,7 @@ use crate::agents::{
     NetworkAgents, ThreadingMode, YieldThenSleep, guarded, network_agents_over,
 };
 use crate::embedded::StreamTerms;
-use crate::error::DriverError;
+use crate::error::{DriverError, EndpointLimit};
 use crate::sessions::receive::SlotRef;
 use karyos_sys::log_buffer::{Conductor, LogBuffer};
 use karyos_sys::term_bytes::HeapTerms;
@@ -318,6 +318,9 @@ struct NetPublication {
     traced: karyos_protocol::trace_hook::PublicationIdentity,
     /// Its lane count.
     lanes: u8,
+    /// What it takes of each endpoint it sends on (karyos#859), held until
+    /// its entry goes, when its removal has ended.
+    demand: Vec<(EndpointId, TxDemand)>,
     /// Its open sender journals to close before `RemovePublication`, in the
     /// same ring (P2.12 step 3): `(lane, journal number)`.
     trace_closes: Vec<(Lane, u64)>,
@@ -407,6 +410,8 @@ struct SendEndpoint {
     endpoint: EndpointId,
     /// Publications and subscriptions that hold it.
     users: usize,
+    /// Its routes, queues and TX slots, fixed at open (karyos#859).
+    capacity: TxDemand,
 }
 
 /// A network subscription of this driver (W3): the receiver holds one
@@ -692,6 +697,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     stale_aliases: Vec<(EndpointId, Alias)>,
     /// Network publications and stale aliases held at once.
     capacity: usize,
+    /// What each send endpoint keeps for the sender's control routes
+    /// (karyos#859): `control_routes` routes and queues of
+    /// `CONTROL_QUEUE_DEPTH` slots each.
+    control_reserve: TxDemand,
     /// `publication_linger` (ns), handed to the sender at each removal.
     publication_linger: u64,
     /// The receiver's `alias_quarantine` (ns): how long a reincarnating
@@ -807,6 +816,15 @@ impl<T: StreamTerms> Network<T> {
             reopened: 0,
             stale_aliases: Vec::with_capacity(config.agents.publications),
             capacity: config.agents.publications,
+            control_reserve: {
+                let routes = u32::try_from(config.agents.control_routes).unwrap_or(u32::MAX);
+                TxDemand {
+                    routes,
+                    queues: routes,
+                    slots: routes
+                        .saturating_mul(u32::from(crate::agents::control::CONTROL_QUEUE_DEPTH)),
+                }
+            },
             publication_linger: config.stream_defaults.publication_linger,
             alias_quarantine: config.agents.sessions.alias_quarantine,
             reincarnations: Vec::with_capacity(config.agents.publications),
@@ -879,6 +897,11 @@ impl<T: StreamTerms> Network<T> {
         }
         let mut config = SocketsConfig::new(bind);
         config.multicast = multicast;
+        let capacity = TxDemand {
+            routes: u32::from(config.max_routes.get()),
+            queues: u32::from(config.max_queues.get()),
+            slots: u32::from(config.tx_slots.get()),
+        };
         let endpoint = self
             .endpoints
             .open(&self.links, config, OsSocket::new())
@@ -888,6 +911,7 @@ impl<T: StreamTerms> Network<T> {
             multicast,
             endpoint,
             users: 1,
+            capacity,
         });
         Ok(endpoint)
     }
@@ -1731,6 +1755,14 @@ impl<T: StreamTerms> Network<T> {
         if total.is_none_or(|total| total > self.capacity) {
             return Err(DriverError::NetworkPublicationsFull);
         }
+        // Each endpoint it sends on must hold its routes, queues and TX
+        // slots with what its other publications hold and the control
+        // reserve, or it could never open and would send nothing
+        // (karyos#859).
+        let demand = outbound.tx_demand();
+        for &(path, need) in &demand {
+            self.endpoint_room(path, need)?;
+        }
         let mut published = 0usize;
         for path in paths() {
             let posted = self
@@ -1800,6 +1832,7 @@ impl<T: StreamTerms> Network<T> {
             frontier,
             traced,
             lanes,
+            demand,
             trace_closes: Vec::new(),
             channel: Some(channel),
             reincarnating: false,
@@ -1810,6 +1843,46 @@ impl<T: StreamTerms> Network<T> {
             destination_changes: std::collections::VecDeque::new(),
             admission,
         });
+        Ok(())
+    }
+
+    /// Whether `endpoint` holds `need` more with what its publications
+    /// hold and the control reserve (karyos#859). An endpoint not in the
+    /// send table (none opened it for sending) is not checked.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::EndpointCapacity`]: the first limit that `need`
+    /// passes, with the endpoint's capacity and what it would take.
+    fn endpoint_room(&self, endpoint: EndpointId, need: TxDemand) -> Result<(), DriverError> {
+        let Some(capacity) = self
+            .send_endpoints
+            .iter()
+            .find(|entry| entry.endpoint == endpoint)
+            .map(|entry| entry.capacity)
+        else {
+            return Ok(());
+        };
+        let held = self
+            .publications
+            .iter()
+            .flat_map(|entry| entry.demand.iter())
+            .filter(|(held, _)| *held == endpoint)
+            .fold(self.control_reserve, |sum, (_, demand)| sum.plus(*demand));
+        let total = held.plus(need);
+        for (limit, capacity, needed) in [
+            (EndpointLimit::TxSlots, capacity.slots, total.slots),
+            (EndpointLimit::Queues, capacity.queues, total.queues),
+            (EndpointLimit::Routes, capacity.routes, total.routes),
+        ] {
+            if needed > capacity {
+                return Err(DriverError::EndpointCapacity {
+                    limit,
+                    capacity,
+                    needed,
+                });
+            }
+        }
         Ok(())
     }
 
