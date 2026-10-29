@@ -1036,7 +1036,7 @@ fn a_solicit_answer_installs_an_image() {
 /// held off for `setup_challenge_timeout`.
 #[test]
 fn a_data_storm_sends_one_solicit_per_entry() {
-    let mut sessions = table(SessionConfig::default());
+    let mut sessions = table(one_shot(SessionConfig::default()));
     let mut nonces = Counter::default();
     let outcome = sessions.solicit(key(1), 0, &mut nonces);
     let first = sent(&mut sessions, outcome);
@@ -1070,7 +1070,7 @@ fn a_data_storm_sends_one_solicit_per_entry() {
 /// A mismatched answer leaves the entry; an expired one is refused.
 #[test]
 fn a_solicit_answer_must_match_before_expiry() {
-    let mut sessions = table(SessionConfig::default());
+    let mut sessions = table(one_shot(SessionConfig::default()));
     let mut nonces = Counter::default();
     let solicit = solicited(sessions.solicit(key(1), 0, &mut nonces));
     let nonce = solicit.challenge.nonce;
@@ -1256,7 +1256,7 @@ fn solicits_are_bounded() {
         max_pending_per_source: 2,
         ..SessionConfig::default()
     };
-    let mut sessions = table(config);
+    let mut sessions = table(one_shot(config));
     let mut nonces = Counter::default();
     solicited(sessions.solicit(key(1), 0, &mut nonces));
     solicited(sessions.solicit(key(3), 0, &mut nonces));
@@ -1376,7 +1376,7 @@ fn the_holdoff_table_reuses_rows_and_never_grows() {
         max_pending_per_source: 2,
         ..SessionConfig::default()
     };
-    let mut sessions = table(config);
+    let mut sessions = table(one_shot(config));
     let mut nonces = Counter::default();
     let capacity = sessions.holdoffs.capacity();
     solicited(sessions.solicit(key(1), 0, &mut nonces));
@@ -1555,4 +1555,122 @@ fn a_next_incarnation_binds_its_key_once_the_old_image_retired() {
         sessions.announce(key(2), &announce(1), 10 * SECOND, &mut nonces),
         AnnounceOutcome::Dropped(Ignored::Quarantined)
     );
+}
+
+/// A solicit entry sent once and ended at `setup_challenge_timeout`, as
+/// before plan 164: the tests of the entry's other rules, retries apart.
+fn one_shot(config: SessionConfig) -> SessionConfig {
+    SessionConfig {
+        solicit_attempts: 1,
+        solicit_retry_initial: config.setup_challenge_timeout,
+        ..config
+    }
+}
+
+/// Plan 164: an unanswered SOLICIT is due a retry after 50 ms, the wait
+/// doubling (at 50, 150, 350, 750 and 1 550 ms), six SOLICITs at most;
+/// the retry window, 2 s from the first, then ends the entry without a
+/// binding and the key is held off.
+#[test]
+fn an_unanswered_solicit_is_retried_with_backoff() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let outcome = sessions.solicit(key(1), 0, &mut nonces);
+    sent(&mut sessions, outcome);
+    let mut due = Vec::with_capacity(4);
+    let due_at = |sessions: &ReceiveSessions, due: &mut Vec<BindingKey>, at| {
+        due.clear();
+        sessions.due_solicits(at, due);
+        !due.is_empty()
+    };
+    let mut at = 0;
+    for wait in [50 * MS, 100 * MS, 200 * MS, 400 * MS, 800 * MS] {
+        assert!(
+            !due_at(&sessions, &mut due, at + wait - 1),
+            "not before {wait}"
+        );
+        at += wait;
+        assert!(due_at(&sessions, &mut due, at), "due at {at}");
+        let retry = sessions.retry_solicit(&key(1), &mut nonces).unwrap();
+        sessions.solicit_retried(&key(1), retry.challenge.nonce, at);
+    }
+    assert_eq!(at, 1_550 * MS);
+    assert_eq!(
+        sessions.counters().solicit_retries,
+        5,
+        "six SOLICITs in all"
+    );
+    // No seventh: the attempts are spent; the window ends the entry.
+    assert!(!due_at(&sessions, &mut due, at + SECOND));
+    sessions.timers(2 * SECOND - 1);
+    assert_eq!(sessions.counters().solicits_expired, 0);
+    sessions.timers(2 * SECOND);
+    assert_eq!(sessions.counters().solicits_expired, 1);
+    assert_eq!(
+        sessions.solicit(key(1), 2 * SECOND + 1, &mut nonces),
+        SolicitOutcome::Dropped(Ignored::SolicitHoldoff)
+    );
+}
+
+/// Plan 164: after a retry, an ANSWER to the earlier nonce is late:
+/// dropped and counted; the current nonce's ANSWER binds.
+#[test]
+fn a_late_answer_to_an_earlier_solicit_is_dropped() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let outcome = sessions.solicit(key(1), 0, &mut nonces);
+    let first = sent(&mut sessions, outcome);
+    let retry = sessions.retry_solicit(&key(1), &mut nonces).unwrap();
+    assert_ne!(
+        retry.challenge.nonce, first.challenge.nonce,
+        "a fresh nonce"
+    );
+    sessions.solicit_retried(&key(1), retry.challenge.nonce, 50 * MS);
+    assert_eq!(
+        sessions.answer(key(1), &answer(1, first.challenge.nonce), 60 * MS, || true),
+        AnswerOutcome::Dropped(Ignored::StaleNonce)
+    );
+    assert_eq!(sessions.counters().solicit_stale_answers, 1);
+    assert!(matches!(
+        sessions.answer(key(1), &answer(1, retry.challenge.nonce), 70 * MS, || true),
+        AnswerOutcome::CreateImage { .. }
+    ));
+}
+
+/// Plan 164: retries the rates refuse are not attempts, but no entry
+/// retries past `solicit_retry_window` (2 s) from its first SOLICIT.
+#[test]
+fn refused_retries_end_at_the_retry_window() {
+    let mut sessions = table(SessionConfig::default());
+    let mut nonces = Counter::default();
+    let outcome = sessions.solicit(key(1), 0, &mut nonces);
+    sent(&mut sessions, outcome);
+    let mut due = Vec::with_capacity(4);
+    let mut at = 0;
+    let mut refused = 0;
+    while at < 3 * SECOND {
+        at += 10 * MS;
+        due.clear();
+        sessions.due_solicits(at, &mut due);
+        if !due.is_empty() {
+            sessions.solicit_refused(&key(1), at);
+            refused += 1;
+        }
+        sessions.timers(at);
+    }
+    assert!(refused > 0, "retries were due");
+    assert_eq!(
+        sessions.counters().solicit_retries,
+        0,
+        "none counted as an attempt"
+    );
+    assert_eq!(sessions.counters().solicit_retries_refused, refused);
+    assert_eq!(
+        sessions.counters().solicits_expired,
+        1,
+        "ended by the window"
+    );
+    due.clear();
+    sessions.due_solicits(3 * SECOND, &mut due);
+    assert!(due.is_empty());
 }
