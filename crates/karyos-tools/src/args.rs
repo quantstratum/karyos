@@ -43,8 +43,9 @@ Configuration:
                                     tables (TOML); the options below override it
   --io-backend <name>               the I/O backend, overriding [io] backend; this driver
                                     has sockets [sockets]
-  --io-require <capability>         a capability that must be active, or startup fails;
-                                    any use replaces [io] require; repeatable
+  --io-require <capability>         a capability every endpoint must have active; one
+                                    that lacks it fails to open, at startup or at the
+                                    first add; any use replaces [io] require; repeatable
                                     The io configuration needs --network on.
 
 Admission:

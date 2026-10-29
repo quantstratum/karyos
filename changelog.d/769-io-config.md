@@ -3,7 +3,9 @@
 - A configuration file for `karyosd` (R-CORE-43, karyos#769):
   `--config <path>` reads the `[io]` table of SPEC 16.9 (TOML).
   `backend` selects the I/O backend (default `sockets`) and `require`
-  the capabilities every endpoint must have active, or startup fails.
+  the capabilities every endpoint must have active: one that lacks a
+  required capability fails to open, at startup or at the first add
+  that opens it.
   `[io.sockets]` sets `tx_slots`, `max_queues` and `max_routes` of each
   endpoint. `--io-backend` and `--io-require` override the file; the io
   configuration needs `--network on`.
