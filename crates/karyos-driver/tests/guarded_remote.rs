@@ -375,8 +375,8 @@ fn a_remote_handle_follows_a_rate_policy_change() {
 /// The #852 review (decided 2026-10-28 by QS-COORDINATOR) across
 /// processes: a remote handle bound to a reincarnation reads when it began
 /// from its ring (`outcome_ring::REINCARNATED_AT`) and starts its copy
-/// empty then: bound at once, empty; bound 50 ms after, the burst, as the
-/// reincarnation's gate.
+/// empty then: bound at once, empty or nearly; bound 250 ms after, the
+/// burst, as the reincarnation's gate.
 #[test]
 fn a_remote_handle_of_a_reincarnation_earns_since_it_began() {
     use karyos_driver::GuardRate;
@@ -387,8 +387,8 @@ fn a_remote_handle_of_a_reincarnation_earns_since_it_began() {
     let mut driver = driver(&dir);
     let stream = driver.add_stream(stream_config()).unwrap();
     let guard = driver.add_guard("orders").unwrap();
-    // A thousand a second, a burst of two: 50 ms earns the burst, a few
-    // microseconds nothing.
+    // Ten a second, a burst of two: 250 ms earns the burst, while a bind
+    // delayed by up to 100 ms under load earns one token at most.
     driver
         .guard_stream(
             stream,
@@ -396,7 +396,7 @@ fn a_remote_handle_of_a_reincarnation_earns_since_it_began() {
             4,
             Some(GuardRate::publication(RatePolicy {
                 messages: Rate {
-                    per_second: 1_000,
+                    per_second: 10,
                     burst: 2,
                 },
                 bytes: None,
@@ -424,19 +424,20 @@ fn a_remote_handle_of_a_reincarnation_earns_since_it_began() {
     };
     let (client, first, tokens) = serve_while(&mut driver, move || take(client));
     assert_eq!(tokens, Some(2), "the first incarnation starts full");
-    // Reincarnated (close, drop, reopen); bound at once: empty.
+    // Reincarnated (close, drop, reopen); bound at once: empty, or one token
+    // if the bind waited.
     assert_eq!(driver.close_guard(guard, 2), Ok(Closed::Now { epoch: 3 }));
     drop(first);
     let _ = driver.do_work().unwrap();
     assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
     let (client, second, tokens) = serve_while(&mut driver, move || take(client));
     assert!(matches!(tokens, Some(0 | 1)), "{tokens:?}");
-    // Reincarnated again, stamped 50 ms before it happens: the burst.
+    // Reincarnated again, stamped 250 ms before it happens: the burst.
     assert_eq!(driver.close_guard(guard, 4), Ok(Closed::Now { epoch: 5 }));
     drop(second);
     let _ = driver.do_work().unwrap();
     driver
-        .backdate_next_reincarnation(stream, 50_000_000)
+        .backdate_next_reincarnation(stream, 250_000_000)
         .unwrap();
     assert_eq!(driver.reopen_guard(guard, 5, 5), Ok(6));
     let (client, third, tokens) = serve_while(&mut driver, move || take(client));
