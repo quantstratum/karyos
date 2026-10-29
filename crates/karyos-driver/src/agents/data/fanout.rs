@@ -53,7 +53,7 @@ use karyos_sys::log_buffer::{ReadError, ReadOrigin, ReadOutcome};
 
 use super::removal::{EosSent, RemovalStep};
 use super::{Limit, OPENED_QUEUES, Opened, Outbound, STAGED_PER_LANE, align_frame};
-use crate::agents::{AgentError, AgentKind};
+use crate::agents::{AgentError, AgentKind, EndpointId};
 use crate::embedded::StreamTerms;
 
 /// Consecutive send faults after which an optional destination is removed
@@ -147,6 +147,9 @@ pub(super) struct Target {
     /// Per lane, since when it submitted nothing: its idle heartbeat is
     /// due `sender_heartbeat_interval` later.
     idle_since: [Option<u64>; 4],
+    /// When it last submitted DATA or a PATH_HB: its PATH_HB is due
+    /// `path_heartbeat_interval` later (RP-3, karyos#859).
+    path_sent: Option<u64>,
     counters: TargetCounters,
     /// Removed, why and when: it gets nothing more, and its SMs and NAKs
     /// are ignored.
@@ -204,6 +207,7 @@ impl Target {
             bounds: false,
             stalled: false,
             idle_since: [None; 4],
+            path_sent: None,
             counters: TargetCounters::default(),
             removed: None,
             reported: false,
@@ -339,6 +343,45 @@ impl LaneGate for TargetGate<'_> {
 }
 
 impl Fanout {
+    /// Names through `post` each live destination due a PATH_HB: it
+    /// submitted nothing for `interval` ns at `now` (RP-3, karyos#859);
+    /// its wait starts at the first look. `post` says whether it took it.
+    pub(super) fn path_heartbeats(
+        &mut self,
+        endpoint: EndpointId,
+        now: u64,
+        interval: u64,
+        mut post: impl FnMut(EndpointId, SocketAddr) -> bool,
+    ) -> u32 {
+        let mut posted = 0u32;
+        for target in &mut self.targets {
+            if !target.live || target.removed.is_some() {
+                target.path_sent = Some(now);
+                continue;
+            }
+            let since = *target.path_sent.get_or_insert(now);
+            if now.checked_sub(since).is_none_or(|quiet| quiet < interval) {
+                continue;
+            }
+            if post(endpoint, target.address) {
+                // At most `MAX_DESTINATIONS`: no overflow.
+                posted = posted.saturating_add(1);
+            }
+        }
+        posted
+    }
+
+    /// Records a PATH_HB submitted to `destination` at `now`.
+    pub(super) fn path_heartbeat_sent(&mut self, destination: SocketAddr, now: u64) {
+        if let Some(target) = self
+            .targets
+            .iter_mut()
+            .find(|target| target.address == destination)
+        {
+            target.path_sent = Some(now);
+        }
+    }
+
     /// The fan-out toward `destinations`, of which `required` are required,
     /// with `lanes` lanes of datagrams of at most `mtu` bytes served under
     /// `drr`, each lane starting at `joins[lane]`.
@@ -1009,6 +1052,8 @@ impl<T: StreamTerms> Outbound<T> {
                 }
             } else if target.lanes.iter().any(|track| track.submitted) {
                 target.faults = 0;
+                // DATA left: its path's PATH_HB waits again.
+                target.path_sent = Some(now);
             }
             for track in &mut target.lanes {
                 track.submitted = false;

@@ -5482,7 +5482,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     Sent::Submitted
                 ) {
                     if let Some(outbound) = self.publications.get_mut(index) {
-                        outbound.path_heartbeat_sent(endpoint, now);
+                        outbound.path_heartbeat_sent(endpoint, destination, now);
                     }
                     self.count(|c| &mut c.path_heartbeats_sent);
                     if let Some(next) = submitted.checked_add(1) {

@@ -19,7 +19,7 @@ use karyos_protocol::channel::{
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{Role, SealReason};
 
-use super::{ANY_PORT, BUDGET, LOOPBACK, aggregate, bound, channel, driver, pump};
+use super::{ANY_PORT, BUDGET, LOOPBACK, aggregate, bound, channel, driver, driver_with, pump};
 use crate::agents::ThreadingMode;
 use crate::embedded::EmbeddedDriver;
 use crate::error::DriverError;
@@ -1078,4 +1078,132 @@ fn endpoint_resets_remove_no_optional_destination() {
     // Review B3 of #829: the resets' refused opens are not limits.
     let counters = super::shared(&mut a).sender.outbound_counters(0).unwrap();
     assert_eq!(counters.endpoint_limits, 0, "{counters:?}");
+}
+
+/// karyos#859: an idle multi-destination publication sends each
+/// destination its idle DATA heartbeats, which are image evidence, not path
+/// evidence (RP-2). Whether each destination's subscriber keeps its path
+/// through `KARYOS_IDLE_SECS` (default 25) idle seconds, or loses it at
+/// `path_liveness_timeout` and binds it again by SOLICIT: a measurement.
+#[test]
+#[ignore = "a measurement: KARYOS_IDLE_SECS idle seconds"]
+#[allow(
+    clippy::print_stdout,
+    reason = "a measurement printed to the job's log"
+)]
+fn m859_an_idle_multi_destination_publication_keeps_its_paths() {
+    use std::time::{Duration, Instant};
+
+    let secs = std::env::var("KARYOS_IDLE_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(25u64);
+    let mut a = driver(ThreadingMode::Shared);
+    let (mut receivers, addresses) = receivers_on(2, true);
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &destinations(&addresses, true))
+        .unwrap();
+    let mut images = vec![None; receivers.len()];
+    {
+        let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+            .chain(receivers.iter_mut())
+            .collect();
+        pump(&mut all, |drivers| {
+            for (image, receiver) in images.iter_mut().zip(drivers.iter().skip(1)) {
+                *image = receiver.network_image(10, 3);
+            }
+            images.iter().all(Option::is_some)
+        });
+    }
+    let start = Instant::now();
+    let mut next = Duration::from_secs(5);
+    while start.elapsed() < Duration::from_secs(secs) {
+        let _ = a.do_work().unwrap();
+        for receiver in &mut receivers {
+            let _ = receiver.do_work().unwrap();
+        }
+        if start.elapsed() >= next {
+            next += Duration::from_secs(5);
+            for (index, receiver) in receivers.iter().enumerate() {
+                let counters = receiver.net.as_ref().unwrap().receiver_counters().unwrap();
+                println!(
+                    "idle_destinations {:>3} s receiver {index}: paths_bound {} data_unbound {} path_heartbeats {} heartbeats {} stationary {} images {}",
+                    start.elapsed().as_secs(),
+                    counters.paths_bound,
+                    counters.data_unbound,
+                    counters.path_heartbeats,
+                    counters.heartbeats,
+                    counters.heartbeats_stationary,
+                    receiver.net.as_ref().unwrap().image_count(),
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+}
+
+/// karyos#859: an idle multi-destination publication sends each live
+/// destination a PATH_HB, so each subscriber keeps its path through three
+/// `path_liveness_timeout`s (1 s here) and binds nothing again. Without it
+/// each path was lost at the timeout and bound again by SOLICIT.
+#[test]
+fn an_idle_multi_destination_publication_keeps_each_path() {
+    use std::time::{Duration, Instant};
+
+    let mut agents = crate::agents::AgentConfig::default();
+    agents.sessions.path_liveness_timeout = 1_000_000_000;
+    let mut a = driver(ThreadingMode::Shared);
+    let mut receivers = Vec::new();
+    let mut addresses = Vec::new();
+    for _ in 0..2 {
+        let mut receiver = driver_with(ThreadingMode::Shared, agents.clone());
+        let _ = receiver
+            .add_network_subscription(10, &channel(ANY_PORT, true))
+            .unwrap();
+        addresses.push(bound(&receiver, 10));
+        receivers.push(receiver);
+    }
+    let _publication = a
+        .add_network_publication(aggregate(10, 3, 1), &destinations(&addresses, true))
+        .unwrap();
+    {
+        let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
+            .chain(receivers.iter_mut())
+            .collect();
+        pump(&mut all, |drivers| {
+            drivers
+                .iter()
+                .skip(1)
+                .all(|receiver| receiver.network_image(10, 3).is_some())
+        });
+    }
+    let bound_before: Vec<u64> = receivers
+        .iter()
+        .map(|receiver| {
+            receiver
+                .net
+                .as_ref()
+                .unwrap()
+                .receiver_counters()
+                .unwrap()
+                .paths_bound
+        })
+        .collect();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        let _ = a.do_work().unwrap();
+        for receiver in &mut receivers {
+            let _ = receiver.do_work().unwrap();
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    for (receiver, before) in receivers.iter().zip(bound_before) {
+        let counters = receiver.net.as_ref().unwrap().receiver_counters().unwrap();
+        assert_eq!(
+            counters.paths_bound, before,
+            "a path bound again: {counters:?}"
+        );
+        assert_eq!(counters.data_unbound, 0, "a path lost: {counters:?}");
+        assert!(counters.path_heartbeats > 0);
+    }
 }

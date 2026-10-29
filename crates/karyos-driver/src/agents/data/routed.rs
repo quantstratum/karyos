@@ -739,8 +739,8 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// its destination; `post` says whether it took it. A publication on
     /// one path has one, its own (karyos#859): its subscriber may hold
     /// several paths, which DATA alone keeps live. A multi-destination
-    /// publication has none here, nor one being removed or whose guard
-    /// admits no lane. The caller reports each one submitted
+    /// publication has one per live destination. None while it is removed
+    /// or its guard admits no lane. The caller reports each one submitted
     /// ([`Outbound::path_heartbeat_sent`]). Returns the count taken.
     pub fn path_heartbeats(
         &mut self,
@@ -759,22 +759,33 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         if let Some(routed) = self.routed.as_deref_mut() {
             return routed.path_heartbeats(now, interval, post);
         }
+        if self.removing() {
+            return 0;
+        }
+        let endpoint = self.endpoint;
+        if let Some(fanout) = self.fanout.as_deref_mut() {
+            return fanout.path_heartbeats(endpoint, now, interval, post);
+        }
         // Its idle wait starts at the first look, as a lane's heartbeat's.
         let since = *self.path_sent.get_or_insert(now);
         let idle = now
             .checked_sub(since)
             .is_some_and(|quiet| quiet >= interval);
-        if !idle || self.fanout.is_some() || self.removing() {
+        if !idle {
             return 0;
         }
-        u32::from(post(self.endpoint, self.destination))
+        u32::from(post(endpoint, self.destination))
     }
 
-    /// Records a PATH_HB submitted on the path on `endpoint` at `now`: the
-    /// path is not idle until `path_heartbeat_interval` later. Only a
-    /// submitted one counts (#336 review), so a refused send is tried again
-    /// next cycle.
-    pub fn path_heartbeat_sent(&mut self, endpoint: EndpointId, now: u64) {
+    /// Records a PATH_HB submitted on the path on `endpoint` toward
+    /// `destination` at `now`: the path is not idle until
+    /// `path_heartbeat_interval` later. Only a submitted one counts (#336
+    /// review), so a refused send is tried again next cycle.
+    pub fn path_heartbeat_sent(&mut self, endpoint: EndpointId, destination: SocketAddr, now: u64) {
+        if let Some(fanout) = self.fanout.as_deref_mut() {
+            fanout.path_heartbeat_sent(destination, now);
+            return;
+        }
         if self.routed.is_none() {
             if endpoint == self.endpoint {
                 self.path_sent = Some(now);
