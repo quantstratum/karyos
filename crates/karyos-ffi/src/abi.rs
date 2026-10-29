@@ -17,12 +17,14 @@ use crate::boundary::{drop_payload, guard};
 use crate::handles::Handle;
 use crate::status::{Failure, Status, UNKNOWN_CODE};
 
-/// The ABI version's major number (`KARYOS_ABI_VERSION_MAJOR`).
-pub(crate) const ABI_VERSION_MAJOR: u32 = 0;
+/// The ABI version's major number (`KARYOS_ABI_VERSION_MAJOR`), from its
+/// single source in `karyos-protocol` (karyos#729); the header test checks
+/// the header's.
+pub(crate) const ABI_VERSION_MAJOR: u32 = karyos_protocol::versions::C_ABI_MAJOR;
 /// The ABI version's minor number (`KARYOS_ABI_VERSION_MINOR`).
-pub(crate) const ABI_VERSION_MINOR: u32 = 1;
+pub(crate) const ABI_VERSION_MINOR: u32 = karyos_protocol::versions::C_ABI_MINOR;
 /// The ABI version's patch number (`KARYOS_ABI_VERSION_PATCH`).
-pub(crate) const ABI_VERSION_PATCH: u32 = 5;
+pub(crate) const ABI_VERSION_PATCH: u32 = karyos_protocol::versions::C_ABI_PATCH;
 
 /// Whether `out` can take a `T`: not null and aligned. It cannot tell a
 /// dangling pointer; the caller's contract excludes one.

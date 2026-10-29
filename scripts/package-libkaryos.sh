@@ -13,6 +13,7 @@
 #   share/karyos/conformance/                      (the suite of this commit)
 #   share/karyos/MANIFEST                          (versions and build)
 #   share/karyos/abi-manifest.txt                  (scripts/abi-manifest.sh)
+#   share/karyos/versions.json                     (`karyos-tools --versions`)
 #   LICENSE.md
 #
 # The crate's library is `karyos_ffi` (`karyos` would collide with the
@@ -168,6 +169,18 @@ cp "$root/LICENSE.md" "$stage/LICENSE.md"
 "$root/scripts/abi-manifest.sh" "$stage/include/karyos.h" >"$stage/share/karyos/abi-manifest.txt" ||
     fail "the ABI manifest could not be measured"
 
+# Every contract version of this commit (R-CORE-33, karyos#729), as the
+# tools report them with `--versions`: written by this build's binary,
+# since the package carries none, and checked against MANIFEST below.
+"$cargo" build -q -p karyos-tools --bin karyos-tools --release --locked ||
+    fail "the karyos-tools build failed"
+"$release/karyos-tools" --versions >"$stage/share/karyos/versions.json" ||
+    fail "karyos-tools --versions failed"
+for pair in "\"version\":\"$abi\"" "\"admission\":$protocol," "\"release\":\"$core_version\""; do
+    grep -qF "$pair" "$stage/share/karyos/versions.json" ||
+        fail "versions.json disagrees with MANIFEST: no $pair"
+done
+
 cat >"$stage/lib/pkgconfig/karyos.pc" <<EOF
 prefix=\${pcfiledir}/../..
 libdir=\${prefix}/lib
@@ -216,6 +229,7 @@ rustc=$(rustc -V)
 profile=release
 pkg_config=karyos.pc karyos-static.pc
 abi_manifest=share/karyos/abi-manifest.txt
+versions=share/karyos/versions.json
 contents=library
 excludes=karyosd
 EOF

@@ -41,3 +41,4 @@ pub mod replay;
 pub mod replay_live;
 pub mod stat;
 pub mod trace;
+pub mod versions;

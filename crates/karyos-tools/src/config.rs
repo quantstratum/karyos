@@ -255,6 +255,13 @@ struct Registered {
     load: fn(&str) -> Result<Option<LoadedTable>, ConfigError>,
 }
 
+/// The configuration file's schema version (R-CORE-33, karyos#729;
+/// `quantstratum-docs: karyos/design/versions.md`), which `--versions`
+/// reports. Version 1 is the `[io]` schema of R-CORE-43 (karyos#874).
+/// Adding an optional key or a backend table keeps it; removing a key, or
+/// changing what one means or accepts, increments it.
+pub const SCHEMA_VERSION: u32 = 1;
+
 /// The backends a driver binary has, whose tables a configuration file
 /// may hold.
 #[derive(Clone)]
