@@ -41,23 +41,25 @@ config = 1
 # Admission: a driver admits only its own protocol version
 # (crates/karyos-ffi/tests/connect.rs; conformance op.connect.other.version).
 # Observed by scripts/compat-test.sh (its run, head and command:
-# RELEASING.md, the wire compatibility matrix row): the refusal does not
-# name the driver's version across these releases (driver: None), because
-# the admission Refused message has no version field, on main too:
-# karyos#879.
+# RELEASING.md, the wire compatibility matrix row): the refusal names the
+# driver's version in neither direction (driver: None). From karyos#879 a
+# main driver states its version in word 1 of the Refused, which a main
+# client reads, but a 0.1.0-alpha.2 driver states none (word 1 is 0) and a
+# 0.1.0-alpha.2 client does not read it. The first release pair with the
+# change on both sides will show it.
 [[entry]]
 surface = "admission"
 from = "main"
 to = "0.1.0-alpha.2"
 outcome = "refuse"
-reason = "IncompatibleVersion: the 0.1.0-alpha.2 driver refuses protocol 3 (observed: AttachError::IncompatibleVersion { driver: None }; the refusal carries no version, karyos#879)"
+reason = "IncompatibleVersion: the 0.1.0-alpha.2 driver refuses protocol 3 (observed: AttachError::IncompatibleVersion { driver: None }; a 0.1.0-alpha.2 driver's refusal states no version, karyos#879)"
 
 [[entry]]
 surface = "admission"
 from = "0.1.0-alpha.2"
 to = "main"
 outcome = "refuse"
-reason = "IncompatibleVersion: the main driver refuses protocol 2 (observed: AttachError::IncompatibleVersion { driver: None }; the refusal carries no version, karyos#879)"
+reason = "IncompatibleVersion: the main driver refuses protocol 2 and states protocol 3 in its refusal (karyos#879), which a 0.1.0-alpha.2 client does not read (observed: AttachError::IncompatibleVersion { driver: None })"
 
 # Frame: the same frame version, 1, on both sides, which is not enough by
 # itself (R-CORE-36). Observed by scripts/compat-test.sh (its run, head
