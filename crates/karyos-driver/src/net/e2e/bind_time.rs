@@ -638,13 +638,12 @@ fn measure_one_driver(label: &str, reliable: bool, count: usize, streams: usize)
                 let reasons: Vec<_> = ignored.seen().collect();
                 let own = joiner.net.as_ref().unwrap().receiver_counters().unwrap();
                 println!(
-                    "bind_time {label} round: solicits {} retries {} refused {} stale {} expired {} \
+                    "bind_time {label} round: solicits {} retries {} refused {} expired {} \
                      | joiner rsp_setup_rate_limited {} rsp_setup_total_limited {} rsp_setup_destinations_full {} \
                      ring_full_rsp_setup {} | ignored {reasons:?}",
                     sessions.solicits,
                     sessions.solicit_retries,
                     sessions.solicit_retries_refused,
-                    sessions.solicit_stale_answers,
                     sessions.solicits_expired,
                     own.rsp_setup_rate_limited,
                     own.rsp_setup_total_limited,

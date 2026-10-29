@@ -3790,7 +3790,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
     }
 
     /// Retries the solicit entries whose ANSWER has not come
-    /// (network-control-schemas.md §6.3, plan 164): each with a fresh
+    /// (network-control-schemas.md §6.3, plan 164): each with its entry's
     /// nonce, through the RSP_SETUP limits of §7.4 like a first SOLICIT. A
     /// retry they refuse is not an attempt and waits for the next step.
     /// Returns the retries sent. Nothing allocates.
@@ -3800,10 +3800,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.sessions.due_solicits(now, &mut due);
         let mut sent = 0u32;
         for key in due.drain(..) {
-            let Some(solicit) = self.sessions.retry_solicit(&key, &mut self.nonces) else {
+            let Some(solicit) = self.sessions.retry_solicit(&key) else {
                 continue;
             };
-            let nonce = solicit.challenge.nonce;
             let mut intake = Intake {
                 endpoint: key.endpoint,
                 now,
@@ -3812,7 +3811,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 work: 0,
             };
             if intake.challenge(key.source, Control::Solicit(solicit)) {
-                self.sessions.solicit_retried(&key, nonce, now);
+                self.sessions.solicit_retried(&key, now);
                 sent = sent.saturating_add(1);
             } else {
                 self.sessions.solicit_refused(&key, now);

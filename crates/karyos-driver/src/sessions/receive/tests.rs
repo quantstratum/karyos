@@ -1591,8 +1591,8 @@ fn an_unanswered_solicit_is_retried_with_backoff() {
         );
         at += wait;
         assert!(due_at(&sessions, &mut due, at), "due at {at}");
-        let retry = sessions.retry_solicit(&key(1), &mut nonces).unwrap();
-        sessions.solicit_retried(&key(1), retry.challenge.nonce, at);
+        assert!(sessions.retry_solicit(&key(1)).is_some());
+        sessions.solicit_retried(&key(1), at);
     }
     assert_eq!(at, 1_550 * MS);
     assert_eq!(
@@ -1612,28 +1612,26 @@ fn an_unanswered_solicit_is_retried_with_backoff() {
     );
 }
 
-/// Plan 164: after a retry, an ANSWER to the earlier nonce is late:
-/// dropped and counted; the current nonce's ANSWER binds.
+/// Plan 164: every retry carries the entry's nonce, so an ANSWER to the
+/// first SOLICIT that arrives after a retry still binds (an RTT above the
+/// 50 ms first wait); a replay then finds no challenge.
 #[test]
-fn a_late_answer_to_an_earlier_solicit_is_dropped() {
+fn an_answer_to_the_first_solicit_binds_after_a_retry() {
     let mut sessions = table(SessionConfig::default());
     let mut nonces = Counter::default();
     let outcome = sessions.solicit(key(1), 0, &mut nonces);
     let first = sent(&mut sessions, outcome);
-    let retry = sessions.retry_solicit(&key(1), &mut nonces).unwrap();
-    assert_ne!(
-        retry.challenge.nonce, first.challenge.nonce,
-        "a fresh nonce"
-    );
-    sessions.solicit_retried(&key(1), retry.challenge.nonce, 50 * MS);
-    assert_eq!(
-        sessions.answer(key(1), &answer(1, first.challenge.nonce), 60 * MS, || true),
-        AnswerOutcome::Dropped(Ignored::StaleNonce)
-    );
-    assert_eq!(sessions.counters().solicit_stale_answers, 1);
+    let retry = sessions.retry_solicit(&key(1)).unwrap();
+    assert_eq!(retry.challenge, first.challenge, "the same nonce");
+    sessions.solicit_retried(&key(1), 50 * MS);
+    let late = answer(1, first.challenge.nonce);
     assert!(matches!(
-        sessions.answer(key(1), &answer(1, retry.challenge.nonce), 70 * MS, || true),
+        sessions.answer(key(1), &late, 200 * MS, || true),
         AnswerOutcome::CreateImage { .. }
+    ));
+    assert!(matches!(
+        sessions.answer(key(1), &late, 210 * MS, || true),
+        AnswerOutcome::Dropped(_)
     ));
 }
 

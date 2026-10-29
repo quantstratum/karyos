@@ -5306,7 +5306,7 @@ fn a_route_back_in_a_new_epoch_but_not_reopened_bounds_nothing() {
 }
 
 /// Plan 164: the receiver's duty retries an unanswered SOLICIT with a
-/// fresh nonce after 50 ms, then 100 ms later, to the same source; DATA
+/// the entry's nonce after 50 ms, then 100 ms later, to the same source; DATA
 /// in between sends none.
 #[test]
 fn the_receiver_duty_retries_an_unanswered_solicit() {
@@ -5347,7 +5347,7 @@ fn the_receiver_duty_retries_an_unanswered_solicit() {
         .unwrap();
     let second = take();
     assert_eq!(second.len(), 1, "the first retry");
-    assert_ne!(second, first, "a fresh nonce");
+    assert_eq!(second, first, "the entry's nonce");
     let _ = receiver
         .duty::<OsSocket>(&mut [], &sessions, 149 * MS)
         .unwrap();

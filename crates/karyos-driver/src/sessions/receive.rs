@@ -295,8 +295,6 @@ pub enum Ignored {
     /// The answer does not match the challenge (identity, parameters, boot
     /// id or nonce).
     Mismatch,
-    /// An ANSWER to a retried SOLICIT's earlier nonce (plan 164).
-    StaleNonce,
     /// The challenge expired.
     Expired,
     /// The challenge was already answered.
@@ -348,14 +346,12 @@ pub struct SessionCounters {
     /// Solicit entries freed by the timer, ended without a binding: their
     /// attempts or their retry window spent (plan 164).
     pub solicits_expired: u64,
-    /// SOLICITs retried with a fresh nonce (network-control-schemas.md
+    /// SOLICITs retried with their entry's nonce (network-control-schemas.md
     /// §6.3, plan 164).
     pub solicit_retries: u64,
     /// Retries the RSP_SETUP rates or the control ring refused: not an
     /// attempt, they wait for the next step.
     pub solicit_retries_refused: u64,
-    /// ANSWERs to a SOLICIT's earlier nonce, after its retry: dropped.
-    pub solicit_stale_answers: u64,
     /// Solicited answers accepted (an image created or a path bound).
     pub solicits_answered: u64,
     /// Solicit entries withdrawn: never sent, or answered with no command
@@ -424,10 +420,8 @@ enum State {
     /// and, accepted, makes it an answered challenge.
     Solicited {
         key: BindingKey,
+        /// The nonce of every SOLICIT of the entry, its retries included.
         nonce: [u64; 2],
-        /// The nonce of the SOLICIT before the current one: an ANSWER to
-        /// it is late, dropped and counted.
-        previous: Option<[u64; 2]>,
         /// The first SOLICIT: `solicit_retry_window` runs from here.
         created_at: u64,
         /// The last SOLICIT sent, or the retry the rates refused.
@@ -902,22 +896,16 @@ impl ReceiveSessions {
         }
     }
 
-    /// The retry of `key`'s solicit entry, with a fresh nonce not yet the
-    /// entry's: [`ReceiveSessions::solicit_retried`] makes it so once the
-    /// SOLICIT went out. `None` with no such entry or no nonce.
-    pub fn retry_solicit(
-        &mut self,
-        key: &BindingKey,
-        nonces: &mut impl NonceSource,
-    ) -> Option<RspSolicit> {
-        let found = self
-            .slots
-            .iter()
-            .any(|slot| matches!(slot.state, State::Solicited { key: held, .. } if held == *key));
-        if !found {
-            return None;
-        }
-        let nonce = nonces.nonce()?;
+    /// The retry of `key`'s solicit entry, with the entry's nonce: an
+    /// ANSWER to any of its SOLICITs binds within the retry window, as for
+    /// a resent CHALLENGE (§6.3). `None` with no such entry.
+    pub fn retry_solicit(&self, key: &BindingKey) -> Option<RspSolicit> {
+        let nonce = self.slots.iter().find_map(|slot| match slot.state {
+            State::Solicited {
+                key: held, nonce, ..
+            } if held == *key => Some(nonce),
+            _ => None,
+        })?;
         Some(RspSolicit {
             alias: key.alias,
             challenge: ChallengeBlock {
@@ -927,10 +915,9 @@ impl ReceiveSessions {
         })
     }
 
-    /// `key`'s retry with `nonce` went out at `now`: the entry takes the
-    /// nonce (the old one kept to recognise a late ANSWER), counts the
-    /// attempt and doubles its wait up to `setup_challenge_timeout`.
-    pub fn solicit_retried(&mut self, key: &BindingKey, nonce: [u64; 2], now: u64) {
+    /// `key`'s retry went out at `now`: the entry counts the attempt and
+    /// doubles its wait up to `setup_challenge_timeout`.
+    pub fn solicit_retried(&mut self, key: &BindingKey, now: u64) {
         let cap = self.config.setup_challenge_timeout;
         let found = self
             .slots
@@ -938,16 +925,12 @@ impl ReceiveSessions {
             .find(|slot| matches!(slot.state, State::Solicited { key: held, .. } if held == *key));
         if let Some(slot) = found
             && let State::Solicited {
-                nonce: current,
-                previous,
                 last_sent,
                 wait,
                 attempts,
                 ..
             } = &mut slot.state
         {
-            *previous = Some(*current);
-            *current = nonce;
             *last_sent = now;
             *wait = wait.saturating_mul(2).min(cap);
             *attempts = attempts.saturating_add(1);
@@ -1020,7 +1003,6 @@ impl ReceiveSessions {
             slot.state = State::Solicited {
                 key,
                 nonce,
-                previous: None,
                 created_at: now,
                 last_sent: now,
                 wait: self.config.solicit_retry_initial,
@@ -1291,7 +1273,6 @@ impl ReceiveSessions {
         };
         if let State::Solicited {
             nonce,
-            previous,
             created_at,
             last_sent,
             wait,
@@ -1305,7 +1286,7 @@ impl ReceiveSessions {
                 &slot,
                 key,
                 answer,
-                (nonce, previous, created_at, over),
+                (nonce, created_at, over),
                 now,
                 reserve,
             );
@@ -1390,18 +1371,12 @@ impl ReceiveSessions {
         slot: &Slot,
         key: BindingKey,
         answer: &SetupAnswer,
-        (nonce, previous, created_at, over): ([u64; 2], Option<[u64; 2]>, u64, bool),
+        (nonce, created_at, over): ([u64; 2], u64, bool),
         now: u64,
         reserve: impl FnOnce() -> bool,
     ) -> AnswerOutcome {
         // The caller builds the key from the answer's alias.
         debug_assert_eq!(answer.alias, key.alias);
-        if answer.challenge.receiver_boot_id == self.boot_id
-            && previous == Some(answer.challenge.nonce)
-        {
-            self.counters.bump(|c| &mut c.solicit_stale_answers);
-            return AnswerOutcome::Dropped(self.ignore(Ignored::StaleNonce));
-        }
         if answer.challenge.receiver_boot_id != self.boot_id || answer.challenge.nonce != nonce {
             return AnswerOutcome::Dropped(self.ignore(Ignored::Mismatch));
         }
