@@ -4046,7 +4046,13 @@ fn an_idle_lane_sends_a_data_heartbeat_at_its_position() {
     use karyos_sys::log_buffer::AppendOptions;
 
     let interval = AgentConfig::default().sender_heartbeat_interval;
-    let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
+    // Its PATH_HB (karyos#859) waits past the test: only DATA heartbeats
+    // are counted here.
+    let config = AgentConfig {
+        path_heartbeat_interval: 100 * interval,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) = super::roles(&config).unwrap();
     let (replies, _keep) =
         super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
     let (path, mut log) = outbound(EndpointId(1), "10.0.0.9:5000".parse().unwrap());
