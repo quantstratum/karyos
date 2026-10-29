@@ -1192,8 +1192,8 @@ impl TxCore {
 
 impl Drop for TxCore {
     /// Memory safe in every state; not a shutdown path (S-19). A drop
-    /// outside unwinding with pending items is a driver bug: counted, and
-    /// asserted in debug builds.
+    /// outside unwinding with pending items is a driver bug, counted in
+    /// every build and never a panic (karyos#880).
     fn drop(&mut self) {
         let pending = self.pending_total();
         if pending != Some(0) && !std::thread::panicking() {
@@ -1202,7 +1202,7 @@ impl Drop for TxCore {
             // `usize` fits `u64` on every supported target. The process
             // counter is checked; the documented choice for overflow is
             // that it keeps its value, as no process discards 2^64 items.
-            // A total that cannot be counted adds nothing and asserts below.
+            // A total that cannot be counted adds nothing.
             let discarded = pending.and_then(|pending| u64::try_from(pending).ok());
             let mut current = TX_DISCARDED_ON_DROP.load(Ordering::Relaxed);
             while let Some(total) = discarded.and_then(|discarded| current.checked_add(discarded)) {
@@ -1215,16 +1215,6 @@ impl Drop for TxCore {
                     Ok(_) => break,
                     Err(actual) => current = actual,
                 }
-            }
-            match pending {
-                Some(pending) => debug_assert!(
-                    self.injected(),
-                    "a sockets TX half dropped with {pending} pending items; use reset or retire"
-                ),
-                None => debug_assert!(
-                    self.injected(),
-                    "a sockets TX half dropped with uncountable pending items; use reset or retire"
-                ),
             }
         }
     }

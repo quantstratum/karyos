@@ -465,28 +465,15 @@ fn retire_and_drop() {
     assert_eq!(tx_drops_on_this_thread(), before);
 }
 
-#[cfg(debug_assertions)]
-#[test]
-#[should_panic(expected = "dropped with 1 pending items")]
-fn retire_and_drop_non_unwinding_drop_with_pending_items_asserts() {
-    let mut h = Harness::new();
-    h.commit_n(0, 1);
-    drop(h);
-}
-
-/// S3 review P3: a non-unwinding drop with pending items is counted. The
-/// fault injection hook marks the half as carrying an injected fault (its
-/// head owner is rewritten to its own queue, which changes nothing else),
-/// so the debug assertion stands aside and the release build path runs:
-/// this thread's count grows by one drop and the process counter
+/// S3 review P3 and karyos#880: a non-unwinding drop with pending items is
+/// counted, and never panics, in a debug build too, with no injected
+/// fault: this thread's count grows by one drop and the process counter
 /// `tx_discarded_on_drop` by at least the two pending items. Other tests
 /// run in parallel, so the process counter is checked with `>=` only.
 #[test]
 fn retire_and_drop_non_unwinding_drop_with_pending_items_is_counted() {
     let mut h = Harness::new();
     h.commit_n(0, 2);
-    let queue = h.queue;
-    assert!(h.tx.core.inject_head_owner(queue, Some(queue)).is_some());
     let drops = tx_drops_on_this_thread();
     let discarded = tx_discarded_on_drop();
     drop(h);
