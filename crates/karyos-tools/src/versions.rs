@@ -30,6 +30,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 /// The flag that asks for the versions.
 pub const FLAG: &str = "--versions";
 
+/// Every backend `[io] backend` can name (Karyos SPEC 16.9): `io_uring`
+/// and `af_xdp` are planned, and `ef_vi` and `dpdk` are built by
+/// `karyosd-native` only (ADR-0050).
+pub const BACKENDS: [&str; 5] = ["sockets", "io_uring", "af_xdp", "ef_vi", "dpdk"];
+
 /// A backend the core knows, and whether this build compiled it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Backend {
@@ -72,6 +77,9 @@ pub struct Versions {
 /// The versions of this build, from their source constants.
 #[must_use]
 pub fn current() -> Versions {
+    // What this build's daemon can select: the backends its schema
+    // registers (the sockets backend on Linux and macOS).
+    let registered = crate::config::IoSchema::core().names();
     Versions {
         core: karyos::CORE_VERSION,
         admission: karyos::PROTOCOL_VERSION,
@@ -87,31 +95,10 @@ pub fn current() -> Versions {
         capture_contract: karyos_archive::group::record::CONTRACT_VERSION,
         archive_durable: karyos_archive::durable::VERSION,
         config: crate::config::SCHEMA_VERSION,
-        backends: [
-            // The sockets backend is Linux only.
-            Backend {
-                name: "sockets",
-                compiled: cfg!(target_os = "linux"),
-            },
-            // Planned, not in the core yet (SPEC.md §16).
-            Backend {
-                name: "io_uring",
-                compiled: false,
-            },
-            Backend {
-                name: "af_xdp",
-                compiled: false,
-            },
-            // Native backends, built by `karyosd-native` only (ADR-0050).
-            Backend {
-                name: "ef_vi",
-                compiled: false,
-            },
-            Backend {
-                name: "dpdk",
-                compiled: false,
-            },
-        ],
+        backends: BACKENDS.map(|name| Backend {
+            name,
+            compiled: registered.contains(&name),
+        }),
         features: if cfg!(feature = "test-hooks") {
             &["test-hooks"]
         } else {
@@ -269,11 +256,21 @@ mod tests {
         ] {
             assert!(json.contains(field), "{field} in {json}");
         }
-        let sockets = format!(
-            r#"{{"name":"sockets","compiled":{}}}"#,
-            cfg!(target_os = "linux")
+        // Compiled exactly when this build's schema registers it.
+        let registered = crate::config::IoSchema::core().names();
+        assert!(registered.contains(&"sockets"));
+        for backend in current().backends {
+            assert_eq!(
+                backend.compiled,
+                registered.contains(&backend.name),
+                "{}",
+                backend.name
+            );
+        }
+        assert!(
+            json.contains(r#"{"name":"sockets","compiled":true}"#),
+            "{json}"
         );
-        assert!(json.contains(&sockets), "{json}");
     }
 
     #[test]
