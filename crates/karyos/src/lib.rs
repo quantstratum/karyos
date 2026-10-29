@@ -77,10 +77,10 @@ pub use karyos_client::{
     Accepted, Claim, Client, ClientError, ConflatedBudget, ConflatedLimits, ConflatedOptions,
     ConflatedSubscription, ConflatedValue, Connection, Context, ContextBuilder, Freshness,
     IdleStrategy, ImageChange, ImageEnd, ImageStop, Lane, MessageInfo, MessageLength, MessageLimit,
-    NetworkAdmission, OfferError, OfferOptions, PollError, PollSummary, Publication,
-    PublicationRoles, ReceiverIdentity, RejoinPolicy, SealReason, Secondary, SnapshotSource,
-    Strategy, StreamId, SubscriberRole, Subscription, SubscriptionError, SubscriptionOptions,
-    SubscriptionPoll, ViewClosed,
+    NetworkAdmission, OfferError, OfferOptions, Overrun, PollError, PollSummary, Publication,
+    PublicationRoles, ReceiverIdentity, RejoinPolicy, SealReason, Secondary, SnapshotFailed,
+    SnapshotSource, Strategy, StreamId, SubscriberRole, Subscription, SubscriptionError,
+    SubscriptionOptions, SubscriptionPoll, ViewClosed,
 };
 
 /// The low-level client API: the conductor and the per-lane handles with

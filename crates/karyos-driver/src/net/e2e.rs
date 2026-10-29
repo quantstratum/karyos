@@ -1513,10 +1513,7 @@ fn view_until(
     latest: &mut [Option<(u8, karyos_sys::freshness::Freshness)>; 4],
     mut done: impl FnMut(&[Option<(u8, karyos_sys::freshness::Freshness)>; 4]) -> bool,
 ) {
-    let budget = karyos_sys::conflation::Budget {
-        keys: 16,
-        retries: 4,
-    };
+    let budget = karyos_sys::conflation::Budget::new(16, 4);
     pump(&mut [a, b], |_| {
         let _ = reader.poll_changed(budget, |key, _, value, freshness| {
             latest[key as usize] = Some((value[0], freshness));
@@ -1598,10 +1595,7 @@ fn two_images_of_one_alias_get_a_view_each() {
     // Publisher p offers 10 * (p + 1) + key under each key.
     let mut offered = [0i64; 2];
     let mut latest = [[None; 4]; 2];
-    let budget = karyos_sys::conflation::Budget {
-        keys: 16,
-        retries: 4,
-    };
+    let budget = karyos_sys::conflation::Budget::new(16, 4);
     pump(&mut [&mut a1, &mut a2, &mut b], |_| {
         for (publisher, lane) in lanes.iter_mut().enumerate() {
             let key = offered[publisher];
@@ -1862,10 +1856,7 @@ fn a_published_terminal_cell_closes_the_network_view() {
     pump(&mut [&mut a, &mut b], |drivers| {
         drivers[1].network_view_counters().closed_terminal == 1
     });
-    let budget = karyos_sys::conflation::Budget {
-        keys: 16,
-        retries: 4,
-    };
+    let budget = karyos_sys::conflation::Budget::new(16, 4);
     let mut delivered = 0;
     let report = reader.poll_changed(budget, |_, _, _, _| delivered += 1);
     assert_eq!((delivered, report.terminal), (0, Some(terminal)));
@@ -2104,10 +2095,7 @@ fn a_retired_image_closes_its_view_as_retired() {
     offer_keyed(&mut a, &mut b, &mut lane, 0, 10);
     drop(lane);
     a.remove_aggregate(&publication).unwrap();
-    let budget = karyos_sys::conflation::Budget {
-        keys: 16,
-        retries: 4,
-    };
+    let budget = karyos_sys::conflation::Budget::new(16, 4);
     let mut terminal = None;
     pump(&mut [&mut a, &mut b], |_| {
         terminal = reader.poll_changed(budget, |_, _, _, _| {}).terminal;

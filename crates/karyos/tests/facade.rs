@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A consumer of the facade alone can name every claim and poll type, and
-//! every image change type.
+//! A consumer of the facade alone can name every claim and poll type,
+//! every image change type, and implement `SnapshotSource` (karyos#777).
 
 use karyos::embedded::{Aborted, ClaimOutcome, ClientClaim, ClientPublication, CommitOutcome};
 use karyos::{ImageChange, ImageEnd, Lane, PollSummary, SealReason};
@@ -68,4 +68,48 @@ fn image_change_types_are_reachable() {
         change.end.map(|end| (end.reason, end.position)),
         Some((SealReason::EndOfStream, Some(64)))
     );
+}
+
+/// A snapshot source written against the facade alone: the trait, its
+/// argument and its error are all `karyos::` paths (karyos#777).
+struct Rebuilt {
+    resumed_at: Option<u64>,
+    fail: bool,
+}
+
+impl karyos::SnapshotSource for Rebuilt {
+    fn rebuild(&mut self, overrun: &karyos::Overrun) -> Result<(), karyos::SnapshotFailed> {
+        if self.fail {
+            return Err(karyos::SnapshotFailed);
+        }
+        self.resumed_at = Some(overrun.resume);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_snapshot_source_is_implemented_through_the_facade() {
+    let overrun = karyos::Overrun::new(10, 20, 24);
+    let mut source = Rebuilt {
+        resumed_at: None,
+        fail: false,
+    };
+    assert_eq!(
+        karyos::SnapshotSource::rebuild(&mut source, &overrun),
+        Ok(())
+    );
+    assert_eq!(source.resumed_at, Some(24));
+    let mut failing = Rebuilt {
+        resumed_at: None,
+        fail: true,
+    };
+    assert_eq!(
+        karyos::SnapshotSource::rebuild(&mut failing, &overrun),
+        Err(karyos::SnapshotFailed)
+    );
+    // It is what a subscription's rejoin policy takes.
+    let _policy = karyos::RejoinPolicy::Snapshot(Box::new(source));
+    // The budget's constructor, through the facade's name.
+    let budget = karyos::ConflatedBudget::new(4, 1);
+    assert_eq!((budget.keys, budget.retries), (4, 1));
 }

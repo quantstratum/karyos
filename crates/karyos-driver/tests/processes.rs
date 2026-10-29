@@ -1465,10 +1465,7 @@ fn conflated_view(dir: &Path, timeout: Duration) {
     let Outcome::FetchableConflated(fetchable) = next(&mut client) else {
         panic!("no view");
     };
-    let budget = karyos_sys::conflation::Budget {
-        keys: 1,
-        retries: 1,
-    };
+    let budget = karyos_sys::conflation::Budget::new(1, 1);
     let mut view = client
         .take_conflated(&fetchable, budget, ConflatedLimits::default())
         .unwrap()

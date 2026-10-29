@@ -254,10 +254,7 @@ impl ConflatedSource for ConflatedSubscription {
     }
 
     fn poll_one(&mut self, handler: &mut ValueHandler<'_>) -> Result<u32, ClientError> {
-        let budget = Budget {
-            keys: 1,
-            retries: 4,
-        };
+        let budget = Budget::new(1, 4);
         self.poll_changed_with(budget, |key, value| {
             handler(key, value.payload(), value.version(), value.freshness());
         })

@@ -435,10 +435,7 @@ impl Default for DriverConfig {
                 Some(value) => value,
                 None => NonZeroU32::MIN,
             },
-            conflated_subscription_budget: ConflationBudget {
-                keys: 1024,
-                retries: 3,
-            },
+            conflated_subscription_budget: ConflationBudget::new(1024, 3),
             counters_capacity: 1024,
             position_sample_interval: 10_000_000,
             error_log_records: karyos_sys::diag::DEFAULT_ERROR_RECORDS,

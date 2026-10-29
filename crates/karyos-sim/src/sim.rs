@@ -878,10 +878,7 @@ impl<'s> Sim<'s> {
         id: u32,
         stream: usize,
     ) -> Result<(), Failure> {
-        let budget = karyos_sys::conflation::Budget {
-            keys: self.rng.between(1, 4) as u32,
-            retries: 2,
-        };
+        let budget = karyos_sys::conflation::Budget::new(self.rng.between(1, 4) as u32, 2);
         let Some(record) = self.streams.get(stream).map(|s| &s.record) else {
             return Ok(());
         };

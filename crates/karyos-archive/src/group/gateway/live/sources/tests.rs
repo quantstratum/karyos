@@ -595,13 +595,8 @@ fn view(
     ConflatedSubscription,
 ) {
     let writer = karyos_sys::conflation::conflation(4, value_capacity, 4096).unwrap();
-    let view = ConflatedSubscription::new(
-        writer.reader(),
-        karyos_sys::conflation::Budget {
-            keys: 4,
-            retries: 4,
-        },
-    );
+    let view =
+        ConflatedSubscription::new(writer.reader(), karyos_sys::conflation::Budget::new(4, 4));
     (writer, view)
 }
 
@@ -680,13 +675,8 @@ fn conflated_values_are_recorded_as_seen_and_replayed() {
         karyos_sys::freshness::FreshnessLink::new(),
     )
     .unwrap();
-    let view = ConflatedSubscription::new(
-        writer.reader(),
-        karyos_sys::conflation::Budget {
-            keys: 4,
-            retries: 4,
-        },
-    );
+    let view =
+        ConflatedSubscription::new(writer.reader(), karyos_sys::conflation::Budget::new(4, 4));
     rig.gateway.add_conflated(Box::new(view), 5, 1).unwrap();
     let observe = |event: &Event<'_>| match event {
         Event::Conflated {

@@ -95,13 +95,9 @@ fn feeder_keeps_latest_value_and_regular_subscriber_gets_every_message() {
 
     let mut values = Vec::new();
     let report = conflated
-        .poll_changed_with(
-            Budget {
-                keys: 8,
-                retries: 3,
-            },
-            |key, value| values.push((key, value.version(), value.payload().to_vec())),
-        )
+        .poll_changed_with(Budget::new(8, 3), |key, value| {
+            values.push((key, value.version(), value.payload().to_vec()))
+        })
         .unwrap();
     assert_eq!(report.delivered, 1);
     assert_eq!(values, [(1, 4, b"latest".to_vec())]);
@@ -158,13 +154,9 @@ fn publication_validation_precedes_reservation_and_close_closes_the_table() {
 
     let mut values = Vec::new();
     let report = conflated
-        .poll_changed_with(
-            Budget {
-                keys: 8,
-                retries: 3,
-            },
-            |key, value| values.push((key, value.version(), value.payload().to_vec())),
-        )
+        .poll_changed_with(Budget::new(8, 3), |key, value| {
+            values.push((key, value.version(), value.payload().to_vec()))
+        })
         .unwrap();
     assert_eq!(report.delivered, 1);
     assert_eq!(values, [(1, 2, b"ok".to_vec())]);
@@ -214,13 +206,9 @@ fn feeder_and_table_survive_a_mapping_cutover() {
 
     let mut values = Vec::new();
     let report = conflated
-        .poll_changed_with(
-            Budget {
-                keys: 8,
-                retries: 3,
-            },
-            |key, value| values.push((key, value.version(), value.payload().to_vec())),
-        )
+        .poll_changed_with(Budget::new(8, 3), |key, value| {
+            values.push((key, value.version(), value.payload().to_vec()))
+        })
         .unwrap();
     assert_eq!(report.delivered, 2);
     assert_eq!(
@@ -311,19 +299,13 @@ fn read_all(
 ) {
     for _ in 0..64 {
         let report = conflated
-            .poll_changed_with(
-                Budget {
-                    keys: 64,
-                    retries: 3,
-                },
-                |key, value| {
-                    let version = value.version();
-                    if let Some((before, _)) = seen.get(&key) {
-                        assert!(version > *before, "key {key}: {version} after {before}");
-                    }
-                    let _ = seen.insert(key, (version, value.payload().to_vec()));
-                },
-            )
+            .poll_changed_with(Budget::new(64, 3), |key, value| {
+                let version = value.version();
+                if let Some((before, _)) = seen.get(&key) {
+                    assert!(version > *before, "key {key}: {version} after {before}");
+                }
+                let _ = seen.insert(key, (version, value.payload().to_vec()));
+            })
             .unwrap();
         assert!(!report.closed, "the table closed");
         if report.pending == 0 && !report.scanning && report.journal_drained {
@@ -468,17 +450,11 @@ fn test_conflation_view_survives_cutover_with_a_slow_feeder_and_a_paused_driver(
         // the cutover starts, so it is still there when the successor
         // opens.
         let mut behind = 0u32;
-        let _ = conflated.poll_changed_with(
-            Budget {
-                keys: 64,
-                retries: 3,
-            },
-            |_, value| {
-                let version = value.version();
-                assert!(version < 2 * u64::from(updates) / 2, "the feeder caught up");
-                behind += 1;
-            },
-        );
+        let _ = conflated.poll_changed_with(Budget::new(64, 3), |_, value| {
+            let version = value.version();
+            assert!(version < 2 * u64::from(updates) / 2, "the feeder caught up");
+            behind += 1;
+        });
         assert!(behind <= 2, "paused: {paused}");
         if paused {
             // The driver sleeps through the cutover deadline.
@@ -551,13 +527,7 @@ fn a_conflated_view_feeds_its_reader_counts_into_client_counters() {
     let _ = driver.do_work().unwrap();
     // One key per poll: the budget runs out until the view caught up.
     for _ in 0..8 {
-        let _ = conflated.poll_changed_with(
-            Budget {
-                keys: 1,
-                retries: 1,
-            },
-            |_, _| {},
-        );
+        let _ = conflated.poll_changed_with(Budget::new(1, 1), |_, _| {});
     }
     let counts = conflated.counts();
     assert!(counts.budgets_exhausted >= 3, "{counts:?}");

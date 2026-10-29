@@ -41,15 +41,10 @@ fn conflation_write_poll(c: &mut Criterion) {
                 let write = writer
                     .write(0, black_box(&payload))
                     .unwrap_or_else(|_| std::process::abort());
-                let poll = reader.poll_changed(
-                    Budget {
-                        keys: 1,
-                        retries: 3,
-                    },
-                    |key, version, value, freshness| {
+                let poll =
+                    reader.poll_changed(Budget::new(1, 3), |key, version, value, freshness| {
                         black_box((key, version, value, freshness));
-                    },
-                );
+                    });
                 black_box((write, poll));
             });
         });

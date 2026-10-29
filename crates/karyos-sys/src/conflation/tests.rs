@@ -6,10 +6,7 @@ use super::*;
 use crate::freshness::{Freshness, FreshnessLink, Terminal, TerminalCell};
 use crate::sync::{AtomicU64, Ordering};
 
-const BUDGET: Budget = Budget {
-    keys: 64,
-    retries: 4,
-};
+const BUDGET: Budget = Budget::new(64, 4);
 
 fn value(key: u32, round: u32, len: usize) -> Vec<u8> {
     (0..len)
@@ -213,16 +210,10 @@ fn a_new_reader_scans_existing_values() {
         writer.write(key, &value(key, 1, 8)).unwrap();
     }
     let mut reader = writer.reader();
-    let mut seen: Vec<u32> = drain(
-        &mut reader,
-        Budget {
-            keys: 5,
-            retries: 1,
-        },
-    )
-    .into_iter()
-    .map(|(key, ..)| key)
-    .collect();
+    let mut seen: Vec<u32> = drain(&mut reader, Budget::new(5, 1))
+        .into_iter()
+        .map(|(key, ..)| key)
+        .collect();
     seen.sort_unstable();
     assert_eq!(seen, (0..70).step_by(3).collect::<Vec<_>>());
 }
@@ -283,15 +274,9 @@ fn a_lapped_reader_scans_and_converges() {
     let mut lapped = false;
     let mut latest = vec![None; 200];
     for _ in 0..1000 {
-        let report = reader.poll_changed(
-            Budget {
-                keys: 7,
-                retries: 2,
-            },
-            |key, _, value, _| {
-                latest[key as usize] = Some(value.to_vec());
-            },
-        );
+        let report = reader.poll_changed(Budget::new(7, 2), |key, _, value, _| {
+            latest[key as usize] = Some(value.to_vec());
+        });
         lapped |= report.lapped;
         if report.journal_drained && report.pending == 0 && !report.scanning {
             break;
@@ -329,15 +314,9 @@ fn a_stuck_slot_does_not_starve_the_others() {
     writer.write(7, &value(7, 500, 8)).unwrap();
     let mut latest = vec![None; 8];
     for _ in 0..200 {
-        let report = reader.poll_changed(
-            Budget {
-                keys: 1,
-                retries: 1,
-            },
-            |key, _, value, _| {
-                latest[key as usize] = Some(value.to_vec());
-            },
-        );
+        let report = reader.poll_changed(Budget::new(1, 1), |key, _, value, _| {
+            latest[key as usize] = Some(value.to_vec());
+        });
         assert!(report.delivered + report.skipped + report.unstable <= 1);
     }
     for key in [0, 1, 2, 4, 5, 6] {
@@ -413,17 +392,12 @@ fn concurrent_writer_and_readers_converge() {
                     let mut latest = vec![None; keys as usize];
                     loop {
                         let finished = done.load(Ordering::Acquire);
-                        let report = reader.poll_changed(
-                            Budget {
-                                keys: 4,
-                                retries: 2,
-                            },
-                            |key, version, data, _| {
+                        let report =
+                            reader.poll_changed(Budget::new(4, 2), |key, version, data, _| {
                                 let round = u32::from(data[0] ^ (key as u8).wrapping_mul(7));
                                 assert_eq!(data, &value(key, round, 24)[..]);
                                 latest[key as usize] = Some((version, data.to_vec()));
-                            },
-                        );
+                            });
                         if finished
                             && report.journal_drained
                             && report.pending == 0
@@ -478,15 +452,9 @@ fn a_value_without_a_journal_record_is_found_by_the_sweep() {
     let version = writer.table_slot(33).unwrap().write(b"silent").unwrap();
     let mut seen = Vec::new();
     for _ in 0..40 {
-        reader.poll_changed(
-            Budget {
-                keys: 1,
-                retries: 1,
-            },
-            |key, version, value, _| {
-                seen.push((key, version, value.to_vec()));
-            },
-        );
+        reader.poll_changed(Budget::new(1, 1), |key, version, value, _| {
+            seen.push((key, version, value.to_vec()));
+        });
     }
     assert_eq!(seen, vec![(33, version, b"silent".to_vec())]);
 }
@@ -504,15 +472,9 @@ fn a_late_reader_after_overflow_delivers_everything() {
     let mut reader = writer.reader();
     let mut latest = vec![None; 50];
     for _ in 0..100 {
-        reader.poll_changed(
-            Budget {
-                keys: 3,
-                retries: 1,
-            },
-            |key, _, value, _| {
-                latest[key as usize] = Some(value.to_vec());
-            },
-        );
+        reader.poll_changed(Budget::new(3, 1), |key, _, value, _| {
+            latest[key as usize] = Some(value.to_vec());
+        });
     }
     for key in 0..50 {
         assert_eq!(latest[key as usize], Some(value(key, 3, 8)));
@@ -554,15 +516,9 @@ fn closing_delivers_unread_values_before_finishing() {
     let mut delivered = 0;
     let mut finished = false;
     for _ in 0..100 {
-        let report = reader.poll_changed(
-            Budget {
-                keys: 2,
-                retries: 1,
-            },
-            |_, _, _, _| {
-                delivered += 1;
-            },
-        );
+        let report = reader.poll_changed(Budget::new(2, 1), |_, _, _, _| {
+            delivered += 1;
+        });
         assert!(report.closed);
         if report.finished {
             finished = true;
@@ -578,13 +534,7 @@ fn a_zero_budget_does_nothing() {
     let mut writer = conflation(2, 8, 1024).unwrap();
     let mut reader = writer.reader();
     writer.write(0, b"v").unwrap();
-    let report = reader.poll_changed(
-        Budget {
-            keys: 0,
-            retries: 5,
-        },
-        |_, _, _, _| unreachable!(),
-    );
+    let report = reader.poll_changed(Budget::new(0, 5), |_, _, _, _| unreachable!());
     assert_eq!(report.delivered, 0);
     assert!(report.scanning);
 }

@@ -186,14 +186,7 @@ fn karyosd_conflation_gives_a_stream_its_table() {
         panic!("no view of the conflated stream");
     };
     let mut view = client
-        .take_conflated(
-            &fetchable,
-            Budget {
-                keys: 16,
-                retries: 4,
-            },
-            ConflatedLimits::default(),
-        )
+        .take_conflated(&fetchable, Budget::new(16, 4), ConflatedLimits::default())
         .unwrap();
     let mut publication = publication_of(&mut client, table);
     for (key, value) in [(1, b"a"), (1, b"b"), (2, b"c")] {

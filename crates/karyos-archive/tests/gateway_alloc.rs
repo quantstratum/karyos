@@ -273,10 +273,7 @@ fn reports_and_values_dispatch_without_allocating() {
     let writer = karyos_sys::conflation::conflation(4, 64, 4096).unwrap();
     let view = karyos_client::ConflatedSubscription::new(
         writer.reader(),
-        karyos_sys::conflation::Budget {
-            keys: 4,
-            retries: 4,
-        },
+        karyos_sys::conflation::Budget::new(4, 4),
     );
     let mut writer = writer;
     let _ = gateway.add_conflated(Box::new(view), 5, 1).unwrap();

@@ -139,6 +139,11 @@ impl Overrun {
 
 /// The application's rebuild of its state after an overrun
 /// (`quantstratum-docs: karyos/design/rejoin-policies.md`, `snapshot`).
+///
+/// Applications implement it, so it only grows compatibly (owner item 41):
+/// a method added later comes with a default body, and any other change is
+/// a breaking version. Its argument and error types, [`Overrun`] and
+/// [`SnapshotFailed`], are re-exported beside it by the `karyos` facade.
 pub trait SnapshotSource: Send {
     /// Brings the application's state to where it would be after consuming
     /// every message before `overrun.resume`. Runs once per overrun, on the
