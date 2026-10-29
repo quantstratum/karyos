@@ -15,6 +15,12 @@
 //! KARYOS_IDLE_SECS=60 cargo test -p karyos-driver --lib --locked idle_paths -- --ignored --nocapture
 //! ```
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    reason = "a measurement printed to the job's log (ADR-0007 allows these in tests)"
+)]
+
 use std::io::Write as _;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
