@@ -54,9 +54,12 @@
 
 use std::collections::BTreeSet;
 
+use karyos_sys::counters::{CellRead, CountersReader, TYPE_TRACE_POINT};
 use karyos_sys::trace_mirror::{EntryRead, LogRead, TraceMirrorReader};
 
-use crate::api::{ExportJournal, ExportLoss, ExportPage, ExportRecord, ExportRefusal, LossReason};
+use crate::api::{
+    ExportJournal, ExportLoss, ExportPage, ExportPoint, ExportRecord, ExportRefusal, LossReason,
+};
 
 /// Overwrites within one page retried at most before the page ends.
 pub(crate) const OVERWRITE_RETRIES: usize = 4;
@@ -93,7 +96,9 @@ const BUSY_BUDGET: std::time::Duration = std::time::Duration::from_millis(1);
 const BUSY_RETRIES: usize = 16;
 
 /// Up to `count` records (at most [`crate::api::EXPORT_MAX`]) of
-/// `mirror`, of driver instance `epoch`, from sequence `from` on, in a
+/// `mirror`, with the application points they reference named from
+/// `points` (the client counters region, R-CORE-1), of driver instance
+/// `epoch`, from sequence `from` on, in a
 /// reply of at most `max_bytes` plus one record and one journal; `asked` is
 /// the epoch of the reader's cursor, if it has one.
 ///
@@ -111,6 +116,7 @@ const BUSY_RETRIES: usize = 16;
 /// [`ExportRefusal::Busy`] when the ring's bounds could not be read.
 pub fn export(
     mirror: &TraceMirrorReader,
+    points: Option<&CountersReader>,
     epoch: u128,
     from: u64,
     count: usize,
@@ -119,6 +125,7 @@ pub fn export(
 ) -> Result<ExportPage, ExportRefusal> {
     export_within(
         mirror,
+        points,
         (epoch, asked),
         from,
         count,
@@ -144,6 +151,7 @@ pub(crate) struct Waits {
 /// overwritten ranges.
 pub(crate) fn export_within(
     mirror: &TraceMirrorReader,
+    points: Option<&CountersReader>,
     (epoch, asked): (u128, Option<u128>),
     from: u64,
     count: usize,
@@ -169,6 +177,7 @@ pub(crate) fn export_within(
     let mut lost: Vec<ExportLoss> = Vec::new();
     let mut records: Vec<ExportRecord> = Vec::new();
     let mut named = BTreeSet::new();
+    let mut referenced = BTreeSet::new();
     let mut used = crate::json::EXPORT_REPLY_OVERHEAD;
     let mut stop = None;
     let note = |lost: &mut Vec<ExportLoss>, first: u64, last: u64, reason: LossReason| match lost
@@ -221,19 +230,28 @@ pub(crate) fn export_within(
                 } else {
                     crate::api::MAX_JOURNAL_REPLY
                 };
+                let point = application_point(record.payload);
+                let point_bytes = match point {
+                    Some(id) if !referenced.contains(&id) => crate::api::MAX_POINT_REPLY,
+                    _ => 0,
+                };
                 let size = crate::json::export_record_len_of(
                     record.seq,
                     record.journal,
                     record.sequence,
                     record.payload,
                 )
-                .saturating_add(journal);
+                .saturating_add(journal)
+                .saturating_add(point_bytes);
                 if !records.is_empty() && used.saturating_add(size) > max_bytes {
                     stop = Some(record.seq);
                     return;
                 }
                 used = used.saturating_add(size);
                 let _ = named.insert(record.journal);
+                if let Some(id) = point {
+                    let _ = referenced.insert(id);
+                }
                 records.push(ExportRecord {
                     seq: record.seq,
                     journal: record.journal,
@@ -350,6 +368,7 @@ pub(crate) fn export_within(
             _ => {}
         }
     }
+    let points = name_points(points, &records, &journals);
     // The head is the ring's, read again after the page, never the cursor.
     let head = (0..BUSY_RETRIES)
         .find_map(|_| mirror.bounds())
@@ -362,9 +381,94 @@ pub(crate) fn export_within(
         next,
         head,
         journals,
+        points,
         unknown_records: u64::try_from(unknown_records).unwrap_or(u64::MAX),
         unreadable_records: u64::try_from(unreadable_records).unwrap_or(u64::MAX),
     })
+}
+
+/// The application point id of a karyos-trace record payload (layout
+/// version 4, point code 9, the id in word 16's low 16 bits), if it is
+/// one. Read without decoding the record: the export delivers payloads as
+/// they are, and a malformed one only goes unnamed.
+fn application_point(payload: &[u64]) -> Option<u16> {
+    let head = *payload.first()?;
+    let id = *payload.get(16)? as u16;
+    (head & 0xFF == 4 && (head >> 8) & 0xFF == 9 && id != 0).then_some(id)
+}
+
+/// The application points `records` reference, by id, named from the
+/// client counters region: a point is named only by the single live trace
+/// point cell holding its id, and only when that cell's client is the
+/// client of every live journal whose records reference the id. Clients
+/// can write their cells, so two cells claiming one id, or a cell of
+/// another client than the records', leave the point unnamed rather than
+/// misattributed.
+fn name_points(
+    points: Option<&CountersReader>,
+    records: &[ExportRecord],
+    journals: &[ExportJournal],
+) -> Vec<ExportPoint> {
+    // Each referenced id with the clients of the live journals its records
+    // are in.
+    let mut referenced: std::collections::BTreeMap<u16, BTreeSet<u64>> = Default::default();
+    for record in records {
+        let Some(id) = application_point(&record.payload) else {
+            continue;
+        };
+        let clients = referenced.entry(id).or_default();
+        if let Some(ExportJournal::Live(entry)) = journals
+            .binary_search_by_key(&record.journal, journal_number)
+            .ok()
+            .and_then(|at| journals.get(at))
+        {
+            let _ = clients.insert(entry.client);
+        }
+    }
+    if referenced.is_empty() {
+        return Vec::new();
+    }
+    // The trace point cells holding a referenced id: label and client.
+    let mut cells: std::collections::BTreeMap<u16, Vec<(String, u64)>> = Default::default();
+    if let Some(reader) = points {
+        for index in 0..reader.capacity() {
+            let CellRead::Allocated {
+                metadata, value, ..
+            } = reader.read(index)
+            else {
+                continue;
+            };
+            let Ok(id) = u16::try_from(value) else {
+                continue;
+            };
+            if metadata.type_id == TYPE_TRACE_POINT && referenced.contains_key(&id) {
+                cells.entry(id).or_default().push((
+                    String::from_utf8_lossy(metadata.label()).into_owned(),
+                    metadata.keys.participant,
+                ));
+            }
+        }
+    }
+    referenced
+        .into_iter()
+        .map(|(id, clients)| {
+            let named = match cells.get(&id).map(Vec::as_slice) {
+                Some([(label, client)])
+                    if clients
+                        .iter()
+                        .all(|journal_client| journal_client == client) =>
+                {
+                    Some((label.clone(), *client))
+                }
+                _ => None,
+            };
+            ExportPoint {
+                id,
+                label: named.as_ref().map(|(label, _)| label.clone()),
+                client: named.map(|(_, client)| client),
+            }
+        })
+        .collect()
 }
 
 /// The number of `journal`.

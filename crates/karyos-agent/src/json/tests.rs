@@ -575,6 +575,7 @@ fn export_page(records: u64) -> crate::api::ExportPage {
         next: 5 + records,
         head: 5 + records,
         journals: vec![ExportJournal::Unknown { journal: 10 }],
+        points: Vec::new(),
         unknown_records: 3,
         unreadable_records: 0,
     }
@@ -595,7 +596,7 @@ fn an_export_page_is_encoded_whole() {
         "{whole}"
     );
     assert!(
-        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"unknown_records":3,"unreadable_records":0}"#),
+        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"points":[],"unknown_records":3,"unreadable_records":0}"#),
         "{whole}"
     );
     assert_eq!(whole.matches(r#"{"seq":"#).count(), 3);
@@ -697,6 +698,7 @@ fn the_largest_record_and_journal_encode_within_their_bounds() {
         next: 4000,
         head: 4000,
         journals: vec![ExportJournal::Live(Box::new(entry))],
+        points: Vec::new(),
         unknown_records: 0,
         unreadable_records: 0,
     };

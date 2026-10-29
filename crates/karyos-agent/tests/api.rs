@@ -279,7 +279,10 @@ fn a_client_negotiates_the_limits() {
         r#""write.deadline_ms":{"value":250,"negotiable":false},"#,
         r#""write.response_bytes":{"value":null},"#,
         r#""connection.accepts_per_poll":{"value":16,"negotiable":false},"#,
-        r#""connection.requests":{"value":1,"negotiable":false}}}"#,
+        r#""connection.requests":{"value":1,"negotiable":false},"#,
+        r#""trace.point_ids":{"value":65535,"negotiable":false},"#,
+        r#""trace.points_per_client":{"value":16,"negotiable":false},"#,
+        r#""trace.point_registrations_per_client":{"value":256,"negotiable":false}}}"#,
         "\n"
     );
     let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 limits\n");
