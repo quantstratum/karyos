@@ -669,6 +669,15 @@ pub(crate) fn take_fault(driver: u64) -> bool {
         })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's seam right after the table check of
+    /// [`panic_next_duty_cycle`], run once (karyos#699): it closes the
+    /// driver at exactly the point a race could.
+    pub(crate) static AFTER_CHECK: std::cell::Cell<Option<fn(u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// How long the fault hook waits for a driver's thread to take its panic.
 #[cfg(feature = "test-hooks")]
 const FAULT_WAIT: Duration = Duration::from_secs(10);
@@ -685,10 +694,22 @@ const FAULT_WAIT: Duration = Duration::from_secs(10);
 /// [`FAULT_WAIT`] (the hook is disarmed).
 #[cfg(feature = "test-hooks")]
 pub(crate) fn panic_next_duty_cycle(driver: Handle) -> Result<(), Status> {
+    // Armed inside the table's guard: a close removes the driver under the
+    // same guard and only then disarms it, so an arm is either before that
+    // close (which disarms it) or refused with the handle's error, never
+    // left on a closed driver (karyos#699).
     let threaded = drivers().with(driver, |slot| {
-        matches!(slot.mode, Mode::Threaded(_)).then(|| slot.state.clone())
-    })?;
-    arm_fault(driver.raw())?;
+        arm_fault(driver.raw())
+            .map(|()| matches!(slot.mode, Mode::Threaded(_)).then(|| slot.state.clone()))
+    })??;
+    // Where the arm used to follow the check (tests only): a close here
+    // must find the fault armed, and disarm it.
+    #[cfg(test)]
+    AFTER_CHECK.with(|hook| {
+        if let Some(hook) = hook.take() {
+            hook(driver.raw());
+        }
+    });
     let Some(state) = threaded else {
         return Ok(());
     };
