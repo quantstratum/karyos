@@ -1846,25 +1846,39 @@ impl<T: StreamTerms> Outbound<T> {
                 continue;
             }
             let mut sent_high = [0u64; karyos_protocol::network::MAX_LANES];
-            for (high, track) in sent_high.iter_mut().zip(&target.lanes) {
-                // A catch-up reads up to its end, above what was submitted.
-                *high = track.high.max(track.catch_up_to);
+            for ((high, track), edge) in sent_high.iter_mut().zip(&target.lanes).zip(target.edges) {
+                // A catch-up reads up to its end, above what was submitted,
+                // never past the destination's own edge (design 4.2).
+                *high = track.high.max(track.catch_up_to.min(edge));
             }
             let closed = [false; karyos_protocol::network::MAX_LANES];
             let Some(repair) = target.repair.as_deref_mut() else {
                 continue;
             };
-            // A catch-up waiting for room in the destination's share.
-            for (lane, (track, reader)) in target.lanes.iter_mut().zip(&self.readers).enumerate() {
-                let (Some(range), Ok(lane)) = (track.catch_up, u8::try_from(lane)) else {
+            // A catch-up waiting for room in the destination's share, or
+            // for its window: like new DATA, it is served only up to the
+            // destination's own edge, and the rest waits for the window to
+            // open (design 4.2; karyos#890 review).
+            for (lane, ((track, reader), edge)) in target
+                .lanes
+                .iter_mut()
+                .zip(&self.readers)
+                .zip(target.edges)
+                .enumerate()
+            {
+                let (Some((from, to)), Ok(lane)) = (track.catch_up, u8::try_from(lane)) else {
                     continue;
                 };
-                track.catch_up = match repair.catch_up(lane, range, reader.floor()) {
+                let end = to.min(edge);
+                if end <= from {
+                    continue;
+                }
+                track.catch_up = match repair.catch_up(lane, (from, end), reader.floor()) {
                     crate::agents::repair::CatchUp::Queued { through } => {
-                        (through < range.1).then_some((through, range.1))
+                        (through < to).then_some((through, to))
                     }
-                    crate::agents::repair::CatchUp::Full { from } => Some((from, range.1)),
-                    crate::agents::repair::CatchUp::Done => None,
+                    crate::agents::repair::CatchUp::Full { from } => Some((from, to)),
+                    crate::agents::repair::CatchUp::Done => (end < to).then_some((end, to)),
                 };
             }
             let before = repair.counts().submitted;

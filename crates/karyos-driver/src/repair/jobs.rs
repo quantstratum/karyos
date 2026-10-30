@@ -210,11 +210,8 @@ pub struct Jobs {
     counts: JobsCounts,
     /// Per lane, the end of what catch-up jobs have submitted: the
     /// destination has it from there down (MD-20, karyos#802).
-    catch_up_through: [u64; CATCH_UP_LANES],
+    catch_up_through: [u64; karyos_protocol::network::MAX_LANES],
 }
-
-/// Lanes a catch-up position is kept for.
-const CATCH_UP_LANES: usize = 4;
 
 impl Jobs {
     /// The table, allocated here.
@@ -245,7 +242,7 @@ impl Jobs {
             lingers: vec![None; config.repair_linger_entries],
             next_order: 0,
             counts: JobsCounts::default(),
-            catch_up_through: [0; CATCH_UP_LANES],
+            catch_up_through: [0; karyos_protocol::network::MAX_LANES],
         })
     }
 

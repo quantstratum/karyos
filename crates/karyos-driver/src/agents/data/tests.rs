@@ -1157,7 +1157,7 @@ fn a_reset_resends_only_what_each_destination_lacks() {
             .unwrap();
     }
     // Each destination's receiver: its own source, id and window.
-    let status = |path: &mut Box<super::Outbound>, source, id, window, now| {
+    let status = |path: &mut Box<super::Outbound>, source, id, (consumption, window), now| {
         let key = SmKey {
             endpoint: EndpointId(1),
             alias,
@@ -1174,7 +1174,7 @@ fn a_reset_resends_only_what_each_destination_lacks() {
             receiver: key.receiver,
             group_tag: 0,
             lanes: Lanes::new(&[LaneStatus {
-                consumption: 0,
+                consumption,
                 window,
             }])
             .unwrap(),
@@ -1183,8 +1183,8 @@ fn a_reset_resends_only_what_each_destination_lacks() {
     };
     let held = u32::try_from(4 * FRAME).unwrap();
     for now in 0..8 {
-        status(&mut path, first, 1, 32_768, now);
-        status(&mut path, second, 2, held, now);
+        status(&mut path, first, 1, (0, 32_768), now);
+        status(&mut path, second, 2, (0, held), now);
         let _ = path.serve(&mut tx, FLOW_BUDGET, None, now).unwrap();
     }
     // Where each stands when the endpoint resets: the readers at `r`,
@@ -1225,9 +1225,38 @@ fn a_reset_resends_only_what_each_destination_lacks() {
     let _ = endpoint.reopen(&local).unwrap();
     let (mut tx, rx) = endpoint.split().unwrap();
     let mut budget = crate::repair::scheduler::RepairBudget::default();
-    for now in 8..24 {
-        status(&mut path, first, 1, 32_768, now);
-        status(&mut path, second, 2, 32_768, now);
+    // karyos#890 review (codex): still held at its window, the second gets
+    // no catch-up past its own edge, as no new DATA would pass it (4.2).
+    for now in 8..16 {
+        status(&mut path, first, 1, (0, 32_768), now);
+        status(&mut path, second, 2, (0, held), now);
+        let _ = path.serve(&mut tx, FLOW_BUDGET, None, now).unwrap();
+        let _ = path.serve_repair(&mut tx, &mut budget, now);
+        budget = crate::repair::scheduler::RepairBudget::default();
+    }
+    {
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            count(&sent, second, u64::MAX),
+            0,
+            "nothing past the second's edge while its window is shut: {sent:?}"
+        );
+    }
+    // It consumes what it has, so its window opens (a window never
+    // changes size, design 4.2): the rest arrives, once and in order
+    // (below).
+    for now in 16..32 {
+        let consumed = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(at, _)| *at == second)
+            .map(|(_, position)| position + FRAME)
+            .max()
+            .unwrap_or(second_high)
+            .min(r);
+        status(&mut path, first, 1, (0, 32_768), now);
+        status(&mut path, second, 2, (consumed, held), now);
         let _ = path.serve(&mut tx, FLOW_BUDGET, None, now).unwrap();
         let _ = path.serve_repair(&mut tx, &mut budget, now);
         budget = crate::repair::scheduler::RepairBudget::default();
@@ -1259,9 +1288,8 @@ fn a_reset_resends_only_what_each_destination_lacks() {
         "in order, once each"
     );
     // karyos#890 review (codex): the catch-up's submissions are the
-    // destination's, so its frontier reaches `r` with nothing new sent
-    // (idle after the reset), and a NAK below `r` is a valid repair
-    // request, not RangeInvalid.
+    // destination's, so its frontier reaches `r`, and a NAK below `r` is a
+    // valid repair request, not RangeInvalid.
     let after = path.destination_catch_ups();
     let high_of = |to| {
         after
@@ -1270,7 +1298,9 @@ fn a_reset_resends_only_what_each_destination_lacks() {
             .map(|(_, _, high, _)| *high)
             .unwrap()
     };
-    assert_eq!(high_of(second), r, "the frontier follows the catch-up");
+    // Its window open, new DATA follows the catch-up, so the frontier is
+    // at least `r`.
+    assert!(high_of(second) >= r, "the frontier follows the catch-up");
     let nak = karyos_protocol::network::Nak {
         alias,
         identity,
@@ -1292,7 +1322,7 @@ fn a_reset_resends_only_what_each_destination_lacks() {
             consumption: 0,
             window: 32_768,
         },
-        30,
+        40,
     );
     assert!(
         !matches!(outcome, crate::agents::repair::NakOutcome::Reply(_)),
