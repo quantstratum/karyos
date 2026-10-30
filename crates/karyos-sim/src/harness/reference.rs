@@ -33,14 +33,19 @@
 //!
 //! **Leader change** (W5; karyos#687 P3). Its only change of leader is a
 //! handover, never an election: the leader hands over to a voter that
-//! durably holds its whole log, stops taking proposals (it answers with
-//! the target as leader), and sends it `TimeoutNow`. The target leads the
-//! next term at once, saving its term and itself as the vote, and appends
-//! an empty entry of its term so that term commits. Appends carry the
-//! term: a server takes a higher one and its sender as leader, and ignores
-//! a lower one. A handover that does not complete within
-//! [`TRANSFER_TIMEOUT`] ticks is abandoned. A new leader first sends empty
-//! appends, so each follower acknowledges where it stands.
+//! durably holds its whole log and stops taking proposals for good (it
+//! answers with the target as leader). It saves the target as its vote
+//! first, and sends `TimeoutNow` only once that is durable, then again at
+//! every resend until it sees the higher term: it never resumes its own
+//! term, so a late `TimeoutNow` cannot make a leader that lacks what it
+//! committed (karyos#905 review). Restarted, it follows the target. The
+//! target leads the next term at once, saving its term and itself as the
+//! vote, and appends an empty entry of its term so that term commits.
+//! Appends carry the term: a server takes a higher one and its sender as
+//! leader, and ignores a lower one. A new leader first sends empty
+//! appends, so each follower acknowledges where it stands. With no
+//! election, a handover whose old leader crashes before the target leads
+//! stalls (a liveness gap); it never loses a committed entry.
 //!
 //! **Snapshots** (W5; karyos#687). It takes the node's compactions, and
 //! when a follower's next entry is below the log's first index, it asks for
@@ -76,8 +81,6 @@ use crate::net::NodeId;
 pub const LEADER: NodeId = 0;
 /// Its first term; a handover moves to the next.
 pub const TERM: u64 = 1;
-/// Ticks a handover waits for the target to lead before it is abandoned.
-pub const TRANSFER_TIMEOUT: u64 = 64;
 /// Ticks between the leader's resends.
 pub const RESEND: u64 = 4;
 /// Frame bytes per append message at most (at least one entry).
@@ -178,8 +181,8 @@ pub struct Reference {
     leader: NodeId,
     /// Its current term.
     term: u64,
-    /// A handover in progress: its target, and the tick it began.
-    transferring: Option<(NodeId, u64)>,
+    /// A handover in progress: its target. Never abandoned.
+    transferring: Option<NodeId>,
     /// The bootstrap voters, ascending.
     peers: Vec<NodeId>,
     /// The configurations in the log, written or not, ascending.
@@ -399,7 +402,7 @@ impl ConsensusCore for Reference {
             return Err(not_leader.into());
         }
         // Handing over: the target leads next.
-        if let Some((to, _)) = self.transferring {
+        if let Some(to) = self.transferring {
             return Err(NotLeader { leader: Some(to) }.into());
         }
         // The last index is u64::MAX: the log takes no more.
@@ -506,15 +509,13 @@ impl ConsensusCore for Reference {
 
     fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
         self.now = now;
-        if let Some((_, since)) = self.transferring
-            && now
-                .checked_sub(since)
-                .is_some_and(|waited| waited > TRANSFER_TIMEOUT)
-        {
-            self.transferring = None;
-        }
         if !self.leading() || !now.is_multiple_of(RESEND) {
             return;
+        }
+        // A handover's TimeoutNow again, until the target leads: released
+        // only once the vote for it is durable.
+        if let (Some(to), Some(term)) = (self.transferring, self.term.checked_add(1)) {
+            self.after_persist.push((to, Message::TimeoutNow { term }));
         }
         let Some(end) = log.last_index().and_then(|last| last.checked_add(1)) else {
             return;
@@ -633,7 +634,9 @@ impl ConsensusCore for Reference {
         }
         let hard_state = self.dirty.then_some(HardState {
             current_term: self.term,
-            voted_for: Some(u64::from(self.leader)),
+            // Handing over, it votes for the target: restarted, it follows
+            // it and never resumes its own term.
+            voted_for: Some(u64::from(self.transferring.unwrap_or(self.leader))),
             commit: self.commit,
         });
         if self.messages.is_empty()
@@ -718,8 +721,10 @@ impl ConsensusCore for Reference {
             return Err(TransferRefused::Lagging { behind });
         }
         let term = self.term.checked_add(1).ok_or(TransferRefused::Invalid)?;
-        self.transferring = Some((to, self.now));
-        self.messages.push((to, Message::TimeoutNow { term }));
+        self.transferring = Some(to);
+        // The vote for the target is saved first; TimeoutNow waits for it.
+        self.dirty = true;
+        self.after_persist.push((to, Message::TimeoutNow { term }));
         Ok(())
     }
 

@@ -380,6 +380,8 @@ impl W5 {
         // leadership moves to server 1; the cut heals before the retry.
         let mut retry = base("lost reply, leader change and retry");
         retry.compaction = None;
+        retry.handover = Some(1);
+        retry.retried = true;
         retry.operations = 8;
         let client = NodeId::try_from(self.processes).map_err(|_| W2Overflow)?;
         // Mid-run: each operation takes a few steps.
@@ -530,6 +532,13 @@ pub struct Case {
     pub notes: Vec<&'static str>,
     /// Its servers' log compaction (W5), if any.
     pub compaction: Option<Compaction>,
+    /// A handover the case must show taken (W5): its target must answer
+    /// a handover `Ok` and then commit as leader, or the case fails
+    /// ([`Failed::NotShown`]; karyos#905 review).
+    pub handover: Option<NodeId>,
+    /// The case must show a retry answered from deduplication (W5), or it
+    /// fails ([`Failed::NotShown`]).
+    pub retried: bool,
     /// A follower cut off until the first heal, and the entries the
     /// leaders must have committed past its own commit by then: W2's slow
     /// follower must really be that far behind, or the case fails
@@ -581,6 +590,8 @@ impl Case {
             notes: Vec::new(),
             behind: None,
             compaction: None,
+            handover: None,
+            retried: false,
         }
     }
 }
@@ -679,6 +690,9 @@ pub enum Failed {
         /// The up servers' last applied index and digest.
         states: Vec<(NodeId, Option<u64>, u64)>,
     },
+    /// What the case must show did not happen: `"handover"`
+    /// ([`Case::handover`]) or `"retry"` ([`Case::retried`]).
+    NotShown(&'static str),
     /// The cut-off follower was not as far behind at the heal as the case
     /// requires ([`Case::behind`]).
     NotBehind {
@@ -1187,6 +1201,28 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
         (Err(gap), Progress::MayStop) => Some(gap),
         (Err(gap), Progress::Expected) => return Err(Failed::Liveness(gap)),
     };
+    if let Some(to) = case.handover {
+        let taken = outcome.observations.iter().position(|observation| {
+            matches!(
+                observation,
+                Observation::Transfer { to: target, result: Ok(()), .. } if *target == to
+            )
+        });
+        let leads = taken.is_some_and(|at| {
+            outcome.observations.iter().skip(at).any(|observation| {
+                matches!(
+                    observation,
+                    Observation::Commit { node, leader: true, .. } if *node == to
+                )
+            })
+        });
+        if !leads {
+            return Err(Failed::NotShown("handover"));
+        }
+    }
+    if case.retried && outcome.deduplicated == 0 {
+        return Err(Failed::NotShown("retry"));
+    }
     if let Some((follower, required)) = case.behind {
         match gap_at_heal(&outcome.observations, follower) {
             Some(reached) if reached >= required => {}

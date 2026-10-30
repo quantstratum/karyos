@@ -209,11 +209,14 @@ impl Command {
 pub const RETENTION: usize = 10_000;
 
 /// One client's deduplication: its last [`RETENTION`] answers by
-/// sequence, and the highest sequence it applied.
+/// sequence, and the highest sequence it evicted. A sequence at or below
+/// the floor and not kept was answered and forgotten: [`Ret::Expired`]. One
+/// above it and not kept was never applied, even below one that was (a
+/// window's requests may commit out of order; karyos#905 review).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Answers {
     by_sequence: BTreeMap<u64, Ret>,
-    highest: u64,
+    floor: u64,
 }
 
 /// The deterministic test service: an append-only register, with a
@@ -266,7 +269,7 @@ impl TestService {
             }
             return Some((command, ret.clone()));
         }
-        if command.sequence <= answers.highest {
+        if command.sequence <= answers.floor {
             if let Some(count) = self.expired.checked_add(1) {
                 self.expired = count;
             }
@@ -280,9 +283,10 @@ impl TestService {
             Op::Read => Ret::Values(self.values.clone()),
         };
         let _ = answers.by_sequence.insert(command.sequence, ret.clone());
-        answers.highest = command.sequence;
         while answers.by_sequence.len() > self.retention {
-            let _ = answers.by_sequence.pop_first();
+            if let Some((evicted, _)) = answers.by_sequence.pop_first() {
+                answers.floor = answers.floor.max(evicted);
+            }
         }
         Some((command, ret))
     }
@@ -319,7 +323,7 @@ impl TestService {
         count(&mut bytes, self.answered.len())?;
         for (client, answers) in &self.answered {
             bytes.extend_from_slice(&client.to_le_bytes());
-            bytes.extend_from_slice(&answers.highest.to_le_bytes());
+            bytes.extend_from_slice(&answers.floor.to_le_bytes());
             count(&mut bytes, answers.by_sequence.len())?;
             for (sequence, ret) in &answers.by_sequence {
                 bytes.extend_from_slice(&sequence.to_le_bytes());
@@ -370,10 +374,10 @@ impl TestService {
         let mut answered = BTreeMap::new();
         for _ in 0..u32_at(&mut rest)? {
             let client = NodeId::from_le_bytes(*take(&mut rest, 4)?.first_chunk::<4>()?);
-            let highest = u64_at(&mut rest)?;
+            let floor = u64_at(&mut rest)?;
             let mut answers = Answers {
                 by_sequence: BTreeMap::new(),
-                highest,
+                floor,
             };
             let kept = u32_at(&mut rest)?;
             if kept > retention {
@@ -383,7 +387,7 @@ impl TestService {
                 let sequence = u64_at(&mut rest)?;
                 let length = u32_at(&mut rest)?;
                 let ret = Ret::decode(take(&mut rest, length)?)?;
-                if sequence > highest || answers.by_sequence.insert(sequence, ret).is_some() {
+                if sequence <= floor || answers.by_sequence.insert(sequence, ret).is_some() {
                     return None;
                 }
             }
@@ -706,6 +710,12 @@ mod service_snapshot_tests {
         let mut restored = restored;
         assert_eq!(apply(&mut restored, 6, 2), Some(Ret::Appended(2)));
         assert_eq!(Ret::decode(&Ret::Expired.canonical()), Some(Ret::Expired));
+        // A gap: 5 applied before 4 (a window across a redirect). 4 was
+        // never applied, so it is, not answered Expired.
+        let mut service = TestService::with_retention(2);
+        assert_eq!(apply(&mut service, 1, 5), Some(Ret::Appended(1)));
+        assert_eq!(apply(&mut service, 2, 4), Some(Ret::Appended(2)));
+        assert_eq!(service.expired(), 0);
     }
 
     /// Every cut, an extra byte and another tag are refused: a snapshot
