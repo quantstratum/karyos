@@ -928,10 +928,18 @@ impl<D: Disk + Clone> RaftLog<D> {
         {
             return Ok(());
         }
-        let state = HardState {
-            current_term: stored.map_or(term, |state| state.current_term.max(term)),
-            voted_for: stored.and_then(|state| state.voted_for),
-            commit: Some(base),
+        // A vote is for its own term: one of an older term than the base's
+        // does not carry into it (karyos#903 review, codex).
+        let state = match stored {
+            Some(state) if state.current_term >= term => HardState {
+                commit: Some(base),
+                ..state
+            },
+            _ => HardState {
+                current_term: term,
+                voted_for: None,
+                commit: Some(base),
+            },
         };
         match file::replace(&mut self.disk, &self.dir, HARD_STATE_FILE, &state.encode()) {
             Ok(()) => {
@@ -1346,8 +1354,10 @@ impl<D: Disk + Clone> RaftLog<D> {
     }
 }
 
-/// Refuses unless `snapshots`' latest snapshot is at `index` of `term` and
-/// verifies whole.
+/// Refuses unless `snapshots`' latest snapshot verifies whole and holds
+/// the state up to `index`: at `index` of `term` itself, or a later one (a
+/// compaction after the install: it holds a superset; karyos#903 review,
+/// codex).
 fn verify_base<E: Disk + Clone>(
     snapshots: Option<&SnapshotStore<E>>,
     index: u64,
@@ -1357,7 +1367,7 @@ fn verify_base<E: Disk + Clone>(
     let store = snapshots.ok_or(unverified)?;
     let latest = store
         .latest()
-        .filter(|info| info.index == index && info.term == term)
+        .filter(|info| info.index > index || (info.index == index && info.term == term))
         .ok_or(LogError::InstallUnverified { index, term })?;
     store
         .verify(&latest)

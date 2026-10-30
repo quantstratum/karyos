@@ -294,3 +294,56 @@ fn an_install_without_its_snapshot_or_not_past_the_commit_is_refused() {
         Err(LogError::InstallStale { index: BASE, .. })
     ));
 }
+
+/// An installed log reopens after a later compaction: a newer snapshot
+/// holds the base's state too (karyos#903 review, codex: latest 30 against
+/// an install at 20 was InstallUnverified). The install's vote, of an older
+/// term than the base's, does not carry into the base's term.
+#[test]
+fn an_install_survives_a_later_snapshot_and_drops_an_old_vote() {
+    let disk = SimDisk::new();
+    let _ = prepare(&disk);
+    let mut store = snapshots(disk.clone()).unwrap();
+    let mut log = RaftLog::open_with(disk.clone(), Path::new(LOG), geometry(), Some(&store))
+        .unwrap()
+        .log;
+    log.install(BASE, BASE_TERM, &store).unwrap();
+    let state = log.hard_state().unwrap();
+    assert_eq!(
+        (state.current_term, state.voted_for, state.commit),
+        (BASE_TERM, None, Some(BASE)),
+        "the term-1 vote does not carry into term 2"
+    );
+    let _ = log
+        .append(
+            &(BASE + 1..=BASE + 10)
+                .map(|index| entry(index, BASE_TERM))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    let _ = log.sync().unwrap();
+    log.save_hard_state(HardState {
+        current_term: BASE_TERM,
+        voted_for: None,
+        commit: Some(BASE + 10),
+    })
+    .unwrap();
+    // A compaction at 30: the newer snapshot, then a purge that keeps the
+    // last entries and so leaves the install's record.
+    let _ = store
+        .write(
+            BASE + 10,
+            BASE_TERM,
+            &[Section::new(SectionKind::Service, 1, b"the state up to 30")],
+        )
+        .unwrap();
+    let _ = log.purge_prefix(BASE + 1).unwrap();
+    drop(log);
+    let reopened = RaftLog::open_with(disk, Path::new(LOG), geometry(), Some(&store))
+        .unwrap()
+        .log;
+    assert_eq!(
+        (reopened.first_index(), reopened.last_index()),
+        (BASE + 1, Some(BASE + 10))
+    );
+}

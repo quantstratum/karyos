@@ -1368,8 +1368,13 @@ impl<C: ConsensusCore> ServerNode<C> {
             let _ = log.purge_prefix(below);
         }
         let first = log.first_index();
+        // The duty's budget holds for the hook's reads too.
+        let budget = self.limits.map(|_| self.budget.clone());
         if core
-            .compacted(base, &mut LogView::new(log).with_base(Some(base)))
+            .compacted(
+                base,
+                &mut LogView::metered(log, budget.as_ref()).with_base(Some(base)),
+            )
             .is_err()
         {
             // The core takes no snapshots: never again under it.
@@ -1442,7 +1447,11 @@ impl<C: ConsensusCore> ServerNode<C> {
         let digest = service.digest();
         self.service = service;
         self.observe(Observation::Installed { node, base, digest });
-        if let Err(refused) = core.install(base, &mut LogView::new(log).with_base(Some(base))) {
+        let budget = self.limits.map(|_| self.budget.clone());
+        if let Err(refused) = core.install(
+            base,
+            &mut LogView::metered(log, budget.as_ref()).with_base(Some(base)),
+        ) {
             match refused {
                 super::core::InstallRefused::Unsupported => {
                     self.compaction = None;
@@ -1865,6 +1874,8 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     ) {
         self.now = now;
         if let Wire::Snapshot { base, service } = message {
+            // A delivery is a duty: its budget refills.
+            let _ = self.refill();
             if let Some((mut core, mut log)) = self.running.take() {
                 self.install_snapshot(&mut core, &mut log, (base, service));
                 self.running = Some((core, log));
