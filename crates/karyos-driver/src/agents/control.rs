@@ -23,7 +23,6 @@
 //!   [`Control`], so DATA can never pass it (the guard gate is phase 7,
 //!   `guards-and-abort.md`).
 
-use karyos_sys::host_clock::age_ns;
 use std::net::SocketAddr;
 use std::num::NonZeroU16;
 
@@ -551,9 +550,7 @@ impl ControlRoutes {
                         Some(entry) => *entry.closing_since.get_or_insert(now),
                         None => now,
                     };
-                    // A clock behind since counts as no time elapsed
-                    // (age_ns), as for the data paths' closes.
-                    let late = age_ns(now, since) >= CONTROL_CLOSE_TIMEOUT;
+                    let late = super::close_late(since, now);
                     if late {
                         super::roles::bump(&mut self.close_timeouts, &mut self.overflowed);
                         self.close_failure();

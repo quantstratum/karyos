@@ -182,6 +182,14 @@ pub const MAX_PATH_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 /// `close_queue` per queue and one `remove_route` call each, no syscall.
 pub const CLOSE_IN_FLIGHT_TIMEOUT: u64 = 1_000_000_000;
 
+/// The one grace rule for a close still in flight, data and control alike
+/// (#847): late once [`CLOSE_IN_FLIGHT_TIMEOUT`] has passed since `since`,
+/// the first duty that found it in flight. A clock behind `since` counts
+/// as no time elapsed (`age_ns`).
+pub(crate) fn close_late(since: u64, now: u64) -> bool {
+    karyos_sys::host_clock::age_ns(now, since) >= CLOSE_IN_FLIGHT_TIMEOUT
+}
+
 /// The bytes the receiver's path queues allocate for `config`; `None` past
 /// `usize`.
 pub(crate) fn path_queue_bytes(config: &AgentConfig) -> Option<usize> {

@@ -5411,8 +5411,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let mut index = 0;
         while let Some((mut opened, since)) = self.closing_again.get(index).copied() {
             let outcome = self.close_entry(halves, &mut opened);
-            // A clock behind `since` counts as no time elapsed (`age_ns`).
-            let late = age_ns(now, since) >= super::CLOSE_IN_FLIGHT_TIMEOUT;
+            let late = super::close_late(since, now);
             match outcome {
                 EntryClosed::Done => {
                     self.closing_again.swap_remove(index);
