@@ -6931,29 +6931,50 @@ fn controls_waiting_across_an_epoch_change_are_counted_dropped() {
 
     use super::super::control::ControlRoutes;
 
-    let endpoint =
-        SocketsEndpoint::open(&loopback(), InstanceId::FIRST, ScriptedSocket::new()).unwrap();
-    let (mut tx, rx) = endpoint.split().unwrap();
-    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 46_000 + index));
-    let mut routes = ControlRoutes::new(1);
-    routes.hold_closes = true;
-    for index in 1..=8 {
-        let _ = routes.send_or_wait(&mut tx, at(index), &challenge_control());
+    // Through the duty, a plain send and a send that may wait (#910 review).
+    for entry in 0..3 {
+        let socket = ScriptedSocket::new();
+        for _ in 0..64 {
+            socket.push_send(karyos_io::sockets::ops::SendResult::Sent {
+                sent: 1,
+                error: None,
+            });
+        }
+        let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+        let (mut tx, rx) = endpoint.split().unwrap();
+        let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 46_000 + index));
+        let mut routes = ControlRoutes::new(1);
+        routes.hold_closes = true;
+        for index in 1..=8 {
+            let _ = routes.send_or_wait(&mut tx, at(index), &challenge_control());
+        }
+        let waiting = routes.waiting();
+        assert!(waiting > 0, "some wait");
+        // The endpoint's reset and reopen, as the endpoint table does.
+        let mut joined = SocketsEndpoint::join(tx, rx).ok().unwrap();
+        let mut report = karyos_io::backend::TxReport::new();
+        while joined.reset(&mut report).more {
+            while report.pop_front().is_some() {}
+        }
+        let _ = joined.reopen(&loopback()).unwrap();
+        let (mut tx, _rx) = joined.split().unwrap();
+        routes.hold_closes = false;
+        match entry {
+            0 => routes.close_lingering(&mut tx, 0),
+            1 => {
+                let _ = routes.send(&mut tx, at(9), &challenge_control());
+            }
+            _ => {
+                let _ = routes.send_or_wait(&mut tx, at(9), &challenge_control());
+            }
+        }
+        assert_eq!(routes.waiting(), 0, "entry {entry}");
+        assert_eq!(
+            routes.waits_dropped,
+            u64::try_from(waiting).unwrap(),
+            "entry {entry}: every waiting control dropped, none sent on the new epoch"
+        );
     }
-    let waiting = routes.waiting();
-    assert!(waiting > 0, "some wait");
-    // The endpoint's reset and reopen, as the endpoint table does.
-    let mut joined = SocketsEndpoint::join(tx, rx).ok().unwrap();
-    let mut report = karyos_io::backend::TxReport::new();
-    while joined.reset(&mut report).more {
-        while report.pop_front().is_some() {}
-    }
-    let _ = joined.reopen(&loopback()).unwrap();
-    let (mut tx, _rx) = joined.split().unwrap();
-    routes.close_lingering(&mut tx, 0);
-    assert_eq!(routes.waiting(), 0);
-    assert_eq!(routes.waits_dropped, u64::try_from(waiting).unwrap());
-    routes.hold_closes = false;
 }
 
 /// #847 (#838 review): a removed publication's route the close list has

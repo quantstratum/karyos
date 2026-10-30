@@ -594,6 +594,15 @@ impl ControlRoutes {
 
     /// Sends the controls waiting, in order, until one is blocked again.
     fn send_waiting<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>) {
+        // Waiting since an epoch the endpoint has left: none goes out on
+        // the new one; all are dropped, counted.
+        if self
+            .epoch
+            .is_some_and(|epoch| epoch != tx.capabilities().epoch)
+        {
+            self.drop_waiting();
+            return;
+        }
         while let Some((address, control)) = self.waiting.pop_front() {
             match self.send_now(tx, address, &control) {
                 Ok(()) => {}
