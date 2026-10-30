@@ -255,28 +255,254 @@ impl TestService {
 }
 
 /// The test service as C3's sequential model.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ServiceModel;
+///
+/// Its state is a [`SharedLog`]: appending shares the earlier values, so
+/// the checker's search clones a state in O(1) and hashes it by its length
+/// and digest, while equality stays exact, value by value (karyos#687;
+/// decided 2026-10-30 by QS-COORDINATOR: the checker never trusts a
+/// digest alone).
+#[derive(Debug, Clone, Copy)]
+pub struct ServiceModel {
+    /// Folds a value into the digest of the values before it.
+    fold: fn(u64, &[u8]) -> u64,
+}
+
+impl Default for ServiceModel {
+    fn default() -> Self {
+        Self { fold: fnv1a }
+    }
+}
+
+impl ServiceModel {
+    /// The model with `fold` as its digest: a test forces collisions with
+    /// it, and the model still tells the states apart.
+    #[cfg(test)]
+    pub(crate) fn with_fold(fold: fn(u64, &[u8]) -> u64) -> Self {
+        Self { fold }
+    }
+}
+
+/// FNV-1a over the earlier digest, the value's length and its bytes.
+fn fnv1a(digest: u64, value: &[u8]) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let length = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    digest
+        .to_le_bytes()
+        .iter()
+        .chain(&length.to_le_bytes())
+        .chain(value)
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+        })
+}
 
 impl lin::Model for ServiceModel {
-    type State = Vec<Vec<u8>>;
+    type State = SharedLog;
     type Op = Op;
     type Ret = Ret;
 
     fn init(&self) -> Self::State {
-        Vec::new()
+        SharedLog::default()
     }
 
     fn step(&self, state: &Self::State, op: &Op) -> (Self::State, Ret) {
         match op {
-            Op::Append(value) => {
-                let mut next = state.clone();
-                next.push(value.clone());
-                let length = u64::try_from(next.len()).unwrap_or(u64::MAX);
-                (next, Ret::Appended(length))
-            }
-            Op::Read => (state.clone(), Ret::Values(state.clone())),
+            Op::Append(value) => match state.push(value.clone(), self.fold) {
+                Some(next) => {
+                    let length = next.len();
+                    (next, Ret::Appended(length))
+                }
+                // A log of u64::MAX values cannot be built from a history
+                // (it holds fewer operations); were it, the append answers
+                // length 0, which no recorded append returns, so the
+                // checker refuses it rather than accept a wrapped count.
+                None => (state.clone(), Ret::Appended(0)),
+            },
+            Op::Read => (state.clone(), Ret::Values(state.values())),
         }
+    }
+}
+
+/// The values appended, newest last, as a persistent list: a push shares
+/// every earlier value, so a clone is O(1). It hashes by its length and
+/// digest, and compares equal only value by value.
+#[derive(Debug, Clone, Default)]
+pub struct SharedLog {
+    last: Option<Rc<Link>>,
+}
+
+/// One value of a [`SharedLog`], and the values before it.
+#[derive(Debug)]
+struct Link {
+    value: Vec<u8>,
+    before: Option<Rc<Link>>,
+    /// Values up to this one.
+    length: u64,
+    /// The fold of the values up to this one.
+    digest: u64,
+}
+
+impl SharedLog {
+    /// Values held.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.last.as_ref().map_or(0, |link| link.length)
+    }
+
+    /// Whether it holds none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.last.is_none()
+    }
+
+    fn digest(&self) -> u64 {
+        self.last.as_ref().map_or(0, |link| link.digest)
+    }
+
+    /// It with `value` appended, its digest folded by `fold`; `None` when
+    /// its length would pass `u64::MAX`.
+    fn push(&self, value: Vec<u8>, fold: fn(u64, &[u8]) -> u64) -> Option<Self> {
+        let length = self.len().checked_add(1)?;
+        let digest = fold(self.digest(), &value);
+        Some(Self {
+            last: Some(Rc::new(Link {
+                value,
+                before: self.last.clone(),
+                length,
+                digest,
+            })),
+        })
+    }
+
+    /// Its values, oldest first.
+    #[must_use]
+    pub fn values(&self) -> Vec<Vec<u8>> {
+        let mut values = Vec::new();
+        let mut at = self.last.as_deref();
+        while let Some(link) = at {
+            values.push(link.value.clone());
+            at = link.before.as_deref();
+        }
+        values.reverse();
+        values
+    }
+}
+
+impl PartialEq for SharedLog {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() || self.digest() != other.digest() {
+            return false;
+        }
+        // Equal digests prove nothing: compare value by value, down to a
+        // shared tail.
+        let (mut left, mut right) = (self.last.as_ref(), other.last.as_ref());
+        loop {
+            match (left, right) {
+                (None, None) => return true,
+                (Some(a), Some(b)) => {
+                    if Rc::ptr_eq(a, b) {
+                        return true;
+                    }
+                    if a.value != b.value {
+                        return false;
+                    }
+                    (left, right) = (a.before.as_ref(), b.before.as_ref());
+                }
+                _ => return false,
+            }
+        }
+    }
+}
+
+impl Eq for SharedLog {}
+
+impl std::hash::Hash for SharedLog {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.len().hash(state);
+        self.digest().hash(state);
+    }
+}
+
+impl Drop for SharedLog {
+    // Iterative: a long list dropped link by link would recurse as deep as
+    // it is long.
+    fn drop(&mut self) {
+        let mut at = self.last.take();
+        while let Some(link) = at {
+            match Rc::try_unwrap(link) {
+                Ok(mut link) => at = link.before.take(),
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_log_tests {
+    #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
+
+    use super::*;
+    use crate::lin::Model;
+
+    /// Every digest the same: equal states are still told only by their
+    /// values (karyos#687).
+    fn colliding(_: u64, _: &[u8]) -> u64 {
+        7
+    }
+
+    #[test]
+    fn colliding_digests_never_make_different_logs_equal() {
+        let model = ServiceModel::with_fold(colliding);
+        let push = |state: &SharedLog, value: u8| model.step(state, &Op::Append(vec![value])).0;
+        let empty = model.init();
+        let ab = push(&push(&empty, 1), 2);
+        let ba = push(&push(&empty, 2), 1);
+        let ab_again = push(&push(&empty, 1), 2);
+        assert_eq!(ab.digest(), ba.digest(), "forced to collide");
+        assert_ne!(ab, ba);
+        assert_eq!(ab, ab_again);
+        assert_eq!(
+            model.step(&ab, &Op::Read).1,
+            Ret::Values(vec![vec![1], vec![2]])
+        );
+        assert_eq!(
+            model.step(&ba, &Op::Read).1,
+            Ret::Values(vec![vec![2], vec![1]])
+        );
+        // A memo keyed by the colliding state keeps both.
+        let seen: std::collections::HashSet<SharedLog> = [ab, ba, ab_again].into_iter().collect();
+        assert_eq!(seen.len(), 2);
+    }
+
+    /// Two appends left open, then a read of the second before the first,
+    /// under colliding digests: the search reaches {both appended} first
+    /// as [1, 2], which the read refutes, then as [2, 1]. Keyed by a digest
+    /// alone, the memo would take the second for the first and prune it,
+    /// a false "not linearizable"; compared value by value, it is
+    /// linearizable.
+    #[test]
+    fn the_checker_tells_apart_states_whose_digests_collide() {
+        use crate::lin::{History, Verdict, check};
+        let model = ServiceModel::with_fold(colliding);
+        let mut history = History::default();
+        history
+            .invoke(1, Op::Append(vec![1]))
+            .invoke(2, Op::Append(vec![2]))
+            .invoke(3, Op::Read)
+            .ret(3, Ret::Values(vec![vec![2], vec![1]]));
+        let verdict = check(&model, &history, crate::harness::check::LIMIT).unwrap();
+        assert!(matches!(verdict, Verdict::Linearizable(_)), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_long_log_drops_without_recursing() {
+        let model = ServiceModel::default();
+        let mut log = model.init();
+        for value in 0..200_000u32 {
+            log = log.push(value.to_le_bytes().to_vec(), fnv1a).unwrap();
+        }
+        assert_eq!(log.len(), 200_000);
+        drop(log);
     }
 }
 
