@@ -377,6 +377,17 @@ fn registry_requests_are_refused_by_bound_and_shape() {
             "{\"error\":\"bad arguments\",\"request\":\"join-get\",\"detail\":\"key\"}\n"
                 .to_owned(),
         ),
+        // A list's cursor is a key, checked as a read's (karyos#893).
+        (
+            format!("KARYOS-AGENT 1 join-list {driver_dir} stream 07\n"),
+            "{\"error\":\"bad arguments\",\"request\":\"join-list\",\"detail\":\"key\"}\n"
+                .to_owned(),
+        ),
+        (
+            format!("KARYOS-AGENT 1 join-list {driver_dir} point {}\n", "k".repeat(65)),
+            "{\"error\":\"above bound\",\"dimension\":\"join.key_bytes\",\"bound\":64}\n"
+                .to_owned(),
+        ),
         (
             format!("KARYOS-AGENT 1 join-list {driver_dir} point\n"),
             "{\"error\":\"bad arguments\",\"request\":\"join-list\"}\n".to_owned(),

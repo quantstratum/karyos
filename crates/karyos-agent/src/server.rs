@@ -1475,4 +1475,82 @@ mod tests {
         assert!(Role::Administrator.may_register());
         assert!(!Role::Viewer.may_register() && !Role::Operator.may_register());
     }
+
+    /// A join request line: the head and a tail of generated words, or
+    /// any text, around both request bounds.
+    fn join_line() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let word = proptest::collection::vec(
+            prop_oneof![
+                6 => proptest::char::range('a', 'z'),
+                1 => proptest::char::range('0', '9'),
+                1 => Just('='),
+                1 => Just(' '),
+                1 => Just('\r'),
+                1 => Just('é'),
+            ],
+            0..80,
+        )
+        .prop_map(|chars| chars.into_iter().collect::<String>());
+        let name = prop_oneof![
+            Just("join-put"),
+            Just("join-retire"),
+            Just("join-get"),
+            Just("join-list"),
+            Just("view"),
+        ];
+        let kind = prop_oneof![
+            Just("stream"),
+            Just("point"),
+            Just("counter"),
+            Just("table")
+        ];
+        prop_oneof![
+            (
+                name,
+                kind,
+                proptest::collection::vec(word, 0..20),
+                any::<bool>()
+            )
+                .prop_map(|(name, kind, words, newline)| {
+                    let tail = words.join(" ");
+                    let end = if newline { "\n" } else { "" };
+                    format!("KARYOS-AGENT 1 {name} /run/d {kind} {tail}{end}")
+                }),
+            any::<String>(),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1024))]
+
+        /// Any line (karyos#893): the parser never panics; a join request
+        /// it reads came from a line within its bound, and each field it
+        /// returns is text of that line.
+        #[test]
+        fn a_join_request_parses_within_its_bounds(line in join_line()) {
+            let parsed = parse(&line);
+            let within = |field: &str| line.contains(field);
+            match parsed {
+                Request::JoinPut { dir, key, attributes, .. } => {
+                    proptest::prop_assert!(line.len() <= MAX_JOIN_REQUEST);
+                    proptest::prop_assert!(within(dir) && within(key) && within(attributes));
+                    proptest::prop_assert!(!key.is_empty());
+                }
+                Request::JoinRetire { dir, key, .. } | Request::JoinGet { dir, key, .. } => {
+                    proptest::prop_assert!(line.len() <= MAX_REQUEST);
+                    proptest::prop_assert!(within(dir) && within(key) && !key.is_empty());
+                }
+                Request::JoinList { dir, after } => {
+                    proptest::prop_assert!(line.len() <= MAX_REQUEST);
+                    proptest::prop_assert!(within(dir));
+                    if let Some((_, key)) = after {
+                        proptest::prop_assert!(within(key) && !key.is_empty());
+                    }
+                }
+                Request::JoinTooLong => proptest::prop_assert!(line.len() > MAX_JOIN_REQUEST),
+                _ => {}
+            }
+        }
+    }
 }

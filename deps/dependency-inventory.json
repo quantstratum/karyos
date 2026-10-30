@@ -1576,6 +1576,15 @@
           "features": [
             "std"
           ],
+          "from": "workspace:karyos-agent@0.1.0-alpha.2",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "std"
+          ],
           "from": "workspace:karyos-archive@0.1.0-alpha.2",
           "kind": "dev",
           "target": null,

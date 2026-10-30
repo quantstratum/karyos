@@ -629,3 +629,121 @@ fn a_token_is_bounded_and_read_from_a_private_file() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// One raw head to `exporter` and what it answered; the answer's bytes
+/// may be cut by a reset when the head went past its bound.
+fn exchange_bytes(exporter: &mut Exporter, request: &[u8]) -> (Vec<u8>, Vec<Answered>) {
+    let mut client = TcpStream::connect(exporter.local_addr().unwrap()).unwrap();
+    let _ = client.write_all(request);
+    let _ = client.shutdown(std::net::Shutdown::Write);
+    let mut answered = Vec::new();
+    for _ in 0..200 {
+        answered = exporter.poll(|| "karyos_up 1\n".to_owned()).unwrap();
+        if !answered.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut answer = Vec::new();
+    let _ = client.read_to_end(&mut answer);
+    (answer, answered)
+}
+
+const TOKEN: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+/// A generated head: request lines and `Authorization` variants (the
+/// token, one byte off, a prefix, an extension, another scheme, no space,
+/// any case), other headers, non-UTF-8 bytes, and padding up to and past
+/// the head's bound, cut anywhere.
+fn head() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+    use proptest::prelude::*;
+    let line = prop_oneof![
+        Just(b"GET /metrics HTTP/1.1\r\n".to_vec()),
+        Just(b"GET /metrics HTTP/1.0\n".to_vec()),
+        Just(b"get /metrics HTTP/1.1\r\n".to_vec()),
+        Just(b"GET /other HTTP/1.1\r\n".to_vec()),
+        Just(b"POST /metrics HTTP/1.1\r\n".to_vec()),
+        Just(b"GET /metrics\r\n".to_vec()),
+        Just(b"GET /metrics SPDY/3\r\n".to_vec()),
+        proptest::collection::vec(any::<u8>(), 0..64),
+    ];
+    let mut off = TOKEN.to_vec();
+    if let Some(last) = off.last_mut() {
+        *last = b'X';
+    }
+    let value = prop_oneof![
+        Just(TOKEN.to_vec()),
+        Just(off),
+        Just(TOKEN.get(..31).unwrap().to_vec()),
+        Just([TOKEN, b"0"].concat()),
+        proptest::collection::vec(any::<u8>(), 0..300),
+    ];
+    let scheme = prop_oneof![
+        Just(b"Bearer ".to_vec()),
+        Just(b"bearer ".to_vec()),
+        Just(b"BEARER  ".to_vec()),
+        Just(b"Bearer".to_vec()),
+        Just(b"Basic ".to_vec()),
+    ];
+    let name = prop_oneof![
+        Just(b"Authorization: ".to_vec()),
+        Just(b"authorization:".to_vec()),
+        Just(b"Authorisation: ".to_vec()),
+        Just(b"X-Authorization: ".to_vec()),
+    ];
+    let authorization = (name, scheme, value)
+        .prop_map(|(name, scheme, value)| [name, scheme, value, b"\r\n".to_vec()].concat());
+    let header = prop_oneof![
+        3 => authorization,
+        1 => Just(b"Host: localhost\r\n".to_vec()),
+        1 => proptest::collection::vec(any::<u8>(), 0..40),
+        1 => (0..1200usize).prop_map(|length| [vec![b'p'; length], b"\r\n".to_vec()].concat()),
+    ];
+    (
+        line,
+        proptest::collection::vec(header, 0..4),
+        any::<bool>(),
+        any::<prop::sample::Index>(),
+    )
+        .prop_map(|(line, headers, cut, at)| {
+            let mut head = [line, headers.concat(), b"\r\n".to_vec()].concat();
+            if cut {
+                head.truncate(at.index(head.len() + 1));
+            }
+            head
+        })
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+
+    /// Whatever head comes (karyos#893): a poll never fails or panics, and
+    /// metrics are served only to a head whose bounded part carries an
+    /// `Authorization` header with exactly the token.
+    #[test]
+    fn no_head_without_the_token_is_served_metrics(head in head()) {
+        let token = Token::new(TOKEN.to_vec()).unwrap();
+        let mut exporter = bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_token(token);
+        let (answer, answered) = exchange_bytes(&mut exporter, &head);
+        proptest::prop_assert_eq!(answered.len(), 1);
+        if answered.contains(&Answered::Metrics) {
+            let read = head.get(..MAX_REQUEST).unwrap_or(&head);
+            let carries = read
+                .split(|byte| *byte == b'\n')
+                .any(|line| {
+                    let line = String::from_utf8_lossy(line).to_ascii_lowercase();
+                    line.starts_with("authorization:")
+                        && line.trim_end().ends_with(&String::from_utf8_lossy(TOKEN).to_string())
+                });
+            proptest::prop_assert!(carries, "{:?}", String::from_utf8_lossy(&head));
+        } else {
+            proptest::prop_assert!(
+                !answer.windows(9).any(|window| window == b"karyos_up"),
+                "{:?}",
+                String::from_utf8_lossy(&answer)
+            );
+        }
+    }
+}

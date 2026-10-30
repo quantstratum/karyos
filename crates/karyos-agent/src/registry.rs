@@ -333,7 +333,10 @@ impl Registry {
         // put leaves the registry as it was.
         let (number, dropped) = match self.entries.get(&id) {
             Some(entry) => (
-                entry.versions.back().map_or(Some(1), |last| last.number.checked_add(1)),
+                entry
+                    .versions
+                    .back()
+                    .map_or(Some(1), |last| last.number.checked_add(1)),
                 if entry.versions.len() == MAX_VERSIONS {
                     entry.history_dropped.checked_add(1)
                 } else {

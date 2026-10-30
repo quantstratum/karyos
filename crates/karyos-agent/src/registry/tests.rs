@@ -8,6 +8,8 @@
 
 use super::*;
 
+use proptest::prelude::*;
+
 const UID: u32 = 1000;
 
 /// A product puts an entry and reads it back; a second put makes version
@@ -370,4 +372,94 @@ fn generations_differ_and_memory_is_bounded() {
     assert_eq!(Registry::new(42).since_ns(), 42);
     assert_eq!(MAX_MEMORY_BYTES, 6_864_896);
     const { assert!(MAX_MEMORY_BYTES <= 8 << 20) };
+}
+
+/// Any text: a key or attribute bytes, ASCII and not, spaces and `=`
+/// included, around each bound.
+fn text(max: usize) -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        prop_oneof![
+            4 => proptest::char::range('a', 'z'),
+            1 => proptest::char::range('0', '9'),
+            1 => Just('='),
+            1 => Just(' '),
+            1 => Just('.'),
+            1 => Just('A'),
+            1 => Just('é'),
+            1 => Just('\u{0}'),
+        ],
+        0..=max,
+    )
+    .prop_map(|chars| chars.into_iter().collect())
+}
+
+/// Lowercase words up to `max` bytes: keys and names mostly accepted.
+fn word(max: usize) -> impl Strategy<Value = String> {
+    proptest::collection::vec(proptest::char::range('a', 'z'), 1..=max)
+        .prop_map(|chars| chars.into_iter().collect())
+}
+
+/// Attributes mostly well formed, their counts and lengths around each
+/// bound.
+fn attributes() -> impl Strategy<Value = String> {
+    proptest::collection::vec(
+        (word(MAX_NAME_BYTES + 1), text(MAX_VALUE_BYTES + 1)),
+        0..=MAX_ATTRIBUTES + 1,
+    )
+    .prop_map(|pairs| {
+        pairs
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+fn kind() -> impl Strategy<Value = Kind> {
+    prop_oneof![Just(Kind::Stream), Just(Kind::Point), Just(Kind::Counter)]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// Whatever is put (karyos#893): it never panics; what is kept holds
+    /// every bound; and a refused put changes nothing a reader sees.
+    #[test]
+    fn a_put_keeps_its_bounds_and_a_refused_one_changes_nothing(
+        puts in proptest::collection::vec(
+            (
+                0..2usize,
+                kind(),
+                prop_oneof![word(MAX_KEY_BYTES + 1), text(MAX_KEY_BYTES + 2)],
+                prop_oneof![attributes(), text(2 * MAX_VALUE_BYTES)],
+            ),
+            1..16,
+        ),
+    ) {
+        let mut registry = Registry::new(0);
+        for (now, (driver, kind, key, attributes)) in (1u64..).zip(&puts) {
+            let before = registry.get(*driver, *kind, key).cloned();
+            let (len, evicted) = (registry.len(), registry.evicted());
+            match registry.put(*driver, *kind, key, attributes, UID, now) {
+                Ok(number) => {
+                    let entry = registry.get(*driver, *kind, key).unwrap();
+                    prop_assert_eq!(entry.versions.back().unwrap().number, number);
+                    prop_assert!(entry.key.len() <= MAX_KEY_BYTES);
+                    prop_assert!(entry.versions.len() <= MAX_VERSIONS);
+                    let kept: Vec<_> = entry.versions.back().unwrap().attributes().collect();
+                    prop_assert!(!kept.is_empty() && kept.len() <= MAX_ATTRIBUTES);
+                    for (name, value) in kept {
+                        prop_assert!(!name.is_empty() && name.len() <= MAX_NAME_BYTES);
+                        prop_assert!(value.len() <= MAX_VALUE_BYTES);
+                    }
+                }
+                Err(_) => {
+                    prop_assert_eq!(registry.get(*driver, *kind, key).cloned(), before);
+                    prop_assert_eq!(registry.len(), len);
+                    prop_assert_eq!(registry.evicted(), evicted);
+                }
+            }
+            prop_assert!(registry.len() <= MAX_KEYS);
+        }
+    }
 }
