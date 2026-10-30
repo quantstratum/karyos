@@ -81,11 +81,22 @@ pub struct SetCounts {
     pub frees: u64,
 }
 
+/// A [`window`] is already open in this process: one at a time, or the
+/// second would reset the first's counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowOpen;
+
 /// Runs `call` with the window open: every allocation, reallocation and
-/// free of a thread enrolled meanwhile, on any thread, counts. One window
-/// at a time in a process (its callers serialize). Meaningful only when
-/// [`CountingAllocator`] is the global allocator.
-pub fn window<R>(call: impl FnOnce() -> R) -> (R, SetCounts) {
+/// free of a thread enrolled meanwhile, on any thread, counts. The totals
+/// are exact for what happens before `call` returns, so the path's threads
+/// must be joined (or their work otherwise finished) inside `call`; an
+/// enrolled thread still running after it may be counted or missed.
+/// Meaningful only when [`CountingAllocator`] is the global allocator.
+///
+/// # Errors
+///
+/// [`WindowOpen`] while another window is open, with `call` not run.
+pub fn window<R>(call: impl FnOnce() -> R) -> Result<(R, SetCounts), WindowOpen> {
     /// Closes the window on every exit, a panic in `call` included.
     struct Close;
 
@@ -95,9 +106,14 @@ pub fn window<R>(call: impl FnOnce() -> R) -> (R, SetCounts) {
         }
     }
 
+    if WINDOW
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(WindowOpen);
+    }
     SET_ALLOCATIONS.store(0, Ordering::SeqCst);
     SET_FREES.store(0, Ordering::SeqCst);
-    WINDOW.store(true, Ordering::SeqCst);
     let close = Close;
     let result = call();
     drop(close);
@@ -105,7 +121,7 @@ pub fn window<R>(call: impl FnOnce() -> R) -> (R, SetCounts) {
         allocations: SET_ALLOCATIONS.load(Ordering::SeqCst),
         frees: SET_FREES.load(Ordering::SeqCst),
     };
-    (result, counts)
+    Ok((result, counts))
 }
 
 /// The system allocator, counting the calling thread's operations while

@@ -17,8 +17,10 @@
 //! - **Per replicated entry**: the counts over the entries the leaders
 //!   committed past the warm-up ([`AllocationReport::entries`]).
 //! - Counting needs `karyos_sys::alloc_count::CountingAllocator` as the
-//!   global allocator, which a test binary installs; one measurement at a
-//!   time in a process.
+//!   global allocator, which a test binary installs. One measurement at a
+//!   time in a process: a second one while a window is open is refused
+//!   ([`MeasureError::WindowOpen`]). The simulator runs on the calling
+//!   thread, so the window ends when its work does.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -143,16 +145,26 @@ impl AllocationReport {
     }
 }
 
+/// Why a measurement gave no report.
+#[derive(Debug)]
+pub enum MeasureError {
+    /// The run could not be set up or stepped.
+    Run(RunError),
+    /// Another measurement's window is open in this process.
+    WindowOpen,
+}
+
 /// Measures `case` of core `C` under `seed`: its run with every call of
 /// `C` past the warm-up counted.
 ///
 /// # Errors
 ///
-/// [`RunError`] when the run cannot be set up or stepped.
-pub fn measure<C: ConsensusCore>(case: &Case, seed: u64) -> Result<AllocationReport, RunError> {
+/// [`MeasureError`].
+pub fn measure<C: ConsensusCore>(case: &Case, seed: u64) -> Result<AllocationReport, MeasureError> {
     LEADER_COMMITTED.store(0, Ordering::SeqCst);
-    let (outcome, counts) = window(|| run::<Probed<C>>(case, seed));
-    let outcome = outcome?;
+    let (outcome, counts) =
+        window(|| run::<Probed<C>>(case, seed)).map_err(|_| MeasureError::WindowOpen)?;
+    let outcome = outcome.map_err(MeasureError::Run)?;
     let entries = LEADER_COMMITTED
         .load(Ordering::SeqCst)
         .saturating_sub(WARMUP);

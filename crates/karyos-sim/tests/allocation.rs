@@ -17,7 +17,7 @@ use karyos_sim::harness::corpus::Evidence;
 use karyos_sim::harness::probe::{WARMUP, measure};
 use karyos_sim::harness::reference::Reference;
 use karyos_sim::harness::workloads::W1;
-use karyos_sys::alloc_count::{CountingAllocator, SetCounts, enroll, window};
+use karyos_sys::alloc_count::{CountingAllocator, SetCounts, WindowOpen, enroll, window};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -42,7 +42,8 @@ fn the_probe_counts_the_enrolled_threads_and_nothing_else() {
         let _enrolled = enroll();
         let kept = std::hint::black_box(vec![0u8; 64]);
         drop(kept);
-    });
+    })
+    .unwrap();
     assert_eq!(
         counts,
         SetCounts {
@@ -53,12 +54,15 @@ fn the_probe_counts_the_enrolled_threads_and_nothing_else() {
     let ((), nothing) = window(|| {
         let _enrolled = enroll();
         std::hint::black_box(0u64);
-    });
+    })
+    .unwrap();
     assert_eq!(nothing, SetCounts::default(), "a no-op");
     let ((), outside) = window(|| {
         drop(std::hint::black_box(vec![0u8; 64]));
-    });
+    })
+    .unwrap();
     assert_eq!(outside, SetCounts::default(), "not enrolled");
+    // A declared thread, joined inside the window.
     let ((), threaded) = window(|| {
         std::thread::scope(|scope| {
             scope
@@ -69,11 +73,22 @@ fn the_probe_counts_the_enrolled_threads_and_nothing_else() {
                 .join()
                 .unwrap();
         });
-    });
+    })
+    .unwrap();
     assert!(
         threaded.allocations >= 1 && threaded.frees >= 1,
         "{threaded:?}"
     );
+    // One window at a time: a second, opened inside the first, is refused
+    // and the first keeps its counts.
+    let (inner, outer) = window(|| {
+        let _enrolled = enroll();
+        drop(std::hint::black_box(vec![0u8; 64]));
+        window(|| ())
+    })
+    .unwrap();
+    assert_eq!(inner, Err(WindowOpen));
+    assert_eq!(outer.allocations, 1, "{outer:?}");
 }
 
 /// One W1 case of the `Reference` fixture, measured: entries past the
