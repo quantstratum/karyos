@@ -39,11 +39,9 @@ karyos-driver = { path = "crates/karyos-driver", version = "0.1.0-alpha.2" }
 karyos-trace = { path = "crates/karyos-trace", version = "0.1.0-alpha.2" }
 karyos-archive = { path = "crates/karyos-archive", version = "0.1.0-alpha.2" }
 karyos-cluster = { path = "crates/karyos-cluster", version = "0.1.0-alpha.2" }
-karyos-feed = { path = "crates/karyos-feed", version = "0.1.0-alpha.2" }
 karyos-sim = { path = "crates/karyos-sim", version = "0.1.0-alpha.2" }
 karyos = { path = "crates/karyos", version = "0.1.0-alpha.2" }
 karyos-tools = { path = "crates/karyos-tools", version = "0.1.0-alpha.2" }
-karyos-bench = { path = "crates/karyos-bench", version = "0.1.0-alpha.2" }
 karyos-agent = { path = "crates/karyos-agent", version = "0.1.0-alpha.2" }
 
 # External dependencies; each admission is recorded in deps/dependencies.md.
