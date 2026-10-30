@@ -134,6 +134,11 @@ pub enum SysError {
     /// A fixed capacity (slots, registry cells or loan credits) is exhausted.
     #[error("resources unavailable")]
     ResourcesUnavailable,
+    /// Read leases were asked of a buffer attached from another process:
+    /// only the creator's conductor scans the lease bank before it
+    /// reclaims, so only the creator may lease (R-CORE-45).
+    #[error("read leases need the creating process's buffer")]
+    LeasesNotOnAttached,
     /// A required subscriber found its data gone; its cursor did not move.
     #[error("required subscriber lapped at position {position}")]
     RequiredSubscriberLapped {

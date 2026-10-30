@@ -96,13 +96,14 @@
 use core::sync::atomic::{Ordering, fence};
 use std::collections::VecDeque;
 
+use super::read_lease::{LeaseOutcome, ReadLease, StageReason};
 use super::{
     BufferOwner, Cursor, LogBuffer, Lookup, RetentionHold, Role, SealWord, Subscription,
     SubscriptionContext, Validated, decode_seal,
 };
 use crate::error::SysError;
 use crate::frame::{Flags, FrameType, HEADER_LENGTH, Word0};
-use crate::loan::{LoanOutcome, release_loan, take_loan};
+use crate::loan::{LoanOutcome, claim_lease, release_loan, take_loan};
 use crate::participant;
 use crate::publication::{load_interior, observe_block};
 use crate::sizing::align_frame;
@@ -263,6 +264,12 @@ pub struct SenderReadCounters {
     pub restart_raised: u64,
     /// Word 0 loads spent by NAK scans.
     pub nak_loads: u64,
+    /// Cursor reads that took a read lease (R-CORE-45).
+    pub leases: u64,
+    /// Bytes leased.
+    pub lease_bytes: u64,
+    /// Lease reads staged because the lease bank was full.
+    pub leases_staged: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -298,6 +305,41 @@ enum Copy {
         record: CanonicalKind,
         end: u32,
     },
+    /// A canonical record at the position, which a lease cannot carry: it
+    /// is synthesized, not term bytes.
+    Record,
+}
+
+/// Where a cursor read puts what it reads: copied into the caller's
+/// frame, or left in the term under a read lease of at most `cap` bytes.
+enum Sink<'a> {
+    Copy(&'a mut [u8]),
+    Lease { cap: usize },
+}
+
+impl Sink<'_> {
+    fn cap(&self) -> usize {
+        match self {
+            Self::Copy(out) => out.len(),
+            Self::Lease { cap } => *cap,
+        }
+    }
+}
+
+/// What a cursor read got.
+enum Got {
+    Read(ReadOutcome),
+    /// Whole frames from `start` of `slot`, `len` bytes, under lease word
+    /// `word`; the cursor is at `next`.
+    Leased {
+        word: usize,
+        slot: u8,
+        start: u32,
+        len: usize,
+        next: u64,
+    },
+    /// The read must stage: why.
+    Stage(StageReason),
 }
 
 /// Why a copy under a loan stopped with nothing to send.
@@ -1044,12 +1086,86 @@ impl<O: BufferOwner> SenderRead<O> {
                 self.counters
                     .bump(|c| &mut c.read_bytes, u64::from(HEADER_LENGTH));
             }
-            Ok(ReadOutcome::Pending) | Err(ReadError::TooSmall { .. }) => {}
-            Err(ReadError::Unavailable { .. }) => self.counters.bump(|c| &mut c.unavailable, 1),
-            Err(ReadError::Retry) => self.counters.bump(|c| &mut c.retry, 1),
-            Err(ReadError::Invariant) => self.counters.bump(|c| &mut c.invariant, 1),
-            Err(ReadError::Revoked) => {}
-            Err(ReadError::CorruptTerm { .. }) => {
+            Ok(ReadOutcome::Pending) => {}
+            Err(error) => return Err(self.account(from, error)),
+        }
+        result
+    }
+
+    /// Takes a read lease on the committed frames of this lane at `from`
+    /// (R-CORE-45; SPEC.md §16.6): what [`SenderRead::read_committed`]
+    /// would copy into a frame of `cap` bytes, validated the same way and
+    /// left in the term under a lease that pins it until dropped. `from`
+    /// must be the cursor; a lease moves the cursor to its `next`, as a
+    /// copy does. A position the lease cannot carry, or a full lease bank,
+    /// is [`LeaseOutcome::Stage`] with the cursor unmoved, as is any read
+    /// through a borrowed (`&LogBuffer`) owner: a lease outlives borrows,
+    /// so only an `Arc`-owned buffer leases.
+    ///
+    /// # Errors
+    ///
+    /// As [`SenderRead::read_committed`]; no lease is held on any error.
+    pub fn lease_committed(
+        &mut self,
+        from: u64,
+        origin: ReadOrigin,
+        cap: usize,
+    ) -> Result<LeaseOutcome, ReadError> {
+        let ReadOrigin::Cursor = origin;
+        if let Some(position) = self.faulted {
+            self.counters.bump(|c| &mut c.corrupt, 1);
+            return Err(ReadError::Faulted { position });
+        }
+        // A lease outlives any borrow of the buffer: only a shared owner
+        // can hand one out.
+        let Some(source) = self.subscription.buffer.lease_source() else {
+            return Ok(LeaseOutcome::Stage(StageReason::Borrowed));
+        };
+        let result = self.read_into(from, Sink::Lease { cap });
+        self.lapped = matches!(result, Err(ReadError::Unavailable { .. }));
+        match result {
+            Ok(Got::Leased {
+                word,
+                slot,
+                start,
+                len,
+                next,
+            }) => {
+                self.corrupt = None;
+                self.counters.bump(|c| &mut c.leases, 1);
+                match u64::try_from(len) {
+                    Ok(len) => self.counters.bump(|c| &mut c.lease_bytes, len),
+                    Err(_) => self.counters.overflowed = true,
+                }
+                Ok(LeaseOutcome::Leased(ReadLease::new(
+                    source, word, slot, start, len, from, next,
+                )))
+            }
+            Ok(Got::Read(ReadOutcome::Pending)) => Ok(LeaseOutcome::Pending),
+            Ok(Got::Stage(reason)) => {
+                if reason == StageReason::BankFull {
+                    self.counters.bump(|c| &mut c.leases_staged, 1);
+                }
+                Ok(LeaseOutcome::Stage(reason))
+            }
+            // A lease neither copies nor writes a record.
+            Ok(Got::Read(_)) => {
+                self.counters.bump(|c| &mut c.invariant, 1);
+                Err(ReadError::Invariant)
+            }
+            Err(error) => Err(self.account(from, error)),
+        }
+    }
+
+    /// Counts a cursor read's error at `from` and returns the error to
+    /// report: a `CorruptTerm` repeated past the retries faults the reader.
+    fn account(&mut self, from: u64, error: ReadError) -> ReadError {
+        match error {
+            ReadError::TooSmall { .. } | ReadError::Revoked => {}
+            ReadError::Unavailable { .. } => self.counters.bump(|c| &mut c.unavailable, 1),
+            ReadError::Retry => self.counters.bump(|c| &mut c.retry, 1),
+            ReadError::Invariant => self.counters.bump(|c| &mut c.invariant, 1),
+            ReadError::CorruptTerm { .. } => {
                 self.counters.bump(|c| &mut c.corrupt, 1);
                 // A count past `u32::MAX` faults like one past the limit.
                 let failures = match self.corrupt {
@@ -1059,15 +1175,15 @@ impl<O: BufferOwner> SenderRead<O> {
                 self.corrupt = failures.map(|failures| (from, failures));
                 let Some(failures) = failures.filter(|f| *f <= self.corrupt_retries) else {
                     self.faulted = Some(from);
-                    return Err(ReadError::Faulted { position: from });
+                    return ReadError::Faulted { position: from };
                 };
-                return Err(ReadError::CorruptTerm { failures });
+                return ReadError::CorruptTerm { failures };
             }
-            Err(ReadError::Faulted { .. }) => self.counters.bump(|c| &mut c.corrupt, 1),
+            ReadError::Faulted { .. } => self.counters.bump(|c| &mut c.corrupt, 1),
             // NAK reads only.
-            Err(ReadError::BadRequest | ReadError::Budget) => {}
+            ReadError::BadRequest | ReadError::Budget => {}
         }
-        result
+        error
     }
 
     /// Copies committed frames of this lane starting at `from`, a NAK's
@@ -1222,11 +1338,13 @@ impl<O: BufferOwner> SenderRead<O> {
             slot,
             count,
             offset,
-            out,
+            Sink::Copy(out),
         );
         release_loan(&cell.loan);
         let next = |end: u32| buffer.position(count, end);
         let result = match copied {
+            // A copy always carries a record.
+            Ok(Copy::Record) => Err(ReadError::Invariant),
             Ok(Copy::Frames { len, end, .. }) => Ok(ReadOutcome::Copied {
                 len,
                 next: next(end),
@@ -1447,6 +1565,17 @@ impl<O: BufferOwner> SenderRead<O> {
     }
 
     fn read(&mut self, from: u64, out: &mut [u8]) -> Result<ReadOutcome, ReadError> {
+        match self.read_into(from, Sink::Copy(out))? {
+            Got::Read(outcome) => Ok(outcome),
+            // A copy never leases nor stages.
+            Got::Leased { .. } | Got::Stage(_) => Err(ReadError::Invariant),
+        }
+    }
+
+    /// The cursor read: under a loan taken in the sender's cell (a copy,
+    /// released before it returns) or in a free word of the buffer's lease
+    /// bank (a lease, held on success until the [`ReadLease`] ends).
+    fn read_into(&mut self, from: u64, sink: Sink<'_>) -> Result<Got, ReadError> {
         let invariant = |_| ReadError::Invariant;
         // Split borrows: the buffer (and the cell taken from it) stays
         // borrowed across the copy, so the loan is released through the
@@ -1479,7 +1608,7 @@ impl<O: BufferOwner> SenderRead<O> {
             return Err(ReadError::Invariant);
         }
         if from == head {
-            return Ok(ReadOutcome::Pending);
+            return Ok(Got::Read(ReadOutcome::Pending));
         }
         let slot = match buffer.lookup(count).map_err(invariant)? {
             Lookup::Slot(slot) => slot,
@@ -1506,7 +1635,37 @@ impl<O: BufferOwner> SenderRead<O> {
             _ => {}
         }
         let target = buffer.target(slot, count).map_err(invariant)?;
-        match take_loan(&cell.loan, &cell.revoked, descriptor, target) {
+        let leasing = matches!(sink, Sink::Lease { .. });
+        // The loan word: the cell's own for a copy, a free bank word for a
+        // lease (none free: stage).
+        let (word, lease_word) = if leasing {
+            let mut taken = None;
+            for (index, word) in buffer.lease_words().iter().enumerate() {
+                match claim_lease(word, &cell.revoked, descriptor, target) {
+                    Ok(None) => {}
+                    outcome => {
+                        taken = Some((index, word, outcome));
+                        break;
+                    }
+                }
+            }
+            let Some((index, word, outcome)) = taken else {
+                return Ok(Got::Stage(StageReason::BankFull));
+            };
+            let outcome = match outcome {
+                Ok(Some(outcome)) => Ok(outcome),
+                Ok(None) => return Err(ReadError::Invariant),
+                Err(error) => Err(error),
+            };
+            (word, Some((index, outcome)))
+        } else {
+            (&cell.loan, None)
+        };
+        let taken = match lease_word {
+            Some((_, outcome)) => outcome,
+            None => take_loan(word, &cell.revoked, descriptor, target),
+        };
+        match taken {
             Ok(LoanOutcome::Granted) => {}
             Ok(LoanOutcome::Retry) => return Err(ReadError::Retry),
             Ok(LoanOutcome::Overrun) => {
@@ -1521,7 +1680,7 @@ impl<O: BufferOwner> SenderRead<O> {
         // The floor again, after the loan and before any read.
         let floor = buffer.floor().load(Ordering::Acquire);
         if from < floor {
-            release_loan(&cell.loan);
+            release_loan(word);
             return Err(ReadError::Unavailable { lowest: floor });
         }
         // A test pause with the loan held (`test-hooks`).
@@ -1538,9 +1697,15 @@ impl<O: BufferOwner> SenderRead<O> {
             slot,
             count,
             offset,
-            out,
+            sink,
         );
-        release_loan(&cell.loan);
+        // A lease of frames stays held: the bytes are read later, by the
+        // backend, until the `ReadLease` ends. Any other outcome ends the
+        // loan here, on every path.
+        let keep = matches!(copied, Ok(Copy::Frames { .. })) && lease_word.is_some();
+        if !keep {
+            release_loan(word);
+        }
         let next = |end: u32| buffer.position(count, end);
         match copied {
             Ok(Copy::Frames { len, end, open }) => {
@@ -1550,17 +1715,27 @@ impl<O: BufferOwner> SenderRead<O> {
                 if open.is_none() {
                     Self::remember(boundaries, next);
                 }
-                Ok(ReadOutcome::Copied { len, next })
+                Ok(match lease_word {
+                    Some((index, _)) => Got::Leased {
+                        word: index,
+                        slot,
+                        start: offset,
+                        len,
+                        next,
+                    },
+                    None => Got::Read(ReadOutcome::Copied { len, next }),
+                })
             }
-            Ok(Copy::Pending) => Ok(ReadOutcome::Pending),
+            Ok(Copy::Pending) => Ok(Got::Read(ReadOutcome::Pending)),
             Ok(Copy::Canonical { record, end }) => {
                 let next = next(end);
                 subscription.cursor.position = next;
                 *open_block = None;
                 Self::remember(boundaries, next);
                 checkpoints.record(buffer.term_length, from, 0, true);
-                Ok(ReadOutcome::Canonical { record, next })
+                Ok(Got::Read(ReadOutcome::Canonical { record, next }))
             }
+            Ok(Copy::Record) => Ok(Got::Stage(StageReason::Record)),
             Err(CopyError::Corrupt) => Err(ReadError::CorruptTerm { failures: 0 }),
             Err(CopyError::TooSmall(needed)) => Err(ReadError::TooSmall { needed }),
             Err(CopyError::Invariant) => Err(ReadError::Invariant),
@@ -1579,9 +1754,10 @@ impl<O: BufferOwner> SenderRead<O> {
         slot: u8,
         count: TermCount,
         start: u32,
-        out: &mut [u8],
+        mut sink: Sink<'_>,
     ) -> Result<Copy, CopyError> {
         let _ = &hook;
+        let cap = sink.cap();
         let term_length = buffer.term_length;
         let lane = buffer.config.lane;
         // A block resumed at an interior frame: its first word 0 was
@@ -1606,6 +1782,9 @@ impl<O: BufferOwner> SenderRead<O> {
                         Ok(Validated::Block(block)) => (block.end, true),
                         Ok(Validated::Pending) => break,
                         Ok(Validated::Pad) if len == 0 => {
+                            let Sink::Copy(out) = sink else {
+                                return Ok(Copy::Record);
+                            };
                             let extent = term_length.checked_sub(at).ok_or(CopyError::Invariant)?;
                             return Self::canonical(
                                 buffer,
@@ -1617,6 +1796,9 @@ impl<O: BufferOwner> SenderRead<O> {
                             );
                         }
                         Ok(Validated::Aborted { extent }) if len == 0 => {
+                            let Sink::Copy(out) = sink else {
+                                return Ok(Copy::Record);
+                            };
                             return Self::canonical(
                                 buffer,
                                 CanonicalKind::Aborted,
@@ -1662,17 +1844,23 @@ impl<O: BufferOwner> SenderRead<O> {
                 let frame_end = stride.checked_add(length).ok_or(CopyError::Invariant)?;
                 let padded = stride.checked_add(reserved).ok_or(CopyError::Invariant)?;
                 let body_at = at.checked_add(8).ok_or(CopyError::Invariant)?;
-                let Some(target) = out.get_mut(stride..frame_end) else {
+                if frame_end > cap {
                     if len == 0 {
                         return Err(CopyError::TooSmall(length));
                     }
                     return Ok(Copy::Frames { len, end: at, open });
-                };
-                let (head, body) = target.split_at_mut(8);
-                head.copy_from_slice(&raw.to_le_bytes());
-                // SAFETY: loan held; the frame's bytes after word 0 lie
-                // inside the validated block (`check_frame`).
-                unsafe { buffer.regions.read_bytes(slot, body_at, body) };
+                }
+                // A lease leaves the bytes where they are: the frames lie
+                // in the term exactly as a copy lays them out, at the same
+                // strides from `start`.
+                if let Sink::Copy(out) = &mut sink {
+                    let target = out.get_mut(stride..frame_end).ok_or(CopyError::Invariant)?;
+                    let (head, body) = target.split_at_mut(8);
+                    head.copy_from_slice(&raw.to_le_bytes());
+                    // SAFETY: loan held; the frame's bytes after word 0 lie
+                    // inside the validated block (`check_frame`).
+                    unsafe { buffer.regions.read_bytes(slot, body_at, body) };
+                }
                 #[cfg(test)]
                 if let Some(TestHook::Word0BetweenLoads { offset, raw }) = *hook
                     && offset == at
@@ -1690,7 +1878,9 @@ impl<O: BufferOwner> SenderRead<O> {
                     }
                     return Err(CopyError::Corrupt);
                 }
-                if let Some(padding) = out.get_mut(frame_end..padded.min(out.len())) {
+                if let Sink::Copy(out) = &mut sink
+                    && let Some(padding) = out.get_mut(frame_end..padded.min(out.len()))
+                {
                     padding.fill(0);
                 }
                 // A frame the cursor path copied: a NAK checkpoint (S2 2.3).

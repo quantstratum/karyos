@@ -73,6 +73,7 @@ mod concurrent;
 mod deadline;
 mod frame_reader;
 mod image_read;
+mod read_lease;
 mod receive_owner;
 mod sender_read;
 mod skip_policy;
@@ -80,6 +81,7 @@ mod skip_policy;
 pub use frame_reader::{
     FrameEnd, FrameReader, FrameStep, MessageInfo, Peek, SKIP_WALK_FRAMES, STEP_CHARGE, Stepped,
 };
+pub use read_lease::{LeaseCopyError, LeaseOutcome, ReadLease, StageReason};
 pub use receive_owner::{
     GapCounters, ReceiveCounter, ReceiveCounters, ReceiveError, ReceiveOwner, Received,
 };
@@ -106,7 +108,11 @@ pub use concurrent::{
 mod sealed {
     /// Prevents implementations of [`super::BufferOwner`] outside this
     /// module.
-    pub trait Sealed {}
+    pub trait Sealed {
+        /// The buffer as the source of a read lease, which outlives any
+        /// borrow: only a shared (`Arc`) owner has one (R-CORE-45).
+        fn lease_source(&self) -> Option<std::sync::Arc<dyn super::read_lease::LeaseSource>>;
+    }
 }
 
 /// A stable owner of a [`LogBuffer`]: every dereference returns the same
@@ -116,11 +122,20 @@ pub trait BufferOwner: Deref<Target = LogBuffer<Self::Terms>> + Clone + sealed::
     type Terms: TermBytes;
 }
 
-impl<T: TermBytes> sealed::Sealed for &LogBuffer<T> {}
+impl<T: TermBytes> sealed::Sealed for &LogBuffer<T> {
+    fn lease_source(&self) -> Option<Arc<dyn read_lease::LeaseSource>> {
+        None
+    }
+}
 impl<T: TermBytes> BufferOwner for &LogBuffer<T> {
     type Terms = T;
 }
-impl<T: TermBytes> sealed::Sealed for Arc<LogBuffer<T>> {}
+impl<T: TermBytes> sealed::Sealed for Arc<LogBuffer<T>> {
+    fn lease_source(&self) -> Option<Arc<dyn read_lease::LeaseSource>> {
+        // An unsizing coercion of the same allocation: nothing allocates.
+        Some(Arc::clone(self) as Arc<dyn read_lease::LeaseSource>)
+    }
+}
 impl<T: TermBytes> BufferOwner for Arc<LogBuffer<T>> {
     type Terms = T;
 }
@@ -334,6 +349,15 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     layout: Layout,
     /// Local: only the creator issues the conductor.
     conductor_taken: AtomicBool,
+    /// Local: the read lease bank (R-CORE-45; SPEC.md §16.6), installed
+    /// once by [`LogBuffer::install_leases`]. Each word is a loan word a
+    /// lease holds past the read that took it; reclaim scans them as it
+    /// scans the registry's.
+    leases: std::sync::OnceLock<Box<[AtomicU64]>>,
+    /// Local: attached from another process's region
+    /// (`LogBuffer::attach` (Linux)): its own conductor never reclaims what the
+    /// creator's does, so it takes no read lease.
+    attached: bool,
     /// Test hook: an injected deadline fault (feature `test-hooks`).
     #[cfg(feature = "test-hooks")]
     deadline_fault: AtomicBool,
@@ -522,6 +546,7 @@ impl LogBuffer<SharedTerms> {
             max_message_length,
         )?;
         buffer.conflation = conflation;
+        buffer.attached = true;
         // Capacities whose rings round to the same region length (1 and
         // 2) would attach on a rewritten configuration word: the ring's own
         // capacity word, written at creation, must agree.
@@ -651,6 +676,8 @@ impl<T: TermBytes> LogBuffer<T> {
             backing,
             layout,
             conductor_taken: AtomicBool::new(false),
+            leases: std::sync::OnceLock::new(),
+            attached: false,
             #[cfg(feature = "test-hooks")]
             deadline_fault: AtomicBool::new(false),
         })
@@ -786,6 +813,47 @@ impl<T: TermBytes> LogBuffer<T> {
     fn tails(&self) -> &[Line] {
         // SAFETY: as `control`, for the tails.
         unsafe { self.tails.as_ref() }
+    }
+
+    /// Installs a bank of `capacity` read lease words (R-CORE-45): at most
+    /// that many leases are live on this buffer at once, whoever takes
+    /// them. Allocated here, on the control path; the bank is never
+    /// resized. A second call succeeds when it asks no more than the
+    /// installed capacity. Only the creating process's buffer leases: the
+    /// creator's conductor is the one that reclaims, and the bank is
+    /// local to this process, so a lease taken through an attached buffer
+    /// would pin nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::LeasesNotOnAttached`] on a buffer from
+    /// `LogBuffer::attach` (Linux); [`SysError::ResourcesUnavailable`] when a
+    /// smaller bank is installed already.
+    pub fn install_leases(&self, capacity: u16) -> Result<(), SysError> {
+        if self.attached {
+            return Err(SysError::LeasesNotOnAttached);
+        }
+        let bank = self
+            .leases
+            .get_or_init(|| (0..capacity).map(|_| AtomicU64::new(0)).collect());
+        if bank.len() < usize::from(capacity) {
+            return Err(SysError::ResourcesUnavailable);
+        }
+        Ok(())
+    }
+
+    /// The read lease bank's words; empty when none is installed.
+    pub(crate) fn lease_words(&self) -> &[AtomicU64] {
+        self.leases.get().map_or(&[], |bank| bank)
+    }
+
+    /// The read leases live on this buffer.
+    #[must_use]
+    pub fn leases_live(&self) -> usize {
+        self.lease_words()
+            .iter()
+            .filter(|word| word.load(Ordering::Acquire) != 0)
+            .count()
     }
 
     fn cells(&self) -> &[Cell] {
@@ -5264,7 +5332,8 @@ impl<T: TermBytes> ConductorContext<'_, T> {
             self.deadlines.forget_slot(slot);
             let cleaning = begin_cleaning(word, reclaiming)?;
             // SAFETY: this conductor moved the slot to CLEANING after a
-            // complete scan of every registry cell found no loan for its term.
+            // complete scan of every registry cell and of the read lease
+            // bank found no loan for its term.
             unsafe { buffer.regions.clean(slot) };
             publish(word, cleaning.with_state(SlotState::Free));
             report.cleaned += 1;
@@ -5272,7 +5341,9 @@ impl<T: TermBytes> ConductorContext<'_, T> {
         Ok(())
     }
 
-    /// Scans every registry cell, publication included.
+    /// Scans every registry cell, publication included, then the read
+    /// lease bank (R-CORE-45): a live lease of the term keeps the slot
+    /// quarantined however long it lives.
     fn loan_held(&self, slot: u8, reclaiming: Descriptor) -> Result<bool, SysError> {
         let index = SlotIndex::try_new(slot)?;
         for cell in self.buffer.cells().iter() {
@@ -5280,7 +5351,7 @@ impl<T: TermBytes> ConductorContext<'_, T> {
                 return Ok(true);
             }
         }
-        Ok(false)
+        loan_held(self.buffer.lease_words(), index, reclaiming)
     }
 
     /// Prepares `t + 1` in any FREE slot if it is not prepared yet.
@@ -5670,6 +5741,7 @@ mod heap_tests {
     include!("log_buffer_tests/diagnostics.rs");
     include!("log_buffer_tests/frame_reader.rs");
     include!("log_buffer_tests/sender_read.rs");
+    include!("log_buffer_tests/read_lease.rs");
     include!("log_buffer_tests/schedule.rs");
 }
 
@@ -5700,6 +5772,7 @@ mod shared_tests {
     include!("log_buffer_tests/diagnostics.rs");
     include!("log_buffer_tests/frame_reader.rs");
     include!("log_buffer_tests/sender_read.rs");
+    include!("log_buffer_tests/read_lease.rs");
     include!("log_buffer_tests/schedule.rs");
 
     /// A peer that keeps the access ABI (aligned `AtomicU64` stores) but not
@@ -6109,6 +6182,22 @@ mod region_tests {
         ));
         word.store(2, Ordering::Release);
         assert!(attach(&creator).is_ok());
+    }
+
+    /// Read leases are the creator's (karyos#912 review): an attached
+    /// buffer's conductor never reclaims what the creator's does, so
+    /// installing a lease bank there is refused, typed.
+    #[test]
+    fn an_attached_buffer_takes_no_read_lease() {
+        let creator =
+            LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
+        let attached = attach(&creator).unwrap();
+        assert_eq!(
+            attached.install_leases(1),
+            Err(SysError::LeasesNotOnAttached)
+        );
+        assert_eq!(attached.leases_live(), 0);
+        assert_eq!(creator.install_leases(1), Ok(()));
     }
 
     /// A region of an older layout version, 1 (shipped in v0.1.0-alpha.1,

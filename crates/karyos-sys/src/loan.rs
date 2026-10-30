@@ -228,6 +228,49 @@ fn classify(raw: u64, target: LoanTarget) -> Result<LoanOutcome, SysError> {
     })
 }
 
+/// Takes a read lease on `target` in `word`, one of a lease bank's words
+/// (R-CORE-45; SPEC.md §16.6): the [`take_loan`] handshake on a word claimed
+/// from empty, so several lease takers can share a bank. A granted lease is
+/// an ordinary loan that outlives the call: reclaim keeps the slot
+/// quarantined while it is held, and [`release_loan`], from any thread,
+/// ends it. `None` when the word is held already (another lease); on any
+/// outcome other than [`LoanOutcome::Granted`] the word is empty again.
+///
+/// # Errors
+///
+/// As [`take_loan`]; the word is emptied in that case too.
+pub fn claim_lease(
+    word: &AtomicU64,
+    revoked: &AtomicU64,
+    descriptor: &AtomicU64,
+    target: LoanTarget,
+) -> Result<Option<LoanOutcome>, SysError> {
+    // The claim is the handshake's store: a `SeqCst` read-modify-write.
+    if word
+        .compare_exchange(
+            0,
+            target.loan().encode(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return Ok(None);
+    }
+    // Pairs with the fence in `begin_reclaim`, as in `take_loan`.
+    fence(Ordering::SeqCst);
+    let observed = descriptor.load(Ordering::SeqCst);
+    let outcome = if revoked.load(Ordering::SeqCst) == 0 {
+        classify(observed, target)
+    } else {
+        Ok(LoanOutcome::Revoked)
+    };
+    if !matches!(outcome, Ok(LoanOutcome::Granted)) {
+        word.store(0, Ordering::SeqCst);
+    }
+    outcome.map(Some)
+}
+
 /// Ends a granted loan. Every access under the loan must happen before this
 /// call; the `Release` store orders them before the driver's scan.
 #[inline]
