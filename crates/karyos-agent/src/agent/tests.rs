@@ -209,3 +209,123 @@ fn an_agent_id_outside_the_rule_is_not_taken() {
     assert_eq!(id("has space"), None);
     assert_eq!(id(&"x".repeat(65)), None);
 }
+
+/// A cell of a sample: `label` on `stream` lane `lane`, holding `value`.
+fn cell(label: &str, stream: u64, lane: u8, value: u64) -> crate::api::Counter {
+    crate::api::Counter {
+        label: label.to_owned(),
+        type_id: karyos_sys::counters::TYPE_GAUGE,
+        stream,
+        lane,
+        kind: 0,
+        participant: 0,
+        cell_registration: 0,
+        value,
+        read_ns: 0,
+        changed_ns: None,
+    }
+}
+
+fn sample(counters: Vec<crate::api::Counter>) -> Sample {
+    Sample {
+        consistent: true,
+        sampled: true,
+        age_ns: Some(0),
+        counters,
+        lanes: Vec::new(),
+    }
+}
+
+/// karyos#885: a stream's holders are, over every lane with its wire id,
+/// the client publication cells plus the embedded count; another wire id
+/// counts for nothing, and a negative id is read back.
+#[test]
+fn a_streams_holders_are_its_lanes_publications() {
+    use karyos_sys::counters::{
+        LABEL_EMBEDDED_PUBLICATIONS, LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, wire_stream_id_value,
+    };
+
+    let counters = vec![
+        cell("counters unavailable", 0, 0, 0),
+        // Stream registration 11, lanes 0 and 1, wire id -7.
+        cell(LABEL_STREAM_WIRE_ID, 11, 0, wire_stream_id_value(-7)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 11, 0, 1),
+        cell(LABEL_PUBLICATION, 11, 0, 900),
+        cell(LABEL_STREAM_WIRE_ID, 11, 1, wire_stream_id_value(-7)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 11, 1, 0),
+        cell(LABEL_PUBLICATION, 11, 1, 901),
+        // Stream registration 12, wire id 8: one publication.
+        cell(LABEL_STREAM_WIRE_ID, 12, 0, wire_stream_id_value(8)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 12, 0, 0),
+        cell(LABEL_PUBLICATION, 12, 0, 902),
+    ];
+    let seen = stream_presence(true, Some(&sample(counters.clone())), "-7");
+    assert_eq!((seen.present, seen.holders), (Some(true), Some(3)));
+    let seen = stream_presence(true, Some(&sample(counters.clone())), "8");
+    assert_eq!(
+        (seen.present, seen.holders, seen.shared()),
+        (Some(true), Some(1), Some(false))
+    );
+    let seen = stream_presence(true, Some(&sample(counters)), "9");
+    assert_eq!((seen.present, seen.holders), (Some(false), Some(0)));
+    // One embedded handle and one client publication make it shared.
+    let counters = vec![
+        cell(LABEL_STREAM_WIRE_ID, 13, 0, wire_stream_id_value(4)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 13, 0, 1),
+        cell(LABEL_PUBLICATION, 13, 0, 903),
+    ];
+    let seen = stream_presence(true, Some(&sample(counters)), "4");
+    assert_eq!((seen.holders, seen.shared()), (Some(2), Some(true)));
+}
+
+/// karyos#885: the conditions under which a stream's holders are unknown,
+/// never undercounted: a cell the driver could not allocate, no pass of
+/// the driver yet, a count that overflows, no sample of the agent yet,
+/// and no attachment.
+#[test]
+fn a_streams_holders_are_unknown_while_cells_are_missing() {
+    use karyos_sys::counters::{
+        LABEL_EMBEDDED_PUBLICATIONS, LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, wire_stream_id_value,
+    };
+
+    let counters = vec![
+        cell("counters unavailable", 0, 0, 1),
+        cell(LABEL_STREAM_WIRE_ID, 11, 0, wire_stream_id_value(7)),
+        cell(LABEL_PUBLICATION, 11, 0, 900),
+    ];
+    assert_eq!(
+        stream_presence(true, Some(&sample(counters.clone())), "7"),
+        registry::Presence::default()
+    );
+    let mut unsampled = sample(counters);
+    unsampled.counters[0].value = 0;
+    unsampled.sampled = false;
+    assert_eq!(
+        stream_presence(true, Some(&unsampled), "7"),
+        registry::Presence::default()
+    );
+    unsampled.sampled = true;
+    // Two lanes whose embedded counts sum past u64::MAX: unknown.
+    let overflowing = sample(vec![
+        cell(LABEL_STREAM_WIRE_ID, 11, 0, wire_stream_id_value(5)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 11, 0, u64::MAX),
+        cell(LABEL_STREAM_WIRE_ID, 11, 1, wire_stream_id_value(5)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 11, 1, 1),
+    ]);
+    assert_eq!(
+        stream_presence(true, Some(&overflowing), "5"),
+        registry::Presence::default()
+    );
+    assert_eq!(
+        stream_presence(true, Some(&unsampled), "7").holders,
+        Some(1)
+    );
+    assert_eq!(
+        stream_presence(true, None, "7"),
+        registry::Presence::default()
+    );
+    assert_eq!(
+        stream_presence(false, Some(&unsampled), "7"),
+        registry::Presence::default()
+    );
+}

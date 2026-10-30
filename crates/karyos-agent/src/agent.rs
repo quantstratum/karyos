@@ -629,11 +629,13 @@ impl Driver {
     /// What the agent observes now of the identity `kind` `key` in this
     /// driver (karyos#736): for a trace point or an application counter,
     /// whether a client cell of that type and label exists and how many;
-    /// for a stream, nothing, as no cell carries a wire stream id; and
-    /// nothing while not attached.
+    /// for a stream, its publications in the last sample
+    /// ([`stream_presence`], karyos#885); and nothing while not attached.
     fn presence(&self, kind: Kind, key: &str) -> registry::Presence {
         let types: &[u64] = match kind {
-            Kind::Stream => return registry::Presence::default(),
+            Kind::Stream => {
+                return stream_presence(self.tool.is_some(), self.sample.as_ref(), key);
+            }
             Kind::Point => &[karyos_sys::counters::TYPE_TRACE_POINT],
             Kind::Counter => &[
                 karyos_sys::counters::TYPE_APPLICATION_EVENT,
@@ -778,6 +780,69 @@ impl Driver {
             catalog: self.catalog.as_ref().map(CatalogWatch::view),
             attachment: self.attachment,
         }
+    }
+}
+
+/// What `sample` shows of the stream whose wire id is `key` (karyos#885):
+/// its holders are the publications of every lane with that wire id, a
+/// client's `publication` cell each plus the lane's `embedded
+/// publications` count, and it is present when it has at least one.
+/// Nothing while not `attached`, before the agent's first sample or the
+/// driver's first pass, or while `counters unavailable` is nonzero, since
+/// a cell the driver could not allocate would undercount them and make a
+/// shared stream look unshared; nothing either when the count overflows.
+fn stream_presence(attached: bool, sample: Option<&Sample>, key: &str) -> registry::Presence {
+    let (true, Some(sample)) = (attached, sample) else {
+        return registry::Presence::default();
+    };
+    use karyos_sys::counters::{
+        LABEL_EMBEDDED_PUBLICATIONS, LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, wire_stream_id,
+    };
+
+    let Ok(stream_id) = key.parse::<i32>() else {
+        return registry::Presence::default();
+    };
+    let unavailable = sample.counters.iter().any(|counter| {
+        counter.stream == 0 && counter.label == "counters unavailable" && counter.value > 0
+    });
+    if !sample.sampled || unavailable {
+        return registry::Presence::default();
+    }
+    let lane_count = |lane: &crate::api::Counter, label: &str| -> Option<u64> {
+        sample
+            .counters
+            .iter()
+            .filter(|counter| {
+                counter.label == label && counter.stream == lane.stream && counter.lane == lane.lane
+            })
+            .map(|counter| {
+                if label == LABEL_PUBLICATION {
+                    1
+                } else {
+                    counter.value
+                }
+            })
+            .try_fold(0, u64::checked_add)
+    };
+    let holders = sample
+        .counters
+        .iter()
+        .filter(|counter| {
+            counter.label == LABEL_STREAM_WIRE_ID
+                && wire_stream_id(counter.value) == Some(stream_id)
+        })
+        .map(|lane| {
+            lane_count(lane, LABEL_PUBLICATION)?
+                .checked_add(lane_count(lane, LABEL_EMBEDDED_PUBLICATIONS)?)
+        })
+        .try_fold(0_u64, |sum, lane| sum.checked_add(lane?));
+    // A count past u64::MAX is no count: unknown, as for a missing cell.
+    let Some(holders) = holders else {
+        return registry::Presence::default();
+    };
+    registry::Presence {
+        present: Some(holders > 0),
+        holders: Some(holders),
     }
 }
 
