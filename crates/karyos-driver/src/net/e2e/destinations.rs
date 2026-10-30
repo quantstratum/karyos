@@ -662,7 +662,8 @@ fn twenty_moves_neither_fill_the_table_nor_leak() {
     let mut a = driver(ThreadingMode::Shared);
     let (mut receivers, addresses) = receivers(1);
     // Destinations nobody listens on: routed and opened, never live.
-    let moving = |index: u16| SocketAddr::from((LOOPBACK, 41_000 + index));
+    let reserved = Reserved::new(21);
+    let moving = |index: u16| reserved.at(usize::from(index));
     let (publication, _) = connect(
         &mut a,
         &mut receivers,
@@ -914,8 +915,9 @@ fn additions_never_overcommit_the_repair_job_table() {
         None,
     );
     let table = JobsConfig::default().repair_jobs;
+    let reserved = Reserved::new(MAX_DESTINATIONS);
     for port in 0..u16::try_from(MAX_DESTINATIONS).unwrap() {
-        a.add_network_destination(&publication, SocketAddr::from((LOOPBACK, 42_000 + port)))
+        a.add_network_destination(&publication, reserved.at(usize::from(port)))
             .unwrap();
         let (_, outcome) = answer(&mut a, &mut receivers, &publication);
         let capacity = super::shared(&mut a).sender.fanout_job_capacity(0);
@@ -1068,7 +1070,8 @@ fn an_addition_after_every_destination_removed_is_still_taken() {
 fn endpoint_resets_remove_no_optional_destination() {
     let mut a = driver(ThreadingMode::Shared);
     let (mut receivers, addresses) = receivers(1);
-    let idle = SocketAddr::from((LOOPBACK, 44_000));
+    let reserved = Reserved::new(1);
+    let idle = reserved.at(0);
     let (publication, images) = connect(
         &mut a,
         &mut receivers,
