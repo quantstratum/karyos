@@ -262,7 +262,7 @@ pub const LIMIT: Limit = Limit {
 /// [`Violation::NotLinearizable`], [`Violation::Undecided`] or
 /// [`Violation::MalformedHistory`].
 pub fn linearizable(history: &History<Op, Ret>) -> Result<(), Violation> {
-    match lin::check(&ServiceModel, history, LIMIT) {
+    match lin::check(&ServiceModel::default(), history, LIMIT) {
         Ok(Verdict::Linearizable(_)) => Ok(()),
         Ok(Verdict::NotLinearizable(counterexample)) => {
             Err(Violation::NotLinearizable(counterexample))

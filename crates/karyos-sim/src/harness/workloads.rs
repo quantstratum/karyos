@@ -742,7 +742,7 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
 
 /// The digest of the register the linearization of `history` builds.
 fn linearized_digest(history: &History<Op, Ret>) -> Result<u64, Failed> {
-    let violation = match lin::check(&ServiceModel, history, check::LIMIT) {
+    let violation = match lin::check(&ServiceModel::default(), history, check::LIMIT) {
         Ok(Verdict::Linearizable(order)) => return Ok(digest_in(history, &order)),
         Ok(Verdict::NotLinearizable(counterexample)) => Violation::NotLinearizable(counterexample),
         Ok(Verdict::Undecided { explored }) => Violation::Undecided { explored },
