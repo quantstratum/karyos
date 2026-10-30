@@ -10,9 +10,12 @@
   term is never cleaned or reused under it, across any rotation.
   Dropping the lease ends it with one `Release` store, from any thread,
   with no lock and no allocation. `ReadLease::copy_to` stages a lease
-  byte for byte as `read_committed` copies. A full bank, or a padding
-  or aborted record at the cursor, stages (`LeaseOutcome::Stage`), with
-  the cursor unmoved. New counters: `leases`, `lease_bytes`,
+  byte for byte as `read_committed` copies. A full bank, a padding or
+  aborted record at the cursor, or a reader that borrows its buffer
+  (`&LogBuffer`) stages (`LeaseOutcome::Stage`), with the cursor
+  unmoved. `ReadLease` names no buffer type: it holds its `Arc`-owned
+  buffer as a trait object, with no allocation, so a backend can keep
+  leases of any buffer. `TermBytes` is now `'static`. New counters: `leases`, `lease_bytes`,
   `leases_staged`. The `loom_read_lease` models check that cleaning
   never races a lease released on another thread, with a second lease
   taken concurrently on the same term.
