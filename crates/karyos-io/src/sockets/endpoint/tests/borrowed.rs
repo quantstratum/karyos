@@ -15,7 +15,9 @@ use karyos_sys::sizing::{MIN_TERM_LENGTH, TermLength};
 use karyos_sys::term::TermId;
 
 use super::*;
-use crate::backend::{BorrowError, LeaseLedger, ResetDrain, TxBackend as _, TxItemOutcome};
+use crate::backend::{
+    BorrowError, LeaseLedger, LedgerError, ResetDrain, TxBackend as _, TxItemOutcome,
+};
 use crate::sockets::ops::SendResult;
 
 /// A datagram of the harness: [`config`]'s 256 bytes.
@@ -157,7 +159,7 @@ fn a_ledger_holds_each_lease_until_released() {
     let mut leasing = reader(&buffer);
     let mut h = Harness::new();
     let tickets = h.commit_n(0, 2);
-    let mut ledger = LeaseLedger::new(1, 1_000);
+    let mut ledger = LeaseLedger::new(1, 1_000).unwrap();
     ledger.hold(tickets[0], lease(&mut leasing)).unwrap();
     assert_eq!((ledger.live(), buffer.leases_live()), (1, 1));
     // Full: the next is handed back, still held, and counted.
@@ -184,7 +186,7 @@ fn a_reset_past_the_bound_with_a_lease_held_is_stuck() {
     let mut leasing = reader(&buffer);
     let mut h = Harness::new();
     let ticket = h.commit_n(0, 1)[0];
-    let mut ledger = LeaseLedger::new(2, 1_000);
+    let mut ledger = LeaseLedger::new(2, 1_000).unwrap();
     assert_eq!(ledger.reset_drain(5), ResetDrain::Done);
     ledger.hold(ticket, lease(&mut leasing)).unwrap();
     assert_eq!(
@@ -229,7 +231,7 @@ impl<'h> Borrowing<'h> {
     fn new(tx: &'h mut SocketsTx<ScriptedSocket>, capacity: usize) -> Self {
         Self {
             tx,
-            ledger: LeaseLedger::new(capacity, 1_000),
+            ledger: LeaseLedger::new(capacity, 1_000).unwrap(),
             in_flight: Vec::new(),
         }
     }
@@ -361,7 +363,7 @@ fn leasing_and_staging_allocate_nothing() {
     let mut h = Harness::new();
     let queue = h.queue;
     let tickets = h.commit_n(0, 1);
-    let mut ledger = LeaseLedger::new(1, 1_000);
+    let mut ledger = LeaseLedger::new(1, 1_000).unwrap();
     let ((), allocations) = karyos_sys::alloc_count::count(|| {
         let staged = lease(&mut leasing);
         assert!(
@@ -383,7 +385,7 @@ fn a_new_reset_starts_its_bound_anew() {
     let mut leasing = reader(&buffer);
     let mut h = Harness::new();
     let ticket = h.commit_n(0, 1)[0];
-    let mut ledger = LeaseLedger::new(1, 1_000);
+    let mut ledger = LeaseLedger::new(1, 1_000).unwrap();
     ledger.hold(ticket, lease(&mut leasing)).unwrap();
     ledger.begin_reset();
     assert_eq!(
@@ -411,4 +413,17 @@ fn a_new_reset_starts_its_bound_anew() {
     );
     assert_eq!(ledger.counters().stuck, 2, "once per reset");
     assert!(ledger.release(ticket));
+}
+
+/// A ledger's room is reserved fallibly (#913 review, codex): a capacity
+/// no allocator can give is refused, typed, never a panic; 0 is refused.
+#[test]
+fn a_ledger_too_large_or_empty_is_refused() {
+    assert_eq!(
+        LeaseLedger::new(usize::MAX, 1_000).err(),
+        Some(LedgerError::Allocation {
+            capacity: usize::MAX
+        })
+    );
+    assert_eq!(LeaseLedger::new(0, 1_000).err(), Some(LedgerError::Empty));
 }

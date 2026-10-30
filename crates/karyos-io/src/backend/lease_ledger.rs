@@ -58,6 +58,21 @@ impl LeaseLedgerCounters {
     }
 }
 
+/// Why a [`LeaseLedger`] was not created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum LedgerError {
+    /// A capacity of 0: a borrowing backend holds at least one lease.
+    #[error("a lease ledger of capacity 0")]
+    Empty,
+    /// The room for `capacity` leases could not be reserved.
+    #[error("cannot reserve a lease ledger of {capacity} entries")]
+    Allocation {
+        /// The capacity asked.
+        capacity: usize,
+    },
+}
+
 /// Where a reset's leases stand ([`LeaseLedger::reset_drain`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -81,17 +96,26 @@ pub enum ResetDrain {
 impl LeaseLedger {
     /// A ledger for at most `capacity` leases, allocated here, whose
     /// resets wait at most `retirement_bound` nanoseconds for them.
-    #[must_use]
-    pub fn new(capacity: usize, retirement_bound: u64) -> Self {
-        let mut held = Vec::with_capacity(capacity);
+    ///
+    /// # Errors
+    ///
+    /// [`LedgerError::Empty`] for a capacity of 0, and
+    /// [`LedgerError::Allocation`] when the room cannot be reserved.
+    pub fn new(capacity: usize, retirement_bound: u64) -> Result<Self, LedgerError> {
+        if capacity == 0 {
+            return Err(LedgerError::Empty);
+        }
+        let mut held = Vec::new();
+        held.try_reserve_exact(capacity)
+            .map_err(|_| LedgerError::Allocation { capacity })?;
         held.resize_with(capacity, || None);
-        Self {
+        Ok(Self {
             held,
             retirement_bound,
             draining_since: None,
             stuck_counted: false,
             counters: LeaseLedgerCounters::default(),
-        }
+        })
     }
 
     /// Keeps `lease` for the item `ticket`.

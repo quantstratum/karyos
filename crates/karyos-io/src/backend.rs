@@ -31,7 +31,7 @@ use std::ops::ControlFlow;
 use karyos_sys::log_buffer::{LeaseCopyError, ReadLease};
 use thiserror::Error;
 
-pub use lease_ledger::{LeaseLedger, LeaseLedgerCounters, ResetDrain};
+pub use lease_ledger::{LeaseLedger, LeaseLedgerCounters, LedgerError, ResetDrain};
 
 /// Entries one [`TxReport`] holds, and so the most candidates one flush,
 /// cancellation, close, reset or retirement call reports.

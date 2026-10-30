@@ -7,9 +7,11 @@
   lease. The sockets backend, and every backend that does not borrow,
   behaves as before. A refusal hands the lease back, still held, with a
   typed `BorrowError`. A backend that borrows keeps its leases in a
-  `LeaseLedger`, allocated at creation for the sender's bound. A lease
-  is released only when a completion or a returned item proves the bytes
-  are no longer referenced. A reset (`begin_reset`) waits for every
-  lease and past the retirement bound reports `ResetDrain::Stuck`,
-  counted once, keeping the leases so their terms stay pinned. Leasing,
-  staging and the ledger's hold and release allocate nothing.
+  `LeaseLedger`, allocated at creation for the sender's bound
+  (`LeaseLedger::new` reserves fallibly and refuses 0 or an impossible
+  capacity, typed `LedgerError`). A lease is released only when a
+  completion or a returned item proves the bytes are no longer
+  referenced. A reset (`begin_reset`) waits for every lease and past the
+  retirement bound reports `ResetDrain::Stuck`, counted once, keeping
+  the leases so their terms stay pinned. Leasing, staging and the
+  ledger's hold and release allocate nothing.
