@@ -310,7 +310,7 @@ pub enum LogError {
     Io(#[from] io::Error),
 }
 
-/// What is wrong with a frame at recovery.
+/// What is wrong with a frame, at recovery or at a read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainProblem {
     /// Not a frame: another magic.
@@ -330,6 +330,22 @@ pub enum ChainProblem {
     TermBack {
         /// The previous term.
         last: u64,
+        /// The frame's term.
+        got: u64,
+    },
+    /// At a read: its header and payload are not the bytes its index
+    /// entry spans, or for the last entry run past the written end
+    /// (karyos#904).
+    Length {
+        /// The bytes the index gives it.
+        span: u64,
+        /// The bytes its header claims, header included.
+        claimed: u64,
+    },
+    /// At a read: its term is not the one the index holds (karyos#904).
+    Term {
+        /// The indexed term.
+        expected: u64,
         /// The frame's term.
         got: u64,
     },
@@ -962,42 +978,84 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// `max_bytes`; the first is returned whatever its size, so a range is
     /// never refused.
     ///
+    /// Every frame is checked against the in-memory index before its
+    /// payload is read or allocated, then by its CRC-32C (karyos#904): its
+    /// header must name the indexed index and term, and its header and
+    /// payload must span exactly the bytes from its position to the next
+    /// frame's, or for the last fit before the written end. A frame that does not is a typed
+    /// [`LogError::Chain`], never a short, long or wrong entry. A read
+    /// changes nothing, so it does not poison the log: the bytes on disk
+    /// stay as they are, and the next open walks them again.
+    ///
     /// # Errors
     ///
     /// The store's errors, and [`LogError::Chain`] for a frame that no
-    /// longer reads as one.
+    /// longer reads as the one the index holds.
     pub fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, LogError> {
         let mut found = Vec::new();
         let mut bytes = 0u64;
         for index in range {
-            let Some(&(position, _)) = self.slot(index).and_then(|slot| self.entries.get(slot))
-            else {
+            let Some(slot) = self.slot(index) else {
                 break;
             };
-            let foreign = LogError::Chain {
-                position,
-                problem: ChainProblem::Foreign,
+            let Some(&(position, term)) = self.entries.get(slot) else {
+                break;
             };
+            let chain = |problem| LogError::Chain { position, problem };
+            // The bytes the index gives this frame: exactly up to the next
+            // one; for the last, at most up to the written end (a failed
+            // append may have written past it, unindexed).
+            let (end, last) = match slot.checked_add(1).and_then(|next| self.entries.get(next)) {
+                Some((next, _)) => (*next, false),
+                None => (self.store.written(), true),
+            };
+            let span = end
+                .checked_sub(position)
+                .ok_or_else(|| chain(ChainProblem::PastEnd))?;
             let mut header = [0u8; FRAME_HEADER];
             self.store.read(position, &mut header)?;
-            let frame = Header::decode(&header).ok_or(foreign)?;
-            let encoded = u64::from(frame.length)
+            let frame = Header::decode(&header).ok_or_else(|| chain(ChainProblem::Foreign))?;
+            if frame.index != index {
+                return Err(chain(ChainProblem::Index {
+                    expected: index,
+                    got: frame.index,
+                }));
+            }
+            if frame.term != term {
+                return Err(chain(ChainProblem::Term {
+                    expected: term,
+                    got: frame.term,
+                }));
+            }
+            let claimed = u64::from(frame.length)
                 .checked_add(FRAME_HEADER_LEN)
-                .and_then(|size| bytes.checked_add(size));
-            let Some(total) = encoded.filter(|total| found.is_empty() || *total <= max_bytes)
+                .ok_or_else(|| chain(ChainProblem::PastEnd))?;
+            if claimed > span || (!last && claimed != span) {
+                return Err(chain(ChainProblem::Length { span, claimed }));
+            }
+            let Some(total) = bytes
+                .checked_add(claimed)
+                .filter(|total| found.is_empty() || *total <= max_bytes)
             else {
                 break;
             };
-            let past = LogError::Chain {
-                position,
-                problem: ChainProblem::PastEnd,
-            };
-            let length = usize::try_from(frame.length).map_err(|_| past)?;
+            // Within the span the index gives: the allocation is bounded.
+            let length = usize::try_from(frame.length).map_err(|_| chain(ChainProblem::PastEnd))?;
             let mut payload = vec![0u8; length];
             let at = position
                 .checked_add(FRAME_HEADER_LEN)
                 .ok_or(LogError::Store(SegmentError::PositionOverflow))?;
             self.store.read(at, &mut payload)?;
+            let mut crc = Crc32c::new();
+            crc.update(
+                header
+                    .split_first_chunk::<32>()
+                    .map_or(&[][..], |(head, _)| head),
+            );
+            crc.update(&payload);
+            if crc.finish() != frame.crc {
+                return Err(chain(ChainProblem::Checksum));
+            }
             found.push(Entry {
                 index: frame.index,
                 term: frame.term,
