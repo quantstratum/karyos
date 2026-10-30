@@ -1863,7 +1863,7 @@ impl<T: StreamTerms> Outbound<T> {
                     crate::agents::repair::CatchUp::Queued { through } => {
                         (through < range.1).then_some((through, range.1))
                     }
-                    crate::agents::repair::CatchUp::Full => Some(range),
+                    crate::agents::repair::CatchUp::Full { from } => Some((from, range.1)),
                     crate::agents::repair::CatchUp::Done => None,
                 };
             }
@@ -1876,6 +1876,14 @@ impl<T: StreamTerms> Outbound<T> {
                 now,
             );
             let after = repair.counts().submitted;
+            // What the catch-up submitted is the destination's: its
+            // frontier moves there, so its NAKs, the retention and a later
+            // reset's start follow (MD-20, karyos#890 review).
+            for (lane, track) in target.lanes.iter_mut().enumerate() {
+                if let Ok(lane) = u8::try_from(lane) {
+                    track.high = track.high.max(repair.catch_up_through(lane));
+                }
+            }
             target.counters.repairs = target
                 .counters
                 .repairs
@@ -2298,7 +2306,10 @@ mod tests {
             repair.catch_up(0, (1_024, 4_096), 0),
             CatchUp::Queued { through: 4_096 }
         );
-        assert_eq!(repair.catch_up(0, (8_192, 9_216), 0), CatchUp::Full);
+        assert_eq!(
+            repair.catch_up(0, (8_192, 9_216), 0),
+            CatchUp::Full { from: 8_192 }
+        );
         // Below the floor: lost, counted, and only the rest is asked for.
         assert_eq!(repair.catch_up(0, (0, 512), 1_024), CatchUp::Done);
         let counts = repair.counts();
@@ -2310,6 +2321,18 @@ mod tests {
             ),
             (2, 1, 512)
         );
+        // karyos#890 review (codex): while the share stays full, retrying
+        // as the fanout does (from the start it was handed back) counts
+        // the prefix below the floor once, not once per retry.
+        let mut range = (0, 6_144);
+        for _ in 0..3 {
+            match repair.catch_up(0, range, 1_024) {
+                CatchUp::Full { from } => range = (from, range.1),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(range, (1_024, 6_144));
+        assert_eq!(repair.counts().catch_up_lost, 512 + 1_024);
     }
 
     /// karyos#802: with every destination's step 8 ERR list full in one

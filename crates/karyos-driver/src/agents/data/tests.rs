@@ -1258,6 +1258,46 @@ fn a_reset_resends_only_what_each_destination_lacks() {
             .collect::<Vec<_>>(),
         "in order, once each"
     );
+    // karyos#890 review (codex): the catch-up's submissions are the
+    // destination's, so its frontier reaches `r` with nothing new sent
+    // (idle after the reset), and a NAK below `r` is a valid repair
+    // request, not RangeInvalid.
+    let after = path.destination_catch_ups();
+    let high_of = |to| {
+        after
+            .iter()
+            .find(|(at, ..)| *at == to)
+            .map(|(_, _, high, _)| *high)
+            .unwrap()
+    };
+    assert_eq!(high_of(second), r, "the frontier follows the catch-up");
+    let nak = karyos_protocol::network::Nak {
+        alias,
+        identity,
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 2,
+        },
+        range: karyos_protocol::network::NakRange {
+            lane: karyos_sys::frame::Lane::ZERO,
+            length: u32::try_from(FRAME).unwrap(),
+            start: r - FRAME,
+        },
+    };
+    let outcome = path.nak_from(
+        second,
+        &nak,
+        crate::repair::admission::Requester::Member {
+            join: 0,
+            consumption: 0,
+            window: 32_768,
+        },
+        30,
+    );
+    assert!(
+        !matches!(outcome, crate::agents::repair::NakOutcome::Reply(_)),
+        "{outcome:?}"
+    );
     let counters = path.destination_counters();
     let repairs = |to| {
         counters

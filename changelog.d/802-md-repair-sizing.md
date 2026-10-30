@@ -13,7 +13,10 @@
     - nothing goes to a destination that already has it.
 
     The job takes a slot in the destination's share with no admission and
-    no ERR. A full share leaves the catch-up waiting to be tried again, and
+    no ERR. What it submits is the destination's: as the backend submits
+    it, the destination's frontier advances, so its NAKs, the retention and
+    a later reset start from there. A full share leaves the catch-up waiting
+    to be tried again from its start past the floor, and
     a part below the retention floor is counted lost
     (`catch_ups`, `catch_ups_full`, `catch_up_lost` in the repair counts).
     Nothing else changes for that part: the receiver NAKs the gap, gets

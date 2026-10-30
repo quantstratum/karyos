@@ -190,8 +190,12 @@ pub enum CatchUp {
         /// The end of what the job covers.
         through: u64,
     },
-    /// The destination's job share is full: try again.
-    Full,
+    /// The destination's job share is full: try again from `from`, the
+    /// range's start past the floor, so a lost prefix is counted once.
+    Full {
+        /// Where the range now starts.
+        from: u64,
+    },
     /// Nothing left to repair (the range was empty or below the floor).
     Done,
 }
@@ -400,9 +404,16 @@ impl RepairPath {
             }
             Joined::Lingering | Joined::Full => {
                 self.counts.bump(|c| &mut c.catch_ups_full);
-                CatchUp::Full
+                CatchUp::Full { from }
             }
         }
+    }
+
+    /// The end of what its catch-up jobs have submitted on `lane`, 0 for
+    /// none (MD-20): moved only by a backend submission.
+    #[must_use]
+    pub fn catch_up_through(&self, lane: u8) -> u64 {
+        self.jobs.catch_up_through(lane)
     }
 
     /// Fills its step 8 reply list with `reply` up to its bound, as a

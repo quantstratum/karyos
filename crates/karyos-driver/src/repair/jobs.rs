@@ -208,7 +208,13 @@ pub struct Jobs {
     lingers: Vec<Option<Linger>>,
     next_order: u64,
     counts: JobsCounts,
+    /// Per lane, the end of what catch-up jobs have submitted: the
+    /// destination has it from there down (MD-20, karyos#802).
+    catch_up_through: [u64; CATCH_UP_LANES],
 }
+
+/// Lanes a catch-up position is kept for.
+const CATCH_UP_LANES: usize = 4;
 
 impl Jobs {
     /// The table, allocated here.
@@ -239,6 +245,7 @@ impl Jobs {
             lingers: vec![None; config.repair_linger_entries],
             next_order: 0,
             counts: JobsCounts::default(),
+            catch_up_through: [0; CATCH_UP_LANES],
         })
     }
 
@@ -463,6 +470,27 @@ impl Jobs {
             return;
         };
         job.cursor = job.cursor.max(through.min(end));
+        if job.key.domain == Domain::CatchUp {
+            let (lane, cursor) = (job.key.lane, job.cursor);
+            self.note_catch_up(lane, cursor);
+        }
+    }
+
+    /// A catch-up job submitted `lane` up to `through`.
+    fn note_catch_up(&mut self, lane: u8, through: u64) {
+        if let Some(slot) = self.catch_up_through.get_mut(usize::from(lane)) {
+            *slot = (*slot).max(through);
+        }
+    }
+
+    /// The end of what catch-up jobs have submitted on `lane`, 0 for none
+    /// (MD-20): only a backend submission moves it, never a job's creation.
+    #[must_use]
+    pub fn catch_up_through(&self, lane: u8) -> u64 {
+        self.catch_up_through
+            .get(usize::from(lane))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The backend submitted `job`'s last frame at `now`: the job ends and
@@ -471,6 +499,11 @@ impl Jobs {
         let Some(key) = self.take(job) else {
             return;
         };
+        if key.domain == Domain::CatchUp
+            && let Some(end) = key.start.checked_add(u64::from(key.length))
+        {
+            self.note_catch_up(key.lane, end);
+        }
         self.counts.bump(|c| &mut c.done);
         let linger = self.config.repair_linger;
         let entry = self
