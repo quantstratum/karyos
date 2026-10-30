@@ -1148,8 +1148,13 @@ fn reset_with_a_held_window(extra: u64) {
     let (mut path, mut log) = outbound(EndpointId(1), alias, first, term, 1, true);
     // The second is required: held at its own edge, it is never removed
     // as slow (MD-7).
-    path.set_destinations(&[first, second], &[second], Some(true))
-        .unwrap();
+    path.set_destinations(
+        crate::agents::data::DEFAULT_MAX_DESTINATIONS,
+        &[first, second],
+        &[second],
+        Some(true),
+    )
+    .unwrap();
     path.enable_repair(&RepairConfig::default(), term.term_length, identity)
         .unwrap();
     // `max`: each destination waits at its own edge only.

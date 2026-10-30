@@ -370,6 +370,9 @@ struct NetPublication {
     /// The run-time destination additions posted and not answered yet:
     /// each holds `per_destination` in `demand` until its answer.
     adds_pending: Vec<std::net::SocketAddr>,
+    /// `max_destinations` (MD-6): the most destination changes and
+    /// removals kept, and additions in flight.
+    max_destinations: usize,
     /// The endpoint limit its sender reported, until it opened.
     limited: Option<EndpointLimit>,
     /// Its open sender journals to close before `RemovePublication`, in the
@@ -382,13 +385,13 @@ struct NetPublication {
     /// in a [`Reincarnation`].
     reincarnating: bool,
     /// The destinations its sender removed, with why, the newest
-    /// `MAX_DESTINATIONS`, oldest first (karyos#630), and how many older
+    /// `max_destinations`, oldest first (karyos#630), and how many older
     /// ones were overwritten: a destination can be removed again after it
     /// is added back.
     removed_destinations: std::collections::VecDeque<crate::agents::data::DestinationRemoval>,
     removals_overwritten: u64,
     /// The answers to its run-time destination changes, oldest first, at
-    /// most `MAX_DESTINATIONS` (karyos#630).
+    /// most `max_destinations` (karyos#630).
     destination_changes:
         std::collections::VecDeque<(std::net::SocketAddr, crate::agents::data::DestinationChange)>,
     /// The slot its sender stores its admission state's code in each cycle
@@ -728,6 +731,8 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     agents: Agents<T>,
     /// The first agent that failed (DN-9), latched.
     failed: Option<AgentKind>,
+    /// `max_destinations` (MD-6; karyos#889), from the agents' settings.
+    max_destinations: usize,
     publications: Vec<NetPublication>,
     send_endpoints: Vec<SendEndpoint>,
     subscriptions: Vec<NetSubscription>,
@@ -848,9 +853,18 @@ impl<T: StreamTerms> Network<T> {
             return Err(DriverError::InvalidConfig);
         }
         control_group::validate(&config.nak_control_groups)?;
+        // MD-6, 3.5: one publication's destinations fit an endpoint's
+        // route table (the sum over an endpoint's publications is
+        // karyos#915).
+        if config.agents.max_destinations > usize::from(config.endpoint_tables.max_routes.get()) {
+            return Err(DriverError::MaxDestinations {
+                value: config.agents.max_destinations,
+            });
+        }
         let (mut agents, links) =
             network_agents_over::<OsSocket, T>(config.agents).map_err(|error| match error {
                 AgentError::BarrierAckTimeout(bound) => DriverError::BarrierAckTimeout(bound),
+                AgentError::MaxDestinations { value } => DriverError::MaxDestinations { value },
                 _ => DriverError::InvalidConfig,
             })?;
         // Each agent writes its own cells from its first cycle (M2).
@@ -868,6 +882,7 @@ impl<T: StreamTerms> Network<T> {
             images: ImageTable::new(config.agents.sessions.max_images, config.images),
             agents,
             failed: None,
+            max_destinations: config.agents.max_destinations,
             publications: Vec::with_capacity(config.agents.publications),
             send_endpoints: Vec::with_capacity(config.agents.max_endpoints),
             subscriptions: Vec::with_capacity(config.agents.subscriptions),
@@ -1220,6 +1235,11 @@ impl<T: StreamTerms> Network<T> {
         if let Some(count) = self.path_failures.checked_add(1) {
             self.path_failures = count;
         }
+    }
+
+    /// `max_destinations` (MD-6; karyos#889).
+    pub(crate) const fn max_destinations(&self) -> usize {
+        self.max_destinations
     }
 
     /// Whether this driver can isolate the sockets of redundant paths
@@ -1983,14 +2003,13 @@ impl<T: StreamTerms> Network<T> {
             lanes,
             demand,
             per_destination,
-            adds_pending: Vec::with_capacity(crate::agents::data::MAX_DESTINATIONS),
+            adds_pending: Vec::with_capacity(self.max_destinations),
+            max_destinations: self.max_destinations,
             limited: None,
             trace_closes: Vec::new(),
             channel: Some(channel),
             reincarnating: false,
-            removed_destinations: std::collections::VecDeque::with_capacity(
-                crate::agents::data::MAX_DESTINATIONS,
-            ),
+            removed_destinations: std::collections::VecDeque::with_capacity(self.max_destinations),
             removals_overwritten: 0,
             destination_changes: std::collections::VecDeque::new(),
             admission,
@@ -2316,7 +2335,7 @@ impl<T: StreamTerms> Network<T> {
     /// [`DriverError::EndpointCapacity`] for an addition its endpoint
     /// cannot hold with what it holds and the additions not answered yet
     /// (karyos#859); [`DriverError::NetworkBusy`] when the sender's ring is
-    /// full or [`MAX_DESTINATIONS`](crate::agents::data::MAX_DESTINATIONS)
+    /// full or `max_destinations`
     /// additions wait for their answer.
     pub(crate) fn change_destination(
         &mut self,
@@ -2348,7 +2367,7 @@ impl<T: StreamTerms> Network<T> {
         // so that additions in flight count too.
         let hold = per_destination.filter(|_| add);
         if let Some(need) = hold {
-            if waiting >= crate::agents::data::MAX_DESTINATIONS {
+            if waiting >= self.max_destinations {
                 return Err(DriverError::NetworkBusy);
             }
             self.endpoint_room(endpoint, need)?;
@@ -2394,7 +2413,7 @@ impl<T: StreamTerms> Network<T> {
     }
 
     /// The destinations the sender of the network publication
-    /// `registration` removed, the newest `MAX_DESTINATIONS` in order, with
+    /// `registration` removed, the newest `max_destinations` in order, with
     /// why (karyos#630).
     pub(crate) fn removed_destinations(
         &self,
@@ -3262,7 +3281,7 @@ fn publication_answer<T: StreamTerms>(
                         entry.hold(endpoint, need, false);
                     }
                 }
-                if entry.destination_changes.len() >= crate::agents::data::MAX_DESTINATIONS {
+                if entry.destination_changes.len() >= entry.max_destinations {
                     let _ = entry.destination_changes.pop_front();
                 }
                 entry.destination_changes.push_back((destination, outcome));
@@ -3282,7 +3301,7 @@ fn publication_answer<T: StreamTerms>(
             }
         }
         // A destination its sender removed: kept with the publication, the
-        // newest `MAX_DESTINATIONS`, an older one overwritten and counted.
+        // newest `max_destinations`, an older one overwritten and counted.
         AgentEvent::DestinationRemoved {
             endpoint,
             alias,
@@ -3297,7 +3316,7 @@ fn publication_answer<T: StreamTerms>(
                 if let Some(need) = entry.per_destination {
                     entry.hold(endpoint, need, false);
                 }
-                if entry.removed_destinations.len() >= crate::agents::data::MAX_DESTINATIONS {
+                if entry.removed_destinations.len() >= entry.max_destinations {
                     let _ = entry.removed_destinations.pop_front();
                     entry.removals_overwritten = entry.removals_overwritten.saturating_add(1);
                 }

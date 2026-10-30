@@ -566,3 +566,41 @@ fn agent_cells_store_changed_counts_and_go_back() {
     assert_eq!(cells.take().count(), 2);
     assert_eq!(cells.take().count(), 0);
 }
+
+/// karyos#889: `max_destinations` is 1 to 64, refused outside by its
+/// typed error, and refused where a repair table holds less than one
+/// entry per destination.
+#[test]
+fn max_destinations_is_one_to_sixty_four() {
+    for value in [
+        1,
+        data::DEFAULT_MAX_DESTINATIONS,
+        data::MAX_MAX_DESTINATIONS,
+    ] {
+        let config = AgentConfig {
+            max_destinations: value,
+            ..AgentConfig::default()
+        };
+        assert!(config.validate().is_ok(), "{value}");
+    }
+    for value in [0, data::MAX_MAX_DESTINATIONS + 1] {
+        let config = AgentConfig {
+            max_destinations: value,
+            ..AgentConfig::default()
+        };
+        assert!(
+            matches!(config.validate(), Err(AgentError::MaxDestinations { value: refused }) if refused == value),
+            "{value}"
+        );
+    }
+    // 64 destinations need 64 replies: 63 leave one without a share.
+    let mut config = AgentConfig {
+        max_destinations: data::MAX_MAX_DESTINATIONS,
+        ..AgentConfig::default()
+    };
+    config.repair.replies = data::MAX_MAX_DESTINATIONS - 1;
+    assert!(matches!(
+        config.validate(),
+        Err(AgentError::InvalidConfig(_))
+    ));
+}

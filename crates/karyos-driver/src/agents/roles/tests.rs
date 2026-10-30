@@ -4636,14 +4636,14 @@ fn a_retired_destinations_pending_items_return_queue_closed() {
 /// cycle's duty: a move at capacity right after the report is `Added`.
 #[test]
 fn a_move_right_after_the_report_is_added_in_the_cycle_order() {
-    use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
+    use crate::agents::data::{DEFAULT_MAX_DESTINATIONS, DestinationChange};
 
     let (mut sender, _receiver) =
         super::roles::<karyos_sys::term_bytes::HeapTerms>(&AgentConfig::default()).unwrap();
     let (replies, _keep) =
         super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(64).unwrap());
     let address = |port: u16| SocketAddr::from(([10, 0, 0, 9], port));
-    let destinations: Vec<SocketAddr> = (0..u16::try_from(MAX_DESTINATIONS).unwrap())
+    let destinations: Vec<SocketAddr> = (0..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap())
         .map(|index| address(5000 + index))
         .collect();
     let term = publication(EndpointId(1)).term;
@@ -4656,7 +4656,12 @@ fn a_move_right_after_the_report_is_added_in_the_cycle_order() {
         false,
     );
     outbound
-        .set_destinations(&destinations, &[], Some(true))
+        .set_destinations(
+            crate::agents::data::DEFAULT_MAX_DESTINATIONS,
+            &destinations,
+            &[],
+            Some(true),
+        )
         .unwrap();
     // Every destination opened: its removal leaves a route and queues to
     // close.
@@ -4779,7 +4784,12 @@ fn a_removed_destinations_member_is_released_with_the_ring_full() {
     let (mut outbound, _log) =
         super::super::data::testing::outbound(EndpointId(1), alias(), receiver, term, 1, false);
     outbound
-        .set_destinations(&[receiver, other], &[], Some(true))
+        .set_destinations(
+            crate::agents::data::DEFAULT_MAX_DESTINATIONS,
+            &[receiver, other],
+            &[],
+            Some(true),
+        )
         .unwrap();
     let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
         reply: replies.reserve().unwrap(),
@@ -4821,13 +4831,13 @@ fn a_removed_destinations_member_is_released_with_the_ring_full() {
 }
 
 /// Review H1 of #829, in real cycles (commands, duty, reports) on an
-/// endpoint whose route table holds exactly `MAX_DESTINATIONS` routes: a
+/// endpoint whose route table holds exactly `DEFAULT_MAX_DESTINATIONS` routes: a
 /// destination removed and reported frees its slot for the next cycle's
 /// move, and that cycle's duty closes the old route before it opens the
 /// new one, which could not open otherwise.
 #[test]
 fn a_move_closes_the_old_route_before_opening_the_new_one() {
-    use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
+    use crate::agents::data::{DEFAULT_MAX_DESTINATIONS, DestinationChange};
     use karyos_io::backend::InstanceId;
     use karyos_io::sockets::endpoint::{SocketsConfig, SocketsEndpoint};
     use karyos_io::sockets::scripted::ScriptedSocket;
@@ -4837,7 +4847,7 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
     let (replies, _keep) =
         super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(64).unwrap());
     let address = |port: u16| SocketAddr::from(([10, 0, 0, 9], port));
-    let destinations: Vec<SocketAddr> = (0..u16::try_from(MAX_DESTINATIONS).unwrap())
+    let destinations: Vec<SocketAddr> = (0..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap())
         .map(|index| address(5000 + index))
         .collect();
     let term = publication(EndpointId(1)).term;
@@ -4850,7 +4860,12 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
         false,
     );
     outbound
-        .set_destinations(&destinations, &[], Some(true))
+        .set_destinations(
+            crate::agents::data::DEFAULT_MAX_DESTINATIONS,
+            &destinations,
+            &[],
+            Some(true),
+        )
         .unwrap();
     let _ = sender.command(AgentCommand::<OsSocket>::AddPublication {
         reply: replies.reserve().unwrap(),
@@ -4861,7 +4876,7 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
     });
     let mut config = SocketsConfig::new("10.0.0.1:7000".parse().unwrap());
     config.max_routes =
-        std::num::NonZeroU16::new(u16::try_from(MAX_DESTINATIONS).unwrap()).unwrap();
+        std::num::NonZeroU16::new(u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap()).unwrap();
     config.max_queues = std::num::NonZeroU16::new(256).unwrap();
     config.tx_slots = std::num::NonZeroU16::new(4096).unwrap();
     let (tx, _rx) = SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new())
@@ -5782,7 +5797,13 @@ fn limit_after(case: LimitCase) -> (usize, bool) {
         let (mut path, log) =
             super::super::data::testing::outbound(EndpointId(1), alias(), receiver, term, 1, false);
         if fanout {
-            path.set_destinations(&[receiver], &[], Some(true)).unwrap();
+            path.set_destinations(
+                crate::agents::data::DEFAULT_MAX_DESTINATIONS,
+                &[receiver],
+                &[],
+                Some(true),
+            )
+            .unwrap();
         }
         (path, log)
     };

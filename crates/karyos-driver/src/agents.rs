@@ -116,6 +116,14 @@ pub enum AgentError {
     /// An agent panicked; its thread stopped.
     #[error("the {0:?} agent panicked")]
     Panicked(AgentKind),
+    /// `max_destinations` is outside 1 to
+    /// [`MAX_MAX_DESTINATIONS`](data::MAX_MAX_DESTINATIONS) (MD-6;
+    /// karyos#889).
+    #[error("max_destinations {value} is outside 1 to 64")]
+    MaxDestinations {
+        /// The value refused.
+        value: usize,
+    },
 }
 
 /// How an agent thread waits after an iteration without work. The driver
@@ -295,6 +303,12 @@ pub struct AgentConfig {
     /// The repair settings of reliable publications (reliable-transport.md;
     /// R4, R5, R7).
     pub repair: repair::RepairConfig,
+    /// `max_destinations`: the most destinations of one multi-destination
+    /// publication, 1 to 64 (default 16, MD-6; karyos#889). Every
+    /// per-destination share of the repair tables divides by it, whatever
+    /// the current count (MD-8), so each table must hold at least one
+    /// entry per destination.
+    pub max_destinations: usize,
     /// A multicast image's NAK timing and suppression (reliable-transport.md,
     /// "Timers, retries and suppression"; RC-2 to RC-5, RC-14), with the
     /// design defaults: `nak_delay_scale` 16, `repair_linger` and
@@ -356,6 +370,7 @@ impl Default for AgentConfig {
             idle_image_timeout: 60_000_000_000,
             rtt: crate::rtt::RttConfig::default(),
             repair: repair::RepairConfig::default(),
+            max_destinations: data::DEFAULT_MAX_DESTINATIONS,
             multicast: crate::repair::loss::MulticastConfig::default(),
             group_nak_budget: 64,
             stop_timeout: Duration::from_secs(1),
@@ -446,6 +461,18 @@ impl AgentConfig {
         self.rtt
             .validate()
             .map_err(|_| AgentError::InvalidConfig("invalid RTT configuration"))?;
+        // MD-6: 1 to 64 destinations, and a share of each repair table for
+        // every one of them (MD-8).
+        if !(1..=data::MAX_MAX_DESTINATIONS).contains(&self.max_destinations) {
+            return Err(AgentError::MaxDestinations {
+                value: self.max_destinations,
+            });
+        }
+        data::destination_share(&self.repair, self.max_destinations).map_err(|_| {
+            AgentError::InvalidConfig(
+                "a repair table holds less than one entry per destination (max_destinations)",
+            )
+        })?;
         // RTT snapshots lie between the floor and the probe timeout (the
         // RTT configuration checks `rtt_floor <= rtt_initial <=
         // rtt_probe_timeout` above).
