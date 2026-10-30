@@ -214,13 +214,13 @@ fn an_append_holds_to_the_in_flight_entries() {
     assert!((1..=2).contains(&largest), "largest append {largest}");
 }
 
-/// A run whose servers may read one byte per duty still completes: each
-/// read takes at least one entry, and a spent budget refuses the next
-/// read until the next duty.
+/// A run whose servers may read a few entries per duty still completes:
+/// each duty reads what fits, and a spent budget refuses the next read
+/// until the next duty.
 #[test]
 fn a_tight_read_budget_slows_a_run_and_loses_nothing() {
     let limits = Limits {
-        log_read_bytes: 1,
+        log_read_bytes: 2_048,
         ..Limits::W2
     };
     let case = limited("read-budget", 4, limits);
@@ -228,9 +228,11 @@ fn a_tight_read_budget_slows_a_run_and_loses_nothing() {
     assert_eq!(pass(&case, &outcome), Ok(None));
 }
 
-/// A metered view: a read is held to the budget left, at least one entry,
-/// spends the payload bytes it returns, and is refused once the budget is
-/// spent; a refill reads again.
+/// A metered view never reads past its budget (karyos#899 review, codex:
+/// 277-byte entries against an uneven budget overshot it by one entry). A
+/// read returns the entries that fit and spends them; once none fits, it
+/// is refused, and a refill reads again. An entry larger than the whole
+/// budget is never returned.
 #[test]
 fn a_metered_view_spends_and_refuses_its_budget() {
     let mut log =
@@ -240,7 +242,7 @@ fn a_metered_view_spends_and_refuses_its_budget() {
             index,
             term: 1,
             event_time: 0,
-            payload: vec![0; 256],
+            payload: vec![0; 277],
         })
         .collect();
     let _ = log.append(&entries).unwrap();
@@ -248,24 +250,27 @@ fn a_metered_view_spends_and_refuses_its_budget() {
     let budget = ReadBudget::new();
     budget.refill(600);
     let mut view = LogView::metered(&mut log, Some(&budget));
-    let first = view.entries(1..9, u64::MAX).unwrap();
-    assert!(!first.is_empty() && first.len() < 8, "{}", first.len());
-    let mut read = first.len() * 256;
-    while let Ok(more) = view.entries(1..9, u64::MAX) {
-        read += more.len() * 256;
-        assert!(
-            read <= 600 + 256,
-            "past the budget by more than one entry: {read}"
-        );
+    let mut read = 0;
+    let mut next = 1;
+    while let Ok(more) = view.entries(next..9, u64::MAX) {
+        read += more.len() * 277;
+        next += u64::try_from(more.len()).unwrap();
     }
+    assert_eq!(read, 2 * 277, "two entries fit in 600 bytes, never a third");
+    assert_eq!(budget.left(), 600 - 2 * 277);
     assert!(matches!(
-        view.entries(1..9, u64::MAX),
+        view.entries(next..9, u64::MAX),
         Err(ReadError::Budget)
     ));
     budget.refill(600);
     assert!(
-        view.entries(1..9, u64::MAX).is_ok(),
+        !view.entries(next..9, u64::MAX).unwrap().is_empty(),
         "a new duty reads again"
+    );
+    budget.refill(276);
+    assert!(
+        matches!(view.entries(1..9, u64::MAX), Err(ReadError::Budget)),
+        "an entry larger than the budget is never returned"
     );
     // Unmetered, the same read takes them all.
     let mut free = LogView::new(&mut log);

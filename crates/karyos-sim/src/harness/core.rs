@@ -133,13 +133,15 @@ impl<'a> LogView<'a> {
     }
 
     /// Entries in `range`, up to `max_bytes` of frames (at least one).
-    /// Metered, the read is held to the duty's budget left, still at least
-    /// one entry, and spends the payload bytes it returns.
+    /// Metered, it returns only the entries whose payloads fit in the
+    /// duty's budget left, and spends them: a duty never reads past its
+    /// budget, and an entry larger than what is left waits for the next
+    /// duty (karyos#899 review, codex).
     ///
     /// # Errors
     ///
-    /// [`ReadError::Budget`] once the duty's budget is spent, and the
-    /// log's read error.
+    /// [`ReadError::Budget`] when not one entry fits in the budget left,
+    /// and the log's read error.
     pub fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, ReadError> {
         let Some(budget) = self.budget else {
             return Ok(self.log.entries(range, max_bytes)?);
@@ -148,11 +150,29 @@ impl<'a> LogView<'a> {
         if left == 0 {
             return Err(ReadError::Budget);
         }
-        let entries = self.log.entries(range, max_bytes.min(left))?;
-        let read = entries.iter().fold(0u64, |sum, entry| {
-            sum.saturating_add(u64::try_from(entry.payload.len()).unwrap_or(u64::MAX))
-        });
-        budget.left.set(left.saturating_sub(read));
+        let mut entries = self.log.entries(range, max_bytes.min(left))?;
+        // The log returns at least one entry; keep those that fit.
+        let mut spent = 0u64;
+        let fits = entries
+            .iter()
+            .take_while(|entry| {
+                let next = u64::try_from(entry.payload.len())
+                    .ok()
+                    .and_then(|bytes| spent.checked_add(bytes))
+                    .filter(|next| *next <= left);
+                if let Some(next) = next {
+                    spent = next;
+                }
+                next.is_some()
+            })
+            .count();
+        if fits == 0 {
+            return Err(ReadError::Budget);
+        }
+        entries.truncate(fits);
+        budget
+            .left
+            .set(left.checked_sub(spent).ok_or(ReadError::Budget)?);
         Ok(entries)
     }
 
