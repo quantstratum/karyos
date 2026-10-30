@@ -1810,9 +1810,7 @@ pub(super) fn roles<T: StreamTerms>(
             // One ANNOUNCE waiting per publication and destination at most.
             routes: ControlRoutes::with_waiting(
                 config.control_routes,
-                config
-                    .publications
-                    .saturating_mul(super::data::MAX_DESTINATIONS),
+                config.publications.saturating_mul(config.max_destinations),
             ),
         })
         .collect();
@@ -1837,7 +1835,7 @@ pub(super) fn roles<T: StreamTerms>(
                     .publications
                     .checked_mul(
                         karyos_io::lanes::routes::MAX_ROUTES
-                            .saturating_add(super::data::MAX_DESTINATIONS.saturating_mul(2)),
+                            .saturating_add(config.max_destinations.saturating_mul(2)),
                     )
                     .and_then(|share| share.checked_mul(2))
                     .ok_or(AgentError::InvalidConfig("publications too large"))?,
@@ -1849,7 +1847,7 @@ pub(super) fn roles<T: StreamTerms>(
                     .publications
                     .checked_mul(
                         karyos_io::lanes::routes::MAX_ROUTES
-                            .saturating_add(super::data::MAX_DESTINATIONS.saturating_mul(2)),
+                            .saturating_add(config.max_destinations.saturating_mul(2)),
                     )
                     .ok_or(AgentError::InvalidConfig("publications too large"))?,
             ),
@@ -5972,7 +5970,7 @@ impl<T: StreamTerms> SenderRole<T> {
                     })
                     .filter(|outbound| outbound.destinations().is_some())
                     .map(|outbound| {
-                        let mut targets = [None; super::data::MAX_DESTINATIONS];
+                        let mut targets = [None; super::data::MAX_MAX_DESTINATIONS];
                         for (slot, address) in
                             targets.iter_mut().zip(outbound.destinations_not_live())
                         {

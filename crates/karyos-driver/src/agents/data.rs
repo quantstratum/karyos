@@ -345,7 +345,7 @@ pub struct OutboundCounters {
     /// their slot freed (karyos#630, design 3.7).
     pub destinations_retired: u64,
     /// Retired destinations' quarantine records forgotten while still in
-    /// their quarantine, to make room (more than `MAX_DESTINATIONS` within
+    /// their quarantine, to make room (more than `max_destinations` within
     /// one quarantine): the record removed earliest, which may be the
     /// incoming one. An incoming record already past its quarantine is not
     /// kept, and not counted.
@@ -2595,13 +2595,14 @@ pub(crate) struct Opened {
 }
 
 pub(super) mod fanout;
+pub(crate) use fanout::destination_share;
 mod heartbeat;
 mod removal;
 mod routed;
 
 pub use fanout::{
-    DESTINATION_FAULT_LIMIT, DestinationChange, DestinationRemoval, MAX_DESTINATIONS,
-    RemovalReason, TargetCounters,
+    DEFAULT_MAX_DESTINATIONS, DESTINATION_FAULT_LIMIT, DestinationChange, DestinationRemoval,
+    MAX_MAX_DESTINATIONS, RemovalReason, TargetCounters,
 };
 
 pub use routed::{MAX_PATH_BACKOFF, MAX_PATH_COPY_ENTRIES, PathCounters, PathPolicy};

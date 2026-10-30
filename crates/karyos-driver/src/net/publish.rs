@@ -40,7 +40,7 @@ use super::{NetworkPublicationState, SenderChannel};
 use karyos_io::lanes::routes::MAX_ROUTES;
 
 use crate::agents::EndpointId;
-use crate::agents::data::{GuardSpec, MAX_DESTINATIONS, Outbound};
+use crate::agents::data::{GuardSpec, Outbound};
 use crate::embedded::{AggregateConfig, AggregateHandle, EmbeddedDriver, FIRST_INCARNATION};
 use crate::error::DriverError;
 use crate::guards::{GuardHandle, GuardRate};
@@ -105,7 +105,7 @@ fn route(channel: &UdpConfig) -> Result<(SocketAddr, Vec<SocketAddr>), DriverErr
 
 /// The destinations of a multi-destination channel and its required ones
 /// (design 2.1, 3.5; MD-6, MD-11, MD-17): none for another channel, which
-/// names no required destination. At most `MAX_DESTINATIONS`, the
+/// names no required destination. At most `max_destinations`, the
 /// destinations distinct, of one address family, and the required ones
 /// among them.
 ///
@@ -117,6 +117,7 @@ fn route(channel: &UdpConfig) -> Result<(SocketAddr, Vec<SocketAddr>), DriverErr
 fn destinations_of(
     channel: &UdpConfig,
     required: &[SocketAddr],
+    max_destinations: usize,
 ) -> Result<(Vec<SocketAddr>, Vec<SocketAddr>), DriverError> {
     let Destination::MultiDestination { destinations, .. } = &channel.destination else {
         return if required.is_empty() {
@@ -133,7 +134,7 @@ fn destinations_of(
             .any(|other| other == address)
     });
     if destinations.is_empty()
-        || destinations.len() > MAX_DESTINATIONS
+        || destinations.len() > max_destinations
         || !distinct
         || destinations
             .iter()
@@ -452,7 +453,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::UnsupportedChannel);
         }
         let (destination, binds) = route(channel)?;
-        let destinations = destinations_of(channel, required_destinations)?;
+        let max_destinations = net.max_destinations();
+        let destinations = destinations_of(channel, required_destinations, max_destinations)?;
         // Guards and timed lanes are not combined with destinations yet
         // (karyos#630).
         if !destinations.0.is_empty() && (guard.is_some() || timed.is_some()) {
@@ -557,7 +559,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// removed less than `image_liveness_timeout` ago (MD-14), or a full
     /// set. A removed destination holds its slot until its removal is
     /// reported, in the sender cycle of the removal: a move at
-    /// [`MAX_DESTINATIONS`] answers `Full` until then, and a move retried
+    /// `max_destinations` answers `Full` until then, and a move retried
     /// after the removal shows in
     /// [`EmbeddedDriver::network_removed_destinations`] finds the slot
     /// free.
@@ -570,7 +572,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// more route with its queues, counting the additions not answered yet
     /// (karyos#859; retryable once room is freed),
     /// [`DriverError::NetworkBusy`] when the sender's ring is full or
-    /// [`MAX_DESTINATIONS`] additions wait for their answer (nothing
+    /// `max_destinations` additions wait for their answer (nothing
     /// changes; retry).
     pub fn add_network_destination(
         &mut self,
@@ -606,7 +608,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// The sender's answers to the destination changes of `aggregate`,
-    /// oldest first (the latest `MAX_DESTINATIONS`), taken.
+    /// oldest first (the latest `max_destinations`), taken.
     pub fn take_network_destination_changes(
         &mut self,
         aggregate: &AggregateHandle,
@@ -618,7 +620,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// The destinations the multi-destination publication `aggregate` has
-    /// removed, the newest `MAX_DESTINATIONS` in order, each with its
+    /// removed, the newest `max_destinations` in order, each with its
     /// reason: an optional destination whose queue was full (MD-7), whose
     /// sends kept faulting (MD-12), or removed by command (MD-3)
     /// (karyos#630). Empty for another publication.
@@ -635,7 +637,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
 
     /// How many removals of `aggregate`'s destinations were overwritten in
     /// [`Self::network_removed_destinations`], which keeps the newest
-    /// `MAX_DESTINATIONS` (karyos#630).
+    /// `max_destinations` (karyos#630).
     #[must_use]
     pub fn network_removals_overwritten(&self, aggregate: &AggregateHandle) -> u64 {
         self.net
@@ -918,6 +920,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let ipv4 = net
             .endpoint_address(endpoint)
             .map(|address| address.is_ipv4());
+        let max_destinations = net.max_destinations();
         let outbound = if held.len() > 1 {
             Outbound::new_routed(&held, alias, readers, &quanta, config.mtu, reliable)
         } else {
@@ -932,7 +935,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             )
             .and_then(|mut outbound| {
                 if !destinations.is_empty() {
-                    outbound.set_destinations(&destinations, &required_destinations, ipv4)?;
+                    outbound.set_destinations(
+                        max_destinations,
+                        &destinations,
+                        &required_destinations,
+                        ipv4,
+                    )?;
                 }
                 Ok(outbound)
             })

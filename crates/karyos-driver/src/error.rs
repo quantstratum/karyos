@@ -196,6 +196,13 @@ pub enum DriverError {
     /// karyos#658).
     #[error("{0}")]
     BarrierAckTimeout(crate::agents::BarrierAckBound),
+    /// `max_destinations` is outside 1 to 64, or above the endpoint's
+    /// `max_routes` (MD-6; karyos#889).
+    #[error("max_destinations {value} is outside 1 to 64 or above max_routes")]
+    MaxDestinations {
+        /// The value refused.
+        value: usize,
+    },
     /// A replay's feed wrote past the end it was finished at; its target
     /// retired.
     #[error("a replay finished at {end} but written to {written}")]

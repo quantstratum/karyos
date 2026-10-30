@@ -354,7 +354,7 @@ enum Closed {
 
 /// The default room in the waiting queue: one publication's ANNOUNCE to
 /// each of its destinations.
-const WAITING_EXTRA: usize = super::data::MAX_DESTINATIONS;
+const WAITING_EXTRA: usize = super::data::DEFAULT_MAX_DESTINATIONS;
 
 /// What a waiting control is unique by, with its destination: its kind,
 /// and an ANNOUNCE's alias (each publication announces itself).

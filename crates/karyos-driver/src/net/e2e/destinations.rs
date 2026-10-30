@@ -715,7 +715,7 @@ fn twenty_moves_neither_fill_the_table_nor_leak() {
     assert_eq!(a.network_removals_overwritten(&publication), 4);
 }
 
-/// Plan 157, point 2: a move at `MAX_DESTINATIONS` answers `Full` while
+/// Plan 157, point 2: a move at `DEFAULT_MAX_DESTINATIONS` answers `Full` while
 /// the removed destination holds its slot, and once its removal shows in
 /// `network_removed_destinations` (it is reported in the cycle of the
 /// removal, which hands its route and queues to the close list), the move
@@ -729,14 +729,88 @@ fn a_move_at_capacity_waits_for_the_removal_to_retire() {
     move_at_capacity(ThreadingMode::Dedicated);
 }
 
+/// karyos#889: a driver configured for 64 destinations takes a
+/// publication up to 64 and answers `Full` to the 65th.
+#[test]
+fn a_publication_takes_up_to_the_configured_max_destinations() {
+    use crate::agents::AgentConfig;
+    use crate::agents::data::{DestinationChange, MAX_MAX_DESTINATIONS};
+
+    let mut a = driver_with(
+        ThreadingMode::Shared,
+        AgentConfig {
+            max_destinations: MAX_MAX_DESTINATIONS,
+            ..AgentConfig::default()
+        },
+    );
+    let (mut receivers, addresses) = receivers(1);
+    let reserved = Reserved::new(MAX_MAX_DESTINATIONS);
+    let (publication, _) = connect(
+        &mut a,
+        &mut receivers,
+        &destinations(&addresses, false),
+        &[],
+        None,
+    );
+    for index in 1..MAX_MAX_DESTINATIONS {
+        a.add_network_destination(&publication, reserved.at(index))
+            .unwrap();
+        assert_eq!(
+            answer(&mut a, &mut receivers, &publication),
+            (reserved.at(index), DestinationChange::Added),
+            "destination {index}"
+        );
+    }
+    a.add_network_destination(&publication, reserved.at(0))
+        .unwrap();
+    assert_eq!(
+        answer(&mut a, &mut receivers, &publication),
+        (reserved.at(0), DestinationChange::Full)
+    );
+}
+
+/// karyos#889: a driver refuses `max_destinations` outside 1 to 64, and
+/// above its endpoints' `max_routes`, by the typed error.
+#[test]
+fn a_driver_refuses_max_destinations_out_of_range() {
+    use crate::agents::AgentConfig;
+    use crate::embedded::DriverConfig;
+    use crate::net::{EndpointTables, NetworkConfig};
+
+    let start = |max_destinations: usize, max_routes: u16| {
+        EmbeddedDriver::with_config(DriverConfig {
+            network: Some(NetworkConfig {
+                agents: AgentConfig {
+                    max_destinations,
+                    ..AgentConfig::default()
+                },
+                endpoint_tables: EndpointTables {
+                    max_routes: std::num::NonZeroU16::new(max_routes).unwrap(),
+                    ..EndpointTables::default()
+                },
+                ..NetworkConfig::default()
+            }),
+            ..DriverConfig::default()
+        })
+        .err()
+    };
+    for (value, routes) in [(0, 128), (65, 128), (16, 8)] {
+        assert!(
+            matches!(start(value, routes), Some(DriverError::MaxDestinations { value: refused }) if refused == value),
+            "{value} with {routes} routes"
+        );
+    }
+    assert!(start(64, 64).is_none());
+}
+
 /// [`a_move_at_capacity_waits_for_the_removal_to_retire`] in `threading`.
 fn move_at_capacity(threading: ThreadingMode) {
-    use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
+    use crate::agents::data::{DEFAULT_MAX_DESTINATIONS, DestinationChange};
 
     let mut a = driver(threading);
     let (mut receivers, addresses) = receivers(1);
     // Index 0 is unused; the move goes to the last.
-    let reserved = Reserved::new(MAX_DESTINATIONS + 1);
+    let reserved = Reserved::new(DEFAULT_MAX_DESTINATIONS + 1);
     let at = |index: usize| reserved.at(index);
     let (publication, _) = connect(
         &mut a,
@@ -745,7 +819,7 @@ fn move_at_capacity(threading: ThreadingMode) {
         &[],
         None,
     );
-    for index in 1..MAX_DESTINATIONS {
+    for index in 1..DEFAULT_MAX_DESTINATIONS {
         a.add_network_destination(&publication, at(index)).unwrap();
         assert_eq!(
             answer(&mut a, &mut receivers, &publication),
@@ -753,7 +827,7 @@ fn move_at_capacity(threading: ThreadingMode) {
         );
     }
     a.remove_network_destination(&publication, at(1)).unwrap();
-    a.add_network_destination(&publication, at(MAX_DESTINATIONS))
+    a.add_network_destination(&publication, at(DEFAULT_MAX_DESTINATIONS))
         .unwrap();
     let mut answers = Vec::new();
     {
@@ -803,11 +877,11 @@ fn move_at_capacity(threading: ThreadingMode) {
     } else {
         DestinationChange::Added
     };
-    a.add_network_destination(&publication, at(MAX_DESTINATIONS))
+    a.add_network_destination(&publication, at(DEFAULT_MAX_DESTINATIONS))
         .unwrap();
     assert_eq!(
         answer(&mut a, &mut receivers, &publication),
-        (at(MAX_DESTINATIONS), expected)
+        (at(DEFAULT_MAX_DESTINATIONS), expected)
     );
 }
 
@@ -898,11 +972,11 @@ fn a_destination_added_back_starts_with_a_fresh_repair_path() {
 }
 
 /// MD-8: each destination's repair cap is the job table's share for
-/// `MAX_DESTINATIONS`, so a reliable publication grown to sixteen
+/// `DEFAULT_MAX_DESTINATIONS`, so a reliable publication grown to sixteen
 /// destinations at run time never holds more jobs than its table.
 #[test]
 fn additions_never_overcommit_the_repair_job_table() {
-    use crate::agents::data::{DestinationChange, MAX_DESTINATIONS};
+    use crate::agents::data::{DEFAULT_MAX_DESTINATIONS, DestinationChange};
     use crate::repair::jobs::JobsConfig;
 
     let mut a = driver(ThreadingMode::Shared);
@@ -915,14 +989,14 @@ fn additions_never_overcommit_the_repair_job_table() {
         None,
     );
     let table = JobsConfig::default().repair_jobs;
-    let reserved = Reserved::new(MAX_DESTINATIONS);
-    for port in 0..u16::try_from(MAX_DESTINATIONS).unwrap() {
+    let reserved = Reserved::new(DEFAULT_MAX_DESTINATIONS);
+    for port in 0..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap() {
         a.add_network_destination(&publication, reserved.at(usize::from(port)))
             .unwrap();
         let (_, outcome) = answer(&mut a, &mut receivers, &publication);
         let capacity = super::shared(&mut a).sender.fanout_job_capacity(0);
         assert!(capacity <= table, "{capacity} jobs over a table of {table}");
-        if usize::from(port) + 1 < MAX_DESTINATIONS {
+        if usize::from(port) + 1 < DEFAULT_MAX_DESTINATIONS {
             assert_eq!(outcome, DestinationChange::Added);
         } else {
             assert_eq!(outcome, DestinationChange::Full);

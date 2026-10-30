@@ -91,7 +91,7 @@ pub enum DestinationChange {
     Absent,
     /// Refused: it was removed less than its quarantine ago (MD-14).
     Quarantined,
-    /// Refused: the publication has [`MAX_DESTINATIONS`] destinations,
+    /// Refused: the publication has `max_destinations` destinations,
     /// counting those removed whose removal is not reported yet: a removal
     /// is reported at once, retired at its report, and its route and queues
     /// go to the close list then.
@@ -103,12 +103,16 @@ pub enum DestinationChange {
     Unknown,
 }
 
-/// The most destinations of one publication (MD-6: `max_destinations`
-/// defaults to 16, configurable up to 64; this step fixes it at 16).
-pub const MAX_DESTINATIONS: usize = 16;
+/// The default of `max_destinations`, the most destinations of one
+/// publication (MD-6; [`AgentConfig::max_destinations`](crate::agents::AgentConfig::max_destinations)).
+pub const DEFAULT_MAX_DESTINATIONS: usize = 16;
+
+/// The largest `max_destinations` (MD-6): the most destinations a URI
+/// names.
+pub const MAX_MAX_DESTINATIONS: usize = karyos_protocol::channel::MAX_URI_DESTINATIONS;
 
 /// The repair configuration of one destination of a multi-destination
-/// publication: its share, for [`MAX_DESTINATIONS`], of each table sized
+/// publication: its share, for `max_destinations`, of each table sized
 /// per publication, whatever the current count, so that adding a
 /// destination at run time never overcommits a table and the paths of
 /// every destination together stay within the configured tables (MD-8;
@@ -126,15 +130,16 @@ pub const MAX_DESTINATIONS: usize = 16;
 /// [`RepairConfigError::TableShare`]: crate::agents::repair::RepairConfigError::TableShare
 pub(crate) fn destination_share(
     config: &crate::agents::repair::RepairConfig,
+    max_destinations: usize,
 ) -> Result<crate::agents::repair::RepairConfig, crate::agents::repair::RepairConfigError> {
     use crate::agents::repair::RepairConfigError;
-    let share = |value: usize| value / MAX_DESTINATIONS;
+    let share = |value: usize| value.checked_div(max_destinations).unwrap_or(0);
     let mut shared = *config;
     shared.jobs.repair_jobs = share(config.jobs.repair_jobs);
     if shared.jobs.repair_jobs == 0 {
         return Err(RepairConfigError::DestinationShare {
             repair_jobs: config.jobs.repair_jobs,
-            destinations: MAX_DESTINATIONS,
+            destinations: max_destinations,
         });
     }
     for (table, value, slot) in [
@@ -155,7 +160,7 @@ pub(crate) fn destination_share(
             return Err(RepairConfigError::TableShare {
                 table,
                 value,
-                destinations: MAX_DESTINATIONS,
+                destinations: max_destinations,
             });
         }
     }
@@ -390,8 +395,11 @@ pub(super) struct Fanout {
     drr: DrrConfig,
     mtu: usize,
     /// Retired destinations and when they were removed, kept for their
-    /// quarantine (MD-14), at most [`MAX_DESTINATIONS`], oldest first.
+    /// quarantine (MD-14), at most `max`, oldest first.
     quarantined: VecDeque<(SocketAddr, u64)>,
+    /// `max_destinations` (MD-6): its targets and the removed ones not yet
+    /// retired, at most.
+    max: usize,
     /// The quarantine of a removed destination (MD-14) and the spacing of
     /// counted open failures (`setup_interval`), from the sender's settings.
     quarantine: u64,
@@ -475,7 +483,7 @@ impl Fanout {
                 continue;
             }
             if post(endpoint, target.address) {
-                // At most `MAX_DESTINATIONS`: no overflow.
+                // At most `max`: no overflow.
                 posted = posted.saturating_add(1);
             }
         }
@@ -495,8 +503,13 @@ impl Fanout {
 
     /// The fan-out toward `destinations`, of which `required` are required,
     /// with `lanes` lanes of datagrams of at most `mtu` bytes served under
-    /// `drr`, each lane starting at `joins[lane]`.
+    /// `drr`, each lane starting at `joins[lane]`, holding at most `max`.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the fan-out's sizes, fixed at creation"
+    )]
     pub(super) fn new(
+        max: usize,
         destinations: &[SocketAddr],
         required: &[SocketAddr],
         drr: DrrConfig,
@@ -508,7 +521,7 @@ impl Fanout {
         let joins: Vec<u64> = (0..lanes)
             .map(|lane| joins.get(lane).copied().unwrap_or(0))
             .collect();
-        let mut targets = Vec::with_capacity(MAX_DESTINATIONS);
+        let mut targets = Vec::with_capacity(max);
         for address in destinations {
             targets.push(Target::new(
                 *address,
@@ -521,16 +534,17 @@ impl Fanout {
         Some(Self {
             staged_for: (0..lanes)
                 .map(|_| {
-                    let mut flags = Vec::with_capacity(MAX_DESTINATIONS);
+                    let mut flags = Vec::with_capacity(max);
                     flags.resize(targets.len(), false);
                     flags
                 })
                 .collect(),
-            quarantined: VecDeque::with_capacity(MAX_DESTINATIONS),
+            quarantined: VecDeque::with_capacity(max),
+            max,
             quarantine: 0,
             open_spacing: 0,
             ipv4,
-            retired: Vec::with_capacity(MAX_DESTINATIONS),
+            retired: Vec::with_capacity(max),
             targets,
             pending: vec![None; lanes],
             joins: vec![0; lanes],
@@ -673,7 +687,7 @@ impl Fanout {
             let mut keep = now
                 .checked_sub(removed_at)
                 .is_none_or(|age| age < quarantine);
-            if keep && fanout.quarantined.len() >= MAX_DESTINATIONS {
+            if keep && fanout.quarantined.len() >= fanout.max {
                 let earliest = fanout
                     .quarantined
                     .iter()
@@ -785,6 +799,7 @@ impl<T: StreamTerms> Outbound<T> {
     /// the endpoint's: it could never open.
     pub(crate) fn set_destinations(
         &mut self,
+        max_destinations: usize,
         destinations: &[SocketAddr],
         required: &[SocketAddr],
         ipv4: Option<bool>,
@@ -799,6 +814,7 @@ impl<T: StreamTerms> Outbound<T> {
                 .any(|other| other == address)
         });
         if destinations.is_empty()
+            || destinations.len() > max_destinations
             || !distinct
             || destinations.iter().any(|address| address.is_ipv4() != ipv4)
             || required
@@ -814,6 +830,7 @@ impl<T: StreamTerms> Outbound<T> {
             .map(|reader| reader.position())
             .collect();
         let fanout = Fanout::new(
+            max_destinations,
             destinations,
             required,
             self.drr,
@@ -1767,7 +1784,7 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Enables a repair path per destination, each with its share of the
-    /// repair tables for [`MAX_DESTINATIONS`] (MD-8, karyos#802; control
+    /// repair tables for its `max_destinations` (MD-8, karyos#802; control
     /// path, allocates).
     pub(super) fn enable_fanout_repair(
         &mut self,
@@ -1783,7 +1800,7 @@ impl<T: StreamTerms> Outbound<T> {
         // `max_destinations`, whatever the current count, so additions never
         // overcommit it. A table below one job per destination is refused
         // (`RepairConfigError::DestinationShare`).
-        let config = destination_share(config)?;
+        let config = destination_share(config, fanout.max)?;
         fanout.repair = Some((config, term_length, alias, identity));
         for target in &mut fanout.targets {
             target.repair = Some(Box::new(crate::agents::repair::RepairPath::new(
@@ -2049,7 +2066,7 @@ impl<T: StreamTerms> Outbound<T> {
                 // ring is full nothing is reported and nothing retires, so
                 // churn never grows the targets, their flags or the retired
                 // list past their capacity.
-                if fanout.targets.len().saturating_add(fanout.retired.len()) >= MAX_DESTINATIONS {
+                if fanout.targets.len().saturating_add(fanout.retired.len()) >= fanout.max {
                     return DestinationChange::Full;
                 }
                 // A fresh optional destination, joining at the cursor; its
@@ -2082,7 +2099,17 @@ mod tests {
         let address: SocketAddr = "127.0.0.1:4000".parse().unwrap();
         let drr = DrrConfig::new(&[1536], 1536).unwrap();
         let required = if required { vec![address] } else { Vec::new() };
-        let mut fanout = Fanout::new(&[address], &required, drr, 1, 1500, &[0], true).unwrap();
+        let mut fanout = Fanout::new(
+            DEFAULT_MAX_DESTINATIONS,
+            &[address],
+            &required,
+            drr,
+            1,
+            1500,
+            &[0],
+            true,
+        )
+        .unwrap();
         let mut target = fanout.targets.pop().unwrap();
         target.stalled = true;
         target
@@ -2267,7 +2294,32 @@ mod tests {
     fn each_repair_table_is_shared_out_within_its_configured_size() {
         use crate::agents::repair::{RepairConfig, RepairConfigError};
         let config = RepairConfig::default();
-        let shared = destination_share(&config).unwrap();
+        // karyos#889: at every `max_destinations`, each table over all its
+        // destinations stays within its configured size.
+        for max in [1, DEFAULT_MAX_DESTINATIONS, MAX_MAX_DESTINATIONS] {
+            let shared = destination_share(&config, max).unwrap();
+            for (one, all) in [
+                (shared.jobs.repair_jobs, config.jobs.repair_jobs),
+                (shared.err_linger_entries, config.err_linger_entries),
+                (
+                    shared.jobs.repair_linger_entries,
+                    config.jobs.repair_linger_entries,
+                ),
+                (shared.replies, config.replies),
+            ] {
+                assert!(one >= 1, "{max}");
+                assert!(one * max <= all, "{one} x {max} > {all}");
+            }
+        }
+        // Above 64 the default job table (64) holds less than one job each.
+        assert_eq!(
+            destination_share(&config, MAX_MAX_DESTINATIONS + 1),
+            Err(RepairConfigError::DestinationShare {
+                repair_jobs: config.jobs.repair_jobs,
+                destinations: MAX_MAX_DESTINATIONS + 1,
+            })
+        );
+        let shared = destination_share(&config, DEFAULT_MAX_DESTINATIONS).unwrap();
         for (one, all) in [
             (shared.jobs.repair_jobs, config.jobs.repair_jobs),
             (shared.err_linger_entries, config.err_linger_entries),
@@ -2279,8 +2331,8 @@ mod tests {
         ] {
             assert!(one >= 1);
             assert!(
-                one * MAX_DESTINATIONS <= all,
-                "{one} x {MAX_DESTINATIONS} > {all}"
+                one * DEFAULT_MAX_DESTINATIONS <= all,
+                "{one} x {DEFAULT_MAX_DESTINATIONS} > {all}"
             );
         }
         // Requesters are per job.
@@ -2291,14 +2343,14 @@ mod tests {
         let small = |set: fn(&mut RepairConfig)| {
             let mut config = RepairConfig::default();
             set(&mut config);
-            destination_share(&config)
+            destination_share(&config, DEFAULT_MAX_DESTINATIONS)
         };
         assert_eq!(
-            small(|c| c.replies = MAX_DESTINATIONS - 1),
+            small(|c| c.replies = DEFAULT_MAX_DESTINATIONS - 1),
             Err(RepairConfigError::TableShare {
                 table: "replies",
-                value: MAX_DESTINATIONS - 1,
-                destinations: MAX_DESTINATIONS,
+                value: DEFAULT_MAX_DESTINATIONS - 1,
+                destinations: DEFAULT_MAX_DESTINATIONS,
             })
         );
         assert!(matches!(
@@ -2331,7 +2383,7 @@ mod tests {
         let mut outbound = fanned(address(4000));
         let mut config = RepairConfig::default();
         // One job per destination.
-        config.jobs.repair_jobs = MAX_DESTINATIONS;
+        config.jobs.repair_jobs = DEFAULT_MAX_DESTINATIONS;
         let identity = karyos_protocol::network::Identity {
             driver_id: [1, 2],
             registration_id: 1,
@@ -2394,7 +2446,7 @@ mod tests {
         use karyos_protocol::network::{Nak, NakRange, NakReply, NakReplyReason, Receiver};
         let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
         let mut outbound = fanned(address(4000));
-        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+        for port in 1..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap() {
             let _ = outbound.change_destination(address(4000 + port), true, 0, 0);
         }
         let config = RepairConfig::default();
@@ -2422,13 +2474,16 @@ mod tests {
         };
         let reply = NakReply::answering(&nak, NakReplyReason::RangeInvalid);
         let fanout = outbound.fanout.as_deref_mut().unwrap();
-        assert_eq!(fanout.targets.len(), MAX_DESTINATIONS);
+        assert_eq!(fanout.targets.len(), DEFAULT_MAX_DESTINATIONS);
         let held: usize = fanout
             .targets
             .iter_mut()
             .map(|target| target.repair.as_deref_mut().unwrap().fill_replies(reply))
             .sum();
-        assert_eq!(held, MAX_DESTINATIONS * (config.replies / MAX_DESTINATIONS));
+        assert_eq!(
+            held,
+            DEFAULT_MAX_DESTINATIONS * (config.replies / DEFAULT_MAX_DESTINATIONS)
+        );
         // The role's own list and its drop rule (roles.rs).
         let mut replies = Vec::with_capacity(config.replies);
         let mut dropped = 0u64;
@@ -2444,6 +2499,11 @@ mod tests {
 
     /// A multi-destination publication of one lane toward `first`.
     fn fanned(first: SocketAddr) -> Box<Outbound> {
+        fanned_with(DEFAULT_MAX_DESTINATIONS, first)
+    }
+
+    /// [`fanned`] holding at most `max` destinations.
+    fn fanned_with(max: usize, first: SocketAddr) -> Box<Outbound> {
         let term = karyos_protocol::network::TermParams {
             term_length: 65_536,
             initial_term_id: 9,
@@ -2462,9 +2522,54 @@ mod tests {
             false,
         );
         outbound
-            .set_destinations(&[first], &[], Some(true))
+            .set_destinations(max, &[first], &[], Some(true))
             .unwrap();
         outbound
+    }
+
+    /// karyos#889: a publication takes up to `max_destinations`
+    /// destinations, at 1, 16 and 64, and answers `Full` to the next; one
+    /// configured with more than that many is refused.
+    #[test]
+    fn a_publication_holds_max_destinations_and_refuses_the_next() {
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        for max in [1, DEFAULT_MAX_DESTINATIONS, MAX_MAX_DESTINATIONS] {
+            let mut outbound = fanned_with(max, address(4000));
+            for port in 1..u16::try_from(max).unwrap() {
+                let change = outbound.change_destination(address(4000 + port), true, 0, 0);
+                assert_eq!(change, DestinationChange::Added, "{max}");
+            }
+            assert_eq!(
+                outbound.change_destination(address(5000), true, 0, 0),
+                DestinationChange::Full,
+                "{max}"
+            );
+            assert_eq!(outbound.fanout.as_deref().unwrap().targets.len(), max);
+            let (mut outbound, _log) = super::super::testing::outbound(
+                crate::agents::EndpointId(1),
+                karyos_protocol::network::Alias {
+                    session_id: 5,
+                    stream_id: 6,
+                },
+                address(4000),
+                karyos_protocol::network::TermParams {
+                    term_length: 65_536,
+                    initial_term_id: 9,
+                    mtu: 1408,
+                },
+                1,
+                false,
+            );
+            let over: Vec<SocketAddr> = (0..=u16::try_from(max).unwrap())
+                .map(|port| address(4000 + port))
+                .collect();
+            assert!(
+                outbound
+                    .set_destinations(max, &over, &[], Some(true))
+                    .is_err(),
+                "{max}"
+            );
+        }
     }
 
     /// Plan 157, point 1: a publication removed before the sender's next
@@ -2556,13 +2661,13 @@ mod tests {
                 other => panic!("{other:?}"),
             }
             let fanout = outbound.fanout.as_deref().unwrap();
-            assert!(fanout.targets.len() <= MAX_DESTINATIONS);
-            assert!(fanout.staged_for[0].len() <= MAX_DESTINATIONS);
+            assert!(fanout.targets.len() <= DEFAULT_MAX_DESTINATIONS);
+            assert!(fanout.staged_for[0].len() <= DEFAULT_MAX_DESTINATIONS);
         }
         assert!(full > 0, "the table filled");
         // The ring drains: each report retires its target, whose route and
         // queues go to the retired list and then to the close list.
-        let mut closing = Vec::with_capacity(MAX_DESTINATIONS);
+        let mut closing = Vec::with_capacity(DEFAULT_MAX_DESTINATIONS);
         while let Some(removal) = outbound.removal_unreported() {
             let (_, allocations) = karyos_sys::alloc_count::count_allocations(|| {
                 outbound.removal_reported(removal.destination, 0);
@@ -2574,12 +2679,12 @@ mod tests {
         }
         assert_eq!(
             outbound.fanout.as_deref().unwrap().retired.len(),
-            MAX_DESTINATIONS - 1
+            DEFAULT_MAX_DESTINATIONS - 1
         );
         let (_, allocations) =
             karyos_sys::alloc_count::count_allocations(|| outbound.drain_retired(&mut closing));
         assert_eq!(allocations, 0, "the drain allocates nothing");
-        assert_eq!(closing.len(), MAX_DESTINATIONS - 1);
+        assert_eq!(closing.len(), DEFAULT_MAX_DESTINATIONS - 1);
         assert_eq!(outbound.counters().destinations_retired, 15);
         assert_eq!(capacities(&outbound), before, "nothing reallocated");
     }
@@ -2592,7 +2697,7 @@ mod tests {
         let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
         let mut tx = roomy_tx();
         let mut outbound = fanned(address(4000));
-        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+        for port in 1..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap() {
             let change = outbound.change_destination(address(4000 + port), true, 0, 0);
             assert_eq!(change, DestinationChange::Added);
         }
@@ -2622,7 +2727,7 @@ mod tests {
             "its route and queues go to the close list"
         );
         // The next duty closes them before it serves commands.
-        let mut closing = Vec::with_capacity(MAX_DESTINATIONS);
+        let mut closing = Vec::with_capacity(DEFAULT_MAX_DESTINATIONS);
         outbound.drain_retired(&mut closing);
         assert_eq!(
             outbound.change_destination(address(4100), true, 0, 0),
@@ -2650,7 +2755,7 @@ mod tests {
             SocketsEndpoint::open(&config, InstanceId::FIRST, ScriptedSocket::new()).unwrap();
         let (mut tx, rx) = endpoint.split().unwrap();
         let mut outbound = fanned(address(4000));
-        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+        for port in 1..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap() {
             let _ = outbound.change_destination(address(4000 + port), true, 0, 0);
         }
         let _ = outbound.open_targets(&mut tx, 0);
@@ -2701,7 +2806,7 @@ mod tests {
         );
         outbound.removal_reported(address(4001), 5_100);
         assert_eq!(outbound.counters().destinations_retired, 1, "at its report");
-        outbound.drain_retired(&mut Vec::with_capacity(MAX_DESTINATIONS));
+        outbound.drain_retired(&mut Vec::with_capacity(DEFAULT_MAX_DESTINATIONS));
         assert_eq!(
             outbound.change_destination(address(4001), true, 5_999, quarantine),
             DestinationChange::Quarantined
@@ -2720,7 +2825,7 @@ mod tests {
         let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
         let mut tx = roomy_tx();
         let mut outbound = fanned(address(4000));
-        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+        for port in 1..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap() {
             let _ = outbound.change_destination(address(4000 + port), true, 0, 0);
         }
         // Opened once, then never served again.
@@ -2728,7 +2833,7 @@ mod tests {
         assert!(remove_opened(&mut outbound, address(4005)) == 0);
         let removal = outbound.removal_unreported().expect("no serve needed");
         outbound.removal_reported(removal.destination, 0);
-        outbound.drain_retired(&mut Vec::with_capacity(MAX_DESTINATIONS));
+        outbound.drain_retired(&mut Vec::with_capacity(DEFAULT_MAX_DESTINATIONS));
         assert_eq!(
             outbound.change_destination(address(4100), true, 0, 0),
             DestinationChange::Added
@@ -2744,7 +2849,7 @@ mod tests {
         let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
         // Never served: none of its destinations opened.
         let mut outbound = fanned(address(4000));
-        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+        for port in 1..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap() {
             let change = outbound.change_destination(address(4000 + port), true, 0, 0);
             assert_eq!(change, DestinationChange::Added);
         }
@@ -2854,11 +2959,11 @@ mod tests {
         let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
         let mut tx = roomy_tx();
         let mut outbound = fanned(address(4000));
-        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+        for port in 1..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap() {
             let _ = outbound.change_destination(address(4000 + port), true, 0, 0);
         }
         let _ = outbound.open_targets(&mut tx, 0);
-        for port in 0..u16::try_from(MAX_DESTINATIONS).unwrap() {
+        for port in 0..u16::try_from(DEFAULT_MAX_DESTINATIONS).unwrap() {
             let _ = remove_opened(&mut outbound, address(4000 + port));
             outbound.removal_reported(address(4000 + port), 0);
         }
@@ -2869,9 +2974,9 @@ mod tests {
             DestinationChange::Full,
             "the old routes have not left yet"
         );
-        let mut closing = Vec::with_capacity(2 * MAX_DESTINATIONS);
+        let mut closing = Vec::with_capacity(2 * DEFAULT_MAX_DESTINATIONS);
         outbound.drain_retired(&mut closing);
-        assert_eq!(closing.len(), MAX_DESTINATIONS, "every one taken");
+        assert_eq!(closing.len(), DEFAULT_MAX_DESTINATIONS, "every one taken");
         assert_eq!(
             outbound.change_destination(address(4100), true, 0, 0),
             DestinationChange::Added
@@ -3010,7 +3115,12 @@ mod tests {
             );
             assert!(
                 outbound
-                    .set_destinations(&destinations, &destinations, family)
+                    .set_destinations(
+                        DEFAULT_MAX_DESTINATIONS,
+                        &destinations,
+                        &destinations,
+                        family
+                    )
                     .is_err(),
                 "{destinations:?} on {family:?}"
             );
