@@ -236,14 +236,16 @@ fn a_tight_read_budget_slows_a_run_and_loses_nothing() {
 }
 
 /// A metered view never reads past its budget (karyos#899 review, codex:
-/// 277-byte entries against an uneven budget overshot it by one entry). A
-/// read returns the entries that fit and spends them; once none fits, it
-/// is refused, and a refill reads again. An entry larger than the whole
-/// budget is never returned.
+/// 277-byte entries against an uneven budget overshot it by one entry),
+/// and a refused read reads nothing from the disk: frames are sized from
+/// the log's index. It returns the frames that fit and spends their bytes;
+/// once none fits it is refused, and a refill reads again. A frame larger
+/// than the whole budget is never read.
 #[test]
 fn a_metered_view_spends_and_refuses_its_budget() {
+    let disk = SimDisk::new();
     let mut log =
-        RaftLog::create(SimDisk::new(), Path::new(LOG_DIR), geometry().unwrap(), 1).unwrap();
+        RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry().unwrap(), 1).unwrap();
     let entries: Vec<Entry> = (1..=8)
         .map(|index| Entry {
             index,
@@ -254,31 +256,38 @@ fn a_metered_view_spends_and_refuses_its_budget() {
         .collect();
     let _ = log.append(&entries).unwrap();
     let _ = log.sync().unwrap();
+    let span = log.frame_span(1).unwrap();
+    assert!(span > 277, "a frame holds its header: {span}");
+    let room = 2 * span + span / 2;
     let budget = ReadBudget::new();
-    budget.refill(600);
+    budget.refill(room);
     let mut view = LogView::metered(&mut log, Some(&budget));
     let mut read = 0;
     let mut next = 1;
     while let Ok(more) = view.entries(next..9, u64::MAX) {
-        read += more.len() * 277;
+        read += more.len();
         next += u64::try_from(more.len()).unwrap();
     }
-    assert_eq!(read, 2 * 277, "two entries fit in 600 bytes, never a third");
-    assert_eq!(budget.left(), 600 - 2 * 277);
+    assert_eq!(read, 2, "two frames fit, never a third");
+    assert_eq!(budget.left(), room - 2 * span);
+    let before = disk.used();
     assert!(matches!(
         view.entries(next..9, u64::MAX),
         Err(ReadError::Budget)
     ));
-    budget.refill(600);
+    assert_eq!(disk.used(), before, "a refused read touches no disk");
+    budget.refill(room);
     assert!(
         !view.entries(next..9, u64::MAX).unwrap().is_empty(),
         "a new duty reads again"
     );
-    budget.refill(276);
+    budget.refill(span - 1);
+    let before = disk.used();
     assert!(
         matches!(view.entries(1..9, u64::MAX), Err(ReadError::Budget)),
-        "an entry larger than the budget is never returned"
+        "a frame larger than the budget is never read"
     );
+    assert_eq!(disk.used(), before);
     // Unmetered, the same read takes them all.
     let mut free = LogView::new(&mut log);
     assert_eq!(free.entries(1..9, u64::MAX).unwrap().len(), 8);
@@ -321,4 +330,126 @@ fn an_append_holds_to_the_in_flight_bytes() {
     assert!(refusals(&outcome.observations, Limit::InFlightBytes) > 0);
     assert_eq!(HEAVIEST.with(Cell::get), 0, "nothing sent past the cap");
     assert!(pass(&tight, &outcome).is_ok());
+}
+
+/// `Reference`, except that server 2 drops every append it is sent: a
+/// follower that never applies anything.
+#[derive(Debug)]
+struct Deaf(Reference, NodeId);
+
+impl ConsensusCore for Deaf {
+    type Message = Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        Self(Reference::recover(id, peers, log), id)
+    }
+
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, karyos_sim::harness::core::Unsupported> {
+        Reference::recover_with(id, peers, limits, log).map(|core| Self(core, id))
+    }
+
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Message>> {
+        self.0.ready(log)
+    }
+
+    fn step(&mut self, from: NodeId, message: Message, log: &mut LogView<'_>) {
+        if self.1 == 2 && matches!(message, Message::Append { .. }) {
+            return;
+        }
+        self.0.step(from, message, log);
+    }
+
+    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
+        self.0.propose(command, log)
+    }
+
+    fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
+        self.0.tick(now, log);
+    }
+
+    fn advance(&mut self, persisted: Persisted, log: &mut LogView<'_>) {
+        self.0.advance(persisted, log);
+    }
+
+    fn term(&self) -> u64 {
+        self.0.term()
+    }
+
+    fn leads(&self) -> bool {
+        self.0.leads()
+    }
+
+    fn received(&self) -> Option<u64> {
+        self.0.received()
+    }
+
+    fn committed(&self) -> Option<u64> {
+        self.0.committed()
+    }
+}
+
+/// W2 holds every up server to the same applied index and state
+/// (karyos#899 review, codex): a follower that never applies fails it,
+/// where the generic check, which compares only the servers at the
+/// highest index, lets it pass.
+#[test]
+fn a_follower_that_never_applies_fails_w2() {
+    use karyos_sim::harness::workloads::{Failed, W2};
+    let cases = W2::skeleton().cases().unwrap();
+    let nominal = &cases[0];
+    assert!(nominal.converged);
+    let outcome = run::<Deaf>(nominal, 1).unwrap();
+    assert!(
+        matches!(pass(nominal, &outcome), Err(Failed::Diverged(_))),
+        "{:?}",
+        outcome.states
+    );
+    let mut lax = nominal.clone();
+    lax.converged = false;
+    assert_eq!(
+        pass(&lax, &outcome),
+        Ok(None),
+        "the generic check misses it"
+    );
+}
+
+/// Every raw result line of a W2 run states its client window and the
+/// in-flight byte limit it does not reach, so a "pass" never hides the gap
+/// the run record states (karyos#899 review, codex); other workloads'
+/// lines have a window of 1 and no note.
+#[test]
+fn w2_lines_carry_their_window_and_coverage_note() {
+    use karyos_sim::harness::workloads::{W1, W2};
+    let w2 = |_seed: u64| W2::skeleton().cases().unwrap();
+    let w1 = |_seed: u64| W1::skeleton().cases().into_iter().take(1).collect();
+    let workloads: [Workload<'_>; 2] = [("W2", &w2), ("W1", &w1)];
+    let mut out = Vec::new();
+    let summary = run_corpus::<Reference>(
+        "reference",
+        Evidence::HarnessValidation,
+        &workloads,
+        (1..=1, 1),
+        &mut out,
+    )
+    .unwrap();
+    assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+    let text = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 6);
+    let note = format!("\"notes\":[\"{}\"]", W2::IN_FLIGHT_BYTES);
+    for line in &lines[..5] {
+        assert!(line.contains(&note), "{line}");
+        assert!(line.contains("\"window\":"), "{line}");
+    }
+    let windows: Vec<&str> = lines[..5]
+        .iter()
+        .filter_map(|line| line.split("\"window\":").nth(1)?.split(',').next())
+        .collect();
+    assert_eq!(windows, ["1", "32", "2", "1", "1"]);
+    assert!(lines[5].contains("\"window\":1,") && lines[5].contains("\"notes\":[]"));
 }

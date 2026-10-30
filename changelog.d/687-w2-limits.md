@@ -15,4 +15,8 @@
   off while the leader commits 10,000 entries, and one 4x the log-read
   limit behind. At 256 B the in-flight byte limit is never reached: every
   W2 run record states it, and the report scores it not demonstrated. The reference fixture honours every limit, as
-  harness validation.
+  harness validation. A metered read is sized from the log's index (`RaftLog::frame_span`,
+  new in karyos-cluster): a duty reads only whole frames that fit its
+  budget, and a refused read reads nothing. W2 holds every up server to
+  the same applied index and state, and every raw result line states its
+  client window and what the case does not cover.

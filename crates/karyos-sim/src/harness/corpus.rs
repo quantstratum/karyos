@@ -11,10 +11,12 @@
 //!   the field says so in the data, not only in documents. The runner
 //!   writes where its caller tells it, never into the evaluation record.
 //! - **A line** holds the evidence, the core, the workload, the case, the
-//!   seed, the repetitions of the determinism mode, the verdict ([`Verdict`]), whether the run ended at its step
-//!   bound with clients still waiting, the case's fault schedule as
-//!   `step:action`, the trace digest, and the error of a run that could
-//!   not be set up or stepped.
+//!   seed, the repetitions of the determinism mode, the client window
+//!   ([`Case::window`]), the verdict ([`Verdict`]), whether the run ended
+//!   at its step bound with clients still waiting, the case's fault
+//!   schedule as `step:action`, what the case does not cover
+//!   ([`Case::notes`]), the trace digest, and the error of a run that
+//!   could not be set up or stepped.
 //! - **Not yet.** Per-fault coverage (before the first commit, during
 //!   replication, after the last commit) and the minimised traces of
 //!   failing seeds (manifest, Corpora) need commit times in steps, which
@@ -217,18 +219,21 @@ impl Line<'_> {
             .iter()
             .map(|(step, action)| string(&format!("{step}:{action:?}")))
             .collect();
+        let notes: Vec<String> = self.case.notes.iter().map(|note| string(note)).collect();
         format!(
-            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"repetitions\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"digest\":{},\"error\":{}}}",
+            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"repetitions\":{},\"window\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"notes\":[{}],\"digest\":{},\"error\":{}}}",
             string(self.evidence.text()),
             string(self.core),
             string(self.workload),
             string(&self.case.name),
             self.seed,
             self.repetitions.max(1),
+            self.case.window.max(1),
             string(self.verdict.name()),
             self.bound,
             self.case.steps,
             schedule.join(","),
+            notes.join(","),
             self.digest
                 .map_or_else(|| "null".to_owned(), |digest| digest.to_string()),
             self.error.map_or_else(|| "null".to_owned(), string),

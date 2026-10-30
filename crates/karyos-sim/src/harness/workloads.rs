@@ -170,6 +170,8 @@ impl W2 {
         );
         case.payload = self.payload_bytes;
         case.limits = Some(self.limits);
+        case.converged = true;
+        case.notes = vec![Self::IN_FLIGHT_BYTES];
         case
     }
 
@@ -192,6 +194,8 @@ impl W2 {
         );
         case.payload = self.payload_bytes;
         case.limits = Some(self.limits);
+        case.converged = true;
+        case.notes = vec![Self::IN_FLIGHT_BYTES];
         case.window = window;
         let _ = case.sessions().ok_or(W2Overflow)?;
         // A refused request waits its retry interval: a few intervals.
@@ -228,6 +232,8 @@ impl W2 {
         );
         case.payload = self.payload_bytes;
         case.limits = Some(self.limits);
+        case.converged = true;
+        case.notes = vec![Self::IN_FLIGHT_BYTES];
         // By default, long enough for the share to commit while it is cut
         // off: a few steps for each operation.
         let work = u64::try_from(share)
@@ -379,6 +385,13 @@ pub struct Case {
     /// [`Case::operations`] each. A harness capability, named in every
     /// run record.
     pub window: usize,
+    /// Every up server must end at the same applied index and state, not
+    /// only those at the highest: W2's catch-up is the point of the case
+    /// (karyos#899 review).
+    pub converged: bool,
+    /// What the case does not cover, stated in every raw result line of
+    /// its runs: W2's [`W2::IN_FLIGHT_BYTES`].
+    pub notes: Vec<&'static str>,
 }
 
 impl Case {
@@ -421,6 +434,8 @@ impl Case {
             stay_on_primary: Vec::new(),
             limits: None,
             window: 1,
+            converged: false,
+            notes: Vec::new(),
         }
     }
 }
@@ -934,6 +949,14 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
         (Err(gap), Progress::MayStop) => Some(gap),
         (Err(gap), Progress::Expected) => return Err(Failed::Liveness(gap)),
     };
+    if case.converged
+        && outcome
+            .states
+            .windows(2)
+            .any(|pair| matches!(pair, [a, b] if (a.1, a.2) != (b.1, b.2)))
+    {
+        return Err(Failed::Diverged(outcome.states.clone()));
+    }
     let applied = outcome.states.iter().map(|(_, applied, _)| *applied).max();
     let mut digests = outcome
         .states

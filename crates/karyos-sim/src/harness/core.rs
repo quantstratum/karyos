@@ -78,8 +78,9 @@ pub struct LogView<'a> {
     budget: Option<&'a ReadBudget>,
 }
 
-/// A duty's log-read budget (W2's log-read limit): the payload bytes a
-/// core may still read through its [`LogView`]s this duty.
+/// A duty's log-read budget (W2's log-read limit): the log bytes a core
+/// may still read through its [`LogView`]s this duty, counted in whole
+/// frames as the log lays them out ([`RaftLog::frame_span`]).
 #[derive(Debug, Clone, Default)]
 pub struct ReadBudget {
     /// Bytes left this duty.
@@ -133,43 +134,43 @@ impl<'a> LogView<'a> {
     }
 
     /// Entries in `range`, up to `max_bytes` of frames (at least one).
-    /// Metered, it returns only the entries whose payloads fit in the
-    /// duty's budget left, and spends them: a duty never reads past its
-    /// budget, and an entry larger than what is left waits for the next
-    /// duty (karyos#899 review, codex).
+    /// Metered, it takes only the frames that fit in the duty's budget
+    /// left, sized from the log's index before anything is read
+    /// ([`RaftLog::frame_span`]), and spends their bytes: a duty never
+    /// reads past its budget, and a refused read reads nothing (karyos#899
+    /// review, codex).
     ///
     /// # Errors
     ///
-    /// [`ReadError::Budget`] when not one entry fits in the budget left,
+    /// [`ReadError::Budget`] when not one frame fits in the budget left,
     /// and the log's read error.
     pub fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, ReadError> {
         let Some(budget) = self.budget else {
             return Ok(self.log.entries(range, max_bytes)?);
         };
         let left = budget.left();
-        if left == 0 {
-            return Err(ReadError::Budget);
+        let (mut end, mut spent) = (range.start, 0u64);
+        while end < range.end {
+            let Some(next) = self
+                .log
+                .frame_span(end)
+                .and_then(|span| spent.checked_add(span))
+                .filter(|next| *next <= left && (end == range.start || *next <= max_bytes))
+            else {
+                break;
+            };
+            spent = next;
+            end = end.checked_add(1).ok_or(ReadError::Budget)?;
         }
-        let mut entries = self.log.entries(range, max_bytes.min(left))?;
-        // The log returns at least one entry; keep those that fit.
-        let mut spent = 0u64;
-        let fits = entries
-            .iter()
-            .take_while(|entry| {
-                let next = u64::try_from(entry.payload.len())
-                    .ok()
-                    .and_then(|bytes| spent.checked_add(bytes))
-                    .filter(|next| *next <= left);
-                if let Some(next) = next {
-                    spent = next;
-                }
-                next.is_some()
-            })
-            .count();
-        if fits == 0 {
-            return Err(ReadError::Budget);
+        if end == range.start {
+            // Nothing fits, or the log holds nothing there: a log that
+            // holds the entry refuses it for the budget, unread.
+            if self.log.frame_span(range.start).is_some() {
+                return Err(ReadError::Budget);
+            }
+            return Ok(Vec::new());
         }
-        entries.truncate(fits);
+        let entries = self.log.entries(range.start..end, u64::MAX)?;
         budget
             .left
             .set(left.checked_sub(spent).ok_or(ReadError::Budget)?);
@@ -224,7 +225,7 @@ pub struct Limits {
     pub in_flight_bytes: u64,
     /// Client requests a server holds, proposed and not committed, at most.
     pub queue: u64,
-    /// Payload bytes a server reads from its log per duty, at most (the
+    /// Log bytes a server reads per duty, in whole frames, at most (the
     /// harness enforces it: [`ReadBudget`]).
     pub log_read_bytes: u64,
 }

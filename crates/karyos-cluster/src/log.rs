@@ -708,6 +708,21 @@ impl<D: Disk + Clone> RaftLog<D> {
             .map(|(_, term)| *term)
     }
 
+    /// The bytes entry `index`'s frame spans in the log, from its start to
+    /// the next frame's (any padding between included), read from the
+    /// in-memory index without touching the store; `None` when the log
+    /// does not hold it.
+    #[must_use]
+    pub fn frame_span(&self, index: u64) -> Option<u64> {
+        let slot = self.slot(index)?;
+        let (start, _) = *self.entries.get(slot)?;
+        let end = match slot.checked_add(1).and_then(|next| self.entries.get(next)) {
+            Some((next, _)) => *next,
+            None => self.store.written(),
+        };
+        end.checked_sub(start)
+    }
+
     fn slot(&self, index: u64) -> Option<usize> {
         usize::try_from(index.checked_sub(self.first_index)?).ok()
     }
