@@ -14,7 +14,7 @@
 //!   restart** reopens the log and rebuilds the core from it
 //!   ([`ConsensusCore::recover`]); a refused open is recorded as an
 //!   [`Observation::OpenFailed`], and the node stays down.
-//! - **A log error** in [`drive`] stops the node until a restart. One the
+//! - **A log error** in [`drive`](super::core::drive) stops the node until a restart. One the
 //!   core caused by breaking C4's contract (an append that is not next, a
 //!   term or commit going back, a truncation below the commit) is an
 //!   [`Observation::Contract`], which the checks report as a violation;
@@ -48,8 +48,8 @@ use karyos_archive::segment::Geometry;
 use karyos_cluster::{Entry, LogError, RaftLog};
 
 use super::core::{
-    Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, Limits, LogView,
-    ReadBudget, Release, Step, Unsupported, drive_metered,
+    Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, Limit, Limits,
+    LogView, ReadBudget, Refused, Release, Step, Unsupported, drive_metered,
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
@@ -509,7 +509,7 @@ mod shared_log_tests {
 /// What a node reports, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Observation {
-    /// A server's [`drive`] step.
+    /// A server's [`drive`](super::core::drive) step.
     Drive {
         /// The server.
         node: NodeId,
@@ -602,6 +602,18 @@ pub enum Observation {
         client: NodeId,
         /// The answer's generation.
         generation: u64,
+    },
+    /// A server's core refused a client request with backpressure (W2):
+    /// the client was told, and sends it again.
+    Backpressure {
+        /// The server.
+        node: NodeId,
+        /// The client.
+        client: NodeId,
+        /// The request's sequence.
+        sequence: u64,
+        /// The limit it named.
+        limit: Limit,
     },
     /// A standby server refused a feed entry, and the rest of its send.
     FeedRefused {
@@ -1413,12 +1425,24 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
                     Ok(()) => {
                         let _ = self.pending.insert(key);
                     }
-                    Err(_) => out.push((
-                        command.client,
-                        Wire::Refused {
-                            sequence: command.sequence,
-                        },
-                    )),
+                    Err(refused) => {
+                        if let Refused::Backpressure(limit) = refused {
+                            self.recorder.borrow_mut().observations.push(
+                                Observation::Backpressure {
+                                    node: self.id,
+                                    client: command.client,
+                                    sequence: command.sequence,
+                                    limit,
+                                },
+                            );
+                        }
+                        out.push((
+                            command.client,
+                            Wire::Refused {
+                                sequence: command.sequence,
+                            },
+                        ));
+                    }
                 }
             }
             Wire::Change(change) => {

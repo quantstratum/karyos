@@ -873,6 +873,7 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::Configuration { node, .. }
         | Observation::Change { node, .. }
         | Observation::FeedRefused { node, .. }
+        | Observation::Backpressure { node, .. }
         | Observation::FeedApplied { node, .. }
         | Observation::Promoted { node, .. } => Some(*node),
         Observation::Success { .. }

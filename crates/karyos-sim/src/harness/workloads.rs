@@ -9,10 +9,11 @@
 //!
 //! Each workload is a struct whose fields are the ADR table's frozen
 //! dimensions, holding the values this skeleton runs; each one's doc names
-//! the values the ADR freezes where the skeleton runs fewer. W2 and W5
-//! need what the harness does not have yet (declared capacity limits,
-//! snapshots, client retries): [`w2`] and [`w5`] return a [`NotYet`]
-//! saying so.
+//! the values the ADR freezes where the skeleton runs fewer. W5 needs
+//! what the harness does not have yet (snapshots, client retries across a
+//! leader change): [`w5`] returns a [`NotYet`] saying so. W2 declares its
+//! limits to the core ([`Case::limits`]); a core that takes none has its
+//! W2 cases not demonstrated, never passed.
 //!
 //! [`run`] runs one case of any [`ConsensusCore`] and returns an
 //! [`Outcome`] with safety ([`check::all`]) and liveness ([`Liveness`])
@@ -26,10 +27,10 @@ use karyos_archive::segment::{Geometry, SegmentError};
 use karyos_cluster::LogError;
 
 use super::check::{self, Violation};
-use super::core::{Change, ConsensusCore};
+use super::core::{Change, ConsensusCore, Limits, Unsupported};
 use super::node::{
-    ClientNode, Member, Observation, Op, RETRY_AFTER, Recorder, Ret, ServerNode, ServiceModel,
-    Shared, TestService, Wire,
+    ClientNode, Member, Observation, Op, RETRY_AFTER, Recorder, Ret, ServerError, ServerNode,
+    ServiceModel, Shared, TestService, Wire,
 };
 use super::reference;
 use super::standby::{ExternalLease, FeedFault, Fencing};
@@ -52,17 +53,109 @@ pub struct NotYet {
     pub reason: &'static str,
 }
 
-/// W2, capacity and slow follower.
+/// W2, capacity and slow follower (karyos#687), under declared
+/// [`Limits`].
 ///
-/// # Errors
+/// The manifest freezes 3 servers, 32 clients, 256 B payloads, the limits
+/// of [`Limits::W2`], bursts at 4x each limit, and a follower paused for
+/// 2,000 ticks while the leader continues, then catching up from 10,000
+/// entries behind. The pause is an isolation: the follower runs, and
+/// nothing reaches it or leaves it. Its pass condition is W1's, the
+/// follower caught up to the same state, with every refusal typed.
 ///
-/// Always [`NotYet`].
-pub fn w2() -> Result<Vec<Case>, NotYet> {
-    Err(NotYet {
-        workload: "W2",
-        reason: "needs declared in-flight, queue and log-read limits with typed \
-                 backpressure, and allocation counters, in the core interface",
-    })
+/// **Not yet run:** the bursts. A client keeps one request open, so 32
+/// clients cannot hold the 4,096 requests a burst at 4x the queue needs,
+/// nor 256 in flight; and at 256 B, 64 entries are 16 KiB, so the 1 MiB
+/// in-flight byte limit is never the one reached. These wait for a
+/// decision on pipelined clients (karyos#687).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct W2 {
+    /// Servers.
+    pub processes: usize,
+    /// Clients.
+    pub clients: usize,
+    /// Bytes per appended value.
+    pub payload_bytes: usize,
+    /// The declared limits.
+    pub limits: Limits,
+    /// Steps the follower is cut off.
+    pub pause: u64,
+    /// Entries committed while it is cut off, at least.
+    pub behind: u64,
+}
+
+impl W2 {
+    /// The follower the slow case cuts off: not the reference's leader.
+    pub const SLOW: NodeId = 2;
+
+    /// The values the manifest freezes.
+    #[must_use]
+    pub fn manifest() -> Self {
+        Self {
+            processes: 3,
+            clients: 32,
+            payload_bytes: 256,
+            limits: Limits::W2,
+            pause: 2_000,
+            behind: 10_000,
+        }
+    }
+
+    /// The values the skeleton runs in the test suite: the manifest's
+    /// shape, a tenth of its catch-up, and a pause long enough for the
+    /// fewer clients to commit it.
+    #[must_use]
+    pub fn skeleton() -> Self {
+        Self {
+            clients: 8,
+            pause: 1_000,
+            behind: 1_000,
+            ..Self::manifest()
+        }
+    }
+
+    /// Its cases: the clients under the limits, and the slow follower.
+    #[must_use]
+    pub fn cases(&self) -> Vec<Case> {
+        let clients = self.clients.max(1);
+        let mut nominal = Case::healthy(
+            &format!("W2 n={} clients={} nominal", self.processes, clients),
+            self.processes,
+            clients,
+            4,
+        );
+        nominal.payload = self.payload_bytes;
+        nominal.limits = Some(self.limits);
+        // Every client's share of the entries the follower misses, and
+        // two more each for what it holds before it is cut off.
+        let share = usize::try_from(self.behind)
+            .unwrap_or(usize::MAX)
+            .div_ceil(clients)
+            .saturating_add(2);
+        let mut slow = Case::healthy(
+            &format!(
+                "W2 n={} clients={} slow follower {} behind",
+                self.processes, clients, self.behind
+            ),
+            self.processes,
+            clients,
+            share,
+        );
+        slow.payload = self.payload_bytes;
+        slow.limits = Some(self.limits);
+        let healed = self.pause.saturating_add(10);
+        slow.schedule = vec![(10, Action::Isolate(Self::SLOW)), (healed, Action::Heal)];
+        // The clients' work (a few steps per operation, generously), or
+        // the pause if longer, then twice the catch-up the reference
+        // needs at its in-flight entries per resend.
+        let work = u64::try_from(share).unwrap_or(u64::MAX).saturating_mul(8);
+        let catch_up = self
+            .behind
+            .div_ceil(self.limits.in_flight_entries.max(1))
+            .saturating_mul(reference::RESEND);
+        slow.steps = healed.max(work).saturating_add(catch_up.saturating_mul(2));
+        vec![nominal, slow]
+    }
 }
 
 /// W5, snapshots and retries.
@@ -186,6 +279,9 @@ pub struct Case {
     pub feed_faults: Vec<(u64, FeedFault)>,
     /// Clients, by index, that stay on the primary after a promotion.
     pub stay_on_primary: Vec<usize>,
+    /// The limits every server's core is declared (W2), if any: a core
+    /// that takes none cannot run the case ([`RunError::Unsupported`]).
+    pub limits: Option<Limits>,
 }
 
 impl Case {
@@ -217,6 +313,7 @@ impl Case {
             lease_margin: 0,
             feed_faults: Vec::new(),
             stay_on_primary: Vec::new(),
+            limits: None,
         }
     }
 }
@@ -303,6 +400,9 @@ pub enum RunError {
     Geometry(SegmentError),
     /// A count beyond the node id range.
     Count,
+    /// The case declares limits its core does not take: what it would
+    /// show is not demonstrated for that core, never passed.
+    Unsupported(Unsupported),
 }
 
 /// The servers' log geometry: terms that fit the largest W1 payload.
@@ -409,15 +509,30 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         }
         let in_standby = standby.contains(&id);
         let group = if in_standby { &standby } else { &peers };
-        let mut server = ServerNode::<C>::new(
-            id,
-            group.clone(),
-            disk,
-            per_server(case.survives, id),
-            geometry,
-            Rc::clone(&recorder),
-        )
-        .map_err(RunError::Log)?;
+        let survives = per_server(case.survives, id);
+        let mut server = match case.limits {
+            None => ServerNode::<C>::new(
+                id,
+                group.clone(),
+                disk,
+                survives,
+                geometry,
+                Rc::clone(&recorder),
+            )
+            .map_err(RunError::Log)?,
+            Some(limits) => ServerNode::<C>::with_limits(
+                id,
+                group.clone(),
+                (disk, survives),
+                geometry,
+                Rc::clone(&recorder),
+                limits,
+            )
+            .map_err(|error| match error {
+                ServerError::Log(error) => RunError::Log(error),
+                ServerError::Unsupported(unsupported) => RunError::Unsupported(unsupported),
+            })?,
+        };
         if in_standby {
             server = server.as_standby(primary.clone());
         } else {

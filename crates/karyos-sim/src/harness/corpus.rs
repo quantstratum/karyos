@@ -26,7 +26,7 @@ use std::io::Write;
 use std::ops::RangeInclusive;
 
 use super::core::ConsensusCore;
-use super::workloads::{Case, Failed, pass, run};
+use super::workloads::{Case, Failed, RunError, pass, run};
 
 /// What a run is evidence of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +59,9 @@ pub enum Verdict {
     Failed(&'static str),
     /// It could not be set up or stepped.
     Error,
+    /// The case needs a capability the core does not have (a W2 case's
+    /// limits): nothing was shown, so it neither passes nor fails.
+    NotDemonstrated,
 }
 
 impl Verdict {
@@ -70,6 +73,7 @@ impl Verdict {
             Self::LivenessGap => "liveness_gap",
             Self::Failed(kind) => kind,
             Self::Error => "error",
+            Self::NotDemonstrated => "not_demonstrated",
         }
     }
 }
@@ -100,6 +104,8 @@ pub struct Summary {
     pub failed: Vec<(String, String, u64)>,
     /// Runs that could not be set up or stepped.
     pub errors: u64,
+    /// Runs whose case needs a capability the core does not have.
+    pub not_demonstrated: u64,
 }
 
 /// One workload: its name and its cases under a seed (W4's survival modes
@@ -144,6 +150,7 @@ pub fn run_corpus<C: ConsensusCore>(
                             None,
                         )
                     }
+                    Err(RunError::Unsupported(_)) => (Verdict::NotDemonstrated, false, None, None),
                     Err(error) => (Verdict::Error, false, None, Some(format!("{error:?}"))),
                 };
                 summary.runs = summary.runs.saturating_add(1);
@@ -158,6 +165,9 @@ pub fn run_corpus<C: ConsensusCore>(
                             .push(((*workload).to_owned(), case.name.clone(), seed));
                     }
                     Verdict::Error => summary.errors = summary.errors.saturating_add(1),
+                    Verdict::NotDemonstrated => {
+                        summary.not_demonstrated = summary.not_demonstrated.saturating_add(1);
+                    }
                 }
                 if bound {
                     summary.step_bound = summary.step_bound.saturating_add(1);

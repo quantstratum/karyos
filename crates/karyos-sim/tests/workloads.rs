@@ -18,7 +18,7 @@
 
 use karyos_sim::harness::reference::Reference;
 use karyos_sim::harness::workloads::{
-    self, ADR_0043, Failed, Liveness, Progress, W1, W3, W3Fault, W4, W4Cut, W6,
+    self, ADR_0043, Action, Failed, Liveness, Progress, W1, W2, W3, W3Fault, W4, W4Cut, W6,
 };
 use karyos_sim::scenarios;
 
@@ -35,8 +35,60 @@ fn corpus() -> Vec<u64> {
 fn the_module_records_its_adr_revision() {
     assert!(ADR_0043.contains("03ffb394"));
     assert!(ADR_0043.contains("Proposed"));
-    assert_eq!(workloads::w2().unwrap_err().workload, "W2");
     assert_eq!(workloads::w5().unwrap_err().workload, "W5");
+}
+
+/// W2's skeleton under the declared limits (harness validation): the
+/// clients complete, and the follower cut off while the leader commits
+/// its entries catches up to the same state.
+#[test]
+fn w2_passes() {
+    let w2 = W2::skeleton();
+    let cases = w2.cases();
+    assert_eq!(cases.len(), 2);
+    for case in &cases {
+        assert_eq!(case.limits, Some(w2.limits));
+        let outcome = workloads::run::<Reference>(case, 1).unwrap();
+        assert_eq!(workloads::pass(case, &outcome), Ok(None), "{}", case.name);
+        let applied: Vec<_> = outcome
+            .states
+            .iter()
+            .map(|(_, applied, _)| *applied)
+            .collect();
+        assert!(
+            applied.windows(2).all(|pair| pair[0] == pair[1]),
+            "{}: {applied:?}",
+            case.name
+        );
+    }
+    // The same run stopped as the pause ends: the follower is the case's
+    // `behind` entries back, or more.
+    let slow = &cases[1];
+    let mut paused = slow.clone();
+    paused.steps = w2.pause + 10;
+    paused
+        .schedule
+        .retain(|(_, action)| !matches!(action, Action::Heal));
+    paused.quiet = 0;
+    paused.progress = Progress::MayStop;
+    let outcome = workloads::run::<Reference>(&paused, 1).unwrap();
+    let applied = |node| {
+        outcome
+            .states
+            .iter()
+            .find(|(id, ..)| *id == node)
+            .and_then(|(_, applied, _)| *applied)
+            .unwrap_or(0)
+    };
+    let gap = applied(0).saturating_sub(applied(W2::SLOW));
+    assert!(gap >= w2.behind, "{gap} behind at the heal");
+    let manifest = W2::manifest();
+    assert_eq!(manifest.limits, karyos_sim::harness::core::Limits::W2);
+    assert_eq!(
+        (manifest.processes, manifest.clients, manifest.payload_bytes),
+        (3, 32, 256)
+    );
+    assert_eq!((manifest.pause, manifest.behind), (2_000, 10_000));
 }
 
 #[test]
@@ -63,6 +115,18 @@ fn w1_passes() {
                 case.name
             );
         }
+    }
+}
+
+/// W2 at the manifest's values (harness validation): 32 clients, and the
+/// follower catching up from 10,000 entries behind. About 30 s in a
+/// release build.
+#[test]
+#[ignore = "the manifest's W2 takes long; run on request"]
+fn w2_manifest_passes() {
+    for case in W2::manifest().cases() {
+        let outcome = workloads::run::<Reference>(&case, 1).unwrap();
+        assert_eq!(workloads::pass(&case, &outcome), Ok(None), "{}", case.name);
     }
 }
 
