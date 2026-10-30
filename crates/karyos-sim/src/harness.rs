@@ -32,6 +32,7 @@ pub mod corpus;
 pub mod delivery;
 pub mod membership;
 pub mod node;
+pub mod probe;
 pub mod reference;
 pub mod standby;
 pub mod workloads;

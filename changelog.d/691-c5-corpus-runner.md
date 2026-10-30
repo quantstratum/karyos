@@ -23,3 +23,19 @@
   W1, W3, W4 and W6, ignored by default, and prints the time and size.
   Per-fault coverage and minimised traces of failing seeds are a later
   step.
+- The C5 allocation gate's probe (part of karyos#691).
+  - `karyos_sys::alloc_count` counts a set of threads: a thread enrolls
+    (`enroll`) and `window` sums every enrolled thread's allocations and
+    frees while it runs, for a path that spans an executor's tasks or a
+    background thread.
+  - `karyos_sim::harness::probe::Probed<C>` wraps a core so that each of
+    its calls, once it has committed `WARMUP` (16) entries, is counted.
+  - `measure` reports the allocations and frees per entry the leaders
+    committed past the warm-up.
+  - The declared path is every `ConsensusCore` call plus any thread the
+    adapter declares in the run record.
+  - `tests/allocation.rs` checks the probe: a known allocation counts, a
+    no-op and an unenrolled thread count nothing, and a declared second
+    thread counts. It also measures the `Reference` fixture on W1 (about
+    62 allocations per entry: it is no candidate, and the line says
+    "harness validation, not C5 evidence").
