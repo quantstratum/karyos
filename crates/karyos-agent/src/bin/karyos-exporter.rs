@@ -3,9 +3,10 @@
 //! `karyos-exporter`: the agent's view of each driver in the Prometheus
 //! text format, over HTTP on a loopback address (SPEC.md §11, ADR-0055;
 //! quantstratum-docs: karyos/design/management-agent-gap-analysis.md, M8;
-//! owner item 51, interim 4). A separate process from `karyos-agent`; off
-//! unless started. Exit status: 2 on a bad command line or when the address
-//! cannot be bound, 1 when serving fails.
+//! owner item 51, interim 4; R-CORE-39, karyos#734). A separate process
+//! from `karyos-agent`; off unless started. Exit status: 2 on a bad command
+//! line, an address that cannot be bound or a token file refused, 1 when
+//! serving fails.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -39,7 +40,20 @@ fn serve(args: karyos_agent::cli::ExporterArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let mut agent = Agent::new(AgentConfig::new(args.drivers));
+    if let Some(path) = &args.token_file {
+        match exporter::Token::read(path) {
+            Ok(token) => listener = listener.with_token(token),
+            Err(error) => {
+                let _ = writeln!(std::io::stderr(), "karyos-exporter: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let mut config = AgentConfig::new(args.drivers);
+    if let Some(id) = args.agent_id {
+        config = config.with_agent_id(id);
+    }
+    let mut agent = Agent::new(config);
     // Between refreshes the listener is polled every 10 ms; a scrape reads
     // the view of the last refresh.
     let tick = Duration::from_millis(10).min(args.refresh);
