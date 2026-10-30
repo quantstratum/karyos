@@ -91,10 +91,29 @@ fn each_armed_driver_takes_its_own_fault() {
     assert!(!crate::api::driver::take_fault(d), "disarmed at its close");
 }
 
-/// An arm racing a close is never left on the closed driver (karyos#699):
-/// it is armed inside the table's guard, so it either precedes the close,
-/// which disarms it, or is refused with the handle's error. A stress
-/// check: the window the fix closes is too narrow to hit reliably.
+/// A close right after the arm's table check, forced through the test
+/// seam (karyos#699): the fault, armed inside the table's guard, is
+/// disarmed by that close. With the arm after the guard, as before, the
+/// close found nothing armed and the fault stayed on the closed driver.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_close_right_after_the_check_leaves_nothing_armed() {
+    let _serial = serial();
+    let driver = invoker();
+    crate::api::driver::AFTER_CHECK.with(|hook| {
+        hook.set(Some(|driver| {
+            assert_eq!(karyos_driver_close(driver), Status::Ok.code());
+        }));
+    });
+    let _ = karyos_test_panic_next_duty_cycle(driver);
+    assert!(
+        !crate::api::driver::take_fault(driver),
+        "armed after its close"
+    );
+}
+
+/// An arm racing a close is never left on the closed driver (karyos#699),
+/// from another thread: a stress check beside the forced case above.
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn an_arm_racing_a_close_is_never_left_armed() {
