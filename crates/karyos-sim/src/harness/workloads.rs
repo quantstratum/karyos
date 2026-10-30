@@ -234,6 +234,7 @@ impl W2 {
         case.limits = Some(self.limits);
         case.converged = true;
         case.notes = vec![Self::IN_FLIGHT_BYTES];
+        case.behind = Some((Self::SLOW, behind));
         // By default, long enough for the share to commit while it is cut
         // off: a few steps for each operation.
         let work = u64::try_from(share)
@@ -392,6 +393,11 @@ pub struct Case {
     /// What the case does not cover, stated in every raw result line of
     /// its runs: W2's [`W2::IN_FLIGHT_BYTES`].
     pub notes: Vec<&'static str>,
+    /// A follower cut off until the first heal, and the entries the
+    /// leaders must have committed past its own commit by then: W2's slow
+    /// follower must really be that far behind, or the case fails
+    /// ([`Failed::NotBehind`]; karyos#899 review).
+    pub behind: Option<(NodeId, u64)>,
 }
 
 impl Case {
@@ -436,8 +442,38 @@ impl Case {
             window: 1,
             converged: false,
             notes: Vec::new(),
+            behind: None,
         }
     }
+}
+
+/// How far the leaders' commit was past `follower`'s own at the first
+/// heal: the highest commit a leader observed before it, less the
+/// follower's highest commit before it; `None` without a heal, or with the
+/// follower ahead of the leaders, neither of which is a gap.
+fn gap_at_heal(observations: &[Observation], follower: NodeId) -> Option<u64> {
+    let heal = observations
+        .iter()
+        .position(|observation| matches!(observation, Observation::Healed))?;
+    let before = observations.get(..heal).unwrap_or_default();
+    let highest = |wanted: &dyn Fn(NodeId, bool) -> bool| {
+        before
+            .iter()
+            .filter_map(|observation| match observation {
+                Observation::Commit {
+                    node,
+                    leader,
+                    index,
+                    ..
+                } if wanted(*node, *leader) => Some(*index),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    };
+    let leaders = highest(&|_, leader| leader);
+    let own = highest(&|node, _| node == follower);
+    leaders.checked_sub(own)
 }
 
 /// The quiet period: steps a run takes after restarting its crashed and
@@ -504,6 +540,14 @@ pub enum Failed {
         expected: u64,
         /// The up servers' last applied index and digest.
         states: Vec<(NodeId, Option<u64>, u64)>,
+    },
+    /// The cut-off follower was not as far behind at the heal as the case
+    /// requires ([`Case::behind`]).
+    NotBehind {
+        /// The entries required.
+        required: u64,
+        /// The entries the leaders' commits were past the follower's.
+        reached: u64,
     },
 }
 
@@ -742,7 +786,10 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             Action::Isolate(id) => sim.net_mut().isolate(id, &everyone),
             Action::Cut { from, to } => sim.net_mut().cut(from, to),
             Action::Split { left, right } => sim.net_mut().split(&left, &right),
-            Action::Heal => sim.net_mut().heal(),
+            Action::Heal => {
+                sim.net_mut().heal();
+                recorder.borrow_mut().observations.push(Observation::Healed);
+            }
             Action::Join(id) => {
                 sim.restart(id).map_err(RunError::Node)?;
                 if !joined.contains(&id) {
@@ -949,6 +996,17 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
         (Err(gap), Progress::MayStop) => Some(gap),
         (Err(gap), Progress::Expected) => return Err(Failed::Liveness(gap)),
     };
+    if let Some((follower, required)) = case.behind {
+        match gap_at_heal(&outcome.observations, follower) {
+            Some(reached) if reached >= required => {}
+            reached => {
+                return Err(Failed::NotBehind {
+                    required,
+                    reached: reached.unwrap_or_default(),
+                });
+            }
+        }
+    }
     if case.converged
         && outcome
             .states

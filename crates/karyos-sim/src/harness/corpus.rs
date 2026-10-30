@@ -88,6 +88,7 @@ const fn failed_kind(failed: &Failed) -> &'static str {
         Failed::Diverged(_) => "failed_diverged",
         Failed::NotReplayed => "failed_not_replayed",
         Failed::WrongState { .. } => "failed_wrong_state",
+        Failed::NotBehind { .. } => "failed_not_behind",
     }
 }
 

@@ -683,6 +683,9 @@ pub enum Observation {
         /// written yet.
         entry_term: Option<u64>,
     },
+    /// The harness healed every link ([`super::workloads::Action::Heal`]):
+    /// a mark in the order of observations.
+    Healed,
     /// A server's core answered an operator's membership change.
     Change {
         /// The server.

@@ -460,3 +460,103 @@ fn w2_lines_carry_their_window_and_coverage_note() {
     assert!(lines[5].contains("\"window\":1,") && lines[5].contains("\"notes\":[]"));
     assert!(lines[5].contains("\"limits\":null"), "{}", lines[5]);
 }
+
+thread_local! {
+    /// The step `Lazy`'s leader waits for before it replicates.
+    static WAKE: Cell<u64> = const { Cell::new(0) };
+}
+
+/// `Reference` whose leader sends nothing until [`WAKE`]: no entry commits
+/// while the follower is cut off, so it is never behind.
+#[derive(Debug)]
+struct Lazy(Reference);
+
+impl ConsensusCore for Lazy {
+    type Message = Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        Self(Reference::recover(id, peers, log))
+    }
+
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, karyos_sim::harness::core::Unsupported> {
+        Reference::recover_with(id, peers, limits, log).map(Self)
+    }
+
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Message>> {
+        self.0.ready(log)
+    }
+
+    fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
+        if now >= WAKE.with(Cell::get) {
+            self.0.tick(now, log);
+        }
+    }
+
+    fn step(&mut self, from: NodeId, message: Message, log: &mut LogView<'_>) {
+        self.0.step(from, message, log);
+    }
+
+    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
+        self.0.propose(command, log)
+    }
+
+    fn advance(&mut self, persisted: Persisted, log: &mut LogView<'_>) {
+        self.0.advance(persisted, log);
+    }
+
+    fn term(&self) -> u64 {
+        self.0.term()
+    }
+
+    fn leads(&self) -> bool {
+        self.0.leads()
+    }
+
+    fn received(&self) -> Option<u64> {
+        self.0.received()
+    }
+
+    fn committed(&self) -> Option<u64> {
+        self.0.committed()
+    }
+}
+
+/// W2's slow follower must really be behind at the heal (karyos#899
+/// review, codex): a core that commits nothing until then ends with every
+/// server in the same state, and still fails the case.
+#[test]
+fn a_follower_never_behind_fails_the_slow_case() {
+    use karyos_sim::harness::workloads::{Action, Failed, W2};
+    let cases = W2::skeleton().cases().unwrap();
+    let slow = cases
+        .iter()
+        .find(|case| case.name.contains("slow follower"))
+        .unwrap();
+    let healed = slow
+        .schedule
+        .iter()
+        .find_map(|(step, action)| matches!(action, Action::Heal).then_some(*step))
+        .unwrap();
+    WAKE.with(|wake| wake.set(healed));
+    let outcome = run::<Lazy>(slow, 1).unwrap();
+    WAKE.with(|wake| wake.set(0));
+    assert!(
+        matches!(
+            pass(slow, &outcome),
+            Err(Failed::NotBehind { reached: 0, .. })
+        ),
+        "{:?}",
+        pass(slow, &outcome)
+    );
+    let mut lax = slow.clone();
+    lax.behind = None;
+    assert!(
+        pass(&lax, &outcome).is_ok(),
+        "without the requirement it passes"
+    );
+}

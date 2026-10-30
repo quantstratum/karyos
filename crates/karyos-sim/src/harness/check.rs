@@ -879,7 +879,8 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         Observation::Success { .. }
         | Observation::StaleGeneration { .. }
         | Observation::Fenced { .. }
-        | Observation::PromotionRefused { .. } => None,
+        | Observation::PromotionRefused { .. }
+        | Observation::Healed => None,
     }
 }
 
