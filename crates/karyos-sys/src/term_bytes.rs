@@ -154,7 +154,7 @@ pub(crate) mod sealed {
 
 /// The term memory of a log buffer: [`HeapTerms`] or [`SharedTerms`].
 /// Sealed: no other implementation exists.
-pub trait TermBytes: sealed::Access + Debug + Send + Sync {}
+pub trait TermBytes: sealed::Access + Debug + Send + Sync + 'static {}
 
 fn checked_len(term_length: TermLength, slots: u8) -> Result<usize, SysError> {
     let len = (term_length.get() as usize)

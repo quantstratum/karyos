@@ -30,22 +30,116 @@
 //!
 //! [`SenderRead::lease_committed`]: super::SenderRead::lease_committed
 
-use core::sync::atomic::{Ordering, fence};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
+use std::sync::Arc;
 
-use super::{BufferOwner, LogBuffer};
+use super::LogBuffer;
 use crate::frame::Word0;
 use crate::loan::release_loan;
 use crate::publication::load_interior;
 use crate::sizing::align_frame;
-use crate::term_bytes::sealed::Access as _;
+use crate::term_bytes::TermBytes;
+
+/// A buffer a lease can outlive a borrow of: its bank words and its term
+/// bytes, whatever its term memory. Implemented only by [`LogBuffer`];
+/// a lease holds it as `Arc<dyn LeaseSource>`, the same allocation as
+/// the owner's `Arc`, so a lease names no buffer type and a backend can
+/// keep leases of any buffer (R-CORE-45).
+pub trait LeaseSource: core::fmt::Debug + Send + Sync {
+    /// The lease bank's words.
+    fn lease_words(&self) -> &[AtomicU64];
+
+    /// Copies the validated frames from `start` of `slot`, `len` bytes,
+    /// into `out` as a copy read lays them out.
+    ///
+    /// # Errors
+    ///
+    /// As [`ReadLease::copy_to`].
+    fn copy_frames(
+        &self,
+        slot: u8,
+        start: u32,
+        len: usize,
+        out: &mut [u8],
+    ) -> Result<usize, LeaseCopyError>;
+}
+
+impl<T: TermBytes> LeaseSource for LogBuffer<T> {
+    fn lease_words(&self) -> &[AtomicU64] {
+        LogBuffer::lease_words(self)
+    }
+
+    fn copy_frames(
+        &self,
+        slot: u8,
+        start: u32,
+        len: usize,
+        out: &mut [u8],
+    ) -> Result<usize, LeaseCopyError> {
+        let out = out
+            .get_mut(..len)
+            .ok_or(LeaseCopyError::TooSmall { needed: len })?;
+        let end = u32::try_from(len)
+            .ok()
+            .and_then(|len| start.checked_add(len))
+            .ok_or(LeaseCopyError::Changed)?;
+        let mut at = start;
+        let mut stride = 0usize;
+        while at < end {
+            // SAFETY: the caller's lease holds a loan pinning this slot's
+            // term (module documentation, Safety); `at` is a frame start
+            // the lease validated, a location only ever accessed
+            // atomically.
+            let word = unsafe { self.regions.word0(slot, at) };
+            let raw = load_interior(word);
+            let length = Word0::unpack(raw)
+                .ok()
+                .and_then(|word| u32::try_from(word.frame_length()).ok())
+                .ok_or(LeaseCopyError::Changed)?;
+            let reserved = align_frame(length).map_err(|_| LeaseCopyError::Changed)?;
+            let frame_end = at.checked_add(length).filter(|frame_end| *frame_end <= end);
+            let (Some(_), Ok(length)) = (frame_end, usize::try_from(length)) else {
+                return Err(LeaseCopyError::Changed);
+            };
+            let out_end = stride.checked_add(length).ok_or(LeaseCopyError::Changed)?;
+            let target = out
+                .get_mut(stride..out_end)
+                .ok_or(LeaseCopyError::Changed)?;
+            let (head, body) = target
+                .split_at_mut_checked(8)
+                .ok_or(LeaseCopyError::Changed)?;
+            head.copy_from_slice(&raw.to_le_bytes());
+            let body_at = at.checked_add(8).ok_or(LeaseCopyError::Changed)?;
+            // SAFETY: the lease's loan is held; the bytes after word 0 lie
+            // inside the frame, inside a block the lease validated.
+            unsafe { self.regions.read_bytes(slot, body_at, body) };
+            // As the copy path: a word 0 that changed means the copy may
+            // mix two values.
+            fence(Ordering::Acquire);
+            if load_interior(word) != raw {
+                return Err(LeaseCopyError::Changed);
+            }
+            let padded = stride
+                .checked_add(usize::try_from(reserved).map_err(|_| LeaseCopyError::Changed)?)
+                .ok_or(LeaseCopyError::Changed)?;
+            if let Some(padding) = out.get_mut(out_end..padded.min(out.len())) {
+                padding.fill(0);
+            }
+            stride = padded;
+            at = at.checked_add(reserved).ok_or(LeaseCopyError::Changed)?;
+        }
+        Ok(len)
+    }
+}
 
 /// Whole committed frames of one term, left in place under a read lease
 /// (R-CORE-45). The term cannot be cleaned or reused until the lease ends;
-/// it ends when dropped, on any thread.
+/// it ends when dropped, on any thread. It names no buffer type, so a
+/// backend keeps leases of any buffer.
 #[derive(Debug)]
 #[must_use = "a lease pins its term until it is dropped"]
-pub struct ReadLease<O: BufferOwner> {
-    buffer: O,
+pub struct ReadLease {
+    source: Arc<dyn LeaseSource>,
     /// The lease bank word holding the loan.
     word: usize,
     slot: u8,
@@ -59,9 +153,9 @@ pub struct ReadLease<O: BufferOwner> {
     next: u64,
 }
 
-impl<O: BufferOwner> ReadLease<O> {
+impl ReadLease {
     pub(super) fn new(
-        buffer: O,
+        source: Arc<dyn LeaseSource>,
         word: usize,
         slot: u8,
         start: u32,
@@ -70,7 +164,7 @@ impl<O: BufferOwner> ReadLease<O> {
         next: u64,
     ) -> Self {
         Self {
-            buffer,
+            source,
             word,
             slot,
             start,
@@ -116,67 +210,16 @@ impl<O: BufferOwner> ReadLease<O> {
     /// frame inside the lease (a producer wrote committed bytes: nothing
     /// may be sent).
     pub fn copy_to(&self, out: &mut [u8]) -> Result<usize, LeaseCopyError> {
-        let out = out
-            .get_mut(..self.len)
-            .ok_or(LeaseCopyError::TooSmall { needed: self.len })?;
-        let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        let end = u32::try_from(self.len)
-            .ok()
-            .and_then(|len| self.start.checked_add(len))
-            .ok_or(LeaseCopyError::Changed)?;
-        let mut at = self.start;
-        let mut stride = 0usize;
-        while at < end {
-            // SAFETY: the lease's loan pins this slot's term (module
-            // documentation, Safety); `at` is a frame start the lease
-            // validated, a location only ever accessed atomically.
-            let word = unsafe { buffer.regions.word0(self.slot, at) };
-            let raw = load_interior(word);
-            let length = Word0::unpack(raw)
-                .ok()
-                .and_then(|word| u32::try_from(word.frame_length()).ok())
-                .ok_or(LeaseCopyError::Changed)?;
-            let reserved = align_frame(length).map_err(|_| LeaseCopyError::Changed)?;
-            let frame_end = at.checked_add(length).filter(|frame_end| *frame_end <= end);
-            let (Some(_), Ok(length)) = (frame_end, usize::try_from(length)) else {
-                return Err(LeaseCopyError::Changed);
-            };
-            let out_end = stride.checked_add(length).ok_or(LeaseCopyError::Changed)?;
-            let target = out
-                .get_mut(stride..out_end)
-                .ok_or(LeaseCopyError::Changed)?;
-            let (head, body) = target
-                .split_at_mut_checked(8)
-                .ok_or(LeaseCopyError::Changed)?;
-            head.copy_from_slice(&raw.to_le_bytes());
-            let body_at = at.checked_add(8).ok_or(LeaseCopyError::Changed)?;
-            // SAFETY: the lease's loan is held; the bytes after word 0 lie
-            // inside the frame, inside a block the lease validated.
-            unsafe { buffer.regions.read_bytes(self.slot, body_at, body) };
-            // As the copy path: a word 0 that changed means the copy may
-            // mix two values.
-            fence(Ordering::Acquire);
-            if load_interior(word) != raw {
-                return Err(LeaseCopyError::Changed);
-            }
-            let padded = stride
-                .checked_add(usize::try_from(reserved).map_err(|_| LeaseCopyError::Changed)?)
-                .ok_or(LeaseCopyError::Changed)?;
-            if let Some(padding) = out.get_mut(out_end..padded.min(out.len())) {
-                padding.fill(0);
-            }
-            stride = padded;
-            at = at.checked_add(reserved).ok_or(LeaseCopyError::Changed)?;
-        }
-        Ok(self.len)
+        self.source
+            .copy_frames(self.slot, self.start, self.len, out)
     }
 }
 
-impl<O: BufferOwner> Drop for ReadLease<O> {
+impl Drop for ReadLease {
     fn drop(&mut self) {
         // Ends the loan: every access through the lease happened before
         // this `Release`, which reclaim's scan synchronizes with.
-        if let Some(word) = self.buffer.lease_words().get(self.word) {
+        if let Some(word) = self.source.lease_words().get(self.word) {
             release_loan(word);
         }
     }
@@ -186,10 +229,10 @@ impl<O: BufferOwner> Drop for ReadLease<O> {
 #[derive(Debug)]
 #[non_exhaustive]
 #[must_use]
-pub enum LeaseOutcome<O: BufferOwner> {
+pub enum LeaseOutcome {
     /// Whole committed frames under a lease; the cursor moved to its
     /// `next`.
-    Leased(ReadLease<O>),
+    Leased(ReadLease),
     /// Nothing is committed at the position yet.
     Pending,
     /// No lease was taken and the cursor did not move: stage the position
@@ -207,6 +250,9 @@ pub enum StageReason {
     /// The block at the position is padding or aborted: its canonical
     /// record is synthesized, not term bytes.
     Record,
+    /// The reader borrows its buffer (`&LogBuffer`): a lease must outlive
+    /// any borrow, so only an `Arc`-owned buffer leases.
+    Borrowed,
 }
 
 /// Why [`ReadLease::copy_to`] copied nothing.

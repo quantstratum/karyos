@@ -108,7 +108,11 @@ pub use concurrent::{
 mod sealed {
     /// Prevents implementations of [`super::BufferOwner`] outside this
     /// module.
-    pub trait Sealed {}
+    pub trait Sealed {
+        /// The buffer as the source of a read lease, which outlives any
+        /// borrow: only a shared (`Arc`) owner has one (R-CORE-45).
+        fn lease_source(&self) -> Option<std::sync::Arc<dyn super::read_lease::LeaseSource>>;
+    }
 }
 
 /// A stable owner of a [`LogBuffer`]: every dereference returns the same
@@ -118,11 +122,20 @@ pub trait BufferOwner: Deref<Target = LogBuffer<Self::Terms>> + Clone + sealed::
     type Terms: TermBytes;
 }
 
-impl<T: TermBytes> sealed::Sealed for &LogBuffer<T> {}
+impl<T: TermBytes> sealed::Sealed for &LogBuffer<T> {
+    fn lease_source(&self) -> Option<Arc<dyn read_lease::LeaseSource>> {
+        None
+    }
+}
 impl<T: TermBytes> BufferOwner for &LogBuffer<T> {
     type Terms = T;
 }
-impl<T: TermBytes> sealed::Sealed for Arc<LogBuffer<T>> {}
+impl<T: TermBytes> sealed::Sealed for Arc<LogBuffer<T>> {
+    fn lease_source(&self) -> Option<Arc<dyn read_lease::LeaseSource>> {
+        // An unsizing coercion of the same allocation: nothing allocates.
+        Some(Arc::clone(self) as Arc<dyn read_lease::LeaseSource>)
+    }
+}
 impl<T: TermBytes> BufferOwner for Arc<LogBuffer<T>> {
     type Terms = T;
 }
@@ -342,7 +355,7 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     /// scans the registry's.
     leases: std::sync::OnceLock<Box<[AtomicU64]>>,
     /// Local: attached from another process's region
-    /// ([`LogBuffer::attach`]): its own conductor never reclaims what the
+    /// (`LogBuffer::attach` (Linux)): its own conductor never reclaims what the
     /// creator's does, so it takes no read lease.
     attached: bool,
     /// Test hook: an injected deadline fault (feature `test-hooks`).
@@ -814,7 +827,7 @@ impl<T: TermBytes> LogBuffer<T> {
     /// # Errors
     ///
     /// [`SysError::LeasesNotOnAttached`] on a buffer from
-    /// [`LogBuffer::attach`]; [`SysError::ResourcesUnavailable`] when a
+    /// `LogBuffer::attach` (Linux); [`SysError::ResourcesUnavailable`] when a
     /// smaller bank is installed already.
     pub fn install_leases(&self, capacity: u16) -> Result<(), SysError> {
         if self.attached {

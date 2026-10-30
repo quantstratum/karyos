@@ -1098,7 +1098,9 @@ impl<O: BufferOwner> SenderRead<O> {
     /// left in the term under a lease that pins it until dropped. `from`
     /// must be the cursor; a lease moves the cursor to its `next`, as a
     /// copy does. A position the lease cannot carry, or a full lease bank,
-    /// is [`LeaseOutcome::Stage`] with the cursor unmoved.
+    /// is [`LeaseOutcome::Stage`] with the cursor unmoved, as is any read
+    /// through a borrowed (`&LogBuffer`) owner: a lease outlives borrows,
+    /// so only an `Arc`-owned buffer leases.
     ///
     /// # Errors
     ///
@@ -1108,12 +1110,17 @@ impl<O: BufferOwner> SenderRead<O> {
         from: u64,
         origin: ReadOrigin,
         cap: usize,
-    ) -> Result<LeaseOutcome<O>, ReadError> {
+    ) -> Result<LeaseOutcome, ReadError> {
         let ReadOrigin::Cursor = origin;
         if let Some(position) = self.faulted {
             self.counters.bump(|c| &mut c.corrupt, 1);
             return Err(ReadError::Faulted { position });
         }
+        // A lease outlives any borrow of the buffer: only a shared owner
+        // can hand one out.
+        let Some(source) = self.subscription.buffer.lease_source() else {
+            return Ok(LeaseOutcome::Stage(StageReason::Borrowed));
+        };
         let result = self.read_into(from, Sink::Lease { cap });
         self.lapped = matches!(result, Err(ReadError::Unavailable { .. }));
         match result {
@@ -1131,13 +1138,7 @@ impl<O: BufferOwner> SenderRead<O> {
                     Err(_) => self.counters.overflowed = true,
                 }
                 Ok(LeaseOutcome::Leased(ReadLease::new(
-                    self.subscription.buffer.clone(),
-                    word,
-                    slot,
-                    start,
-                    len,
-                    from,
-                    next,
+                    source, word, slot, start, len, from, next,
                 )))
             }
             Ok(Got::Read(ReadOutcome::Pending)) => Ok(LeaseOutcome::Pending),
