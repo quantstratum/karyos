@@ -121,7 +121,8 @@ fn numbers(text: &str, field: &str) -> Vec<u64> {
 /// A product registers versioned entries and a collector reads them
 /// through the agent: the version in force at an instant before the new
 /// one is the old one; what the agent observes of a trace point and an
-/// application counter is given, and of a stream nothing; a viewer may
+/// application counter is given, and of a stream with no publication its
+/// absence; a viewer may
 /// not write; the view of API v1 is unchanged.
 #[test]
 fn a_registrar_writes_and_a_collector_joins_against_the_right_version() {
@@ -197,7 +198,7 @@ fn a_registrar_writes_and_a_collector_joins_against_the_right_version() {
     let counter_at = list.find("\"kind\":\"counter\"").unwrap();
     assert!(stream_at < point_at && point_at < counter_at, "{list}");
     assert!(
-        list.contains(r#""kind":"stream","key":"7","present":null,"holders":null,"shared":null,"#),
+        list.contains(r#""kind":"stream","key":"7","present":false,"holders":0,"shared":false,"#),
         "{list}"
     );
     assert!(
@@ -455,4 +456,96 @@ fn an_incarnation_change_leaves_the_registry_as_it_was() {
         "{after}"
     );
     assert!(after.contains("\"number\":1,"), "{after}");
+}
+
+/// karyos#885: what the agent observes of a `stream` entry comes from the
+/// driver's cells for that wire id: one client publication is present
+/// and unshared, a second makes it shared, and the stream's identity is
+/// the wire id, so another stream's publication counts for nothing.
+#[test]
+fn a_stream_entry_counts_the_streams_publications() {
+    use karyos_client::StreamId;
+    use karyos_driver::{LossPolicy, StreamConfig};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    let _serial = serial();
+    let dir = dir("stream");
+    let mut driver = driver(&dir.join("driver"));
+    let config = |stream_id| StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 8,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Concurrent {
+                publishers: 4,
+                allow_non_lse: true,
+            },
+            schedule_capacity: 0,
+        },
+        allow_unconnected: false,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    };
+    let _seven = driver.add_stream(config(7)).unwrap();
+    let _eight = driver.add_stream(config(8)).unwrap();
+    let mut agent = Agent::new(
+        AgentConfig::new(vec![dir.join("driver")]).with_attach_timeout(Duration::from_secs(5)),
+    );
+    let context = || {
+        Context::builder()
+            .dir(dir.join("driver"))
+            .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
+            .build()
+            .unwrap()
+    };
+    let registrar = &mut server(&dir, "api", Role::Registrar);
+    let driver_dir = dir.join("driver").display().to_string();
+    serving(&mut driver, || agent.refresh());
+    ask(
+        registrar,
+        &mut agent,
+        &format!("KARYOS-AGENT 1 join-put {driver_dir} stream 7 feed=itch\n"),
+    );
+    let get = format!("KARYOS-AGENT 1 join-get {driver_dir} stream 7\n");
+    // Publishes on `stream_id` from a new client, then lets a positions
+    // pass run before the agent reads.
+    let publish = |driver: &mut IpcDriver, agent: &mut Agent, stream_id: i32| {
+        serving(driver, || {
+            let mut client = Client::connect(context()).unwrap();
+            let publication = client
+                .add_concurrent_publication("karyos:ipc", StreamId::new(stream_id))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            agent.refresh();
+            (client, publication)
+        })
+    };
+    let _other = publish(&mut driver, &mut agent, 8);
+    let (none, _) = ask(registrar, &mut agent, &get);
+    assert!(
+        none.contains("\"present\":false,\"holders\":0,\"shared\":false"),
+        "{none}"
+    );
+    let _first = publish(&mut driver, &mut agent, 7);
+    let (one, _) = ask(registrar, &mut agent, &get);
+    assert!(
+        one.contains("\"present\":true,\"holders\":1,\"shared\":false"),
+        "{one}"
+    );
+    let _second = publish(&mut driver, &mut agent, 7);
+    let (two, _) = ask(registrar, &mut agent, &get);
+    assert!(
+        two.contains("\"present\":true,\"holders\":2,\"shared\":true"),
+        "{two}"
+    );
 }

@@ -209,3 +209,87 @@ fn an_agent_id_outside_the_rule_is_not_taken() {
     assert_eq!(id("has space"), None);
     assert_eq!(id(&"x".repeat(65)), None);
 }
+
+/// A cell of a sample: `label` on `stream` lane `lane`, holding `value`.
+fn cell(label: &str, stream: u64, lane: u8, value: u64) -> crate::api::Counter {
+    crate::api::Counter {
+        label: label.to_owned(),
+        type_id: karyos_sys::counters::TYPE_GAUGE,
+        stream,
+        lane,
+        kind: 0,
+        participant: 0,
+        cell_registration: 0,
+        value,
+        read_ns: 0,
+        changed_ns: None,
+    }
+}
+
+fn sample(counters: Vec<crate::api::Counter>) -> Sample {
+    Sample {
+        consistent: true,
+        sampled: true,
+        age_ns: Some(0),
+        counters,
+        lanes: Vec::new(),
+    }
+}
+
+/// karyos#885: a stream's holders are, over every lane with its wire id,
+/// the client publication cells plus the embedded count; another wire id
+/// counts for nothing, and a negative id is read back.
+#[test]
+fn a_streams_holders_are_its_lanes_publications() {
+    use karyos_sys::counters::{
+        LABEL_EMBEDDED_PUBLICATIONS, LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, wire_stream_id_value,
+    };
+
+    let counters = vec![
+        cell("counters unavailable", 0, 0, 0),
+        // Stream registration 11, lanes 0 and 1, wire id -7.
+        cell(LABEL_STREAM_WIRE_ID, 11, 0, wire_stream_id_value(-7)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 11, 0, 1),
+        cell(LABEL_PUBLICATION, 11, 0, 900),
+        cell(LABEL_STREAM_WIRE_ID, 11, 1, wire_stream_id_value(-7)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 11, 1, 0),
+        cell(LABEL_PUBLICATION, 11, 1, 901),
+        // Stream registration 12, wire id 8: one publication.
+        cell(LABEL_STREAM_WIRE_ID, 12, 0, wire_stream_id_value(8)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 12, 0, 0),
+        cell(LABEL_PUBLICATION, 12, 0, 902),
+    ];
+    let seen = stream_presence(&sample(counters.clone()), "-7");
+    assert_eq!((seen.present, seen.holders), (Some(true), Some(3)));
+    let seen = stream_presence(&sample(counters.clone()), "8");
+    assert_eq!(
+        (seen.present, seen.holders, seen.shared()),
+        (Some(true), Some(1), Some(false))
+    );
+    let seen = stream_presence(&sample(counters), "9");
+    assert_eq!((seen.present, seen.holders), (Some(false), Some(0)));
+}
+
+/// karyos#885: with a cell the driver could not allocate, or before its
+/// first pass, a stream's holders are unknown, never undercounted.
+#[test]
+fn a_streams_holders_are_unknown_while_cells_are_missing() {
+    use karyos_sys::counters::{LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, wire_stream_id_value};
+
+    let counters = vec![
+        cell("counters unavailable", 0, 0, 1),
+        cell(LABEL_STREAM_WIRE_ID, 11, 0, wire_stream_id_value(7)),
+        cell(LABEL_PUBLICATION, 11, 0, 900),
+    ];
+    assert_eq!(
+        stream_presence(&sample(counters.clone()), "7"),
+        registry::Presence::default()
+    );
+    let mut unsampled = sample(counters);
+    unsampled.counters[0].value = 0;
+    unsampled.sampled = false;
+    assert_eq!(
+        stream_presence(&unsampled, "7"),
+        registry::Presence::default()
+    );
+}
