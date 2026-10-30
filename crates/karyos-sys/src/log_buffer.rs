@@ -6190,8 +6190,7 @@ mod region_tests {
     #[test]
     fn an_attached_buffer_takes_no_read_lease() {
         let creator =
-            LogBuffer::new_shared_with_generation(config(PublicationMode::Exclusive), generation())
-                .unwrap();
+            LogBuffer::create_in(1, 7, config(PublicationMode::Exclusive), generation()).unwrap();
         let attached = attach(&creator).unwrap();
         assert_eq!(
             attached.install_leases(1),
