@@ -184,11 +184,18 @@ pub struct RepairCounts {
 /// What a sender-initiated catch-up did (MD-20, karyos#802).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchUp {
-    /// A job covers the range up to `through`; a range longer than a job
-    /// takes leaves the rest, from `through`, for another.
+    /// A job covers the range from `from` (its start past the floor) up
+    /// to `through`. What it submits moves
+    /// [`RepairPath::catch_up_through`]; once it ends, done or refused, the
+    /// rest of the range starts there, never at `through` (karyos#890
+    /// review).
     Queued {
+        /// Where the job starts.
+        from: u64,
         /// The end of what the job covers.
         through: u64,
+        /// The job, to know when it ends.
+        job: crate::repair::jobs::JobRef,
     },
     /// The destination's job share is full: try again from `from`, the
     /// range's start past the floor, so a lost prefix is counted once.
@@ -396,10 +403,12 @@ impl RepairPath {
         }
         let length = u32::try_from(end.saturating_sub(from)).unwrap_or(u32::MAX);
         match self.jobs.create_catch_up(lane, from, length) {
-            Joined::Created(_) | Joined::Joined(_) => {
+            Joined::Created(job) | Joined::Joined(job) => {
                 self.counts.bump(|c| &mut c.catch_ups);
                 CatchUp::Queued {
+                    from,
                     through: from.saturating_add(u64::from(length)),
+                    job,
                 }
             }
             Joined::Lingering | Joined::Full => {
@@ -407,6 +416,13 @@ impl RepairPath {
                 CatchUp::Full { from }
             }
         }
+    }
+
+    /// Whether catch-up `job` is still pending: not done, refused nor
+    /// dropped.
+    #[must_use]
+    pub fn catch_up_pending(&self, job: crate::repair::jobs::JobRef) -> bool {
+        self.jobs.current(job)
     }
 
     /// The end of what its catch-up jobs have submitted on `lane`, 0 for

@@ -190,6 +190,8 @@ struct TargetLane {
     hole: Option<u64>,
     /// A catch-up range waiting for a job in the destination's share.
     catch_up: Option<(u64, u64)>,
+    /// The catch-up job now serving part of that range, if any.
+    catch_up_job: Option<crate::repair::jobs::JobRef>,
     /// The end of the last catch-up queued: its jobs read up to it, above
     /// `high`, which only submitted heads raise.
     catch_up_to: u64,
@@ -309,6 +311,7 @@ impl Target {
                     unsent: false,
                     hole: None,
                     catch_up: None,
+                    catch_up_job: None,
                     catch_up_to: 0,
                     mismatched: false,
                     submitted: false,
@@ -1832,6 +1835,7 @@ impl<T: StreamTerms> Outbound<T> {
         if !self.open_targets(tx, now) {
             return 0;
         }
+        let max_frame = self.max_frame;
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return 0;
         };
@@ -1857,8 +1861,13 @@ impl<T: StreamTerms> Outbound<T> {
             };
             // A catch-up waiting for room in the destination's share, or
             // for its window: like new DATA, it is served only up to the
-            // destination's own edge, and the rest waits for the window to
-            // open (design 4.2; karyos#890 review).
+            // destination's own edge, and a job is taken only when a whole
+            // maximum frame fits below that edge (or the range ends
+            // first), the rest waiting for the window to open (design 4.2;
+            // karyos#890 review). One job at a time per lane: the range
+            // moves on only by what the job submitted, a frame boundary,
+            // never to the job's end, so a job that stopped inside a frame
+            // is taken up again from its last whole frame.
             for (lane, ((track, reader), edge)) in target
                 .lanes
                 .iter_mut()
@@ -1866,16 +1875,35 @@ impl<T: StreamTerms> Outbound<T> {
                 .zip(target.edges)
                 .enumerate()
             {
-                let (Some((from, to)), Ok(lane)) = (track.catch_up, u8::try_from(lane)) else {
+                let Ok(lane) = u8::try_from(lane) else {
+                    continue;
+                };
+                if let Some(job) = track.catch_up_job {
+                    if repair.catch_up_pending(job) {
+                        continue;
+                    }
+                    track.catch_up_job = None;
+                    let through = repair.catch_up_through(lane);
+                    track.catch_up = track
+                        .catch_up
+                        .filter(|(_, to)| through < *to)
+                        .map(|(from, to)| (from.max(through), to));
+                }
+                let Some((from, to)) = track.catch_up else {
                     continue;
                 };
                 let end = to.min(edge);
-                if end <= from {
+                let whole = end == to
+                    || from
+                        .checked_add(max_frame)
+                        .is_some_and(|frame| frame <= end);
+                if end <= from || !whole {
                     continue;
                 }
                 track.catch_up = match repair.catch_up(lane, (from, end), reader.floor()) {
-                    crate::agents::repair::CatchUp::Queued { through } => {
-                        (through < to).then_some((through, to))
+                    crate::agents::repair::CatchUp::Queued { from, job, .. } => {
+                        track.catch_up_job = Some(job);
+                        Some((from, to))
                     }
                     crate::agents::repair::CatchUp::Full { from } => Some((from, to)),
                     crate::agents::repair::CatchUp::Done => (end < to).then_some((end, to)),
@@ -2129,6 +2157,7 @@ mod tests {
             unsent: false,
             hole: None,
             catch_up: None,
+            catch_up_job: None,
             catch_up_to: 0,
             mismatched: false,
             submitted: false,
@@ -2311,14 +2340,19 @@ mod tests {
         outbound.enable_repair(&config, 65_536, identity).unwrap();
         let fanout = outbound.fanout.as_deref_mut().unwrap();
         let repair = fanout.targets[0].repair.as_deref_mut().unwrap();
-        assert_eq!(
-            repair.catch_up(0, (1_024, 4_096), 0),
-            CatchUp::Queued { through: 4_096 }
-        );
+        let CatchUp::Queued { from, through, job } = repair.catch_up(0, (1_024, 4_096), 0) else {
+            panic!("no job");
+        };
+        assert_eq!((from, through), (1_024, 4_096));
+        assert!(repair.catch_up_pending(job));
         // The same range joins the pending job; another finds the share full.
         assert_eq!(
             repair.catch_up(0, (1_024, 4_096), 0),
-            CatchUp::Queued { through: 4_096 }
+            CatchUp::Queued {
+                from: 1_024,
+                through: 4_096,
+                job
+            }
         );
         assert_eq!(
             repair.catch_up(0, (8_192, 9_216), 0),

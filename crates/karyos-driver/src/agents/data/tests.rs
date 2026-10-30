@@ -1082,6 +1082,22 @@ fn a_partly_sent_timed_message_is_replayed_after_a_reset() {
 /// exactly the sixteen frames it lacked.
 #[test]
 fn a_reset_resends_only_what_each_destination_lacks() {
+    reset_with_a_held_window(0);
+}
+
+/// karyos#890 review (codex): the same with the second destination's
+/// window ending 32 bytes into a frame. The catch-up never takes a job
+/// that ends inside a frame as its last word: it waits until a whole
+/// frame fits, and a job that stopped inside one resumes from its last
+/// whole frame, so every frame still arrives once and in order.
+#[test]
+fn a_catch_up_held_at_an_unaligned_edge_still_arrives_whole() {
+    reset_with_a_held_window(32);
+}
+
+/// The reset scenario, the second destination's window `4 x FRAME +
+/// extra` bytes.
+fn reset_with_a_held_window(extra: u64) {
     use karyos_io::backend::TxReport;
     use karyos_protocol::network::{Identity, LaneStatus, Lanes, Receiver, StatusMessage};
 
@@ -1181,7 +1197,7 @@ fn a_reset_resends_only_what_each_destination_lacks() {
         };
         let _ = path.membership_mut().unwrap().status(&key, &sm, now);
     };
-    let held = u32::try_from(4 * FRAME).unwrap();
+    let held = u32::try_from(4 * FRAME + extra).unwrap();
     for now in 0..8 {
         status(&mut path, first, 1, (0, 32_768), now);
         status(&mut path, second, 2, (0, held), now);
