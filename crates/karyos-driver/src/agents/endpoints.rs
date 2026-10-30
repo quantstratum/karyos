@@ -594,11 +594,11 @@ impl<O: SocketOps> Endpoints<O> {
             let due = entry.waiting.is_some()
                 && entry
                     .refused_at
-                    .is_none_or(|at| now < at || age_ns(now, at) >= entry.backoff)
+                    .is_none_or(|at| elapsed(at, now, entry.backoff))
                 && matches!(entry.state, State::Active)
                 && entry
                     .last_reset
-                    .is_none_or(|at| now < at || age_ns(now, at) >= entry.backoff);
+                    .is_none_or(|at| elapsed(at, now, entry.backoff));
             if due {
                 if entry.refused_at.is_some() {
                     self.counters.bump(|c| &mut c.standing_retries);
@@ -685,8 +685,12 @@ impl<O: SocketOps> Endpoints<O> {
                 Some(epoch) => {
                     // A fault while its reset is in flight: the next reset
                     // doubles the interval, as a deferral does. Not before
-                    // a first reset (the endpoint still opening).
-                    if entry.last_reset.is_some() {
+                    // a first reset (the endpoint still opening), nor once
+                    // its interval has elapsed.
+                    if entry
+                        .last_reset
+                        .is_some_and(|at| !elapsed(at, now, entry.backoff))
+                    {
                         entry.deferred = true;
                     }
                     entry.waiting = Some(epoch);
@@ -699,8 +703,7 @@ impl<O: SocketOps> Endpoints<O> {
         // elapsed interval: deferring until it catches up would break the
         // interval's bound.
         if let Some(at) = entry.last_reset
-            && now >= at
-            && age_ns(now, at) < entry.backoff
+            && !elapsed(at, now, entry.backoff)
         {
             entry.deferred = true;
             if let Some(epoch) = standing
@@ -741,13 +744,16 @@ impl<O: SocketOps> Endpoints<O> {
                         entry.waiting = Some(epoch);
                     }
                     // Any other error (the agent gone, a broken invariant)
-                    // drops it, counted.
+                    // drops it, counted; a refusal already counted while it
+                    // stood is not counted again.
                     (Some(_), entry) => {
-                        if let Some(entry) = entry {
+                        let counted = entry.is_some_and(|entry| {
                             entry.waiting = None;
-                            entry.refused_at = None;
+                            entry.refused_at.take().is_some()
+                        });
+                        if !counted {
+                            self.counters.bump(|c| &mut c.resets_refused);
                         }
-                        self.counters.bump(|c| &mut c.resets_refused);
                         self.counters.bump(|c| &mut c.standing_dropped);
                     }
                     // An ordinary one is counted, and leaves a kept standing
@@ -1229,3 +1235,10 @@ impl<O: SocketOps> Endpoints<O> {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether `backoff` has elapsed since `at` by `now`. A clock behind `at`
+/// (stepped back) counts as elapsed: waiting for it to catch up would break
+/// the interval's bound.
+fn elapsed(at: u64, now: u64, backoff: u64) -> bool {
+    now < at || age_ns(now, at) >= backoff
+}

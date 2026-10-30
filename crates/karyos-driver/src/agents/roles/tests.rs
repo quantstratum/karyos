@@ -4392,6 +4392,21 @@ fn removed_after_opening_on(
     Vec<super::super::data::Opened>,
     Rxs,
 ) {
+    removed_after_opening_full(routes, reliable, false)
+}
+
+/// [`removed_after_opening_on`], with the sender's close list full at the
+/// removal when `full`.
+fn removed_after_opening_full(
+    routes: &[(EndpointId, SocketAddr)],
+    reliable: bool,
+    full: bool,
+) -> (
+    super::SenderRole,
+    Halves,
+    Vec<super::super::data::Opened>,
+    Rxs,
+) {
     let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
     let (replies, _keep) =
         super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
@@ -4431,6 +4446,11 @@ fn removed_after_opening_on(
     let mut opened = Vec::new();
     sender.publications[0].opened_resources(|held| opened.push(held));
     assert_eq!(opened.len(), routes.len(), "a route on every path");
+    if full {
+        while sender.closing.len() < sender.closing.capacity() {
+            sender.closing.push(opened[0]);
+        }
+    }
     let removed = sender.command(AgentCommand::<OsSocket>::RemoveSenderSession {
         reply: replies.reserve().unwrap(),
         endpoint: EndpointId(1),
@@ -6103,7 +6123,7 @@ fn control_routes_report_limits_and_failed_closes() {
                 epoch,
                 ControlRefusal {
                     limited: true,
-                    close_failed: false
+                    close_failed: 0
                 }
             )),
             "queue limit {queue_limit}"
@@ -6168,7 +6188,7 @@ fn a_control_close_failure_counts_for_the_limit() {
                 epoch,
                 ControlRefusal {
                     limited: false,
-                    close_failed: true,
+                    close_failed: 1,
                 },
             );
         }
@@ -6182,7 +6202,7 @@ fn a_control_close_failure_counts_for_the_limit() {
             limited_in,
             ControlRefusal {
                 limited: true,
-                close_failed: false,
+                close_failed: 0,
             },
         );
         let mut asked = 0usize;
@@ -6853,4 +6873,157 @@ fn solicits_leave_from_the_control_endpoint() {
         60 * MS,
     );
     assert_eq!(from(), [EndpointId(1)]);
+}
+
+/// #847: every failed control close of an epoch is counted, not one flag
+/// per endpoint: two routes past the bound are two failed closes.
+#[test]
+fn each_failed_control_close_is_counted() {
+    use super::super::control::{CONTROL_CLOSE_TIMEOUT, ControlRoutes};
+
+    let (mut tx, _seen) = recording_tx();
+    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 44_000 + index));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    // Two evictions in flight: the first and second destinations.
+    for index in 1..=3 {
+        let _ = routes.send(&mut tx, at(index), &challenge_control());
+    }
+    assert_eq!(routes.lingering(), 2);
+    routes.close_lingering(&mut tx, 0);
+    routes.close_lingering(&mut tx, CONTROL_CLOSE_TIMEOUT);
+    assert_eq!(routes.lingering(), 0);
+    assert_eq!(routes.close_timeouts, 2);
+    let (_, refusal) = routes.take_refusal().unwrap();
+    assert_eq!(refusal.close_failed, 2, "each counted");
+    routes.hold_closes = false;
+}
+
+/// #847 (#849 review): a clock that steps back while a control route is
+/// in flight is no time elapsed, as for the data paths: the route keeps
+/// its place, not failed.
+#[test]
+fn a_control_close_in_flight_survives_a_clock_step_back() {
+    use super::super::control::{CONTROL_CLOSE_TIMEOUT, ControlRoutes};
+
+    let (mut tx, _seen) = recording_tx();
+    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 45_000 + index));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    for index in 1..=2 {
+        let _ = routes.send(&mut tx, at(index), &challenge_control());
+    }
+    routes.close_lingering(&mut tx, 10 * CONTROL_CLOSE_TIMEOUT);
+    routes.close_lingering(&mut tx, 5 * CONTROL_CLOSE_TIMEOUT);
+    assert_eq!(routes.lingering(), 1, "kept");
+    assert_eq!(routes.close_timeouts, 0);
+    assert_eq!(routes.take_refusal(), None);
+    routes.hold_closes = false;
+}
+
+/// #847 (#849 review): the controls waiting when the endpoint moves to a
+/// new epoch are dropped, and counted.
+#[test]
+fn controls_waiting_across_an_epoch_change_are_counted_dropped() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::control::ControlRoutes;
+
+    // Through the duty, a plain send and a send that may wait (#910 review).
+    for entry in 0..3 {
+        let socket = ScriptedSocket::new();
+        for _ in 0..64 {
+            socket.push_send(karyos_io::sockets::ops::SendResult::Sent {
+                sent: 1,
+                error: None,
+            });
+        }
+        let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+        let (mut tx, rx) = endpoint.split().unwrap();
+        let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 46_000 + index));
+        let mut routes = ControlRoutes::new(1);
+        routes.hold_closes = true;
+        for index in 1..=8 {
+            let _ = routes.send_or_wait(&mut tx, at(index), &challenge_control());
+        }
+        let waiting = routes.waiting();
+        assert!(waiting > 0, "some wait");
+        // The endpoint's reset and reopen, as the endpoint table does.
+        let mut joined = SocketsEndpoint::join(tx, rx).ok().unwrap();
+        let mut report = karyos_io::backend::TxReport::new();
+        while joined.reset(&mut report).more {
+            while report.pop_front().is_some() {}
+        }
+        let _ = joined.reopen(&loopback()).unwrap();
+        let (mut tx, _rx) = joined.split().unwrap();
+        routes.hold_closes = false;
+        match entry {
+            0 => routes.close_lingering(&mut tx, 0),
+            1 => {
+                let _ = routes.send(&mut tx, at(9), &challenge_control());
+            }
+            _ => {
+                let _ = routes.send_or_wait(&mut tx, at(9), &challenge_control());
+            }
+        }
+        assert_eq!(routes.waiting(), 0, "entry {entry}");
+        assert_eq!(
+            routes.waits_dropped,
+            u64::try_from(waiting).unwrap(),
+            "entry {entry}: every waiting control dropped, none sent on the new epoch"
+        );
+    }
+}
+
+/// #847 (#838 review): a removed publication's route the close list has
+/// no room for, under sustained churn, is counted and recorded as its
+/// endpoint's close failure, so that endpoint's standing reset drops it.
+#[test]
+fn a_removal_the_close_list_cannot_hold_records_a_close_failure() {
+    let (sender, _halves, opened, _rxs) = removed_after_opening_full(
+        &[(EndpointId(1), "10.0.0.9:5000".parse().unwrap())],
+        false,
+        true,
+    );
+    assert_eq!(sender.counters().removed_unrecorded, 1);
+    assert!(
+        sender
+            .close_failures
+            .iter()
+            .any(|record| record.endpoint == EndpointId(1) && record.epoch == opened[0].epoch),
+        "recorded for its endpoint and epoch"
+    );
+}
+
+/// #847 (QS-COORDINATOR): a plain send never overtakes a control waiting
+/// for the same destination: the waiting ones go first, in order, then it.
+#[test]
+fn a_plain_send_never_overtakes_a_waiting_control() {
+    use super::super::control::ControlRoutes;
+
+    let (mut tx, seen) = recording_tx();
+    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 47_000 + index));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    for index in 1..=4 {
+        let _ = routes
+            .send_or_wait(&mut tx, at(index), &challenge_control())
+            .unwrap();
+    }
+    assert!(routes.waiting() > 0, "some wait");
+    let last = at(4);
+    // The routes close; no duty has run yet.
+    routes.hold_closes = false;
+    let sent_before = seen.lock().unwrap().len();
+    let _ = routes.send(&mut tx, last, &challenge_control());
+    let sent = seen.lock().unwrap().clone();
+    let after = &sent[sent_before..];
+    let first_to_last = after.iter().position(|address| *address == last);
+    assert_eq!(routes.waiting(), 0, "drained first");
+    assert!(
+        after.len() >= 2 && first_to_last.is_some_and(|first| first < after.len() - 1),
+        "the waiting control to {last} went before the plain one: {after:?}"
+    );
 }

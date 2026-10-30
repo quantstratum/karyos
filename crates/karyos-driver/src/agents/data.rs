@@ -2594,7 +2594,7 @@ pub(crate) struct Opened {
     pub(crate) queues: [Option<TxQueueId>; OPENED_QUEUES],
 }
 
-mod fanout;
+pub(super) mod fanout;
 mod heartbeat;
 mod removal;
 mod routed;

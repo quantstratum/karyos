@@ -1611,7 +1611,7 @@ const fn route_own(error: karyos_io::backend::RouteError) -> bool {
 /// failure is the destination's own; the others are not limits either: a
 /// reset (`NotActive`, `NeedsReset`), identities exhausted, a report not
 /// empty, or a stale handle.
-pub(super) const fn queue_limit(error: karyos_io::backend::QueueError) -> bool {
+pub(in crate::agents) const fn queue_limit(error: karyos_io::backend::QueueError) -> bool {
     use karyos_io::backend::QueueError;
     matches!(
         error,

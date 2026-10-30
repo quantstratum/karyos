@@ -382,8 +382,9 @@ pub struct SenderCounters {
     pub removed_returned: u64,
     /// Removed publications' routes or queues, or retired destinations',
     /// not recorded for closing: the preallocated close list was full
-    /// (never, by construction; their endpoint's next reset drops them, and
-    /// a retired destination's wait in the publication for a later duty).
+    /// (under sustained churn). A removed publication's are recorded as
+    /// their endpoint's close failure, whose standing reset drops them; a
+    /// retired destination's wait in the publication for a later duty.
     pub removed_unrecorded: u64,
     /// Entries of the close list dropped at their duty, each counted once:
     /// their endpoint's TX half was not held (in a reset, which drops them,
@@ -590,7 +591,7 @@ impl ReceiverBinding {
 /// evicts (network-control-schemas.md §6.3, plan 169).
 const MAX_ADOPTIONS: usize = karyos_protocol::channel::MAX_PATHS - 1;
 
-fn bump(value: &mut u64, overflowed: &mut bool) {
+pub(super) fn bump(value: &mut u64, overflowed: &mut bool) {
     match value.checked_add(1) {
         Some(next) => *value = next,
         None => *overflowed = true,
@@ -5306,19 +5307,20 @@ impl<T: StreamTerms> SenderRole<T> {
         }
         // Its routes and queues close at the next duty, which holds the TX
         // halves (driver-network-agents.md §7).
+        // One the close list has no room for (under sustained churn) is
+        // counted, and recorded as its endpoint's close failure: the
+        // standing reset it asks for drops it.
         if let Some(outbound) = outbound.as_deref() {
-            let (closing, mut full) = (&mut self.closing, 0u64);
+            let mut closing = std::mem::take(&mut self.closing);
             outbound.opened_resources(|opened| {
                 if closing.len() < closing.capacity() {
                     closing.push(opened);
-                } else if let Some(count) = full.checked_add(1) {
-                    full = count;
+                } else {
+                    self.count(|c| &mut c.removed_unrecorded);
+                    self.note_close_failure(opened.endpoint, opened.epoch);
                 }
             });
-            debug_assert_eq!(full, 0, "the close list holds every route");
-            for _ in 0..full {
-                self.count(|c| &mut c.removed_unrecorded);
-            }
+            self.closing = closing;
         }
         // Every path's SETUP side and bindings go with it.
         match outbound.as_deref() {
@@ -5409,8 +5411,7 @@ impl<T: StreamTerms> SenderRole<T> {
         let mut index = 0;
         while let Some((mut opened, since)) = self.closing_again.get(index).copied() {
             let outcome = self.close_entry(halves, &mut opened);
-            // A clock behind `since` counts as no time elapsed (`age_ns`).
-            let late = age_ns(now, since) >= super::CLOSE_IN_FLIGHT_TIMEOUT;
+            let late = super::close_late(since, now);
             match outcome {
                 EntryClosed::Done => {
                     self.closing_again.swap_remove(index);
@@ -5513,7 +5514,7 @@ impl<T: StreamTerms> SenderRole<T> {
             else {
                 continue;
             };
-            if refusal.close_failed {
+            for _ in 0..refusal.close_failed {
                 self.close_failed(endpoint, epoch);
             }
             if refusal.limited {
