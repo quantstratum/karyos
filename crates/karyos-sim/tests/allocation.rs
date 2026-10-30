@@ -13,7 +13,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use karyos_sim::harness::core::{ConsensusCore, LogView, NotLeader, Persisted, Ready};
+use karyos_sim::harness::core::{ConsensusCore, LogView, Persisted, Ready, Refused};
 use karyos_sim::harness::corpus::Evidence;
 use karyos_sim::harness::probe::{WARMUP, measure};
 use karyos_sim::harness::reference::Reference;
@@ -186,7 +186,7 @@ impl ConsensusCore for Noisy {
         Self(Reference::recover(id, peers, log))
     }
 
-    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader> {
+    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
         self.0.propose(command, log)
     }
 
@@ -244,4 +244,38 @@ fn allocations_in_a_read_only_call_are_counted() {
         noisy.counts,
         plain.counts
     );
+}
+
+/// A metered read the budget refuses allocates nothing: it is sized from
+/// the log's index and refused before any read (karyos#899 review).
+#[test]
+fn a_refused_metered_read_allocates_nothing() {
+    use std::path::Path;
+
+    use karyos_cluster::{Entry, RaftLog};
+    use karyos_sim::disk::SimDisk;
+    use karyos_sim::harness::core::{ReadBudget, ReadError};
+    use karyos_sim::harness::node::LOG_DIR;
+    use karyos_sim::harness::workloads::geometry;
+    use karyos_sys::alloc_count::count;
+
+    let _serial = serial();
+    let mut log =
+        RaftLog::create(SimDisk::new(), Path::new(LOG_DIR), geometry().unwrap(), 1).unwrap();
+    let entries: Vec<Entry> = (1..=4)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            event_time: 0,
+            payload: vec![0; 256],
+        })
+        .collect();
+    let _ = log.append(&entries).unwrap();
+    let _ = log.sync().unwrap();
+    let budget = ReadBudget::new();
+    budget.refill(10);
+    let mut view = LogView::metered(&mut log, Some(&budget));
+    let (refused, operations) = count(|| view.entries(1..5, u64::MAX));
+    assert!(matches!(refused, Err(ReadError::Budget)));
+    assert_eq!(operations, 0, "a refused read allocates and frees nothing");
 }

@@ -11,10 +11,12 @@
 //!   the field says so in the data, not only in documents. The runner
 //!   writes where its caller tells it, never into the evaluation record.
 //! - **A line** holds the evidence, the core, the workload, the case, the
-//!   seed, the repetitions of the determinism mode, the verdict ([`Verdict`]), whether the run ended at its step
-//!   bound with clients still waiting, the case's fault schedule as
-//!   `step:action`, the trace digest, and the error of a run that could
-//!   not be set up or stepped.
+//!   seed, the repetitions of the determinism mode, the client window
+//!   ([`Case::window`]), the declared limits ([`Case::limits`]), the verdict ([`Verdict`]), whether the run ended
+//!   at its step bound with clients still waiting, the case's fault
+//!   schedule as `step:action`, what the case does not cover
+//!   ([`Case::notes`]), the trace digest, and the error of a run that
+//!   could not be set up or stepped.
 //! - **Not yet.** Per-fault coverage (before the first commit, during
 //!   replication, after the last commit) and the minimised traces of
 //!   failing seeds (manifest, Corpora) need commit times in steps, which
@@ -26,7 +28,7 @@ use std::io::Write;
 use std::ops::RangeInclusive;
 
 use super::core::ConsensusCore;
-use super::workloads::{Case, Failed, pass, run};
+use super::workloads::{Case, Failed, RunError, pass, run};
 
 /// What a run is evidence of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +61,9 @@ pub enum Verdict {
     Failed(&'static str),
     /// It could not be set up or stepped.
     Error,
+    /// The case needs a capability the core does not have (a W2 case's
+    /// limits): nothing was shown, so it neither passes nor fails.
+    NotDemonstrated,
 }
 
 impl Verdict {
@@ -70,6 +75,7 @@ impl Verdict {
             Self::LivenessGap => "liveness_gap",
             Self::Failed(kind) => kind,
             Self::Error => "error",
+            Self::NotDemonstrated => "not_demonstrated",
         }
     }
 }
@@ -82,6 +88,7 @@ const fn failed_kind(failed: &Failed) -> &'static str {
         Failed::Diverged(_) => "failed_diverged",
         Failed::NotReplayed => "failed_not_replayed",
         Failed::WrongState { .. } => "failed_wrong_state",
+        Failed::NotBehind { .. } => "failed_not_behind",
     }
 }
 
@@ -100,6 +107,8 @@ pub struct Summary {
     pub failed: Vec<(String, String, u64)>,
     /// Runs that could not be set up or stepped.
     pub errors: u64,
+    /// Runs whose case needs a capability the core does not have.
+    pub not_demonstrated: u64,
 }
 
 /// One workload: its name and its cases under a seed (W4's survival modes
@@ -144,6 +153,7 @@ pub fn run_corpus<C: ConsensusCore>(
                             None,
                         )
                     }
+                    Err(RunError::Unsupported(_)) => (Verdict::NotDemonstrated, false, None, None),
                     Err(error) => (Verdict::Error, false, None, Some(format!("{error:?}"))),
                 };
                 summary.runs = summary.runs.saturating_add(1);
@@ -158,6 +168,12 @@ pub fn run_corpus<C: ConsensusCore>(
                             .push(((*workload).to_owned(), case.name.clone(), seed));
                     }
                     Verdict::Error => summary.errors = summary.errors.saturating_add(1),
+                    Verdict::NotDemonstrated => {
+                        summary.not_demonstrated = summary
+                            .not_demonstrated
+                            .checked_add(1)
+                            .ok_or_else(|| std::io::Error::other("run count overflow"))?;
+                    }
                 }
                 if bound {
                     summary.step_bound = summary.step_bound.saturating_add(1);
@@ -204,18 +220,31 @@ impl Line<'_> {
             .iter()
             .map(|(step, action)| string(&format!("{step}:{action:?}")))
             .collect();
+        let notes: Vec<String> = self.case.notes.iter().map(|note| string(note)).collect();
         format!(
-            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"repetitions\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"digest\":{},\"error\":{}}}",
+            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"repetitions\":{},\"window\":{},\"limits\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"notes\":[{}],\"digest\":{},\"error\":{}}}",
             string(self.evidence.text()),
             string(self.core),
             string(self.workload),
             string(&self.case.name),
             self.seed,
             self.repetitions.max(1),
+            self.case.window.max(1),
+            self.case.limits.map_or_else(
+                || "null".to_owned(),
+                |limits| format!(
+                    "{{\"in_flight_entries\":{},\"in_flight_bytes\":{},\"queue\":{},\"log_read_bytes\":{}}}",
+                    limits.in_flight_entries,
+                    limits.in_flight_bytes,
+                    limits.queue,
+                    limits.log_read_bytes
+                ),
+            ),
             string(self.verdict.name()),
             self.bound,
             self.case.steps,
             schedule.join(","),
+            notes.join(","),
             self.digest
                 .map_or_else(|| "null".to_owned(), |digest| digest.to_string()),
             self.error.map_or_else(|| "null".to_owned(), string),

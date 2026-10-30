@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use karyos_sim::harness::corpus::{Evidence, run_corpus};
 use karyos_sim::harness::reference::Reference;
-use karyos_sim::harness::workloads::{W1, W3, W4, W6};
+use karyos_sim::harness::workloads::{W1, W2, W3, W4, W6};
 
 /// The manifest's CI seeds.
 const CI_SEEDS: std::ops::RangeInclusive<u64> = 1..=1_000;
@@ -53,12 +53,24 @@ fn the_ci_corpus_of_the_reference_fixture() {
         PathBuf::from,
     );
     let w1 = |_seed: u64| W1::skeleton().cases();
+    let w2 = |_seed: u64| W2::skeleton().cases().unwrap();
     let w3 = |_seed: u64| W3::skeleton().cases();
     let w4 = |seed: u64| W4::skeleton(seed).cases();
     let w6 = |_seed: u64| W6::skeleton().cases();
-    let counts = (w1(1).len(), w3(1).len(), w4(1).len(), w6(1).len());
-    let workloads: [karyos_sim::harness::corpus::Workload<'_>; 4] =
-        [("W1", &w1), ("W3", &w3), ("W4", &w4), ("W6", &w6)];
+    let counts = (
+        w1(1).len(),
+        w2(1).len(),
+        w3(1).len(),
+        w4(1).len(),
+        w6(1).len(),
+    );
+    let workloads: [karyos_sim::harness::corpus::Workload<'_>; 5] = [
+        ("W1", &w1),
+        ("W2", &w2),
+        ("W3", &w3),
+        ("W4", &w4),
+        ("W6", &w6),
+    ];
     let seeds = seeds();
     let start = Instant::now();
     let mut file = BufWriter::new(std::fs::File::create(&out).unwrap());
@@ -74,20 +86,23 @@ fn the_ci_corpus_of_the_reference_fixture() {
     let elapsed = start.elapsed();
     let bytes = std::fs::metadata(&out).unwrap().len();
     println!(
-        "c5 corpus: reference, seeds {seeds:?}, cases W1 {} W3 {} W4 {} W6 {}, runs {}, passed {}, liveness gaps {}, step bound {}, failed {}, errors {}, {:.1} s, {bytes} bytes, {}",
+        "c5 corpus: reference, seeds {seeds:?}, cases W1 {} W2 {} W3 {} W4 {} W6 {}, runs {}, passed {}, liveness gaps {}, step bound {}, failed {}, errors {}, not demonstrated {}, {:.1} s, {bytes} bytes, {}",
         counts.0,
         counts.1,
         counts.2,
         counts.3,
+        counts.4,
         summary.runs,
         summary.passed,
         summary.liveness_gaps,
         summary.step_bound,
         summary.failed.len(),
         summary.errors,
+        summary.not_demonstrated,
         elapsed.as_secs_f64(),
         out.display()
     );
     assert!(summary.failed.is_empty(), "{:?}", summary.failed);
     assert_eq!(summary.errors, 0);
+    assert_eq!(summary.not_demonstrated, 0, "the fixture takes W2's limits");
 }

@@ -221,7 +221,7 @@ fn test_delivery_a_restarted_server_rebuilds_its_container_from_the_log() {
 mod deposable {
     use std::cell::Cell;
 
-    use karyos_sim::harness::core::{ConsensusCore, LogView, NotLeader, Persisted, Ready};
+    use karyos_sim::harness::core::{ConsensusCore, LogView, NotLeader, Persisted, Ready, Refused};
     use karyos_sim::harness::reference::{Message, Reference};
     use karyos_sim::net::NodeId;
 
@@ -262,10 +262,10 @@ mod deposable {
             }
         }
 
-        fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader> {
+        fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
             if deposed(self.id) {
                 // A deposed leader knows of no leader.
-                return Err(NotLeader { leader: None });
+                return Err(NotLeader { leader: None }.into());
             }
             self.inner.propose(command, log)
         }
