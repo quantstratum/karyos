@@ -1074,3 +1074,296 @@ fn a_partly_sent_timed_message_is_replayed_after_a_reset() {
         while report.pop_front().is_some() {}
     }
 }
+
+/// MD-20 (karyos#802): two destinations at different positions when the
+/// endpoint resets. The second's member window holds it at four frames
+/// while the first takes all twenty; after the reset, the first is resent
+/// nothing, and the second is caught up by its own repair path over
+/// exactly the sixteen frames it lacked.
+#[test]
+fn a_reset_resends_only_what_each_destination_lacks() {
+    reset_with_a_held_window(0);
+}
+
+/// karyos#890 review (codex): the same with the second destination's
+/// window ending 32 bytes into a frame. The catch-up never takes a job
+/// that ends inside a frame as its last word: it waits until a whole
+/// frame fits, and a job that stopped inside one resumes from its last
+/// whole frame, so every frame still arrives once and in order.
+#[test]
+fn a_catch_up_held_at_an_unaligned_edge_still_arrives_whole() {
+    reset_with_a_held_window(32);
+}
+
+/// The reset scenario, the second destination's window `4 x FRAME +
+/// extra` bytes.
+fn reset_with_a_held_window(extra: u64) {
+    use karyos_io::backend::TxReport;
+    use karyos_protocol::network::{Identity, LaneStatus, Lanes, Receiver, StatusMessage};
+
+    use crate::agents::repair::RepairConfig;
+    use crate::membership::{Membership, MembershipConfig, Roles, SmKey};
+
+    let first = SocketAddr::from(([127, 0, 0, 1], 41_001));
+    let second = SocketAddr::from(([127, 0, 0, 1], 41_002));
+    let socket = ScriptedSocket::new();
+    for _ in 0..1024 {
+        socket.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let observer = socket.observer();
+    // Each DATA datagram sent, by destination and position: one 1056-byte
+    // frame per datagram at this MTU, message `i` carrying `[i; 1000]`.
+    let sent: Arc<Mutex<Vec<(SocketAddr, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&sent);
+    observer.set_send_hook(Box::new(move |route, datagrams| {
+        let mut sent = record.lock().unwrap();
+        for datagram in datagrams {
+            if let Ok(Datagram::DataBatch(_)) = classify(datagram)
+                && let Some(index) = datagram.get(karyos_sys::frame::HEADER_LENGTH as usize)
+            {
+                sent.push((route.address(), u64::from(*index) * FRAME));
+            }
+        }
+    }));
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let alias = Alias {
+        session_id: 5,
+        stream_id: 6,
+    };
+    let identity = Identity {
+        driver_id: [1, 2],
+        registration_id: 1,
+        incarnation: 1,
+    };
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1408,
+    };
+    let (mut path, mut log) = outbound(EndpointId(1), alias, first, term, 1, true);
+    // The second is required: held at its own edge, it is never removed
+    // as slow (MD-7).
+    path.set_destinations(&[first, second], &[second], Some(true))
+        .unwrap();
+    path.enable_repair(&RepairConfig::default(), term.term_length, identity)
+        .unwrap();
+    // `max`: each destination waits at its own edge only.
+    let mut config = MembershipConfig::new(1, 1408, 32_768);
+    config.strategy = crate::membership::Strategy::Max;
+    let membership = Membership::new(
+        config,
+        identity,
+        alias,
+        &Roles {
+            required: &[],
+            tags: &[],
+        },
+        0,
+    )
+    .unwrap();
+    path.attach_membership(Box::new(membership));
+    for i in 0..20u8 {
+        let _ = log.publications[0]
+            .append(&[i; 1000], AppendOptions::default())
+            .unwrap();
+    }
+    // Each destination's receiver: its own source, id and window.
+    let status = |path: &mut Box<super::Outbound>, source, id, (consumption, window), now| {
+        let key = SmKey {
+            endpoint: EndpointId(1),
+            alias,
+            source,
+            identity,
+            receiver: Receiver {
+                receiver_boot_id: [7, 8],
+                receiver_id: id,
+            },
+        };
+        let sm = StatusMessage {
+            alias,
+            identity,
+            receiver: key.receiver,
+            group_tag: 0,
+            lanes: Lanes::new(&[LaneStatus {
+                consumption,
+                window,
+            }])
+            .unwrap(),
+        };
+        let _ = path.membership_mut().unwrap().status(&key, &sm, now);
+    };
+    let held = u32::try_from(4 * FRAME + extra).unwrap();
+    for now in 0..8 {
+        status(&mut path, first, 1, (0, 32_768), now);
+        status(&mut path, second, 2, (0, held), now);
+        let _ = path.serve(&mut tx, FLOW_BUDGET, None, now).unwrap();
+    }
+    // Where each stands when the endpoint resets: the readers at `r`,
+    // each destination at its own submitted `high`.
+    let before = path.destination_catch_ups();
+    let r = path.readers()[0].position();
+    let high = |to| {
+        before
+            .iter()
+            .find(|(at, ..)| *at == to)
+            .map(|(_, _, high, _)| *high)
+            .unwrap()
+    };
+    let (first_high, second_high) = (high(first), high(second));
+    // Frames sent to `to` below `r` (resent or caught up) and from it (new).
+    let count = |sent: &[(SocketAddr, u64)], to, below: u64| {
+        sent.iter()
+            .filter(|(at, position)| *at == to && *position < below)
+            .count()
+    };
+    {
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            u64::try_from(count(&sent, second, u64::MAX)).unwrap() * FRAME,
+            second_high
+        );
+        assert_eq!(second_high, 4 * FRAME, "held at its window");
+        assert!(first_high > second_high, "{first_high} {second_high}");
+    }
+    sent.lock().unwrap().clear();
+    // The reset: the endpoint reopens in its next epoch.
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = TxReport::new();
+    while endpoint.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    while report.pop_front().is_some() {}
+    let _ = endpoint.reopen(&local).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let mut budget = crate::repair::scheduler::RepairBudget::default();
+    // karyos#890 review (codex): still held at its window, the second gets
+    // no catch-up past its own edge, as no new DATA would pass it (4.2).
+    for now in 8..16 {
+        status(&mut path, first, 1, (0, 32_768), now);
+        status(&mut path, second, 2, (0, held), now);
+        let _ = path.serve(&mut tx, FLOW_BUDGET, None, now).unwrap();
+        let _ = path.serve_repair(&mut tx, &mut budget, now);
+        budget = crate::repair::scheduler::RepairBudget::default();
+    }
+    {
+        let sent = sent.lock().unwrap();
+        assert_eq!(
+            count(&sent, second, u64::MAX),
+            0,
+            "nothing past the second's edge while its window is shut: {sent:?}"
+        );
+    }
+    // It consumes what it has, so its window opens (a window never
+    // changes size, design 4.2): the rest arrives, once and in order
+    // (below).
+    for now in 16..32 {
+        let consumed = sent
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(at, _)| *at == second)
+            .map(|(_, position)| position + FRAME)
+            .max()
+            .unwrap_or(second_high)
+            .min(r);
+        status(&mut path, first, 1, (0, 32_768), now);
+        status(&mut path, second, 2, (consumed, held), now);
+        let _ = path.serve(&mut tx, FLOW_BUDGET, None, now).unwrap();
+        let _ = path.serve_repair(&mut tx, &mut budget, now);
+        budget = crate::repair::scheduler::RepairBudget::default();
+    }
+    let sent = sent.lock().unwrap();
+    let lacked = |high: u64| usize::try_from((r - high) / FRAME).unwrap();
+    // Below `r`: what each lacked, nothing more; the first lacked nothing
+    // it was sent. What is sent from `r` on is new, not resent.
+    assert_eq!(
+        count(&sent, first, r),
+        lacked(first_high),
+        "the first gets only what it lacked: {sent:?}"
+    );
+    assert_eq!(
+        count(&sent, second, r),
+        lacked(second_high),
+        "the second gets exactly [high, r): {sent:?}"
+    );
+    let caught_up: Vec<u64> = sent
+        .iter()
+        .filter(|(at, position)| *at == second && *position < r)
+        .map(|(_, position)| *position)
+        .collect();
+    assert_eq!(
+        caught_up,
+        (second_high / FRAME..r / FRAME)
+            .map(|i| i * FRAME)
+            .collect::<Vec<_>>(),
+        "in order, once each"
+    );
+    // karyos#890 review (codex): the catch-up's submissions are the
+    // destination's, so its frontier reaches `r`, and a NAK below `r` is a
+    // valid repair request, not RangeInvalid.
+    let after = path.destination_catch_ups();
+    let high_of = |to| {
+        after
+            .iter()
+            .find(|(at, ..)| *at == to)
+            .map(|(_, _, high, _)| *high)
+            .unwrap()
+    };
+    // Its window open, new DATA follows the catch-up, so the frontier is
+    // at least `r`.
+    assert!(high_of(second) >= r, "the frontier follows the catch-up");
+    let nak = karyos_protocol::network::Nak {
+        alias,
+        identity,
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 2,
+        },
+        range: karyos_protocol::network::NakRange {
+            lane: karyos_sys::frame::Lane::ZERO,
+            length: u32::try_from(FRAME).unwrap(),
+            start: r - FRAME,
+        },
+    };
+    let outcome = path.nak_from(
+        second,
+        &nak,
+        crate::repair::admission::Requester::Member {
+            join: 0,
+            consumption: 0,
+            window: 32_768,
+        },
+        40,
+    );
+    assert!(
+        !matches!(outcome, crate::agents::repair::NakOutcome::Reply(_)),
+        "{outcome:?}"
+    );
+    let counters = path.destination_counters();
+    let repairs = |to| {
+        counters
+            .iter()
+            .find(|(at, _)| *at == to)
+            .map(|(_, counters)| counters.repairs)
+    };
+    assert_eq!(
+        (repairs(first), repairs(second)),
+        (
+            Some(u64::try_from(lacked(first_high)).unwrap()),
+            Some(u64::try_from(lacked(second_high)).unwrap())
+        )
+    );
+    drop(sent);
+    let mut endpoint = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    while !matches!(
+        endpoint.retire(&mut report),
+        karyos_io::sockets::endpoint::Retired::Complete { .. }
+    ) {
+        while report.pop_front().is_some() {}
+    }
+}

@@ -107,6 +107,71 @@ pub enum DestinationChange {
 /// defaults to 16, configurable up to 64; this step fixes it at 16).
 pub const MAX_DESTINATIONS: usize = 16;
 
+/// The repair configuration of one destination of a multi-destination
+/// publication: its share, for [`MAX_DESTINATIONS`], of each table sized
+/// per publication, whatever the current count, so that adding a
+/// destination at run time never overcommits a table and the paths of
+/// every destination together stay within the configured tables (MD-8;
+/// karyos#802). The job table (MD-8), the ERR linger entries, the job
+/// linger entries and the step 8 replies are shared; requesters are per
+/// job and stay as configured. A table below one entry per destination
+/// is refused.
+///
+/// # Errors
+///
+/// [`RepairConfigError::DestinationShare`] for the job table, and
+/// [`RepairConfigError::TableShare`] for another.
+///
+/// [`RepairConfigError::DestinationShare`]: crate::agents::repair::RepairConfigError::DestinationShare
+/// [`RepairConfigError::TableShare`]: crate::agents::repair::RepairConfigError::TableShare
+pub(crate) fn destination_share(
+    config: &crate::agents::repair::RepairConfig,
+) -> Result<crate::agents::repair::RepairConfig, crate::agents::repair::RepairConfigError> {
+    use crate::agents::repair::RepairConfigError;
+    let share = |value: usize| value / MAX_DESTINATIONS;
+    let mut shared = *config;
+    shared.jobs.repair_jobs = share(config.jobs.repair_jobs);
+    if shared.jobs.repair_jobs == 0 {
+        return Err(RepairConfigError::DestinationShare {
+            repair_jobs: config.jobs.repair_jobs,
+            destinations: MAX_DESTINATIONS,
+        });
+    }
+    for (table, value, slot) in [
+        (
+            "err_linger_entries",
+            config.err_linger_entries,
+            &mut shared.err_linger_entries,
+        ),
+        (
+            "repair_linger_entries",
+            config.jobs.repair_linger_entries,
+            &mut shared.jobs.repair_linger_entries,
+        ),
+        ("replies", config.replies, &mut shared.replies),
+    ] {
+        *slot = share(value);
+        if *slot == 0 {
+            return Err(RepairConfigError::TableShare {
+                table,
+                value,
+                destinations: MAX_DESTINATIONS,
+            });
+        }
+    }
+    Ok(shared)
+}
+
+/// A destination's address, lane 0 catch-up, `high` and repair counts
+/// (tests of MD-20).
+#[cfg(test)]
+pub(crate) type CatchUpView = (
+    SocketAddr,
+    Option<(u64, u64)>,
+    u64,
+    Option<crate::agents::repair::RepairCounts>,
+);
+
 /// One target's lane: its staged heads, in order, and what left.
 #[derive(Debug)]
 struct TargetLane {
@@ -116,10 +181,58 @@ struct TargetLane {
     high: u64,
     /// A head was returned unsent or of unknown exposure.
     unsent: bool,
+    /// Where the first head returned unsent in this epoch began (its
+    /// `high` then): a later submitted head raises `high` past it, so a
+    /// catch-up after a reset starts here, not at `high` (MD-20,
+    /// karyos#802). A head of an earlier epoch reported after the reopen
+    /// matches no staged ticket, as the reopen cleared them, so it never
+    /// records one.
+    hole: Option<u64>,
+    /// A catch-up range waiting for a job in the destination's share.
+    catch_up: Option<(u64, u64)>,
+    /// The catch-up job now serving part of that range, if any.
+    catch_up_job: Option<crate::repair::jobs::JobRef>,
+    /// The end of the last catch-up queued: its jobs read up to it, above
+    /// `high`, which only submitted heads raise.
+    catch_up_to: u64,
     /// A head left out of staging order.
     mismatched: bool,
     /// A head was submitted this cycle.
     submitted: bool,
+}
+
+impl TargetLane {
+    /// A staged head ending at `next` left `how`: a submitted one raises
+    /// `high`; the first one returned unsent in the epoch records where it
+    /// began, `high` then, as the lane's `hole` (MD-20, karyos#802).
+    fn left(&mut self, next: u64, how: Left) {
+        match how {
+            Left::Submitted => {
+                self.high = self.high.max(next);
+                self.submitted = true;
+            }
+            Left::Returned | Left::Unknown => {
+                self.unsent = true;
+                let high = self.high;
+                self.hole.get_or_insert(high);
+            }
+        }
+    }
+
+    /// After an endpoint reset with the readers at `position`: what this
+    /// destination lacks of the lane, from where its own submissions stop
+    /// (its `hole`, else `high`) to `position`, joins any catch-up still
+    /// waiting (MD-20, karyos#802). Nothing when it has it all.
+    fn catch_up_after_reset(&mut self, position: u64) {
+        let start = self.hole.take().unwrap_or(self.high);
+        let from = self
+            .catch_up
+            .map_or(start, |(pending, _)| pending.min(start));
+        if from < position {
+            self.catch_up = Some((from, position));
+            self.catch_up_to = self.catch_up_to.max(position);
+        }
+    }
 }
 
 /// One destination (design section 2.1).
@@ -196,6 +309,10 @@ impl Target {
                     staged: VecDeque::with_capacity(bound),
                     high: *join,
                     unsent: false,
+                    hole: None,
+                    catch_up: None,
+                    catch_up_job: None,
+                    catch_up_to: 0,
                     mismatched: false,
                     submitted: false,
                 })
@@ -330,13 +447,7 @@ impl LaneGate for TargetGate<'_> {
             return;
         };
         match track.staged.pop_front() {
-            Some((ticket, next)) if ticket == staged.ticket => match how {
-                Left::Submitted => {
-                    track.high = track.high.max(next);
-                    track.submitted = true;
-                }
-                Left::Returned | Left::Unknown => track.unsent = true,
-            },
+            Some((ticket, next)) if ticket == staged.ticket => track.left(next, how),
             _ => track.mismatched = true,
         }
     }
@@ -892,11 +1003,22 @@ impl<T: StreamTerms> Outbound<T> {
         };
         if reopened {
             // What the old epoch read but had not staged everywhere is
-            // dropped. A reliable lane reads again from its restart position,
-            // so the targets get it again (receivers drop copies); an
-            // unreliable one leaves the gap to the receivers' gap policy.
+            // dropped. On a reliable publication with repair paths each
+            // destination catches up alone (MD-20, karyos#802): one job per
+            // lane over what it lacks, from where its own submissions stop
+            // (`hole`, else `high`) to the readers' position, and nothing to
+            // a destination that has it. Without repair paths a reliable
+            // lane reads again from its restart position, so every target
+            // gets it again (receivers drop copies). An unreliable one
+            // leaves the gap to the receivers' gap policy.
             fanout.pending.fill(None);
-            if self.reliable {
+            if self.reliable && fanout.repair.is_some() {
+                for target in fanout.targets.iter_mut().filter(|t| t.removed.is_none()) {
+                    for (track, reader) in target.lanes.iter_mut().zip(&self.readers) {
+                        track.catch_up_after_reset(reader.position());
+                    }
+                }
+            } else if self.reliable {
                 for reader in &mut self.readers {
                     let _ = reader.rewind();
                 }
@@ -1605,6 +1727,30 @@ impl<T: StreamTerms> Outbound<T> {
         })
     }
 
+    /// Each destination's lane 0 catch-up, `high` and repair counts
+    /// (tests of MD-20).
+    #[cfg(test)]
+    pub(crate) fn destination_catch_ups(&self) -> Vec<CatchUpView> {
+        self.fanout
+            .as_deref()
+            .map(|fanout| {
+                fanout
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        let lane = target.lanes.first();
+                        (
+                            target.address,
+                            lane.and_then(|lane| lane.catch_up),
+                            lane.map_or(0, |lane| lane.high),
+                            target.repair.as_deref().map(|repair| repair.counts()),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Each destination's counters (tests).
     #[cfg(test)]
     pub(crate) fn destination_counters(&self) -> Vec<(SocketAddr, TargetCounters)> {
@@ -1621,7 +1767,8 @@ impl<T: StreamTerms> Outbound<T> {
     }
 
     /// Enables a repair path per destination, each with its share of the
-    /// job table for [`MAX_DESTINATIONS`] (MD-8; control path, allocates).
+    /// repair tables for [`MAX_DESTINATIONS`] (MD-8, karyos#802; control
+    /// path, allocates).
     pub(super) fn enable_fanout_repair(
         &mut self,
         config: &crate::agents::repair::RepairConfig,
@@ -1636,15 +1783,7 @@ impl<T: StreamTerms> Outbound<T> {
         // `max_destinations`, whatever the current count, so additions never
         // overcommit it. A table below one job per destination is refused
         // (`RepairConfigError::DestinationShare`).
-        let share = config.jobs.repair_jobs / MAX_DESTINATIONS;
-        if share == 0 {
-            return Err(crate::agents::repair::RepairConfigError::DestinationShare {
-                repair_jobs: config.jobs.repair_jobs,
-                destinations: MAX_DESTINATIONS,
-            });
-        }
-        let mut config = *config;
-        config.jobs.repair_jobs = share;
+        let config = destination_share(config)?;
         fanout.repair = Some((config, term_length, alias, identity));
         for target in &mut fanout.targets {
             target.repair = Some(Box::new(crate::agents::repair::RepairPath::new(
@@ -1696,6 +1835,7 @@ impl<T: StreamTerms> Outbound<T> {
         if !self.open_targets(tx, now) {
             return 0;
         }
+        let max_frame = self.max_frame;
         let Some(fanout) = self.fanout.as_deref_mut() else {
             return 0;
         };
@@ -1710,13 +1850,65 @@ impl<T: StreamTerms> Outbound<T> {
                 continue;
             }
             let mut sent_high = [0u64; karyos_protocol::network::MAX_LANES];
-            for (high, track) in sent_high.iter_mut().zip(&target.lanes) {
-                *high = track.high;
+            for ((high, track), edge) in sent_high.iter_mut().zip(&target.lanes).zip(target.edges) {
+                // A catch-up reads up to its end, above what was submitted,
+                // never past the destination's own edge (design 4.2).
+                *high = track.high.max(track.catch_up_to.min(edge));
             }
             let closed = [false; karyos_protocol::network::MAX_LANES];
             let Some(repair) = target.repair.as_deref_mut() else {
                 continue;
             };
+            // A catch-up waiting for room in the destination's share, or
+            // for its window: like new DATA, it is served only up to the
+            // destination's own edge, and a job is taken only when a whole
+            // maximum frame fits below that edge (or the range ends
+            // first), the rest waiting for the window to open (design 4.2;
+            // karyos#890 review). One job at a time per lane: the range
+            // moves on only by what the job submitted, a frame boundary,
+            // never to the job's end, so a job that stopped inside a frame
+            // is taken up again from its last whole frame.
+            for (lane, ((track, reader), edge)) in target
+                .lanes
+                .iter_mut()
+                .zip(&self.readers)
+                .zip(target.edges)
+                .enumerate()
+            {
+                let Ok(lane) = u8::try_from(lane) else {
+                    continue;
+                };
+                if let Some(job) = track.catch_up_job {
+                    if repair.catch_up_pending(job) {
+                        continue;
+                    }
+                    track.catch_up_job = None;
+                    let through = repair.catch_up_through(lane);
+                    track.catch_up = track
+                        .catch_up
+                        .filter(|(_, to)| through < *to)
+                        .map(|(from, to)| (from.max(through), to));
+                }
+                let Some((from, to)) = track.catch_up else {
+                    continue;
+                };
+                let end = to.min(edge);
+                let whole = end == to
+                    || from
+                        .checked_add(max_frame)
+                        .is_some_and(|frame| frame <= end);
+                if end <= from || !whole {
+                    continue;
+                }
+                track.catch_up = match repair.catch_up(lane, (from, end), reader.floor()) {
+                    crate::agents::repair::CatchUp::Queued { from, job, .. } => {
+                        track.catch_up_job = Some(job);
+                        Some((from, to))
+                    }
+                    crate::agents::repair::CatchUp::Full { from } => Some((from, to)),
+                    crate::agents::repair::CatchUp::Done => (end < to).then_some((end, to)),
+                };
+            }
             let before = repair.counts().submitted;
             let report = repair.serve_routes(
                 &mut [Some(&mut *tx)],
@@ -1726,6 +1918,14 @@ impl<T: StreamTerms> Outbound<T> {
                 now,
             );
             let after = repair.counts().submitted;
+            // What the catch-up submitted is the destination's: its
+            // frontier moves there, so its NAKs, the retention and a later
+            // reset's start follow (MD-20, karyos#890 review).
+            for (lane, track) in target.lanes.iter_mut().enumerate() {
+                if let Ok(lane) = u8::try_from(lane) {
+                    track.high = track.high.max(repair.catch_up_through(lane));
+                }
+            }
             target.counters.repairs = target
                 .counters
                 .repairs
@@ -1947,6 +2147,299 @@ mod tests {
             route,
             queues,
         }
+    }
+
+    /// A destination lane at `high`, nothing staged.
+    fn lane_at(high: u64) -> TargetLane {
+        TargetLane {
+            staged: VecDeque::new(),
+            high,
+            unsent: false,
+            hole: None,
+            catch_up: None,
+            catch_up_job: None,
+            catch_up_to: 0,
+            mismatched: false,
+            submitted: false,
+        }
+    }
+
+    /// MD-20 (karyos#802): after a reset with the readers at 6 000, each
+    /// destination catches up over exactly what it lacks: one at 1 000
+    /// from 1 000, one already at 6 000 nothing, and one whose head at
+    /// 2 000 was returned unsent while a later one was submitted (its
+    /// `high` 4 000 passed the hole) from 2 000, not from 4 000.
+    #[test]
+    fn a_reset_catches_up_each_destination_over_what_it_lacks() {
+        let position = 6_000;
+        let mut behind = lane_at(1_000);
+        let mut caught_up = lane_at(6_000);
+        let mut holed = lane_at(2_000);
+        holed.left(3_000, Left::Returned);
+        holed.left(4_000, Left::Submitted);
+        assert_eq!((holed.high, holed.hole), (4_000, Some(2_000)));
+        let mut unknown = lane_at(5_000);
+        unknown.left(5_500, Left::Unknown);
+        for lane in [&mut behind, &mut caught_up, &mut holed, &mut unknown] {
+            lane.catch_up_after_reset(position);
+        }
+        assert_eq!(behind.catch_up, Some((1_000, 6_000)));
+        assert_eq!(
+            caught_up.catch_up, None,
+            "nothing to a destination that has it"
+        );
+        assert_eq!(holed.catch_up, Some((2_000, 6_000)));
+        assert_eq!(unknown.catch_up, Some((5_000, 6_000)));
+        // The hole is used once; `high`, the publication's sent frontier,
+        // never moves back.
+        assert_eq!((holed.hole, holed.high), (None, 4_000));
+        assert_eq!(holed.catch_up_to, 6_000);
+        // A second reset before the first catch-up found room keeps the
+        // lower start and the new end.
+        holed.catch_up_after_reset(7_000);
+        assert_eq!(holed.catch_up, Some((2_000, 7_000)));
+        assert_eq!(holed.catch_up_to, 7_000);
+    }
+
+    /// karyos#890 review: an outcome of a head staged before a reset that
+    /// is reported after the reopen (which clears the lane's staged heads)
+    /// matches no staged ticket: it marks the lane `mismatched` and never
+    /// records a `hole`, so no stale hole starts a later catch-up early.
+    #[test]
+    fn a_heads_outcome_after_the_reopen_records_no_hole() {
+        use karyos_io::backend::{Commit, TxOptions};
+        let mut tx = roomy_tx();
+        let route = tx.add_route("127.0.0.1:7001".parse().unwrap()).unwrap();
+        let queue = tx
+            .open_queue(TxQueueConfig {
+                authority: Authority::FIRST,
+                route,
+                max_pending: NonZeroU16::MIN,
+            })
+            .unwrap();
+        let frame = tx.claim_tx(queue, 1408).unwrap();
+        let ticket = frame
+            .commit(Commit {
+                len: 64,
+                token: SenderToken::new(1),
+                options: TxOptions::none(),
+            })
+            .unwrap();
+        let staged = Staged {
+            ticket,
+            charge: 64,
+            len: 64,
+        };
+        let mut lanes = [lane_at(1_000)];
+        lanes[0].staged.push_back((ticket, 2_000));
+        // The reopen clears what was staged, as `open_targets` does.
+        lanes[0].staged.clear();
+        let mut gate = TargetGate {
+            lanes: &mut lanes,
+            held: false,
+            edges: [u64::MAX; 4],
+        };
+        gate.left(0, staged, Left::Returned);
+        assert_eq!(
+            (lanes[0].hole, lanes[0].mismatched, lanes[0].high),
+            (None, true, 1_000)
+        );
+        // Staged in the same epoch, the same outcome records its hole.
+        let mut lanes = [lane_at(1_000)];
+        lanes[0].staged.push_back((ticket, 2_000));
+        let mut gate = TargetGate {
+            lanes: &mut lanes,
+            held: false,
+            edges: [u64::MAX; 4],
+        };
+        gate.left(0, staged, Left::Returned);
+        assert_eq!((lanes[0].hole, lanes[0].mismatched), (Some(1_000), false));
+        // The committed item is never sent: a TX half dropped with it
+        // pending asserts, so the test lets it go.
+        std::mem::forget(tx);
+    }
+
+    /// The shares (MD-8, karyos#802): each table a destination's repair
+    /// path holds, over every destination the publication may have, stays
+    /// within the configured table; a table below one entry per
+    /// destination is refused by name.
+    #[test]
+    fn each_repair_table_is_shared_out_within_its_configured_size() {
+        use crate::agents::repair::{RepairConfig, RepairConfigError};
+        let config = RepairConfig::default();
+        let shared = destination_share(&config).unwrap();
+        for (one, all) in [
+            (shared.jobs.repair_jobs, config.jobs.repair_jobs),
+            (shared.err_linger_entries, config.err_linger_entries),
+            (
+                shared.jobs.repair_linger_entries,
+                config.jobs.repair_linger_entries,
+            ),
+            (shared.replies, config.replies),
+        ] {
+            assert!(one >= 1);
+            assert!(
+                one * MAX_DESTINATIONS <= all,
+                "{one} x {MAX_DESTINATIONS} > {all}"
+            );
+        }
+        // Requesters are per job.
+        assert_eq!(
+            shared.jobs.requesters_per_job,
+            config.jobs.requesters_per_job
+        );
+        let small = |set: fn(&mut RepairConfig)| {
+            let mut config = RepairConfig::default();
+            set(&mut config);
+            destination_share(&config)
+        };
+        assert_eq!(
+            small(|c| c.replies = MAX_DESTINATIONS - 1),
+            Err(RepairConfigError::TableShare {
+                table: "replies",
+                value: MAX_DESTINATIONS - 1,
+                destinations: MAX_DESTINATIONS,
+            })
+        );
+        assert!(matches!(
+            small(|c| c.err_linger_entries = 1),
+            Err(RepairConfigError::TableShare {
+                table: "err_linger_entries",
+                ..
+            })
+        ));
+        assert!(matches!(
+            small(|c| c.jobs.repair_linger_entries = 3),
+            Err(RepairConfigError::TableShare {
+                table: "repair_linger_entries",
+                ..
+            })
+        ));
+        assert!(matches!(
+            small(|c| c.jobs.repair_jobs = 2),
+            Err(RepairConfigError::DestinationShare { .. })
+        ));
+    }
+
+    /// MD-20 (karyos#802): a catch-up takes a job in its destination's
+    /// share with no admission; a full share leaves it to try again, and a
+    /// part below the retention floor is counted lost, never read.
+    #[test]
+    fn a_catch_up_takes_a_job_waits_on_a_full_share_and_counts_what_is_below_the_floor() {
+        use crate::agents::repair::{CatchUp, RepairConfig};
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut outbound = fanned(address(4000));
+        let mut config = RepairConfig::default();
+        // One job per destination.
+        config.jobs.repair_jobs = MAX_DESTINATIONS;
+        let identity = karyos_protocol::network::Identity {
+            driver_id: [1, 2],
+            registration_id: 1,
+            incarnation: 1,
+        };
+        outbound.enable_repair(&config, 65_536, identity).unwrap();
+        let fanout = outbound.fanout.as_deref_mut().unwrap();
+        let repair = fanout.targets[0].repair.as_deref_mut().unwrap();
+        let CatchUp::Queued { from, through, job } = repair.catch_up(0, (1_024, 4_096), 0) else {
+            panic!("no job");
+        };
+        assert_eq!((from, through), (1_024, 4_096));
+        assert!(repair.catch_up_pending(job));
+        // The same range joins the pending job; another finds the share full.
+        assert_eq!(
+            repair.catch_up(0, (1_024, 4_096), 0),
+            CatchUp::Queued {
+                from: 1_024,
+                through: 4_096,
+                job
+            }
+        );
+        assert_eq!(
+            repair.catch_up(0, (8_192, 9_216), 0),
+            CatchUp::Full { from: 8_192 }
+        );
+        // Below the floor: lost, counted, and only the rest is asked for.
+        assert_eq!(repair.catch_up(0, (0, 512), 1_024), CatchUp::Done);
+        let counts = repair.counts();
+        assert_eq!(
+            (
+                counts.catch_ups,
+                counts.catch_ups_full,
+                counts.catch_up_lost
+            ),
+            (2, 1, 512)
+        );
+        // karyos#890 review (codex): while the share stays full, retrying
+        // as the fanout does (from the start it was handed back) counts
+        // the prefix below the floor once, not once per retry.
+        let mut range = (0, 6_144);
+        for _ in 0..3 {
+            match repair.catch_up(0, range, 1_024) {
+                CatchUp::Full { from } => range = (from, range.1),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(range, (1_024, 6_144));
+        assert_eq!(repair.counts().catch_up_lost, 512 + 1_024);
+    }
+
+    /// karyos#802: with every destination's step 8 ERR list full in one
+    /// cycle, the sender's list (`replies`, as the role sizes it) takes
+    /// them all: the shares of the destinations sum within it, so nothing
+    /// counts toward `nak_replies_dropped`.
+    #[test]
+    fn every_destinations_errs_fit_the_senders_list() {
+        use crate::agents::repair::RepairConfig;
+        use karyos_protocol::frame::Lane;
+        use karyos_protocol::network::{Nak, NakRange, NakReply, NakReplyReason, Receiver};
+        let address = |port: u16| SocketAddr::from(([127, 0, 0, 1], port));
+        let mut outbound = fanned(address(4000));
+        for port in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+            let _ = outbound.change_destination(address(4000 + port), true, 0, 0);
+        }
+        let config = RepairConfig::default();
+        let identity = karyos_protocol::network::Identity {
+            driver_id: [1, 2],
+            registration_id: 1,
+            incarnation: 1,
+        };
+        outbound.enable_repair(&config, 65_536, identity).unwrap();
+        let nak = Nak {
+            alias: karyos_protocol::network::Alias {
+                session_id: 5,
+                stream_id: 6,
+            },
+            identity,
+            receiver: Receiver {
+                receiver_boot_id: [7, 8],
+                receiver_id: 1,
+            },
+            range: NakRange {
+                lane: Lane::ZERO,
+                length: 64,
+                start: 0,
+            },
+        };
+        let reply = NakReply::answering(&nak, NakReplyReason::RangeInvalid);
+        let fanout = outbound.fanout.as_deref_mut().unwrap();
+        assert_eq!(fanout.targets.len(), MAX_DESTINATIONS);
+        let held: usize = fanout
+            .targets
+            .iter_mut()
+            .map(|target| target.repair.as_deref_mut().unwrap().fill_replies(reply))
+            .sum();
+        assert_eq!(held, MAX_DESTINATIONS * (config.replies / MAX_DESTINATIONS));
+        // The role's own list and its drop rule (roles.rs).
+        let mut replies = Vec::with_capacity(config.replies);
+        let mut dropped = 0u64;
+        outbound.drain_repair_replies_on(|reply, endpoint| {
+            if replies.len() < replies.capacity() {
+                replies.push((endpoint, *reply));
+            } else {
+                dropped += 1;
+            }
+        });
+        assert_eq!((replies.len(), dropped), (held, 0));
     }
 
     /// A multi-destination publication of one lane toward `first`.

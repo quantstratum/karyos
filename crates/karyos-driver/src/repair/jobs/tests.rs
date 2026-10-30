@@ -285,3 +285,31 @@ fn requesters_belong_to_their_job() {
     assert_eq!(next.slot, first.slot);
     assert_eq!(jobs.requesters(next), &[receiver(3)]);
 }
+
+/// karyos#890 review: only a submission moves a lane's catch-up
+/// position. A job that progressed one frame and was then refused (its
+/// end inside a frame) leaves it at that frame's end, never at the job's
+/// end; one refused before submitting anything leaves it where it was.
+#[test]
+fn a_refused_catch_up_moves_nothing_it_did_not_submit() {
+    let mut jobs = jobs(JobsConfig::default());
+    let job = created(jobs.create_catch_up(0, 4_224, 1_088));
+    jobs.progress(job, 5_280);
+    jobs.failed(job);
+    assert!(!jobs.current(job));
+    assert_eq!(jobs.catch_up_through(0), 5_280);
+    let job = created(jobs.create_catch_up(0, 5_280, 32));
+    jobs.failed(job);
+    assert_eq!(
+        jobs.catch_up_through(0),
+        5_280,
+        "a refused job adds nothing"
+    );
+    let job = created(jobs.create_catch_up(0, 5_280, 1_056));
+    jobs.done(job, 0);
+    assert_eq!(
+        jobs.catch_up_through(0),
+        6_336,
+        "a done job submitted all of it"
+    );
+}

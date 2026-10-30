@@ -128,6 +128,21 @@ pub enum RepairConfigError {
         /// The most destinations of the publication.
         destinations: usize,
     },
+    /// Another of a multi-destination publication's repair tables holds
+    /// less than one entry per destination: each destination gets its
+    /// share, `value / max_destinations`, of at least 1, so the tables of
+    /// every destination together stay within the configured one
+    /// (karyos#802).
+    #[error("{table} {value} is below one entry for each of {destinations} destinations")]
+    TableShare {
+        /// The table: `err_linger_entries`, `repair_linger_entries` or
+        /// `replies`.
+        table: &'static str,
+        /// Its configured size.
+        value: usize,
+        /// The most destinations of the publication.
+        destinations: usize,
+    },
     /// A `retransmit_window` of zero, above half the term, or not
     /// frame-aligned.
     #[error("retransmit_window must be frame-aligned, nonzero and at most half a term")]
@@ -154,8 +169,42 @@ pub struct RepairCounts {
     /// A head submitted for a read it was not staged from: a broken
     /// invariant.
     pub unstaged: u64,
+    /// Catch-up jobs created after an endpoint reset (MD-20, karyos#802).
+    pub catch_ups: u64,
+    /// Catch-up jobs that found the destination's job share full: they
+    /// wait and are tried again.
+    pub catch_ups_full: u64,
+    /// Bytes a catch-up could not repair, being below the retention floor:
+    /// lost for the destination, as a NAK for them would be.
+    pub catch_up_lost: u64,
     /// An increment did not apply (sticky).
     pub overflowed: bool,
+}
+
+/// What a sender-initiated catch-up did (MD-20, karyos#802).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchUp {
+    /// A job covers the range from `from` (its start past the floor) up
+    /// to `through`. What it submits moves
+    /// [`RepairPath::catch_up_through`]; once it ends, done or refused, the
+    /// rest of the range starts there, never at `through` (karyos#890
+    /// review).
+    Queued {
+        /// Where the job starts.
+        from: u64,
+        /// The end of what the job covers.
+        through: u64,
+        /// The job, to know when it ends.
+        job: crate::repair::jobs::JobRef,
+    },
+    /// The destination's job share is full: try again from `from`, the
+    /// range's start past the floor, so a lost prefix is counted once.
+    Full {
+        /// Where the range now starts.
+        from: u64,
+    },
+    /// Nothing left to repair (the range was empty or below the floor).
+    Done,
 }
 
 /// What a repair path counted on one route of a routed publication
@@ -333,6 +382,65 @@ impl RepairPath {
                 None => counts.overflowed = true,
             }
         }
+    }
+
+    /// A sender-initiated catch-up of `lane` over `[start, end)` after its
+    /// destination's endpoint reset (MD-20, karyos#802): one job in the
+    /// destination's share, no admission and no ERR. The part below
+    /// `floor`, the lane's retention floor, cannot be repaired and is
+    /// counted lost; a full share leaves the range to try again.
+    pub fn catch_up(&mut self, lane: u8, (start, end): (u64, u64), floor: u64) -> CatchUp {
+        let from = start.max(floor);
+        if from > start {
+            let lost = from.min(end).saturating_sub(start);
+            match self.counts.catch_up_lost.checked_add(lost) {
+                Some(next) => self.counts.catch_up_lost = next,
+                None => self.counts.overflowed = true,
+            }
+        }
+        if from >= end {
+            return CatchUp::Done;
+        }
+        let length = u32::try_from(end.saturating_sub(from)).unwrap_or(u32::MAX);
+        match self.jobs.create_catch_up(lane, from, length) {
+            Joined::Created(job) | Joined::Joined(job) => {
+                self.counts.bump(|c| &mut c.catch_ups);
+                CatchUp::Queued {
+                    from,
+                    through: from.saturating_add(u64::from(length)),
+                    job,
+                }
+            }
+            Joined::Lingering | Joined::Full => {
+                self.counts.bump(|c| &mut c.catch_ups_full);
+                CatchUp::Full { from }
+            }
+        }
+    }
+
+    /// Whether catch-up `job` is still pending: not done, refused nor
+    /// dropped.
+    #[must_use]
+    pub fn catch_up_pending(&self, job: crate::repair::jobs::JobRef) -> bool {
+        self.jobs.current(job)
+    }
+
+    /// The end of what its catch-up jobs have submitted on `lane`, 0 for
+    /// none (MD-20): moved only by a backend submission.
+    #[must_use]
+    pub fn catch_up_through(&self, lane: u8) -> u64 {
+        self.jobs.catch_up_through(lane)
+    }
+
+    /// Fills its step 8 reply list with `reply` up to its bound, as a
+    /// cycle of failed jobs would (tests of the shares, karyos#802); how
+    /// many it holds.
+    #[cfg(test)]
+    pub(crate) fn fill_replies(&mut self, reply: NakReply) -> usize {
+        while self.replies.len() < self.max_replies {
+            self.replies.push((reply, 0));
+        }
+        self.replies.len()
     }
 
     /// The endpoint epoch changed: `queue` is the new repair queue (or none

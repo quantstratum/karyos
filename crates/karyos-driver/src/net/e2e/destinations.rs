@@ -1080,6 +1080,83 @@ fn endpoint_resets_remove_no_optional_destination() {
     assert_eq!(counters.endpoint_limits, 0, "{counters:?}");
 }
 
+/// MD-20 (karyos#802): a reliable publication whose endpoint resets three
+/// times between rounds of traffic catches each destination up by its own
+/// repair path instead of resending everything to all of them: both
+/// receivers still get every message, in order and exactly once, and no
+/// destination is removed.
+#[test]
+fn a_reliable_reset_catches_each_destination_up_in_order() {
+    let mut a = driver(ThreadingMode::Shared);
+    let (mut receivers, addresses) = receivers_on(2, true);
+    let (publication, images) = connect(
+        &mut a,
+        &mut receivers,
+        &destinations(&addresses, true),
+        &[],
+        None,
+    );
+    let (endpoint, alias) = a
+        .net
+        .as_ref()
+        .unwrap()
+        .publication_route(publication.registration())
+        .unwrap();
+    let mut second = receivers.pop().unwrap();
+    let mut first = receivers.pop().unwrap();
+    let mut readers = [
+        first
+            .subscribe_aggregate(&images[0], Role::Required)
+            .unwrap(),
+        second
+            .subscribe_aggregate(&images[1], Role::Required)
+            .unwrap(),
+    ];
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let mut sent = 0u32;
+    let mut seen = [0u32; 2];
+    for (reset, until) in (0..=3u64).zip([64u32, 128, 192, 256]) {
+        if reset > 0 {
+            a.net
+                .as_ref()
+                .unwrap()
+                .links()
+                .sender
+                .post(|_reply| crate::agents::AgentCommand::ForceReset { endpoint, alias })
+                .unwrap();
+        }
+        pump(&mut [&mut a, &mut first, &mut second], |drivers| {
+            while sent < until {
+                match lane.offer(&sent.to_le_bytes()).unwrap() {
+                    OfferOutcome::Accepted { .. } => sent += 1,
+                    _ => break,
+                }
+            }
+            for (reader, count) in readers.iter_mut().zip(seen.iter_mut()) {
+                let _ = reader.poll(
+                    |bytes, _, _| {
+                        let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                        assert_eq!(index, *count, "in order, exactly once");
+                        *count += 1;
+                    },
+                    BUDGET,
+                );
+            }
+            drivers[0].net.as_ref().unwrap().reopened() >= reset
+                && seen.iter().all(|count| *count >= until)
+        });
+    }
+    assert_eq!(seen, [256, 256]);
+    assert!(a.network_removed_destinations(&publication).is_empty());
+    // That nothing below a reset's position goes twice to a destination
+    // that had it is shown frame by frame at driver level
+    // (`agents::data::tests::a_reset_resends_only_what_each_destination_lacks`):
+    // here receivers drop copies, and the per-destination repair counts
+    // also carry NAK repairs for loopback loss, so no count would tell it.
+}
+
 /// karyos#859: an idle multi-destination publication sends each
 /// destination its idle DATA heartbeats, which are image evidence, not path
 /// evidence (RP-2). Whether each destination's subscriber keeps its path

@@ -51,6 +51,9 @@ pub enum Domain {
         /// Its membership generation.
         generation: u64,
     },
+    /// No requester: a sender-initiated catch-up of one destination after
+    /// its endpoint reset (MD-20, karyos#802). It answers no ERR.
+    CatchUp,
 }
 
 /// A job's coalescing key.
@@ -205,6 +208,9 @@ pub struct Jobs {
     lingers: Vec<Option<Linger>>,
     next_order: u64,
     counts: JobsCounts,
+    /// Per lane, the end of what catch-up jobs have submitted: the
+    /// destination has it from there down (MD-20, karyos#802).
+    catch_up_through: [u64; karyos_protocol::network::MAX_LANES],
 }
 
 impl Jobs {
@@ -236,6 +242,7 @@ impl Jobs {
             lingers: vec![None; config.repair_linger_entries],
             next_order: 0,
             counts: JobsCounts::default(),
+            catch_up_through: [0; karyos_protocol::network::MAX_LANES],
         })
     }
 
@@ -347,6 +354,61 @@ impl Jobs {
         Joined::Created(job_ref(at, generation))
     }
 
+    /// A sender-initiated catch-up job over `length` bytes of `lane` from
+    /// `start` (MD-20, karyos#802): no admission, no requester and no ERR,
+    /// in a free slot of the table like any job, so it counts against the
+    /// destination's share. An identical pending catch-up is joined.
+    pub fn create_catch_up(&mut self, lane: u8, start: u64, length: u32) -> Joined {
+        let key = JobKey {
+            lane,
+            start,
+            length,
+            domain: Domain::CatchUp,
+        };
+        if let Some((at, slot)) = self
+            .slots
+            .iter()
+            .enumerate()
+            .find(|(_, slot)| slot.job.is_some_and(|job| job.key == key))
+        {
+            return Joined::Joined(job_ref(at, slot.generation));
+        }
+        let free = self.slots.iter_mut().enumerate().find_map(|(at, slot)| {
+            if slot.retired || slot.job.is_some() {
+                return None;
+            }
+            match slot.generation.checked_add(1) {
+                Some(next) => {
+                    slot.generation = next;
+                    Some((at, slot))
+                }
+                None => {
+                    slot.retired = true;
+                    None
+                }
+            }
+        });
+        let Some((at, slot)) = free else {
+            self.counts.bump(|c| &mut c.full);
+            return Joined::Full;
+        };
+        let order = self.next_order;
+        slot.requesters.clear();
+        slot.routes.clear();
+        slot.job = Some(Job {
+            key,
+            cursor: key.start,
+            order,
+        });
+        let generation = slot.generation;
+        match order.checked_add(1) {
+            Some(next) => self.next_order = next,
+            None => self.counts.overflowed = true,
+        }
+        self.counts.bump(|c| &mut c.created);
+        Joined::Created(job_ref(at, generation))
+    }
+
     /// Whether `job` is still pending.
     #[must_use]
     pub fn current(&self, job: JobRef) -> bool {
@@ -405,6 +467,27 @@ impl Jobs {
             return;
         };
         job.cursor = job.cursor.max(through.min(end));
+        if job.key.domain == Domain::CatchUp {
+            let (lane, cursor) = (job.key.lane, job.cursor);
+            self.note_catch_up(lane, cursor);
+        }
+    }
+
+    /// A catch-up job submitted `lane` up to `through`.
+    fn note_catch_up(&mut self, lane: u8, through: u64) {
+        if let Some(slot) = self.catch_up_through.get_mut(usize::from(lane)) {
+            *slot = (*slot).max(through);
+        }
+    }
+
+    /// The end of what catch-up jobs have submitted on `lane`, 0 for none
+    /// (MD-20): only a backend submission moves it, never a job's creation.
+    #[must_use]
+    pub fn catch_up_through(&self, lane: u8) -> u64 {
+        self.catch_up_through
+            .get(usize::from(lane))
+            .copied()
+            .unwrap_or(0)
     }
 
     /// The backend submitted `job`'s last frame at `now`: the job ends and
@@ -413,6 +496,11 @@ impl Jobs {
         let Some(key) = self.take(job) else {
             return;
         };
+        if key.domain == Domain::CatchUp
+            && let Some(end) = key.start.checked_add(u64::from(key.length))
+        {
+            self.note_catch_up(key.lane, end);
+        }
         self.counts.bump(|c| &mut c.done);
         let linger = self.config.repair_linger;
         let entry = self
