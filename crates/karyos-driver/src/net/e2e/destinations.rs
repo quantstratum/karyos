@@ -9,7 +9,7 @@
 //! without stalling the others (MD-7), and a retransmission goes only to
 //! the destination that asked (MD-8). Dynamic registration is refused.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 
 use karyos_client::OfferOutcome;
 use karyos_client::aggregate::LaneEnd;
@@ -41,6 +41,29 @@ pub(super) fn destinations(destinations: &[SocketAddr], reliable: bool) -> UdpCo
     }
 }
 
+/// Loopback addresses no receiver can bind while this is held: each is
+/// the ephemeral port of a socket kept open (karyos#900). A fixed port
+/// can be one a receiver drew from the same ephemeral range, which turns
+/// an expected `Added` into `Present`.
+struct Reserved {
+    sockets: Vec<UdpSocket>,
+}
+
+impl Reserved {
+    /// `count` reserved loopback ports.
+    fn new(count: usize) -> Self {
+        let sockets = (0..count)
+            .map(|_| UdpSocket::bind(SocketAddr::from((LOOPBACK, 0))).unwrap())
+            .collect();
+        Self { sockets }
+    }
+
+    /// The `index`th reserved address.
+    fn at(&self, index: usize) -> SocketAddr {
+        self.sockets[index].local_addr().unwrap()
+    }
+}
+
 /// Receivers on their own drivers, each subscribed to stream 10 on any
 /// port, with the addresses they bound.
 fn receivers(count: usize) -> (Vec<EmbeddedDriver>, Vec<SocketAddr>) {
@@ -60,6 +83,23 @@ pub(super) fn receivers_on(count: usize, reliable: bool) -> (Vec<EmbeddedDriver>
         drivers.push(receiver);
     }
     (drivers, addresses)
+}
+
+/// karyos#900: a reserved address is never one a receiver bound, and no
+/// receiver can bind it while it is held.
+#[test]
+fn a_reserved_destination_is_never_a_receivers_port() {
+    let (_receivers, addresses) = receivers(4);
+    let reserved = Reserved::new(8);
+    for index in 0..8 {
+        let address = reserved.at(index);
+        assert!(!addresses.contains(&address), "{address} is a receiver's");
+        assert!(UdpSocket::bind(address).is_err(), "{address} is free");
+    }
+    let (_late, late) = receivers(4);
+    for index in 0..8 {
+        assert!(!late.contains(&reserved.at(index)));
+    }
 }
 
 /// One publication reaches three unicast destinations, each through its
@@ -622,7 +662,8 @@ fn twenty_moves_neither_fill_the_table_nor_leak() {
     let mut a = driver(ThreadingMode::Shared);
     let (mut receivers, addresses) = receivers(1);
     // Destinations nobody listens on: routed and opened, never live.
-    let moving = |index: u16| SocketAddr::from((LOOPBACK, 41_000 + index));
+    let reserved = Reserved::new(21);
+    let moving = |index: u16| reserved.at(usize::from(index));
     let (publication, _) = connect(
         &mut a,
         &mut receivers,
@@ -694,7 +735,9 @@ fn move_at_capacity(threading: ThreadingMode) {
 
     let mut a = driver(threading);
     let (mut receivers, addresses) = receivers(1);
-    let at = |index: u16| SocketAddr::from((LOOPBACK, 43_000 + index));
+    // Index 0 is unused; the move goes to the last.
+    let reserved = Reserved::new(MAX_DESTINATIONS + 1);
+    let at = |index: usize| reserved.at(index);
     let (publication, _) = connect(
         &mut a,
         &mut receivers,
@@ -702,7 +745,7 @@ fn move_at_capacity(threading: ThreadingMode) {
         &[],
         None,
     );
-    for index in 1..u16::try_from(MAX_DESTINATIONS).unwrap() {
+    for index in 1..MAX_DESTINATIONS {
         a.add_network_destination(&publication, at(index)).unwrap();
         assert_eq!(
             answer(&mut a, &mut receivers, &publication),
@@ -710,7 +753,8 @@ fn move_at_capacity(threading: ThreadingMode) {
         );
     }
     a.remove_network_destination(&publication, at(1)).unwrap();
-    a.add_network_destination(&publication, at(100)).unwrap();
+    a.add_network_destination(&publication, at(MAX_DESTINATIONS))
+        .unwrap();
     let mut answers = Vec::new();
     {
         let mut all: Vec<&mut EmbeddedDriver> = std::iter::once(&mut a)
@@ -759,10 +803,11 @@ fn move_at_capacity(threading: ThreadingMode) {
     } else {
         DestinationChange::Added
     };
-    a.add_network_destination(&publication, at(100)).unwrap();
+    a.add_network_destination(&publication, at(MAX_DESTINATIONS))
+        .unwrap();
     assert_eq!(
         answer(&mut a, &mut receivers, &publication),
-        (at(100), expected)
+        (at(MAX_DESTINATIONS), expected)
     );
 }
 
@@ -870,8 +915,9 @@ fn additions_never_overcommit_the_repair_job_table() {
         None,
     );
     let table = JobsConfig::default().repair_jobs;
+    let reserved = Reserved::new(MAX_DESTINATIONS);
     for port in 0..u16::try_from(MAX_DESTINATIONS).unwrap() {
-        a.add_network_destination(&publication, SocketAddr::from((LOOPBACK, 42_000 + port)))
+        a.add_network_destination(&publication, reserved.at(usize::from(port)))
             .unwrap();
         let (_, outcome) = answer(&mut a, &mut receivers, &publication);
         let capacity = super::shared(&mut a).sender.fanout_job_capacity(0);
@@ -984,7 +1030,8 @@ fn an_addition_after_every_destination_removed_is_still_taken() {
 
     let mut a = driver(ThreadingMode::Shared);
     let (mut receivers, addresses) = receivers(1);
-    let lone = SocketAddr::from((LOOPBACK, 43_000));
+    let reserved = Reserved::new(2);
+    let lone = reserved.at(0);
     let (publication, _) = connect(
         &mut a,
         &mut receivers,
@@ -1001,12 +1048,13 @@ fn an_addition_after_every_destination_removed_is_still_taken() {
     }
     // No destination is left: the publication is not served, so its
     // removed targets retire only once one is added and served again.
-    let next = SocketAddr::from((LOOPBACK, 43_001));
+    let next = reserved.at(1);
     a.add_network_destination(&publication, next).unwrap();
     assert_eq!(
         answer(&mut a, &mut receivers, &publication),
         (next, DestinationChange::Added)
     );
+    // Of another family, so no IPv4 receiver can hold it.
     let v6: SocketAddr = "[::1]:43002".parse().unwrap();
     a.add_network_destination(&publication, v6).unwrap();
     assert_eq!(
@@ -1022,7 +1070,8 @@ fn an_addition_after_every_destination_removed_is_still_taken() {
 fn endpoint_resets_remove_no_optional_destination() {
     let mut a = driver(ThreadingMode::Shared);
     let (mut receivers, addresses) = receivers(1);
-    let idle = SocketAddr::from((LOOPBACK, 44_000));
+    let reserved = Reserved::new(1);
+    let idle = reserved.at(0);
     let (publication, images) = connect(
         &mut a,
         &mut receivers,
