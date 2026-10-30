@@ -278,12 +278,15 @@ fn a_streams_holders_are_its_lanes_publications() {
     assert_eq!((seen.holders, seen.shared()), (Some(2), Some(true)));
 }
 
-/// karyos#885: the four conditions under which a stream's holders are
-/// unknown, never undercounted: a cell the driver could not allocate, no
-/// pass of the driver yet, no sample of the agent yet, and no attachment.
+/// karyos#885: the conditions under which a stream's holders are unknown,
+/// never undercounted: a cell the driver could not allocate, no pass of
+/// the driver yet, a count that overflows, no sample of the agent yet,
+/// and no attachment.
 #[test]
 fn a_streams_holders_are_unknown_while_cells_are_missing() {
-    use karyos_sys::counters::{LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, wire_stream_id_value};
+    use karyos_sys::counters::{
+        LABEL_EMBEDDED_PUBLICATIONS, LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, wire_stream_id_value,
+    };
 
     let counters = vec![
         cell("counters unavailable", 0, 0, 1),
@@ -302,6 +305,17 @@ fn a_streams_holders_are_unknown_while_cells_are_missing() {
         registry::Presence::default()
     );
     unsampled.sampled = true;
+    // Two lanes whose embedded counts sum past u64::MAX: unknown.
+    let overflowing = sample(vec![
+        cell(LABEL_STREAM_WIRE_ID, 11, 0, wire_stream_id_value(5)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 11, 0, u64::MAX),
+        cell(LABEL_STREAM_WIRE_ID, 11, 1, wire_stream_id_value(5)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 11, 1, 1),
+    ]);
+    assert_eq!(
+        stream_presence(true, Some(&overflowing), "5"),
+        registry::Presence::default()
+    );
     assert_eq!(
         stream_presence(true, Some(&unsampled), "7").holders,
         Some(1)

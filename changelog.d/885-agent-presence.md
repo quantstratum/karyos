@@ -6,4 +6,5 @@
   `publication` cell each plus the lane's `embedded publications`. They
   stay `null` while the driver is not attached, before its first
   positions pass, and while `counters unavailable` is nonzero, so a
-  shared stream is never shown unshared.
+  shared stream is never shown unshared; a count that would overflow
+  is unknown too.

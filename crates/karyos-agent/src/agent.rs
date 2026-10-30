@@ -790,7 +790,7 @@ impl Driver {
 /// Nothing while not `attached`, before the agent's first sample or the
 /// driver's first pass, or while `counters unavailable` is nonzero, since
 /// a cell the driver could not allocate would undercount them and make a
-/// shared stream look unshared.
+/// shared stream look unshared; nothing either when the count overflows.
 fn stream_presence(attached: bool, sample: Option<&Sample>, key: &str) -> registry::Presence {
     let (true, Some(sample)) = (attached, sample) else {
         return registry::Presence::default();
@@ -808,7 +808,7 @@ fn stream_presence(attached: bool, sample: Option<&Sample>, key: &str) -> regist
     if !sample.sampled || unavailable {
         return registry::Presence::default();
     }
-    let lane_count = |lane: &crate::api::Counter, label: &str| -> u64 {
+    let lane_count = |lane: &crate::api::Counter, label: &str| -> Option<u64> {
         sample
             .counters
             .iter()
@@ -822,7 +822,7 @@ fn stream_presence(attached: bool, sample: Option<&Sample>, key: &str) -> regist
                     counter.value
                 }
             })
-            .fold(0, u64::saturating_add)
+            .try_fold(0, u64::checked_add)
     };
     let holders = sample
         .counters
@@ -832,10 +832,14 @@ fn stream_presence(attached: bool, sample: Option<&Sample>, key: &str) -> regist
                 && wire_stream_id(counter.value) == Some(stream_id)
         })
         .map(|lane| {
-            lane_count(lane, LABEL_PUBLICATION)
-                .saturating_add(lane_count(lane, LABEL_EMBEDDED_PUBLICATIONS))
+            lane_count(lane, LABEL_PUBLICATION)?
+                .checked_add(lane_count(lane, LABEL_EMBEDDED_PUBLICATIONS)?)
         })
-        .fold(0, u64::saturating_add);
+        .try_fold(0_u64, |sum, lane| sum.checked_add(lane?));
+    // A count past u64::MAX is no count: unknown, as for a missing cell.
+    let Some(holders) = holders else {
+        return registry::Presence::default();
+    };
     registry::Presence {
         present: Some(holders > 0),
         holders: Some(holders),
