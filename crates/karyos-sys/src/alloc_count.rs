@@ -24,6 +24,10 @@ thread_local! {
     static SEEN: Cell<u64> = const { Cell::new(0) };
     /// Allocations and reallocations alone seen while armed.
     static ALLOCATED: Cell<u64> = const { Cell::new(0) };
+    /// Bytes allocated less bytes freed while armed (layout sizes).
+    static NET: Cell<i128> = const { Cell::new(0) };
+    /// The highest [`NET`] reached while armed.
+    static PEAK: Cell<i128> = const { Cell::new(0) };
 }
 
 thread_local! {
@@ -140,6 +144,26 @@ fn note_allocation() {
     }
 }
 
+/// Counts `delta` bytes, allocated (positive) or freed (negative).
+fn note_bytes(delta: i128) {
+    let armed = ARMED.try_with(Cell::get).unwrap_or(false);
+    if armed {
+        let net = NET.try_with(|net| {
+            let now = net.get().checked_add(delta).unwrap_or(net.get());
+            net.set(now);
+            now
+        });
+        if let Ok(now) = net {
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+        }
+    }
+}
+
+/// A layout size as a signed byte count.
+fn size(bytes: usize) -> i128 {
+    i128::try_from(bytes).unwrap_or(i128::MAX)
+}
+
 fn note() {
     // `try_with`: a thread-local being destroyed is simply not counted.
     // These const-initialized cells need no destructor and never allocate.
@@ -150,10 +174,10 @@ fn note() {
 }
 
 // SAFETY: every method forwards its arguments unchanged to `System`, which
-// upholds the `GlobalAlloc` contract; `note`, `note_allocation` and
-// `note_set` only touch const-initialized thread-local cells, which need no
-// destructor, and static atomics, which never allocate. On the targets these tests
-// run on (Linux and macOS, native thread-locals) touching them never
+// upholds the `GlobalAlloc` contract; `note`, `note_allocation`,
+// `note_set` and `note_bytes` only touch const-initialized thread-local
+// cells, which need no destructor, and static atomics, which never
+// allocate. On the targets these tests run on (Linux and macOS, native thread-locals) touching them never
 // allocates, so the allocator never re-enters itself; a target with the
 // OS-key thread-local fallback would allocate on first access.
 unsafe impl GlobalAlloc for CountingAllocator {
@@ -161,6 +185,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         note();
         note_allocation();
         note_set(true);
+        note_bytes(size(layout.size()));
         // SAFETY: forwarded with the caller's guarantees.
         unsafe { System.alloc(layout) }
     }
@@ -169,6 +194,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         note();
         note_allocation();
         note_set(true);
+        note_bytes(size(layout.size()));
         // SAFETY: forwarded with the caller's guarantees.
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -176,6 +202,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         note();
         note_set(false);
+        note_bytes(-size(layout.size()));
         // SAFETY: forwarded with the caller's guarantees.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -184,6 +211,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
         note();
         note_allocation();
         note_set(true);
+        note_bytes(size(new_size) - size(layout.size()));
         // SAFETY: forwarded with the caller's guarantees.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -216,4 +244,26 @@ pub fn count_allocations<R>(call: impl FnOnce() -> R) -> (R, u64) {
     ALLOCATED.with(|seen| seen.set(0));
     let (result, _) = count(call);
     (result, ALLOCATED.with(Cell::get))
+}
+
+/// What [`count_bytes`] saw, in layout bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bytes {
+    /// Allocated less freed: what the call left held.
+    pub net: i128,
+    /// The most held at any point of the call.
+    pub peak: i128,
+}
+
+/// [`count`], counting the bytes the calling thread allocated and freed:
+/// for a bound on the memory a structure holds (karyos#893).
+pub fn count_bytes<R>(call: impl FnOnce() -> R) -> (R, Bytes) {
+    NET.with(|net| net.set(0));
+    PEAK.with(|peak| peak.set(0));
+    let (result, _) = count(call);
+    let bytes = Bytes {
+        net: NET.with(Cell::get),
+        peak: PEAK.with(Cell::get),
+    };
+    (result, bytes)
 }

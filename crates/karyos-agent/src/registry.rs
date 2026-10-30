@@ -54,15 +54,21 @@ pub const LIST_PAGE: usize = 64;
 /// The bytes one version holds at most besides its fixed fields: its
 /// attributes as `name=value`, separated by spaces.
 const MAX_ATTRIBUTE_TEXT: usize = MAX_ATTRIBUTES * (MAX_NAME_BYTES + 1 + MAX_VALUE_BYTES + 1);
-/// The fixed size of one version: its number, uid and two instants, and
-/// its attribute text's allocation header.
-const VERSION_BYTES: usize = 8 + 4 + 8 + 8 + 24;
-/// The fixed size of one key: its kind, text, version queue, counts and
-/// map node, rounded up.
-const KEY_BYTES: usize = 160 + MAX_KEY_BYTES;
+/// The fixed size of one version in its key's queue (the queue holds
+/// exactly [`MAX_VERSIONS`]); its attribute text is held exactly, as
+/// accepted.
+const VERSION_BYTES: usize = std::mem::size_of::<Version>();
+/// One key besides its versions: its text twice (the map's key and the
+/// entry's) and its share of the map's nodes. A node holds up to 11 keys
+/// and at least 5 (the root excepted), and the inner nodes are fewer than
+/// a fifth of the leaves, so a key's share is under 3 slots of key and
+/// entry (karyos#893).
+const KEY_BYTES: usize = 2 * MAX_KEY_BYTES + 3 * std::mem::size_of::<(Key, Entry)>();
 /// The most memory the registry's entries hold:
 /// `MAX_KEYS x (KEY_BYTES + MAX_VERSIONS x (VERSION_BYTES + MAX_ATTRIBUTE_TEXT))`,
-/// 6 864 896 bytes (6.5 MiB).
+/// in layout bytes; 7 208 960 bytes (6.9 MiB) on 64-bit targets. The
+/// counting allocator measures a registry filled to every bound at
+/// 7 057 552 held and 7 059 375 at its peak (`tests/registry_memory.rs`).
 pub const MAX_MEMORY_BYTES: usize =
     MAX_KEYS * (KEY_BYTES + MAX_VERSIONS * (VERSION_BYTES + MAX_ATTRIBUTE_TEXT));
 

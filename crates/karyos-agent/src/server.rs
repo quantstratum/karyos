@@ -110,7 +110,8 @@ pub const MAX_ACCEPTS: usize = 16;
 /// above. Only `read.request_bytes` is negotiable in v1, and only
 /// downwards: no bound is raised. The `join.*` dimensions are the join
 /// metadata registry's (karyos#736): `join.memory_bytes` is the computed
-/// worst case of the memory its entries hold. The `trace.*` dimensions are the
+/// worst case of the memory its entries hold, in layout bytes, measured
+/// against the counting allocator (karyos#893). The `trace.*` dimensions are the
 /// driver's application trace point bounds (R-CORE-1): the ids an instance
 /// assigns, a protocol constant, and the per-client bounds at the
 /// driver's built-in defaults: the CnC does not expose a driver's

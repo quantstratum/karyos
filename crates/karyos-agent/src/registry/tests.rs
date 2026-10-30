@@ -370,7 +370,7 @@ fn a_list_pages_one_drivers_keys() {
 fn generations_differ_and_memory_is_bounded() {
     assert_ne!(Registry::new(0).generation(), Registry::new(0).generation());
     assert_eq!(Registry::new(42).since_ns(), 42);
-    assert_eq!(MAX_MEMORY_BYTES, 6_864_896);
+    assert_eq!(MAX_MEMORY_BYTES, 7_208_960);
     const { assert!(MAX_MEMORY_BYTES <= 8 << 20) };
 }
 
