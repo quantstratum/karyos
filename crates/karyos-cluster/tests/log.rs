@@ -1692,3 +1692,91 @@ fn open_follows_a_purge_whose_first_index_file_is_stale() {
     assert_ne!(std::fs::read(dir.0.join(FIRST_INDEX_FILE)).unwrap(), stale);
     assert_eq!(open(StdDisk, &dir.0, small()).first_index(), first);
 }
+
+/// Reads verify each frame against the index and its CRC (karyos#904): a
+/// frame corrupted on disk after the open is a typed `LogError::Chain`,
+/// never a short, long or wrong entry, and its claimed length is checked
+/// before anything is allocated (a length of 4 GiB would abort the test
+/// otherwise).
+#[test]
+fn a_corrupt_frame_is_refused_on_read() {
+    use karyos_cluster::log::LOG_RECORDING;
+
+    // Header: magic 4, length 4, index 8, term 8, event time 8, CRC 4.
+    let cases: [(&str, usize, Vec<u8>); 7] = [
+        ("longer", 4, 1024u32.to_le_bytes().to_vec()),
+        ("shorter", 4, 100u32.to_le_bytes().to_vec()),
+        ("huge", 4, u32::MAX.to_le_bytes().to_vec()),
+        ("index", 8, 99u64.to_le_bytes().to_vec()),
+        ("term", 16, 7u64.to_le_bytes().to_vec()),
+        ("payload", FRAME_HEADER + 10, vec![0xAA]),
+        ("crc", 32, vec![0, 0, 0, 0]),
+    ];
+    for (label, offset, bytes) in cases {
+        for frame in [0u64, 2] {
+            let dir = TempDir::new(&format!("corrupt-{label}-{frame}"));
+            let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+            let written: Vec<Entry> = (1..=3).map(|index| entry(index, 1, &[5; 256])).collect();
+            log.append(&written).unwrap();
+            log.sync().unwrap();
+            let span = 256 + FRAME_HEADER as u64;
+            // Frame 0 (entry 1) and frame 2 (entry 3, the last).
+            let at = frame * span + offset as u64;
+            let segment = dir.0.join(format!("{LOG_RECORDING:016x}-{:016x}.seg", 0));
+            let mut disk = StdDisk;
+            let file = disk.open(&segment).unwrap();
+            disk.write_at(&file, at, &bytes).unwrap();
+            let index = frame + 1;
+            let read = log.entries(index..index + 1, u64::MAX);
+            let expected = match label {
+                // The last frame may be shorter than the written end (a
+                // failed append's bytes may follow it): its CRC refuses it.
+                "shorter" if frame == 2 => matches!(
+                    read,
+                    Err(LogError::Chain {
+                        problem: ChainProblem::Checksum,
+                        ..
+                    })
+                ),
+                "longer" | "shorter" | "huge" => matches!(
+                    read,
+                    Err(LogError::Chain {
+                        problem: ChainProblem::Length { .. },
+                        ..
+                    })
+                ),
+                "index" => matches!(
+                    read,
+                    Err(LogError::Chain {
+                        problem: ChainProblem::Index { got: 99, .. },
+                        ..
+                    })
+                ),
+                "term" => matches!(
+                    read,
+                    Err(LogError::Chain {
+                        problem: ChainProblem::Term {
+                            expected: 1,
+                            got: 7
+                        },
+                        ..
+                    })
+                ),
+                _ => matches!(
+                    read,
+                    Err(LogError::Chain {
+                        problem: ChainProblem::Checksum,
+                        ..
+                    })
+                ),
+            };
+            assert!(expected, "{label} at frame {frame}: {read:?}");
+            // The others still read whole.
+            let other = if frame == 0 { 2 } else { 1 };
+            assert_eq!(
+                log.entries(other..other + 1, u64::MAX).unwrap()[0].payload,
+                vec![5; 256]
+            );
+        }
+    }
+}

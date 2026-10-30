@@ -1,0 +1,3 @@
+### Fixed
+
+- `RaftLog::entries` checks each frame against the in-memory index before it reads or allocates the payload, then checks its CRC-32C (karyos#904). The header must name the indexed index and term, and the header and payload must span exactly the frame's indexed bytes; the last frame must fit before the written end. Before, a frame corrupted on disk after the open was read silently: a wrong length returned a payload running into the next frame. Such a frame is now a typed `LogError::Chain`, with new `ChainProblem::Length` and `ChainProblem::Term` problems, and the read does not poison the log.
