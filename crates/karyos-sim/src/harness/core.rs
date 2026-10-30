@@ -76,6 +76,28 @@ pub struct LogView<'a> {
     log: &'a mut RaftLog<SimDisk>,
     /// The duty's read budget, when the log-read limit applies.
     budget: Option<&'a ReadBudget>,
+    /// The latest snapshot the node holds, if any (W5).
+    base: Option<SnapshotBase>,
+}
+
+/// A snapshot's base: the last log index it includes and that entry's
+/// term (W5; karyos#687).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotBase {
+    /// The last index it includes.
+    pub index: u64,
+    /// That entry's term.
+    pub term: u64,
+}
+
+/// Why a core refused to install a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallRefused {
+    /// The core does not take snapshots: its W5 snapshot cases are not
+    /// demonstrated.
+    Unsupported,
+    /// It already holds the snapshot's base or more.
+    Stale,
 }
 
 /// A duty's log-read budget (W2's log-read limit): the log bytes a core
@@ -125,12 +147,20 @@ impl From<LogError> for ReadError {
 impl<'a> LogView<'a> {
     /// A view of `log`, unmetered.
     pub fn new(log: &'a mut RaftLog<SimDisk>) -> Self {
-        Self { log, budget: None }
+        Self {
+            log,
+            budget: None,
+            base: None,
+        }
     }
 
     /// A view of `log` whose reads spend `budget`.
     pub fn metered(log: &'a mut RaftLog<SimDisk>, budget: Option<&'a ReadBudget>) -> Self {
-        Self { log, budget }
+        Self {
+            log,
+            budget,
+            base: None,
+        }
     }
 
     /// Entries in `range`, up to `max_bytes` of frames (at least one).
@@ -184,10 +214,30 @@ impl<'a> LogView<'a> {
         Ok(self.log.entries(range.start..end, u64::MAX)?)
     }
 
-    /// The term of entry `index`, if the log holds it.
+    /// It, with `base` as the node's latest snapshot.
+    #[must_use]
+    pub fn with_base(mut self, base: Option<SnapshotBase>) -> Self {
+        self.base = base;
+        self
+    }
+
+    /// The node's latest snapshot, if any: the log holds no entry at or
+    /// below its index that a core may need, and that entry's term is the
+    /// base's.
+    #[must_use]
+    pub fn base(&self) -> Option<SnapshotBase> {
+        self.base
+    }
+
+    /// The term of entry `index`, if the log holds it, or the snapshot's
+    /// base names it.
     #[must_use]
     pub fn term(&self, index: u64) -> Option<u64> {
-        self.log.term(index)
+        self.log.term(index).or_else(|| {
+            self.base
+                .filter(|base| base.index == index)
+                .map(|base| base.term)
+        })
     }
 
     /// The first index.
@@ -299,6 +349,9 @@ pub struct Ready<M> {
     pub after_persist: Vec<(NodeId, M)>,
     /// Committed entries to apply, in order.
     pub committed: Vec<Entry>,
+    /// Followers to send the node's latest snapshot to: they need entries
+    /// the log no longer holds (W5).
+    pub snapshot_to: Vec<NodeId>,
 }
 
 impl<M> Default for Ready<M> {
@@ -310,6 +363,7 @@ impl<M> Default for Ready<M> {
             hard_state: None,
             after_persist: Vec::new(),
             committed: Vec::new(),
+            snapshot_to: Vec::new(),
         }
     }
 }
@@ -391,6 +445,32 @@ pub trait ConsensusCore: Sized {
     /// static membership.
     fn configuration(&self) -> Option<Configuration> {
         None
+    }
+
+    /// The node compacted its log below a snapshot at `base`: entries at
+    /// or below it may no longer be in the log (W5).
+    ///
+    /// # Errors
+    ///
+    /// [`Unsupported`], the default, for a core that takes no snapshots:
+    /// the harness never compacts under it, and its W5 snapshot cases are
+    /// not demonstrated.
+    fn compacted(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), Unsupported> {
+        let _ = (base, log);
+        Err(Unsupported)
+    }
+
+    /// The node installed a leader's snapshot at `base`: its service holds
+    /// the state up to `base.index`, and its log starts after it (W5).
+    ///
+    /// # Errors
+    ///
+    /// [`InstallRefused::Unsupported`], the default, for a core that takes
+    /// no snapshots; [`InstallRefused::Stale`] when it already holds
+    /// `base` or more.
+    fn install(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), InstallRefused> {
+        let _ = (base, log);
+        Err(InstallRefused::Unsupported)
     }
 
     /// Proposes one membership change.

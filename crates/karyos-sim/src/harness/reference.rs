@@ -538,6 +538,7 @@ impl ConsensusCore for Reference {
             hard_state,
             after_persist: std::mem::take(&mut self.after_persist),
             committed,
+            snapshot_to: Vec::new(),
         })
     }
 

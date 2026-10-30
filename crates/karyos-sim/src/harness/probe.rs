@@ -29,7 +29,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_sys::alloc_count::{SetCounts, enroll, window};
 
-use super::core::{ConsensusCore, Limits, LogView, Persisted, Ready, Refused, Unsupported};
+use super::core::{
+    ConsensusCore, InstallRefused, Limits, LogView, Persisted, Ready, Refused, SnapshotBase,
+    Unsupported,
+};
 use super::workloads::{Case, Outcome, RunError, run};
 use crate::net::NodeId;
 
@@ -134,6 +137,14 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
 
     fn configuration(&self) -> Option<super::core::Configuration> {
         self.read(C::configuration)
+    }
+
+    fn compacted(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), Unsupported> {
+        self.counted(|core| core.compacted(base, log))
+    }
+
+    fn install(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), InstallRefused> {
+        self.counted(|core| core.install(base, log))
     }
 
     fn propose_change(
