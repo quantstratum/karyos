@@ -629,3 +629,211 @@ fn a_token_is_bounded_and_read_from_a_private_file() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// One raw head to `exporter` and what it answered; the answer's bytes
+/// may be cut by a reset when the head went past its bound.
+fn exchange_bytes(exporter: &mut Exporter, request: &[u8]) -> (Vec<u8>, Vec<Answered>) {
+    let mut client = TcpStream::connect(exporter.local_addr().unwrap()).unwrap();
+    let _ = client.write_all(request);
+    let _ = client.shutdown(std::net::Shutdown::Write);
+    let mut answered = Vec::new();
+    for _ in 0..200 {
+        answered = exporter.poll(|| "karyos_up 1\n".to_owned()).unwrap();
+        if !answered.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut answer = Vec::new();
+    let _ = client.read_to_end(&mut answer);
+    (answer, answered)
+}
+
+const TOKEN: &[u8] = b"0123456789abcdef0123456789abcdef";
+
+/// The token a head offers, by an oracle of its own: within the bytes the
+/// exporter reads, the last `Authorization` header before the blank line,
+/// its scheme `Bearer` in any case followed by one space, and the rest
+/// trimmed. `None` when there is no such header.
+fn bearer_of(head: &[u8]) -> Option<Vec<u8>> {
+    let read = head.get(..MAX_REQUEST).unwrap_or(head);
+    let mut lines = read.split(|byte| *byte == b'\n');
+    let _request = lines.next()?;
+    let mut offered = None;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let (name, value) = line.split_at(colon);
+        let value = value.get(1..).unwrap_or_default();
+        if !name.trim_ascii().eq_ignore_ascii_case(b"authorization") {
+            continue;
+        }
+        let value = value.trim_ascii();
+        offered = match value.get(..7) {
+            Some(scheme) if scheme.eq_ignore_ascii_case(b"bearer ") => {
+                value.get(7..).map(|token| token.trim_ascii().to_vec())
+            }
+            _ => None,
+        };
+    }
+    offered
+}
+
+/// A generated head: request lines and `Authorization` variants (the
+/// token, one byte off, a prefix, an extension, another scheme, no space,
+/// any case), other headers, non-UTF-8 bytes, and padding up to and past
+/// the head's bound, cut anywhere.
+fn head() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+    use proptest::prelude::*;
+    let line = prop_oneof![
+        6 => Just(b"GET /metrics HTTP/1.1\r\n".to_vec()),
+        1 => Just(b"GET /metrics HTTP/1.0\n".to_vec()),
+        1 => Just(b"get /metrics HTTP/1.1\r\n".to_vec()),
+        1 => Just(b"GET /other HTTP/1.1\r\n".to_vec()),
+        1 => Just(b"POST /metrics HTTP/1.1\r\n".to_vec()),
+        1 => Just(b"GET /metrics\r\n".to_vec()),
+        1 => Just(b"GET /metrics SPDY/3\r\n".to_vec()),
+        1 => proptest::collection::vec(any::<u8>(), 0..64),
+    ];
+    let mut off = TOKEN.to_vec();
+    if let Some(last) = off.last_mut() {
+        *last = b'X';
+    }
+    let value = prop_oneof![
+        6 => Just(TOKEN.to_vec()),
+        1 => Just(off),
+        1 => Just(TOKEN.get(..31).unwrap().to_vec()),
+        1 => Just([TOKEN, b"0"].concat()),
+        1 => proptest::collection::vec(any::<u8>(), 0..300),
+    ];
+    let scheme = prop_oneof![
+        Just(b"Bearer ".to_vec()),
+        Just(b"bearer ".to_vec()),
+        Just(b"BEARER  ".to_vec()),
+        Just(b"Bearer".to_vec()),
+        Just(b"Basic ".to_vec()),
+        // Seven bytes, as `Bearer `: only the scheme check refuses it.
+        Just(b"Basic  ".to_vec()),
+    ];
+    let name = prop_oneof![
+        Just(b"Authorization: ".to_vec()),
+        Just(b"authorization:".to_vec()),
+        Just(b"Authorisation: ".to_vec()),
+        Just(b"X-Authorization: ".to_vec()),
+    ];
+    let authorization = (name, scheme, value)
+        .prop_map(|(name, scheme, value)| [name, scheme, value, b"\r\n".to_vec()].concat());
+    let header = prop_oneof![
+        3 => authorization,
+        1 => Just(b"Host: localhost\r\n".to_vec()),
+        1 => proptest::collection::vec(any::<u8>(), 0..40),
+        1 => (0..1200usize).prop_map(|length| [vec![b'p'; length], b"\r\n".to_vec()].concat()),
+    ];
+    (
+        line,
+        proptest::collection::vec(header, 0..4),
+        any::<bool>(),
+        any::<prop::sample::Index>(),
+    )
+        .prop_map(|(line, headers, cut, at)| {
+            let mut head = [line, headers.concat(), b"\r\n".to_vec()].concat();
+            if cut {
+                head.truncate(at.index(head.len() + 1));
+            }
+            head
+        })
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(128))]
+
+    /// Whatever head comes (karyos#893): a poll never fails or panics, and
+    /// metrics are served only to a head whose bounded part carries an
+    /// `Authorization` header with exactly the token.
+    #[test]
+    fn no_head_without_the_token_is_served_metrics(head in head()) {
+        let token = Token::new(TOKEN.to_vec()).unwrap();
+        let mut exporter = bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_token(token);
+        let (answer, answered) = exchange_bytes(&mut exporter, &head);
+        proptest::prop_assert_eq!(answered.len(), 1);
+        if answered.contains(&Answered::Metrics) {
+            proptest::prop_assert!(
+                bearer_of(&head).as_deref() == Some(TOKEN),
+                "{:?}",
+                String::from_utf8_lossy(&head)
+            );
+        } else {
+            proptest::prop_assert!(
+                !answer.windows(9).any(|window| window == b"karyos_up"),
+                "{:?}",
+                String::from_utf8_lossy(&answer)
+            );
+        }
+    }
+}
+
+/// The scheme, the header's name, and the last header decide (karyos#893,
+/// codex): a seven-byte scheme other than `Bearer `, a header named
+/// otherwise, and an earlier good header overridden by a later bad one
+/// are refused; a later good one is served.
+#[test]
+fn only_the_last_bearer_authorization_with_the_token_is_served() {
+    let token = Token::new(TOKEN.to_vec()).unwrap();
+    let mut exporter = bind("127.0.0.1:0".parse().unwrap())
+        .unwrap()
+        .with_token(token);
+    let good = "Authorization: Bearer 0123456789abcdef0123456789abcdef\r\n";
+    let bad = "Authorization: Bearer 0123456789abcdef0123456789abcdeX\r\n";
+    for (head, expected) in [
+        (
+            "Authorization: Basic  0123456789abcdef0123456789abcdef\r\n".to_owned(),
+            Answered::Unauthorized,
+        ),
+        (
+            "X-Authorization: Bearer 0123456789abcdef0123456789abcdef\r\n".to_owned(),
+            Answered::Unauthorized,
+        ),
+        (format!("{good}{bad}"), Answered::Unauthorized),
+        (format!("{bad}{good}"), Answered::Metrics),
+    ] {
+        let request = format!("GET /metrics HTTP/1.1\r\n{head}\r\n");
+        let (_, answered) = exchange(&mut exporter, &request);
+        assert_eq!(answered, [expected], "{head:?}");
+        assert_eq!(
+            bearer_of(request.as_bytes()).as_deref() == Some(TOKEN),
+            expected == Answered::Metrics,
+            "the oracle agrees: {head:?}"
+        );
+    }
+}
+
+/// A header line that is not UTF-8 makes the head bad (karyos#893, codex):
+/// a good `Authorization` followed by one whose token is not UTF-8 is a
+/// 400, never metrics on the earlier header.
+#[test]
+fn a_head_with_a_header_that_is_not_utf8_is_refused() {
+    let token = Token::new(TOKEN.to_vec()).unwrap();
+    let mut exporter = bind("127.0.0.1:0".parse().unwrap())
+        .unwrap()
+        .with_token(token);
+    let head = [
+        &b"GET /metrics HTTP/1.1\r\nAuthorization: Bearer "[..],
+        TOKEN,
+        b"\r\nAuthorization: Bearer \xff\r\n\r\n",
+    ]
+    .concat();
+    let (answer, answered) = exchange_bytes(&mut exporter, &head);
+    assert_eq!(answered, [Answered::Refused]);
+    assert!(
+        answer.starts_with(b"HTTP/1.1 400"),
+        "{:?}",
+        String::from_utf8_lossy(&answer)
+    );
+}

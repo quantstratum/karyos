@@ -54,15 +54,21 @@ pub const LIST_PAGE: usize = 64;
 /// The bytes one version holds at most besides its fixed fields: its
 /// attributes as `name=value`, separated by spaces.
 const MAX_ATTRIBUTE_TEXT: usize = MAX_ATTRIBUTES * (MAX_NAME_BYTES + 1 + MAX_VALUE_BYTES + 1);
-/// The fixed size of one version: its number, uid and two instants, and
-/// its attribute text's allocation header.
-const VERSION_BYTES: usize = 8 + 4 + 8 + 8 + 24;
-/// The fixed size of one key: its kind, text, version queue, counts and
-/// map node, rounded up.
-const KEY_BYTES: usize = 160 + MAX_KEY_BYTES;
+/// The fixed size of one version in its key's queue (the queue holds
+/// exactly [`MAX_VERSIONS`]); its attribute text is held exactly, as
+/// accepted.
+const VERSION_BYTES: usize = std::mem::size_of::<Version>();
+/// One key besides its versions: its text twice (the map's key and the
+/// entry's) and its share of the map's nodes. A node holds up to 11 keys
+/// and at least 5 (the root excepted), and the inner nodes are fewer than
+/// a fifth of the leaves, so a key's share is under 3 slots of key and
+/// entry (karyos#893).
+const KEY_BYTES: usize = 2 * MAX_KEY_BYTES + 3 * std::mem::size_of::<(Key, Entry)>();
 /// The most memory the registry's entries hold:
 /// `MAX_KEYS x (KEY_BYTES + MAX_VERSIONS x (VERSION_BYTES + MAX_ATTRIBUTE_TEXT))`,
-/// 6 864 896 bytes (6.5 MiB).
+/// in layout bytes; 7 208 960 bytes (6.9 MiB) on 64-bit targets. The
+/// counting allocator measures a registry filled to every bound at
+/// 7 057 552 held and 7 059 375 at its peak (`tests/registry_memory.rs`).
 pub const MAX_MEMORY_BYTES: usize =
     MAX_KEYS * (KEY_BYTES + MAX_VERSIONS * (VERSION_BYTES + MAX_ATTRIBUTE_TEXT));
 
@@ -178,6 +184,9 @@ pub enum Refusal {
     Bad(&'static str),
     /// No current entry under the key.
     NotFound,
+    /// A counter would pass `u64::MAX`: which one. Nothing was changed
+    /// (SPEC §14).
+    Overflow(&'static str),
 }
 
 /// What the agent observes of an entry's identity at a read: a
@@ -188,13 +197,14 @@ pub struct Presence {
     /// cannot tell (a stream, whose wire id no cell carries, or a driver
     /// not attached).
     pub present: Option<bool>,
-    /// How many clients hold it now (cells of that type and label);
-    /// `None` when the agent cannot tell.
+    /// How many client cells of that type and label hold it now (one
+    /// client may hold several); `None` when the agent cannot tell.
     pub holders: Option<u64>,
 }
 
 impl Presence {
-    /// Whether more than one holder is observed now; `None` when unknown.
+    /// Whether more than one client cell is observed now; `None` when
+    /// unknown.
     #[must_use]
     pub fn shared(self) -> Option<bool> {
         self.holders.map(|holders| holders > 1)
@@ -310,8 +320,10 @@ impl Registry {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Bad`] for a malformed key or attribute, and
-    /// [`Refusal::Above`] past a bound.
+    /// [`Refusal::Bad`] for a malformed key or attribute,
+    /// [`Refusal::Above`] past a bound, and [`Refusal::Overflow`] when the
+    /// version number, `history_dropped` or `evicted` would pass
+    /// `u64::MAX`; a refused put changes nothing.
     pub fn put(
         &mut self,
         driver: usize,
@@ -324,9 +336,27 @@ impl Registry {
         check_key(kind, key)?;
         let attributes = check_attributes(attributes)?;
         let id = (driver, kind, key.to_owned());
-        if !self.entries.contains_key(&id) {
-            self.make_room(driver)?;
-        }
+        // Every counter is checked before anything changes, so a refused
+        // put leaves the registry as it was.
+        let (number, dropped) = match self.entries.get(&id) {
+            Some(entry) => (
+                entry
+                    .versions
+                    .back()
+                    .map_or(Some(1), |last| last.number.checked_add(1)),
+                if entry.versions.len() == MAX_VERSIONS {
+                    entry.history_dropped.checked_add(1)
+                } else {
+                    Some(entry.history_dropped)
+                },
+            ),
+            None => {
+                self.make_room(driver)?;
+                (Some(1), Some(0))
+            }
+        };
+        let number = number.ok_or(Refusal::Overflow("version number"))?;
+        let dropped = dropped.ok_or(Refusal::Overflow("history_dropped"))?;
         let entry = self.entries.entry(id).or_insert_with(|| Entry {
             kind,
             key: key.to_owned(),
@@ -338,10 +368,6 @@ impl Registry {
         let now = entry.versions.back().map_or(now, |last| {
             now.max(last.valid_to.unwrap_or(last.valid_from))
         });
-        let number = entry
-            .versions
-            .back()
-            .map_or(1, |last| last.number.saturating_add(1));
         if let Some(last) = entry.versions.back_mut()
             && last.valid_to.is_none()
         {
@@ -349,8 +375,8 @@ impl Registry {
         }
         if entry.versions.len() == MAX_VERSIONS {
             entry.versions.pop_front();
-            entry.history_dropped = entry.history_dropped.saturating_add(1);
         }
+        entry.history_dropped = dropped;
         entry.versions.push_back(Version {
             number,
             registered_by: uid,
@@ -448,8 +474,11 @@ impl Registry {
             .map(|(_, id)| id);
         match oldest {
             Some(id) => {
+                self.evicted = self
+                    .evicted
+                    .checked_add(1)
+                    .ok_or(Refusal::Overflow("evicted"))?;
                 self.entries.remove(&id);
-                self.evicted = self.evicted.saturating_add(1);
                 Ok(())
             }
             None => Err(Refusal::Above {

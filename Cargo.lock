@@ -264,6 +264,7 @@ dependencies = [
  "karyos-protocol",
  "karyos-sys",
  "karyos-trace",
+ "proptest",
  "thiserror",
 ]
 
