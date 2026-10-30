@@ -1017,12 +1017,40 @@ impl<T: StreamTerms> Stream<T> {
 
     /// A new generation link for a handle on the current mapping.
     pub(crate) fn join(&mut self, kind: MemberKind) -> (Arc<GenerationLink<T>>, u64) {
+        self.join_member(kind, false)
+    }
+
+    /// As [`join`](Self::join), for a handle the embedding program holds
+    /// through the driver's own API (karyos#885).
+    pub(crate) fn join_host(&mut self, kind: MemberKind) -> (Arc<GenerationLink<T>>, u64) {
+        self.join_member(kind, true)
+    }
+
+    fn join_member(&mut self, kind: MemberKind, host: bool) -> (Arc<GenerationLink<T>>, u64) {
         let link = GenerationLink::new();
         self.members.push(Member {
             link: Arc::downgrade(&link),
             kind,
+            host,
         });
         (link, self.base)
+    }
+
+    /// The embedding program's live publication handles on this lane,
+    /// exclusive and concurrent, a pending cutover's included: the value of
+    /// its `embedded publications` gauge (karyos#885).
+    pub(crate) fn host_publications(&self) -> u64 {
+        let pending = self
+            .cutover
+            .as_ref()
+            .map_or(&[][..], crate::generations::Cutover::pending_members);
+        let live = self
+            .members
+            .iter()
+            .chain(pending)
+            .filter(|member| member.is_live_host_publication())
+            .count();
+        u64::try_from(live).unwrap_or(u64::MAX)
     }
 
     /// The conductor of incarnation `incarnation`: the current one, or a
@@ -1861,7 +1889,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .due(now, self.config.position_sample_interval)
         {
             self.positions
-                .sample(now, &mut self.counters, &self.streams);
+                .sample(now, &mut self.counters, &self.streams, &self.registrations);
         }
     }
 
@@ -3138,6 +3166,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let member = Member {
                     link: Arc::downgrade(&link),
                     kind: MemberKind::Feeder,
+                    host: false,
                 };
                 (Some(feeder), vec![member])
             }
@@ -3262,7 +3291,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 .ok_or(DriverError::PublicationTaken)?,
         };
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
-        let (link, base) = stream.join(MemberKind::Exclusive);
+        let (link, base) = stream.join_host(MemberKind::Exclusive);
         // Its stream's conflation table comes with the buffer (F7b-2c-2).
         let publication = ClientPublication::with_lease(inner, stream.allow_unconnected, lease);
         let mut publication = publication.with_generation(link, base)?;
@@ -3918,7 +3947,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map_err(mode_error)?
             .ok_or(DriverError::PublicationTaken)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
-        let (link, base) = stream.join(MemberKind::Concurrent);
+        let (link, base) = stream.join_host(MemberKind::Concurrent);
         // Its stream's conflation table comes with the buffer (F7b-2c-2).
         let publication =
             ClientConcurrentPublication::with_lease(inner, stream.allow_unconnected, lease);
@@ -4868,6 +4897,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             stream.members.push(Member {
                 link: Arc::downgrade(&generation),
                 kind: MemberKind::Feeder,
+                host: false,
             });
             stream.conflation = Some(config);
             stream.feeder = Some(ConflationFeeder {
@@ -5046,6 +5076,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream.members.push(Member {
             link: Arc::downgrade(&generation),
             kind: MemberKind::Feeder,
+            host: false,
         });
         stream.feeder = Some(ConflationFeeder {
             subscription,

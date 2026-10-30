@@ -92,6 +92,43 @@ pub const KIND_ENDPOINT: u8 = 4;
 /// karyos/design/management-agent-gap-analysis.md`, M4).
 pub const KIND_GUARD: u8 = 5;
 
+/// Label of a stream lane's wire id cell (karyos#885): a gauge with the
+/// lane's stream keys whose value is the lane's wire `stream_id`, its
+/// `i32` bits zero-extended; [`wire_stream_id`] reads it back. The driver
+/// sets it in the positions pass that allocates the cell, so a reader of a
+/// consistent pass reads the id.
+pub const LABEL_STREAM_WIRE_ID: &str = "stream wire id";
+
+/// Label of a client publication's cell (karyos#885): a gauge keyed
+/// [`KIND_PUBLICATION`] with the lane's stream keys, `participant` the
+/// publication's registration id, whose value is the id of the client that
+/// registered it. One per publication, exclusive or concurrent, of a
+/// client; the embedding program's own handles have none.
+pub const LABEL_PUBLICATION: &str = "publication";
+
+/// Label of a stream lane's count of the embedding program's publications
+/// (karyos#885): a gauge with the lane's stream keys whose value is the
+/// number of live exclusive and concurrent handles the program holds on
+/// the lane through the driver's own API, which have no registration and
+/// so no [`LABEL_PUBLICATION`] cell. A lane's publications are its
+/// [`LABEL_PUBLICATION`] cells plus this value.
+pub const LABEL_EMBEDDED_PUBLICATIONS: &str = "embedded publications";
+
+/// The value of a [`LABEL_STREAM_WIRE_ID`] cell for `stream_id`: its `i32`
+/// bits, zero-extended.
+#[must_use]
+pub fn wire_stream_id_value(stream_id: i32) -> u64 {
+    u64::from(stream_id.cast_unsigned())
+}
+
+/// The wire `stream_id` a [`LABEL_STREAM_WIRE_ID`] cell's `value` holds:
+/// its low 32 bits read back as `i32`; `None` when a higher bit is set, which
+/// no driver writes.
+#[must_use]
+pub fn wire_stream_id(value: u64) -> Option<i32> {
+    u32::try_from(value).ok().map(u32::cast_signed)
+}
+
 /// The three key words that let tools group counters without parsing
 /// labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -1244,6 +1281,19 @@ mod owned {
 #[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
+
+    /// karyos#885: a wire stream id round-trips through its cell value,
+    /// negative ids included, which a reader sign-casts back.
+    #[test]
+    fn a_wire_stream_id_round_trips_through_its_cell_value() {
+        for id in [0, 7, -1, -42, i32::MIN, i32::MAX] {
+            let value = wire_stream_id_value(id);
+            assert_eq!(value >> 32, 0, "{id} sets a high bit");
+            assert_eq!(wire_stream_id(value), Some(id));
+        }
+        assert_eq!(wire_stream_id_value(-1), u64::from(u32::MAX));
+        assert_eq!(wire_stream_id(1 << 32), None);
+    }
 
     #[test]
     fn allocate_increment_read_and_free() {

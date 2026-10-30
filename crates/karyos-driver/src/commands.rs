@@ -200,6 +200,11 @@ impl Registration {
     pub(crate) fn client(&self) -> u64 {
         self.client
     }
+
+    /// Whether it is a publication, exclusive or concurrent.
+    pub(crate) fn is_publication(&self) -> bool {
+        self.kind == Kind::Publication
+    }
 }
 
 impl<T: StreamTerms> EmbeddedDriver<T> {
