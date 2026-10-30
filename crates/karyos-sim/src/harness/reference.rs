@@ -31,6 +31,22 @@
 //! read budget, and a refused read sends nothing until the next resend.
 //! As a fixture, it labels what it shows harness validation.
 //!
+//! **Leader change** (W5; karyos#687 P3). Its only change of leader is a
+//! handover, never an election: the leader hands over to a voter that
+//! durably holds its whole log and stops taking proposals for good (it
+//! answers with the target as leader). It saves the target as its vote
+//! first, and sends `TimeoutNow` only once that is durable, then again at
+//! every resend until it sees the higher term: it never resumes its own
+//! term, so a late `TimeoutNow` cannot make a leader that lacks what it
+//! committed (karyos#905 review). Restarted, it follows the target. The
+//! target leads the next term at once, saving its term and itself as the
+//! vote, and appends an empty entry of its term so that term commits.
+//! Appends carry the term: a server takes a higher one and its sender as
+//! leader, and ignores a lower one. A new leader first sends empty
+//! appends, so each follower acknowledges where it stands. With no
+//! election, a handover whose old leader crashes before the target leads
+//! stalls (a liveness gap); it never loses a committed entry.
+//!
 //! **Snapshots** (W5; karyos#687). It takes the node's compactions, and
 //! when a follower's next entry is below the log's first index, it asks for
 //! the node's snapshot to be sent to it instead of entries. A follower
@@ -55,7 +71,7 @@ use karyos_cluster::{Entry, HardState};
 
 use super::core::{
     Change, ChangeRefused, Configuration, ConsensusCore, InstallRefused, Limit, Limits, LogView,
-    NotLeader, Persisted, Ready, Refused, SnapshotBase, Unsupported,
+    NotLeader, Persisted, Ready, Refused, SnapshotBase, TransferRefused, Unsupported,
 };
 use crate::net::NodeId;
 
@@ -63,7 +79,7 @@ use crate::net::NodeId;
 /// is led by the lowest id of its bootstrap peers, so a standby group
 /// (phase 5, P5-S2) has its own.
 pub const LEADER: NodeId = 0;
-/// Its only term.
+/// Its first term; a handover moves to the next.
 pub const TERM: u64 = 1;
 /// Ticks between the leader's resends.
 pub const RESEND: u64 = 4;
@@ -137,10 +153,17 @@ type Logged = (u64, Vec<NodeId>, Vec<NodeId>);
 pub enum Message {
     /// The leader's entries from some index, and its commit index.
     Append {
+        /// The leader's term.
+        term: u64,
         /// The entries, consecutive.
         entries: Vec<Entry>,
         /// The leader's commit index.
         commit: Option<u64>,
+    },
+    /// The leader hands over: the receiver leads `term` at once.
+    TimeoutNow {
+        /// The term the receiver leads.
+        term: u64,
     },
     /// A follower holds every entry up to `index` durably.
     Ack {
@@ -153,8 +176,13 @@ pub enum Message {
 #[derive(Debug, Clone)]
 pub struct Reference {
     id: NodeId,
-    /// The fixed leader: the lowest id of the bootstrap peers.
+    /// The leader of its term: at first the lowest id of the bootstrap
+    /// peers, then whoever a handover made one.
     leader: NodeId,
+    /// Its current term.
+    term: u64,
+    /// A handover in progress: its target. Never abandoned.
+    transferring: Option<NodeId>,
     /// The bootstrap voters, ascending.
     peers: Vec<NodeId>,
     /// The configurations in the log, written or not, ascending.
@@ -256,10 +284,33 @@ impl Reference {
         let candidate = durable.get(majority).copied().flatten();
         if candidate > self.commit
             && let Some(index) = candidate
-            && self.term_at(log, index) == Some(TERM)
+            && self.term_at(log, index) == Some(self.term)
         {
             self.commit = candidate;
             self.dirty = true;
+        }
+    }
+
+    /// Leads `term` after a handover: saves the term and itself as the
+    /// vote, knows no follower's position yet, and appends an empty entry
+    /// of its term so that term commits.
+    fn lead(&mut self, term: u64, log: &LogView<'_>) {
+        self.term = term;
+        self.leader = self.id;
+        self.transferring = None;
+        self.dirty = true;
+        for (member, known) in &mut self.acked {
+            if *member != self.id {
+                *known = None;
+            }
+        }
+        if let Some(index) = self.next(log) {
+            self.unpersisted.push(Entry {
+                index,
+                term,
+                event_time: self.now,
+                payload: Vec::new(),
+            });
         }
     }
 
@@ -300,10 +351,17 @@ impl ConsensusCore for Reference {
         let stored = log.hard_state();
         let mut peers = peers.to_vec();
         peers.sort_unstable();
-        let leader = peers.first().copied().unwrap_or(id);
+        // The stored vote is the leader of the stored term.
+        let leader = stored
+            .and_then(|state| state.voted_for)
+            .and_then(|vote| NodeId::try_from(vote).ok())
+            .or_else(|| peers.first().copied())
+            .unwrap_or(id);
         Self {
             id,
             leader,
+            term: stored.map_or(TERM, |state| state.current_term.max(TERM)),
+            transferring: None,
             peers,
             configs,
             unpersisted: Vec::new(),
@@ -343,6 +401,10 @@ impl ConsensusCore for Reference {
         if !self.leading() {
             return Err(not_leader.into());
         }
+        // Handing over: the target leads next.
+        if let Some(to) = self.transferring {
+            return Err(NotLeader { leader: Some(to) }.into());
+        }
         // The last index is u64::MAX: the log takes no more.
         let Some(index) = self.next(log) else {
             return Err(not_leader.into());
@@ -367,7 +429,7 @@ impl ConsensusCore for Reference {
         }
         self.unpersisted.push(Entry {
             index,
-            term: TERM,
+            term: self.term,
             event_time: self.now,
             payload: command,
         });
@@ -376,8 +438,30 @@ impl ConsensusCore for Reference {
     }
 
     fn step(&mut self, from: NodeId, message: Message, log: &mut LogView<'_>) {
+        match &message {
+            // A stale leader's: ignored.
+            Message::Append { term, .. } if *term < self.term => {
+                self.settle(log);
+                return;
+            }
+            // A later term's leader: it follows it.
+            Message::Append { term, .. } if *term > self.term => {
+                self.term = *term;
+                self.leader = from;
+                self.transferring = None;
+                self.dirty = true;
+            }
+            Message::TimeoutNow { term } if *term > self.term => {
+                self.lead(*term, log);
+                self.settle(log);
+                return;
+            }
+            _ => {}
+        }
         match message {
-            Message::Append { entries, commit } if !self.leading() => {
+            Message::Append {
+                entries, commit, ..
+            } if !self.leading() => {
                 for entry in entries {
                     let Some(next) = self.next(log) else {
                         break;
@@ -418,7 +502,7 @@ impl ConsensusCore for Reference {
                 *known = index.max(*known);
                 self.recompute_commit(log);
             }
-            Message::Append { .. } | Message::Ack { .. } => {}
+            Message::Append { .. } | Message::Ack { .. } | Message::TimeoutNow { .. } => {}
         }
         self.settle(log);
     }
@@ -427,6 +511,11 @@ impl ConsensusCore for Reference {
         self.now = now;
         if !self.leading() || !now.is_multiple_of(RESEND) {
             return;
+        }
+        // A handover's TimeoutNow again, until the target leads: released
+        // only once the vote for it is durable.
+        if let (Some(to), Some(term)) = (self.transferring, self.term.checked_add(1)) {
+            self.after_persist.push((to, Message::TimeoutNow { term }));
         }
         let Some(end) = log.last_index().and_then(|last| last.checked_add(1)) else {
             return;
@@ -442,12 +531,19 @@ impl ConsensusCore for Reference {
             // A follower that acknowledged nothing holds nothing: it needs
             // the log from its start, index 1, which a compaction may have
             // purged.
+            // A leader of a later term does not know where a follower
+            // stands yet: it sends nothing, so the follower acknowledges.
+            let unknown = if self.term == TERM {
+                Some(log.first_index().min(1))
+            } else {
+                Some(end)
+            };
             let next = self
                 .acked
                 .get(&peer)
                 .copied()
                 .flatten()
-                .map_or(Some(log.first_index().min(1)), |index| index.checked_add(1))
+                .map_or(unknown, |index| index.checked_add(1))
                 .unwrap_or(end);
             // Below the log's first index: only the snapshot holds it.
             if next < log.first_index() && log.base().is_some() {
@@ -483,6 +579,7 @@ impl ConsensusCore for Reference {
             self.messages.push((
                 peer,
                 Message::Append {
+                    term: self.term,
                     entries,
                     commit: self.commit,
                 },
@@ -536,8 +633,10 @@ impl ConsensusCore for Reference {
             expected = entry.index.checked_add(1);
         }
         let hard_state = self.dirty.then_some(HardState {
-            current_term: TERM,
-            voted_for: Some(u64::from(self.leader)),
+            current_term: self.term,
+            // Handing over, it votes for the target: restarted, it follows
+            // it and never resumes its own term.
+            voted_for: Some(u64::from(self.transferring.unwrap_or(self.leader))),
             commit: self.commit,
         });
         if self.messages.is_empty()
@@ -576,7 +675,7 @@ impl ConsensusCore for Reference {
     }
 
     fn term(&self) -> u64 {
-        TERM
+        self.term
     }
 
     fn leads(&self) -> bool {
@@ -599,6 +698,45 @@ impl ConsensusCore for Reference {
             outgoing: Vec::new(),
             learners: learners.to_vec(),
         })
+    }
+
+    fn transfer_leadership(
+        &mut self,
+        to: NodeId,
+        log: &mut LogView<'_>,
+    ) -> Result<(), TransferRefused> {
+        if !self.leading() {
+            return Err(TransferRefused::NotLeader(NotLeader {
+                leader: Some(self.leader),
+            }));
+        }
+        // One handover at a time: a second target would hold a TimeoutNow
+        // for the same next term as the first, and both could lead it.
+        if let Some(target) = self.transferring {
+            return if target == to {
+                Ok(())
+            } else {
+                Err(TransferRefused::NotLeader(NotLeader {
+                    leader: Some(target),
+                }))
+            };
+        }
+        let (voters, _) = self.members();
+        if to == self.id || !voters.contains(&to) {
+            return Err(TransferRefused::Invalid);
+        }
+        // The target must durably hold the whole log, written or not.
+        let last = self.last(log).unwrap_or(0);
+        let held = self.acked.get(&to).copied().flatten().unwrap_or(0);
+        if let Some(behind) = last.checked_sub(held).filter(|behind| *behind > 0) {
+            return Err(TransferRefused::Lagging { behind });
+        }
+        let term = self.term.checked_add(1).ok_or(TransferRefused::Invalid)?;
+        self.transferring = Some(to);
+        // The vote for the target is saved first; TimeoutNow waits for it.
+        self.dirty = true;
+        self.after_persist.push((to, Message::TimeoutNow { term }));
+        Ok(())
     }
 
     fn compacted(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), Unsupported> {
@@ -687,7 +825,7 @@ impl ConsensusCore for Reference {
         }
         self.unpersisted.push(Entry {
             index,
-            term: TERM,
+            term: self.term,
             event_time: self.now,
             payload: encode_configuration(&voters, &learners),
         });

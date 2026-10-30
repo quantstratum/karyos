@@ -894,12 +894,16 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::Installed { node, .. }
         | Observation::SnapshotRefused { node, .. }
         | Observation::Unsupported { node, .. }
+        | Observation::Transfer { node, .. }
+        | Observation::Deduplicated { node, .. }
+        | Observation::Redirected { node, .. }
         | Observation::FeedApplied { node, .. }
         | Observation::Promoted { node, .. } => Some(*node),
         Observation::Success { .. }
         | Observation::StaleGeneration { .. }
         | Observation::Fenced { .. }
         | Observation::PromotionRefused { .. }
+        | Observation::Expired { .. }
         | Observation::Healed => None,
     }
 }

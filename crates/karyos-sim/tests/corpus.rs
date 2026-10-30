@@ -27,7 +27,7 @@ use std::time::Instant;
 
 use karyos_sim::harness::corpus::{Evidence, run_corpus};
 use karyos_sim::harness::reference::Reference;
-use karyos_sim::harness::workloads::{W1, W2, W3, W4, W5Snapshots, W6};
+use karyos_sim::harness::workloads::{W1, W2, W3, W4, W5, W6};
 
 /// The manifest's CI seeds.
 const CI_SEEDS: std::ops::RangeInclusive<u64> = 1..=1_000;
@@ -56,7 +56,7 @@ fn the_ci_corpus_of_the_reference_fixture() {
     let w2 = |_seed: u64| W2::skeleton().cases().unwrap();
     let w3 = |_seed: u64| W3::skeleton().cases();
     let w4 = |seed: u64| W4::skeleton(seed).cases();
-    let w5 = |_seed: u64| W5Snapshots::skeleton().cases().unwrap();
+    let w5 = |_seed: u64| W5::skeleton().cases().unwrap();
     let w6 = |_seed: u64| W6::skeleton().cases();
     let counts = (
         w1(1).len(),

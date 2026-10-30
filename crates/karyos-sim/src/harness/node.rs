@@ -50,7 +50,8 @@ use karyos_cluster::{Entry, LogError, RaftLog};
 
 use super::core::{
     Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, Limit, Limits,
-    LogView, ReadBudget, Refused, Release, SnapshotBase, Step, Unsupported, drive_metered,
+    LogView, NotLeader, ReadBudget, Refused, Release, SnapshotBase, Step, TransferRefused,
+    Unsupported, drive_metered,
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
@@ -70,7 +71,7 @@ pub const LOG_DIR: &str = "/raft";
 /// The directory of a server's snapshot store, beside its log (W5).
 pub const SNAPSHOT_DIR: &str = "/snap";
 /// The version of the service section a snapshot holds.
-pub const SERVICE_SECTION_VERSION: u64 = 1;
+pub const SERVICE_SECTION_VERSION: u64 = 2;
 
 /// A case's log compaction (W5): a snapshot every `every` applied
 /// entries, the log purged below it but its last `keep` entries.
@@ -98,6 +99,10 @@ pub enum Ret {
     Appended(u64),
     /// Every value, in order.
     Values(Vec<Vec<u8>>),
+    /// A retry of a request whose answer the deduplication table no longer
+    /// keeps ([`RETENTION`]): its outcome is unknown, reported explicitly,
+    /// never applied again (W5).
+    Expired,
 }
 
 impl Ret {
@@ -111,6 +116,7 @@ impl Ret {
                 bytes.push(0);
                 bytes.extend_from_slice(&length.to_le_bytes());
             }
+            Self::Expired => bytes.push(2),
             Self::Values(values) => {
                 bytes.push(1);
                 for value in values {
@@ -143,6 +149,7 @@ impl Ret {
                 }
                 Some(Self::Values(values))
             }
+            2 => rest.is_empty().then_some(Self::Expired),
             _ => None,
         }
     }
@@ -197,30 +204,76 @@ impl Command {
     }
 }
 
-/// The deterministic test service: an append-only register.
+/// The answers a client's deduplication keeps (W5's retention): a retry
+/// of an older request is answered [`Ret::Expired`].
+pub const RETENTION: usize = 10_000;
+
+/// One client's deduplication: its last [`RETENTION`] answers by
+/// sequence, and the highest sequence it evicted. A sequence at or below
+/// the floor and not kept was answered and forgotten: [`Ret::Expired`]. One
+/// above it and not kept was never applied, even below one that was (a
+/// window's requests may commit out of order; karyos#905 review).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Answers {
+    by_sequence: BTreeMap<u64, Ret>,
+    floor: u64,
+}
+
+/// The deterministic test service: an append-only register, with a
+/// deduplication table of each client's last [`RETENTION`] answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestService {
     values: Vec<Vec<u8>>,
-    /// Per client, its last sequence applied and its answer.
-    answered: BTreeMap<NodeId, (u64, Ret)>,
+    /// Per client, its retained answers.
+    answered: BTreeMap<NodeId, Answers>,
     applied: Option<u64>,
     deduplicated: u64,
+    /// Retries answered [`Ret::Expired`].
+    expired: u64,
+    /// Answers kept per client.
+    retention: usize,
+}
+
+impl Default for TestService {
+    fn default() -> Self {
+        Self::with_retention(RETENTION)
+    }
 }
 
 impl TestService {
-    /// Applies the committed `entry`; returns the command and its answer,
-    /// the earlier answer for a retried sequence. An entry that holds no
-    /// command (a core's own entry) answers nothing.
+    /// A service keeping `retention` answers per client (tests of the
+    /// expiry use a small one).
+    #[must_use]
+    pub fn with_retention(retention: usize) -> Self {
+        Self {
+            values: Vec::new(),
+            answered: BTreeMap::new(),
+            applied: None,
+            deduplicated: 0,
+            expired: 0,
+            retention: retention.max(1),
+        }
+    }
+
+    /// Applies the committed `entry`; returns the command and its answer:
+    /// the kept answer for a retried sequence, [`Ret::Expired`] for one
+    /// whose answer is no longer kept. An entry that holds no command (a
+    /// core's own entry) answers nothing.
     pub fn apply(&mut self, entry: &Entry) -> Option<(Command, Ret)> {
         self.applied = Some(entry.index);
         let command = Command::decode(&entry.payload)?;
-        if let Some((sequence, ret)) = self.answered.get(&command.client)
-            && *sequence == command.sequence
-        {
+        let answers = self.answered.entry(command.client).or_default();
+        if let Some(ret) = answers.by_sequence.get(&command.sequence) {
             if let Some(count) = self.deduplicated.checked_add(1) {
                 self.deduplicated = count;
             }
             return Some((command, ret.clone()));
+        }
+        if command.sequence <= answers.floor {
+            if let Some(count) = self.expired.checked_add(1) {
+                self.expired = count;
+            }
+            return Some((command, Ret::Expired));
         }
         let ret = match &command.op {
             Op::Append(value) => {
@@ -229,10 +282,19 @@ impl TestService {
             }
             Op::Read => Ret::Values(self.values.clone()),
         };
-        let _ = self
-            .answered
-            .insert(command.client, (command.sequence, ret.clone()));
+        let _ = answers.by_sequence.insert(command.sequence, ret.clone());
+        while answers.by_sequence.len() > self.retention {
+            if let Some((evicted, _)) = answers.by_sequence.pop_first() {
+                answers.floor = answers.floor.max(evicted);
+            }
+        }
         Some((command, ret))
+    }
+
+    /// Retries it answered [`Ret::Expired`].
+    #[must_use]
+    pub fn expired(&self) -> u64 {
+        self.expired
     }
 
     /// The last index applied.
@@ -257,13 +319,18 @@ impl TestService {
             count(&mut bytes, value.len())?;
             bytes.extend_from_slice(value);
         }
+        count(&mut bytes, self.retention)?;
         count(&mut bytes, self.answered.len())?;
-        for (client, (sequence, ret)) in &self.answered {
+        for (client, answers) in &self.answered {
             bytes.extend_from_slice(&client.to_le_bytes());
-            bytes.extend_from_slice(&sequence.to_le_bytes());
-            let ret = ret.canonical();
-            count(&mut bytes, ret.len())?;
-            bytes.extend_from_slice(&ret);
+            bytes.extend_from_slice(&answers.floor.to_le_bytes());
+            count(&mut bytes, answers.by_sequence.len())?;
+            for (sequence, ret) in &answers.by_sequence {
+                bytes.extend_from_slice(&sequence.to_le_bytes());
+                let ret = ret.canonical();
+                count(&mut bytes, ret.len())?;
+                bytes.extend_from_slice(&ret);
+            }
         }
         match self.applied {
             Some(index) => {
@@ -273,6 +340,7 @@ impl TestService {
             None => bytes.push(0),
         }
         bytes.extend_from_slice(&self.deduplicated.to_le_bytes());
+        bytes.extend_from_slice(&self.expired.to_le_bytes());
         Some(bytes)
     }
 
@@ -299,13 +367,31 @@ impl TestService {
             let length = u32_at(&mut rest)?;
             values.push(take(&mut rest, length)?.to_vec());
         }
+        let retention = u32_at(&mut rest)?;
+        if retention == 0 {
+            return None;
+        }
         let mut answered = BTreeMap::new();
         for _ in 0..u32_at(&mut rest)? {
             let client = NodeId::from_le_bytes(*take(&mut rest, 4)?.first_chunk::<4>()?);
-            let sequence = u64_at(&mut rest)?;
-            let length = u32_at(&mut rest)?;
-            let ret = Ret::decode(take(&mut rest, length)?)?;
-            if answered.insert(client, (sequence, ret)).is_some() {
+            let floor = u64_at(&mut rest)?;
+            let mut answers = Answers {
+                by_sequence: BTreeMap::new(),
+                floor,
+            };
+            let kept = u32_at(&mut rest)?;
+            if kept > retention {
+                return None;
+            }
+            for _ in 0..kept {
+                let sequence = u64_at(&mut rest)?;
+                let length = u32_at(&mut rest)?;
+                let ret = Ret::decode(take(&mut rest, length)?)?;
+                if sequence <= floor || answers.by_sequence.insert(sequence, ret).is_some() {
+                    return None;
+                }
+            }
+            if answered.insert(client, answers).is_some() {
                 return None;
             }
         }
@@ -315,11 +401,14 @@ impl TestService {
             _ => return None,
         };
         let deduplicated = u64_at(&mut rest)?;
+        let expired = u64_at(&mut rest)?;
         rest.is_empty().then_some(Self {
             values,
             answered,
             applied,
             deduplicated,
+            expired,
+            retention,
         })
     }
 
@@ -579,6 +668,54 @@ mod service_snapshot_tests {
             TestService::decode(&TestService::default().encode().unwrap()),
             Some(TestService::default())
         );
+    }
+
+    /// A client's retry is answered from its kept answers; once its answer
+    /// fell out of the retention, it is answered Expired, explicitly, and
+    /// never applied again (W5). The section keeps the retained answers.
+    #[test]
+    fn a_retry_past_the_retention_is_answered_expired() {
+        let mut service = TestService::with_retention(2);
+        let apply = |service: &mut TestService, index: u64, sequence: u64| {
+            let command = Command {
+                client: 7,
+                sequence,
+                op: Op::Append(vec![u8::try_from(sequence).unwrap()]),
+            };
+            service
+                .apply(&Entry {
+                    index,
+                    term: 1,
+                    event_time: 0,
+                    payload: command.encode(),
+                })
+                .map(|(_, ret)| ret)
+        };
+        for sequence in 1..=3 {
+            assert_eq!(
+                apply(&mut service, sequence, sequence),
+                Some(Ret::Appended(sequence))
+            );
+        }
+        // Kept: 2 and 3. A retry of 3 is answered as it was; of 1, expired.
+        assert_eq!(apply(&mut service, 4, 3), Some(Ret::Appended(3)));
+        assert_eq!(apply(&mut service, 5, 1), Some(Ret::Expired));
+        assert_eq!((service.deduplicated(), service.expired()), (1, 1));
+        assert_eq!(
+            service.digest(),
+            TestService::digest_of(&[vec![1], vec![2], vec![3]])
+        );
+        let restored = TestService::decode(&service.encode().unwrap()).unwrap();
+        assert_eq!(restored, service);
+        let mut restored = restored;
+        assert_eq!(apply(&mut restored, 6, 2), Some(Ret::Appended(2)));
+        assert_eq!(Ret::decode(&Ret::Expired.canonical()), Some(Ret::Expired));
+        // A gap: 5 applied before 4 (a window across a redirect). 4 was
+        // never applied, so it is, not answered Expired.
+        let mut service = TestService::with_retention(2);
+        assert_eq!(apply(&mut service, 1, 5), Some(Ret::Appended(1)));
+        assert_eq!(apply(&mut service, 2, 4), Some(Ret::Appended(2)));
+        assert_eq!(service.expired(), 0);
     }
 
     /// Every cut, an extra byte and another tag are refused: a snapshot
@@ -844,6 +981,45 @@ pub enum Observation {
         /// written yet.
         entry_term: Option<u64>,
     },
+    /// A server's service answered a retried request from its
+    /// deduplication table (W5).
+    Deduplicated {
+        /// The server.
+        node: NodeId,
+        /// The client.
+        client: NodeId,
+        /// The request's sequence.
+        sequence: u64,
+    },
+    /// A server sent a client's request on to the leader its core named
+    /// (W5).
+    Redirected {
+        /// The server.
+        node: NodeId,
+        /// The client.
+        client: NodeId,
+        /// The request's sequence.
+        sequence: u64,
+        /// The leader named.
+        to: NodeId,
+    },
+    /// A client's retry was answered [`Ret::Expired`]: its outcome is
+    /// unknown (W5).
+    Expired {
+        /// The client.
+        client: NodeId,
+        /// The request's sequence.
+        sequence: u64,
+    },
+    /// A server's core answered an operator's leadership handover (W5).
+    Transfer {
+        /// The server.
+        node: NodeId,
+        /// The target.
+        to: NodeId,
+        /// What it answered.
+        result: Result<(), TransferRefused>,
+    },
     /// The harness healed every link ([`super::workloads::Action::Heal`]):
     /// a mark in the order of observations.
     Healed,
@@ -1002,6 +1178,9 @@ pub enum Wire<M> {
     /// An operator's membership change, which the server's core takes or
     /// refuses ([`Observation::Change`]); nothing answers it.
     Change(Change),
+    /// An operator's leadership handover to a server, which the core takes
+    /// or refuses ([`Observation::Transfer`]); nothing answers it (W5).
+    Transfer(NodeId),
     /// A leader's snapshot (W5): its base and its service section.
     Snapshot {
         /// The snapshot's base.
@@ -1660,12 +1839,23 @@ impl<C: ConsensusCore> ServerNode<C> {
                     served.payload = Vec::new();
                 }
             }
+            let deduplicated = self.service.deduplicated();
             let answer = self.service.apply(&served);
+            let replayed = self.service.deduplicated() > deduplicated;
             let response = answer.as_ref().map(|(_, ret)| ret.canonical());
             if let Some((command, ret)) = answer
                 && self.pending.remove(&(command.client, command.sequence))
                 && acts
             {
+                // The evidence of a retry is a retained answer actually sent
+                // to a waiting client, not a replica's application.
+                if replayed {
+                    self.observe(Observation::Deduplicated {
+                        node,
+                        client: command.client,
+                        sequence: command.sequence,
+                    });
+                }
                 self.observe(Observation::Reply {
                     node,
                     client: command.client,
@@ -1919,11 +2109,40 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
                         let sequence = command.sequence;
                         let answer = match refused {
                             Refused::Backpressure(_) => Wire::Busy { sequence },
+                            // It names another leader (a handover, W5):
+                            // the client goes there.
+                            Refused::NotLeader(NotLeader {
+                                leader: Some(leader),
+                            }) if leader != self.id => {
+                                self.recorder.borrow_mut().observations.push(
+                                    Observation::Redirected {
+                                        node: self.id,
+                                        client: command.client,
+                                        sequence,
+                                        to: leader,
+                                    },
+                                );
+                                Wire::Redirect { server: leader }
+                            }
                             Refused::NotLeader(_) => Wire::Refused { sequence },
                         };
                         out.push((command.client, answer));
                     }
                 }
+            }
+            Wire::Transfer(to) => {
+                let result = core.transfer_leadership(to, &mut view);
+                let node = self.id;
+                let mut recorder = self.recorder.borrow_mut();
+                if result == Err(TransferRefused::Unsupported) {
+                    recorder.observations.push(Observation::Unsupported {
+                        node,
+                        what: "transfer_leadership",
+                    });
+                }
+                recorder
+                    .observations
+                    .push(Observation::Transfer { node, to, result });
             }
             Wire::Change(change) => {
                 let result = core.propose_change(change, &mut view);
@@ -2233,6 +2452,19 @@ impl<M> Node<Wire<M>> for ClientNode {
                     return;
                 };
                 self.open = None;
+                // Its answer expired: the outcome is unknown, so it stays
+                // open in the history (taken or not), and the client stops.
+                if ret == Ret::Expired {
+                    self.next = self.script.len();
+                    self.recorder
+                        .borrow_mut()
+                        .observations
+                        .push(Observation::Expired {
+                            client: self.id,
+                            sequence,
+                        });
+                    return;
+                }
                 self.generation = generation;
                 let mut recorder = self.recorder.borrow_mut();
                 let _ = recorder.history.ret(self.id, ret);

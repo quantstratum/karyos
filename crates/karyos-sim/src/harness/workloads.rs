@@ -9,9 +9,7 @@
 //!
 //! Each workload is a struct whose fields are the ADR table's frozen
 //! dimensions, holding the values this skeleton runs; each one's doc names
-//! the values the ADR freezes where the skeleton runs fewer. W5 needs
-//! what the harness does not have yet (snapshots, client retries across a
-//! leader change): [`w5`] returns a [`NotYet`] saying so. W2 declares its
+//! the values the ADR freezes where the skeleton runs fewer. W2 declares its
 //! limits to the core ([`Case::limits`]); a core that takes none has its
 //! W2 cases not demonstrated, never passed.
 //!
@@ -43,15 +41,6 @@ use crate::sim::Failure;
 /// The ADR-0043 revision this module follows.
 pub const ADR_0043: &str = "quantstratum-docs 03ffb3944343885c8da04557c54814627dbe5001 \
      (2026-10-12), ADR-0043 Proposed, owner item 31";
-
-/// A workload the harness cannot run yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotYet {
-    /// The workload.
-    pub workload: &'static str,
-    /// What it needs first.
-    pub reason: &'static str,
-}
 
 /// A W2 count or step bound past its type ([`W2::cases`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,22 +244,9 @@ impl W2 {
     }
 }
 
-/// W5's retries: a lost reply, a leader change and a retry answered from
-/// deduplication (P3 of karyos#687).
-///
-/// # Errors
-///
-/// Always [`NotYet`].
-pub fn w5() -> Result<Vec<Case>, NotYet> {
-    Err(NotYet {
-        workload: "W5",
-        reason: "its retries need a leader change in the core interface \
-                 (karyos#687 P3); its snapshot half is W5Snapshots",
-    })
-}
-
-/// W5's snapshot half (karyos#687 P2): compaction, a follower held behind
-/// the compaction point, and snapshot build and install interrupted.
+/// W5, snapshots and retries (karyos#687): compaction, a follower held
+/// behind the compaction point, snapshot build and install interrupted, and
+/// a lost client reply followed by a leader change and a retry.
 ///
 /// The manifest freezes 3 servers, 2 clients, 256 B payloads, compaction
 /// every 1,000 applied entries keeping 100, a follower held behind the
@@ -283,8 +259,16 @@ pub fn w5() -> Result<Vec<Case>, NotYet> {
 /// the heal and installs once restarted, and a server crashes between two
 /// of its builds. A core that takes no snapshots has these cases not
 /// demonstrated, never passed.
+///
+/// The retries: a client's reply is lost (the leader's link to it cut),
+/// the operator hands the leadership over, and the client's retry, sent to
+/// the old leader and redirected, is answered from the new leader's
+/// deduplication table, which keeps each client's last
+/// [`super::node::RETENTION`] answers and answers an older retry
+/// [`super::node::Ret::Expired`]. A core that cannot hand its leadership
+/// over has this case not demonstrated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct W5Snapshots {
+pub struct W5 {
     /// Servers.
     pub processes: usize,
     /// Clients.
@@ -295,7 +279,7 @@ pub struct W5Snapshots {
     pub compaction: Compaction,
 }
 
-impl W5Snapshots {
+impl W5 {
     /// The follower held behind: not the reference's leader.
     pub const BEHIND: NodeId = 2;
 
@@ -391,7 +375,30 @@ impl W5Snapshots {
             (at, Action::Crash(1)),
             (at.checked_add(40).ok_or(W2Overflow)?, Action::Restart(1)),
         ];
-        Ok(vec![compaction, behind, install, build])
+        // A lost reply, a handover and the retry: the first client's
+        // replies from the leader are cut while its request commits; the
+        // leadership moves to server 1; the cut heals before the retry.
+        let mut retry = base("lost reply, leader change and retry");
+        retry.compaction = None;
+        retry.handover = Some(1);
+        retry.retried = true;
+        retry.operations = 8;
+        let client = NodeId::try_from(self.processes).map_err(|_| W2Overflow)?;
+        // Mid-run: each operation takes a few steps.
+        let lost = 12;
+        retry.schedule = vec![
+            (
+                lost,
+                Action::Cut {
+                    from: 0,
+                    to: client,
+                },
+            ),
+            (lost + 10, Action::TransferLeadership(1)),
+            (lost + 30, Action::Heal),
+        ];
+        retry.steps = 2_000;
+        Ok(vec![compaction, behind, install, build, retry])
     }
 }
 
@@ -427,6 +434,9 @@ pub enum Action {
     /// An operator's membership change, sent to every server that is up;
     /// a core that does not lead refuses it.
     Change(Change),
+    /// An operator's leadership handover to `to`, sent to every server
+    /// that is up; a core that does not lead refuses it (W5).
+    TransferLeadership(NodeId),
     /// The primary's leader stops reaching the arbiter: its lease is no
     /// longer renewed ([`Case::lease`]).
     CutArbiter,
@@ -522,6 +532,16 @@ pub struct Case {
     pub notes: Vec<&'static str>,
     /// Its servers' log compaction (W5), if any.
     pub compaction: Option<Compaction>,
+    /// A handover the case must show taken (W5): its target must answer
+    /// a handover `Ok` and then commit as leader, or the case fails
+    /// ([`Failed::NotShown`]; karyos#905 review).
+    pub handover: Option<NodeId>,
+    /// The case must show a retry across the handover (W5), or it fails
+    /// ([`Failed::NotShown`]): one request, redirected by another server
+    /// to the handover's target, then answered from deduplication by that
+    /// target after it took the handover and committed as leader
+    /// (karyos#905 review).
+    pub retried: bool,
     /// A follower cut off until the first heal, and the entries the
     /// leaders must have committed past its own commit by then: W2's slow
     /// follower must really be that far behind, or the case fails
@@ -573,6 +593,8 @@ impl Case {
             notes: Vec::new(),
             behind: None,
             compaction: None,
+            handover: None,
+            retried: false,
         }
     }
 }
@@ -671,6 +693,9 @@ pub enum Failed {
         /// The up servers' last applied index and digest.
         states: Vec<(NodeId, Option<u64>, u64)>,
     },
+    /// What the case must show did not happen: `"handover"`
+    /// ([`Case::handover`]) or `"retry"` ([`Case::retried`]).
+    NotShown(&'static str),
     /// The cut-off follower was not as far behind at the heal as the case
     /// requires ([`Case::behind`]).
     NotBehind {
@@ -894,10 +919,12 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     }
     // The operator, a client with no script, only where a change is
     // scheduled, so a phase 4 case runs the nodes it always did.
-    let changes = case
-        .schedule
-        .iter()
-        .any(|(_, action)| matches!(action, Action::Change(_) | Action::Promote(_)));
+    let changes = case.schedule.iter().any(|(_, action)| {
+        matches!(
+            action,
+            Action::Change(_) | Action::Promote(_) | Action::TransferLeadership(_)
+        )
+    });
     let mut operator = None;
     if changes {
         let id = case
@@ -1033,6 +1060,20 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                     }
                 }
             }
+            Action::TransferLeadership(to) => {
+                let operator = operator.ok_or(RunError::Count)?;
+                for &id in &everyone {
+                    if sim
+                        .node(id)
+                        .and_then(Member::server)
+                        .is_some_and(ServerNode::is_up)
+                    {
+                        let _ = sim
+                            .send(operator, id, Wire::Transfer(to))
+                            .map_err(RunError::Sim)?;
+                    }
+                }
+            }
         }
     }
     if let Some(steps) = case.steps.checked_sub(done).filter(|steps| *steps > 0) {
@@ -1163,6 +1204,69 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
         (Err(gap), Progress::MayStop) => Some(gap),
         (Err(gap), Progress::Expected) => return Err(Failed::Liveness(gap)),
     };
+    if let Some(to) = case.handover {
+        let observations = &outcome.observations;
+        // The target took the handover, then committed as leader: from
+        // there on it leads.
+        let leads = observations
+            .iter()
+            .position(|observation| {
+                matches!(
+                    observation,
+                    Observation::Transfer { to: target, result: Ok(()), .. } if *target == to
+                )
+            })
+            .and_then(|taken| {
+                observations
+                    .iter()
+                    .skip(taken)
+                    .position(|observation| {
+                        matches!(
+                            observation,
+                            Observation::Commit { node, leader: true, .. } if *node == to
+                        )
+                    })
+                    .and_then(|led| taken.checked_add(led))
+            });
+        let Some(leads) = leads else {
+            return Err(Failed::NotShown("handover"));
+        };
+        // One request redirected to the target by another server, then
+        // answered from deduplication by the target, once it leads.
+        if case.retried {
+            let retried = observations
+                .iter()
+                .enumerate()
+                .skip(leads)
+                .any(|(at, observation)| {
+                    let Observation::Deduplicated {
+                        node,
+                        client,
+                        sequence,
+                    } = observation
+                    else {
+                        return false;
+                    };
+                    *node == to
+                        && observations.iter().take(at).any(|earlier| {
+                            matches!(
+                                earlier,
+                                Observation::Redirected {
+                                    node: from,
+                                    client: c,
+                                    sequence: s,
+                                    to: target,
+                                } if *from != to && c == client && s == sequence && *target == to
+                            )
+                        })
+                });
+            if !retried {
+                return Err(Failed::NotShown("retry"));
+            }
+        }
+    } else if case.retried {
+        return Err(Failed::NotShown("retry"));
+    }
     if let Some((follower, required)) = case.behind {
         match gap_at_heal(&outcome.observations, follower) {
             Some(reached) if reached >= required => {}
