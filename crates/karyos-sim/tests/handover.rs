@@ -499,3 +499,83 @@ fn a_second_handover_mid_handover_never_makes_two_leaders() {
         assert!(refused, "gap {gap}: the second was refused: {transfers:?}");
     }
 }
+
+/// `Late` that also drops every Append to node 1 after tick 22 (karyos#909,
+/// codex's artifact 276): the target falls behind the old leader.
+#[derive(Debug)]
+struct Starved(Late);
+
+impl Starved {
+    fn wrap(core: Reference) -> Self {
+        Self(Late::wrap(core))
+    }
+    fn inner(&mut self) -> &mut Reference {
+        self.0.inner()
+    }
+    fn inner_ref(&self) -> &Reference {
+        self.0.inner_ref()
+    }
+}
+
+impl ConsensusCore for Starved {
+    type Message = Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        Self::wrap(Reference::recover(id, peers, log))
+    }
+
+    fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
+        self.0.tick(now, log);
+    }
+
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Message>> {
+        let mut ready = self.0.ready(log);
+        if self.0.now > 22
+            && let Some(ready) = ready.as_mut()
+        {
+            let starved = |(to, message): &(NodeId, Message)| {
+                !(*to == 1 && matches!(message, Message::Append { .. }))
+            };
+            ready.messages.retain(starved);
+            ready.after_persist.retain(starved);
+        }
+        ready
+    }
+
+    fn transfer_leadership(
+        &mut self,
+        to: NodeId,
+        log: &mut LogView<'_>,
+    ) -> Result<(), TransferRefused> {
+        self.0.transfer_leadership(to, log)
+    }
+
+    fn propose_change(
+        &mut self,
+        change: karyos_sim::harness::core::Change,
+        log: &mut LogView<'_>,
+    ) -> Result<(), karyos_sim::harness::core::ChangeRefused> {
+        self.inner().propose_change(change, log)
+    }
+
+    delegate!();
+}
+
+/// A membership change asked while a handover is under way (karyos#909,
+/// codex): the old leader refuses it, naming the target, so no entry of
+/// its term goes past what the target holds; with the target starved of
+/// appends and its TimeoutNow late, nothing diverges.
+#[test]
+fn a_membership_change_mid_handover_is_refused() {
+    let mut case = retry_case();
+    case.operations = 200;
+    case.steps = 10_000;
+    case.schedule.push((
+        30,
+        Action::Change(karyos_sim::harness::core::Change::Remove(1)),
+    ));
+    RELEASE.with(|release| release.set(200));
+    let outcome = run::<Starved>(&case, 1).unwrap();
+    RELEASE.with(|release| release.set(0));
+    assert!(outcome.safety.is_ok(), "{:?}", outcome.safety);
+}

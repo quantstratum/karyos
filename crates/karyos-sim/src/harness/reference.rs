@@ -776,6 +776,12 @@ impl ConsensusCore for Reference {
                 leader: Some(self.leader),
             }));
         }
+        // Handing over: the target leads next, and decides membership
+        // (karyos#909): an entry of this term past the target's log would
+        // diverge from the target's next term.
+        if let Some(to) = self.transferring {
+            return Err(ChangeRefused::NotLeader(NotLeader { leader: Some(to) }));
+        }
         // One change at a time: the last one must be committed.
         if self
             .configs
