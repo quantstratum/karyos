@@ -136,9 +136,10 @@ impl<'a> LogView<'a> {
     /// Entries in `range`, up to `max_bytes` of frames (at least one).
     /// Metered, it takes only the frames that fit in the duty's budget
     /// left, sized from the log's index before anything is read
-    /// ([`RaftLog::frame_span`]), and spends their bytes: a duty never
-    /// reads past its budget, and a refused read reads nothing (karyos#899
-    /// review, codex).
+    /// ([`RaftLog::frame_span`]), and spends their bytes before reading,
+    /// so a read that fails part-way is charged too: a duty never reads
+    /// past its budget, and a refused read reads nothing (karyos#899
+    /// review, codex). An empty range reads and spends nothing.
     ///
     /// # Errors
     ///
@@ -148,6 +149,10 @@ impl<'a> LogView<'a> {
         let Some(budget) = self.budget else {
             return Ok(self.log.entries(range, max_bytes)?);
         };
+        // An empty range asks for nothing: no read, no charge.
+        if range.is_empty() {
+            return Ok(Vec::new());
+        }
         let left = budget.left();
         let (mut end, mut spent) = (range.start, 0u64);
         while end < range.end {
@@ -170,11 +175,13 @@ impl<'a> LogView<'a> {
             }
             return Ok(Vec::new());
         }
-        let entries = self.log.entries(range.start..end, u64::MAX)?;
+        // Charged before the read: a read that fails part-way still
+        // examined those bytes, and its retries stay within the budget
+        // (ADR-0008; karyos#899 review).
         budget
             .left
             .set(left.checked_sub(spent).ok_or(ReadError::Budget)?);
-        Ok(entries)
+        Ok(self.log.entries(range.start..end, u64::MAX)?)
     }
 
     /// The term of entry `index`, if the log holds it.

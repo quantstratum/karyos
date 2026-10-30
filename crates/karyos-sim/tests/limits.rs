@@ -560,3 +560,46 @@ fn a_follower_never_behind_fails_the_slow_case() {
         "without the requirement it passes"
     );
 }
+
+/// A metered read that fails part-way is charged for the frames it took
+/// (karyos#899 review, codex: a damaged second frame let ten failing reads
+/// make 30 disk operations while the budget stayed whole), so its retries
+/// end in Budget; an empty range reads and spends nothing.
+#[test]
+fn a_failed_metered_read_is_charged_and_an_empty_one_is_free() {
+    use karyos_archive::disk::Disk;
+    use karyos_cluster::log::LOG_RECORDING;
+
+    let mut disk = SimDisk::new();
+    let mut log =
+        RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry().unwrap(), 1).unwrap();
+    let entries: Vec<Entry> = (1..=2)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            event_time: 0,
+            payload: vec![0; 256],
+        })
+        .collect();
+    let _ = log.append(&entries).unwrap();
+    let _ = log.sync().unwrap();
+    let (first, second) = (log.frame_span(1).unwrap(), log.frame_span(2).unwrap());
+    // Damage the second frame's magic, in its segment's data file.
+    let segment = Path::new(LOG_DIR).join(format!("{LOG_RECORDING:016x}-{:016x}.seg", 0));
+    let file = disk.open(&segment).unwrap();
+    disk.write_at(&file, first, b"XXXX").unwrap();
+    let budget = ReadBudget::new();
+    budget.refill(first + second);
+    let mut view = LogView::metered(&mut log, Some(&budget));
+    assert!(view.entries(1..1, u64::MAX).unwrap().is_empty());
+    assert_eq!(budget.left(), first + second, "an empty range is free");
+    assert!(matches!(
+        view.entries(1..3, u64::MAX),
+        Err(ReadError::Log(_))
+    ));
+    assert_eq!(budget.left(), 0, "the failed read is charged");
+    assert!(matches!(
+        view.entries(1..3, u64::MAX),
+        Err(ReadError::Budget)
+    ));
+}
