@@ -103,10 +103,30 @@ impl Node {
         (outcome, drain(&mut report))
     }
 
-    /// Joins and retires the endpoint.
-    fn shutdown(self) {
+    /// Joins and retires the endpoint, returning the items still pending.
+    fn retire(self) -> Vec<TxEntry> {
         let mut endpoint = SocketsEndpoint::join(self.tx, self.rx).unwrap();
-        assert!(retire_all(&mut endpoint).is_empty());
+        retire_all(&mut endpoint)
+    }
+
+    /// Joins and retires the endpoint, which must hold no pending item.
+    fn shutdown(self) {
+        assert!(self.retire().is_empty());
+    }
+}
+
+/// Retires `nodes` after a case that may skip: a case that ran asserts no
+/// item is left pending, while a skip, such as a send refused with no
+/// route, may leave one, and its retirement returns it (karyos#880).
+fn finish(nodes: impl IntoIterator<Item = Node>, skipped: Option<String>) {
+    match skipped {
+        None => nodes.into_iter().for_each(Node::shutdown),
+        Some(reason) => {
+            for node in nodes {
+                node.retire();
+            }
+            skip(&reason);
+        }
     }
 }
 
@@ -664,14 +684,31 @@ fn multicast_loopback_on_the_default_interface() {
         &mut quiet,
         destination,
     );
-    // Every node shuts down, on a skip too: a TX half dropped with an item
+    // Every node retires, on a skip too: a TX half dropped with an item
     // queued discards it (karyos#880).
-    for node in [receiver_a, receiver_b, looped, quiet] {
-        node.shutdown();
-    }
-    if let Some(reason) = skipped {
-        skip(&reason);
-    }
+    finish([receiver_a, receiver_b, looped, quiet], skipped);
+}
+
+/// A skip that leaves an item pending retires it rather than failing the
+/// shutdown check, as a multicast send refused with no route does
+/// (karyos#880).
+#[test]
+fn a_skip_retires_a_pending_item() {
+    let mut node = Node::loopback();
+    let queue = node.queue_to(node.local);
+    let mut frame = node.tx.claim_tx(queue, 4).unwrap();
+    frame.bytes_mut().copy_from_slice(b"left");
+    frame
+        .commit(Commit {
+            len: 4,
+            token: SenderToken::new(0),
+            options: TxOptions::none(),
+        })
+        .unwrap();
+    finish(
+        [node],
+        Some("a forced skip with an item pending".to_owned()),
+    );
 }
 
 /// The checks of [`multicast_loopback_on_the_default_interface`], returning
