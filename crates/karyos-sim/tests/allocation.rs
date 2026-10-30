@@ -13,7 +13,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use karyos_sim::harness::core::{ConsensusCore, LogView, NotLeader, Persisted, Ready};
+use karyos_sim::harness::core::{ConsensusCore, LogView, Persisted, Ready, Refused};
 use karyos_sim::harness::corpus::Evidence;
 use karyos_sim::harness::probe::{WARMUP, measure};
 use karyos_sim::harness::reference::Reference;
@@ -186,7 +186,7 @@ impl ConsensusCore for Noisy {
         Self(Reference::recover(id, peers, log))
     }
 
-    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader> {
+    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
         self.0.propose(command, log)
     }
 

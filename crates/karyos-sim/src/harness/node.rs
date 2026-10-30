@@ -48,8 +48,8 @@ use karyos_archive::segment::Geometry;
 use karyos_cluster::{Entry, LogError, RaftLog};
 
 use super::core::{
-    Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, LogView, Release,
-    Step, drive,
+    Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, Limits, LogView,
+    ReadBudget, Release, Step, Unsupported, drive_metered,
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
@@ -863,6 +863,26 @@ pub struct ServerNode<C: ConsensusCore> {
     lease: Option<Rc<RefCell<ExternalLease>>>,
     /// The standby state, for a standby server.
     standby: Option<StandbyIn>,
+    /// The limits its core is declared (W2), at every start.
+    limits: Option<Limits>,
+    /// Its duty's log-read budget, refilled at each tick and delivery
+    /// under [`Limits::log_read_bytes`].
+    budget: ReadBudget,
+}
+
+/// Why a server could not be created.
+#[derive(Debug)]
+pub enum ServerError {
+    /// The log's refusal to be created.
+    Log(LogError),
+    /// Its core takes no limits.
+    Unsupported(Unsupported),
+}
+
+impl From<LogError> for ServerError {
+    fn from(error: LogError) -> Self {
+        Self::Log(error)
+    }
 }
 
 impl<C: ConsensusCore> ServerNode<C> {
@@ -882,6 +902,74 @@ impl<C: ConsensusCore> ServerNode<C> {
     ) -> Result<Self, LogError> {
         let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
         let core = C::recover(id, &peers, &mut LogView::new(&mut log));
+        Ok(Self::assemble(
+            id,
+            peers,
+            (disk, survives),
+            geometry,
+            recorder,
+            (core, log),
+            None,
+        ))
+    }
+
+    /// [`ServerNode::new`] under declared `limits` (W2), at its first start
+    /// and every restart.
+    ///
+    /// # Errors
+    ///
+    /// The log's refusal to be created, and [`Unsupported`] for a core
+    /// that takes no limits.
+    pub fn with_limits(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        (disk, survives): (SimDisk, Survives),
+        geometry: Geometry,
+        recorder: Shared,
+        limits: Limits,
+    ) -> Result<Self, ServerError> {
+        Self::create(
+            id,
+            peers,
+            (disk, survives),
+            geometry,
+            recorder,
+            Some(limits),
+        )
+    }
+
+    fn create(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        (disk, survives): (SimDisk, Survives),
+        geometry: Geometry,
+        recorder: Shared,
+        limits: Option<Limits>,
+    ) -> Result<Self, ServerError> {
+        let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
+        let core =
+            Self::recovered(id, &peers, limits, &mut log).map_err(ServerError::Unsupported)?;
+        Ok(Self::assemble(
+            id,
+            peers,
+            (disk, survives),
+            geometry,
+            recorder,
+            (core, log),
+            limits,
+        ))
+    }
+
+    /// A server running `core` over `log`.
+    fn assemble(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        (disk, survives): (SimDisk, Survives),
+        geometry: Geometry,
+        recorder: Shared,
+        (core, log): (C, RaftLog<SimDisk>),
+        limits: Option<Limits>,
+    ) -> Self {
         let commit = core.committed();
         let configuration = core.configuration();
         let mut server = Self {
@@ -902,11 +990,13 @@ impl<C: ConsensusCore> ServerNode<C> {
             feed: None,
             lease: None,
             standby: None,
+            limits,
+            budget: ReadBudget::new(),
         };
         if let Some(configuration) = configuration {
             server.record_configuration(configuration, None);
         }
-        Ok(server)
+        server
     }
 
     /// Server `id` of `peers` over the log already on `disk`, started as
@@ -938,6 +1028,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             feed: None,
             lease: None,
             standby: None,
+            limits: None,
+            budget: ReadBudget::new(),
         };
         server.start();
         server
@@ -971,6 +1063,28 @@ impl<C: ConsensusCore> ServerNode<C> {
             ..StandbyIn::default()
         });
         self
+    }
+
+    /// Its core over `log`, under `limits` when it has them.
+    fn recovered(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: Option<Limits>,
+        log: &mut RaftLog<SimDisk>,
+    ) -> Result<C, Unsupported> {
+        let mut view = LogView::new(log);
+        match limits {
+            Some(limits) => C::recover_with(id, peers, &limits, &mut view),
+            None => Ok(C::recover(id, peers, &mut view)),
+        }
+    }
+
+    /// A new duty: its read budget refilled, when it has limits (a handle
+    /// on the same budget).
+    fn refill(&self) -> Option<ReadBudget> {
+        let limits = self.limits?;
+        self.budget.refill(limits.log_read_bytes);
+        Some(self.budget.clone())
     }
 
     /// Its generation.
@@ -1019,9 +1133,11 @@ impl<C: ConsensusCore> ServerNode<C> {
         let node = self.id;
         let recorder = Rc::clone(&self.recorder);
         let mut applied = Vec::new();
-        let driven = drive(
+        let budget = self.limits.is_some().then_some(&self.budget);
+        let driven = drive_metered(
             &mut core,
             &mut log,
+            budget,
             &mut |to, message, release| {
                 if let Some(release) = release {
                     recorder
@@ -1217,7 +1333,15 @@ impl<C: ConsensusCore> ServerNode<C> {
             entries,
             durable: log.durable_index(),
         });
-        let core = C::recover(self.id, &self.peers, &mut LogView::new(&mut log));
+        let core = match Self::recovered(self.id, &self.peers, self.limits, &mut log) {
+            Ok(core) => core,
+            // The core took its limits at its creation: it is not the
+            // same core if it refuses them now.
+            Err(Unsupported) => {
+                self.lost = Some("its core no longer takes its limits".to_owned());
+                return;
+            }
+        };
         // The service's state is rebuilt from the log as the core hands
         // out its committed entries again; the recovered commit is a
         // baseline, not a new commit.
@@ -1241,8 +1365,9 @@ impl<C: ConsensusCore> ServerNode<C> {
 impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     fn tick(&mut self, now: u64, out: &mut Outbox<Wire<C::Message>>) {
         self.now = now;
+        let budget = self.refill();
         if let Some((core, log)) = self.running.as_mut() {
-            core.tick(now, &mut LogView::new(log));
+            core.tick(now, &mut LogView::metered(log, budget.as_ref()));
             if core.leads() {
                 if let Some(lease) = &self.lease {
                     let mut lease = lease.borrow_mut();
@@ -1269,10 +1394,11 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     ) {
         self.now = now;
         let acts = self.acts();
+        let budget = self.refill();
         let Some((core, log)) = self.running.as_mut() else {
             return;
         };
-        let mut view = LogView::new(log);
+        let mut view = LogView::metered(log, budget.as_ref());
         match message {
             Wire::Core(message) => core.step(from, message, &mut view),
             Wire::Request(command) if !acts => out.push((

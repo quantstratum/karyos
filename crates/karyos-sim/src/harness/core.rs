@@ -40,9 +40,20 @@
 //! **The log.** Every call gets a [`LogView`], a read-only view of C4's
 //! log (entries, terms, indices, the hard state), as raft-rs's `Storage`
 //! and openraft's log reader would read it; only [`drive`] writes the log.
+//!
+//! **Limits** (W2; karyos#687). A core started with
+//! [`ConsensusCore::recover_with`] is given the declared [`Limits`] and
+//! refuses what passes them with a typed [`Refused::Backpressure`], never
+//! by dropping it. The log-read limit is the harness's to enforce: a
+//! metered [`LogView`] answers [`ReadError::Budget`] once a duty has read
+//! its bytes. A core that takes no limits answers [`Unsupported`], the
+//! default, and the harness reports its W2 cases as not demonstrated,
+//! never as passed.
 
+use std::cell::Cell;
 use std::fmt::Debug;
 use std::ops::Range;
+use std::rc::Rc;
 
 use karyos_cluster::{Entry, HardState, LogError, RaftLog};
 
@@ -63,21 +74,86 @@ use crate::net::NodeId;
 /// read. A core handles a read error; it does not unwrap it.
 pub struct LogView<'a> {
     log: &'a mut RaftLog<SimDisk>,
+    /// The duty's read budget, when the log-read limit applies.
+    budget: Option<&'a ReadBudget>,
+}
+
+/// A duty's log-read budget (W2's log-read limit): the payload bytes a
+/// core may still read through its [`LogView`]s this duty.
+#[derive(Debug, Clone, Default)]
+pub struct ReadBudget {
+    /// Bytes left this duty.
+    left: Rc<Cell<u64>>,
+}
+
+impl ReadBudget {
+    /// A budget refilled to `bytes` at each [`ReadBudget::refill`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A new duty: `bytes` to read.
+    pub fn refill(&self, bytes: u64) {
+        self.left.set(bytes);
+    }
+
+    /// Bytes left this duty.
+    #[must_use]
+    pub fn left(&self) -> u64 {
+        self.left.get()
+    }
+}
+
+/// Why a [`LogView`] read gave no entries.
+#[derive(Debug)]
+pub enum ReadError {
+    /// The log's read error.
+    Log(LogError),
+    /// The duty's read budget is spent (W2's log-read limit): the read is
+    /// refused, never blocked; the next duty reads again.
+    Budget,
+}
+
+impl From<LogError> for ReadError {
+    fn from(error: LogError) -> Self {
+        Self::Log(error)
+    }
 }
 
 impl<'a> LogView<'a> {
-    /// A view of `log`.
+    /// A view of `log`, unmetered.
     pub fn new(log: &'a mut RaftLog<SimDisk>) -> Self {
-        Self { log }
+        Self { log, budget: None }
+    }
+
+    /// A view of `log` whose reads spend `budget`.
+    pub fn metered(log: &'a mut RaftLog<SimDisk>, budget: Option<&'a ReadBudget>) -> Self {
+        Self { log, budget }
     }
 
     /// Entries in `range`, up to `max_bytes` of frames (at least one).
+    /// Metered, the read is held to the duty's budget left, still at least
+    /// one entry, and spends the payload bytes it returns.
     ///
     /// # Errors
     ///
-    /// The log's read error.
-    pub fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, LogError> {
-        self.log.entries(range, max_bytes)
+    /// [`ReadError::Budget`] once the duty's budget is spent, and the
+    /// log's read error.
+    pub fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, ReadError> {
+        let Some(budget) = self.budget else {
+            return Ok(self.log.entries(range, max_bytes)?);
+        };
+        let left = budget.left();
+        if left == 0 {
+            return Err(ReadError::Budget);
+        }
+        let entries = self.log.entries(range, max_bytes.min(left))?;
+        let read = entries.iter().fold(0u64, |sum, entry| {
+            sum.saturating_add(u64::try_from(entry.payload.len()).unwrap_or(u64::MAX))
+        });
+        budget.left.set(left.saturating_sub(read));
+        Ok(entries)
     }
 
     /// The term of entry `index`, if the log holds it.
@@ -117,6 +193,66 @@ pub struct NotLeader {
     /// The leader it knows of, if any.
     pub leader: Option<NodeId>,
 }
+
+/// The limits a core is declared (W2; quantstratum-docs:
+/// karyos/evaluations/c5-raft-comparison-v1.md, Workloads and bounds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Entries sent to one follower and not acknowledged, at most.
+    pub in_flight_entries: u64,
+    /// Payload bytes sent to one follower and not acknowledged, at most.
+    pub in_flight_bytes: u64,
+    /// Client requests a server holds, proposed and not committed, at most.
+    pub queue: u64,
+    /// Payload bytes a server reads from its log per duty, at most (the
+    /// harness enforces it: [`ReadBudget`]).
+    pub log_read_bytes: u64,
+}
+
+impl Limits {
+    /// The manifest's W2 limits: 64 entries or 1 MiB in flight per
+    /// follower, a queue of 1024 per server, 1 MiB read per duty.
+    pub const W2: Self = Self {
+        in_flight_entries: 64,
+        in_flight_bytes: 1024 * 1024,
+        queue: 1024,
+        log_read_bytes: 1024 * 1024,
+    };
+}
+
+/// Which limit a refusal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    /// [`Limits::in_flight_entries`].
+    InFlightEntries,
+    /// [`Limits::in_flight_bytes`].
+    InFlightBytes,
+    /// [`Limits::queue`].
+    Queue,
+    /// [`Limits::log_read_bytes`].
+    LogRead,
+}
+
+/// Why a core refused a proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refused {
+    /// It does not lead.
+    NotLeader(NotLeader),
+    /// Taking it would pass a declared limit: typed, so the client knows
+    /// to retry, and nothing is dropped silently.
+    Backpressure(Limit),
+}
+
+impl From<NotLeader> for Refused {
+    fn from(not_leader: NotLeader) -> Self {
+        Self::NotLeader(not_leader)
+    }
+}
+
+/// A capability the core does not have: the harness reports what needs
+/// it as not demonstrated, never as passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unsupported;
 
 /// What a core asks its node to do, in [`drive`]'s order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,12 +304,32 @@ pub trait ConsensusCore: Sized {
     /// its log holds: at the first start and after every restart.
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self;
 
+    /// [`ConsensusCore::recover`] under declared `limits` (W2), which the
+    /// core honours: it refuses with [`Refused::Backpressure`] what would
+    /// pass them.
+    ///
+    /// # Errors
+    ///
+    /// [`Unsupported`], the default, for a core that takes no limits: it
+    /// is never started without them, so its W2 cases are not
+    /// demonstrated.
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, Unsupported> {
+        let _ = (id, peers, limits, log);
+        Err(Unsupported)
+    }
+
     /// Proposes `command` for the log.
     ///
     /// # Errors
     ///
-    /// [`NotLeader`] when this core cannot take proposals.
-    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader>;
+    /// [`Refused`]: the core does not lead, or the proposal would pass a
+    /// declared limit.
+    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused>;
 
     /// `message` from `from` arrives.
     fn step(&mut self, from: NodeId, message: Self::Message, log: &mut LogView<'_>);
@@ -361,8 +517,24 @@ pub fn drive<C: ConsensusCore>(
     apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
 ) -> Result<(), DriveError> {
+    drive_metered(core, log, None, send, apply, observe)
+}
+
+/// [`drive`], the core's reads spending `budget` when one is given.
+///
+/// # Errors
+///
+/// As [`drive`].
+pub fn drive_metered<C: ConsensusCore>(
+    core: &mut C,
+    log: &mut RaftLog<SimDisk>,
+    budget: Option<&ReadBudget>,
+    send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
+    apply: &mut dyn FnMut(&Entry, Applying),
+    observe: &mut dyn FnMut(Step),
+) -> Result<(), DriveError> {
     let mut readies = 0usize;
-    while let Some(ready) = core.ready(&mut LogView::new(log)) {
+    while let Some(ready) = core.ready(&mut LogView::metered(log, budget)) {
         if readies == MAX_READIES {
             return Err(DriveError::WorkBudget { readies });
         }
@@ -392,7 +564,7 @@ pub fn drive<C: ConsensusCore>(
             durable,
             hard_state: ready.hard_state,
         };
-        core.advance(persisted, &mut LogView::new(log));
+        core.advance(persisted, &mut LogView::metered(log, budget));
         observe(Step::Persisted {
             persisted,
             truncated_from: ready.truncate_from,

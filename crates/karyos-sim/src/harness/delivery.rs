@@ -52,7 +52,7 @@ use karyos_cluster::service::{
 };
 use karyos_cluster::{Entry, LogError, RaftLog};
 
-use super::core::{Change, ConsensusCore, LogView, drive};
+use super::core::{Change, ConsensusCore, LogView, Refused, drive};
 use super::node::LOG_DIR;
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
@@ -184,7 +184,13 @@ impl<C: ConsensusCore> Propose for Proposer<'_, '_, C> {
     fn propose(&mut self, payload: Vec<u8>) -> Result<(), NotLeader> {
         self.core
             .propose(payload, self.log)
-            .map_err(|refused| NotLeader::new(refused.leader.map(u64::from)))
+            .map_err(|refused| match refused {
+                Refused::NotLeader(refused) => NotLeader::new(refused.leader.map(u64::from)),
+                // The delivery cases declare no limits, so a core never
+                // pushes back here; were it to, the container retries as
+                // it does for a leader it does not know.
+                Refused::Backpressure(_) => NotLeader::new(None),
+            })
     }
 }
 

@@ -31,7 +31,7 @@ use karyos_sim::disk::{SimDisk, Survives};
 use karyos_sim::harness::check::{self, Violation};
 use karyos_sim::harness::core::{
     Applying, ConsensusCore, DriveError, LogView, MAX_READIES, NotLeader, Persisted, Ready,
-    Release, Step, drive,
+    Refused, Release, Step, drive,
 };
 use karyos_sim::harness::node::{
     Breach, ClientNode, LOG_DIR, Member, Observation, Op, Positions, Recorder, Ret, ServerNode,
@@ -615,8 +615,8 @@ impl ConsensusCore for Busy {
         }
     }
 
-    fn propose(&mut self, _command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), NotLeader> {
-        Err(NotLeader { leader: None })
+    fn propose(&mut self, _command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), Refused> {
+        Err(NotLeader { leader: None }.into())
     }
 
     fn step(&mut self, _from: NodeId, _message: (), _log: &mut LogView<'_>) {}

@@ -22,6 +22,15 @@
 //! term. Every server saves its vote for the leader at its first Ready,
 //! and its hard state at each commit change.
 //!
+//! **Limits** (W2; karyos#687). Started with [`Limits`], it honours them:
+//! a proposal past [`Limits::queue`] requests held and not committed is
+//! refused with [`Limit::Queue`]; each append message carries at most
+//! [`Limits::in_flight_entries`] entries and [`Limits::in_flight_bytes`]
+//! bytes, and since it resends from what a follower acknowledged, that is
+//! all a follower has in flight; its log reads are held to the harness's
+//! read budget, and a refused read sends nothing until the next resend.
+//! As a fixture, it labels what it shows harness validation.
+//!
 //! **Membership** (phase 5; quantstratum-docs:
 //! karyos/design/phase-5-cluster-scenarios.md, P5-S1). The leader takes
 //! one [`Change`] at a time, once the last configuration entry is
@@ -39,7 +48,8 @@ use std::collections::BTreeMap;
 use karyos_cluster::{Entry, HardState};
 
 use super::core::{
-    Change, ChangeRefused, Configuration, ConsensusCore, LogView, NotLeader, Persisted, Ready,
+    Change, ChangeRefused, Configuration, ConsensusCore, Limit, Limits, LogView, NotLeader,
+    Persisted, Ready, Refused, Unsupported,
 };
 use crate::net::NodeId;
 
@@ -143,6 +153,8 @@ pub struct Reference {
     /// Its clock at its last tick: the event time of the entries it
     /// proposes (karyos#686, decision E1).
     now: u64,
+    /// The limits it was started with, if any.
+    limits: Option<Limits>,
 }
 
 impl Reference {
@@ -278,21 +290,40 @@ impl ConsensusCore for Reference {
             // Until its first tick; the log time never goes back, as it
             // is the highest event time applied.
             now: 0,
+            limits: None,
         }
     }
 
-    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader> {
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, Unsupported> {
+        let mut core = Self::recover(id, peers, log);
+        core.limits = Some(*limits);
+        Ok(core)
+    }
+
+    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
+        let not_leader = NotLeader {
+            leader: Some(self.leader),
+        };
         if !self.leading() {
-            return Err(NotLeader {
-                leader: Some(self.leader),
-            });
+            return Err(not_leader.into());
         }
         // The last index is u64::MAX: the log takes no more.
         let Some(index) = self.next(log) else {
-            return Err(NotLeader {
-                leader: Some(self.leader),
-            });
+            return Err(not_leader.into());
         };
+        // Held and not committed: what it proposed past its commit.
+        let held = index.saturating_sub(
+            self.commit
+                .map_or(log.first_index(), |c| c.saturating_add(1)),
+        );
+        if self.limits.is_some_and(|limits| held >= limits.queue) {
+            return Err(Refused::Backpressure(Limit::Queue));
+        }
         self.unpersisted.push(Entry {
             index,
             term: TERM,
@@ -374,9 +405,19 @@ impl ConsensusCore for Reference {
                 .flatten()
                 .map_or(Some(log.first_index()), |index| index.checked_add(1))
                 .unwrap_or(end);
+            // Within the in-flight limits: it resends from the follower's
+            // acknowledgement, so one message is all it has in flight.
+            let (end, bytes) = match self.limits {
+                Some(limits) => (
+                    end.min(from.saturating_add(limits.in_flight_entries)),
+                    BATCH_BYTES.min(limits.in_flight_bytes),
+                ),
+                None => (end, BATCH_BYTES),
+            };
             let entries = if from < end {
-                // A failed read sends none; the next resend retries.
-                log.entries(from..end, BATCH_BYTES).unwrap_or_default()
+                // A failed or refused read sends none; the next resend
+                // retries.
+                log.entries(from..end, bytes).unwrap_or_default()
             } else {
                 Vec::new()
             };

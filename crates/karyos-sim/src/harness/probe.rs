@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_sys::alloc_count::{SetCounts, enroll, window};
 
-use super::core::{ConsensusCore, LogView, NotLeader, Persisted, Ready};
+use super::core::{ConsensusCore, Limits, LogView, Persisted, Ready, Refused, Unsupported};
 use super::workloads::{Case, Outcome, RunError, run};
 use crate::net::NodeId;
 
@@ -84,7 +84,19 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
         }
     }
 
-    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader> {
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, Unsupported> {
+        Ok(Self {
+            core: C::recover_with(id, peers, limits, log)?,
+            past: Cell::new(false),
+        })
+    }
+
+    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
         self.counted(|core| core.propose(command, log))
     }
 
