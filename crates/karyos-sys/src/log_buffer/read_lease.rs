@@ -52,10 +52,17 @@ pub trait LeaseSource: core::fmt::Debug + Send + Sync {
     /// Copies the validated frames from `start` of `slot`, `len` bytes,
     /// into `out` as a copy read lays them out.
     ///
+    /// # Safety
+    ///
+    /// The caller holds a granted lease, in this buffer's bank, on the
+    /// term in `slot`, covering `start..start + len`, a range of whole
+    /// committed DATA frames the lease validated, until this call
+    /// returns.
+    ///
     /// # Errors
     ///
     /// As [`ReadLease::copy_to`].
-    fn copy_frames(
+    unsafe fn copy_frames(
         &self,
         slot: u8,
         start: u32,
@@ -69,7 +76,7 @@ impl<T: TermBytes> LeaseSource for LogBuffer<T> {
         LogBuffer::lease_words(self)
     }
 
-    fn copy_frames(
+    unsafe fn copy_frames(
         &self,
         slot: u8,
         start: u32,
@@ -86,10 +93,9 @@ impl<T: TermBytes> LeaseSource for LogBuffer<T> {
         let mut at = start;
         let mut stride = 0usize;
         while at < end {
-            // SAFETY: the caller's lease holds a loan pinning this slot's
-            // term (module documentation, Safety); `at` is a frame start
-            // the lease validated, a location only ever accessed
-            // atomically.
+            // SAFETY: by the function's contract the caller's lease holds a
+            // loan pinning this slot's term; `at` is a frame start the
+            // lease validated, a location only ever accessed atomically.
             let word = unsafe { self.regions.word0(slot, at) };
             let raw = load_interior(word);
             let length = Word0::unpack(raw)
@@ -110,8 +116,9 @@ impl<T: TermBytes> LeaseSource for LogBuffer<T> {
                 .ok_or(LeaseCopyError::Changed)?;
             head.copy_from_slice(&raw.to_le_bytes());
             let body_at = at.checked_add(8).ok_or(LeaseCopyError::Changed)?;
-            // SAFETY: the lease's loan is held; the bytes after word 0 lie
-            // inside the frame, inside a block the lease validated.
+            // SAFETY: by the function's contract the lease's loan is held;
+            // the bytes after word 0 lie inside the frame, inside a block
+            // the lease validated.
             unsafe { self.regions.read_bytes(slot, body_at, body) };
             // As the copy path: a word 0 that changed means the copy may
             // mix two values.
@@ -210,8 +217,14 @@ impl ReadLease {
     /// frame inside the lease (a producer wrote committed bytes: nothing
     /// may be sent).
     pub fn copy_to(&self, out: &mut [u8]) -> Result<usize, LeaseCopyError> {
-        self.source
-            .copy_frames(self.slot, self.start, self.len, out)
+        // SAFETY: `self` is a granted lease: its bank word in `source`
+        // holds the loan on the term in `slot` until `self` drops, after
+        // this call, and `start..start + len` are the whole committed
+        // DATA frames `SenderRead::lease_committed` validated under it.
+        unsafe {
+            self.source
+                .copy_frames(self.slot, self.start, self.len, out)
+        }
     }
 }
 
