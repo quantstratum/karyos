@@ -14,6 +14,11 @@
 //! store, from any thread, with no lock and no allocation, as a backend's
 //! completion or a NIC driver's free callback needs.
 //!
+//! Precondition: only the creating process's buffer leases
+//! ([`LogBuffer::install_leases`] refuses an attached one). The bank is
+//! local to this process and only the creator's conductor reclaims, so
+//! only there does a held lease word keep the term from being cleaned.
+//!
 //! Safety (ADR-0034): the lease's bytes were validated as committed DATA
 //! frames under the loan, with the first word 0 of each block loaded with
 //! `Acquire` and every word 0 loaded again after the frame was checked, as
@@ -136,9 +141,9 @@ impl<O: BufferOwner> ReadLease<O> {
             let (Some(_), Ok(length)) = (frame_end, usize::try_from(length)) else {
                 return Err(LeaseCopyError::Changed);
             };
-            let target = stride
-                .checked_add(length)
-                .and_then(|frame_end| out.get_mut(stride..frame_end))
+            let out_end = stride.checked_add(length).ok_or(LeaseCopyError::Changed)?;
+            let target = out
+                .get_mut(stride..out_end)
                 .ok_or(LeaseCopyError::Changed)?;
             let (head, body) = target
                 .split_at_mut_checked(8)
@@ -157,7 +162,7 @@ impl<O: BufferOwner> ReadLease<O> {
             let padded = stride
                 .checked_add(usize::try_from(reserved).map_err(|_| LeaseCopyError::Changed)?)
                 .ok_or(LeaseCopyError::Changed)?;
-            if let Some(padding) = out.get_mut(stride + length..padded.min(out.len())) {
+            if let Some(padding) = out.get_mut(out_end..padded.min(out.len())) {
                 padding.fill(0);
             }
             stride = padded;

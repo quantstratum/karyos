@@ -341,6 +341,10 @@ pub struct LogBuffer<T: TermBytes = HeapTerms> {
     /// lease holds past the read that took it; reclaim scans them as it
     /// scans the registry's.
     leases: std::sync::OnceLock<Box<[AtomicU64]>>,
+    /// Local: attached from another process's region
+    /// ([`LogBuffer::attach`]): its own conductor never reclaims what the
+    /// creator's does, so it takes no read lease.
+    attached: bool,
     /// Test hook: an injected deadline fault (feature `test-hooks`).
     #[cfg(feature = "test-hooks")]
     deadline_fault: AtomicBool,
@@ -529,6 +533,7 @@ impl LogBuffer<SharedTerms> {
             max_message_length,
         )?;
         buffer.conflation = conflation;
+        buffer.attached = true;
         // Capacities whose rings round to the same region length (1 and
         // 2) would attach on a rewritten configuration word: the ring's own
         // capacity word, written at creation, must agree.
@@ -659,6 +664,7 @@ impl<T: TermBytes> LogBuffer<T> {
             layout,
             conductor_taken: AtomicBool::new(false),
             leases: std::sync::OnceLock::new(),
+            attached: false,
             #[cfg(feature = "test-hooks")]
             deadline_fault: AtomicBool::new(false),
         })
@@ -800,13 +806,20 @@ impl<T: TermBytes> LogBuffer<T> {
     /// that many leases are live on this buffer at once, whoever takes
     /// them. Allocated here, on the control path; the bank is never
     /// resized. A second call succeeds when it asks no more than the
-    /// installed capacity.
+    /// installed capacity. Only the creating process's buffer leases: the
+    /// creator's conductor is the one that reclaims, and the bank is
+    /// local to this process, so a lease taken through an attached buffer
+    /// would pin nothing.
     ///
     /// # Errors
     ///
-    /// [`SysError::ResourcesUnavailable`] when a smaller bank is installed
-    /// already.
+    /// [`SysError::LeasesNotOnAttached`] on a buffer from
+    /// [`LogBuffer::attach`]; [`SysError::ResourcesUnavailable`] when a
+    /// smaller bank is installed already.
     pub fn install_leases(&self, capacity: u16) -> Result<(), SysError> {
+        if self.attached {
+            return Err(SysError::LeasesNotOnAttached);
+        }
         let bank = self
             .leases
             .get_or_init(|| (0..capacity).map(|_| AtomicU64::new(0)).collect());
@@ -6162,6 +6175,23 @@ mod region_tests {
     /// before the seal word's successor bit, ADR-0061), 2 (before the
     /// schedule ring, TT-1) or 3 (before the ring's eight word header,
     /// TT-6b), is refused at attach with `LayoutVersion`, by
+    /// Read leases are the creator's (karyos#912 review): an attached
+    /// buffer's conductor never reclaims what the creator's does, so
+    /// installing a lease bank there is refused, typed.
+    #[test]
+    fn an_attached_buffer_takes_no_read_lease() {
+        let creator =
+            LogBuffer::new_shared_with_generation(config(PublicationMode::Exclusive), generation())
+                .unwrap();
+        let attached = attach(&creator).unwrap();
+        assert_eq!(
+            attached.install_leases(1),
+            Err(SysError::LeasesNotOnAttached)
+        );
+        assert_eq!(attached.leases_live(), 0);
+        assert_eq!(creator.install_leases(1), Ok(()));
+    }
+
     /// its record and by its configuration block, so a mixed build never
     /// misreads a seal or a ring.
     #[test]

@@ -1,7 +1,9 @@
 ### Added
 
 - Read leases on committed term bytes (karyos#771, R-CORE-45 part 1).
-  `LogBuffer::install_leases` installs a bounded bank of lease words.
+  `LogBuffer::install_leases` installs a bounded bank of lease words,
+  on the creating process's buffer only (an attached one is refused,
+  `SysError::LeasesNotOnAttached`).
   `SenderRead::lease_committed` validates the frames a copy would carry
   and leaves them in the term under a `ReadLease` instead of copying
   them. While a lease lives, reclaim keeps its slot quarantined, so the
