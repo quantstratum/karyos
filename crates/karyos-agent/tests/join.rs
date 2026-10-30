@@ -536,16 +536,30 @@ fn a_stream_entry_counts_the_streams_publications() {
         none.contains("\"present\":false,\"holders\":0,\"shared\":false"),
         "{none}"
     );
-    let _first = publish(&mut driver, &mut agent, 7);
+    let first = publish(&mut driver, &mut agent, 7);
     let (one, _) = ask(registrar, &mut agent, &get);
     assert!(
         one.contains("\"present\":true,\"holders\":1,\"shared\":false"),
         "{one}"
     );
-    let _second = publish(&mut driver, &mut agent, 7);
+    let second = publish(&mut driver, &mut agent, 7);
     let (two, _) = ask(registrar, &mut agent, &get);
     assert!(
         two.contains("\"present\":true,\"holders\":2,\"shared\":true"),
         "{two}"
     );
+    // Both publications go: the stream is absent again.
+    drop((first, second));
+    let start = Instant::now();
+    loop {
+        serving(&mut driver, || {
+            std::thread::sleep(Duration::from_millis(20));
+            agent.refresh();
+        });
+        let (gone, _) = ask(registrar, &mut agent, &get);
+        if gone.contains("\"present\":false,\"holders\":0,\"shared\":false") {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "{gone}");
+    }
 }

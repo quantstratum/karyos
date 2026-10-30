@@ -634,10 +634,7 @@ impl Driver {
     fn presence(&self, kind: Kind, key: &str) -> registry::Presence {
         let types: &[u64] = match kind {
             Kind::Stream => {
-                return match (&self.tool, &self.sample) {
-                    (Some(_), Some(sample)) => stream_presence(sample, key),
-                    _ => registry::Presence::default(),
-                };
+                return stream_presence(self.tool.is_some(), self.sample.as_ref(), key);
             }
             Kind::Point => &[karyos_sys::counters::TYPE_TRACE_POINT],
             Kind::Counter => &[
@@ -789,10 +786,15 @@ impl Driver {
 /// What `sample` shows of the stream whose wire id is `key` (karyos#885):
 /// its holders are the publications of every lane with that wire id, a
 /// client's `publication` cell each plus the lane's `embedded
-/// publications` count. Nothing before the driver's first pass, or while
-/// `counters unavailable` is nonzero, since a cell the driver could not
-/// allocate would undercount them and make a shared stream look unshared.
-fn stream_presence(sample: &Sample, key: &str) -> registry::Presence {
+/// publications` count, and it is present when it has at least one.
+/// Nothing while not `attached`, before the agent's first sample or the
+/// driver's first pass, or while `counters unavailable` is nonzero, since
+/// a cell the driver could not allocate would undercount them and make a
+/// shared stream look unshared.
+fn stream_presence(attached: bool, sample: Option<&Sample>, key: &str) -> registry::Presence {
+    let (true, Some(sample)) = (attached, sample) else {
+        return registry::Presence::default();
+    };
     use karyos_sys::counters::{
         LABEL_EMBEDDED_PUBLICATIONS, LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, wire_stream_id,
     };

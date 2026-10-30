@@ -259,19 +259,28 @@ fn a_streams_holders_are_its_lanes_publications() {
         cell(LABEL_EMBEDDED_PUBLICATIONS, 12, 0, 0),
         cell(LABEL_PUBLICATION, 12, 0, 902),
     ];
-    let seen = stream_presence(&sample(counters.clone()), "-7");
+    let seen = stream_presence(true, Some(&sample(counters.clone())), "-7");
     assert_eq!((seen.present, seen.holders), (Some(true), Some(3)));
-    let seen = stream_presence(&sample(counters.clone()), "8");
+    let seen = stream_presence(true, Some(&sample(counters.clone())), "8");
     assert_eq!(
         (seen.present, seen.holders, seen.shared()),
         (Some(true), Some(1), Some(false))
     );
-    let seen = stream_presence(&sample(counters), "9");
+    let seen = stream_presence(true, Some(&sample(counters)), "9");
     assert_eq!((seen.present, seen.holders), (Some(false), Some(0)));
+    // One embedded handle and one client publication make it shared.
+    let counters = vec![
+        cell(LABEL_STREAM_WIRE_ID, 13, 0, wire_stream_id_value(4)),
+        cell(LABEL_EMBEDDED_PUBLICATIONS, 13, 0, 1),
+        cell(LABEL_PUBLICATION, 13, 0, 903),
+    ];
+    let seen = stream_presence(true, Some(&sample(counters)), "4");
+    assert_eq!((seen.holders, seen.shared()), (Some(2), Some(true)));
 }
 
-/// karyos#885: with a cell the driver could not allocate, or before its
-/// first pass, a stream's holders are unknown, never undercounted.
+/// karyos#885: the four conditions under which a stream's holders are
+/// unknown, never undercounted: a cell the driver could not allocate, no
+/// pass of the driver yet, no sample of the agent yet, and no attachment.
 #[test]
 fn a_streams_holders_are_unknown_while_cells_are_missing() {
     use karyos_sys::counters::{LABEL_PUBLICATION, LABEL_STREAM_WIRE_ID, wire_stream_id_value};
@@ -282,14 +291,27 @@ fn a_streams_holders_are_unknown_while_cells_are_missing() {
         cell(LABEL_PUBLICATION, 11, 0, 900),
     ];
     assert_eq!(
-        stream_presence(&sample(counters.clone()), "7"),
+        stream_presence(true, Some(&sample(counters.clone())), "7"),
         registry::Presence::default()
     );
     let mut unsampled = sample(counters);
     unsampled.counters[0].value = 0;
     unsampled.sampled = false;
     assert_eq!(
-        stream_presence(&unsampled, "7"),
+        stream_presence(true, Some(&unsampled), "7"),
+        registry::Presence::default()
+    );
+    unsampled.sampled = true;
+    assert_eq!(
+        stream_presence(true, Some(&unsampled), "7").holders,
+        Some(1)
+    );
+    assert_eq!(
+        stream_presence(true, None, "7"),
+        registry::Presence::default()
+    );
+    assert_eq!(
+        stream_presence(false, Some(&unsampled), "7"),
         registry::Presence::default()
     );
 }
