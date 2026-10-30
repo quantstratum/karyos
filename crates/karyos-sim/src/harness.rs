@@ -28,6 +28,7 @@
 
 pub mod check;
 pub mod core;
+pub mod corpus;
 pub mod delivery;
 pub mod membership;
 pub mod node;
