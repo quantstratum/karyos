@@ -569,6 +569,14 @@ pub enum RunError {
     /// The case declares limits its core does not take: what it would
     /// show is not demonstrated for that core, never passed.
     Unsupported(Unsupported),
+    /// The case's entries do not fit one duty's log-read budget, so no
+    /// core could ever read them back (karyos#899 review).
+    Unreadable {
+        /// Log bytes one of its entries spans.
+        entry: u64,
+        /// [`Limits::log_read_bytes`].
+        budget: u64,
+    },
 }
 
 /// The servers' log geometry: terms that fit the largest W1 payload.
@@ -635,6 +643,24 @@ fn per_server(survives: Survives, id: NodeId) -> Survives {
 ///
 /// [`RunError`] when the run cannot be set up or stepped.
 pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError> {
+    if let Some(limits) = case.limits {
+        // The largest entry the case writes: a client's append, framed.
+        let command = super::node::Command {
+            client: NodeId::MAX,
+            sequence: u64::MAX,
+            op: Op::Append(vec![0; case.payload]),
+        };
+        let entry = u64::try_from(command.encode().len())
+            .ok()
+            .and_then(|bytes| bytes.checked_add(karyos_cluster::log::FRAME_HEADER_LEN))
+            .ok_or(RunError::Count)?;
+        if entry > limits.log_read_bytes {
+            return Err(RunError::Unreadable {
+                entry,
+                budget: limits.log_read_bytes,
+            });
+        }
+    }
     let geometry = geometry().map_err(RunError::Geometry)?;
     let recorder: Shared = Rc::new(RefCell::new(Recorder::default()));
     let mut sim: ClusterSim<Member<C>, Wire<C::Message>> =

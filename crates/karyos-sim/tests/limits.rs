@@ -603,3 +603,22 @@ fn a_failed_metered_read_is_charged_and_an_empty_one_is_free() {
         Err(ReadError::Budget)
     ));
 }
+
+/// A case whose entries are larger than a duty's whole log-read budget is
+/// refused before it runs: no core could read them back, so replication
+/// would only stall (karyos#899 review, QS-REVIEWER).
+#[test]
+fn a_case_whose_entries_exceed_the_read_budget_is_refused() {
+    let case = limited(
+        "unreadable",
+        2,
+        Limits {
+            log_read_bytes: 256,
+            ..Limits::W2
+        },
+    );
+    assert!(matches!(
+        run::<Reference>(&case, 1),
+        Err(RunError::Unreadable { budget: 256, entry }) if entry > 256
+    ));
+}

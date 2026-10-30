@@ -233,7 +233,9 @@ pub struct Limits {
     /// Client requests a server holds, proposed and not committed, at most.
     pub queue: u64,
     /// Log bytes a server reads per duty, in whole frames, at most (the
-    /// harness enforces it: [`ReadBudget`]).
+    /// harness enforces it: [`ReadBudget`]). A frame larger than this is
+    /// never read, so a case whose entries do not fit is refused before it
+    /// runs ([`super::workloads::RunError::Unreadable`]).
     pub log_read_bytes: u64,
 }
 
