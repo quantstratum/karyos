@@ -866,10 +866,21 @@ fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) 
     // the connection over unread bytes; bounded by the same limit.
     // The token offered, if any: the last `Authorization: Bearer` header.
     let mut offered: Option<Vec<u8>> = None;
+    // A header line that cannot be read (not UTF-8, or past the bound)
+    // makes the whole head bad: an earlier header is never taken for the
+    // last one (karyos#893, codex).
+    let mut malformed = false;
     let mut header = String::new();
-    while matches!(reader.read_line(&mut header), Ok(read) if read > 0)
-        && !matches!(header.as_str(), "\r\n" | "\n")
-    {
+    loop {
+        match reader.read_line(&mut header) {
+            Ok(0) => break,
+            Ok(_) if matches!(header.as_str(), "\r\n" | "\n") => break,
+            Ok(_) => {}
+            Err(_) => {
+                malformed = true;
+                break;
+            }
+        }
         if let Some((name, value)) = header.split_once(':')
             && name.trim().eq_ignore_ascii_case("authorization")
         {
@@ -886,6 +897,11 @@ fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) 
     let request = (words.next(), words.next(), words.next(), words.next());
     let authorized = token.is_none_or(|token| offered.as_deref().is_some_and(|o| token.matches(o)));
     let (status, answered, content) = match request {
+        _ if malformed => (
+            "400 Bad Request",
+            Answered::Refused,
+            "bad request\n".to_owned(),
+        ),
         (Some(_), Some(_), Some(version), None) if !version.starts_with("HTTP/1.") => (
             "400 Bad Request",
             Answered::Refused,

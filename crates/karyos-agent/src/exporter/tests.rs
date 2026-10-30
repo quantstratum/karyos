@@ -813,3 +813,27 @@ fn only_the_last_bearer_authorization_with_the_token_is_served() {
         );
     }
 }
+
+/// A header line that is not UTF-8 makes the head bad (karyos#893, codex):
+/// a good `Authorization` followed by one whose token is not UTF-8 is a
+/// 400, never metrics on the earlier header.
+#[test]
+fn a_head_with_a_header_that_is_not_utf8_is_refused() {
+    let token = Token::new(TOKEN.to_vec()).unwrap();
+    let mut exporter = bind("127.0.0.1:0".parse().unwrap())
+        .unwrap()
+        .with_token(token);
+    let head = [
+        &b"GET /metrics HTTP/1.1\r\nAuthorization: Bearer "[..],
+        TOKEN,
+        b"\r\nAuthorization: Bearer \xff\r\n\r\n",
+    ]
+    .concat();
+    let (answer, answered) = exchange_bytes(&mut exporter, &head);
+    assert_eq!(answered, [Answered::Refused]);
+    assert!(
+        answer.starts_with(b"HTTP/1.1 400"),
+        "{:?}",
+        String::from_utf8_lossy(&answer)
+    );
+}
