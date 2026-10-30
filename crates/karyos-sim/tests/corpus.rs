@@ -10,6 +10,12 @@
 //! directory's `c5-corpus-reference.jsonl`); `KARYOS_C5_SEEDS=FIRST..=LAST`
 //! narrows the seeds. It prints the runs, the time taken and the bytes
 //! written, and fails on a failed check or a run that could not be set up.
+//!
+//! Seeds are independent, so a long corpus (the nightly seeds, 1,001 to
+//! 101,000) splits into processes by seed range, each with its own output:
+//! `KARYOS_C5_SEEDS=1001..=26000 KARYOS_C5_OUT=nightly-1.jsonl`, and so on.
+//! The raw lines compress well; publish them as `gzip -9 nightly-*.jsonl`
+//! (about 280 bytes a line before compression).
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
