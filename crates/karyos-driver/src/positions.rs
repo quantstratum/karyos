@@ -98,6 +98,11 @@ struct StreamCells {
     embedded: Option<Counter>,
     subscribers: Vec<SubscriberCells>,
     publications: Vec<PublicationCell>,
+    /// The previous pass's [`publications`](Self::publications) while
+    /// [`admit_publications`](Self::admit_publications) rebuilds them;
+    /// empty between passes, its capacity kept so a steady pass allocates
+    /// nothing.
+    publications_scratch: Vec<PublicationCell>,
 }
 
 /// The sampling state: the epoch, when the last pass ran and the cells
@@ -390,6 +395,7 @@ impl StreamCells {
             embedded: allocator.new_typed(TYPE_GAUGE, LABEL_EMBEDDED_PUBLICATIONS, keys),
             subscribers: Vec::new(),
             publications: Vec::new(),
+            publications_scratch: Vec::new(),
         };
         set(cells.wire.as_ref(), wire_stream_id_value(stream_id));
         cells
@@ -419,13 +425,16 @@ impl StreamCells {
     /// Gives each client publication of this lane a cell, after
     /// [`release_departed_publications`](Self::release_departed_publications),
     /// in the order of `registrations`, and retries cells refused in an
-    /// earlier pass (counted once, when first refused).
+    /// earlier pass (counted once, when first refused). Each lane scans
+    /// every registration, so a pass costs streams × registrations,
+    /// bounded by the driver's limits.
     fn admit_publications(
         &mut self,
         allocator: &mut PassAllocator<'_>,
         registrations: &[Registration],
     ) {
-        let mut held = core::mem::take(&mut self.publications);
+        core::mem::swap(&mut self.publications, &mut self.publications_scratch);
+        let held = &mut self.publications_scratch;
         for registration in registrations
             .iter()
             .filter(|registration| registration.is_publication())
@@ -1380,6 +1389,50 @@ mod tests {
         assert_eq!(held.len(), 1, "{held:?}");
         assert_eq!(held[0].1, second.owner().client);
         assert_eq!(fixed(&driver, "counters unavailable"), 0);
+    }
+
+    /// karyos#885: once its client publications hold their cells, a
+    /// positions pass allocates nothing.
+    #[test]
+    fn a_steady_pass_over_client_publications_allocates_nothing() {
+        use karyos_sys::alloc_count::count;
+
+        let ((), made) = count(|| drop(std::hint::black_box(vec![0_u8; 8])));
+        assert!(made > 0, "the counting allocator counts in this binary");
+        let mut driver = driver(DriverConfig::default().counters_capacity);
+        let mut config = stream_config(5);
+        config.buffer.spare_slots = 8;
+        config.buffer.publication = PublicationMode::Concurrent {
+            publishers: 4,
+            allow_non_lse: true,
+        };
+        let _handle = driver.add_stream(config).unwrap();
+        let key = StreamKey {
+            stream_id: 5,
+            session_id: 1,
+        };
+        let mut clients = Vec::new();
+        let mut publications = Vec::new();
+        for _ in 0..2 {
+            let mut client = driver.connect().unwrap();
+            let _ = client.add_concurrent_publication(key, true).unwrap();
+            publications.push(take_publication(&mut driver, &mut client));
+            clients.push(client);
+        }
+        driver.positions.force_due();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(labelled(&driver, LABEL_PUBLICATION).len(), 2);
+        let now = karyos_sys::host_clock::host_monotonic_ns();
+        let ((), allocations) = count(|| {
+            driver.positions.sample(
+                now,
+                &mut driver.counters,
+                &driver.streams,
+                &driver.registrations,
+            );
+        });
+        assert_eq!(allocations, 0);
+        assert_eq!(labelled(&driver, LABEL_PUBLICATION).len(), 2);
     }
 
     /// karyos#885: at the default limits, every stream in use, each with
