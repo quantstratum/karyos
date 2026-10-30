@@ -9,9 +9,7 @@
 //!
 //! Each workload is a struct whose fields are the ADR table's frozen
 //! dimensions, holding the values this skeleton runs; each one's doc names
-//! the values the ADR freezes where the skeleton runs fewer. W5 needs
-//! what the harness does not have yet (snapshots, client retries across a
-//! leader change): [`w5`] returns a [`NotYet`] saying so. W2 declares its
+//! the values the ADR freezes where the skeleton runs fewer. W2 declares its
 //! limits to the core ([`Case::limits`]); a core that takes none has its
 //! W2 cases not demonstrated, never passed.
 //!
@@ -43,15 +41,6 @@ use crate::sim::Failure;
 /// The ADR-0043 revision this module follows.
 pub const ADR_0043: &str = "quantstratum-docs 03ffb3944343885c8da04557c54814627dbe5001 \
      (2026-10-12), ADR-0043 Proposed, owner item 31";
-
-/// A workload the harness cannot run yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotYet {
-    /// The workload.
-    pub workload: &'static str,
-    /// What it needs first.
-    pub reason: &'static str,
-}
 
 /// A W2 count or step bound past its type ([`W2::cases`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,22 +244,9 @@ impl W2 {
     }
 }
 
-/// W5's retries: a lost reply, a leader change and a retry answered from
-/// deduplication (P3 of karyos#687).
-///
-/// # Errors
-///
-/// Always [`NotYet`].
-pub fn w5() -> Result<Vec<Case>, NotYet> {
-    Err(NotYet {
-        workload: "W5",
-        reason: "its retries need a leader change in the core interface \
-                 (karyos#687 P3); its snapshot half is W5Snapshots",
-    })
-}
-
-/// W5's snapshot half (karyos#687 P2): compaction, a follower held behind
-/// the compaction point, and snapshot build and install interrupted.
+/// W5, snapshots and retries (karyos#687): compaction, a follower held
+/// behind the compaction point, snapshot build and install interrupted, and
+/// a lost client reply followed by a leader change and a retry.
 ///
 /// The manifest freezes 3 servers, 2 clients, 256 B payloads, compaction
 /// every 1,000 applied entries keeping 100, a follower held behind the
@@ -283,8 +259,16 @@ pub fn w5() -> Result<Vec<Case>, NotYet> {
 /// the heal and installs once restarted, and a server crashes between two
 /// of its builds. A core that takes no snapshots has these cases not
 /// demonstrated, never passed.
+///
+/// The retries: a client's reply is lost (the leader's link to it cut),
+/// the operator hands the leadership over, and the client's retry, sent to
+/// the old leader and redirected, is answered from the new leader's
+/// deduplication table, which keeps each client's last
+/// [`super::node::RETENTION`] answers and answers an older retry
+/// [`super::node::Ret::Expired`]. A core that cannot hand its leadership
+/// over has this case not demonstrated.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct W5Snapshots {
+pub struct W5 {
     /// Servers.
     pub processes: usize,
     /// Clients.
@@ -295,7 +279,7 @@ pub struct W5Snapshots {
     pub compaction: Compaction,
 }
 
-impl W5Snapshots {
+impl W5 {
     /// The follower held behind: not the reference's leader.
     pub const BEHIND: NodeId = 2;
 
@@ -391,7 +375,28 @@ impl W5Snapshots {
             (at, Action::Crash(1)),
             (at.checked_add(40).ok_or(W2Overflow)?, Action::Restart(1)),
         ];
-        Ok(vec![compaction, behind, install, build])
+        // A lost reply, a handover and the retry: the first client's
+        // replies from the leader are cut while its request commits; the
+        // leadership moves to server 1; the cut heals before the retry.
+        let mut retry = base("lost reply, leader change and retry");
+        retry.compaction = None;
+        retry.operations = 8;
+        let client = NodeId::try_from(self.processes).map_err(|_| W2Overflow)?;
+        // Mid-run: each operation takes a few steps.
+        let lost = 12;
+        retry.schedule = vec![
+            (
+                lost,
+                Action::Cut {
+                    from: 0,
+                    to: client,
+                },
+            ),
+            (lost + 10, Action::TransferLeadership(1)),
+            (lost + 30, Action::Heal),
+        ];
+        retry.steps = 2_000;
+        Ok(vec![compaction, behind, install, build, retry])
     }
 }
 
@@ -427,6 +432,9 @@ pub enum Action {
     /// An operator's membership change, sent to every server that is up;
     /// a core that does not lead refuses it.
     Change(Change),
+    /// An operator's leadership handover to `to`, sent to every server
+    /// that is up; a core that does not lead refuses it (W5).
+    TransferLeadership(NodeId),
     /// The primary's leader stops reaching the arbiter: its lease is no
     /// longer renewed ([`Case::lease`]).
     CutArbiter,
@@ -894,10 +902,12 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     }
     // The operator, a client with no script, only where a change is
     // scheduled, so a phase 4 case runs the nodes it always did.
-    let changes = case
-        .schedule
-        .iter()
-        .any(|(_, action)| matches!(action, Action::Change(_) | Action::Promote(_)));
+    let changes = case.schedule.iter().any(|(_, action)| {
+        matches!(
+            action,
+            Action::Change(_) | Action::Promote(_) | Action::TransferLeadership(_)
+        )
+    });
     let mut operator = None;
     if changes {
         let id = case
@@ -1029,6 +1039,20 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                     {
                         let _ = sim
                             .send(operator, id, Wire::Change(change))
+                            .map_err(RunError::Sim)?;
+                    }
+                }
+            }
+            Action::TransferLeadership(to) => {
+                let operator = operator.ok_or(RunError::Count)?;
+                for &id in &everyone {
+                    if sim
+                        .node(id)
+                        .and_then(Member::server)
+                        .is_some_and(ServerNode::is_up)
+                    {
+                        let _ = sim
+                            .send(operator, id, Wire::Transfer(to))
                             .map_err(RunError::Sim)?;
                     }
                 }

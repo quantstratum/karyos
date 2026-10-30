@@ -20,8 +20,7 @@ use karyos_sim::harness::core::Limit;
 use karyos_sim::harness::node::Observation;
 use karyos_sim::harness::reference::Reference;
 use karyos_sim::harness::workloads::{
-    self, ADR_0043, Action, Failed, Liveness, Progress, W1, W2, W3, W3Fault, W4, W4Cut,
-    W5Snapshots, W6,
+    self, ADR_0043, Action, Failed, Liveness, Progress, W1, W2, W3, W3Fault, W4, W4Cut, W5, W6,
 };
 use karyos_sim::scenarios;
 
@@ -38,7 +37,6 @@ fn corpus() -> Vec<u64> {
 fn the_module_records_its_adr_revision() {
     assert!(ADR_0043.contains("03ffb394"));
     assert!(ADR_0043.contains("Proposed"));
-    assert_eq!(workloads::w5().unwrap_err().workload, "W5");
 }
 
 /// W5's snapshot half at the manifest's values (harness validation):
@@ -46,7 +44,7 @@ fn the_module_records_its_adr_revision() {
 #[test]
 #[ignore = "the manifest's W5 takes long; run on request"]
 fn w5_snapshots_manifest_passes() {
-    for case in W5Snapshots::manifest().cases().unwrap() {
+    for case in W5::manifest().cases().unwrap() {
         let outcome = workloads::run::<Reference>(&case, 1).unwrap();
         assert_eq!(workloads::pass(&case, &outcome), Ok(None), "{}", case.name);
     }
@@ -55,22 +53,58 @@ fn w5_snapshots_manifest_passes() {
 /// W5's snapshot half, the skeleton (harness validation): every case
 /// compacts and converges; the follower behind the compaction point
 /// catches up by an installed snapshot, also when its install or another
-/// server's snapshot build is cut by a crash.
+/// server's snapshot build is cut by a crash; and a retry after a lost
+/// reply and a leader change is answered from deduplication.
 #[test]
-fn w5_snapshots_pass() {
-    let cases = W5Snapshots::skeleton().cases().unwrap();
-    assert_eq!(cases.len(), 4);
+fn w5_passes() {
+    let cases = W5::skeleton().cases().unwrap();
+    assert_eq!(cases.len(), 5);
     for case in &cases {
         let outcome = workloads::run::<Reference>(case, 1).unwrap();
         assert_eq!(workloads::pass(case, &outcome), Ok(None), "{}", case.name);
         let count = |wanted: &dyn Fn(&Observation) -> bool| {
             outcome.observations.iter().filter(|o| wanted(o)).count()
         };
-        assert!(
-            count(&|o| matches!(o, Observation::Compacted { .. })) > 0,
-            "{}: nothing compacted",
-            case.name
-        );
+        if case.compaction.is_some() {
+            assert!(
+                count(&|o| matches!(o, Observation::Compacted { .. })) > 0,
+                "{}: nothing compacted",
+                case.name
+            );
+        } else {
+            // The retry: the handover took, the new leader committed in its
+            // term, and a retry was answered from deduplication.
+            assert!(
+                count(&|o| matches!(
+                    o,
+                    Observation::Transfer {
+                        node: 0,
+                        to: 1,
+                        result: Ok(())
+                    }
+                )) == 1,
+                "{}: no handover",
+                case.name
+            );
+            assert!(
+                count(&|o| matches!(
+                    o,
+                    Observation::Commit {
+                        node: 1,
+                        leader: true,
+                        term: 2,
+                        ..
+                    }
+                )) > 0,
+                "{}: the new leader committed nothing",
+                case.name
+            );
+            assert!(
+                outcome.deduplicated > 0,
+                "{}: no retry deduplicated",
+                case.name
+            );
+        }
         if case.behind.is_some() {
             assert!(
                 count(&|o| matches!(o, Observation::Installed { node: 2, .. })) > 0,
@@ -311,4 +345,61 @@ fn w6_replays_every_seed() {
             );
         }
     }
+}
+
+/// The reference's handover refuses itself and a stranger as targets, and
+/// one behind its log; a handover to a caught-up voter takes, and the run
+/// stays safe and complete (harness validation).
+#[test]
+fn a_handover_refuses_what_it_cannot_hand_over_to() {
+    use karyos_sim::harness::core::TransferRefused;
+    let mut case = workloads::Case::healthy("handover", 3, 2, 8);
+    case.schedule = vec![
+        (3, Action::TransferLeadership(1)),
+        (4, Action::TransferLeadership(0)),
+        (5, Action::TransferLeadership(9)),
+        (60, Action::TransferLeadership(2)),
+    ];
+    case.steps = 1_200;
+    let outcome = workloads::run::<Reference>(&case, 1).unwrap();
+    assert_eq!(workloads::pass(&case, &outcome), Ok(None));
+    let leader_answers: Vec<_> = outcome
+        .observations
+        .iter()
+        .filter_map(|o| match o {
+            Observation::Transfer {
+                node: 0,
+                to,
+                result,
+            } => Some((*to, *result)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        matches!(
+            leader_answers[..],
+            [
+                (1, Err(TransferRefused::Lagging { .. }) | Ok(())),
+                (
+                    0,
+                    Err(TransferRefused::Invalid) | Err(TransferRefused::NotLeader(_))
+                ),
+                (
+                    9,
+                    Err(TransferRefused::Invalid) | Err(TransferRefused::NotLeader(_))
+                ),
+                ..
+            ]
+        ),
+        "{leader_answers:?}"
+    );
+    // Some server led the last handover's term.
+    assert!(outcome.observations.iter().any(|o| matches!(
+        o,
+        Observation::Commit {
+            leader: true,
+            term: 2..,
+            ..
+        }
+    )));
 }

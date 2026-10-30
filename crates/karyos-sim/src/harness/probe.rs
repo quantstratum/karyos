@@ -31,7 +31,7 @@ use karyos_sys::alloc_count::{SetCounts, enroll, window};
 
 use super::core::{
     ConsensusCore, InstallRefused, Limits, LogView, Persisted, Ready, Refused, SnapshotBase,
-    Unsupported,
+    TransferRefused, Unsupported,
 };
 use super::workloads::{Case, Outcome, RunError, run};
 use crate::net::NodeId;
@@ -145,6 +145,14 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
 
     fn install(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), InstallRefused> {
         self.counted(|core| core.install(base, log))
+    }
+
+    fn transfer_leadership(
+        &mut self,
+        to: NodeId,
+        log: &mut LogView<'_>,
+    ) -> Result<(), TransferRefused> {
+        self.counted(|core| core.transfer_leadership(to, log))
     }
 
     fn propose_change(

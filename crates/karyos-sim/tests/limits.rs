@@ -628,8 +628,8 @@ fn a_case_whose_entries_exceed_the_read_budget_is_refused() {
 /// (decided 2026-10-30 by QS-COORDINATOR).
 #[test]
 fn a_core_without_snapshots_is_not_demonstrated_on_w5() {
-    use karyos_sim::harness::workloads::W5Snapshots;
-    for case in W5Snapshots::skeleton().cases().unwrap() {
+    use karyos_sim::harness::workloads::W5;
+    for case in W5::skeleton().cases().unwrap() {
         assert!(
             matches!(run::<Plain>(&case, 1), Err(RunError::Unsupported(_))),
             "{}",
@@ -705,8 +705,8 @@ impl ConsensusCore for Greedy {
 /// against a 400-byte budget).
 #[test]
 fn the_snapshot_hooks_read_under_the_duty_budget() {
-    use karyos_sim::harness::workloads::W5Snapshots;
-    let mut case = W5Snapshots::skeleton().cases().unwrap().remove(0);
+    use karyos_sim::harness::workloads::W5;
+    let mut case = W5::skeleton().cases().unwrap().remove(0);
     case.limits = Some(Limits {
         log_read_bytes: 1_000,
         ..Limits::W2
@@ -767,7 +767,7 @@ impl ConsensusCore for Seer {
 /// (karyos#903 review, codex: recovery saw first index 91 and no base).
 #[test]
 fn a_restarted_core_sees_its_snapshot_base() {
-    use karyos_sim::harness::workloads::W5Snapshots as W5;
+    use karyos_sim::harness::workloads::W5;
     let case = W5::skeleton()
         .cases()
         .unwrap()

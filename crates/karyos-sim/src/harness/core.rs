@@ -90,6 +90,24 @@ pub struct SnapshotBase {
     pub term: u64,
 }
 
+/// Why a core refused to hand its leadership over (W5's leader change;
+/// karyos#687).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferRefused {
+    /// The core cannot hand its leadership over: W5's retries across a
+    /// leader change are not demonstrated for it.
+    Unsupported,
+    /// It does not lead.
+    NotLeader(NotLeader),
+    /// The target is not a voter, or is itself.
+    Invalid,
+    /// The target is behind the leader's log by `behind` entries.
+    Lagging {
+        /// Entries it is behind.
+        behind: u64,
+    },
+}
+
 /// Why a core refused to install a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallRefused {
@@ -471,6 +489,23 @@ pub trait ConsensusCore: Sized {
     fn install(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), InstallRefused> {
         let _ = (base, log);
         Err(InstallRefused::Unsupported)
+    }
+
+    /// Hands the leadership over to `to`, which leads the next term once
+    /// it holds the whole log (W5's leader change).
+    ///
+    /// # Errors
+    ///
+    /// [`TransferRefused::Unsupported`], the default, for a core that
+    /// cannot: its W5 retry cases are not demonstrated; otherwise why it
+    /// refused.
+    fn transfer_leadership(
+        &mut self,
+        to: NodeId,
+        log: &mut LogView<'_>,
+    ) -> Result<(), TransferRefused> {
+        let _ = (to, log);
+        Err(TransferRefused::Unsupported)
     }
 
     /// Proposes one membership change.
