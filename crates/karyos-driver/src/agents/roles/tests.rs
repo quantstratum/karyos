@@ -4392,6 +4392,21 @@ fn removed_after_opening_on(
     Vec<super::super::data::Opened>,
     Rxs,
 ) {
+    removed_after_opening_full(routes, reliable, false)
+}
+
+/// [`removed_after_opening_on`], with the sender's close list full at the
+/// removal when `full`.
+fn removed_after_opening_full(
+    routes: &[(EndpointId, SocketAddr)],
+    reliable: bool,
+    full: bool,
+) -> (
+    super::SenderRole,
+    Halves,
+    Vec<super::super::data::Opened>,
+    Rxs,
+) {
     let (mut sender, _receiver) = super::roles(&AgentConfig::default()).unwrap();
     let (replies, _keep) =
         super::ring::ring::<AgentEvent<OsSocket>>(std::num::NonZeroUsize::new(4).unwrap());
@@ -4431,6 +4446,11 @@ fn removed_after_opening_on(
     let mut opened = Vec::new();
     sender.publications[0].opened_resources(|held| opened.push(held));
     assert_eq!(opened.len(), routes.len(), "a route on every path");
+    if full {
+        while sender.closing.len() < sender.closing.capacity() {
+            sender.closing.push(opened[0]);
+        }
+    }
     let removed = sender.command(AgentCommand::<OsSocket>::RemoveSenderSession {
         reply: replies.reserve().unwrap(),
         endpoint: EndpointId(1),
@@ -6934,4 +6954,24 @@ fn controls_waiting_across_an_epoch_change_are_counted_dropped() {
     assert_eq!(routes.waiting(), 0);
     assert_eq!(routes.waits_dropped, u64::try_from(waiting).unwrap());
     routes.hold_closes = false;
+}
+
+/// #847 (#838 review): a removed publication's route the close list has
+/// no room for, under sustained churn, is counted and recorded as its
+/// endpoint's close failure, so that endpoint's standing reset drops it.
+#[test]
+fn a_removal_the_close_list_cannot_hold_records_a_close_failure() {
+    let (sender, _halves, opened, _rxs) = removed_after_opening_full(
+        &[(EndpointId(1), "10.0.0.9:5000".parse().unwrap())],
+        false,
+        true,
+    );
+    assert_eq!(sender.counters().removed_unrecorded, 1);
+    assert!(
+        sender
+            .close_failures
+            .iter()
+            .any(|record| record.endpoint == EndpointId(1) && record.epoch == opened[0].epoch),
+        "recorded for its endpoint and epoch"
+    );
 }

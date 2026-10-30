@@ -382,8 +382,9 @@ pub struct SenderCounters {
     pub removed_returned: u64,
     /// Removed publications' routes or queues, or retired destinations',
     /// not recorded for closing: the preallocated close list was full
-    /// (never, by construction; their endpoint's next reset drops them, and
-    /// a retired destination's wait in the publication for a later duty).
+    /// (under sustained churn). A removed publication's are recorded as
+    /// their endpoint's close failure, whose standing reset drops them; a
+    /// retired destination's wait in the publication for a later duty.
     pub removed_unrecorded: u64,
     /// Entries of the close list dropped at their duty, each counted once:
     /// their endpoint's TX half was not held (in a reset, which drops them,
@@ -5306,19 +5307,20 @@ impl<T: StreamTerms> SenderRole<T> {
         }
         // Its routes and queues close at the next duty, which holds the TX
         // halves (driver-network-agents.md §7).
+        // One the close list has no room for (under sustained churn) is
+        // counted, and recorded as its endpoint's close failure: the
+        // standing reset it asks for drops it.
         if let Some(outbound) = outbound.as_deref() {
-            let (closing, mut full) = (&mut self.closing, 0u64);
+            let mut closing = std::mem::take(&mut self.closing);
             outbound.opened_resources(|opened| {
                 if closing.len() < closing.capacity() {
                     closing.push(opened);
-                } else if let Some(count) = full.checked_add(1) {
-                    full = count;
+                } else {
+                    self.count(|c| &mut c.removed_unrecorded);
+                    self.note_close_failure(opened.endpoint, opened.epoch);
                 }
             });
-            debug_assert_eq!(full, 0, "the close list holds every route");
-            for _ in 0..full {
-                self.count(|c| &mut c.removed_unrecorded);
-            }
+            self.closing = closing;
         }
         // Every path's SETUP side and bindings go with it.
         match outbound.as_deref() {
