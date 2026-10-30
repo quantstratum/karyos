@@ -132,6 +132,15 @@ impl LeaseLedger {
         self.held.iter().filter(|entry| entry.is_some()).count()
     }
 
+    /// Starts a reset's wait: the retirement bound runs from the next
+    /// [`LeaseLedger::reset_drain`] that finds a lease held. Call it when a
+    /// reset begins, so one abandoned before (its endpoint closed) leaves
+    /// nothing behind.
+    pub fn begin_reset(&mut self) {
+        self.draining_since = None;
+        self.stuck_counted = false;
+    }
+
     /// A reset's check at `now`: [`ResetDrain::Done`] once no lease is
     /// held; otherwise waiting, and stuck once `retirement_bound` has
     /// passed since the first check that found one (each stuck reset

@@ -374,3 +374,41 @@ fn leasing_and_staging_allocate_nothing() {
     });
     assert_eq!(allocations, 0);
 }
+
+/// A reset abandoned mid-drain leaves nothing behind once the next one
+/// begins: its bound runs anew (#913 review).
+#[test]
+fn a_new_reset_starts_its_bound_anew() {
+    let buffer = buffer();
+    let mut leasing = reader(&buffer);
+    let mut h = Harness::new();
+    let ticket = h.commit_n(0, 1)[0];
+    let mut ledger = LeaseLedger::new(1, 1_000);
+    ledger.hold(ticket, lease(&mut leasing)).unwrap();
+    ledger.begin_reset();
+    assert_eq!(
+        ledger.reset_drain(0),
+        ResetDrain::Waiting { outstanding: 1 }
+    );
+    // Abandoned; a later reset begins at 5_000.
+    ledger.begin_reset();
+    assert_eq!(
+        ledger.reset_drain(5_000),
+        ResetDrain::Waiting { outstanding: 1 }
+    );
+    assert_eq!(
+        ledger.reset_drain(6_000),
+        ResetDrain::Stuck { outstanding: 1 }
+    );
+    ledger.begin_reset();
+    assert_eq!(
+        ledger.reset_drain(9_000),
+        ResetDrain::Waiting { outstanding: 1 }
+    );
+    assert_eq!(
+        ledger.reset_drain(10_000),
+        ResetDrain::Stuck { outstanding: 1 }
+    );
+    assert_eq!(ledger.counters().stuck, 2, "once per reset");
+    assert!(ledger.release(ticket));
+}
