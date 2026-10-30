@@ -18,12 +18,22 @@ karyos-driver.workspace = true
 karyos-archive.workspace = true
 karyos-cluster.workspace = true
 
+[features]
+# The C5 allocation probe (harness::probe, tests/allocation.rs; karyos#691):
+# it needs karyos-sys's counting allocator, a test hook, so the library
+# builds without it unless asked.
+alloc-probe = ["karyos-sys/test-hooks"]
+
 [dev-dependencies]
 # The scripted sockets of the timed scenarios (tests/timed.rs).
 karyos-io = { workspace = true, features = ["test-hooks"] }
 # The read pause points of the stall test with an asynchronous Archive
 # (tests/stall_isolation_archive.rs).
 karyos-sys = { workspace = true, features = ["test-hooks"] }
+
+[[test]]
+name = "allocation"
+required-features = ["alloc-probe"]
 
 [lints]
 workspace = true

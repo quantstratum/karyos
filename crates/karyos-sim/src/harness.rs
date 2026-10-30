@@ -32,6 +32,7 @@ pub mod corpus;
 pub mod delivery;
 pub mod membership;
 pub mod node;
+#[cfg(feature = "alloc-probe")]
 pub mod probe;
 pub mod reference;
 pub mod standby;
