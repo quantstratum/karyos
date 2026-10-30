@@ -6171,10 +6171,6 @@ mod region_tests {
         assert!(attach(&creator).is_ok());
     }
 
-    /// A region of an older layout version, 1 (shipped in v0.1.0-alpha.1,
-    /// before the seal word's successor bit, ADR-0061), 2 (before the
-    /// schedule ring, TT-1) or 3 (before the ring's eight word header,
-    /// TT-6b), is refused at attach with `LayoutVersion`, by
     /// Read leases are the creator's (karyos#912 review): an attached
     /// buffer's conductor never reclaims what the creator's does, so
     /// installing a lease bank there is refused, typed.
@@ -6192,6 +6188,10 @@ mod region_tests {
         assert_eq!(creator.install_leases(1), Ok(()));
     }
 
+    /// A region of an older layout version, 1 (shipped in v0.1.0-alpha.1,
+    /// before the seal word's successor bit, ADR-0061), 2 (before the
+    /// schedule ring, TT-1) or 3 (before the ring's eight word header,
+    /// TT-6b), is refused at attach with `LayoutVersion`, by
     /// its record and by its configuration block, so a mixed build never
     /// misreads a seal or a ring.
     #[test]
