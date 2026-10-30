@@ -710,6 +710,17 @@ impl ConsensusCore for Reference {
                 leader: Some(self.leader),
             }));
         }
+        // One handover at a time: a second target would hold a TimeoutNow
+        // for the same next term as the first, and both could lead it.
+        if let Some(target) = self.transferring {
+            return if target == to {
+                Ok(())
+            } else {
+                Err(TransferRefused::NotLeader(NotLeader {
+                    leader: Some(target),
+                }))
+            };
+        }
         let (voters, _) = self.members();
         if to == self.id || !voters.contains(&to) {
             return Err(TransferRefused::Invalid);

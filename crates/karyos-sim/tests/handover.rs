@@ -454,3 +454,48 @@ fn a_replica_applying_the_retry_does_not_show_it() {
         );
     }
 }
+
+/// Two handovers asked back to back (karyos#905 review, codex): the
+/// second, to another target, is refused while the first is under way, so
+/// two nodes never both lead the next term.
+#[test]
+fn a_second_handover_mid_handover_never_makes_two_leaders() {
+    for gap in [0, 1, 2, 5] {
+        let mut case = Case::healthy("overlapping handovers", 3, 2, 40);
+        let at = 1_000;
+        case.schedule = vec![
+            (at, Action::TransferLeadership(1)),
+            (at + gap, Action::TransferLeadership(2)),
+        ];
+        case.steps = 2_000;
+        let outcome = run::<Reference>(&case, 1).unwrap();
+        assert!(outcome.safety.is_ok(), "gap {gap}: {:?}", outcome.safety);
+        let refused = outcome.observations.iter().any(|o| {
+            matches!(
+                o,
+                karyos_sim::harness::node::Observation::Transfer {
+                    node: 0,
+                    to: 2,
+                    result: Err(TransferRefused::NotLeader(_)),
+                }
+            )
+        });
+        let transfers: Vec<_> = outcome
+            .observations
+            .iter()
+            .filter(|o| matches!(o, karyos_sim::harness::node::Observation::Transfer { .. }))
+            .collect();
+        assert!(
+            transfers.iter().any(|o| matches!(
+                o,
+                karyos_sim::harness::node::Observation::Transfer {
+                    node: 0,
+                    to: 1,
+                    result: Ok(()),
+                }
+            )),
+            "gap {gap}: the first handover began: {transfers:?}"
+        );
+        assert!(refused, "gap {gap}: the second was refused: {transfers:?}");
+    }
+}
