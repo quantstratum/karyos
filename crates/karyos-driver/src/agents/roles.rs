@@ -590,7 +590,7 @@ impl ReceiverBinding {
 /// evicts (network-control-schemas.md §6.3, plan 169).
 const MAX_ADOPTIONS: usize = karyos_protocol::channel::MAX_PATHS - 1;
 
-fn bump(value: &mut u64, overflowed: &mut bool) {
+pub(super) fn bump(value: &mut u64, overflowed: &mut bool) {
     match value.checked_add(1) {
         Some(next) => *value = next,
         None => *overflowed = true,
@@ -5513,7 +5513,7 @@ impl<T: StreamTerms> SenderRole<T> {
             else {
                 continue;
             };
-            if refusal.close_failed {
+            for _ in 0..refusal.close_failed {
                 self.close_failed(endpoint, epoch);
             }
             if refusal.limited {

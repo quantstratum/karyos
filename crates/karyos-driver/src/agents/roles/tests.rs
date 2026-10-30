@@ -6103,7 +6103,7 @@ fn control_routes_report_limits_and_failed_closes() {
                 epoch,
                 ControlRefusal {
                     limited: true,
-                    close_failed: false
+                    close_failed: 0
                 }
             )),
             "queue limit {queue_limit}"
@@ -6168,7 +6168,7 @@ fn a_control_close_failure_counts_for_the_limit() {
                 epoch,
                 ControlRefusal {
                     limited: false,
-                    close_failed: true,
+                    close_failed: 1,
                 },
             );
         }
@@ -6182,7 +6182,7 @@ fn a_control_close_failure_counts_for_the_limit() {
             limited_in,
             ControlRefusal {
                 limited: true,
-                close_failed: false,
+                close_failed: 0,
             },
         );
         let mut asked = 0usize;
@@ -6853,4 +6853,85 @@ fn solicits_leave_from_the_control_endpoint() {
         60 * MS,
     );
     assert_eq!(from(), [EndpointId(1)]);
+}
+
+/// #847: every failed control close of an epoch is counted, not one flag
+/// per endpoint: two routes past the bound are two failed closes.
+#[test]
+fn each_failed_control_close_is_counted() {
+    use super::super::control::{CONTROL_CLOSE_TIMEOUT, ControlRoutes};
+
+    let (mut tx, _seen) = recording_tx();
+    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 44_000 + index));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    // Two evictions in flight: the first and second destinations.
+    for index in 1..=3 {
+        let _ = routes.send(&mut tx, at(index), &challenge_control());
+    }
+    assert_eq!(routes.lingering(), 2);
+    routes.close_lingering(&mut tx, 0);
+    routes.close_lingering(&mut tx, CONTROL_CLOSE_TIMEOUT);
+    assert_eq!(routes.lingering(), 0);
+    assert_eq!(routes.close_timeouts, 2);
+    let (_, refusal) = routes.take_refusal().unwrap();
+    assert_eq!(refusal.close_failed, 2, "each counted");
+    routes.hold_closes = false;
+}
+
+/// #847 (#849 review): a clock that steps back while a control route is
+/// in flight is no time elapsed, as for the data paths: the route keeps
+/// its place, not failed.
+#[test]
+fn a_control_close_in_flight_survives_a_clock_step_back() {
+    use super::super::control::{CONTROL_CLOSE_TIMEOUT, ControlRoutes};
+
+    let (mut tx, _seen) = recording_tx();
+    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 45_000 + index));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    for index in 1..=2 {
+        let _ = routes.send(&mut tx, at(index), &challenge_control());
+    }
+    routes.close_lingering(&mut tx, 10 * CONTROL_CLOSE_TIMEOUT);
+    routes.close_lingering(&mut tx, 5 * CONTROL_CLOSE_TIMEOUT);
+    assert_eq!(routes.lingering(), 1, "kept");
+    assert_eq!(routes.close_timeouts, 0);
+    assert_eq!(routes.take_refusal(), None);
+    routes.hold_closes = false;
+}
+
+/// #847 (#849 review): the controls waiting when the endpoint moves to a
+/// new epoch are dropped, and counted.
+#[test]
+fn controls_waiting_across_an_epoch_change_are_counted_dropped() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::control::ControlRoutes;
+
+    let endpoint =
+        SocketsEndpoint::open(&loopback(), InstanceId::FIRST, ScriptedSocket::new()).unwrap();
+    let (mut tx, rx) = endpoint.split().unwrap();
+    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 46_000 + index));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    for index in 1..=8 {
+        let _ = routes.send_or_wait(&mut tx, at(index), &challenge_control());
+    }
+    let waiting = routes.waiting();
+    assert!(waiting > 0, "some wait");
+    // The endpoint's reset and reopen, as the endpoint table does.
+    let mut joined = SocketsEndpoint::join(tx, rx).ok().unwrap();
+    let mut report = karyos_io::backend::TxReport::new();
+    while joined.reset(&mut report).more {
+        while report.pop_front().is_some() {}
+    }
+    let _ = joined.reopen(&loopback()).unwrap();
+    let (mut tx, _rx) = joined.split().unwrap();
+    routes.close_lingering(&mut tx, 0);
+    assert_eq!(routes.waiting(), 0);
+    assert_eq!(routes.waits_dropped, u64::try_from(waiting).unwrap());
+    routes.hold_closes = false;
 }

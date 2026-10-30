@@ -317,6 +317,8 @@ pub struct ControlRoutes {
     pub(crate) waits_dropped: u64,
     /// Evicted routes that outlived [`CONTROL_CLOSE_TIMEOUT`] in flight.
     pub(crate) close_timeouts: u64,
+    /// A count above would have overflowed: it holds its last value.
+    pub(crate) overflowed: bool,
     /// Entries at most, open and closing: twice the cache, allocated at
     /// creation.
     limit: usize,
@@ -338,8 +340,8 @@ pub struct ControlRoutes {
 pub struct ControlRefusal {
     /// A route or queue was refused for the endpoint's limit.
     pub limited: bool,
-    /// A live route or queue did not close.
-    pub close_failed: bool,
+    /// Live routes or queues that did not close, each counted.
+    pub close_failed: u32,
 }
 
 /// How a control entry's close went.
@@ -398,6 +400,7 @@ impl ControlRoutes {
             waiting: std::collections::VecDeque::with_capacity(waiting.max(1)),
             waits_dropped: 0,
             close_timeouts: 0,
+            overflowed: false,
             limit: max.saturating_mul(2),
             refusal: ControlRefusal::default(),
             #[cfg(test)]
@@ -414,6 +417,21 @@ impl ControlRoutes {
         self.waiting.clear();
         self.epoch = None;
         self.refusal = ControlRefusal::default();
+    }
+
+    /// Counts a live route or queue that did not close in this epoch.
+    fn close_failure(&mut self) {
+        match self.refusal.close_failed.checked_add(1) {
+            Some(failed) => self.refusal.close_failed = failed,
+            None => self.overflowed = true,
+        }
+    }
+
+    /// Drops the controls waiting, counted: their epoch is gone.
+    fn drop_waiting(&mut self) {
+        for _ in self.waiting.drain(..) {
+            super::roles::bump(&mut self.waits_dropped, &mut self.overflowed);
+        }
     }
 
     /// Test only: the entries evicted in flight, not closed yet.
@@ -440,7 +458,9 @@ impl ControlRoutes {
     pub(crate) fn refuse(&mut self, epoch: BackendEpoch, refusal: ControlRefusal) {
         self.epoch = Some(epoch);
         self.refusal.limited |= refusal.limited;
-        self.refusal.close_failed |= refusal.close_failed;
+        for _ in 0..refusal.close_failed {
+            self.close_failure();
+        }
     }
 
     /// What this epoch's control routes refused or failed to close since
@@ -494,7 +514,7 @@ impl ControlRoutes {
             }
             Closed::Failed => {
                 self.entries.swap_remove(index);
-                self.refusal.close_failed = true;
+                self.close_failure();
             }
         }
     }
@@ -509,7 +529,7 @@ impl ControlRoutes {
     pub fn close_lingering<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, now: u64) {
         if self.epoch != Some(tx.capabilities().epoch) {
             self.entries.clear();
-            self.waiting.clear();
+            self.drop_waiting();
             return;
         }
         let mut index = 0;
@@ -523,7 +543,7 @@ impl ControlRoutes {
                     self.entries.swap_remove(index);
                 }
                 Closed::Failed => {
-                    self.refusal.close_failed = true;
+                    self.close_failure();
                     self.entries.swap_remove(index);
                 }
                 Closed::InFlight => {
@@ -531,10 +551,12 @@ impl ControlRoutes {
                         Some(entry) => *entry.closing_since.get_or_insert(now),
                         None => now,
                     };
-                    let late = now < since || age_ns(now, since) >= CONTROL_CLOSE_TIMEOUT;
+                    // A clock behind since counts as no time elapsed
+                    // (age_ns), as for the data paths' closes.
+                    let late = age_ns(now, since) >= CONTROL_CLOSE_TIMEOUT;
                     if late {
-                        self.close_timeouts = self.close_timeouts.saturating_add(1);
-                        self.refusal.close_failed = true;
+                        super::roles::bump(&mut self.close_timeouts, &mut self.overflowed);
+                        self.close_failure();
                         self.entries.swap_remove(index);
                     } else {
                         index += 1;
@@ -584,7 +606,7 @@ impl ControlRoutes {
                 }
                 // Its turn came and it was refused otherwise: dropped,
                 // counted.
-                Err(_) => self.waits_dropped = self.waits_dropped.saturating_add(1),
+                Err(_) => super::roles::bump(&mut self.waits_dropped, &mut self.overflowed),
             }
         }
     }
@@ -637,7 +659,7 @@ impl ControlRoutes {
         let epoch = tx.capabilities().epoch;
         if self.epoch != Some(epoch) {
             self.entries.clear();
-            self.waiting.clear();
+            self.drop_waiting();
             self.epoch = Some(epoch);
             self.refusal = ControlRefusal::default();
         }
@@ -777,7 +799,7 @@ impl ControlRoutes {
                     self.waiting.push_back((address, *control));
                     return Ok(false);
                 }
-                self.waits_dropped = self.waits_dropped.saturating_add(1);
+                super::roles::bump(&mut self.waits_dropped, &mut self.overflowed);
                 Err(ControlSendError::Blocked)
             }
             Err(error) => Err(error),
