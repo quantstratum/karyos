@@ -307,11 +307,17 @@ impl lin::Model for ServiceModel {
 
     fn step(&self, state: &Self::State, op: &Op) -> (Self::State, Ret) {
         match op {
-            Op::Append(value) => {
-                let next = state.push(value.clone(), self.fold);
-                let length = next.len();
-                (next, Ret::Appended(length))
-            }
+            Op::Append(value) => match state.push(value.clone(), self.fold) {
+                Some(next) => {
+                    let length = next.len();
+                    (next, Ret::Appended(length))
+                }
+                // A log of u64::MAX values cannot be built from a history
+                // (it holds fewer operations); were it, the append answers
+                // length 0, which no recorded append returns, so the
+                // checker refuses it rather than accept a wrapped count.
+                None => (state.clone(), Ret::Appended(0)),
+            },
             Op::Read => (state.clone(), Ret::Values(state.values())),
         }
     }
@@ -353,17 +359,19 @@ impl SharedLog {
         self.last.as_ref().map_or(0, |link| link.digest)
     }
 
-    /// It with `value` appended, its digest folded by `fold`.
-    fn push(&self, value: Vec<u8>, fold: fn(u64, &[u8]) -> u64) -> Self {
+    /// It with `value` appended, its digest folded by `fold`; `None` when
+    /// its length would pass `u64::MAX`.
+    fn push(&self, value: Vec<u8>, fold: fn(u64, &[u8]) -> u64) -> Option<Self> {
+        let length = self.len().checked_add(1)?;
         let digest = fold(self.digest(), &value);
-        Self {
+        Some(Self {
             last: Some(Rc::new(Link {
                 value,
                 before: self.last.clone(),
-                length: self.len().saturating_add(1),
+                length,
                 digest,
             })),
-        }
+        })
     }
 
     /// Its values, oldest first.
@@ -491,7 +499,7 @@ mod shared_log_tests {
         let model = ServiceModel::default();
         let mut log = model.init();
         for value in 0..200_000u32 {
-            log = log.push(value.to_le_bytes().to_vec(), fnv1a);
+            log = log.push(value.to_le_bytes().to_vec(), fnv1a).unwrap();
         }
         assert_eq!(log.len(), 200_000);
         drop(log);
