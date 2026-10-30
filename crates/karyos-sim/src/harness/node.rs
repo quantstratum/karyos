@@ -1841,20 +1841,21 @@ impl<C: ConsensusCore> ServerNode<C> {
             }
             let deduplicated = self.service.deduplicated();
             let answer = self.service.apply(&served);
-            if self.service.deduplicated() > deduplicated
-                && let Some((command, _)) = &answer
-            {
-                self.observe(Observation::Deduplicated {
-                    node,
-                    client: command.client,
-                    sequence: command.sequence,
-                });
-            }
+            let replayed = self.service.deduplicated() > deduplicated;
             let response = answer.as_ref().map(|(_, ret)| ret.canonical());
             if let Some((command, ret)) = answer
                 && self.pending.remove(&(command.client, command.sequence))
                 && acts
             {
+                // The evidence of a retry is a retained answer actually sent
+                // to a waiting client, not a replica's application.
+                if replayed {
+                    self.observe(Observation::Deduplicated {
+                        node,
+                        client: command.client,
+                        sequence: command.sequence,
+                    });
+                }
                 self.observe(Observation::Reply {
                     node,
                     client: command.client,

@@ -10,7 +10,8 @@
 use std::cell::Cell;
 
 use karyos_sim::harness::core::{
-    ConsensusCore, Limits, LogView, Persisted, Ready, Refused, TransferRefused, Unsupported,
+    ConsensusCore, Limits, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
+    Unsupported,
 };
 use karyos_sim::harness::reference::{Message, Reference};
 use karyos_sim::harness::workloads::{Action, Case, Failed, Progress, W5, pass, run};
@@ -307,4 +308,149 @@ fn a_handover_after_the_retries_does_not_show_them() {
         "the deferred handover still happened"
     );
     assert_eq!(pass(&case, &outcome), Err(Failed::NotShown("retry")));
+}
+
+thread_local! {
+    /// The tick `Held` releases the target's held applications.
+    static APPLY: Cell<u64> = const { Cell::new(0) };
+}
+
+/// `Deferred` that also redirects one request to node 1 at tick 7 and holds
+/// node 1's applications until [`APPLY`] (karyos#905 review, codex's
+/// artifact 267): node 1 then applies the retried request as a replica
+/// after it leads, without ever serving that client.
+#[derive(Debug)]
+struct Held {
+    id: NodeId,
+    deferred: Deferred,
+    redirected: bool,
+    held: Vec<karyos_cluster::Entry>,
+    now: u64,
+}
+
+impl Held {
+    fn wrap(id: NodeId, core: Reference) -> Self {
+        Self {
+            id,
+            deferred: Deferred::wrap(core),
+            redirected: false,
+            held: Vec::new(),
+            now: 0,
+        }
+    }
+    fn inner(&mut self) -> &mut Reference {
+        &mut self.deferred.core
+    }
+    fn inner_ref(&self) -> &Reference {
+        &self.deferred.core
+    }
+}
+
+impl ConsensusCore for Held {
+    type Message = Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        Self::wrap(id, Reference::recover(id, peers, log))
+    }
+
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, Unsupported> {
+        Reference::recover_with(id, peers, limits, log).map(|core| Self::wrap(id, core))
+    }
+
+    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
+        if self.now >= 7 && !self.redirected && self.id != 1 && self.inner_ref().leads() {
+            self.redirected = true;
+            return Err(Refused::NotLeader(NotLeader { leader: Some(1) }));
+        }
+        self.inner().propose(command, log)
+    }
+
+    fn step(&mut self, from: NodeId, message: Message, log: &mut LogView<'_>) {
+        self.inner().step(from, message, log);
+    }
+
+    fn advance(&mut self, persisted: Persisted, log: &mut LogView<'_>) {
+        self.inner().advance(persisted, log);
+    }
+
+    fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
+        self.now = now;
+        self.deferred.tick(now, log);
+    }
+
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Message>> {
+        let mut ready = self.deferred.ready(log);
+        if self.id != 1 {
+            return ready;
+        }
+        if let Some(ready) = ready.as_mut() {
+            self.held.append(&mut ready.committed);
+        }
+        if self.now < APPLY.with(Cell::get) || self.held.is_empty() {
+            return ready;
+        }
+        let mut ready = ready.unwrap_or_default();
+        ready.committed = std::mem::take(&mut self.held);
+        Some(ready)
+    }
+
+    fn transfer_leadership(
+        &mut self,
+        to: NodeId,
+        log: &mut LogView<'_>,
+    ) -> Result<(), TransferRefused> {
+        self.deferred.transfer_leadership(to, log)
+    }
+
+    fn term(&self) -> u64 {
+        self.inner_ref().term()
+    }
+
+    fn leads(&self) -> bool {
+        self.inner_ref().leads()
+    }
+
+    fn received(&self) -> Option<u64> {
+        self.inner_ref().received()
+    }
+
+    fn committed(&self) -> Option<u64> {
+        self.inner_ref().committed()
+    }
+}
+
+/// A retry is shown only by a retained answer the target actually sends
+/// (karyos#905 review, codex's artifact 267): the target applying the
+/// retried request as a replica, after it leads, serves no client, and
+/// fails the case whenever its applications are released.
+#[test]
+fn a_replica_applying_the_retry_does_not_show_it() {
+    for release in [1_000, 1_100] {
+        let case = retry_case();
+        APPLY.with(|apply| apply.set(release));
+        let outcome = run::<Held>(&case, 1).unwrap();
+        APPLY.with(|apply| apply.set(0));
+        assert!(
+            outcome.safety.is_ok(),
+            "release {release}: {:?}",
+            outcome.safety
+        );
+        assert!(
+            outcome.observations.iter().any(|o| matches!(
+                o,
+                karyos_sim::harness::node::Observation::Redirected { to: 1, .. }
+            )),
+            "release {release}: the redirect happened"
+        );
+        assert_eq!(
+            pass(&case, &outcome),
+            Err(Failed::NotShown("retry")),
+            "release {release}"
+        );
+    }
 }
