@@ -63,11 +63,14 @@ pub struct NotYet {
 /// nothing reaches it or leaves it. Its pass condition is W1's, the
 /// follower caught up to the same state, with every refusal typed.
 ///
-/// **Not yet run:** the bursts. A client keeps one request open, so 32
-/// clients cannot hold the 4,096 requests a burst at 4x the queue needs,
-/// nor 256 in flight; and at 256 B, 64 entries are 16 KiB, so the 1 MiB
-/// in-flight byte limit is never the one reached. These wait for a
-/// decision on pipelined clients (karyos#687).
+/// The bursts at 4x each limit come from pipelined clients
+/// ([`Case::window`]): 4x the queue's requests open at once, 4x the
+/// in-flight entries, and a follower behind by 4x the log-read limit's
+/// bytes. At 256 B, 64 entries are 16 KiB, so the 1 MiB in-flight byte
+/// limit is never the one reached: every W2 run record says so
+/// ([`W2::IN_FLIGHT_BYTES`]), and the report scores that sub-check not
+/// demonstrated (decided 2026-10-30 by QS-COORDINATOR;
+/// quantstratum-docs#731 proposes a large-payload case).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct W2 {
     /// Servers.
@@ -88,6 +91,13 @@ impl W2 {
     /// The follower the slow case cuts off: not the reference's leader.
     pub const SLOW: NodeId = 2;
 
+    /// What every W2 v1 run record states of the in-flight byte limit.
+    pub const IN_FLIGHT_BYTES: &str =
+        "in-flight bytes limit: not reached by W2 v1 (256 B payloads)";
+
+    /// The bursts' factor over each limit.
+    pub const BURST: u64 = 4;
+
     /// The values the manifest freezes.
     #[must_use]
     pub fn manifest() -> Self {
@@ -102,59 +112,116 @@ impl W2 {
     }
 
     /// The values the skeleton runs in the test suite: the manifest's
-    /// shape, a tenth of its catch-up, and a pause long enough for the
-    /// fewer clients to commit it.
+    /// shape, a tenth of its catch-up, and limits a sixteenth of the
+    /// manifest's, so its bursts stay small.
     #[must_use]
     pub fn skeleton() -> Self {
         Self {
             clients: 8,
             pause: 1_000,
             behind: 1_000,
+            limits: Limits {
+                in_flight_entries: 4,
+                in_flight_bytes: 64 * 1024,
+                queue: 64,
+                log_read_bytes: 64 * 1024,
+            },
             ..Self::manifest()
         }
     }
 
-    /// Its cases: the clients under the limits, and the slow follower.
+    /// Its cases: the clients under the limits, the bursts at
+    /// [`W2::BURST`] times the queue and the in-flight entries, the slow
+    /// follower, and one behind by [`W2::BURST`] times the log-read limit.
     #[must_use]
     pub fn cases(&self) -> Vec<Case> {
         let clients = self.clients.max(1);
-        let mut nominal = Case::healthy(
-            &format!("W2 n={} clients={} nominal", self.processes, clients),
+        let payload = u64::try_from(self.payload_bytes.max(1)).unwrap_or(u64::MAX);
+        let read_behind = self
+            .limits
+            .log_read_bytes
+            .saturating_mul(Self::BURST)
+            .div_ceil(payload);
+        vec![
+            self.nominal(clients),
+            self.burst(clients, "queue", self.limits.queue),
+            self.burst(clients, "in-flight entries", self.limits.in_flight_entries),
+            self.slow(clients, self.behind, Some(self.pause), "slow follower"),
+            self.slow(clients, read_behind, None, "log-read burst"),
+        ]
+    }
+
+    /// The clients under the limits.
+    fn nominal(&self, clients: usize) -> Case {
+        let mut case = Case::healthy(
+            &format!("W2 n={} clients={clients} nominal", self.processes),
             self.processes,
             clients,
             4,
         );
-        nominal.payload = self.payload_bytes;
-        nominal.limits = Some(self.limits);
+        case.payload = self.payload_bytes;
+        case.limits = Some(self.limits);
+        case
+    }
+
+    /// [`W2::BURST`] times `limit` requests open at once: each client's
+    /// window holds its share, one request each.
+    fn burst(&self, clients: usize, what: &str, limit: u64) -> Case {
+        let open = usize::try_from(limit.saturating_mul(Self::BURST)).unwrap_or(usize::MAX);
+        let window = open.div_ceil(clients);
+        let mut case = Case::healthy(
+            &format!(
+                "W2 n={} clients={clients} window={window} burst {}x {what}",
+                self.processes,
+                Self::BURST
+            ),
+            self.processes,
+            clients,
+            1,
+        );
+        case.payload = self.payload_bytes;
+        case.limits = Some(self.limits);
+        case.window = window;
+        // A refused request waits its retry interval: a few intervals.
+        case.steps = case.steps.max(
+            case.retry_after
+                .saturating_mul(Self::BURST.saturating_add(2)),
+        );
+        case
+    }
+
+    /// A follower cut off for `pause` steps (by default, long enough for
+    /// the leader to commit `behind` entries), then catching up.
+    fn slow(&self, clients: usize, behind: u64, pause: Option<u64>, what: &str) -> Case {
         // Every client's share of the entries the follower misses, and
         // two more each for what it holds before it is cut off.
-        let share = usize::try_from(self.behind)
+        let share = usize::try_from(behind)
             .unwrap_or(usize::MAX)
             .div_ceil(clients)
             .saturating_add(2);
-        let mut slow = Case::healthy(
+        let mut case = Case::healthy(
             &format!(
-                "W2 n={} clients={} slow follower {} behind",
-                self.processes, clients, self.behind
+                "W2 n={} clients={clients} {what} {behind} behind",
+                self.processes
             ),
             self.processes,
             clients,
             share,
         );
-        slow.payload = self.payload_bytes;
-        slow.limits = Some(self.limits);
-        let healed = self.pause.saturating_add(10);
-        slow.schedule = vec![(10, Action::Isolate(Self::SLOW)), (healed, Action::Heal)];
-        // The clients' work (a few steps per operation, generously), or
-        // the pause if longer, then twice the catch-up the reference
-        // needs at its in-flight entries per resend.
+        case.payload = self.payload_bytes;
+        case.limits = Some(self.limits);
+        // By default, long enough for the share to commit while it is cut
+        // off: a few steps for each operation.
         let work = u64::try_from(share).unwrap_or(u64::MAX).saturating_mul(8);
-        let catch_up = self
-            .behind
+        let healed = pause.unwrap_or(work).saturating_add(10);
+        case.schedule = vec![(10, Action::Isolate(Self::SLOW)), (healed, Action::Heal)];
+        // Then twice the catch-up the reference needs at its in-flight
+        // entries per resend.
+        let catch_up = behind
             .div_ceil(self.limits.in_flight_entries.max(1))
             .saturating_mul(reference::RESEND);
-        slow.steps = healed.max(work).saturating_add(catch_up.saturating_mul(2));
-        vec![nominal, slow]
+        case.steps = healed.max(work).saturating_add(catch_up.saturating_mul(2));
+        case
     }
 }
 

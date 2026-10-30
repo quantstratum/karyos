@@ -16,6 +16,8 @@
 // test exemptions (ADR-0007 exempts tests from these lints).
 #![allow(clippy::unwrap_used, clippy::panic)]
 
+use karyos_sim::harness::core::Limit;
+use karyos_sim::harness::node::Observation;
 use karyos_sim::harness::reference::Reference;
 use karyos_sim::harness::workloads::{
     self, ADR_0043, Action, Failed, Liveness, Progress, W1, W2, W3, W3Fault, W4, W4Cut, W6,
@@ -45,10 +47,30 @@ fn the_module_records_its_adr_revision() {
 fn w2_passes() {
     let w2 = W2::skeleton();
     let cases = w2.cases();
-    assert_eq!(cases.len(), 2);
+    assert_eq!(cases.len(), 5);
     for case in &cases {
         assert_eq!(case.limits, Some(w2.limits));
         let outcome = workloads::run::<Reference>(case, 1).unwrap();
+        // The queue's burst is pushed back, typed; nothing else is.
+        let pushed = outcome
+            .observations
+            .iter()
+            .filter(|observation| {
+                matches!(
+                    observation,
+                    Observation::Backpressure {
+                        limit: Limit::Queue,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            pushed > 0,
+            case.name.contains("burst 4x queue"),
+            "{}: {pushed}",
+            case.name
+        );
         assert_eq!(workloads::pass(case, &outcome), Ok(None), "{}", case.name);
         let applied: Vec<_> = outcome
             .states
@@ -63,7 +85,8 @@ fn w2_passes() {
     }
     // The same run stopped as the pause ends: the follower is the case's
     // `behind` entries back, or more.
-    let slow = &cases[1];
+    let slow = &cases[3];
+    assert!(slow.name.contains("slow follower"), "{}", slow.name);
     let mut paused = slow.clone();
     paused.steps = w2.pause + 10;
     paused
@@ -89,6 +112,12 @@ fn w2_passes() {
         (3, 32, 256)
     );
     assert_eq!((manifest.pause, manifest.behind), (2_000, 10_000));
+    // The manifest's bursts: 4,096 requests open for the queue, 256 for
+    // the in-flight entries, a follower 16,384 entries (4 MiB) behind.
+    let full = manifest.cases();
+    assert_eq!((full[1].sessions(), full[2].sessions()), (4_096, 256));
+    assert!(full[4].name.contains("16384 behind"), "{}", full[4].name);
+    assert!(W2::IN_FLIGHT_BYTES.contains("not reached"));
 }
 
 #[test]
@@ -118,9 +147,10 @@ fn w1_passes() {
     }
 }
 
-/// W2 at the manifest's values (harness validation): 32 clients, and the
-/// follower catching up from 10,000 entries behind. About 30 s in a
-/// release build.
+/// W2 at the manifest's values (harness validation): 32 clients, the
+/// bursts (4,096 requests open, 256 in flight, a follower 4 MiB behind),
+/// and the follower catching up from 10,000 entries behind. About 10 s in
+/// a release build.
 #[test]
 #[ignore = "the manifest's W2 takes long; run on request"]
 fn w2_manifest_passes() {

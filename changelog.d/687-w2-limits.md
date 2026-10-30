@@ -9,7 +9,10 @@
   `Refused::Backpressure(Limit)`; each backpressure refusal is recorded,
   and the client sends again, so nothing is lost. The harness holds a
   core's log reads to its per-duty budget (`ReadError::Budget`). W2 runs
-  its nominal case and a follower cut off while the leader commits
-  10,000 entries, then catching up; the bursts at 4x each limit wait for
-  pipelined clients. The reference fixture honours every limit, as
+  its nominal case, bursts at 4x the queue and the in-flight entries
+  from pipelined clients (`Case::window`, each open request a session of
+  its own; a client told `Busy` waits its retry interval), a follower cut
+  off while the leader commits 10,000 entries, and one 4x the log-read
+  limit behind. At 256 B the in-flight byte limit is never reached: every
+  W2 run record states it, and the report scores it not demonstrated. The reference fixture honours every limit, as
   harness validation.
