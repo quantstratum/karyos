@@ -595,7 +595,7 @@ impl<D: Disk + Clone> RaftLog<D> {
                 let index = first_index
                     .checked_sub(1)
                     .ok_or(LogError::InstallUnverified { index: 0, term })?;
-                verify_base(snapshots, index, term)?;
+                verify_base(snapshots, (index, term), Base::OrLater)?;
                 Some(index)
             }
             None => None,
@@ -857,8 +857,12 @@ impl<D: Disk + Clone> RaftLog<D> {
 
     /// Discards every entry and restarts the log after a snapshot at
     /// `base_index` of `base_term`, which `snapshots` already holds
-    /// durably: a follower installing a leader's snapshot (W5; decided
-    /// 2026-10-30 by QS-COORDINATOR). Durable on return, in this order:
+    /// durably as its latest: a follower installing a leader's snapshot
+    /// (W5; decided 2026-10-30 by QS-COORDINATOR). When the log already
+    /// holds `base_index` at `base_term`, Raft keeps the entries after it
+    /// (figure 13, step 6): the caller does not install then. A vote of an
+    /// older term than the base's is dropped. Durable on return, in this
+    /// order:
     ///
     /// 1. the first-index file names `base_index + 1` and `base_term`, in
     ///    one record, replaced atomically;
@@ -884,7 +888,7 @@ impl<D: Disk + Clone> RaftLog<D> {
         snapshots: &SnapshotStore<E>,
     ) -> Result<(), LogError> {
         self.check_writable()?;
-        verify_base(Some(snapshots), base_index, base_term)?;
+        verify_base(Some(snapshots), (base_index, base_term), Base::Exact)?;
         let commit = self.hard_state.and_then(|state| state.commit);
         if commit.is_some_and(|commit| base_index <= commit) {
             return Err(LogError::InstallStale {
@@ -1354,20 +1358,33 @@ impl<D: Disk + Clone> RaftLog<D> {
     }
 }
 
-/// Refuses unless `snapshots`' latest snapshot verifies whole and holds
-/// the state up to `index`: at `index` of `term` itself, or a later one (a
-/// compaction after the install: it holds a superset; karyos#903 review,
-/// codex).
+/// Whether [`verify_base`] takes only a snapshot at exactly the base, or
+/// also a later one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Base {
+    /// An install: the latest snapshot is the base, index and term.
+    Exact,
+    /// An open: the latest snapshot is the base or a later one, which holds
+    /// the base's state too (a compaction after the install; karyos#903
+    /// review, codex).
+    OrLater,
+}
+
+/// Refuses unless `snapshots`' latest snapshot verifies whole and is at
+/// `index` of `term`, or under [`Base::OrLater`] past `index`.
 fn verify_base<E: Disk + Clone>(
     snapshots: Option<&SnapshotStore<E>>,
-    index: u64,
-    term: u64,
+    (index, term): (u64, u64),
+    base: Base,
 ) -> Result<(), LogError> {
     let unverified = LogError::InstallUnverified { index, term };
     let store = snapshots.ok_or(unverified)?;
     let latest = store
         .latest()
-        .filter(|info| info.index > index || (info.index == index && info.term == term))
+        .filter(|info| {
+            (info.index == index && info.term == term)
+                || (base == Base::OrLater && info.index > index)
+        })
         .ok_or(LogError::InstallUnverified { index, term })?;
     store
         .verify(&latest)

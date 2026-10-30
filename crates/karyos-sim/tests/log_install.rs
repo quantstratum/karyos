@@ -278,6 +278,25 @@ fn an_install_without_its_snapshot_or_not_past_the_commit_is_refused() {
         Err(LogError::InstallUnverified { .. })
     ));
     assert_eq!((log.first_index(), log.last_index()), (1, Some(6)));
+    // A later snapshot is no install's base: the latest must be the base
+    // itself, index and term (karyos#903 review, QS-REVIEWER).
+    let mut later = snapshots(disk.clone()).unwrap();
+    let _ = later
+        .write(
+            BASE + 10,
+            BASE_TERM,
+            &[Section::new(SectionKind::Service, 1, b"the state up to 30")],
+        )
+        .unwrap();
+    assert!(matches!(
+        log.install(BASE, BASE_TERM + 1, &later),
+        Err(LogError::InstallUnverified { .. })
+    ));
+    assert!(matches!(
+        log.install(BASE, BASE_TERM, &later),
+        Err(LogError::InstallUnverified { .. })
+    ));
+    assert_eq!((log.first_index(), log.last_index()), (1, Some(6)));
     // Past the commit only: a commit at the base refuses it.
     let _ = log
         .append(&(7..=20).map(|index| entry(index, 1)).collect::<Vec<_>>())
