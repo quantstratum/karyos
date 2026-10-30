@@ -651,6 +651,39 @@ fn exchange_bytes(exporter: &mut Exporter, request: &[u8]) -> (Vec<u8>, Vec<Answ
 
 const TOKEN: &[u8] = b"0123456789abcdef0123456789abcdef";
 
+/// The token a head offers, by an oracle of its own: within the bytes the
+/// exporter reads, the last `Authorization` header before the blank line,
+/// its scheme `Bearer` in any case followed by one space, and the rest
+/// trimmed. `None` when there is no such header.
+fn bearer_of(head: &[u8]) -> Option<Vec<u8>> {
+    let read = head.get(..MAX_REQUEST).unwrap_or(head);
+    let mut lines = read.split(|byte| *byte == b'\n');
+    let _request = lines.next()?;
+    let mut offered = None;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let (name, value) = line.split_at(colon);
+        let value = value.get(1..).unwrap_or_default();
+        if !name.trim_ascii().eq_ignore_ascii_case(b"authorization") {
+            continue;
+        }
+        let value = value.trim_ascii();
+        offered = match value.get(..7) {
+            Some(scheme) if scheme.eq_ignore_ascii_case(b"bearer ") => {
+                value.get(7..).map(|token| token.trim_ascii().to_vec())
+            }
+            _ => None,
+        };
+    }
+    offered
+}
+
 /// A generated head: request lines and `Authorization` variants (the
 /// token, one byte off, a prefix, an extension, another scheme, no space,
 /// any case), other headers, non-UTF-8 bytes, and padding up to and past
@@ -658,25 +691,25 @@ const TOKEN: &[u8] = b"0123456789abcdef0123456789abcdef";
 fn head() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
     use proptest::prelude::*;
     let line = prop_oneof![
-        Just(b"GET /metrics HTTP/1.1\r\n".to_vec()),
-        Just(b"GET /metrics HTTP/1.0\n".to_vec()),
-        Just(b"get /metrics HTTP/1.1\r\n".to_vec()),
-        Just(b"GET /other HTTP/1.1\r\n".to_vec()),
-        Just(b"POST /metrics HTTP/1.1\r\n".to_vec()),
-        Just(b"GET /metrics\r\n".to_vec()),
-        Just(b"GET /metrics SPDY/3\r\n".to_vec()),
-        proptest::collection::vec(any::<u8>(), 0..64),
+        6 => Just(b"GET /metrics HTTP/1.1\r\n".to_vec()),
+        1 => Just(b"GET /metrics HTTP/1.0\n".to_vec()),
+        1 => Just(b"get /metrics HTTP/1.1\r\n".to_vec()),
+        1 => Just(b"GET /other HTTP/1.1\r\n".to_vec()),
+        1 => Just(b"POST /metrics HTTP/1.1\r\n".to_vec()),
+        1 => Just(b"GET /metrics\r\n".to_vec()),
+        1 => Just(b"GET /metrics SPDY/3\r\n".to_vec()),
+        1 => proptest::collection::vec(any::<u8>(), 0..64),
     ];
     let mut off = TOKEN.to_vec();
     if let Some(last) = off.last_mut() {
         *last = b'X';
     }
     let value = prop_oneof![
-        Just(TOKEN.to_vec()),
-        Just(off),
-        Just(TOKEN.get(..31).unwrap().to_vec()),
-        Just([TOKEN, b"0"].concat()),
-        proptest::collection::vec(any::<u8>(), 0..300),
+        6 => Just(TOKEN.to_vec()),
+        1 => Just(off),
+        1 => Just(TOKEN.get(..31).unwrap().to_vec()),
+        1 => Just([TOKEN, b"0"].concat()),
+        1 => proptest::collection::vec(any::<u8>(), 0..300),
     ];
     let scheme = prop_oneof![
         Just(b"Bearer ".to_vec()),
@@ -684,6 +717,8 @@ fn head() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
         Just(b"BEARER  ".to_vec()),
         Just(b"Bearer".to_vec()),
         Just(b"Basic ".to_vec()),
+        // Seven bytes, as `Bearer `: only the scheme check refuses it.
+        Just(b"Basic  ".to_vec()),
     ];
     let name = prop_oneof![
         Just(b"Authorization: ".to_vec()),
@@ -729,15 +764,11 @@ proptest::proptest! {
         let (answer, answered) = exchange_bytes(&mut exporter, &head);
         proptest::prop_assert_eq!(answered.len(), 1);
         if answered.contains(&Answered::Metrics) {
-            let read = head.get(..MAX_REQUEST).unwrap_or(&head);
-            let carries = read
-                .split(|byte| *byte == b'\n')
-                .any(|line| {
-                    let line = String::from_utf8_lossy(line).to_ascii_lowercase();
-                    line.starts_with("authorization:")
-                        && line.trim_end().ends_with(&String::from_utf8_lossy(TOKEN).to_string())
-                });
-            proptest::prop_assert!(carries, "{:?}", String::from_utf8_lossy(&head));
+            proptest::prop_assert!(
+                bearer_of(&head).as_deref() == Some(TOKEN),
+                "{:?}",
+                String::from_utf8_lossy(&head)
+            );
         } else {
             proptest::prop_assert!(
                 !answer.windows(9).any(|window| window == b"karyos_up"),
@@ -745,5 +776,40 @@ proptest::proptest! {
                 String::from_utf8_lossy(&answer)
             );
         }
+    }
+}
+
+/// The scheme, the header's name, and the last header decide (karyos#893,
+/// codex): a seven-byte scheme other than `Bearer `, a header named
+/// otherwise, and an earlier good header overridden by a later bad one
+/// are refused; a later good one is served.
+#[test]
+fn only_the_last_bearer_authorization_with_the_token_is_served() {
+    let token = Token::new(TOKEN.to_vec()).unwrap();
+    let mut exporter = bind("127.0.0.1:0".parse().unwrap())
+        .unwrap()
+        .with_token(token);
+    let good = "Authorization: Bearer 0123456789abcdef0123456789abcdef\r\n";
+    let bad = "Authorization: Bearer 0123456789abcdef0123456789abcdeX\r\n";
+    for (head, expected) in [
+        (
+            "Authorization: Basic  0123456789abcdef0123456789abcdef\r\n".to_owned(),
+            Answered::Unauthorized,
+        ),
+        (
+            "X-Authorization: Bearer 0123456789abcdef0123456789abcdef\r\n".to_owned(),
+            Answered::Unauthorized,
+        ),
+        (format!("{good}{bad}"), Answered::Unauthorized),
+        (format!("{bad}{good}"), Answered::Metrics),
+    ] {
+        let request = format!("GET /metrics HTTP/1.1\r\n{head}\r\n");
+        let (_, answered) = exchange(&mut exporter, &request);
+        assert_eq!(answered, [expected], "{head:?}");
+        assert_eq!(
+            bearer_of(request.as_bytes()).as_deref() == Some(TOKEN),
+            expected == Answered::Metrics,
+            "the oracle agrees: {head:?}"
+        );
     }
 }
