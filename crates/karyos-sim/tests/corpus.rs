@@ -53,7 +53,7 @@ fn the_ci_corpus_of_the_reference_fixture() {
         PathBuf::from,
     );
     let w1 = |_seed: u64| W1::skeleton().cases();
-    let w2 = |_seed: u64| W2::skeleton().cases();
+    let w2 = |_seed: u64| W2::skeleton().cases().unwrap();
     let w3 = |_seed: u64| W3::skeleton().cases();
     let w4 = |seed: u64| W4::skeleton(seed).cases();
     let w6 = |_seed: u64| W6::skeleton().cases();

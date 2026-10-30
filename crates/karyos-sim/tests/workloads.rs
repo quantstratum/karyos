@@ -46,7 +46,7 @@ fn the_module_records_its_adr_revision() {
 #[test]
 fn w2_passes() {
     let w2 = W2::skeleton();
-    let cases = w2.cases();
+    let cases = w2.cases().unwrap();
     assert_eq!(cases.len(), 5);
     for case in &cases {
         assert_eq!(case.limits, Some(w2.limits));
@@ -103,7 +103,7 @@ fn w2_passes() {
             .and_then(|(_, applied, _)| *applied)
             .unwrap_or(0)
     };
-    let gap = applied(0).saturating_sub(applied(W2::SLOW));
+    let gap = applied(0).checked_sub(applied(W2::SLOW)).unwrap();
     assert!(gap >= w2.behind, "{gap} behind at the heal");
     let manifest = W2::manifest();
     assert_eq!(manifest.limits, karyos_sim::harness::core::Limits::W2);
@@ -114,8 +114,11 @@ fn w2_passes() {
     assert_eq!((manifest.pause, manifest.behind), (2_000, 10_000));
     // The manifest's bursts: 4,096 requests open for the queue, 256 for
     // the in-flight entries, a follower 16,384 entries (4 MiB) behind.
-    let full = manifest.cases();
-    assert_eq!((full[1].sessions(), full[2].sessions()), (4_096, 256));
+    let full = manifest.cases().unwrap();
+    assert_eq!(
+        (full[1].sessions(), full[2].sessions()),
+        (Some(4_096), Some(256))
+    );
     assert!(full[4].name.contains("16384 behind"), "{}", full[4].name);
     assert!(W2::IN_FLIGHT_BYTES.contains("not reached"));
 }
@@ -154,7 +157,7 @@ fn w1_passes() {
 #[test]
 #[ignore = "the manifest's W2 takes long; run on request"]
 fn w2_manifest_passes() {
-    for case in W2::manifest().cases() {
+    for case in W2::manifest().cases().unwrap() {
         let outcome = workloads::run::<Reference>(&case, 1).unwrap();
         assert_eq!(workloads::pass(&case, &outcome), Ok(None), "{}", case.name);
     }

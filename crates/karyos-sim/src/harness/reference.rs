@@ -316,12 +316,16 @@ impl ConsensusCore for Reference {
         let Some(index) = self.next(log) else {
             return Err(not_leader.into());
         };
-        // Held and not committed: what it proposed past its commit.
-        let held = index.saturating_sub(
-            self.commit
-                .map_or(log.first_index(), |c| c.saturating_add(1)),
-        );
-        if self.limits.is_some_and(|limits| held >= limits.queue) {
+        // Held and not committed: what it proposed past its commit. A
+        // count it cannot take fails closed, refused as a full queue.
+        let held = self
+            .commit
+            .map_or(Some(log.first_index()), |commit| commit.checked_add(1))
+            .and_then(|first| index.checked_sub(first));
+        if self
+            .limits
+            .is_some_and(|limits| held.is_none_or(|held| held >= limits.queue))
+        {
             return Err(Refused::Backpressure(Limit::Queue));
         }
         self.unpersisted.push(Entry {
@@ -409,7 +413,9 @@ impl ConsensusCore for Reference {
             // acknowledgement, so one message is all it has in flight.
             let (end, bytes) = match self.limits {
                 Some(limits) => (
-                    end.min(from.saturating_add(limits.in_flight_entries)),
+                    // Past u64::MAX the cap is no bound: `end` is.
+                    from.checked_add(limits.in_flight_entries)
+                        .map_or(end, |cap| end.min(cap)),
                     BATCH_BYTES.min(limits.in_flight_bytes),
                 ),
                 None => (end, BATCH_BYTES),

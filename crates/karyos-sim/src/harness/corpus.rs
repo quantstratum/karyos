@@ -166,7 +166,10 @@ pub fn run_corpus<C: ConsensusCore>(
                     }
                     Verdict::Error => summary.errors = summary.errors.saturating_add(1),
                     Verdict::NotDemonstrated => {
-                        summary.not_demonstrated = summary.not_demonstrated.saturating_add(1);
+                        summary.not_demonstrated = summary
+                            .not_demonstrated
+                            .checked_add(1)
+                            .ok_or_else(|| std::io::Error::other("run count overflow"))?;
                     }
                 }
                 if bound {

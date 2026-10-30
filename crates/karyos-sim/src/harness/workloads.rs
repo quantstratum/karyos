@@ -53,6 +53,10 @@ pub struct NotYet {
     pub reason: &'static str,
 }
 
+/// A W2 count or step bound past its type ([`W2::cases`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct W2Overflow;
+
 /// W2, capacity and slow follower (karyos#687), under declared
 /// [`Limits`].
 ///
@@ -133,22 +137,27 @@ impl W2 {
     /// Its cases: the clients under the limits, the bursts at
     /// [`W2::BURST`] times the queue and the in-flight entries, the slow
     /// follower, and one behind by [`W2::BURST`] times the log-read limit.
-    #[must_use]
-    pub fn cases(&self) -> Vec<Case> {
+    ///
+    /// # Errors
+    ///
+    /// [`W2Overflow`] when a count or a step bound derived from its values
+    /// passes its type: values no frozen profile comes near.
+    pub fn cases(&self) -> Result<Vec<Case>, W2Overflow> {
         let clients = self.clients.max(1);
-        let payload = u64::try_from(self.payload_bytes.max(1)).unwrap_or(u64::MAX);
+        let payload = u64::try_from(self.payload_bytes.max(1)).map_err(|_| W2Overflow)?;
         let read_behind = self
             .limits
             .log_read_bytes
-            .saturating_mul(Self::BURST)
+            .checked_mul(Self::BURST)
+            .ok_or(W2Overflow)?
             .div_ceil(payload);
-        vec![
+        Ok(vec![
             self.nominal(clients),
-            self.burst(clients, "queue", self.limits.queue),
-            self.burst(clients, "in-flight entries", self.limits.in_flight_entries),
-            self.slow(clients, self.behind, Some(self.pause), "slow follower"),
-            self.slow(clients, read_behind, None, "log-read burst"),
-        ]
+            self.burst(clients, "queue", self.limits.queue)?,
+            self.burst(clients, "in-flight entries", self.limits.in_flight_entries)?,
+            self.slow(clients, self.behind, Some(self.pause), "slow follower")?,
+            self.slow(clients, read_behind, None, "log-read burst")?,
+        ])
     }
 
     /// The clients under the limits.
@@ -166,9 +175,11 @@ impl W2 {
 
     /// [`W2::BURST`] times `limit` requests open at once: each client's
     /// window holds its share, one request each.
-    fn burst(&self, clients: usize, what: &str, limit: u64) -> Case {
-        let open = usize::try_from(limit.saturating_mul(Self::BURST)).unwrap_or(usize::MAX);
-        let window = open.div_ceil(clients);
+    fn burst(&self, clients: usize, what: &str, limit: u64) -> Result<Case, W2Overflow> {
+        let open = limit.checked_mul(Self::BURST).ok_or(W2Overflow)?;
+        let window = usize::try_from(open)
+            .map_err(|_| W2Overflow)?
+            .div_ceil(clients);
         let mut case = Case::healthy(
             &format!(
                 "W2 n={} clients={clients} window={window} burst {}x {what}",
@@ -182,23 +193,30 @@ impl W2 {
         case.payload = self.payload_bytes;
         case.limits = Some(self.limits);
         case.window = window;
+        let _ = case.sessions().ok_or(W2Overflow)?;
         // A refused request waits its retry interval: a few intervals.
-        case.steps = case.steps.max(
-            case.retry_after
-                .saturating_mul(Self::BURST.saturating_add(2)),
-        );
-        case
+        let intervals = Self::BURST.checked_add(2).ok_or(W2Overflow)?;
+        let waits = case.retry_after.checked_mul(intervals).ok_or(W2Overflow)?;
+        case.steps = case.steps.max(waits);
+        Ok(case)
     }
 
     /// A follower cut off for `pause` steps (by default, long enough for
     /// the leader to commit `behind` entries), then catching up.
-    fn slow(&self, clients: usize, behind: u64, pause: Option<u64>, what: &str) -> Case {
+    fn slow(
+        &self,
+        clients: usize,
+        behind: u64,
+        pause: Option<u64>,
+        what: &str,
+    ) -> Result<Case, W2Overflow> {
         // Every client's share of the entries the follower misses, and
         // two more each for what it holds before it is cut off.
         let share = usize::try_from(behind)
-            .unwrap_or(usize::MAX)
+            .map_err(|_| W2Overflow)?
             .div_ceil(clients)
-            .saturating_add(2);
+            .checked_add(2)
+            .ok_or(W2Overflow)?;
         let mut case = Case::healthy(
             &format!(
                 "W2 n={} clients={clients} {what} {behind} behind",
@@ -212,16 +230,21 @@ impl W2 {
         case.limits = Some(self.limits);
         // By default, long enough for the share to commit while it is cut
         // off: a few steps for each operation.
-        let work = u64::try_from(share).unwrap_or(u64::MAX).saturating_mul(8);
-        let healed = pause.unwrap_or(work).saturating_add(10);
+        let work = u64::try_from(share)
+            .ok()
+            .and_then(|share| share.checked_mul(8))
+            .ok_or(W2Overflow)?;
+        let healed = pause.unwrap_or(work).checked_add(10).ok_or(W2Overflow)?;
         case.schedule = vec![(10, Action::Isolate(Self::SLOW)), (healed, Action::Heal)];
         // Then twice the catch-up the reference needs at its in-flight
         // entries per resend.
         let catch_up = behind
             .div_ceil(self.limits.in_flight_entries.max(1))
-            .saturating_mul(reference::RESEND);
-        case.steps = healed.max(work).saturating_add(catch_up.saturating_mul(2));
-        case
+            .checked_mul(reference::RESEND)
+            .and_then(|steps| steps.checked_mul(2))
+            .ok_or(W2Overflow)?;
+        case.steps = healed.max(work).checked_add(catch_up).ok_or(W2Overflow)?;
+        Ok(case)
     }
 }
 
@@ -359,10 +382,11 @@ pub struct Case {
 }
 
 impl Case {
-    /// The client sessions it runs: every client's window.
+    /// The client sessions it runs, every client's window; `None` past
+    /// `usize::MAX`.
     #[must_use]
-    pub fn sessions(&self) -> usize {
-        self.clients.saturating_mul(self.window.max(1))
+    pub fn sessions(&self) -> Option<usize> {
+        self.clients.checked_mul(self.window.max(1))
     }
 }
 
@@ -638,7 +662,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     }
     let leader = peers.first().copied().ok_or(RunError::Count)?;
     let mut clients = Vec::new();
-    for index in 0..case.sessions() {
+    for index in 0..case.sessions().ok_or(RunError::Count)? {
         let id = u32::try_from(index)
             .ok()
             .and_then(|index| standby_end.checked_add(index))
@@ -658,8 +682,9 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         .any(|(_, action)| matches!(action, Action::Change(_) | Action::Promote(_)));
     let mut operator = None;
     if changes {
-        let id = u32::try_from(case.sessions())
-            .ok()
+        let id = case
+            .sessions()
+            .and_then(|count| u32::try_from(count).ok())
             .and_then(|count| standby_end.checked_add(count))
             .ok_or(RunError::Count)?;
         let node = ClientNode::new(id, leader, Vec::new(), Rc::clone(&recorder));
