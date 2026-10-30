@@ -622,3 +622,18 @@ fn a_case_whose_entries_exceed_the_read_budget_is_refused() {
         Err(RunError::Unreadable { budget: 256, entry }) if entry > 256
     ));
 }
+
+/// A core that takes no snapshots cannot pass W5's snapshot half: its
+/// first compaction is refused, and the run is not demonstrated
+/// (decided 2026-10-30 by QS-COORDINATOR).
+#[test]
+fn a_core_without_snapshots_is_not_demonstrated_on_w5() {
+    use karyos_sim::harness::workloads::W5Snapshots;
+    for case in W5Snapshots::skeleton().cases().unwrap() {
+        assert!(
+            matches!(run::<Plain>(&case, 1), Err(RunError::Unsupported(_))),
+            "{}",
+            case.name
+        );
+    }
+}

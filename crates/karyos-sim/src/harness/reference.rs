@@ -31,6 +31,12 @@
 //! read budget, and a refused read sends nothing until the next resend.
 //! As a fixture, it labels what it shows harness validation.
 //!
+//! **Snapshots** (W5; karyos#687). It takes the node's compactions, and
+//! when a follower's next entry is below the log's first index, it asks for
+//! the node's snapshot to be sent to it instead of entries. A follower
+//! installing one moves its commit to the base and acknowledges it. As a
+//! fixture, it labels what it shows harness validation.
+//!
 //! **Membership** (phase 5; quantstratum-docs:
 //! karyos/design/phase-5-cluster-scenarios.md, P5-S1). The leader takes
 //! one [`Change`] at a time, once the last configuration entry is
@@ -48,8 +54,8 @@ use std::collections::BTreeMap;
 use karyos_cluster::{Entry, HardState};
 
 use super::core::{
-    Change, ChangeRefused, Configuration, ConsensusCore, Limit, Limits, LogView, NotLeader,
-    Persisted, Ready, Refused, Unsupported,
+    Change, ChangeRefused, Configuration, ConsensusCore, InstallRefused, Limit, Limits, LogView,
+    NotLeader, Persisted, Ready, Refused, SnapshotBase, Unsupported,
 };
 use crate::net::NodeId;
 
@@ -174,6 +180,8 @@ pub struct Reference {
     now: u64,
     /// The limits it was started with, if any.
     limits: Option<Limits>,
+    /// Followers to send the node's snapshot to (W5).
+    snapshot_to: Vec<NodeId>,
 }
 
 impl Reference {
@@ -189,7 +197,10 @@ impl Reference {
             Some(from) => from
                 .checked_sub(1)
                 .filter(|last| *last >= log.first_index()),
-            None => log.last_index(),
+            // An installed log holds nothing yet: its last is the base.
+            None => log
+                .last_index()
+                .or_else(|| log.base().map(|base| base.index)),
         }
     }
 
@@ -310,6 +321,7 @@ impl ConsensusCore for Reference {
             // is the highest event time applied.
             now: 0,
             limits: None,
+            snapshot_to: Vec::new(),
         }
     }
 
@@ -427,13 +439,24 @@ impl ConsensusCore for Reference {
             .filter(|member| *member != self.id)
             .collect();
         for peer in members {
-            let from = self
+            // A follower that acknowledged nothing holds nothing: it needs
+            // the log from its start, index 1, which a compaction may have
+            // purged.
+            let next = self
                 .acked
                 .get(&peer)
                 .copied()
                 .flatten()
-                .map_or(Some(log.first_index()), |index| index.checked_add(1))
+                .map_or(Some(log.first_index().min(1)), |index| index.checked_add(1))
                 .unwrap_or(end);
+            // Below the log's first index: only the snapshot holds it.
+            if next < log.first_index() && log.base().is_some() {
+                if !self.snapshot_to.contains(&peer) {
+                    self.snapshot_to.push(peer);
+                }
+                continue;
+            }
+            let from = next;
             // Within the in-flight limits: it resends from the follower's
             // acknowledgement, so one message is all it has in flight.
             let (end, bytes) = match self.limits {
@@ -518,6 +541,7 @@ impl ConsensusCore for Reference {
             commit: self.commit,
         });
         if self.messages.is_empty()
+            && self.snapshot_to.is_empty()
             && self.unpersisted.is_empty()
             && self.truncate.is_none()
             && hard_state.is_none()
@@ -538,7 +562,7 @@ impl ConsensusCore for Reference {
             hard_state,
             after_persist: std::mem::take(&mut self.after_persist),
             committed,
-            snapshot_to: Vec::new(),
+            snapshot_to: std::mem::take(&mut self.snapshot_to),
         })
     }
 
@@ -575,6 +599,33 @@ impl ConsensusCore for Reference {
             outgoing: Vec::new(),
             learners: learners.to_vec(),
         })
+    }
+
+    fn compacted(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), Unsupported> {
+        let _ = (base, log);
+        // It reads entries through the log and asks for the snapshot when
+        // one is gone: nothing of its own to drop.
+        Ok(())
+    }
+
+    fn install(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), InstallRefused> {
+        if self.commit.is_some_and(|commit| base.index <= commit) {
+            return Err(InstallRefused::Stale);
+        }
+        // Its log restarted after the base, which the node made durable.
+        self.unpersisted.clear();
+        self.truncate = None;
+        self.commit = Some(base.index);
+        self.handed = Some(base.index);
+        let _ = self.acked.insert(self.id, Some(base.index));
+        self.after_persist.push((
+            self.leader,
+            Message::Ack {
+                index: Some(base.index),
+            },
+        ));
+        self.settle(log);
+        Ok(())
     }
 
     fn propose_change(

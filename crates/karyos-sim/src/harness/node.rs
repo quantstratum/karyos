@@ -45,11 +45,12 @@ use std::path::Path;
 use std::rc::Rc;
 
 use karyos_archive::segment::Geometry;
+use karyos_cluster::snapshot::{Section, SectionKind, SnapshotConfig, SnapshotStore};
 use karyos_cluster::{Entry, LogError, RaftLog};
 
 use super::core::{
     Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, Limit, Limits,
-    LogView, ReadBudget, Refused, Release, Step, Unsupported, drive_metered,
+    LogView, ReadBudget, Refused, Release, SnapshotBase, Step, Unsupported, drive_metered,
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
@@ -66,6 +67,20 @@ pub const COMMAND_MAGIC: [u8; 4] = *b"KC5\x01";
 
 /// The directory of a server's log on its disk.
 pub const LOG_DIR: &str = "/raft";
+/// The directory of a server's snapshot store, beside its log (W5).
+pub const SNAPSHOT_DIR: &str = "/snap";
+/// The version of the service section a snapshot holds.
+pub const SERVICE_SECTION_VERSION: u64 = 1;
+
+/// A case's log compaction (W5): a snapshot every `every` applied
+/// entries, the log purged below it but its last `keep` entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Compaction {
+    /// Applied entries between snapshots.
+    pub every: u64,
+    /// Entries kept below a snapshot's base, for a slow follower.
+    pub keep: u64,
+}
 
 /// A client's operation on the test service.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -832,6 +847,43 @@ pub enum Observation {
     /// The harness healed every link ([`super::workloads::Action::Heal`]):
     /// a mark in the order of observations.
     Healed,
+    /// A server took a snapshot of its service and compacted its log
+    /// below `first` (W5): what it dropped, the snapshot holds.
+    Compacted {
+        /// The server.
+        node: NodeId,
+        /// The snapshot's base.
+        base: SnapshotBase,
+        /// The log's first index after the purge.
+        first: u64,
+    },
+    /// A server installed a leader's snapshot (W5): its log restarts after
+    /// `base`, and its service holds the state of `digest`.
+    Installed {
+        /// The server.
+        node: NodeId,
+        /// The snapshot's base.
+        base: SnapshotBase,
+        /// The restored service's digest.
+        digest: u64,
+    },
+    /// A server refused a snapshot it was sent.
+    SnapshotRefused {
+        /// The server.
+        node: NodeId,
+        /// The snapshot's base.
+        base: SnapshotBase,
+        /// Why.
+        reason: String,
+    },
+    /// A server's core lacks a capability the case needs: the case is
+    /// not demonstrated for it, never passed.
+    Unsupported {
+        /// The server.
+        node: NodeId,
+        /// What it lacks.
+        what: &'static str,
+    },
     /// A server's core answered an operator's membership change.
     Change {
         /// The server.
@@ -950,6 +1002,13 @@ pub enum Wire<M> {
     /// An operator's membership change, which the server's core takes or
     /// refuses ([`Observation::Change`]); nothing answers it.
     Change(Change),
+    /// A leader's snapshot (W5): its base and its service section.
+    Snapshot {
+        /// The snapshot's base.
+        base: SnapshotBase,
+        /// The service's state at the base ([`TestService::encode`]).
+        service: Vec<u8>,
+    },
     /// The primary's committed entries after the standby's verified
     /// position, and its commit.
     Feed {
@@ -1036,6 +1095,12 @@ pub struct ServerNode<C: ConsensusCore> {
     /// Its duty's log-read budget, refilled at each tick and delivery
     /// under [`Limits::log_read_bytes`].
     budget: ReadBudget,
+    /// Its compaction, if the case has one (W5).
+    compaction: Option<Compaction>,
+    /// Its snapshot store, when it compacts.
+    snapshots: Option<SnapshotStore<SimDisk>>,
+    /// Its latest snapshot's base.
+    base: Option<SnapshotBase>,
 }
 
 /// Why a server could not be created.
@@ -1160,6 +1225,9 @@ impl<C: ConsensusCore> ServerNode<C> {
             standby: None,
             limits,
             budget: ReadBudget::new(),
+            compaction: None,
+            snapshots: None,
+            base: None,
         };
         if let Some(configuration) = configuration {
             server.record_configuration(configuration, None);
@@ -1198,9 +1266,196 @@ impl<C: ConsensusCore> ServerNode<C> {
             standby: None,
             limits: None,
             budget: ReadBudget::new(),
+            compaction: None,
+            snapshots: None,
+            base: None,
         };
         server.start();
         server
+    }
+
+    /// Compacts its log under `compaction` (W5), with a snapshot store
+    /// beside its log; it is lost when the store does not open.
+    #[must_use]
+    pub fn with_compaction(mut self, compaction: Compaction) -> Self {
+        self.compaction = Some(compaction);
+        match Self::open_snapshots(&self.disk, self.geometry) {
+            Ok(store) => self.snapshots = Some(store),
+            Err(error) => self.lost = Some(error),
+        }
+        self
+    }
+
+    fn open_snapshots(
+        disk: &SimDisk,
+        geometry: Geometry,
+    ) -> Result<SnapshotStore<SimDisk>, String> {
+        SnapshotStore::open(
+            disk.clone(),
+            Path::new(SNAPSHOT_DIR),
+            geometry,
+            SnapshotConfig::default(),
+        )
+        .map(|opened| opened.store)
+        .map_err(|error| format!("snapshot store: {error}"))
+    }
+
+    /// The service section of `store`'s latest snapshot, and its base.
+    fn latest_service(store: &SnapshotStore<SimDisk>) -> Option<(SnapshotBase, Vec<u8>)> {
+        let info = store.latest()?;
+        let sections = store.read(&info).ok()?;
+        let service = sections
+            .into_iter()
+            .find(|section| section.kind == SectionKind::Service)?;
+        Some((
+            SnapshotBase {
+                index: info.index,
+                term: info.term,
+            },
+            service.bytes,
+        ))
+    }
+
+    /// Takes a snapshot of its service and compacts its log, when its
+    /// service has applied [`Compaction::every`] entries since the last.
+    fn compact(&mut self, core: &mut C, log: &mut RaftLog<SimDisk>) {
+        let (Some(compaction), Some(store), Some(applied)) = (
+            self.compaction,
+            self.snapshots.as_mut(),
+            self.service.applied(),
+        ) else {
+            return;
+        };
+        let since = self
+            .base
+            .map_or(Some(applied), |base| applied.checked_sub(base.index));
+        if since.is_none_or(|since| since < compaction.every.max(1)) {
+            return;
+        }
+        let (Some(term), Some(bytes)) = (log.term(applied), self.service.encode()) else {
+            return;
+        };
+        let written = store.write(
+            applied,
+            term,
+            &[Section::new(
+                SectionKind::Service,
+                SERVICE_SECTION_VERSION,
+                &bytes,
+            )],
+        );
+        if let Err(error) = written {
+            self.observe(Observation::SnapshotRefused {
+                node: self.id,
+                base: SnapshotBase {
+                    index: applied,
+                    term,
+                },
+                reason: format!("write: {error}"),
+            });
+            return;
+        }
+        let base = SnapshotBase {
+            index: applied,
+            term,
+        };
+        self.base = Some(base);
+        // Keep the last `keep` entries below the base for a slow follower.
+        if let Some(below) = applied
+            .checked_add(1)
+            .and_then(|next| next.checked_sub(compaction.keep))
+        {
+            let _ = log.purge_prefix(below);
+        }
+        let first = log.first_index();
+        if core
+            .compacted(base, &mut LogView::new(log).with_base(Some(base)))
+            .is_err()
+        {
+            // The core takes no snapshots: never again under it.
+            self.compaction = None;
+            self.observe(Observation::Unsupported {
+                node: self.id,
+                what: "compacted",
+            });
+        }
+        self.observe(Observation::Compacted {
+            node: self.id,
+            base,
+            first,
+        });
+    }
+
+    /// Sends its latest snapshot to `to`, which needs entries its log no
+    /// longer holds.
+    fn send_snapshot(&self, to: NodeId, out: &mut Outbox<Wire<C::Message>>) {
+        let Some((base, service)) = self.snapshots.as_ref().and_then(Self::latest_service) else {
+            return;
+        };
+        out.push((to, Wire::Snapshot { base, service }));
+    }
+
+    /// Installs a leader's snapshot: written to its store first, then the
+    /// log restarts after it, the service restores it, and the core is
+    /// told; any refusal is recorded and changes nothing further.
+    fn install_snapshot(
+        &mut self,
+        core: &mut C,
+        log: &mut RaftLog<SimDisk>,
+        (base, bytes): (SnapshotBase, Vec<u8>),
+    ) {
+        let node = self.id;
+        let refuse = |this: &Self, reason: String| {
+            this.observe(Observation::SnapshotRefused { node, base, reason });
+        };
+        if self
+            .service
+            .applied()
+            .is_some_and(|applied| base.index <= applied)
+        {
+            return;
+        }
+        let Some(service) = TestService::decode(&bytes) else {
+            return refuse(self, "malformed service section".to_owned());
+        };
+        if service.applied() != Some(base.index) {
+            return refuse(self, "service section not at its base".to_owned());
+        }
+        let Some(store) = self.snapshots.as_mut() else {
+            return refuse(self, "no snapshot store".to_owned());
+        };
+        if let Err(error) = store.write(
+            base.index,
+            base.term,
+            &[Section::new(
+                SectionKind::Service,
+                SERVICE_SECTION_VERSION,
+                &bytes,
+            )],
+        ) {
+            return refuse(self, format!("write: {error}"));
+        }
+        if let Err(error) = log.install(base.index, base.term, store) {
+            return refuse(self, format!("install: {error}"));
+        }
+        self.base = Some(base);
+        let digest = service.digest();
+        self.service = service;
+        self.observe(Observation::Installed { node, base, digest });
+        if let Err(refused) = core.install(base, &mut LogView::new(log).with_base(Some(base))) {
+            match refused {
+                super::core::InstallRefused::Unsupported => {
+                    self.compaction = None;
+                    self.observe(Observation::Unsupported {
+                        node,
+                        what: "install",
+                    });
+                }
+                super::core::InstallRefused::Stale => {
+                    refuse(self, "the core holds the base already".to_owned());
+                }
+            }
+        }
     }
 
     /// Feeds its committed entries to the standby servers `to` while its
@@ -1301,11 +1556,12 @@ impl<C: ConsensusCore> ServerNode<C> {
         let node = self.id;
         let recorder = Rc::clone(&self.recorder);
         let mut applied = Vec::new();
+        let mut snapshot_to = Vec::new();
         let budget = self.limits.is_some().then_some(&self.budget);
         let driven = drive_metered(
             &mut core,
             &mut log,
-            budget,
+            (budget, self.base),
             &mut |to, message, release| {
                 if let Some(release) = release {
                     recorder
@@ -1317,6 +1573,9 @@ impl<C: ConsensusCore> ServerNode<C> {
             },
             &mut |entry, applying| applied.push((entry.clone(), applying)),
             &mut |step| {
+                if let Step::SnapshotTo(to) = step {
+                    snapshot_to.push(to);
+                }
                 recorder
                     .borrow_mut()
                     .observations
@@ -1349,6 +1608,15 @@ impl<C: ConsensusCore> ServerNode<C> {
         let acts = self.acts();
         let verified_before = self.standby.as_ref().and_then(|standby| standby.verified);
         for (entry, applying) in applied {
+            // A snapshot already holds it (W5): the service skips it.
+            if self
+                .service
+                .applied()
+                .is_some_and(|applied| entry.index <= applied)
+                && self.base.is_some()
+            {
+                continue;
+            }
             // A standby's service applies the primary entry an entry
             // wraps, once.
             let mut served = entry.clone();
@@ -1441,6 +1709,10 @@ impl<C: ConsensusCore> ServerNode<C> {
             });
             self.commit = committed;
         }
+        self.compact(&mut core, &mut log);
+        for to in snapshot_to {
+            self.send_snapshot(to, out);
+        }
         self.positions(&core, &log);
         self.running = Some((core, log));
     }
@@ -1459,8 +1731,14 @@ impl<C: ConsensusCore> ServerNode<C> {
             node: self.id,
             positions: Positions {
                 received: core.received(),
-                written: log.last_index(),
-                durable: log.durable_index(),
+                // An installed log that holds nothing yet: the snapshot
+                // holds up to its base, durably.
+                written: log
+                    .last_index()
+                    .or_else(|| log.base().map(|(index, _)| index)),
+                durable: log
+                    .durable_index()
+                    .or_else(|| log.base().map(|(index, _)| index)),
                 committed: core.committed(),
                 applied: self.service.applied(),
             },
@@ -1476,7 +1754,26 @@ impl<C: ConsensusCore> ServerNode<C> {
             });
             return;
         }
-        let opened = RaftLog::open(self.disk.clone(), Path::new(LOG_DIR), self.geometry);
+        if self.compaction.is_some() {
+            match Self::open_snapshots(&self.disk, self.geometry) {
+                Ok(store) => self.snapshots = Some(store),
+                Err(error) => {
+                    self.observe(Observation::OpenFailed {
+                        node: self.id,
+                        error,
+                    });
+                    return;
+                }
+            }
+        }
+        let latest = self.snapshots.as_ref().and_then(Self::latest_service);
+        self.base = latest.as_ref().map(|(base, _)| *base);
+        let opened = RaftLog::open_with(
+            self.disk.clone(),
+            Path::new(LOG_DIR),
+            self.geometry,
+            self.snapshots.as_ref(),
+        );
         let mut log = match opened {
             Ok(opened) => opened.log,
             Err(error) => {
@@ -1510,10 +1807,13 @@ impl<C: ConsensusCore> ServerNode<C> {
                 return;
             }
         };
-        // The service's state is rebuilt from the log as the core hands
-        // out its committed entries again; the recovered commit is a
+        // The service's state is its latest snapshot's, then rebuilt from
+        // the log as the core hands out its committed entries again (those
+        // the snapshot holds are skipped); the recovered commit is a
         // baseline, not a new commit.
-        self.service = TestService::default();
+        self.service = latest
+            .and_then(|(_, bytes)| TestService::decode(&bytes))
+            .unwrap_or_default();
         self.commit = core.committed();
         // A standby rebuilds its verified position as its service does.
         if let Some(standby) = self.standby.as_mut() {
@@ -1535,7 +1835,10 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
         self.now = now;
         let budget = self.refill();
         if let Some((core, log)) = self.running.as_mut() {
-            core.tick(now, &mut LogView::metered(log, budget.as_ref()));
+            core.tick(
+                now,
+                &mut LogView::metered(log, budget.as_ref()).with_base(self.base),
+            );
             if core.leads() {
                 if let Some(lease) = &self.lease {
                     let mut lease = lease.borrow_mut();
@@ -1561,12 +1864,20 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
         out: &mut Outbox<Wire<C::Message>>,
     ) {
         self.now = now;
+        if let Wire::Snapshot { base, service } = message {
+            if let Some((mut core, mut log)) = self.running.take() {
+                self.install_snapshot(&mut core, &mut log, (base, service));
+                self.running = Some((core, log));
+            }
+            self.duty(out);
+            return;
+        }
         let acts = self.acts();
         let budget = self.refill();
         let Some((core, log)) = self.running.as_mut() else {
             return;
         };
-        let mut view = LogView::metered(log, budget.as_ref());
+        let mut view = LogView::metered(log, budget.as_ref()).with_base(self.base);
         match message {
             Wire::Core(message) => core.step(from, message, &mut view),
             Wire::Request(command) if !acts => out.push((
@@ -1663,6 +1974,7 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
                 }
             }
             Wire::Response { .. }
+            | Wire::Snapshot { .. }
             | Wire::Refused { .. }
             | Wire::Busy { .. }
             | Wire::Redirect { .. } => {}

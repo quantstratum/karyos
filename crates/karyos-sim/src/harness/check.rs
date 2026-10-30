@@ -373,6 +373,22 @@ impl DurableLogs {
                 let _ = self.logs.insert(*node, log);
                 Vec::new()
             }
+            // A compaction drops entries its snapshot holds: no loss.
+            Observation::Compacted { node, first, .. } => {
+                if let Some(log) = self.logs.get_mut(node) {
+                    *log = log.split_off(first);
+                }
+                Vec::new()
+            }
+            // An install drops the whole log: entries up to the base its
+            // snapshot holds; any after it are removed, as a truncation.
+            Observation::Installed { node, base, .. } => {
+                let log = self.logs.remove(node).unwrap_or_default();
+                log.into_iter()
+                    .filter(|(index, _)| *index > base.index)
+                    .map(|(index, term)| (*node, index, term))
+                    .collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -874,6 +890,10 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::Change { node, .. }
         | Observation::FeedRefused { node, .. }
         | Observation::Backpressure { node, .. }
+        | Observation::Compacted { node, .. }
+        | Observation::Installed { node, .. }
+        | Observation::SnapshotRefused { node, .. }
+        | Observation::Unsupported { node, .. }
         | Observation::FeedApplied { node, .. }
         | Observation::Promoted { node, .. } => Some(*node),
         Observation::Success { .. }

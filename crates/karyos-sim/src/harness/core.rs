@@ -543,6 +543,9 @@ pub enum ChangeRefused {
 /// What [`drive`] reports, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
+    /// A [`Ready`] asks for the node's latest snapshot to be sent to a
+    /// follower ([`Ready::snapshot_to`]), before anything else of it.
+    SnapshotTo(NodeId),
     /// A [`Ready`]'s truncation, entries and hard state are durable.
     Persisted {
         /// What the core was told.
@@ -627,10 +630,11 @@ pub fn drive<C: ConsensusCore>(
     apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
 ) -> Result<(), DriveError> {
-    drive_metered(core, log, None, send, apply, observe)
+    drive_metered(core, log, (None, None), send, apply, observe)
 }
 
-/// [`drive`], the core's reads spending `budget` when one is given.
+/// [`drive`], the core's reads spending `budget` when one is given, and
+/// its views naming `base` as the node's latest snapshot.
 ///
 /// # Errors
 ///
@@ -638,19 +642,22 @@ pub fn drive<C: ConsensusCore>(
 pub fn drive_metered<C: ConsensusCore>(
     core: &mut C,
     log: &mut RaftLog<SimDisk>,
-    budget: Option<&ReadBudget>,
+    (budget, base): (Option<&ReadBudget>, Option<SnapshotBase>),
     send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
     apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
 ) -> Result<(), DriveError> {
     let mut readies = 0usize;
-    while let Some(ready) = core.ready(&mut LogView::metered(log, budget)) {
+    while let Some(ready) = core.ready(&mut LogView::metered(log, budget).with_base(base)) {
         if readies == MAX_READIES {
             return Err(DriveError::WorkBudget { readies });
         }
         // Below MAX_READIES, so it does not overflow.
         readies += 1;
         // 1. What depends on nothing.
+        for to in ready.snapshot_to {
+            observe(Step::SnapshotTo(to));
+        }
         for (to, message) in ready.messages {
             send(to, message, None);
         }
@@ -674,7 +681,10 @@ pub fn drive_metered<C: ConsensusCore>(
             durable,
             hard_state: ready.hard_state,
         };
-        core.advance(persisted, &mut LogView::metered(log, budget));
+        core.advance(
+            persisted,
+            &mut LogView::metered(log, budget).with_base(base),
+        );
         observe(Step::Persisted {
             persisted,
             truncated_from: ready.truncate_from,
