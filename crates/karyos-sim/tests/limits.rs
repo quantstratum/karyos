@@ -28,6 +28,8 @@ use karyos_sim::net::NodeId;
 thread_local! {
     /// The most entries one `Watched` append message carried.
     static LARGEST: Cell<usize> = const { Cell::new(0) };
+    /// The most payload bytes one `Watched` append message carried.
+    static HEAVIEST: Cell<usize> = const { Cell::new(0) };
 }
 
 /// `Reference` with no `recover_with`: a core that takes no limits.
@@ -109,6 +111,11 @@ impl ConsensusCore for Watched {
         for (_, message) in &ready.messages {
             if let Message::Append { entries, .. } = message {
                 LARGEST.with(|largest| largest.set(largest.get().max(entries.len())));
+                let bytes = entries
+                    .iter()
+                    .map(|entry| entry.payload.len())
+                    .sum::<usize>();
+                HEAVIEST.with(|heaviest| heaviest.set(heaviest.get().max(bytes)));
             }
         }
         Some(ready)
@@ -275,4 +282,43 @@ fn a_metered_view_spends_and_refuses_its_budget() {
     // Unmetered, the same read takes them all.
     let mut free = LogView::new(&mut log);
     assert_eq!(free.entries(1..9, u64::MAX).unwrap().len(), 8);
+}
+
+/// Each append message carries at most the in-flight bytes, and a command
+/// no append could carry within them is refused with typed backpressure,
+/// never sent past the cap (karyos#899 review, codex: a 256-byte cap and
+/// 273-byte commands sent 273 bytes with no refusal).
+#[test]
+fn an_append_holds_to_the_in_flight_bytes() {
+    // Two 273-byte commands fit in 600 bytes, three do not.
+    let case = limited(
+        "in-flight bytes",
+        8,
+        Limits {
+            in_flight_bytes: 600,
+            ..Limits::W2
+        },
+    );
+    HEAVIEST.with(|heaviest| heaviest.set(0));
+    let outcome = run::<Watched>(&case, 1).unwrap();
+    assert_eq!(pass(&case, &outcome), Ok(None));
+    let heaviest = HEAVIEST.with(Cell::get);
+    assert!((1..=600).contains(&heaviest), "heaviest append {heaviest}");
+    // Below one command: every request is refused, typed, and nothing is
+    // appended past the cap; progress stops, which this case allows.
+    let mut tight = limited(
+        "in-flight bytes below a command",
+        2,
+        Limits {
+            in_flight_bytes: 256,
+            ..Limits::W2
+        },
+    );
+    tight.progress = karyos_sim::harness::workloads::Progress::MayStop;
+    tight.steps = 1_000;
+    HEAVIEST.with(|heaviest| heaviest.set(0));
+    let outcome = run::<Watched>(&tight, 1).unwrap();
+    assert!(refusals(&outcome.observations, Limit::InFlightBytes) > 0);
+    assert_eq!(HEAVIEST.with(Cell::get), 0, "nothing sent past the cap");
+    assert!(pass(&tight, &outcome).is_ok());
 }

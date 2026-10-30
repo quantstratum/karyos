@@ -103,6 +103,25 @@ pub fn decode_configuration(bytes: &[u8]) -> Option<(Vec<NodeId>, Vec<NodeId>)> 
     rest.is_empty().then_some((voters, learners))
 }
 
+/// How many of `entries`, from the first, have payloads that fit in
+/// `bytes`.
+fn fitting(entries: &[Entry], bytes: u64) -> usize {
+    let mut spent = 0u64;
+    entries
+        .iter()
+        .take_while(|entry| {
+            let next = u64::try_from(entry.payload.len())
+                .ok()
+                .and_then(|payload| spent.checked_add(payload))
+                .filter(|next| *next <= bytes);
+            if let Some(next) = next {
+                spent = next;
+            }
+            next.is_some()
+        })
+        .count()
+}
+
 /// A configuration in the log: the entry's index, the voters and the
 /// learners.
 type Logged = (u64, Vec<NodeId>, Vec<NodeId>);
@@ -316,6 +335,12 @@ impl ConsensusCore for Reference {
         let Some(index) = self.next(log) else {
             return Err(not_leader.into());
         };
+        // A command no append could carry within the in-flight bytes.
+        if self.limits.is_some_and(|limits| {
+            u64::try_from(command.len()).map_or(true, |bytes| bytes > limits.in_flight_bytes)
+        }) {
+            return Err(Refused::Backpressure(Limit::InFlightBytes));
+        }
         // Held and not committed: what it proposed past its commit. A
         // count it cannot take fails closed, refused as a full queue.
         let held = self
@@ -420,13 +445,18 @@ impl ConsensusCore for Reference {
                 ),
                 None => (end, BATCH_BYTES),
             };
-            let entries = if from < end {
+            let mut entries = if from < end {
                 // A failed or refused read sends none; the next resend
                 // retries.
                 log.entries(from..end, bytes).unwrap_or_default()
             } else {
                 Vec::new()
             };
+            // The log returns at least one entry: keep the payloads that
+            // fit the in-flight bytes (karyos#899 review, codex).
+            if let Some(limits) = self.limits {
+                entries.truncate(fitting(&entries, limits.in_flight_bytes));
+            }
             self.messages.push((
                 peer,
                 Message::Append {
