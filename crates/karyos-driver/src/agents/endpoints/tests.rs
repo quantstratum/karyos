@@ -919,3 +919,63 @@ fn a_standing_request_kept_through_a_reset_is_dropped_at_the_reopen() {
         "dropped by the poll, uncounted"
     );
 }
+
+/// #847: a standing request the ring refused (counted once), then refused
+/// for good, is counted refused once, not twice, and dropped.
+#[test]
+fn a_standing_request_refused_then_dropped_is_counted_once() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    settle(&mut agents, &links, &mut endpoints, 1);
+    let mut held = Vec::new();
+    while let Ok(prepared) = links.sender.prepare() {
+        held.push(prepared);
+    }
+    let epoch = epoch_of(&endpoints, id);
+    endpoints.requested(&links, id, Some(epoch), 10 * SEC);
+    assert_eq!(endpoints.counters().resets_refused, 1);
+    drop(held);
+    drop(agents);
+    endpoints.poll(&links, 12 * SEC, |_| {}, |_| {});
+    let counters = endpoints.counters();
+    assert_eq!(counters.standing_dropped, 1, "dropped");
+    assert_eq!(counters.resets_refused, 1, "counted once");
+}
+
+/// #847: a fault while the endpoint is not active, long after its last
+/// reset's interval ended, does not double the next interval: the reset
+/// it gets starts over at 1 s.
+#[test]
+fn a_fault_after_the_interval_while_inactive_does_not_double_it() {
+    const SEC: u64 = 1_000_000_000;
+
+    let agent_config = AgentConfig::default();
+    let (mut agents, links, mut endpoints) = table(&agent_config);
+    let id = endpoints
+        .open(&links, config(), ScriptedSocket::new())
+        .unwrap();
+    settle(&mut agents, &links, &mut endpoints, 1);
+    endpoints.requested(&links, id, None, 10 * SEC);
+    assert_eq!(endpoints.counters().resets, 1);
+    // Its reset still in flight (nothing polled) long after the interval:
+    // a standing request waits for it to be active again.
+    let epoch = epoch_of(&endpoints, id);
+    endpoints.requested(&links, id, Some(epoch), 100 * SEC);
+    // The reopen drops that request (its epoch is gone).
+    poll_at(&mut endpoints, &mut agents, &links, 100 * SEC);
+    // The next fault resets, and its interval starts over at 1 s.
+    endpoints.requested(&links, id, None, 101 * SEC);
+    poll_at(&mut endpoints, &mut agents, &links, 101 * SEC);
+    let resets = endpoints.counters().resets;
+    assert_eq!(resets, 2);
+    // A fault 1.5 s after that reset is past a 1 s interval.
+    endpoints.requested(&links, id, None, 102 * SEC + SEC / 2);
+    let counters = endpoints.counters();
+    assert_eq!(counters.resets_deferred, 0, "the interval is 1 s, not 2 s");
+    assert_eq!(counters.resets, resets + 1);
+}

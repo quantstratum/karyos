@@ -685,8 +685,12 @@ impl<O: SocketOps> Endpoints<O> {
                 Some(epoch) => {
                     // A fault while its reset is in flight: the next reset
                     // doubles the interval, as a deferral does. Not before
-                    // a first reset (the endpoint still opening).
-                    if entry.last_reset.is_some() {
+                    // a first reset (the endpoint still opening), nor once
+                    // its interval has elapsed.
+                    if entry
+                        .last_reset
+                        .is_some_and(|at| !elapsed(at, now, entry.backoff))
+                    {
                         entry.deferred = true;
                     }
                     entry.waiting = Some(epoch);
@@ -740,13 +744,16 @@ impl<O: SocketOps> Endpoints<O> {
                         entry.waiting = Some(epoch);
                     }
                     // Any other error (the agent gone, a broken invariant)
-                    // drops it, counted.
+                    // drops it, counted; a refusal already counted while it
+                    // stood is not counted again.
                     (Some(_), entry) => {
-                        if let Some(entry) = entry {
+                        let counted = entry.is_some_and(|entry| {
                             entry.waiting = None;
-                            entry.refused_at = None;
+                            entry.refused_at.take().is_some()
+                        });
+                        if !counted {
+                            self.counters.bump(|c| &mut c.resets_refused);
                         }
-                        self.counters.bump(|c| &mut c.resets_refused);
                         self.counters.bump(|c| &mut c.standing_dropped);
                     }
                     // An ordinary one is counted, and leaves a kept standing
