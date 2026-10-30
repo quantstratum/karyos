@@ -603,3 +603,179 @@ fn a_failed_metered_read_is_charged_and_an_empty_one_is_free() {
         Err(ReadError::Budget)
     ));
 }
+
+/// A case whose entries are larger than a duty's whole log-read budget is
+/// refused before it runs: no core could read them back, so replication
+/// would only stall (karyos#899 review, QS-REVIEWER).
+#[test]
+fn a_case_whose_entries_exceed_the_read_budget_is_refused() {
+    let case = limited(
+        "unreadable",
+        2,
+        Limits {
+            log_read_bytes: 256,
+            ..Limits::W2
+        },
+    );
+    assert!(matches!(
+        run::<Reference>(&case, 1),
+        Err(RunError::Unreadable { budget: 256, entry }) if entry > 256
+    ));
+}
+
+/// A core that takes no snapshots cannot pass W5's snapshot half: its
+/// first compaction is refused, and the run is not demonstrated
+/// (decided 2026-10-30 by QS-COORDINATOR).
+#[test]
+fn a_core_without_snapshots_is_not_demonstrated_on_w5() {
+    use karyos_sim::harness::workloads::W5Snapshots;
+    for case in W5Snapshots::skeleton().cases().unwrap() {
+        assert!(
+            matches!(run::<Plain>(&case, 1), Err(RunError::Unsupported(_))),
+            "{}",
+            case.name
+        );
+    }
+}
+
+thread_local! {
+    /// The most payload bytes `Greedy`'s hooks read in one call.
+    static GREEDIEST: Cell<usize> = const { Cell::new(0) };
+}
+
+/// `Reference` whose compaction hook reads all it can of the log.
+#[derive(Debug)]
+struct Greedy(Reference);
+
+impl ConsensusCore for Greedy {
+    type Message = Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        Self(Reference::recover(id, peers, log))
+    }
+
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, karyos_sim::harness::core::Unsupported> {
+        Reference::recover_with(id, peers, limits, log).map(Self)
+    }
+
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Message>> {
+        self.0.ready(log)
+    }
+
+    fn compacted(
+        &mut self,
+        base: karyos_sim::harness::core::SnapshotBase,
+        log: &mut LogView<'_>,
+    ) -> Result<(), karyos_sim::harness::core::Unsupported> {
+        let (first, last) = (log.first_index(), log.last_index().unwrap_or(0));
+        let mut read = 0;
+        let mut next = first;
+        while let Ok(entries) = log.entries(next..last + 1, u64::MAX) {
+            if entries.is_empty() {
+                break;
+            }
+            read += entries
+                .iter()
+                .map(|entry| entry.payload.len())
+                .sum::<usize>();
+            next += u64::try_from(entries.len()).unwrap();
+        }
+        GREEDIEST.with(|greediest| greediest.set(greediest.get().max(read)));
+        self.0.compacted(base, log)
+    }
+
+    fn install(
+        &mut self,
+        base: karyos_sim::harness::core::SnapshotBase,
+        log: &mut LogView<'_>,
+    ) -> Result<(), karyos_sim::harness::core::InstallRefused> {
+        self.0.install(base, log)
+    }
+
+    delegate!(Greedy);
+}
+
+/// A core's snapshot hooks read under the duty's budget too (karyos#903
+/// review, codex: compacted got an unmetered view and read 5,460 bytes
+/// against a 400-byte budget).
+#[test]
+fn the_snapshot_hooks_read_under_the_duty_budget() {
+    use karyos_sim::harness::workloads::W5Snapshots;
+    let mut case = W5Snapshots::skeleton().cases().unwrap().remove(0);
+    case.limits = Some(Limits {
+        log_read_bytes: 1_000,
+        ..Limits::W2
+    });
+    GREEDIEST.with(|greediest| greediest.set(0));
+    let outcome = run::<Greedy>(&case, 1).unwrap();
+    assert_eq!(pass(&case, &outcome), Ok(None));
+    let greediest = GREEDIEST.with(Cell::get);
+    assert!(
+        (1..=1_000).contains(&greediest),
+        "a hook read {greediest} bytes"
+    );
+}
+
+thread_local! {
+    /// Whether a `Seer` recovered with a snapshot base in view.
+    static SAW_BASE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `Reference` noting whether its recovery sees the node's snapshot base.
+#[derive(Debug)]
+struct Seer(Reference);
+
+impl ConsensusCore for Seer {
+    type Message = Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        if log.base().is_some() {
+            SAW_BASE.with(|saw| saw.set(true));
+        }
+        Self(Reference::recover(id, peers, log))
+    }
+
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Message>> {
+        self.0.ready(log)
+    }
+
+    fn compacted(
+        &mut self,
+        base: karyos_sim::harness::core::SnapshotBase,
+        log: &mut LogView<'_>,
+    ) -> Result<(), karyos_sim::harness::core::Unsupported> {
+        self.0.compacted(base, log)
+    }
+
+    fn install(
+        &mut self,
+        base: karyos_sim::harness::core::SnapshotBase,
+        log: &mut LogView<'_>,
+    ) -> Result<(), karyos_sim::harness::core::InstallRefused> {
+        self.0.install(base, log)
+    }
+
+    delegate!(Seer);
+}
+
+/// A core restarted over a compacted log sees its node's snapshot base
+/// (karyos#903 review, codex: recovery saw first index 91 and no base).
+#[test]
+fn a_restarted_core_sees_its_snapshot_base() {
+    use karyos_sim::harness::workloads::W5Snapshots as W5;
+    let case = W5::skeleton()
+        .cases()
+        .unwrap()
+        .into_iter()
+        .find(|case| case.name.contains("between builds"))
+        .unwrap();
+    SAW_BASE.with(|saw| saw.set(false));
+    let outcome = run::<Seer>(&case, 1).unwrap();
+    assert_eq!(pass(&case, &outcome), Ok(None));
+    assert!(SAW_BASE.with(Cell::get), "the restarted core saw no base");
+}

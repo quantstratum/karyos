@@ -29,8 +29,8 @@ use karyos_cluster::LogError;
 use super::check::{self, Violation};
 use super::core::{Change, ConsensusCore, Limits, Unsupported};
 use super::node::{
-    ClientNode, Member, Observation, Op, RETRY_AFTER, Recorder, Ret, ServerError, ServerNode,
-    ServiceModel, Shared, TestService, Wire,
+    ClientNode, Compaction, Member, Observation, Op, RETRY_AFTER, Recorder, Ret, ServerError,
+    ServerNode, ServiceModel, Shared, TestService, Wire,
 };
 use super::reference;
 use super::standby::{ExternalLease, FeedFault, Fencing};
@@ -255,7 +255,8 @@ impl W2 {
     }
 }
 
-/// W5, snapshots and retries.
+/// W5's retries: a lost reply, a leader change and a retry answered from
+/// deduplication (P3 of karyos#687).
 ///
 /// # Errors
 ///
@@ -263,9 +264,135 @@ impl W2 {
 pub fn w5() -> Result<Vec<Case>, NotYet> {
     Err(NotYet {
         workload: "W5",
-        reason: "needs snapshots and compaction in the core interface and the \
-                 log, and a leader change for its lost-reply retries",
+        reason: "its retries need a leader change in the core interface \
+                 (karyos#687 P3); its snapshot half is W5Snapshots",
     })
+}
+
+/// W5's snapshot half (karyos#687 P2): compaction, a follower held behind
+/// the compaction point, and snapshot build and install interrupted.
+///
+/// The manifest freezes 3 servers, 2 clients, 256 B payloads, compaction
+/// every 1,000 applied entries keeping 100, a follower held behind the
+/// compaction point, and snapshot build and install interrupted at every
+/// manifest and truncation boundary. A build or an install runs whole
+/// within one step of the simulator, so a step's crash cannot cut it: its
+/// boundaries are crashed one disk operation at a time by the snapshot
+/// store's and the log install's own tests (`tests/snapshot_crash.rs`,
+/// `tests/log_install.rs`). Here, in whole runs, a follower crashes after
+/// the heal and installs once restarted, and a server crashes between two
+/// of its builds. A core that takes no snapshots has these cases not
+/// demonstrated, never passed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct W5Snapshots {
+    /// Servers.
+    pub processes: usize,
+    /// Clients.
+    pub clients: usize,
+    /// Bytes per appended value.
+    pub payload_bytes: usize,
+    /// The compaction.
+    pub compaction: Compaction,
+}
+
+impl W5Snapshots {
+    /// The follower held behind: not the reference's leader.
+    pub const BEHIND: NodeId = 2;
+
+    /// The values the manifest freezes.
+    #[must_use]
+    pub fn manifest() -> Self {
+        Self {
+            processes: 3,
+            clients: 2,
+            payload_bytes: 256,
+            compaction: Compaction {
+                every: 1_000,
+                keep: 100,
+            },
+        }
+    }
+
+    /// The values the skeleton runs in the test suite: a tenth of the
+    /// manifest's compaction.
+    #[must_use]
+    pub fn skeleton() -> Self {
+        Self {
+            compaction: Compaction {
+                every: 100,
+                keep: 10,
+            },
+            ..Self::manifest()
+        }
+    }
+
+    /// Its cases.
+    ///
+    /// # Errors
+    ///
+    /// [`W2Overflow`] when a count derived from its values passes its type.
+    pub fn cases(&self) -> Result<Vec<Case>, W2Overflow> {
+        let every = self.compaction.every.max(1);
+        // Three compactions' worth of entries, between the clients.
+        let entries = every.checked_mul(3).ok_or(W2Overflow)?;
+        let clients = self.clients.max(1);
+        let share = usize::try_from(entries)
+            .map_err(|_| W2Overflow)?
+            .div_ceil(clients);
+        let work = u64::try_from(share)
+            .ok()
+            .and_then(|share| share.checked_mul(8))
+            .ok_or(W2Overflow)?;
+        let steps = work.checked_mul(2).ok_or(W2Overflow)?;
+        let base = |name: &str| {
+            let mut case = Case::healthy(
+                &format!("W5 n={} {name}", self.processes),
+                self.processes,
+                clients,
+                share,
+            );
+            case.payload = self.payload_bytes;
+            case.compaction = Some(self.compaction);
+            case.converged = true;
+            case.steps = steps;
+            case
+        };
+        let compaction = base("compaction under load");
+        // Held behind the compaction point until two compactions passed.
+        let mut behind = base("follower behind the compaction point");
+        let heal = work
+            .checked_mul(2)
+            .ok_or(W2Overflow)?
+            .checked_div(3)
+            .ok_or(W2Overflow)?;
+        behind.schedule = vec![(1, Action::Isolate(Self::BEHIND)), (heal, Action::Heal)];
+        let gap = every.checked_add(self.compaction.keep).ok_or(W2Overflow)?;
+        behind.behind = Some((Self::BEHIND, gap));
+        behind.steps = work.checked_mul(3).ok_or(W2Overflow)?;
+        // The same, the follower crashing right after the heal and
+        // installing once restarted.
+        let mut install = behind.clone();
+        install.name = format!("W5 n={} follower crash around its install", self.processes);
+        install.schedule.extend([
+            (
+                heal.checked_add(2).ok_or(W2Overflow)?,
+                Action::Crash(Self::BEHIND),
+            ),
+            (
+                heal.checked_add(40).ok_or(W2Overflow)?,
+                Action::Restart(Self::BEHIND),
+            ),
+        ]);
+        // A follower crashing between its first and second snapshot
+        // builds, restarting from its snapshot and its log.
+        let mut build = base("follower crash between builds");
+        let at = work.checked_div(3).ok_or(W2Overflow)?;
+        build.schedule = vec![
+            (at, Action::Crash(1)),
+            (at.checked_add(40).ok_or(W2Overflow)?, Action::Restart(1)),
+        ];
+        Ok(vec![compaction, behind, install, build])
+    }
 }
 
 /// A scheduled change to a run.
@@ -393,6 +520,8 @@ pub struct Case {
     /// What the case does not cover, stated in every raw result line of
     /// its runs: W2's [`W2::IN_FLIGHT_BYTES`].
     pub notes: Vec<&'static str>,
+    /// Its servers' log compaction (W5), if any.
+    pub compaction: Option<Compaction>,
     /// A follower cut off until the first heal, and the entries the
     /// leaders must have committed past its own commit by then: W2's slow
     /// follower must really be that far behind, or the case fails
@@ -443,6 +572,7 @@ impl Case {
             converged: false,
             notes: Vec::new(),
             behind: None,
+            compaction: None,
         }
     }
 }
@@ -569,6 +699,14 @@ pub enum RunError {
     /// The case declares limits its core does not take: what it would
     /// show is not demonstrated for that core, never passed.
     Unsupported(Unsupported),
+    /// The case's entries do not fit one duty's log-read budget, so no
+    /// core could ever read them back (karyos#899 review).
+    Unreadable {
+        /// Log bytes one of its entries spans.
+        entry: u64,
+        /// [`Limits::log_read_bytes`].
+        budget: u64,
+    },
 }
 
 /// The servers' log geometry: terms that fit the largest W1 payload.
@@ -635,6 +773,24 @@ fn per_server(survives: Survives, id: NodeId) -> Survives {
 ///
 /// [`RunError`] when the run cannot be set up or stepped.
 pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError> {
+    if let Some(limits) = case.limits {
+        // The largest entry the case writes: a client's append, framed.
+        let command = super::node::Command {
+            client: NodeId::MAX,
+            sequence: u64::MAX,
+            op: Op::Append(vec![0; case.payload]),
+        };
+        let entry = u64::try_from(command.encode().len())
+            .ok()
+            .and_then(|bytes| bytes.checked_add(karyos_cluster::log::FRAME_HEADER_LEN))
+            .ok_or(RunError::Count)?;
+        if entry > limits.log_read_bytes {
+            return Err(RunError::Unreadable {
+                entry,
+                budget: limits.log_read_bytes,
+            });
+        }
+    }
     let geometry = geometry().map_err(RunError::Geometry)?;
     let recorder: Shared = Rc::new(RefCell::new(Recorder::default()));
     let mut sim: ClusterSim<Member<C>, Wire<C::Message>> =
@@ -708,6 +864,9 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             if let Some(lease) = &lease {
                 server = server.with_lease(Rc::clone(lease));
             }
+        }
+        if let Some(compaction) = case.compaction {
+            server = server.with_compaction(compaction);
         }
         let index = usize::try_from(id).map_err(|_| RunError::Count)?;
         let drift = case.drift_ppm.get(index).copied().unwrap_or(0);
@@ -940,6 +1099,14 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     }
     sim.run_for(case.quiet).map_err(RunError::Sim)?;
     let recorded = recorder.borrow();
+    // A core that lacks a capability the case needs: not demonstrated.
+    if recorded
+        .observations
+        .iter()
+        .any(|observation| matches!(observation, Observation::Unsupported { .. }))
+    {
+        return Err(RunError::Unsupported(Unsupported));
+    }
     Ok(Outcome {
         safety: safety(case, &recorded, &primary, &standby),
         liveness,

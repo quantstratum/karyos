@@ -260,21 +260,18 @@ fn entries_stop_at_max_bytes_but_always_return_one() {
     assert_eq!(log.entries(5..1005, 360).unwrap().len(), 10);
 }
 
-/// A frame's span comes from the index, without a read: consecutive
-/// frames tile the written log, the last one ends at the written position,
-/// and an index the log does not hold has none (karyos#899).
+/// A frame's span comes from the index, without a read: frames lie back
+/// to back, so each spans exactly its header and payload, and an index the
+/// log does not hold has none (karyos#899).
 #[test]
 fn frame_spans_tile_the_log() {
     let dir = TempDir::new("spans");
     let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
-    let _ = log.append(&entries(1..6, 1)).unwrap();
-    let spans: Vec<u64> = (1..6).map(|index| log.frame_span(index).unwrap()).collect();
-    assert!(
-        spans.iter().all(|span| *span > FRAME_HEADER as u64),
-        "{spans:?}"
-    );
-    let total: u64 = spans.iter().sum();
-    assert!(total <= log.written(), "{total} > {}", log.written());
+    let written = entries(1..6, 1);
+    let _ = log.append(&written).unwrap();
+    for entry in &written {
+        assert_eq!(log.frame_span(entry.index), entry.encoded_len());
+    }
     assert_eq!(log.frame_span(6), None);
     assert_eq!(log.frame_span(0), None);
 }

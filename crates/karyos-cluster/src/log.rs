@@ -58,6 +58,15 @@
 //!   segments below; then the first-index file is replaced. A crash
 //!   between the two leaves the file below the first frame, and
 //!   [`RaftLog::open`] takes the first frame's index, then rewrites it.
+//! - **Install** (W5; karyos#687, decided 2026-10-30 by QS-COORDINATOR).
+//!   [`RaftLog::install`] restarts the log after a snapshot the node's
+//!   snapshot store already holds verified: the first-index file names the
+//!   next index and the base term in one record, then the watermark is
+//!   cleared, A2 cuts every frame, and the commit becomes the base.
+//!   [`RaftLog::open_with`] opens such a log only over its verified
+//!   snapshot, and finishes an install a crash cut short; without it, the
+//!   open is [`LogError::InstallUnverified`]. A later purge's plain record
+//!   ends the install's base.
 //! - **Allocation.** An append encodes each frame into a new `Vec`; C5's
 //!   zero-allocation gate will need it reused.
 //!
@@ -94,6 +103,7 @@ use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 use crate::file::{self, Read};
 use crate::hard_state::{HARD_STATE_FILE, HARD_STATE_LEN, HardState, HardStateProblem};
 use crate::mark::{self, MARK_FILE, MARK_LEN, Slot};
+use crate::snapshot::SnapshotStore;
 
 /// The A2 recording id of the log.
 pub const LOG_RECORDING: u64 = 1;
@@ -114,6 +124,9 @@ const CREATED: (usize, Slot) = (
 );
 /// The first-index record: the index, then its CRC-32C.
 const FIRST_LEN: usize = 12;
+/// The first-index record after an install: the index, the base term (of
+/// the entry before it), then their CRC-32C.
+const INSTALLED_LEN: usize = 20;
 
 /// One log entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,6 +252,25 @@ pub enum LogError {
     PurgeBeyondCommit {
         /// The first index asked to keep.
         below: u64,
+        /// The stored commit.
+        commit: Option<u64>,
+    },
+    /// An install, or an open after one, without a verified snapshot at
+    /// its base durable in the snapshot store: the state up to the base
+    /// would exist nowhere.
+    #[error("no verified snapshot at index {index}, term {term}")]
+    InstallUnverified {
+        /// The base index.
+        index: u64,
+        /// The base term.
+        term: u64,
+    },
+    /// An install whose base is not past the stored commit: a snapshot
+    /// installs only what the log does not already hold committed.
+    #[error("installing at {index} would not move past the commit {commit:?}")]
+    InstallStale {
+        /// The base index.
+        index: u64,
         /// The stored commit.
         commit: Option<u64>,
     },
@@ -379,6 +411,9 @@ pub struct RaftLog<D: Disk + Clone> {
     first_index: u64,
     /// Per entry from `first_index`: its frame's position and its term.
     entries: Vec<(u64, u64)>,
+    /// The term of entry `first_index - 1` after an install, which only a
+    /// snapshot holds.
+    base_term: Option<u64>,
     hard_state: Option<HardState>,
     poisoned: bool,
     /// The watermark's file, its newest slot and the mark it holds.
@@ -408,11 +443,31 @@ fn encode_first(first: u64) -> [u8; FIRST_LEN] {
     bytes
 }
 
-fn decode_first(bytes: &[u8]) -> Option<u64> {
+fn encode_installed(first: u64, base_term: u64) -> [u8; INSTALLED_LEN] {
+    let mut bytes = [0u8; INSTALLED_LEN];
+    let (body, crc) = bytes.split_at_mut(16);
+    let (index, term) = body.split_at_mut(8);
+    index.copy_from_slice(&first.to_le_bytes());
+    term.copy_from_slice(&base_term.to_le_bytes());
+    let digest = crc32c(body);
+    crc.copy_from_slice(&digest.to_le_bytes());
+    bytes
+}
+
+/// The first index, and the base term when the record is an install's.
+fn decode_first(bytes: &[u8]) -> Option<(u64, Option<u64>)> {
+    if let Ok(record) = <&[u8; INSTALLED_LEN]>::try_from(bytes) {
+        let (body, crc) = record.split_first_chunk::<16>()?;
+        let crc: [u8; 4] = crc.try_into().ok()?;
+        let (index, term) = body.split_first_chunk::<8>()?;
+        let term: [u8; 8] = term.try_into().ok()?;
+        return (u32::from_le_bytes(crc) == crc32c(body))
+            .then(|| (u64::from_le_bytes(*index), Some(u64::from_le_bytes(term))));
+    }
     let record: &[u8; FIRST_LEN] = bytes.try_into().ok()?;
     let (index, crc) = record.split_first_chunk::<8>()?;
     let crc: [u8; 4] = crc.try_into().ok()?;
-    (u32::from_le_bytes(crc) == crc32c(index)).then(|| u64::from_le_bytes(*index))
+    (u32::from_le_bytes(crc) == crc32c(index)).then(|| (u64::from_le_bytes(*index), None))
 }
 
 impl<D: Disk + Clone> RaftLog<D> {
@@ -481,6 +536,7 @@ impl<D: Disk + Clone> RaftLog<D> {
             dir: dir.to_path_buf(),
             first_index,
             entries: Vec::new(),
+            base_term: None,
             hard_state,
             poisoned: false,
             mark_file,
@@ -506,12 +562,44 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// continue the chain; [`LogError::TornBelowCommit`] and
     /// [`LogError::CommitBeyondDurable`] for a stored commit the kept log
     /// does not hold; the store's and the disk's errors.
-    pub fn open(mut disk: D, dir: &Path, geometry: Geometry) -> Result<Opened<D>, LogError> {
-        let first_index = match file::read(&mut disk, dir, FIRST_INDEX_FILE, FIRST_LEN)? {
-            Read::Bytes(bytes) => decode_first(&bytes),
-            Read::Missing | Read::TooLong(_) => None,
-        }
-        .ok_or(LogError::FirstIndex)?;
+    pub fn open(disk: D, dir: &Path, geometry: Geometry) -> Result<Opened<D>, LogError> {
+        Self::open_with::<D>(disk, dir, geometry, None)
+    }
+
+    /// [`RaftLog::open`] for a log that may hold an install
+    /// ([`RaftLog::install`]): `snapshots` is the node's snapshot store. A
+    /// log whose first index an install set opens only when the store's
+    /// latest snapshot verifies at that base; an install a crash cut short
+    /// is then finished: the frames below the first index are dropped and
+    /// the commit is the base.
+    ///
+    /// # Errors
+    ///
+    /// As [`RaftLog::open`], and [`LogError::InstallUnverified`] for an
+    /// installed log without its snapshot.
+    pub fn open_with<E: Disk + Clone>(
+        mut disk: D,
+        dir: &Path,
+        geometry: Geometry,
+        snapshots: Option<&SnapshotStore<E>>,
+    ) -> Result<Opened<D>, LogError> {
+        let (first_index, base_term) =
+            match file::read(&mut disk, dir, FIRST_INDEX_FILE, INSTALLED_LEN)? {
+                Read::Bytes(bytes) => decode_first(&bytes),
+                Read::Missing | Read::TooLong(_) => None,
+            }
+            .ok_or(LogError::FirstIndex)?;
+        // An installed log opens only over its verified snapshot.
+        let base = match base_term {
+            Some(term) => {
+                let index = first_index
+                    .checked_sub(1)
+                    .ok_or(LogError::InstallUnverified { index: 0, term })?;
+                verify_base(snapshots, (index, term), Base::OrLater)?;
+                Some(index)
+            }
+            None => None,
+        };
         let hard_state = match file::read(&mut disk, dir, HARD_STATE_FILE, HARD_STATE_LEN)? {
             Read::Missing => None,
             Read::Bytes(bytes) => Some(HardState::decode(&bytes).map_err(LogError::HardState)?),
@@ -527,6 +615,9 @@ impl<D: Disk + Clone> RaftLog<D> {
             Read::Missing | Read::TooLong(_) => return Err(LogError::Mark),
         };
         let mark_file = disk.open(&dir.join(MARK_FILE))?;
+        // An install cut short before its hard state keeps the stored
+        // commit, below the base: the checks below allow up to the base,
+        // and `finish_install` saves it once the open succeeds.
         // Plan first: nothing is cut before the log decides.
         let plan = match SegmentStore::verify(disk.clone(), dir, LOG_RECORDING, geometry) {
             Ok(plan) => plan,
@@ -539,8 +630,12 @@ impl<D: Disk + Clone> RaftLog<D> {
             // A creation that stopped before the store had a valid header:
             // recovery removes what it began, and the log starts empty,
             // with its stored term and vote.
-            check_mark(mark.durable, None)?;
-            if let Some(commit) = hard_state.and_then(|state| state.commit) {
+            if base.is_none() {
+                check_mark(mark.durable, None)?;
+            }
+            if let Some(commit) = hard_state.and_then(|state| state.commit)
+                && base.is_none_or(|base| commit > base)
+            {
                 return Err(LogError::CommitBeyondDurable {
                     commit,
                     durable: None,
@@ -556,7 +651,7 @@ impl<D: Disk + Clone> RaftLog<D> {
                 Ok(_) | Err(SegmentError::NotFound { .. }) => {}
                 Err(error) => return Err(LogError::Store(error)),
             }
-            let log = Self::create_store(
+            let mut log = Self::create_store(
                 disk,
                 dir,
                 geometry,
@@ -565,6 +660,8 @@ impl<D: Disk + Clone> RaftLog<D> {
                 (mark_slot, mark),
                 hard_state,
             )?;
+            log.base_term = base_term;
+            log.finish_install()?;
             return Ok(Opened { log, cut: None });
         };
         // A store that starts past 0 was purged (C8b). A2's floor is
@@ -572,7 +669,16 @@ impl<D: Disk + Clone> RaftLog<D> {
         // between them leaves the file below the first frame: the first
         // frame's index is the log's, rewritten once the open succeeds.
         let stored_first = first_index;
-        let first_index = if kept.start > 0 && kept.written > kept.start {
+        // An install cut short after its record, before its frames were
+        // dropped: the frames start below the first index, and all of
+        // them go (the verified snapshot holds what they held).
+        let stale = base.is_some() && kept.written > kept.start && {
+            let mut reader = RawReader::new(&mut disk, dir, geometry);
+            let mut header = [0u8; FRAME_HEADER];
+            reader.read(kept.start, &mut header)?;
+            Header::decode(&header).is_some_and(|frame| frame.index < first_index)
+        };
+        let first_index = if !stale && kept.start > 0 && kept.written > kept.start {
             let mut reader = RawReader::new(&mut disk, dir, geometry);
             let mut header = [0u8; FRAME_HEADER];
             reader.read(kept.start, &mut header)?;
@@ -583,9 +689,19 @@ impl<D: Disk + Clone> RaftLog<D> {
         } else {
             first_index
         };
-        let walk = {
+        let walk = if stale {
+            Walk {
+                entries: Vec::new(),
+                torn: None,
+            }
+        } else {
             let mut reader = RawReader::new(&mut disk, dir, geometry);
-            walk(&mut reader, kept.start, kept.written, first_index, geometry)?
+            walk(
+                &mut reader,
+                (kept.start, kept.written),
+                (first_index, base_term),
+                geometry,
+            )?
         };
         let last = index_after(first_index, walk.entries.len());
         if let (Some((_, index)), Some(commit)) =
@@ -594,9 +710,12 @@ impl<D: Disk + Clone> RaftLog<D> {
         {
             return Err(LogError::TornBelowCommit { index, commit });
         }
-        check_mark(mark.durable, last)?;
+        if !stale {
+            check_mark(mark.durable, last)?;
+        }
         if let Some(commit) = hard_state.and_then(|state| state.commit)
             && last.is_none_or(|last| commit > last)
+            && base.is_none_or(|base| commit > base)
         {
             return Err(LogError::CommitBeyondDurable {
                 commit,
@@ -621,12 +740,16 @@ impl<D: Disk + Clone> RaftLog<D> {
         if let Some((position, _)) = walk.torn {
             store.truncate(position)?;
         }
+        if stale {
+            store.truncate(kept.start)?;
+        }
         let mut log = Self {
             store,
             disk,
             dir: dir.to_path_buf(),
             first_index,
             entries: walk.entries,
+            base_term,
             hard_state,
             poisoned: false,
             mark_file,
@@ -643,6 +766,7 @@ impl<D: Disk + Clone> RaftLog<D> {
         }
         // What recovery kept is durable: the mark follows it.
         log.write_mark(log.last_index())?;
+        log.finish_install()?;
         Ok(Opened {
             log,
             cut: walk
@@ -722,6 +846,120 @@ impl<D: Disk + Clone> RaftLog<D> {
         self.slot(index)
             .and_then(|slot| self.entries.get(slot))
             .map(|(_, term)| *term)
+            .or_else(|| {
+                self.base_term
+                    .filter(|_| self.first_index.checked_sub(1) == Some(index))
+            })
+    }
+
+    /// The base an install set: the index before the first one and its
+    /// term, while the log's first index is the install's.
+    #[must_use]
+    pub fn base(&self) -> Option<(u64, u64)> {
+        let term = self.base_term?;
+        Some((self.first_index.checked_sub(1)?, term))
+    }
+
+    /// Discards every entry and restarts the log after a snapshot at
+    /// `base_index` of `base_term`, which `snapshots` already holds
+    /// durably as its latest: a follower installing a leader's snapshot
+    /// (W5; decided 2026-10-30 by QS-COORDINATOR). When the log already
+    /// holds `base_index` at `base_term`, Raft keeps the entries after it
+    /// (figure 13, step 6): the caller does not install then. A vote of an
+    /// older term than the base's is dropped. Durable on return, in this
+    /// order:
+    ///
+    /// 1. the first-index file names `base_index + 1` and `base_term`, in
+    ///    one record, replaced atomically;
+    /// 2. the watermark is cleared;
+    /// 3. A2 cuts every frame;
+    /// 4. the hard state's commit becomes `base_index`.
+    ///
+    /// A crash after 1 leaves a log [`RaftLog::open_with`] finishes over
+    /// the same verified snapshot, and refuses without it; a crash before
+    /// it leaves the log as it was.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::InstallUnverified`] unless the store's latest snapshot
+    /// verifies at that base, and [`LogError::InstallStale`] for a base
+    /// not past the stored commit, both changing nothing;
+    /// [`LogError::Poisoned`]; the store's and the disk's errors, which
+    /// poison.
+    pub fn install<E: Disk + Clone>(
+        &mut self,
+        base_index: u64,
+        base_term: u64,
+        snapshots: &SnapshotStore<E>,
+    ) -> Result<(), LogError> {
+        self.check_writable()?;
+        verify_base(Some(snapshots), (base_index, base_term), Base::Exact)?;
+        let commit = self.hard_state.and_then(|state| state.commit);
+        if commit.is_some_and(|commit| base_index <= commit) {
+            return Err(LogError::InstallStale {
+                index: base_index,
+                commit,
+            });
+        }
+        let first = base_index
+            .checked_add(1)
+            .ok_or(LogError::TooLarge { index: base_index })?;
+        if let Err(error) = file::replace(
+            &mut self.disk,
+            &self.dir,
+            FIRST_INDEX_FILE,
+            &encode_installed(first, base_term),
+        ) {
+            self.poisoned = true;
+            return Err(LogError::Io(error));
+        }
+        self.write_mark(None)?;
+        if let Some(&(start, _)) = self.entries.first() {
+            let cut = self.store.truncate(start);
+            self.poison_on(cut)?;
+        }
+        self.entries.clear();
+        self.first_index = first;
+        self.base_term = Some(base_term);
+        self.finish_install()
+    }
+
+    /// An install's last step: the hard state's commit is at least the
+    /// base, and its term not below the base's.
+    fn finish_install(&mut self) -> Result<(), LogError> {
+        let Some((base, term)) = self.base() else {
+            return Ok(());
+        };
+        let stored = self.hard_state;
+        if stored
+            .and_then(|state| state.commit)
+            .is_some_and(|commit| commit >= base)
+        {
+            return Ok(());
+        }
+        // A vote is for its own term: one of an older term than the base's
+        // does not carry into it (karyos#903 review, codex).
+        let state = match stored {
+            Some(state) if state.current_term >= term => HardState {
+                commit: Some(base),
+                ..state
+            },
+            _ => HardState {
+                current_term: term,
+                voted_for: None,
+                commit: Some(base),
+            },
+        };
+        match file::replace(&mut self.disk, &self.dir, HARD_STATE_FILE, &state.encode()) {
+            Ok(()) => {
+                self.hard_state = Some(state);
+                Ok(())
+            }
+            Err(error) => {
+                self.poisoned = true;
+                Err(LogError::Io(error))
+            }
+        }
     }
 
     /// The bytes entry `index`'s frame spans in the log, from its start to
@@ -784,7 +1022,13 @@ impl<D: Disk + Clone> RaftLog<D> {
         let mut expected = self
             .next_index()
             .ok_or(LogError::TooLarge { index: u64::MAX })?;
-        let mut last = self.entries.last().map(|(_, term)| *term);
+        // An installed log that holds nothing yet goes on from its base's
+        // term: terms never go back across the base (karyos#903 review).
+        let mut last = self
+            .entries
+            .last()
+            .map(|(_, term)| *term)
+            .or(self.base_term);
         let mut frames = Vec::with_capacity(entries.len());
         for entry in entries {
             if entry.index != expected {
@@ -970,6 +1214,8 @@ impl<D: Disk + Clone> RaftLog<D> {
         }
         let _ = self.entries.drain(..kept);
         self.first_index = first;
+        // The plain record replaced the install's: its base is purged.
+        self.base_term = None;
         Ok(first)
     }
 
@@ -1075,6 +1321,10 @@ impl<D: Disk + Clone> RaftLog<D> {
 
     fn check_commit(&self, commit: u64) -> Result<(), LogError> {
         let durable = self.durable_index();
+        // The base an install set is durable in its snapshot.
+        if self.base().is_some_and(|(base, _)| commit <= base) {
+            return Ok(());
+        }
         if durable.is_none_or(|durable| commit > durable) {
             return Err(LogError::CommitBeyondDurable { commit, durable });
         }
@@ -1117,6 +1367,39 @@ impl<D: Disk + Clone> RaftLog<D> {
             }
         }
     }
+}
+
+/// Whether [`verify_base`] takes only a snapshot at exactly the base, or
+/// also a later one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Base {
+    /// An install: the latest snapshot is the base, index and term.
+    Exact,
+    /// An open: the latest snapshot is the base or a later one, which holds
+    /// the base's state too (a compaction after the install; karyos#903
+    /// review, codex).
+    OrLater,
+}
+
+/// Refuses unless `snapshots`' latest snapshot verifies whole and is at
+/// `index` of `term`, or under [`Base::OrLater`] past `index`.
+fn verify_base<E: Disk + Clone>(
+    snapshots: Option<&SnapshotStore<E>>,
+    (index, term): (u64, u64),
+    base: Base,
+) -> Result<(), LogError> {
+    let unverified = LogError::InstallUnverified { index, term };
+    let store = snapshots.ok_or(unverified)?;
+    let latest = store
+        .latest()
+        .filter(|info| {
+            (info.index == index && info.term == term)
+                || (base == Base::OrLater && info.index > index)
+        })
+        .ok_or(LogError::InstallUnverified { index, term })?;
+    store
+        .verify(&latest)
+        .map_err(|_| LogError::InstallUnverified { index, term })
 }
 
 /// Refuses a log that would end at `last`, below the watermark `mark`.
@@ -1195,15 +1478,15 @@ struct Walk {
 /// is [`LogError::Chain`].
 fn walk<D: Disk>(
     reader: &mut RawReader<'_, D>,
-    start: u64,
-    written: u64,
-    first_index: u64,
+    (start, written): (u64, u64),
+    (first_index, base_term): (u64, Option<u64>),
     geometry: Geometry,
 ) -> Result<Walk, LogError> {
     let mut entries = Vec::new();
     let mut position = start;
     let mut next = first_index;
-    let mut last_term = None;
+    // After an install, the first frame's term is not below the base's.
+    let mut last_term = base_term;
     let at_segment_end = written.is_multiple_of(geometry.segment_length());
     while position < written {
         let chain = |problem| LogError::Chain { position, problem };

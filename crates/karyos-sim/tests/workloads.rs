@@ -20,7 +20,8 @@ use karyos_sim::harness::core::Limit;
 use karyos_sim::harness::node::Observation;
 use karyos_sim::harness::reference::Reference;
 use karyos_sim::harness::workloads::{
-    self, ADR_0043, Action, Failed, Liveness, Progress, W1, W2, W3, W3Fault, W4, W4Cut, W6,
+    self, ADR_0043, Action, Failed, Liveness, Progress, W1, W2, W3, W3Fault, W4, W4Cut,
+    W5Snapshots, W6,
 };
 use karyos_sim::scenarios;
 
@@ -38,6 +39,52 @@ fn the_module_records_its_adr_revision() {
     assert!(ADR_0043.contains("03ffb394"));
     assert!(ADR_0043.contains("Proposed"));
     assert_eq!(workloads::w5().unwrap_err().workload, "W5");
+}
+
+/// W5's snapshot half at the manifest's values (harness validation):
+/// compaction every 1,000 entries, keeping 100.
+#[test]
+#[ignore = "the manifest's W5 takes long; run on request"]
+fn w5_snapshots_manifest_passes() {
+    for case in W5Snapshots::manifest().cases().unwrap() {
+        let outcome = workloads::run::<Reference>(&case, 1).unwrap();
+        assert_eq!(workloads::pass(&case, &outcome), Ok(None), "{}", case.name);
+    }
+}
+
+/// W5's snapshot half, the skeleton (harness validation): every case
+/// compacts and converges; the follower behind the compaction point
+/// catches up by an installed snapshot, also when its install or another
+/// server's snapshot build is cut by a crash.
+#[test]
+fn w5_snapshots_pass() {
+    let cases = W5Snapshots::skeleton().cases().unwrap();
+    assert_eq!(cases.len(), 4);
+    for case in &cases {
+        let outcome = workloads::run::<Reference>(case, 1).unwrap();
+        assert_eq!(workloads::pass(case, &outcome), Ok(None), "{}", case.name);
+        let count = |wanted: &dyn Fn(&Observation) -> bool| {
+            outcome.observations.iter().filter(|o| wanted(o)).count()
+        };
+        assert!(
+            count(&|o| matches!(o, Observation::Compacted { .. })) > 0,
+            "{}: nothing compacted",
+            case.name
+        );
+        if case.behind.is_some() {
+            assert!(
+                count(&|o| matches!(o, Observation::Installed { node: 2, .. })) > 0,
+                "{}: the follower installed nothing",
+                case.name
+            );
+        }
+        assert_eq!(
+            count(&|o| matches!(o, Observation::SnapshotRefused { .. })),
+            0,
+            "{}",
+            case.name
+        );
+    }
 }
 
 /// W2's skeleton under the declared limits (harness validation): the
