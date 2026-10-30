@@ -1023,6 +1023,15 @@ pub fn join_refusal(request: &str, error: crate::registry::JoinError) -> String 
             text
         }
         JoinError::Refused(Refusal::NotFound) => error_text("no such entry"),
+        JoinError::Refused(Refusal::Overflow(counter)) => {
+            let mut text = String::new();
+            Out(&mut text).object(|fields| {
+                fields.string("error", "counter overflow");
+                fields.string("request", request);
+                fields.string("detail", counter);
+            });
+            text
+        }
         JoinError::UnknownDriver => error_text("unknown driver"),
     }
 }

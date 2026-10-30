@@ -282,6 +282,62 @@ fn the_key_bounds_refuse_or_evict_the_oldest_retired() {
     assert_eq!(registry.len(), MAX_KEYS);
 }
 
+/// Each counter at `u64::MAX` refuses the put that would pass it, as a
+/// typed overflow, and the refused put changes nothing (SPEC §14).
+#[test]
+fn a_counter_at_its_maximum_refuses_and_changes_nothing() {
+    let mut registry = Registry::new(0);
+    registry.put(0, Kind::Point, "p", "n=v", UID, 1).unwrap();
+    registry
+        .entries
+        .get_mut(&(0, Kind::Point, "p".to_owned()))
+        .unwrap()
+        .versions
+        .back_mut()
+        .unwrap()
+        .number = u64::MAX;
+    let before = registry.get(0, Kind::Point, "p").cloned();
+    assert_eq!(
+        registry.put(0, Kind::Point, "p", "n=w", UID, 2),
+        Err(Refusal::Overflow("version number"))
+    );
+    assert_eq!(registry.get(0, Kind::Point, "p").cloned(), before);
+
+    for index in 0..MAX_VERSIONS {
+        registry
+            .put(0, Kind::Point, "h", &format!("n=v{index}"), UID, 1)
+            .unwrap();
+    }
+    registry
+        .entries
+        .get_mut(&(0, Kind::Point, "h".to_owned()))
+        .unwrap()
+        .history_dropped = u64::MAX;
+    let before = registry.get(0, Kind::Point, "h").cloned();
+    assert_eq!(
+        registry.put(0, Kind::Point, "h", "n=w", UID, 2),
+        Err(Refusal::Overflow("history_dropped"))
+    );
+    assert_eq!(registry.get(0, Kind::Point, "h").cloned(), before);
+
+    let mut registry = Registry::new(0);
+    for index in 0..MAX_KEYS_PER_DRIVER {
+        registry
+            .put(0, Kind::Counter, &format!("c{index}"), "n=v", UID, 1)
+            .unwrap();
+    }
+    registry.retire(0, Kind::Counter, "c3", 5).unwrap();
+    registry.evicted = u64::MAX;
+    assert_eq!(
+        registry.put(0, Kind::Counter, "one-more", "n=v", UID, 6),
+        Err(Refusal::Overflow("evicted"))
+    );
+    assert_eq!(registry.evicted(), u64::MAX);
+    assert!(registry.get(0, Kind::Counter, "c3").is_some());
+    assert!(registry.get(0, Kind::Counter, "one-more").is_none());
+    assert_eq!(registry.len(), MAX_KEYS_PER_DRIVER);
+}
+
 /// A list pages a driver's keys in order, and only that driver's.
 #[test]
 fn a_list_pages_one_drivers_keys() {

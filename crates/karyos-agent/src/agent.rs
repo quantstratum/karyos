@@ -527,7 +527,8 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// [`JoinError::UnknownDriver`].
+    /// [`JoinError::UnknownDriver`], or a malformed or oversized cursor
+    /// key, refused as [`Agent::join_get`] refuses it.
     pub fn join_list<'a>(
         &'a self,
         dir: &'a Path,
@@ -535,6 +536,10 @@ impl Agent {
     ) -> Result<registry::Page<'a>, JoinError> {
         let index = self.driver_index(dir)?;
         let driver = self.drivers.get(index).ok_or(JoinError::UnknownDriver)?;
+        // A cursor is a key: refused as a get refuses it (karyos#893).
+        if let Some((kind, key)) = after {
+            registry::check_key(kind, key).map_err(JoinError::Refused)?;
+        }
         let (entries, more) = self.registry.list(index, after);
         Ok(registry::Page {
             generation: self.registry.generation(),

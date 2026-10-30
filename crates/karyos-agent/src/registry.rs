@@ -178,6 +178,9 @@ pub enum Refusal {
     Bad(&'static str),
     /// No current entry under the key.
     NotFound,
+    /// A counter would pass `u64::MAX`: which one. Nothing was changed
+    /// (SPEC §14).
+    Overflow(&'static str),
 }
 
 /// What the agent observes of an entry's identity at a read: a
@@ -310,8 +313,10 @@ impl Registry {
     ///
     /// # Errors
     ///
-    /// [`Refusal::Bad`] for a malformed key or attribute, and
-    /// [`Refusal::Above`] past a bound.
+    /// [`Refusal::Bad`] for a malformed key or attribute,
+    /// [`Refusal::Above`] past a bound, and [`Refusal::Overflow`] when the
+    /// version number, `history_dropped` or `evicted` would pass
+    /// `u64::MAX`; a refused put changes nothing.
     pub fn put(
         &mut self,
         driver: usize,
@@ -324,9 +329,24 @@ impl Registry {
         check_key(kind, key)?;
         let attributes = check_attributes(attributes)?;
         let id = (driver, kind, key.to_owned());
-        if !self.entries.contains_key(&id) {
-            self.make_room(driver)?;
-        }
+        // Every counter is checked before anything changes, so a refused
+        // put leaves the registry as it was.
+        let (number, dropped) = match self.entries.get(&id) {
+            Some(entry) => (
+                entry.versions.back().map_or(Some(1), |last| last.number.checked_add(1)),
+                if entry.versions.len() == MAX_VERSIONS {
+                    entry.history_dropped.checked_add(1)
+                } else {
+                    Some(entry.history_dropped)
+                },
+            ),
+            None => {
+                self.make_room(driver)?;
+                (Some(1), Some(0))
+            }
+        };
+        let number = number.ok_or(Refusal::Overflow("version number"))?;
+        let dropped = dropped.ok_or(Refusal::Overflow("history_dropped"))?;
         let entry = self.entries.entry(id).or_insert_with(|| Entry {
             kind,
             key: key.to_owned(),
@@ -338,10 +358,6 @@ impl Registry {
         let now = entry.versions.back().map_or(now, |last| {
             now.max(last.valid_to.unwrap_or(last.valid_from))
         });
-        let number = entry
-            .versions
-            .back()
-            .map_or(1, |last| last.number.saturating_add(1));
         if let Some(last) = entry.versions.back_mut()
             && last.valid_to.is_none()
         {
@@ -349,8 +365,8 @@ impl Registry {
         }
         if entry.versions.len() == MAX_VERSIONS {
             entry.versions.pop_front();
-            entry.history_dropped = entry.history_dropped.saturating_add(1);
         }
+        entry.history_dropped = dropped;
         entry.versions.push_back(Version {
             number,
             registered_by: uid,
@@ -448,8 +464,11 @@ impl Registry {
             .map(|(_, id)| id);
         match oldest {
             Some(id) => {
+                self.evicted = self
+                    .evicted
+                    .checked_add(1)
+                    .ok_or(Refusal::Overflow("evicted"))?;
                 self.entries.remove(&id);
-                self.evicted = self.evicted.saturating_add(1);
                 Ok(())
             }
             None => Err(Refusal::Above {
