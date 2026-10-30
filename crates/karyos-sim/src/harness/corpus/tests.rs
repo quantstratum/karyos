@@ -23,7 +23,7 @@ fn every_line_says_what_it_is_evidence_of() {
         "reference",
         Evidence::HarnessValidation,
         &[("W1", &two)],
-        1..=2,
+        (1..=2, 1),
         &mut out,
     )
     .unwrap();
@@ -45,7 +45,7 @@ fn every_line_says_what_it_is_evidence_of() {
         assert!(line.contains("\"error\":null"), "{line}");
     }
     assert!(lines[0].contains(&format!("\"case\":{}", string(&cases[0].name))));
-    assert!(lines[0].contains("\"seed\":1,"));
+    assert!(lines[0].contains("\"seed\":1,\"repetitions\":1,"));
     assert!(lines[3].contains("\"seed\":2,"));
 }
 
@@ -61,7 +61,7 @@ fn a_corpus_run_is_reproducible() {
             "reference",
             Evidence::HarnessValidation,
             &[("W1", &one)],
-            7..=8,
+            (7..=8, 1),
             &mut out,
         )
         .unwrap();
@@ -74,4 +74,25 @@ fn a_corpus_run_is_reproducible() {
 #[test]
 fn strings_are_escaped() {
     assert_eq!(string("a\"b\\c\nd"), "\"a\\\"b\\\\c\\u000ad\"");
+}
+
+/// The determinism mode: every seed's run repeated; the reference fixture
+/// replays exactly, so every repetition agrees.
+#[test]
+fn the_determinism_mode_repeats_each_seed() {
+    let cases = W1::skeleton().cases();
+    let one = |_seed: u64| cases[..1].to_vec();
+    let mut out = Vec::new();
+    let summary = run_corpus::<Reference>(
+        "reference",
+        Evidence::HarnessValidation,
+        &[("W1", &one)],
+        (3..=4, 3),
+        &mut out,
+    )
+    .unwrap();
+    assert_eq!(summary.runs, 2);
+    assert!(summary.failed.is_empty(), "{summary:?}");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.lines().all(|line| line.contains("\"repetitions\":3,")));
 }

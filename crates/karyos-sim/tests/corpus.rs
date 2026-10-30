@@ -60,7 +60,7 @@ fn the_ci_corpus_of_the_reference_fixture() {
         "reference",
         Evidence::HarnessValidation,
         &workloads,
-        seeds.clone(),
+        (seeds.clone(), 1),
         &mut file,
     )
     .unwrap();

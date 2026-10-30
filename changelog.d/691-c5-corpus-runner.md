@@ -12,6 +12,10 @@
   - whether the run ended at its step bound with clients waiting;
   - the fault schedule, the trace digest, and any error.
 
+  With `repetitions` above 1 it is the determinism gate's mode: each
+  seed's run is repeated, and an outcome that differs fails it as
+  `failed_not_replayed`.
+
   Every line of a run of the `Reference` fixture says "harness validation,
   not C5 evidence" in its `evidence` field: no candidate is behind
   `ConsensusCore` yet (#678, #690), so the runner validates the harness

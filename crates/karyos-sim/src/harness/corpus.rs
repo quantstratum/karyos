@@ -11,7 +11,7 @@
 //!   the field says so in the data, not only in documents. The runner
 //!   writes where its caller tells it, never into the evaluation record.
 //! - **A line** holds the evidence, the core, the workload, the case, the
-//!   seed, the verdict ([`Verdict`]), whether the run ended at its step
+//!   seed, the repetitions of the determinism mode, the verdict ([`Verdict`]), whether the run ended at its step
 //!   bound with clients still waiting, the case's fault schedule as
 //!   `step:action`, the trace digest, and the error of a run that could
 //!   not be set up or stepped.
@@ -108,6 +108,10 @@ pub type Workload<'a> = (&'a str, &'a dyn Fn(u64) -> Vec<Case>);
 
 /// Runs every case of `workloads` of core `C`, named `core`, under each
 /// seed of `seeds`, writing one JSON line per run to `out` as `evidence`.
+/// With `repetitions` above 1, the determinism gate's mode (manifest,
+/// Hard gates): each seed's run is repeated, and a repetition whose
+/// outcome differs from the first's (trace, digest, history, states, any
+/// of them) fails it as `failed_not_replayed`.
 ///
 /// # Errors
 ///
@@ -116,7 +120,7 @@ pub fn run_corpus<C: ConsensusCore>(
     core: &str,
     evidence: Evidence,
     workloads: &[Workload<'_>],
-    seeds: RangeInclusive<u64>,
+    (seeds, repetitions): (RangeInclusive<u64>, u32),
     out: &mut impl Write,
 ) -> std::io::Result<Summary> {
     let mut summary = Summary::default();
@@ -125,7 +129,10 @@ pub fn run_corpus<C: ConsensusCore>(
             for case in &cases(seed) {
                 let (verdict, bound, digest, error) = match run::<C>(case, seed) {
                     Ok(outcome) => {
+                        let replayed = (1..repetitions)
+                            .all(|_| run::<C>(case, seed).is_ok_and(|again| again == outcome));
                         let verdict = match pass(case, &outcome) {
+                            _ if !replayed => Verdict::Failed(failed_kind(&Failed::NotReplayed)),
                             Ok(None) => Verdict::Pass,
                             Ok(Some(_)) => Verdict::LivenessGap,
                             Err(failed) => Verdict::Failed(failed_kind(&failed)),
@@ -161,6 +168,7 @@ pub fn run_corpus<C: ConsensusCore>(
                     workload,
                     case,
                     seed,
+                    repetitions,
                     verdict,
                     bound,
                     digest,
@@ -180,6 +188,7 @@ struct Line<'a> {
     workload: &'a str,
     case: &'a Case,
     seed: u64,
+    repetitions: u32,
     verdict: Verdict,
     bound: bool,
     digest: Option<u64>,
@@ -196,12 +205,13 @@ impl Line<'_> {
             .map(|(step, action)| string(&format!("{step}:{action:?}")))
             .collect();
         format!(
-            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"digest\":{},\"error\":{}}}",
+            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"repetitions\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"digest\":{},\"error\":{}}}",
             string(self.evidence.text()),
             string(self.core),
             string(self.workload),
             string(&self.case.name),
             self.seed,
+            self.repetitions.max(1),
             string(self.verdict.name()),
             self.bound,
             self.case.steps,
