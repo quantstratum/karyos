@@ -696,11 +696,7 @@ impl ControlRoutes {
                 max_pending: NonZeroU16::new(CONTROL_QUEUE_DEPTH).unwrap_or(NonZeroU16::MIN),
             })
             .map_err(|error| {
-                if matches!(
-                    error,
-                    karyos_io::backend::QueueError::QueueLimit
-                        | karyos_io::backend::QueueError::OverCommitted { .. }
-                ) {
+                if super::data::fanout::queue_limit(error) {
                     self.refusal.limited = true;
                 }
                 let _ = tx.remove_route(route);
