@@ -791,6 +791,13 @@ pub enum Wire<M> {
         /// The client's sequence number.
         sequence: u64,
     },
+    /// The server's core pushed back on the request (W2's backpressure):
+    /// the client sends it again after its retry interval, not at once,
+    /// so a full queue is not flooded.
+    Busy {
+        /// The client's sequence number.
+        sequence: u64,
+    },
     /// An operator's membership change, which the server's core takes or
     /// refuses ([`Observation::Change`]); nothing answers it.
     Change(Change),
@@ -1436,12 +1443,12 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
                                 },
                             );
                         }
-                        out.push((
-                            command.client,
-                            Wire::Refused {
-                                sequence: command.sequence,
-                            },
-                        ));
+                        let sequence = command.sequence;
+                        let answer = match refused {
+                            Refused::Backpressure(_) => Wire::Busy { sequence },
+                            Refused::NotLeader(_) => Wire::Refused { sequence },
+                        };
+                        out.push((command.client, answer));
                     }
                 }
             }
@@ -1506,7 +1513,10 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
                     }
                 }
             }
-            Wire::Response { .. } | Wire::Refused { .. } | Wire::Redirect { .. } => {}
+            Wire::Response { .. }
+            | Wire::Refused { .. }
+            | Wire::Busy { .. }
+            | Wire::Redirect { .. } => {}
         }
         self.duty(out);
     }

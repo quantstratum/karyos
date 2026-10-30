@@ -282,6 +282,21 @@ pub struct Case {
     /// The limits every server's core is declared (W2), if any: a core
     /// that takes none cannot run the case ([`RunError::Unsupported`]).
     pub limits: Option<Limits>,
+    /// Requests each client keeps open at once, at least 1: a pipelined
+    /// client (W2's bursts; decided 2026-10-30 by QS-COORDINATOR). Each
+    /// open slot is a session of its own, its own process in the history
+    /// and its own deduplication, so `clients x window` sessions run
+    /// [`Case::operations`] each. A harness capability, named in every
+    /// run record.
+    pub window: usize,
+}
+
+impl Case {
+    /// The client sessions it runs: every client's window.
+    #[must_use]
+    pub fn sessions(&self) -> usize {
+        self.clients.saturating_mul(self.window.max(1))
+    }
 }
 
 impl Case {
@@ -314,6 +329,7 @@ impl Case {
             feed_faults: Vec::new(),
             stay_on_primary: Vec::new(),
             limits: None,
+            window: 1,
         }
     }
 }
@@ -555,7 +571,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     }
     let leader = peers.first().copied().ok_or(RunError::Count)?;
     let mut clients = Vec::new();
-    for index in 0..case.clients {
+    for index in 0..case.sessions() {
         let id = u32::try_from(index)
             .ok()
             .and_then(|index| standby_end.checked_add(index))
@@ -575,7 +591,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         .any(|(_, action)| matches!(action, Action::Change(_) | Action::Promote(_)));
     let mut operator = None;
     if changes {
-        let id = u32::try_from(case.clients)
+        let id = u32::try_from(case.sessions())
             .ok()
             .and_then(|count| standby_end.checked_add(count))
             .ok_or(RunError::Count)?;
