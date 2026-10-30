@@ -536,8 +536,11 @@ pub struct Case {
     /// a handover `Ok` and then commit as leader, or the case fails
     /// ([`Failed::NotShown`]; karyos#905 review).
     pub handover: Option<NodeId>,
-    /// The case must show a retry answered from deduplication (W5), or it
-    /// fails ([`Failed::NotShown`]).
+    /// The case must show a retry across the handover (W5), or it fails
+    /// ([`Failed::NotShown`]): one request, redirected by another server
+    /// to the handover's target, then answered from deduplication by that
+    /// target after it took the handover and committed as leader
+    /// (karyos#905 review).
     pub retried: bool,
     /// A follower cut off until the first heal, and the entries the
     /// leaders must have committed past its own commit by then: W2's slow
@@ -1202,25 +1205,66 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
         (Err(gap), Progress::Expected) => return Err(Failed::Liveness(gap)),
     };
     if let Some(to) = case.handover {
-        let taken = outcome.observations.iter().position(|observation| {
-            matches!(
-                observation,
-                Observation::Transfer { to: target, result: Ok(()), .. } if *target == to
-            )
-        });
-        let leads = taken.is_some_and(|at| {
-            outcome.observations.iter().skip(at).any(|observation| {
+        let observations = &outcome.observations;
+        // The target took the handover, then committed as leader: from
+        // there on it leads.
+        let leads = observations
+            .iter()
+            .position(|observation| {
                 matches!(
                     observation,
-                    Observation::Commit { node, leader: true, .. } if *node == to
+                    Observation::Transfer { to: target, result: Ok(()), .. } if *target == to
                 )
             })
-        });
-        if !leads {
+            .and_then(|taken| {
+                observations
+                    .iter()
+                    .skip(taken)
+                    .position(|observation| {
+                        matches!(
+                            observation,
+                            Observation::Commit { node, leader: true, .. } if *node == to
+                        )
+                    })
+                    .and_then(|led| taken.checked_add(led))
+            });
+        let Some(leads) = leads else {
             return Err(Failed::NotShown("handover"));
+        };
+        // One request redirected to the target by another server, then
+        // answered from deduplication by the target, once it leads.
+        if case.retried {
+            let retried = observations
+                .iter()
+                .enumerate()
+                .skip(leads)
+                .any(|(at, observation)| {
+                    let Observation::Deduplicated {
+                        node,
+                        client,
+                        sequence,
+                    } = observation
+                    else {
+                        return false;
+                    };
+                    *node == to
+                        && observations.iter().take(at).any(|earlier| {
+                            matches!(
+                                earlier,
+                                Observation::Redirected {
+                                    node: from,
+                                    client: c,
+                                    sequence: s,
+                                    to: target,
+                                } if *from != to && c == client && s == sequence && *target == to
+                            )
+                        })
+                });
+            if !retried {
+                return Err(Failed::NotShown("retry"));
+            }
         }
-    }
-    if case.retried && outcome.deduplicated == 0 {
+    } else if case.retried {
         return Err(Failed::NotShown("retry"));
     }
     if let Some((follower, required)) = case.behind {

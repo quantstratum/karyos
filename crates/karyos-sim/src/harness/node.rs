@@ -981,6 +981,28 @@ pub enum Observation {
         /// written yet.
         entry_term: Option<u64>,
     },
+    /// A server's service answered a retried request from its
+    /// deduplication table (W5).
+    Deduplicated {
+        /// The server.
+        node: NodeId,
+        /// The client.
+        client: NodeId,
+        /// The request's sequence.
+        sequence: u64,
+    },
+    /// A server sent a client's request on to the leader its core named
+    /// (W5).
+    Redirected {
+        /// The server.
+        node: NodeId,
+        /// The client.
+        client: NodeId,
+        /// The request's sequence.
+        sequence: u64,
+        /// The leader named.
+        to: NodeId,
+    },
     /// A client's retry was answered [`Ret::Expired`]: its outcome is
     /// unknown (W5).
     Expired {
@@ -1817,7 +1839,17 @@ impl<C: ConsensusCore> ServerNode<C> {
                     served.payload = Vec::new();
                 }
             }
+            let deduplicated = self.service.deduplicated();
             let answer = self.service.apply(&served);
+            if self.service.deduplicated() > deduplicated
+                && let Some((command, _)) = &answer
+            {
+                self.observe(Observation::Deduplicated {
+                    node,
+                    client: command.client,
+                    sequence: command.sequence,
+                });
+            }
             let response = answer.as_ref().map(|(_, ret)| ret.canonical());
             if let Some((command, ret)) = answer
                 && self.pending.remove(&(command.client, command.sequence))
@@ -2080,7 +2112,17 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
                             // the client goes there.
                             Refused::NotLeader(NotLeader {
                                 leader: Some(leader),
-                            }) if leader != self.id => Wire::Redirect { server: leader },
+                            }) if leader != self.id => {
+                                self.recorder.borrow_mut().observations.push(
+                                    Observation::Redirected {
+                                        node: self.id,
+                                        client: command.client,
+                                        sequence,
+                                        to: leader,
+                                    },
+                                );
+                                Wire::Redirect { server: leader }
+                            }
                             Refused::NotLeader(_) => Wire::Refused { sequence },
                         };
                         out.push((command.client, answer));

@@ -228,3 +228,83 @@ fn an_old_leader_crashing_mid_handover_stays_safe() {
         assert!(!matches!(pass(&case, &outcome), Err(Failed::Safety(_))));
     }
 }
+
+/// `Reference` that answers a handover Ok at once and makes it only at
+/// tick 1,000, after every request has finished (karyos#905 review,
+/// codex's artifact 264).
+#[derive(Debug)]
+struct Deferred {
+    core: Reference,
+    pending: Option<NodeId>,
+}
+
+impl Deferred {
+    fn wrap(core: Reference) -> Self {
+        Self {
+            core,
+            pending: None,
+        }
+    }
+    fn inner(&mut self) -> &mut Reference {
+        &mut self.core
+    }
+    fn inner_ref(&self) -> &Reference {
+        &self.core
+    }
+}
+
+impl ConsensusCore for Deferred {
+    type Message = Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        Self::wrap(Reference::recover(id, peers, log))
+    }
+
+    fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
+        if now >= 1_000
+            && let Some(to) = self.pending.take()
+        {
+            let _ = self.core.transfer_leadership(to, log);
+        }
+        self.core.tick(now, log);
+    }
+
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Message>> {
+        self.core.ready(log)
+    }
+
+    fn transfer_leadership(
+        &mut self,
+        to: NodeId,
+        _log: &mut LogView<'_>,
+    ) -> Result<(), TransferRefused> {
+        if !self.core.leads() {
+            return Err(TransferRefused::Invalid);
+        }
+        self.pending = Some(to);
+        Ok(())
+    }
+
+    delegate!();
+}
+
+/// The retry must cross the handover, in order (karyos#905 review): a
+/// handover made only after every request finished, with retries
+/// deduplicated before it, does not show the case.
+#[test]
+fn a_handover_after_the_retries_does_not_show_them() {
+    let case = retry_case();
+    let outcome = run::<Deferred>(&case, 1).unwrap();
+    assert!(
+        outcome.observations.iter().any(|o| matches!(
+            o,
+            karyos_sim::harness::node::Observation::Commit {
+                node: 1,
+                leader: true,
+                ..
+            }
+        )),
+        "the deferred handover still happened"
+    );
+    assert_eq!(pass(&case, &outcome), Err(Failed::NotShown("retry")));
+}

@@ -895,6 +895,8 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::SnapshotRefused { node, .. }
         | Observation::Unsupported { node, .. }
         | Observation::Transfer { node, .. }
+        | Observation::Deduplicated { node, .. }
+        | Observation::Redirected { node, .. }
         | Observation::FeedApplied { node, .. }
         | Observation::Promoted { node, .. } => Some(*node),
         Observation::Success { .. }
