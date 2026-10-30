@@ -197,13 +197,14 @@ pub struct Presence {
     /// cannot tell (a stream, whose wire id no cell carries, or a driver
     /// not attached).
     pub present: Option<bool>,
-    /// How many clients hold it now (cells of that type and label);
-    /// `None` when the agent cannot tell.
+    /// How many client cells of that type and label hold it now (one
+    /// client may hold several); `None` when the agent cannot tell.
     pub holders: Option<u64>,
 }
 
 impl Presence {
-    /// Whether more than one holder is observed now; `None` when unknown.
+    /// Whether more than one client cell is observed now; `None` when
+    /// unknown.
     #[must_use]
     pub fn shared(self) -> Option<bool> {
         self.holders.map(|holders| holders > 1)
