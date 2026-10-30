@@ -13,11 +13,13 @@
 
 use std::sync::{Mutex, MutexGuard};
 
+use karyos_sim::harness::core::{ConsensusCore, LogView, NotLeader, Persisted, Ready};
 use karyos_sim::harness::corpus::Evidence;
 use karyos_sim::harness::probe::{WARMUP, measure};
 use karyos_sim::harness::reference::Reference;
 use karyos_sim::harness::workloads::W1;
-use karyos_sys::alloc_count::{CountingAllocator, SetCounts, WindowOpen, enroll, window};
+use karyos_sim::net::NodeId;
+use karyos_sys::alloc_count::{CountingAllocator, Enrolled, SetCounts, WindowOpen, enroll, window};
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
@@ -123,5 +125,123 @@ fn a_measurement_of_the_reference_fixture_sees_its_allocations() {
         report.entries,
         report.counts.allocations,
         report.counts.frees,
+    );
+}
+
+/// A guard never leaves its thread (codex, karyos#892): this compiles only
+/// while `Enrolled` is not `Send`, as two impls then stay unambiguous.
+#[test]
+fn an_enrolled_guard_is_not_send() {
+    trait AmbiguousIfSend<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    <Enrolled as AmbiguousIfSend<_>>::some_item();
+}
+
+/// Windows taken in turn from two threads each count only their own
+/// call (codex, karyos#892): a window's totals are read before it closes,
+/// so the next one cannot reset them first. A stress check: the race it
+/// guards is narrower than a test can hit reliably.
+#[test]
+fn windows_in_turn_keep_their_own_counts() {
+    let _serial = serial();
+    std::thread::scope(|scope| {
+        for _ in 0..2 {
+            scope.spawn(|| {
+                for _ in 0..200 {
+                    let counts = loop {
+                        let measured = window(|| {
+                            let _enrolled = enroll();
+                            drop(std::hint::black_box(vec![0u8; 64]));
+                        });
+                        if let Ok(((), counts)) = measured {
+                            break counts;
+                        }
+                        std::thread::yield_now();
+                    };
+                    assert_eq!(
+                        counts,
+                        SetCounts {
+                            allocations: 1,
+                            frees: 1
+                        }
+                    );
+                }
+            });
+        }
+    });
+}
+
+/// `Reference`, allocating and freeing once more in each read of its
+/// commit index.
+#[derive(Debug)]
+struct Noisy(Reference);
+
+impl ConsensusCore for Noisy {
+    type Message = <Reference as ConsensusCore>::Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        Self(Reference::recover(id, peers, log))
+    }
+
+    fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), NotLeader> {
+        self.0.propose(command, log)
+    }
+
+    fn step(&mut self, from: NodeId, message: Self::Message, log: &mut LogView<'_>) {
+        self.0.step(from, message, log);
+    }
+
+    fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
+        self.0.tick(now, log);
+    }
+
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
+        self.0.ready(log)
+    }
+
+    fn advance(&mut self, persisted: Persisted, log: &mut LogView<'_>) {
+        self.0.advance(persisted, log);
+    }
+
+    fn term(&self) -> u64 {
+        self.0.term()
+    }
+
+    fn leads(&self) -> bool {
+        self.0.leads()
+    }
+
+    fn received(&self) -> Option<u64> {
+        self.0.received()
+    }
+
+    fn committed(&self) -> Option<u64> {
+        drop(std::hint::black_box(Box::new(0u64)));
+        self.0.committed()
+    }
+}
+
+/// A read-only call of the core is on the declared path too (codex,
+/// karyos#892): allocations in `committed` past the warm-up are counted.
+#[test]
+fn allocations_in_a_read_only_call_are_counted() {
+    let _serial = serial();
+    let cases = W1::skeleton().cases();
+    let case = cases
+        .iter()
+        .max_by_key(|case| case.clients * case.operations)
+        .unwrap();
+    let plain = measure::<Reference>(case, 1).unwrap();
+    let noisy = measure::<Noisy>(case, 1).unwrap();
+    assert_eq!(noisy.entries, plain.entries);
+    assert!(
+        noisy.counts.allocations > plain.counts.allocations
+            && noisy.counts.frees > plain.counts.frees,
+        "{:?} vs {:?}",
+        noisy.counts,
+        plain.counts
     );
 }

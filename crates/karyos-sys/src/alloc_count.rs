@@ -55,10 +55,11 @@ fn note_set(allocation: bool) {
 /// A thread enrolled in the counted set until the guard drops: the
 /// declared path's threads (quantstratum-docs:
 /// karyos/evaluations/c5-raft-comparison-v1.md, Hard gates, allocation,
-/// karyos#691). Guards nest.
+/// karyos#691). Guards nest. A guard stays on the thread it enrolled: it
+/// is neither `Send` nor `Sync`, so its drop always unenrolls that thread.
 #[derive(Debug)]
 #[must_use = "the thread is enrolled only while the guard lives"]
-pub struct Enrolled(());
+pub struct Enrolled(std::marker::PhantomData<*const ()>);
 
 impl Drop for Enrolled {
     fn drop(&mut self) {
@@ -69,7 +70,7 @@ impl Drop for Enrolled {
 /// Enrolls the calling thread in the counted set until the guard drops.
 pub fn enroll() -> Enrolled {
     let _ = ENROLLED.try_with(|count| count.set(count.get().saturating_add(1)));
-    Enrolled(())
+    Enrolled(std::marker::PhantomData)
 }
 
 /// What the enrolled threads did in a [`window`].
@@ -116,11 +117,13 @@ pub fn window<R>(call: impl FnOnce() -> R) -> Result<(R, SetCounts), WindowOpen>
     SET_FREES.store(0, Ordering::SeqCst);
     let close = Close;
     let result = call();
-    drop(close);
+    // Read while the window is still this call's: once it closes, another
+    // window may reset the totals.
     let counts = SetCounts {
         allocations: SET_ALLOCATIONS.load(Ordering::SeqCst),
         frees: SET_FREES.load(Ordering::SeqCst),
     };
+    drop(close);
     Ok((result, counts))
 }
 
