@@ -451,5 +451,12 @@ fn w2_lines_carry_their_window_and_coverage_note() {
         .filter_map(|line| line.split("\"window\":").nth(1)?.split(',').next())
         .collect();
     assert_eq!(windows, ["1", "32", "2", "1", "1"]);
+    for line in &lines[..5] {
+        assert!(
+            line.contains("\"limits\":{\"in_flight_entries\":4,"),
+            "{line}"
+        );
+    }
     assert!(lines[5].contains("\"window\":1,") && lines[5].contains("\"notes\":[]"));
+    assert!(lines[5].contains("\"limits\":null"), "{}", lines[5]);
 }

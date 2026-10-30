@@ -12,7 +12,7 @@
 //!   writes where its caller tells it, never into the evaluation record.
 //! - **A line** holds the evidence, the core, the workload, the case, the
 //!   seed, the repetitions of the determinism mode, the client window
-//!   ([`Case::window`]), the verdict ([`Verdict`]), whether the run ended
+//!   ([`Case::window`]), the declared limits ([`Case::limits`]), the verdict ([`Verdict`]), whether the run ended
 //!   at its step bound with clients still waiting, the case's fault
 //!   schedule as `step:action`, what the case does not cover
 //!   ([`Case::notes`]), the trace digest, and the error of a run that
@@ -221,7 +221,7 @@ impl Line<'_> {
             .collect();
         let notes: Vec<String> = self.case.notes.iter().map(|note| string(note)).collect();
         format!(
-            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"repetitions\":{},\"window\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"notes\":[{}],\"digest\":{},\"error\":{}}}",
+            "{{\"evidence\":{},\"core\":{},\"workload\":{},\"case\":{},\"seed\":{},\"repetitions\":{},\"window\":{},\"limits\":{},\"verdict\":{},\"step_bound\":{},\"steps\":{},\"schedule\":[{}],\"notes\":[{}],\"digest\":{},\"error\":{}}}",
             string(self.evidence.text()),
             string(self.core),
             string(self.workload),
@@ -229,6 +229,16 @@ impl Line<'_> {
             self.seed,
             self.repetitions.max(1),
             self.case.window.max(1),
+            self.case.limits.map_or_else(
+                || "null".to_owned(),
+                |limits| format!(
+                    "{{\"in_flight_entries\":{},\"in_flight_bytes\":{},\"queue\":{},\"log_read_bytes\":{}}}",
+                    limits.in_flight_entries,
+                    limits.in_flight_bytes,
+                    limits.queue,
+                    limits.log_read_bytes
+                ),
+            ),
             string(self.verdict.name()),
             self.bound,
             self.case.steps,
