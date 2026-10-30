@@ -720,3 +720,62 @@ fn the_snapshot_hooks_read_under_the_duty_budget() {
         "a hook read {greediest} bytes"
     );
 }
+
+thread_local! {
+    /// Whether a `Seer` recovered with a snapshot base in view.
+    static SAW_BASE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `Reference` noting whether its recovery sees the node's snapshot base.
+#[derive(Debug)]
+struct Seer(Reference);
+
+impl ConsensusCore for Seer {
+    type Message = Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        if log.base().is_some() {
+            SAW_BASE.with(|saw| saw.set(true));
+        }
+        Self(Reference::recover(id, peers, log))
+    }
+
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Message>> {
+        self.0.ready(log)
+    }
+
+    fn compacted(
+        &mut self,
+        base: karyos_sim::harness::core::SnapshotBase,
+        log: &mut LogView<'_>,
+    ) -> Result<(), karyos_sim::harness::core::Unsupported> {
+        self.0.compacted(base, log)
+    }
+
+    fn install(
+        &mut self,
+        base: karyos_sim::harness::core::SnapshotBase,
+        log: &mut LogView<'_>,
+    ) -> Result<(), karyos_sim::harness::core::InstallRefused> {
+        self.0.install(base, log)
+    }
+
+    delegate!(Seer);
+}
+
+/// A core restarted over a compacted log sees its node's snapshot base
+/// (karyos#903 review, codex: recovery saw first index 91 and no base).
+#[test]
+fn a_restarted_core_sees_its_snapshot_base() {
+    use karyos_sim::harness::workloads::W5Snapshots as W5;
+    let case = W5::skeleton()
+        .cases()
+        .unwrap()
+        .into_iter()
+        .find(|case| case.name.contains("between builds"))
+        .unwrap();
+    SAW_BASE.with(|saw| saw.set(false));
+    let outcome = run::<Seer>(&case, 1).unwrap();
+    assert_eq!(pass(&case, &outcome), Ok(None));
+    assert!(SAW_BASE.with(Cell::get), "the restarted core saw no base");
+}

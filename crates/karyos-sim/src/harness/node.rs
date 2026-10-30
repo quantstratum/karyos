@@ -1180,8 +1180,8 @@ impl<C: ConsensusCore> ServerNode<C> {
         limits: Option<Limits>,
     ) -> Result<Self, ServerError> {
         let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
-        let core =
-            Self::recovered(id, &peers, limits, &mut log).map_err(ServerError::Unsupported)?;
+        let core = Self::recovered(id, &peers, (limits, None), &mut log)
+            .map_err(ServerError::Unsupported)?;
         Ok(Self::assemble(
             id,
             peers,
@@ -1501,10 +1501,12 @@ impl<C: ConsensusCore> ServerNode<C> {
     fn recovered(
         id: NodeId,
         peers: &[NodeId],
-        limits: Option<Limits>,
+        (limits, base): (Option<Limits>, Option<SnapshotBase>),
         log: &mut RaftLog<SimDisk>,
     ) -> Result<C, Unsupported> {
-        let mut view = LogView::new(log);
+        // The core sees the snapshot its node recovers over (karyos#903
+        // review).
+        let mut view = LogView::new(log).with_base(base);
         match limits {
             Some(limits) => C::recover_with(id, peers, &limits, &mut view),
             None => Ok(C::recover(id, peers, &mut view)),
@@ -1807,7 +1809,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             entries,
             durable: log.durable_index(),
         });
-        let core = match Self::recovered(self.id, &self.peers, self.limits, &mut log) {
+        let core = match Self::recovered(self.id, &self.peers, (self.limits, self.base), &mut log) {
             Ok(core) => core,
             // The core took its limits at its creation: it is not the
             // same core if it refuses them now.

@@ -366,3 +366,57 @@ fn an_install_survives_a_later_snapshot_and_drops_an_old_vote() {
         (BASE + 1, Some(BASE + 10))
     );
 }
+
+/// Terms never go back across an install's base (karyos#903 review): an
+/// append below the base's term is refused, and a reopen refuses a frame
+/// below it on disk.
+#[test]
+fn terms_never_go_back_across_the_base() {
+    use karyos_archive::crc32c::crc32c;
+    use karyos_cluster::log::FIRST_INDEX_FILE;
+
+    // The append.
+    let disk = SimDisk::new();
+    let _ = prepare(&disk);
+    let store = snapshots(disk.clone()).unwrap();
+    let mut log = RaftLog::open_with(disk.clone(), Path::new(LOG), geometry(), Some(&store))
+        .unwrap()
+        .log;
+    log.install(BASE, BASE_TERM, &store).unwrap();
+    assert!(matches!(
+        log.append(&[entry(BASE + 1, BASE_TERM - 1)]),
+        Err(LogError::TermBack { .. })
+    ));
+    let _ = log.append(&[entry(BASE + 1, BASE_TERM)]).unwrap();
+
+    // The reopen: a log whose first frame, at 21, is of term 1, under an
+    // install record naming base term 2.
+    let mut disk = SimDisk::new();
+    let mut log = RaftLog::create(disk.clone(), Path::new(LOG), geometry(), BASE + 1).unwrap();
+    let _ = log.append(&[entry(BASE + 1, BASE_TERM - 1)]).unwrap();
+    let _ = log.sync().unwrap();
+    drop(log);
+    let mut record = Vec::new();
+    record.extend_from_slice(&(BASE + 1).to_le_bytes());
+    record.extend_from_slice(&BASE_TERM.to_le_bytes());
+    let digest = crc32c(&record);
+    record.extend_from_slice(&digest.to_le_bytes());
+    let file = disk.create(&Path::new(LOG).join(FIRST_INDEX_FILE)).unwrap();
+    disk.write_at(&file, 0, &record).unwrap();
+    disk.sync(&file).unwrap();
+    let mut store = snapshots(disk.clone()).unwrap();
+    let _ = store
+        .write(
+            BASE,
+            BASE_TERM,
+            &[Section::new(SectionKind::Service, 1, b"s")],
+        )
+        .unwrap();
+    assert!(matches!(
+        RaftLog::open_with(disk, Path::new(LOG), geometry(), Some(&store)),
+        Err(LogError::Chain {
+            problem: karyos_cluster::ChainProblem::TermBack { last: 2, got: 1 },
+            ..
+        })
+    ));
+}

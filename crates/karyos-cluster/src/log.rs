@@ -696,7 +696,12 @@ impl<D: Disk + Clone> RaftLog<D> {
             }
         } else {
             let mut reader = RawReader::new(&mut disk, dir, geometry);
-            walk(&mut reader, kept.start, kept.written, first_index, geometry)?
+            walk(
+                &mut reader,
+                (kept.start, kept.written),
+                (first_index, base_term),
+                geometry,
+            )?
         };
         let last = index_after(first_index, walk.entries.len());
         if let (Some((_, index)), Some(commit)) =
@@ -1017,7 +1022,13 @@ impl<D: Disk + Clone> RaftLog<D> {
         let mut expected = self
             .next_index()
             .ok_or(LogError::TooLarge { index: u64::MAX })?;
-        let mut last = self.entries.last().map(|(_, term)| *term);
+        // An installed log that holds nothing yet goes on from its base's
+        // term: terms never go back across the base (karyos#903 review).
+        let mut last = self
+            .entries
+            .last()
+            .map(|(_, term)| *term)
+            .or(self.base_term);
         let mut frames = Vec::with_capacity(entries.len());
         for entry in entries {
             if entry.index != expected {
@@ -1467,15 +1478,15 @@ struct Walk {
 /// is [`LogError::Chain`].
 fn walk<D: Disk>(
     reader: &mut RawReader<'_, D>,
-    start: u64,
-    written: u64,
-    first_index: u64,
+    (start, written): (u64, u64),
+    (first_index, base_term): (u64, Option<u64>),
     geometry: Geometry,
 ) -> Result<Walk, LogError> {
     let mut entries = Vec::new();
     let mut position = start;
     let mut next = first_index;
-    let mut last_term = None;
+    // After an install, the first frame's term is not below the base's.
+    let mut last_term = base_term;
     let at_segment_end = written.is_multiple_of(geometry.segment_length());
     while position < written {
         let chain = |problem| LogError::Chain { position, problem };
