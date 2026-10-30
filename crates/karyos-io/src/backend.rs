@@ -19,6 +19,7 @@
 // The handle table, the slot pool, the queue table and the ledger: the
 // building blocks of the sockets endpoint.
 pub(crate) mod handles;
+mod lease_ledger;
 pub(crate) mod ledger;
 mod pool;
 mod queues;
@@ -27,7 +28,10 @@ use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 use std::ops::ControlFlow;
 
+use karyos_sys::log_buffer::{LeaseCopyError, ReadLease};
 use thiserror::Error;
+
+pub use lease_ledger::{LeaseLedger, LeaseLedgerCounters, ResetDrain};
 
 /// Entries one [`TxReport`] holds, and so the most candidates one flush,
 /// cancellation, close, reset or retirement call reports.
@@ -879,6 +883,89 @@ pub trait TxBackend {
         queue: TxQueueId,
         report: &mut TxReport,
     ) -> Result<CancelOutcome, QueueError>;
+
+    /// The optional borrowed-term TX operation (R-CORE-45; SPEC.md §16.6):
+    /// queues the frames `lease` holds, as one datagram to `queue`'s route,
+    /// instead of a frame the caller filled. A backend that borrows keeps
+    /// the lease, in a [`LeaseLedger`], until it no longer references the
+    /// bytes: through every pending, submitted, `Unknown` and reset state,
+    /// released only when its contract proves access ended.
+    ///
+    /// The default stages, so every backend that does not borrow behaves
+    /// exactly as before: it claims a frame of the lease's length, copies
+    /// the frames into it ([`ReadLease::copy_to`], byte for byte what a
+    /// copy read gives), commits it, and ends the lease once the commit is
+    /// accepted.
+    ///
+    /// # Errors
+    ///
+    /// [`BorrowRejected`] with the lease, still held, and why: the claim,
+    /// the copy or the commit failed. Nothing is queued then, and the
+    /// claimed frame, if any, went back to its pool.
+    fn submit_borrowed(
+        &mut self,
+        queue: TxQueueId,
+        lease: ReadLease,
+        token: SenderToken,
+        options: TxOptions,
+    ) -> Result<TxTicket, BorrowRejected> {
+        let len = lease.len();
+        let mut frame = match self.claim_tx(queue, len) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return Err(BorrowRejected {
+                    lease,
+                    error: BorrowError::Claim(error),
+                });
+            }
+        };
+        if let Err(error) = lease.copy_to(frame.bytes_mut()) {
+            return Err(BorrowRejected {
+                lease,
+                error: BorrowError::Copy(error),
+            });
+        }
+        match frame.commit(Commit {
+            len,
+            token,
+            options,
+        }) {
+            // Staged: the frame holds the bytes, the lease ends here.
+            Ok(ticket) => Ok(ticket),
+            Err(rejected) => Err(BorrowRejected {
+                lease,
+                error: BorrowError::Commit(rejected.error),
+            }),
+        }
+    }
+}
+
+/// A borrowed submission refused, with its lease, still held
+/// ([`TxBackend::submit_borrowed`]).
+#[derive(Debug)]
+pub struct BorrowRejected {
+    /// The lease, unchanged: the caller stages it, retries or drops it.
+    pub lease: ReadLease,
+    /// Why it was refused.
+    pub error: BorrowError,
+}
+
+/// Why a borrowed submission was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum BorrowError {
+    /// The staging frame could not be claimed.
+    #[error("staging claim refused: {0}")]
+    Claim(ClaimError),
+    /// The lease could not be copied into the staging frame.
+    #[error("lease copy refused: {0:?}")]
+    Copy(LeaseCopyError),
+    /// The staging frame's commit was rejected.
+    #[error("staging commit rejected: {0}")]
+    Commit(CommitError),
+    /// The backend's ledger of borrowed leases is full.
+    #[error("lease ledger full")]
+    LedgerFull,
 }
 
 /// The RX half of a backend endpoint.

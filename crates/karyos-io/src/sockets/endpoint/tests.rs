@@ -6,6 +6,7 @@
 //! rows that need only a real socket on loopback, on Linux and on macOS.
 //! Rows that need more are listed, with their batch, in `DEFERRED_ROWS`.
 
+mod borrowed;
 mod lifecycle;
 mod loopback;
 mod model;
