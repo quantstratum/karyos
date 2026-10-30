@@ -91,6 +91,34 @@ fn each_armed_driver_takes_its_own_fault() {
     assert!(!crate::api::driver::take_fault(d), "disarmed at its close");
 }
 
+/// An arm racing a close is never left on the closed driver (karyos#699):
+/// it is armed inside the table's guard, so it either precedes the close,
+/// which disarms it, or is refused with the handle's error. A stress
+/// check: the window the fix closes is too narrow to hit reliably.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn an_arm_racing_a_close_is_never_left_armed() {
+    let _serial = serial();
+    for _ in 0..200 {
+        let driver = invoker();
+        std::thread::scope(|scope| {
+            let arming = scope.spawn(|| {
+                while karyos_test_panic_next_duty_cycle(driver) != Status::Closed.code() {
+                    std::hint::spin_loop();
+                }
+            });
+            while karyos_driver_close(driver) != Status::Ok.code() {
+                std::hint::spin_loop();
+            }
+            arming.join().unwrap();
+        });
+        assert!(
+            !crate::api::driver::take_fault(driver),
+            "armed after its close"
+        );
+    }
+}
+
 /// The slots are bounded: past [`MAX_ARMED`] distinct drivers an arm is
 /// refused with RESOURCES_UNAVAILABLE, typed, and a taken fault frees its
 /// slot. Raw handles only: no driver needed, so Miri runs it.

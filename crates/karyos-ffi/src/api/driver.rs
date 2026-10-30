@@ -685,10 +685,14 @@ const FAULT_WAIT: Duration = Duration::from_secs(10);
 /// [`FAULT_WAIT`] (the hook is disarmed).
 #[cfg(feature = "test-hooks")]
 pub(crate) fn panic_next_duty_cycle(driver: Handle) -> Result<(), Status> {
+    // Armed inside the table's guard: a close removes the driver under the
+    // same guard and only then disarms it, so an arm is either before that
+    // close (which disarms it) or refused with the handle's error, never
+    // left on a closed driver (karyos#699).
     let threaded = drivers().with(driver, |slot| {
-        matches!(slot.mode, Mode::Threaded(_)).then(|| slot.state.clone())
-    })?;
-    arm_fault(driver.raw())?;
+        arm_fault(driver.raw())
+            .map(|()| matches!(slot.mode, Mode::Threaded(_)).then(|| slot.state.clone()))
+    })??;
     let Some(state) = threaded else {
         return Ok(());
     };
