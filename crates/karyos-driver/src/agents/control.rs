@@ -748,16 +748,25 @@ impl ControlRoutes {
     /// }
     /// ```
     ///
+    /// The controls waiting go first, so none to the same destination is
+    /// overtaken: a receiver never sees a control before the ANNOUNCE it
+    /// refers to (#847).
+    ///
     /// # Errors
     ///
-    /// The [`ControlSendError`] reason; nothing waits for a later cycle,
-    /// and the destination's entry is evicted.
+    /// The [`ControlSendError`] reason; nothing waits for a later cycle.
+    /// `Blocked` while a control to `address` still waits; otherwise the
+    /// destination's entry is evicted.
     pub fn send<O: SocketOps>(
         &mut self,
         tx: &mut SocketsTx<O>,
         address: SocketAddr,
         control: &Control,
     ) -> Result<(), ControlSendError> {
+        self.send_waiting(tx);
+        if self.waiting.iter().any(|(at, _)| *at == address) {
+            return Err(ControlSendError::Blocked);
+        }
         self.send_now(tx, address, control)
     }
 

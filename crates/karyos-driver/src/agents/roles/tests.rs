@@ -6975,3 +6975,34 @@ fn a_removal_the_close_list_cannot_hold_records_a_close_failure() {
         "recorded for its endpoint and epoch"
     );
 }
+
+/// #847 (QS-COORDINATOR): a plain send never overtakes a control waiting
+/// for the same destination: the waiting ones go first, in order, then it.
+#[test]
+fn a_plain_send_never_overtakes_a_waiting_control() {
+    use super::super::control::ControlRoutes;
+
+    let (mut tx, seen) = recording_tx();
+    let at = |index: u16| SocketAddr::from(([127, 0, 0, 1], 47_000 + index));
+    let mut routes = ControlRoutes::new(1);
+    routes.hold_closes = true;
+    for index in 1..=4 {
+        let _ = routes
+            .send_or_wait(&mut tx, at(index), &challenge_control())
+            .unwrap();
+    }
+    assert!(routes.waiting() > 0, "some wait");
+    let last = at(4);
+    // The routes close; no duty has run yet.
+    routes.hold_closes = false;
+    let sent_before = seen.lock().unwrap().len();
+    let _ = routes.send(&mut tx, last, &challenge_control());
+    let sent = seen.lock().unwrap().clone();
+    let after = &sent[sent_before..];
+    let first_to_last = after.iter().position(|address| *address == last);
+    assert_eq!(routes.waiting(), 0, "drained first");
+    assert!(
+        after.len() >= 2 && first_to_last.is_some_and(|first| first < after.len() - 1),
+        "the waiting control to {last} went before the plain one: {after:?}"
+    );
+}
