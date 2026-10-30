@@ -226,6 +226,88 @@ impl TestService {
         self.applied
     }
 
+    /// Its whole state as a snapshot's service section (W5; karyos#687):
+    /// the values, the deduplication table, the last index applied and
+    /// the deduplicated count, each length-prefixed, little endian; `None`
+    /// when a length passes its prefix.
+    #[must_use]
+    pub fn encode(&self) -> Option<Vec<u8>> {
+        fn count(bytes: &mut Vec<u8>, n: usize) -> Option<()> {
+            bytes.extend_from_slice(&u32::try_from(n).ok()?.to_le_bytes());
+            Some(())
+        }
+        let mut bytes = SERVICE_MAGIC.to_vec();
+        count(&mut bytes, self.values.len())?;
+        for value in &self.values {
+            count(&mut bytes, value.len())?;
+            bytes.extend_from_slice(value);
+        }
+        count(&mut bytes, self.answered.len())?;
+        for (client, (sequence, ret)) in &self.answered {
+            bytes.extend_from_slice(&client.to_le_bytes());
+            bytes.extend_from_slice(&sequence.to_le_bytes());
+            let ret = ret.canonical();
+            count(&mut bytes, ret.len())?;
+            bytes.extend_from_slice(&ret);
+        }
+        match self.applied {
+            Some(index) => {
+                bytes.push(1);
+                bytes.extend_from_slice(&index.to_le_bytes());
+            }
+            None => bytes.push(0),
+        }
+        bytes.extend_from_slice(&self.deduplicated.to_le_bytes());
+        Some(bytes)
+    }
+
+    /// A service restored from [`TestService::encode`]'s bytes; `None` for
+    /// bytes that are not exactly one, so a malformed or cut snapshot is
+    /// refused, never half restored.
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        fn take<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+            let (head, tail) = (rest.get(..n)?, rest.get(n..)?);
+            *rest = tail;
+            Some(head)
+        }
+        fn u32_at(rest: &mut &[u8]) -> Option<usize> {
+            let bytes = take(rest, 4)?.first_chunk::<4>()?;
+            usize::try_from(u32::from_le_bytes(*bytes)).ok()
+        }
+        fn u64_at(rest: &mut &[u8]) -> Option<u64> {
+            Some(u64::from_le_bytes(*take(rest, 8)?.first_chunk::<8>()?))
+        }
+        let mut rest = bytes.strip_prefix(&SERVICE_MAGIC)?;
+        let mut values = Vec::new();
+        for _ in 0..u32_at(&mut rest)? {
+            let length = u32_at(&mut rest)?;
+            values.push(take(&mut rest, length)?.to_vec());
+        }
+        let mut answered = BTreeMap::new();
+        for _ in 0..u32_at(&mut rest)? {
+            let client = NodeId::from_le_bytes(*take(&mut rest, 4)?.first_chunk::<4>()?);
+            let sequence = u64_at(&mut rest)?;
+            let length = u32_at(&mut rest)?;
+            let ret = Ret::decode(take(&mut rest, length)?)?;
+            if answered.insert(client, (sequence, ret)).is_some() {
+                return None;
+            }
+        }
+        let applied = match take(&mut rest, 1)? {
+            [0] => None,
+            [1] => Some(u64_at(&mut rest)?),
+            _ => return None,
+        };
+        let deduplicated = u64_at(&mut rest)?;
+        rest.is_empty().then_some(Self {
+            values,
+            answered,
+            applied,
+            deduplicated,
+        })
+    }
+
     /// Retried commands it answered from its deduplication table.
     #[must_use]
     pub fn deduplicated(&self) -> u64 {
@@ -253,6 +335,9 @@ impl TestService {
         digest
     }
 }
+
+/// The tag a [`TestService::encode`] section starts with.
+pub const SERVICE_MAGIC: [u8; 4] = *b"KRSV";
 
 /// The test service as C3's sequential model.
 ///
@@ -434,6 +519,67 @@ impl Drop for SharedLog {
                 Err(_) => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod service_snapshot_tests {
+    #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
+
+    use super::*;
+
+    fn service() -> TestService {
+        let mut service = TestService::default();
+        let commands = [
+            (1, 1, Op::Append(b"a".to_vec())),
+            (2, 1, Op::Append(b"bb".to_vec())),
+            (1, 2, Op::Read),
+            (2, 1, Op::Append(b"bb".to_vec())),
+        ];
+        for (index, (client, sequence, op)) in (1u64..).zip(commands) {
+            let command = Command {
+                client,
+                sequence,
+                op,
+            };
+            let _ = service.apply(&Entry {
+                index,
+                term: 1,
+                event_time: 0,
+                payload: command.encode(),
+            });
+        }
+        service
+    }
+
+    /// A service restored from its snapshot section is the same service:
+    /// values, deduplication answers, last index and count (karyos#687).
+    #[test]
+    fn a_service_round_trips_through_its_snapshot_section() {
+        let service = service();
+        assert_eq!(service.deduplicated(), 1);
+        let bytes = service.encode().unwrap();
+        assert_eq!(TestService::decode(&bytes), Some(service.clone()));
+        assert_eq!(
+            TestService::decode(&TestService::default().encode().unwrap()),
+            Some(TestService::default())
+        );
+    }
+
+    /// Every cut, an extra byte and another tag are refused: a snapshot
+    /// is restored whole or not at all.
+    #[test]
+    fn a_malformed_section_is_refused() {
+        let bytes = service().encode().unwrap();
+        for cut in 0..bytes.len() {
+            assert_eq!(TestService::decode(&bytes[..cut]), None, "cut at {cut}");
+        }
+        let mut longer = bytes.clone();
+        longer.push(0);
+        assert_eq!(TestService::decode(&longer), None);
+        let mut other = bytes;
+        other[0] ^= 1;
+        assert_eq!(TestService::decode(&other), None);
     }
 }
 
