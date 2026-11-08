@@ -7,6 +7,6 @@
   core release and protocol version it pins, before any other call;
   compares each scenario's `abi` with the ABI version its pinned core
   release declares; and answers `op.library.version` with the core
-  release and protocol version, required from step B1. The release rule
+  release and protocol version, required from step B1 (at B0 it is `later`, the one `later` its B0 release allows). The release rule
   "no skip" reads "at the core release it targets" for that runner. The
   C ABI runners are unchanged.
