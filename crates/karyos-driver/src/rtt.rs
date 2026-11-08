@@ -554,24 +554,27 @@ impl<I: ProbeIds> RttProbes<I> {
     /// path or one with a probe outstanding within its timeout is left as
     /// it is. Returns how many
     /// paths it moved.
-    pub fn expedite(&mut self, now: u64) -> u32 {
+    pub fn expedite(&mut self, now: u64) -> usize {
         let timeout = self.config.rtt_probe_timeout;
-        let mut moved = 0u32;
-        for state in &mut self.paths {
+        let moved = self
+            .paths
+            .iter_mut()
             // A probe on its way already ends the wait for a sample.
-            if state.early
-                || state.retired
-                || !state.samples.is_empty()
-                || state
-                    .outstanding
-                    .is_some_and(|probe| age_ns(now, probe.issued_at) < timeout)
-            {
-                continue;
-            }
-            state.early = true;
-            state.last_probe = None;
+            .filter(|state| {
+                !(state.early
+                    || state.retired
+                    || !state.samples.is_empty()
+                    || state
+                        .outstanding
+                        .is_some_and(|probe| age_ns(now, probe.issued_at) < timeout))
+            })
+            .map(|state| {
+                state.early = true;
+                state.last_probe = None;
+            })
+            .count();
+        for _ in 0..moved {
             bump(&mut self.counts.early_probes, &mut self.counts.overflows);
-            moved = moved.saturating_add(1);
         }
         moved
     }
