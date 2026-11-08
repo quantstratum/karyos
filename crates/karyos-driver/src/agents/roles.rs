@@ -776,6 +776,8 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     rtt: RttConfig,
     /// A multicast image's NAK timing.
     multicast: MulticastConfig,
+    /// A unicast image's retry slack (owner item 9).
+    unicast_retry_slack: u64,
     /// The multicast NAK delays, drawn from a pool restocked on the timer
     /// step (RC-2).
     delays: OsDelayDraw,
@@ -1070,6 +1072,8 @@ fn settle_copies<T: StreamTerms>(
         match (settled, anchored) {
             (SendReport::Submitted(start), false) => {
                 image.loss.submitted(&nak, start, &image.rtt);
+                // A NAK before the path's first sample probes early (owner item 9).
+                let _ = image.rtt.expedite(start);
                 if let Some(anchor) = image.anchored.get_mut(at) {
                     *anchor = Some(nak);
                 }
@@ -1105,6 +1109,8 @@ fn settle_founding<T: StreamTerms>(
     match (settled, anchored) {
         (SendReport::Submitted(start), false) => {
             image.loss.submitted(&nak, start, &image.rtt);
+            // A NAK before the path's first sample probes early (owner item 9).
+            let _ = image.rtt.expedite(start);
             if let Some(slot) = image.anchored.get_mut(at) {
                 *slot = Some(nak);
             }
@@ -1135,6 +1141,8 @@ fn anchor_uncertain<T: StreamTerms>(image: &mut Installed<T>, at: usize) {
         && image.anchored.get(at).copied().flatten() != Some(nak)
     {
         image.loss.submitted(&nak, start, &image.rtt);
+        // A NAK before the path's first sample probes early (owner item 9).
+        let _ = image.rtt.expedite(start);
         if let Some(slot) = image.anchored.get_mut(at) {
             *slot = Some(nak);
         }
@@ -1924,6 +1932,7 @@ pub(super) fn roles<T: StreamTerms>(
             path_intake: None,
             rtt: config.rtt,
             multicast: config.multicast,
+            unicast_retry_slack: config.unicast_retry_slack,
             delays,
             clock: karyos_sys::host_clock::host_monotonic_ns,
             counters: ReceiverCounters::default(),
@@ -2901,6 +2910,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
         let loss = ImageLoss::new(
             LossConfig {
                 skew_window_ns: self.path_config.path_skew_window,
+                unicast_retry_slack_ns: self.unicast_retry_slack,
                 ..LossConfig::default()
             },
             key.alias,

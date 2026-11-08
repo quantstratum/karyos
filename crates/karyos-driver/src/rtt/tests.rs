@@ -381,3 +381,42 @@ fn the_reply_sources_are_bounded() {
     assert_eq!(replies.sources_full(), 1);
     assert!(replies.admit(source(3), SECOND));
 }
+
+/// Owner item 9: a NAK before a path's first sample moves its next probe
+/// ahead of `rtt_probe_interval`, once per path binding generation, never
+/// once per NAK; a sampled path, or one whose probe is still on its way,
+/// is left alone, and a rebinding allows one more.
+#[test]
+fn a_nak_before_the_first_sample_probes_early_once_per_generation() {
+    // An interval longer than the timeout, so that an expired probe leaves
+    // a wait that only `expedite` can cut short.
+    let config = RttConfig {
+        rtt_probe_interval: 4 * RttConfig::default().rtt_probe_timeout,
+        ..RttConfig::default()
+    };
+    let timeout = config.rtt_probe_timeout;
+    let mut probes = RttProbes::with_ids(config, 2, Ids::default()).unwrap();
+    // Path 0's first probe is lost: it expires, and the interval holds the
+    // next one back.
+    let lost = send(&mut probes, 0, 0);
+    assert_eq!(probes.due(0, timeout), None, "held to the interval");
+    // Path 1's probe is still on its way at the first NAK.
+    let _ = send(&mut probes, 1, timeout);
+    assert_eq!(probes.expedite(timeout + MS), 1, "path 0 only");
+    let early = probes.due(0, timeout + MS).unwrap();
+    assert_ne!(early.probe_id, lost.probe_id);
+    probes.submitted(early, timeout + MS);
+    // Later NAKs in the same generation take no other early probe.
+    assert_eq!(probes.expedite(timeout + 2 * MS), 0);
+    assert_eq!(probes.counts().early_probes, 1);
+    // A sampled path is never moved.
+    probes.reply(0, 0, early.probe_id, timeout + 3 * MS);
+    probes.rebind(1);
+    assert_eq!(
+        probes.expedite(timeout + 4 * MS),
+        1,
+        "path 1's new generation"
+    );
+    assert_eq!(probes.counts().early_probes, 2);
+    assert!(probes.due(1, timeout + 4 * MS).is_some());
+}
