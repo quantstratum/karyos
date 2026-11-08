@@ -665,6 +665,7 @@ fn a_removed_two_path_publication_ends_at_its_eos_on_both_paths() {
     let port = crate::test_ports::test_port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), port);
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: vec![

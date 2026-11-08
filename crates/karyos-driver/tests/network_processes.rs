@@ -162,6 +162,7 @@ fn free_address() -> SocketAddr {
 /// A reliable unicast channel to `address` over loopback.
 fn channel(address: SocketAddr) -> UdpConfig {
     UdpConfig {
+        retransmit_window: None,
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),

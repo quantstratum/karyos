@@ -190,6 +190,24 @@ The common URI rule binds every key added after the sixteen above.
   `Repeated`, `NotApplicable`, `Conflict`, `InvalidValue`, or
   `InvalidDuration` for a duration.
 
+### Keys added under this rule
+
+| Key | Media | Value |
+| --- | --- | --- |
+| `retransmit-window` | udp | `decimal` bytes: positive, a multiple of 32, at most `term-length` / 2; default `term-length` / 2 |
+
+- **`retransmit-window`** (owner item 63) is fixed at channel creation and
+  overrides the driver's repair setting for that channel. It applies only
+  to a reliable channel: with `reliable=false` it is a `Conflict` of
+  `reliable` and `retransmit-window`. When the URI gives `term-length`, a
+  window above half of it is `InvalidValue` at parse time; otherwise the
+  driver refuses it, typed, against the stream's term when it creates the
+  publication. It is how far below its sent position the publication
+  keeps its lanes for repair: the reliable-network held floor without
+  required receivers is `sent` minus the window. A smaller window can
+  make a hole unrecoverable even for a counted receiver; that loss is
+  reported, never silent.
+
 ### Durations
 
 ```abnf

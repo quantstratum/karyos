@@ -284,6 +284,16 @@ pub enum DriverError {
         /// The stream id.
         stream: u64,
     },
+    /// A channel's `retransmit-window` is above half of the stream's
+    /// term (owner item 63), refused at channel creation before anything
+    /// is configured.
+    #[error("retransmit-window {window} is above half of the term {term_length}")]
+    RetransmitWindowAboveHalfTerm {
+        /// The channel's window, in bytes.
+        window: u32,
+        /// The stream's term length, in bytes.
+        term_length: u32,
+    },
     /// A rate limit names a scope other than the publication's, which
     /// Phase 2 does not support (GC-5).
     #[error("rate limits of scope {scope} are not supported")]

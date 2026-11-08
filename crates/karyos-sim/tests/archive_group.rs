@@ -1017,6 +1017,7 @@ fn loopback(port: u16) -> karyos_protocol::channel::UdpConfig {
     use karyos_protocol::channel::{Destination, Interface, Security, UdpConfig};
     use std::net::{Ipv4Addr, SocketAddr};
     UdpConfig {
+        retransmit_window: None,
         destination: Destination::Unicast(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
         interface: Some(Interface::Address(Ipv4Addr::LOCALHOST.into())),
         paths: Vec::new(),
