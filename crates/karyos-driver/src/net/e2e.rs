@@ -96,6 +96,7 @@ fn aggregate(stream_id: i32, session_id: i32, lanes: usize) -> AggregateConfig {
 
 fn channel(address: SocketAddr, reliable: bool) -> UdpConfig {
     UdpConfig {
+        retransmit_window: None,
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),
@@ -864,6 +865,7 @@ fn a_multicast_publication_reaches_every_subscriber() {
     let port = free_port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 1)), port);
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -948,6 +950,7 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
     }
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), free_port());
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -1413,6 +1416,7 @@ fn multicast_cycles_run_on_the_network_clock() {
         .unwrap()
     };
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -2699,6 +2703,7 @@ fn optional_receiver_closes(
     let port = free_port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), port);
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -3044,6 +3049,98 @@ fn a_lone_optional_unicast_receivers_hole_is_repaired() {
     );
 }
 
+/// Owner item 63: a channel's `retransmit-window` above half the
+/// stream's term is refused at channel creation, typed, and leaves nothing
+/// configured: the same stream is then added with a window of half a term.
+#[test]
+fn a_retransmit_window_above_half_the_term_is_refused_at_channel_creation() {
+    let mut a = driver(ThreadingMode::Shared);
+    let socket = silent();
+    let mut above = channel(socket.local_addr().unwrap(), true);
+    above.retransmit_window = Some(MIN_TERM_LENGTH / 2 + 32);
+    assert_eq!(
+        a.add_network_publication(aggregate(12, 3, 1), &above).err(),
+        Some(DriverError::RetransmitWindowAboveHalfTerm {
+            window: MIN_TERM_LENGTH / 2 + 32,
+            term_length: MIN_TERM_LENGTH,
+        })
+    );
+    let mut half = above.clone();
+    half.retransmit_window = Some(MIN_TERM_LENGTH / 2);
+    assert!(
+        a.add_network_publication(aggregate(12, 3, 1), &half)
+            .is_ok()
+    );
+}
+
+/// Owner item 63: a channel's `retransmit-window` below half a term moves
+/// the held floor up to `sent - window`, so a hole that the default window
+/// would repair (see [`a_lone_optional_unicast_receivers_hole_is_repaired`])
+/// becomes unrecoverable even for the lone receiver that flow control
+/// counts. The loss is reported: B's NAK is answered RANGE_UNAVAILABLE and
+/// its image closes as unrecoverable, never a silent hole.
+#[test]
+fn a_small_retransmit_window_makes_a_counted_receivers_hole_unrecoverable() {
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let stream_id = 11;
+    let _ = b
+        .add_network_subscription(stream_id, &channel(ANY_PORT, true))
+        .unwrap();
+    let address = bound(&b, stream_id);
+    let window = 4096;
+    let mut small = channel(address, true);
+    small.retransmit_window = Some(window);
+    let publication = a
+        .add_network_publication(aggregate(stream_id, 3, 1), &small)
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(stream_id, 3);
+        image.is_some()
+    });
+    let image = image.unwrap();
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let total = MIN_TERM_LENGTH * 3 / 2 / 1000;
+    a.net.as_mut().unwrap().sender_ignores_naks(true);
+    b.net.as_mut().unwrap().drop_receiver_data(&[2]);
+    let (mut sent, mut seen) = (0u32, 0u32);
+    for _ in 0..4_000 {
+        offer_and_read(
+            [&mut a, &mut b],
+            &mut lane,
+            &mut reader,
+            (&mut sent, &mut seen),
+            total,
+        );
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert_eq!(seen, 2, "B holds at its hole");
+    assert!(
+        u64::from(sent) * 1056 > u64::from(window) + 3 * 1056,
+        "sent {sent} past the window above the hole"
+    );
+    a.net.as_mut().unwrap().sender_ignores_naks(false);
+    let mut closed = false;
+    for _ in 0..40_000 {
+        let _ = a.do_work().unwrap();
+        let _ = b.do_work().unwrap();
+        let receiver = b.net.as_ref().unwrap().receiver_counters().unwrap();
+        if receiver.images_closed_unrecoverable >= 1 {
+            closed = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert!(
+        closed,
+        "B's hole below `sent - window` was reported unrecoverable"
+    );
+    assert_eq!(seen, 2, "no message past the hole was delivered");
+}
+
 /// Docs#336's second gate: a slow optional receiver under `min` (the
 /// multicast default), C, is bounded by flow control and its hole is
 /// repaired. While the sender holds NAKs back, C loses its third DATA
@@ -3066,6 +3163,7 @@ fn a_slow_optional_receiver_under_min_is_bounded_and_repaired() {
     let port = free_port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), port);
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -3322,6 +3420,7 @@ fn two_paths(
     }
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), free_port());
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: vec![
@@ -3535,6 +3634,7 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
     let port = free_port();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)), port);
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: vec![

@@ -465,6 +465,10 @@ fn published_keys_keep_their_meaning() {
                     ttl: Some(1)
                 }
             ),
+            Key::RetransmitWindow => assert_eq!(
+                udp("karyos:udp?endpoint=10.0.0.5:1|retransmit-window=4096").retransmit_window,
+                Some(4096)
+            ),
         }
         assert_eq!(key.name(), name);
     }
@@ -683,4 +687,60 @@ proptest::proptest! {
         let _ = ChannelConfig::parse(&format!("karyos:udp?{query}"));
         let _ = ChannelConfig::parse(&format!("karyos:ipc?{query}"));
     }
+}
+
+/// `retransmit-window` (owner item 63): a positive multiple of 32, at most
+/// half of a `term-length` the URI gives; `None` when absent, so the
+/// driver's setting (half a term by default) stays.
+#[test]
+fn the_retransmit_window_key_is_validated() {
+    assert_eq!(
+        udp("karyos:udp?endpoint=10.0.0.5:1").retransmit_window,
+        None
+    );
+    assert_eq!(
+        udp("karyos:udp?endpoint=10.0.0.5:1|term-length=65536|retransmit-window=32768")
+            .retransmit_window,
+        Some(32768)
+    );
+    for refused in [
+        "karyos:udp?endpoint=10.0.0.5:1|retransmit-window=0",
+        "karyos:udp?endpoint=10.0.0.5:1|retransmit-window=33",
+        "karyos:udp?endpoint=10.0.0.5:1|retransmit-window=+64",
+        "karyos:udp?endpoint=10.0.0.5:1|retransmit-window=064",
+        "karyos:udp?endpoint=10.0.0.5:1|retransmit-window=4294967328",
+        "karyos:udp?endpoint=10.0.0.5:1|term-length=65536|retransmit-window=32800",
+    ] {
+        assert!(
+            matches!(
+                ChannelConfig::parse(refused),
+                Err(ChannelError::InvalidValue {
+                    key: "retransmit-window",
+                    ..
+                })
+            ),
+            "{refused}"
+        );
+    }
+    assert_eq!(
+        ChannelConfig::parse("karyos:udp?endpoint=10.0.0.5:1|reliable=false|retransmit-window=64"),
+        Err(ChannelError::Conflict {
+            first: "reliable",
+            second: "retransmit-window"
+        })
+    );
+    assert_eq!(
+        ChannelConfig::parse("karyos:ipc?retransmit-window=64"),
+        Err(ChannelError::NotApplicable {
+            key: "retransmit-window"
+        })
+    );
+    assert_eq!(
+        ChannelConfig::parse(
+            "karyos:udp?endpoint=10.0.0.5:1|retransmit-window=64|retransmit-window=128"
+        ),
+        Err(ChannelError::Repeated {
+            key: "retransmit-window"
+        })
+    );
 }

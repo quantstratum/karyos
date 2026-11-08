@@ -28,6 +28,7 @@ use crate::membership::{PublicationRoles, Strategy};
 /// A manual multi-destination channel to `destinations`.
 pub(super) fn destinations(destinations: &[SocketAddr], reliable: bool) -> UdpConfig {
     UdpConfig {
+        retransmit_window: None,
         destination: Destination::MultiDestination {
             destinations: destinations.to_vec(),
             control: None,

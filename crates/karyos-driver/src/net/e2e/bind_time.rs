@@ -235,6 +235,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
     let _route = MulticastOnLoopback::route();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 11)), free_port());
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -534,6 +535,7 @@ fn measure_drivers(label: &str, reliable: bool, count: usize, streams: usize, dr
     let _route = MulticastOnLoopback::route();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 12)), free_port());
     let channel = UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),

@@ -305,6 +305,13 @@ pub struct UdpConfig {
     pub flow_control: Option<FlowControl>,
     /// The protection class.
     pub security: Security,
+    /// How far below its sent position a reliable publication keeps its
+    /// lanes for repair, in bytes (`retransmit-window`, owner item 63):
+    /// positive and a multiple of 32; at most half the term, which the
+    /// URI checks when it gives `term-length` and the driver checks at
+    /// channel creation otherwise. `None` keeps the driver's setting,
+    /// whose default is half a term.
+    pub retransmit_window: Option<u32>,
 }
 
 /// A validated channel.
@@ -345,9 +352,10 @@ enum Key {
     Control,
     ControlMode,
     Ttl,
+    RetransmitWindow,
 }
 
-const KEYS: [(&str, Key); 16] = [
+const KEYS: [(&str, Key); 17] = [
     ("endpoint", Key::Endpoint),
     ("group", Key::Group),
     ("interface", Key::Interface),
@@ -364,6 +372,7 @@ const KEYS: [(&str, Key); 16] = [
     ("control", Key::Control),
     ("control-mode", Key::ControlMode),
     ("ttl", Key::Ttl),
+    ("retransmit-window", Key::RetransmitWindow),
 ];
 
 /// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
@@ -511,7 +520,16 @@ impl ChannelConfig {
                 .unwrap_or_default(),
         };
         let media = if udp {
-            Media::Udp(parse_udp(&get)?)
+            let udp = parse_udp(&get)?;
+            if let (Some(window), Some(term)) = (udp.retransmit_window, common.term_length)
+                && u64::from(window) > u64::from(term.get()) / 2
+            {
+                return Err(invalid(
+                    Key::RetransmitWindow,
+                    "above half of `term-length`",
+                ));
+            }
+            Media::Udp(udp)
         } else {
             Media::Ipc
         };
@@ -673,6 +691,15 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         })
         .transpose()?
         .unwrap_or_default();
+    let retransmit_window = get(Key::RetransmitWindow)
+        .map(parse_retransmit_window)
+        .transpose()?;
+    if retransmit_window.is_some() && !reliable {
+        return Err(ChannelError::Conflict {
+            first: Key::Reliable.name(),
+            second: Key::RetransmitWindow.name(),
+        });
+    }
     Ok(UdpConfig {
         destination,
         interface,
@@ -680,6 +707,7 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         reliable,
         flow_control,
         security,
+        retransmit_window,
     })
 }
 
@@ -745,6 +773,26 @@ fn parse_mtu(value: &str) -> Result<u32, ChannelError> {
         .map(|_| mtu)
         .map_err(|_| invalid(Key::Mtu, "no room for a frame header and payload"))
 }
+
+/// A `retransmit-window` value: a positive `decimal`, a multiple of 32
+/// (the frame alignment). Its bound of half a term is checked against the
+/// term in force.
+fn parse_retransmit_window(value: &str) -> Result<u32, ChannelError> {
+    let window: u64 =
+        decimal(value).ok_or_else(|| invalid(Key::RetransmitWindow, "not a decimal integer"))?;
+    u32::try_from(window)
+        .ok()
+        .filter(|&window| window > 0 && window.is_multiple_of(RETRANSMIT_WINDOW_ALIGNMENT))
+        .ok_or_else(|| {
+            invalid(
+                Key::RetransmitWindow,
+                "not a positive multiple of 32 within a term",
+            )
+        })
+}
+
+/// The alignment of a `retransmit-window`: a frame's.
+pub const RETRANSMIT_WINDOW_ALIGNMENT: u32 = 32;
 
 fn parse_term_length(value: &str) -> Result<TermLength, ChannelError> {
     let length: u32 =

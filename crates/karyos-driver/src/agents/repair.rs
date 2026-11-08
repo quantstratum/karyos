@@ -87,7 +87,8 @@ pub struct RepairConfig {
     /// default, is half a term, which is also the most: a counted
     /// receiver's window is at most half a term, so its holes stay above
     /// the floor. A smaller window can lose data even for a counted
-    /// receiver, reported as unrecoverable. No URI key sets it yet.
+    /// receiver, reported as unrecoverable. A channel's `retransmit-window`
+    /// overrides it for that channel.
     pub retransmit_window: Option<u32>,
 }
 

@@ -461,6 +461,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::UnsupportedChannel);
         }
         let quanta = Lanes::new(&config.quanta).map_err(|_| DriverError::InvalidConfig)?;
+        // The channel's `retransmit-window` (owner item 63), fixed here, at
+        // channel creation: at most half the term. Its other bounds, nonzero
+        // and a multiple of 32, are the URI's.
+        if let Some(window) = channel.retransmit_window {
+            let term_length = config.stream.buffer.term_length.get();
+            if window > term_length / 2 {
+                return Err(DriverError::RetransmitWindowAboveHalfTerm {
+                    window,
+                    term_length,
+                });
+            }
+        }
         // The incarnation's first term id, drawn on the control path before
         // the publication and its SETUP exist (SPEC §4, initial state; §5),
         // shared by every lane; a failed draw refuses the add.
@@ -486,6 +498,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             quanta,
             guard,
             roles,
+            retransmit_window: channel.retransmit_window,
         };
         let added = self.attach_sender(&handle, channel, FIRST_INCARNATION, false);
         if let Err(error) = added {
@@ -797,6 +810,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             quanta,
             guard,
             roles,
+            retransmit_window,
         } = channel;
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
         let mut term = None;
@@ -956,6 +970,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 if let Some(cells) = cells {
                     outbound.set_cells(cells);
                 }
+                outbound.set_retransmit_window(retransmit_window);
                 Ok(outbound)
             })
             .map_err(|_| DriverError::InvalidConfig)

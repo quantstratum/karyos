@@ -419,6 +419,9 @@ pub(crate) struct SenderChannel {
     pub(crate) guard: Option<publish::NetworkGuard>,
     /// Its receivers' roles.
     pub(crate) roles: Option<Box<crate::membership::PublicationRoles>>,
+    /// The channel's `retransmit-window`, checked against its term;
+    /// `None` keeps the driver's repair setting.
+    pub(crate) retransmit_window: Option<u32>,
 }
 
 /// A network publication between incarnations (guards-and-abort.md, On
