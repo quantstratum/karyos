@@ -148,6 +148,10 @@ pub struct RttCounts {
     pub id_failures: u64,
     /// Paths whose binding generation is exhausted: they stopped probing.
     pub generations_exhausted: u64,
+    /// Early probes: a NAK preceded the path's first sample, so its next
+    /// probe was not held to `rtt_probe_interval` (owner item 9), at most
+    /// once per path binding generation.
+    pub early_probes: u64,
     /// Counts that would have overflowed and kept their last value.
     pub overflows: u64,
 }
@@ -288,6 +292,8 @@ struct PathRtt {
     /// The last accepted samples, oldest overwritten first.
     samples: Vec<u64>,
     next_sample: usize,
+    /// This generation's early probe was taken (owner item 9).
+    early: bool,
 }
 
 /// A probe the caller sends on a path.
@@ -353,6 +359,7 @@ impl<I: ProbeIds> RttProbes<I> {
                     last_probe: None,
                     samples: Vec::with_capacity(window),
                     next_sample: 0,
+                    early: false,
                 })
                 .collect(),
             ids,
@@ -536,7 +543,40 @@ impl<I: ProbeIds> RttProbes<I> {
             state.last_probe = None;
             state.samples.clear();
             state.next_sample = 0;
+            state.early = false;
         }
+    }
+
+    /// A NAK was submitted at `now`: each path with no accepted sample yet probes
+    /// at its next step, outside `rtt_probe_interval`, so the retry stops
+    /// timing on `rtt_initial` sooner (owner item 9). At most once per
+    /// path binding generation, counted; a path with a sample, a retired
+    /// path or one with a probe outstanding within its timeout is left as
+    /// it is. Returns how many
+    /// paths it moved.
+    pub fn expedite(&mut self, now: u64) -> usize {
+        let timeout = self.config.rtt_probe_timeout;
+        let moved = self
+            .paths
+            .iter_mut()
+            // A probe on its way already ends the wait for a sample.
+            .filter(|state| {
+                !(state.early
+                    || state.retired
+                    || !state.samples.is_empty()
+                    || state
+                        .outstanding
+                        .is_some_and(|probe| age_ns(now, probe.issued_at) < timeout))
+            })
+            .map(|state| {
+                state.early = true;
+                state.last_probe = None;
+            })
+            .count();
+        for _ in 0..moved {
+            bump(&mut self.counts.early_probes, &mut self.counts.overflows);
+        }
+        moved
     }
 
     /// `path`'s estimate: the largest of its last accepted samples, or

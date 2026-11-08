@@ -240,18 +240,38 @@ pub struct LossConfig {
     /// default 1 ms. With fewer than two live paths at detection there is
     /// no wait (RP-5).
     pub skew_window_ns: u64,
+    /// `unicast_retry_slack` (owner item 9): how far past its RTT snapshot
+    /// a unicast NAK's retry waits, 0 to 1 s, default 0 (the accepted
+    /// rule). Distinct from the multicast `repair_slack`, which it leaves
+    /// unchanged. A non-zero default waits for a recorded comparison of
+    /// repair duplication and recovery latency under low RTT and loss.
+    pub unicast_retry_slack_ns: u64,
 }
 
 /// The largest `path_skew_window` (RP-4): one second.
 pub const MAX_SKEW_WINDOW_NS: u64 = 1_000_000_000;
+
+/// The largest `unicast_retry_slack` (owner item 9): one second.
+pub const MAX_UNICAST_RETRY_SLACK_NS: u64 = 1_000_000_000;
 
 impl Default for LossConfig {
     fn default() -> Self {
         Self {
             range_invalid_limit: 3,
             skew_window_ns: 1_000_000,
+            unicast_retry_slack_ns: 0,
         }
     }
+}
+
+/// Whether a unicast NAK `age` ns old is due again, with the RTT snapshot
+/// `rtt` copied at its submission and `slack` (owner item 9): once its age
+/// reaches the RTT and the excess over it reaches the slack. Checked
+/// subtraction, never a deadline formed by addition: an age below the RTT
+/// is not due, and nothing can wrap.
+#[must_use]
+pub fn unicast_retry_due(age: u64, rtt: u64, slack: u64) -> bool {
+    age.checked_sub(rtt).is_some_and(|excess| excess >= slack)
 }
 
 /// A configuration the component refuses.
@@ -270,6 +290,9 @@ pub enum LossConfigError {
     /// `path_skew_window` above [`MAX_SKEW_WINDOW_NS`].
     #[error("path_skew_window above 1 s")]
     SkewWindow,
+    /// `unicast_retry_slack` above [`MAX_UNICAST_RETRY_SLACK_NS`].
+    #[error("unicast_retry_slack above 1 s")]
+    UnicastRetrySlack,
 }
 
 /// One missing interval of a lane, within one term.
@@ -577,6 +600,9 @@ impl ImageLoss {
         }
         if config.skew_window_ns > MAX_SKEW_WINDOW_NS {
             return Err(LossConfigError::SkewWindow);
+        }
+        if config.unicast_retry_slack_ns > MAX_UNICAST_RETRY_SLACK_NS {
+            return Err(LossConfigError::UnicastRetrySlack);
         }
         let lane_count = usize::from(lane_count);
         if !(1..=MAX_LANES).contains(&lane_count) {
@@ -951,6 +977,7 @@ impl ImageLoss {
         }
         let (alias, identity, receiver) = (self.alias, self.identity, self.receiver);
         let multicast = self.multicast.is_some();
+        let slack = self.config.unicast_retry_slack_ns;
         let state = self.lane_mut(lane)?;
         // RP-4: a gap waits its skew deadline before any NAK.
         if matches!(state.decision, Decision::NakDue { .. }) && now < state.skew_until {
@@ -968,8 +995,8 @@ impl ImageLoss {
                 }
                 _ => return None,
             },
-            // Unicast retries one RTT after submission; multicast retries
-            // through the next cycle (ImageLoss::cycle).
+            // Unicast retries one RTT plus its slack after submission;
+            // multicast retries through the next cycle (ImageLoss::cycle).
             (
                 Decision::AwaitRepair {
                     hole,
@@ -978,7 +1005,7 @@ impl ImageLoss {
                     ..
                 },
                 false,
-            ) if age_ns(now, submitted_at) >= rtt => hole,
+            ) if unicast_retry_due(age_ns(now, submitted_at), rtt, slack) => hole,
             _ => return None,
         };
         let nameable = hole.length >= FRAME

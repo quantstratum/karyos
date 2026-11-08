@@ -1220,3 +1220,84 @@ fn an_own_route_fault_spares_healthy_routes() {
     loss.set_other_route_healthy(true);
     assert!(loss.due(lane(0), 10 * RTT).is_some());
 }
+
+/// Owner item 9: the unicast retry slack defaults to 0, the accepted
+/// rule, is bounded at 1 s, and is distinct from the multicast
+/// `repair_slack`, whose default stays 1 ms.
+#[test]
+fn the_unicast_retry_slack_defaults_to_zero_and_is_bounded() {
+    assert_eq!(LossConfig::default().unicast_retry_slack_ns, 0);
+    assert_eq!(MulticastConfig::default().repair_slack_ns, 1_000_000);
+    let at = |slack| LossConfig {
+        unicast_retry_slack_ns: slack,
+        ..LossConfig::default()
+    };
+    assert!(
+        ImageLoss::new(
+            at(MAX_UNICAST_RETRY_SLACK_NS),
+            alias(),
+            identity(),
+            receiver(),
+            1,
+            0
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        ImageLoss::new(
+            at(MAX_UNICAST_RETRY_SLACK_NS + 1),
+            alias(),
+            identity(),
+            receiver(),
+            1,
+            0
+        )
+        .err(),
+        Some(LossConfigError::UnicastRetrySlack)
+    );
+}
+
+/// The due rule compares the excess of the age over the RTT with the slack
+/// by checked subtraction: an age below the RTT is never due, whatever the
+/// values, and nothing wraps at the ends of `u64`.
+#[test]
+fn the_unicast_retry_rule_cannot_underflow() {
+    for (age, rtt, slack, due) in [
+        (0, 1, 0, false),
+        (999, 1_000, 0, false),
+        (1_000, 1_000, 0, true),
+        (0, u64::MAX, 0, false),
+        (u64::MAX - 1, u64::MAX, 0, false),
+        (u64::MAX, u64::MAX, 0, true),
+        (u64::MAX, 0, u64::MAX, true),
+        (u64::MAX, 1, u64::MAX, false),
+        (1_499, 1_000, 500, false),
+        (1_500, 1_000, 500, true),
+    ] {
+        assert_eq!(
+            unicast_retry_due(age, rtt, slack),
+            due,
+            "{age} {rtt} {slack}"
+        );
+    }
+}
+
+/// With a slack the retry waits one RTT plus the slack from submission, at
+/// `RTT + slack - 1` not yet and at `RTT + slack` due; with 0 it is the
+/// accepted rule ([`the_retry_waits_one_rtt_from_submission`]).
+#[test]
+fn a_unicast_retry_waits_its_slack_past_the_rtt() {
+    let config = LossConfig {
+        unicast_retry_slack_ns: 500,
+        ..LossConfig::default()
+    };
+    let mut loss = ImageLoss::new(config, alias(), identity(), receiver(), 2, 1).unwrap();
+    let rtt = FakeRtt::new(1_000);
+    let _ = loss.observe(lane(0), hole(0, 64), 0);
+    let nak = loss.due(lane(0), 0).unwrap();
+    loss.submitted(&nak, 100, &rtt);
+    assert_eq!(loss.due(lane(0), 50), None, "a clock before the submission");
+    assert_eq!(loss.due(lane(0), 1_100), None, "one RTT, inside the slack");
+    assert_eq!(loss.due(lane(0), 1_599), None);
+    assert_eq!(loss.due(lane(0), 1_600), Some(nak));
+}

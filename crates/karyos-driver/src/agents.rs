@@ -314,6 +314,11 @@ pub struct AgentConfig {
     /// design defaults: `nak_delay_scale` 16, `repair_linger` and
     /// `repair_slack` 1 ms, the `group` response domain.
     pub multicast: crate::repair::loss::MulticastConfig,
+    /// `unicast_retry_slack` in ns: how far past its RTT snapshot a
+    /// unicast NAK's retry waits, 0 to 1 s (owner item 9). Default 0, the
+    /// accepted rule; distinct from the multicast `repair_slack`, which it
+    /// leaves unchanged.
+    pub unicast_retry_slack: u64,
     /// `group_nak_budget`: control group datagrams the receiver reads per
     /// cycle, at least 1 (default 64, provisional, RC-15).
     pub group_nak_budget: u32,
@@ -372,6 +377,7 @@ impl Default for AgentConfig {
             repair: repair::RepairConfig::default(),
             max_destinations: data::DEFAULT_MAX_DESTINATIONS,
             multicast: crate::repair::loss::MulticastConfig::default(),
+            unicast_retry_slack: 0,
             group_nak_budget: 64,
             stop_timeout: Duration::from_secs(1),
             barrier_ack_timeout: conflated_gate::DEFAULT_BARRIER_ACK_TIMEOUT_NS,
@@ -479,6 +485,9 @@ impl AgentConfig {
         self.multicast
             .validate_for(self.rtt.rtt_floor, self.rtt.rtt_probe_timeout)
             .map_err(|_| AgentError::InvalidConfig("invalid multicast NAK timing"))?;
+        if self.unicast_retry_slack > crate::repair::loss::MAX_UNICAST_RETRY_SLACK_NS {
+            return Err(AgentError::InvalidConfig("unicast_retry_slack above 1 s"));
+        }
         if self.group_nak_budget == 0 {
             return Err(AgentError::InvalidConfig(
                 "group_nak_budget must be at least 1",
