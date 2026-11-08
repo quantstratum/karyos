@@ -65,6 +65,7 @@ fn aggregate(stream_id: i32, session_id: i32, lanes: usize) -> AggregateConfig {
 
 fn channel(address: SocketAddr) -> UdpConfig {
     UdpConfig {
+        retransmit_window: None,
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),

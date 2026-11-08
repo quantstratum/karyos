@@ -291,7 +291,7 @@ gives a message as in Calls. `->` lists the results of `ok`.
 
 | Op | Arguments | Results | Feature |
 | --- | --- | --- | --- |
-| `library.version` | none | `major`, `minor`, `patch` | |
+| `library.version` | none | `major`, `minor`, `patch`; for a semantic runner, its core release and protocol version (Versions) | |
 | `clock.now` | `domain`: `"monotonic"` or `"tai"` | `now` | `tai-clock` for `"tai"` |
 | `driver.create` | none | `driver` | `embedded-driver` |
 | `driver.create_networked` | none: the options of `karyos_driver_options_init` with `network` set to `KARYOS_NETWORK_ON` | `driver` | `embedded-driver`, `embedded-network` |
@@ -598,7 +598,8 @@ suite <sha256> header <sha256> core <major.minor.patch> <library id>
 The Python binding wraps the Rust crates, not the C ABI: it prints the
 suite, then its semantic target in place of the header and core,
 `core <release> protocol <version>`, the core release and the protocol
-version it was built against.
+version it was built against. A runner that prints this line is a
+semantic runner, and checks versions as Versions, Semantic target says.
 
 ## Failures
 
@@ -654,6 +655,29 @@ scenario runs when the major versions are equal and:
 
 Any other scenario is skipped, never reported as passed.
 
+### Semantic target
+
+A runner with no ABI version (Pinning: a binding that wraps the Rust
+crates, not the C ABI) targets a core release and a protocol version
+instead. In place of the `karyos_abi_version` check it compares, first,
+before any other call, the core release and the protocol version it
+pins with `karyos::CORE_VERSION` and `karyos::PROTOCOL_VERSION` of the
+crates it links; a mismatch fails the run, as a library outside the
+range above does. In place of the library's ABI version, each
+scenario's `abi` is compared, by the rules above, with the ABI version
+that the pinned core release declares (the `karyos_abi_version` of that
+release, which the suite at that release's tag records).
+
+`op.library.version` (`library.version`) reports, for a semantic runner,
+the core release and the protocol version of the crates it links, not
+the ABI's `major` and `minor`. The runner checks them against its
+pinned core release and protocol version in place of the scenario's
+`major` and `minor` results, and a mismatch fails the scenario. The
+scenario is required of a semantic runner from step B1, not B0, since
+that runner's B0 calls no client API: at B0 it reports it `later`.
+
+The runners that drive the C ABI keep the rules above unchanged.
+
 ## Reporting
 
 A runner prints the pinning line first (Format 2, Pinning), then the
@@ -669,21 +693,30 @@ file and line of the step that failed:
 
 - `passed`;
 - `failed`;
-- `skipped`: its `abi` does not run against the library (Versions);
+- `skipped`: its `abi` does not run against the library, or for a
+  semantic runner against the ABI version its pinned core release
+  declares (Versions);
 - `unsupported <feature>`: it needs a feature the runner declared
   absent. A feature the runner neither offers nor declares absent is a
   failure, never `unsupported`;
-- `later`: its `since` step comes after the runner's step.
+- `later`: its `since` step comes after the runner's step. For a
+  semantic runner, `op.library.version`'s `since B0` reads as B1
+  (Versions, Semantic target), so at B0 it is `later`.
 
 A runner checks a scenario in that order, its `abi` (`skipped`), its
 `since` (`later`), then its features (`unsupported`), and reports the
 first that applies, so the reports of two runners compare line by line.
 
 A scenario is required when its `abi` runs, its `since` is the runner's
-step or earlier, and the runner offers its features; a required
+step or earlier (for a semantic runner, with `op.library.version`'s
+`since` read as B1), and the runner offers its features; a required
 scenario passes or fails, and is never skipped. A binding release
-requires no failure, no skip at the ABI version it targets and no
-`later` at the step it releases (SPEC.md §13). Each `unsupported` is
+requires no failure, no skip at the ABI version it targets (for a
+semantic runner, at the core release it targets) and no
+`later` at the step it releases (SPEC.md §13). A semantic runner's B0
+release therefore carries `op.library.version` as `later`, the one
+`later` that rule allows it at B0, and from B1 on the scenario is
+required and passes or fails. Each `unsupported` is
 one of the features its binding SPEC lets it lack at that step, and the
 binding's runner states which features it offers and why it lacks the
 others. The declaration line lets a release gate check the absent

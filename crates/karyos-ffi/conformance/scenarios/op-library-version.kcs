@@ -1,5 +1,7 @@
 # A binding reports the library's ABI version before any other call
 # (SPEC.md §13 "abi version"; each binding's version check at step B0).
+# A semantic runner reports its core release and protocol version
+# instead, and from step B1 (FORMAT.md, Versions, Semantic target).
 format 2
 id op.library.version
 abi 0.1

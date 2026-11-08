@@ -2373,6 +2373,49 @@ mod tests {
         ));
     }
 
+    /// Owner item 63: without a channel `retransmit-window` the repair
+    /// path keeps the driver's setting, half a term by default; a channel's
+    /// window overrides it for that publication alone, and the driver's
+    /// setting is the fallback.
+    #[test]
+    fn the_retransmit_window_defaults_to_half_a_term_and_a_channels_overrides_it() {
+        use crate::agents::repair::RepairConfig;
+        let term = karyos_protocol::network::TermParams {
+            term_length: 65_536,
+            initial_term_id: 9,
+            mtu: 1408,
+        };
+        let alias = karyos_protocol::network::Alias {
+            session_id: 5,
+            stream_id: 6,
+        };
+        let identity = karyos_protocol::network::Identity {
+            driver_id: [1, 2],
+            registration_id: 1,
+            incarnation: 1,
+        };
+        let build = |window: Option<u32>, driver: Option<u32>| {
+            let (mut outbound, _log) = super::super::testing::outbound(
+                crate::agents::EndpointId(1),
+                alias,
+                SocketAddr::from(([127, 0, 0, 1], 4000)),
+                term,
+                1,
+                true,
+            );
+            outbound.set_retransmit_window(window);
+            let config = RepairConfig {
+                retransmit_window: driver,
+                ..RepairConfig::default()
+            };
+            outbound.enable_repair(&config, 65_536, identity).unwrap();
+            outbound.repair().unwrap().retransmit_window()
+        };
+        assert_eq!(build(None, None), 32_768, "half a term by default");
+        assert_eq!(build(None, Some(8_192)), 8_192, "the driver's setting");
+        assert_eq!(build(Some(4_096), Some(8_192)), 4_096, "the channel's wins");
+    }
+
     /// MD-20 (karyos#802): a catch-up takes a job in its destination's
     /// share with no admission; a full share leaves it to try again, and a
     /// part below the retention floor is counted lost, never read.

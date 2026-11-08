@@ -43,6 +43,7 @@ fn idle_secs() -> u64 {
 
 fn channel(group: SocketAddr, paths: Vec<Interface>) -> UdpConfig {
     UdpConfig {
+        retransmit_window: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths,

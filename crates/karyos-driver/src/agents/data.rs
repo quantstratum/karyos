@@ -372,6 +372,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     destination: SocketAddr,
     readers: Vec<LaneReader<T>>,
     reliable: bool,
+    /// The channel's `retransmit-window`, overriding the driver's repair
+    /// setting when its repair path is built; `None` keeps that setting.
+    retransmit_window: Option<u32>,
     /// The largest datagram, the channel MTU.
     mtu: usize,
     /// The largest datagram's aligned charge.
@@ -629,6 +632,7 @@ impl<T: StreamTerms> Outbound<T> {
             destination,
             readers,
             reliable,
+            retransmit_window: None,
             receivers_live: false,
             mtu: usize::try_from(mtu).map_err(|_| OutboundError::Mtu)?,
             max_frame: u64::from(max_charge),
@@ -801,6 +805,12 @@ impl<T: StreamTerms> Outbound<T> {
         self.membership = Some(membership);
     }
 
+    /// Sets the channel's `retransmit-window` (control path), applied when
+    /// its repair path is built; `None` keeps the driver's setting.
+    pub fn set_retransmit_window(&mut self, window: Option<u32>) {
+        self.retransmit_window = window;
+    }
+
     /// Enables its repair path (a reliable publication of `term_length`
     /// terms, incarnation `identity`; control path, allocates).
     ///
@@ -813,6 +823,12 @@ impl<T: StreamTerms> Outbound<T> {
         term_length: u32,
         identity: Identity,
     ) -> Result<(), RepairConfigError> {
+        // The channel's window, fixed at its creation, wins over the
+        // driver's (owner item 63).
+        let config = &RepairConfig {
+            retransmit_window: self.retransmit_window.or(config.retransmit_window),
+            ..*config
+        };
         if self.fanout.is_some() {
             return self.enable_fanout_repair(config, term_length, identity);
         }

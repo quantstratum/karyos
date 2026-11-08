@@ -117,6 +117,7 @@ fn aggregate(claim_deadline: u64) -> AggregateConfig {
 
 fn channel(address: SocketAddr) -> UdpConfig {
     UdpConfig {
+        retransmit_window: None,
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),
