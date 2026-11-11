@@ -427,11 +427,11 @@ completion handling (ADR-0008).
 - Worktrees only under `/Users/joaquin/tmp/worktrees/karyos/<name>`;
   never inside the repository. `/Users/joaquin/tmp` itself is immutable;
   write only inside `worktrees/`. Remove a worktree when done.
-- Hosted CI is not running (karyos#623) and merges never wait for CI
-  (ADR-0046). The merge gate is local: `make pre-push` passes on the exact
-  PR head, the reviewer reruns it in a clean worktree, and approves that
-  head. A new commit voids the verdict; warn the reviewer before pushing
-  after a review handoff.
+- CI runs on push and pull request, but merges never wait for it
+  (ADR-0046; karyos#623). The merge gate is local: `make pre-push`
+  passes on the exact PR head, the reviewer reruns it in a clean
+  worktree, and approves that head. A new commit voids the verdict;
+  warn the reviewer before pushing after a review handoff.
 - A PR closes only issues whose acceptance criteria it meets in full. A
   partial PR says "Part of #N" and carries no closing keyword. Review
   follow-ups go in small PRs ("Follow-up to the #N review").
