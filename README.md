@@ -84,7 +84,9 @@ scripts/linux-test.sh                     # cargo test in a Linux container
 scripts/linux-test.sh -p karyos-sys --locked  # any cargo test arguments
 ```
 
-Hosted CI is not running; the gates above are run locally before a merge.
+CI runs on every push to `main` and every pull request, and is
+informational: a merge waits on the local gates above, not on CI
+(ADR-0046).
 The gates a release runs, and how their results are recorded, are in
 [RELEASING.md](RELEASING.md).
 

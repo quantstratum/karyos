@@ -53,10 +53,11 @@ if [ "$dest" = / ] || [ "$dest" = "${HOME%/}" ]; then
     fail "refusing DEST $dest"
 fi
 if [ -e "$dest" ]; then
-    [ -d "$dest" ] && [ -f "$dest/SHA256SUMS" ] ||
+    if [ ! -d "$dest" ] || [ ! -f "$dest/SHA256SUMS" ]; then
         fail "$dest exists and is not a release directory; remove it or pick another DEST"
+    fi
     listed="$(awk '{print $2}' "$dest/SHA256SUMS" | sed 's/^\*//' | LC_ALL=C sort)"
-    present="$(cd "$dest" && find . -mindepth 1 | sed 's|^\./||' | grep -vx SHA256SUMS | LC_ALL=C sort || true)"
+    present="$(cd "$dest" || exit 1; find . -mindepth 1 | sed 's|^\./||' | grep -vx SHA256SUMS | LC_ALL=C sort || true)"
     [ "$present" = "$listed" ] ||
         fail "$dest holds files other than its SHA256SUMS and the archives it lists; remove it or pick another DEST"
 fi

@@ -13,11 +13,11 @@ point 4, "Release procedure while hosted CI is off").
 
 ## Evidence
 
-Hosted CI is not running (karyos#623), so every gate below is run
-locally and recorded as a row of the "Evidence" table of the release
-notes: the check with its exact command, the platform (with the kernel
-for a Linux run), the head, and the result with its counts, its wall
-time and its exit code.
+CI is informational (ADR-0046) and does not run every gate below
+(karyos#623), so every gate below is run locally and recorded as a
+row of the "Evidence" table of the release notes: the check with its
+exact command, the platform (with the kernel for a Linux run), the
+head, and the result with its counts, its wall time and its exit code.
 
 A gate is run at the release head. The 0.1.0-alpha.2 notes also accept
 a release tree that differs from the tagged head only in documentation,
