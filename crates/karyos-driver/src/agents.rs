@@ -655,6 +655,13 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// its own `setup_answer_rate` bucket at the publisher. `None`: they
         /// leave from `endpoint`, as before.
         solicit_from: Option<EndpointId>,
+        /// The `control` address of a `control-mode=dynamic` subscription
+        /// (`quantstratum-docs: karyos/design/multi-destination-unicast.md`
+        /// 3.2; karyos#644): the receiver sends REGISTER for the stream
+        /// there from `endpoint` every `setup_interval` until an image of
+        /// the stream from that address is bound. `None`: it registers
+        /// nowhere, as before.
+        register_at: Option<std::net::SocketAddr>,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer
@@ -1635,6 +1642,12 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
     #[must_use]
     pub fn counters(&self) -> roles::SenderCounters {
         self.role.counters()
+    }
+
+    /// The driver's dynamic registration counters (tests).
+    #[cfg(test)]
+    pub(crate) fn registration_counters(&self) -> crate::sessions::register::RegistrationCounters {
+        self.role.registration_counters()
     }
 
     /// The send sessions' counters: answers and their rate drops (tests).

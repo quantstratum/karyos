@@ -136,6 +136,16 @@ pub struct ReceiverCounters {
     pub ring_full_challenge: u64,
     /// REGISTERs dropped because the sender ring was full (karyos#644).
     pub ring_full_register: u64,
+    /// REGISTERs a `control-mode=dynamic` subscription sent to its
+    /// `control` address (design 3.2; karyos#644).
+    pub registers_sent: u64,
+    /// REGISTERs due that did not go: the RSP_SETUP limits or the control
+    /// ring refused them; each is tried again at the next interval.
+    pub registers_unsent: u64,
+    /// ERR REGISTRATIONs read from a subscription's `control` address
+    /// (`DESTINATIONS_FULL`): the subscription keeps registering at its
+    /// interval.
+    pub registration_refusals: u64,
     /// Received SOLICITs dropped with the control ring full.
     pub ring_full_solicit: u64,
     /// Challenges not sent: the source is not an answerable unicast
@@ -753,6 +763,13 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// Per subscription key, the endpoint its SOLICITs leave from (plan
     /// 164), allocated at creation.
     solicit_from: Vec<(EndpointId, i32, EndpointId)>,
+    /// The `control-mode=dynamic` subscription keys (design 3.2;
+    /// karyos#644): endpoint, stream, the `control` address they register
+    /// at, and the monotonic time their next REGISTER is due. Allocated at
+    /// creation: at most one per subscription key.
+    registering: Vec<(EndpointId, i32, std::net::SocketAddr, u64)>,
+    /// `setup_interval`: the spacing of a dynamic subscription's REGISTERs.
+    setup_interval: u64,
     /// The conflated lane of subscribed keys (conflated-network-images.md
     /// (a); at most one per key, allocated at start): their images gate
     /// that lane's seals.
@@ -1552,6 +1569,17 @@ fn receiver_id(slot: SlotRef) -> u64 {
     (u64::from(slot.slot) << 32) | u64::from(slot.generation)
 }
 
+/// The `receiver_id` a dynamic subscription with no configured identity
+/// names in its REGISTERs: the boot id's first word, never zero. No sender
+/// matches it against the CHALLENGE (only the boot id and source are,
+/// design 3.2), and it does not outlive the boot.
+fn dynamic_receiver_id(boot_id: [u64; 2]) -> u64 {
+    match boot_id[0] {
+        0 => boot_id[1].max(1),
+        first => first,
+    }
+}
+
 /// The publication identity an image receives (trace-network.md §5).
 fn publication_of<T: StreamTerms>(
     image: &Installed<T>,
@@ -1941,6 +1969,8 @@ pub(super) fn roles<T: StreamTerms>(
             group_start: 0,
             identities: Vec::with_capacity(config.subscriptions),
             solicit_from: Vec::with_capacity(config.subscriptions),
+            registering: Vec::with_capacity(config.subscriptions),
+            setup_interval: config.setup_interval,
             conflated: Vec::with_capacity(config.subscriptions),
             barrier_ack_timeout: config.barrier_ack_timeout,
             unsubscribed: false,
@@ -2047,6 +2077,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 identity,
                 conflated,
                 solicit_from,
+                register_at,
             } => {
                 let held = self
                     .subscriptions
@@ -2085,6 +2116,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
                         // And the endpoint its SOLICITs leave from.
                         if let Some(from) = solicit_from {
                             self.solicit_from.push((endpoint, stream_id, from));
+                        }
+                        // And the address it registers at, due at once.
+                        if let Some(control) = register_at {
+                            self.registering.push((endpoint, stream_id, control, 0));
                         }
                         true
                     }
@@ -2129,6 +2164,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
                         .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
                     self.solicit_from
                         .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
+                    self.registering
+                        .retain(|(held, stream, ..)| (*held, *stream) != (endpoint, stream_id));
                     self.unsubscribed = true;
                 }
                 if let Some(index) = self
@@ -3812,6 +3849,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
             .checked_add(self.retry_solicits(sessions, now))
             .ok_or(overflow.clone())?;
         work = work
+            .checked_add(self.send_registers(sessions, now))
+            .ok_or(overflow.clone())?;
+        work = work
             .checked_add(self.image_timers(sessions, now)?)
             .ok_or(overflow.clone())?;
         for (endpoint, half) in halves.iter() {
@@ -3933,6 +3973,69 @@ impl<T: StreamTerms> ReceiverRole<T> {
             }
         }
         self.solicit_due = due;
+        sent
+    }
+
+    /// Sends REGISTER for each `control-mode=dynamic` subscription key
+    /// that is due and has no image of its stream from its `control`
+    /// address (design 3.2: repeated every `setup_interval` until bound,
+    /// then stopped; again once that image is gone). Each goes to the
+    /// validated `control` address from the key's endpoint, under the
+    /// RSP_SETUP limits of §7.4; one refused waits for the next interval.
+    /// The receiver block is this boot's, with the key's configured
+    /// `receiver_id`, else one derived from the boot id. Returns the
+    /// REGISTERs sent. Nothing allocates.
+    fn send_registers(&mut self, sessions: &SessionEnd<T>, now: u64) -> u32 {
+        let mut sent = 0u32;
+        for index in 0..self.registering.len() {
+            let Some(&(endpoint, stream_id, control, due)) = self.registering.get(index) else {
+                break;
+            };
+            if now < due {
+                continue;
+            }
+            let bound = self.images.iter().any(|image| {
+                image.key.endpoint == endpoint
+                    && normalized(image.key.source) == normalized(control)
+                    && image.key.alias.stream_id == stream_id
+            });
+            if bound {
+                continue;
+            }
+            let receiver_id = self
+                .identities
+                .iter()
+                .find(|(held, stream, _)| (*held, *stream) == (endpoint, stream_id))
+                .map_or_else(
+                    || dynamic_receiver_id(self.sessions.boot_id()),
+                    |(.., identity)| identity.receiver_id.get(),
+                );
+            let register = Control::Register(karyos_protocol::network::RspRegister {
+                stream_id,
+                receiver: Receiver {
+                    receiver_boot_id: self.sessions.boot_id(),
+                    receiver_id,
+                },
+            });
+            let mut intake = Intake {
+                endpoint,
+                now,
+                role: self,
+                sessions,
+                work: 0,
+            };
+            if intake.challenge_from(endpoint, control, register) {
+                self.count(|c| &mut c.registers_sent);
+                sent = sent.saturating_add(1);
+            } else {
+                self.count(|c| &mut c.registers_unsent);
+            }
+            // The next one is due an interval on, sent or not; a clock
+            // past `u64` (never) sends no more.
+            if let Some(entry) = self.registering.get_mut(index) {
+                entry.3 = now.saturating_add(self.setup_interval);
+            }
+        }
         sent
     }
 
@@ -4876,8 +4979,23 @@ impl<T: StreamTerms> Intake<'_, T> {
             // A REGISTER names only its stream (design 2.5): it goes to the
             // sender for a stream published on this endpoint, which admits
             // it only for a `control-mode=dynamic` publication (design
-            // 3.2). The receiver's own REGISTER loop, and so an ERR
-            // REGISTRATION it would read, come with step 3 of karyos#644.
+            // 3.2).
+            // An ERR REGISTRATION from the address a dynamic subscription
+            // of its stream registers at: counted; the subscription keeps
+            // registering at its interval (design 3.2). From anywhere else
+            // it is unhandled.
+            Control::Registration(refusal) => {
+                let registering = self.role.registering.iter().any(|(held, stream, at, _)| {
+                    *held == endpoint
+                        && *stream == refusal.stream_id
+                        && normalized(*at) == normalized(source)
+                });
+                if registering {
+                    self.role.count(|c| &mut c.registration_refusals);
+                } else {
+                    self.role.count(|c| &mut c.unhandled);
+                }
+            }
             Control::Register(register) => {
                 let published = self.role.published.iter().any(|(held, alias)| {
                     *held == endpoint && alias.stream_id == register.stream_id

@@ -387,3 +387,123 @@ fn the_receiver_forwards_a_register_only_for_a_published_stream() {
     assert_eq!(role.counters().unhandled, before.unhandled + 1);
     assert!(matches!(sender.from_receiver.try_take(), Ok(None)));
 }
+
+/// A `control-mode=dynamic` subscription key on endpoint 1, registering
+/// at `control` (step 3b).
+fn subscribe_dynamic(role: &mut super::super::ReceiverRole, control: SocketAddr) {
+    let (replies, _keep) = super::super::super::ring::ring::<AgentEvent<OsSocket>>(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    );
+    let _ = role.command(AgentCommand::<OsSocket>::AddSubscription {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        stream_id: alias().stream_id,
+        max_term_length: 1 << 20,
+        reliable: true,
+        multicast: false,
+        control_group: None,
+        identity: None,
+        conflated: None,
+        solicit_from: None,
+        register_at: Some(control),
+    });
+}
+
+/// The REGISTERs `sender` holds from the receiver, each with where it goes.
+fn registers_posted(sender: &super::super::SenderRole) -> Vec<(SocketAddr, RspRegister)> {
+    use super::super::super::control::ControlItem;
+
+    let mut out = Vec::new();
+    while let Ok(Some(item)) = sender.from_receiver.try_take() {
+        if let ControlItem::Outgoing {
+            endpoint,
+            destination,
+            control: Control::Register(register),
+            ..
+        } = item
+        {
+            assert_eq!(endpoint, EndpointId(1));
+            out.push((destination, register));
+        }
+    }
+    out
+}
+
+/// A dynamic subscription sends REGISTER to its `control` address at once,
+/// then every `setup_interval`, never in between, with this boot's receiver
+/// block; it stops once an image of its stream from `control` is bound,
+/// and its removal stops it too (design 3.2, step 3b).
+#[test]
+fn a_dynamic_subscription_registers_every_interval_until_bound() {
+    let config = AgentConfig::default();
+    let interval = config.setup_interval;
+    let (sender, mut role) = receiver_with(config);
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    // Nothing is due before a dynamic key exists.
+    assert_eq!(role.send_registers(&events, T0), 0);
+    subscribe_dynamic(&mut role, control);
+    assert_eq!(role.send_registers(&events, T0), 1);
+    let posted = registers_posted(&sender);
+    assert_eq!(posted.len(), 1);
+    let (to, register) = posted[0];
+    assert_eq!(to, control);
+    assert_eq!(register.stream_id, alias().stream_id);
+    assert_eq!(register.receiver.receiver_boot_id, role.sessions.boot_id());
+    assert_ne!(register.receiver.receiver_id, 0);
+    // Not again within the interval; again at it.
+    assert_eq!(role.send_registers(&events, T0 + interval - 1), 0);
+    assert_eq!(role.send_registers(&events, T0 + interval), 1);
+    assert_eq!(registers_posted(&sender).len(), 1);
+    assert_eq!(role.counters().registers_sent, 2);
+    // Bound: an image of the stream from `control` stops it.
+    let (image, _) = super::installed_image();
+    assert_eq!(image.key.source, control);
+    role.images.push(image);
+    assert_eq!(role.send_registers(&events, T0 + 4 * interval), 0);
+    assert!(registers_posted(&sender).is_empty());
+    // Gone again: it registers again.
+    role.images.clear();
+    assert_eq!(role.send_registers(&events, T0 + 5 * interval), 1);
+    let _ = registers_posted(&sender);
+    // Removed: never again.
+    let (replies, _keep) = super::super::super::ring::ring::<AgentEvent<OsSocket>>(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    );
+    let _ = role.command(AgentCommand::<OsSocket>::RemoveSubscription {
+        reply: replies.reserve().unwrap(),
+        endpoint: EndpointId(1),
+        stream_id: alias().stream_id,
+    });
+    assert_eq!(role.send_registers(&events, T0 + 10 * interval), 0);
+}
+
+/// An ERR REGISTRATION from the address a dynamic subscription of its
+/// stream registers at is counted, and the subscription keeps registering
+/// at its interval; one from anywhere else, or for another stream, is
+/// unhandled.
+#[test]
+fn an_err_registration_is_read_only_from_the_control_address() {
+    let config = AgentConfig::default();
+    let interval = config.setup_interval;
+    let (sender, mut role) = receiver_with(config);
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    subscribe_dynamic(&mut role, control);
+    assert_eq!(role.send_registers(&events, T0), 1);
+    intake(&mut role, &events, T0 + 1).control(control, full_err());
+    assert_eq!(role.counters().registration_refusals, 1);
+    let other: SocketAddr = "10.0.0.9:5001".parse().unwrap();
+    let unhandled = role.counters().unhandled;
+    intake(&mut role, &events, T0 + 2).control(other, full_err());
+    let other_stream = Control::Registration(Registration {
+        stream_id: alias().stream_id + 1,
+        reason: RegistrationReason::DestinationsFull,
+    });
+    intake(&mut role, &events, T0 + 3).control(control, other_stream);
+    assert_eq!(role.counters().unhandled, unhandled + 2);
+    assert_eq!(role.counters().registration_refusals, 1);
+    // Still registering at its interval.
+    assert_eq!(role.send_registers(&events, T0 + interval), 1);
+    assert_eq!(registers_posted(&sender).len(), 2);
+}

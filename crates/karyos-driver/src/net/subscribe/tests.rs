@@ -1151,6 +1151,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         later_routes: [None; crate::net::LATER_PATHS],
         identity: None,
         conflated: None,
+        register_at: None,
         users: 1,
     }
 }

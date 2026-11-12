@@ -4,16 +4,23 @@
 //! `quantstratum-docs: karyos/design/multi-destination-unicast.md` 3.2):
 //! a `control-mode=dynamic` publication binds its `control` endpoint and
 //! answers a REGISTER from an allowed source with one SETUP ANNOUNCE to
-//! that source, and nothing to a source outside its allowlist. The
-//! receiver side is not here, so a raw socket registers.
+//! that source, and nothing to a source outside its allowlist. The first
+//! tests register from a raw socket; the later ones from a Karyos
+//! receiver's `control-mode=dynamic` subscription (step 3b), which
+//! registers, is challenged, binds and receives, and reads the ERR of a
+//! full table.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 
 use karyos_protocol::channel::{ControlMode, Destination, Interface, Security, UdpConfig};
 use karyos_protocol::network::{Control, MAX_CONTROL_LENGTH, Receiver, RspRegister};
 
-use super::{LOOPBACK, aggregate, driver, free_port, pump};
+use karyos_sys::log_buffer::Role;
+
+use super::{LOOPBACK, aggregate, driver, driver_with, exchange, free_port, pump};
+use crate::agents::AgentConfig;
 use crate::agents::ThreadingMode;
+use crate::embedded::{AggregateHandle, EmbeddedDriver};
 use crate::error::DriverError;
 use crate::sessions::register::{AddressRange, RegistrationAllowlist};
 
@@ -173,6 +180,170 @@ fn what_a_dynamic_publication_does_not_take_is_refused() {
     ));
     assert!(matches!(
         a.add_network_publication(aggregate(10, 3, 1), &dynamic(control)),
+        Err(DriverError::DynamicRegistrationUnsupported)
+    ));
+}
+
+/// `dynamic(control)` as a Karyos receiver subscribes to it: reliable, and
+/// bound on loopback.
+fn subscribed(control: SocketAddr) -> UdpConfig {
+    UdpConfig {
+        interface: Some(Interface::Address(LOOPBACK)),
+        reliable: true,
+        ..dynamic(control)
+    }
+}
+
+/// `dynamic(control)`, reliable, as its publication serves it.
+fn reliable(control: SocketAddr) -> UdpConfig {
+    UdpConfig {
+        reliable: true,
+        ..dynamic(control)
+    }
+}
+
+/// `driver`'s registration counters at its sender.
+fn registrations(driver: &EmbeddedDriver) -> crate::sessions::register::RegistrationCounters {
+    driver
+        .net
+        .as_ref()
+        .unwrap()
+        .registration_counters()
+        .unwrap()
+}
+
+/// `driver`'s receiver counters.
+fn receiver(driver: &EmbeddedDriver) -> crate::agents::roles::ReceiverCounters {
+    driver.net.as_ref().unwrap().receiver_counters().unwrap()
+}
+
+/// Pumps `a` and `b` until `b` has an image of `stream_id` (session 3).
+fn image_of(a: &mut EmbeddedDriver, b: &mut EmbeddedDriver, stream_id: i32) -> AggregateHandle {
+    let mut image = None;
+    pump(&mut [a, b], |drivers| {
+        image = drivers[1].network_image(stream_id, 3);
+        image.is_some()
+    });
+    image.unwrap()
+}
+
+/// A Karyos receiver's dynamic subscription registers at `control`, is
+/// announced, CHALLENGEs, binds and receives every message in order: the
+/// whole exchange of design 3.2 between two drivers.
+#[test]
+fn a_dynamic_subscription_registers_binds_and_receives() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let publication = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+        )
+        .unwrap();
+    let _subscription = b
+        .add_dynamic_network_subscription(10, &subscribed(control), None)
+        .unwrap();
+    let image = image_of(&mut a, &mut b, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    exchange(&mut a, &mut b, &publication, &mut reader, 64);
+    assert!(receiver(&b).registers_sent >= 1);
+    let counters = registrations(&a);
+    assert!(counters.registered >= 1, "{counters:?}");
+    assert!(counters.challenged >= 1, "{counters:?}");
+}
+
+/// A Karyos receiver outside a publication's allowlist gets nothing: its
+/// REGISTERs are dropped with no reply, while the same receiver's
+/// subscription of another stream on that endpoint, whose allowlist names
+/// it, binds. Ordered with no sleep: the pump ends only once the sender
+/// counted the refused REGISTER and the admitted stream's image exists.
+#[test]
+fn a_dynamic_subscription_outside_the_allowlist_gets_nothing() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let _outside = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([10, 0, 0, 0], 8),
+        )
+        .unwrap();
+    let _inside = a
+        .add_dynamic_network_publication(
+            aggregate(11, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+        )
+        .unwrap();
+    let _refused = b
+        .add_dynamic_network_subscription(10, &subscribed(control), None)
+        .unwrap();
+    let _admitted = b
+        .add_dynamic_network_subscription(11, &subscribed(control), None)
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        registrations(drivers[0]).dropped_not_allowed >= 1
+            && drivers[1].network_image(11, 3).is_some()
+    });
+    assert!(b.network_image(10, 3).is_none());
+    // Nothing was announced to it: the only registration is stream 11's.
+    let counters = registrations(&a);
+    assert_eq!(counters.refused_full, 0, "{counters:?}");
+    assert!(counters.registered >= 1, "{counters:?}");
+}
+
+/// A REGISTER finding the destination table full is answered ERR
+/// REGISTRATION, which the receiver reads; the joined destination keeps
+/// receiving. A publication of `max_destinations` 1: B joins, then C
+/// registers.
+#[test]
+fn a_full_table_answers_err_and_keeps_its_destination() {
+    let agents = AgentConfig {
+        max_destinations: 1,
+        ..AgentConfig::default()
+    };
+    let mut a = driver_with(ThreadingMode::Shared, agents);
+    let mut b = driver(ThreadingMode::Shared);
+    let mut c = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let publication = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+        )
+        .unwrap();
+    let _joined = b
+        .add_dynamic_network_subscription(10, &subscribed(control), None)
+        .unwrap();
+    let image = image_of(&mut a, &mut b, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
+        .unwrap();
+    super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..16);
+    let _refused = c
+        .add_dynamic_network_subscription(10, &subscribed(control), None)
+        .unwrap();
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        receiver(drivers[2]).registration_refusals >= 1
+    });
+    assert!(c.network_image(10, 3).is_none());
+    assert!(registrations(&a).refused_full >= 1);
+    super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 16..32);
+}
+
+/// The public subscription calls refuse dynamic mode, as the publication
+/// calls do, until the rest of karyos#644 lands.
+#[test]
+fn the_public_subscription_calls_refuse_dynamic_mode() {
+    let mut b = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    assert!(matches!(
+        b.add_network_subscription(10, &subscribed(control)),
         Err(DriverError::DynamicRegistrationUnsupported)
     ));
 }
