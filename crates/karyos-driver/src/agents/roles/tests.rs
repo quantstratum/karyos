@@ -811,7 +811,7 @@ fn the_sender_validates_sms_against_its_bindings() {
         },
         joins: Lanes::new(&[0]).unwrap(),
     };
-    sender.bind(endpoint, receiver, &answer([7, 8]), 0);
+    sender.bind(endpoint, receiver, &answer([7, 8]), None, 0);
     let status = |boot_id, receiver_id, identity, lanes: &[LaneStatus]| StatusMessage {
         alias: alias(),
         identity,
@@ -890,7 +890,7 @@ fn the_sender_validates_sms_against_its_bindings() {
         &status([7, 8], 2, identity(), &at(4096)),
         4,
     );
-    sender.bind(endpoint, receiver, &answer([7, 8]), 5);
+    sender.bind(endpoint, receiver, &answer([7, 8]), None, 5);
     sender.status(
         endpoint,
         receiver,
@@ -935,7 +935,7 @@ fn answered_from(
         },
         joins: Lanes::new(&[0]).unwrap(),
     };
-    sender.bind(endpoint, solicited, &answer, 0);
+    sender.bind(endpoint, solicited, &answer, None, 0);
     let status = |receiver_id, lanes: &[karyos_protocol::network::LaneStatus]| StatusMessage {
         alias: alias(),
         identity: identity(),
@@ -1021,7 +1021,7 @@ fn a_fresh_answer_lets_an_adopted_image_bind_its_new_receiver_id() {
         },
         joins: Lanes::new(&[0]).unwrap(),
     };
-    sender.bind(endpoint, control, &answer, 3);
+    sender.bind(endpoint, control, &answer, None, 3);
     sender.status(endpoint, a, &status(1, &lane(4096)), 4);
     // The image at B is reinstalled: a new receiver id.
     sender.status(endpoint, b, &status(3, &lane(8192)), 5);
@@ -1138,14 +1138,14 @@ fn accepted_sms_and_gone_bindings_reach_the_membership() {
             now,
         )
     };
-    sender.bind(endpoint, receiver, &answer, 0);
+    sender.bind(endpoint, receiver, &answer, None, 0);
     sender.status(endpoint, receiver, &status(1, 0), 1);
     assert!(matches!(
         member(&mut sender, 1, 1),
         Requester::Member { .. }
     ));
     // A new answer (a reinstalled image), then an SM of receiver 2: 1 goes.
-    sender.bind(endpoint, receiver, &answer, 2);
+    sender.bind(endpoint, receiver, &answer, None, 2);
     sender.status(endpoint, receiver, &status(2, 0), 3);
     assert_eq!(member(&mut sender, 1, 3), Requester::Unknown);
     assert!(matches!(
@@ -1154,7 +1154,7 @@ fn accepted_sms_and_gone_bindings_reach_the_membership() {
     ));
     // A new answer resets the row; it expires before its next SM, and the
     // former receiver's membership goes with it.
-    sender.bind(endpoint, receiver, &answer, 4);
+    sender.bind(endpoint, receiver, &answer, None, 4);
     assert!(matches!(
         member(&mut sender, 2, 4),
         Requester::Member { .. }
@@ -1164,16 +1164,16 @@ fn accepted_sms_and_gone_bindings_reach_the_membership() {
     assert_eq!(member(&mut sender, 2, 5), Requester::Unknown);
     // Confirmed, then its SMs stop: the binding expires, and the member
     // with it, at once.
-    sender.bind(endpoint, receiver, &answer, 6);
+    sender.bind(endpoint, receiver, &answer, None, 6);
     sender.status(endpoint, receiver, &status(3, 0), 7);
     sender.expire_bindings(7 + config.image_liveness_timeout);
     assert!(sender.bindings.is_empty());
     assert_eq!(member(&mut sender, 3, 8), Requester::Unknown);
     // A reset row evicted for a newcomer ends its former receiver's too.
     let t = 8 + config.image_liveness_timeout;
-    sender.bind(endpoint, receiver, &answer, t);
+    sender.bind(endpoint, receiver, &answer, None, t);
     sender.status(endpoint, receiver, &status(4, 0), t + 1);
-    sender.bind(endpoint, receiver, &answer, t + 2);
+    sender.bind(endpoint, receiver, &answer, None, t + 2);
     for boot in 1..u64::try_from(config.receiver_bindings).unwrap() {
         let mut stranger = answer;
         stranger.challenge.receiver_boot_id = [boot, 99];
@@ -1182,6 +1182,7 @@ fn accepted_sms_and_gone_bindings_reach_the_membership() {
             endpoint,
             SocketAddr::from(([10, 0, 0, 8], port)),
             &stranger,
+            None,
             t + 3,
         );
     }
@@ -1195,6 +1196,7 @@ fn accepted_sms_and_gone_bindings_reach_the_membership() {
         endpoint,
         SocketAddr::from(([10, 0, 0, 7], 7000)),
         &newcomer,
+        None,
         t + 4,
     );
     assert_eq!(sender.counters().bindings_evicted, 1);
@@ -1291,13 +1293,13 @@ fn unconfirmed_bindings_never_hold_the_table() {
     // A full table of strangers, answered at once.
     for boot in 1..=64u64 {
         let port = u16::try_from(boot).unwrap();
-        sender.bind(endpoint, source(port), &answer(boot), 0);
+        sender.bind(endpoint, source(port), &answer(boot), None, 0);
     }
     assert_eq!(sender.bindings.len(), config.receiver_bindings);
     // The real receiver still binds (the oldest stranger goes) and is
     // confirmed by its SM.
     let receiver = SocketAddr::from(([10, 0, 0, 9], 5000));
-    sender.bind(endpoint, receiver, &answer(99), 1);
+    sender.bind(endpoint, receiver, &answer(99), None, 1);
     let status = StatusMessage {
         alias: alias(),
         identity: identity(),
@@ -1567,11 +1569,11 @@ fn a_rebind_never_moves_a_reliable_position_back() {
     let mut sender = sm_sender();
     let endpoint = EndpointId(1);
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(endpoint, receiver, &sm_status([7, 8], 8192), 1);
     assert_eq!(sender.consumption_at(endpoint, alias()).unwrap()[0], 8192);
     // A new answer to the same receiver, at an older join: held.
-    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 2);
+    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), None, 2);
     assert_eq!(sender.consumption_at(endpoint, alias()).unwrap()[0], 8192);
     // Its next SM, older still: held, counted stale.
     sender.status(endpoint, receiver, &sm_status([7, 8], 4096), 3);
@@ -1586,9 +1588,9 @@ fn an_unconfirmed_receiver_bounds_at_its_joins() {
     let first: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let second: SocketAddr = "10.0.0.10:5000".parse().unwrap();
     assert_eq!(sender.consumption_at(endpoint, alias()), None);
-    sender.bind(endpoint, first, &sm_answer([7, 8], 0), 0);
+    sender.bind(endpoint, first, &sm_answer([7, 8], 0), None, 0);
     sender.status(endpoint, first, &sm_status([7, 8], 8192), 1);
-    sender.bind(endpoint, second, &sm_answer([3, 4], 1024), 2);
+    sender.bind(endpoint, second, &sm_answer([3, 4], 1024), None, 2);
     // The second is answered but silent: it bounds at its join.
     assert_eq!(sender.consumption_at(endpoint, alias()).unwrap()[0], 1024);
     // Once heard from, at its consumption.
@@ -1933,8 +1935,8 @@ fn rttm_requests_are_reported_and_answered() {
     // An earlier incarnation's binding from the same receiver, found first.
     let mut old = answer;
     old.identity.incarnation -= 1;
-    sender.bind(EndpointId(1), source, &old, 899);
-    sender.bind(EndpointId(1), source, &answer, 900);
+    sender.bind(EndpointId(1), source, &old, None, 899);
+    sender.bind(EndpointId(1), source, &answer, None, 900);
     let (path, _log) = outbound(EndpointId(1), source);
     sender.publications.push(path);
     let status = StatusMessage {
@@ -2207,7 +2209,7 @@ impl RepairRig {
                 },
                 joins: Lanes::new(&[0]).unwrap(),
             };
-            sender.bind(EndpointId(1), source, &answer, 0);
+            sender.bind(EndpointId(1), source, &answer, None, 0);
             let status = StatusMessage {
                 alias: *alias,
                 identity: identity(),
@@ -2658,7 +2660,7 @@ fn a_confirmed_binding_keeps_the_publication_established() {
     let mut sender = sm_sender();
     let endpoint = EndpointId(1);
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(endpoint, receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(endpoint, receiver, &sm_status([7, 8], 0), 1);
     assert!(sender.sessions.is_established(endpoint, alias()));
     let mut halves: [(EndpointId, super::Half<karyos_io::sockets::OsSocket>); 0] = [];
@@ -3433,7 +3435,7 @@ fn the_sender_serves_a_routed_publication_on_every_path() {
         counts.push(data);
     }
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), receiver, &sm_status([7, 8], 1 << 20), 1);
     assert!(sender.sessions.is_established(EndpointId(1), alias()));
     for i in 0..2u8 {
@@ -3481,7 +3483,7 @@ fn a_routed_publication_has_a_setup_side_per_path() {
     assert!(!sender.sessions.is_established(EndpointId(2), alias()));
     // The receiver of the later path answers and its SM arrives there.
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(EndpointId(2), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(2), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(2), receiver, &sm_status([7, 8], 0), 1);
     assert!(sender.sessions.is_established(EndpointId(2), alias()));
     assert!(super::established(
@@ -3580,7 +3582,7 @@ fn an_idle_path_sends_a_path_heartbeat() {
         beats.push(count);
     }
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
     let _ = log.publications[0]
         .append(&[1; 1000], AppendOptions::default())
@@ -3678,7 +3680,7 @@ fn a_receiver_on_a_later_path_bounds_the_publication() {
     let (event, _log) = add_routed(&mut sender);
     assert!(matches!(event, Some(AgentEvent::PublicationAdded { .. })));
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(EndpointId(2), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(2), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(2), receiver, &sm_status([7, 8], 0), 1);
     let bound = sender.consumption(&sender.publications[0]);
     assert_eq!(bound.map(|positions| positions[0]), Some(0));
@@ -3776,7 +3778,7 @@ fn a_refused_path_heartbeat_is_tried_next_cycle() {
         beats.push(count);
     }
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
     let _ = log.publications[0]
         .append(&[1; 1000], AppendOptions::default())
@@ -3985,8 +3987,8 @@ fn an_sm_on_two_paths_changes_the_sender_once() {
     assert!(matches!(event, Some(AgentEvent::PublicationAdded { .. })));
     let on_a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let on_b: SocketAddr = "10.0.0.10:5000".parse().unwrap();
-    sender.bind(EndpointId(1), on_a, &sm_answer([7, 8], 0), 0);
-    sender.bind(EndpointId(2), on_b, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), on_a, &sm_answer([7, 8], 0), None, 0);
+    sender.bind(EndpointId(2), on_b, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), on_a, &sm_status([7, 8], 0), 1);
     let once = member_on(&mut sender, 1);
     sender.status(EndpointId(2), on_b, &sm_status([7, 8], 0), 2);
@@ -4023,8 +4025,8 @@ fn a_path_that_lost_its_return_direction_keeps_the_member() {
     let (_event, _log) = add_routed(&mut sender);
     let on_a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let on_b: SocketAddr = "10.0.0.10:5000".parse().unwrap();
-    sender.bind(EndpointId(1), on_a, &sm_answer([7, 8], 0), 0);
-    sender.bind(EndpointId(2), on_b, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), on_a, &sm_answer([7, 8], 0), None, 0);
+    sender.bind(EndpointId(2), on_b, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), on_a, &sm_status([7, 8], 0), 1);
     sender.status(EndpointId(2), on_b, &sm_status([7, 8], 0), 1);
     // Only B's SMs come back, every tenth of the timeout, for three
@@ -4112,10 +4114,10 @@ fn a_later_paths_higher_join_leaves_the_members_join() {
     let (_event, _log) = add_routed(&mut sender);
     let on_a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     let on_b: SocketAddr = "10.0.0.10:5000".parse().unwrap();
-    sender.bind(EndpointId(1), on_a, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), on_a, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), on_a, &sm_status([7, 8], 0), 1);
     // B's ANSWER names a join two frames on: the path lags.
-    sender.bind(EndpointId(2), on_b, &sm_answer([7, 8], 2112), 2);
+    sender.bind(EndpointId(2), on_b, &sm_answer([7, 8], 2112), None, 2);
     sender.status(EndpointId(2), on_b, &sm_status([7, 8], 0), 3);
     let member = member_on(&mut sender, 3);
     assert!(
@@ -4136,7 +4138,7 @@ fn a_nak_below_a_later_bindings_join_is_admitted() {
     let mut rig = RepairRig::new(AgentConfig::default(), &[alias()], 4);
     let later: SocketAddr = "10.0.0.10:5001".parse().unwrap();
     rig.sender
-        .bind(EndpointId(1), later, &sm_answer([7, 8], 2 * FRAME), 1);
+        .bind(EndpointId(1), later, &sm_answer([7, 8], 2 * FRAME), None, 1);
     rig.sender
         .status(EndpointId(1), later, &sm_status([7, 8], 0), 1);
     let joins = rig.sender.publications[0]
@@ -4252,7 +4254,7 @@ fn an_idle_lane_sends_a_data_heartbeat_at_its_position() {
     let (half, frames, data) = header_only_frames();
     let mut halves = vec![(EndpointId(1), half)];
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
     let _ = log.publications[0]
         .append(&[1; 1000], AppendOptions::default())
@@ -4334,7 +4336,7 @@ fn a_guard_closed_lane_sends_no_heartbeat() {
     let (half, frames, _data) = header_only_frames();
     let mut halves = vec![(EndpointId(1), half)];
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
     let _ = karyos_sys::guard::close(&word.words()[0]).unwrap();
     for now in [2, 3, 3 + interval, 3 + 3 * interval] {
@@ -4439,7 +4441,7 @@ fn removed_after_opening_full(
     }
     let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     for (endpoint, _) in routes {
-        sender.bind(*endpoint, receiver, &sm_answer([7, 8], 0), 0);
+        sender.bind(*endpoint, receiver, &sm_answer([7, 8], 0), None, 0);
         sender.status(*endpoint, receiver, &sm_status([7, 8], 0), 1);
     }
     for now in 2..4 {
@@ -4800,7 +4802,7 @@ fn a_removed_destinations_member_is_released_with_the_ring_full() {
         guard: None,
         roles: None,
     });
-    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
     let live = |sender: &mut super::SenderRole| {
         sender.publications[0]
@@ -4886,7 +4888,13 @@ fn a_move_closes_the_old_route_before_opening_the_new_one() {
         .split()
         .unwrap();
     let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
-    sender.bind(EndpointId(1), destinations[0], &sm_answer([7, 8], 0), 0);
+    sender.bind(
+        EndpointId(1),
+        destinations[0],
+        &sm_answer([7, 8], 0),
+        None,
+        0,
+    );
     sender.status(EndpointId(1), destinations[0], &sm_status([7, 8], 0), 1);
     for now in 2..4 {
         let _ = sender.duty(&mut halves, now).unwrap();
@@ -5100,7 +5108,13 @@ fn routed_lane(
     for (endpoint, at) in [(1, "10.0.0.2:4000"), (2, "10.0.0.3:4000")] {
         let _ = at;
         let receiver: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-        sender.bind(EndpointId(endpoint), receiver, &sm_answer([7, 8], 0), 0);
+        sender.bind(
+            EndpointId(endpoint),
+            receiver,
+            &sm_answer([7, 8], 0),
+            None,
+            0,
+        );
         sender.status(EndpointId(endpoint), receiver, &sm_status([7, 8], 0), 1);
     }
     let _ = log.publications[0]
@@ -5817,7 +5831,7 @@ fn limit_after(case: LimitCase) -> (usize, bool) {
         roles: None,
     });
     for (endpoint, _) in &halves {
-        sender.bind(*endpoint, receiver, &sm_answer([7, 8], 0), 0);
+        sender.bind(*endpoint, receiver, &sm_answer([7, 8], 0), None, 0);
         sender.status(*endpoint, receiver, &sm_status([7, 8], 0), 1);
     }
     let mut asked = 0usize;
@@ -6763,7 +6777,7 @@ fn a_refused_open_counts_an_endpoint_limit_and_waits_its_spacing() {
         .split()
         .unwrap();
     let mut halves: Halves = vec![(EndpointId(1), super::super::Half::Tx(Box::new(tx)))];
-    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
     // Many cycles within one spacing: one try.
     for now in 2..2 + 100 {
@@ -6818,7 +6832,7 @@ fn a_limited_open_is_reported_once_and_ends_at_the_open() {
         super::super::Half::Tx(Box::new(tx))
     };
     let mut halves: Halves = vec![(EndpointId(1), half(4, 1))];
-    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), 0);
+    sender.bind(EndpointId(1), receiver, &sm_answer([7, 8], 0), None, 0);
     sender.status(EndpointId(1), receiver, &sm_status([7, 8], 0), 1);
     let mut reported = Vec::new();
     let mut run = |sender: &mut super::SenderRole, halves: &mut Halves, now: u64| {
