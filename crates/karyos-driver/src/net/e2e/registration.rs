@@ -205,7 +205,7 @@ fn what_a_dynamic_publication_does_not_take_is_refused() {
     ] {
         assert!(matches!(
             refused,
-            Err(DriverError::DynamicRegistrationRequired)
+            Err(DriverError::DynamicRegistrationUnsupported)
         ));
     }
     assert_eq!(
@@ -386,11 +386,11 @@ fn a_dynamic_subscription_needs_its_identity_and_a_dynamic_channel() {
     let control = SocketAddr::new(LOOPBACK, free_port());
     assert!(matches!(
         b.add_network_subscription(10, &subscribed(control)),
-        Err(DriverError::DynamicRegistrationRequired)
+        Err(DriverError::DynamicRegistrationUnsupported)
     ));
     assert!(matches!(
         b.add_network_subscription_as(10, &subscribed(control), as_receiver(1)),
-        Err(DriverError::DynamicRegistrationRequired)
+        Err(DriverError::DynamicRegistrationUnsupported)
     ));
     let unicast = super::channel(SocketAddr::new(LOOPBACK, free_port()), true);
     assert!(matches!(
@@ -560,4 +560,85 @@ fn a_receiver_back_at_a_new_port_moves_after_the_quiet_time() {
         .unwrap();
     super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..16);
     assert_eq!(sender(&a).registrants_restarted, 0);
+}
+
+/// Every public publication and subscription call refuses a
+/// `control-mode=dynamic` channel with
+/// [`DriverError::DynamicRegistrationUnsupported`]: dynamic mode stays
+/// unreachable from outside the crate until the registration defects
+/// reported on karyos#644 are fixed.
+#[test]
+fn every_public_call_refuses_dynamic_mode() {
+    use karyos_client::schedule::{ScheduleClock, ScheduleOptions};
+    use karyos_sys::conflation::ConflationConfig;
+    use karyos_sys::frame::Lane;
+
+    let mut a = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let channel = dynamic(control);
+    let guard = a.add_guard("dynamic").unwrap();
+    let options = ScheduleOptions::default();
+    let clock = ScheduleClock::host(options.domain).unwrap();
+    // Valid for each call, so that only the channel is refused: spare
+    // slots for a guard, a schedule ring for a timed lane.
+    let config = || {
+        let mut config = aggregate(10, 3, 1);
+        config.stream.buffer.spare_slots = 4;
+        config.stream.buffer.schedule_capacity = 4;
+        config
+    };
+    let publications = [
+        a.add_network_publication(config(), &channel),
+        a.add_network_publication_with_roles(
+            config(),
+            &channel,
+            crate::membership::PublicationRoles {
+                strategy: crate::membership::Strategy::Min,
+                required: Vec::new(),
+                tags: Vec::new(),
+            },
+        ),
+        a.add_network_publication_with_destinations(config(), &channel, None, &[]),
+        a.add_guarded_network_publication(
+            config(),
+            &channel,
+            crate::net::NetworkGuard {
+                guard,
+                messages: 2,
+                rate: None,
+            },
+        ),
+        a.add_timed_network_publication(config(), &channel, None, options),
+        a.add_timed_network_publication_with_clock(config(), &channel, None, options, clock),
+    ];
+    for (call, refused) in publications.into_iter().enumerate() {
+        assert!(
+            matches!(refused, Err(DriverError::DynamicRegistrationUnsupported)),
+            "publication call {call}: {refused:?}"
+        );
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    let subscribed = subscribed(control);
+    let subscriptions = [
+        b.add_network_subscription(10, &subscribed),
+        b.add_network_subscription_as(10, &subscribed, as_receiver(1)),
+        b.add_network_subscription_conflated(
+            10,
+            &subscribed,
+            Lane::ZERO,
+            ConflationConfig {
+                keys: 4,
+                value_capacity: 8,
+                journal_capacity: 1024,
+                refresh: false,
+            },
+        ),
+    ];
+    for refused in subscriptions {
+        assert!(
+            matches!(refused, Err(DriverError::DynamicRegistrationUnsupported)),
+            "{:?}",
+            refused.err()
+        );
+    }
 }

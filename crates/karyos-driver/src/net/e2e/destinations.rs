@@ -242,7 +242,7 @@ fn what_manual_mode_does_not_take_yet_is_refused() {
     };
     assert!(matches!(
         a.add_network_publication(aggregate(10, 3, 1), &dynamic),
-        Err(DriverError::DynamicRegistrationRequired)
+        Err(DriverError::DynamicRegistrationUnsupported)
     ));
     let mut controlled = destinations(&[one], false);
     controlled.destination = Destination::MultiDestination {

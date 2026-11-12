@@ -1,13 +1,15 @@
 ### Added
 
 - Dynamic multi-destination registration (`control-mode=dynamic`) is
-  accepted (#644). `EmbeddedDriver::add_dynamic_network_publication`
-  publishes on a dynamic channel to the receivers that register at its
-  `control` address from a source its `RegistrationAllowlist` names; the
-  allowlist is explicit and never empty (a broad range is written out,
-  `0.0.0.0/0`), and it restricts admission without authenticating
-  anything. `EmbeddedDriver::add_dynamic_network_subscription` registers
-  a receiver with its configured `ReceiverIdentity`. Challenge and
+  complete inside the driver (#644, step 3c) and still refused by every
+  public publication and subscription call with
+  `DriverError::DynamicRegistrationUnsupported`: a review found denial of
+  service defects in the registration path, and the refusal stays until
+  they are fixed (#644). Inside the driver, a dynamic publication admits
+  the receivers that register at its `control` address from a source its
+  explicit, never empty `RegistrationAllowlist` names, which restricts
+  admission without authenticating anything, and a dynamic subscription
+  registers with its configured `ReceiverIdentity`. Challenge and
   response, the driver's registration rates and pending bounds and the
   source checks apply to every registrant, and a full destination table
   answers one ERR REGISTRATION per source per interval.

@@ -121,7 +121,10 @@ fn receive_route(
         }
         // Dynamic registration with no listed destination and no
         // redundant path, as its publication (design 3.2), only through
-        // the call that carries the receiver's identity.
+        // the crate-internal call that carries the receiver's identity:
+        // every public call refuses dynamic mode until the registration
+        // defects found after karyos#939 are fixed (karyos#644, reopened:
+        // https://github.com/quantstratum/karyos/issues/644#issuecomment-6826655946).
         Destination::MultiDestination {
             destinations,
             control: Some(control),
@@ -141,7 +144,7 @@ fn receive_route(
         Destination::MultiDestination {
             mode: ControlMode::Dynamic,
             ..
-        } => Err(DriverError::DynamicRegistrationRequired),
+        } => Err(DriverError::DynamicRegistrationUnsupported),
         // Manual multi-destination, or a destination a later protocol
         // version parses: not served.
         _ => Err(DriverError::UnsupportedChannel),
@@ -388,27 +391,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// M1). One receiving driver is at most one destination of a
     /// publication.
     ///
-    /// ```no_run
-    /// use std::num::NonZeroU64;
-    ///
-    /// use karyos_driver::EmbeddedDriver;
-    /// use karyos_driver::net::NetworkSubscription;
-    /// use karyos_protocol::channel::UdpConfig;
-    /// use karyos_protocol::roles::ReceiverIdentity;
-    ///
-    /// /// Subscribes stream 10 on `channel`, a `control-mode=dynamic`
-    /// /// channel, as receiver 42.
-    /// fn subscribe(
-    ///     driver: &mut EmbeddedDriver,
-    ///     channel: &UdpConfig,
-    /// ) -> Result<NetworkSubscription, Box<dyn std::error::Error>> {
-    ///     let identity = ReceiverIdentity {
-    ///         receiver_id: NonZeroU64::new(42).ok_or("a receiver id is nonzero")?,
-    ///         group_tag: 0,
-    ///     };
-    ///     Ok(driver.add_dynamic_network_subscription(10, channel, identity)?)
-    /// }
-    /// ```
+    /// Test-only, as the public calls refuse dynamic mode with
+    /// [`DriverError::DynamicRegistrationUnsupported`] until the
+    /// registration defects reported on karyos#644 after it was first
+    /// exposed are fixed: the loopback end-to-end tests drive it here.
     ///
     /// # Errors
     ///
@@ -418,7 +404,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// destinations or names redundant paths, whose `interface` is of
     /// another family than `control`, or for a stream already subscribed
     /// on the endpoint registering at another address.
-    pub fn add_dynamic_network_subscription(
+    #[cfg(test)]
+    pub(crate) fn add_dynamic_network_subscription(
         &mut self,
         stream_id: i32,
         channel: &UdpConfig,

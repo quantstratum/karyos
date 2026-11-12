@@ -66,20 +66,18 @@ pub enum DriverError {
     /// on a publication: a tagged group is never 0.
     #[error("unsupported network channel")]
     UnsupportedChannel,
-    /// A multi-destination channel in `control-mode=dynamic` given to a
-    /// call that carries no registration (ADR-0082; karyos#644): a
-    /// publication needs its explicit, non-empty allowlist, through
-    /// [`EmbeddedDriver::add_dynamic_network_publication`], and a
-    /// subscription its configured receiver identity, through
-    /// [`EmbeddedDriver::add_dynamic_network_subscription`]. A missing
-    /// allowlist is a refusal, never a permissive default.
-    ///
-    /// [`EmbeddedDriver::add_dynamic_network_publication`]: crate::EmbeddedDriver::add_dynamic_network_publication
-    /// [`EmbeddedDriver::add_dynamic_network_subscription`]: crate::EmbeddedDriver::add_dynamic_network_subscription
-    #[error(
-        "a control-mode=dynamic channel needs its registration: an allowlist for a publication, a receiver identity for a subscription"
-    )]
-    DynamicRegistrationRequired,
+    /// A multi-destination channel in `control-mode=dynamic`: refused by
+    /// every public publication and subscription call until dynamic
+    /// registration is safe to expose (ADR-0082; karyos#644). It was
+    /// reachable for a while, and a post-merge review then reproduced denial
+    /// of service defects in the registration path (the per-source pending
+    /// bound, required targets and the quota, the eviction of a live
+    /// optional receiver); karyos#644 was reopened with them
+    /// (<https://github.com/quantstratum/karyos/issues/644#issuecomment-6826655946>).
+    /// The refusal is lifted by the change that fixes them and makes the
+    /// dynamic calls public again.
+    #[error("dynamic multi-destination registration is not supported yet")]
+    DynamicRegistrationUnsupported,
     /// A second `control-mode=dynamic` publication of one stream on one
     /// control endpoint: a REGISTER names only its stream, so one endpoint
     /// holds at most one dynamic publication of it (`quantstratum-docs:
