@@ -293,7 +293,9 @@ pub struct AgentConfig {
     /// S5).
     pub image_liveness_timeout: u64,
     /// Receiver bindings the sender tracks (the receivers it answered),
-    /// at least 1 (default 64).
+    /// at least 1 and at least `max_destinations` (default 64). The
+    /// `control-mode=dynamic` publications of a driver together take at
+    /// most this many destinations (karyos#941 item 2).
     pub receiver_bindings: usize,
     /// `idle_image_timeout` in ns: how long stationary heartbeats (an idle
     /// sender repeating its position) keep an image alive after its last
@@ -485,6 +487,15 @@ impl AgentConfig {
                 value: self.max_destinations,
             });
         }
+        // A dynamic publication's destinations each need a binding at the
+        // sender, required ids among them (karyos#941 item 2): the table
+        // holds at least one publication's worth. The sum over a driver's
+        // dynamic publications is checked as each is added.
+        if self.receiver_bindings < self.max_destinations {
+            return Err(AgentError::InvalidConfig(
+                "receiver_bindings must be at least max_destinations",
+            ));
+        }
         data::destination_share(&self.repair, self.max_destinations).map_err(|_| {
             AgentError::InvalidConfig(
                 "a repair table holds less than one entry per destination (max_destinations)",
@@ -659,9 +670,13 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
         /// (`quantstratum-docs: karyos/design/multi-destination-unicast.md`
         /// 3.2; karyos#644): the receiver sends REGISTER for the stream
         /// there from `endpoint` every `setup_interval` until an image of
-        /// the stream from that address is bound. `None`: it registers
-        /// nowhere, as before.
-        register_at: Option<std::net::SocketAddr>,
+        /// the stream from that address is bound, with the registration
+        /// state the receiver writes for the application (karyos#941 item
+        /// 3). `None`: it registers nowhere, as before.
+        register_at: Option<(
+            std::net::SocketAddr,
+            std::sync::Arc<crate::sessions::register::RegistrationStatus>,
+        )>,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer
@@ -1348,12 +1363,21 @@ pub(crate) const IMAGE_CELLS: [&str; 3] =
 /// The receiver's system counters in the CnC, in [`AgentCells`] order:
 /// datagrams read, dropped by the backend and not decoded, SMs sent, and
 /// images retired at their liveness timeout.
-pub(crate) const RECEIVER_CELLS: [&str; 5] = [
+///
+/// Then its dynamic subscriptions' registrations (`quantstratum-docs:
+/// karyos/design/multi-destination-unicast.md` 3.2; karyos#941 item 3):
+/// REGISTERs sent and not sent, and ERR REGISTRATIONs read from a
+/// `control` address. Appended last, so the ids of the cells allocated
+/// after the receiver's move by three; readers find cells by label.
+pub(crate) const RECEIVER_CELLS: [&str; 8] = [
     "datagrams received",
     "datagrams dropped by backend",
     "invalid frames received",
     "status messages sent",
     "images retired at timeout",
+    "registers sent",
+    "registers unsent",
+    "registration refusals received",
 ];
 
 fn sender_values(
@@ -1397,6 +1421,9 @@ fn receiver_values(counters: &roles::ReceiverCounters) -> [u64; RECEIVER_CELLS.l
         counters.decode_errors,
         counters.sm_sent,
         counters.images_retired,
+        counters.registers_sent,
+        counters.registers_unsent,
+        counters.registration_refusals,
     ]
 }
 

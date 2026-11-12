@@ -119,6 +119,39 @@ use karyos_sys::log_buffer::ReceiveOwner;
 use karyos_sys::log_buffer::{CloseCause, SkipConfig, SkipPolicy};
 use karyos_sys::term_bytes::HeapTerms;
 
+/// A `control-mode=dynamic` subscription key (design 3.2; karyos#644):
+/// where it registers, when its next REGISTER is due and its backoff.
+#[derive(Debug)]
+struct Registering {
+    endpoint: EndpointId,
+    stream_id: i32,
+    /// The `control` address it registers at.
+    control: SocketAddr,
+    /// The monotonic time its next REGISTER is due, in ns.
+    due: u64,
+    /// The spacing of its next REGISTER, in ns: `setup_interval`, doubled
+    /// after each one up to [`REGISTER_BACKOFF_STEPS`] doublings, and
+    /// `setup_interval` again on an ANNOUNCE from `control` or once its
+    /// image is gone (karyos#941 item 1).
+    interval: u64,
+    /// The registration state it writes for the application (karyos#941
+    /// item 3).
+    status: Arc<crate::sessions::register::RegistrationStatus>,
+}
+
+/// The doublings of a dynamic subscription's REGISTER interval while
+/// nothing binds it: from `setup_interval` (100 ms) to sixteen times it
+/// (1.6 s), so a publisher that is absent or refusing costs at most one
+/// REGISTER every 1.6 s per key after the first second and a half
+/// (karyos#941 item 1).
+const REGISTER_BACKOFF_STEPS: u32 = 4;
+
+/// The spread of the keys' REGISTERs within an interval: key `i` is due
+/// `i mod REGISTER_STAGGER` eighths of an interval later than the bare
+/// interval, so keys at one `control` do not all send in one cycle
+/// (karyos#941 item 1).
+const REGISTER_STAGGER: u64 = 8;
+
 /// The receiver's counters; checked, sticky on overflow.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReceiverCounters {
@@ -144,9 +177,16 @@ pub struct ReceiverCounters {
     /// each is tried again at the next interval.
     pub registers_unsent: u64,
     /// ERR REGISTRATIONs read from a subscription's `control` address
-    /// (`DESTINATIONS_FULL`): the subscription keeps registering at its
-    /// interval.
+    /// (`DESTINATIONS_FULL`): the subscription keeps registering, backing
+    /// off.
     pub registration_refusals: u64,
+    /// REGISTERs due that their `control` address's own bucket refused
+    /// (karyos#941 item 1); also counted in `registers_unsent`.
+    pub registers_rate_limited: u64,
+    /// SETUP ANNOUNCEs and ANSWERs dropped on a `control-mode=dynamic`
+    /// key because they came from another source than its `control`
+    /// address (karyos#941 item 5).
+    pub setup_not_from_control: u64,
     /// Received SOLICITs dropped with the control ring full.
     pub ring_full_solicit: u64,
     /// Challenges not sent: the source is not an answerable unicast
@@ -471,6 +511,15 @@ pub struct SenderCounters {
     /// Answered receivers not recorded: the binding table was full of
     /// confirmed bindings.
     pub bindings_full: u64,
+    /// Receivers not recorded, or a dynamic publication's CHALLENGE not
+    /// answered, because the free bindings are kept for required receiver
+    /// ids of dynamic publications that have not joined yet (karyos#941
+    /// item 2).
+    pub bindings_reserved: u64,
+    /// A dynamic publication's CHALLENGEs not answered because the binding
+    /// table had no room for their receiver: the receiver gets no ANSWER,
+    /// so it keeps registering (karyos#941 item 2).
+    pub challenges_unbound: u64,
     /// SMs from a second source of a bound receiver (sender endpoint,
     /// alias, boot id and incarnation) that adopted a binding of their own
     /// (plan 169).
@@ -780,12 +829,17 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// 164), allocated at creation.
     solicit_from: Vec<(EndpointId, i32, EndpointId)>,
     /// The `control-mode=dynamic` subscription keys (design 3.2;
-    /// karyos#644): endpoint, stream, the `control` address they register
-    /// at, and the monotonic time their next REGISTER is due. Allocated at
-    /// creation: at most one per subscription key.
-    registering: Vec<(EndpointId, i32, std::net::SocketAddr, u64)>,
-    /// `setup_interval`: the spacing of a dynamic subscription's REGISTERs.
+    /// karyos#644). Allocated at creation: at most one per subscription
+    /// key.
+    registering: Vec<Registering>,
+    /// `setup_interval`: the first spacing of a dynamic subscription's
+    /// REGISTERs, which backs off from there (karyos#941 item 1).
     setup_interval: u64,
+    /// The REGISTERs' own bucket per `control` address, the port ignored,
+    /// apart from the RSP_SETUP limits its CHALLENGEs and SOLICITs draw on
+    /// (karyos#941 item 1): `rsp_setup_per_destination` a second, for at
+    /// most `subscriptions` addresses (allocated at creation).
+    register_rates: EndpointRates,
     /// The conflated lane of subscribed keys (conflated-network-images.md
     /// (a); at most one per key, allocated at start): their images gate
     /// that lane's seals.
@@ -1870,6 +1924,8 @@ pub(super) fn roles<T: StreamTerms>(
     .ok_or(AgentError::InvalidConfig("rsp_setup rate or table is zero"))?;
     let rsp_total = TotalRate::new(config.rsp_setup_rate, 0)
         .ok_or(AgentError::InvalidConfig("rsp_setup_rate is zero"))?;
+    let register_rates = EndpointRates::new(config.rsp_setup_per_destination, config.subscriptions)
+        .ok_or(AgentError::InvalidConfig("rsp_setup rate or table is zero"))?;
     let replies = RttReplies::new(&config.rtt)
         .map_err(|_| AgentError::InvalidConfig("invalid RTT configuration"))?;
     let routes = (0..config.max_endpoints)
@@ -1975,6 +2031,7 @@ pub(super) fn roles<T: StreamTerms>(
             identities: Vec::with_capacity(config.subscriptions),
             solicit_from: Vec::with_capacity(config.subscriptions),
             registering: Vec::with_capacity(config.subscriptions),
+            register_rates,
             setup_interval: config.setup_interval,
             conflated: Vec::with_capacity(config.subscriptions),
             barrier_ack_timeout: config.barrier_ack_timeout,
@@ -2030,10 +2087,57 @@ fn reserve_chain<T: StreamTerms>(
     ))
 }
 
+/// What [`SenderRole::make_room`] would do for one more binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Room {
+    /// A free binding beyond those kept for required receiver ids.
+    Free,
+    /// None free: the unconfirmed binding at this index is evicted.
+    Evict(usize),
+    /// The free bindings are kept for required receiver ids that have not
+    /// joined (karyos#941 item 2).
+    Reserved,
+    /// Full of confirmed bindings.
+    Full,
+}
+
+/// Whether `binding` names `receiver_id`: the receiver block its REGISTER
+/// named, the id its SMs bring, or the one it had before it was answered
+/// again.
+fn names(binding: &ReceiverBinding, receiver_id: u64) -> bool {
+    binding
+        .registered
+        .is_some_and(|receiver| receiver.receiver_id == receiver_id)
+        || binding.receiver_id == Some(receiver_id)
+        || binding.former == Some(receiver_id)
+}
+
+/// When a dynamic subscription key at `index` is next due to REGISTER,
+/// `interval` after `now` plus its stagger, `index mod REGISTER_STAGGER`
+/// eighths of `interval` (karyos#941 item 1). Saturating: a clock past
+/// `u64` (never) sends no more, which is the definition wanted.
+fn next_register_due(now: u64, interval: u64, index: usize) -> u64 {
+    let slot = u64::try_from(index).map_or(0, |index| index % REGISTER_STAGGER);
+    let stagger = (interval / REGISTER_STAGGER).checked_mul(slot).unwrap_or(0);
+    now.saturating_add(interval).saturating_add(stagger)
+}
+
+/// `interval` doubled, at most `setup_interval` doubled
+/// [`REGISTER_BACKOFF_STEPS`] times (karyos#941 item 1).
+fn backed_off(interval: u64, setup_interval: u64) -> u64 {
+    let cap = setup_interval
+        .checked_shl(REGISTER_BACKOFF_STEPS)
+        .filter(|cap| cap >> REGISTER_BACKOFF_STEPS == setup_interval)
+        .unwrap_or(u64::MAX);
+    interval
+        .checked_mul(2)
+        .map_or(cap, |doubled| doubled.min(cap))
+}
+
 /// Whether an RSP_SETUP may answer `source` (network-control-schemas.md
 /// §7.3): a unicast address with a nonzero port; never a multicast,
 /// broadcast or unspecified address, an IPv4-mapped one included.
-fn answerable(source: SocketAddr) -> bool {
+pub(crate) fn answerable(source: SocketAddr) -> bool {
     let source = normalized(source);
     let ip = source.ip();
     let broadcast = match ip {
@@ -2123,8 +2227,15 @@ impl<T: StreamTerms> ReceiverRole<T> {
                             self.solicit_from.push((endpoint, stream_id, from));
                         }
                         // And the address it registers at, due at once.
-                        if let Some(control) = register_at {
-                            self.registering.push((endpoint, stream_id, control, 0));
+                        if let Some((control, status)) = register_at {
+                            self.registering.push(Registering {
+                                endpoint,
+                                stream_id,
+                                control,
+                                due: 0,
+                                interval: self.setup_interval,
+                                status,
+                            });
                         }
                         true
                     }
@@ -2170,7 +2281,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     self.solicit_from
                         .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
                     self.registering
-                        .retain(|(held, stream, ..)| (*held, *stream) != (endpoint, stream_id));
+                        .retain(|key| (key.endpoint, key.stream_id) != (endpoint, stream_id));
                     self.unsubscribed = true;
                 }
                 if let Some(index) = self
@@ -3983,30 +4094,52 @@ impl<T: StreamTerms> ReceiverRole<T> {
 
     /// Sends REGISTER for each `control-mode=dynamic` subscription key
     /// that is due and has no image of its stream from its `control`
-    /// address (design 3.2: repeated every `setup_interval` until bound,
-    /// then stopped; again once that image is gone). Each goes to the
-    /// validated `control` address from the key's endpoint, under the
-    /// RSP_SETUP limits of §7.4; one refused waits for the next interval.
-    /// The receiver block is this boot's, with the key's configured
-    /// `receiver_id`: a receiver id is configured and stable across
-    /// restarts (design 2.3; multicast-flow-control.md M1), so a key with
-    /// none sends nothing and counts each due REGISTER unsent. Returns the
-    /// REGISTERs sent. Nothing allocates.
+    /// address (design 3.2: repeated until bound, then stopped; again once
+    /// that image is gone). Each goes to the validated `control` address
+    /// from the key's endpoint under the REGISTERs' own bucket per
+    /// `control` address, never the RSP_SETUP limits its CHALLENGEs draw
+    /// on, so REGISTERs cannot starve the CHALLENGE that answers its
+    /// publisher's ANNOUNCE (karyos#941 item 1). A key's interval starts at
+    /// `setup_interval` and doubles after each REGISTER, sent or not, up to
+    /// [`REGISTER_BACKOFF_STEPS`] doublings; an ANNOUNCE from `control` or
+    /// the loss of its image starts it over. Keys are spread within an
+    /// interval ([`REGISTER_STAGGER`]). The receiver block is this boot's,
+    /// with the key's configured `receiver_id`: a receiver id is configured
+    /// and stable across restarts (design 2.3; multicast-flow-control.md
+    /// M1), so a key with none sends nothing and counts each due REGISTER
+    /// unsent. Each key's registration state follows (karyos#941 item 3).
+    /// Returns the REGISTERs sent. Nothing allocates.
     fn send_registers(&mut self, sessions: &SessionEnd<T>, now: u64) -> u32 {
+        use crate::sessions::register::RegistrationState;
+
         let mut sent = 0u32;
         for index in 0..self.registering.len() {
-            let Some(&(endpoint, stream_id, control, due)) = self.registering.get(index) else {
+            let Some(key) = self.registering.get(index) else {
                 break;
             };
-            if now < due {
-                continue;
-            }
+            let (endpoint, stream_id, control, due) =
+                (key.endpoint, key.stream_id, key.control, key.due);
             let bound = self.images.iter().any(|image| {
                 image.key.endpoint == endpoint
                     && normalized(image.key.source) == normalized(control)
                     && image.key.alias.stream_id == stream_id
             });
             if bound {
+                if let Some(key) = self.registering.get_mut(index) {
+                    key.status.set(RegistrationState::Bound);
+                    // Once the image goes, the first REGISTER is due at
+                    // once and the backoff starts over.
+                    key.due = now;
+                    key.interval = self.setup_interval;
+                }
+                continue;
+            }
+            if let Some(key) = self.registering.get(index)
+                && key.status.get() == RegistrationState::Bound
+            {
+                key.status.set(RegistrationState::Registering);
+            }
+            if now < due {
                 continue;
             }
             let receiver_id = self
@@ -4014,37 +4147,36 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 .iter()
                 .find(|(held, stream, _)| (*held, *stream) == (endpoint, stream_id))
                 .map(|(.., identity)| identity.receiver_id.get());
-            let Some(receiver_id) = receiver_id else {
-                self.count(|c| &mut c.registers_unsent);
-                if let Some(entry) = self.registering.get_mut(index) {
-                    entry.3 = now.saturating_add(self.setup_interval);
+            let went = match receiver_id {
+                Some(receiver_id) => {
+                    let register = Control::Register(karyos_protocol::network::RspRegister {
+                        stream_id,
+                        receiver: Receiver {
+                            receiver_boot_id: self.sessions.boot_id(),
+                            receiver_id,
+                        },
+                    });
+                    let mut intake = Intake {
+                        endpoint,
+                        now,
+                        role: self,
+                        sessions,
+                        work: 0,
+                    };
+                    intake.register_to(control, register)
                 }
-                continue;
+                None => false,
             };
-            let register = Control::Register(karyos_protocol::network::RspRegister {
-                stream_id,
-                receiver: Receiver {
-                    receiver_boot_id: self.sessions.boot_id(),
-                    receiver_id,
-                },
-            });
-            let mut intake = Intake {
-                endpoint,
-                now,
-                role: self,
-                sessions,
-                work: 0,
-            };
-            if intake.challenge_from(endpoint, control, register) {
+            if went {
                 self.count(|c| &mut c.registers_sent);
                 sent = sent.saturating_add(1);
             } else {
                 self.count(|c| &mut c.registers_unsent);
             }
-            // The next one is due an interval on, sent or not; a clock
-            // past `u64` (never) sends no more.
-            if let Some(entry) = self.registering.get_mut(index) {
-                entry.3 = now.saturating_add(self.setup_interval);
+            let setup_interval = self.setup_interval;
+            if let Some(key) = self.registering.get_mut(index) {
+                key.due = next_register_due(now, key.interval, index);
+                key.interval = backed_off(key.interval, setup_interval);
             }
         }
         sent
@@ -4700,6 +4832,72 @@ impl<T: StreamTerms> Intake<'_, T> {
         })
     }
 
+    /// Whether a SETUP ANNOUNCE (`announce`) or ANSWER for `stream_id`
+    /// from `source` may set up an image on this endpoint: on a
+    /// `control-mode=dynamic` key only from the `control` address it
+    /// registers at, port included, so no other host that reaches the
+    /// key's port can announce an image of its stream (karyos#941 item 5);
+    /// any source on another key, as before. A refused one is counted. An
+    /// ANNOUNCE from `control` shows the key `Announced` and starts its
+    /// REGISTER backoff over, its next REGISTER due one `setup_interval`
+    /// on (karyos#941 items 1 and 3).
+    fn setup_from_control(
+        &mut self,
+        endpoint: EndpointId,
+        stream_id: i32,
+        source: SocketAddr,
+        announce: bool,
+    ) -> bool {
+        use crate::sessions::register::RegistrationState;
+
+        let setup_interval = self.role.setup_interval;
+        let now = self.now;
+        let Some(key) = self
+            .role
+            .registering
+            .iter_mut()
+            .find(|key| (key.endpoint, key.stream_id) == (endpoint, stream_id))
+        else {
+            return true;
+        };
+        if normalized(key.control) != normalized(source) {
+            self.role.count(|c| &mut c.setup_not_from_control);
+            return false;
+        }
+        if announce {
+            if key.status.get() != RegistrationState::Bound {
+                key.status.set(RegistrationState::Announced);
+            }
+            key.interval = setup_interval;
+            key.due = key.due.min(now.saturating_add(setup_interval));
+        }
+        true
+    }
+
+    /// Sends `register` from this endpoint to `control` under the
+    /// REGISTERs' own bucket for `control`'s address, the port ignored
+    /// (karyos#941 item 1); §7.3's source rule applies as to any RSP_SETUP.
+    /// Returns whether it was handed to the sender.
+    fn register_to(&mut self, control: SocketAddr, register: Control) -> bool {
+        if !answerable(control) {
+            self.role.count(|c| &mut c.unanswerable_source);
+            return false;
+        }
+        let address = SocketAddr::new(normalized(control).ip(), 0);
+        if self.role.register_rates.admit(address, self.now).is_err() {
+            self.role.count(|c| &mut c.registers_rate_limited);
+            return false;
+        }
+        #[cfg(test)]
+        self.role.posted_challenges.push((self.endpoint, register));
+        self.forward(ControlItem::Outgoing {
+            endpoint: self.endpoint,
+            destination: control,
+            control: register,
+            guard: None,
+        })
+    }
+
     /// DATA for `key`, which has no active binding, on a subscribed stream
     /// (network-control-schemas.md §6.3): one SOLICIT per entry to the
     /// validated unicast source, under the RSP_SETUP limits. A source that
@@ -4825,6 +5023,12 @@ impl<T: StreamTerms> Intake<'_, T> {
                     self.role.count(|c| &mut c.term_too_large);
                     return;
                 }
+                // A registering key is set up by its `control` address
+                // alone (karyos#941 item 5); an ANNOUNCE from there starts
+                // its REGISTER backoff over.
+                if !self.setup_from_control(endpoint, announce.alias.stream_id, source, true) {
+                    return;
+                }
                 let key = BindingKey {
                     endpoint,
                     source,
@@ -4856,6 +5060,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                 };
                 if answer.term.term_length > max_term_length {
                     self.role.count(|c| &mut c.term_too_large);
+                    return;
+                }
+                if !self.setup_from_control(endpoint, answer.alias.stream_id, source, false) {
                     return;
                 }
                 let key = BindingKey {
@@ -4992,16 +5199,21 @@ impl<T: StreamTerms> Intake<'_, T> {
             // it only for a `control-mode=dynamic` publication (design
             // 3.2).
             // An ERR REGISTRATION from the address a dynamic subscription
-            // of its stream registers at: counted; the subscription keeps
-            // registering at its interval (design 3.2). From anywhere else
-            // it is unhandled.
+            // of its stream registers at: counted and shown as its state;
+            // the subscription keeps registering, backing off (design 3.2;
+            // karyos#941 items 1 and 3). From anywhere else it is
+            // unhandled.
             Control::Registration(refusal) => {
-                let registering = self.role.registering.iter().any(|(held, stream, at, _)| {
-                    *held == endpoint
-                        && *stream == refusal.stream_id
-                        && normalized(*at) == normalized(source)
+                let registering = self.role.registering.iter().find(|key| {
+                    key.endpoint == endpoint
+                        && key.stream_id == refusal.stream_id
+                        && normalized(key.control) == normalized(source)
                 });
-                if registering {
+                if let Some(key) = registering {
+                    // The application sees it (karyos#941 item 3); the
+                    // key keeps backing off.
+                    key.status
+                        .set(crate::sessions::register::RegistrationState::Refused);
                     self.role.count(|c| &mut c.registration_refusals);
                 } else {
                     self.role.count(|c| &mut c.unhandled);
@@ -6609,7 +6821,7 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             return;
         }
-        if !self.make_room(now) {
+        if !self.make_room(endpoint, answer.alias, registered, now) {
             return;
         }
         let id = self.next_binding;
@@ -6633,27 +6845,136 @@ impl<T: StreamTerms> SenderRole<T> {
         });
     }
 
-    /// Whether the table has room for one more binding: a full one evicts
-    /// its oldest unconfirmed binding, with its adoptions, and counts; one
-    /// full of confirmed bindings refuses and counts `bindings_full`.
-    fn make_room(&mut self, now: u64) -> bool {
-        if self.bindings.len() < self.max_bindings {
-            return true;
+    /// Whether the table has room for one more binding, for the receiver
+    /// `registered` of the publication `alias` on `endpoint`, keeping one
+    /// free binding for each required receiver id of a dynamic publication
+    /// that has not joined (karyos#941 item 2): a required id that has not
+    /// joined uses its own. Without room, the oldest unconfirmed binding
+    /// that holds no such required id is evicted, with its adoptions, and
+    /// counted; without one, it refuses and counts `bindings_reserved`
+    /// when the reservation decides, else `bindings_full`.
+    fn make_room(
+        &mut self,
+        endpoint: EndpointId,
+        alias: Alias,
+        registered: Option<Receiver>,
+        now: u64,
+    ) -> bool {
+        match self.room_for(endpoint, alias, registered) {
+            Room::Free => true,
+            Room::Evict(index) => {
+                self.count(|c| &mut c.bindings_evicted);
+                self.remove_binding(index, now, |c| &mut c.bindings_evicted);
+                true
+            }
+            Room::Reserved => {
+                self.count(|c| &mut c.bindings_reserved);
+                false
+            }
+            Room::Full => {
+                self.count(|c| &mut c.bindings_full);
+                false
+            }
         }
+    }
+
+    /// Whether a binding for `registered` of `alias` on `endpoint` would
+    /// fit, as [`Self::make_room`] decides it, changing nothing.
+    fn room_for(&self, endpoint: EndpointId, alias: Alias, registered: Option<Receiver>) -> Room {
+        let own = registered
+            .is_some_and(|receiver| self.unjoined_required(endpoint, alias, receiver.receiver_id));
+        // The bindings kept for the others: a required id that has not
+        // joined keeps one for itself, which this binding is when `own`.
+        // `own` is set only for an id the count includes: saturating is
+        // exact here and never floors a real count.
+        let reserved = self
+            .unjoined_required_count()
+            .saturating_sub(usize::from(own));
+        let held = self.bindings.len().checked_add(reserved);
+        if held.is_some_and(|held| held < self.max_bindings) {
+            return Room::Free;
+        }
+        // An eviction keeps the count: it makes room only when the table
+        // is exactly full with the reservation kept, never out of a
+        // reserved binding.
+        let kept = held == Some(self.max_bindings);
         let oldest = self
             .bindings
             .iter()
             .enumerate()
-            .filter(|(_, held)| held.last_sm.is_none())
+            .filter(|(_, held)| held.last_sm.is_none() && !self.holds_required_registration(held))
             .min_by_key(|(_, held)| held.answered_at)
             .map(|(index, _)| index);
-        let Some(index) = oldest else {
-            self.count(|c| &mut c.bindings_full);
+        match oldest {
+            Some(index) if kept => Room::Evict(index),
+            _ if self.bindings.len() < self.max_bindings => Room::Reserved,
+            _ => Room::Full,
+        }
+    }
+
+    /// Whether `receiver_id` is a required receiver id of the dynamic
+    /// publication `alias` on `endpoint` that has not joined: it holds no
+    /// required slot and no binding of that publication names it
+    /// (karyos#941 item 2).
+    fn unjoined_required(&self, endpoint: EndpointId, alias: Alias, receiver_id: u64) -> bool {
+        self.publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            .is_some_and(|outbound| {
+                outbound
+                    .registration()
+                    .is_some_and(|policy| policy.is_required(receiver_id))
+                    && !outbound.holds_required(receiver_id)
+                    && !self.bindings.iter().any(|held| {
+                        outbound.serves(held.endpoint)
+                            && held.alias == alias
+                            && names(held, receiver_id)
+                    })
+            })
+    }
+
+    /// The required receiver ids of every dynamic publication that have
+    /// not joined ([`Self::unjoined_required`]): one free binding is kept
+    /// for each (karyos#941 item 2). Bounded by the publications and their
+    /// required ids, at most `max_destinations` each.
+    fn unjoined_required_count(&self) -> usize {
+        self.publications
+            .iter()
+            .filter_map(|outbound| Some((outbound, outbound.registration()?)))
+            .map(|(outbound, policy)| {
+                policy
+                    .required()
+                    .iter()
+                    .filter(|&&receiver_id| {
+                        !outbound.holds_required(receiver_id)
+                            && !self.bindings.iter().any(|held| {
+                                outbound.serves(held.endpoint)
+                                    && held.alias == outbound.alias()
+                                    && names(held, receiver_id)
+                            })
+                    })
+                    .count()
+            })
+            // At most the publications times `max_destinations`, far below
+            // `usize::MAX`: saturating never applies, and a bound past it
+            // would only keep more bindings free.
+            .fold(0usize, usize::saturating_add)
+    }
+
+    /// Whether `binding` was answered for a REGISTER naming a required
+    /// receiver id of its dynamic publication: no eviction takes it, and
+    /// it is renamed to another receiver only with room for that id
+    /// (karyos#941 item 2), which would otherwise hand on the binding
+    /// kept for it.
+    fn holds_required_registration(&self, binding: &ReceiverBinding) -> bool {
+        let Some(receiver) = binding.registered else {
             return false;
         };
-        self.count(|c| &mut c.bindings_evicted);
-        self.remove_binding(index, now, |c| &mut c.bindings_evicted);
-        true
+        self.publications
+            .iter()
+            .find(|outbound| outbound.serves(binding.endpoint) && outbound.alias() == binding.alias)
+            .and_then(|outbound| outbound.registration())
+            .is_some_and(|policy| policy.is_required(receiver.receiver_id))
     }
 
     /// Removes the binding at `index` and, for one an ANSWER created, its
@@ -7502,8 +7823,9 @@ impl<T: StreamTerms> SenderRole<T> {
             // At a slot already held, the binding is the one that holds it
             // or one beside it: it stays, reset and unconfirmed, so it
             // expires at `setup_challenge_timeout` and the slot retires
-            // with it (`registrant_timed_out`), unless its own receiver's
-            // next SM confirms it first. Dropping it would leave the slot
+            // with it (`retire_uncovered_registrants`, run by
+            // `remove_binding` when the reset binding expires), unless its
+            // own receiver's next SM confirms it first. Dropping it would leave the slot
             // with nothing to expire it (karyos#945 review).
             if stranger {
                 self.remove_binding(index, now, |c| &mut c.registrants_refused);
@@ -7585,6 +7907,104 @@ impl<T: StreamTerms> SenderRole<T> {
             challenge.challenge.receiver_boot_id,
             now,
         )
+    }
+
+    /// Whether the publication `alias` on `endpoint` is a
+    /// `control-mode=dynamic` one.
+    fn registration_of(&self, endpoint: EndpointId, alias: Alias) -> bool {
+        self.publications.iter().any(|outbound| {
+            outbound.serves(endpoint)
+                && outbound.alias() == alias
+                && outbound.registration().is_some()
+        })
+    }
+
+    /// Whether the ANSWER to the CHALLENGE `control` from `source` would
+    /// leave a binding behind ([`Self::bind`]): its tuple is already bound,
+    /// or [`Self::make_room`] would find room for its receiver, the one
+    /// its pending entry names (karyos#941 item 2). Expires the bindings
+    /// due by `now` first, as `bind` does.
+    fn can_bind(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        control: &Control,
+        now: u64,
+    ) -> bool {
+        let Control::Challenge(challenge) = control else {
+            return true;
+        };
+        self.expire_bindings(now);
+        let source = normalized(source);
+        let bound = self
+            .bindings
+            .iter()
+            .find(|held| {
+                held.parent.is_none()
+                    && held.endpoint == endpoint
+                    && held.alias == challenge.alias
+                    && held.solicited_from == source
+                    && held.boot_id == challenge.challenge.receiver_boot_id
+                    && held.identity == challenge.identity
+            })
+            .copied();
+        let registered = self
+            .publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == challenge.alias)
+            .and_then(|outbound| outbound.registration())
+            .and_then(|policy| {
+                self.registrations.challenge_receiver(
+                    policy,
+                    challenge.alias.stream_id,
+                    source,
+                    challenge.challenge.receiver_boot_id,
+                    now,
+                )
+            });
+        let room = match bound {
+            // Answered again, its binding stays; it is renamed to this
+            // receiver block. A required id's own binding renamed to
+            // another receiver hands its kept binding on, so it needs one
+            // more free binding for that id (karyos#941 item 2).
+            Some(held) => {
+                let renamed = held.registered.filter(|was| {
+                    registered.map(|now| now.receiver_id) != Some(was.receiver_id)
+                        && self.holds_required_registration(&held)
+                });
+                match renamed {
+                    None => Room::Free,
+                    Some(_) => {
+                        let own = registered.is_some_and(|receiver| {
+                            self.unjoined_required(endpoint, challenge.alias, receiver.receiver_id)
+                        });
+                        let after = self
+                            .bindings
+                            .len()
+                            .checked_add(self.unjoined_required_count())
+                            .and_then(|held| held.checked_add(1))
+                            .and_then(|held| held.checked_sub(usize::from(own)));
+                        if after.is_some_and(|after| after <= self.max_bindings) {
+                            Room::Free
+                        } else {
+                            Room::Reserved
+                        }
+                    }
+                }
+            }
+            None => self.room_for(endpoint, challenge.alias, registered),
+        };
+        match room {
+            Room::Free | Room::Evict(_) => true,
+            Room::Reserved => {
+                self.count(|c| &mut c.bindings_reserved);
+                false
+            }
+            Room::Full => {
+                self.count(|c| &mut c.bindings_full);
+                false
+            }
+        }
     }
 
     /// Takes the pending entry the CHALLENGE `control` from `source`
@@ -7685,7 +8105,9 @@ impl<T: StreamTerms> SenderRole<T> {
     /// one).
     fn adopt(&mut self, parent: usize, source: SocketAddr, now: u64) -> Option<usize> {
         let parent = *self.bindings.get(parent)?;
-        if !self.make_room(now) {
+        // An adoption is of a static publication only, and names no
+        // registered receiver: the reservation applies as to any other.
+        if !self.make_room(parent.endpoint, parent.alias, None, now) {
             return None;
         }
         if !self.bindings.iter().any(|binding| binding.id == parent.id) {
@@ -7749,6 +8171,16 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             Some(_) => destination,
         };
+        // A dynamic publication answers only a receiver it can bind
+        // (karyos#941 item 2): one with no room gets no ANSWER, keeps its
+        // pending entry, installs no image and so keeps registering, where
+        // an ANSWER with no binding left it believing it was bound while
+        // its SMs were dropped.
+        if self.registration_of(endpoint, alias) && !self.can_bind(endpoint, source, &control, now)
+        {
+            self.count(|c| &mut c.challenges_unbound);
+            return None;
+        }
         // A registrant's CHALLENGE is charged to its address's bucket of
         // the registrations, not to the shared `setup_answer_rate` table
         // (karyos#945 review): a refused one keeps its pending entry.

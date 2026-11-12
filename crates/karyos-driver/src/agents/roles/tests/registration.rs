@@ -370,8 +370,9 @@ fn register_and_challenge_pairs_leave_the_answer_rate_table_free() {
             }
         }
     }
-    // Each address's bucket of 20 takes 10 pairs.
-    assert_eq!(answered, 8 * 10);
+    // Each address has a bucket of 20 for its REGISTERs and another for
+    // its CHALLENGEs (karyos#941 item 1): all 16 pairs of each pass.
+    assert_eq!(answered, 8 * 16);
     let fresh: SocketAddr = "10.0.0.50:5000".parse().unwrap();
     assert!(
         sender
@@ -404,11 +405,9 @@ fn a_registrant_challenge_with_the_rate_table_full_is_answered() {
         "10.0.0.9:5000".parse().unwrap(),
         "10.0.0.10:5000".parse().unwrap(),
     );
-    assert!(
-        sender
-            .register(EndpointId(1), tracked, &register_as(5, 7), T0)
-            .is_some()
-    );
+    // The tracked address takes the one entry of both tables, its
+    // REGISTERs' and its CHALLENGEs' (karyos#941 item 1).
+    assert_eq!(join_as(&mut sender, tracked, 5, 7, T0), None);
     assert_eq!(join_as(&mut sender, untracked, 6, 8, T0), None);
     assert!(sender.sends_to(EndpointId(1), alias(), untracked));
     assert_eq!(sender.registration_counters().source_rates_full, 2);
@@ -416,36 +415,75 @@ fn a_registrant_challenge_with_the_rate_table_full_is_answered() {
 
 /// karyos#940 item 7: a registrant's CHALLENGE whose ANSWER its rate
 /// refuses takes no pending entry: the next CHALLENGE, once the bucket
-/// refills, finds it and is answered. Its rate is its address's bucket of
-/// the registrations, not `setup_answer_rate` (karyos#945 review).
+/// refills, finds it and is answered. Its rate is its address's CHALLENGE
+/// bucket of the registrations, not `setup_answer_rate` (karyos#945
+/// review) and not its REGISTERs' bucket (karyos#941 item 1): two
+/// REGISTERs a second apart, at a rate of one a second, leave the
+/// CHALLENGE bucket one token for two CHALLENGEs.
 #[test]
 fn a_challenge_refused_for_its_rate_keeps_its_pending_entry() {
     let mut config = AgentConfig::default();
-    config.registration.source_rate = 3;
+    config.registration.source_rate = 1;
     let mut sender = dynamic_sender_config(&config, 4, &[]);
     let from: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    // REGISTER, CHALLENGE and REGISTER take the address's three tokens.
-    assert_eq!(join_as(&mut sender, from, 5, 7, T0), None);
+    let second: SocketAddr = "10.0.0.9:5001".parse().unwrap();
+    let later = T0 + 1_000_000_000;
     assert!(
         sender
-            .register(EndpointId(1), from, &register_as(6, 8), T0 + 2)
+            .register(EndpointId(1), from, &register_as(5, 7), T0)
+            .is_some()
+    );
+    assert!(
+        sender
+            .register(EndpointId(1), second, &register_as(6, 8), later)
+            .is_some()
+    );
+    assert!(
+        sender
+            .answer_for(EndpointId(1), from, later, challenge_of(7))
             .is_some()
     );
     assert_eq!(
-        sender.answer_for(EndpointId(1), from, T0 + 2, challenge_of(8)),
+        sender.answer_for(EndpointId(1), second, later, challenge_of(8)),
         None
     );
     assert_eq!(sender.registration_counters().dropped_challenge_rate, 1);
     assert_eq!(sender.session_counters().rate_limited, 0);
     assert_eq!(sender.registrations.pending().len(), 1);
     assert_eq!(sender.registration_counters().challenged, 1);
-    let later = T0 + 1_000_000_000;
+    let refilled = later + 1_000_000_000;
     assert!(matches!(
-        sender.answer_for(EndpointId(1), from, later, challenge_of(8)),
-        Some((to, Control::SetupAnswer(_))) if to == from
+        sender.answer_for(EndpointId(1), second, refilled, challenge_of(8)),
+        Some((to, Control::SetupAnswer(_))) if to == second
     ));
     assert!(sender.registrations.pending().is_empty());
     assert_eq!(sender.registration_counters().challenged, 2);
+}
+
+/// karyos#941 item 1: REGISTERs from one address cannot spend the
+/// CHALLENGE that completes a registration from it. Three subscriptions
+/// of one receiving driver share its address; their REGISTERs empty the
+/// address's REGISTER bucket, and the CHALLENGE that answers one of them
+/// is still answered, from a bucket of its own.
+#[test]
+fn registers_from_an_address_leave_its_challenge_its_own_bucket() {
+    let mut sender = dynamic_sender(4);
+    let from: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert!(
+        sender
+            .register(EndpointId(1), from, &register_as(5, 7), T0)
+            .is_some()
+    );
+    // Retries of the same REGISTER spend the address's bucket of 20.
+    for _ in 0..40 {
+        let _ = sender.register(EndpointId(1), from, &register_as(5, 7), T0);
+    }
+    assert_eq!(sender.registration_counters().dropped_source_rate, 21);
+    assert!(matches!(
+        sender.answer_for(EndpointId(1), from, T0, challenge_of(7)),
+        Some((to, Control::SetupAnswer(_))) if to == from
+    ));
+    assert_eq!(sender.registration_counters().dropped_challenge_rate, 0);
 }
 
 /// The receiver hands a REGISTER to the sender only for a stream published
@@ -491,14 +529,26 @@ fn subscribe_dynamic(
     role: &mut super::super::ReceiverRole,
     control: SocketAddr,
     identity: Option<crate::membership::ReceiverIdentity>,
-) {
+) -> std::sync::Arc<crate::sessions::register::RegistrationStatus> {
+    subscribe_dynamic_stream(role, alias().stream_id, control, identity)
+}
+
+/// [`subscribe_dynamic`] of `stream_id`, returning the registration state
+/// its receiver writes.
+fn subscribe_dynamic_stream(
+    role: &mut super::super::ReceiverRole,
+    stream_id: i32,
+    control: SocketAddr,
+    identity: Option<crate::membership::ReceiverIdentity>,
+) -> std::sync::Arc<crate::sessions::register::RegistrationStatus> {
     let (replies, _keep) = super::super::super::ring::ring::<AgentEvent<OsSocket>>(
         std::num::NonZeroUsize::new(4).unwrap(),
     );
+    let status = std::sync::Arc::<crate::sessions::register::RegistrationStatus>::default();
     let _ = role.command(AgentCommand::<OsSocket>::AddSubscription {
         reply: replies.reserve().unwrap(),
         endpoint: EndpointId(1),
-        stream_id: alias().stream_id,
+        stream_id,
         max_term_length: 1 << 20,
         reliable: true,
         multicast: false,
@@ -506,8 +556,190 @@ fn subscribe_dynamic(
         identity,
         conflated: None,
         solicit_from: None,
-        register_at: Some(control),
+        register_at: Some((control, status.clone())),
     });
+    status
+}
+
+/// A SETUP ANNOUNCE of the test stream.
+fn announce_of_stream() -> Control {
+    Control::SetupAnnounce(karyos_protocol::network::SetupAnnounce {
+        alias: alias(),
+        identity: identity(),
+        term: karyos_protocol::network::TermParams {
+            term_length: 65_536,
+            initial_term_id: 9,
+            mtu: 1408,
+        },
+        lane_count: 1,
+    })
+}
+
+/// The CHALLENGEs the receiver posted, drained.
+fn challenges_posted(role: &mut super::super::ReceiverRole) -> usize {
+    let count = role
+        .posted_challenges
+        .iter()
+        .filter(|(_, control)| matches!(control, Control::Challenge(_)))
+        .count();
+    role.posted_challenges.clear();
+    count
+}
+
+/// karyos#941 item 1: an unanswered dynamic subscription backs off, its
+/// interval doubling from `setup_interval` to sixteen times it, and an
+/// ANNOUNCE from its `control` address starts it over: the next REGISTER
+/// is due one `setup_interval` on.
+#[test]
+fn an_unanswered_registration_backs_off_and_an_announce_starts_it_over() {
+    let config = AgentConfig::default();
+    let interval = config.setup_interval;
+    let (sender, mut role) = receiver_with(config);
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let _status = subscribe_dynamic(&mut role, control, receiver_42());
+    // Sent at 0, 1, 3, 7, 15, 31 and 47 intervals: the gaps double up to
+    // sixteen intervals, then stay there.
+    let mut sent_at = Vec::new();
+    for step in 0..=48u64 {
+        if role.send_registers(&events, T0 + step * interval) == 1 {
+            sent_at.push(step);
+        }
+    }
+    assert_eq!(sent_at, [0, 1, 3, 7, 15, 31, 47]);
+    let _ = registers_posted(&sender);
+    // An ANNOUNCE from `control` at 48: due again at 49, then the gaps
+    // double again from one interval.
+    intake(&mut role, &events, T0 + 48 * interval).control(control, announce_of_stream());
+    let mut again = Vec::new();
+    for step in 48..=52u64 {
+        if role.send_registers(&events, T0 + step * interval) == 1 {
+            again.push(step);
+        }
+    }
+    assert_eq!(again, [49, 50, 52]);
+}
+
+/// karyos#941 item 1: keys registering at one `control` address are
+/// spread within an interval: after their first REGISTERs, sent
+/// together, the second key's next one is due an eighth of an interval
+/// after the first's.
+#[test]
+fn keys_registering_at_one_control_are_staggered() {
+    let config = AgentConfig::default();
+    let interval = config.setup_interval;
+    let (_sender, mut role) = receiver_with(config);
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let _first = subscribe_dynamic_stream(&mut role, alias().stream_id, control, receiver_42());
+    let _second =
+        subscribe_dynamic_stream(&mut role, alias().stream_id + 1, control, receiver_42());
+    assert_eq!(role.send_registers(&events, T0), 2);
+    assert_eq!(role.send_registers(&events, T0 + interval), 1);
+    assert_eq!(
+        role.send_registers(&events, T0 + interval + interval / 8 - 1),
+        0
+    );
+    assert_eq!(
+        role.send_registers(&events, T0 + interval + interval / 8),
+        1
+    );
+}
+
+/// karyos#941 item 1: REGISTERs draw on their own bucket per `control`
+/// address, not on the RSP_SETUP limits: 21 keys due at once send 20 and
+/// count one rate limited, and the CHALLENGE answering `control`'s
+/// ANNOUNCE still goes.
+#[test]
+fn registers_leave_the_challenge_its_rsp_setup_bucket() {
+    let config = AgentConfig::default();
+    let (_sender, mut role) = receiver_with(config);
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let _status = subscribe_dynamic(&mut role, control, receiver_42());
+    for stream in 1..=20 {
+        let _ = subscribe_dynamic_stream(
+            &mut role,
+            alias().stream_id + stream,
+            control,
+            receiver_42(),
+        );
+    }
+    assert_eq!(role.send_registers(&events, T0), 20);
+    assert_eq!(role.counters().registers_rate_limited, 1);
+    assert_eq!(role.counters().registers_unsent, 1);
+    role.posted_challenges.clear();
+    intake(&mut role, &events, T0 + 1).control(control, announce_of_stream());
+    assert_eq!(challenges_posted(&mut role), 1);
+    assert_eq!(role.counters().rsp_setup_rate_limited, 0);
+}
+
+/// karyos#941 item 5: on a registering key a SETUP ANNOUNCE or ANSWER is
+/// taken only from its `control` address, port included: one from any
+/// other source is counted and challenges nothing, so no host that
+/// reaches the key's port can set up an image of its stream.
+#[test]
+fn a_registering_key_takes_setup_only_from_its_control_address() {
+    use karyos_protocol::network::{ChallengeBlock, Lanes, SetupAnswer};
+
+    let (_sender, mut role) = receiver_with(AgentConfig::default());
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let _status = subscribe_dynamic(&mut role, control, receiver_42());
+    for stranger in ["10.0.0.10:5000", "10.0.0.9:5001"] {
+        let stranger: SocketAddr = stranger.parse().unwrap();
+        intake(&mut role, &events, T0).control(stranger, announce_of_stream());
+        let answer = Control::SetupAnswer(SetupAnswer {
+            alias: alias(),
+            identity: identity(),
+            term: karyos_protocol::network::TermParams {
+                term_length: 65_536,
+                initial_term_id: 9,
+                mtu: 1408,
+            },
+            challenge: ChallengeBlock {
+                receiver_boot_id: role.sessions.boot_id(),
+                nonce: [9, 9],
+            },
+            joins: Lanes::new(&[0]).unwrap(),
+        });
+        intake(&mut role, &events, T0).control(stranger, answer);
+    }
+    assert_eq!(challenges_posted(&mut role), 0);
+    assert_eq!(role.counters().setup_not_from_control, 4);
+    intake(&mut role, &events, T0 + 1).control(control, announce_of_stream());
+    assert_eq!(challenges_posted(&mut role), 1);
+    assert_eq!(role.counters().setup_not_from_control, 4);
+}
+
+/// karyos#941 item 3: a dynamic subscription's state, which the
+/// application reads, follows its registration: `Registering` until its
+/// `control` address answers, `Announced` on an ANNOUNCE from there,
+/// `Refused` on an ERR REGISTRATION, `Bound` once its image is installed
+/// and `Registering` again once the image is gone.
+#[test]
+fn a_dynamic_subscriptions_state_follows_its_registration() {
+    use crate::sessions::register::RegistrationState;
+
+    let config = AgentConfig::default();
+    let interval = config.setup_interval;
+    let (_sender, mut role) = receiver_with(config);
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let status = subscribe_dynamic(&mut role, control, receiver_42());
+    assert_eq!(role.send_registers(&events, T0), 1);
+    assert_eq!(status.get(), RegistrationState::Registering);
+    intake(&mut role, &events, T0 + 1).control(control, full_err());
+    assert_eq!(status.get(), RegistrationState::Refused);
+    intake(&mut role, &events, T0 + 2).control(control, announce_of_stream());
+    assert_eq!(status.get(), RegistrationState::Announced);
+    let (image, _) = super::installed_image();
+    role.images.push(image);
+    let _ = role.send_registers(&events, T0 + interval);
+    assert_eq!(status.get(), RegistrationState::Bound);
+    role.images.clear();
+    let _ = role.send_registers(&events, T0 + 2 * interval);
+    assert_eq!(status.get(), RegistrationState::Registering);
 }
 
 /// The configured identity of receiver 42.
@@ -551,7 +783,7 @@ fn a_dynamic_subscription_registers_every_interval_until_bound() {
     let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     // Nothing is due before a dynamic key exists.
     assert_eq!(role.send_registers(&events, T0), 0);
-    subscribe_dynamic(&mut role, control, receiver_42());
+    let _status = subscribe_dynamic(&mut role, control, receiver_42());
     assert_eq!(role.send_registers(&events, T0), 1);
     let posted = registers_posted(&sender);
     assert_eq!(posted.len(), 1);
@@ -598,7 +830,7 @@ fn an_err_registration_is_read_only_from_the_control_address() {
     let (sender, mut role) = receiver_with(config);
     let (events, _link) = event_ring();
     let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    subscribe_dynamic(&mut role, control, receiver_42());
+    let _status = subscribe_dynamic(&mut role, control, receiver_42());
     assert_eq!(role.send_registers(&events, T0), 1);
     intake(&mut role, &events, T0 + 1).control(control, full_err());
     assert_eq!(role.counters().registration_refusals, 1);
@@ -895,7 +1127,7 @@ fn a_dynamic_key_without_an_identity_sends_no_register() {
     let (sender, mut role) = receiver_with(config);
     let (events, _link) = event_ring();
     let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    subscribe_dynamic(&mut role, control, None);
+    let _status = subscribe_dynamic(&mut role, control, None);
     assert_eq!(role.send_registers(&events, T0), 0);
     assert_eq!(role.send_registers(&events, T0 + interval - 1), 0);
     assert_eq!(role.send_registers(&events, T0 + interval), 0);
@@ -1877,7 +2109,9 @@ enum Step {
 /// table and a three-binding one: they reach every path that removes a
 /// binding (expiry, `make_room` eviction, a full or refused join, a
 /// restart, a move), each asserted reached. A failure names its seed, the
-/// step and the sequence so far.
+/// step and the sequence so far. It also checks that the binding kept for
+/// required id 42 until it joins is never taken (karyos#941 item 2), with
+/// the refusals that keep it asserted reached.
 #[test]
 fn every_optional_slot_keeps_a_binding_able_to_expire_it() {
     const SEEDS: u64 = 12_000;
@@ -1965,6 +2199,14 @@ fn every_optional_slot_keeps_a_binding_able_to_expire_it() {
                     uncovered.is_empty(),
                     "receiver_bindings {bindings}, seed {seed}: {uncovered:?} uncovered after {steps:#?}"
                 );
+                // karyos#941 item 2: the binding kept for required id 42
+                // until it joins is never taken by another receiver.
+                let kept = sender.unjoined_required_count();
+                assert!(
+                    sender.bindings.len() + kept <= bindings,
+                    "receiver_bindings {bindings}, seed {seed}: {} bindings and {kept} kept for 42 after {steps:#?}",
+                    sender.bindings.len()
+                );
             }
             for step in 1..=24u64 {
                 let at = now + step * live / 4;
@@ -1985,6 +2227,8 @@ fn every_optional_slot_keeps_a_binding_able_to_expire_it() {
             reached.registrants_restarted += counters.registrants_restarted;
             reached.registrants_moved += counters.registrants_moved;
             reached.registrants_timed_out += counters.registrants_timed_out;
+            reached.bindings_reserved += counters.bindings_reserved;
+            reached.challenges_unbound += counters.challenges_unbound;
         }
     }
     for (path, count) in [
@@ -1995,6 +2239,11 @@ fn every_optional_slot_keeps_a_binding_able_to_expire_it() {
         ("restart", reached.registrants_restarted),
         ("move", reached.registrants_moved),
         ("slot retired", reached.registrants_timed_out),
+        ("binding kept for a required id", reached.bindings_reserved),
+        (
+            "challenge with no room unanswered",
+            reached.challenges_unbound,
+        ),
     ] {
         assert!(count > 0, "the sequences never reach {path}");
     }
@@ -2133,4 +2382,164 @@ fn only_a_binding_of_its_own_publication_covers_a_slot() {
     sender.expire_bindings(expired);
     assert!(sender.publications[0].registrant_at(a).is_none());
     assert!(sender.publications[1].registrant_at(a).is_some());
+}
+
+/// karyos#941 item 2, found by the property test (seed 49): a required
+/// id's binding, answered again at its own tuple for another receiver
+/// block, would hand on the binding kept for that id. With the table full
+/// but for it, that CHALLENGE gets no ANSWER and the binding still names
+/// 42. Optional receivers evict no required id's binding either.
+#[test]
+fn a_required_ids_binding_is_not_handed_to_another_receiver() {
+    let config = AgentConfig {
+        receiver_bindings: 3,
+        ..AgentConfig::default()
+    };
+    let mut sender = dynamic_sender_config(&config, 4, &[42]);
+    let (a, b, c, d): (SocketAddr, SocketAddr, SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+        "10.0.0.11:5000".parse().unwrap(),
+        "10.0.0.12:5000".parse().unwrap(),
+    );
+    assert_eq!(join_as(&mut sender, a, 1, 7, T0), None);
+    assert_eq!(join_as(&mut sender, b, 2, 8, T0), None);
+    // The third binding is kept for 42: optional receiver 3 is not
+    // answered.
+    let refused = |sender: &mut super::super::SenderRole, now| {
+        assert!(
+            sender
+                .register(EndpointId(1), d, &register_as(3, 6), now)
+                .is_some()
+        );
+        assert_eq!(
+            sender.answer_for(EndpointId(1), d, now, challenge_of(6)),
+            None
+        );
+    };
+    refused(&mut sender, T0 + 1);
+    assert_eq!(sender.counters().bindings_reserved, 1);
+    assert_eq!(sender.counters().challenges_unbound, 1);
+    // 42 is answered and takes it, unconfirmed.
+    assert!(
+        sender
+            .register(EndpointId(1), c, &register_as(42, 9), T0 + 2)
+            .is_some()
+    );
+    assert!(
+        sender
+            .answer_for(EndpointId(1), c, T0 + 2, challenge_of(9))
+            .is_some()
+    );
+    // Receiver 3 again: no eviction of 42's unconfirmed binding makes
+    // room for it.
+    refused(&mut sender, T0 + 3);
+    assert_eq!(sender.counters().bindings_evicted, 0);
+    assert_eq!(sender.counters().bindings_full, 1);
+    // Another receiver block at 42's tuple is not answered either.
+    assert!(
+        sender
+            .register(EndpointId(1), c, &register_as(3, 9), T0 + 4)
+            .is_some()
+    );
+    assert_eq!(
+        sender.answer_for(EndpointId(1), c, T0 + 4, challenge_of(9)),
+        None
+    );
+    assert_eq!(sender.counters().bindings_reserved, 2);
+    assert!(sender.bindings.iter().any(|held| {
+        held.registered
+            .is_some_and(|receiver| receiver.receiver_id == 42)
+    }));
+    // 42's first SM joins its reserved slot.
+    assert_eq!(sender.status(EndpointId(1), c, &sm_as(42, 9), T0 + 5), None);
+    assert_eq!(sender.counters().registrants_joined, 3);
+}
+
+/// karyos#941 item 2: with no dynamic publication nothing is kept, and a
+/// static publication's receivers use the whole table as before; a full
+/// table evicts its oldest unconfirmed binding.
+#[test]
+fn without_a_dynamic_publication_no_binding_is_kept() {
+    let config = AgentConfig {
+        receiver_bindings: 2,
+        max_destinations: 2,
+        ..AgentConfig::default()
+    };
+    let (mut sender, _receiver) = super::super::roles(&config).unwrap();
+    let endpoint = EndpointId(1);
+    let (path, _log) = super::super::super::data::testing::outbound(
+        endpoint,
+        alias(),
+        "10.0.0.2:4000".parse().unwrap(),
+        publication(endpoint).term,
+        1,
+        false,
+    );
+    sender.publications.push(path);
+    let answer = |boot| karyos_protocol::network::SetupAnswer {
+        alias: alias(),
+        identity: identity(),
+        term: publication(endpoint).term,
+        challenge: karyos_protocol::network::ChallengeBlock {
+            receiver_boot_id: [boot, boot],
+            nonce: [9, 9],
+        },
+        joins: karyos_protocol::network::Lanes::new(&[0]).unwrap(),
+    };
+    let source: SocketAddr = "10.0.0.2:4000".parse().unwrap();
+    for boot in 1..=3 {
+        sender.bind(endpoint, source, &answer(boot), None, T0 + boot);
+    }
+    assert_eq!(sender.unjoined_required_count(), 0);
+    assert_eq!(sender.bindings.len(), 2);
+    assert_eq!(sender.counters().bindings_evicted, 1);
+    assert_eq!(sender.counters().bindings_reserved, 0);
+}
+
+/// karyos#941 item 1: once its image goes, a key registers again at once
+/// and from `setup_interval`, not from the backoff it had reached.
+#[test]
+fn a_key_whose_image_goes_registers_again_from_the_first_interval() {
+    let config = AgentConfig::default();
+    let interval = config.setup_interval;
+    let (_sender, mut role) = receiver_with(config);
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let _status = subscribe_dynamic(&mut role, control, receiver_42());
+    for step in 0..=31u64 {
+        let _ = role.send_registers(&events, T0 + step * interval);
+    }
+    let (image, _) = super::installed_image();
+    role.images.push(image);
+    assert_eq!(role.send_registers(&events, T0 + 40 * interval), 0);
+    role.images.clear();
+    assert_eq!(role.send_registers(&events, T0 + 41 * interval), 1);
+    assert_eq!(role.send_registers(&events, T0 + 42 * interval - 1), 0);
+    assert_eq!(role.send_registers(&events, T0 + 42 * interval), 1);
+}
+
+/// karyos#941 item 2: a required id that joined keeps no binding free
+/// once its own binding expires (its slot is held lost, and its REGISTER
+/// is dropped): optional receivers use the whole table again.
+#[test]
+fn a_joined_required_id_keeps_no_binding_once_its_own_expires() {
+    let config = AgentConfig {
+        receiver_bindings: 2,
+        ..AgentConfig::default()
+    };
+    let mut sender = dynamic_sender_config(&config, 4, &[42]);
+    let (a, b, c): (SocketAddr, SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+        "10.0.0.11:5000".parse().unwrap(),
+    );
+    assert_eq!(join_as(&mut sender, c, 42, 9, T0), None);
+    let later = T0 + 2 * sender.confirmed_timeout;
+    sender.expire_bindings(later);
+    assert!(sender.bindings.is_empty());
+    assert_eq!(sender.unjoined_required_count(), 0);
+    assert_eq!(join_as(&mut sender, a, 1, 7, later), None);
+    assert_eq!(join_as(&mut sender, b, 2, 8, later + 10), None);
+    assert_eq!(sender.counters().bindings_reserved, 0);
 }

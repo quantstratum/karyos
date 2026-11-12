@@ -1152,6 +1152,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         identity: None,
         conflated: None,
         register_at: None,
+        registration: None,
         users: 1,
     }
 }

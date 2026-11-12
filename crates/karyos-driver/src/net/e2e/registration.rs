@@ -642,3 +642,406 @@ fn every_public_call_refuses_dynamic_mode() {
         );
     }
 }
+
+/// Subscriptions of streams `10..10 + count` on one driver, all
+/// registering at one `control` address, with their publisher started
+/// three seconds later (karyos#941 item 1): each binds. The three seconds
+/// are the scenario, long past the REGISTER burst of every key; the end is
+/// synchronised on the images, with no sleep.
+fn subscriptions_bind_with_their_publisher_started_later(count: i32) {
+    use crate::sessions::register::RegistrationState;
+
+    let streams = 10..10 + count;
+    let agents = AgentConfig {
+        receiver_bindings: 128,
+        ..AgentConfig::default()
+    };
+    let mut a = driver_with(ThreadingMode::Shared, agents);
+    let mut b = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let subscriptions: Vec<_> = streams
+        .clone()
+        .map(|stream| {
+            b.add_dynamic_network_subscription(stream, &subscribed(control), as_receiver(1))
+                .unwrap()
+        })
+        .collect();
+    let start = std::time::Instant::now();
+    pump(&mut [&mut b], |_| {
+        start.elapsed() >= std::time::Duration::from_secs(3)
+    });
+    // Nothing answered: each shows it is still registering, and backed
+    // off from ten REGISTERs a second per key.
+    for subscription in &subscriptions {
+        assert_eq!(
+            b.network_registration_state(*subscription),
+            Some(RegistrationState::Registering)
+        );
+    }
+    let sent = receiver(&b).registers_sent;
+    let keys = u64::try_from(count).unwrap();
+    assert!(sent < keys * 30, "{sent} REGISTERs in 3 s");
+    let _publications: Vec<_> = streams
+        .clone()
+        .map(|stream| {
+            a.add_dynamic_network_publication(
+                aggregate(stream, 3, 1),
+                &reliable(control),
+                allowlist([127, 0, 0, 0], 8),
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        streams
+            .clone()
+            .all(|stream| drivers[1].network_image(stream, 3).is_some())
+    });
+    pump(&mut [&mut a, &mut b], |drivers| {
+        subscriptions.iter().all(|subscription| {
+            drivers[1].network_registration_state(*subscription) == Some(RegistrationState::Bound)
+        })
+    });
+}
+
+/// karyos#941 item 1, as the issue reproduced it: three dynamic
+/// subscriptions to one control address bind when their publisher starts
+/// after them. Their REGISTERs no longer spend the bucket the CHALLENGE
+/// answering the publisher's ANNOUNCE needs, at the receiver or at the
+/// sender.
+#[test]
+fn three_dynamic_subscriptions_to_one_control_bind_with_their_publisher_started_later() {
+    subscriptions_bind_with_their_publisher_started_later(3);
+}
+
+/// [`three_dynamic_subscriptions_to_one_control_bind_with_their_publisher_started_later`]
+/// with five, the other count the issue reproduced.
+#[test]
+fn five_dynamic_subscriptions_to_one_control_bind_with_their_publisher_started_later() {
+    subscriptions_bind_with_their_publisher_started_later(5);
+}
+
+/// karyos#941 item 2: `receiver_bindings` below `max_destinations` is
+/// refused at driver start, where a required receiver id could be kept
+/// out by a table full of optional bindings (the issue's case,
+/// `max_destinations` 3 and `receiver_bindings` 2).
+#[test]
+fn receiver_bindings_below_max_destinations_are_refused_at_start() {
+    let refused = EmbeddedDriver::with_config(crate::embedded::DriverConfig {
+        network: Some(crate::net::NetworkConfig {
+            threading: ThreadingMode::Shared,
+            agents: AgentConfig {
+                max_destinations: 3,
+                receiver_bindings: 2,
+                ..AgentConfig::default()
+            },
+            ..crate::net::NetworkConfig::default()
+        }),
+        ..crate::embedded::DriverConfig::default()
+    });
+    assert!(refused.is_err());
+    let equal = AgentConfig {
+        max_destinations: 3,
+        receiver_bindings: 3,
+        ..AgentConfig::default()
+    };
+    let _ = driver_with(ThreadingMode::Shared, equal);
+}
+
+/// karyos#941 item 2: a driver's dynamic publications together take at
+/// most `receiver_bindings` destinations, `max_destinations` each; one
+/// more is refused naming both numbers.
+#[test]
+fn dynamic_publications_beyond_receiver_bindings_are_refused() {
+    let agents = AgentConfig {
+        max_destinations: 3,
+        receiver_bindings: 7,
+        ..AgentConfig::default()
+    };
+    let mut a = driver_with(ThreadingMode::Shared, agents);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    for stream in [10, 11] {
+        assert!(
+            a.add_dynamic_network_publication(
+                aggregate(stream, 3, 1),
+                &dynamic(control),
+                allowlist([127, 0, 0, 0], 8),
+                None,
+            )
+            .is_ok()
+        );
+    }
+    assert_eq!(
+        a.add_dynamic_network_publication(
+            aggregate(12, 3, 1),
+            &dynamic(control),
+            allowlist([127, 0, 0, 0], 8),
+            None,
+        )
+        .err(),
+        Some(DriverError::ReceiverBindings { needed: 9, held: 7 })
+    );
+}
+
+/// karyos#941 item 2 between drivers: a publication of `max_destinations`
+/// 3 with required receiver 42, on a sender with three bindings, one held
+/// by a static publication's receiver. Optional receiver 1 joins; optional
+/// receiver 2 is announced but gets no ANSWER, since the one free binding
+/// is kept for 42, so it keeps registering and installs no image. Receiver
+/// 42 then joins and receives. Before the fix receiver 2 took the binding
+/// and 42 was answered, believed itself bound and stopped registering
+/// while the sender dropped its SMs.
+#[test]
+fn a_required_receiver_joins_with_the_other_bindings_taken() {
+    use crate::membership::{PublicationRoles, Strategy};
+    use crate::sessions::register::RegistrationState;
+
+    let agents = AgentConfig {
+        max_destinations: 3,
+        receiver_bindings: 3,
+        ..AgentConfig::default()
+    };
+    let mut a = driver_with(ThreadingMode::Shared, agents);
+    let (mut s, mut b, mut c, mut d) = (
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
+    let _static = super::connected(&mut a, &mut s, true, 20);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let roles = PublicationRoles {
+        strategy: Strategy::Min,
+        required: vec![42],
+        tags: Vec::new(),
+    };
+    let publication = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+            Some(roles),
+        )
+        .unwrap();
+    let _optional = b
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    pump(&mut [&mut a, &mut s, &mut b], |drivers| {
+        drivers[2].network_image(10, 3).is_some()
+    });
+    let kept_out = c
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(2))
+        .unwrap();
+    // It keeps registering past its first exchanges, where an answered
+    // receiver stops.
+    pump(&mut [&mut a, &mut s, &mut b, &mut c], |drivers| {
+        receiver(drivers[3]).registers_sent >= 4
+    });
+    assert!(c.network_image(10, 3).is_none());
+    assert_eq!(
+        c.network_registration_state(kept_out),
+        Some(RegistrationState::Announced)
+    );
+    let required = d
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(42))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut s, &mut b, &mut c, &mut d], |drivers| {
+        image = drivers[4].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = d
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
+        .unwrap();
+    super::exchange_on(&mut a, &mut d, &mut lane, &mut reader, 0..16);
+    assert_eq!(
+        d.network_registration_state(required),
+        Some(RegistrationState::Bound)
+    );
+    assert!(c.network_image(10, 3).is_none());
+    assert_eq!(sender(&a).registrants_joined, 2);
+    assert_eq!(sender(&a).bindings_full, 0);
+    assert!(sender(&a).challenges_unbound >= 1);
+}
+
+/// karyos#941 item 3 between drivers: a refused dynamic subscription is
+/// visible to its application. On a full table its state is `Refused` and
+/// the documented CnC cell `registration refusals received` counts the
+/// ERR; the joined receiver's state is `Bound`; a subscription outside the
+/// allowlist, which gets no reply at all, stays `Registering` while its
+/// `registers sent` cell grows.
+#[test]
+fn a_refused_dynamic_subscription_shows_it_in_its_state_and_the_cnc() {
+    use crate::sessions::register::RegistrationState;
+
+    let agents = AgentConfig {
+        max_destinations: 1,
+        ..AgentConfig::default()
+    };
+    let mut a = driver_with(ThreadingMode::Shared, agents);
+    let (mut b, mut c) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let _publication = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+            None,
+        )
+        .unwrap();
+    let _outside = a
+        .add_dynamic_network_publication(
+            aggregate(11, 3, 1),
+            &reliable(control),
+            allowlist([10, 0, 0, 0], 8),
+            None,
+        )
+        .unwrap();
+    let joined = b
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    let _ = image_of(&mut a, &mut b, 10);
+    let refused = c
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(2))
+        .unwrap();
+    let silent = c
+        .add_dynamic_network_subscription(11, &subscribed(control), as_receiver(2))
+        .unwrap();
+    let cell = |driver: &EmbeddedDriver, label| super::cells(driver, label)[0].0;
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        cell(drivers[2], "registration refusals received") >= 1
+            && cell(drivers[2], "registers sent") >= 3
+            && registrations(drivers[0]).dropped_not_allowed >= 1
+    });
+    assert_eq!(
+        b.network_registration_state(joined),
+        Some(RegistrationState::Bound)
+    );
+    assert_eq!(
+        c.network_registration_state(refused),
+        Some(RegistrationState::Refused)
+    );
+    assert_eq!(
+        c.network_registration_state(silent),
+        Some(RegistrationState::Registering)
+    );
+    assert_eq!(
+        cell(&c, "registration refusals received"),
+        receiver(&c).registration_refusals
+    );
+    // A subscription that does not register has no state.
+    let plain = b
+        .add_network_subscription(12, &super::channel(super::ANY_PORT, true))
+        .unwrap();
+    assert_eq!(b.network_registration_state(plain), None);
+}
+
+/// An allowlist with no range of `control`'s address family admits no
+/// registrant, since step 1 drops every REGISTER of the other family: it
+/// is refused at creation, naming `control` (karyos#941 item 7).
+#[test]
+fn an_allowlist_with_no_range_of_the_control_family_is_refused() {
+    use crate::sessions::register::RegistrationConfigError;
+
+    let mut a = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let v6 = AddressRange::new(IpAddr::from([0u16, 0, 0, 0, 0, 0, 0, 1]), 128).unwrap();
+    let refused = a.add_dynamic_network_publication(
+        aggregate(10, 3, 1),
+        &dynamic(control),
+        RegistrationAllowlist::new(&[v6]).unwrap(),
+        None,
+    );
+    assert_eq!(
+        refused.err(),
+        Some(DriverError::Registration(
+            RegistrationConfigError::AllowlistFamily { control }
+        ))
+    );
+    // One range of the family is enough, beside one of the other.
+    let v4 = AddressRange::new(IpAddr::from([127, 0, 0, 0]), 8).unwrap();
+    assert!(
+        a.add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &dynamic(control),
+            RegistrationAllowlist::new(&[v6, v4]).unwrap(),
+            None,
+        )
+        .is_ok()
+    );
+}
+
+/// Required receiver ids above `max_destinations` are refused with the
+/// registration error that names them (karyos#941 item 7; karyos#943
+/// M55), not a bare `InvalidConfig`; a repeated one is invalid roles.
+#[test]
+fn required_ids_the_publication_cannot_hold_are_refused_naming_them() {
+    use crate::membership::{PublicationRoles, Strategy};
+    use crate::sessions::register::RegistrationConfigError;
+
+    let agents = AgentConfig {
+        max_destinations: 2,
+        ..AgentConfig::default()
+    };
+    let mut a = driver_with(ThreadingMode::Shared, agents);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let mut add = |required: Vec<u64>| {
+        let roles = PublicationRoles {
+            strategy: Strategy::Min,
+            required,
+            tags: Vec::new(),
+        };
+        a.add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &dynamic(control),
+            allowlist([127, 0, 0, 0], 8),
+            Some(roles),
+        )
+        .err()
+    };
+    assert_eq!(
+        add(vec![41, 42, 43]),
+        Some(DriverError::Registration(
+            RegistrationConfigError::TooManyRequired {
+                required: 3,
+                max_destinations: 2,
+            }
+        ))
+    );
+    // A repeated id is invalid roles before any registration exists.
+    assert_eq!(add(vec![42, 42]), Some(DriverError::InvalidRoles));
+    // As many as `max_destinations` is admitted.
+    assert_eq!(add(vec![41, 42]), None);
+}
+
+/// A hand-built dynamic channel skips the URI parser: a `control` with a
+/// zero port, or an unspecified, multicast or broadcast address, is
+/// refused naming it, where every REGISTER would count unsent for ever
+/// (karyos#941 item 7).
+#[test]
+fn a_dynamic_subscription_refuses_a_control_no_register_can_reach() {
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    for control in [
+        SocketAddr::new(LOOPBACK, 0),
+        SocketAddr::new(IpAddr::from([0, 0, 0, 0]), port),
+        SocketAddr::new(IpAddr::from([224, 0, 0, 1]), port),
+        SocketAddr::new(IpAddr::from([255, 255, 255, 255]), port),
+    ] {
+        assert_eq!(
+            b.add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+                .err(),
+            Some(DriverError::InvalidRegistrationControl { control }),
+            "{control}"
+        );
+    }
+    let control = SocketAddr::new(LOOPBACK, port);
+    assert!(
+        b.add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+            .is_ok()
+    );
+}

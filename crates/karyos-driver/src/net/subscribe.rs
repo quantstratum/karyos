@@ -261,6 +261,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.exposed_network_image(stream_id, session_id)
     }
 
+    /// How far the registration of `subscription`, a
+    /// `control-mode=dynamic` one, has got (karyos#941 item 3): whether
+    /// its publisher answered, refused it with ERR REGISTRATION, or bound
+    /// it, or nothing has come back from `control` yet. `None` for a
+    /// subscription that does not register, or one removed.
+    #[must_use]
+    pub fn network_registration_state(
+        &self,
+        subscription: NetworkSubscription,
+    ) -> Option<crate::sessions::register::RegistrationState> {
+        self.net.as_ref()?.registration_state(subscription)
+    }
+
     /// Network subscriptions the receiver refused although the conductor's
     /// mirror of its table had room: a drift between the two, never
     /// expected (ACS 16077).
@@ -378,11 +391,26 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// ADR-0082; `quantstratum-docs:
     /// karyos/design/multi-destination-unicast.md` 3.2; karyos#644): the
     /// subscription binds `interface`, else the unspecified address of
-    /// `control`'s family, on a port the kernel picks, and registers at
-    /// the channel's `control` address every `setup_interval` until an
-    /// image of the stream from there is bound, and again once that image
-    /// is gone. An ERR REGISTRATION from `control` (a full destination
-    /// table) is counted, and the subscription keeps registering.
+    /// `control`'s family, on a port the kernel picks. Every dynamic
+    /// subscription of a driver with the same bind address shares that one
+    /// endpoint and port (karyos#941 item 6): a publisher sees them as one
+    /// source, so its per-source bounds (`registration_pending_per_source`,
+    /// 2, and the per-address REGISTER rate) are shared by all of them,
+    /// and at most two of them are pending at one publisher at once. It
+    /// registers at the channel's `control` address until an image of the
+    /// stream from there is bound, and again once that image is gone.
+    /// REGISTERs start every `setup_interval` and back off, doubling to
+    /// sixteen times it while nothing binds; an ANNOUNCE from `control`
+    /// starts the backoff over. They draw on their own bucket per
+    /// `control` address, so they never spend the RSP_SETUP limits the
+    /// CHALLENGE answering that ANNOUNCE needs (karyos#941 item 1). Only
+    /// `control`, port included, may set up its image: an ANNOUNCE or
+    /// ANSWER of the stream from anywhere else is dropped and counted
+    /// (karyos#941 item 5). How far it got, and an ERR REGISTRATION from
+    /// `control` (a full destination table), is shown by
+    /// [`EmbeddedDriver::network_registration_state`] and by the CnC cells
+    /// `registers sent`, `registers unsent` and `registration refusals
+    /// received` (karyos#941 item 3); the subscription keeps registering.
     ///
     /// A dynamic subscription names its configured `identity` in every
     /// REGISTER and status message: the publisher looks a registrant up by
@@ -403,7 +431,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// `control-mode=dynamic` with a `control` address, that lists
     /// destinations or names redundant paths, whose `interface` is of
     /// another family than `control`, or for a stream already subscribed
-    /// on the endpoint registering at another address.
+    /// on the endpoint registering at another address;
+    /// [`DriverError::InvalidRegistrationControl`] for a `control` with a
+    /// zero port or an unspecified, multicast or broadcast address.
     #[cfg(test)]
     pub(crate) fn add_dynamic_network_subscription(
         &mut self,
@@ -411,8 +441,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         identity: ReceiverIdentity,
     ) -> Result<NetworkSubscription, DriverError> {
-        if register_at(channel).is_none() {
+        let Some(control) = register_at(channel) else {
             return Err(DriverError::UnsupportedChannel);
+        };
+        // A hand-built channel skips the URI parser: a `control` no
+        // REGISTER can reach would count every one unsent for ever
+        // (karyos#941 item 7).
+        if !crate::agents::roles::answerable(control) {
+            return Err(DriverError::InvalidRegistrationControl { control });
         }
         self.subscribe_network(stream_id, channel, (Some(identity), None), true)
     }

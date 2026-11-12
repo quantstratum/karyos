@@ -44,8 +44,10 @@
 //! as written, and quantstratum-docs#829 carries the amendment that
 //! records them (karyos#945 review). Step 3: the per-source bucket is
 //! this module's own, not `setup_answer_rate` as 3.2 step 3 names it,
-//! and a registrant's CHALLENGE is charged to it rather than to
-//! `setup_answer_rate` as 9.2 puts the ANSWER; an address the full
+//! and a registrant's CHALLENGE is charged to a second bucket of its
+//! address, as large, rather than to `setup_answer_rate` as 9.2 puts the
+//! ANSWER, so that REGISTERs from one address cannot spend the CHALLENGE
+//! that completes one of them (karyos#941 item 1); an address the full
 //! per-address table cannot track falls back to the driver total alone,
 //! so that address may be sent up to `registration_rate` ANNOUNCEs a
 //! second rather than the per-source bound of 9.2. Step 5: at a bound the
@@ -53,7 +55,12 @@
 //! drops it. Step 4: what the publication holds is looked up with the
 //! restart quiet time `move_quiet`, and a required receiver id whose
 //! reserved slot is held with no binding left is dropped
-//! ([`Existing::RequiredLost`]); the owner's lookup states both.
+//! ([`Existing::RequiredLost`]); the owner's lookup states both. Where
+//! the state between a CHALLENGE and the first SM lives, the sender's
+//! driver-wide bindings table, which keeps one binding free per required
+//! receiver id not yet joined and answers no CHALLENGE it cannot bind
+//! (karyos#941 item 2), is recorded there too: design 3.5 puts it in
+//! `Membership`.
 //!
 //! **No authentication.** The allowlist restricts admission and supplies
 //! no authentication (ADR-0082, decision 1): an admitted registration is
@@ -339,6 +346,22 @@ pub enum RegistrationConfigError {
         /// The [`RegistrationConfig`] field at fault, or `required` for
         /// the required receiver ids' reserved entries.
         field: &'static str,
+    },
+    /// An allowlist with no range of the publication's control address
+    /// family: it would admit no registrant (karyos#941 item 7).
+    #[error("no registration allowlist range is of the family of control address {control}")]
+    AllowlistFamily {
+        /// The publication's control address.
+        control: std::net::SocketAddr,
+    },
+    /// More required receiver ids than `max_destinations` slots: each
+    /// reserves one (design 3.5; MD-17).
+    #[error("{required} required receiver ids, above max_destinations {max_destinations}")]
+    TooManyRequired {
+        /// The number of required receiver ids given.
+        required: usize,
+        /// The driver's `max_destinations`.
+        max_destinations: usize,
     },
     /// A required receiver id that is zero or repeated
     /// ([`RegistrationPolicy::with_required`]).
@@ -637,8 +660,14 @@ struct Refusal {
 pub struct Registrations {
     config: RegistrationConfig,
     rate: TotalRate,
-    /// The per-source-address buckets, keyed by address with port 0.
+    /// The per-source-address buckets of REGISTERs, keyed by address with
+    /// port 0.
     source_rates: EndpointRates,
+    /// The per-source-address buckets of registrants' CHALLENGEs, keyed
+    /// the same way and as large, apart from the REGISTERs' so that
+    /// REGISTERs from one address cannot starve the CHALLENGE that
+    /// completes their registration (karyos#941 item 1).
+    challenge_rates: EndpointRates,
     pending: Vec<PendingRegistration>,
     refusals: Vec<Refusal>,
     counters: RegistrationCounters,
@@ -695,8 +724,14 @@ impl Registrations {
                 field: "source_rate",
             },
         )?;
+        let challenge_rates = EndpointRates::new(config.source_rate, config.sources).ok_or(
+            RegistrationConfigError::InvalidLimit {
+                field: "source_rate",
+            },
+        )?;
         Ok(Self {
             source_rates,
+            challenge_rates,
             pending: table(config.pending, "pending")?,
             refusals: table(config.sources, "sources")?,
             rate,
@@ -1013,26 +1048,51 @@ impl Registrations {
         receiver_boot_id: [u64; 2],
         now: u64,
     ) -> bool {
+        self.challenge_receiver(policy, stream_id, source, receiver_boot_id, now)
+            .is_some()
+    }
+
+    /// The receiver block of the pending entry a CHALLENGE from `source`
+    /// with `receiver_boot_id` for `stream_id` would take at `now`, as
+    /// [`Self::challenged`] would pick it, changing nothing: the sender
+    /// checks it has a binding for that receiver before it answers
+    /// (karyos#941 item 2).
+    #[must_use]
+    pub fn challenge_receiver(
+        &self,
+        policy: &RegistrationPolicy,
+        stream_id: i32,
+        source: SocketAddr,
+        receiver_boot_id: [u64; 2],
+        now: u64,
+    ) -> Option<Receiver> {
         let source = normalized(source);
-        self.pending.iter().chain(&policy.reserved).any(|entry| {
-            entry.expires > now
-                && entry.stream_id == stream_id
-                && entry.source == source
-                && entry.receiver.receiver_boot_id == receiver_boot_id
-        })
+        self.pending
+            .iter()
+            .chain(&policy.reserved)
+            .find(|entry| {
+                entry.expires > now
+                    && entry.stream_id == stream_id
+                    && entry.source == source
+                    && entry.receiver.receiver_boot_id == receiver_boot_id
+            })
+            .map(|entry| entry.receiver)
     }
 
     /// Charges a registrant's CHALLENGE from `source` at `now` to its
-    /// address's bucket, the one its REGISTERs draw on, the port ignored,
-    /// instead of the shared `setup_answer_rate` table keyed on address
-    /// and port (karyos#945 review): REGISTER and CHALLENGE pairs cannot
-    /// fill that table and deny other receivers their ANSWER. `false`
-    /// when the bucket is empty. With the table full, the CHALLENGE is
-    /// admitted: each registrant's ANSWER takes the pending entry an
-    /// admitted REGISTER made, so the driver's REGISTER total bounds them.
+    /// address's CHALLENGE bucket, the port ignored, instead of the shared
+    /// `setup_answer_rate` table keyed on address and port (karyos#945
+    /// review): REGISTER and CHALLENGE pairs cannot fill that table and
+    /// deny other receivers their ANSWER. The bucket is not the one its
+    /// REGISTERs draw on, so several subscriptions registering from one
+    /// address cannot spend the CHALLENGE that completes one of them
+    /// (karyos#941 item 1). `false` when the bucket is empty. With the
+    /// table full, the CHALLENGE is admitted: each registrant's ANSWER
+    /// takes the pending entry an admitted REGISTER made, so the driver's
+    /// REGISTER total bounds them.
     pub fn admit_challenge(&mut self, source: SocketAddr, now: u64) -> bool {
         let address = SocketAddr::new(normalized(source).ip(), 0);
-        match self.source_rates.admit(address, now) {
+        match self.challenge_rates.admit(address, now) {
             Ok(()) => true,
             Err(RateRefused::Limited) => {
                 self.counters.bump(|c| &mut c.dropped_challenge_rate);
@@ -1085,6 +1145,68 @@ impl Registrations {
         // A `usize` count fits a `u64` on every supported target.
         let removed = u64::try_from(removed).unwrap_or(u64::MAX);
         self.counters.add(|c| &mut c.expired, removed);
+    }
+}
+
+/// How far a `control-mode=dynamic` subscription's registration has got,
+/// as its receiver last saw it (karyos#941 item 3): the receiving side of
+/// design 3.2, where a refusal would otherwise look like silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RegistrationState {
+    /// REGISTERs go to `control` and nothing has come back: no
+    /// publication there yet, or a REGISTER dropped with no reply (outside
+    /// the allowlist, over a rate or a pending bound, quarantined, a
+    /// duplicate receiver), which the publisher never answers (design 3.2
+    /// steps 1 to 5, 9.2).
+    Registering,
+    /// `control` answered a SETUP ANNOUNCE: the challenge is under way.
+    Announced,
+    /// The last word from `control` was ERR REGISTRATION
+    /// `DESTINATIONS_FULL` (design 3.2 step 6): the subscription keeps
+    /// registering, more slowly.
+    Refused,
+    /// An image of the stream from `control` is bound: REGISTERs stop.
+    Bound,
+}
+
+impl RegistrationState {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Registering => 0,
+            Self::Announced => 1,
+            Self::Refused => 2,
+            Self::Bound => 3,
+        }
+    }
+
+    const fn of(code: u8) -> Self {
+        match code {
+            1 => Self::Announced,
+            2 => Self::Refused,
+            3 => Self::Bound,
+            _ => Self::Registering,
+        }
+    }
+}
+
+/// One dynamic subscription's [`RegistrationState`], shared between its
+/// receiver, the only writer, and the driver that reads it for the
+/// application; allocated with the subscription, on the control path.
+#[derive(Debug, Default)]
+pub struct RegistrationStatus(std::sync::atomic::AtomicU8);
+
+impl RegistrationStatus {
+    /// The state last stored.
+    #[must_use]
+    pub fn get(&self) -> RegistrationState {
+        RegistrationState::of(self.0.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Stores `state`; only the subscription's receiver writes it.
+    pub fn set(&self, state: RegistrationState) {
+        self.0
+            .store(state.code(), std::sync::atomic::Ordering::Release);
     }
 }
 
