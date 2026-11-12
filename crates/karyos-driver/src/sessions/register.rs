@@ -72,10 +72,10 @@ impl AddressRange {
         let network = network.to_canonical();
         let bits = bits_of(network);
         if prefix > bits {
-            return Err(RegistrationConfigError::InvalidRange);
+            return Err(RegistrationConfigError::InvalidRange { network, prefix });
         }
         if masked(network, prefix) != network {
-            return Err(RegistrationConfigError::InvalidRange);
+            return Err(RegistrationConfigError::InvalidRange { network, prefix });
         }
         Ok(Self { network, prefix })
     }
@@ -151,7 +151,9 @@ impl RegistrationAllowlist {
             return Err(RegistrationConfigError::EmptyAllowlist);
         }
         if ranges.len() > MAX_ALLOW_RANGES {
-            return Err(RegistrationConfigError::TooManyRanges);
+            return Err(RegistrationConfigError::TooManyRanges {
+                count: ranges.len(),
+            });
         }
         Ok(Self {
             ranges: ranges.to_vec(),
@@ -171,6 +173,12 @@ impl RegistrationAllowlist {
     }
 }
 
+/// The most pending registrations, and refusal entries, a driver may be
+/// configured to hold: an implementation ceiling far above the design's
+/// defaults (32 and 64), so a configured value is refused as a typed
+/// error and never reaches an allocation that panics or aborts.
+pub const MAX_REGISTRATION_TABLE: usize = 65_536;
+
 /// Why a registration configuration is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -180,40 +188,49 @@ pub enum RegistrationConfigError {
     #[error("dynamic registration needs a non-empty allowlist")]
     EmptyAllowlist,
     /// More than [`MAX_ALLOW_RANGES`] ranges.
-    #[error("too many registration allowlist ranges")]
-    TooManyRanges,
+    #[error("{count} registration allowlist ranges, above the maximum of {MAX_ALLOW_RANGES}")]
+    TooManyRanges {
+        /// The number of ranges given.
+        count: usize,
+    },
     /// A prefix longer than its address, or host bits set below it.
-    #[error("invalid registration address range")]
-    InvalidRange,
-    /// A zero rate, bound, interval or timeout, or a per-source bound
-    /// above the total.
-    #[error("invalid registration limit")]
-    InvalidLimit,
+    #[error("invalid registration address range {network}/{prefix}")]
+    InvalidRange {
+        /// The network address given.
+        network: IpAddr,
+        /// The prefix length given.
+        prefix: u8,
+    },
+    /// A zero rate, bound, interval or timeout, a per-source bound above
+    /// the total, or a table above [`MAX_REGISTRATION_TABLE`].
+    #[error("invalid registration limit `{field}`")]
+    InvalidLimit {
+        /// The [`RegistrationConfig`] field at fault.
+        field: &'static str,
+    },
 }
 
-/// The registration limits of design 3.2 (MD-11: driver and stream
-/// configuration, not URI parameters). Every limit is mandatory and
-/// nonzero; only the allowlist has no default.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The driver's registration limits of design 3.2 (MD-11: driver and
+/// stream configuration, not URI parameters). Every limit is mandatory and
+/// nonzero. The per-source bucket is not here: it is the sender's existing
+/// `setup_answer_rate` table, which [`Registrations::register`] borrows.
+/// The allowlist is per publication and passed with each REGISTER.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RegistrationConfig {
-    /// Which sources may register at all.
-    pub allowlist: RegistrationAllowlist,
-    /// REGISTERs per second per source endpoint, also the burst (the
-    /// `setup_answer_rate` of 20).
-    pub per_source_rate: u64,
     /// REGISTERs per second for the driver, also the burst
-    /// (`registration_rate`, 256).
+    /// (`registration_rate`, 256 per driver).
     pub rate: u64,
-    /// Source endpoints whose rates and refusal times are tracked at once
-    /// (64); a new source with no reusable entry is dropped.
+    /// Source addresses whose refusal times are tracked at once (64); a
+    /// new source with no reusable entry is not refused again.
     pub sources: usize,
-    /// Pending registrations in all (`registration_pending`, 32).
+    /// Pending registrations in all (`registration_pending`, 32 per
+    /// driver).
     pub pending: usize,
-    /// Pending registrations per source endpoint
-    /// (`registration_pending_per_source`, 2).
+    /// Pending registrations per source address
+    /// (`registration_pending_per_source`, 2; SPEC.md §6).
     pub pending_per_source: usize,
-    /// The least time between two ERR REGISTRATIONs to one source
+    /// The least time between two ERR REGISTRATIONs to one source address
     /// (`registration_refusal_interval`, 1 s), in ns.
     pub refusal_interval: u64,
     /// How long a pending registration waits for its receiver
@@ -221,13 +238,10 @@ pub struct RegistrationConfig {
     pub join_timeout: u64,
 }
 
-impl RegistrationConfig {
-    /// The design's defaults under `allowlist`, which has none.
-    #[must_use]
-    pub fn new(allowlist: RegistrationAllowlist) -> Self {
+impl Default for RegistrationConfig {
+    /// The design's defaults.
+    fn default() -> Self {
         Self {
-            allowlist,
-            per_source_rate: 20,
             rate: 256,
             sources: 64,
             pending: 32,
@@ -236,23 +250,35 @@ impl RegistrationConfig {
             join_timeout: 5_000_000_000,
         }
     }
+}
 
+impl RegistrationConfig {
     /// Checks every limit.
     ///
     /// # Errors
     ///
-    /// [`RegistrationConfigError::InvalidLimit`] for a zero limit or a
-    /// per-source pending bound above the total.
+    /// [`RegistrationConfigError::InvalidLimit`], naming the field, for a
+    /// zero limit, a per-source pending bound above the total, or a table
+    /// above [`MAX_REGISTRATION_TABLE`].
     pub fn validate(&self) -> Result<(), RegistrationConfigError> {
-        let zero = self.per_source_rate == 0
-            || self.rate == 0
-            || self.sources == 0
-            || self.pending == 0
-            || self.pending_per_source == 0
-            || self.refusal_interval == 0
-            || self.join_timeout == 0;
-        if zero || self.pending_per_source > self.pending {
-            return Err(RegistrationConfigError::InvalidLimit);
+        let bad = |field| Err(RegistrationConfigError::InvalidLimit { field });
+        if self.rate == 0 {
+            return bad("rate");
+        }
+        if self.sources == 0 || self.sources > MAX_REGISTRATION_TABLE {
+            return bad("sources");
+        }
+        if self.pending == 0 || self.pending > MAX_REGISTRATION_TABLE {
+            return bad("pending");
+        }
+        if self.pending_per_source == 0 || self.pending_per_source > self.pending {
+            return bad("pending_per_source");
+        }
+        if self.refusal_interval == 0 {
+            return bad("refusal_interval");
+        }
+        if self.join_timeout == 0 {
+            return bad("join_timeout");
         }
         Ok(())
     }
@@ -301,14 +327,14 @@ pub enum RegisterDrop {
     Rate,
     /// `pending` entries are held.
     PendingFull,
-    /// `pending_per_source` entries are held by this source.
+    /// `pending_per_source` entries are held by this source address.
     SourcePendingFull,
-    /// The table is full and this source was refused within
+    /// The table is full and this source address was refused within
     /// `refusal_interval`, or no refusal entry is free for it.
     RefusalLimited,
 }
 
-/// Counters of [`Registrations`], each saturating.
+/// Counters of [`Registrations`]; checked, sticky on overflow (design 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct RegistrationCounters {
@@ -336,12 +362,30 @@ pub struct RegistrationCounters {
     pub challenged: u64,
     /// Pending entries removed at `join_timeout`.
     pub expired: u64,
+    /// An increment did not apply.
+    pub overflowed: bool,
+}
+
+impl RegistrationCounters {
+    fn add(&mut self, field: fn(&mut Self) -> &mut u64, amount: u64) {
+        let value = field(self);
+        match value.checked_add(amount) {
+            Some(next) => *value = next,
+            None => self.overflowed = true,
+        }
+    }
+
+    fn bump(&mut self, field: fn(&mut Self) -> &mut u64) {
+        self.add(field, 1);
+    }
 }
 
 /// One pending registration (design 3.2 step 7): unverified until its
 /// receiver's CHALLENGE takes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PendingRegistration {
+    /// The stream the REGISTER named.
+    pub stream_id: i32,
     /// The normalized source.
     pub source: SocketAddr,
     /// The receiver block the REGISTER named.
@@ -350,27 +394,38 @@ pub struct PendingRegistration {
     pub expires: u64,
 }
 
-/// The time of the last ERR REGISTRATION to one source.
+/// The time of the last ERR REGISTRATION to one source address.
 #[derive(Debug, Clone, Copy)]
 struct Refusal {
-    source: SocketAddr,
+    source: IpAddr,
     at: u64,
 }
 
-/// The bounded registration state of one dynamic publication.
+/// The bounded registration state of one driver, shared by its dynamic
+/// publications: the per-driver rate, the pending table and the refusal
+/// table (design 3.2 steps 3, 5 and 6 scope these to the driver). Each
+/// publication keeps its own allowlist (ADR-0082, decision 1).
 #[derive(Debug)]
 pub struct Registrations {
     config: RegistrationConfig,
     ipv4: bool,
-    source_rates: EndpointRates,
     rate: TotalRate,
     pending: Vec<PendingRegistration>,
     refusals: Vec<Refusal>,
     counters: RegistrationCounters,
 }
 
+/// Allocates room for `len` entries, or names `field` at fault.
+fn table<T>(len: usize, field: &'static str) -> Result<Vec<T>, RegistrationConfigError> {
+    let mut table = Vec::new();
+    table
+        .try_reserve_exact(len)
+        .map_err(|_| RegistrationConfigError::InvalidLimit { field })?;
+    Ok(table)
+}
+
 impl Registrations {
-    /// The registrations of a publication whose endpoint is IPv4 when
+    /// The registrations of a driver whose control endpoint is IPv4 when
     /// `ipv4`, under `config`, at `now`; every table is allocated here.
     ///
     /// # Errors
@@ -382,14 +437,12 @@ impl Registrations {
         now: u64,
     ) -> Result<Self, RegistrationConfigError> {
         config.validate()?;
-        let source_rates = EndpointRates::new(config.per_source_rate, config.sources)
-            .ok_or(RegistrationConfigError::InvalidLimit)?;
-        let rate = TotalRate::new(config.rate, now).ok_or(RegistrationConfigError::InvalidLimit)?;
+        let rate = TotalRate::new(config.rate, now)
+            .ok_or(RegistrationConfigError::InvalidLimit { field: "rate" })?;
         Ok(Self {
-            pending: Vec::with_capacity(config.pending),
-            refusals: Vec::with_capacity(config.sources),
+            pending: table(config.pending, "pending")?,
+            refusals: table(config.sources, "sources")?,
             ipv4,
-            source_rates,
             rate,
             config,
             counters: RegistrationCounters::default(),
@@ -414,36 +467,41 @@ impl Registrations {
         &self.pending
     }
 
-    /// Admits or drops `register` from `source` at `now`, with the
-    /// destination table's `capacity` (design 3.2; module docs).
+    /// Admits or drops `register` from `source` at `now`, for the
+    /// publication whose allowlist is `allowlist` and whose destination
+    /// table reports `capacity`, charging the sender's per-source
+    /// `setup_answer_rate` table `source_rates` (design 3.2; module docs).
     pub fn register(
         &mut self,
+        source_rates: &mut EndpointRates,
+        allowlist: &RegistrationAllowlist,
         source: SocketAddr,
         register: &RspRegister,
         capacity: Capacity,
         now: u64,
     ) -> RegisterOutcome {
-        let outcome = self.decide(source, register, capacity, now);
-        let counters = &mut self.counters;
-        let counter = match outcome {
+        let outcome = self.decide(source_rates, allowlist, source, register, capacity, now);
+        let counter: fn(&mut RegistrationCounters) -> &mut u64 = match outcome {
             RegisterOutcome::Announce { .. } => return outcome,
-            RegisterOutcome::Refuse { .. } => &mut counters.refused_full,
+            RegisterOutcome::Refuse { .. } => |c| &mut c.refused_full,
             RegisterOutcome::Drop(reason) => match reason {
-                RegisterDrop::Source => &mut counters.dropped_source,
-                RegisterDrop::NotAllowed => &mut counters.dropped_not_allowed,
-                RegisterDrop::SourceRate => &mut counters.dropped_source_rate,
-                RegisterDrop::Rate => &mut counters.dropped_rate,
-                RegisterDrop::PendingFull => &mut counters.dropped_pending_full,
-                RegisterDrop::SourcePendingFull => &mut counters.dropped_source_pending_full,
-                RegisterDrop::RefusalLimited => &mut counters.dropped_refusal_limited,
+                RegisterDrop::Source => |c| &mut c.dropped_source,
+                RegisterDrop::NotAllowed => |c| &mut c.dropped_not_allowed,
+                RegisterDrop::SourceRate => |c| &mut c.dropped_source_rate,
+                RegisterDrop::Rate => |c| &mut c.dropped_rate,
+                RegisterDrop::PendingFull => |c| &mut c.dropped_pending_full,
+                RegisterDrop::SourcePendingFull => |c| &mut c.dropped_source_pending_full,
+                RegisterDrop::RefusalLimited => |c| &mut c.dropped_refusal_limited,
             },
         };
-        *counter = counter.saturating_add(1);
+        self.counters.bump(counter);
         outcome
     }
 
     fn decide(
         &mut self,
+        source_rates: &mut EndpointRates,
+        allowlist: &RegistrationAllowlist,
         source: SocketAddr,
         register: &RspRegister,
         capacity: Capacity,
@@ -455,37 +513,39 @@ impl Registrations {
             return RegisterOutcome::Drop(RegisterDrop::Source);
         }
         // Step 2: the allowlist, before any state is charged.
-        if !self.config.allowlist.admits(source.ip()) {
+        if !allowlist.admits(source.ip()) {
             return RegisterOutcome::Drop(RegisterDrop::NotAllowed);
         }
         // Step 3: both rates must admit before either is charged.
-        if self.source_rates.would_admit(source, now).is_err() {
+        if source_rates.would_admit(source, now).is_err() {
             return RegisterOutcome::Drop(RegisterDrop::SourceRate);
         }
         if !self.rate.would_admit(now) {
             return RegisterOutcome::Drop(RegisterDrop::Rate);
         }
-        if self.source_rates.admit(source, now).is_err() {
+        if source_rates.admit(source, now).is_err() {
             return RegisterOutcome::Drop(RegisterDrop::SourceRate);
         }
         if !self.rate.admit(now) {
             return RegisterOutcome::Drop(RegisterDrop::Rate);
         }
         self.expire(now);
-        // Step 4: a retry resends its one ANNOUNCE.
-        if self
-            .pending
-            .iter()
-            .any(|entry| entry.source == source && entry.receiver == register.receiver)
-        {
-            self.counters.retried = self.counters.retried.saturating_add(1);
+        // Step 4: a retry resends its one ANNOUNCE; it matches the source
+        // endpoint, the stream and the receiver block.
+        if self.pending.iter().any(|entry| {
+            entry.source == source
+                && entry.stream_id == register.stream_id
+                && entry.receiver == register.receiver
+        }) {
+            self.counters.bump(|c| &mut c.retried);
             return RegisterOutcome::Announce { source };
         }
-        // Step 5: pending bounds.
+        // Step 5: pending bounds, per source address (SPEC.md §6): a
+        // source varying its port holds no more.
         let held = self
             .pending
             .iter()
-            .filter(|entry| entry.source == source)
+            .filter(|entry| entry.source.ip() == source.ip())
             .count();
         if held >= self.config.pending_per_source {
             return RegisterOutcome::Drop(RegisterDrop::SourcePendingFull);
@@ -495,15 +555,16 @@ impl Registrations {
         }
         // Step 6: capacity.
         if capacity == Capacity::Full {
-            return self.refuse(source, now);
+            return self.refuse(source.ip(), source, now);
         }
         // Step 7: the pending entry; its room was checked above.
         self.pending.push(PendingRegistration {
+            stream_id: register.stream_id,
             source,
             receiver: register.receiver,
             expires: now.saturating_add(self.config.join_timeout),
         });
-        self.counters.registered = self.counters.registered.saturating_add(1);
+        self.counters.bump(|c| &mut c.registered);
         RegisterOutcome::Announce { source }
     }
 
@@ -516,14 +577,15 @@ impl Registrations {
         unicast && source.port() != 0 && source.is_ipv4() == self.ipv4
     }
 
-    /// Step 6: one ERR per source per `refusal_interval`, in a bounded
-    /// table whose entries are reused once their interval has passed.
-    fn refuse(&mut self, source: SocketAddr, now: u64) -> RegisterOutcome {
+    /// Step 6: one ERR per source address per `refusal_interval`, in a
+    /// bounded table whose entries are reused once their interval has
+    /// passed.
+    fn refuse(&mut self, address: IpAddr, source: SocketAddr, now: u64) -> RegisterOutcome {
         let interval = self.config.refusal_interval;
         if let Some(entry) = self
             .refusals
             .iter_mut()
-            .find(|entry| entry.source == source)
+            .find(|entry| entry.source == address)
         {
             if age_ns(now, entry.at) < interval {
                 return RegisterOutcome::Drop(RegisterDrop::RefusalLimited);
@@ -531,7 +593,10 @@ impl Registrations {
             entry.at = now;
             return RegisterOutcome::Refuse { source };
         }
-        let fresh = Refusal { source, at: now };
+        let fresh = Refusal {
+            source: address,
+            at: now,
+        };
         if self.refusals.len() < self.config.sources {
             self.refusals.push(fresh);
         } else if let Some(entry) = self
@@ -546,12 +611,14 @@ impl Registrations {
         RegisterOutcome::Refuse { source }
     }
 
-    /// Takes the pending entry a CHALLENGE from `source` with
-    /// `receiver_boot_id` answers (design 3.2: the CHALLENGE moves it into
-    /// `Membership`); `None` when none is pending, so a CHALLENGE from a
-    /// source that never registered is not answered on this path.
+    /// Takes the pending entry for `stream_id` that a CHALLENGE from
+    /// `source` with `receiver_boot_id` answers (design 3.2: the CHALLENGE
+    /// moves it into `Membership`); `None` when none is pending, so a
+    /// CHALLENGE from a source that never registered is not answered on
+    /// this path.
     pub fn challenged(
         &mut self,
+        stream_id: i32,
         source: SocketAddr,
         receiver_boot_id: [u64; 2],
         now: u64,
@@ -559,11 +626,13 @@ impl Registrations {
         self.expire(now);
         let source = normalized(source);
         let at = self.pending.iter().position(|entry| {
-            entry.source == source && entry.receiver.receiver_boot_id == receiver_boot_id
+            entry.stream_id == stream_id
+                && entry.source == source
+                && entry.receiver.receiver_boot_id == receiver_boot_id
         })?;
         // `at` is in range: `position` found it.
         let taken = (at < self.pending.len()).then(|| self.pending.remove(at))?;
-        self.counters.challenged = self.counters.challenged.saturating_add(1);
+        self.counters.bump(|c| &mut c.challenged);
         Some(taken)
     }
 
@@ -572,10 +641,9 @@ impl Registrations {
         let before = self.pending.len();
         self.pending.retain(|entry| entry.expires > now);
         let removed = before.saturating_sub(self.pending.len());
-        self.counters.expired = self
-            .counters
-            .expired
-            .saturating_add(u64::try_from(removed).unwrap_or(u64::MAX));
+        // A `usize` count fits a `u64` on every supported target.
+        let removed = u64::try_from(removed).unwrap_or(u64::MAX);
+        self.counters.add(|c| &mut c.expired, removed);
     }
 }
 

@@ -28,17 +28,77 @@ fn allow(ranges: &[AddressRange]) -> RegistrationAllowlist {
     RegistrationAllowlist::new(ranges).unwrap()
 }
 
-fn config(ranges: &[AddressRange]) -> RegistrationConfig {
-    RegistrationConfig::new(allow(ranges))
+/// One publication's allowlist with the driver's limits.
+struct Setup {
+    allow: RegistrationAllowlist,
+    config: RegistrationConfig,
 }
 
-fn registrations(config: RegistrationConfig) -> Registrations {
-    Registrations::new(config, true, T0).unwrap()
+fn config(ranges: &[AddressRange]) -> Setup {
+    Setup {
+        allow: allow(ranges),
+        config: RegistrationConfig::default(),
+    }
 }
 
-fn lan() -> Registrations {
+/// The driver's registrations, the sender's `setup_answer_rate` table they
+/// borrow (20 per second, one entry per tracked source) and one
+/// publication's allowlist.
+struct Harness {
+    registrations: Registrations,
+    source_rates: EndpointRates,
+    allow: RegistrationAllowlist,
+}
+
+impl Harness {
+    fn register(
+        &mut self,
+        source: SocketAddr,
+        register: &RspRegister,
+        capacity: Capacity,
+        now: u64,
+    ) -> RegisterOutcome {
+        self.registrations.register(
+            &mut self.source_rates,
+            &self.allow,
+            source,
+            register,
+            capacity,
+            now,
+        )
+    }
+
+    fn challenged(
+        &mut self,
+        source: SocketAddr,
+        boot: [u64; 2],
+        now: u64,
+    ) -> Option<PendingRegistration> {
+        self.registrations.challenged(STREAM, source, boot, now)
+    }
+
+    fn pending(&self) -> &[PendingRegistration] {
+        self.registrations.pending()
+    }
+
+    fn counters(&self) -> RegistrationCounters {
+        self.registrations.counters()
+    }
+}
+
+fn registrations(setup: Setup) -> Harness {
+    Harness {
+        source_rates: EndpointRates::new(20, setup.config.sources).unwrap(),
+        registrations: Registrations::new(setup.config, true, T0).unwrap(),
+        allow: setup.allow,
+    }
+}
+
+fn lan() -> Harness {
     registrations(config(&[range([10, 0, 0, 0], 8)]))
 }
+
+const STREAM: i32 = 1001;
 
 fn source(last: u8, port: u16) -> SocketAddr {
     SocketAddr::from(([10, 0, 0, last], port))
@@ -46,7 +106,7 @@ fn source(last: u8, port: u16) -> SocketAddr {
 
 fn register(receiver_id: u64) -> RspRegister {
     RspRegister {
-        stream_id: 1001,
+        stream_id: STREAM,
         receiver: Receiver {
             receiver_boot_id: [receiver_id, 1],
             receiver_id,
@@ -72,7 +132,9 @@ fn a_missing_allowlist_is_a_refusal_never_a_permissive_default() {
     let too_many = vec![range([10, 0, 0, 0], 8); MAX_ALLOW_RANGES + 1];
     assert_eq!(
         RegistrationAllowlist::new(&too_many),
-        Err(RegistrationConfigError::TooManyRanges)
+        Err(RegistrationConfigError::TooManyRanges {
+            count: MAX_ALLOW_RANGES + 1
+        })
     );
     assert!(RegistrationAllowlist::new(&too_many[..MAX_ALLOW_RANGES]).is_ok());
 }
@@ -82,15 +144,24 @@ fn ranges_are_named_exactly() {
     // Host bits below the prefix, or a prefix longer than the address.
     assert_eq!(
         AddressRange::new(IpAddr::from([10, 0, 0, 1]), 8),
-        Err(RegistrationConfigError::InvalidRange)
+        Err(RegistrationConfigError::InvalidRange {
+            network: IpAddr::from([10, 0, 0, 1]),
+            prefix: 8
+        })
     );
     assert_eq!(
         AddressRange::new(IpAddr::from([10, 0, 0, 0]), 33),
-        Err(RegistrationConfigError::InvalidRange)
+        Err(RegistrationConfigError::InvalidRange {
+            network: IpAddr::from([10, 0, 0, 0]),
+            prefix: 33
+        })
     );
     assert_eq!(
         AddressRange::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 129),
-        Err(RegistrationConfigError::InvalidRange)
+        Err(RegistrationConfigError::InvalidRange {
+            network: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            prefix: 129
+        })
     );
     let lan = range([10, 1, 0, 0], 16);
     assert!(lan.contains(IpAddr::from([10, 1, 255, 7])));
@@ -107,29 +178,99 @@ fn ranges_are_named_exactly() {
     assert!(!any_v4.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)));
 }
 
+/// One change to a valid configuration.
+type Change = fn(&mut RegistrationConfig);
+
 #[test]
-fn limits_are_mandatory_and_nonzero() {
-    let base = config(&[range([10, 0, 0, 0], 8)]);
+fn limits_are_mandatory_nonzero_bounded_and_named() {
+    let base = RegistrationConfig::default();
     assert_eq!(base.validate(), Ok(()));
-    let cases: [fn(&mut RegistrationConfig); 8] = [
-        |c| c.per_source_rate = 0,
-        |c| c.rate = 0,
-        |c| c.sources = 0,
-        |c| c.pending = 0,
-        |c| c.pending_per_source = 0,
-        |c| c.refusal_interval = 0,
-        |c| c.join_timeout = 0,
-        |c| c.pending_per_source = c.pending + 1,
+    let cases: [(Change, &str); 9] = [
+        (|c| c.rate = 0, "rate"),
+        (|c| c.sources = 0, "sources"),
+        (|c| c.sources = MAX_REGISTRATION_TABLE + 1, "sources"),
+        (|c| c.pending = 0, "pending"),
+        (|c| c.pending = usize::MAX, "pending"),
+        (|c| c.pending_per_source = 0, "pending_per_source"),
+        (
+            |c| c.pending_per_source = c.pending + 1,
+            "pending_per_source",
+        ),
+        (|c| c.refusal_interval = 0, "refusal_interval"),
+        (|c| c.join_timeout = 0, "join_timeout"),
     ];
-    for (at, change) in cases.iter().enumerate() {
-        let mut bad = base.clone();
+    for (change, field) in cases {
+        let mut bad = base;
         change(&mut bad);
+        let refused = Registrations::new(bad, true, T0).map(|_| ());
         assert_eq!(
-            Registrations::new(bad, true, T0).map(|_| ()),
-            Err(RegistrationConfigError::InvalidLimit),
-            "case {at}"
+            refused,
+            Err(RegistrationConfigError::InvalidLimit { field })
         );
+        assert!(refused.unwrap_err().to_string().contains(field));
     }
+    // The ceiling itself is accepted and allocated.
+    let mut top = base;
+    top.sources = MAX_REGISTRATION_TABLE;
+    top.pending = MAX_REGISTRATION_TABLE;
+    assert!(Registrations::new(top, true, T0).is_ok());
+}
+
+/// Design 3.2 steps 3 and 5 scope the rate and the pending table to the
+/// driver: two dynamic publications share them, each with its own
+/// allowlist.
+#[test]
+fn the_driver_limits_are_shared_by_its_publications() {
+    let c = RegistrationConfig {
+        pending: 3,
+        rate: 4,
+        ..RegistrationConfig::default()
+    };
+    let mut driver = Registrations::new(c, true, T0).unwrap();
+    let mut rates = EndpointRates::new(20, 64).unwrap();
+    let lan = allow(&[range([10, 0, 0, 0], 8)]);
+    let other = allow(&[range([10, 9, 0, 0], 16)]);
+    let mut on = |allowlist: &RegistrationAllowlist, from: SocketAddr, stream_id: i32| {
+        let mut r = register(u64::from(from.port()));
+        r.stream_id = stream_id;
+        driver.register(&mut rates, allowlist, from, &r, Capacity::Free, T0)
+    };
+    for (allowlist, host, stream) in [(&lan, 1, 1), (&other, 2, 2), (&lan, 3, 1)] {
+        let from = SocketAddr::from(([10, 9, 0, host], 40_000));
+        assert!(matches!(
+            on(allowlist, from, stream),
+            RegisterOutcome::Announce { .. }
+        ));
+    }
+    // The fourth, to either publication, finds the driver's table full.
+    let from = SocketAddr::from(([10, 9, 0, 4], 40_000));
+    assert_eq!(
+        on(&other, from, 2),
+        RegisterOutcome::Drop(RegisterDrop::PendingFull)
+    );
+    // Then the driver's total of four per second is spent for both.
+    assert_eq!(
+        on(&lan, SocketAddr::from(([10, 9, 0, 5], 40_000)), 1),
+        RegisterOutcome::Drop(RegisterDrop::Rate)
+    );
+    // A CHALLENGE takes only the entry of its own stream.
+    let from = SocketAddr::from(([10, 9, 0, 2], 40_000));
+    assert_eq!(driver.challenged(1, from, [40_000, 1], T0), None);
+    assert!(driver.challenged(2, from, [40_000, 1], T0).is_some());
+}
+
+#[test]
+fn counters_are_checked_and_sticky_on_overflow() {
+    let mut counters = RegistrationCounters {
+        registered: u64::MAX,
+        ..RegistrationCounters::default()
+    };
+    counters.bump(|c| &mut c.registered);
+    assert_eq!(counters.registered, u64::MAX);
+    assert!(counters.overflowed);
+    counters.bump(|c| &mut c.retried);
+    assert_eq!(counters.retried, 1);
+    assert!(counters.overflowed);
 }
 
 #[test]
@@ -272,8 +413,8 @@ fn the_per_source_rate_is_a_limit() {
 fn the_driver_rate_is_a_limit() {
     // Tables large enough that only the total decides.
     let mut c = config(&[range([10, 0, 0, 0], 8)]);
-    c.sources = 1024;
-    c.pending = 1024;
+    c.config.sources = 1024;
+    c.config.pending = 1024;
     let mut r = registrations(c);
     let mut announced = 0;
     for host in 0..300u16 {
@@ -361,7 +502,7 @@ fn a_full_table_answers_one_err_per_source_per_interval() {
 #[test]
 fn the_refusal_table_is_bounded() {
     let mut c = config(&[range([10, 0, 0, 0], 8)]);
-    c.sources = 4;
+    c.config.sources = 4;
     let mut r = registrations(c);
     for host in 1..=4 {
         assert!(matches!(
@@ -382,10 +523,69 @@ fn the_refusal_table_is_bounded() {
     ));
 }
 
+/// The refusal table's own bound: with `refusal_interval` above one
+/// second, the rate entries are idle again before the refusal entries, and
+/// a fifth source finds no refusal entry free.
+#[test]
+fn a_full_refusal_table_drops_a_new_source() {
+    let mut c = config(&[range([10, 0, 0, 0], 8)]);
+    c.config.sources = 4;
+    c.config.refusal_interval = 10 * SECOND;
+    let mut r = registrations(c);
+    for host in 1..=4 {
+        assert!(matches!(
+            r.register(source(host, 1), &register(1), Capacity::Full, T0),
+            RegisterOutcome::Refuse { .. }
+        ));
+    }
+    assert_eq!(
+        r.register(source(5, 1), &register(1), Capacity::Full, T0 + SECOND),
+        RegisterOutcome::Drop(RegisterDrop::RefusalLimited)
+    );
+    assert_eq!(r.counters().dropped_refusal_limited, 1);
+    // Once an interval has passed, its entry is reused.
+    assert!(matches!(
+        r.register(source(5, 1), &register(1), Capacity::Full, T0 + 10 * SECOND),
+        RegisterOutcome::Refuse { .. }
+    ));
+}
+
+/// SPEC.md §6 bounds pending registrations per source address: a source
+/// that varies its port, or a spoofer of one victim address, holds no more
+/// entries and draws no more ERRs than one port would.
+#[test]
+fn the_per_source_bounds_hold_across_ports() {
+    let mut r = lan();
+    let mut announced = 0;
+    for port in 1..=64u16 {
+        if let RegisterOutcome::Announce { .. } = r.register(
+            source(77, port),
+            &register(u64::from(port)),
+            Capacity::Free,
+            T0,
+        ) {
+            announced += 1;
+        }
+    }
+    assert_eq!(announced, 2);
+    assert_eq!(r.pending().len(), 2);
+    assert_eq!(r.counters().dropped_source_pending_full, 62);
+    let mut r = lan();
+    let mut errs = 0;
+    for port in 1..=64u16 {
+        if let RegisterOutcome::Refuse { .. } =
+            r.register(source(77, port), &register(1), Capacity::Full, T0)
+        {
+            errs += 1;
+        }
+    }
+    assert_eq!(errs, 1);
+}
+
 /// Design 9.2: the sender cannot be used to reflect traffic at a third
 /// party. A flood of REGISTERs spoofing a victim's address causes, per
-/// second, at most `per_source_rate` replies of at most 72 bytes to that
-/// address, and over many spoofed victims at most the driver's `rate`;
+/// second, at most `setup_answer_rate` replies of at most 72 bytes to
+/// that address, and over many spoofed victims at most the driver's `rate`;
 /// a victim outside the allowlist gets nothing.
 #[test]
 fn the_sender_cannot_be_used_to_reflect_traffic() {
@@ -432,8 +632,8 @@ fn the_sender_cannot_be_used_to_reflect_traffic() {
     assert_eq!(errs, 1);
     // Many spoofed victims: the driver's total bounds the sum.
     let mut c = config(&[range([10, 0, 0, 0], 8)]);
-    c.sources = 4096;
-    c.pending = 4096;
+    c.config.sources = 4096;
+    c.config.pending = 4096;
     let mut r = registrations(c);
     let mut replies = 0;
     for n in 0..4096u64 {

@@ -7,8 +7,10 @@
   design MD-4, MD-5; karyos#644, step 1).
 - `sessions::register`, the bounded admission of a REGISTER: an explicit
   non-empty `RegistrationAllowlist` (no permissive default; it supplies no
-  authentication), per-source and per-driver rates, global and per-source
-  pending bounds, one ERR per source per `refusal_interval` on a full
-  table, and expiry at `join_timeout`. `control-mode=dynamic` stays
+  authentication) per publication; the driver's rate, pending table and
+  refusal table shared by its publications, with the sender's
+  `setup_answer_rate` as the per-source bucket; pending bounds and one
+  ERR per `refusal_interval` per source address, whatever its port;
+  checked, sticky counters; and expiry at `join_timeout`. `control-mode=dynamic` stays
   refused until the sender and receiver paths are implemented and tested
   (karyos#644).
