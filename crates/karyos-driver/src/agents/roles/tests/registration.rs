@@ -2034,3 +2034,103 @@ fn an_unregistered_binding_at_a_removed_destination_takes_no_slot() {
     assert_eq!(sender.counters().registrants_refused, refused + 1);
     assert!(!sender.sends_to(EndpointId(1), alias(), a));
 }
+
+/// A destination added by command to a dynamic publication took no
+/// registrant's SM and holds no receiver id: a binding's removal never
+/// retires it, as no binding was ever meant to expire it (karyos#945
+/// review).
+#[test]
+fn a_binding_removal_leaves_a_commanded_destination_in_place() {
+    let mut sender = dynamic_sender(4);
+    let quarantine = sender.membership.receiver_timeout;
+    let commanded: SocketAddr = "10.0.0.77:5000".parse().unwrap();
+    assert_eq!(
+        sender.publications[0].change_destination(commanded, true, T0, quarantine),
+        crate::agents::data::DestinationChange::Added
+    );
+    let a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
+    let late = T0 + 2 * sender.confirmed_timeout;
+    sender.expire_bindings(late);
+    assert_eq!(
+        removals(&mut sender, late),
+        vec![(a, RemovalReason::Timeout)]
+    );
+    assert!(sender.sends_to(EndpointId(1), alias(), commanded));
+}
+
+/// A second dynamic publication, stream 8, on endpoint 1 of `sender`.
+fn add_second_dynamic_publication(
+    sender: &mut super::super::SenderRole,
+) -> karyos_protocol::network::Alias {
+    let (replies, _keep) = super::super::super::ring::ring::<AgentEvent<OsSocket>>(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    );
+    let mut publication = publication(EndpointId(1));
+    publication.alias.session_id = 7;
+    publication.alias.stream_id = 8;
+    let (mut outbound, _log) = super::super::super::data::testing::outbound(
+        publication.endpoint,
+        publication.alias,
+        "10.0.0.2:4000".parse().unwrap(),
+        publication.term,
+        1,
+        false,
+    );
+    outbound.set_registration(4, lan()).unwrap();
+    let added = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication,
+        outbound,
+        guard: None,
+        roles: Some(Box::new(crate::membership::PublicationRoles {
+            strategy: crate::membership::Strategy::Min,
+            required: Vec::new(),
+            tags: Vec::new(),
+        })),
+    });
+    assert!(matches!(
+        added,
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    publication.alias
+}
+
+/// A slot is covered only by a binding of its own publication: a binding
+/// of another publication at the same address keeps it no longer than its
+/// own, and the slot retires when its own binding expires (karyos#945
+/// review).
+#[test]
+fn only_a_binding_of_its_own_publication_covers_a_slot() {
+    let mut sender = dynamic_sender(4);
+    let other = add_second_dynamic_publication(&mut sender);
+    let a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
+    // The same receiver joins the second publication from `a` later.
+    let later = T0 + sender.confirmed_timeout / 2;
+    let mut register = register_as(6, 8);
+    register.stream_id = other.stream_id;
+    assert!(
+        sender
+            .register(EndpointId(1), a, &register, later)
+            .is_some()
+    );
+    let Control::Challenge(mut challenge) = challenge_of(8) else {
+        unreachable!()
+    };
+    challenge.alias = other;
+    assert!(
+        sender
+            .answer_for(EndpointId(1), a, later, Control::Challenge(challenge))
+            .is_some()
+    );
+    let mut status = sm_as(6, 8);
+    status.alias = other;
+    assert_eq!(sender.status(EndpointId(1), a, &status, later + 1), None);
+    assert!(sender.publications[1].registrant_at(a).is_some());
+    // The first publication's binding expires; the second's still lives.
+    let expired = T0 + 1 + sender.confirmed_timeout;
+    sender.expire_bindings(expired);
+    assert!(sender.publications[0].registrant_at(a).is_none());
+    assert!(sender.publications[1].registrant_at(a).is_some());
+}
