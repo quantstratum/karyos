@@ -89,8 +89,14 @@
 //! failures`, `naks received`, `status messages received`, `heartbeats
 //! sent`. Receiver: `datagrams received`, `datagrams dropped by backend`,
 //! `invalid frames received`, `status messages sent`, `images retired at
-//! timeout`. When no cell is free one is not allocated and `counters
-//! unavailable` counts it.
+//! timeout`, and for `control-mode=dynamic` subscriptions (karyos#941)
+//! `registers sent`, `registers unsent` (a rate, the control ring or a
+//! missing identity refused one due) and `registration refusals received`
+//! (ERR REGISTRATION `DESTINATIONS_FULL` from a `control` address). A
+//! dynamic subscription whose REGISTERs are dropped with no reply (the
+//! allowlist, a rate, quarantine) shows only `registers sent` growing.
+//! When no cell is free one is not allocated and `counters unavailable`
+//! counts it.
 //!
 //! Each network publication and exposed image has its own cells (M2b),
 //! keyed by its stream's registration (key0; lane, kind and participant

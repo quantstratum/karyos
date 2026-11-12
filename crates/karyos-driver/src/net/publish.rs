@@ -149,8 +149,9 @@ fn destinations_of(
         };
     };
     // A dynamic channel lists none: its registrants join (design 3.2), and
-    // it names no required destination (MD-17's required receiver ids are
-    // not configurable in dynamic mode yet).
+    // it names no required destination endpoint: its required receivers
+    // are the receiver ids of its roles (design 3.5; MD-17), checked with
+    // its registration policy.
     if *mode == ControlMode::Dynamic {
         return if required.is_empty() {
             Ok((Vec::new(), Vec::new()))
@@ -365,8 +366,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// [`DriverError::UnsupportedChannel`] for a channel that is not
     /// `control-mode=dynamic` with a `control` address, or that also lists
     /// destinations, names an interface or redundant paths;
-    /// [`DriverError::InvalidConfig`] for more required receiver ids than
-    /// `max_destinations`; and [`DriverError::DynamicPublicationExists`]
+    /// [`DriverError::Registration`] naming the field at fault for more
+    /// required receiver ids than `max_destinations`
+    /// ([`crate::sessions::register::RegistrationConfigError::TooManyRequired`]), a zero or repeated
+    /// one, or an allowlist with no range of `control`'s address family
+    /// ([`crate::sessions::register::RegistrationConfigError::AllowlistFamily`]);
+    /// [`DriverError::ReceiverBindings`] when the driver's dynamic
+    /// publications would take more destinations, `max_destinations`
+    /// each, than `receiver_bindings` (karyos#941 item 2); and
+    /// [`DriverError::DynamicPublicationExists`]
     /// for a second dynamic publication of the stream on that control
     /// endpoint. Guards and timed lanes are not combined with destinations
     /// ([`DriverError::UnsupportedChannel`]).
@@ -595,15 +603,32 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let required = roles
                     .as_ref()
                     .map_or(&[][..], |roles| roles.required.as_slice());
+                use crate::sessions::register::{RegistrationConfigError, RegistrationPolicy};
                 if required.len() > max_destinations {
-                    return Err(DriverError::InvalidConfig);
+                    return Err(DriverError::Registration(
+                        RegistrationConfigError::TooManyRequired {
+                            required: required.len(),
+                            max_destinations,
+                        },
+                    ));
                 }
-                let policy = crate::sessions::register::RegistrationPolicy::new(
-                    allowlist,
-                    destination.is_ipv4(),
-                )
-                .with_required(required)
-                .map_err(|_| DriverError::InvalidConfig)?;
+                // A REGISTER of the other family is dropped at step 1, so
+                // an allowlist with no range of `control`'s family admits
+                // nobody: refused, not accepted silently (karyos#941 item 7).
+                let family = allowlist
+                    .ranges()
+                    .iter()
+                    .any(|range| range.network().is_ipv4() == destination.is_ipv4());
+                if !family {
+                    return Err(DriverError::Registration(
+                        RegistrationConfigError::AllowlistFamily {
+                            control: destination,
+                        },
+                    ));
+                }
+                let policy = RegistrationPolicy::new(allowlist, destination.is_ipv4())
+                    .with_required(required)
+                    .map_err(DriverError::Registration)?;
                 Some(policy)
             }
             (_, Some(_)) => return Err(DriverError::InvalidConfig),

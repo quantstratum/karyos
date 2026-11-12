@@ -206,6 +206,29 @@ pub enum DriverError {
     /// A control-channel limit or size is invalid.
     #[error("invalid driver configuration")]
     InvalidConfig,
+    /// A `control-mode=dynamic` publication's registration settings are
+    /// refused, the field at fault named (karyos#941 item 7).
+    #[error(transparent)]
+    Registration(crate::sessions::register::RegistrationConfigError),
+    /// One more `control-mode=dynamic` publication would take more
+    /// destinations, `max_destinations` each, than the sender has
+    /// `receiver_bindings` for (karyos#941 item 2).
+    #[error("dynamic publications need {needed} receiver_bindings, {held} configured")]
+    ReceiverBindings {
+        /// The bindings the dynamic publications would need with this one.
+        needed: usize,
+        /// `receiver_bindings`.
+        held: usize,
+    },
+    /// A `control-mode=dynamic` subscription's `control` address is not
+    /// one a REGISTER can be sent to: a zero port, an unspecified,
+    /// multicast or broadcast address (network-control-schemas.md §7.3;
+    /// karyos#941 item 7).
+    #[error("dynamic registration control address {control} is not a unicast endpoint")]
+    InvalidRegistrationControl {
+        /// The `control` address refused.
+        control: std::net::SocketAddr,
+    },
     /// `barrier_ack_timeout` misses a bound: at driver start, the floor or
     /// the conductor duty periods; at a conflated subscription of an
     /// unreliable channel, the far-window timeout (SPEC.md §7.1;

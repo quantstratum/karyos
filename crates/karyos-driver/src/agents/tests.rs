@@ -604,3 +604,106 @@ fn max_destinations_is_one_to_sixty_four() {
         Err(AgentError::InvalidConfig(_))
     ));
 }
+
+/// karyos#943 M23 and karyos#941 item 3: each CnC cell of the agents
+/// carries the counter its label names. Every counter takes its own
+/// value, so two cells swapped, or one cell reading another counter, fail.
+#[test]
+fn every_agent_cell_carries_the_counter_its_label_names() {
+    let sender = roles::SenderCounters {
+        sent: 1,
+        send_failures: 2,
+        naks: 3,
+        sm_accepted: 4,
+        heartbeats_sent: 5,
+        registrants_joined: 21,
+        registrants_full: 22,
+        registrants_refused: 23,
+        registrants_restarted: 24,
+        registrants_moved: 25,
+        registrants_timed_out: 26,
+        ..roles::SenderCounters::default()
+    };
+    let registrations = crate::sessions::register::RegistrationCounters {
+        registered: 6,
+        retried: 7,
+        refused_full: 8,
+        dropped_refusal_limited: 9,
+        dropped_source: 10,
+        dropped_not_allowed: 11,
+        dropped_source_rate: 12,
+        dropped_rate: 13,
+        dropped_pending_full: 14,
+        dropped_source_pending_full: 15,
+        dropped_bound: 16,
+        dropped_boot_changed: 17,
+        duplicate_receiver: 18,
+        required_pending_replaced: 19,
+        expired: 20,
+        ..crate::sessions::register::RegistrationCounters::default()
+    };
+    let expected_sender = [
+        ("network controls sent", 1),
+        ("network control send failures", 2),
+        ("naks received", 3),
+        ("status messages received", 4),
+        ("heartbeats sent", 5),
+        ("registrations", 6),
+        ("registration retries", 7),
+        ("registration errs sent", 8),
+        ("registration errs suppressed", 9),
+        ("registrations dropped source", 10),
+        ("registrations dropped range", 11),
+        ("registrations dropped source rate", 12),
+        ("registrations dropped rate", 13),
+        ("registrations dropped pending", 14),
+        ("registrations dropped source pending", 15),
+        ("registrations dropped bound", 16),
+        ("registrations dropped boot changed", 17),
+        ("registrations duplicate receiver", 18),
+        ("required registrations replaced", 19),
+        ("registrations expired", 20),
+        ("registrants joined", 21),
+        ("registrants full", 22),
+        ("registrants refused", 23),
+        ("registrants restarted", 24),
+        ("registrants moved", 25),
+        ("registrants timed out", 26),
+    ];
+    let values = sender_values(&sender, &registrations);
+    assert_eq!(SENDER_CELLS.len(), expected_sender.len());
+    for ((label, value), (expected_label, expected)) in
+        SENDER_CELLS.iter().zip(values).zip(expected_sender)
+    {
+        assert_eq!((*label, value), (expected_label, expected));
+    }
+    let receiver = roles::ReceiverCounters {
+        datagrams: 1,
+        backend_drops: 2,
+        decode_errors: 3,
+        sm_sent: 4,
+        images_retired: 5,
+        registers_sent: 6,
+        registers_unsent: 7,
+        registration_refusals: 8,
+        ..roles::ReceiverCounters::default()
+    };
+    let expected_receiver = [
+        ("datagrams received", 1),
+        ("datagrams dropped by backend", 2),
+        ("invalid frames received", 3),
+        ("status messages sent", 4),
+        ("images retired at timeout", 5),
+        ("registers sent", 6),
+        ("registers unsent", 7),
+        ("registration refusals received", 8),
+    ];
+    assert_eq!(RECEIVER_CELLS.len(), expected_receiver.len());
+    for ((label, value), (expected_label, expected)) in RECEIVER_CELLS
+        .iter()
+        .zip(receiver_values(&receiver))
+        .zip(expected_receiver)
+    {
+        assert_eq!((*label, value), (expected_label, expected));
+    }
+}

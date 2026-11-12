@@ -491,7 +491,7 @@ enum EndpointPurpose {
 /// A network subscription of this driver (W3): the receiver holds one
 /// entry per endpoint and stream, so the handles of one key are counted
 /// (#283 P2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct NetSubscription {
     endpoint: EndpointId,
     stream_id: i32,
@@ -511,6 +511,9 @@ struct NetSubscription {
     /// The `control` address of a `control-mode=dynamic` key, which every
     /// handle of it shares (design 3.2; karyos#644).
     register_at: Option<SocketAddr>,
+    /// The key's registration state, which its receiver writes
+    /// (karyos#941 item 3); with `register_at` only.
+    registration: Option<std::sync::Arc<crate::sessions::register::RegistrationStatus>>,
     /// The endpoints of the channel's later redundant paths, each with its
     /// own receiver entry (redundant-paths.md; the first path is
     /// `endpoint`).
@@ -742,6 +745,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     failed: Option<AgentKind>,
     /// `max_destinations` (MD-6; karyos#889), from the agents' settings.
     max_destinations: usize,
+    /// `receiver_bindings`, from the agents' settings: the most
+    /// destinations the driver's dynamic publications take together
+    /// (karyos#941 item 2).
+    receiver_bindings: usize,
     publications: Vec<NetPublication>,
     send_endpoints: Vec<SendEndpoint>,
     subscriptions: Vec<NetSubscription>,
@@ -892,6 +899,7 @@ impl<T: StreamTerms> Network<T> {
             agents,
             failed: None,
             max_destinations: config.agents.max_destinations,
+            receiver_bindings: config.agents.receiver_bindings,
             publications: Vec::with_capacity(config.agents.publications),
             send_endpoints: Vec::with_capacity(config.agents.max_endpoints),
             subscriptions: Vec::with_capacity(config.agents.subscriptions),
@@ -1155,6 +1163,9 @@ impl<T: StreamTerms> Network<T> {
         // plan 164): one per driver and family, held by every multicast key
         // and closed with the last.
         let solicit = multicast.and_then(|_| self.hold_solicit_endpoint(bind));
+        // A dynamic key's registration state, shared with its receiver.
+        let registration = register_at
+            .map(|_| std::sync::Arc::new(crate::sessions::register::RegistrationStatus::default()));
         let posted = self
             .links
             .receiver
@@ -1169,7 +1180,7 @@ impl<T: StreamTerms> Network<T> {
                 identity,
                 conflated: conflated.map(|(lane, _)| lane),
                 solicit_from: solicit,
-                register_at,
+                register_at: register_at.zip(registration.clone()),
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
@@ -1241,11 +1252,27 @@ impl<T: StreamTerms> Network<T> {
             identity,
             conflated,
             register_at,
+            registration,
             later: held,
             later_routes,
             users: 1,
         });
         Ok(handle)
+    }
+
+    /// The registration state of `subscription`, a `control-mode=dynamic`
+    /// one; `None` for any other (karyos#941 item 3).
+    pub(crate) fn registration_state(
+        &self,
+        subscription: NetworkSubscription,
+    ) -> Option<crate::sessions::register::RegistrationState> {
+        self.subscriptions
+            .iter()
+            .find(|entry| {
+                (entry.endpoint, entry.stream_id) == (subscription.endpoint, subscription.stream_id)
+            })
+            .and_then(|entry| entry.registration.as_deref())
+            .map(crate::sessions::register::RegistrationStatus::get)
     }
 
     /// One later path of a subscription that could not be held.
@@ -1905,6 +1932,31 @@ impl<T: StreamTerms> Network<T> {
             return Err(DriverError::DynamicPublicationExists {
                 stream_id: alias.stream_id,
             });
+        }
+        // Every destination of a dynamic publication needs a binding at
+        // the sender, so the driver's dynamic publications together fit
+        // `receiver_bindings` (karyos#941 item 2); one still being removed
+        // counts until it is gone.
+        if channel.registration.is_some() {
+            let dynamic = self
+                .publications
+                .iter()
+                .filter(|entry| {
+                    entry
+                        .channel
+                        .as_ref()
+                        .is_some_and(|held| held.registration.is_some())
+                })
+                .count();
+            let needed = dynamic
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(self.max_destinations));
+            if needed.is_none_or(|needed| needed > self.receiver_bindings) {
+                return Err(DriverError::ReceiverBindings {
+                    needed: needed.unwrap_or(usize::MAX),
+                    held: self.receiver_bindings,
+                });
+            }
         }
         // A reincarnating publication's key stays reserved for its next
         // incarnation, the only add that takes it.
