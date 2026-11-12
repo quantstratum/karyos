@@ -259,6 +259,10 @@ pub(super) struct Target {
     address: SocketAddr,
     /// Named required by its endpoint at creation (MD-11, MD-17).
     required: bool,
+    /// The receiver id a dynamic registrant joined with: the only id whose
+    /// SMs this slot takes, and for a required id its one reserved slot
+    /// (design 3.2, 3.5; karyos#940). `None` for a listed destination.
+    receiver_id: Option<u64>,
     sender: LaneSender,
     queues: Vec<TxQueueId>,
     lanes: Vec<TargetLane>,
@@ -319,6 +323,7 @@ impl Target {
         Some(Self {
             address,
             required,
+            receiver_id: None,
             sender,
             queues,
             lanes: joins
@@ -598,7 +603,8 @@ impl Fanout {
 
     /// The optional destinations held, counting those removed and not
     /// retired yet: a retired slot is always an optional one's, since a
-    /// required destination is never removed.
+    /// required destination is never removed (a required receiver id never
+    /// leaves its one slot, karyos#940).
     fn optional_held(&self) -> usize {
         self.targets
             .iter()
@@ -949,6 +955,70 @@ impl<T: StreamTerms> Outbound<T> {
         }
     }
 
+    /// The receiver id of the live dynamic registrant at `destination`, if
+    /// one is there (design 3.2 step 4).
+    pub(crate) fn registrant_at(&self, destination: SocketAddr) -> Option<u64> {
+        self.fanout.as_deref().and_then(|fanout| {
+            fanout
+                .targets
+                .iter()
+                .find(|target| target.address == destination && target.removed.is_none())
+                .and_then(|target| target.receiver_id)
+        })
+    }
+
+    /// Whether a required destination slot holds `receiver_id`, taken by
+    /// its first SM ([`Self::join_registrant`]); it is held for the
+    /// publication's incarnation (design 4.6, M5).
+    pub(crate) fn holds_required(&self, receiver_id: u64) -> bool {
+        self.fanout.as_deref().is_some_and(|fanout| {
+            fanout.targets.iter().any(|target| {
+                target.required
+                    && target.removed.is_none()
+                    && target.receiver_id == Some(receiver_id)
+            })
+        })
+    }
+
+    /// The first live optional registrant slot, one a dynamic
+    /// registrant's first SM took ([`Self::join_registrant`]), whose
+    /// address `covered` rejects: the roles retire it in the step that
+    /// leaves it with no binding able to expire it (karyos#945 review).
+    pub(crate) fn uncovered_registrant(
+        &self,
+        covered: impl Fn(SocketAddr) -> bool,
+    ) -> Option<SocketAddr> {
+        self.registration.as_ref()?;
+        self.fanout.as_deref().and_then(|fanout| {
+            fanout
+                .targets
+                .iter()
+                .filter(|target| {
+                    !target.required && target.removed.is_none() && target.receiver_id.is_some()
+                })
+                .map(|target| target.address)
+                .find(|address| !covered(*address))
+        })
+    }
+
+    /// Whether `destination` was removed less than `quarantine` before
+    /// `now` (design 3.7, MD-14), changing nothing: its REGISTER is
+    /// dropped meanwhile.
+    pub(crate) fn in_quarantine(&self, destination: SocketAddr, now: u64, quarantine: u64) -> bool {
+        self.fanout.as_deref().is_some_and(|fanout| {
+            fanout
+                .targets
+                .iter()
+                .any(|target| target.address == destination && target.removed.is_some())
+                || fanout.quarantined.iter().any(|(retired, removed_at)| {
+                    *retired == destination
+                        && now
+                            .checked_sub(*removed_at)
+                            .is_none_or(|age| age < quarantine)
+                })
+        })
+    }
+
     /// The optional destinations a dynamic publication may hold:
     /// `max_destinations` minus its required receiver ids (MD-17).
     fn optional_quota(&self, fanout: &Fanout) -> usize {
@@ -959,15 +1029,22 @@ impl<T: StreamTerms> Outbound<T> {
         fanout.max.saturating_sub(required)
     }
 
-    /// The registrant at `destination` takes a destination slot at its
-    /// first valid SM, at `now` (design 3.2): a required receiver id its
-    /// reserved slot, an optional one a slot of the optional quota, else
-    /// [`DestinationChange::Full`]. Otherwise as
-    /// [`Outbound::change_destination`] adds one.
+    /// The registrant at `destination` with receiver id `receiver_id`
+    /// takes a destination slot at its first valid SM, at `now` (design
+    /// 3.2): a required receiver id its one reserved slot, an optional one
+    /// a slot of the optional quota, else [`DestinationChange::Full`].
+    /// Otherwise as [`Outbound::change_destination`] adds one.
+    ///
+    /// A required id holds one slot for the publication's incarnation
+    /// (karyos#940; design 3.2 step 4, 4.6, M5): while it holds one
+    /// elsewhere, even one whose binding expired, a join from another
+    /// destination is refused ([`DestinationChange::Required`]), as its
+    /// `Membership` holds it `LostRequired`. Whether such a return may
+    /// replace its slot is open in quantstratum-docs#829.
     pub(crate) fn join_registrant(
         &mut self,
         destination: SocketAddr,
-        required: bool,
+        (receiver_id, required): (u64, bool),
         now: u64,
         quarantine: u64,
     ) -> DestinationChange {
@@ -981,7 +1058,28 @@ impl<T: StreamTerms> Outbound<T> {
         if full {
             return DestinationChange::Full;
         }
-        self.add_target(destination, required, now, quarantine)
+        let held_elsewhere = required
+            && self.fanout.as_deref().is_some_and(|fanout| {
+                fanout.targets.iter().any(|target| {
+                    target.required
+                        && target.removed.is_none()
+                        && target.receiver_id == Some(receiver_id)
+                        && target.address != destination
+                })
+            });
+        if held_elsewhere {
+            return DestinationChange::Required;
+        }
+        let added = self.add_target(destination, required, now, quarantine);
+        if added == DestinationChange::Added
+            && let Some(target) = self
+                .fanout
+                .as_deref_mut()
+                .and_then(|fanout| fanout.target_at(destination))
+        {
+            target.receiver_id = Some(receiver_id);
+        }
+        added
     }
 
     /// Removes the optional registrant at `destination` for `reason` at

@@ -309,12 +309,6 @@ impl SendSessions {
         })
     }
 
-    /// The `setup_answer_rate` table, whose per-source bucket a REGISTER
-    /// is charged to as well (design 3.2 step 3).
-    pub(crate) fn rates_mut(&mut self) -> &mut EndpointRates {
-        &mut self.rates
-    }
-
     /// The announcements due at `now`, each to send on its endpoint;
     /// `emit` is called once per due SETUP.
     pub fn announce_due(&mut self, now: u64, mut emit: impl FnMut(EndpointId, SetupAnnounce)) {
@@ -369,7 +363,37 @@ impl SendSessions {
         let publication = session.publication;
         self.answer(
             &publication,
-            source,
+            Some(source),
+            now,
+            challenge.challenge,
+            joins(&publication),
+        )
+    }
+
+    /// A registrant's RSP_SETUP CHALLENGE, as [`SendSessions::challenge`]
+    /// but not charged to `setup_answer_rate`: the caller charged it to
+    /// the registrations' per-address bucket (karyos#945 review).
+    ///
+    /// # Errors
+    ///
+    /// The [`SendIgnored`] reason; the drop is counted.
+    pub(crate) fn registrant_challenge(
+        &mut self,
+        endpoint: EndpointId,
+        now: u64,
+        challenge: &RspChallenge,
+        joins: impl FnOnce(&Publication) -> Lanes<u64>,
+    ) -> Result<SetupAnswer, SendIgnored> {
+        let Some(session) = self.find(endpoint, challenge.alias) else {
+            return Err(self.ignore(SendIgnored::UnknownAlias));
+        };
+        if session.publication.identity != challenge.identity {
+            return Err(self.ignore(SendIgnored::WrongIdentity));
+        }
+        let publication = session.publication;
+        self.answer(
+            &publication,
+            None,
             now,
             challenge.challenge,
             joins(&publication),
@@ -396,7 +420,7 @@ impl SendSessions {
         let publication = session.publication;
         self.answer(
             &publication,
-            source,
+            Some(source),
             now,
             solicit.challenge,
             joins(&publication),
@@ -406,7 +430,7 @@ impl SendSessions {
     fn answer(
         &mut self,
         publication: &Publication,
-        source: SocketAddr,
+        charged: Option<SocketAddr>,
         now: u64,
         challenge: karyos_protocol::network::ChallengeBlock,
         joins: Lanes<u64>,
@@ -414,7 +438,10 @@ impl SendSessions {
         if joins.count() != publication.lane_count {
             return Err(self.ignore(SendIgnored::Joins));
         }
-        self.admit(source, now)?;
+        // `None`: charged by the caller to another bucket.
+        if let Some(source) = charged {
+            self.admit(source, now)?;
+        }
         self.counters.bump(|c| &mut c.answers);
         Ok(SetupAnswer {
             alias: publication.alias,

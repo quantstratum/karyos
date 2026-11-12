@@ -42,12 +42,9 @@ fn config(ranges: &[AddressRange]) -> Setup {
     }
 }
 
-/// The driver's registrations, the sender's `setup_answer_rate` table they
-/// borrow (20 per second, one entry per tracked source) and one
-/// publication's allowlist.
+/// The driver's registrations and one publication's allowlist.
 struct Harness {
     registrations: Registrations,
-    source_rates: EndpointRates,
     allow: RegistrationPolicy,
 }
 
@@ -60,7 +57,6 @@ impl Harness {
         now: u64,
     ) -> RegisterOutcome {
         self.registrations.register(
-            &mut self.source_rates,
             &mut self.allow,
             source,
             register,
@@ -90,7 +86,6 @@ impl Harness {
 
 fn registrations(setup: Setup) -> Harness {
     Harness {
-        source_rates: EndpointRates::new(20, setup.config.sources).unwrap(),
         registrations: Registrations::new(setup.config, T0).unwrap(),
         allow: setup.allow,
     }
@@ -230,20 +225,12 @@ fn the_driver_limits_are_shared_by_its_publications() {
         ..RegistrationConfig::default()
     };
     let mut driver = Registrations::new(c, T0).unwrap();
-    let mut rates = EndpointRates::new(20, 64).unwrap();
     let mut lan = allow(&[range([10, 0, 0, 0], 8)]);
     let mut other = allow(&[range([10, 9, 0, 0], 16)]);
     let mut on = |allowlist: &mut RegistrationPolicy, from: SocketAddr, stream_id: i32| {
         let mut r = register(u64::from(from.port()));
         r.stream_id = stream_id;
-        driver.register(
-            &mut rates,
-            allowlist,
-            from,
-            &r,
-            (Existing::None, Capacity::Free),
-            T0,
-        )
+        driver.register(allowlist, from, &r, (Existing::None, Capacity::Free), T0)
     };
     for (host, stream) in [(1, 1), (2, 2), (3, 1)] {
         let from = SocketAddr::from(([10, 9, 0, host], 40_000));
@@ -253,17 +240,21 @@ fn the_driver_limits_are_shared_by_its_publications() {
             RegisterOutcome::Announce { .. }
         ));
     }
-    // The fourth, to either publication, finds the driver's table full.
+    // The fourth, to either publication, finds the driver's table full
+    // and replaces its oldest entry, the first publication's.
     let from = SocketAddr::from(([10, 9, 0, 4], 40_000));
     assert_eq!(
         on(&mut other, from, 2),
-        RegisterOutcome::Drop(RegisterDrop::PendingFull)
+        RegisterOutcome::Announce { source: from }
     );
     // Then the driver's total of four per second is spent for both.
     assert_eq!(
         on(&mut lan, SocketAddr::from(([10, 9, 0, 5], 40_000)), 1),
         RegisterOutcome::Drop(RegisterDrop::Rate)
     );
+    assert_eq!(driver.counters().pending_replaced, 1);
+    assert_eq!(driver.pending().len(), 3);
+    assert_eq!(driver.pending()[0].source.ip(), IpAddr::from([10, 9, 0, 2]));
     // A CHALLENGE takes only the entry of its own stream.
     let from = SocketAddr::from(([10, 9, 0, 2], 40_000));
     assert_eq!(driver.challenged(&mut lan, 1, from, [40_000, 1], T0), None);
@@ -359,19 +350,15 @@ fn the_allowlist_is_not_authentication() {
     let any = [range([0, 0, 0, 0], 0)];
     let mut r = registrations(config(&any));
     let from = source(5, 40_123);
-    // Admission is not trust: the per-source bounds still apply.
-    assert!(matches!(
-        r.register(from, &register(1), Capacity::Free, T0),
-        RegisterOutcome::Announce { .. }
-    ));
-    assert!(matches!(
-        r.register(from, &register(2), Capacity::Free, T0),
-        RegisterOutcome::Announce { .. }
-    ));
-    assert_eq!(
-        r.register(from, &register(3), Capacity::Free, T0),
-        RegisterOutcome::Drop(RegisterDrop::SourcePendingFull)
-    );
+    // Admission is not trust: the per-source bounds still apply, a third
+    // entry replacing the source's oldest.
+    for id in [3, 1, 2] {
+        assert!(matches!(
+            r.register(from, &register(id), Capacity::Free, T0),
+            RegisterOutcome::Announce { .. }
+        ));
+    }
+    assert_eq!(r.counters().pending_replaced, 1);
     // A full table refuses an allowed source as any other.
     let other = source(6, 40_123);
     assert_eq!(
@@ -407,9 +394,14 @@ fn the_per_source_rate_is_a_limit() {
         RegisterOutcome::Drop(RegisterDrop::SourceRate)
     );
     assert_eq!(r.counters().retried, 19);
-    // Another source of the same host has its own bucket.
-    assert!(matches!(
+    // Another port of the same address shares its bucket (karyos#940);
+    // another address has its own.
+    assert_eq!(
         r.register(source(5, 40_124), &register(8), Capacity::Free, T0),
+        RegisterOutcome::Drop(RegisterDrop::SourceRate)
+    );
+    assert!(matches!(
+        r.register(source(6, 40_123), &register(8), Capacity::Free, T0),
         RegisterOutcome::Announce { .. }
     ));
     // One token back after 1/20 s.
@@ -447,18 +439,23 @@ fn the_driver_rate_is_a_limit() {
 #[test]
 fn pending_registrations_are_bounded_globally_and_per_source() {
     let mut r = lan();
-    // Per source: two entries, whatever the receiver.
+    // Per source: two entries, whatever the receiver; a third replaces
+    // the source's oldest (karyos#940).
     let from = source(1, 40_000);
-    for id in 1..=2 {
+    for id in 1..=3 {
         assert!(matches!(
             r.register(from, &register(id), Capacity::Free, T0),
             RegisterOutcome::Announce { .. }
         ));
     }
-    assert_eq!(
-        r.register(from, &register(3), Capacity::Free, T0),
-        RegisterOutcome::Drop(RegisterDrop::SourcePendingFull)
-    );
+    let ids = |r: &Harness| -> Vec<u64> {
+        r.pending()
+            .iter()
+            .map(|entry| entry.receiver.receiver_id)
+            .collect()
+    };
+    assert_eq!(ids(&r), [2, 3]);
+    assert_eq!(r.counters().pending_replaced, 1);
     // Globally: 32 entries in all.
     let mut id = 10;
     for host in 2..=31u8 {
@@ -469,15 +466,20 @@ fn pending_registrations_are_bounded_globally_and_per_source() {
         ));
     }
     assert_eq!(r.pending().len(), 32);
-    assert_eq!(
-        r.register(source(200, 40_000), &register(999), Capacity::Free, T0),
-        RegisterOutcome::Drop(RegisterDrop::PendingFull)
-    );
+    // Globally: a 33rd replaces the oldest entry, never grows the table.
+    assert!(matches!(
+        r.register(source(200, 40_000), &register(999), Capacity::Free, T0 + 1),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert_eq!(r.pending().len(), 32);
+    assert_eq!(ids(&r)[..2], [3, 11]);
+    assert_eq!(r.counters().pending_replaced, 2);
+    assert_eq!(r.counters().dropped_pending_full, 0);
     // An entry not challenged by `join_timeout` is removed, and its room
     // is free again.
-    let late = T0 + 5 * SECOND;
+    let late = T0 + 1 + 5 * SECOND;
     assert!(matches!(
-        r.register(source(200, 40_000), &register(999), Capacity::Free, late),
+        r.register(source(201, 40_000), &register(998), Capacity::Free, late),
         RegisterOutcome::Announce { .. }
     ));
     assert_eq!(r.pending().len(), 1);
@@ -526,11 +528,13 @@ fn the_refusal_table_is_bounded() {
         ));
     }
     // Every rate entry is busy within the second: a fifth source gets no
-    // rate entry, so it is dropped before the refusal table is reached.
+    // rate entry and is bound by the driver's total alone, and with no
+    // refusal entry free within its interval it gets no ERR.
     assert_eq!(
         r.register(source(5, 1), &register(1), Capacity::Full, T0),
-        RegisterOutcome::Drop(RegisterDrop::SourceRate)
+        RegisterOutcome::Drop(RegisterDrop::RefusalLimited)
     );
+    assert_eq!(r.counters().source_rates_full, 1);
     // A second later both tables reuse idle entries.
     assert!(matches!(
         r.register(source(5, 1), &register(1), Capacity::Full, T0 + SECOND),
@@ -567,7 +571,8 @@ fn a_full_refusal_table_drops_a_new_source() {
 
 /// SPEC.md §6 bounds pending registrations per source address: a source
 /// that varies its port, or a spoofer of one victim address, holds no more
-/// entries and draws no more ERRs than one port would.
+/// entries, draws no more replies and no more ERRs than one port would
+/// (karyos#940: the rate is the address's too).
 #[test]
 fn the_per_source_bounds_hold_across_ports() {
     let mut r = lan();
@@ -582,9 +587,10 @@ fn the_per_source_bounds_hold_across_ports() {
             announced += 1;
         }
     }
-    assert_eq!(announced, 2);
+    assert_eq!(announced, 20);
     assert_eq!(r.pending().len(), 2);
-    assert_eq!(r.counters().dropped_source_pending_full, 62);
+    assert_eq!(r.counters().dropped_source_rate, 44);
+    assert_eq!(r.counters().pending_replaced, 18);
     let mut r = lan();
     let mut errs = 0;
     for port in 1..=64u16 {
@@ -618,11 +624,14 @@ fn the_sender_cannot_be_used_to_reflect_traffic() {
             bytes += sent_bytes(outcome);
         }
     }
-    // Only two pending entries per source: the rest is dropped, so the
-    // victim gets two ANNOUNCEs, far below the flood.
-    assert_eq!(replies, 2);
-    assert_eq!(bytes, 2 * 72);
-    assert!(bytes < flood_bytes);
+    // Only two pending entries per source, each new one replacing the
+    // oldest, and the address's rate: the victim gets 20 ANNOUNCEs at
+    // once and one per 50 ms after (19 within the second), far below the
+    // flood.
+    assert_eq!(replies, 20 + 19, "{replies}");
+    assert_eq!(bytes, replies * 72);
+    assert!(bytes * 100 < flood_bytes);
+    assert_eq!(r.pending().len(), 2);
     // Retries of one entry are the most a source can draw: the rate.
     let mut r = lan();
     let mut replies = 0;
@@ -632,8 +641,8 @@ fn the_sender_cannot_be_used_to_reflect_traffic() {
             replies += 1;
         }
     }
-    // 20 at once, then one per 50 ms over the remaining second.
-    assert!(replies <= 20 + 20, "{replies}");
+    // 20 at once, then one per 50 ms over the remaining second (19).
+    assert_eq!(replies, 20 + 19, "{replies}");
     // A full table: one ERR per second whatever the flood.
     let mut r = lan();
     let mut errs = 0;
@@ -679,7 +688,6 @@ fn the_sender_cannot_be_used_to_reflect_traffic() {
 #[test]
 fn each_publication_checks_its_own_address_family() {
     let mut driver = Registrations::new(RegistrationConfig::default(), T0).unwrap();
-    let mut rates = EndpointRates::new(20, 64).unwrap();
     let any_v6 =
         RegistrationAllowlist::new(&[
             AddressRange::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).unwrap()
@@ -690,7 +698,6 @@ fn each_publication_checks_its_own_address_family() {
     let from = SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 9), 40_000));
     assert_eq!(
         driver.register(
-            &mut rates,
             &mut v4,
             from,
             &register(7),
@@ -701,7 +708,6 @@ fn each_publication_checks_its_own_address_family() {
     );
     assert_eq!(
         driver.register(
-            &mut rates,
             &mut v6,
             from,
             &register(7),
@@ -726,7 +732,6 @@ fn an_existing_receiver_drops_the_register_under_its_own_reason() {
     ];
     for (at, (existing, dropped)) in (0u64..).zip(cases) {
         let outcome = r.registrations.register(
-            &mut r.source_rates,
             &mut r.allow,
             from,
             &register(7),
@@ -747,7 +752,6 @@ fn an_existing_receiver_drops_the_register_under_its_own_reason() {
         RegisterOutcome::Announce { .. }
     ));
     let retried = r.registrations.register(
-        &mut r.source_rates,
         &mut r.allow,
         from,
         &register(8),
@@ -809,10 +813,11 @@ fn a_required_id_registers_past_full_optional_tables() {
             RegisterOutcome::Announce { .. }
         ));
     }
-    assert_eq!(
+    // A third optional entry replaces the oldest: the table never grows.
+    assert!(matches!(
         r.register(source(3, 1), &register(3), Capacity::Free, T0),
-        RegisterOutcome::Drop(RegisterDrop::PendingFull)
-    );
+        RegisterOutcome::Announce { .. }
+    ));
     let required = source(9, 1);
     assert_eq!(
         r.register(required, &register(42), Capacity::Full, T0),
@@ -896,15 +901,265 @@ fn reserved_entries_count_per_source_and_expire() {
         r.register(from, &named(7, 2), Capacity::Free, T0),
         RegisterOutcome::Announce { .. }
     ));
-    assert_eq!(
-        r.register(from, &named(43, 3), Capacity::Free, T0),
-        RegisterOutcome::Drop(RegisterDrop::SourcePendingFull)
-    );
-    let late = T0 + RegistrationConfig::default().join_timeout;
+    // A third replaces the source's oldest, the optional one (the tie
+    // goes to the optional table): the source still holds two.
     assert!(matches!(
-        r.register(from, &named(43, 3), Capacity::Free, late),
+        r.register(from, &named(43, 3), Capacity::Free, T0 + 1),
         RegisterOutcome::Announce { .. }
     ));
-    assert_eq!(r.allow.reserved().len(), 1);
+    assert_eq!(r.counters().required_pending_replaced, 1);
+    let ids: Vec<u64> = r
+        .allow
+        .reserved()
+        .iter()
+        .chain(r.pending())
+        .map(|entry| entry.receiver.receiver_id)
+        .collect();
+    assert_eq!(ids, [42, 43]);
+    let join_timeout = RegistrationConfig::default().join_timeout;
+    assert!(matches!(
+        r.register(from, &named(42, 4), Capacity::Free, T0 + join_timeout),
+        RegisterOutcome::Announce { .. }
+    ));
+    // 42's first entry expired; 43's, a nanosecond younger, not yet.
+    assert_eq!(r.counters().expired, 1);
+    assert_eq!(r.allow.reserved().len(), 2);
+    assert!(r.pending().is_empty());
+}
+
+fn named(receiver_id: u64, boot: u64) -> RspRegister {
+    RspRegister {
+        stream_id: STREAM,
+        receiver: Receiver {
+            receiver_boot_id: [boot, boot],
+            receiver_id,
+        },
+    }
+}
+
+/// karyos#940 item 1: two entries held under a required receiver's own
+/// address, on other ports and naming optional ids, do not keep its
+/// REGISTER out: it replaces the older, at every retry.
+#[test]
+fn optional_entries_under_a_required_receivers_address_do_not_lock_it_out() {
+    let mut r = with_required(&[42]);
+    let real = source(100, 5000);
+    let join_timeout = RegistrationConfig::default().join_timeout;
+    for (round, now) in [T0, T0 + join_timeout].into_iter().enumerate() {
+        for port in [1u16, 2] {
+            assert!(matches!(
+                r.register(
+                    source(100, port),
+                    &named(u64::from(port), 1),
+                    Capacity::Free,
+                    now
+                ),
+                RegisterOutcome::Announce { .. }
+            ));
+        }
+        assert_eq!(
+            r.register(real, &named(42, 100), Capacity::Free, now + 1),
+            RegisterOutcome::Announce { source: real }
+        );
+        assert_eq!(r.counters().required_pending_replaced, 1 + round as u64);
+        assert_eq!(r.counters().dropped_source_pending_full, 0);
+        // Its CHALLENGE finds its entry; the source holds two at most.
+        let held = r
+            .pending()
+            .iter()
+            .chain(r.allow.reserved())
+            .filter(|entry| entry.source.ip() == real.ip())
+            .count();
+        assert_eq!(held, 2);
+        assert!(r.challenged(real, [100, 100], now + 2).is_some());
+    }
+}
+
+/// karyos#940 item 1: two reserved entries of the required id itself,
+/// spoofed from its own address, are replaced, not counted against the
+/// bound its REGISTER replaces.
+#[test]
+fn required_entries_under_a_required_receivers_address_are_replaced() {
+    let mut r = with_required(&[42]);
+    for port in [1u16, 2] {
+        assert!(matches!(
+            r.register(
+                source(100, port),
+                &named(42, u64::from(port)),
+                Capacity::Free,
+                T0
+            ),
+            RegisterOutcome::Announce { .. }
+        ));
+    }
+    let real = source(100, 5000);
+    assert_eq!(
+        r.register(real, &named(42, 100), Capacity::Free, T0 + 1),
+        RegisterOutcome::Announce { source: real }
+    );
+    assert_eq!(r.counters().required_pending_replaced, 1);
+    // Only the older of its own entries went: one replacement, not two.
+    let held: Vec<SocketAddr> = r
+        .allow
+        .reserved()
+        .iter()
+        .map(|entry| entry.source)
+        .collect();
+    assert_eq!(held, [source(100, 2), real]);
+    assert!(r.challenged(real, [100, 100], T0 + 2).is_some());
+}
+
+/// karyos#940 item 5: spoofed REGISTERs filling the driver's optional
+/// pending table do not keep a registrant out: its REGISTER replaces the
+/// oldest entry, and a retry of an entry does not refresh it.
+#[test]
+fn a_full_pending_table_replaces_its_oldest_entry() {
+    let mut r = lan();
+    for host in 1..=16u8 {
+        for port in [1u16, 2] {
+            assert!(matches!(
+                r.register(
+                    source(host, port),
+                    &named(u64::from(host) * 10 + u64::from(port), 1),
+                    Capacity::Free,
+                    T0
+                ),
+                RegisterOutcome::Announce { .. }
+            ));
+        }
+    }
+    assert_eq!(r.pending().len(), 32);
+    // A retry of the oldest entry is a retry: it is not moved to the end.
+    assert!(matches!(
+        r.register(source(1, 1), &named(11, 1), Capacity::Free, T0 + 1),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert_eq!(r.counters().retried, 1);
+    let real = source(200, 5000);
+    assert_eq!(
+        r.register(real, &named(7, 7), Capacity::Free, T0 + 2),
+        RegisterOutcome::Announce { source: real }
+    );
+    assert_eq!(r.pending().len(), 32);
+    assert_eq!(r.counters().pending_replaced, 1);
+    assert_eq!(r.counters().dropped_pending_full, 0);
+    assert!(
+        r.pending()
+            .iter()
+            .all(|entry| entry.receiver.receiver_id != 11)
+    );
+    assert!(r.challenged(real, [7, 7], T0 + 3).is_some());
+}
+
+/// karyos#940 item 4: the per-source rate is the address's, in a table of
+/// its own: 64 REGISTERs from one address on as many ports in one second
+/// do not make another address's REGISTER drop for its rate.
+#[test]
+fn registers_from_many_ports_of_one_address_leave_other_addresses_their_rate() {
+    let mut r = lan();
+    for port in 1..=64u16 {
+        let _ = r.register(source(77, port), &named(1, 1), Capacity::Free, T0);
+    }
+    assert_eq!(r.counters().dropped_source_rate, 44);
+    let other = source(50, 5000);
+    assert_eq!(
+        r.register(other, &named(5, 50), Capacity::Free, T0 + 1),
+        RegisterOutcome::Announce { source: other }
+    );
+    assert_eq!(r.counters().dropped_source_rate, 44);
+}
+
+/// karyos#945 review: filling the per-address rate table denies no
+/// REGISTER the driver's total admits. 64 allowlisted addresses, one
+/// REGISTER every 900 ms each (about 71 a second), keep every entry
+/// active, and a required receiver's REGISTER from a 65th address,
+/// retried every 100 ms for 5 s, is announced at each retry.
+#[test]
+fn sixty_four_addresses_filling_the_rate_table_leave_a_new_address_its_register() {
+    let mut r = with_required(&[42]);
+    let real = source(200, 5000);
+    let mut announced = 0;
+    for tick in 0..50u64 {
+        let now = T0 + tick * SECOND / 10;
+        if tick % 9 == 0 {
+            for host in 1..=64u8 {
+                let _ = r.register(
+                    source(host, 1),
+                    &named(1000 + u64::from(host), 1),
+                    Capacity::Free,
+                    now,
+                );
+            }
+        }
+        if matches!(
+            r.register(real, &named(42, 42), Capacity::Free, now + 1),
+            RegisterOutcome::Announce { .. }
+        ) {
+            announced += 1;
+        }
+    }
+    assert_eq!(announced, 50);
+    assert_eq!(r.counters().dropped_source_rate, 0);
+    assert_eq!(r.counters().source_rates_full, 50);
+}
+
+/// karyos#945 review: an address with no entry in a full rate table is
+/// still bound by the driver's total: it draws no more than `rate`.
+#[test]
+fn an_untracked_address_is_bound_by_the_driver_total() {
+    let mut c = config(&[range([10, 0, 0, 0], 8)]);
+    c.config.sources = 1;
+    c.config.pending = 4096;
+    c.config.pending_per_source = 4096;
+    let rate = c.config.rate;
+    let mut r = registrations(c);
+    assert!(matches!(
+        r.register(source(1, 1), &named(1, 1), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    let mut announced = 0u64;
+    for n in 0..2 * rate {
+        if matches!(
+            r.register(source(2, 1), &named(n + 2, n + 2), Capacity::Free, T0),
+            RegisterOutcome::Announce { .. }
+        ) {
+            announced += 1;
+        }
+    }
+    assert_eq!(announced, rate - 1);
+    assert_eq!(r.counters().dropped_rate, rate + 1);
+}
+
+/// MC-6: a CHALLENGE at or after its entry's `join_timeout` takes nothing
+/// and would take nothing; one just before does.
+#[test]
+fn a_challenge_after_join_timeout_takes_no_entry() {
+    let mut r = with_required(&[42]);
+    let join_timeout = RegistrationConfig::default().join_timeout;
+    let (optional, required) = (source(5, 1), source(6, 1));
+    assert!(matches!(
+        r.register(optional, &named(7, 7), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert!(matches!(
+        r.register(required, &named(42, 42), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    let late = T0 + join_timeout;
+    let both = [(optional, 7), (required, 42)];
+    for (from, boot) in both {
+        assert!(
+            r.registrations
+                .would_challenge(&r.allow, STREAM, from, [boot, boot], late - 1)
+        );
+        assert!(
+            !r.registrations
+                .would_challenge(&r.allow, STREAM, from, [boot, boot], late)
+        );
+    }
+    for (from, boot) in both {
+        assert_eq!(r.challenged(from, [boot, boot], late), None);
+    }
     assert_eq!(r.counters().expired, 2);
+    assert_eq!(r.counters().challenged, 0);
 }

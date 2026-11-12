@@ -592,6 +592,10 @@ struct ReceiverBinding {
     sm_source: Option<SocketAddr>,
     /// The receiver boot id of the challenge block.
     boot_id: [u64; 2],
+    /// The receiver block of the REGISTER whose pending entry its last
+    /// ANSWER took, for a dynamic publication's registrant: its first SM
+    /// must name it (design 3.2; karyos#940). `None` for any other answer.
+    registered: Option<Receiver>,
     /// The publication incarnation answered.
     identity: Identity,
     /// The receiver id of its first SM since the last answer.
@@ -6544,16 +6548,25 @@ impl<T: StreamTerms> SenderRole<T> {
     }
 
     /// Records the receiver `answer` goes to: its challenge's `source` on
-    /// `endpoint` and its boot id. Its SMs then come from any source with
-    /// that boot id and incarnation; the first sets the binding's SM source
-    /// ([`Self::status`]).
+    /// `endpoint` and its boot id. On a static publication its SMs then
+    /// come from any source with that boot id and incarnation; the first
+    /// sets the binding's SM source and the others adopt it
+    /// ([`Self::status`]). On a dynamic publication its SM source is
+    /// `source` alone and it adopts nothing (design 2.4, MD-16).
     ///
     /// A new answer to a known tuple starts it over: unconfirmed, with no
     /// receiver id or status, so a reinstalled image binds again; its SM
     /// source and its adoptions stay. A full table evicts its oldest
     /// unconfirmed binding first; one full of confirmed bindings refuses
     /// and counts.
-    fn bind(&mut self, endpoint: EndpointId, source: SocketAddr, answer: &SetupAnswer, now: u64) {
+    fn bind(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        answer: &SetupAnswer,
+        registered: Option<Receiver>,
+        now: u64,
+    ) {
         self.expire_bindings(now);
         let tuple = |held: &ReceiverBinding| {
             (
@@ -6578,6 +6591,7 @@ impl<T: StreamTerms> SenderRole<T> {
             // and the receiver id it had is remembered for the next SM.
             held.former = held.receiver_id.or(held.former);
             held.receiver_id = None;
+            held.registered = registered;
             held.joins = answer.joins;
             held.answered_at = now;
             held.last_sm = None;
@@ -6608,6 +6622,7 @@ impl<T: StreamTerms> SenderRole<T> {
             solicited_from: normalized(source),
             sm_source: None,
             boot_id: answer.challenge.receiver_boot_id,
+            registered,
             identity: answer.identity,
             receiver_id: None,
             former: None,
@@ -6674,6 +6689,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 self.binding_gone(&child, receiver_id, now);
             }
         }
+        self.retire_uncovered_registrants(removed.endpoint, removed.alias, now);
     }
 
     /// Removes the bindings past their lifetime at `now`: an unconfirmed
@@ -6688,43 +6704,54 @@ impl<T: StreamTerms> SenderRole<T> {
         };
         while let Some(index) = self.bindings.iter().position(expired) {
             self.count(|c| &mut c.bindings_expired);
-            self.registrant_timed_out(index, now);
             self.remove_binding(index, now, |c| &mut c.bindings_expired);
         }
     }
 
-    /// Frees the slot of a dynamic publication's optional registrant whose
-    /// confirmed binding at `index` expires at `now` with no SM for
-    /// `image_liveness_timeout` (design 3.7, 8), unless another binding
-    /// still takes SMs at its address (a receiver restarted there).
-    fn registrant_timed_out(&mut self, index: usize, now: u64) {
-        let Some(held) = self.bindings.get(index).copied() else {
-            return;
-        };
-        let Some(address) = held.sm_source else {
-            return;
-        };
-        let shared = self.bindings.iter().enumerate().any(|(at, other)| {
-            at != index
-                && other.endpoint == held.endpoint
-                && other.alias == held.alias
-                && other.sm_source == Some(address)
-        });
-        if shared {
-            return;
-        }
-        let retired = self
-            .publications
-            .iter_mut()
-            .find(|outbound| outbound.serves(held.endpoint) && outbound.alias() == held.alias)
-            .is_some_and(|outbound| {
-                outbound.retire_registrant(
-                    address,
-                    crate::agents::data::RemovalReason::Timeout,
-                    now,
-                )
+    /// Frees each optional registrant slot of the dynamic publication of
+    /// `alias` on `endpoint` that no binding covers any more, as a
+    /// timeout (design 3.7, 8): run by [`Self::remove_binding`], the one
+    /// place a binding goes, so the slot goes in the same step.
+    ///
+    /// The invariant it keeps: every optional registrant slot of a dynamic
+    /// publication has a binding whose source ([`ReceiverBinding::source`])
+    /// is the slot's address, and that binding expires with no SM
+    /// ([`Self::expire_bindings`]). It holds because a slot is taken only
+    /// through the binding at its address (`settle_registrant`), a
+    /// dynamic binding's source never changes (it learns its SM source
+    /// only where it was answered and adopts nothing), and every removal
+    /// path (expiry, `make_room` eviction, a refused or full join, a
+    /// restart or move, a child with its parent) runs through
+    /// [`Self::remove_binding`]. Removing a publication drops its slots
+    /// with its bindings. Static publications hold no registrant slot,
+    /// so this changes nothing for them.
+    fn retire_uncovered_registrants(&mut self, endpoint: EndpointId, alias: Alias, now: u64) {
+        loop {
+            let bindings = &self.bindings;
+            let Some(outbound) = self
+                .publications
+                .iter_mut()
+                .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            else {
+                return;
+            };
+            let uncovered = outbound.uncovered_registrant(|address| {
+                bindings.iter().any(|binding| {
+                    outbound.serves(binding.endpoint)
+                        && binding.alias == alias
+                        && binding.source() == address
+                })
             });
-        if retired {
+            let Some(address) = uncovered else {
+                return;
+            };
+            if !outbound.retire_registrant(
+                address,
+                crate::agents::data::RemovalReason::Timeout,
+                now,
+            ) {
+                return;
+            }
             self.count(|c| &mut c.registrants_timed_out);
         }
     }
@@ -7079,10 +7106,12 @@ impl<T: StreamTerms> SenderRole<T> {
             return None;
         }
         // Only the registrant this sender answered, at the source it
-        // registered from, with no SM yet: a stranger anything else is
-        // unbound.
+        // registered from, with no SM since its last ANSWER: a stranger
+        // anything else is unbound. A binding answered again at its own
+        // SM source is one too, so its next SM cannot rename the slot it
+        // holds (karyos#940).
         let registrant = match found {
-            SmBinding::Learn(index) if dynamic => self
+            SmBinding::Learn(index) | SmBinding::Bound(index) if dynamic => self
                 .bindings
                 .get(index)
                 .filter(|binding| {
@@ -7094,6 +7123,26 @@ impl<T: StreamTerms> SenderRole<T> {
             _ => None,
         };
         if stranger && registrant.is_none() {
+            self.count(|c| &mut c.sm_unbound);
+            return None;
+        }
+        // On a dynamic publication a binding learns its SM source only
+        // from the source it was answered at, and adopts none: a
+        // destination has one binding, whose source is its endpoint
+        // (design 2.4, MD-16). An SM from another source, such as another
+        // slot of the same host, would name a receiver id past
+        // `settle_registrant`, and an adoption would share a slot's address
+        // with a binding that can go without it (karyos#945 review).
+        // Static publications adopt as before.
+        let elsewhere = match found {
+            SmBinding::Learn(index) => self
+                .bindings
+                .get(index)
+                .is_some_and(|binding| binding.solicited_from != source),
+            SmBinding::Adopt(_) => true,
+            SmBinding::Bound(_) => false,
+        };
+        if dynamic && elsewhere {
             self.count(|c| &mut c.sm_unbound);
             return None;
         }
@@ -7211,7 +7260,12 @@ impl<T: StreamTerms> SenderRole<T> {
             .iter_mut()
             .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias)
             .map_or(DestinationChange::Unknown, |outbound| {
-                outbound.join_registrant(source, required, now, quarantine)
+                outbound.join_registrant(
+                    source,
+                    (status.receiver.receiver_id, required),
+                    now,
+                    quarantine,
+                )
             });
         match outcome {
             DestinationChange::Added => {
@@ -7242,7 +7296,9 @@ impl<T: StreamTerms> SenderRole<T> {
     /// its validated source, or nothing. Only a `control-mode=dynamic`
     /// publication of its stream on that endpoint, not being removed,
     /// admits it, through the driver's registrations under that
-    /// publication's policy, charging the `setup_answer_rate` bucket.
+    /// publication's policy. A receiver restarting at the endpoint of its
+    /// own optional slot needs no new slot: it is not refused for a full
+    /// table (design 3.2 step 4).
     fn register(
         &mut self,
         endpoint: EndpointId,
@@ -7264,7 +7320,13 @@ impl<T: StreamTerms> SenderRole<T> {
         };
         let outbound = self.publications.get(at)?;
         let alias = outbound.alias();
-        let capacity = outbound.registration_capacity();
+        let reused =
+            outbound.registrant_at(normalized(source)) == Some(register.receiver.receiver_id);
+        let capacity = if reused {
+            crate::sessions::register::Capacity::Free
+        } else {
+            outbound.registration_capacity()
+        };
         let required = outbound
             .registration()?
             .is_required(register.receiver.receiver_id);
@@ -7277,14 +7339,9 @@ impl<T: StreamTerms> SenderRole<T> {
             now,
         );
         let policy = self.publications.get_mut(at)?.registration_mut()?;
-        let outcome = self.registrations.register(
-            self.sessions.rates_mut(),
-            policy,
-            source,
-            register,
-            (existing, capacity),
-            now,
-        );
+        let outcome =
+            self.registrations
+                .register(policy, source, register, (existing, capacity), now);
         match outcome {
             RegisterOutcome::Announce { source } => self
                 .sessions
@@ -7304,10 +7361,11 @@ impl<T: StreamTerms> SenderRole<T> {
     /// What the publication `alias` on `endpoint` holds of `receiver`,
     /// registering from `source` at `now` (design 2.3, 3.2 step 4): its
     /// confirmed bindings are its memberships, looked up by source, then
-    /// by `receiver_id`. A required receiver id is never restarted nor
-    /// moved (owner decision M4, MD-19); an optional one restarts, or
-    /// moves once its old binding has accepted no SM for
-    /// `destination_move_quiet`.
+    /// by `receiver_id`. A source in its quarantine is dropped (design
+    /// 3.7). A required receiver id is never restarted nor moved (owner
+    /// decision M4, MD-19); an optional one restarts or moves once its old
+    /// binding has accepted no SM for `destination_move_quiet`, so a host
+    /// naming a live receiver's id cannot evict it (karyos#940).
     fn registrant_lookup(
         &self,
         endpoint: EndpointId,
@@ -7321,30 +7379,51 @@ impl<T: StreamTerms> SenderRole<T> {
 
         let identity = self.sessions.identity(endpoint, alias);
         let quiet = self.registrations.config().move_quiet;
+        let quarantine = self.membership.receiver_timeout;
+        let quarantined = self
+            .publications
+            .iter()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            .is_some_and(|outbound| outbound.in_quarantine(source, now, quarantine));
+        if quarantined {
+            return Existing::Quarantined;
+        }
         let mut existing = Existing::None;
         for held in self.bindings.iter().filter(|held| {
             held.endpoint == endpoint
                 && held.alias == alias
                 && Some(held.identity) == identity
-                && held.receiver_id == Some(receiver.receiver_id)
+                && held.receiver_id.or(held.former) == Some(receiver.receiver_id)
         }) {
             let at_source = held.source() == source;
             let same_boot = held.boot_id == receiver.receiver_boot_id;
+            let live = held.last_sm.is_none_or(|last| age_ns(now, last) < quiet);
             let decided = match (same_boot, at_source) {
                 (true, true) => Existing::Bound,
                 (false, _) if required => Existing::BootChanged,
+                (false, _) if live => Existing::DuplicateReceiver,
                 (false, _) => Existing::None,
-                (true, false)
-                    if required || held.last_sm.is_none_or(|last| age_ns(now, last) < quiet) =>
-                {
-                    Existing::DuplicateReceiver
-                }
+                (true, false) if required || live => Existing::DuplicateReceiver,
                 (true, false) => Existing::None,
             };
             if decided != Existing::None {
                 existing = decided;
                 break;
             }
+        }
+        // A required id with no binding left whose reserved slot is still
+        // held: its `Membership` refuses it for the incarnation (design
+        // 4.6, M5), so its REGISTER is dropped, at its own endpoint or any
+        // other, before it is announced (karyos#945 review).
+        if existing == Existing::None
+            && required
+            && self
+                .publications
+                .iter()
+                .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+                .is_some_and(|outbound| outbound.holds_required(receiver.receiver_id))
+        {
+            existing = Existing::RequiredLost;
         }
         existing
     }
@@ -7358,8 +7437,9 @@ impl<T: StreamTerms> SenderRole<T> {
     /// `moved`); a required receiver id is never restarted nor moved, and a
     /// receiver still live elsewhere is a `duplicate_receiver`. A
     /// `stranger`, not a destination yet, takes its slot first. `None`
-    /// when settled; otherwise its binding is dropped and the outcome holds
-    /// what to answer.
+    /// when settled; otherwise the outcome holds what to answer, and a
+    /// stranger's binding is dropped, while one at a slot already held
+    /// stays, reset, to expire it.
     #[allow(
         clippy::option_option,
         reason = "settled, refused with a reply, or refused without one"
@@ -7391,19 +7471,43 @@ impl<T: StreamTerms> SenderRole<T> {
                 && held.endpoint == endpoint
                 && held.alias == status.alias
                 && held.identity == status.identity
-                && held.receiver_id == Some(receiver.receiver_id)
+                && held.receiver_id.or(held.former) == Some(receiver.receiver_id)
         };
-        // Decide first, change nothing yet.
-        let refused = self.bindings.iter().filter(|held| other(held)).any(|held| {
-            let same_boot = held.boot_id == receiver.receiver_boot_id;
-            required
-                || (same_boot
-                    && held.source() != source
-                    && held.last_sm.is_none_or(|last| age_ns(now, last) < quiet))
-        });
+        // Decide first, change nothing yet. The SM must name the receiver
+        // block its REGISTER named, and at a slot already held, that
+        // slot's receiver id (karyos#940): an SM cannot claim an id, a
+        // required one least of all, that its REGISTER did not.
+        let unregistered = match mine.registered {
+            Some(registered) => registered != receiver,
+            None => stranger,
+        };
+        let foreign = !stranger
+            && self
+                .publications
+                .iter()
+                .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias)
+                .and_then(|outbound| outbound.registrant_at(source))
+                != Some(receiver.receiver_id);
+        // Another binding of the id: a required id is never restarted nor
+        // moved, and an optional one only once quiet (karyos#940).
+        let refused = unregistered
+            || foreign
+            || self.bindings.iter().filter(|held| other(held)).any(|held| {
+                let same_boot = held.boot_id == receiver.receiver_boot_id;
+                let live = held.last_sm.is_none_or(|last| age_ns(now, last) < quiet);
+                required || (live && !(same_boot && held.source() == source))
+            });
         if refused {
             self.count(|c| &mut c.registrants_refused);
-            self.remove_binding(index, now, |c| &mut c.registrants_refused);
+            // At a slot already held, the binding is the one that holds it
+            // or one beside it: it stays, reset and unconfirmed, so it
+            // expires at `setup_challenge_timeout` and the slot retires
+            // with it (`registrant_timed_out`), unless its own receiver's
+            // next SM confirms it first. Dropping it would leave the slot
+            // with nothing to expire it (karyos#945 review).
+            if stranger {
+                self.remove_binding(index, now, |c| &mut c.registrants_refused);
+            }
             return Some(None);
         }
         if stranger
@@ -7449,11 +7553,12 @@ impl<T: StreamTerms> SenderRole<T> {
 
     /// Whether `control` is the CHALLENGE of a pending registrant of the
     /// `control-mode=dynamic` publication it names on `endpoint`, from the
-    /// source it registered from (design 3.2, 9.2): it takes that pending
-    /// entry, so the ANSWER goes to that validated source and nowhere
-    /// else. A CHALLENGE naming another incarnation takes nothing.
+    /// source it registered from (design 3.2, 9.2), so the ANSWER goes to
+    /// that validated source and nowhere else. Changes nothing: the entry
+    /// is taken by [`Self::registrant_taken`] once the ANSWER goes. A
+    /// CHALLENGE naming another incarnation matches nothing.
     fn registrant_challenge(
-        &mut self,
+        &self,
         endpoint: EndpointId,
         source: SocketAddr,
         control: &Control,
@@ -7467,12 +7572,43 @@ impl<T: StreamTerms> SenderRole<T> {
         }
         let Some(policy) = self
             .publications
-            .iter_mut()
+            .iter()
             .find(|outbound| outbound.serves(endpoint) && outbound.alias() == challenge.alias)
-            .and_then(|outbound| outbound.registration_mut())
+            .and_then(|outbound| outbound.registration())
         else {
             return false;
         };
+        self.registrations.would_challenge(
+            policy,
+            challenge.alias.stream_id,
+            source,
+            challenge.challenge.receiver_boot_id,
+            now,
+        )
+    }
+
+    /// Takes the pending entry the CHALLENGE `control` from `source`
+    /// answers, as [`Self::registrant_challenge`] matched it, once its
+    /// ANSWER goes (design 3.2: the CHALLENGE moves it on), and returns the
+    /// receiver block its REGISTER named; `None` when it took none.
+    fn registrant_taken(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        control: &Control,
+        now: u64,
+    ) -> Option<Receiver> {
+        let Control::Challenge(challenge) = control else {
+            return None;
+        };
+        if self.sessions.identity(endpoint, challenge.alias) != Some(challenge.identity) {
+            return None;
+        }
+        let policy = self
+            .publications
+            .iter_mut()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == challenge.alias)
+            .and_then(|outbound| outbound.registration_mut())?;
         self.registrations
             .challenged(
                 policy,
@@ -7481,7 +7617,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 challenge.challenge.receiver_boot_id,
                 now,
             )
-            .is_some()
+            .map(|entry| entry.receiver)
     }
 
     /// Which binding an SM from `source` on `endpoint` belongs to (plan
@@ -7592,6 +7728,9 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.refused);
             return None;
         };
+        // Whether it is a pending registrant's CHALLENGE, from the source
+        // it registered from: decided once (karyos#945 review).
+        let registrant = self.registrant_challenge(endpoint, normalized(source), &control, now);
         // A multi-destination publication answers only a configured
         // destination, at that destination (design 9.2; MD-16): a source
         // outside its set is refused, so it reflects nothing.
@@ -7599,9 +7738,9 @@ impl<T: StreamTerms> SenderRole<T> {
             None => destination,
             Some(fanout) if fanout => {
                 let source = normalized(source);
-                // A registrant's CHALLENGE takes its pending entry even at
-                // a destination's address: a receiver restarted there.
-                let registrant = self.registrant_challenge(endpoint, source, &control, now);
+                // A registrant's CHALLENGE answers even at a destination's
+                // address: a receiver restarted there. Its pending entry is
+                // taken only once the ANSWER goes (karyos#940).
                 if !registrant && !self.sends_to(endpoint, alias, source) {
                     self.count(|c| &mut c.refused);
                     return None;
@@ -7610,7 +7749,18 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             Some(_) => destination,
         };
+        // A registrant's CHALLENGE is charged to its address's bucket of
+        // the registrations, not to the shared `setup_answer_rate` table
+        // (karyos#945 review): a refused one keeps its pending entry.
+        if registrant && !self.registrations.admit_challenge(source, now) {
+            self.count(|c| &mut c.refused);
+            return None;
+        }
         let answer = match control {
+            Control::Challenge(challenge) if registrant => {
+                self.sessions
+                    .registrant_challenge(endpoint, now, &challenge, |_| joins)
+            }
             Control::Challenge(challenge) => {
                 self.sessions
                     .challenge(endpoint, source, now, &challenge, |_| joins)
@@ -7623,7 +7773,8 @@ impl<T: StreamTerms> SenderRole<T> {
         };
         match answer {
             Ok(answer) => {
-                self.bind(endpoint, source, &answer, now);
+                let registered = self.registrant_taken(endpoint, source, &control, now);
+                self.bind(endpoint, source, &answer, registered, now);
                 Some((destination, Control::SetupAnswer(answer)))
             }
             Err(_) => {
