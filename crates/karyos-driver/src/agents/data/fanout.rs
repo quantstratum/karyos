@@ -603,24 +603,14 @@ impl Fanout {
 
     /// The optional destinations held, counting those removed and not
     /// retired yet: a retired slot is always an optional one's, since a
-    /// required destination is never removed.
+    /// required destination is never removed (a required receiver id never
+    /// leaves its one slot, karyos#940).
     fn optional_held(&self) -> usize {
         self.targets
             .iter()
             .filter(|target| !target.required)
             .count()
             .saturating_add(self.retired.len())
-    }
-
-    /// The required targets held beyond the required receiver ids
-    /// `reserved`, counting those removed and not retired yet: they take
-    /// optional slots (design 3.5).
-    fn required_over(&self, reserved: usize) -> usize {
-        self.targets
-            .iter()
-            .filter(|target| target.required)
-            .count()
-            .saturating_sub(reserved)
     }
 
     fn target_at(&mut self, address: SocketAddr) -> Option<&mut Target> {
@@ -955,31 +945,14 @@ impl<T: StreamTerms> Outbound<T> {
 
     /// Whether an optional registrant could take a slot now (design 3.2
     /// step 6, 3.5): the optional destinations, counting those removed and
-    /// not retired yet, and the required ones beyond the required receiver
-    /// ids, are below `max_destinations` minus the required receiver ids,
-    /// whose slots stay reserved (MD-17).
+    /// not retired yet, are below `max_destinations` minus the required
+    /// receiver ids, whose slots stay reserved (MD-17).
     pub(crate) fn registration_capacity(&self) -> crate::sessions::register::Capacity {
         use crate::sessions::register::Capacity;
         match self.fanout.as_deref() {
-            Some(fanout) if self.optional_taken(fanout) < self.optional_quota(fanout) => {
-                Capacity::Free
-            }
+            Some(fanout) if fanout.optional_held() < self.optional_quota(fanout) => Capacity::Free,
             _ => Capacity::Full,
         }
-    }
-
-    /// The slots of the optional quota taken: the optional destinations,
-    /// counting those removed and not retired yet, and the required ones
-    /// beyond the required receiver ids (a required id's slot that is
-    /// being replaced).
-    fn optional_taken(&self, fanout: &Fanout) -> usize {
-        let required = self
-            .registration
-            .as_deref()
-            .map_or(0, |policy| policy.required().len());
-        fanout
-            .optional_held()
-            .saturating_add(fanout.required_over(required))
     }
 
     /// The receiver id of the live dynamic registrant at `destination`, if
@@ -1028,10 +1001,12 @@ impl<T: StreamTerms> Outbound<T> {
     /// a slot of the optional quota, else [`DestinationChange::Full`].
     /// Otherwise as [`Outbound::change_destination`] adds one.
     ///
-    /// A required id holds one slot at a time (karyos#940): one it still
-    /// holds elsewhere, whose binding its owner found gone, is removed
-    /// first (reason `timeout`), and the new one waits for that removal's
-    /// report if the table has no other room.
+    /// A required id holds one slot for the publication's incarnation
+    /// (karyos#940; design 3.2 step 4, 4.6, M5): while it holds one
+    /// elsewhere, even one whose binding expired, a join from another
+    /// destination is refused ([`DestinationChange::Required`]), as its
+    /// `Membership` holds it `LostRequired`. Whether such a return may
+    /// replace its slot is open in quantstratum-docs#829.
     pub(crate) fn join_registrant(
         &mut self,
         destination: SocketAddr,
@@ -1043,21 +1018,23 @@ impl<T: StreamTerms> Outbound<T> {
             return DestinationChange::Unknown;
         }
         let full = match self.fanout.as_deref() {
-            Some(fanout) => !required && self.optional_taken(fanout) >= self.optional_quota(fanout),
+            Some(fanout) => !required && fanout.optional_held() >= self.optional_quota(fanout),
             None => return DestinationChange::Unknown,
         };
         if full {
             return DestinationChange::Full;
         }
-        if required && let Some(fanout) = self.fanout.as_deref_mut() {
-            for target in fanout.targets.iter_mut().filter(|target| {
-                target.required
-                    && target.removed.is_none()
-                    && target.receiver_id == Some(receiver_id)
-                    && target.address != destination
-            }) {
-                remove_target(target, RemovalReason::Timeout, now);
-            }
+        let held_elsewhere = required
+            && self.fanout.as_deref().is_some_and(|fanout| {
+                fanout.targets.iter().any(|target| {
+                    target.required
+                        && target.removed.is_none()
+                        && target.receiver_id == Some(receiver_id)
+                        && target.address != destination
+                })
+            });
+        if held_elsewhere {
+            return DestinationChange::Required;
         }
         let added = self.add_target(destination, required, now, quarantine);
         if added == DestinationChange::Added

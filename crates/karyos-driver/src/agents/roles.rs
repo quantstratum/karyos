@@ -7359,7 +7359,7 @@ impl<T: StreamTerms> SenderRole<T> {
             held.endpoint == endpoint
                 && held.alias == alias
                 && Some(held.identity) == identity
-                && held.receiver_id == Some(receiver.receiver_id)
+                && held.receiver_id.or(held.former) == Some(receiver.receiver_id)
         }) {
             let at_source = held.source() == source;
             let same_boot = held.boot_id == receiver.receiver_boot_id;
@@ -7422,7 +7422,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 && held.endpoint == endpoint
                 && held.alias == status.alias
                 && held.identity == status.identity
-                && held.receiver_id == Some(receiver.receiver_id)
+                && held.receiver_id.or(held.former) == Some(receiver.receiver_id)
         };
         // Decide first, change nothing yet. The SM must name the receiver
         // block its REGISTER named, and at a slot already held, that
@@ -7450,7 +7450,15 @@ impl<T: StreamTerms> SenderRole<T> {
             });
         if refused {
             self.count(|c| &mut c.registrants_refused);
-            self.remove_binding(index, now, |c| &mut c.registrants_refused);
+            // At a slot already held, the binding is the one that holds it
+            // or one beside it: it stays, reset and unconfirmed, so it
+            // expires at `setup_challenge_timeout` and the slot retires
+            // with it (`registrant_timed_out`), unless its own receiver's
+            // next SM confirms it first. Dropping it would leave the slot
+            // with nothing to expire it (karyos#945 review).
+            if stranger {
+                self.remove_binding(index, now, |c| &mut c.registrants_refused);
+            }
             return Some(None);
         }
         if stranger

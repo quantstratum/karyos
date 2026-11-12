@@ -635,22 +635,19 @@ fn dynamic_sender_config(
     outbound
         .set_registration(max, lan().with_required(required).unwrap())
         .unwrap();
-    outbound.attach_membership(Box::new(
-        crate::membership::Membership::new(
-            crate::membership::MembershipConfig::new(1, 1408, 32_768),
-            super::identity(),
-            alias(),
-            &crate::membership::Roles::default(),
-            0,
-        )
-        .unwrap(),
-    ));
+    // The publication's roles name the same required receiver ids as its
+    // registration policy, as `net/publish.rs` wires both: `AddPublication`
+    // builds the publication's `Membership` from them.
     let added = sender.command(AgentCommand::<OsSocket>::AddPublication {
         reply: replies.reserve().unwrap(),
         publication,
         outbound,
         guard: None,
-        roles: None,
+        roles: Some(Box::new(crate::membership::PublicationRoles {
+            strategy: crate::membership::Strategy::Min,
+            required: required.to_vec(),
+            tags: Vec::new(),
+        })),
     });
     assert!(matches!(
         added,
@@ -1046,10 +1043,30 @@ fn a_first_sm_naming_another_receiver_than_its_register_takes_no_slot() {
     assert_eq!(required_targets(&sender), [real]);
 }
 
+/// REGISTER, CHALLENGE and first SM of `receiver_id` with boot `boot` from
+/// `from` at `now`, each step only if the one before went through; what
+/// the SM answered, `None` also when an earlier step was refused.
+fn try_join(
+    sender: &mut super::super::SenderRole,
+    from: SocketAddr,
+    receiver_id: u64,
+    boot: u64,
+    now: u64,
+) -> Option<(SocketAddr, Control)> {
+    sender.register(EndpointId(1), from, &register_as(receiver_id, boot), now)?;
+    sender.answer_for(EndpointId(1), from, now, challenge_of(boot))?;
+    sender.status(EndpointId(1), from, &sm_as(receiver_id, boot), now + 1)
+}
+
+/// The admission of the publication's `Membership` at `now`.
+fn admission(sender: &super::super::SenderRole, now: u64) -> crate::membership::Admission {
+    sender.publications[0].membership().unwrap().admission(now)
+}
+
 /// karyos#940 item 2: one allowlisted host cannot turn the table into
 /// required targets. Joining as required id 42 from port after port, and
 /// renaming each slot by a REGISTER at its endpoint as an optional id,
-/// leaves at most one required target, and the optional quota free.
+/// leaves one required target, and the optional quota free.
 #[test]
 fn a_required_id_holds_at_most_one_slot() {
     let mut sender = dynamic_sender_with(4, &[42]);
@@ -1057,34 +1074,16 @@ fn a_required_id_holds_at_most_one_slot() {
     let mut now = T0;
     for port in 1..=4u16 {
         let boot = u64::from(port);
-        assert_eq!(
-            join_as(&mut sender, at(port), 42, boot, now),
-            None,
-            "port {port}"
-        );
-        let _ = removals(&mut sender, now + 1);
+        let _ = try_join(&mut sender, at(port), 42, boot, now);
         now += 10;
-        // A REGISTER at the slot's endpoint as another id: its first SM
-        // is refused, the slot stays 42's.
+        // A REGISTER at the required slot's endpoint as another id: its
+        // first SM is refused, the slot stays 42's.
         let other = 1000 + u64::from(port);
-        assert!(
-            sender
-                .register(EndpointId(1), at(port), &register_as(other, boot), now)
-                .is_some()
-        );
-        assert!(
-            sender
-                .answer_for(EndpointId(1), at(port), now, challenge_of(boot))
-                .is_some()
-        );
-        assert_eq!(
-            sender.status(EndpointId(1), at(port), &sm_as(other, boot), now + 1),
-            None
-        );
+        let _ = try_join(&mut sender, at(1), other, 1, now);
         now += 10;
-        assert!(required_targets(&sender).len() <= 1);
+        assert_eq!(required_targets(&sender), [at(1)], "port {port}");
     }
-    assert_eq!(sender.counters().registrants_refused, 4);
+    assert!(removals(&mut sender, now).is_empty());
     // The three optional slots are free for registrants.
     for last in 50..53u8 {
         let legit = SocketAddr::from(([10, 0, 0, last], 5000));
@@ -1096,31 +1095,43 @@ fn a_required_id_holds_at_most_one_slot() {
     }
 }
 
-/// karyos#940 item 2, with no attacker: a required receiver back on a new
-/// port after its liveness timeout replaces its slot (the old one is
-/// removed, reason `timeout`) instead of taking a second.
+/// karyos#945 review: a required receiver id holds one slot for the
+/// publication's incarnation (design 3.2 step 4, 4.6, M5). Back on a new
+/// port after its binding expired, with a new boot id or the same one, it
+/// is refused: its old slot stays, nothing is removed, and its
+/// `Membership`, which holds it `LostRequired`, and the destination table
+/// agree. Whether such a return may replace its slot is open in
+/// quantstratum-docs#829.
 #[test]
-fn a_required_receiver_back_after_its_timeout_replaces_its_slot() {
-    let mut sender = dynamic_sender_with(4, &[42]);
-    let (a, b): (SocketAddr, SocketAddr) = (
-        "10.0.0.9:5000".parse().unwrap(),
-        "10.0.0.9:5001".parse().unwrap(),
-    );
-    assert_eq!(join_as(&mut sender, a, 42, 7, T0), None);
-    let late = T0 + 2 * sender.confirmed_timeout;
-    sender.expire_bindings(late);
-    // A required target is never retired at its timeout.
-    assert_eq!(sender.counters().registrants_timed_out, 0);
-    assert_eq!(required_targets(&sender), [a]);
-    assert_eq!(join_as(&mut sender, b, 42, 8, late), None);
-    assert_eq!(removals(&mut sender, late), [(a, RemovalReason::Timeout)]);
-    assert_eq!(required_targets(&sender), [b]);
+fn a_required_receiver_back_on_another_port_is_refused_while_its_membership_holds_it_lost() {
+    use crate::membership::Admission;
+
+    for boot in [8, 7] {
+        let mut sender = dynamic_sender_with(4, &[42]);
+        let (a, b): (SocketAddr, SocketAddr) = (
+            "10.0.0.9:5000".parse().unwrap(),
+            "10.0.0.9:5001".parse().unwrap(),
+        );
+        assert_eq!(join_as(&mut sender, a, 42, 7, T0), None);
+        assert_eq!(admission(&sender, T0 + 2), Admission::Open);
+        let late = T0 + 2 * sender.confirmed_timeout;
+        sender.expire_bindings(late);
+        assert_eq!(sender.counters().registrants_timed_out, 0);
+        assert_eq!(admission(&sender, late), Admission::LostRequired);
+        let joined = sender.counters().registrants_joined;
+        assert_eq!(try_join(&mut sender, b, 42, boot, late), None);
+        assert_eq!(sender.counters().registrants_joined, joined, "boot {boot}");
+        assert_eq!(required_targets(&sender), [a]);
+        assert!(!sender.sends_to(EndpointId(1), alias(), b));
+        assert!(removals(&mut sender, late).is_empty());
+        assert_eq!(admission(&sender, late + 2), Admission::LostRequired);
+    }
 }
 
-/// karyos#940 item 2: while a required id's replaced slot is removed and
-/// not reported, it takes a slot of the optional quota.
+/// karyos#945 review: a required id never takes a second slot, so it
+/// takes no slot of the optional quota either, even with the table full.
 #[test]
-fn a_replaced_required_slot_counts_against_the_optional_quota() {
+fn a_required_id_never_takes_a_second_slot() {
     use crate::agents::data::DestinationChange;
     use crate::sessions::register::Capacity;
 
@@ -1134,7 +1145,7 @@ fn a_replaced_required_slot_counts_against_the_optional_quota() {
         false,
     );
     outbound
-        .set_registration(3, lan().with_required(&[42]).unwrap())
+        .set_registration(2, lan().with_required(&[42]).unwrap())
         .unwrap();
     let at = |last: u8| SocketAddr::from(([10, 0, 0, last], 5000));
     assert_eq!(
@@ -1145,27 +1156,121 @@ fn a_replaced_required_slot_counts_against_the_optional_quota() {
         outbound.join_registrant(at(2), (42, true), T0, 0),
         DestinationChange::Added
     );
-    assert_eq!(outbound.registration_capacity(), Capacity::Free);
     assert_eq!(
         outbound.join_registrant(at(3), (42, true), T0, 0),
-        DestinationChange::Added
+        DestinationChange::Required
     );
+    assert!(outbound.removal_unreported().is_none());
     assert_eq!(outbound.registration_capacity(), Capacity::Full);
     assert_eq!(
-        outbound.join_registrant(at(4), (2, false), T0, 0),
-        DestinationChange::Full
-    );
-    let removal = outbound.removal_unreported().unwrap();
-    assert_eq!(
-        (removal.destination, removal.reason),
-        (at(2), RemovalReason::Timeout)
-    );
-    outbound.removal_reported(at(2), T0);
-    assert_eq!(outbound.registration_capacity(), Capacity::Free);
-    assert_eq!(
         outbound.required_destinations().collect::<Vec<_>>(),
-        [at(3)]
+        [at(2)]
     );
+}
+
+/// karyos#945 review: an SM refused at a slot already held (a bare
+/// CHALLENGE at the slot's own endpoint, then an SM naming another
+/// receiver id, or a REGISTER as another id there) leaves the binding
+/// that holds the slot unconfirmed, so the slot retires at its timeout
+/// (reason `timeout`) and the optional quota is free again.
+#[test]
+fn a_refused_sm_at_a_held_slot_retires_the_slot_at_its_timeout() {
+    let mut sender = dynamic_sender(4);
+    let at = |port: u16| SocketAddr::from(([10, 0, 0, 9], port));
+    let mut now = T0;
+    for port in 1..=4u16 {
+        let boot = u64::from(port);
+        assert_eq!(join_as(&mut sender, at(port), 100 + boot, boot, now), None);
+        now += 10;
+        if port % 2 == 0 {
+            assert!(
+                sender
+                    .answer_for(EndpointId(1), at(port), now, challenge_of(boot))
+                    .is_some()
+            );
+        } else {
+            assert!(
+                sender
+                    .register(EndpointId(1), at(port), &register_as(7777, boot), now)
+                    .is_some()
+            );
+            assert!(
+                sender
+                    .answer_for(EndpointId(1), at(port), now, challenge_of(boot))
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            sender.status(EndpointId(1), at(port), &sm_as(7777, boot), now + 1),
+            None
+        );
+        now += 10;
+    }
+    assert_eq!(sender.counters().registrants_refused, 4);
+    let late = now + sender.unconfirmed_timeout;
+    sender.expire_bindings(late);
+    let mut removed = removals(&mut sender, late);
+    removed.sort_by_key(|(address, _)| *address);
+    assert_eq!(
+        removed,
+        (1..=4u16)
+            .map(|port| (at(port), RemovalReason::Timeout))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(sender.counters().registrants_timed_out, 4);
+    let legit: SocketAddr = "10.0.0.50:5000".parse().unwrap();
+    assert_eq!(join_as(&mut sender, legit, 5, 50, late + 10), None);
+}
+
+/// karyos#945 review: the slot's own receiver confirms its binding again
+/// after a refused SM at its slot, and keeps the slot.
+#[test]
+fn a_refused_sm_at_a_held_slot_leaves_its_own_receiver_the_slot() {
+    let mut sender = dynamic_sender(4);
+    let a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
+    assert!(
+        sender
+            .answer_for(EndpointId(1), a, T0 + 10, challenge_of(7))
+            .is_some()
+    );
+    assert_eq!(sender.status(EndpointId(1), a, &sm_as(6, 7), T0 + 11), None);
+    assert_eq!(sender.counters().registrants_refused, 1);
+    assert_eq!(sender.status(EndpointId(1), a, &sm_as(5, 7), T0 + 12), None);
+    let late = T0 + 12 + sender.unconfirmed_timeout;
+    sender.expire_bindings(late);
+    assert!(removals(&mut sender, late).is_empty());
+    assert!(sender.sends_to(EndpointId(1), alias(), a));
+}
+
+/// karyos#945 review: a binding answered again keeps its receiver id
+/// until its next SM. A REGISTER naming that live required id from
+/// another host, after a CHALLENGE from the live receiver's endpoint
+/// with its boot id, still meets that id's binding (`boot_changed`): the
+/// required slot stays where it is.
+#[test]
+fn a_reset_binding_still_holds_its_receiver_id() {
+    let mut sender = dynamic_sender_with(4, &[42]);
+    let real: SocketAddr = "10.0.0.42:5000".parse().unwrap();
+    let other: SocketAddr = "10.0.0.66:1".parse().unwrap();
+    assert_eq!(join_as(&mut sender, real, 42, 4242, T0), None);
+    let now = T0 + 5_000_000;
+    assert_eq!(
+        sender.status(EndpointId(1), real, &sm_as(42, 4242), now),
+        None
+    );
+    assert!(
+        sender
+            .answer_for(EndpointId(1), real, now + 2, challenge_of(4242))
+            .is_some()
+    );
+    assert_eq!(
+        sender.register(EndpointId(1), other, &register_as(42, 666), now + 3),
+        None
+    );
+    assert_eq!(sender.registration_counters().dropped_boot_changed, 1);
+    assert_eq!(required_targets(&sender), [real]);
+    assert!(removals(&mut sender, now + 4).is_empty());
 }
 
 /// karyos#940 item 3: a REGISTER naming a bound optional `receiver_id`
