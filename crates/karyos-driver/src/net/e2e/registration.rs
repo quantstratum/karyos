@@ -88,13 +88,19 @@ fn a_registrant_is_announced_only_inside_the_allowlist() {
     let control = SocketAddr::new(LOOPBACK, free_port());
     let channel = dynamic(control);
     let _outside = a
-        .add_dynamic_network_publication(aggregate(10, 3, 1), &channel, allowlist([10, 0, 0, 0], 8))
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &channel,
+            allowlist([10, 0, 0, 0], 8),
+            None,
+        )
         .unwrap();
     let _inside = a
         .add_dynamic_network_publication(
             aggregate(11, 4, 1),
             &channel,
             allowlist([127, 0, 0, 0], 8),
+            None,
         )
         .unwrap();
     let socket = registrant();
@@ -137,21 +143,22 @@ fn a_second_dynamic_publication_of_a_stream_is_a_typed_error() {
     let channel = dynamic(control);
     let lan = || allowlist([127, 0, 0, 0], 8);
     let _first = a
-        .add_dynamic_network_publication(aggregate(10, 3, 1), &channel, lan())
+        .add_dynamic_network_publication(aggregate(10, 3, 1), &channel, lan(), None)
         .unwrap();
     assert!(matches!(
-        a.add_dynamic_network_publication(aggregate(10, 5, 1), &channel, lan()),
+        a.add_dynamic_network_publication(aggregate(10, 5, 1), &channel, lan(), None),
         Err(DriverError::DynamicPublicationExists { stream_id: 10 })
     ));
     assert!(
-        a.add_dynamic_network_publication(aggregate(11, 6, 1), &channel, lan())
+        a.add_dynamic_network_publication(aggregate(11, 6, 1), &channel, lan(), None)
             .is_ok()
     );
 }
 
 /// What a dynamic publication does not take: listed destinations, an
-/// interface, or an allowlist on another channel. The public calls carry no
-/// allowlist and still refuse dynamic mode.
+/// interface, or an allowlist on another channel. A call that carries no
+/// allowlist refuses dynamic mode, and no allowlist is empty: a missing
+/// allowlist is a refusal, never a permissive default (ADR-0082).
 #[test]
 fn what_a_dynamic_publication_does_not_take_is_refused() {
     let mut a = driver(ThreadingMode::Shared);
@@ -164,24 +171,47 @@ fn what_a_dynamic_publication_does_not_take_is_refused() {
         mode: ControlMode::Dynamic,
     };
     assert!(matches!(
-        a.add_dynamic_network_publication(aggregate(10, 3, 1), &listed, lan()),
+        a.add_dynamic_network_publication(aggregate(10, 3, 1), &listed, lan(), None),
         Err(DriverError::UnsupportedChannel)
     ));
     let mut bound = dynamic(control);
     bound.interface = Some(Interface::Address(LOOPBACK));
     assert!(matches!(
-        a.add_dynamic_network_publication(aggregate(10, 3, 1), &bound, lan()),
+        a.add_dynamic_network_publication(aggregate(10, 3, 1), &bound, lan(), None),
         Err(DriverError::UnsupportedChannel)
     ));
     let unicast = super::channel(SocketAddr::new(LOOPBACK, free_port()), false);
     assert!(matches!(
-        a.add_dynamic_network_publication(aggregate(10, 3, 1), &unicast, lan()),
-        Err(DriverError::InvalidConfig)
+        a.add_dynamic_network_publication(aggregate(10, 3, 1), &unicast, lan(), None),
+        Err(DriverError::UnsupportedChannel)
     ));
-    assert!(matches!(
+    for refused in [
         a.add_network_publication(aggregate(10, 3, 1), &dynamic(control)),
-        Err(DriverError::DynamicRegistrationUnsupported)
-    ));
+        a.add_network_publication_with_roles(
+            aggregate(10, 3, 1),
+            &dynamic(control),
+            crate::membership::PublicationRoles {
+                strategy: crate::membership::Strategy::Min,
+                required: Vec::new(),
+                tags: Vec::new(),
+            },
+        ),
+        a.add_network_publication_with_destinations(
+            aggregate(10, 3, 1),
+            &dynamic(control),
+            None,
+            &[],
+        ),
+    ] {
+        assert!(matches!(
+            refused,
+            Err(DriverError::DynamicRegistrationRequired)
+        ));
+    }
+    assert_eq!(
+        RegistrationAllowlist::new(&[]),
+        Err(crate::sessions::register::RegistrationConfigError::EmptyAllowlist)
+    );
 }
 
 /// `dynamic(control)` as a Karyos receiver subscribes to it: reliable, and
@@ -199,6 +229,14 @@ fn reliable(control: SocketAddr) -> UdpConfig {
     UdpConfig {
         reliable: true,
         ..dynamic(control)
+    }
+}
+
+/// The configured identity of receiver `receiver_id`.
+fn as_receiver(receiver_id: u64) -> crate::membership::ReceiverIdentity {
+    crate::membership::ReceiverIdentity {
+        receiver_id: std::num::NonZeroU64::new(receiver_id).unwrap(),
+        group_tag: 0,
     }
 }
 
@@ -240,10 +278,11 @@ fn a_dynamic_subscription_registers_binds_and_receives() {
             aggregate(10, 3, 1),
             &reliable(control),
             allowlist([127, 0, 0, 0], 8),
+            None,
         )
         .unwrap();
     let _subscription = b
-        .add_dynamic_network_subscription(10, &subscribed(control), None)
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
         .unwrap();
     let image = image_of(&mut a, &mut b, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
@@ -269,6 +308,7 @@ fn a_dynamic_subscription_outside_the_allowlist_gets_nothing() {
             aggregate(10, 3, 1),
             &reliable(control),
             allowlist([10, 0, 0, 0], 8),
+            None,
         )
         .unwrap();
     let _inside = a
@@ -276,13 +316,14 @@ fn a_dynamic_subscription_outside_the_allowlist_gets_nothing() {
             aggregate(11, 3, 1),
             &reliable(control),
             allowlist([127, 0, 0, 0], 8),
+            None,
         )
         .unwrap();
     let _refused = b
-        .add_dynamic_network_subscription(10, &subscribed(control), None)
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
         .unwrap();
     let _admitted = b
-        .add_dynamic_network_subscription(11, &subscribed(control), None)
+        .add_dynamic_network_subscription(11, &subscribed(control), as_receiver(1))
         .unwrap();
     pump(&mut [&mut a, &mut b], |drivers| {
         registrations(drivers[0]).dropped_not_allowed >= 1
@@ -314,10 +355,11 @@ fn a_full_table_answers_err_and_keeps_its_destination() {
             aggregate(10, 3, 1),
             &reliable(control),
             allowlist([127, 0, 0, 0], 8),
+            None,
         )
         .unwrap();
     let _joined = b
-        .add_dynamic_network_subscription(10, &subscribed(control), None)
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
         .unwrap();
     let image = image_of(&mut a, &mut b, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
@@ -326,7 +368,7 @@ fn a_full_table_answers_err_and_keeps_its_destination() {
         .unwrap();
     super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..16);
     let _refused = c
-        .add_dynamic_network_subscription(10, &subscribed(control), None)
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(2))
         .unwrap();
     pump(&mut [&mut a, &mut b, &mut c], |drivers| {
         receiver(drivers[2]).registration_refusals >= 1
@@ -336,14 +378,186 @@ fn a_full_table_answers_err_and_keeps_its_destination() {
     super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 16..32);
 }
 
-/// The public subscription calls refuse dynamic mode, as the publication
-/// calls do, until the rest of karyos#644 lands.
+/// A subscription call that carries no receiver identity refuses dynamic
+/// mode, and the dynamic call refuses a channel that is not dynamic.
 #[test]
-fn the_public_subscription_calls_refuse_dynamic_mode() {
+fn a_dynamic_subscription_needs_its_identity_and_a_dynamic_channel() {
     let mut b = driver(ThreadingMode::Shared);
     let control = SocketAddr::new(LOOPBACK, free_port());
     assert!(matches!(
         b.add_network_subscription(10, &subscribed(control)),
-        Err(DriverError::DynamicRegistrationUnsupported)
+        Err(DriverError::DynamicRegistrationRequired)
     ));
+    assert!(matches!(
+        b.add_network_subscription_as(10, &subscribed(control), as_receiver(1)),
+        Err(DriverError::DynamicRegistrationRequired)
+    ));
+    let unicast = super::channel(SocketAddr::new(LOOPBACK, free_port()), true);
+    assert!(matches!(
+        b.add_dynamic_network_subscription(10, &unicast, as_receiver(1)),
+        Err(DriverError::UnsupportedChannel)
+    ));
+}
+
+/// `driver`'s sender counters.
+fn sender(driver: &EmbeddedDriver) -> crate::agents::roles::SenderCounters {
+    driver.net.as_ref().unwrap().sender_counters().unwrap()
+}
+
+/// MD-17 between drivers: a publication of `max_destinations` 2 with
+/// required receiver 42. Optional receiver 1 joins and takes the one
+/// optional slot; optional receiver 2 is answered ERR; receiver 42 still
+/// joins in its reserved slot, which opens admission, and receives.
+#[test]
+fn a_required_receiver_joins_after_optional_registrants_fill_their_quota() {
+    use crate::membership::{PublicationRoles, Strategy};
+
+    let agents = AgentConfig {
+        max_destinations: 2,
+        ..AgentConfig::default()
+    };
+    let mut a = driver_with(ThreadingMode::Shared, agents);
+    let (mut b, mut c, mut d) = (
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+        driver(ThreadingMode::Shared),
+    );
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let roles = PublicationRoles {
+        strategy: Strategy::Min,
+        required: vec![42],
+        tags: Vec::new(),
+    };
+    let publication = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+            Some(roles),
+        )
+        .unwrap();
+    let _optional = b
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].network_image(10, 3).is_some()
+    });
+    let _refused = c
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(2))
+        .unwrap();
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        receiver(drivers[2]).registration_refusals >= 1
+    });
+    let _required = d
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(42))
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b, &mut c, &mut d], |drivers| {
+        image = drivers[3].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = d
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    pump(&mut [&mut a, &mut b, &mut c, &mut d], |_| {
+        while sent < 16 {
+            let payload = sent.to_le_bytes();
+            match lane.offer(&payload).unwrap() {
+                karyos_client::OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                assert_eq!(bytes[..4], seen.to_le_bytes(), "in order, exactly once");
+                seen += 1;
+            },
+            super::BUDGET,
+        );
+        seen == 16
+    });
+    assert!(c.network_image(10, 3).is_none());
+    assert_eq!(sender(&a).registrants_joined, 2);
+}
+
+/// Design 3.2 step 4 between drivers: receiver 1's driver goes and a new
+/// one (a new boot id) registers with the same `receiver_id` from another
+/// port. Its first SM retires the old destination (reason `restarted`)
+/// and the new one binds.
+#[test]
+fn a_restarted_receiver_replaces_its_old_destination() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let _publication = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+            None,
+        )
+        .unwrap();
+    let _first = b
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    let _ = image_of(&mut a, &mut b, 10);
+    drop(b);
+    let mut restarted = driver(ThreadingMode::Shared);
+    let _again = restarted
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    let _ = image_of(&mut a, &mut restarted, 10);
+    pump(&mut [&mut a], |drivers| {
+        sender(drivers[0]).registrants_restarted >= 1
+    });
+    assert_eq!(sender(&a).registrants_joined, 2);
+}
+
+/// MD-19 between drivers: receiver 1 unsubscribes and subscribes again in
+/// the same driver, so the same receiver block registers from a new port.
+/// Once its old destination has been quiet for `destination_move_quiet`
+/// its membership moves there (reason `moved`) and it receives again. The
+/// receiver keeps a retired incarnation out for `alias_quarantine`
+/// (network-sessions.md, "Fresh establishment"), 1 ms here so that the
+/// same incarnation can be set up again at the new port.
+#[test]
+fn a_receiver_back_at_a_new_port_moves_after_the_quiet_time() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut quick = AgentConfig::default();
+    quick.sessions.alias_quarantine = 1_000_000;
+    let mut b = driver_with(ThreadingMode::Shared, quick);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let publication = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+            None,
+        )
+        .unwrap();
+    let first = b
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    let _ = image_of(&mut a, &mut b, 10);
+    b.remove_network_subscription(first).unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        receiver(drivers[1]).images_retired >= 1
+    });
+    let _again = b
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    let image = image_of(&mut a, &mut b, 10);
+    pump(&mut [&mut a], |drivers| {
+        sender(drivers[0]).registrants_moved >= 1
+    });
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
+        .unwrap();
+    super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..16);
+    assert_eq!(sender(&a).registrants_restarted, 0);
 }

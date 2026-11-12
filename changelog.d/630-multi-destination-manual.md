@@ -14,4 +14,4 @@
   next steps, a destination that stops consuming holds the others,
   retransmissions are not sent, and reliable channels, guards and timed
   lanes with destinations are refused. `control-mode=dynamic` is refused
-  with the new `DriverError::DynamicRegistrationUnsupported`.
+  by these calls with `DriverError::DynamicRegistrationRequired`.

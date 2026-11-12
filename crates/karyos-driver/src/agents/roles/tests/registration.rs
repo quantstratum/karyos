@@ -389,8 +389,12 @@ fn the_receiver_forwards_a_register_only_for_a_published_stream() {
 }
 
 /// A `control-mode=dynamic` subscription key on endpoint 1, registering
-/// at `control` (step 3b).
-fn subscribe_dynamic(role: &mut super::super::ReceiverRole, control: SocketAddr) {
+/// at `control` (step 3b) as `identity`.
+fn subscribe_dynamic(
+    role: &mut super::super::ReceiverRole,
+    control: SocketAddr,
+    identity: Option<crate::membership::ReceiverIdentity>,
+) {
     let (replies, _keep) = super::super::super::ring::ring::<AgentEvent<OsSocket>>(
         std::num::NonZeroUsize::new(4).unwrap(),
     );
@@ -402,11 +406,19 @@ fn subscribe_dynamic(role: &mut super::super::ReceiverRole, control: SocketAddr)
         reliable: true,
         multicast: false,
         control_group: None,
-        identity: None,
+        identity,
         conflated: None,
         solicit_from: None,
         register_at: Some(control),
     });
+}
+
+/// The configured identity of receiver 42.
+fn receiver_42() -> Option<crate::membership::ReceiverIdentity> {
+    Some(crate::membership::ReceiverIdentity {
+        receiver_id: std::num::NonZeroU64::new(42).unwrap(),
+        group_tag: 0,
+    })
 }
 
 /// The REGISTERs `sender` holds from the receiver, each with where it goes.
@@ -442,7 +454,7 @@ fn a_dynamic_subscription_registers_every_interval_until_bound() {
     let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
     // Nothing is due before a dynamic key exists.
     assert_eq!(role.send_registers(&events, T0), 0);
-    subscribe_dynamic(&mut role, control);
+    subscribe_dynamic(&mut role, control, receiver_42());
     assert_eq!(role.send_registers(&events, T0), 1);
     let posted = registers_posted(&sender);
     assert_eq!(posted.len(), 1);
@@ -450,7 +462,7 @@ fn a_dynamic_subscription_registers_every_interval_until_bound() {
     assert_eq!(to, control);
     assert_eq!(register.stream_id, alias().stream_id);
     assert_eq!(register.receiver.receiver_boot_id, role.sessions.boot_id());
-    assert_ne!(register.receiver.receiver_id, 0);
+    assert_eq!(register.receiver.receiver_id, 42);
     // Not again within the interval; again at it.
     assert_eq!(role.send_registers(&events, T0 + interval - 1), 0);
     assert_eq!(role.send_registers(&events, T0 + interval), 1);
@@ -489,7 +501,7 @@ fn an_err_registration_is_read_only_from_the_control_address() {
     let (sender, mut role) = receiver_with(config);
     let (events, _link) = event_ring();
     let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    subscribe_dynamic(&mut role, control);
+    subscribe_dynamic(&mut role, control, receiver_42());
     assert_eq!(role.send_registers(&events, T0), 1);
     intake(&mut role, &events, T0 + 1).control(control, full_err());
     assert_eq!(role.counters().registration_refusals, 1);
@@ -506,4 +518,318 @@ fn an_err_registration_is_read_only_from_the_control_address() {
     // Still registering at its interval.
     assert_eq!(role.send_registers(&events, T0 + interval), 1);
     assert_eq!(registers_posted(&sender).len(), 2);
+}
+
+/// A sender with one dynamic publication on endpoint 1 admitting
+/// `10.0.0.0/8`, at most `max` destinations, `required` its required
+/// receiver ids (MD-17).
+fn dynamic_sender_with(max: usize, required: &[u64]) -> super::super::SenderRole {
+    let (mut sender, _receiver) = super::super::roles(&AgentConfig::default()).unwrap();
+    let (replies, _keep) = super::super::super::ring::ring::<AgentEvent<OsSocket>>(
+        std::num::NonZeroUsize::new(4).unwrap(),
+    );
+    let publication = publication(EndpointId(1));
+    let (mut outbound, _log) = super::super::super::data::testing::outbound(
+        publication.endpoint,
+        publication.alias,
+        "10.0.0.2:4000".parse().unwrap(),
+        publication.term,
+        1,
+        false,
+    );
+    outbound
+        .set_registration(max, lan().with_required(required).unwrap())
+        .unwrap();
+    let added = sender.command(AgentCommand::<OsSocket>::AddPublication {
+        reply: replies.reserve().unwrap(),
+        publication,
+        outbound,
+        guard: None,
+        roles: None,
+    });
+    assert!(matches!(
+        added,
+        Some((_, AgentEvent::PublicationAdded { .. }))
+    ));
+    sender
+}
+
+fn register_as(receiver_id: u64, boot: u64) -> RspRegister {
+    let mut register = register_of(boot);
+    register.receiver.receiver_id = receiver_id;
+    register
+}
+
+fn sm_as(receiver_id: u64, boot: u64) -> karyos_protocol::network::StatusMessage {
+    let mut status = sm_status([boot, boot], 0);
+    status.receiver.receiver_id = receiver_id;
+    status
+}
+
+/// REGISTER, CHALLENGE and first SM of `receiver_id` with boot `boot` from
+/// `from` at `now`; what the SM answered.
+fn join_as(
+    sender: &mut super::super::SenderRole,
+    from: SocketAddr,
+    receiver_id: u64,
+    boot: u64,
+    now: u64,
+) -> Option<(SocketAddr, Control)> {
+    let announced = sender.register(EndpointId(1), from, &register_as(receiver_id, boot), now);
+    assert!(
+        matches!(announced, Some((to, Control::SetupAnnounce(_))) if to == from),
+        "{announced:?}"
+    );
+    let answered = sender.answer_for(EndpointId(1), from, now, challenge_of(boot));
+    assert!(
+        matches!(answered, Some((_, Control::SetupAnswer(_)))),
+        "{answered:?}"
+    );
+    sender.status(EndpointId(1), from, &sm_as(receiver_id, boot), now + 1)
+}
+
+/// MD-17: optional registrants fill only the optional quota; a required
+/// receiver id still joins, in its reserved slot.
+#[test]
+fn a_required_id_joins_its_reserved_slot_after_optional_registrants_fill_their_quota() {
+    let mut sender = dynamic_sender_with(2, &[42]);
+    let (a, b, c): (SocketAddr, SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+        "10.0.0.11:5000".parse().unwrap(),
+    );
+    assert_eq!(join_as(&mut sender, a, 1, 7, T0), None);
+    // The optional quota (2 minus 1 required) is taken: one ERR.
+    assert_eq!(
+        sender.register(EndpointId(1), b, &register_as(2, 8), T0 + 10),
+        Some((b, full_err()))
+    );
+    assert_eq!(join_as(&mut sender, c, 42, 9, T0 + 20), None);
+    assert!(sender.sends_to(EndpointId(1), alias(), a));
+    assert!(sender.sends_to(EndpointId(1), alias(), c));
+    assert_eq!(sender.counters().registrants_joined, 2);
+    assert_eq!(sender.registration_counters().refused_full, 1);
+}
+
+/// More required receiver ids than `max_destinations` is refused at
+/// creation (design 3.5).
+#[test]
+fn more_required_ids_than_destinations_is_refused() {
+    let publication = publication(EndpointId(1));
+    let (mut outbound, _log) = super::super::super::data::testing::outbound(
+        publication.endpoint,
+        publication.alias,
+        "10.0.0.2:4000".parse().unwrap(),
+        publication.term,
+        1,
+        false,
+    );
+    assert_eq!(
+        outbound.set_registration(1, lan().with_required(&[1, 2]).unwrap()),
+        Err(super::super::super::data::OutboundError::Routes)
+    );
+}
+
+/// Design 3.2 step 4: an optional `receiver_id` back with a new boot id at
+/// another endpoint replaces its old membership at its first SM, and the
+/// old destination is removed (reason `restarted`).
+#[test]
+fn a_restarted_optional_receiver_replaces_its_old_destination() {
+    let mut sender = dynamic_sender(4);
+    let (a, b): (SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+    );
+    assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
+    assert_eq!(join_as(&mut sender, b, 5, 8, T0 + 10), None);
+    assert!(!sender.sends_to(EndpointId(1), alias(), a));
+    assert!(sender.sends_to(EndpointId(1), alias(), b));
+    let counters = sender.counters();
+    assert_eq!(counters.registrants_restarted, 1);
+    assert_eq!(counters.registrants_joined, 2);
+    // At the same endpoint the destination stays, with the new receiver.
+    assert!(
+        sender
+            .register(EndpointId(1), b, &register_as(5, 9), T0 + 20)
+            .is_some()
+    );
+    assert!(
+        sender
+            .answer_for(EndpointId(1), b, T0 + 20, challenge_of(9))
+            .is_some()
+    );
+    assert_eq!(sender.status(EndpointId(1), b, &sm_as(5, 9), T0 + 21), None);
+    assert!(sender.sends_to(EndpointId(1), alias(), b));
+    assert_eq!(sender.counters().registrants_restarted, 2);
+}
+
+/// MD-19: the same receiver block at another endpoint is a
+/// `duplicate_receiver` while its old destination took an SM within
+/// `destination_move_quiet`, and a move after it.
+#[test]
+fn an_optional_receiver_moves_only_after_destination_move_quiet() {
+    let mut sender = dynamic_sender(4);
+    let quiet = sender.registrations.config().move_quiet;
+    let (a, b): (SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+    );
+    assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
+    // Its last SM was at T0 + 1.
+    assert_eq!(
+        sender.register(EndpointId(1), b, &register_as(5, 7), T0 + quiet),
+        None
+    );
+    assert_eq!(sender.registration_counters().duplicate_receiver, 1);
+    assert_eq!(join_as(&mut sender, b, 5, 7, T0 + 1 + quiet), None);
+    assert!(!sender.sends_to(EndpointId(1), alias(), a));
+    assert!(sender.sends_to(EndpointId(1), alias(), b));
+    assert_eq!(sender.counters().registrants_moved, 1);
+    // The membership moved: its next SM from the new endpoint is taken.
+    let before = sender.counters().sm_accepted;
+    assert_eq!(
+        sender.status(EndpointId(1), b, &sm_as(5, 7), T0 + 2 + quiet),
+        None
+    );
+    assert_eq!(sender.counters().sm_accepted, before + 1);
+}
+
+/// A required receiver id is never restarted nor moved (owner decision
+/// M4, MD-19): its REGISTER with a new boot id, or at a new port, is
+/// dropped; and a destination at the source with the same receiver block
+/// drops its REGISTER too.
+#[test]
+fn a_required_receiver_never_restarts_nor_moves() {
+    let mut sender = dynamic_sender_with(4, &[42]);
+    let quiet = sender.registrations.config().move_quiet;
+    let (a, b): (SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+    );
+    assert_eq!(join_as(&mut sender, a, 42, 7, T0), None);
+    let late = T0 + 10 * quiet;
+    assert_eq!(
+        sender.register(EndpointId(1), b, &register_as(42, 8), late),
+        None
+    );
+    assert_eq!(
+        sender.register(EndpointId(1), b, &register_as(42, 7), late),
+        None
+    );
+    assert_eq!(
+        sender.register(EndpointId(1), a, &register_as(42, 7), late),
+        None
+    );
+    let counters = sender.registration_counters();
+    assert_eq!(counters.dropped_boot_changed, 1);
+    assert_eq!(counters.duplicate_receiver, 1);
+    assert_eq!(counters.dropped_bound, 1);
+    assert!(sender.sends_to(EndpointId(1), alias(), a));
+    assert!(!sender.sends_to(EndpointId(1), alias(), b));
+}
+
+/// Design 3.7, 8: a registrant whose receiver sends no SM for
+/// `image_liveness_timeout` loses its slot.
+#[test]
+fn a_silent_registrant_is_removed() {
+    let mut sender = dynamic_sender(4);
+    let a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
+    let late = T0 + 1 + sender.confirmed_timeout;
+    let stranger: SocketAddr = "10.0.0.20:5000".parse().unwrap();
+    let _ = sender.status(EndpointId(1), stranger, &sm_as(6, 6), late);
+    assert!(!sender.sends_to(EndpointId(1), alias(), a));
+    assert_eq!(sender.counters().registrants_timed_out, 1);
+}
+
+/// A receiver id is configured and stable across restarts (design 2.3;
+/// multicast-flow-control.md M1): a dynamic key with no identity sends no
+/// REGISTER, never one naming an id of its own making, and counts each
+/// due one unsent.
+#[test]
+fn a_dynamic_key_without_an_identity_sends_no_register() {
+    let config = AgentConfig::default();
+    let interval = config.setup_interval;
+    let (sender, mut role) = receiver_with(config);
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    subscribe_dynamic(&mut role, control, None);
+    assert_eq!(role.send_registers(&events, T0), 0);
+    assert_eq!(role.send_registers(&events, T0 + interval - 1), 0);
+    assert_eq!(role.send_registers(&events, T0 + interval), 0);
+    assert!(registers_posted(&sender).is_empty());
+    assert_eq!(role.counters().registers_unsent, 2);
+    assert_eq!(role.counters().registers_sent, 0);
+}
+
+/// Design 3.6, 9.2: a dynamic publication never announces periodically to
+/// its destinations, live or not; a manual one keeps announcing to one
+/// with no live member.
+#[test]
+fn a_dynamic_destination_gets_no_periodic_announce() {
+    use crate::agents::data::DestinationChange;
+
+    let publication = publication(EndpointId(1));
+    let make = || {
+        super::super::super::data::testing::outbound(
+            publication.endpoint,
+            publication.alias,
+            "10.0.0.2:4000".parse().unwrap(),
+            publication.term,
+            1,
+            false,
+        )
+    };
+    let (mut dynamic, _log) = make();
+    dynamic.set_registration(4, lan()).unwrap();
+    let joined = dynamic.join_registrant("10.0.0.9:5000".parse().unwrap(), false, T0, 0);
+    assert_eq!(joined, DestinationChange::Added);
+    assert!(!dynamic.every_destination_live());
+    assert!(!dynamic.announces_destinations());
+    let (mut manual, _log) = make();
+    manual
+        .set_destinations(4, &["10.0.0.9:5000".parse().unwrap()], &[], Some(true))
+        .unwrap();
+    assert!(manual.announces_destinations());
+}
+
+/// MD-17 at the table: optional registrants get `max_destinations` minus
+/// the required ids; a required id joins past them.
+#[test]
+fn the_optional_quota_leaves_the_reserved_slots_free() {
+    use crate::agents::data::DestinationChange;
+    use crate::sessions::register::Capacity;
+
+    let publication = publication(EndpointId(1));
+    let (mut outbound, _log) = super::super::super::data::testing::outbound(
+        publication.endpoint,
+        publication.alias,
+        "10.0.0.2:4000".parse().unwrap(),
+        publication.term,
+        1,
+        false,
+    );
+    outbound
+        .set_registration(3, lan().with_required(&[42, 43]).unwrap())
+        .unwrap();
+    let at = |last: u8| SocketAddr::from(([10, 0, 0, last], 5000));
+    assert_eq!(outbound.registration_capacity(), Capacity::Free);
+    assert_eq!(
+        outbound.join_registrant(at(1), false, T0, 0),
+        DestinationChange::Added
+    );
+    assert_eq!(outbound.registration_capacity(), Capacity::Full);
+    assert_eq!(
+        outbound.join_registrant(at(2), false, T0, 0),
+        DestinationChange::Full
+    );
+    for last in [3, 4] {
+        assert_eq!(
+            outbound.join_registrant(at(last), true, T0, 0),
+            DestinationChange::Added
+        );
+    }
+    // A required destination is never retired as a registrant.
+    assert!(!outbound.retire_registrant(at(3), crate::agents::data::RemovalReason::Moved, T0));
+    assert!(outbound.retire_registrant(at(1), crate::agents::data::RemovalReason::Moved, T0));
 }

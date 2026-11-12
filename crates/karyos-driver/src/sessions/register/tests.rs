@@ -61,10 +61,10 @@ impl Harness {
     ) -> RegisterOutcome {
         self.registrations.register(
             &mut self.source_rates,
-            &self.allow,
+            &mut self.allow,
             source,
             register,
-            capacity,
+            (Existing::None, capacity),
             now,
         )
     }
@@ -75,7 +75,8 @@ impl Harness {
         boot: [u64; 2],
         now: u64,
     ) -> Option<PendingRegistration> {
-        self.registrations.challenged(STREAM, source, boot, now)
+        self.registrations
+            .challenged(&mut self.allow, STREAM, source, boot, now)
     }
 
     fn pending(&self) -> &[PendingRegistration] {
@@ -186,7 +187,7 @@ type Change = fn(&mut RegistrationConfig);
 fn limits_are_mandatory_nonzero_bounded_and_named() {
     let base = RegistrationConfig::default();
     assert_eq!(base.validate(), Ok(()));
-    let cases: [(Change, &str); 9] = [
+    let cases: [(Change, &str); 10] = [
         (|c| c.rate = 0, "rate"),
         (|c| c.sources = 0, "sources"),
         (|c| c.sources = MAX_REGISTRATION_TABLE + 1, "sources"),
@@ -199,6 +200,7 @@ fn limits_are_mandatory_nonzero_bounded_and_named() {
         ),
         (|c| c.refusal_interval = 0, "refusal_interval"),
         (|c| c.join_timeout = 0, "join_timeout"),
+        (|c| c.move_quiet = 0, "move_quiet"),
     ];
     for (change, field) in cases {
         let mut bad = base;
@@ -229,15 +231,23 @@ fn the_driver_limits_are_shared_by_its_publications() {
     };
     let mut driver = Registrations::new(c, T0).unwrap();
     let mut rates = EndpointRates::new(20, 64).unwrap();
-    let lan = allow(&[range([10, 0, 0, 0], 8)]);
-    let other = allow(&[range([10, 9, 0, 0], 16)]);
-    let mut on = |allowlist: &RegistrationPolicy, from: SocketAddr, stream_id: i32| {
+    let mut lan = allow(&[range([10, 0, 0, 0], 8)]);
+    let mut other = allow(&[range([10, 9, 0, 0], 16)]);
+    let mut on = |allowlist: &mut RegistrationPolicy, from: SocketAddr, stream_id: i32| {
         let mut r = register(u64::from(from.port()));
         r.stream_id = stream_id;
-        driver.register(&mut rates, allowlist, from, &r, Capacity::Free, T0)
+        driver.register(
+            &mut rates,
+            allowlist,
+            from,
+            &r,
+            (Existing::None, Capacity::Free),
+            T0,
+        )
     };
-    for (allowlist, host, stream) in [(&lan, 1, 1), (&other, 2, 2), (&lan, 3, 1)] {
+    for (host, stream) in [(1, 1), (2, 2), (3, 1)] {
         let from = SocketAddr::from(([10, 9, 0, host], 40_000));
+        let allowlist = if stream == 1 { &mut lan } else { &mut other };
         assert!(matches!(
             on(allowlist, from, stream),
             RegisterOutcome::Announce { .. }
@@ -246,18 +256,22 @@ fn the_driver_limits_are_shared_by_its_publications() {
     // The fourth, to either publication, finds the driver's table full.
     let from = SocketAddr::from(([10, 9, 0, 4], 40_000));
     assert_eq!(
-        on(&other, from, 2),
+        on(&mut other, from, 2),
         RegisterOutcome::Drop(RegisterDrop::PendingFull)
     );
     // Then the driver's total of four per second is spent for both.
     assert_eq!(
-        on(&lan, SocketAddr::from(([10, 9, 0, 5], 40_000)), 1),
+        on(&mut lan, SocketAddr::from(([10, 9, 0, 5], 40_000)), 1),
         RegisterOutcome::Drop(RegisterDrop::Rate)
     );
     // A CHALLENGE takes only the entry of its own stream.
     let from = SocketAddr::from(([10, 9, 0, 2], 40_000));
-    assert_eq!(driver.challenged(1, from, [40_000, 1], T0), None);
-    assert!(driver.challenged(2, from, [40_000, 1], T0).is_some());
+    assert_eq!(driver.challenged(&mut lan, 1, from, [40_000, 1], T0), None);
+    assert!(
+        driver
+            .challenged(&mut other, 2, from, [40_000, 1], T0)
+            .is_some()
+    );
 }
 
 #[test]
@@ -671,15 +685,226 @@ fn each_publication_checks_its_own_address_family() {
             AddressRange::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).unwrap()
         ])
         .unwrap();
-    let v6 = RegistrationPolicy::new(any_v6.clone(), false);
-    let v4 = RegistrationPolicy::new(any_v6, true);
+    let mut v6 = RegistrationPolicy::new(any_v6.clone(), false);
+    let mut v4 = RegistrationPolicy::new(any_v6, true);
     let from = SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 9), 40_000));
     assert_eq!(
-        driver.register(&mut rates, &v4, from, &register(7), Capacity::Free, T0),
+        driver.register(
+            &mut rates,
+            &mut v4,
+            from,
+            &register(7),
+            (Existing::None, Capacity::Free),
+            T0,
+        ),
         RegisterOutcome::Drop(RegisterDrop::Source)
     );
     assert_eq!(
-        driver.register(&mut rates, &v6, from, &register(7), Capacity::Free, T0),
+        driver.register(
+            &mut rates,
+            &mut v6,
+            from,
+            &register(7),
+            (Existing::None, Capacity::Free),
+            T0,
+        ),
         RegisterOutcome::Announce { source: from }
     );
+}
+
+/// Design 3.2 step 4: what the publication holds of the receiver drops the
+/// REGISTER, each under its own counter, after the retry check and before
+/// any pending entry or ERR.
+#[test]
+fn an_existing_receiver_drops_the_register_under_its_own_reason() {
+    let mut r = lan();
+    let from = source(5, 40_123);
+    let cases = [
+        (Existing::Bound, RegisterDrop::Bound),
+        (Existing::BootChanged, RegisterDrop::BootChanged),
+        (Existing::DuplicateReceiver, RegisterDrop::DuplicateReceiver),
+    ];
+    for (at, (existing, dropped)) in (0u64..).zip(cases) {
+        let outcome = r.registrations.register(
+            &mut r.source_rates,
+            &mut r.allow,
+            from,
+            &register(7),
+            (existing, Capacity::Full),
+            T0 + at,
+        );
+        assert_eq!(outcome, RegisterOutcome::Drop(dropped));
+    }
+    assert!(r.pending().is_empty());
+    let counters = r.counters();
+    assert_eq!(counters.dropped_bound, 1);
+    assert_eq!(counters.dropped_boot_changed, 1);
+    assert_eq!(counters.duplicate_receiver, 1);
+    assert_eq!(counters.refused_full, 0);
+    // A pending retry is still a retry: the lookup comes after it.
+    assert!(matches!(
+        r.register(from, &register(8), Capacity::Free, T0 + 10),
+        RegisterOutcome::Announce { .. }
+    ));
+    let retried = r.registrations.register(
+        &mut r.source_rates,
+        &mut r.allow,
+        from,
+        &register(8),
+        (Existing::DuplicateReceiver, Capacity::Free),
+        T0 + 11,
+    );
+    assert_eq!(retried, RegisterOutcome::Announce { source: from });
+    assert_eq!(r.counters().retried, 1);
+}
+
+fn with_required(ids: &[u64]) -> Harness {
+    let mut harness = lan();
+    harness.allow = harness.allow.clone().with_required(ids).unwrap();
+    harness
+}
+
+#[test]
+fn required_ids_are_nonzero_distinct_and_named() {
+    let base = || allow(&[range([10, 0, 0, 0], 8)]);
+    assert_eq!(
+        base().with_required(&[3, 0]),
+        Err(RegistrationConfigError::InvalidRequired { receiver_id: 0 })
+    );
+    let repeated = base().with_required(&[3, 4, 3]);
+    assert_eq!(
+        repeated,
+        Err(RegistrationConfigError::InvalidRequired { receiver_id: 3 })
+    );
+    assert!(repeated.unwrap_err().to_string().contains('3'));
+    let policy = base().with_required(&[3, 4]).unwrap();
+    assert_eq!(policy.required(), &[3, 4]);
+    assert!(policy.is_required(4) && !policy.is_required(5));
+    assert!(policy.reserved().is_empty());
+}
+
+/// MD-17: optional registrants that fill the driver's pending table and
+/// the optional slots do not keep a required receiver id out; it takes
+/// its reserved entry, never an optional one, and is never refused full.
+#[test]
+fn a_required_id_registers_past_full_optional_tables() {
+    let c = RegistrationConfig {
+        pending: 2,
+        ..RegistrationConfig::default()
+    };
+    let mut r = registrations(Setup {
+        allow: allow(&[range([10, 0, 0, 0], 8)])
+            .with_required(&[42])
+            .unwrap(),
+        config: c,
+    });
+    for host in 1..=2 {
+        assert!(matches!(
+            r.register(
+                source(host, 1),
+                &register(u64::from(host)),
+                Capacity::Free,
+                T0
+            ),
+            RegisterOutcome::Announce { .. }
+        ));
+    }
+    assert_eq!(
+        r.register(source(3, 1), &register(3), Capacity::Free, T0),
+        RegisterOutcome::Drop(RegisterDrop::PendingFull)
+    );
+    let required = source(9, 1);
+    assert_eq!(
+        r.register(required, &register(42), Capacity::Full, T0),
+        RegisterOutcome::Announce { source: required }
+    );
+    assert_eq!(r.pending().len(), 2);
+    assert_eq!(r.allow.reserved().len(), 1);
+    assert_eq!(r.counters().refused_full, 0);
+    // Its CHALLENGE takes the reserved entry.
+    let taken = r.challenged(required, [42, 1], T0 + 1).unwrap();
+    assert_eq!(taken.receiver.receiver_id, 42);
+    assert!(r.allow.reserved().is_empty());
+}
+
+/// Design 3.2 step 5: spoofed REGISTERs naming a required id from many
+/// sources only replace the older of its two reserved entries; the
+/// retrying receiver gets an entry back at each retry.
+#[test]
+fn spoofed_registers_for_a_required_id_replace_only_the_older_entry() {
+    let mut r = with_required(&[42]);
+    let spoofed = |boot: u64| RspRegister {
+        stream_id: STREAM,
+        receiver: Receiver {
+            receiver_boot_id: [boot, boot],
+            receiver_id: 42,
+        },
+    };
+    for host in 1..=8u8 {
+        let now = T0 + u64::from(host);
+        assert!(matches!(
+            r.register(
+                source(host, 1),
+                &spoofed(u64::from(host)),
+                Capacity::Free,
+                now
+            ),
+            RegisterOutcome::Announce { .. }
+        ));
+        assert!(r.allow.reserved().len() <= REQUIRED_PENDING_PER_ID);
+    }
+    assert_eq!(r.counters().required_pending_replaced, 6);
+    // The two newest are held.
+    let held: Vec<u8> = r
+        .allow
+        .reserved()
+        .iter()
+        .map(|entry| match entry.source.ip() {
+            IpAddr::V4(v4) => v4.octets()[3],
+            IpAddr::V6(_) => 0,
+        })
+        .collect();
+    assert_eq!(held, [7, 8]);
+    // The real receiver's retry takes an entry back, and its CHALLENGE
+    // finds it.
+    let real = source(100, 1);
+    assert!(matches!(
+        r.register(real, &spoofed(100), Capacity::Free, T0 + 20),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert!(r.challenged(real, [100, 100], T0 + 21).is_some());
+}
+
+/// The per-source bound applies to the reserved entries too (design 3.2
+/// step 5), and they expire at `join_timeout`.
+#[test]
+fn reserved_entries_count_per_source_and_expire() {
+    let mut r = with_required(&[42, 43]);
+    let from = source(5, 1);
+    let named = |receiver_id: u64, port: u64| RspRegister {
+        stream_id: STREAM,
+        receiver: Receiver {
+            receiver_boot_id: [port, 1],
+            receiver_id,
+        },
+    };
+    assert!(matches!(
+        r.register(from, &named(42, 1), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert!(matches!(
+        r.register(from, &named(7, 2), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert_eq!(
+        r.register(from, &named(43, 3), Capacity::Free, T0),
+        RegisterOutcome::Drop(RegisterDrop::SourcePendingFull)
+    );
+    let late = T0 + RegistrationConfig::default().join_timeout;
+    assert!(matches!(
+        r.register(from, &named(43, 3), Capacity::Free, late),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert_eq!(r.allow.reserved().len(), 1);
+    assert_eq!(r.counters().expired, 2);
 }

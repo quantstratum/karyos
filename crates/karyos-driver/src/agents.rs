@@ -1286,12 +1286,38 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
 /// (`quantstratum-docs: karyos/design/management-agent-gap-analysis.md`,
 /// M2): controls sent and not sent, NAKs and SMs received, idle
 /// heartbeats sent.
-pub(crate) const SENDER_CELLS: [&str; 5] = [
+///
+/// Then the driver's dynamic registrations (`quantstratum-docs:
+/// karyos/design/multi-destination-unicast.md` section 7; karyos#644):
+/// REGISTERs admitted, retried, answered ERR or not, dropped by reason,
+/// and what registrants' first SMs did.
+pub(crate) const SENDER_CELLS: [&str; 26] = [
     "network controls sent",
     "network control send failures",
     "naks received",
     "status messages received",
     "heartbeats sent",
+    "registrations",
+    "registration retries",
+    "registration errs sent",
+    "registration errs suppressed",
+    "registrations dropped source",
+    "registrations dropped range",
+    "registrations dropped source rate",
+    "registrations dropped rate",
+    "registrations dropped pending",
+    "registrations dropped source pending",
+    "registrations dropped bound",
+    "registrations dropped boot changed",
+    "registrations duplicate receiver",
+    "required registrations replaced",
+    "registrations expired",
+    "registrants joined",
+    "registrants full",
+    "registrants refused",
+    "registrants restarted",
+    "registrants moved",
+    "registrants timed out",
 ];
 
 /// A network publication's counters in the CnC, in [`AgentCells`] order
@@ -1330,13 +1356,37 @@ pub(crate) const RECEIVER_CELLS: [&str; 5] = [
     "images retired at timeout",
 ];
 
-fn sender_values(counters: &roles::SenderCounters) -> [u64; SENDER_CELLS.len()] {
+fn sender_values(
+    counters: &roles::SenderCounters,
+    registrations: &crate::sessions::register::RegistrationCounters,
+) -> [u64; SENDER_CELLS.len()] {
     [
         counters.sent,
         counters.send_failures,
         counters.naks,
         counters.sm_accepted,
         counters.heartbeats_sent,
+        registrations.registered,
+        registrations.retried,
+        registrations.refused_full,
+        registrations.dropped_refusal_limited,
+        registrations.dropped_source,
+        registrations.dropped_not_allowed,
+        registrations.dropped_source_rate,
+        registrations.dropped_rate,
+        registrations.dropped_pending_full,
+        registrations.dropped_source_pending_full,
+        registrations.dropped_bound,
+        registrations.dropped_boot_changed,
+        registrations.duplicate_receiver,
+        registrations.required_pending_replaced,
+        registrations.expired,
+        counters.registrants_joined,
+        counters.registrants_full,
+        counters.registrants_refused,
+        counters.registrants_restarted,
+        counters.registrants_moved,
+        counters.registrants_timed_out,
     ]
 }
 
@@ -1607,7 +1657,10 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
     /// [`AgentError::Invariant`] or [`AgentError::CountOverflow`].
     pub fn do_work(&mut self, now: u64) -> Result<u32, AgentError> {
         let result = self.duty(now);
-        self.cells.publish(&sender_values(&self.role.counters()));
+        self.cells.publish(&sender_values(
+            &self.role.counters(),
+            &self.role.registration_counters(),
+        ));
         self.role.publish_stream_cells();
         result
     }
