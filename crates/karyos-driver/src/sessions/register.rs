@@ -40,6 +40,21 @@
 //! 40-byte ERR, only to its validated source, within the rates and
 //! bounds above (design 9.2). The larger ANSWER follows only a CHALLENGE.
 //!
+//! **Ahead of the design note.** Three rules here run ahead of the note
+//! as written, and quantstratum-docs#829 carries the amendment that
+//! records them (karyos#945 review). Step 3: the per-source bucket is
+//! this module's own, not `setup_answer_rate` as 3.2 step 3 names it,
+//! and a registrant's CHALLENGE is charged to it rather than to
+//! `setup_answer_rate` as 9.2 puts the ANSWER; an address the full
+//! per-address table cannot track falls back to the driver total alone,
+//! so that address may be sent up to `registration_rate` ANNOUNCEs a
+//! second rather than the per-source bound of 9.2. Step 5: at a bound the
+//! new entry replaces the oldest one it competes with, where 3.2 step 5
+//! drops it. Step 4: what the publication holds is looked up with the
+//! restart quiet time `move_quiet`, and a required receiver id whose
+//! reserved slot is held with no binding left is dropped
+//! ([`Existing::RequiredLost`]); the owner's lookup states both.
+//!
 //! **No authentication.** The allowlist restricts admission and supplies
 //! no authentication (ADR-0082, decision 1): an admitted registration is
 //! as unauthenticated as any other, and every check above stays mandatory

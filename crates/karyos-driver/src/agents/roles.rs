@@ -7437,8 +7437,9 @@ impl<T: StreamTerms> SenderRole<T> {
     /// `moved`); a required receiver id is never restarted nor moved, and a
     /// receiver still live elsewhere is a `duplicate_receiver`. A
     /// `stranger`, not a destination yet, takes its slot first. `None`
-    /// when settled; otherwise its binding is dropped and the outcome holds
-    /// what to answer.
+    /// when settled; otherwise the outcome holds what to answer, and a
+    /// stranger's binding is dropped, while one at a slot already held
+    /// stays, reset, to expire it.
     #[allow(
         clippy::option_option,
         reason = "settled, refused with a reply, or refused without one"
@@ -7727,6 +7728,9 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.refused);
             return None;
         };
+        // Whether it is a pending registrant's CHALLENGE, from the source
+        // it registered from: decided once (karyos#945 review).
+        let registrant = self.registrant_challenge(endpoint, normalized(source), &control, now);
         // A multi-destination publication answers only a configured
         // destination, at that destination (design 9.2; MD-16): a source
         // outside its set is refused, so it reflects nothing.
@@ -7737,7 +7741,6 @@ impl<T: StreamTerms> SenderRole<T> {
                 // A registrant's CHALLENGE answers even at a destination's
                 // address: a receiver restarted there. Its pending entry is
                 // taken only once the ANSWER goes (karyos#940).
-                let registrant = self.registrant_challenge(endpoint, source, &control, now);
                 if !registrant && !self.sends_to(endpoint, alias, source) {
                     self.count(|c| &mut c.refused);
                     return None;
@@ -7749,8 +7752,6 @@ impl<T: StreamTerms> SenderRole<T> {
         // A registrant's CHALLENGE is charged to its address's bucket of
         // the registrations, not to the shared `setup_answer_rate` table
         // (karyos#945 review): a refused one keeps its pending entry.
-        let registrant = matches!(control, Control::Challenge(_))
-            && self.registrant_challenge(endpoint, normalized(source), &control, now);
         if registrant && !self.registrations.admit_challenge(source, now) {
             self.count(|c| &mut c.refused);
             return None;
