@@ -71,8 +71,11 @@ fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAd
             .ok_or(DriverError::UnsupportedChannel)?,
         // Dynamic registration: only with an allowlist (ADR-0082, decision
         // 1), with no listed destination, no redundant path and no
-        // interface other than `control`'s (design 3.2; karyos#644). A call
-        // that carries no allowlist refuses it.
+        // interface other than `control`'s (design 3.2; karyos#644). Only
+        // the crate-internal dynamic call carries an allowlist: every public
+        // call refuses dynamic mode until the registration defects found
+        // after karyos#939 are fixed (karyos#644, reopened:
+        // https://github.com/quantstratum/karyos/issues/644#issuecomment-6826655946).
         Destination::MultiDestination {
             destinations,
             control: Some(control),
@@ -87,7 +90,7 @@ fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAd
         Destination::MultiDestination {
             mode: ControlMode::Dynamic,
             ..
-        } => return Err(DriverError::DynamicRegistrationRequired),
+        } => return Err(DriverError::DynamicRegistrationUnsupported),
         Destination::MultiDestination { .. } => return Err(DriverError::UnsupportedChannel),
         // A destination a later protocol version parses: not served.
         _ => return Err(DriverError::UnsupportedChannel),
@@ -331,6 +334,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// destination until one joins (ADR-0056, ADR-0082; `quantstratum-docs:
     /// karyos/design/multi-destination-unicast.md` 3.2; karyos#644).
     ///
+    /// Test-only, as the public calls refuse dynamic mode with
+    /// [`DriverError::DynamicRegistrationUnsupported`] until the
+    /// registration defects reported on karyos#644 after it was first
+    /// exposed are fixed: the loopback end-to-end tests drive it here.
+    ///
     /// A REGISTER is admitted only from a source `allowlist` names. The
     /// allowlist is explicit and never empty: a deployment that means to
     /// admit any source names that broad range (`0.0.0.0/0`, `::/0`). It
@@ -351,24 +359,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// One control endpoint holds at most one dynamic publication of a
     /// stream.
     ///
-    /// ```no_run
-    /// use karyos_driver::sessions::register::{AddressRange, RegistrationAllowlist};
-    /// use karyos_driver::{AggregateConfig, AggregateHandle, EmbeddedDriver};
-    /// use karyos_protocol::channel::UdpConfig;
-    ///
-    /// /// Publishes on `channel`, a `control-mode=dynamic` channel, to
-    /// /// registrants from 10.0.0.0/8 only.
-    /// fn publish(
-    ///     driver: &mut EmbeddedDriver,
-    ///     config: AggregateConfig,
-    ///     channel: &UdpConfig,
-    /// ) -> Result<AggregateHandle, Box<dyn std::error::Error>> {
-    ///     let lan = AddressRange::new("10.0.0.0".parse()?, 8)?;
-    ///     let allowlist = RegistrationAllowlist::new(&[lan])?;
-    ///     Ok(driver.add_dynamic_network_publication(config, channel, allowlist, None)?)
-    /// }
-    /// ```
-    ///
     /// # Errors
     ///
     /// As [`EmbeddedDriver::add_network_publication`];
@@ -380,7 +370,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// for a second dynamic publication of the stream on that control
     /// endpoint. Guards and timed lanes are not combined with destinations
     /// ([`DriverError::UnsupportedChannel`]).
-    pub fn add_dynamic_network_publication(
+    #[cfg(test)]
+    pub(crate) fn add_dynamic_network_publication(
         &mut self,
         config: AggregateConfig,
         channel: &UdpConfig,

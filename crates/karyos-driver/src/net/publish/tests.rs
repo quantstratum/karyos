@@ -203,7 +203,7 @@ fn unsupported_channels_are_refused_before_any_stream() {
     };
     assert_eq!(
         driver.add_network_publication(aggregate(10, 1), &channel(multi)),
-        Err(DriverError::DynamicRegistrationRequired)
+        Err(DriverError::DynamicRegistrationUnsupported)
     );
     let mut named = channel(Destination::Unicast(SocketAddr::new(LOOPBACK, 40_000)));
     named.interface = Some(Interface::Name("lo".into()));
