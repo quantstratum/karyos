@@ -346,9 +346,10 @@ fn registers_from_many_ports_of_one_address_leave_others_their_rates() {
 /// karyos#945 review: registrants' CHALLENGEs are charged to their
 /// address's bucket of the registrations, not to the shared
 /// `setup_answer_rate` table keyed on address and port. REGISTER and
-/// CHALLENGE pairs from 64 address and port pairs (4 addresses, 16 ports
-/// each) leave that table free: a new registrant's CHALLENGE and a joined
-/// destination's own CHALLENGE are still answered.
+/// CHALLENGE pairs from 128 address and port pairs (8 addresses, 16
+/// ports each), twice that table's 64 entries, leave it free: a new
+/// registrant's CHALLENGE and a joined destination's own CHALLENGE are
+/// still answered.
 #[test]
 fn register_and_challenge_pairs_leave_the_answer_rate_table_free() {
     let mut sender = dynamic_sender(8);
@@ -356,7 +357,7 @@ fn register_and_challenge_pairs_leave_the_answer_rate_table_free() {
     assert_eq!(join_as(&mut sender, joined, 5, 7, T0), None);
     let now = T0 + 2_000_000_000;
     let mut answered = 0;
-    for host in 1..=4u8 {
+    for host in 1..=8u8 {
         for port in 1..=16u16 {
             let from = SocketAddr::from(([10, 0, 3, host], port));
             let boot = u64::from(host) * 100 + u64::from(port);
@@ -370,7 +371,7 @@ fn register_and_challenge_pairs_leave_the_answer_rate_table_free() {
         }
     }
     // Each address's bucket of 20 takes 10 pairs.
-    assert_eq!(answered, 4 * 10);
+    assert_eq!(answered, 8 * 10);
     let fresh: SocketAddr = "10.0.0.50:5000".parse().unwrap();
     assert!(
         sender
@@ -389,6 +390,28 @@ fn register_and_challenge_pairs_leave_the_answer_rate_table_free() {
     );
     assert_eq!(sender.session_counters().rate_sources_full, 0);
     assert_eq!(sender.session_counters().rate_limited, 0);
+}
+
+/// karyos#945 review: with the registrations' per-address table full, a
+/// registrant's CHALLENGE from an address it cannot track is answered:
+/// its ANSWER takes the pending entry an admitted REGISTER made.
+#[test]
+fn a_registrant_challenge_with_the_rate_table_full_is_answered() {
+    let mut config = AgentConfig::default();
+    config.registration.sources = 1;
+    let mut sender = dynamic_sender_config(&config, 4, &[]);
+    let (tracked, untracked): (SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+    );
+    assert!(
+        sender
+            .register(EndpointId(1), tracked, &register_as(5, 7), T0)
+            .is_some()
+    );
+    assert_eq!(join_as(&mut sender, untracked, 6, 8, T0), None);
+    assert!(sender.sends_to(EndpointId(1), alias(), untracked));
+    assert_eq!(sender.registration_counters().source_rates_full, 2);
 }
 
 /// karyos#940 item 7: a registrant's CHALLENGE whose ANSWER its rate
@@ -1271,6 +1294,68 @@ fn a_reset_binding_still_holds_its_receiver_id() {
     assert_eq!(sender.registration_counters().dropped_boot_changed, 1);
     assert_eq!(required_targets(&sender), [real]);
     assert!(removals(&mut sender, now + 4).is_empty());
+}
+
+/// karyos#945 review: a binding answered again keeps its optional
+/// receiver id until its next SM. A registrant that registered that id
+/// before, from another endpoint, is refused at its first SM: the id
+/// takes no second slot.
+#[test]
+fn a_reset_binding_keeps_its_optional_id_from_a_second_slot() {
+    let mut sender = dynamic_sender(4);
+    let (a, b): (SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+    );
+    assert!(
+        sender
+            .register(EndpointId(1), b, &register_as(5, 8), T0)
+            .is_some()
+    );
+    assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
+    assert!(
+        sender
+            .answer_for(EndpointId(1), a, T0 + 2, challenge_of(7))
+            .is_some()
+    );
+    assert!(
+        sender
+            .answer_for(EndpointId(1), b, T0 + 3, challenge_of(8))
+            .is_some()
+    );
+    assert_eq!(sender.status(EndpointId(1), b, &sm_as(5, 8), T0 + 4), None);
+    assert!(!sender.sends_to(EndpointId(1), alias(), b));
+    assert!(sender.sends_to(EndpointId(1), alias(), a));
+    assert_eq!(sender.counters().registrants_refused, 1);
+}
+
+/// Owner decision M4, MD-19: a required receiver id is never restarted,
+/// even at its own slot's endpoint with its old binding quiet. A REGISTER
+/// with a new boot id that was pending before the id joined is refused at
+/// its first SM.
+#[test]
+fn a_required_id_is_never_restarted_at_its_slot() {
+    let mut sender = dynamic_sender_with(4, &[42]);
+    let a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert!(
+        sender
+            .register(EndpointId(1), a, &register_as(42, 8), T0)
+            .is_some()
+    );
+    assert_eq!(join_as(&mut sender, a, 42, 7, T0), None);
+    let later = T0 + 100_000_000;
+    assert!(
+        sender
+            .answer_for(EndpointId(1), a, later, challenge_of(8))
+            .is_some()
+    );
+    assert_eq!(
+        sender.status(EndpointId(1), a, &sm_as(42, 8), later + 1),
+        None
+    );
+    assert_eq!(sender.counters().registrants_refused, 1);
+    assert_eq!(sender.counters().registrants_restarted, 0);
+    assert_eq!(required_targets(&sender), [a]);
 }
 
 /// karyos#940 item 3: a REGISTER naming a bound optional `receiver_id`
