@@ -2031,6 +2031,42 @@ fn rttm_probe_ids_are_restocked() {
     assert_eq!(role.images[0].rtt.counts().id_failures, 0);
 }
 
+/// Step 1 of #644 adds the REGISTER and ERR REGISTRATION codecs only: the
+/// role counts both as `unhandled`, forwards nothing to the sender and
+/// answers nothing, until step 2 wires dynamic admission.
+#[test]
+fn registrations_are_unhandled_until_dynamic_admission_is_wired() {
+    use karyos_protocol::network::{Receiver, Registration, RegistrationReason, RspRegister};
+
+    let (sender, mut role) = receiver_with(AgentConfig::default());
+    let (events, _link) = event_ring();
+    let source: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let register = Control::Register(RspRegister {
+        stream_id: 1001,
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 1,
+        },
+    });
+    let refused = Control::Registration(Registration {
+        stream_id: 1001,
+        reason: RegistrationReason::DestinationsFull,
+    });
+    let before = role.counters();
+    intake(&mut role, &events, 3).control(source, register);
+    intake(&mut role, &events, 4).control(source, refused);
+    let after = role.counters();
+    assert_eq!(after.unhandled, before.unhandled + 2);
+    assert!(matches!(sender.from_receiver.try_take(), Ok(None)));
+    assert_eq!(
+        super::ReceiverCounters {
+            unhandled: before.unhandled,
+            ..after
+        },
+        before
+    );
+}
+
 /// An RTTM REQUEST reaches the sender only for an alias published on the
 /// endpoint, stamped with when it was taken from the backend.
 #[test]

@@ -11,6 +11,7 @@
 pub mod paths;
 pub mod rate;
 pub mod receive;
+pub mod register;
 pub mod send;
 
 /// Where random challenge nonces come from (`karyos_sys::random` in the
