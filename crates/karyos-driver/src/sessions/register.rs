@@ -462,6 +462,12 @@ pub enum Existing {
     /// `move_quiet`, or the same required receiver block at another
     /// endpoint (never moved, MD-19): refused.
     DuplicateReceiver,
+    /// A required receiver id whose reserved slot is held with no binding
+    /// left, wherever it registers from and with any boot id: its
+    /// `Membership` holds it `LostRequired` for the incarnation (design
+    /// 4.6, M5), so it is refused here rather than at its first SM
+    /// (karyos#945 review; quantstratum-docs#829).
+    RequiredLost,
 }
 
 /// What a REGISTER causes.
@@ -513,6 +519,8 @@ pub enum RegisterDrop {
     BootChanged,
     /// [`Existing::DuplicateReceiver`].
     DuplicateReceiver,
+    /// [`Existing::RequiredLost`].
+    RequiredLost,
 }
 
 /// Counters of [`Registrations`]; checked, sticky on overflow (design 7).
@@ -547,6 +555,8 @@ pub struct RegistrationCounters {
     pub dropped_boot_changed: u64,
     /// Dropped: [`RegisterDrop::DuplicateReceiver`] (`duplicate_receiver`).
     pub duplicate_receiver: u64,
+    /// Dropped: [`RegisterDrop::RequiredLost`] (karyos#945 review).
+    pub dropped_required_lost: u64,
     /// Pending entries replaced by a newer REGISTER naming a required
     /// receiver id: one of its own reserved entries, or one held by its
     /// source address at `pending_per_source` (`required_pending_replaced`).
@@ -726,6 +736,7 @@ impl Registrations {
                 RegisterDrop::Bound => |c| &mut c.dropped_bound,
                 RegisterDrop::BootChanged => |c| &mut c.dropped_boot_changed,
                 RegisterDrop::DuplicateReceiver => |c| &mut c.duplicate_receiver,
+                RegisterDrop::RequiredLost => |c| &mut c.dropped_required_lost,
             },
         };
         self.counters.bump(counter);
@@ -799,6 +810,7 @@ impl Registrations {
             Existing::DuplicateReceiver => {
                 return RegisterOutcome::Drop(RegisterDrop::DuplicateReceiver);
             }
+            Existing::RequiredLost => return RegisterOutcome::Drop(RegisterDrop::RequiredLost),
         }
         // Step 5: pending bounds, per source address (SPEC.md §6) over the
         // optional and the reserved entries, the port ignored. At each

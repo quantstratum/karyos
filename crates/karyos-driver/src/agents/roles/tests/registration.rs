@@ -1639,3 +1639,363 @@ fn a_moved_receiver_keeps_its_membership() {
         crate::membership::MemberEvent::Joined { .. }
     ));
 }
+
+/// Every live optional registrant slot of the publication: a destination
+/// a registrant's first SM took, not removed, other than the required
+/// ones.
+fn optional_slots(sender: &super::super::SenderRole) -> Vec<SocketAddr> {
+    let required = required_targets(sender);
+    let outbound = &sender.publications[0];
+    outbound
+        .destinations()
+        .unwrap()
+        .filter(|address| !required.contains(address) && outbound.registrant_at(*address).is_some())
+        .collect()
+}
+
+/// The optional slots no binding covers: none may exist (the invariant
+/// `retire_uncovered_registrants` keeps).
+fn uncovered_slots(sender: &super::super::SenderRole) -> Vec<SocketAddr> {
+    optional_slots(sender)
+        .into_iter()
+        .filter(|address| !sender.bindings.iter().any(|held| held.source() == *address))
+        .collect()
+}
+
+/// karyos#945 review: an SM of one slot's receiver sent from another
+/// slot's address (`y` holds boot 7, `x` boot 8) cannot claim required id
+/// 42 through an adoption: it is unbound, no binding names 42, admission
+/// keeps its required target missing, and the real 42 joins.
+#[test]
+fn an_sm_from_another_slot_cannot_claim_a_required_id() {
+    let mut sender = dynamic_sender_with(4, &[42]);
+    let y: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let x: SocketAddr = "10.0.0.9:5001".parse().unwrap();
+    assert_eq!(join_as(&mut sender, y, 1, 7, T0), None);
+    assert_eq!(join_as(&mut sender, x, 2, 8, T0 + 10), None);
+    let before = sender.counters();
+    assert_eq!(
+        sender.status(EndpointId(1), y, &sm_as(42, 8), T0 + 20),
+        None
+    );
+    let after = sender.counters();
+    assert_eq!(after.sm_unbound, before.sm_unbound + 1);
+    assert_eq!(after.sm_accepted, before.sm_accepted);
+    assert_eq!(after.bindings_adopted, 0);
+    assert!(
+        sender
+            .bindings
+            .iter()
+            .all(|held| held.receiver_id != Some(42))
+    );
+    assert!(required_targets(&sender).is_empty());
+    let real: SocketAddr = "10.0.0.42:5000".parse().unwrap();
+    assert_eq!(join_as(&mut sender, real, 42, 4242, T0 + 30), None);
+    assert_eq!(required_targets(&sender), vec![real]);
+    assert_eq!(
+        admission(&sender, T0 + 31),
+        crate::membership::Admission::Open
+    );
+}
+
+/// karyos#945 review: `make_room` evicting a reset binding that holds a
+/// slot leaves the slot to the bindings still at its address, and retires
+/// it with the last of them (on `main` it stayed for good). Three slot owners reset their
+/// bindings with a bare CHALLENGE, then CHALLENGEs with new boot ids
+/// within `setup_answer_rate` fill the table.
+#[test]
+fn an_evicted_binding_retires_the_slot_it_held() {
+    let mut sender = dynamic_sender(4);
+    let at = |port: u16| SocketAddr::from(([10, 0, 0, 9], port));
+    for port in 1..=3u16 {
+        let id = u64::from(port);
+        assert_eq!(join_as(&mut sender, at(port), id, id, T0), None);
+    }
+    let now = T0 + 5_000_000_000;
+    for port in 1..=3u16 {
+        let id = u64::from(port);
+        assert_eq!(
+            sender.status(EndpointId(1), at(port), &sm_as(id, id), now),
+            None
+        );
+        assert!(
+            sender
+                .answer_for(EndpointId(1), at(port), now + 1, challenge_of(id))
+                .is_some()
+        );
+    }
+    for (offset, count) in [(2u64, 19u64), (500_000_000, 9)] {
+        for boot in 0..count {
+            for port in 1..=3u16 {
+                let boot = 1000 + offset % 7 * 1000 + boot * 10 + u64::from(port);
+                let _ =
+                    sender.answer_for(EndpointId(1), at(port), now + offset, challenge_of(boot));
+                assert_eq!(uncovered_slots(&sender), Vec::<SocketAddr>::new());
+            }
+        }
+    }
+    // The bindings that held the slots are evicted; the slots stay only
+    // while the new bindings at their addresses can still expire them.
+    assert!(sender.counters().bindings_evicted > 0);
+    assert!(sender.bindings.iter().all(|held| held.last_sm.is_none()));
+    let late = now + 500_000_000 + sender.unconfirmed_timeout;
+    sender.expire_bindings(late);
+    assert!(optional_slots(&sender).is_empty());
+    let mut removed = removals(&mut sender, late);
+    removed.sort_by_key(|(address, _)| *address);
+    let expected: Vec<_> = (1..=3u16)
+        .map(|port| (at(port), RemovalReason::Timeout))
+        .collect();
+    assert_eq!(removed, expected);
+    assert_eq!(sender.counters().registrants_timed_out, 3);
+}
+
+/// karyos#945 review: with the table at three bindings, five datagrams
+/// evict the binding that holds a slot; the slot goes with the last
+/// binding at its address.
+#[test]
+fn an_evicted_binding_retires_its_slot_with_a_small_table() {
+    let config = AgentConfig {
+        receiver_bindings: 3,
+        ..AgentConfig::default()
+    };
+    let mut sender = dynamic_sender_config(&config, 4, &[]);
+    let a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert_eq!(join_as(&mut sender, a, 1, 7, T0), None);
+    // A bare CHALLENGE resets the binding, then three new boot ids.
+    for (offset, boot) in [(10u64, 7u64), (20, 8), (30, 9), (40, 10)] {
+        assert!(
+            sender
+                .answer_for(EndpointId(1), a, T0 + offset, challenge_of(boot))
+                .is_some()
+        );
+        assert_eq!(uncovered_slots(&sender), Vec::<SocketAddr>::new());
+    }
+    assert_eq!(sender.counters().bindings_evicted, 1);
+    let late = T0 + 40 + sender.unconfirmed_timeout;
+    sender.expire_bindings(late);
+    assert!(optional_slots(&sender).is_empty());
+    assert_eq!(
+        removals(&mut sender, late),
+        vec![(a, RemovalReason::Timeout)]
+    );
+}
+
+/// karyos#945 review: two slots of one host, `y`'s receiver silent and
+/// `x`'s receiver sending from `y` too, leave no slot behind: no adoption
+/// shares `y`'s address, so each slot expires with its own binding, and
+/// four honest registrants take the four slots afterwards.
+#[test]
+fn a_slot_another_receiver_sends_at_still_expires() {
+    let mut sender = dynamic_sender(4);
+    let y: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let x: SocketAddr = "10.0.0.9:5001".parse().unwrap();
+    assert_eq!(join_as(&mut sender, y, 1, 7, T0), None);
+    assert_eq!(join_as(&mut sender, x, 2, 8, T0 + 10), None);
+    let live = sender.confirmed_timeout;
+    let mut at = T0 + 20;
+    while at < T0 + 20 + live / 2 {
+        let _ = sender.status(EndpointId(1), y, &sm_as(2, 8), at);
+        at += live / 20;
+    }
+    assert_eq!(sender.counters().bindings_adopted, 0);
+    let mut removed = Vec::new();
+    for step in 1..=12u64 {
+        let now = at + step * live / 4;
+        sender.expire_bindings(now);
+        removed.extend(removals(&mut sender, now));
+    }
+    removed.sort_by_key(|(address, _)| *address);
+    assert_eq!(
+        removed,
+        vec![(y, RemovalReason::Timeout), (x, RemovalReason::Timeout)]
+    );
+    let late = at + 100 * live;
+    for last in 50..54u8 {
+        let honest = SocketAddr::from(([10, 0, 0, last], 5000));
+        assert_eq!(
+            join_as(&mut sender, honest, u64::from(last), u64::from(last), late),
+            None
+        );
+        assert!(sender.sends_to(EndpointId(1), alias(), honest));
+    }
+}
+
+/// Design 4.6, M5 (karyos#945 review): a required id back at its own
+/// endpoint after its binding expired, with its boot id or a new one, is
+/// dropped at its REGISTER (`dropped_required_lost`), as `Membership`
+/// refuses it: nothing is announced, answered or accepted.
+#[test]
+fn a_required_id_back_with_no_binding_is_dropped_at_its_register() {
+    for boot in [7u64, 8] {
+        let mut sender = dynamic_sender_with(4, &[42]);
+        let a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+        assert_eq!(join_as(&mut sender, a, 42, 7, T0), None);
+        let late = T0 + 2 * sender.confirmed_timeout;
+        sender.expire_bindings(late);
+        assert!(sender.bindings.is_empty());
+        let accepted = sender.counters().sm_accepted;
+        assert_eq!(
+            sender.register(EndpointId(1), a, &register_as(42, boot), late),
+            None
+        );
+        assert_eq!(sender.registration_counters().dropped_required_lost, 1);
+        assert_eq!(try_join(&mut sender, a, 42, boot, late + 10), None);
+        assert_eq!(sender.counters().sm_accepted, accepted);
+        assert_eq!(
+            admission(&sender, late + 20),
+            crate::membership::Admission::LostRequired
+        );
+        // At another endpoint too, before any ANNOUNCE.
+        let b: SocketAddr = "10.0.0.10:5000".parse().unwrap();
+        assert_eq!(
+            sender.register(EndpointId(1), b, &register_as(42, boot), late + 30),
+            None
+        );
+        assert_eq!(sender.registration_counters().dropped_required_lost, 3);
+    }
+}
+
+/// One step of [`every_optional_slot_keeps_a_binding_able_to_expire_it`].
+#[derive(Debug, Clone, Copy)]
+enum Step {
+    /// REGISTER, CHALLENGE and SM, each only if the one before went.
+    Join(usize, u64, u64),
+    Register(usize, u64, u64),
+    Challenge(usize, u64),
+    Sm(usize, u64, u64),
+    Wait(u64),
+    Report,
+}
+
+/// The invariant `retire_uncovered_registrants` keeps (karyos#945
+/// review): every optional registrant slot always has a binding able to
+/// expire it, after every datagram and every wait, and silence leaves no
+/// slot nor binding. Random sequences of REGISTER, CHALLENGE, SM, waits and
+/// removal reports over four endpoints of two hosts, three receiver ids
+/// and one required id, from fixed seeds (xorshift), under the default
+/// table and a three-binding one: they reach every path that removes a
+/// binding (expiry, `make_room` eviction, a full or refused join, a
+/// restart, a move), each asserted reached. A failure names its seed, the
+/// step and the sequence so far.
+#[test]
+fn every_optional_slot_keeps_a_binding_able_to_expire_it() {
+    const SEEDS: u64 = 12_000;
+    let addresses: [SocketAddr; 4] = [
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.9:5001".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+        "10.0.0.42:5000".parse().unwrap(),
+    ];
+    let ids = [1u64, 2, 3, 42];
+    let boots = [7u64, 8, 9];
+    let mut reached = super::super::SenderCounters::default();
+    for bindings in [64usize, 3] {
+        for seed in 1..=SEEDS {
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut next = |n: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                usize::try_from(state % n).unwrap()
+            };
+            let config = AgentConfig {
+                receiver_bindings: bindings,
+                ..AgentConfig::default()
+            };
+            let mut sender = dynamic_sender_config(&config, 4, &[42]);
+            let live = sender.confirmed_timeout;
+            let waits = [
+                1_000_000u64,
+                20_000_000,
+                60_000_000,
+                300_000_000,
+                1_100_000_000,
+                live / 2,
+                live + 1,
+            ];
+            let mut now = T0;
+            let mut steps = Vec::new();
+            let length = 6 + next(30);
+            for _ in 0..length {
+                let step = match next(13) {
+                    0..=2 => Step::Register(next(4), ids[next(4)], boots[next(3)]),
+                    3..=4 => Step::Challenge(next(4), boots[next(3)]),
+                    5..=7 => Step::Sm(next(4), ids[next(4)], boots[next(3)]),
+                    8 => Step::Wait(waits[next(7)]),
+                    9 => Step::Report,
+                    _ => Step::Join(next(4), ids[next(4)], boots[next(3)]),
+                };
+                steps.push(step);
+                now += 1000;
+                match step {
+                    Step::Join(at, id, boot) => {
+                        let _ = try_join(&mut sender, addresses[at], id, boot, now);
+                        now += 1;
+                    }
+                    Step::Register(at, id, boot) => {
+                        let _ = sender.register(
+                            EndpointId(1),
+                            addresses[at],
+                            &register_as(id, boot),
+                            now,
+                        );
+                    }
+                    Step::Challenge(at, boot) => {
+                        let _ = sender.answer_for(
+                            EndpointId(1),
+                            addresses[at],
+                            now,
+                            challenge_of(boot),
+                        );
+                    }
+                    Step::Sm(at, id, boot) => {
+                        let _ = sender.status(EndpointId(1), addresses[at], &sm_as(id, boot), now);
+                    }
+                    Step::Wait(by) => {
+                        now += by;
+                        sender.expire_bindings(now);
+                    }
+                    Step::Report => {
+                        let _ = removals(&mut sender, now);
+                    }
+                }
+                let uncovered = uncovered_slots(&sender);
+                assert!(
+                    uncovered.is_empty(),
+                    "receiver_bindings {bindings}, seed {seed}: {uncovered:?} uncovered after {steps:#?}"
+                );
+            }
+            for step in 1..=24u64 {
+                let at = now + step * live / 4;
+                sender.expire_bindings(at);
+                let _ = removals(&mut sender, at);
+            }
+            let left = optional_slots(&sender);
+            assert!(
+                left.is_empty() && sender.bindings.is_empty(),
+                "receiver_bindings {bindings}, seed {seed}: {left:?} and {} bindings left after silence, from {steps:#?}",
+                sender.bindings.len()
+            );
+            let counters = sender.counters();
+            reached.bindings_expired += counters.bindings_expired;
+            reached.bindings_evicted += counters.bindings_evicted;
+            reached.registrants_full += counters.registrants_full;
+            reached.registrants_refused += counters.registrants_refused;
+            reached.registrants_restarted += counters.registrants_restarted;
+            reached.registrants_moved += counters.registrants_moved;
+            reached.registrants_timed_out += counters.registrants_timed_out;
+        }
+    }
+    for (path, count) in [
+        ("expiry", reached.bindings_expired),
+        ("make_room eviction", reached.bindings_evicted),
+        ("full join", reached.registrants_full),
+        ("refused join", reached.registrants_refused),
+        ("restart", reached.registrants_restarted),
+        ("move", reached.registrants_moved),
+        ("slot retired", reached.registrants_timed_out),
+    ] {
+        assert!(count > 0, "the sequences never reach {path}");
+    }
+}

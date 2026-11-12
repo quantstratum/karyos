@@ -967,6 +967,40 @@ impl<T: StreamTerms> Outbound<T> {
         })
     }
 
+    /// Whether a required destination slot holds `receiver_id`, taken by
+    /// its first SM ([`Self::join_registrant`]); it is held for the
+    /// publication's incarnation (design 4.6, M5).
+    pub(crate) fn holds_required(&self, receiver_id: u64) -> bool {
+        self.fanout.as_deref().is_some_and(|fanout| {
+            fanout.targets.iter().any(|target| {
+                target.required
+                    && target.removed.is_none()
+                    && target.receiver_id == Some(receiver_id)
+            })
+        })
+    }
+
+    /// The first live optional registrant slot, one a dynamic
+    /// registrant's first SM took ([`Self::join_registrant`]), whose
+    /// address `covered` rejects: the roles retire it in the step that
+    /// leaves it with no binding able to expire it (karyos#945 review).
+    pub(crate) fn uncovered_registrant(
+        &self,
+        covered: impl Fn(SocketAddr) -> bool,
+    ) -> Option<SocketAddr> {
+        self.registration.as_ref()?;
+        self.fanout.as_deref().and_then(|fanout| {
+            fanout
+                .targets
+                .iter()
+                .filter(|target| {
+                    !target.required && target.removed.is_none() && target.receiver_id.is_some()
+                })
+                .map(|target| target.address)
+                .find(|address| !covered(*address))
+        })
+    }
+
     /// Whether `destination` was removed less than `quarantine` before
     /// `now` (design 3.7, MD-14), changing nothing: its REGISTER is
     /// dropped meanwhile.

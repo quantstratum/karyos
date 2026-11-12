@@ -15,6 +15,12 @@
   `destination_move_quiet`; a source in its quarantine gets no ANNOUNCE;
   a receiver restarting at its own slot is not refused for a full quota;
   a CHALLENGE whose ANSWER is refused for its rate keeps its pending
-  entry. The new counters `dropped_quarantined`, `pending_replaced`,
-  `source_rates_full` and `dropped_challenge_rate` are not in the CnC
+  entry; on a dynamic publication an SM adopts no binding at another
+  slot's address (it could claim a required id), every optional slot
+  retires with the last binding at its address whichever path removes
+  it (an eviction from a full binding table left it for good), and a
+  required id whose slot is held with no binding is dropped at its
+  REGISTER. The new counters `dropped_quarantined`, `pending_replaced`,
+  `source_rates_full`, `dropped_challenge_rate` and
+  `dropped_required_lost` are not in the CnC
   yet (#942 item 9), so no user can read them.

@@ -6689,6 +6689,7 @@ impl<T: StreamTerms> SenderRole<T> {
                 self.binding_gone(&child, receiver_id, now);
             }
         }
+        self.retire_uncovered_registrants(removed.endpoint, removed.alias, now);
     }
 
     /// Removes the bindings past their lifetime at `now`: an unconfirmed
@@ -6703,43 +6704,54 @@ impl<T: StreamTerms> SenderRole<T> {
         };
         while let Some(index) = self.bindings.iter().position(expired) {
             self.count(|c| &mut c.bindings_expired);
-            self.registrant_timed_out(index, now);
             self.remove_binding(index, now, |c| &mut c.bindings_expired);
         }
     }
 
-    /// Frees the slot of a dynamic publication's optional registrant whose
-    /// confirmed binding at `index` expires at `now` with no SM for
-    /// `image_liveness_timeout` (design 3.7, 8), unless another binding
-    /// still takes SMs at its address (a receiver restarted there).
-    fn registrant_timed_out(&mut self, index: usize, now: u64) {
-        let Some(held) = self.bindings.get(index).copied() else {
-            return;
-        };
-        let Some(address) = held.sm_source else {
-            return;
-        };
-        let shared = self.bindings.iter().enumerate().any(|(at, other)| {
-            at != index
-                && other.endpoint == held.endpoint
-                && other.alias == held.alias
-                && other.sm_source == Some(address)
-        });
-        if shared {
-            return;
-        }
-        let retired = self
-            .publications
-            .iter_mut()
-            .find(|outbound| outbound.serves(held.endpoint) && outbound.alias() == held.alias)
-            .is_some_and(|outbound| {
-                outbound.retire_registrant(
-                    address,
-                    crate::agents::data::RemovalReason::Timeout,
-                    now,
-                )
+    /// Frees each optional registrant slot of the dynamic publication of
+    /// `alias` on `endpoint` that no binding covers any more, as a
+    /// timeout (design 3.7, 8): run by [`Self::remove_binding`], the one
+    /// place a binding goes, so the slot goes in the same step.
+    ///
+    /// The invariant it keeps: every optional registrant slot of a dynamic
+    /// publication has a binding whose source ([`ReceiverBinding::source`])
+    /// is the slot's address, and that binding expires with no SM
+    /// ([`Self::expire_bindings`]). It holds because a slot is taken only
+    /// through the binding at its address (`settle_registrant`), a
+    /// dynamic binding's source never changes (it learns its SM source
+    /// only where it was answered and adopts nothing), and every removal
+    /// path (expiry, `make_room` eviction, a refused or full join, a
+    /// restart or move, a child with its parent) runs through
+    /// [`Self::remove_binding`]. Removing a publication drops its slots
+    /// with its bindings. Static publications hold no registrant slot,
+    /// so this changes nothing for them.
+    fn retire_uncovered_registrants(&mut self, endpoint: EndpointId, alias: Alias, now: u64) {
+        loop {
+            let bindings = &self.bindings;
+            let Some(outbound) = self
+                .publications
+                .iter_mut()
+                .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+            else {
+                return;
+            };
+            let uncovered = outbound.uncovered_registrant(|address| {
+                bindings.iter().any(|binding| {
+                    outbound.serves(binding.endpoint)
+                        && binding.alias == alias
+                        && binding.source() == address
+                })
             });
-        if retired {
+            let Some(address) = uncovered else {
+                return;
+            };
+            if !outbound.retire_registrant(
+                address,
+                crate::agents::data::RemovalReason::Timeout,
+                now,
+            ) {
+                return;
+            }
             self.count(|c| &mut c.registrants_timed_out);
         }
     }
@@ -7398,6 +7410,20 @@ impl<T: StreamTerms> SenderRole<T> {
                 existing = decided;
                 break;
             }
+        }
+        // A required id with no binding left whose reserved slot is still
+        // held: its `Membership` refuses it for the incarnation (design
+        // 4.6, M5), so its REGISTER is dropped, at its own endpoint or any
+        // other, before it is announced (karyos#945 review).
+        if existing == Existing::None
+            && required
+            && self
+                .publications
+                .iter()
+                .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
+                .is_some_and(|outbound| outbound.holds_required(receiver.receiver_id))
+        {
+            existing = Existing::RequiredLost;
         }
         existing
     }
