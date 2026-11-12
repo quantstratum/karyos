@@ -6,22 +6,36 @@
 //!
 //! - **allocation**: [`SessionTable::new`] for each profile, and the first
 //!   fill, every session's window written once with full replies, which
-//!   is when the eagerly reserved pages are first touched;
+//!   is when the eagerly reserved pages are first touched. A replica pays
+//!   this once, cold; the looped cases get the allocator's previous block
+//!   back (on macOS a fresh 512 MiB block costs microseconds to allocate
+//!   and several times more to fill than a reused one), so they are named
+//!   `warm`, and the first table of each profile in the process is timed
+//!   once and printed as `cold`. About 9 ms of the large fill is the
+//!   linear scan of its 65,536 requests, not page cost;
 //! - **lookup**: one applied request with `live` sessions, the client in
 //!   the last slot the scan reaches, at W1's and W2's 1 and 32 clients and
 //!   at each profile's full table; replies of W2's 256 B and W1's largest
-//!   8 KiB;
+//!   8 KiB. `applied` repeats one client, its slots hot in cache, the bound
+//!   for the scan; `rotating` sends from every live client in turn, each
+//!   at its own sequence, as W1's interleaved clients do;
 //! - **retry**: a retained reply, and the refusal of a request past a full
 //!   window, which W2's queue burst (4 × 1024 requests over 32 clients,
 //!   128 per client against a window of 64) reaches;
 //! - **snapshot section**: [`SessionTable::encode`] and
-//!   [`SessionTable::decode`] of a full table, against the 256 MiB
-//!   snapshot trigger.
+//!   [`SessionTable::decode`] of a full table, in memory: the bytes each
+//!   snapshot writes. The 256 MiB trigger counts log bytes since the last
+//!   snapshot, not these; no trigger, allowance or expiry runs here.
+//!
+//! Outputs are dropped outside the timed region, and each timed loop is
+//! preceded by one untimed call that aborts unless the table answers the
+//! outcome the case is named for.
 //!
 //! These are microbenchmarks of the table at the workloads' parameters,
 //! not timings inside a simulated run.
 
 use std::hint::black_box;
+use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_main};
@@ -80,16 +94,60 @@ fn fill(table: &mut SessionTable) {
     }
 }
 
+/// Aborts unless `outcome` is the one the case is named for.
+fn expect(ok: bool) {
+    if !ok {
+        std::process::abort();
+    }
+}
+
+/// Times `routine` per iteration and drops its output after the clock
+/// stops: a replica keeps its table and a snapshot writer hands its bytes
+/// on, so freeing them is not part of the cost.
+fn timed<T>(iterations: u64, mut routine: impl FnMut() -> T) -> Duration {
+    let mut total = Duration::ZERO;
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let output = black_box(routine());
+        total += started.elapsed();
+        drop(output);
+    }
+    total
+}
+
+/// The first table of each profile in this process, allocated and filled
+/// once: the cold cost a replica pays. Printed, not sampled.
+fn cold() {
+    for (name, config) in profiles() {
+        let started = Instant::now();
+        let mut table = black_box(table(black_box(config)));
+        let allocated = started.elapsed();
+        for client in 1..=u64::from(config.sessions) {
+            if table.register(client, client, client).is_err() {
+                std::process::abort();
+            }
+        }
+        fill(&mut table);
+        let filled = started.elapsed();
+        drop(black_box(table));
+        let _ = writeln!(
+            std::io::stderr(),
+            "dedup allocation/cold/{name}: new {allocated:?}, new and first fill {filled:?} (one shot)"
+        );
+    }
+}
+
 fn allocation(c: &mut Criterion) {
+    cold();
     let mut group = c.benchmark_group("dedup allocation");
     group.sample_size(10);
     for (name, config) in profiles() {
         let bytes = config.reserved_bytes().unwrap_or(0);
         group.throughput(Throughput::Bytes(bytes));
-        group.bench_function(BenchmarkId::new("new", name), |b| {
-            b.iter(|| black_box(table(black_box(config))));
+        group.bench_function(BenchmarkId::new("new warm", name), |b| {
+            b.iter_custom(|iterations| timed(iterations, || table(black_box(config))));
         });
-        group.bench_function(BenchmarkId::new("new and first fill", name), |b| {
+        group.bench_function(BenchmarkId::new("new and first fill warm", name), |b| {
             b.iter_custom(|iterations| {
                 let mut total = Duration::ZERO;
                 for _ in 0..iterations {
@@ -118,6 +176,15 @@ fn lookup(c: &mut Criterion) {
             let mut table = registered(config, live);
             let client = u64::from(live);
             let mut sequence = 0u64;
+            expect(matches!(
+                table.request(
+                    Request::new(client, client, sequence, sequence),
+                    u64::from(live),
+                    answer(length)
+                ),
+                Outcome::Applied(_)
+            ));
+            sequence += 1;
             group.throughput(Throughput::Elements(1));
             group.bench_function(
                 BenchmarkId::new(format!("applied {length} B"), format!("live={live}")),
@@ -129,10 +196,37 @@ fn lookup(c: &mut Criterion) {
                         sequence += 1;
                         let outcome =
                             table.request(black_box(request), u64::from(live), answer(length));
-                        black_box(matches!(outcome, Outcome::Applied(_)));
+                        black_box(outcome);
                     });
                 },
             );
+            if live > 1 {
+                // Every live client in turn, each at its own sequence.
+                let mut table = registered(config, live);
+                let mut sequences = vec![0u64; live as usize];
+                let mut next = 0usize;
+                let mut send = move |table: &mut SessionTable| {
+                    let client = next as u64 + 1;
+                    let Some(slot) = sequences.get_mut(next) else {
+                        std::process::abort();
+                    };
+                    let sequence = *slot;
+                    *slot += 1;
+                    next = (next + 1) % sequences.len();
+                    let request = Request::new(client, client, sequence, sequence);
+                    matches!(
+                        table.request(black_box(request), u64::from(live), answer(length)),
+                        Outcome::Applied(_)
+                    )
+                };
+                expect(send(&mut table));
+                group.bench_function(
+                    BenchmarkId::new(format!("rotating {length} B"), format!("live={live}")),
+                    |b| {
+                        b.iter(|| black_box(send(&mut table)));
+                    },
+                );
+            }
         }
     }
     group.finish();
@@ -150,12 +244,31 @@ fn retry(c: &mut Criterion) {
         let window = u64::from(config.window);
         let mut table = registered(config, live);
         for sequence in 0..window {
-            let _ = table.request(
-                Request::new(client, client, sequence, 0),
-                u64::from(live),
-                answer(256),
-            );
+            expect(matches!(
+                table.request(
+                    Request::new(client, client, sequence, 0),
+                    u64::from(live),
+                    answer(256),
+                ),
+                Outcome::Applied(_)
+            ));
         }
+        expect(matches!(
+            table.request(
+                Request::new(client, client, window - 1, 0),
+                u64::from(live),
+                answer(256)
+            ),
+            Outcome::Retained(_)
+        ));
+        expect(matches!(
+            table.request(
+                Request::new(client, client, window, 0),
+                u64::from(live),
+                answer(256)
+            ),
+            Outcome::WindowFull
+        ));
         group.throughput(Throughput::Elements(1));
         group.bench_function(BenchmarkId::new("retained", format!("live={live}")), |b| {
             b.iter(|| {
@@ -164,7 +277,7 @@ fn retry(c: &mut Criterion) {
                     u64::from(live),
                     answer(256),
                 );
-                black_box(matches!(outcome, Outcome::Retained(_)));
+                black_box(outcome);
             });
         });
         group.bench_function(
@@ -176,7 +289,7 @@ fn retry(c: &mut Criterion) {
                         u64::from(live),
                         answer(256),
                     );
-                    black_box(matches!(outcome, Outcome::WindowFull));
+                    black_box(outcome);
                 });
             },
         );
@@ -196,15 +309,16 @@ fn snapshot_section(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(
             u64::try_from(encoded.len()).unwrap_or(u64::MAX),
         ));
+        expect(table.encode() == encoded);
         group.bench_function(BenchmarkId::new("encode", &name), |b| {
-            b.iter(|| black_box(table.encode()));
+            b.iter_custom(|iterations| timed(iterations, || table.encode()));
         });
         group.bench_function(BenchmarkId::new("decode", &name), |b| {
-            b.iter(|| {
-                black_box(
+            b.iter_custom(|iterations| {
+                timed(iterations, || {
                     SessionTable::decode(black_box(&encoded))
-                        .unwrap_or_else(|_| std::process::abort()),
-                )
+                        .unwrap_or_else(|_| std::process::abort())
+                })
             });
         });
     }
