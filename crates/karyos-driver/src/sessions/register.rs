@@ -173,6 +173,39 @@ impl RegistrationAllowlist {
     }
 }
 
+/// What one dynamic publication admits a REGISTER from (design 3.2 steps 1
+/// and 2): its allowlist (ADR-0082, decision 1) and its endpoint's address
+/// family. The driver's [`Registrations`] are shared by every dynamic
+/// publication; each passes its own policy with each REGISTER.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationPolicy {
+    allowlist: RegistrationAllowlist,
+    ipv4: bool,
+}
+
+impl RegistrationPolicy {
+    /// The policy of a publication whose endpoint is IPv4 when `ipv4`,
+    /// admitting the sources `allowlist` names.
+    #[must_use]
+    pub const fn new(allowlist: RegistrationAllowlist, ipv4: bool) -> Self {
+        Self { allowlist, ipv4 }
+    }
+
+    /// The allowlist.
+    #[must_use]
+    #[inline]
+    pub const fn allowlist(&self) -> &RegistrationAllowlist {
+        &self.allowlist
+    }
+
+    /// Whether the publication's endpoint is IPv4.
+    #[must_use]
+    #[inline]
+    pub const fn ipv4(&self) -> bool {
+        self.ipv4
+    }
+}
+
 /// The most pending registrations, and refusal entries, a driver may be
 /// configured to hold: an implementation ceiling far above the design's
 /// defaults (32 and 64), so a configured value is refused as a typed
@@ -408,11 +441,20 @@ struct Refusal {
 #[derive(Debug)]
 pub struct Registrations {
     config: RegistrationConfig,
-    ipv4: bool,
     rate: TotalRate,
     pending: Vec<PendingRegistration>,
     refusals: Vec<Refusal>,
     counters: RegistrationCounters,
+}
+
+/// Step 1: a unicast address of the endpoint's family (IPv4 when `ipv4`),
+/// nonzero port.
+fn valid_source(source: SocketAddr, ipv4: bool) -> bool {
+    let unicast = match source.ip() {
+        IpAddr::V4(v4) => !(v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()),
+        IpAddr::V6(v6) => !(v6.is_unspecified() || v6.is_multicast()),
+    };
+    unicast && source.port() != 0 && source.is_ipv4() == ipv4
 }
 
 /// Allocates room for `len` entries, or names `field` at fault.
@@ -425,24 +467,19 @@ fn table<T>(len: usize, field: &'static str) -> Result<Vec<T>, RegistrationConfi
 }
 
 impl Registrations {
-    /// The registrations of a driver whose control endpoint is IPv4 when
-    /// `ipv4`, under `config`, at `now`; every table is allocated here.
+    /// The registrations of a driver under `config`, at `now`; every table
+    /// is allocated here.
     ///
     /// # Errors
     ///
     /// [`RegistrationConfig::validate`]'s.
-    pub fn new(
-        config: RegistrationConfig,
-        ipv4: bool,
-        now: u64,
-    ) -> Result<Self, RegistrationConfigError> {
+    pub fn new(config: RegistrationConfig, now: u64) -> Result<Self, RegistrationConfigError> {
         config.validate()?;
         let rate = TotalRate::new(config.rate, now)
             .ok_or(RegistrationConfigError::InvalidLimit { field: "rate" })?;
         Ok(Self {
             pending: table(config.pending, "pending")?,
             refusals: table(config.sources, "sources")?,
-            ipv4,
             rate,
             config,
             counters: RegistrationCounters::default(),
@@ -468,19 +505,19 @@ impl Registrations {
     }
 
     /// Admits or drops `register` from `source` at `now`, for the
-    /// publication whose allowlist is `allowlist` and whose destination
+    /// publication whose policy is `policy` and whose destination
     /// table reports `capacity`, charging the sender's per-source
     /// `setup_answer_rate` table `source_rates` (design 3.2; module docs).
     pub fn register(
         &mut self,
         source_rates: &mut EndpointRates,
-        allowlist: &RegistrationAllowlist,
+        policy: &RegistrationPolicy,
         source: SocketAddr,
         register: &RspRegister,
         capacity: Capacity,
         now: u64,
     ) -> RegisterOutcome {
-        let outcome = self.decide(source_rates, allowlist, source, register, capacity, now);
+        let outcome = self.decide(source_rates, policy, source, register, capacity, now);
         let counter: fn(&mut RegistrationCounters) -> &mut u64 = match outcome {
             RegisterOutcome::Announce { .. } => return outcome,
             RegisterOutcome::Refuse { .. } => |c| &mut c.refused_full,
@@ -501,7 +538,7 @@ impl Registrations {
     fn decide(
         &mut self,
         source_rates: &mut EndpointRates,
-        allowlist: &RegistrationAllowlist,
+        policy: &RegistrationPolicy,
         source: SocketAddr,
         register: &RspRegister,
         capacity: Capacity,
@@ -509,11 +546,11 @@ impl Registrations {
     ) -> RegisterOutcome {
         // Step 1: the source.
         let source = normalized(source);
-        if !self.valid_source(source) {
+        if !valid_source(source, policy.ipv4) {
             return RegisterOutcome::Drop(RegisterDrop::Source);
         }
         // Step 2: the allowlist, before any state is charged.
-        if !allowlist.admits(source.ip()) {
+        if !policy.allowlist.admits(source.ip()) {
             return RegisterOutcome::Drop(RegisterDrop::NotAllowed);
         }
         // Step 3: both rates must admit before either is charged.
@@ -566,15 +603,6 @@ impl Registrations {
         });
         self.counters.bump(|c| &mut c.registered);
         RegisterOutcome::Announce { source }
-    }
-
-    /// Step 1: a unicast address of the endpoint's family, nonzero port.
-    fn valid_source(&self, source: SocketAddr) -> bool {
-        let unicast = match source.ip() {
-            IpAddr::V4(v4) => !(v4.is_unspecified() || v4.is_multicast() || v4.is_broadcast()),
-            IpAddr::V6(v6) => !(v6.is_unspecified() || v6.is_multicast()),
-        };
-        unicast && source.port() != 0 && source.is_ipv4() == self.ipv4
     }
 
     /// Step 6: one ERR per source address per `refusal_interval`, in a

@@ -24,13 +24,14 @@ fn range(network: [u8; 4], prefix: u8) -> AddressRange {
     AddressRange::new(IpAddr::from(network), prefix).unwrap()
 }
 
-fn allow(ranges: &[AddressRange]) -> RegistrationAllowlist {
-    RegistrationAllowlist::new(ranges).unwrap()
+/// The policy of an IPv4 publication admitting `ranges`.
+fn allow(ranges: &[AddressRange]) -> RegistrationPolicy {
+    RegistrationPolicy::new(RegistrationAllowlist::new(ranges).unwrap(), true)
 }
 
 /// One publication's allowlist with the driver's limits.
 struct Setup {
-    allow: RegistrationAllowlist,
+    allow: RegistrationPolicy,
     config: RegistrationConfig,
 }
 
@@ -47,7 +48,7 @@ fn config(ranges: &[AddressRange]) -> Setup {
 struct Harness {
     registrations: Registrations,
     source_rates: EndpointRates,
-    allow: RegistrationAllowlist,
+    allow: RegistrationPolicy,
 }
 
 impl Harness {
@@ -89,7 +90,7 @@ impl Harness {
 fn registrations(setup: Setup) -> Harness {
     Harness {
         source_rates: EndpointRates::new(20, setup.config.sources).unwrap(),
-        registrations: Registrations::new(setup.config, true, T0).unwrap(),
+        registrations: Registrations::new(setup.config, T0).unwrap(),
         allow: setup.allow,
     }
 }
@@ -202,7 +203,7 @@ fn limits_are_mandatory_nonzero_bounded_and_named() {
     for (change, field) in cases {
         let mut bad = base;
         change(&mut bad);
-        let refused = Registrations::new(bad, true, T0).map(|_| ());
+        let refused = Registrations::new(bad, T0).map(|_| ());
         assert_eq!(
             refused,
             Err(RegistrationConfigError::InvalidLimit { field })
@@ -213,7 +214,7 @@ fn limits_are_mandatory_nonzero_bounded_and_named() {
     let mut top = base;
     top.sources = MAX_REGISTRATION_TABLE;
     top.pending = MAX_REGISTRATION_TABLE;
-    assert!(Registrations::new(top, true, T0).is_ok());
+    assert!(Registrations::new(top, T0).is_ok());
 }
 
 /// Design 3.2 steps 3 and 5 scope the rate and the pending table to the
@@ -226,11 +227,11 @@ fn the_driver_limits_are_shared_by_its_publications() {
         rate: 4,
         ..RegistrationConfig::default()
     };
-    let mut driver = Registrations::new(c, true, T0).unwrap();
+    let mut driver = Registrations::new(c, T0).unwrap();
     let mut rates = EndpointRates::new(20, 64).unwrap();
     let lan = allow(&[range([10, 0, 0, 0], 8)]);
     let other = allow(&[range([10, 9, 0, 0], 16)]);
-    let mut on = |allowlist: &RegistrationAllowlist, from: SocketAddr, stream_id: i32| {
+    let mut on = |allowlist: &RegistrationPolicy, from: SocketAddr, stream_id: i32| {
         let mut r = register(u64::from(from.port()));
         r.stream_id = stream_id;
         driver.register(&mut rates, allowlist, from, &r, Capacity::Free, T0)
@@ -655,4 +656,30 @@ fn the_sender_cannot_be_used_to_reflect_traffic() {
             RegisterOutcome::Drop(RegisterDrop::NotAllowed)
         ));
     }
+}
+
+/// The driver's registrations are shared by publications on endpoints of
+/// either family: each REGISTER is checked against its own publication's
+/// family (step 1), so an IPv6 publication admits an IPv6 source and an
+/// IPv4 one does not, from one driver state.
+#[test]
+fn each_publication_checks_its_own_address_family() {
+    let mut driver = Registrations::new(RegistrationConfig::default(), T0).unwrap();
+    let mut rates = EndpointRates::new(20, 64).unwrap();
+    let any_v6 =
+        RegistrationAllowlist::new(&[
+            AddressRange::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).unwrap()
+        ])
+        .unwrap();
+    let v6 = RegistrationPolicy::new(any_v6.clone(), false);
+    let v4 = RegistrationPolicy::new(any_v6, true);
+    let from = SocketAddr::from((Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 9), 40_000));
+    assert_eq!(
+        driver.register(&mut rates, &v4, from, &register(7), Capacity::Free, T0),
+        RegisterOutcome::Drop(RegisterDrop::Source)
+    );
+    assert_eq!(
+        driver.register(&mut rates, &v6, from, &register(7), Capacity::Free, T0),
+        RegisterOutcome::Announce { source: from }
+    );
 }

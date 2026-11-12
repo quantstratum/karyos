@@ -295,6 +295,26 @@ impl SendSessions {
         }
     }
 
+    /// The SETUP ANNOUNCE of the publication `alias` on `endpoint`, for the
+    /// one ANNOUNCE a dynamic registration causes (design 3.2 step 7): it
+    /// changes no cadence, and is counted in `announces`.
+    pub fn announcement(&mut self, endpoint: EndpointId, alias: Alias) -> Option<SetupAnnounce> {
+        let publication = self.find(endpoint, alias)?.publication;
+        self.counters.bump(|c| &mut c.announces);
+        Some(SetupAnnounce {
+            alias: publication.alias,
+            identity: publication.identity,
+            term: publication.term,
+            lane_count: publication.lane_count,
+        })
+    }
+
+    /// The `setup_answer_rate` table, whose per-source bucket a REGISTER
+    /// is charged to as well (design 3.2 step 3).
+    pub(crate) fn rates_mut(&mut self) -> &mut EndpointRates {
+        &mut self.rates
+    }
+
     /// The announcements due at `now`, each to send on its endpoint;
     /// `emit` is called once per due SETUP.
     pub fn announce_due(&mut self, now: u64, mut emit: impl FnMut(EndpointId, SetupAnnounce)) {

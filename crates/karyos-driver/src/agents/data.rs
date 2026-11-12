@@ -421,6 +421,10 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     /// The destinations of a multi-destination publication
     /// ([`Outbound::set_destinations`]).
     fanout: Option<Box<fanout::Fanout>>,
+    /// The registration policy of a `control-mode=dynamic` publication
+    /// (design 3.2; karyos#644): its destinations are its admitted
+    /// registrants, none at creation.
+    registration: Option<Box<crate::sessions::register::RegistrationPolicy>>,
     /// Per lane, since when it submitted no DATA nor heartbeat: its idle
     /// heartbeat is due `sender_heartbeat_interval` later (SPEC §6).
     idle_since: [Option<u64>; 4],
@@ -659,6 +663,7 @@ impl<T: StreamTerms> Outbound<T> {
             ),
             routed: None,
             fanout: None,
+            registration: None,
             route: None,
             idle_since: [None; 4],
             open_tried: None,

@@ -134,6 +134,8 @@ pub struct ReceiverCounters {
     pub ring_full_rsp_setup: u64,
     /// Received CHALLENGEs dropped with the control ring full.
     pub ring_full_challenge: u64,
+    /// REGISTERs dropped because the sender ring was full (karyos#644).
+    pub ring_full_register: u64,
     /// Received SOLICITs dropped with the control ring full.
     pub ring_full_solicit: u64,
     /// Challenges not sent: the source is not an answerable unicast
@@ -151,7 +153,7 @@ pub struct ReceiverCounters {
     /// `max_image_term_length`.
     pub term_too_large: u64,
     /// CHALLENGE, SOLICIT and SM for an alias not published on the
-    /// endpoint.
+    /// endpoint, and REGISTER for a stream not published on it.
     pub not_published: u64,
     /// SMs sent for installed images.
     pub sm_sent: u64,
@@ -527,6 +529,25 @@ pub struct SenderCounters {
     /// Publications whose receivers' status messages became live or
     /// lapsed: their connection changed (SPEC.md §4).
     pub connection_changes: u64,
+    /// REGISTERs naming no `control-mode=dynamic` publication of their
+    /// stream on their endpoint, or one being removed: dropped, no reply
+    /// (design 3.2 step 1). The other drops are the driver's
+    /// [`SenderRole::registration_counters`].
+    pub registers_unknown: u64,
+    /// The one SETUP ANNOUNCE or ERR REGISTRATION a REGISTER caused, not
+    /// sent (no route or queue, or the kernel refused it).
+    pub registration_replies_unsent: u64,
+    /// Registrants whose first valid SM took an optional destination slot
+    /// (design 3.2).
+    pub registrants_joined: u64,
+    /// Registrants whose first valid SM found the optional slots taken
+    /// meanwhile: answered one ERR REGISTRATION `DESTINATIONS_FULL`, their
+    /// binding dropped (design 3.2).
+    pub registrants_full: u64,
+    /// Registrants whose first valid SM could not take a slot for another
+    /// reason (the address quarantined, the publication being removed):
+    /// dropped with their binding, no reply.
+    pub registrants_refused: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -1716,6 +1737,10 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     /// The clock read immediately before a REQUEST's backend call.
     clock: fn() -> u64,
     counters: SenderCounters,
+    /// The driver's dynamic registrations, shared by its
+    /// `control-mode=dynamic` publications: the `registration_rate`, the
+    /// pending and the refusal tables (design 3.2; karyos#644).
+    registrations: crate::sessions::register::Registrations,
     /// The network trace hook and journals (P2.12 step 3).
     trace: super::net_trace::SenderTrace,
     /// Test only: NAKs are dropped unread, as from a sender that never
@@ -1789,6 +1814,8 @@ pub(super) fn roles<T: StreamTerms>(
         config.answer_rate,
     )
     .map_err(|_| AgentError::InvalidConfig("invalid sender session configuration"))?;
+    let registrations = crate::sessions::register::Registrations::new(config.registration, 0)
+        .map_err(AgentError::Registration)?;
     // A step starts at most one multicast cycle per lane of each image.
     let delays = OsDelayDraw::new(
         config.sessions.max_images,
@@ -1878,6 +1905,7 @@ pub(super) fn roles<T: StreamTerms>(
             nak_replies: Vec::with_capacity(config.repair.replies),
             clock: karyos_sys::host_clock::host_monotonic_ns,
             counters: SenderCounters::default(),
+            registrations,
             trace: super::net_trace::SenderTrace::default(),
             #[cfg(test)]
             ignore_naks: false,
@@ -4093,6 +4121,10 @@ impl<T: StreamTerms> Intake<'_, T> {
                 control: Control::Nak(_),
                 ..
             } => |c| &mut c.ring_full_nak_forwarded,
+            ControlItem::Incoming {
+                control: Control::Register(_),
+                ..
+            } => |c| &mut c.ring_full_register,
             ControlItem::Incoming { .. } => |c| &mut c.ring_full_challenge,
         };
         match self.role.to_sender.try_post(item) {
@@ -4841,6 +4873,26 @@ impl<T: StreamTerms> Intake<'_, T> {
                 _ => self.role.count(|c| &mut c.unhandled),
             },
             Control::NakReply(reply) => self.nak_reply(source, &reply),
+            // A REGISTER names only its stream (design 2.5): it goes to the
+            // sender for a stream published on this endpoint, which admits
+            // it only for a `control-mode=dynamic` publication (design
+            // 3.2). The receiver's own REGISTER loop, and so an ERR
+            // REGISTRATION it would read, come with step 3 of karyos#644.
+            Control::Register(register) => {
+                let published = self.role.published.iter().any(|(held, alias)| {
+                    *held == endpoint && alias.stream_id == register.stream_id
+                });
+                if !published {
+                    self.role.count(|c| &mut c.not_published);
+                    return;
+                }
+                self.forward(ControlItem::Incoming {
+                    endpoint,
+                    source,
+                    control,
+                    seen: now,
+                });
+            }
             _ => self.role.count(|c| &mut c.unhandled),
         }
     }
@@ -4895,6 +4947,12 @@ impl<T: StreamTerms> SenderRole<T> {
     #[must_use]
     pub fn session_counters(&self) -> crate::sessions::send::SendCounters {
         self.sessions.counters()
+    }
+
+    /// The counters of the driver's dynamic registrations (design 3.2, 7).
+    #[must_use]
+    pub fn registration_counters(&self) -> crate::sessions::register::RegistrationCounters {
+        self.registrations.counters()
     }
 
     /// Stores each publication's changed counts into its CnC cells, at
@@ -5028,6 +5086,16 @@ impl<T: StreamTerms> SenderRole<T> {
         let matches = outbound.endpoint() == publication.endpoint
             && outbound.alias() == publication.alias
             && outbound.readers().len() == usize::from(publication.lane_count);
+        // A REGISTER names only its stream (design 2.5): one control
+        // endpoint holds at most one dynamic publication of a stream
+        // (design 3.2 step 1).
+        let second_dynamic = outbound.registration().is_some()
+            && self.publications.iter().any(|held| {
+                held.registration().is_some()
+                    && held.alias().stream_id == publication.alias.stream_id
+                    && held.serves(publication.endpoint)
+            });
+        let matches = matches && !second_dynamic;
         // Its receivers' membership (multicast-flow-control.md): windows
         // from the largest datagram to half a term, as receivers grant, and
         // the driver's SM cadence and liveness; its configured roles, tags
@@ -5894,7 +5962,27 @@ impl<T: StreamTerms> SenderRole<T> {
                     source,
                     control: Control::Status(status),
                     ..
-                } => self.status(endpoint, source, &status, now),
+                } => {
+                    // A registrant's first SM finding the slots taken is
+                    // answered with one ERR REGISTRATION (design 3.2).
+                    if let Some((destination, reply)) = self.status(endpoint, source, &status, now)
+                    {
+                        let _ = self.send(halves, endpoint, destination, &reply);
+                    }
+                }
+                ControlItem::Incoming {
+                    endpoint,
+                    source,
+                    control: Control::Register(register),
+                    ..
+                } => {
+                    if let Some((destination, reply)) =
+                        self.register(endpoint, source, &register, now)
+                        && !self.send(halves, endpoint, destination, &reply).submitted()
+                    {
+                        self.count(|c| &mut c.registration_replies_unsent);
+                    }
+                }
                 ControlItem::Incoming {
                     endpoint,
                     source,
@@ -6779,7 +6867,7 @@ impl<T: StreamTerms> SenderRole<T> {
         source: SocketAddr,
         status: &StatusMessage,
         now: u64,
-    ) {
+    ) -> Option<(SocketAddr, Control)> {
         self.expire_bindings(now);
         let source = normalized(source);
         let publication = self
@@ -6799,19 +6887,20 @@ impl<T: StreamTerms> SenderRole<T> {
             });
         if !tag_ok {
             self.count(|c| &mut c.sm_tag_mismatch);
-            return;
+            return None;
         }
         // A removed destination's SMs are ignored: it rejoins nothing
-        // (karyos#630).
-        if publication.is_some_and(|outbound| !outbound.sends_to(source)) {
+        // (karyos#630). A dynamic publication's registrant is no
+        // destination until its first valid SM takes a slot (design 3.2).
+        let stranger = publication.is_some_and(|outbound| !outbound.sends_to(source));
+        let dynamic = publication.is_some_and(|outbound| outbound.registration().is_some());
+        if stranger && !dynamic {
             self.count(|c| &mut c.sm_unbound);
-            return;
+            return None;
         }
         // The incarnation is part of the binding: an earlier incarnation's
         // row from the same receiver never shadows the current one.
-        let Some(found) = self.sm_binding(endpoint, source, status) else {
-            return;
-        };
+        let found = self.sm_binding(endpoint, source, status)?;
         // The SM is checked against its binding (an adoption has no
         // receiver id yet) before it sets a source or adopts anything.
         let receiver_id = match found {
@@ -6825,7 +6914,26 @@ impl<T: StreamTerms> SenderRole<T> {
             && receiver_id.is_none_or(|id| id == status.receiver.receiver_id);
         if !matches {
             self.count(|c| &mut c.sm_mismatch);
-            return;
+            return None;
+        }
+        if stranger {
+            // Only the registrant this sender answered, at the source it
+            // registered from, with no SM yet: anything else is unbound.
+            let registrant = match found {
+                SmBinding::Learn(index) => self
+                    .bindings
+                    .get(index)
+                    .filter(|binding| binding.parent.is_none() && binding.solicited_from == source)
+                    .map(|_| index),
+                SmBinding::Bound(_) | SmBinding::Adopt(_) => None,
+            };
+            let Some(index) = registrant else {
+                self.count(|c| &mut c.sm_unbound);
+                return None;
+            };
+            if let Some(refusal) = self.join_registrant(endpoint, source, status, index, now) {
+                return refusal;
+            }
         }
         let index = match found {
             SmBinding::Bound(index) => index,
@@ -6835,14 +6943,9 @@ impl<T: StreamTerms> SenderRole<T> {
                 }
                 index
             }
-            SmBinding::Adopt(parent) => match self.adopt(parent, source, now) {
-                Some(index) => index,
-                None => return,
-            },
+            SmBinding::Adopt(parent) => self.adopt(parent, source, now)?,
         };
-        let Some(binding) = self.bindings.get_mut(index) else {
-            return;
-        };
+        let binding = self.bindings.get_mut(index)?;
         // A reset binding whose next SM names another receiver: the former
         // one's membership ends first (ACS 15648).
         let gone = match (binding.receiver_id, binding.former.take()) {
@@ -6901,6 +7004,146 @@ impl<T: StreamTerms> SenderRole<T> {
         {
             let _ = membership.status(&key, status, now);
         }
+        None
+    }
+
+    /// The first valid SM of the registrant answered through the binding at
+    /// `index` (design 3.2): it takes an optional destination slot of its
+    /// publication. `None` when it joined; otherwise its binding is
+    /// dropped and the outcome holds what to answer: one ERR REGISTRATION
+    /// `DESTINATIONS_FULL` to `source` when the optional slots filled
+    /// meanwhile, nothing for any other refusal.
+    #[allow(
+        clippy::option_option,
+        reason = "joined, refused with a reply, or refused without one"
+    )]
+    fn join_registrant(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        status: &StatusMessage,
+        index: usize,
+        now: u64,
+    ) -> Option<Option<(SocketAddr, Control)>> {
+        use crate::agents::data::DestinationChange;
+        use karyos_protocol::network::{Registration, RegistrationReason};
+
+        let quarantine = self.membership.receiver_timeout;
+        let outcome = self
+            .publications
+            .iter_mut()
+            .find(|outbound| outbound.serves(endpoint) && outbound.alias() == status.alias)
+            .map_or(DestinationChange::Unknown, |outbound| {
+                outbound.change_destination(source, true, now, quarantine)
+            });
+        match outcome {
+            DestinationChange::Added => {
+                self.count(|c| &mut c.registrants_joined);
+                None
+            }
+            DestinationChange::Full => {
+                self.count(|c| &mut c.registrants_full);
+                self.remove_binding(index, now, |c| &mut c.registrants_full);
+                Some(Some((
+                    source,
+                    Control::Registration(Registration {
+                        stream_id: status.alias.stream_id,
+                        reason: RegistrationReason::DestinationsFull,
+                    }),
+                )))
+            }
+            _ => {
+                self.count(|c| &mut c.registrants_refused);
+                self.remove_binding(index, now, |c| &mut c.registrants_refused);
+                Some(None)
+            }
+        }
+    }
+
+    /// What a REGISTER from `source` on `endpoint` at `now` causes (design
+    /// 3.2, 9.2): the one SETUP ANNOUNCE or ERR REGISTRATION to send to
+    /// its validated source, or nothing. Only a `control-mode=dynamic`
+    /// publication of its stream on that endpoint, not being removed,
+    /// admits it, through the driver's registrations under that
+    /// publication's policy, charging the `setup_answer_rate` bucket.
+    fn register(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        register: &karyos_protocol::network::RspRegister,
+        now: u64,
+    ) -> Option<(SocketAddr, Control)> {
+        use crate::sessions::register::RegisterOutcome;
+        use karyos_protocol::network::{Registration, RegistrationReason};
+
+        let Some(outbound) = self.publications.iter().find(|outbound| {
+            outbound.serves(endpoint)
+                && outbound.alias().stream_id == register.stream_id
+                && outbound.registration().is_some()
+                && !outbound.removing()
+        }) else {
+            self.count(|c| &mut c.registers_unknown);
+            return None;
+        };
+        let alias = outbound.alias();
+        let capacity = outbound.registration_capacity();
+        let policy = outbound.registration()?;
+        let outcome = self.registrations.register(
+            self.sessions.rates_mut(),
+            policy,
+            source,
+            register,
+            capacity,
+            now,
+        );
+        match outcome {
+            RegisterOutcome::Announce { source } => self
+                .sessions
+                .announcement(endpoint, alias)
+                .map(|announce| (source, Control::SetupAnnounce(announce))),
+            RegisterOutcome::Refuse { source } => Some((
+                source,
+                Control::Registration(Registration {
+                    stream_id: register.stream_id,
+                    reason: RegistrationReason::DestinationsFull,
+                }),
+            )),
+            RegisterOutcome::Drop(_) => None,
+        }
+    }
+
+    /// Whether `control` is the CHALLENGE of a pending registrant of the
+    /// `control-mode=dynamic` publication it names on `endpoint`, from the
+    /// source it registered from (design 3.2, 9.2): it takes that pending
+    /// entry, so the ANSWER goes to that validated source and nowhere
+    /// else. A CHALLENGE naming another incarnation takes nothing.
+    fn registrant_challenge(
+        &mut self,
+        endpoint: EndpointId,
+        source: SocketAddr,
+        control: &Control,
+        now: u64,
+    ) -> bool {
+        let Control::Challenge(challenge) = control else {
+            return false;
+        };
+        let dynamic = self.publications.iter().any(|outbound| {
+            outbound.serves(endpoint)
+                && outbound.alias() == challenge.alias
+                && outbound.registration().is_some()
+        });
+        if !dynamic || self.sessions.identity(endpoint, challenge.alias) != Some(challenge.identity)
+        {
+            return false;
+        }
+        self.registrations
+            .challenged(
+                challenge.alias.stream_id,
+                source,
+                challenge.challenge.receiver_boot_id,
+                now,
+            )
+            .is_some()
     }
 
     /// Which binding an SM from `source` on `endpoint` belongs to (plan
@@ -7018,7 +7261,9 @@ impl<T: StreamTerms> SenderRole<T> {
             None => destination,
             Some(fanout) if fanout => {
                 let source = normalized(source);
-                if !self.sends_to(endpoint, alias, source) {
+                if !self.sends_to(endpoint, alias, source)
+                    && !self.registrant_challenge(endpoint, source, &control, now)
+                {
                     self.count(|c| &mut c.refused);
                     return None;
                 }

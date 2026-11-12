@@ -847,6 +847,73 @@ impl<T: StreamTerms> Outbound<T> {
         Ok(())
     }
 
+    /// The fan-out of a `control-mode=dynamic` publication admitting
+    /// registrations under `policy`: no destination at creation; each
+    /// registrant takes an optional slot at its first valid SM, at most
+    /// `max_destinations` (design 3.2, 3.5; karyos#644). No destination is
+    /// required: required receiver ids (MD-17) are not configurable yet.
+    ///
+    /// # Errors
+    ///
+    /// [`super::OutboundError::Routes`] for a routed publication, or one
+    /// whose fan-out is already set.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "dynamic publications are admitted at step 3 of karyos#644"
+        )
+    )]
+    pub(crate) fn set_registration(
+        &mut self,
+        max_destinations: usize,
+        policy: crate::sessions::register::RegistrationPolicy,
+    ) -> Result<(), super::OutboundError> {
+        if self.routed.is_some() || self.fanout.is_some() {
+            return Err(super::OutboundError::Routes);
+        }
+        let joins: Vec<u64> = self
+            .readers
+            .iter()
+            .map(|reader| reader.position())
+            .collect();
+        let fanout = Fanout::new(
+            max_destinations,
+            &[],
+            &[],
+            self.drr,
+            self.readers.len(),
+            self.mtu,
+            &joins,
+            policy.ipv4(),
+        )
+        .ok_or(super::OutboundError::Lanes)?;
+        self.fanout = Some(Box::new(fanout));
+        self.registration = Some(Box::new(policy));
+        Ok(())
+    }
+
+    /// Its registration policy, for a `control-mode=dynamic` publication.
+    pub(crate) fn registration(&self) -> Option<&crate::sessions::register::RegistrationPolicy> {
+        self.registration.as_deref()
+    }
+
+    /// Whether a registrant could take a slot now (design 3.2 step 6): a
+    /// slot is free when the destinations, counting those removed and not
+    /// retired yet, are below `max_destinations`, as
+    /// [`Outbound::change_destination`] counts them.
+    pub(crate) fn registration_capacity(&self) -> crate::sessions::register::Capacity {
+        use crate::sessions::register::Capacity;
+        match self.fanout.as_deref() {
+            Some(fanout)
+                if fanout.targets.len().saturating_add(fanout.retired.len()) < fanout.max =>
+            {
+                Capacity::Free
+            }
+            _ => Capacity::Full,
+        }
+    }
+
     /// The retransmission window of a reliable multi-destination
     /// publication's repair paths.
     pub(super) fn fanout_retransmit_window(&self) -> Option<u32> {
