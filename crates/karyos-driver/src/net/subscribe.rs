@@ -44,7 +44,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use karyos_io::sockets::endpoint::{InterfaceSel, MulticastConfig};
-use karyos_protocol::channel::{Destination, Interface, UdpConfig};
+use karyos_protocol::channel::{ControlMode, Destination, Interface, UdpConfig};
 
 use super::{LATER_PATHS, NetworkSubscription};
 use crate::agents::images::DEFAULT_MAX_IMAGE_TERM_LENGTH;
@@ -84,9 +84,13 @@ fn later_routes(channel: &UdpConfig) -> Result<Vec<(SocketAddr, MulticastConfig)
 }
 
 /// The local address a subscription binds, and its multicast group: with
-/// `paths`, those of the first path.
+/// `paths`, those of the first path. A `control-mode=dynamic` channel is
+/// served only when `dynamic` (karyos#644): it binds `interface`, else the
+/// unspecified address of `control`'s family, on a port the kernel picks,
+/// and registers at `control` (design 3.2).
 fn receive_route(
     channel: &UdpConfig,
+    dynamic: bool,
 ) -> Result<(SocketAddr, Option<MulticastConfig>), DriverError> {
     let first_path = channel.paths.first().cloned();
     let interface = match first_path.as_ref().or(channel.interface.as_ref()) {
@@ -115,9 +119,46 @@ fn receive_route(
                 )),
             ))
         }
-        // Multi-destination, or a destination a later protocol version
-        // parses: not served.
+        // Dynamic registration with no listed destination and no
+        // redundant path, as its publication (design 3.2). The public
+        // calls do not serve it yet: dynamic mode stays refused there
+        // until the rest of karyos#644 lands.
+        Destination::MultiDestination {
+            destinations,
+            control: Some(control),
+            mode: ControlMode::Dynamic,
+        } if dynamic => {
+            if !destinations.is_empty() || !channel.paths.is_empty() {
+                return Err(DriverError::UnsupportedChannel);
+            }
+            let ip = match interface {
+                Some(ip) if ip.is_ipv4() == control.is_ipv4() => ip,
+                Some(_) => return Err(DriverError::UnsupportedChannel),
+                None if control.is_ipv4() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                None => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            };
+            Ok((SocketAddr::new(ip, 0), None))
+        }
+        Destination::MultiDestination {
+            mode: ControlMode::Dynamic,
+            ..
+        } => Err(DriverError::DynamicRegistrationUnsupported),
+        // Manual multi-destination, or a destination a later protocol
+        // version parses: not served.
         _ => Err(DriverError::UnsupportedChannel),
+    }
+}
+
+/// The `control` address a subscription of `channel` registers at: that
+/// of a `control-mode=dynamic` channel, else none.
+fn register_at(channel: &UdpConfig) -> Option<SocketAddr> {
+    match &channel.destination {
+        Destination::MultiDestination {
+            control,
+            mode: ControlMode::Dynamic,
+            ..
+        } => *control,
+        _ => None,
     }
 }
 
@@ -138,7 +179,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream_id: i32,
         channel: &UdpConfig,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, (None, None))
+        self.subscribe_network(stream_id, channel, (None, None), false)
     }
 
     /// [`EmbeddedDriver::add_network_subscription`] whose images name the
@@ -158,7 +199,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         identity: ReceiverIdentity,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, (Some(identity), None))
+        self.subscribe_network(stream_id, channel, (Some(identity), None), false)
     }
 
     /// [`EmbeddedDriver::add_network_subscription`] with a conflated view
@@ -191,7 +232,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         lane: karyos_sys::frame::Lane,
         config: karyos_sys::conflation::ConflationConfig,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, (None, Some((lane, config))))
+        self.subscribe_network(stream_id, channel, (None, Some((lane, config))), false)
     }
 
     /// Stops `subscription`: its images retire, which seals their streams
@@ -329,6 +370,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         })
     }
 
+    /// [`EmbeddedDriver::add_network_subscription_as`] on a
+    /// `control-mode=dynamic` channel (design 3.2; karyos#644): the
+    /// subscription registers at the channel's `control` address every
+    /// `setup_interval` until it is bound, and again once its image is
+    /// gone. Crate-internal until the rest of karyos#644 lands: the public
+    /// calls still refuse dynamic mode.
+    #[cfg(test)]
+    pub(crate) fn add_dynamic_network_subscription(
+        &mut self,
+        stream_id: i32,
+        channel: &UdpConfig,
+        identity: Option<ReceiverIdentity>,
+    ) -> Result<NetworkSubscription, DriverError> {
+        self.subscribe_network(stream_id, channel, (identity, None), true)
+    }
+
     pub(crate) fn subscribe_network(
         &mut self,
         stream_id: i32,
@@ -340,6 +397,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 karyos_sys::conflation::ConflationConfig,
             )>,
         ),
+        dynamic: bool,
     ) -> Result<NetworkSubscription, DriverError> {
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
         // Redundant paths need sockets isolated per interface; without
@@ -355,7 +413,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             net.unreliable_view_bound()
                 .map_err(DriverError::BarrierAckTimeout)?;
         }
-        let route = receive_route(channel)?;
+        let route = receive_route(channel, dynamic)?;
         let later = later_routes(channel)?;
         net.add_subscription(
             stream_id,
@@ -363,7 +421,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             &later,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
             channel.reliable,
-            options,
+            (options.0, options.1, register_at(channel)),
         )
     }
 

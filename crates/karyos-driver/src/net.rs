@@ -508,6 +508,9 @@ struct NetSubscription {
     /// The conflated lane and the view's table configuration every handle
     /// of this key shares (conflated-network-images.md (a)).
     conflated: Option<(Lane, karyos_sys::conflation::ConflationConfig)>,
+    /// The `control` address of a `control-mode=dynamic` key, which every
+    /// handle of it shares (design 3.2; karyos#644).
+    register_at: Option<SocketAddr>,
     /// The endpoints of the channel's later redundant paths, each with its
     /// own receiver entry (redundant-paths.md; the first path is
     /// `endpoint`).
@@ -1058,9 +1061,10 @@ impl<T: StreamTerms> Network<T> {
         later: &[(SocketAddr, MulticastConfig)],
         max_term_length: u32,
         reliable: bool,
-        (identity, conflated): (
+        (identity, conflated, register_at): (
             Option<crate::membership::ReceiverIdentity>,
             Option<(Lane, karyos_sys::conflation::ConflationConfig)>,
+            Option<SocketAddr>,
         ),
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
@@ -1103,6 +1107,11 @@ impl<T: StreamTerms> Network<T> {
             if entry.conflated != conflated {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::ConflationMismatch);
+            }
+            // It registers at one `control` address, or at none.
+            if entry.register_at != register_at {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::UnsupportedChannel);
             }
             let Some(users) = entry.users.checked_add(1) else {
                 release(&mut self.send_endpoints, endpoint);
@@ -1160,6 +1169,7 @@ impl<T: StreamTerms> Network<T> {
                 identity,
                 conflated: conflated.map(|(lane, _)| lane),
                 solicit_from: solicit,
+                register_at,
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
@@ -1213,6 +1223,7 @@ impl<T: StreamTerms> Network<T> {
                     identity,
                     conflated: conflated.map(|(lane, _)| lane),
                     solicit_from: solicit,
+                    register_at: None,
                 });
             if posted.is_err() {
                 release(&mut self.send_endpoints, path);
@@ -1229,6 +1240,7 @@ impl<T: StreamTerms> Network<T> {
             solicit,
             identity,
             conflated,
+            register_at,
             later: held,
             later_routes,
             users: 1,
@@ -2841,6 +2853,17 @@ impl<T: StreamTerms> Network<T> {
     pub(crate) fn receiver_reclaimed_tombstones(&self) -> Option<usize> {
         match &self.agents {
             Agents::Shared(agents) => Some(agents.receiver.reclaimed_tombstones()),
+            _ => None,
+        }
+    }
+
+    /// The driver's dynamic registration counters, in Shared mode (tests).
+    #[cfg(test)]
+    pub(crate) fn registration_counters(
+        &self,
+    ) -> Option<crate::sessions::register::RegistrationCounters> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.sender.registration_counters()),
             _ => None,
         }
     }
