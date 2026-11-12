@@ -2496,3 +2496,50 @@ fn without_a_dynamic_publication_no_binding_is_kept() {
     assert_eq!(sender.counters().bindings_evicted, 1);
     assert_eq!(sender.counters().bindings_reserved, 0);
 }
+
+/// karyos#941 item 1: once its image goes, a key registers again at once
+/// and from `setup_interval`, not from the backoff it had reached.
+#[test]
+fn a_key_whose_image_goes_registers_again_from_the_first_interval() {
+    let config = AgentConfig::default();
+    let interval = config.setup_interval;
+    let (_sender, mut role) = receiver_with(config);
+    let (events, _link) = event_ring();
+    let control: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    let _status = subscribe_dynamic(&mut role, control, receiver_42());
+    for step in 0..=31u64 {
+        let _ = role.send_registers(&events, T0 + step * interval);
+    }
+    let (image, _) = super::installed_image();
+    role.images.push(image);
+    assert_eq!(role.send_registers(&events, T0 + 40 * interval), 0);
+    role.images.clear();
+    assert_eq!(role.send_registers(&events, T0 + 41 * interval), 1);
+    assert_eq!(role.send_registers(&events, T0 + 42 * interval - 1), 0);
+    assert_eq!(role.send_registers(&events, T0 + 42 * interval), 1);
+}
+
+/// karyos#941 item 2: a required id that joined keeps no binding free
+/// once its own binding expires (its slot is held lost, and its REGISTER
+/// is dropped): optional receivers use the whole table again.
+#[test]
+fn a_joined_required_id_keeps_no_binding_once_its_own_expires() {
+    let config = AgentConfig {
+        receiver_bindings: 2,
+        ..AgentConfig::default()
+    };
+    let mut sender = dynamic_sender_config(&config, 4, &[42]);
+    let (a, b, c): (SocketAddr, SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.10:5000".parse().unwrap(),
+        "10.0.0.11:5000".parse().unwrap(),
+    );
+    assert_eq!(join_as(&mut sender, c, 42, 9, T0), None);
+    let later = T0 + 2 * sender.confirmed_timeout;
+    sender.expire_bindings(later);
+    assert!(sender.bindings.is_empty());
+    assert_eq!(sender.unjoined_required_count(), 0);
+    assert_eq!(join_as(&mut sender, a, 1, 7, later), None);
+    assert_eq!(join_as(&mut sender, b, 2, 8, later + 10), None);
+    assert_eq!(sender.counters().bindings_reserved, 0);
+}

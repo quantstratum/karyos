@@ -6885,6 +6885,8 @@ impl<T: StreamTerms> SenderRole<T> {
             .is_some_and(|receiver| self.unjoined_required(endpoint, alias, receiver.receiver_id));
         // The bindings kept for the others: a required id that has not
         // joined keeps one for itself, which this binding is when `own`.
+        // `own` is set only for an id the count includes: saturating is
+        // exact here and never floors a real count.
         let reserved = self
             .unjoined_required_count()
             .saturating_sub(usize::from(own));
@@ -6953,6 +6955,9 @@ impl<T: StreamTerms> SenderRole<T> {
                     })
                     .count()
             })
+            // At most the publications times `max_destinations`, far below
+            // `usize::MAX`: saturating never applies, and a bound past it
+            // would only keep more bindings free.
             .fold(0usize, usize::saturating_add)
     }
 
