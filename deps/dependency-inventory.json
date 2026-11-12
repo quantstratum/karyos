@@ -40,7 +40,7 @@
       "pin-project-lite v0.2.17",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
-      "rustix v1.1.5",
+      "rustix v1.1.6",
       "serde v1.0.229",
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
@@ -72,7 +72,7 @@
       "pin-project-lite v0.2.17",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
-      "rustix v1.1.5",
+      "rustix v1.1.6",
       "serde v1.0.229",
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
@@ -224,7 +224,7 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -668,21 +668,21 @@
       "edges": [
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
           "kind": "normal",
           "target": "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))",
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
           "kind": "normal",
           "target": "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
           "kind": "normal",
           "target": "cfg(windows)",
           "uses_default_features": false
@@ -1034,14 +1034,14 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
           "kind": "normal",
           "target": "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))",
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
           "kind": "normal",
           "target": "cfg(all(not(windows), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
           "uses_default_features": false
@@ -1120,7 +1120,7 @@
             "ioctl",
             "no_std"
           ],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
           "kind": "normal",
           "target": "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))",
           "uses_default_features": false
@@ -1131,7 +1131,7 @@
             "ioctl",
             "no_std"
           ],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
           "kind": "normal",
           "target": "cfg(all(any(target_os = \"linux\", target_os = \"android\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
           "uses_default_features": false
@@ -2047,7 +2047,7 @@
         "std",
         "time"
       ],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+      "id": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
       "license": "Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT",
       "name": "rustix",
       "paths": {
@@ -2059,7 +2059,7 @@
       },
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "1.1.5"
+      "version": "1.1.6"
     },
     {
       "build_script": true,
@@ -3304,7 +3304,7 @@
             "Win32_Foundation",
             "Win32_Networking_WinSock"
           ],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.5",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustix@1.1.6",
           "kind": "normal",
           "target": "cfg(windows)",
           "uses_default_features": true
