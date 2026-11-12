@@ -1908,3 +1908,45 @@ fn a_publication_above_the_stream_cap_is_refused_with_its_code() {
         other => panic!("not refused by the cap: {other:?}"),
     }
 }
+
+/// karyos#941 item 4: a client's publication or subscription by a
+/// `control-mode=dynamic` URI is refused as `UnsupportedChannel`, a code no
+/// retry clears, never as the retryable `ResourcesUnavailable`: the client
+/// path carries no allowlist and no receiver identity.
+#[test]
+fn a_dynamic_uri_from_a_client_is_refused_as_an_unsupported_channel() {
+    let mut driver = driver();
+    let mut client = driver.connect().unwrap();
+    let mut outcomes = Vec::new();
+    let uri = format!(
+        "karyos:udp?control=127.0.0.1:{}|control-mode=dynamic",
+        port()
+    );
+    let publication = client.add_network_publication(&uri, 30, true).unwrap();
+    let subscription = client
+        .add_network_subscription(&uri, 30, SubscriberRole::Optional)
+        .unwrap();
+    run(
+        &mut [&mut driver],
+        &mut [&mut client],
+        &mut outcomes,
+        |outcomes, _| {
+            [publication, subscription]
+                .iter()
+                .all(|sequence| outcomes.iter().any(|(_, found, _)| found == sequence))
+        },
+    );
+    for sequence in [publication, subscription] {
+        let outcome = take(&mut outcomes, sequence);
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Refused {
+                    code: ErrorCode::UnsupportedChannel,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+    }
+}

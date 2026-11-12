@@ -99,9 +99,13 @@ fn random_word() -> Option<u64> {
 /// 10 s at the defaults).
 fn refusal(error: &DriverError) -> ErrorCode {
     match error {
-        DriverError::NetworkUnavailable | DriverError::UnsupportedChannel => {
-            ErrorCode::UnsupportedChannel
-        }
+        // A `control-mode=dynamic` channel, and the registration settings
+        // only a dynamic channel takes: the client path carries no
+        // allowlist and no receiver identity, so no retry is granted
+        // (karyos#941 item 4).
+        DriverError::NetworkUnavailable
+        | DriverError::UnsupportedChannel
+        | DriverError::DynamicRegistrationUnsupported => ErrorCode::UnsupportedChannel,
         DriverError::StreamIdsExhausted | DriverError::ExportIdsExhausted => {
             ErrorCode::IdentitiesExhausted
         }
