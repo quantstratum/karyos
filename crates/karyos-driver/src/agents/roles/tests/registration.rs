@@ -1999,3 +1999,38 @@ fn every_optional_slot_keeps_a_binding_able_to_expire_it() {
         assert!(count > 0, "the sequences never reach {path}");
     }
 }
+
+/// karyos#940 item 2: a binding no REGISTER created (a bare CHALLENGE at a
+/// destination's address) gives no slot to its SM once that destination
+/// is removed: the stranger's first SM must name a registered receiver
+/// block. It takes a `setup_challenge_timeout` longer than the quarantine
+/// for the binding to outlive it.
+#[test]
+fn an_unregistered_binding_at_a_removed_destination_takes_no_slot() {
+    let mut config = AgentConfig::default();
+    config.sessions.setup_challenge_timeout = 4 * config.image_liveness_timeout;
+    let mut sender = dynamic_sender_config(&config, 4, &[]);
+    let a: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
+    // A bare CHALLENGE resets the binding: it holds no registered block.
+    assert!(
+        sender
+            .answer_for(EndpointId(1), a, T0 + 10, challenge_of(7))
+            .is_some()
+    );
+    let quarantine = sender.membership.receiver_timeout;
+    assert_eq!(
+        sender.publications[0].change_destination(a, false, T0 + 20, quarantine),
+        crate::agents::data::DestinationChange::Removed
+    );
+    assert_eq!(
+        removals(&mut sender, T0 + 20),
+        vec![(a, RemovalReason::Command)]
+    );
+    let later = T0 + 30 + quarantine;
+    assert_eq!(sender.bindings.len(), 1);
+    let refused = sender.counters().registrants_refused;
+    assert_eq!(sender.status(EndpointId(1), a, &sm_as(5, 7), later), None);
+    assert_eq!(sender.counters().registrants_refused, refused + 1);
+    assert!(!sender.sends_to(EndpointId(1), alias(), a));
+}
