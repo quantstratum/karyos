@@ -307,6 +307,18 @@ fn control(valid: bool) -> BoxedStrategy<Control> {
         }),
         (alias(), challenge(valid))
             .prop_map(|(alias, challenge)| Control::Solicit(RspSolicit { alias, challenge })),
+        (any::<i32>(), receiver(valid)).prop_map(|(stream_id, receiver)| {
+            Control::Register(RspRegister {
+                stream_id,
+                receiver,
+            })
+        }),
+        any::<i32>().prop_map(|stream_id| {
+            Control::Registration(Registration {
+                stream_id,
+                reason: RegistrationReason::DestinationsFull,
+            })
+        }),
         (
             alias(),
             identity(valid),
