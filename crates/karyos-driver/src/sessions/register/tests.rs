@@ -1,0 +1,458 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The bounds of dynamic registration as limits (design 3.2, 9.2; SPEC.md
+//! §6): each step's refusal, the rates and pending bounds at their exact
+//! edge, the one-ERR-per-interval rule and the reflection bound.
+
+#![allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    reason = "tests, as ADR-0007 allows"
+)]
+
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use karyos_protocol::network::{ControlKind, Receiver, RspRegister};
+
+use super::*;
+
+const SECOND: u64 = 1_000_000_000;
+/// A start time far from zero, so ages never saturate.
+const T0: u64 = 1_000 * SECOND;
+
+fn range(network: [u8; 4], prefix: u8) -> AddressRange {
+    AddressRange::new(IpAddr::from(network), prefix).unwrap()
+}
+
+fn allow(ranges: &[AddressRange]) -> RegistrationAllowlist {
+    RegistrationAllowlist::new(ranges).unwrap()
+}
+
+fn config(ranges: &[AddressRange]) -> RegistrationConfig {
+    RegistrationConfig::new(allow(ranges))
+}
+
+fn registrations(config: RegistrationConfig) -> Registrations {
+    Registrations::new(config, true, T0).unwrap()
+}
+
+fn lan() -> Registrations {
+    registrations(config(&[range([10, 0, 0, 0], 8)]))
+}
+
+fn source(last: u8, port: u16) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, last], port))
+}
+
+fn register(receiver_id: u64) -> RspRegister {
+    RspRegister {
+        stream_id: 1001,
+        receiver: Receiver {
+            receiver_boot_id: [receiver_id, 1],
+            receiver_id,
+        },
+    }
+}
+
+/// The bytes `outcome` sends: one ANNOUNCE (72) or one ERR (40).
+fn sent_bytes(outcome: RegisterOutcome) -> usize {
+    match outcome {
+        RegisterOutcome::Announce { .. } => ControlKind::SetupAnnounce.length(1).unwrap(),
+        RegisterOutcome::Refuse { .. } => ControlKind::Registration.length(0).unwrap(),
+        RegisterOutcome::Drop(_) => 0,
+    }
+}
+
+#[test]
+fn a_missing_allowlist_is_a_refusal_never_a_permissive_default() {
+    assert_eq!(
+        RegistrationAllowlist::new(&[]),
+        Err(RegistrationConfigError::EmptyAllowlist)
+    );
+    let too_many = vec![range([10, 0, 0, 0], 8); MAX_ALLOW_RANGES + 1];
+    assert_eq!(
+        RegistrationAllowlist::new(&too_many),
+        Err(RegistrationConfigError::TooManyRanges)
+    );
+    assert!(RegistrationAllowlist::new(&too_many[..MAX_ALLOW_RANGES]).is_ok());
+}
+
+#[test]
+fn ranges_are_named_exactly() {
+    // Host bits below the prefix, or a prefix longer than the address.
+    assert_eq!(
+        AddressRange::new(IpAddr::from([10, 0, 0, 1]), 8),
+        Err(RegistrationConfigError::InvalidRange)
+    );
+    assert_eq!(
+        AddressRange::new(IpAddr::from([10, 0, 0, 0]), 33),
+        Err(RegistrationConfigError::InvalidRange)
+    );
+    assert_eq!(
+        AddressRange::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 129),
+        Err(RegistrationConfigError::InvalidRange)
+    );
+    let lan = range([10, 1, 0, 0], 16);
+    assert!(lan.contains(IpAddr::from([10, 1, 255, 7])));
+    assert!(!lan.contains(IpAddr::from([10, 2, 0, 1])));
+    // An IPv4-mapped IPv6 address is its IPv4 address.
+    let mapped = IpAddr::V6(Ipv4Addr::new(10, 1, 0, 9).to_ipv6_mapped());
+    assert!(lan.contains(mapped));
+    // A /32 is one host; a /0 is every address of its family only.
+    let host = range([10, 1, 2, 3], 32);
+    assert!(host.contains(IpAddr::from([10, 1, 2, 3])));
+    assert!(!host.contains(IpAddr::from([10, 1, 2, 4])));
+    let any_v4 = range([0, 0, 0, 0], 0);
+    assert!(any_v4.contains(IpAddr::from([203, 0, 113, 1])));
+    assert!(!any_v4.contains(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+}
+
+#[test]
+fn limits_are_mandatory_and_nonzero() {
+    let base = config(&[range([10, 0, 0, 0], 8)]);
+    assert_eq!(base.validate(), Ok(()));
+    let cases: [fn(&mut RegistrationConfig); 8] = [
+        |c| c.per_source_rate = 0,
+        |c| c.rate = 0,
+        |c| c.sources = 0,
+        |c| c.pending = 0,
+        |c| c.pending_per_source = 0,
+        |c| c.refusal_interval = 0,
+        |c| c.join_timeout = 0,
+        |c| c.pending_per_source = c.pending + 1,
+    ];
+    for (at, change) in cases.iter().enumerate() {
+        let mut bad = base.clone();
+        change(&mut bad);
+        assert_eq!(
+            Registrations::new(bad, true, T0).map(|_| ()),
+            Err(RegistrationConfigError::InvalidLimit),
+            "case {at}"
+        );
+    }
+}
+
+#[test]
+fn a_registration_inside_the_allowlist_gets_one_announce_and_a_pending_entry() {
+    let mut r = lan();
+    let from = source(5, 40_123);
+    let outcome = r.register(from, &register(7), Capacity::Free, T0);
+    assert_eq!(outcome, RegisterOutcome::Announce { source: from });
+    assert_eq!(r.pending().len(), 1);
+    assert_eq!(r.pending()[0].receiver, register(7).receiver);
+    assert_eq!(r.pending()[0].expires, T0 + 5 * SECOND);
+    assert_eq!(r.counters().registered, 1);
+}
+
+#[test]
+fn a_source_outside_the_allowlist_causes_nothing() {
+    let mut r = lan();
+    let outside = SocketAddr::from(([192, 0, 2, 1], 40_123));
+    for at in 0..100 {
+        assert_eq!(
+            r.register(outside, &register(7), Capacity::Free, T0 + at),
+            RegisterOutcome::Drop(RegisterDrop::NotAllowed)
+        );
+    }
+    assert!(r.pending().is_empty());
+    // Refused before any rate is charged: an allowed source still has its
+    // whole budget.
+    assert_eq!(r.counters().dropped_not_allowed, 100);
+    for at in 0..20 {
+        assert!(matches!(
+            r.register(source(5, 1), &register(8), Capacity::Free, T0 + at),
+            RegisterOutcome::Announce { .. }
+        ));
+    }
+}
+
+#[test]
+fn invalid_sources_are_dropped() {
+    let mut r = registrations(config(&[range([0, 0, 0, 0], 0)]));
+    for bad in [
+        SocketAddr::from(([10, 0, 0, 5], 0)),
+        SocketAddr::from(([0, 0, 0, 0], 40_123)),
+        SocketAddr::from(([224, 0, 0, 1], 40_123)),
+        SocketAddr::from(([255, 255, 255, 255], 40_123)),
+        // Another family than the endpoint's.
+        SocketAddr::from((Ipv6Addr::LOCALHOST, 40_123)),
+    ] {
+        assert_eq!(
+            r.register(bad, &register(7), Capacity::Free, T0),
+            RegisterOutcome::Drop(RegisterDrop::Source),
+            "{bad}"
+        );
+    }
+    // An IPv4-mapped IPv6 source is its IPv4 source.
+    let mapped = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 5).to_ipv6_mapped(), 40_123));
+    assert_eq!(
+        r.register(mapped, &register(7), Capacity::Free, T0),
+        RegisterOutcome::Announce {
+            source: source(5, 40_123)
+        }
+    );
+}
+
+/// ADR-0082, decision 1: the allowlist restricts admission and supplies no
+/// authentication. A source the broadest allowlist admits is still rate
+/// limited, bounded and capacity checked, gets only an unverified pending
+/// entry, and is answered on the CHALLENGE path only if it receives at
+/// its source with the boot id it registered.
+#[test]
+fn the_allowlist_is_not_authentication() {
+    let any = [range([0, 0, 0, 0], 0)];
+    let mut r = registrations(config(&any));
+    let from = source(5, 40_123);
+    // Admission is not trust: the per-source bounds still apply.
+    assert!(matches!(
+        r.register(from, &register(1), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert!(matches!(
+        r.register(from, &register(2), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert_eq!(
+        r.register(from, &register(3), Capacity::Free, T0),
+        RegisterOutcome::Drop(RegisterDrop::SourcePendingFull)
+    );
+    // A full table refuses an allowed source as any other.
+    let other = source(6, 40_123);
+    assert_eq!(
+        r.register(other, &register(4), Capacity::Full, T0),
+        RegisterOutcome::Refuse { source: other }
+    );
+    // The entry proves nothing: a CHALLENGE from another source, or with
+    // another boot id, does not take it.
+    assert_eq!(r.challenged(source(9, 40_123), [1, 1], T0), None);
+    assert_eq!(r.challenged(from, [99, 1], T0), None);
+    assert_eq!(r.pending().len(), 2);
+    let taken = r.challenged(from, [1, 1], T0).unwrap();
+    assert_eq!(taken.receiver.receiver_id, 1);
+    assert_eq!(r.pending().len(), 1);
+    // Taken once: the same CHALLENGE again finds nothing.
+    assert_eq!(r.challenged(from, [1, 1], T0), None);
+}
+
+#[test]
+fn the_per_source_rate_is_a_limit() {
+    let mut r = lan();
+    let from = source(5, 40_123);
+    // The burst is the rate: 20 within one instant, as retries of one
+    // entry, then nothing until the bucket refills.
+    for _ in 0..20 {
+        assert!(matches!(
+            r.register(from, &register(7), Capacity::Free, T0),
+            RegisterOutcome::Announce { .. }
+        ));
+    }
+    assert_eq!(
+        r.register(from, &register(7), Capacity::Free, T0),
+        RegisterOutcome::Drop(RegisterDrop::SourceRate)
+    );
+    assert_eq!(r.counters().retried, 19);
+    // Another source of the same host has its own bucket.
+    assert!(matches!(
+        r.register(source(5, 40_124), &register(8), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    // One token back after 1/20 s.
+    let later = T0 + SECOND / 20;
+    assert!(matches!(
+        r.register(from, &register(7), Capacity::Free, later),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert_eq!(
+        r.register(from, &register(7), Capacity::Free, later),
+        RegisterOutcome::Drop(RegisterDrop::SourceRate)
+    );
+}
+
+#[test]
+fn the_driver_rate_is_a_limit() {
+    // Tables large enough that only the total decides.
+    let mut c = config(&[range([10, 0, 0, 0], 8)]);
+    c.sources = 1024;
+    c.pending = 1024;
+    let mut r = registrations(c);
+    let mut announced = 0;
+    for host in 0..300u16 {
+        let from = SocketAddr::from(([10, 0, (host >> 8) as u8, host as u8], 40_000));
+        match r.register(from, &register(u64::from(host) + 1), Capacity::Free, T0) {
+            RegisterOutcome::Announce { .. } => announced += 1,
+            RegisterOutcome::Drop(RegisterDrop::Rate) => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(announced, 256);
+    assert_eq!(r.counters().dropped_rate, 44);
+}
+
+#[test]
+fn pending_registrations_are_bounded_globally_and_per_source() {
+    let mut r = lan();
+    // Per source: two entries, whatever the receiver.
+    let from = source(1, 40_000);
+    for id in 1..=2 {
+        assert!(matches!(
+            r.register(from, &register(id), Capacity::Free, T0),
+            RegisterOutcome::Announce { .. }
+        ));
+    }
+    assert_eq!(
+        r.register(from, &register(3), Capacity::Free, T0),
+        RegisterOutcome::Drop(RegisterDrop::SourcePendingFull)
+    );
+    // Globally: 32 entries in all.
+    let mut id = 10;
+    for host in 2..=31u8 {
+        id += 1;
+        assert!(matches!(
+            r.register(source(host, 40_000), &register(id), Capacity::Free, T0),
+            RegisterOutcome::Announce { .. }
+        ));
+    }
+    assert_eq!(r.pending().len(), 32);
+    assert_eq!(
+        r.register(source(200, 40_000), &register(999), Capacity::Free, T0),
+        RegisterOutcome::Drop(RegisterDrop::PendingFull)
+    );
+    // An entry not challenged by `join_timeout` is removed, and its room
+    // is free again.
+    let late = T0 + 5 * SECOND;
+    assert!(matches!(
+        r.register(source(200, 40_000), &register(999), Capacity::Free, late),
+        RegisterOutcome::Announce { .. }
+    ));
+    assert_eq!(r.pending().len(), 1);
+    assert_eq!(r.counters().expired, 32);
+}
+
+#[test]
+fn a_full_table_answers_one_err_per_source_per_interval() {
+    let mut r = lan();
+    let from = source(5, 40_123);
+    assert_eq!(
+        r.register(from, &register(7), Capacity::Full, T0),
+        RegisterOutcome::Refuse { source: from }
+    );
+    // Nothing is held for a refused registration.
+    assert!(r.pending().is_empty());
+    for at in 1..20 {
+        assert_eq!(
+            r.register(from, &register(7), Capacity::Full, T0 + at * SECOND / 20),
+            RegisterOutcome::Drop(RegisterDrop::RefusalLimited)
+        );
+    }
+    assert_eq!(
+        r.register(from, &register(7), Capacity::Full, T0 + SECOND),
+        RegisterOutcome::Refuse { source: from }
+    );
+    assert_eq!(r.counters().refused_full, 2);
+    // Another source is refused on its own interval.
+    assert_eq!(
+        r.register(source(6, 1), &register(8), Capacity::Full, T0 + SECOND),
+        RegisterOutcome::Refuse {
+            source: source(6, 1)
+        }
+    );
+}
+
+#[test]
+fn the_refusal_table_is_bounded() {
+    let mut c = config(&[range([10, 0, 0, 0], 8)]);
+    c.sources = 4;
+    let mut r = registrations(c);
+    for host in 1..=4 {
+        assert!(matches!(
+            r.register(source(host, 1), &register(1), Capacity::Full, T0),
+            RegisterOutcome::Refuse { .. }
+        ));
+    }
+    // Every rate entry is busy within the second: a fifth source gets no
+    // rate entry, so it is dropped before the refusal table is reached.
+    assert_eq!(
+        r.register(source(5, 1), &register(1), Capacity::Full, T0),
+        RegisterOutcome::Drop(RegisterDrop::SourceRate)
+    );
+    // A second later both tables reuse idle entries.
+    assert!(matches!(
+        r.register(source(5, 1), &register(1), Capacity::Full, T0 + SECOND),
+        RegisterOutcome::Refuse { .. }
+    ));
+}
+
+/// Design 9.2: the sender cannot be used to reflect traffic at a third
+/// party. A flood of REGISTERs spoofing a victim's address causes, per
+/// second, at most `per_source_rate` replies of at most 72 bytes to that
+/// address, and over many spoofed victims at most the driver's `rate`;
+/// a victim outside the allowlist gets nothing.
+#[test]
+fn the_sender_cannot_be_used_to_reflect_traffic() {
+    let mut r = lan();
+    let victim = source(77, 53);
+    let mut replies = 0usize;
+    let mut bytes = 0usize;
+    let mut flood_bytes = 0usize;
+    // 10 000 REGISTERs within one second, each with a fresh receiver.
+    for n in 0..10_000u64 {
+        let outcome = r.register(victim, &register(n + 1), Capacity::Free, T0 + n * 100_000);
+        flood_bytes += ControlKind::Register.length(0).unwrap();
+        if !matches!(outcome, RegisterOutcome::Drop(_)) {
+            replies += 1;
+            bytes += sent_bytes(outcome);
+        }
+    }
+    // Only two pending entries per source: the rest is dropped, so the
+    // victim gets two ANNOUNCEs, far below the flood.
+    assert_eq!(replies, 2);
+    assert_eq!(bytes, 2 * 72);
+    assert!(bytes < flood_bytes);
+    // Retries of one entry are the most a source can draw: the rate.
+    let mut r = lan();
+    let mut replies = 0;
+    for n in 0..10_000u64 {
+        let outcome = r.register(victim, &register(1), Capacity::Free, T0 + n * 100_000);
+        if !matches!(outcome, RegisterOutcome::Drop(_)) {
+            replies += 1;
+        }
+    }
+    // 20 at once, then one per 50 ms over the remaining second.
+    assert!(replies <= 20 + 20, "{replies}");
+    // A full table: one ERR per second whatever the flood.
+    let mut r = lan();
+    let mut errs = 0;
+    for n in 0..10_000u64 {
+        if let RegisterOutcome::Refuse { .. } =
+            r.register(victim, &register(n + 1), Capacity::Full, T0 + n * 100_000)
+        {
+            errs += 1;
+        }
+    }
+    assert_eq!(errs, 1);
+    // Many spoofed victims: the driver's total bounds the sum.
+    let mut c = config(&[range([10, 0, 0, 0], 8)]);
+    c.sources = 4096;
+    c.pending = 4096;
+    let mut r = registrations(c);
+    let mut replies = 0;
+    for n in 0..4096u64 {
+        let from = SocketAddr::from(([10, 1, (n >> 8) as u8, n as u8], 53));
+        if !matches!(
+            r.register(from, &register(n + 1), Capacity::Free, T0),
+            RegisterOutcome::Drop(_)
+        ) {
+            replies += 1;
+        }
+    }
+    assert_eq!(replies, 256);
+    // Outside the allowlist: nothing at all.
+    let mut r = lan();
+    let outside = SocketAddr::from(([198, 51, 100, 7], 53));
+    for n in 0..1_000u64 {
+        assert!(matches!(
+            r.register(outside, &register(n + 1), Capacity::Free, T0 + n),
+            RegisterOutcome::Drop(RegisterDrop::NotAllowed)
+        ));
+    }
+}

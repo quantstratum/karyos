@@ -28,10 +28,12 @@
 //! | SETUP `0x05` | 2 ANSWER, `count` lanes 1 to 4 | identity; term parameters; challenge; `count` join positions | `104 + 8n` |
 //! | RSP_SETUP `0x07` | 1 CHALLENGE | identity; challenge | 88 |
 //! | RSP_SETUP `0x07` | 2 SOLICIT | challenge | 56 |
+//! | RSP_SETUP `0x07` | 3 REGISTER, `session_id` reserved | receiver; reserved 8 | 56 |
 //! | SM `0x03` | 1 STATUS, `count` lanes 1 to 4 | identity; receiver; `group_tag` u64; per lane consumption u64, window u32, reserved u32 | `88 + 16n` |
 //! | NAK `0x02` | 1 RANGE | identity; receiver; lane u8, reserved 3, length u32, start u64 | 96 |
 //! | ERR `0x04` | 1 NAK_REPLY | identity; the NAK's bytes 56 to 95; reason u16, reserved 6, detail u64 | 112 |
 //! | ERR `0x04` | 2 UNBOUND | reason u16, rejected type u16, rejected version u8, min and max supported u8, reserved u8, rejected length i32, reserved u32 | 40 |
+//! | ERR `0x04` | 3 REGISTRATION, `session_id` reserved | reason u16, reserved 14 | 40 |
 //! | RTTM `0x06` | 1 REQUEST, 2 REPLY | identity; receiver; `probe_id` u64; `service_delay_ns` u64 | 96 |
 //! | PATH_HB `0x10` | 1 PATH | identity | 56 |
 //!
@@ -44,6 +46,13 @@
 //! 8192) and a reserved u32. Positions are u64 lane positions, multiples of
 //! 32 and at most 2^61; windows are u32 multiples of 32, at most 2^29; a NAK
 //! length is a multiple of 32 from 32 to 2^30.
+//!
+//! REGISTER and REGISTRATION are the two wire additions of dynamic
+//! multi-destination registration (ADR-0056, ADR-0082; `quantstratum-docs:
+//! karyos/design/multi-destination-unicast.md` section 2.5, MD-4 and MD-5,
+//! adopted by owner item 4 of 2026-10-21): a registrant does not know the
+//! publication's alias, so REGISTER names only the stream, and a full
+//! destination table answers REGISTRATION `DESTINATIONS_FULL`.
 //!
 //! GUARD, SESSION_ABORT and SESSION_ABORT_ACK have no trusted body: every
 //! decoder returns [`ControlError::GatedType`] after their common word.
@@ -102,6 +111,10 @@ pub mod reason {
     /// ERR NAK_REPLY: the request is not term-bounded, not on complete
     /// original extents or beyond the sent frontier; `detail` is 0.
     pub const RANGE_INVALID: u16 = 3;
+    /// ERR REGISTRATION: the publication's destination table has no free
+    /// slot for the registrant (SPEC.md §6, "Multi-destination unicast";
+    /// design MD-5).
+    pub const DESTINATIONS_FULL: u16 = 4;
 }
 
 /// Errors decoding or encoding a network datagram. These are local
@@ -199,6 +212,8 @@ pub enum ControlKind {
     Challenge,
     /// RSP_SETUP SOLICIT.
     Solicit,
+    /// RSP_SETUP REGISTER.
+    Register,
     /// SM STATUS.
     Status,
     /// NAK RANGE.
@@ -207,6 +222,8 @@ pub enum ControlKind {
     NakReply,
     /// ERR UNBOUND.
     Unbound,
+    /// ERR REGISTRATION.
+    Registration,
     /// RTTM REQUEST.
     RttmRequest,
     /// RTTM REPLY.
@@ -217,15 +234,17 @@ pub enum ControlKind {
 
 impl ControlKind {
     /// Every kind.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::SetupAnnounce,
         Self::SetupAnswer,
         Self::Challenge,
         Self::Solicit,
+        Self::Register,
         Self::Status,
         Self::Nak,
         Self::NakReply,
         Self::Unbound,
+        Self::Registration,
         Self::RttmRequest,
         Self::RttmReply,
         Self::PathHeartbeat,
@@ -236,10 +255,10 @@ impl ControlKind {
     pub const fn frame_type(self) -> FrameType {
         match self {
             Self::SetupAnnounce | Self::SetupAnswer => FrameType::Setup,
-            Self::Challenge | Self::Solicit => FrameType::RspSetup,
+            Self::Challenge | Self::Solicit | Self::Register => FrameType::RspSetup,
             Self::Status => FrameType::Sm,
             Self::Nak => FrameType::Nak,
-            Self::NakReply | Self::Unbound => FrameType::Err,
+            Self::NakReply | Self::Unbound | Self::Registration => FrameType::Err,
             Self::RttmRequest | Self::RttmReply => FrameType::Rttm,
             Self::PathHeartbeat => FrameType::PathHb,
         }
@@ -257,6 +276,7 @@ impl ControlKind {
             | Self::RttmRequest
             | Self::PathHeartbeat => 1,
             Self::SetupAnswer | Self::Solicit | Self::Unbound | Self::RttmReply => 2,
+            Self::Register | Self::Registration => 3,
         }
     }
 
@@ -269,10 +289,12 @@ impl ControlKind {
             (FrameType::Setup, 2) => Self::SetupAnswer,
             (FrameType::RspSetup, 1) => Self::Challenge,
             (FrameType::RspSetup, 2) => Self::Solicit,
+            (FrameType::RspSetup, 3) => Self::Register,
             (FrameType::Sm, 1) => Self::Status,
             (FrameType::Nak, 1) => Self::Nak,
             (FrameType::Err, 1) => Self::NakReply,
             (FrameType::Err, 2) => Self::Unbound,
+            (FrameType::Err, 3) => Self::Registration,
             (FrameType::Rttm, 1) => Self::RttmRequest,
             (FrameType::Rttm, 2) => Self::RttmReply,
             (FrameType::PathHb, 1) => Self::PathHeartbeat,
@@ -304,18 +326,19 @@ impl ControlKind {
             Self::SetupAnnounce => 72,
             Self::SetupAnswer => 104 + 8 * n,
             Self::Challenge => 88,
-            Self::Solicit | Self::PathHeartbeat => 56,
+            Self::Solicit | Self::Register | Self::PathHeartbeat => 56,
             Self::Status => 88 + 16 * n,
             Self::Nak | Self::RttmRequest | Self::RttmReply => 96,
             Self::NakReply => 112,
-            Self::Unbound => 40,
+            Self::Unbound | Self::Registration => 40,
         })
     }
 
     /// The reserved byte ranges of the record, in offset order, as
     /// `(start, end)` pairs; unused slots are empty `(0, 0)` ranges. The
     /// common header contributes bytes 10 to 11 and 20 to 23 (and 12 to 19
-    /// in UNBOUND, where `session_id` and `stream_id` are reserved).
+    /// in UNBOUND, where `session_id` and `stream_id` are reserved, and
+    /// 12 to 15 in REGISTER and REGISTRATION, where `session_id` is).
     #[must_use]
     pub fn reserved(self, count: u8) -> [(usize, usize); 6] {
         const EMPTY: (usize, usize) = (0, 0);
@@ -323,6 +346,8 @@ impl ControlKind {
         const TAIL: (usize, usize) = (20, 24);
         match self {
             Self::Unbound => [HEADER, (12, 24), (31, 32), (36, 40), EMPTY, EMPTY],
+            Self::Register => [HEADER, (12, 16), TAIL, (48, 56), EMPTY, EMPTY],
+            Self::Registration => [HEADER, (12, 16), TAIL, (26, 40), EMPTY, EMPTY],
             Self::SetupAnnounce | Self::SetupAnswer => {
                 [HEADER, TAIL, (68, 72), EMPTY, EMPTY, EMPTY]
             }
@@ -513,6 +538,37 @@ pub struct RspSolicit {
     pub challenge: ChallengeBlock,
 }
 
+/// RSP_SETUP REGISTER: a receiver asks a publication of `stream_id` in
+/// `control-mode=dynamic` to add it as a destination (design 2.5 and 3.2,
+/// MD-4). It names no alias: the registrant does not know one, so
+/// `session_id` is reserved 0 on the wire. Unauthenticated: it proves
+/// nothing about its source until the receiver's CHALLENGE does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RspRegister {
+    /// The stream the receiver subscribes.
+    pub stream_id: i32,
+    /// The registering receiver.
+    pub receiver: Receiver,
+}
+
+/// The reason of an ERR REGISTRATION.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum RegistrationReason {
+    /// [`reason::DESTINATIONS_FULL`].
+    DestinationsFull,
+}
+
+/// ERR REGISTRATION: a registration refused (design 2.5 and 3.2, MD-5).
+/// Like REGISTER it names only the stream; `session_id` is reserved 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Registration {
+    /// The stream of the refused REGISTER.
+    pub stream_id: i32,
+    /// Why it is refused.
+    pub reason: RegistrationReason,
+}
+
 /// SM STATUS: every configured lane's consumption and window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StatusMessage {
@@ -649,6 +705,8 @@ pub enum Control {
     Challenge(RspChallenge),
     /// RSP_SETUP SOLICIT.
     Solicit(RspSolicit),
+    /// RSP_SETUP REGISTER.
+    Register(RspRegister),
     /// SM STATUS.
     Status(StatusMessage),
     /// NAK RANGE.
@@ -657,6 +715,8 @@ pub enum Control {
     NakReply(NakReply),
     /// ERR UNBOUND.
     Unbound(Unbound),
+    /// ERR REGISTRATION.
+    Registration(Registration),
     /// RTTM REQUEST or REPLY.
     Rttm(Rttm),
     /// PATH_HB PATH.
@@ -763,10 +823,12 @@ impl Control {
             Self::SetupAnswer(_) => ControlKind::SetupAnswer,
             Self::Challenge(_) => ControlKind::Challenge,
             Self::Solicit(_) => ControlKind::Solicit,
+            Self::Register(_) => ControlKind::Register,
             Self::Status(_) => ControlKind::Status,
             Self::Nak(_) => ControlKind::Nak,
             Self::NakReply(_) => ControlKind::NakReply,
             Self::Unbound(_) => ControlKind::Unbound,
+            Self::Registration(_) => ControlKind::Registration,
             Self::Rttm(Rttm {
                 kind: RttmKind::Request,
                 ..
@@ -787,7 +849,9 @@ impl Control {
         }
     }
 
-    /// The alias and stream; zero for UNBOUND, which carries none.
+    /// The alias and stream; zero for UNBOUND, which carries none, and a
+    /// zero `session_id` for REGISTER and REGISTRATION, which carry only
+    /// the stream.
     #[must_use]
     pub const fn alias(&self) -> Alias {
         match self {
@@ -801,6 +865,14 @@ impl Control {
             Self::Unbound(_) => Alias {
                 session_id: 0,
                 stream_id: 0,
+            },
+            Self::Register(m) => Alias {
+                session_id: 0,
+                stream_id: m.stream_id,
+            },
+            Self::Registration(m) => Alias {
+                session_id: 0,
+                stream_id: m.stream_id,
             },
             Self::Rttm(m) => m.alias,
             Self::PathHeartbeat(m) => m.alias,
@@ -852,6 +924,8 @@ impl Control {
                 check_challenge(&m.challenge)
             }
             Self::Solicit(m) => check_challenge(&m.challenge),
+            Self::Register(m) => check_receiver(&m.receiver),
+            Self::Registration(_) => Ok(()),
             Self::Status(m) => {
                 check_identity(&m.identity)?;
                 check_receiver(&m.receiver)?;
@@ -939,6 +1013,13 @@ impl Control {
                 w.challenge(56, &m.challenge)?;
             }
             Self::Solicit(m) => w.challenge(24, &m.challenge)?,
+            Self::Register(m) => w.receiver(24, &m.receiver)?,
+            Self::Registration(m) => {
+                let code = match m.reason {
+                    RegistrationReason::DestinationsFull => reason::DESTINATIONS_FULL,
+                };
+                w.put(24, &code.to_le_bytes())?;
+            }
             Self::Status(m) => {
                 w.identity(24, &m.identity)?;
                 w.receiver(56, &m.receiver)?;
@@ -1029,6 +1110,8 @@ kind_codec!(StatusMessage, Status, Status);
 kind_codec!(Nak, Nak, Nak);
 kind_codec!(NakReply, NakReply, NakReply);
 kind_codec!(Unbound, Unbound, Unbound);
+kind_codec!(RspRegister, Register, Register);
+kind_codec!(Registration, Registration, Registration);
 kind_codec!(Rttm, Rttm, RttmRequest, RttmReply);
 kind_codec!(PathHeartbeat, PathHeartbeat, PathHeartbeat);
 
@@ -1162,6 +1245,20 @@ fn decode_control(
             alias,
             challenge: r.challenge(24)?,
         }),
+        ControlKind::Register => Control::Register(RspRegister {
+            stream_id: alias.stream_id,
+            receiver: r.receiver(24)?,
+        }),
+        ControlKind::Registration => {
+            let reason = match r.u16(24)? {
+                reason::DESTINATIONS_FULL => RegistrationReason::DestinationsFull,
+                _ => return Err(ControlError::InvalidValue),
+            };
+            Control::Registration(Registration {
+                stream_id: alias.stream_id,
+                reason,
+            })
+        }
         ControlKind::Status => {
             let identity = r.identity(24)?;
             let receiver = r.receiver(56)?;

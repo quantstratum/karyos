@@ -86,6 +86,18 @@ const V_RSP_2: [[u8; 8]; 7] = [
     [0xD8, 0xD7, 0xD6, 0xD5, 0xD4, 0xD3, 0xD2, 0xD1],
 ];
 
+// RSP_SETUP REGISTER (multi-destination-unicast.md 2.5, MD-4): no
+// alias, the stream, the receiver block at 24, 8 reserved bytes at 48.
+const V_RSP_3: [[u8; 8]; 7] = [
+    [0x38, 0x00, 0x00, 0x00, 0x01, 0x00, 0x07, 0x00],
+    [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0xE9, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0xA8, 0xA7, 0xA6, 0xA5, 0xA4, 0xA3, 0xA2, 0xA1],
+    [0xB8, 0xB7, 0xB6, 0xB5, 0xB4, 0xB3, 0xB2, 0xB1],
+    [0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+];
+
 const V_SM_1: [[u8; 8]; 13] = [
     [0x68, 0x00, 0x00, 0x00, 0x01, 0x00, 0x03, 0x00],
     [0x01, 0x01, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12],
@@ -162,6 +174,16 @@ const V_ERR_2: [[u8; 8]; 5] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
     [0x01, 0x00, 0x03, 0x00, 0x02, 0x01, 0x01, 0x00],
     [0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+];
+
+// ERR REGISTRATION `DESTINATIONS_FULL` (multi-destination-unicast.md
+// 2.5, MD-5): no alias, the stream, reason 4 at 24, reserved to 40.
+const V_ERR_3: [[u8; 8]; 5] = [
+    [0x28, 0x00, 0x00, 0x00, 0x01, 0x00, 0x04, 0x00],
+    [0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0xE9, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
 ];
 
 const V_RTTM_1: [[u8; 8]; 12] = [
@@ -273,6 +295,14 @@ fn valid_vectors() -> Vec<(&'static str, &'static [u8], Control)> {
             }),
         ),
         (
+            "V-RSP-3",
+            V_RSP_3.as_flattened(),
+            Control::Register(RspRegister {
+                stream_id: ALIAS.stream_id,
+                receiver: RECEIVER,
+            }),
+        ),
+        (
             "V-SM-1",
             V_SM_1.as_flattened(),
             Control::Status(StatusMessage {
@@ -339,6 +369,14 @@ fn valid_vectors() -> Vec<(&'static str, &'static [u8], Control)> {
             }),
         ),
         (
+            "V-ERR-3",
+            V_ERR_3.as_flattened(),
+            Control::Registration(Registration {
+                stream_id: ALIAS.stream_id,
+                reason: RegistrationReason::DestinationsFull,
+            }),
+        ),
+        (
             "V-RTTM-1",
             V_RTTM_1.as_flattened(),
             Control::Rttm(Rttm {
@@ -391,6 +429,8 @@ fn decode_kind(kind: ControlKind, bytes: &[u8]) -> Result<Control, ControlError>
         ControlKind::Nak => Nak::decode(bytes).map(Control::Nak),
         ControlKind::NakReply => NakReply::decode(bytes).map(Control::NakReply),
         ControlKind::Unbound => Unbound::decode(bytes).map(Control::Unbound),
+        ControlKind::Register => RspRegister::decode(bytes).map(Control::Register),
+        ControlKind::Registration => Registration::decode(bytes).map(Control::Registration),
         ControlKind::RttmRequest | ControlKind::RttmReply => Rttm::decode(bytes).map(Control::Rttm),
         ControlKind::PathHeartbeat => PathHeartbeat::decode(bytes).map(Control::PathHeartbeat),
     }
@@ -444,6 +484,8 @@ fn per_kind_encoders_match_the_vectors() {
             Control::Nak(m) => m.encode(&mut out),
             Control::NakReply(m) => m.encode(&mut out),
             Control::Unbound(m) => m.encode(&mut out),
+            Control::Register(m) => m.encode(&mut out),
+            Control::Registration(m) => m.encode(&mut out),
             Control::Rttm(m) => m.encode(&mut out),
             Control::PathHeartbeat(m) => m.encode(&mut out),
         }
@@ -617,13 +659,98 @@ fn rsp_setup_mutations() {
         ),
         (
             "X-RSP-6",
-            mutate(v1, 0x08, &[0x03]),
+            mutate(v1, 0x08, &[0x04]),
             ControlError::InvalidVariant,
         ),
     ];
     for (name, bytes, expected) in cases {
         assert_eq!(error_of(&bytes), expected, "{name}");
     }
+}
+
+#[test]
+fn register_and_registration_mutations() {
+    let register = V_RSP_3.as_flattened();
+    let refusal = V_ERR_3.as_flattened();
+    let cases: [(&str, Vec<u8>, ControlError); 9] = [
+        // An alias is never named: `session_id` is reserved.
+        (
+            "REGISTER session",
+            mutate(register, 0x0C, &[0x01]),
+            ControlError::ReservedBits,
+        ),
+        (
+            "REGISTER tail",
+            mutate(register, 0x30, &[0x01]),
+            ControlError::ReservedBits,
+        ),
+        (
+            "REGISTER last",
+            mutate(register, 0x37, &[0x80]),
+            ControlError::ReservedBits,
+        ),
+        (
+            "REGISTER boot id",
+            mutate(register, 0x18, &[0; 16]),
+            ControlError::InvalidIdentity,
+        ),
+        (
+            "REGISTER receiver id",
+            mutate(register, 0x28, &[0; 8]),
+            ControlError::InvalidIdentity,
+        ),
+        (
+            "REGISTER count",
+            mutate(register, 0x09, &[0x01]),
+            ControlError::InvalidCount,
+        ),
+        (
+            "REGISTRATION session",
+            mutate(refusal, 0x0C, &[0x01]),
+            ControlError::ReservedBits,
+        ),
+        (
+            "REGISTRATION tail",
+            mutate(refusal, 0x1A, &[0x01]),
+            ControlError::ReservedBits,
+        ),
+        (
+            "REGISTRATION end",
+            mutate(refusal, 0x27, &[0x01]),
+            ControlError::ReservedBits,
+        ),
+    ];
+    for (name, bytes, expected) in cases {
+        assert_eq!(error_of(&bytes), expected, "{name}");
+    }
+    // Only reason 4 is a registration refusal.
+    for code in [0u16, 1, 2, 3, 5, u16::MAX] {
+        assert_eq!(
+            error_of(&mutate(refusal, 0x18, &code.to_le_bytes())),
+            ControlError::InvalidValue,
+            "reason {code}"
+        );
+    }
+    // Any stream is named, the negative ones included.
+    let negative = mutate(register, 0x10, &(-7i32).to_le_bytes());
+    assert_eq!(
+        Control::decode(&negative),
+        Ok(Control::Register(RspRegister {
+            stream_id: -7,
+            receiver: RECEIVER,
+        }))
+    );
+    // A receiver block the decoder would refuse is never encoded.
+    let mut out = [0xEEu8; MAX_CONTROL_LENGTH];
+    let bad = RspRegister {
+        stream_id: 1,
+        receiver: Receiver {
+            receiver_boot_id: [0, 0],
+            receiver_id: 1,
+        },
+    };
+    assert_eq!(bad.encode(&mut out), Err(ControlError::InvalidIdentity));
+    assert!(out.iter().all(|b| *b == 0xEE));
 }
 
 #[test]
@@ -1128,11 +1255,22 @@ fn every_version_type_variant_count_and_length_is_classified() {
                 Some(kind) if kind.length(control.count()) == Some(bytes.len()) => {
                     // RTTM REQUEST and REPLY share a size: a REQUEST read as
                     // a REPLY is valid, a REPLY with a delay is not a REQUEST.
+                    // SOLICIT and REGISTER, UNBOUND and REGISTRATION share a
+                    // size too: the other kind's fields land in reserved
+                    // bytes, which are checked before any field.
+                    let reserved_set = kind
+                        .reserved(control.count())
+                        .iter()
+                        .any(|(start, end)| bad[*start..*end].iter().any(|b| *b != 0));
                     match result {
                         Ok(other) => {
+                            assert!(!reserved_set, "{name} {variant}");
                             let mut out = [0u8; MAX_CONTROL_LENGTH];
                             assert_eq!(other.encode(&mut out), Ok(bad.len()));
                             assert_eq!(&out[..bad.len()], &bad[..], "{name} {variant}");
+                        }
+                        Err(error) if reserved_set => {
+                            assert_eq!(error, ControlError::ReservedBits, "{name} {variant}");
                         }
                         Err(error) => assert_eq!(error, ControlError::InvalidValue, "{name}"),
                     }
@@ -1205,6 +1343,8 @@ fn sizes_and_reply_ratios() {
         (Nak, 96),
         (NakReply, 112),
         (Unbound, 40),
+        (Register, 56),
+        (Registration, 40),
         (RttmRequest, 96),
         (RttmReply, 96),
         (PathHeartbeat, 56),
@@ -1232,6 +1372,15 @@ fn sizes_and_reply_ratios() {
     assert!(challenge * 100 <= 72 * 123);
     assert!(solicit * 4 <= HEADER_LENGTH as usize * 7);
     assert_eq!(Unbound.length(0), Some(40));
+
+    // Design 9.2: one unverified REGISTER causes at most one 72-byte
+    // ANNOUNCE (ratio about 1.29) or one 40-byte REGISTRATION, never more
+    // bytes than that ratio; REGISTER is padded to SOLICIT's size for it.
+    let register = Register.length(0).unwrap();
+    assert_eq!((register, solicit), (56, 56));
+    assert_eq!(Registration.length(0), Some(40));
+    assert!(Registration.length(0).unwrap() <= register);
+    assert!(SetupAnnounce.length(1).unwrap() * 100 <= register * 129);
 }
 
 #[test]

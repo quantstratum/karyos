@@ -28,6 +28,8 @@ fn decode_kind(kind: ControlKind, bytes: &[u8]) -> Result<Control, ControlError>
         ControlKind::Nak => Nak::decode(bytes).map(Control::Nak),
         ControlKind::NakReply => NakReply::decode(bytes).map(Control::NakReply),
         ControlKind::Unbound => Unbound::decode(bytes).map(Control::Unbound),
+        ControlKind::Register => RspRegister::decode(bytes).map(Control::Register),
+        ControlKind::Registration => Registration::decode(bytes).map(Control::Registration),
         ControlKind::RttmRequest | ControlKind::RttmReply => Rttm::decode(bytes).map(Control::Rttm),
         ControlKind::PathHeartbeat => PathHeartbeat::decode(bytes).map(Control::PathHeartbeat),
     }
