@@ -7690,7 +7690,20 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             Some(_) => destination,
         };
+        // A registrant's CHALLENGE is charged to its address's bucket of
+        // the registrations, not to the shared `setup_answer_rate` table
+        // (karyos#945 review): a refused one keeps its pending entry.
+        let registrant = matches!(control, Control::Challenge(_))
+            && self.registrant_challenge(endpoint, normalized(source), &control, now);
+        if registrant && !self.registrations.admit_challenge(source, now) {
+            self.count(|c| &mut c.refused);
+            return None;
+        }
         let answer = match control {
+            Control::Challenge(challenge) if registrant => {
+                self.sessions
+                    .registrant_challenge(endpoint, now, &challenge, |_| joins)
+            }
             Control::Challenge(challenge) => {
                 self.sessions
                     .challenge(endpoint, source, now, &challenge, |_| joins)

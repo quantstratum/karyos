@@ -343,21 +343,65 @@ fn registers_from_many_ports_of_one_address_leave_others_their_rates() {
     assert_eq!(sender.session_counters().rate_limited, 0);
 }
 
-/// karyos#940 item 7: a CHALLENGE whose ANSWER its `setup_answer_rate`
+/// karyos#945 review: registrants' CHALLENGEs are charged to their
+/// address's bucket of the registrations, not to the shared
+/// `setup_answer_rate` table keyed on address and port. REGISTER and
+/// CHALLENGE pairs from 64 address and port pairs (4 addresses, 16 ports
+/// each) leave that table free: a new registrant's CHALLENGE and a joined
+/// destination's own CHALLENGE are still answered.
+#[test]
+fn register_and_challenge_pairs_leave_the_answer_rate_table_free() {
+    let mut sender = dynamic_sender(8);
+    let joined: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert_eq!(join_as(&mut sender, joined, 5, 7, T0), None);
+    let now = T0 + 2_000_000_000;
+    let mut answered = 0;
+    for host in 1..=4u8 {
+        for port in 1..=16u16 {
+            let from = SocketAddr::from(([10, 0, 3, host], port));
+            let boot = u64::from(host) * 100 + u64::from(port);
+            let _ = sender.register(EndpointId(1), from, &register_as(1000 + boot, boot), now);
+            if sender
+                .answer_for(EndpointId(1), from, now, challenge_of(boot))
+                .is_some()
+            {
+                answered += 1;
+            }
+        }
+    }
+    // Each address's bucket of 20 takes 10 pairs.
+    assert_eq!(answered, 4 * 10);
+    let fresh: SocketAddr = "10.0.0.50:5000".parse().unwrap();
+    assert!(
+        sender
+            .register(EndpointId(1), fresh, &register_as(6, 50), now + 1)
+            .is_some()
+    );
+    assert!(
+        sender
+            .answer_for(EndpointId(1), fresh, now + 2, challenge_of(50))
+            .is_some()
+    );
+    assert!(
+        sender
+            .answer_for(EndpointId(1), joined, now + 3, challenge_of(7))
+            .is_some()
+    );
+    assert_eq!(sender.session_counters().rate_sources_full, 0);
+    assert_eq!(sender.session_counters().rate_limited, 0);
+}
+
+/// karyos#940 item 7: a registrant's CHALLENGE whose ANSWER its rate
 /// refuses takes no pending entry: the next CHALLENGE, once the bucket
-/// refills, finds it and is answered.
+/// refills, finds it and is answered. Its rate is its address's bucket of
+/// the registrations, not `setup_answer_rate` (karyos#945 review).
 #[test]
 fn a_challenge_refused_for_its_rate_keeps_its_pending_entry() {
-    let config = AgentConfig {
-        answer_rate: crate::sessions::send::AnswerRate {
-            per_second: 1,
-            sources: 64,
-        },
-        ..AgentConfig::default()
-    };
+    let mut config = AgentConfig::default();
+    config.registration.source_rate = 3;
     let mut sender = dynamic_sender_config(&config, 4, &[]);
     let from: SocketAddr = "10.0.0.9:5000".parse().unwrap();
-    // The one ANSWER of the second goes to the first registrant.
+    // REGISTER, CHALLENGE and REGISTER take the address's three tokens.
     assert_eq!(join_as(&mut sender, from, 5, 7, T0), None);
     assert!(
         sender
@@ -368,7 +412,8 @@ fn a_challenge_refused_for_its_rate_keeps_its_pending_entry() {
         sender.answer_for(EndpointId(1), from, T0 + 2, challenge_of(8)),
         None
     );
-    assert_eq!(sender.session_counters().rate_limited, 1);
+    assert_eq!(sender.registration_counters().dropped_challenge_rate, 1);
+    assert_eq!(sender.session_counters().rate_limited, 0);
     assert_eq!(sender.registrations.pending().len(), 1);
     assert_eq!(sender.registration_counters().challenged, 1);
     let later = T0 + 1_000_000_000;

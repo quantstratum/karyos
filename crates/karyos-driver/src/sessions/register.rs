@@ -59,7 +59,7 @@ use std::net::{IpAddr, SocketAddr};
 use karyos_protocol::network::{Receiver, RspRegister};
 use karyos_sys::host_clock::age_ns;
 
-use crate::sessions::rate::{EndpointRates, TotalRate, normalized};
+use crate::sessions::rate::{EndpointRates, RateRefused, TotalRate, normalized};
 
 /// The most ranges a [`RegistrationAllowlist`] holds.
 pub const MAX_ALLOW_RANGES: usize = 64;
@@ -350,8 +350,12 @@ pub struct RegistrationConfig {
     /// (karyos#940).
     pub source_rate: u64,
     /// Source addresses whose rates and refusal times are tracked at once
-    /// (64); a new source with no reusable entry is dropped, and is not
-    /// refused again.
+    /// (64). A new address with no reusable rate entry is bound by the
+    /// driver's `rate` alone (karyos#945 review): filling the table costs
+    /// an attacker one REGISTER a second from each of 64 allowlisted
+    /// addresses and gains it nothing beyond the driver's total, which
+    /// still bounds the flood; a new source is not refused again while
+    /// its refusal time cannot be tracked.
     pub sources: usize,
     /// Pending registrations in all (`registration_pending`, 32 per
     /// driver).
@@ -552,6 +556,13 @@ pub struct RegistrationCounters {
     pub pending_replaced: u64,
     /// Pending entries a CHALLENGE took.
     pub challenged: u64,
+    /// REGISTERs and registrants' CHALLENGEs admitted with the
+    /// per-address rate table full, bound by the driver's total or by
+    /// their pending entry alone (karyos#945 review).
+    pub source_rates_full: u64,
+    /// Registrants' CHALLENGEs dropped by their address's bucket
+    /// (karyos#945 review).
+    pub dropped_challenge_rate: u64,
     /// Pending entries removed at `join_timeout`.
     pub expired: u64,
     /// An increment did not apply.
@@ -740,19 +751,31 @@ impl Registrations {
         }
         // Step 3: both rates must admit before either is charged. The
         // source's bucket is its address's: a source varying its port
-        // gets no more (karyos#940).
+        // gets no more (karyos#940). With the table full of addresses
+        // active within the last second, an address with no entry is
+        // bound by the driver's total alone: the per-address bucket only
+        // keeps one address from taking the whole total, so filling the
+        // table denies no REGISTER the total would admit (karyos#945
+        // review).
         let address = SocketAddr::new(source.ip(), 0);
-        if self.source_rates.would_admit(address, now).is_err() {
-            return RegisterOutcome::Drop(RegisterDrop::SourceRate);
-        }
+        let tracked = match self.source_rates.would_admit(address, now) {
+            Ok(()) => true,
+            Err(RateRefused::Limited) => {
+                return RegisterOutcome::Drop(RegisterDrop::SourceRate);
+            }
+            Err(RateRefused::TableFull) => false,
+        };
         if !self.rate.would_admit(now) {
             return RegisterOutcome::Drop(RegisterDrop::Rate);
         }
-        if self.source_rates.admit(address, now).is_err() {
+        if tracked && self.source_rates.admit(address, now).is_err() {
             return RegisterOutcome::Drop(RegisterDrop::SourceRate);
         }
         if !self.rate.admit(now) {
             return RegisterOutcome::Drop(RegisterDrop::Rate);
+        }
+        if !tracked {
+            self.counters.bump(|c| &mut c.source_rates_full);
         }
         self.expire(now);
         self.expire_reserved(policy, now);
@@ -966,6 +989,29 @@ impl Registrations {
                 && entry.source == source
                 && entry.receiver.receiver_boot_id == receiver_boot_id
         })
+    }
+
+    /// Charges a registrant's CHALLENGE from `source` at `now` to its
+    /// address's bucket, the one its REGISTERs draw on, the port ignored,
+    /// instead of the shared `setup_answer_rate` table keyed on address
+    /// and port (karyos#945 review): REGISTER and CHALLENGE pairs cannot
+    /// fill that table and deny other receivers their ANSWER. `false`
+    /// when the bucket is empty. With the table full, the CHALLENGE is
+    /// admitted: each registrant's ANSWER takes the pending entry an
+    /// admitted REGISTER made, so the driver's REGISTER total bounds them.
+    pub fn admit_challenge(&mut self, source: SocketAddr, now: u64) -> bool {
+        let address = SocketAddr::new(normalized(source).ip(), 0);
+        match self.source_rates.admit(address, now) {
+            Ok(()) => true,
+            Err(RateRefused::Limited) => {
+                self.counters.bump(|c| &mut c.dropped_challenge_rate);
+                false
+            }
+            Err(RateRefused::TableFull) => {
+                self.counters.bump(|c| &mut c.source_rates_full);
+                true
+            }
+        }
     }
 
     /// Takes the pending entry, optional or one of `policy`'s reserved

@@ -528,11 +528,13 @@ fn the_refusal_table_is_bounded() {
         ));
     }
     // Every rate entry is busy within the second: a fifth source gets no
-    // rate entry, so it is dropped before the refusal table is reached.
+    // rate entry and is bound by the driver's total alone, and with no
+    // refusal entry free within its interval it gets no ERR.
     assert_eq!(
         r.register(source(5, 1), &register(1), Capacity::Full, T0),
-        RegisterOutcome::Drop(RegisterDrop::SourceRate)
+        RegisterOutcome::Drop(RegisterDrop::RefusalLimited)
     );
+    assert_eq!(r.counters().source_rates_full, 1);
     // A second later both tables reuse idle entries.
     assert!(matches!(
         r.register(source(5, 1), &register(1), Capacity::Full, T0 + SECOND),
@@ -623,9 +625,10 @@ fn the_sender_cannot_be_used_to_reflect_traffic() {
         }
     }
     // Only two pending entries per source, each new one replacing the
-    // oldest, and the address's rate: the victim gets at most 20 ANNOUNCEs
-    // at once and one per 50 ms after, far below the flood.
-    assert!(replies <= 20 + 20, "{replies}");
+    // oldest, and the address's rate: the victim gets 20 ANNOUNCEs at
+    // once and one per 50 ms after (19 within the second), far below the
+    // flood.
+    assert_eq!(replies, 20 + 19, "{replies}");
     assert_eq!(bytes, replies * 72);
     assert!(bytes * 100 < flood_bytes);
     assert_eq!(r.pending().len(), 2);
@@ -638,8 +641,8 @@ fn the_sender_cannot_be_used_to_reflect_traffic() {
             replies += 1;
         }
     }
-    // 20 at once, then one per 50 ms over the remaining second.
-    assert!(replies <= 20 + 20, "{replies}");
+    // 20 at once, then one per 50 ms over the remaining second (19).
+    assert_eq!(replies, 20 + 19, "{replies}");
     // A full table: one ERR per second whatever the flood.
     let mut r = lan();
     let mut errs = 0;
@@ -1064,6 +1067,67 @@ fn registers_from_many_ports_of_one_address_leave_other_addresses_their_rate() {
         RegisterOutcome::Announce { source: other }
     );
     assert_eq!(r.counters().dropped_source_rate, 44);
+}
+
+/// karyos#945 review: filling the per-address rate table denies no
+/// REGISTER the driver's total admits. 64 allowlisted addresses, one
+/// REGISTER every 900 ms each (about 71 a second), keep every entry
+/// active, and a required receiver's REGISTER from a 65th address,
+/// retried every 100 ms for 5 s, is announced at each retry.
+#[test]
+fn sixty_four_addresses_filling_the_rate_table_leave_a_new_address_its_register() {
+    let mut r = with_required(&[42]);
+    let real = source(200, 5000);
+    let mut announced = 0;
+    for tick in 0..50u64 {
+        let now = T0 + tick * SECOND / 10;
+        if tick % 9 == 0 {
+            for host in 1..=64u8 {
+                let _ = r.register(
+                    source(host, 1),
+                    &named(1000 + u64::from(host), 1),
+                    Capacity::Free,
+                    now,
+                );
+            }
+        }
+        if matches!(
+            r.register(real, &named(42, 42), Capacity::Free, now + 1),
+            RegisterOutcome::Announce { .. }
+        ) {
+            announced += 1;
+        }
+    }
+    assert_eq!(announced, 50);
+    assert_eq!(r.counters().dropped_source_rate, 0);
+    assert_eq!(r.counters().source_rates_full, 50);
+}
+
+/// karyos#945 review: an address with no entry in a full rate table is
+/// still bound by the driver's total: it draws no more than `rate`.
+#[test]
+fn an_untracked_address_is_bound_by_the_driver_total() {
+    let mut c = config(&[range([10, 0, 0, 0], 8)]);
+    c.config.sources = 1;
+    c.config.pending = 4096;
+    c.config.pending_per_source = 4096;
+    let rate = c.config.rate;
+    let mut r = registrations(c);
+    assert!(matches!(
+        r.register(source(1, 1), &named(1, 1), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    let mut announced = 0u64;
+    for n in 0..2 * rate {
+        if matches!(
+            r.register(source(2, 1), &named(n + 2, n + 2), Capacity::Free, T0),
+            RegisterOutcome::Announce { .. }
+        ) {
+            announced += 1;
+        }
+    }
+    assert_eq!(announced, rate - 1);
+    assert_eq!(r.counters().dropped_rate, rate + 1);
 }
 
 /// MC-6: a CHALLENGE at or after its entry's `join_timeout` takes nothing
