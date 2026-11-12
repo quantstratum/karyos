@@ -71,6 +71,15 @@ pub enum DriverError {
     /// karyos#644).
     #[error("dynamic multi-destination registration is not supported yet")]
     DynamicRegistrationUnsupported,
+    /// A second `control-mode=dynamic` publication of one stream on one
+    /// control endpoint: a REGISTER names only its stream, so one endpoint
+    /// holds at most one dynamic publication of it (`quantstratum-docs:
+    /// karyos/design/multi-destination-unicast.md` 3.2 step 1; karyos#644).
+    #[error("stream {stream_id} already has a dynamic publication on this control endpoint")]
+    DynamicPublicationExists {
+        /// The stream.
+        stream_id: i32,
+    },
     /// A network publication's typed roles name another strategy than its
     /// channel's `fc`, the one source of the strategy (`min` without one;
     /// owner item 7, karyos#637).

@@ -343,10 +343,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     None,
                     roles.map(Box::new),
                     Some((karyos_client::schedule::ScheduleOptions::default(), None)),
-                    &[],
+                    (&[], None),
                 )
             }
-            None => self.add_network(config, &udp, None, roles.map(Box::new), None, &[]),
+            None => self.add_network(config, &udp, None, roles.map(Box::new), None, (&[], None)),
         };
         let handle = match added {
             Ok(handle) => handle,

@@ -857,13 +857,6 @@ impl<T: StreamTerms> Outbound<T> {
     ///
     /// [`super::OutboundError::Routes`] for a routed publication, or one
     /// whose fan-out is already set.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "dynamic publications are admitted at step 3 of karyos#644"
-        )
-    )]
     pub(crate) fn set_registration(
         &mut self,
         max_destinations: usize,

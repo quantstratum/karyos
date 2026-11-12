@@ -4291,6 +4291,8 @@ fn a_publication_crosses_the_term_id_wrap() {
 
 mod destinations;
 
+mod registration;
+
 /// karyos#859: the driver's accounting of what publications hold of a
 /// send endpoint matches what the endpoint has open, through adds,
 /// removals and a reset: at the end the endpoint's routes, queues and
