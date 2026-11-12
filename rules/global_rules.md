@@ -392,8 +392,11 @@ completion handling (ADR-0008).
   `Cargo.lock` is committed. `make deps-check` (in pre-push) fails on a
   stale inventory.
 - Every cargo build, lint and test command of the gate runs with `--locked`.
-- `deny.toml` holds the licence allowlist and source policy
-  (`make deny`). No C or C++ toolchain in the workspace build (ADR-0006):
+- `deny.toml` holds the licence allowlist, source policy and advisory
+  policy (`make deny`). CI checks licences, bans and sources in one job
+  and RustSec advisories in a separate `Advisories` job, because the
+  advisory database changes without a repository change; `make pre-push`
+  stays offline and does not run `cargo deny` (karyos#933). No C or C++ toolchain in the workspace build (ADR-0006):
   a crate whose build script compiles C is refused.
 - `loom`, `proptest` and `criterion` are dev only; `loom` builds only
   under `--cfg loom`.

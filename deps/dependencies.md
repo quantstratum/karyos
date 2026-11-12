@@ -5,7 +5,8 @@
 Every external dependency is recorded here before code using it is merged
 (ADR-0033, SPEC.md §14). The resolved graph is pinned by the committed
 `Cargo.lock`; builds use `--locked`. `cargo deny check` enforces the licence
-allowlist and sources in `deny.toml`. Build scripts and native linkage are
+allowlist and sources in `deny.toml` and refuses crates with an open RustSec
+advisory; CI runs the advisory check in its own job (karyos#933). Build scripts and native linkage are
 reviewed by hand, because `cargo deny` does not establish their absence.
 
 ## Direct dependencies
