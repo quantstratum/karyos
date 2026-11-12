@@ -14,13 +14,21 @@
 //!    [`RegistrationAllowlist`]'s ranges; otherwise dropped, no reply.
 //! 3. **Rates.** A per-source bucket and a per-driver total; exhaustion
 //!    drops with no reply.
-//! 4. **Retry.** A pending entry with the same source and receiver block
-//!    resends its one ANNOUNCE and takes no new entry.
-//! 5. **Pending bounds.** At most `pending` entries in all and
-//!    `pending_per_source` per source; exhaustion drops, no reply.
-//! 6. **Capacity.** With no free destination slot, one ERR REGISTRATION
-//!    `DESTINATIONS_FULL` to the source, at most once per source per
-//!    `refusal_interval`; existing destinations are unaffected.
+//! 4. **Existing entry.** A pending entry with the same source and
+//!    receiver block is a retry: it resends its one ANNOUNCE and takes no
+//!    new entry. What the publication already holds of the receiver, as
+//!    its owner looks it up ([`Existing`]), drops the rest: a destination
+//!    at the source with the same receiver block, a required receiver id
+//!    with a new boot id, and the same receiver live at another endpoint
+//!    or a required one at a new port (`duplicate_receiver`).
+//! 5. **Pending bounds.** At most `pending` optional entries in all, a
+//!    required receiver id's own [`REQUIRED_PENDING_PER_ID`] reserved
+//!    entries (the older replaced), and `pending_per_source` per source
+//!    over both; exhaustion drops, no reply.
+//! 6. **Capacity.** With no free optional destination slot, one ERR
+//!    REGISTRATION `DESTINATIONS_FULL` to the source, at most once per
+//!    source per `refusal_interval`; existing destinations are unaffected.
+//!    A required receiver id always has its reserved slot (MD-17).
 //! 7. **Pending entry.** The source, its receiver block and an expiry at
 //!    `join_timeout`; exactly one SETUP ANNOUNCE goes to the source.
 //!
@@ -37,8 +45,9 @@
 //! an unauthenticated registration to an `authenticated` or `encrypted`
 //! channel occupying no entry belongs to plan issue 034.
 //!
-//! Every table is allocated at construction; nothing here allocates
-//! afterwards, reads a clock or sends. The caller owns the destination
+//! Every table is allocated at construction (a required receiver id's
+//! reserved entries with its [`RegistrationPolicy`]); nothing here
+//! allocates afterwards, reads a clock or sends. The caller owns the destination
 //! table (step 6 takes its answer as [`Capacity`]) and the step 1 context
 //! check of the stream.
 
@@ -173,22 +182,93 @@ impl RegistrationAllowlist {
     }
 }
 
-/// What one dynamic publication admits a REGISTER from (design 3.2 steps 1
-/// and 2): its allowlist (ADR-0082, decision 1) and its endpoint's address
-/// family. The driver's [`Registrations`] are shared by every dynamic
-/// publication; each passes its own policy with each REGISTER.
+/// The reserved pending entries of each required receiver id of a dynamic
+/// publication (`registration_pending_required`, design 3.2 step 5;
+/// MD-17): a REGISTER naming it when both are held replaces the older.
+pub const REQUIRED_PENDING_PER_ID: usize = 2;
+
+/// What one dynamic publication admits a REGISTER from (design 3.2 steps 1,
+/// 2 and 5): its allowlist (ADR-0082, decision 1), its endpoint's address
+/// family, and its required receiver ids with their reserved pending
+/// entries (MD-17). The driver's [`Registrations`] are shared by every
+/// dynamic publication; each passes its own policy with each REGISTER.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistrationPolicy {
     allowlist: RegistrationAllowlist,
     ipv4: bool,
+    /// The required receiver ids, fixed at creation (owner decision M4).
+    required: Vec<u64>,
+    /// Their reserved pending entries, at most [`REQUIRED_PENDING_PER_ID`]
+    /// per id, allocated with the ids.
+    reserved: Vec<PendingRegistration>,
 }
 
 impl RegistrationPolicy {
     /// The policy of a publication whose endpoint is IPv4 when `ipv4`,
-    /// admitting the sources `allowlist` names.
+    /// admitting the sources `allowlist` names, with no required receiver
+    /// id.
     #[must_use]
     pub const fn new(allowlist: RegistrationAllowlist, ipv4: bool) -> Self {
-        Self { allowlist, ipv4 }
+        Self {
+            allowlist,
+            ipv4,
+            required: Vec::new(),
+            reserved: Vec::new(),
+        }
+    }
+
+    /// The policy with the required receiver ids `receiver_ids` (design
+    /// 3.5, 4.6; MD-17): each has a reserved destination slot and
+    /// [`REQUIRED_PENDING_PER_ID`] reserved pending entries, allocated
+    /// here. The ids are fixed for the publication's life.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistrationConfigError::InvalidRequired`] naming a zero or
+    /// repeated id, and [`RegistrationConfigError::InvalidLimit`] (field
+    /// `required`) for more ids than [`MAX_REGISTRATION_TABLE`] entries
+    /// hold.
+    pub fn with_required(mut self, receiver_ids: &[u64]) -> Result<Self, RegistrationConfigError> {
+        for (at, &receiver_id) in receiver_ids.iter().enumerate() {
+            let repeated = receiver_ids
+                .get(..at)
+                .is_some_and(|before| before.contains(&receiver_id));
+            if receiver_id == 0 || repeated {
+                return Err(RegistrationConfigError::InvalidRequired { receiver_id });
+            }
+        }
+        let entries = receiver_ids
+            .len()
+            .checked_mul(REQUIRED_PENDING_PER_ID)
+            .filter(|entries| *entries <= MAX_REGISTRATION_TABLE)
+            .ok_or(RegistrationConfigError::InvalidLimit { field: "required" })?;
+        let mut required = Vec::new();
+        required
+            .try_reserve_exact(receiver_ids.len())
+            .map_err(|_| RegistrationConfigError::InvalidLimit { field: "required" })?;
+        required.extend_from_slice(receiver_ids);
+        self.reserved = table(entries, "required")?;
+        self.required = required;
+        Ok(self)
+    }
+
+    /// The required receiver ids.
+    #[must_use]
+    pub fn required(&self) -> &[u64] {
+        &self.required
+    }
+
+    /// Whether `receiver_id` is one of the required receiver ids.
+    #[must_use]
+    pub fn is_required(&self, receiver_id: u64) -> bool {
+        self.required.contains(&receiver_id)
+    }
+
+    /// The reserved pending entries of the required receiver ids, oldest
+    /// first.
+    #[must_use]
+    pub fn reserved(&self) -> &[PendingRegistration] {
+        &self.reserved
     }
 
     /// The allowlist.
@@ -238,8 +318,16 @@ pub enum RegistrationConfigError {
     /// the total, or a table above [`MAX_REGISTRATION_TABLE`].
     #[error("invalid registration limit `{field}`")]
     InvalidLimit {
-        /// The [`RegistrationConfig`] field at fault.
+        /// The [`RegistrationConfig`] field at fault, or `required` for
+        /// the required receiver ids' reserved entries.
         field: &'static str,
+    },
+    /// A required receiver id that is zero or repeated
+    /// ([`RegistrationPolicy::with_required`]).
+    #[error("invalid required receiver id {receiver_id}")]
+    InvalidRequired {
+        /// The id at fault.
+        receiver_id: u64,
     },
 }
 
@@ -269,6 +357,11 @@ pub struct RegistrationConfig {
     /// How long a pending registration waits for its receiver
     /// (`join_timeout`, 5 s, as `MembershipConfig`'s), in ns.
     pub join_timeout: u64,
+    /// How long an optional destination must have accepted no SM before
+    /// its receiver, registering with the same receiver block at another
+    /// endpoint, moves there (`destination_move_quiet`, 50 ms, five
+    /// `sm_interval`s; design 3.2 step 4, MD-19), in ns.
+    pub move_quiet: u64,
 }
 
 impl Default for RegistrationConfig {
@@ -281,6 +374,7 @@ impl Default for RegistrationConfig {
             pending_per_source: 2,
             refusal_interval: 1_000_000_000,
             join_timeout: 5_000_000_000,
+            move_quiet: 50_000_000,
         }
     }
 }
@@ -313,6 +407,9 @@ impl RegistrationConfig {
         if self.join_timeout == 0 {
             return bad("join_timeout");
         }
+        if self.move_quiet == 0 {
+            return bad("move_quiet");
+        }
         Ok(())
     }
 }
@@ -325,6 +422,26 @@ pub enum Capacity {
     Free,
     /// Every slot open to an optional registrant is taken.
     Full,
+}
+
+/// What the publication already holds of a REGISTER's receiver, looked up
+/// by its owner by source endpoint, then by `receiver_id` over its
+/// memberships (design 2.3, 3.2 step 4). An optional receiver's restart
+/// (a new boot id) and its move after `move_quiet` proceed as
+/// [`Existing::None`]: its first valid SM retires or moves the old
+/// membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Existing {
+    /// Nothing that decides here.
+    None,
+    /// A destination at the source with the same receiver block: dropped.
+    Bound,
+    /// A required receiver id with a new boot id: refused, as
+    /// `Membership` refuses `BootChanged` (owner decision M4).
+    BootChanged,
+    /// The same receiver block at another endpoint whose membership is
+    /// still live, or required (never moved, MD-19): refused.
+    DuplicateReceiver,
 }
 
 /// What a REGISTER causes.
@@ -365,6 +482,12 @@ pub enum RegisterDrop {
     /// The table is full and this source address was refused within
     /// `refusal_interval`, or no refusal entry is free for it.
     RefusalLimited,
+    /// [`Existing::Bound`].
+    Bound,
+    /// [`Existing::BootChanged`].
+    BootChanged,
+    /// [`Existing::DuplicateReceiver`].
+    DuplicateReceiver,
 }
 
 /// Counters of [`Registrations`]; checked, sticky on overflow (design 7).
@@ -391,6 +514,15 @@ pub struct RegistrationCounters {
     pub dropped_source_pending_full: u64,
     /// Dropped: [`RegisterDrop::RefusalLimited`].
     pub dropped_refusal_limited: u64,
+    /// Dropped: [`RegisterDrop::Bound`].
+    pub dropped_bound: u64,
+    /// Dropped: [`RegisterDrop::BootChanged`].
+    pub dropped_boot_changed: u64,
+    /// Dropped: [`RegisterDrop::DuplicateReceiver`] (`duplicate_receiver`).
+    pub duplicate_receiver: u64,
+    /// Reserved pending entries of a required receiver id replaced by a
+    /// newer REGISTER naming it (`required_pending_replaced`).
+    pub required_pending_replaced: u64,
     /// Pending entries a CHALLENGE took.
     pub challenged: u64,
     /// Pending entries removed at `join_timeout`.
@@ -505,19 +637,27 @@ impl Registrations {
     }
 
     /// Admits or drops `register` from `source` at `now`, for the
-    /// publication whose policy is `policy` and whose destination
-    /// table reports `capacity`, charging the sender's per-source
+    /// publication whose policy is `policy`, which holds `existing` of its
+    /// receiver and whose destination table reports `capacity` for an
+    /// optional registrant, charging the sender's per-source
     /// `setup_answer_rate` table `source_rates` (design 3.2; module docs).
     pub fn register(
         &mut self,
         source_rates: &mut EndpointRates,
-        policy: &RegistrationPolicy,
+        policy: &mut RegistrationPolicy,
         source: SocketAddr,
         register: &RspRegister,
-        capacity: Capacity,
+        (existing, capacity): (Existing, Capacity),
         now: u64,
     ) -> RegisterOutcome {
-        let outcome = self.decide(source_rates, policy, source, register, capacity, now);
+        let outcome = self.decide(
+            source_rates,
+            policy,
+            source,
+            register,
+            (existing, capacity),
+            now,
+        );
         let counter: fn(&mut RegistrationCounters) -> &mut u64 = match outcome {
             RegisterOutcome::Announce { .. } => return outcome,
             RegisterOutcome::Refuse { .. } => |c| &mut c.refused_full,
@@ -529,6 +669,9 @@ impl Registrations {
                 RegisterDrop::PendingFull => |c| &mut c.dropped_pending_full,
                 RegisterDrop::SourcePendingFull => |c| &mut c.dropped_source_pending_full,
                 RegisterDrop::RefusalLimited => |c| &mut c.dropped_refusal_limited,
+                RegisterDrop::Bound => |c| &mut c.dropped_bound,
+                RegisterDrop::BootChanged => |c| &mut c.dropped_boot_changed,
+                RegisterDrop::DuplicateReceiver => |c| &mut c.duplicate_receiver,
             },
         };
         self.counters.bump(counter);
@@ -538,10 +681,10 @@ impl Registrations {
     fn decide(
         &mut self,
         source_rates: &mut EndpointRates,
-        policy: &RegistrationPolicy,
+        policy: &mut RegistrationPolicy,
         source: SocketAddr,
         register: &RspRegister,
-        capacity: Capacity,
+        (existing, capacity): (Existing, Capacity),
         now: u64,
     ) -> RegisterOutcome {
         // Step 1: the source.
@@ -567,25 +710,52 @@ impl Registrations {
             return RegisterOutcome::Drop(RegisterDrop::Rate);
         }
         self.expire(now);
+        self.expire_reserved(policy, now);
         // Step 4: a retry resends its one ANNOUNCE; it matches the source
         // endpoint, the stream and the receiver block.
-        if self.pending.iter().any(|entry| {
+        let retry = |entry: &PendingRegistration| {
             entry.source == source
                 && entry.stream_id == register.stream_id
                 && entry.receiver == register.receiver
-        }) {
+        };
+        if self.pending.iter().any(retry) || policy.reserved.iter().any(retry) {
             self.counters.bump(|c| &mut c.retried);
             return RegisterOutcome::Announce { source };
         }
-        // Step 5: pending bounds, per source address (SPEC.md §6): a
-        // source varying its port holds no more.
+        // Then what the publication holds of the receiver.
+        match existing {
+            Existing::None => {}
+            Existing::Bound => return RegisterOutcome::Drop(RegisterDrop::Bound),
+            Existing::BootChanged => return RegisterOutcome::Drop(RegisterDrop::BootChanged),
+            Existing::DuplicateReceiver => {
+                return RegisterOutcome::Drop(RegisterDrop::DuplicateReceiver);
+            }
+        }
+        // Step 5: pending bounds, per source address (SPEC.md §6) over the
+        // optional and the reserved entries: a source varying its port
+        // holds no more.
         let held = self
             .pending
             .iter()
+            .chain(&policy.reserved)
             .filter(|entry| entry.source.ip() == source.ip())
             .count();
         if held >= self.config.pending_per_source {
             return RegisterOutcome::Drop(RegisterDrop::SourcePendingFull);
+        }
+        let entry = PendingRegistration {
+            stream_id: register.stream_id,
+            source,
+            receiver: register.receiver,
+            expires: now.saturating_add(self.config.join_timeout),
+        };
+        // A required receiver id takes only its own reserved entries and
+        // its reserved slot (MD-17): optional registrants cannot hold it
+        // out, and it holds no optional entry.
+        if policy.is_required(register.receiver.receiver_id) {
+            self.reserve(policy, entry);
+            self.counters.bump(|c| &mut c.registered);
+            return RegisterOutcome::Announce { source };
         }
         if self.pending.len() >= self.config.pending {
             return RegisterOutcome::Drop(RegisterDrop::PendingFull);
@@ -595,14 +765,43 @@ impl Registrations {
             return self.refuse(source.ip(), source, now);
         }
         // Step 7: the pending entry; its room was checked above.
-        self.pending.push(PendingRegistration {
-            stream_id: register.stream_id,
-            source,
-            receiver: register.receiver,
-            expires: now.saturating_add(self.config.join_timeout),
-        });
+        self.pending.push(entry);
         self.counters.bump(|c| &mut c.registered);
         RegisterOutcome::Announce { source }
+    }
+
+    /// Records `entry` in its required receiver id's reserved entries: with
+    /// [`REQUIRED_PENDING_PER_ID`] held, it replaces the older one (design
+    /// 3.2 step 5), so spoofed REGISTERs cannot keep a retrying receiver
+    /// out. The table was allocated with the ids: nothing grows.
+    fn reserve(&mut self, policy: &mut RegistrationPolicy, entry: PendingRegistration) {
+        let receiver_id = entry.receiver.receiver_id;
+        let mine = |held: &PendingRegistration| {
+            held.stream_id == entry.stream_id && held.receiver.receiver_id == receiver_id
+        };
+        let held = policy.reserved.iter().filter(|held| mine(held)).count();
+        if held < REQUIRED_PENDING_PER_ID && policy.reserved.len() < policy.reserved.capacity() {
+            policy.reserved.push(entry);
+            return;
+        }
+        // Entries are pushed in time order, so the first of the id's is
+        // the older.
+        if let Some(older) = policy.reserved.iter().position(mine) {
+            let _ = policy.reserved.remove(older);
+            policy.reserved.push(entry);
+            self.counters.bump(|c| &mut c.required_pending_replaced);
+        }
+    }
+
+    /// Removes `policy`'s reserved entries whose `join_timeout` passed by
+    /// `now`, counting them as expired.
+    fn expire_reserved(&mut self, policy: &mut RegistrationPolicy, now: u64) {
+        let before = policy.reserved.len();
+        policy.reserved.retain(|entry| entry.expires > now);
+        let removed = before.saturating_sub(policy.reserved.len());
+        // A `usize` count fits a `u64` on every supported target.
+        let removed = u64::try_from(removed).unwrap_or(u64::MAX);
+        self.counters.add(|c| &mut c.expired, removed);
     }
 
     /// Step 6: one ERR per source address per `refusal_interval`, in a
@@ -639,27 +838,34 @@ impl Registrations {
         RegisterOutcome::Refuse { source }
     }
 
-    /// Takes the pending entry for `stream_id` that a CHALLENGE from
-    /// `source` with `receiver_boot_id` answers (design 3.2: the CHALLENGE
-    /// moves it into `Membership`); `None` when none is pending, so a
-    /// CHALLENGE from a source that never registered is not answered on
-    /// this path.
+    /// Takes the pending entry, optional or one of `policy`'s reserved
+    /// ones, for `stream_id` that a CHALLENGE from `source` with
+    /// `receiver_boot_id` answers (design 3.2: the CHALLENGE moves it into
+    /// `Membership`); `None` when none is pending, so a CHALLENGE from a
+    /// source that never registered is not answered on this path.
     pub fn challenged(
         &mut self,
+        policy: &mut RegistrationPolicy,
         stream_id: i32,
         source: SocketAddr,
         receiver_boot_id: [u64; 2],
         now: u64,
     ) -> Option<PendingRegistration> {
         self.expire(now);
+        self.expire_reserved(policy, now);
         let source = normalized(source);
-        let at = self.pending.iter().position(|entry| {
+        let answers = |entry: &PendingRegistration| {
             entry.stream_id == stream_id
                 && entry.source == source
                 && entry.receiver.receiver_boot_id == receiver_boot_id
-        })?;
-        // `at` is in range: `position` found it.
-        let taken = (at < self.pending.len()).then(|| self.pending.remove(at))?;
+        };
+        let taken = if let Some(at) = self.pending.iter().position(answers) {
+            // `at` is in range: `position` found it.
+            (at < self.pending.len()).then(|| self.pending.remove(at))?
+        } else {
+            let at = policy.reserved.iter().position(answers)?;
+            (at < policy.reserved.len()).then(|| policy.reserved.remove(at))?
+        };
         self.counters.bump(|c| &mut c.challenged);
         Some(taken)
     }

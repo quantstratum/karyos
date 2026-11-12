@@ -71,6 +71,19 @@ pub enum RemovalReason {
     Fault,
     /// Removed by `RemoveDestination` (MD-3).
     Command,
+    /// A dynamic registrant whose receiver sent no SM for
+    /// `image_liveness_timeout`: its slot is freed (design 3.7, 8;
+    /// karyos#644).
+    Timeout,
+    /// A dynamic registrant whose `receiver_id` registered again with a
+    /// new boot id at another endpoint: the new membership's first SM
+    /// retired it (design 3.2 step 4; karyos#644).
+    Restarted,
+    /// A dynamic registrant whose receiver, quiet for
+    /// `destination_move_quiet`, registered with the same receiver block
+    /// at another endpoint: its membership moved there (MD-19;
+    /// karyos#644).
+    Moved,
 }
 
 /// The outcome of a run-time destination change (MD-3, MD-14; ADR-0082).
@@ -583,6 +596,17 @@ impl Fanout {
             .any(|target| target.address == address && target.removed.is_none())
     }
 
+    /// The optional destinations held, counting those removed and not
+    /// retired yet: a retired slot is always an optional one's, since a
+    /// required destination is never removed.
+    fn optional_held(&self) -> usize {
+        self.targets
+            .iter()
+            .filter(|target| !target.required)
+            .count()
+            .saturating_add(self.retired.len())
+    }
+
     fn target_at(&mut self, address: SocketAddr) -> Option<&mut Target> {
         self.targets
             .iter_mut()
@@ -849,20 +873,25 @@ impl<T: StreamTerms> Outbound<T> {
 
     /// The fan-out of a `control-mode=dynamic` publication admitting
     /// registrations under `policy`: no destination at creation; each
-    /// registrant takes an optional slot at its first valid SM, at most
-    /// `max_destinations` (design 3.2, 3.5; karyos#644). No destination is
-    /// required: required receiver ids (MD-17) are not configurable yet.
+    /// registrant takes a slot at its first valid SM, at most
+    /// `max_destinations` (design 3.2, 3.5; karyos#644). Each of the
+    /// policy's required receiver ids has a reserved slot (MD-17), and
+    /// optional registrants share the rest.
     ///
     /// # Errors
     ///
-    /// [`super::OutboundError::Routes`] for a routed publication, or one
-    /// whose fan-out is already set.
+    /// [`super::OutboundError::Routes`] for a routed publication, one
+    /// whose fan-out is already set, or more required receiver ids than
+    /// `max_destinations`.
     pub(crate) fn set_registration(
         &mut self,
         max_destinations: usize,
         policy: crate::sessions::register::RegistrationPolicy,
     ) -> Result<(), super::OutboundError> {
-        if self.routed.is_some() || self.fanout.is_some() {
+        if self.routed.is_some()
+            || self.fanout.is_some()
+            || policy.required().len() > max_destinations
+        {
             return Err(super::OutboundError::Routes);
         }
         let joins: Vec<u64> = self
@@ -891,19 +920,91 @@ impl<T: StreamTerms> Outbound<T> {
         self.registration.as_deref()
     }
 
-    /// Whether a registrant could take a slot now (design 3.2 step 6): a
-    /// slot is free when the destinations, counting those removed and not
-    /// retired yet, are below `max_destinations`, as
-    /// [`Outbound::change_destination`] counts them.
+    /// Whether it keeps announcing to its destinations: a manual one while
+    /// one of them has no live member (design 3.6). A dynamic one never
+    /// does: each registrant got exactly one ANNOUNCE at its REGISTER, and
+    /// a destination whose receiver goes silent is removed at its timeout
+    /// (design 3.2, 3.6, 9.2).
+    pub(crate) fn announces_destinations(&self) -> bool {
+        self.registration.is_none() && !self.every_destination_live()
+    }
+
+    /// Its registration policy, mutable: its required receiver ids'
+    /// reserved pending entries change with each REGISTER.
+    pub(crate) fn registration_mut(
+        &mut self,
+    ) -> Option<&mut crate::sessions::register::RegistrationPolicy> {
+        self.registration.as_deref_mut()
+    }
+
+    /// Whether an optional registrant could take a slot now (design 3.2
+    /// step 6, 3.5): the optional destinations, counting those removed and
+    /// not retired yet, are below `max_destinations` minus the required
+    /// receiver ids, whose slots stay reserved (MD-17).
     pub(crate) fn registration_capacity(&self) -> crate::sessions::register::Capacity {
         use crate::sessions::register::Capacity;
         match self.fanout.as_deref() {
-            Some(fanout)
-                if fanout.targets.len().saturating_add(fanout.retired.len()) < fanout.max =>
-            {
-                Capacity::Free
-            }
+            Some(fanout) if fanout.optional_held() < self.optional_quota(fanout) => Capacity::Free,
             _ => Capacity::Full,
+        }
+    }
+
+    /// The optional destinations a dynamic publication may hold:
+    /// `max_destinations` minus its required receiver ids (MD-17).
+    fn optional_quota(&self, fanout: &Fanout) -> usize {
+        let required = self
+            .registration
+            .as_deref()
+            .map_or(0, |policy| policy.required().len());
+        fanout.max.saturating_sub(required)
+    }
+
+    /// The registrant at `destination` takes a destination slot at its
+    /// first valid SM, at `now` (design 3.2): a required receiver id its
+    /// reserved slot, an optional one a slot of the optional quota, else
+    /// [`DestinationChange::Full`]. Otherwise as
+    /// [`Outbound::change_destination`] adds one.
+    pub(crate) fn join_registrant(
+        &mut self,
+        destination: SocketAddr,
+        required: bool,
+        now: u64,
+        quarantine: u64,
+    ) -> DestinationChange {
+        if self.registration.is_none() {
+            return DestinationChange::Unknown;
+        }
+        let full = match self.fanout.as_deref() {
+            Some(fanout) => !required && fanout.optional_held() >= self.optional_quota(fanout),
+            None => return DestinationChange::Unknown,
+        };
+        if full {
+            return DestinationChange::Full;
+        }
+        self.add_target(destination, required, now, quarantine)
+    }
+
+    /// Removes the optional registrant at `destination` for `reason` at
+    /// `now`, as a removal by command does (design 3.7). Returns whether
+    /// one was removed: a required destination, or none there, is kept.
+    pub(crate) fn retire_registrant(
+        &mut self,
+        destination: SocketAddr,
+        reason: RemovalReason,
+        now: u64,
+    ) -> bool {
+        if self.registration.is_none() {
+            return false;
+        }
+        let Some(fanout) = self.fanout.as_deref_mut() else {
+            return false;
+        };
+        match fanout.target_at(destination) {
+            Some(target) if !target.required => {
+                remove_target(target, reason, now);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -2115,37 +2216,70 @@ impl<T: StreamTerms> Outbound<T> {
                 if family != Some(destination.is_ipv4()) {
                     return DestinationChange::Unknown;
                 }
-                if fanout.quarantined(destination, now, quarantine) {
-                    return DestinationChange::Quarantined;
-                }
-                // A removed target holds its slot until its route and queues
-                // pass to the close list, at its report: a move retried
-                // after the removal shows in `network_removed_destinations`
-                // finds the slot free, and the next duty closes the old
-                // route before it opens the new one. While the conductor's
-                // ring is full nothing is reported and nothing retires, so
-                // churn never grows the targets, their flags or the retired
-                // list past their capacity.
-                if fanout.targets.len().saturating_add(fanout.retired.len()) >= fanout.max {
-                    return DestinationChange::Full;
-                }
-                // A fresh optional destination, joining at the cursor; its
-                // target is built here (an addition allocates its queues
-                // and repair path), nothing else does.
-                for (join, reader) in fanout.joins.iter_mut().zip(&self.readers) {
-                    *join = reader.position();
-                }
-                let Some(target) = fanout.target(destination, &fanout.joins) else {
-                    return DestinationChange::Unknown;
-                };
-                fanout.targets.push(target);
-                for flags in &mut fanout.staged_for {
-                    // The pending datagram, if any, is not the new target's.
-                    flags.push(true);
-                }
-                DestinationChange::Added
+                self.add_target(destination, false, now, quarantine)
             }
         }
+    }
+
+    /// Adds `destination`, absent from the table, required or not,
+    /// joining at the cursor, unless it is quarantined or the table is
+    /// full (design 3.5, 3.7). Allocates its queues and repair path (a
+    /// run-time command or a registrant's first SM).
+    fn add_target(
+        &mut self,
+        destination: SocketAddr,
+        required: bool,
+        now: u64,
+        quarantine: u64,
+    ) -> DestinationChange {
+        if self.removing() {
+            return DestinationChange::Removing;
+        }
+        let Some(fanout) = self.fanout.as_deref_mut() else {
+            return DestinationChange::Unknown;
+        };
+        match fanout
+            .targets
+            .iter()
+            .find(|target| target.address == destination)
+        {
+            Some(target) if target.removed.is_none() => return DestinationChange::Present,
+            Some(_) => return DestinationChange::Quarantined,
+            None => {}
+        }
+        if fanout.ipv4 != destination.is_ipv4() {
+            return DestinationChange::Unknown;
+        }
+        if fanout.quarantined(destination, now, quarantine) {
+            return DestinationChange::Quarantined;
+        }
+        // A removed target holds its slot until its route and queues
+        // pass to the close list, at its report: a move retried
+        // after the removal shows in `network_removed_destinations`
+        // finds the slot free, and the next duty closes the old
+        // route before it opens the new one. While the conductor's
+        // ring is full nothing is reported and nothing retires, so
+        // churn never grows the targets, their flags or the retired
+        // list past their capacity.
+        if fanout.targets.len().saturating_add(fanout.retired.len()) >= fanout.max {
+            return DestinationChange::Full;
+        }
+        // A fresh destination, joining at the cursor; its
+        // target is built here (an addition allocates its queues
+        // and repair path), nothing else does.
+        for (join, reader) in fanout.joins.iter_mut().zip(&self.readers) {
+            *join = reader.position();
+        }
+        let Some(mut target) = fanout.target(destination, &fanout.joins) else {
+            return DestinationChange::Unknown;
+        };
+        target.required = required;
+        fanout.targets.push(target);
+        for flags in &mut fanout.staged_for {
+            // The pending datagram, if any, is not the new target's.
+            flags.push(true);
+        }
+        DestinationChange::Added
     }
 }
 

@@ -677,6 +677,37 @@ impl Membership {
         slot.is_some()
     }
 
+    /// Moves `receiver`'s binding on `endpoint` from `from` to `to`: an
+    /// optional destination's receiver that came back at a new port keeps
+    /// its membership, window and consumption (MD-19; karyos#644). Returns
+    /// whether an optional member held that binding; a required member is
+    /// never moved (owner decision M4), and nothing changes then.
+    pub fn move_binding(
+        &mut self,
+        receiver: Receiver,
+        endpoint: EndpointId,
+        from: SocketAddr,
+        to: SocketAddr,
+    ) -> bool {
+        let Some(slot) = self.find(receiver) else {
+            return false;
+        };
+        let Some(entry) = self.entries.get_mut(slot).filter(|entry| !entry.required) else {
+            return false;
+        };
+        match entry
+            .bindings
+            .iter_mut()
+            .find(|binding| **binding == Some((endpoint, from)))
+        {
+            Some(binding) => {
+                *binding = Some((endpoint, to));
+                true
+            }
+            None => false,
+        }
+    }
+
     fn member_at(&self, source: SocketAddr, now: u64) -> Option<&Entry> {
         self.entries.iter().find(|entry| {
             entry.state == State::Active

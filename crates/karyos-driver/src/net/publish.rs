@@ -71,9 +71,8 @@ fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAd
             .ok_or(DriverError::UnsupportedChannel)?,
         // Dynamic registration: only with an allowlist (ADR-0082, decision
         // 1), with no listed destination, no redundant path and no
-        // interface other than `control`'s (design 3.2; karyos#644). The
-        // public calls carry no allowlist: dynamic mode stays refused there
-        // until the receiver side and its end-to-end tests land.
+        // interface other than `control`'s (design 3.2; karyos#644). A call
+        // that carries no allowlist refuses it.
         Destination::MultiDestination {
             destinations,
             control: Some(control),
@@ -88,7 +87,7 @@ fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAd
         Destination::MultiDestination {
             mode: ControlMode::Dynamic,
             ..
-        } => return Err(DriverError::DynamicRegistrationUnsupported),
+        } => return Err(DriverError::DynamicRegistrationRequired),
         Destination::MultiDestination { .. } => return Err(DriverError::UnsupportedChannel),
         // A destination a later protocol version parses: not served.
         _ => return Err(DriverError::UnsupportedChannel),
@@ -326,18 +325,86 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// [`EmbeddedDriver::add_network_publication`] on a
-    /// `control-mode=dynamic` channel admitting registrations from the
-    /// sources `allowlist` names (design 3.2; ADR-0082, decision 1;
-    /// karyos#644). Crate-internal until the receiver side lands: the
-    /// public calls still refuse dynamic mode.
-    #[cfg(test)]
-    pub(crate) fn add_dynamic_network_publication(
+    /// `control-mode=dynamic` multi-destination channel
+    /// (`karyos:udp?control=<address>|control-mode=dynamic`): its endpoint
+    /// binds `control`, where receivers register, and it has no
+    /// destination until one joins (ADR-0056, ADR-0082; `quantstratum-docs:
+    /// karyos/design/multi-destination-unicast.md` 3.2; karyos#644).
+    ///
+    /// A REGISTER is admitted only from a source `allowlist` names. The
+    /// allowlist is explicit and never empty: a deployment that means to
+    /// admit any source names that broad range (`0.0.0.0/0`, `::/0`). It
+    /// restricts admission and supplies no authentication: challenge and
+    /// response, the driver's registration rates and pending bounds
+    /// ([`AgentConfig::registration`](crate::agents::AgentConfig::registration))
+    /// and the source checks apply to every registrant. A registrant takes
+    /// a destination slot at its first valid status message; with the
+    /// slots taken it is answered one ERR REGISTRATION `DESTINATIONS_FULL`,
+    /// and the destinations already there are unaffected.
+    ///
+    /// `roles` gives the strategy and any required or tagged receiver
+    /// ids. Each required receiver id has a reserved destination slot and
+    /// reserved pending registrations, so optional registrants can never
+    /// fill the table ahead of it (MD-17); it is never restarted nor moved,
+    /// and admission opens once every one has joined. Optional registrants
+    /// share the remaining `max_destinations` minus required count slots.
+    /// One control endpoint holds at most one dynamic publication of a
+    /// stream.
+    ///
+    /// ```no_run
+    /// use karyos_driver::sessions::register::{AddressRange, RegistrationAllowlist};
+    /// use karyos_driver::{AggregateConfig, AggregateHandle, EmbeddedDriver};
+    /// use karyos_protocol::channel::UdpConfig;
+    ///
+    /// /// Publishes on `channel`, a `control-mode=dynamic` channel, to
+    /// /// registrants from 10.0.0.0/8 only.
+    /// fn publish(
+    ///     driver: &mut EmbeddedDriver,
+    ///     config: AggregateConfig,
+    ///     channel: &UdpConfig,
+    /// ) -> Result<AggregateHandle, Box<dyn std::error::Error>> {
+    ///     let lan = AddressRange::new("10.0.0.0".parse()?, 8)?;
+    ///     let allowlist = RegistrationAllowlist::new(&[lan])?;
+    ///     Ok(driver.add_dynamic_network_publication(config, channel, allowlist, None)?)
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_network_publication`];
+    /// [`DriverError::UnsupportedChannel`] for a channel that is not
+    /// `control-mode=dynamic` with a `control` address, or that also lists
+    /// destinations, names an interface or redundant paths;
+    /// [`DriverError::InvalidConfig`] for more required receiver ids than
+    /// `max_destinations`; and [`DriverError::DynamicPublicationExists`]
+    /// for a second dynamic publication of the stream on that control
+    /// endpoint. Guards and timed lanes are not combined with destinations
+    /// ([`DriverError::UnsupportedChannel`]).
+    pub fn add_dynamic_network_publication(
         &mut self,
         config: AggregateConfig,
         channel: &UdpConfig,
         allowlist: crate::sessions::register::RegistrationAllowlist,
+        roles: Option<PublicationRoles>,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None, None, None, (&[], Some(allowlist)))
+        if !matches!(
+            channel.destination,
+            Destination::MultiDestination {
+                control: Some(_),
+                mode: ControlMode::Dynamic,
+                ..
+            }
+        ) {
+            return Err(DriverError::UnsupportedChannel);
+        }
+        self.add_network(
+            config,
+            channel,
+            None,
+            roles.map(Box::new),
+            None,
+            (&[], Some(allowlist)),
+        )
     }
 
     /// [`EmbeddedDriver::add_network_publication`], guarded by `guard`:
@@ -522,8 +589,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             return Err(DriverError::UnsupportedChannel);
         }
         let (destination, binds) = route(channel, allowlist.is_some())?;
-        // An allowlist belongs to a dynamic channel only, and a dynamic
-        // channel names no required receiver id yet (MD-17, karyos#644).
+        let max_destinations = net.max_destinations();
+        // An allowlist belongs to a dynamic channel only. Its required
+        // receiver ids each reserve a destination slot and pending entries
+        // (design 3.5; MD-17), so there are at most `max_destinations`.
         let registration = match (&channel.destination, allowlist) {
             (
                 Destination::MultiDestination {
@@ -532,21 +601,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 },
                 Some(allowlist),
             ) => {
-                if roles
+                let required = roles
                     .as_ref()
-                    .is_some_and(|roles| !roles.required.is_empty())
-                {
-                    return Err(DriverError::UnsupportedChannel);
+                    .map_or(&[][..], |roles| roles.required.as_slice());
+                if required.len() > max_destinations {
+                    return Err(DriverError::InvalidConfig);
                 }
-                Some(crate::sessions::register::RegistrationPolicy::new(
+                let policy = crate::sessions::register::RegistrationPolicy::new(
                     allowlist,
                     destination.is_ipv4(),
-                ))
+                )
+                .with_required(required)
+                .map_err(|_| DriverError::InvalidConfig)?;
+                Some(policy)
             }
             (_, Some(_)) => return Err(DriverError::InvalidConfig),
             (_, None) => None,
         };
-        let max_destinations = net.max_destinations();
         let destinations = destinations_of(channel, required_destinations, max_destinations)?;
         // Guards and timed lanes are not combined with destinations yet
         // (karyos#630).

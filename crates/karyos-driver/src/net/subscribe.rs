@@ -120,9 +120,8 @@ fn receive_route(
             ))
         }
         // Dynamic registration with no listed destination and no
-        // redundant path, as its publication (design 3.2). The public
-        // calls do not serve it yet: dynamic mode stays refused there
-        // until the rest of karyos#644 lands.
+        // redundant path, as its publication (design 3.2), only through
+        // the call that carries the receiver's identity.
         Destination::MultiDestination {
             destinations,
             control: Some(control),
@@ -142,7 +141,7 @@ fn receive_route(
         Destination::MultiDestination {
             mode: ControlMode::Dynamic,
             ..
-        } => Err(DriverError::DynamicRegistrationUnsupported),
+        } => Err(DriverError::DynamicRegistrationRequired),
         // Manual multi-destination, or a destination a later protocol
         // version parses: not served.
         _ => Err(DriverError::UnsupportedChannel),
@@ -371,19 +370,64 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     }
 
     /// [`EmbeddedDriver::add_network_subscription_as`] on a
-    /// `control-mode=dynamic` channel (design 3.2; karyos#644): the
-    /// subscription registers at the channel's `control` address every
-    /// `setup_interval` until it is bound, and again once its image is
-    /// gone. Crate-internal until the rest of karyos#644 lands: the public
-    /// calls still refuse dynamic mode.
-    #[cfg(test)]
-    pub(crate) fn add_dynamic_network_subscription(
+    /// `control-mode=dynamic` multi-destination channel
+    /// (`karyos:udp?control=<address>|control-mode=dynamic`; ADR-0056,
+    /// ADR-0082; `quantstratum-docs:
+    /// karyos/design/multi-destination-unicast.md` 3.2; karyos#644): the
+    /// subscription binds `interface`, else the unspecified address of
+    /// `control`'s family, on a port the kernel picks, and registers at
+    /// the channel's `control` address every `setup_interval` until an
+    /// image of the stream from there is bound, and again once that image
+    /// is gone. An ERR REGISTRATION from `control` (a full destination
+    /// table) is counted, and the subscription keeps registering.
+    ///
+    /// A dynamic subscription names its configured `identity` in every
+    /// REGISTER and status message: the publisher looks a registrant up by
+    /// its `receiver_id`, which must be stable across restarts, and names
+    /// its required receivers by it (design 2.3; multicast-flow-control.md
+    /// M1). One receiving driver is at most one destination of a
+    /// publication.
+    ///
+    /// ```no_run
+    /// use std::num::NonZeroU64;
+    ///
+    /// use karyos_driver::EmbeddedDriver;
+    /// use karyos_driver::net::NetworkSubscription;
+    /// use karyos_protocol::channel::UdpConfig;
+    /// use karyos_protocol::roles::ReceiverIdentity;
+    ///
+    /// /// Subscribes stream 10 on `channel`, a `control-mode=dynamic`
+    /// /// channel, as receiver 42.
+    /// fn subscribe(
+    ///     driver: &mut EmbeddedDriver,
+    ///     channel: &UdpConfig,
+    /// ) -> Result<NetworkSubscription, Box<dyn std::error::Error>> {
+    ///     let identity = ReceiverIdentity {
+    ///         receiver_id: NonZeroU64::new(42).ok_or("a receiver id is nonzero")?,
+    ///         group_tag: 0,
+    ///     };
+    ///     Ok(driver.add_dynamic_network_subscription(10, channel, identity)?)
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// As [`EmbeddedDriver::add_network_subscription_as`];
+    /// [`DriverError::UnsupportedChannel`] for a channel that is not
+    /// `control-mode=dynamic` with a `control` address, that lists
+    /// destinations or names redundant paths, whose `interface` is of
+    /// another family than `control`, or for a stream already subscribed
+    /// on the endpoint registering at another address.
+    pub fn add_dynamic_network_subscription(
         &mut self,
         stream_id: i32,
         channel: &UdpConfig,
-        identity: Option<ReceiverIdentity>,
+        identity: ReceiverIdentity,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, (identity, None), true)
+        if register_at(channel).is_none() {
+            return Err(DriverError::UnsupportedChannel);
+        }
+        self.subscribe_network(stream_id, channel, (Some(identity), None), true)
     }
 
     pub(crate) fn subscribe_network(
