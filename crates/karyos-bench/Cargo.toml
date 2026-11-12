@@ -59,5 +59,10 @@ criterion = { version = "=0.7.0", default-features = false, features = ["cargo_b
 name = "micro"
 harness = false
 
+# The session table at item 37's initial values (karyos#685).
+[[bench]]
+name = "dedup"
+harness = false
+
 [lints]
 workspace = true
