@@ -422,6 +422,9 @@ pub(crate) struct SenderChannel {
     /// The channel's `retransmit-window`, checked against its term;
     /// `None` keeps the driver's repair setting.
     pub(crate) retransmit_window: Option<u32>,
+    /// A `control-mode=dynamic` publication's registration policy
+    /// (karyos#644); `None` otherwise.
+    pub(crate) registration: Option<crate::sessions::register::RegistrationPolicy>,
 }
 
 /// A network publication between incarnations (guards-and-abort.md, On
@@ -1873,6 +1876,23 @@ impl<T: StreamTerms> Network<T> {
             entry.alias == alias && entry.paths().any(|held| paths().any(|path| path == held))
         }) {
             return Err(DriverError::NetworkBusy);
+        }
+        // One control endpoint holds at most one dynamic publication of a
+        // stream, since a REGISTER names only its stream (design 2.5, 3.2
+        // step 1); the sender refuses it too, this names why.
+        if channel.registration.is_some()
+            && self.publications.iter().any(|entry| {
+                entry.alias.stream_id == alias.stream_id
+                    && entry
+                        .channel
+                        .as_ref()
+                        .is_some_and(|held| held.registration.is_some())
+                    && entry.paths().any(|held| held == endpoint)
+            })
+        {
+            return Err(DriverError::DynamicPublicationExists {
+                stream_id: alias.stream_id,
+            });
         }
         // A reincarnating publication's key stays reserved for its next
         // incarnation, the only add that takes it.

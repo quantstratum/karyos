@@ -49,8 +49,11 @@ use crate::sessions::send::Publication;
 
 /// Where a channel sends, and the local address its endpoint binds: one
 /// per path for a channel with `paths`, the founding path first (control
-/// path, may allocate).
-fn route(channel: &UdpConfig) -> Result<(SocketAddr, Vec<SocketAddr>), DriverError> {
+/// path, may allocate). A `control-mode=dynamic` channel is served only
+/// when `dynamic` (its publication carries an allowlist): its endpoint
+/// binds `control`, where receivers register, and it has no destination
+/// until one joins.
+fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAddr>), DriverError> {
     let destination = match &channel.destination {
         Destination::Unicast(address) => *address,
         Destination::Multicast { group, .. } => *group,
@@ -66,8 +69,22 @@ fn route(channel: &UdpConfig) -> Result<(SocketAddr, Vec<SocketAddr>), DriverErr
         } if channel.paths.is_empty() => *destinations
             .first()
             .ok_or(DriverError::UnsupportedChannel)?,
-        // Dynamic registration stays refused until it is implemented and
-        // tested (ADR-0082; karyos#644).
+        // Dynamic registration: only with an allowlist (ADR-0082, decision
+        // 1), with no listed destination, no redundant path and no
+        // interface other than `control`'s (design 3.2; karyos#644). The
+        // public calls carry no allowlist: dynamic mode stays refused there
+        // until the receiver side and its end-to-end tests land.
+        Destination::MultiDestination {
+            destinations,
+            control: Some(control),
+            mode: ControlMode::Dynamic,
+        } if dynamic => {
+            if !destinations.is_empty() || !channel.paths.is_empty() || channel.interface.is_some()
+            {
+                return Err(DriverError::UnsupportedChannel);
+            }
+            return Ok((*control, vec![*control]));
+        }
         Destination::MultiDestination {
             mode: ControlMode::Dynamic,
             ..
@@ -119,13 +136,26 @@ fn destinations_of(
     required: &[SocketAddr],
     max_destinations: usize,
 ) -> Result<(Vec<SocketAddr>, Vec<SocketAddr>), DriverError> {
-    let Destination::MultiDestination { destinations, .. } = &channel.destination else {
+    let Destination::MultiDestination {
+        destinations, mode, ..
+    } = &channel.destination
+    else {
         return if required.is_empty() {
             Ok((Vec::new(), Vec::new()))
         } else {
             Err(DriverError::InvalidConfig)
         };
     };
+    // A dynamic channel lists none: its registrants join (design 3.2), and
+    // it names no required destination (MD-17's required receiver ids are
+    // not configurable in dynamic mode yet).
+    if *mode == ControlMode::Dynamic {
+        return if required.is_empty() {
+            Ok((Vec::new(), Vec::new()))
+        } else {
+            Err(DriverError::InvalidConfig)
+        };
+    }
     let family = destinations.first().map(SocketAddr::is_ipv4);
     let distinct = destinations.iter().enumerate().all(|(at, address)| {
         !destinations
@@ -214,7 +244,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         config: AggregateConfig,
         channel: &UdpConfig,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None, None, None, &[])
+        self.add_network(config, channel, None, None, None, (&[], None))
     }
 
     /// [`EmbeddedDriver::add_network_publication`] whose receivers have the
@@ -236,7 +266,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         roles: PublicationRoles,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None, Some(Box::new(roles)), None, &[])
+        self.add_network(
+            config,
+            channel,
+            None,
+            Some(Box::new(roles)),
+            None,
+            (&[], None),
+        )
     }
 
     /// [`EmbeddedDriver::add_network_publication_with_roles`] on a
@@ -258,7 +295,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         roles: Option<PublicationRoles>,
         required: &[SocketAddr],
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, None, roles.map(Box::new), None, required)
+        self.add_network(
+            config,
+            channel,
+            None,
+            roles.map(Box::new),
+            None,
+            (required, None),
+        )
     }
 
     /// [`EmbeddedDriver::add_timed_network_publication`] with `roles`
@@ -277,8 +321,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             None,
             Some(Box::new(roles)),
             Some((schedule, None)),
-            &[],
+            (&[], None),
         )
+    }
+
+    /// [`EmbeddedDriver::add_network_publication`] on a
+    /// `control-mode=dynamic` channel admitting registrations from the
+    /// sources `allowlist` names (design 3.2; ADR-0082, decision 1;
+    /// karyos#644). Crate-internal until the receiver side lands: the
+    /// public calls still refuse dynamic mode.
+    #[cfg(test)]
+    pub(crate) fn add_dynamic_network_publication(
+        &mut self,
+        config: AggregateConfig,
+        channel: &UdpConfig,
+        allowlist: crate::sessions::register::RegistrationAllowlist,
+    ) -> Result<AggregateHandle, DriverError> {
+        self.add_network(config, channel, None, None, None, (&[], Some(allowlist)))
     }
 
     /// [`EmbeddedDriver::add_network_publication`], guarded by `guard`:
@@ -305,7 +364,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         guard: NetworkGuard,
     ) -> Result<AggregateHandle, DriverError> {
-        self.add_network(config, channel, Some(guard), None, None, &[])
+        self.add_network(config, channel, Some(guard), None, None, (&[], None))
     }
 
     /// [`EmbeddedDriver::add_network_publication`] whose lanes are timed
@@ -350,7 +409,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if config.stream.buffer.schedule_capacity == 0 {
             return Err(DriverError::InvalidConfig);
         }
-        self.add_network(config, channel, guard, None, Some((schedule, None)), &[])
+        self.add_network(
+            config,
+            channel,
+            guard,
+            None,
+            Some((schedule, None)),
+            (&[], None),
+        )
     }
 
     /// Undoes an add refused before its handle was returned
@@ -390,7 +456,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guard,
             None,
             Some((schedule, Some(clock))),
-            &[],
+            (&[], None),
         )
     }
 
@@ -404,7 +470,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             karyos_client::schedule::ScheduleOptions,
             Option<karyos_client::schedule::ScheduleClock>,
         )>,
-        required_destinations: &[SocketAddr],
+        (required_destinations, allowlist): (
+            &[SocketAddr],
+            Option<crate::sessions::register::RegistrationAllowlist>,
+        ),
     ) -> Result<AggregateHandle, DriverError> {
         let Some(net) = self.net.as_mut() else {
             return Err(DriverError::NetworkUnavailable);
@@ -452,12 +521,38 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             net.count_paths_refused();
             return Err(DriverError::UnsupportedChannel);
         }
-        let (destination, binds) = route(channel)?;
+        let (destination, binds) = route(channel, allowlist.is_some())?;
+        // An allowlist belongs to a dynamic channel only, and a dynamic
+        // channel names no required receiver id yet (MD-17, karyos#644).
+        let registration = match (&channel.destination, allowlist) {
+            (
+                Destination::MultiDestination {
+                    mode: ControlMode::Dynamic,
+                    ..
+                },
+                Some(allowlist),
+            ) => {
+                if roles
+                    .as_ref()
+                    .is_some_and(|roles| !roles.required.is_empty())
+                {
+                    return Err(DriverError::UnsupportedChannel);
+                }
+                Some(crate::sessions::register::RegistrationPolicy::new(
+                    allowlist,
+                    destination.is_ipv4(),
+                ))
+            }
+            (_, Some(_)) => return Err(DriverError::InvalidConfig),
+            (_, None) => None,
+        };
         let max_destinations = net.max_destinations();
         let destinations = destinations_of(channel, required_destinations, max_destinations)?;
         // Guards and timed lanes are not combined with destinations yet
         // (karyos#630).
-        if !destinations.0.is_empty() && (guard.is_some() || timed.is_some()) {
+        if (!destinations.0.is_empty() || registration.is_some())
+            && (guard.is_some() || timed.is_some())
+        {
             return Err(DriverError::UnsupportedChannel);
         }
         let quanta = Lanes::new(&config.quanta).map_err(|_| DriverError::InvalidConfig)?;
@@ -499,6 +594,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guard,
             roles,
             retransmit_window: channel.retransmit_window,
+            registration,
         };
         let added = self.attach_sender(&handle, channel, FIRST_INCARNATION, false);
         if let Err(error) = added {
@@ -811,6 +907,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guard,
             roles,
             retransmit_window,
+            registration,
         } = channel;
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
         let mut term = None;
@@ -948,7 +1045,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 reliable,
             )
             .and_then(|mut outbound| {
-                if !destinations.is_empty() {
+                if let Some(policy) = registration {
+                    outbound.set_registration(max_destinations, policy)?;
+                } else if !destinations.is_empty() {
                     outbound.set_destinations(
                         max_destinations,
                         &destinations,
