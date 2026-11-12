@@ -6548,9 +6548,11 @@ impl<T: StreamTerms> SenderRole<T> {
     }
 
     /// Records the receiver `answer` goes to: its challenge's `source` on
-    /// `endpoint` and its boot id. Its SMs then come from any source with
-    /// that boot id and incarnation; the first sets the binding's SM source
-    /// ([`Self::status`]).
+    /// `endpoint` and its boot id. On a static publication its SMs then
+    /// come from any source with that boot id and incarnation; the first
+    /// sets the binding's SM source and the others adopt it
+    /// ([`Self::status`]). On a dynamic publication its SM source is
+    /// `source` alone and it adopts nothing (design 2.4, MD-16).
     ///
     /// A new answer to a known tuple starts it over: unconfirmed, with no
     /// receiver id or status, so a reinstalled image binds again; its SM
@@ -7113,16 +7115,22 @@ impl<T: StreamTerms> SenderRole<T> {
             return None;
         }
         // On a dynamic publication a binding learns its SM source only
-        // from the source it was answered at: an SM from another source,
-        // such as another slot of the same host, would name a receiver id
-        // past `settle_registrant` (karyos#945 review).
-        if dynamic
-            && let SmBinding::Learn(index) = found
-            && self
+        // from the source it was answered at, and adopts none: a
+        // destination has one binding, whose source is its endpoint
+        // (design 2.4, MD-16). An SM from another source, such as another
+        // slot of the same host, would name a receiver id past
+        // `settle_registrant`, and an adoption would share a slot's address
+        // with a binding that can go without it (karyos#945 review).
+        // Static publications adopt as before.
+        let elsewhere = match found {
+            SmBinding::Learn(index) => self
                 .bindings
                 .get(index)
-                .is_some_and(|binding| binding.solicited_from != source)
-        {
+                .is_some_and(|binding| binding.solicited_from != source),
+            SmBinding::Adopt(_) => true,
+            SmBinding::Bound(_) => false,
+        };
+        if dynamic && elsewhere {
             self.count(|c| &mut c.sm_unbound);
             return None;
         }

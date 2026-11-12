@@ -1568,11 +1568,12 @@ fn a_restart_at_its_own_endpoint_is_not_refused_for_a_full_quota() {
     assert_eq!(sender.counters().registrants_restarted, 1);
 }
 
-/// A registrant timed out at an address another binding still takes SMs
-/// at keeps its slot, and nothing is counted timed out; once that one goes
-/// quiet too, the slot is removed once.
+/// Design 2.4, MD-16 (karyos#945 review): on a dynamic publication an SM
+/// from another slot's address adopts nothing. Receiver 6 sends from both
+/// slots of one host: its SMs from `a` count `sm_unbound`, and `a`'s own
+/// slot expires with its binding once its receiver goes quiet.
 #[test]
-fn a_timed_out_registrant_is_kept_while_its_address_takes_sms() {
+fn an_sm_from_another_slots_address_adopts_nothing_on_a_dynamic_publication() {
     let mut sender = dynamic_sender(4);
     let (a, b): (SocketAddr, SocketAddr) = (
         "10.0.0.9:5000".parse().unwrap(),
@@ -1580,19 +1581,27 @@ fn a_timed_out_registrant_is_kept_while_its_address_takes_sms() {
     );
     assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
     assert_eq!(join_as(&mut sender, b, 6, 8, T0), None);
-    // Receiver 6 sends from both endpoints: its SMs from `a` adopt it.
     let timeout = sender.confirmed_timeout;
     let step = timeout / 4;
+    let unbound = sender.counters().sm_unbound;
     let mut now = T0 + 1;
+    let mut sent = 0;
     while now < T0 + 1 + timeout + step {
         now += step;
         assert_eq!(sender.status(EndpointId(1), b, &sm_as(6, 8), now), None);
         assert_eq!(sender.status(EndpointId(1), a, &sm_as(6, 8), now), None);
+        sent += 1;
     }
+    assert_eq!(sender.counters().sm_unbound, unbound + sent);
+    assert_eq!(sender.counters().bindings_adopted, 0);
     sender.expire_bindings(now);
-    assert!(sender.sends_to(EndpointId(1), alias(), a));
-    assert!(removals(&mut sender, now).is_empty());
-    assert_eq!(sender.counters().registrants_timed_out, 0);
+    assert!(!sender.sends_to(EndpointId(1), alias(), a));
+    assert!(sender.sends_to(EndpointId(1), alias(), b));
+    assert_eq!(
+        removals(&mut sender, now),
+        vec![(a, RemovalReason::Timeout)]
+    );
+    assert_eq!(sender.counters().registrants_timed_out, 1);
 }
 
 /// MD-19: a move carries the receiver's membership to its new endpoint:
