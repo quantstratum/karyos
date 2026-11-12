@@ -124,6 +124,10 @@ pub enum AgentError {
         /// The value refused.
         value: usize,
     },
+    /// [`AgentConfig::registration`] refused a limit, named in the error
+    /// (karyos#644).
+    #[error("invalid registration configuration: {0}")]
+    Registration(crate::sessions::register::RegistrationConfigError),
 }
 
 /// How an agent thread waits after an iteration without work. The driver
@@ -309,6 +313,12 @@ pub struct AgentConfig {
     /// the current count (MD-8), so each table must hold at least one
     /// entry per destination.
     pub max_destinations: usize,
+    /// The driver's limits on dynamic registrations, shared by its
+    /// `control-mode=dynamic` publications (design 3.2 steps 3, 5 and 6;
+    /// MD-11; karyos#644): `registration_rate`, the pending and refusal
+    /// tables, `registration_refusal_interval` and the pending entries'
+    /// `join_timeout`. Each publication's allowlist is its own.
+    pub registration: crate::sessions::register::RegistrationConfig,
     /// A multicast image's NAK timing and suppression (reliable-transport.md,
     /// "Timers, retries and suppression"; RC-2 to RC-5, RC-14), with the
     /// design defaults: `nak_delay_scale` 16, `repair_linger` and
@@ -376,6 +386,7 @@ impl Default for AgentConfig {
             rtt: crate::rtt::RttConfig::default(),
             repair: repair::RepairConfig::default(),
             max_destinations: data::DEFAULT_MAX_DESTINATIONS,
+            registration: crate::sessions::register::RegistrationConfig::default(),
             multicast: crate::repair::loss::MulticastConfig::default(),
             unicast_retry_slack: 0,
             group_nak_budget: 64,
@@ -479,6 +490,9 @@ impl AgentConfig {
                 "a repair table holds less than one entry per destination (max_destinations)",
             )
         })?;
+        self.registration
+            .validate()
+            .map_err(AgentError::Registration)?;
         // RTT snapshots lie between the floor and the probe timeout (the
         // RTT configuration checks `rtt_floor <= rtt_initial <=
         // rtt_probe_timeout` above).
