@@ -1358,6 +1358,67 @@ fn a_required_id_is_never_restarted_at_its_slot() {
     assert_eq!(required_targets(&sender), [a]);
 }
 
+/// karyos#945 review: a host with an optional slot at `y` that registers
+/// and is answered at another port `x` cannot send that binding's first
+/// SM from `y` naming a required id: it is unbound, the binding learns no
+/// receiver id, and the real required receiver still registers and joins.
+#[test]
+fn a_first_sm_from_another_source_than_its_answer_is_unbound() {
+    let mut sender = dynamic_sender_with(4, &[42]);
+    let (y, x, real): (SocketAddr, SocketAddr, SocketAddr) = (
+        "10.0.0.9:5000".parse().unwrap(),
+        "10.0.0.9:5001".parse().unwrap(),
+        "10.0.0.42:5000".parse().unwrap(),
+    );
+    assert_eq!(join_as(&mut sender, y, 1, 7, T0), None);
+    assert!(
+        sender
+            .register(EndpointId(1), x, &register_as(2, 8), T0 + 10)
+            .is_some()
+    );
+    assert!(
+        sender
+            .answer_for(EndpointId(1), x, T0 + 10, challenge_of(8))
+            .is_some()
+    );
+    let unbound = sender.counters().sm_unbound;
+    assert_eq!(
+        sender.status(EndpointId(1), y, &sm_as(42, 8), T0 + 11),
+        None
+    );
+    assert_eq!(sender.counters().sm_unbound, unbound + 1);
+    assert!(
+        sender
+            .bindings
+            .iter()
+            .all(|binding| binding.receiver_id != Some(42))
+    );
+    assert_eq!(join_as(&mut sender, real, 42, 4242, T0 + 20), None);
+    assert_eq!(required_targets(&sender), [real]);
+}
+
+/// karyos#945 review: two required ids each hold their own slot. The
+/// second's join, and the first's refused return on a new port, leave the
+/// other's slot in place.
+#[test]
+fn a_required_id_leaves_another_required_ids_slot_in_place() {
+    let mut sender = dynamic_sender_with(4, &[42, 43]);
+    let (a, b, c): (SocketAddr, SocketAddr, SocketAddr) = (
+        "10.0.0.42:5000".parse().unwrap(),
+        "10.0.0.43:5000".parse().unwrap(),
+        "10.0.0.42:5001".parse().unwrap(),
+    );
+    assert_eq!(join_as(&mut sender, a, 42, 1, T0), None);
+    assert_eq!(join_as(&mut sender, b, 43, 2, T0 + 10), None);
+    let late = T0 + 2 * sender.confirmed_timeout;
+    sender.expire_bindings(late);
+    let _ = try_join(&mut sender, c, 42, 3, late);
+    assert!(removals(&mut sender, late).is_empty());
+    let mut held = required_targets(&sender);
+    held.sort();
+    assert_eq!(held, [a, b]);
+}
+
 /// karyos#940 item 3: a REGISTER naming a bound optional `receiver_id`
 /// with a new boot id while its binding took an SM within
 /// `destination_move_quiet` is a `duplicate_receiver`, and the live
@@ -1462,6 +1523,12 @@ fn a_registrant_in_its_quarantine_gets_no_announce() {
     assert_eq!(join_as(&mut sender, a, 5, 7, T0), None);
     let late = T0 + 1 + sender.confirmed_timeout;
     sender.expire_bindings(late);
+    // Removed and not reported yet, its address is in quarantine already.
+    assert_eq!(
+        sender.register(EndpointId(1), a, &register_as(5, 8), late + 1),
+        None
+    );
+    assert_eq!(sender.registration_counters().dropped_quarantined, 1);
     assert_eq!(removals(&mut sender, late), [(a, RemovalReason::Timeout)]);
     let quarantine = sender.membership.receiver_timeout;
     assert_eq!(
@@ -1472,7 +1539,7 @@ fn a_registrant_in_its_quarantine_gets_no_announce() {
         sender.register(EndpointId(1), a, &register_as(5, 8), late + quarantine - 1),
         None
     );
-    assert_eq!(sender.registration_counters().dropped_quarantined, 2);
+    assert_eq!(sender.registration_counters().dropped_quarantined, 3);
     assert_eq!(sender.registration_counters().registered, 1);
     // The quarantine ends at removal + quarantine: it rejoins.
     assert_eq!(join_as(&mut sender, a, 5, 8, late + quarantine), None);

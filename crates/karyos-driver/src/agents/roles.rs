@@ -7112,6 +7112,20 @@ impl<T: StreamTerms> SenderRole<T> {
             self.count(|c| &mut c.sm_unbound);
             return None;
         }
+        // On a dynamic publication a binding learns its SM source only
+        // from the source it was answered at: an SM from another source,
+        // such as another slot of the same host, would name a receiver id
+        // past `settle_registrant` (karyos#945 review).
+        if dynamic
+            && let SmBinding::Learn(index) = found
+            && self
+                .bindings
+                .get(index)
+                .is_some_and(|binding| binding.solicited_from != source)
+        {
+            self.count(|c| &mut c.sm_unbound);
+            return None;
+        }
         // A dynamic publication's new membership settles what it replaces
         // (design 3.2 step 4); the bindings may move, so it is found again.
         let found = match registrant {

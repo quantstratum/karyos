@@ -885,6 +885,10 @@ impl Registrations {
     /// Removes the oldest pending entry held by source address `address`,
     /// optional or one of `policy`'s reserved ones, other than the
     /// reserved entry at `spare` (which its REGISTER replaces anyway).
+    /// While the per-source bound holds, `spare` at `address` leaves the
+    /// address below the bound and this is not called; it is kept so a
+    /// required id's own entry is never the one evicted should an entry
+    /// count above the bound ever reach here.
     fn evict_oldest_at(
         &mut self,
         policy: &mut RegistrationPolicy,
