@@ -75,3 +75,15 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check licenses bans sources
+
+  # Separate from `deny`: a RustSec database update can turn this job red
+  # with no change in the repository, which must not hide licence, ban or
+  # source results (karyos#933). Not part of the offline `make pre-push`.
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories
