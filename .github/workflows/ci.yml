@@ -51,6 +51,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # The self-hosted Mac builds with Homebrew llvm@23, as the local
+      # macOS setup does, and keeps the user rustup first on PATH.
+      - if: runner.os == 'macOS'
+        run: |
+          echo "/opt/homebrew/opt/llvm@23/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # The runner provides rustup; install the channel pinned in rust-toolchain.toml.
       - run: rustup toolchain install
       - run: rustup show active-toolchain
