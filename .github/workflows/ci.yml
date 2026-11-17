@@ -51,19 +51,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
-      # Self-hosted runners ship no usable toolchain (a root owned
-      # /usr/local/rustup, or a Homebrew rustup without proxies): install a
-      # per-user rustup and the channel pinned in rust-toolchain.toml.
-      - name: Install Rust
-        run: |
-          export RUSTUP_HOME="$HOME/.rustup" CARGO_HOME="$HOME/.cargo"
-          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
-          fi
-          echo "RUSTUP_HOME=$RUSTUP_HOME" >> "$GITHUB_ENV"
-          echo "CARGO_HOME=$CARGO_HOME" >> "$GITHUB_ENV"
-          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
-          "$CARGO_HOME/bin/rustup" toolchain install
+      # The runner provides rustup; install the channel pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - run: rustup show active-toolchain
       - run: make lint test build-release
 
