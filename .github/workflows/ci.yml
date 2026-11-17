@@ -23,6 +23,7 @@ env:
 jobs:
   format:
     name: Format and lint sync
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -36,6 +37,7 @@ jobs:
   # macOS job waits in the queue; the Linux jobs are not held by it.
   test:
     name: Clippy and test (${{ matrix.name }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     strategy:
       fail-fast: false
       matrix:
@@ -45,15 +47,24 @@ jobs:
           - name: ubuntu-24.04-arm
             runner: ubuntu-24.04-arm
           - name: macos-arm64
-            runner: [self-hosted, macOS, ARM64]
+            runner: [self-hosted, macOS, ARM64, quant-macos]
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      # The self-hosted Mac builds with Homebrew llvm@23, as the local
+      # macOS setup does, and keeps the user rustup first on PATH.
+      - if: runner.os == 'macOS'
+        run: |
+          echo "/opt/homebrew/opt/llvm@23/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      # The runner provides rustup; install the channel pinned in rust-toolchain.toml.
+      - run: rustup toolchain install
       - run: rustup show active-toolchain
       - run: make lint test build-release
 
   loom:
     name: Loom models
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +72,7 @@ jobs:
 
   miri:
     name: Miri (karyos-sys)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -69,6 +81,7 @@ jobs:
 
   deny:
     name: Licences and sources
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -81,6 +94,7 @@ jobs:
   # source results (karyos#933). Not part of the offline `make pre-push`.
   advisories:
     name: Advisories
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
