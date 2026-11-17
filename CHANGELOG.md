@@ -9,6 +9,8 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ## [Unreleased]
 
+## [0.1.0-alpha.3]: 2026-11-17
+
 ### Added
 
 - R-CORE-38, the agent API's limits (quantstratum-docs:
@@ -197,6 +199,1019 @@ release may break APIs, wire formats and shared-memory layouts.
     is full, never a terminal outcome. Tested on Linux with one case per cause
     and a change seen by event.
 
+- karyos#622: the first crates.io publication. `karyos-sys`, `karyos-protocol`,
+  `karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`,
+  `karyos-cluster` and the `karyos` facade are published as `0.1.0-alpha.3`;
+  each lifts `publish = false` on its own and carries a README, keywords and
+  categories. Every other crate stays unpublishable. The repository is public.
+
+- The netem suite isolates each fault (karyos#626). N10 and N11 run
+  under reorder alone, with a probe that fails unless the path reordered
+  and lost and duplicated nothing: a reliable channel still delivers
+  exactly once and in order, and an unreliable one at most once and in
+  order, every datagram too late for its place in a reported local gap.
+  N3 adds a duplicates-only phase, in which nothing is NAKed or repaired
+  and every DATA frame dropped is a duplicate. N4 asserts the repair in
+  Dedicated mode through the per-stream cells. `RELEASING.md`: a release
+  is not tagged until every gate has an Evidence row for its own head.
+
+- Multi-destination unicast, manual mode, first sends
+  (`quantstratum-docs: karyos/design/multi-destination-unicast.md`;
+  ADR-0056, ADR-0082; karyos#630, step 1 of 3). A network publication on a
+  `control-mode=manual` channel sends every datagram over unicast to each
+  listed destination from one endpoint, so fan-out needs no IP multicast.
+  Each destination has its own SETUP (announced until its receiver is
+  live), SMs and image; answers go only to a listed destination. The
+  channel's flow-control strategy and required receivers apply across
+  destinations, and each destination is also held at its own window.
+  `EmbeddedDriver::add_network_publication_with_destinations` names
+  required destinations by endpoint; at most 16 destinations. Until the
+  next steps, a destination that stops consuming holds the others,
+  retransmissions are not sent, and reliable channels, guards and timed
+  lanes with destinations are refused. `control-mode=dynamic` is refused
+  with the new `DriverError::DynamicRegistrationUnsupported`.
+
+- Multi-destination unicast, manual mode, step 2 of 3 (karyos#630):
+  - A slow optional destination is removed instead of holding the
+    others (MD-7): at the first datagram its full queue cannot take while
+    the others take it, with no grace, counted in `removed_slow`. It is
+    never removed while the publisher is held by a required loss, while
+    the shared socket pushes back, or while it bounds the others under
+    `min` or inside a `tagged` group. A required destination still bounds
+    the publisher.
+  - Send faults stay with their destination (MD-12): its queue is retried,
+    and after three consecutive faults an optional destination is removed
+    (`removed_fault`) and a required one held. A queue that refuses its
+    retry is counted (`retries_refused`) and, for a required destination,
+    goes to the control path, which resets the endpoint.
+  - A removed destination gets nothing more, its EOS included, and no
+    longer keeps a lane from idling or draining: the others still get
+    their heartbeats and the publication's EOS. One that fails to open on
+    a new epoch no longer holds the others.
+  - Removals are reported with their reason through
+    `EmbeddedDriver::network_removed_destinations`
+    (`DestinationRemoval`, `RemovalReason::{Slow, Fault}`). A removed
+    destination's SMs and NAKs are ignored, and it no longer counts for the
+    strategy edge or the restart position.
+  - Reliable channels with destinations are accepted. Each destination has
+    its own repair path and repair queue, with a fair share of the job
+    table, so a retransmission reaches only the destination that asked
+    (MD-8).
+
+- Multi-destination unicast, manual mode, step 3 of 3 (karyos#630):
+  - Optional destinations change at run time (MD-3). Use
+    `EmbeddedDriver::add_network_destination` and
+    `EmbeddedDriver::remove_network_destination`; the sender's answers
+    come back through `take_network_destination_changes` as a
+    `DestinationChange`.
+  - An optional destination moves by a removal and an addition. A removed
+    destination is quarantined for `image_liveness_timeout` before it can
+    be added again (MD-14).
+  - Required destinations are fixed at creation (ADR-0082): one is never
+    removed or added at run time. A restart of its receiver at the same
+    endpoint is rejected, so the publication's admission is
+    `LostRequired`.
+  - A NAK has one entry point in the sender's publication, which repairs
+    toward the requester's destination on a multi-destination
+    publication and on the single path otherwise.
+  - A removed destination retires once its queues are drained and its
+    removal reported (design 3.7): its queues and route close and its slot
+    is freed (`destinations_retired`), so moving an optional destination
+    any number of times never fills the table. Its address is kept for its
+    quarantine (MD-14); a destination added back is a fresh one, with a
+    fresh repair path.
+  - Each destination's repair cap is the job table's share for
+    `MAX_DESTINATIONS` (MD-8), so additions never overcommit it. A reliable
+    multi-destination publication now needs `repair_jobs` of at least 16;
+    one configured below, which step 2 took, is refused with
+    `RepairConfigError::DestinationShare`.
+  - An optional destination whose route or queues cannot open for a reason
+    of its own (no route or queue left, an address it cannot route) is
+    removed after three tries, at most one per `setup_interval`
+    (`RemovalReason::Fault`); an endpoint reset never counts. A change on
+    a multi-destination publication being removed answers
+    `DestinationChange::Removing`.
+  - `network_removed_destinations` keeps the newest 16 removals;
+    `network_removals_overwritten` counts the older ones.
+  - A removed destination's member stops counting for the strategy edge at
+    its removal (design 3.7), not at its liveness expiry, and a sender
+    reset asked for in an epoch is no longer cleared before the sender
+    acts on it.
+
+- `karyosd --idle-image-timeout <duration>` sets the network agents'
+  `idle_image_timeout`, how long stationary heartbeats keep an image alive
+  after its last fresh evidence (owner item 1; karyos#638). It takes the
+  channel URI's duration grammar (`ns`, `us`, `ms`, `s`), needs
+  `--network on` in any order, and a bad duration is the new
+  `ArgsError::InvalidDuration` with its `DurationError`. `Options` gains
+  `idle_image_timeout`. The default stays 60 s.
+- Tests for owner items 13 and 58 (karyos#638): a network publication with a
+  local reader and a live receiver stays connected through either, so
+  connected never proves remote reachability; and a `Monotonic` lane is
+  refused to a client whose time namespace is proven different (two
+  distinct namespace files), with that namespace's own code. The namespace
+  comparison is now a function of its own, `compare_time_namespaces`, so it
+  is tested without privileges. No behaviour changes.
+
+- The two wire additions of dynamic multi-destination registration:
+  RSP_SETUP variant 3 REGISTER (56 bytes, the stream and the receiver
+  block) and ERR variant 3 REGISTRATION with reason 4 `DESTINATIONS_FULL`
+  (40 bytes), as codecs with hand-written vectors (ADR-0056, ADR-0082;
+  design MD-4, MD-5; karyos#644, step 1).
+- `sessions::register`, the bounded admission of a REGISTER: an explicit
+  non-empty `RegistrationAllowlist` (no permissive default; it supplies no
+  authentication) per publication; the driver's rate, pending table and
+  refusal table shared by its publications, with the sender's
+  `setup_answer_rate` as the per-source bucket; pending bounds and one
+  ERR per `refusal_interval` per source address, whatever its port;
+  checked, sticky counters; and expiry at `join_timeout`. `control-mode=dynamic` stays
+  refused until the sender and receiver paths are implemented and tested
+  (karyos#644).
+
+- Dynamic multi-destination registration (`control-mode=dynamic`) is
+  complete inside the driver (#644, step 3c) and still refused by every
+  public publication and subscription call with
+  `DriverError::DynamicRegistrationUnsupported`: a review found denial of
+  service defects in the registration path, and the refusal stays until
+  they are fixed (#644). Inside the driver, a dynamic publication admits
+  the receivers that register at its `control` address from a source its
+  explicit, never empty `RegistrationAllowlist` names, which restricts
+  admission without authenticating anything, and a dynamic subscription
+  registers with its configured `ReceiverIdentity`. Challenge and
+  response, the driver's registration rates and pending bounds and the
+  source checks apply to every registrant, and a full destination table
+  answers one ERR REGISTRATION per source per interval.
+- Required receiver ids in dynamic mode (MD-17): each has a reserved
+  destination slot and two reserved pending registrations (the older one
+  replaced), so optional registrants cannot fill the table ahead of it;
+  admission opens once every one has joined.
+- The registration lookups of the design's step 4: a receiver at its own
+  destination is dropped; an optional `receiver_id` back with a new boot
+  id replaces its old destination at its first status message
+  (`restarted`); the same receiver at a new port moves there once its old
+  destination has been quiet for `RegistrationConfig::move_quiet` (50 ms,
+  `moved`), and is a `duplicate_receiver` before; a required receiver id
+  is never restarted nor moved. A registrant whose receiver goes silent
+  for `image_liveness_timeout` loses its slot (`timeout`), and no
+  dynamic destination is announced to periodically.
+- The registration counters in the CnC: REGISTERs admitted, retried,
+  answered ERR or suppressed, dropped by reason, and what registrants'
+  first status messages did (joined, full, refused, restarted, moved,
+  timed out).
+
+- A `control-mode=dynamic` publication can be built inside the driver
+  with its registration allowlist (#644, step 3a): its endpoint binds the
+  channel's `control` address and answers a REGISTER from an allowed source
+  with one SETUP ANNOUNCE, tested on loopback. A second dynamic
+  publication of one stream on one control endpoint is refused with
+  `DriverError::DynamicPublicationExists`. The public publication and
+  subscription calls still refuse `control-mode=dynamic` until the
+  receiver side and its end-to-end tests land.
+
+- A `control-mode=dynamic` subscription can be built inside the driver
+  (#644, step 3b): it registers at the channel's `control` address every
+  `setup_interval` until an image of its stream from there is bound, and
+  counts an ERR REGISTRATION it reads (`ReceiverCounters::registers_sent`,
+  `registers_unsent`, `registration_refusals`). Loopback tests show a
+  receiver registering, binding and receiving, a receiver outside the
+  allowlist getting nothing, and a full table answering ERR while the
+  joined destination keeps receiving. The public subscription calls now
+  refuse `control-mode=dynamic` with `DriverError::DynamicRegistrationUnsupported`
+  (before: `UnsupportedChannel`), as the publication calls do.
+
+- The sender side of dynamic multi-destination registration (#644, step
+  2): a REGISTER for a `control-mode=dynamic` publication goes through the
+  driver's bounded admission and causes one SETUP ANNOUNCE or one ERR
+  REGISTRATION to its validated source; only a pending registrant's
+  CHALLENGE is answered, at its source; its first valid SM takes an
+  optional destination slot, or gets one ERR REGISTRATION when the slots
+  filled meanwhile. A second dynamic publication of one stream on one
+  control endpoint is refused. The driver's registration limits are
+  `AgentConfig::registration`. `control-mode=dynamic` is still refused at
+  channel admission until the receiver side and its end-to-end tests land.
+
+- The channel URI key `retransmit-window=<bytes>` (karyos#653, owner
+  item 63) sets a reliable UDP publication's repair window per channel,
+  fixed at channel creation. The value must be positive and a multiple
+  of 32, and at most half the term; the default is half the term. The URI
+  refuses a value that is zero, unaligned, above half of a `term-length`
+  it gives, or combined with `reliable=false` (a `Conflict`). The driver
+  refuses a value above half of the stream's term with
+  `DriverError::RetransmitWindowAboveHalfTerm` before anything is
+  configured. Without the key, the driver's `RepairConfig` applies. The
+  held floor without required receivers is `sent` minus the window, and
+  a test shows that a small window makes the lone counted receiver's
+  hole unrecoverable, reported as such. `CHANNEL-URI.md` lists the key.
+
+- `AgentConfig.unicast_retry_slack` (karyos#655): a unicast NAK is
+  retried only once its age exceeds the RTT estimate plus this slack.
+  The default is 0, which keeps the previous rule; values above 1 s are
+  refused (`LossConfigError::UnicastRetrySlack`). The rule cannot
+  underflow when the age is below the RTT.
+- An early RTT probe: a NAK on a path that has no RTT sample yet moves
+  that path's next probe ahead of `rtt_probe_interval`, once per path
+  binding generation and never once per NAK; a sampled path, or one
+  whose probe is still on its way, is left alone. `RttCounts.early_probes`
+  counts them.
+
+- `karyos-feed` A/B arbitration (`quantstratum-docs:
+  karyos/design/feed-arbitration.md`; SPEC §7.2; karyos#659). An `Arbiter`
+  over a feed's `FeedSequencer` (epoch, sequence, modulus, epoch start)
+  delivers each sequenced message of lines A and B once, in order, from the
+  line that brought it first. A message missing on one line is repaired
+  from the other; one missing on both is a `Gap` once both lines passed it,
+  its skew window expired or the reorder buffer overflowed. A session reset
+  is an epoch change the feed states; a wrap is serial arithmetic inside a
+  window strictly below half the space, and a message at or beyond it is a
+  `Jump`. At a reset the old epoch stays open until both lines report the
+  new one or the skew window expires, so the lagging line can still repair
+  it; the new epoch's messages wait under their own base, and old epoch
+  messages after the close are dropped. `resync` resumes a snapshot's
+  consumer after a stated position. Named counters cover wins, duplicates,
+  late copies, length conflicts and the rest. The reorder buffer is
+  allocated at construction: a steady cycle allocates nothing.
+
+- The `ClusteredService` delivery path in the harness (C10; karyos#686,
+  part 2 of 5). `karyos_sim::harness::delivery`: `DeliveryServer` runs
+  any `ConsensusCore` over C4's log and feeds its committed entries to a
+  `ServiceContainer`, proposing through `Proposer`, the core's `Propose`.
+  `DeliveryClient` registers, then sends its commands under its epoch
+  and sequence. `tests/delivery.rs`:
+  - requests reach the log and their outcomes return on 3 and 5
+    servers, with every replica in the same state and sessions;
+  - a request sent twice is applied once;
+  - a restarted server rebuilds its container from the log.
+
+  `ServerNode` and `TestService`, which the frozen C5 workloads measure,
+  are unchanged. The reference core now stamps its entries with its last
+  tick time instead of 0. This changes the event time only, which
+  `TestService` ignores, so no measured behaviour changes; a test checks
+  it.
+
+- Leader following and unknown outcomes on the delivery path (C10;
+  karyos#686, part 3 of 5).
+  - A follower forwards a client's registration or request, one hop, to
+    the leader its core names, and relays the answer. The client's
+    epoch and sequence are unchanged, so a forward and a retry are
+    deduplicated as one request.
+  - A server whose core stops leading, or changes term, answers the
+    requests it took `Answer::Unknown`, never a failure. The client
+    retries the same epoch and sequence, and reports `Unknown` only at
+    its deadline.
+  - Tests on 3 and 5 servers, over the seed corpus: a forwarded
+    request; a deposed leader with a request pending; a leader change
+    with a forward in flight; and a deadline. Each command runs once.
+
+- The Cluster's service container, core neutral (SPEC §9, C10;
+  karyos#686, part 1 of 5). `karyos_cluster::service::ClusteredService`
+  is the user's state machine: `on_command`, `on_timer` and
+  `on_configuration`, each seeing only a `Context` of the entry's index,
+  term and log time, with timers scheduled and cancelled through it.
+  `ServiceContainer` applies committed entries in order. Requests go
+  through C7a's `SessionTable`, so a retry gets its retained reply and the
+  command runs once. Timer firings and configuration changes are entries,
+  delivered only when applied, and a firing proposed twice delivers once;
+  `ServiceContainer::due` lists the firings a leader proposes. Entries are
+  a versioned `Envelope`, version 1, not frozen. `Propose` is the core
+  boundary a core's adapter implements. `SessionTable::observe` moves the
+  log time for an entry that holds no session operation.
+
+- Timers and configuration changes through the log on the delivery
+  path (C10; karyos#686, part 4 of 5).
+  - A `DeliveryServer` that leads proposes `TimerFired` for every
+    scheduled timer that is due, and a new leadership proposes them all
+    again. A firing applied twice delivers once.
+  - `with_configurations` delivers a core's own configuration entries to
+    the service as changes, instead of stopping the container.
+    `Delivery::Change` takes an operator's membership change.
+  - Tests on 3 and 5 servers: a timer fires at its own entry on every
+    replica, after the request that set it; a configuration change is
+    delivered at its entry; a restored leader proposes due timers again,
+    and each fires once.
+
+  `AppendService` now does nothing for a command it does not know,
+  instead of reporting a reply too large.
+
+- The C5 harness declares W2's limits to the core under test
+  (karyos#687). `ConsensusCore::recover_with` takes `Limits`: in-flight
+  entries and bytes per follower, a request queue per server, and log
+  bytes read per duty. A core that takes none answers `Unsupported`, and
+  its W2 cases are reported as `not_demonstrated`, never as passed.
+  `propose` refuses with `Refused::NotLeader` or a typed
+  `Refused::Backpressure(Limit)`; each backpressure refusal is recorded,
+  and the client sends again, so nothing is lost. The harness holds a
+  core's log reads to its per-duty budget (`ReadError::Budget`). W2 runs
+  its nominal case, bursts at 4x the queue and the in-flight entries
+  from pipelined clients (`Case::window`, each open request a session of
+  its own; a client told `Busy` waits its retry interval), a follower cut
+  off while the leader commits 10,000 entries, and one 4x the log-read
+  limit behind. At 256 B the in-flight byte limit is never reached: every
+  W2 run record states it, and the report scores it not demonstrated. The reference fixture honours every limit, as
+  harness validation. A metered read is sized from the log's index (`RaftLog::frame_span`,
+  new in karyos-cluster): a duty reads only whole frames that fit its
+  budget, and a refused read reads nothing. W2 holds every up server to
+  the same applied index and state, and every raw result line states its
+  client window and what the case does not cover.
+
+- W5's retries in the C5 harness (karyos#687):
+  - a leadership handover in the core interface, `transfer_leadership`, whose `Unsupported` default is scored not demonstrated;
+  - `Action::TransferLeadership`;
+  - a server answers a client sent to a former leader with a redirect to the new one;
+  - the test service keeps each client's last 10,000 answers and answers an older retry `Expired`, explicitly, without applying it again.
+
+  The reference fixture hands over to a caught-up voter, which leads the next term. W5 adds the lost reply, leader change and retry case.
+
+- `RaftLog::install` in karyos-cluster restarts a follower's log after a
+  snapshot its snapshot store already holds verified (karyos#687, decided
+  2026-10-30 by QS-COORDINATOR). Durable on return, in this order:
+  1. the first-index file names the next index and the base term in one
+     record;
+  2. the watermark is cleared;
+  3. every frame is cut;
+  4. the commit becomes the base.
+
+  `RaftLog::open_with` opens such a log only over its verified snapshot,
+  and finishes an install a crash cut short. `RaftLog::open` refuses it
+  with `LogError::InstallUnverified`. `RaftLog::frame_span` gives a
+  frame's length from the in-memory index.
+- The C5 harness's W5 snapshot half (karyos#687):
+  - snapshot hooks in the core interface: `compacted`, `install` and
+    `Ready::snapshot_to`, with `Unsupported` defaults scored not
+    demonstrated;
+  - per-server compaction every N applied entries, keeping K;
+  - snapshot sends and installs, and recovery from the latest snapshot
+    and the log;
+  - `W5Snapshots`, which runs compaction under load, a follower held
+    behind the compaction point, and crashes around an install and
+    between builds.
+
+  A case whose entries cannot fit one duty's log-read budget is refused
+  before it runs.
+
+- karyos-sim's C5 corpus runner (part of karyos#691;
+  quantstratum-docs: karyos/evaluations/c5-raft-comparison-v1.md,
+  Corpora). `harness::corpus::run_corpus` runs every case of the given
+  workloads, of one `ConsensusCore`, over a range of seeds, and writes one
+  JSON line of raw results per run, with a `Summary`. A line holds:
+  - the evidence;
+  - the core, workload, case and seed;
+  - the verdict (`pass`, `liveness_gap`, a failed check's kind, or
+    `error`);
+  - whether the run ended at its step bound with clients waiting;
+  - the fault schedule, the trace digest, and any error.
+
+  With `repetitions` above 1 it is the determinism gate's mode: each
+  seed's run is repeated, and an outcome that differs fails it as
+  `failed_not_replayed`.
+
+  Every line of a run of the `Reference` fixture says "harness validation,
+  not C5 evidence" in its `evidence` field: no candidate is behind
+  `ConsensusCore` yet (#678, #690), so the runner validates the harness
+  only. `tests/corpus.rs` runs the manifest's CI seeds (1 to 1,000) over
+  W1, W3, W4 and W6, ignored by default, and prints the time and size.
+  Per-fault coverage and minimised traces of failing seeds are a later
+  step.
+- The C5 allocation gate's probe (part of karyos#691).
+  - `karyos_sys::alloc_count` counts a set of threads: a thread enrolls
+    (`enroll`) and `window` sums every enrolled thread's allocations and
+    frees while it runs, for a path that spans an executor's tasks or a
+    background thread.
+  - `karyos_sim::harness::probe::Probed<C>` wraps a core so that each of
+    its calls, once it has committed `WARMUP` (16) entries, is counted.
+  - `measure` reports the allocations and frees per entry the leaders
+    committed past the warm-up.
+  - The declared path is every `ConsensusCore` call plus any thread the
+    adapter declares in the run record.
+  - `tests/allocation.rs` checks the probe: a known allocation counts, a
+    no-op and an unenrolled thread count nothing, and a declared second
+    thread counts. It also measures the `Reference` fixture on W1 (about
+    62 allocations per entry: it is no candidate, and the line says
+    "harness validation, not C5 evidence").
+
+- The binding conformance suite runs its panic row (karyos#699). A
+  libkaryos built for the test kit (karyos-ffi feature `test-hooks`)
+  exports `karyos_test_panic_next_duty_cycle`, declared in
+  `include/karyos_test_hooks.h` and never in `karyos.h`, and the new
+  scenario `op.panic.poisons` (feature `fault-hook`) shows a panic on a
+  driver's thread poisoning the driver, its client and that client's
+  subscription and publication while a second driver and its objects
+  still work, and a panic inside a caller's own `karyos_driver_do_work`
+  answering `KARYOS_E_INTERNAL` instead of unwinding. `make test-hooks-absent-check`, part of pre-push,
+  fails when the release library exports the hook or carries its code.
+  `conformance/index.txt` rows are now scenario ids, `pending issue <N>`
+  with a reason, or `outside` with a reason for a row no portable runner
+  can reach; a `pending` row that names no issue is refused. The kept
+  fragment pointer row is `outside`, naming its Rust test, and the older
+  minor ABI row is pending on issue 700. FORMAT.md says that a
+  scenario's row comes from its `covers` header, never its `feature`
+  headers.
+
+- The release tooling of libkaryos as its own artifact, separate from
+  karyosd (owner item 44, karyos#700): `scripts/release-libkaryos.sh`
+  builds the library package and the karyosd artifact as two tarballs
+  with `SHA256SUMS`, deterministic on a host whatever its TZ and umask
+  (`scripts/check-release-reproducible.sh`); `scripts/sign-release.sh`
+  signs exactly what `SHA256SUMS` lists with key-based cosign and a
+  `pkcs11:` key only (no key exists yet, so it refuses); `scripts/conformance-package.sh`
+  runs the conformance suite against a released tarball rather than the
+  build tree. The package's MANIFEST says `contents=library` and
+  `excludes=karyosd`; the conformance test kit says it is not a release
+  package.
+- The ABI manifest of the C header (`scripts/abi-manifest.sh`): every
+  public struct's size, alignment and field offsets and every constant,
+  measured by compiling the header, and every other declaration as
+  written. It ships as `share/karyos/abi-manifest.txt`, and
+  `make abi-manifest-check`, in pre-push, fails a header that no longer
+  matches it, or a change since the last released manifest
+  (`crates/karyos-ffi/abi/released/`) without a higher ABI version.
+- The soname policy is owner item 48's ruling (`0.y` before 1.0), no
+  longer an interim note.
+
+- Trace record layout version 4 for application trace points (R-CORE-1,
+  karyos#722, first part): point code 9, `Point::Application { id,
+  metadata }`, with up to four typed metadata values (`u64`, `i64`,
+  `f64`, an 8-byte ASCII tag) in words 16 to 21, refused when out of
+  bounds on encode, before a sequence is taken, and on decode. Only
+  application records are written as version 4; driver points keep
+  version 3, so a layout 3 reader decodes them and refuses the
+  application records typed. `ApplicationPoint::observe` records into a
+  journal of the point's own client (`TraceWriter::for_client`) and
+  refuses another's with `TraceError::ForeignPoint`; it allocates
+  nothing, nor does a driver point's record with no point registered.
+
+- The agent's `trace-export` names application trace points (R-CORE-1,
+  karyos#722, last part): each page carries `points`, one
+  `{"id","label","client"}` per point its records reference, its label
+  escaped as every string. A point is named only by the single live
+  trace point cell holding its id, of the client of the journals its
+  records are in; otherwise its label and client are `null`, never
+  another point's. A point counts once in the reply's byte bound, at
+  384 bytes. `limits` gains `trace.point_ids` (65 535),
+  `trace.points_per_client` (16) and
+  `trace.point_registrations_per_client` (256), all fixed.
+
+- Application trace point names (R-CORE-1, karyos#722, second part):
+  `Client::add_trace_point(label)` registers a point as a client counter
+  cell of type id 8 (`TYPE_TRACE_POINT`), whose value is the id the
+  driver assigns and publishes with the cell, never reused within the
+  instance. Labels are checked by the client and again by the driver
+  (1 to 64 bytes, no control character; `ClientError::InvalidLabel`,
+  `ErrorCode::InvalidLabel` 27). A client holds at most
+  `max_trace_points_per_client` live points (16) and registers at most
+  `max_trace_point_registrations_per_client` over its life (256), with
+  `karyosd` flags of the same names; once the instance assigned all
+  65 535 ids, a registration is refused with
+  `ErrorCode::TracePointIdsExhausted` (26) and counted in the driver's
+  `trace point ids exhausted`. The agent's Prometheus exposition and
+  `karyos-stat` leave trace point cells out: they name records and hold
+  an id.
+
+- R-CORE-3, application counters (karyos#723). `Client::add_counter(label,
+  CounterKind)` registers a named counter of the driver's client counters
+  region, keyed to the client and to no stream: `CounterKind::Event` (type
+  id 6, `TYPE_APPLICATION_EVENT`) or `CounterKind::Gauge` (type id 7,
+  `TYPE_APPLICATION_GAUGE`). The bound is the driver's
+  `max_counters_per_client`, shared with the client's other counters, and
+  past it registration is refused with `ClientError::Refused`
+  (`ResourcesUnavailable`); a label of more than 64 bytes is refused, never
+  truncated, and a second live counter of the same label and kind with
+  `ClientError::DuplicateCounter`, so the export never repeats a series. The cells are freed when the handle is released or the client
+  goes. The agent's exporter shows them as `karyos_application_events_total`
+  and `karyos_application_gauge`, labelled with the name and the client, and
+  `karyos-stat` lists them under "application counters:". Updating one
+  allocates nothing.
+
+- Raw trace export (R-CORE-13, karyos#724). The new API v1 request
+  `KARYOS-AGENT 1 trace-export DIR FROM [COUNT [EPOCH]]` returns pages of
+  the attached driver's trace mirror records, read from the mirror at the
+  call: whole records in mirror sequence order, `next` to resume from,
+  the ring's `head`, and the journals the records name as the table showed
+  them (entry with clock provenance, time namespace and drop ranges;
+  recycle log entry; or unknown). The epoch is the driver instance (32 hex
+  digits): a cursor survives the collector's and the agent's restart, and
+  one of another instance gets the typed `epoch changed` refusal with the
+  new epoch. A cursor behind retention, or a record overwritten during the
+  read, is never refused or delivered torn: the page states the lost
+  sequences first, in `lost`. At most 16 384 records per request (default
+  1024). A reply holds whole records, each counted with its journal the
+  first time one names it, within 1 MiB plus one record and one journal
+  (`MAX_RECORD_REPLY`, 695 bytes; `MAX_JOURNAL_REPLY`, 2560 bytes), the
+  read itself bounded by those bytes and the count clamped to 16 384; it
+  names only the journals of the records it holds. A cursor beyond the
+  ring is refused (`cursor ahead`, with the ring's `next`), as is a read
+  that finds the ring's bounds busy (`mirror busy`); the head is always
+  the ring's. A record whose journal entry stays busy ends the page
+  before it (the reader retries); a journal recycled for good goes out as
+  `unknown`, its records counted in `unknown_records`. A malformed record
+  (a length past the payload bound, `MirrorRecord::truncated`) is never
+  delivered: it is lost with its sequence and reason `malformed`, and the
+  page goes on. A table or log entry being written is retried, yielding,
+  for 1 ms, the table's before the log is read, as the driver writes a
+  log entry before it reuses a table entry; one still busy then, while a
+  page's first record is its journal's, never stalls the cursor and loses
+  nothing: that journal's leading run of records goes out without
+  calibration, its journal `unreadable`, counted in `unreadable_records`,
+  and the page ends at the next record whose journal was not read. Each lost range carries its `reason`
+  (`overwritten` or `malformed`), is stated once, and is below the page's
+  `next`. The read alone bounds the page, in
+  batches of 64 records; `json::trace_export` encodes it whole.
+  `capabilities` lists `trace-export`.
+- `karyos_sys::diag_ring::scan_at_most` and
+  `TraceMirrorReader::scan_at_most`: a ring scan that delivers at most a
+  given number of records, so its work is bounded by that number.
+- `trace-buckets` paging (R-CORE-23, review of karyos#817): a bucket's
+  `loss` is on its first page only (`first_lane` 0) and `null` on a later
+  page of it, so a reader never counts it twice; no page holds a bucket's
+  header without a lane.
+- The API socket writes each reply within `WRITE_DEADLINE` (250 ms) in
+  all, checked after every write: a reply a client reads too slowly is
+  cut short, and the connection closed, so it ends at EOF without its
+  final newline; a reply written whole is served even if its last write
+  ended at the deadline. `limits` answers it as `write.deadline_ms`. A
+  request is read within `READ_DEADLINE` (250 ms) in all, each read under
+  the time left (`read.deadline_ms`). One poll
+  starts connections for `POLL_BUDGET` (500 ms) at most, so its waiting on
+  clients is 1 s at most, besides the work of building the answers. Refusals of
+  `trace-export` are served as refusals.
+
+- Disjoint trace buckets (R-CORE-23, karyos#727). The agent's trace window
+  keeps each closed slice as a bucket that shares no pair with any other,
+  sparse, under `WindowConfig::max_bucket_bytes` (default 64 MiB of
+  structs and allocations at their capacity, oldest evicted first; a
+  bucket larger than the budget is not kept). The new API v1 request
+  `KARYOS-AGENT 1 trace-buckets DIR FROM [COUNT [EPOCH [LANE]]]` returns
+  them with the window run's `epoch`, each lane as mergeable counts and
+  each bucket's loss (the scan's loss charged to the bucket missing the
+  pairs, malformed and unknown-journal records included); reading
+  consumes nothing, so any number of readers share them. Refusals are
+  typed: `epoch changed`, `buckets expired` (any number below the oldest
+  answered, never an empty bucket in its place), `bucket over budget`. A
+  reply holds whole lanes within 1 MiB plus one lane (at most
+  `MAX_LANE_REPLY`, 2 870 932 bytes): a larger bucket is paged by lane,
+  and `next` names the bucket and the lane where the next read starts. `capabilities` lists
+  `trace-buckets`; the view's trace counts add `buckets_evicted` and
+  `buckets_over_budget`. The rolling `trace-window` view is unchanged.
+- `karyos_trace::Histogram::counts` and `Histogram::from_counts`
+  (`HistogramCounts`, `SideCounts`): a histogram's counts exported and
+  rebuilt exactly, refusing another layout or unit (`Mismatch`) and
+  inconsistent counts (`InvalidCounts`).
+
+- R-CORE-24, the management agent's identity, attachment and capability
+  discovery (karyos#728), all additions to API v1:
+  - `karyos-agent --agent-id NAME` names the agent, as its deployment
+    calls it (for example `namespace/pod`). It is taken from configuration
+    only; the agent looks up no host or orchestrator name.
+  - The view gains `agent`: `id`, `pid` and `started_ns`. The pair (pid,
+    started_ns) identifies the agent's incarnation; `started_ns` is host
+    `CLOCK_MONOTONIC`, not a wall-clock time.
+  - Each driver gains `attachment`: `since_ns`, `attaches`, and `previous`,
+    the end of the last attach (its instance, `ended_ns`, and
+    `driver_gone` or `detached`).
+  - New request `KARYOS-AGENT 1 capabilities`, answered for the caller's
+    role. Each capability of a closed v1 list (`view`, `guard-close`,
+    `guard-reopen`, `gap-ack`, `catalog`, `trace-window`, `limits`) is
+    `served`,
+    `unavailable` (off in this deployment: `not_configured` or
+    `journal_unavailable`) or `forbidden` (`role`).
+  - The request with arguments answers
+    `{"error":"bad arguments","request":"capabilities"}`. An older agent
+    answers `bad request`, which a client reads as no discovery.
+
+- `--versions` on every binary of `karyos-tools` (R-CORE-33, karyos#729):
+  one JSON object with its own schema (`karyos-versions`, version 1),
+  printed before anything else is parsed and touching no driver. It has
+  the core release, the admission and frame protocol versions, the C ABI
+  version, the wire schema versions (Archive control, Cluster log, group
+  records, capture contract, Archive durability), the `karyosd`
+  configuration file schema version (`config::SCHEMA_VERSION`, 1 = the
+  `[io]` schema), the backends the core knows (sockets, io_uring, af_xdp,
+  ef_vi, dpdk) with whether this build compiled them, and the enabled features,
+  each with the id of the rule it is compared under. The C ABI version
+  now has one source, `karyos_protocol::versions`, which `karyos-ffi` and
+  its header follow. A `libkaryos` package carries the same object as
+  `share/karyos/versions.json`, checked against its MANIFEST.
+
+- R-CORE-34, the size of every shared region from its configuration
+  (karyos#730, first part). These are the functions each region's
+  constructor now uses, so they cannot drift from the size it is mapped
+  with:
+  - `karyos_sys::sizing::region_length`, the header stride plus the
+    structure, used by `RegionRecord`;
+  - `command_ring::structure_length` and `broadcast::structure_length`;
+  - `counters::structure_length`, for the counters and the client
+    counters;
+  - `diag::{error_log, loss_report, guard_audit}_structure_length`;
+  - `trace_mirror::structure_length`;
+  - `LogBuffer::structure_length`.
+
+  A Linux test creates every region kind and compares its record and its
+  `memfd` size with them.
+
+- R-CORE-34, the sizing report (karyos#730). `karyos_driver::sizing::report`
+  (Linux) computes, from a driver configuration and its streams alone, the
+  bytes of every shared region the driver and its clients map, each
+  rounded up to the page (`karyos_sys::ipc::page_size`), in two figures:
+  - configured steady state: the regions, plus the network trace journal
+    budget, listed apart as heap;
+  - restart peak: configured plus `max_retained_generations` predecessor
+    mappings of every declared stream, under a stated assumption (no
+    reconfiguration since start).
+
+  Streams added after start and Archive replay targets are excluded, and
+  the report says why: no configuration sets their maximum geometry.
+  Every line names the configuration fields it read. The report states how
+  the cgroup counts a shared `memfd` page and what it excludes, and it
+  refuses whatever the driver refuses.
+- `DriverConfig::validate`, the check a driver applies when it is created,
+  now public and shared with the sizing report.
+- `karyosd --sizing-report` prints that report for the other options,
+  including the Archive's two control streams with `--archive`, and exits
+  without starting a driver; `--dir` is not needed.
+
+  A Linux test compares the report with the regions a driver maps, read
+  from `/proc/self/maps`, to the byte, with a conflated stream and the
+  network on. Another keeps a running `karyosd`'s region pages within the
+  configured figure, and its resident set within that figure plus 10 % and
+  4 MiB.
+
+- R-CORE-35, a bounded startup and readiness signal for a driver
+  (karyos#731).
+  - `EmbeddedDriver::readiness` reports one of five states: starting,
+    ready, recovering (a stream retains a cutover's predecessor), not
+    ready (orderly shutdown, full or terminal) or failed (startup
+    deadline). It is derived from the conditions a client `Hello` is
+    admitted under.
+  - `EmbeddedDriver::startup_complete` and `DriverConfig::startup_timeout`
+    (30 s) bound startup. A host that never declares its startup complete
+    reports failed. `karyosd` declares it once its streams and Archive
+    exist.
+  - The admission protocol (version 3) gains `ProbeHello` and `ProbeState`.
+    A probe gets no descriptor or slot, does not count against
+    `max_clients` or `max_tools`, and one step answers at most
+    `MAX_PROBES_PER_STEP` (4) probes.
+  - Linux: `karyos_client::probe::probe` and `karyos-tools probe --dir D`.
+    The command exits 0 ready, 1 starting or recovering, 2 not ready or
+    failed, 3 unreachable, 4 incompatible driver and 5 refused.
+
+- The wire compatibility matrix (R-CORE-36, karyos#732):
+  `crates/karyos-tools/compat/matrix.toml`, indexed by the full versions
+  tuple of `--versions`, not by the frame version alone, with one entry
+  per ordered pair of builds and surface (admission, frame, C ABI, the
+  Archive and Cluster schemas, the configuration file): interoperate,
+  refuse with its typed reason, or not covered with why.
+  `karyos-tools compat <FROM> <TO>` decides a pair from two `--versions`
+  objects or named columns (exit 0 interoperate, 1 refuse, 2 not covered,
+  3 an unreadable input), through a strict, bounded reader of the
+  `karyos-versions` schema. `scripts/compat-test.sh` is the local release
+  gate that runs a released tag's and this tree's builds against each
+  other in Linux and compares every outcome with the matrix: 0.1.0-alpha.2
+  and main refuse each other's clients at admission and interoperate
+  over karyos:udp.
+
+- The metrics exporter's capabilities for its first release (R-CORE-39,
+  karyos#734).
+  - **Attachment:** `karyos_exporter_info{id,pid}` and
+    `karyos_exporter_started_ns` give its identity as an agent's
+    (`--agent-id`, as `karyos-agent` has). Per driver,
+    `karyos_driver_up`, `karyos_driver_state{state}`,
+    `karyos_driver_info{instance}`, `karyos_driver_attaches_total` and
+    `karyos_driver_attached_since_ns`. A driver that is not attached is
+    reported as a state: no alert count, no counters and no last values,
+    so a dashboard never reads zeros as healthy.
+  - **Security:** still loopback only, now refused with a message that
+    points to a TLS-terminating sidecar or mesh. An optional
+    `--token-file` (mode 0600, 32 to 256 bytes) makes every scrape carry
+    `Authorization: Bearer`, compared in constant time. A request without
+    the token, or with another, is answered `401` with a `Bearer`
+    challenge, and a malformed request head `400`.
+  - **Metric families:** `exporter::FAMILIES` lists each family with its
+    type and stability, and a test keeps the exposition to it. The
+    per-cell families keyed by a driver's internal counter label are
+    unstable.
+  - No OTLP.
+
+- An embedded driver's network over the C ABI (karyos#735), ABI 0.1.4.
+  - `karyos_driver_options` gains `network` (`KARYOS_NETWORK_OFF` 0 or
+    `KARYOS_NETWORK_ON` 1) and `reserved0`.
+  - ON runs the driver's network agents with their default configuration,
+    on their own threads, so its clients create `karyos:udp` publications
+    and subscriptions with the existing calls.
+  - An older caller's struct, and OFF, keep the IPC-only driver.
+  - Any other value, or a nonzero `reserved0`, is
+    `KARYOS_E_INVALID_ARGUMENT`, with nothing created.
+  - Only on and off are exposed. The rest of the network configuration
+    keeps its defaults, as with `karyosd --network on`, and the header
+    lists it.
+- The conformance suite adds the feature `embedded-network`, with
+  `driver.create_networked` and `$network_uri`, and the scenario
+  `op.embedded.network`. The suite still needs ABI 0.1.3; the feature
+  alone needs 0.1.4, and a 0.1.3 binding declares it absent.
+
+- The agent keeps a join metadata registry (karyos#736; Insights
+  ADR-0022: "Versioned metadata joins through a public, agent-visible
+  registry serve stable dimensions"). A product with the new role
+  `registrar` (or an administrator) puts versioned `name=value`
+  attributes about a driver's stream id, application trace point label or
+  application counter label with `join-put DIR KIND KEY NAME=VALUE...`,
+  and ends one with `join-retire`; any role reads the version in force at
+  an instant with `join-get DIR KIND KEY [AT_NS]` and pages them with
+  `join-list DIR [KIND KEY]`. Each version is valid from the agent's host
+  monotonic time of its put to the next put or the retire. Bounded, each
+  bound in `limits` (`join.*`) with a typed refusal: 1024 keys in all and
+  per driver, 4 versions per key, 16 attributes, 32-byte names, 64-byte
+  values, a 1024-byte `join-put` line, and a computed worst case of
+  6.5 MiB (`join.memory_bytes`). In memory only, with a
+  `generation` per agent start. A read gives what the agent observes of
+  the identity now: whether a trace point or application counter of that
+  label exists and how many clients hold it; for a stream, `null`, as no
+  driver cell carries a wire stream id. The `view` is unchanged; the
+  `capabilities` list gains `join-registry` and `join-put`.
+
+- Per-datum identity and sample time in the agent's data (R-CORE-17;
+  karyos#737). API v1 gains fields only.
+  - Each counter now carries `cell_registration`, `read_ns` (when the
+    agent read it) and `changed_ns`. `changed_ns` is the first pass in
+    which the agent saw the value change: an upper bound on the change,
+    which happened after the previous pass's `read_ns`. It is `null`
+    until a change has been seen.
+  - Each lane carries `sampled_ns`, the driver's sampling time of its
+    positions. Each subscriber carries `cell_registration` and
+    `changed_ns`, stamped with the agent's read in a pass that is not
+    consistent.
+  - A datum's identity is the driver instance plus its
+    `cell_registration`, which a region never reuses. A reallocation
+    under the same keys is a new series, and a new instance breaks
+    every join.
+  - The agent tracks changes by registration, in region order, with an
+    index for the cells that churned. A freed counter leaves no entry,
+    the tracking allocates nothing in a steady state, and a pass costs
+    O(cells).
+  - `consistent`, `sampled` and `age_ns` are unchanged.
+
+- Rate policy versions and run-time changes (R-CORE-21, karyos#740):
+  - `EmbeddedDriver::change_rate_policy` and
+    `change_aggregate_rate_policy` change a guarded stream's rate policy
+    by version (compare and set). `RateAuthority::Safety` takes only a
+    provable tightening (`RatePolicy::transition`); `Administrator` takes
+    any valid policy. No policy goes below the stream's control reserve,
+    in messages and, for a byte limit, in reserve messages of the largest
+    frame (each reserved message counted as a full frame). A change on one
+    lane of an aggregate of several lanes is a change of the aggregate:
+    its guarded lanes take it together or not at all, and each guard
+    audits it. The version, the transition and the policy's validity are
+    the publication's; each lane is weighed only against its own reserve,
+    and a lane whose reserve the policy would cross is
+    `DriverError::RateChangeOnLane` with `ReserveCrossed`, naming the lane
+    (`LaneRefusal::Change`), with the refusal's own CnC code. A publication has one
+    policy and one version, kept by the driver for its aggregate: a lane
+    guarded with no rate takes it, one guarded with the same policy joins
+    at its version, and one guarded with another policy is refused and
+    audited (`DriverError::RatePolicyConflict`, with both, code 25): only
+    a change changes it. The first lane guarded with a rate gives the
+    policy, at version 1, to the lanes guarded before without one, each
+    audited from no rate (version 0).
+    A handle with no copy (a rateless lane's, a remote one's before a
+    policy) watches its ring's slot and takes a policy published later
+    at its next call, its copy starting empty; the gate's slot is published with it. A lane guarded
+    without a rate on a publication with a policy is audited from no rate
+    to its version. A publication's stored policy goes with its last lane.
+    A retiring lane, guarded or not, refuses a change as retiring.
+    Unguarded lanes are left as they are. Refusals are `DriverError::RateChange` (`VersionMismatch`,
+    `NotATightening`, `ReserveCrossed`, `NoRate`) and
+    `DriverError::InvalidRatePolicy`, with CnC error codes 19 to 23 (23
+    `RateInvalidPolicy`) and 25 (`RatePolicyConflict`). A byte burst is validated against the largest
+    lane MTU.
+  - A change binds at once and never grants tokens: each bucket earns the
+    old rates up to the change, then its level is clamped to the new
+    burst (`RateLimiter::set_policy`). A byte limit added starts empty.
+  - The driver publishes the policy in each bound handle's outcome ring
+    (header words 6 to 12, reserved and zero in layout version 2, so no
+    version change) and in the sender gate's slot
+    (`karyos_sys::rate_policy_slot`, a sequence lock with a Loom model).
+    A handle's copy compares the slot's sequence word on every call (one
+    Acquire load) and applies a newer version before it answers; a network
+    sender gate at each serve. A handle in another process now takes its
+    rate copy from its ring when it binds (before, only an in-process
+    handle had one), or at its first call that reads the slot whole when a
+    publication was in progress at bind. A reincarnation publishes nothing
+    to the gate's slot, and an aggregate's change publishes it once.
+  - Every call that names a guarded stream, accepted or refused, is in
+    the guard audit: outcome `RateChanged` (ring code 5), or
+    `RateUnchanged` (ring code 6) for the policy in force, `before` and
+    `after` the policy versions, `parameters` the authority.
+
+- The `karyos` facade publishes its versions (R-CORE-33, karyos#752):
+  `karyos::CORE_VERSION`, the core release it was built from, and
+  `karyos::PROTOCOL_VERSION`, the admission protocol version its client
+  announces (defined in `karyos-client`, asserted equal to the protocol's
+  at compile time). They are the values the C ABI and a `libkaryos`
+  package's manifest publish, readable without the C ABI, as the Python
+  binding needs.
+
+- A configuration file for `karyosd` (R-CORE-43, karyos#769):
+  `--config <path>` reads the `[io]` table of SPEC 16.9 (TOML).
+  `backend` selects the I/O backend (default `sockets`) and `require`
+  the capabilities every endpoint must have active: one that lacks a
+  required capability fails to open, at startup or at the first add
+  that opens it.
+  `[io.sockets]` sets `tx_slots`, `max_queues` and `max_routes` of each
+  endpoint. `--io-backend` and `--io-require` override the file; the io
+  configuration needs `--network on`.
+- A backend this build does not have is refused with a typed error and
+  never replaced: `io_uring` and `af_xdp` are not built,
+  `ef_vi` and `dpdk` need `karyosd-native`. Any other key, table or
+  name is refused by name; a table error names its key or its line.
+- `karyos_tools::config`, the extension point: a backend implements
+  `IoBackend` and registers in an `IoSchema`, which parses and
+  validates its `[io.<name>]` table; `args::parse_with` takes the
+  schema and `Options::io` gives the table back. It re-exports `serde`
+  and `toml`, so a major version of either is a breaking change of
+  `karyos-tools`. Running another backend waits on R-CORE-27.
+- `NetworkConfig::require`: the capabilities every endpoint the driver
+  opens must have active.
+
+- The optional borrowed-term TX operation (karyos#771, R-CORE-45 part
+  2). `TxBackend::submit_borrowed` queues the frames of a `ReadLease` as
+  one datagram. Its default stages: it claims a frame, copies the lease
+  into it byte for byte as a copy read gives, commits it, and ends the
+  lease. The sockets backend, and every backend that does not borrow,
+  behaves as before. A refusal hands the lease back, still held, with a
+  typed `BorrowError`. A backend that borrows keeps its leases in a
+  `LeaseLedger`, allocated at creation for the sender's bound
+  (`LeaseLedger::new` reserves fallibly and refuses 0 or an impossible
+  capacity, typed `LedgerError`). A lease is released only when a
+  completion or a returned item proves the bytes are no longer
+  referenced. A reset (`begin_reset`) waits for every lease and past the
+  retirement bound reports `ResetDrain::Stuck`, counted once, keeping
+  the leases so their terms stay pinned. Leasing, staging and the
+  ledger's hold and release allocate nothing.
+
+- Read leases on committed term bytes (karyos#771, R-CORE-45 part 1).
+  `LogBuffer::install_leases` installs a bounded bank of lease words, on
+  the creating process's buffer only (an attached one is refused,
+  `SysError::LeasesNotOnAttached`). `SenderRead::lease_committed`
+  validates the frames a copy would carry and leaves them in the term
+  under a `ReadLease` instead of copying them. While a lease lives,
+  reclaim keeps its slot quarantined, so the term is never cleaned or
+  reused under it, across any rotation. Dropping the lease ends it with
+  one `Release` store, from any thread, with no lock and no allocation.
+  `ReadLease::copy_to` stages a lease byte for byte as `read_committed`
+  copies. A full bank, a padding or aborted record at the cursor, or a
+  reader that borrows its buffer (`&LogBuffer`) stages
+  (`LeaseOutcome::Stage`), with the cursor unmoved. `ReadLease` names no
+  buffer type: it holds its `Arc`-owned buffer as a trait object, with
+  no allocation, so a backend can keep leases of any buffer. `TermBytes`
+  is now `'static`. New counters: `leases`, `lease_bytes`,
+  `leases_staged`. The `loom_read_lease` models check that cleaning
+  never races a lease released on another thread, with a second lease
+  taken concurrently on the same term.
+
+- R-CORE-35 over the C ABI (karyos#794), ABI 0.1.3:
+  - `karyos_driver_startup_complete(driver, *complete)` declares the host's
+    startup complete. It writes 1, or 0 when `startup_timeout_ns` had
+    already passed.
+  - `karyos_driver_readiness(driver, *out)` writes a `karyos_readiness`:
+    the state (`KARYOS_READINESS_STARTING`, `_READY`, `_RECOVERING`,
+    `_NOT_READY`, `_FAILED`), the reason (`KARYOS_READINESS_REASON_*`),
+    and the uptime. The values are those of the admission protocol's
+    readiness probe. A `size` below 24 bytes is
+    `KARYOS_E_INVALID_ARGUMENT`; a larger one gets the fields this version
+    knows.
+  - `karyos_driver_options` gains `startup_timeout_ns`. Its default is 30 s,
+    and an older caller's struct gets that default; 0 is refused.
+  - Both calls work with or without `karyos_driver_start`.
+- `EmbeddedDriver::uptime` is public on every platform, and
+  `Readiness::wire` gives the probe's state and reason codes. The admission
+  server's probe answer and the C ABI share them.
+- The conformance suite needs ABI 0.1.3. It adds `driver.readiness.invoker`,
+  `driver.readiness.threaded` and `struct.size.readiness`.
+
+- R-CORE-34 follow-up (karyos#809): `DriverConfig::max_stream_bytes`.
+  - It is the most bytes one stream lane may take: its log buffer region
+    plus its conflation table's, by `karyos_driver::stream_lane_bytes`
+    (new, public).
+  - Every lane the driver makes is checked against it: `add_stream`,
+    `add_aggregate`, network publications, replay targets and a
+    reconfiguration's successor. A guard reincarnation keeps its stream's
+    geometry, so it stays within the cap.
+  - A larger one is refused with the new `DriverError::StreamTooLarge`,
+    and nothing is created.
+  - A configuration a buffer or a table refuses keeps its own error,
+    whether the cap is set or not.
+  - A C host's `karyos_driver_add_stream` gets
+    `KARYOS_E_INVALID_ARGUMENT`, with the lane's bytes and the cap in the
+    detail.
+  - A client's network publication above the cap is refused with the new
+    wire code `StreamTooLarge` (24); a C client gets `KARYOS_E_REFUSED`,
+    detail code 24.
+  - `None`, the default, bounds nothing; `Some(0)` is refused.
+- With the cap set, the sizing report adds two bounded figures and no
+  longer excludes added streams, replay targets or network publications
+  (`EXCLUDED_CAPPED`). A declared stream above the cap is refused.
+  Without it, the report is unchanged.
+  - The bounded figures assume no incarnation a guard close replaced is
+    still retiring (`BOUNDED_ASSUMPTION`), and the report says so.
+  - Bounded steady state: the regions that are not streams, the heap
+    budgets, and `max_streams` lanes at the cap.
+  - Bounded restart peak: bounded plus every lane's retained generations
+    at the cap.
+- `karyosd --max-stream-bytes <size>`. It rejects 0.
+- `LogBuffer::<SharedTerms>::structure_length` and
+  `ConflationConfig::structure_length` are available on every platform.
+
+- `karyos_driver_options.max_stream_bytes` (ABI 0.1.5, karyos#818): the
+  R-CORE-34 stream cap for a C host. 0, the default and an older caller's
+  struct's, sets no cap.
+  - `karyos_driver_add_stream` above the cap is `KARYOS_E_INVALID_ARGUMENT`
+    with the lane's bytes in `code` and the cap in `value`.
+  - A client's `karyos:udp` publication above it is `KARYOS_E_REFUSED`,
+    detail code 24.
+  - `karyos_driver_options` is 80 bytes.
+- The conformance suite adds the feature `stream-cap` (floor ABI 0.1.5),
+  with `driver.create_capped` and the scenario `op.stream.cap`; the suite
+  itself still needs 0.1.3.
+
+- Forward-compatible CnC refusal codes (karyos#819): an `Error` response
+  whose code this peer does not define is read as a refusal,
+  `ErrorCode::Unknown(UnknownCode)`, with its code and detail kept,
+  instead of an undecodable response that left the request to time out.
+  New public API: `ErrorCode::Unknown`, `UnknownCode` (its wire value,
+  built only by the decoder), `ErrorCode::from_wire`,
+  `ErrorCode::is_defined`, `ErrorCode::ALL` and `ErrorCode::HIGHEST`.
+  Codes 0 and `u64::MAX` stay reserved. `ErrorCode::Unknown` re-encodes
+  to its own wire value. The defined codes are one table, from which
+  `code()`, `from_wire` and `ALL` are generated, so a new code cannot be
+  left undecodable. A C client gets `KARYOS_E_REFUSED` with the raw code
+  in `detail.code`. The driver never sends an undefined code (a debug
+  assertion checks it in debug builds). The admission `VERSION` stays 3;
+  RELEASING.md requires this change in the next release.
+
+- The conformance op `subscription.await_image` and its feature
+  `image-wait` (karyos#830, added by #835): it waits, serving every
+  client, until a subscription has reported `count` images. Each round
+  reads the pending image changes and answers the first that holds, in
+  this order: a failing `karyos_subscription_next_image_change`'s status;
+  `ok` once `count` is reached, even when changes were dropped; then, and
+  only then, a failing `karyos_subscription_image_changes_lost`'s status;
+  `events_lost` for a cumulative lost count above 0; `timeout` past the
+  deadline. Every runner answers the same; the Rust runner and its
+  precedence test share one function.
+
+- `ContextBuilder::attach_timeout` (and `Context::attach_timeout`): the
+  longest wait per message of `Client::connect`'s attach, apart from a
+  control call's timeout, which it defaults to; once attached, the
+  session's fetches of a grant's regions wait the call timeout again. A
+  client whose calls time out fast need not attach as fast.
+  `karyos_client::ipc::attach_with` takes both, and
+  `karyos_sys::ipc::set_timeouts` and `receive_timeout` set and read a
+  socket's (karyos#851).
+
+- `NetworkConfig::endpoint_tables` (`EndpointTables`) sizes each
+  endpoint the driver opens: TX slots, queues and routes (defaults 256,
+  64, 64).
+- `NetworkPublicationState::Limited(EndpointLimit)`: accepted, but its
+  sender's open is refused for an endpoint limit; it sends nothing until
+  it opens. The sender reports it with `AgentEvent::PublicationLimit`,
+  once per epoch, and its end at the open.
+- `SocketsTx::commitment` (`TxCommitment`): what a TX half has open.
+
+- `bindings_adopted` and `bindings_adoption_refused` sender counters: an
+  SM from a second source of a bound receiver adopts a binding of its
+  own, at most `MAX_PATHS - 1` per binding an answer created, removed
+  with it; one more is refused and leaves no state.
+
+- The driver publishes each stream lane's wire `stream_id` and its
+  publications in the counters region (karyos#885), so a tool can tell
+  which wire stream a lane carries and count its publishers. Each lane
+  has a `stream wire id` gauge, with the lane's stream keys, whose value
+  is the `i32` id zero-extended (`karyos_sys::counters::wire_stream_id`
+  reads it back, a negative id included), and an `embedded publications`
+  gauge counting the embedding program's live publication handles on it,
+  a pending cutover's included. Each client publication has a
+  `publication` gauge keyed `KIND_PUBLICATION` with its registration id,
+  whose value is its client's id. A lane's publications are its
+  `publication` cells plus its `embedded publications`. All are kept by
+  the positions pass and change no layout version; at the default limits
+  the default region holds every cell.
+
+- `AgentConfig::max_destinations`, the most destinations of one
+  multi-destination publication: 1 to 64, default 16 (MD-6;
+  karyos#889). Every per-destination share of the repair tables divides
+  by it (MD-8), and a publication answers `Full` past it. A value
+  outside 1 to 64, or above the endpoints' `max_routes`, is refused at
+  driver start with `DriverError::MaxDestinations`, and a repair table
+  with less than one entry per destination with `InvalidConfig`. The
+  constant `MAX_DESTINATIONS` is replaced by `DEFAULT_MAX_DESTINATIONS`
+  and `MAX_MAX_DESTINATIONS`.
+
+- A dynamic subscription's registration is visible to its application
+  (#941): `EmbeddedDriver::network_registration_state` returns
+  `Registering`, `Announced`, `Refused` (an ERR REGISTRATION from
+  `control`) or `Bound`, and the receiver publishes the CnC cells
+  `registers sent`, `registers unsent` and `registration refusals
+  received`. They are appended to the receiver's cells, so the ids of the
+  cells allocated after them move by three; readers find cells by label.
+
 ### Changed
 
 - `ConflationConfig` gains `refresh: bool` (ADR-0080, karyos#634), with
@@ -263,6 +1278,255 @@ release may break APIs, wire formats and shared-memory layouts.
   reliable channel never closes by that timer and is not checked. Decided
   2026-10-27 by QS-COORDINATOR under owner delegation (karyos#658).
 
+- `karyos-feed` depends on no crate (it depended on `karyos-client`), and
+  `karyos-bench` and `karyos-tools` no longer declare it: neither used it.
+
+- The C5 harness's linearizability check holds the test service's state
+  as a shared log (karyos#687): a step shares the earlier values instead
+  of copying them, and the search's memo hashes a state by its length and
+  digest while comparing states value by value, so a digest collision
+  never makes two states equal. A W2 burst of 4,096 client sessions is
+  checked in about 7 s in a release build, where the copying model took
+  over 10 minutes.
+
+- Trace export (R-CORE-13, follow-up to the #826 review): when the page's
+  first record's journal stays busy past the wait, all of that journal's
+  records in the page go out `unreadable`, not only its leading run, so a
+  stuck entry costs one wait per page instead of splitting pages into
+  runs; the page ends at the first record of another journal left unread.
+  The trade-off: those records are uncalibrated, even the ones the entry
+  would have calibrated had it come free. The recycle log has its own
+  1 ms wait after the table's, each part retrying its busy entries at
+  least once and overrunning its wait by one yield and one read at most,
+  so a stuck table entry no longer leaves the log unretried. Known limit:
+  the agent remembers no stuck entry across requests (that needs the
+  entry's version word in the reader API), so each request whose records
+  name a journal not found while an entry is stuck waits again, about
+  1 ms for each part that holds a stuck entry. `TraceMirror::hold_log`
+  (karyos-sys `test-hooks`) holds a log entry mid-write.
+
+- `GuardRate` and `AuditOutcome` are `#[non_exhaustive]` (karyos#740).
+  Build a `GuardRate` with `GuardRate::publication(policy)` (or
+  `GuardRate::scoped(scope, policy)`) and `.with_reserve(rate)` for the
+  new control reserve; a reserve the policy itself crosses is refused at
+  `guard_stream`. `GuardSpec` has a new `policy` field, the gate's slot.
+
+- The driver validates a policy's control reserve against the same
+  aligned charge as its byte burst, the MTU aligned as a frame: on an MTU
+  that is not a multiple of 32 the reserve's byte floor is higher than
+  before (for an MTU of 1400 and a reserve of 10 messages a second, 14 080
+  bytes a second rather than 14 000).
+- A policy a sender gate refuses is applied as the stricter of it and the
+  policy in force, unvalidated on purpose: a byte bucket no datagram fits
+  holds the lanes until a valid version (fail closed). Docs only; the
+  behaviour is #841's.
+- The CnC counter docs size the region for 6 cells per network
+  publication (`network admission` and `network rate policies refused`
+  added), not 4.
+
+- The binding conformance suite's `FORMAT.md` states the version rule
+  for a runner with no ABI version (karyos#751, decided in
+  quantstratum-docs#498). Such a semantic runner checks
+  `karyos::CORE_VERSION` and `karyos::PROTOCOL_VERSION` against the
+  core release and protocol version it pins, before any other call;
+  compares each scenario's `abi` with the ABI version its pinned core
+  release declares; and answers `op.library.version` with the core
+  release and protocol version, required from step B1 (at B0 it is `later`, the one `later` its B0 release allows). The release rule
+  "no skip" reads "at the core release it targets" for that runner. The
+  C ABI runners are unchanged.
+
+- Backend contract (R-CORE-44, karyos#770): `ReturnReason` gains
+  `NeighbourUnresolved` and `NeighbourTableFull`, which a backend that
+  resolves neighbours itself (a native backend in exclusive mode) returns
+  from a flush with the frame intact, never exposed. `ReturnReason` is now
+  `#[non_exhaustive]`: the backend contract types have no stable contract
+  version yet (R-CORE-26), so a backend's exhaustive `match` over it needs
+  a wildcard arm. Sockets never return either reason; the driver counts
+  them as any return.
+
+- Item 57's audit findings (karyos#777). `karyos::ConflatedBudget`
+  (`karyos_sys::conflation::Budget`) is built with `Budget::new(keys,
+  retries)` and is `#[non_exhaustive]`, so a later bound is not a breaking
+  change; a struct literal outside its crate no longer compiles. Both
+  arguments stay valid at 0, as before: `keys` 0 makes a poll a no-op,
+  `retries` 0 counts as one. The facade re-exports `Overrun` and
+  `SnapshotFailed` at its root beside `SnapshotSource`, so an application
+  implements the trait from `karyos` alone (`Overrun` stays under
+  `karyos::embedded` too), and the trait's doc states that a method added
+  later comes with a default body (owner item 41).
+
+- A C host that never calls `karyos_driver_startup_complete` reads
+  `KARYOS_READINESS_FAILED` once `startup_timeout_ns` (30 s by default)
+  has passed. Nothing else in the driver depends on it.
+
+- The Cluster's log entries are schema 2 version 1 (SPEC §8.5;
+  karyos#797), over the ADR-0036 envelope of `karyos-codec`, instead of
+  the unreleased internal version 1 envelope.
+  - `karyos_cluster::service::Envelope` encodes and decodes the five
+    templates (`Register`, `Close`, `Request`, `TimerFired`,
+    `Configuration`) with their value rules and bounds; `to_vec` now
+    returns a `Result`.
+  - `ApplyError::Envelope` carries the codec's error. A payload that is
+    not a schema 2 message is a safety stop: every replica stops at the
+    same index.
+  - `EnvelopeError` and `ENVELOPE_VERSION` are removed.
+
+- `make pre-push` gains `lint-linux`: clippy for `aarch64-unknown-linux-gnu`
+  with every feature, so Linux-only code is checked before a push from any
+  host (RELEASING.md; a follow-up of karyos#798). The conflation tests'
+  Linux-only module builds its configurations with
+  `ConflationConfig::new`, so a field added later no longer breaks it, and
+  the ignored probe measurement may print its quantiles.
+
+- Multi-destination unicast repairs within the configured tables, and
+  catches each destination up alone after an endpoint reset (MD-8, MD-20,
+  karyos#802).
+  - **The reset:** a reliable publication no longer rewinds its shared
+    readers and resends to every destination. Each destination gets, per
+    lane, one repair job over what it lacks:
+    - it starts where its own submissions stop, at its `high`, or lower
+      where a head was returned unsent earlier in the epoch (a later
+      submitted head would otherwise pass that hole);
+    - it ends at the readers' position;
+    - nothing goes to a destination that already has it.
+
+    The job takes a slot in the destination's share with no admission and
+    no ERR. What it submits is the destination's: as the backend submits
+    it, the destination's frontier advances, so its NAKs, the retention and
+    a later reset start from there. A full share leaves the catch-up waiting
+    to be tried again from its start past the floor, and
+    a part below the retention floor is counted lost
+    (`catch_ups`, `catch_ups_full`, `catch_up_lost` in the repair counts).
+    Nothing else changes for that part: the receiver NAKs the gap, gets
+    the usual ERR `RangeUnavailable` and applies its gap policy, as for any
+    NAK below the floor. The rewind it replaces never went below the floor
+    either.
+  - **The tables:** the ERR linger entries, the job linger entries and the
+    step 8 replies are now shared out per destination as the job table is,
+    `value / max_destinations`. A value below one entry per destination is
+    refused (`RepairConfigError::TableShare`). The tables of every
+    destination together stay within the configured ones, and the sender's
+    reply list holds every destination's ERRs, so none is dropped for room.
+
+- A late multicast subscriber binds faster under loss (karyos#839, plan
+  164). An unanswered SOLICIT is retried by the receiver's duty after 50
+  ms, the wait doubling up to `setup_challenge_timeout`, for at most 6
+  SOLICITs within twice `setup_challenge_timeout` of the first; each
+  retry carries the entry's nonce, so an answer to any of its SOLICITs
+  binds within that window, as for a resent CHALLENGE. A retry the
+  RSP_SETUP rates refuse is not an attempt (`solicit_retries_refused`).
+  Measured on Linux netem, 200 late joins: the p99 bind time is 53 ms at
+  2% loss, 153 ms at 10% and 353 ms at 20% (about 2 s, 4 s and 8 s
+  before), and back-to-back joins show no 2 s steps (p99 153 ms). At an
+  RTT of about 200 ms and 2% loss a join takes about one RTT (median 201
+  ms, p99 251 ms).
+
+- The driver takes a remote client's `Leave` with a fetch outstanding (a
+  fetch whose reply the client abandoned, or exports it has not detached)
+  as a clean leave, not a protocol error (decided by QS-COORDINATOR,
+  karyos#851): the client is no longer served, what was exported stays
+  charged until its exit proof, and the new fixed counter `fetches
+  abandoned at leave` counts it; `clients faulty` no longer does. This
+  touches the admission code of karyos#831 (`Leave` acceptance).
+
+- Follow-up to the #852 review (R-CORE-21): a reincarnation's network
+  sender gate starts its bucket as if empty when the reincarnation began
+  (`GuardSpec::empty_since`, the time its handles' rings carry), not when
+  its agent took the guard, so the gate and the handles' copies agree.
+  `EmbeddedDriver::backdate_next_reincarnation` is behind the new
+  karyos-driver feature `test-hooks`, never in a release build. The
+  `REINCARNATED_AT` docs name what orders the word before a handle reads
+  it and what a reader in another time namespace sees.
+
+- API: `NetworkPublicationState` is not `#[non_exhaustive]`, so its new
+  `Limited` variant breaks an exhaustive `match` in client code, and
+  `NetworkConfig` gains a public field, which breaks a struct literal
+  without `..NetworkConfig::default()`.
+
+- A network endpoint's tables default to 1024 TX slots, 256 queues and
+  128 routes (were 256, 64 and 64; karyos#859, plan 168): about 110
+  reliable single-lane publications per endpoint instead of 24, for
+  about 1.5 MiB per endpoint (1448 bytes per slot, 64 per queue and
+  192 per route on Linux). Decided 2026-10-29 by QS-COORDINATOR under
+  owner delegation: 24 publications per endpoint was too low for the
+  core, and 1.5 MiB per endpoint is acceptable on a server. `NetworkConfig::endpoint_tables` sets them.
+  The driver's own caps now bind first for single-lane publications:
+  `AgentConfig::publications` (64 network publications) and
+  `max_streams` (64 local streams, one per lane); an endpoint's tables
+  bind first only for multi-lane ones (a four-lane reliable publication
+  takes 33 slots, 30 per endpoint).
+
+- A SOLICIT for DATA that arrived on a multicast receive endpoint now
+  leaves from the driver's unicast control endpoint of its address
+  family, opened with the first multicast subscription and closed with
+  the last (karyos#873, plan 169). The drivers of one host, which share
+  the group port, are no longer one source to the publisher's
+  `setup_answer_rate`. A unicast subscription's SOLICITs leave from its
+  own endpoint, as before.
+- The sender binds a receiver by its boot id: an SM matches its binding
+  by sender endpoint, alias, boot id and incarnation, and the first
+  accepted SM sets the binding's SM source, which never changes; NAKs,
+  ERRs and RTTMs match and reply on it. In the trusted profile the boot
+  id, not the source address, ties an SM to the receiver that solicited.
+
+- The wire compatibility matrix's admission entries say why the refusal
+  still names no driver version between 0.1.0-alpha.2 and main
+  (karyos#879): a main driver states its version, but a 0.1.0-alpha.2
+  client does not read it and a 0.1.0-alpha.2 driver states none.
+
+- A driver that refuses a client's, tool's or probe's protocol version
+  now states its own in the refusal (karyos#879): word 1 of `Refused`
+  with `INCOMPATIBLE_VERSION`, 0 before, is the refuser's version. The
+  layout and its length are unchanged, so every client of every version
+  decodes it as before. `AttachError::IncompatibleVersion { driver }`
+  and the C ABI's `detail->value` report it; a refusal of
+  0.1.0-alpha.2 or earlier states none and still reports 0. Read it
+  with `Message::refuser_version`, build it with
+  `Message::incompatible_version`; word 1 of every other refusal stays
+  the fetch id.
+
+- A sockets TX half dropped outside unwinding with pending items no
+  longer panics in a debug build (karyos#880). It is counted in
+  `tx_discarded_on_drop` in every build, as release builds did, and
+  remains a driver bug: `reset` and `retire` are the shutdown paths.
+  The default-interface multicast test retires its nodes on every skip
+  path, an item left pending included, so a host without a multicast
+  route records a skip.
+
+- The agent's join registry observes `stream` entries (karyos#885):
+  `present`, `holders` and `shared` count the publications of every
+  lane whose `stream wire id` cell names the entry's key, a client's
+  `publication` cell each plus the lane's `embedded publications`. They
+  stay `null` while the driver is not attached, before its first
+  positions pass, and while `counters unavailable` is nonzero, so a
+  shared stream is never shown unshared; a count that would overflow
+  is unknown too.
+
+- The agent's join registry follow-ups (karyos#893). A `join-list`
+  cursor is checked as a key, as `join-get` checks one: a malformed or
+  oversized cursor is refused. The registry's version number,
+  `history_dropped` and `evicted` counters refuse a put that would pass
+  `u64::MAX` with `{"error":"counter overflow"}`, and a refused put
+  changes nothing (SPEC §14). `join.memory_bytes` is now a true bound,
+  7 208 960 bytes: the counting allocator measures a registry filled to
+  every bound at 7 057 552 bytes held, which the earlier 6 864 896 did
+  not cover. Property tests cover the join request parser, the
+  registry's bounds and the exporter's token check. The exporter answers 400 to a head with a header line that is not
+  UTF-8, instead of reading only the headers before it, where an earlier
+  `Authorization` could have been taken for the last one.
+
+- CI checks RustSec advisories with `cargo deny check advisories` in a new
+  `Advisories` job, separate from the `Licences and sources` job so an
+  advisory database update does not hide licence, ban or source results.
+  `make pre-push` stays offline (karyos#933).
+
+### Removed
+
+- The unused `karyos-feed` and `karyos-bench` aliases in the root
+  `[workspace.dependencies]`, which made Cargo warn
+  (`cargo::unused_workspace_dependencies`) under the pinned Miri
+  toolchain (karyos#901). No member used either.
+
 ### Fixed
 
 - The alpha.2 release notes stated that "A conflated view closed at
@@ -270,6 +1534,434 @@ release may break APIs, wire formats and shared-memory layouts.
   implemented until this change. That limitation's two halves, the missing
   recreation test and the missing duty period check, are both closed here
   (karyos#658).
+
+- The test kit's `karyos_test_panic_next_duty_cycle` arms its fault
+  inside the driver table's guard (karyos#699). A close racing the arm
+  either comes after it and disarms it, or makes the arm fail with the
+  handle's error; the fault is never left armed on a closed driver.
+
+- Rate policies at a reincarnation (R-CORE-21, follow-up to the #841
+  review): a handle bound to a reincarnation of its publication (an
+  incarnation past the first), in process or remote, starts its rate copy
+  empty at the time the reincarnation began and has earned since, as the
+  reincarnation's sender gate has: reincarnating buys no new burst, and a
+  handle bound later is not stricter than the gate
+  (`GuardBinding::reincarnated_at`, decided by QS-COORDINATOR). The driver
+  writes that time, host monotonic nanoseconds, in header word 13 of each
+  handle's outcome ring (`outcome_ring::REINCARNATED_AT`, reserved and zero
+  before, so no layout change); a handle that reads 0 (the first
+  incarnation, or a driver that predates the word) starts empty.
+
+- The netem test N6 no longer fails intermittently (karyos#790). A
+  multicast subscriber that missed the SETUP binds through a SOLICIT. A
+  lost SOLICIT or challenge is retried only after the setup timeout and its
+  holdoff, and under netem loss that could take longer than the publisher
+  took to offer its 1000 messages. The image was then installed at the
+  head with nothing left to read, and the test waited for a message that
+  never came. The protocol behaved as specified: the test now publishes
+  500 messages past the later of the two installs. The new
+  `n6_a_late_multicast_subscriber_reads_the_stream_from_its_join` joins
+  one subscriber after the first 1000 messages, and fails without the
+  tail.
+
+- The IPC descriptor count test no longer fails intermittently
+  (karyos#804). It counted the driver process's descriptors after the
+  warm-up client exited, but the thread draining that client's stderr
+  closes its pipe at end of file, asynchronously. When the thread was
+  late, the first count included the pipe, which then closed during the
+  rounds, and the second count was one lower. The test now waits for the
+  drain thread before each count. A failure names the descriptors that
+  appeared or went.
+
+- An unreliable lane now reports a lost tail as a local gap (karyos#806).
+  When the last messages were lost and the sender went idle, only its
+  heartbeat showed the tail, and the receiver ignored it: the loss was a
+  silent hole, and N1 failed about one run in thirty. A fresh heartbeat
+  above the covered end now opens a hole up to its position, never past
+  a recorded terminal bound, and sealed as `ReorderExpired`.
+- Each lost range ages from the moment it was revealed. When an open
+  hole grows, through a higher heartbeat or DATA above it, the new part
+  has its own detection time and its own `gap_reorder_timeout` deadline,
+  and the older part keeps its own. Each part is sealed at its own
+  deadline with its exact range: data of a newer part that arrives
+  before its deadline is delivered, and a hole that keeps growing still
+  seals its oldest part on time. Data that arrives before a part's
+  deadline leaves nothing of it to seal. A reliable lane still NAKs its
+  tail.
+- This covers single-path publications. A redundant-path publication's
+  `PATH_HB` names no position, so an unreliable redundant-path image
+  still cannot see a lost tail.
+
+- Follow-up to the #814 review (R-CORE-21, karyos#740):
+  - A network sender gate built for a lane guarded with no rate creates
+    its bucket from the first policy published to its slot, so a rateless
+    lane's publication getting a policy is limited at the gate too, not
+    only in its handles. Positions such a gate let through before are
+    exempt: never charged, never refunded into the adopted bucket, and
+    never charged again for another route's copy.
+  - A bucket created for a policy taken at run time, the gate's or a
+    handle's copy, starts empty (`RateLimiter::empty`): a change never
+    grants tokens. A handle that binds to a policy in force, read whole,
+    starts full, as a lane guarded with it does; one whose read at bind
+    found the policy being written starts empty. A reincarnation's gate
+    starts its bucket empty (`GuardSpec::full`), so reincarnating never
+    buys a new burst.
+  - The driver validates a byte burst against the largest charge its
+    sender gate does, the MTU aligned as a frame (it used the MTU), so a
+    policy it accepts and audits is never one the gate refuses. Were the
+    gate to refuse one anyway, it fails closed: it limits with the
+    stricter of that policy and the one in force, counted in the new
+    per-publication CnC cell `network rate policies refused`, which the
+    agent reports.
+  - A gate built for a publication whose policy changed starts from the
+    policy in force. Freeing retired streams drops the freed
+    publications' stored policies in one pass over the lanes left.
+    `GateCounts` is `#[non_exhaustive]`.
+
+- Multi-destination unicast, the follow-up of its run-time destinations
+  (karyos#822, plan 157):
+  - A publication removed before the sender's next duty now closes the
+    routes and queues of the destinations retired since that duty's
+    drain; they used to stay open until an endpoint epoch change.
+  - A removed destination is retired as a removed publication is: its
+    removal is reported in the cycle it happens, whatever the state of
+    the publication (served or not, established or not) or of its
+    queues (an endpoint reset included), and it is retired at that
+    report, with its quarantine counted from its removal (MD-14). Its
+    route and queues go to the sender's close list: items still pending
+    in its queues come back as `QueueClosed` and are counted in
+    `removed_returned` and `removed_closed` (both now cover retired
+    destinations too). Handles of an epoch older than the publication's
+    died with that epoch and are dropped. The report hands its route and
+    queues to the close list, which frees its slot for the next cycle's
+    commands; that cycle's duty closes them before it opens any new
+    route or queue, so a new destination never opens beside an old
+    route. While the conductor's event ring was full, remove and add
+    churn grew the per-destination state past `MAX_DESTINATIONS` and
+    allocated on the duty path; an addition now answers `Full` instead,
+    and a move at capacity retried after the removal shows in
+    `network_removed_destinations` finds the slot free. A removal, a
+    refused addition, a report with its retirement and the drain allocate
+    nothing; only an accepted addition does. A close entry whose
+    endpoint's TX half is not held at its duty (the half is in a reset,
+    which drops the handles, or retired), or is of another epoch, is
+    dropped and counted once (`removed_dropped`); a handle already gone
+    counts as closed. An entry whose queue still has frames in flight is
+    closed again at each duty (`removed_close_deferred`) and counts as
+    failed only on a close error or after `CLOSE_IN_FLIGHT_TIMEOUT` (1 s)
+    in flight (`removed_close_timeouts`): a kernel backend shows no
+    progress on frames it holds, so a cycle count would fail closes that
+    are only slow. One that finds no room to wait stays in the close
+    list for the next duty (`removed_close_overflow`), never failed; one
+    with a live handle the endpoint will not close is counted once
+    (`removed_close_failed`). When that endpoint then refuses a route or
+    a queue for its limit (`RouteLimit`, `QueueLimit`, `OverCommitted`),
+    on any open path, in the same epoch, its reset is asked for once,
+    tagged with that epoch; the served reset starts a new epoch, which
+    drops what did not close. The endpoint table keeps this standing
+    request while the endpoint is not active or within its interval, and
+    serves it once in that epoch; with its command ring full it is
+    counted refused once and tried again at most once per endpoint
+    interval (`standing_retries`); an agent gone, or a new epoch, drops
+    it (`standing_dropped`). An ordinary request refused meanwhile leaves
+    it kept. Other reset requests are dropped then, as before,
+    and asked again by their owner while the need holds. Without a
+    failed close in the epoch the limit is an ordinary refusal and
+    resets nothing. With the
+    quarantine full, the record removed earliest makes room, the
+    incoming one included; an incoming record already past its
+    quarantine is not kept.
+  - A route table, queue entries or TX slots that other publications
+    filled (`RouteLimit`, `QueueLimit`, `OverCommitted`) no longer count
+    as the destination's own fault, so an optional destination is not
+    removed for them. They are counted in the new `endpoint_limits`
+    counter; a reset or a stale handle is not.
+  - A destination whose open failed is retried once per
+    `setup_interval` in that epoch, at once in a new one, instead of on
+    every serve.
+  - A publication whose initial destinations are not all of the shared
+    endpoint's address family, or whose endpoint address is unknown, is
+    refused at creation (design 3.1). An unknown address is no longer
+    taken for IPv4.
+
+- With `max_stream_bytes` set, a conflation table the driver refuses (a
+  value capacity past `u32`) keeps its own `InvalidConfig` on
+  `add_stream`, `add_aggregate` and a reconfiguration, instead of
+  `StreamTooLarge` (karyos#824).
+- A client's network publication above the cap is refused with CnC code
+  24 and the lane's bytes in the detail; a C client reads them in
+  `detail.value` (karyos#824).
+- `stream_lane_bytes` is `None` for a conflation table that a stream
+  refuses, and the sizing report refuses such a stream as an invalid
+  conflation configuration, with or without the cap. For every stream it
+  accepts, the report's text without the cap is unchanged (karyos#824).
+
+- Follow-up to the #831 and #837 reviews (karyos#827, karyos#824):
+  - The drain of a remote client found gone reads a 0-byte datagram
+    queued before its close as a datagram, not as the end of the stream,
+    so the `Detach` behind it is served.
+  - A failed `poll` of the peer reads as hung up: a real end of file is no
+    longer taken for empty datagrams.
+  - A closed client that gives no exit proof counts as faulty after its own
+    bound (1 s), not `fetch_deadline`, and the driver logs a diagnostic
+    naming the client.
+  - A skipped `ECONNRESET` no longer takes a datagram of the drain's bound.
+  - A closed client's time is the step's clock reading, and the exit
+    check runs once per drain.
+  - `karyos.h`'s `karyos_client_add_publication` says that an unsupported
+    channel (CnC code 13) leaves 0 in `detail.code` and the stream id in
+    `detail.value`, and an ABI test pins it.
+  - The sizing report checks the stream cap with the driver's own check.
+
+- An IPC driver now reads what an exited client queued on its admission
+  socket before its exit proof releases it (karyos#827). A `Detach` the
+  client sent before exiting ends its grant as a detach, so "grants
+  detached" no longer misses it.
+  - Only messages that release something are served; a queued `Fetch` is
+    dropped.
+  - An exited client is drained instead of served, never after its
+    turn, so nothing is fetched or sent for it.
+  - A client whose socket closes (end of file, `EPIPE` or `ECONNRESET`)
+    before its exit is visible (Linux closes a dying process's
+    descriptors first) is drained the same way, then retired, not as
+    faulty, its slot charged until its exit proof: the new counter
+    "clients closed before their exit". The end of file is confirmed with
+    `POLLRDHUP`, so a 0-byte datagram from a live client stays a protocol
+    error. A closed client with no exit proof within `fetch_deadline` then
+    counts as faulty, and its slot stays charged until its exit proof.
+  - The drain reads at most 1024 datagrams, the driver's own bound, and
+    at most 8 exited clients are drained in one admission step.
+  - Messages queued for the exited client are dropped unsent.
+  - New driver counters: "grants released at exit" (grants whose
+    descriptor left and that the exit ended), "fetches dropped at exit",
+    "admission messages dropped at exit" and "admission messages not sent
+    at exit" (each at exit or at a close before it), and "clients closed
+    before their exit".
+
+- A redundant-path publication's idle lane now sends the idle DATA
+  heartbeat on every path that can send (karyos#834), as a single-path
+  lane does on its one. Each path waits a whole interval after its own
+  last DATA or heartbeat, and while any path holds a copy of the lane (its
+  socket full, or returning to the live set; a path whose endpoint's half
+  is not held at the epoch it opened in bounds nothing, as it can send
+  nothing) every path's heartbeat stops at that copy's
+  position: it never announces a position a held copy would still bring,
+  and still reveals a tail lost below it. A tail above a copy held for
+  long is revealed once the copy goes. PATH_HB still keeps each path's
+  binding live (RP-3). A tail lost on every path is now revealed: a reliable image
+  NAKs it, and an unreliable one seals it as a local gap at the reorder
+  deadline, with its exact range. A tail lost on one path still arrives
+  by the other. The cost while idle is one 32-byte frame per lane per
+  path per `sender_heartbeat_interval`: N lanes over P paths send N × P
+  frames each interval.
+
+- Skip policy follow-up to karyos#821 (part of karyos#834). On an
+  unreliable channel a data hole's part is seen up to the heartbeat's
+  mark as well as the covered end, so a tail above a data hole ages from
+  when the mark showed it. The receiver feeds every lane of an image up
+  to its `lane_count` to the skip policy, each mark clamped to the
+  lane's terminal bound. A reliable image's hole the receive owner cannot
+  compute, a data hole or a heartbeat's tail, is counted in the new
+  `hole_query_errors` receiver counter instead of being dropped
+  silently, and a heartbeat mark off a frame boundary is rejected as an
+  invalid gap. Tests cover the parts past their
+  capacity, the clamped tail seal at the driver, and both seals of a
+  tail across a term end.
+
+- The sender's control routes take part in the #838 rule. A control
+  route or queue refused for the endpoint's limit (`RouteLimit`,
+  `QueueLimit`, `OverCommitted`), or a control route that will not
+  close, counts as the data paths' do, so the endpoint's standing reset
+  is asked for. An evicted control route whose queue still has frames in
+  flight keeps its place in the cache, sends nothing more, and is closed
+  again at each sender duty; it counts as a failed close only on a close
+  error or after `CONTROL_CLOSE_TIMEOUT` (1 s) in flight
+  (`close_timeouts`), and a burst of controls changes nothing of that.
+  At most `control_routes` routes are open and as many closing, within
+  the capacity allocated at creation. An ANNOUNCE refused while every
+  cached route is closing waits in order and goes at the next send or
+  duty, so every destination gets it: at most one waits per destination
+  and publication, a later one replacing it in place, within room
+  allocated at creation (`publications` × 16 per endpoint), so none is
+  dropped. The new `controls_waiting` sender counter counts them. Any
+  other control refused then is dropped and counted by kind
+  (`blocked_status`, `blocked_naks`, `blocked_setup_answers`,
+  `blocked_other`): SMs and NAKs are sent again periodically, and a
+  SETUP answer is solicited again by its peer. A destination removed, or
+  a publication removed, purges the ANNOUNCEs waiting for it. Open and
+  closing routes together stay within twice `control_routes`, allocated
+  at creation: a further destination is refused then, and no route is
+  ever given up as failed to make room.
+
+- Close and reset follow-ups to #838 and #849 (karyos#847).
+  - Each failed control close is counted: `ControlRefusal::close_failed`
+    is now a count, not a flag, so `removed_close_failed` counts every
+    one.
+  - A control route in flight uses the data paths' grace rule: a clock
+    that steps back is no time elapsed.
+  - Controls waiting when the endpoint moves to a new epoch are counted
+    in `waits_dropped`.
+  - A plain control send drains the waiting controls first and is
+    refused (`Blocked`) while one to its destination still waits, so a
+    receiver never sees a control before the ANNOUNCE it refers to.
+  - A removed publication's route that the full close list cannot hold
+    is recorded as its endpoint's close failure, so the standing reset
+    drops it; it is still counted in `removed_unrecorded`.
+  - A standing reset the ring refused and then dropped counts once in
+    `resets_refused`.
+  - A fault while the endpoint is not active doubles the next reset
+    interval only while the last reset's interval still runs.
+  - The control routes' counters are checked: an overflow sets
+    `overflowed` and keeps the last value.
+
+- A remote client whose fetch of a grant's regions timed out abandons that
+  fetch, not its session: the manifest, arriving late, is drained at the
+  next fetch (its regions closed and their exports detached), and the next
+  fetch then reads its own reply. Before, the late manifest could be read
+  as the next fetch's reply, which left the session out of step
+  (karyos#851). A region that does not arrive still leaves the session
+  out of step, now after the regions received are detached.
+
+- A remote client releases a late grant even when the fetch that takes it
+  times out (karyos#851). Before, the take failed, the release was not
+  counted, and what the abandoned fetch exported stayed held until the
+  client's next fetch drained it. Now `Client::poll` drains abandoned
+  fetches without waiting (`RemoteClient::drain_abandoned`), so their
+  exports are detached at once, and the release removes the grant's
+  registration itself. The remote late-grant tests also retry a request
+  whose fetch timed out under load.
+
+- A remote client whose fetch times out after its manifest, while its
+  regions are arriving, abandons that fetch with the regions still to
+  come instead of leaving its session out of step (karyos#851): the
+  regions that arrived are detached at once, and those that arrive later
+  are drained one at a time, at the next poll or before the next fetch's
+  reply, and detached. Draining at a poll never waits: it takes the fetch
+  lock only if free, reads only what has arrived, and costs one load when
+  nothing is abandoned.
+
+- The remote reincarnation rate test ran at a thousand messages a second,
+  so a bind delayed 2 ms under load already earned the burst it expected
+  to be empty; it runs at ten a second now, with a 250 ms backdate for the
+  burst case. The images-in-turn test states why its witness subscription
+  proves the other's images hold their messages (karyos#856 review).
+
+- The images-in-turn test (`client_facade.rs`,
+  `a_network_subscription_polls_its_images_in_turn`) read before both
+  images held their messages: under load, one image's datagrams arrived
+  after the reads began, and the first reads rightly took the only image
+  with data. A second subscription of the channel now witnesses that both
+  images hold all 16 messages before the first is read one at a time
+  (karyos#853, plan 167). No timeout is longer.
+
+- A network publication its endpoint cannot hold is no longer accepted
+  and silent (karyos#859, plan 168). The driver keeps what each
+  publication takes of each endpoint it sends on (a reliable single-lane
+  one: a route, 2 queues, 9 TX slots) with a reserve for the sender's
+  control routes, and refuses an add past the endpoint's TX slots,
+  queues or routes with `DriverError::EndpointCapacity`
+  (`ResourcesUnavailable` to a client, the detail word
+  `limit << 56 | capacity << 32 | needed`,
+  limit 1 TX slots, 2 queues, 3 routes). The room of a removed
+  publication is free once its removal has ended, so a refusal during a
+  removal is retryable. With the defaults one endpoint holds 24
+  reliable single-lane publications; before, the 25th and later ones
+  were accepted and sent nothing, and a late subscriber could not bind
+  them (the 19 s of plan 168).
+- A destination added at run time to a multi-destination publication
+  is checked against its endpoint as at the add and refused with
+  `DriverError::EndpointCapacity`; from its post to its answer it holds
+  its room, a refused one gives it back and a removal frees it at its
+  report. A reliable multi-destination publication counts a repair
+  queue per destination (it counted none: they open after the add).
+- A refused network publication add leaves nothing behind: its stream
+  key is free in the same cycle, so the same add retried at once is
+  never `DuplicateStream` (it was for a few cycles).
+- A refused open of a publication's route or queues counts in
+  `endpoint_limits` for an endpoint limit and is tried again
+  `setup_interval` later, not every cycle.
+
+- An idle publication keeps its subscribers' paths (karyos#859, plan
+  168). Every established publication now sends a PATH_HB on each idle
+  path: one on one path, each path of a routed one, and each live
+  destination of a multi-destination one, at most one per
+  `path_heartbeat_interval`. A path with DATA in the interval sends
+  none, nor a publication being removed or whose guard admits no lane.
+  Before, an idle publication on one path, or to several destinations,
+  lost each subscriber path at `path_liveness_timeout` and bound it
+  again by SOLICIT, about one SOLICIT per path every 10 s.
+
+- The multi-destination end-to-end tests no longer add fixed loopback
+  ports a receiver may have drawn from the ephemeral range, which made
+  an expected `Added` report `Present` (karyos#900). Each fixed
+  destination is the port of a socket the test holds open.
+
+- `RaftLog::entries` checks each frame against the in-memory index before it reads or allocates the payload, then checks its CRC-32C (karyos#904). The header must name the indexed index and term, and the header and payload must span exactly the frame's indexed bytes; the last frame must fit before the written end. Before, a frame corrupted on disk after the open was read silently: a wrong length returned a payload running into the next frame. Such a frame is now a typed `LogError::Chain`, with new `ChainProblem::Length` and `ChainProblem::Term` problems, and the read does not poison the log.
+
+- The reference fixture refuses a membership change while a leadership
+  handover is under way, naming the target as leader, as it already
+  did for client requests (karyos#909). Before, the old leader could
+  append a configuration entry the target never held, and the target's
+  next term diverged from it.
+
+- Dynamic registration, sender side (#940; behind the refusal of dynamic
+  mode on the public API): a REGISTER at the per-source or the driver's
+  pending bound replaces the oldest entry it competes with instead of
+  being dropped, so spoofed REGISTERs from a required receiver's address
+  no longer lock it out; REGISTERs and registrants' CHALLENGEs draw on a
+  per-address bucket of their own, not on `setup_answer_rate`, and an
+  address the full table cannot track is bound by the driver's total;
+  the first SM must name the receiver block its REGISTER named, and a
+  required id holds one slot for the publication's incarnation (its
+  return at another endpoint is refused, as its membership holds it
+  lost); an SM refused at a held slot leaves the slot to retire at its
+  timeout; a restart replaces a binding only once it is quiet for
+  `destination_move_quiet`; a source in its quarantine gets no ANNOUNCE;
+  a receiver restarting at its own slot is not refused for a full quota;
+  a CHALLENGE whose ANSWER is refused for its rate keeps its pending
+  entry; on a dynamic publication an SM adopts no binding at another
+  slot's address (it could claim a required id), every optional slot
+  retires with the last binding at its address whichever path removes
+  it (an eviction from a full binding table left it for good), and a
+  required id whose slot is held with no binding is dropped at its
+  REGISTER. The new counters `dropped_quarantined`, `pending_replaced`,
+  `source_rates_full`, `dropped_challenge_rate` and
+  `dropped_required_lost` are not in the CnC
+  yet (#942 item 9), so no user can read them.
+
+- Dynamic registration, receiver side (#941; behind the refusal of
+  dynamic mode on the public API): three or more dynamic subscriptions
+  registering at one `control` address now bind when their publisher
+  starts after them. Their REGISTERs draw on a bucket of their own per
+  `control` address at the receiver, and a registrant's CHALLENGE on a
+  bucket of its own per address at the sender, so REGISTERs no longer
+  spend the CHALLENGE that completes a registration; each key backs off
+  from `setup_interval` to sixteen times it while nothing binds, starts
+  over on an ANNOUNCE from `control`, and keys are spread within an
+  interval. A required receiver id is no longer kept out by a full
+  bindings table while it believes it is bound: the sender keeps one
+  binding free per required id not yet joined, answers no CHALLENGE of a
+  dynamic publication it cannot bind (counted `challenges_unbound`, and
+  `bindings_reserved` when the kept binding decides), and refuses
+  `receiver_bindings` below `max_destinations` at start and dynamic
+  publications whose `max_destinations` together exceed
+  `receiver_bindings` (`DriverError::ReceiverBindings`). On a registering
+  key a SETUP ANNOUNCE or ANSWER is taken only from its `control` address
+  (`setup_not_from_control`). A client's `control-mode=dynamic` URI is
+  refused as `UnsupportedChannel`, not the retryable
+  `ResourcesUnavailable`. A dynamic publication's allowlist with no range
+  of `control`'s family, and a dynamic subscription's `control` no
+  REGISTER can reach, are refused with errors that name them
+  (`DriverError::Registration`, `DriverError::InvalidRegistrationControl`),
+  as are more required ids than `max_destinations`
+  (`RegistrationConfigError::TooManyRequired`, before `InvalidConfig`).
+
+### Security
+
+- `rustix` is updated from 1.1.5 to 1.1.6 in `Cargo.lock` (karyos#928),
+  the fixed release for RUSTSEC-2026-0486 (the `rustix::fs` xattr
+  functions marked unwritten bytes as initialised on a zero-length
+  buffer). No other crate moves; `linux-raw-sys` stays at 0.12.1.
 
 ## [0.1.0-alpha.2]: 2026-10-21
 
