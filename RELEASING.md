@@ -33,6 +33,17 @@ last run, does not stand in for one. Decided 2026-10-27 by
 QS-COORDINATOR under owner delegation (Joaquín, 2026-10-26),
 [karyos#767](https://github.com/quantstratum/karyos/pull/767).
 
+### 0.1.0-alpha.3 (prerelease)
+
+0.1.0-alpha.3, the first crates.io publication (karyos#622), was gated by
+`CHANGELOG_RELEASE=1 make pre-push` and a `cargo publish --dry-run` of the
+eight published crates only, by owner decision of 2026-11-17 while hosted
+CI is off (karyos#623). These gates of the table below were **not run** for
+it: `make loom-full`, both Miri halves, `make sim`, the Linux tests,
+Clippy with every feature on Linux, the network impairment suite, the C
+library package, the binding conformance suite and the wire compatibility
+matrix. This exception covers 0.1.0-alpha.3 only.
+
 ## Changelog
 
 The author of the release pull request assembles the changelog, in that
