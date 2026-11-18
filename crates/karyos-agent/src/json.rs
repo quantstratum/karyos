@@ -321,6 +321,7 @@ pub fn retention_answer(answer: &crate::retention::RetentionAnswer) -> String {
         }
         RetentionAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
         RetentionAnswer::NoArchive => fields.string("error", "no archive"),
+        RetentionAnswer::Busy => fields.string("error", "busy"),
     });
     text
 }

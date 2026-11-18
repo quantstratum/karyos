@@ -205,7 +205,7 @@ pub struct Agent {
     /// The join metadata registry (karyos#736), in memory.
     registry: Registry,
     /// The Archive's retention operations (M12), once one is attached.
-    retention: Option<Box<dyn crate::retention::RetentionBackend>>,
+    retention: Option<crate::retention::SharedBackend>,
 }
 
 impl Agent {
@@ -326,7 +326,7 @@ impl Agent {
 
     /// Attaches the Archive the retention operations go to (M12).
     pub fn set_retention(&mut self, backend: Box<dyn crate::retention::RetentionBackend>) {
-        self.retention = Some(backend);
+        self.retention = Some(crate::retention::shared(backend));
     }
 
     /// Makes retention `operation` on `recording` for operator `uid`,
@@ -352,8 +352,9 @@ impl Agent {
         };
         crate::retention::retention_command(
             self.journal.as_mut(),
-            self.retention.as_deref_mut(),
+            self.retention.as_ref(),
             &command,
+            self.config.guard_timeout,
             host_monotonic_ns,
         )
     }

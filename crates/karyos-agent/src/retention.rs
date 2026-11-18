@@ -29,7 +29,20 @@
 //! | hold-release | no     | no       | no           | yes           |
 //! | purge        | no     | no       | no           | yes           |
 
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
+
 use crate::journal::{Journal, JournalRecord, Kind, MAX_REASON, UNKNOWN_OUTCOME};
+
+/// An Archive backend shared with the worker that calls it: every call
+/// runs off the agent's polling thread, waited for at most a bound.
+pub type SharedBackend = Arc<Mutex<Box<dyn RetentionBackend>>>;
+
+/// `backend` shared for [`retention_command`].
+#[must_use]
+pub fn shared(backend: Box<dyn RetentionBackend>) -> SharedBackend {
+    Arc::new(Mutex::new(backend))
+}
 
 /// What the Archive answered to a hold, a release or a purge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +173,8 @@ pub enum RetentionAnswer {
     JournalUnavailable,
     /// The agent has no Archive to send it to.
     NoArchive,
+    /// An earlier call to the Archive has not returned yet: not sent.
+    Busy,
     /// Sent, and no answer came.
     NoAnswer {
         /// The operation id.
@@ -207,17 +222,63 @@ impl Command<'_> {
     }
 }
 
+/// What the worker brings back.
+enum Raw {
+    Reply(RetentionReply),
+    Ranges(Option<Vec<RangeOutcome>>),
+}
+
+/// Calls `backend` for `operation` on a worker, waiting at most `wait`:
+/// `None` when no answer came in time, the call then finishing on its
+/// own.
+fn call(
+    backend: &SharedBackend,
+    operation: Operation,
+    recording: u64,
+    id: u64,
+    operator: u32,
+    wait: Duration,
+) -> Option<Raw> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let backend = Arc::clone(backend);
+    let spawned = std::thread::Builder::new()
+        .name("karyos-agent-retention".to_owned())
+        .spawn(move || {
+            let Ok(mut backend) = backend.lock() else {
+                return;
+            };
+            let raw = match operation {
+                Operation::Verify => Raw::Ranges(backend.verify(recording)),
+                Operation::Hold => Raw::Reply(backend.hold(recording, id, operator)),
+                Operation::Release => Raw::Reply(backend.release(recording, id, operator)),
+                Operation::Purge { before } => {
+                    Raw::Reply(backend.purge(recording, before, id, operator))
+                }
+            };
+            let _ = sender.send(raw);
+        });
+    spawned.ok()?;
+    receiver.recv_timeout(wait).ok()
+}
+
 /// Makes `command` through `backend`, journalled in `journal` when there
-/// is one, at host monotonic times from `now`.
+/// is one, at host monotonic times from `now`. The Archive is called on a
+/// worker and waited for at most `wait`, so a slow one never holds the
+/// agent's polling thread; no answer in time is an unknown outcome.
 pub fn retention_command(
     mut journal: Option<&mut Journal>,
-    backend: Option<&mut (dyn RetentionBackend + '_)>,
+    backend: Option<&SharedBackend>,
     command: &Command<'_>,
+    wait: Duration,
     mut now: impl FnMut() -> u64,
 ) -> RetentionAnswer {
     let Some(backend) = backend else {
         return RetentionAnswer::NoArchive;
     };
+    // A call still running holds the backend: refuse before journalling.
+    if backend.try_lock().is_err() {
+        return RetentionAnswer::Busy;
+    }
     let (request, outcome) = command.operation.kinds();
     let record = command.record(request, now());
     if command.operation.fails_closed() {
@@ -232,17 +293,13 @@ pub fn retention_command(
         let _ = journal.append(&record, record.time);
     }
     let (id, recording, operator) = (command.id, command.recording, command.operator);
-    let answer = match command.operation {
-        Operation::Verify => match backend.verify(recording) {
-            Some(ranges) => RetentionAnswer::Verified {
-                operation: id,
-                ranges,
-            },
-            None => RetentionAnswer::NoAnswer { operation: id },
+    let answer = match call(backend, command.operation, recording, id, operator, wait) {
+        Some(Raw::Ranges(Some(ranges))) => RetentionAnswer::Verified {
+            operation: id,
+            ranges,
         },
-        Operation::Hold => reply(id, backend.hold(recording, id, operator)),
-        Operation::Release => reply(id, backend.release(recording, id, operator)),
-        Operation::Purge { before } => reply(id, backend.purge(recording, before, id, operator)),
+        Some(Raw::Reply(answer)) => reply(id, answer),
+        Some(Raw::Ranges(None)) | None => RetentionAnswer::NoAnswer { operation: id },
     };
     if let Some(journal) = journal {
         let mut record = command.record(outcome, now());

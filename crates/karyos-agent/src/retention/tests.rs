@@ -7,6 +7,8 @@
 )]
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::*;
 use crate::journal::{GapReason, Journal};
@@ -18,12 +20,29 @@ fn dir(name: &str) -> PathBuf {
     dir
 }
 
-/// An Archive that records what it was sent and holds recordings.
+/// What the Archive saw, shared with the test.
 #[derive(Debug, Default)]
-struct Archive {
+struct Seen {
     sent: Vec<&'static str>,
     held: Vec<u64>,
+}
+
+/// An Archive that records what it was sent and holds recordings.
+#[derive(Debug, Default, Clone)]
+struct Archive {
+    seen: Arc<Mutex<Seen>>,
     silent: bool,
+    slow: Option<Duration>,
+}
+
+impl Archive {
+    fn sent(&self) -> Vec<&'static str> {
+        self.seen.lock().unwrap().sent.clone()
+    }
+
+    fn held(&self) -> Vec<u64> {
+        self.seen.lock().unwrap().held.clone()
+    }
 }
 
 /// The Archive's refusal code for a purge under hold, as it names it.
@@ -31,23 +50,26 @@ const LEGAL_HOLD: u64 = 2;
 
 impl RetentionBackend for Archive {
     fn hold(&mut self, recording: u64, _: u64, _: u32) -> RetentionReply {
-        self.sent.push("hold");
-        self.held.push(recording);
+        let mut seen = self.seen.lock().unwrap();
+        seen.sent.push("hold");
+        seen.held.push(recording);
         RetentionReply::Done { evidenced: true }
     }
 
     fn release(&mut self, recording: u64, _: u64, _: u32) -> RetentionReply {
-        self.sent.push("release");
-        self.held.retain(|held| *held != recording);
+        let mut seen = self.seen.lock().unwrap();
+        seen.sent.push("release");
+        seen.held.retain(|held| *held != recording);
         RetentionReply::Done { evidenced: true }
     }
 
     fn purge(&mut self, recording: u64, _: u64, _: u64, _: u32) -> RetentionReply {
-        self.sent.push("purge");
+        let mut seen = self.seen.lock().unwrap();
+        seen.sent.push("purge");
         if self.silent {
             return RetentionReply::NoAnswer;
         }
-        if self.held.contains(&recording) {
+        if seen.held.contains(&recording) {
             return RetentionReply::Refused {
                 code: LEGAL_HOLD,
                 reason: "legal_hold".to_owned(),
@@ -57,7 +79,10 @@ impl RetentionBackend for Archive {
     }
 
     fn verify(&mut self, _: u64) -> Option<Vec<RangeOutcome>> {
-        self.sent.push("verify");
+        self.seen.lock().unwrap().sent.push("verify");
+        if let Some(slow) = self.slow {
+            std::thread::sleep(slow);
+        }
         Some(vec![RangeOutcome {
             start: 0,
             end: 64,
@@ -82,11 +107,18 @@ fn run(
     archive: &mut Archive,
     command: &Command<'_>,
 ) -> RetentionAnswer {
+    let backend = shared(Box::new(archive.clone()));
     let mut time = 100;
-    retention_command(journal, Some(archive), command, || {
-        time += 1;
-        time
-    })
+    retention_command(
+        journal,
+        Some(&backend),
+        command,
+        Duration::from_secs(5),
+        || {
+            time += 1;
+            time
+        },
+    )
 }
 
 #[test]
@@ -107,7 +139,7 @@ fn a_hold_applies_while_the_journal_is_unavailable() {
             evidenced: true
         }
     );
-    assert_eq!(archive.held, vec![7]);
+    assert_eq!(archive.held(), vec![7]);
     // With no journal at all, too.
     let answer = run(None, &mut archive, &command(Operation::Hold, 2));
     assert!(matches!(answer, RetentionAnswer::Done { .. }));
@@ -118,18 +150,16 @@ fn a_release_refuses_while_the_journal_is_unavailable() {
     let dir = dir("release-down");
     let mut journal = Journal::open(&dir, 10).unwrap();
     journal.break_recorder();
-    let mut archive = Archive {
-        held: vec![7],
-        ..Archive::default()
-    };
+    let mut archive = Archive::default();
+    archive.seen.lock().unwrap().held.push(7);
     let answer = run(
         Some(&mut journal),
         &mut archive,
         &command(Operation::Release, 1),
     );
     assert_eq!(answer, RetentionAnswer::JournalUnavailable);
-    assert!(archive.sent.is_empty(), "nothing was sent");
-    assert_eq!(archive.held, vec![7]);
+    assert!(archive.sent().is_empty(), "nothing was sent");
+    assert_eq!(archive.held(), vec![7]);
     let answer = run(None, &mut archive, &command(Operation::Release, 2));
     assert_eq!(answer, RetentionAnswer::JournalUnavailable);
 }
@@ -146,7 +176,7 @@ fn a_purge_refuses_while_the_journal_is_unavailable() {
         &command(Operation::Purge { before: 4096 }, 1),
     );
     assert_eq!(answer, RetentionAnswer::JournalUnavailable);
-    assert!(archive.sent.is_empty(), "nothing was sent");
+    assert!(archive.sent().is_empty(), "nothing was sent");
 }
 
 #[test]
@@ -238,6 +268,41 @@ fn a_verification_reports_the_archives_outcomes_verbatim() {
 fn without_an_archive_nothing_is_journalled_or_sent() {
     let dir = dir("no-archive");
     let mut journal = Journal::open(&dir, 10).unwrap();
-    let answer = retention_command(Some(&mut journal), None, &command(Operation::Hold, 1), || 0);
+    let answer = retention_command(
+        Some(&mut journal),
+        None,
+        &command(Operation::Hold, 1),
+        Duration::from_secs(1),
+        || 0,
+    );
     assert_eq!(answer, RetentionAnswer::NoArchive);
+}
+
+/// A slow verification is waited for at most its bound: it answers no
+/// answer, and the call still running makes the next one busy.
+#[test]
+fn a_slow_archive_is_waited_for_at_most_the_bound() {
+    let archive = Archive {
+        slow: Some(Duration::from_millis(500)),
+        ..Archive::default()
+    };
+    let backend = shared(Box::new(archive));
+    let started = Instant::now();
+    let answer = retention_command(
+        None,
+        Some(&backend),
+        &command(Operation::Verify, 1),
+        Duration::from_millis(20),
+        || 0,
+    );
+    assert_eq!(answer, RetentionAnswer::NoAnswer { operation: 1 });
+    assert!(started.elapsed() < Duration::from_millis(400));
+    let answer = retention_command(
+        None,
+        Some(&backend),
+        &command(Operation::Hold, 2),
+        Duration::from_millis(20),
+        || 0,
+    );
+    assert_eq!(answer, RetentionAnswer::Busy);
 }
