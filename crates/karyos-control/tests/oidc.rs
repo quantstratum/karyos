@@ -592,13 +592,18 @@ fn an_unreachable_issuer_refuses_every_token() {
 /// or no metadata) never does, and the answer is 503, never a grant.
 #[test]
 fn an_expired_set_is_never_used() {
-    for (cache_control, age, usable) in [
-        ("max-age=300", None, true),
-        ("max-age=300", Some("300"), false),
-        ("max-age=0", None, false),
-        ("max-age=300, no-cache", None, false),
-        ("max-age=300, must-revalidate", None, true),
-        ("", None, false),
+    // `first`: whether the fetching request verifies (a set stale on
+    // receipt never does); `usable`: whether the set verifies afterwards.
+    for (cache_control, age, first, usable) in [
+        ("max-age=300", None, true, true),
+        ("max-age=300", Some("290"), true, true),
+        ("max-age=300", Some("300"), false, false),
+        ("max-age=300", Some("301"), false, false),
+        ("max-age=0", None, true, false),
+        ("max-age=0", Some("5"), false, false),
+        ("max-age=300, no-cache", None, true, false),
+        ("max-age=300, must-revalidate", None, true, true),
+        ("", None, true, false),
     ] {
         let state = issuer();
         let url = state.lock().unwrap().url.clone();
@@ -613,9 +618,14 @@ fn an_expired_set_is_never_used() {
             let state = state.lock().unwrap();
             state.signer.token("at+jwt", &state.claims("alice@example"))
         };
-        // The fetch it triggers verifies the first token, whatever the set's
-        // lifetime.
-        assert_eq!(refused(address, &token).0, 200, "{cache_control} {age:?}");
+        // The fetch it triggers verifies the first token unless the set is
+        // stale on receipt.
+        let expected = if first { 200 } else { 503 };
+        assert_eq!(
+            refused(address, &token).0,
+            expected,
+            "{cache_control} {age:?}"
+        );
         state.lock().unwrap().up = false;
         let expected = if usable { 200 } else { 503 };
         assert_eq!(
@@ -623,7 +633,8 @@ fn an_expired_set_is_never_used() {
             expected,
             "{cache_control} {age:?}"
         );
-        assert_eq!(lines.lock().unwrap().len(), if usable { 2 } else { 1 });
+        let verified = usize::from(first) + usize::from(usable);
+        assert_eq!(lines.lock().unwrap().len(), verified);
     }
 }
 

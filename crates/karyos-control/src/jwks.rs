@@ -17,8 +17,9 @@
 //! - **Freshness (RFC 9111 §4.2, §5.2).** A set's lifetime is its
 //!   `max-age`, else `Expires` minus `Date`, else zero; `no-store` and
 //!   `no-cache` make it zero; `Age` counts towards its age. The lifetime
-//!   is never raised. A set past it is never used: every token that needs
-//!   it is refused with [`KeysError::Unavailable`] (`503`) until a fetch
+//!   is never raised. A set past it is never used, including one already
+//!   past it on receipt (its `Age` consumed the lifetime): every token that
+//!   needs it is refused with [`KeysError::Unavailable`] (`503`) until a fetch
 //!   succeeds.
 //! - **One fetch at a time.** One [`Jwks`] per configured issuer holds at
 //!   most one fetch in flight and one budget: after a fetch, the next may
@@ -294,6 +295,17 @@ impl Jwks {
         state.generation = state.generation.wrapping_add(1);
         let now = Instant::now();
         match result {
+            // A response whose `Age` already consumed its lifetime is stale
+            // on receipt: never used, not even by the request that fetched
+            // it. Only an origin response (age zero) of zero lifetime serves
+            // that one request and its waiters.
+            Ok((_, _, freshness)) if freshness.stale_on_receipt() => {
+                state.failures = state.failures.saturating_add(1);
+                let failures = state.failures;
+                state.next_allowed = Some(now + self.issuer.budget.wait(failures));
+                state.fetched = None;
+                Err(KeysError::Unavailable)
+            }
             Ok((uri, set, freshness)) => {
                 let set = Arc::new(set);
                 state.jwks_uri = Some(uri);
@@ -429,6 +441,18 @@ pub struct Freshness {
     pub lifetime: Duration,
     /// How old it already is (`Age`).
     pub age: Duration,
+}
+
+impl Freshness {
+    /// Its age has reached a positive lifetime, or a cache held a response
+    /// of zero lifetime: no request may use it.
+    fn stale_on_receipt(&self) -> bool {
+        if self.lifetime.is_zero() {
+            !self.age.is_zero()
+        } else {
+            self.age >= self.lifetime
+        }
+    }
 }
 
 impl Freshness {
