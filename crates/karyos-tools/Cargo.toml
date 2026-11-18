@@ -30,6 +30,8 @@ toml.workspace = true
 
 [dev-dependencies]
 karyos-agent.workspace = true
+# The test signing key of the `karyos-catalog verify` tests (karyos#665).
+karyos-archive = { workspace = true, features = ["test-hooks"] }
 # The compat JSON reader's properties (ADR-0062; ADR-0033, dev only).
 proptest.workspace = true
 

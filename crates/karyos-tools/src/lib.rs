@@ -29,6 +29,7 @@ pub mod archive;
 pub mod args;
 pub mod capability_log;
 pub mod catalog;
+pub mod catalog_verify;
 pub mod compat;
 pub mod config;
 pub mod daemon;

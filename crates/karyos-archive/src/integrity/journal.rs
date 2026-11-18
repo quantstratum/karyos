@@ -28,6 +28,40 @@ pub const JOURNAL_FILE: &str = "integrity.journal";
 /// The length of a record, as a file offset.
 const RECORD_LENGTH: u64 = SEAL_RECORD_LENGTH as u64;
 
+/// The records of the journal in `dir`, read only, for a verifier: every
+/// whole record up to the first that does not decode, and that record's
+/// inconsistency, if any. A missing journal reads as no records; a
+/// partial tail is left out, as [`IntegrityJournal::open`] would cut it.
+///
+/// # Errors
+///
+/// The operating system's error.
+pub fn read_records<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+) -> io::Result<(Vec<SealRecord>, Option<Inconsistency>)> {
+    let path = IntegrityJournal::<D>::path(dir);
+    let file = match disk.open_read(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), None)),
+        Err(error) => return Err(error),
+    };
+    let whole = disk.len(&file)? / RECORD_LENGTH;
+    let mut records = Vec::new();
+    let mut buf = [0u8; SEAL_RECORD_LENGTH];
+    for index in 0..whole {
+        let offset = index
+            .checked_mul(RECORD_LENGTH)
+            .ok_or_else(|| io::Error::other("journal offset overflow"))?;
+        disk.read_at(&file, offset, &mut buf)?;
+        match SealRecord::decode(&buf) {
+            Ok(record) => records.push(record),
+            Err(error) => return Ok((records, Some(Inconsistency::Malformed { index, error }))),
+        }
+    }
+    Ok((records, None))
+}
+
 /// A failure of the integrity journal.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

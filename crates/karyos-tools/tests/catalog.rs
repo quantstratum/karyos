@@ -31,6 +31,14 @@ fn the_binary_lists_reads_only_and_refuses_what_it_does_not_know() {
         out.contains("Usage: karyos-catalog list <dir> [--json]"),
         "{out}"
     );
+    // `verify` is a subcommand with its own help (karyos#665).
+    let (status, verify_help, _) = run(&["verify".as_ref(), "--help".as_ref()]);
+    assert_eq!(status, Some(0));
+    assert!(
+        verify_help.starts_with("karyos-catalog verify: "),
+        "{verify_help}"
+    );
+    assert!(out.contains("karyos-catalog verify <dir>"), "{out}");
     let (status, _, err) = run(&["frobnicate".as_ref()]);
     assert_eq!(status, Some(2));
     assert!(
