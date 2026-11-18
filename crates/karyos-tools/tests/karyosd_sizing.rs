@@ -152,6 +152,8 @@ fn with_the_archive_the_report_counts_its_control_streams() {
         archive.to_str().unwrap(),
         "--archive-control",
         "10,11",
+        "--archive-anchor-interval",
+        "3600s",
     ]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let report = String::from_utf8(output.stdout).unwrap();

@@ -359,8 +359,8 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         &mut self.source
     }
 
-    /// The store, to read it back (tests).
-    #[cfg(test)]
+    /// The store, to read it back: tests, and the sealing of its durable
+    /// ranges (A10).
     pub(crate) fn store_mut(&mut self) -> &mut SegmentStore<D> {
         &mut self.store
     }

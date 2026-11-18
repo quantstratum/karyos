@@ -187,6 +187,14 @@ impl Sealer {
             .ok_or(SealerError::Untracked { recording })
     }
 
+    /// Stops tracking `recording` without sealing the rest of it: its
+    /// store failed, so its unsealed tail is left for the verifier to
+    /// report. True when it was tracked.
+    #[must_use = "false when the recording was not tracked"]
+    pub fn untrack(&mut self, recording: u64) -> bool {
+        self.windows.remove(&recording).is_some()
+    }
+
     /// Reports `recording` written up to `end` at `now_ns`.
     ///
     /// # Errors

@@ -146,6 +146,12 @@ Archive:
                                     uid. Per-client authorization comes with owner item 43.
   --archive-min-free <size>         refuse a recording while the archive's file system has
                                     less free space [1g]
+  --archive-seal-interval <duration>
+                                    seal each recorded byte in the integrity journal within
+                                    this time [1s]
+  --archive-anchor-interval <duration>
+                                    sign the integrity journal's head at least this often;
+                                    required with --archive, no default
 
 Shutdown:
   --shutdown-linger <duration>      time clients have to leave after SIGTERM or SIGINT [5s]
@@ -295,7 +301,15 @@ pub struct ArchiveOptions {
     /// The free bytes of the archive's file system below which a
     /// recording is refused.
     pub min_free: u64,
+    /// The `seal_interval`: each recorded byte is sealed within it (A10).
+    pub seal_interval: Duration,
+    /// The `anchor_interval`, required: the integrity journal's head is
+    /// signed at least this often (A10).
+    pub anchor_interval: Duration,
 }
+
+/// The default `--archive-seal-interval`: 1 s.
+pub const DEFAULT_ARCHIVE_SEAL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The default `--archive-min-free`: 1 GiB. A free-space floor that
 /// protects the host; it complements retention (karyos#667) and never
@@ -518,6 +532,27 @@ where
                 option,
                 value: value.to_string_lossy().into_owned(),
             })?;
+        if matches!(
+            option,
+            "--archive-seal-interval" | "--archive-anchor-interval"
+        ) {
+            let parsed = karyos_protocol::channel::parse_duration(&value).map_err(|error| {
+                ArgsError::InvalidDuration {
+                    option,
+                    value: value.clone(),
+                    error,
+                }
+            })?;
+            if parsed.is_zero() {
+                return Err(ArgsError::InvalidValue { option, value });
+            }
+            if option == "--archive-seal-interval" {
+                archive.seal_interval = Some(parsed);
+            } else {
+                archive.anchor_interval = Some(parsed);
+            }
+            continue;
+        }
         if option == "--idle-image-timeout" {
             let parsed = karyos_protocol::channel::parse_duration(&value).map_err(|error| {
                 ArgsError::InvalidDuration {
@@ -690,6 +725,8 @@ const OPTIONS: &[&str] = &[
     "--archive-control",
     "--record",
     "--archive-min-free",
+    "--archive-seal-interval",
+    "--archive-anchor-interval",
 ];
 
 /// The static name of a known option.
@@ -1094,6 +1131,8 @@ struct Archive {
     control: Option<(i32, i32)>,
     records: Vec<RecordOption>,
     min_free: Option<u64>,
+    seal_interval: Option<Duration>,
+    anchor_interval: Option<Duration>,
 }
 
 impl Archive {
@@ -1110,6 +1149,8 @@ impl Archive {
             for (given, option) in [
                 (!self.records.is_empty(), "--record"),
                 (self.min_free.is_some(), "--archive-min-free"),
+                (self.seal_interval.is_some(), "--archive-seal-interval"),
+                (self.anchor_interval.is_some(), "--archive-anchor-interval"),
             ] {
                 if given {
                     return Err(ArgsError::Needs {
@@ -1124,12 +1165,20 @@ impl Archive {
             option: "--archive",
             needs: "--archive-control",
         })?;
+        // No default: an Archive whose heads are never anchored is refused
+        // rather than started with an interval nobody chose.
+        let anchor_interval = self.anchor_interval.ok_or(ArgsError::Needs {
+            option: "--archive",
+            needs: "--archive-anchor-interval",
+        })?;
         Ok(Some(ArchiveOptions {
             dir,
             requests,
             responses,
             records: self.records,
             min_free: self.min_free.unwrap_or(DEFAULT_ARCHIVE_MIN_FREE),
+            seal_interval: self.seal_interval.unwrap_or(DEFAULT_ARCHIVE_SEAL_INTERVAL),
+            anchor_interval,
         }))
     }
 }
@@ -1504,6 +1553,8 @@ mod tests {
             "--archive=/var/archive",
             "--archive-control",
             "100,101",
+            "--archive-anchor-interval",
+            "3600s",
             "--record=8:2:none",
             "--record",
             "9:3:250ms",
@@ -1534,6 +1585,8 @@ mod tests {
                     record(10, 4, SyncPolicy::PerSegment),
                 ],
                 min_free: DEFAULT_ARCHIVE_MIN_FREE,
+                seal_interval: DEFAULT_ARCHIVE_SEAL_INTERVAL,
+                anchor_interval: Duration::from_secs(3600),
             })
         );
         let guarded = options(&[
@@ -1544,10 +1597,14 @@ mod tests {
             "--archive-control",
             "1,2",
             "--archive-min-free=64m",
+            "--archive-anchor-interval=600s",
+            "--archive-seal-interval=250ms",
         ])
         .archive
         .unwrap();
         assert_eq!(guarded.min_free, 64 << 20);
+        assert_eq!(guarded.anchor_interval, Duration::from_secs(600));
+        assert_eq!(guarded.seal_interval, Duration::from_millis(250));
         assert_eq!(options(&["--dir", "/run/k"]).archive, None);
     }
 
@@ -1558,6 +1615,15 @@ mod tests {
         assert_eq!(
             run(&["--dir", "d", "--archive", "a"]),
             needs("--archive", "--archive-control")
+        );
+        // An unconfigured anchor_interval refuses to start the Archive.
+        assert_eq!(
+            run(&["--dir", "d", "--archive", "a", "--archive-control", "1,2"]),
+            needs("--archive", "--archive-anchor-interval")
+        );
+        assert_eq!(
+            run(&["--dir", "d", "--archive-anchor-interval", "3600s"]),
+            needs("--archive-anchor-interval", "--archive")
         );
         assert_eq!(
             run(&["--dir", "d", "--archive-control", "1,2"]),
@@ -1580,6 +1646,8 @@ mod tests {
             ("--record", "1:2:sometimes"),
             ("--record", "1:2:0ms"),
             ("--archive-min-free", "lots"),
+            ("--archive-anchor-interval", "0s"),
+            ("--archive-seal-interval", "0ms"),
         ] {
             assert_eq!(
                 run(&["--dir", "d", "--archive", "a", option, value]),

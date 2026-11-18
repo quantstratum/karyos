@@ -457,8 +457,12 @@ impl DaemonArchive {
             started: Vec::new(),
             next: 1,
         };
-        let agent = ArchiveHandle::spawn(StdDisk, &options.dir, AgentConfig::default())
-            .map_err(|error| ArchiveStartError::Agent(format!("{error:?}")))?;
+        let agent = ArchiveHandle::spawn(
+            StdDisk,
+            &options.dir,
+            AgentConfig::default().with_seal_interval(Some(options.seal_interval)),
+        )
+        .map_err(|error| ArchiveStartError::Agent(format!("{error:?}")))?;
         let host = DaemonHost {
             inner: DriverHost::new(driver),
             dir: options.dir.clone(),

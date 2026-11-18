@@ -3471,3 +3471,56 @@ fn a_fenced_recording_is_counted() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// With a `seal_interval`, the running agent seals every byte of a
+/// recording, its last range closing, and chains the catalog's start and
+/// stop, without the test calling the integrity APIs (A10; karyos#961).
+#[test]
+fn a_recording_is_sealed_and_its_catalog_changes_chained() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::{SealKind, verify_chain, verify_range};
+
+    let dir = temp_dir("sealed");
+    let config = AgentConfig {
+        idle: Duration::from_millis(1),
+        seal_interval: Some(Duration::from_millis(1)),
+        ..AgentConfig::default()
+    };
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    agent.shutdown().unwrap();
+
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    assert!(verify_chain(records.iter()).is_ok());
+    let ranges: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind.is_range() && record.subject == id)
+        .collect();
+    assert!(!ranges.is_empty());
+    assert_eq!(ranges.first().unwrap().start, 0);
+    let last = ranges.last().unwrap();
+    assert_eq!(last.end, all.len() as u64);
+    assert_eq!(last.kind, SealKind::ClosedSegment);
+    for range in &ranges {
+        let bytes = &all[range.start as usize..range.end as usize];
+        assert!(verify_range(range, bytes).is_ok());
+    }
+    let catalog: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind == SealKind::Catalog && record.subject == id)
+        .collect();
+    assert_eq!(catalog.len(), 2, "the start and the stop");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Without a `seal_interval` the agent keeps no integrity journal.
+#[test]
+fn without_a_seal_interval_nothing_is_sealed() {
+    let dir = temp_dir("unsealed");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    let _ = sealed_recording(&agent);
+    agent.shutdown().unwrap();
+    assert!(!crate::integrity::journal::IntegrityJournal::<StdDisk>::path(&dir).exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
