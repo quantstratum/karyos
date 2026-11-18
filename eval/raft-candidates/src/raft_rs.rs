@@ -92,9 +92,19 @@ pub fn election_ticks(id: NodeId, voters: &[NodeId]) -> (usize, usize) {
 }
 
 /// The W2 refusal of a proposal of `command` by a leader whose log ends
-/// at `last` and commits `committed`: a command no append could carry
-/// within the in-flight bytes, or one past the queue of proposals held and
-/// not committed. A count that does not fit fails closed, as a full queue.
+/// at `last` and commits `committed`: a command larger than its share of
+/// the in-flight bytes, or one past the queue of proposals held and not
+/// committed. A count that does not fit fails closed, as a full queue.
+///
+/// Neither candidate meters the bytes it has in flight to a follower:
+/// each caps only the entries (raft-rs one entry per append and at most
+/// `in_flight_entries` appends unacknowledged; OpenRaft one append of at
+/// most `in_flight_entries` entries). So the byte cap is kept by the
+/// entries' size instead: no command passes `in_flight_bytes /
+/// in_flight_entries`, and a follower's full window of entries never
+/// passes `in_flight_bytes` however many commands queue behind it
+/// (karyos#963 review). A command within the cap but over its share is
+/// refused: a finding of the comparison.
 ///
 /// # Errors
 ///
@@ -105,7 +115,11 @@ pub fn refuse_past(
     last: u64,
     committed: u64,
 ) -> Result<(), Refused> {
-    if u64::try_from(command.len()).map_or(true, |bytes| bytes > limits.in_flight_bytes) {
+    let share = limits
+        .in_flight_bytes
+        .checked_div(limits.in_flight_entries)
+        .unwrap_or(0);
+    if u64::try_from(command.len()).map_or(true, |bytes| bytes > share) {
         return Err(Refused::Backpressure(Limit::InFlightBytes));
     }
     let held = last.checked_sub(committed);
@@ -326,6 +340,11 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
         limits: &Limits,
         log: &mut LogView<'_>,
     ) -> Result<Self, Unsupported> {
+        // No entry in flight is no replication: refused before startup,
+        // not a core without Raft (karyos#963 review).
+        if limits.in_flight_entries == 0 {
+            return Err(Unsupported);
+        }
         Ok(Self {
             node: Self::build(id, peers, Some(limits), log),
             pending: None,

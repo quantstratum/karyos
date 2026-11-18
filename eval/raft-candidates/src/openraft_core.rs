@@ -947,6 +947,11 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
         limits: &Limits,
         log: &mut LogView<'_>,
     ) -> Result<Self, Unsupported> {
+        // OpenRaft refuses `max_payload_entries = 0`: refused here, before
+        // startup, not a core without Raft (karyos#963 review).
+        if limits.in_flight_entries == 0 {
+            return Err(Unsupported);
+        }
         Ok(Self::start(id, peers, Some(limits), log))
     }
 

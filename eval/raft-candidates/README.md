@@ -68,12 +68,13 @@ candidate (the parameters are plan issue 062's to freeze).
 
 | Workload | `raft` 0.7.0 | `openraft` 0.10.0-alpha.37 |
 | --- | --- | --- |
-| W2 limits taken | `recover_with`: one entry per append and at most `in_flight_entries` appends unacknowledged; queue and in-flight bytes refused in `propose` | `recover_with`: `max_payload_entries = in_flight_entries`, one append in flight per follower (its sequential stream); queue and in-flight bytes refused in `propose` |
+| W2 limits taken | `recover_with`: one entry per append and at most `in_flight_entries` appends unacknowledged; queue and in-flight bytes refused in `propose`; `in_flight_entries = 0` refused as `Unsupported` | `recover_with`: `max_payload_entries = in_flight_entries`, one append in flight per follower (its sequential stream); queue and in-flight bytes refused in `propose`; `in_flight_entries = 0` refused as `Unsupported` |
 | W2 queue burst | refused with typed `Backpressure(Queue)`, nothing else refused; passes | the same; passes |
 | W2 in-flight burst, nominal | pass | pass |
-| W2 slow follower, log-read burst | pass | **fail, typed**: `NotBehind`: the leader commits 787 of the 1,000 entries (842 of 1,024) required while the follower is cut off, so the case cannot establish its slow follower |
+| W2 slow follower | pass | **fail, typed**: `NotBehind`: the leader commits 787 of the 1,000 entries required while the follower is cut off, so the case cannot establish its slow follower |
+| W2 log-read burst | **not demonstrated**: safety holds, but the catch-up reads bypass the metered log (next row), so it is never counted a pass | the same (its run also commits only 842 of the 1,024 entries required) |
 | W2 log-read limit | **not honoured through the harness's metered log**: raft-rs reads its `MemStorage` mirror | **not honoured through the harness's metered log**: OpenRaft reads the adapter's in-memory view |
-| W2 in-flight bytes | not reached at 256 B payloads (`W2::IN_FLIGHT_BYTES`) | the same |
+| W2 in-flight bytes | not reached at 256 B payloads by W2 v1 (`W2::IN_FLIGHT_BYTES`). Neither candidate meters a follower's bytes in flight, so the adapter keeps the cap by entry size: a command over `in_flight_bytes / in_flight_entries` is refused with typed `Backpressure(InFlightBytes)`, even within the cap; asserted with 256 B values against 8 entries and 1 KiB | the same |
 | W5 snapshot cases | `NotYet`: no compaction or install through the core; refused as `Unsupported`, follow-up plan issue 065 | the same |
 | W5 lost reply, leader change, retry | runs, keeps safety, **retry not shown**: the frozen schedule assumes the reference's leader, server 0 from step 0; moved 30 steps later it shows the retry | runs, keeps safety, **retry not shown**: OpenRaft's first leader need not be server 0 |
 | Reproducibility | every W2 case reproduces from its seed, asserted | the same |

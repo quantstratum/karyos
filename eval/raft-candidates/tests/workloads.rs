@@ -13,7 +13,7 @@
 
 use karyos_raft_eval::openraft_core::OpenRaft;
 use karyos_raft_eval::raft_rs::RaftRs;
-use karyos_sim::harness::core::{ConsensusCore, Limit, Unsupported};
+use karyos_sim::harness::core::{ConsensusCore, Limit, Limits, Unsupported};
 use karyos_sim::harness::node::Observation;
 use karyos_sim::harness::workloads::{
     self, Failed, Liveness, RunError, W1, W2, W3, W3Fault, W4, W5, W6,
@@ -141,6 +141,14 @@ fn w2<C: ConsensusCore>(short: &[&str]) {
         } else {
             assert!(pushed.is_empty(), "{}: {pushed:?}", case.name);
         }
+        // Not demonstrated, whatever its result (karyos#963 review): a
+        // lagging follower catches up from the adapter's own mirror of the
+        // log, never through the harness's metered `LogView`, so a read
+        // past `log_read_bytes` would go unseen. Its safety is asserted
+        // above; it is never counted a pass.
+        if case.name.contains("log-read burst") {
+            continue;
+        }
         let result = workloads::pass(case, &outcome);
         if short.iter().any(|name| case.name.contains(name)) {
             assert!(
@@ -162,7 +170,63 @@ fn w2_raft<C: ConsensusCore>() {
 /// cut off (787 of 1,000 and 842 of 1,024 at seed 1): the case cannot
 /// establish its slow follower, a typed failure, not a pass.
 fn w2_openraft<C: ConsensusCore>() {
-    w2::<C>(&["slow follower", "log-read burst"]);
+    w2::<C>(&["slow follower"]);
+}
+
+/// The byte cap reached before the entry cap (karyos#963 review): 256 B
+/// values against 8 entries and 1 KiB in flight, a share of 128 B per
+/// entry. Neither adapter meters a follower's bytes in flight, so each
+/// refuses every command over its share, typed `Backpressure(InFlightBytes)`,
+/// rather than let a full window of entries pass the byte cap. Safety
+/// holds and no other limit is named.
+fn w2_byte_cap_binds_before_the_entry_cap<C: ConsensusCore>() {
+    let w2 = W2 {
+        payload_bytes: 256,
+        limits: Limits {
+            in_flight_entries: 8,
+            in_flight_bytes: 1024,
+            ..W2::skeleton().limits
+        },
+        ..W2::skeleton()
+    };
+    let case = w2.cases().unwrap().into_iter().next().unwrap();
+    let outcome = workloads::run::<C>(&case, 1).unwrap();
+    assert!(outcome.safety.is_ok(), "{}", case.name);
+    let pushed: Vec<_> = outcome
+        .observations
+        .iter()
+        .filter_map(|observation| match observation {
+            Observation::Backpressure { limit, .. } => Some(*limit),
+            _ => None,
+        })
+        .collect();
+    assert!(!pushed.is_empty(), "{}", case.name);
+    assert!(
+        pushed.iter().all(|limit| *limit == Limit::InFlightBytes),
+        "{}: {pushed:?}",
+        case.name
+    );
+}
+
+/// No entry in flight is refused before startup as unsupported limits,
+/// never a core that cannot elect (karyos#963 review).
+fn a_zero_entry_cap_is_unsupported<C: ConsensusCore>() {
+    let w2 = W2 {
+        limits: Limits {
+            in_flight_entries: 0,
+            ..W2::skeleton().limits
+        },
+        ..W2::skeleton()
+    };
+    let case = w2.cases().unwrap().into_iter().next().unwrap();
+    assert!(
+        matches!(
+            workloads::run::<C>(&case, 1),
+            Err(RunError::Unsupported(Unsupported))
+        ),
+        "{}",
+        case.name
+    );
 }
 
 /// W5 (karyos#679). Its snapshot cases need compaction and a snapshot
@@ -229,6 +293,16 @@ macro_rules! suite {
             #[test]
             fn a_seed_reproduces_its_run() {
                 super::a_seed_reproduces_its_run::<$core>();
+            }
+
+            #[test]
+            fn w2_byte_cap_binds_before_the_entry_cap() {
+                super::w2_byte_cap_binds_before_the_entry_cap::<$core>();
+            }
+
+            #[test]
+            fn a_zero_entry_cap_is_unsupported() {
+                super::a_zero_entry_cap_is_unsupported::<$core>();
             }
 
             #[test]
