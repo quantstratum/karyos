@@ -47,12 +47,18 @@
 //! [`sealer::Sealer`] schedule), keyed by their recording id; nothing in
 //! the chain distinguishes them, which is the point.
 
+pub mod anchor;
+pub mod copies;
 pub mod journal;
 pub mod ledger;
 pub mod sealer;
 pub mod signing;
 pub mod trust;
 
+#[cfg(test)]
+mod anchor_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
