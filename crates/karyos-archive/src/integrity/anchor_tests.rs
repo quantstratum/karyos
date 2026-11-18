@@ -52,7 +52,14 @@ fn externality() -> Externality {
 }
 
 fn check(records: &[SealRecord], anchors: &[Anchor]) -> AnchorReport {
-    check_anchors(records, JOURNAL, anchors, &registry(), &externality(), &Receipts)
+    check_anchors(
+        records,
+        JOURNAL,
+        anchors,
+        &registry(),
+        &externality(),
+        &Receipts,
+    )
 }
 
 #[test]
@@ -163,7 +170,14 @@ fn a_local_replica_and_a_circular_pair_are_refused_as_external() {
     };
     pair.anchored_by_this.insert(OPERATOR);
     let circular = anchor(AnchorKind::ReplicaJournal, OPERATOR, 0, &records[2]);
-    let report = check_anchors(&records, JOURNAL, &[circular], &registry(), &pair, &Receipts);
+    let report = check_anchors(
+        &records,
+        JOURNAL,
+        &[circular],
+        &registry(),
+        &pair,
+        &Receipts,
+    );
     assert_eq!(
         report.findings,
         vec![AnchorFinding::Untrusted {
@@ -440,8 +454,7 @@ fn a_copy_whose_journal_append_failed_never_counts() {
         .unwrap()
         .journal;
     let copies_disk = FaultDisk::default();
-    let mut copies =
-        CopyCatalog::open(copies_disk.clone(), Path::new(DIR), &mut journal).unwrap();
+    let mut copies = CopyCatalog::open(copies_disk.clone(), Path::new(DIR), &mut journal).unwrap();
     let remote = copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock);
     assert!(copies.record(remote, &mut journal).is_err());
     assert!(journal_disk.has_crashed());
