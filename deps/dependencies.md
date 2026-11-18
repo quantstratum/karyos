@@ -73,7 +73,9 @@ scopes it. Its transitive runtime crates, admitted with it, are `digest`
 0.4.15, `typenum` 1.20.1 and `cpufeatures` 0.3.1 (all MIT OR
 Apache-2.0); `cfg-if` 1.0.5 and `libc` 0.2.190 (under `cpufeatures`, for
 CPU feature detection on aarch64 Linux and macOS) were already in the
-lockfile. None of these has a build script, so none compiles C.
+lockfile. Of these only `libc` has a build script, already admitted with
+`libc` itself: it emits `cfg` flags from `rustc --version` and the target,
+and compiles no C. None of the crates added with `sha2` has one.
 
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
 absent from every normal and release build and from the graph shipped to

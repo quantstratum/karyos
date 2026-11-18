@@ -640,3 +640,75 @@ fn a_failed_append_poisons_the_journal_until_it_is_reopened() {
     assert!(opened.truncated > 0);
     assert_eq!(opened.journal.next_counter(), 1);
 }
+
+#[test]
+fn a_partial_seal_keeps_the_age_of_the_bytes_still_pending() {
+    let mut sealer = Sealer::new(INTERVAL);
+    sealer.track(RECORDING, SealSource::ClusterLog, 0).unwrap();
+    sealer.written(RECORDING, 100, 0).unwrap();
+    let due = sealer.due(1_000)[0];
+    sealer.sealed(&due, 50).unwrap();
+    assert_eq!(
+        sealer.backlog(1_000),
+        SealBacklog {
+            ranges: 1,
+            bytes: 50,
+            overdue: 1,
+            oldest_age_ns: Some(1_000),
+        }
+    );
+    assert_eq!(sealer.next_deadline_ns(), Some(1_000));
+}
+
+#[test]
+fn a_close_reported_after_a_seal_was_found_due_stays_due() {
+    let mut journal = open(FaultDisk::default());
+    let mut sealer = Sealer::new(INTERVAL);
+    let bytes = payload(100, 5);
+    sealer.track(RECORDING, SealSource::Segments, 0).unwrap();
+    sealer.written(RECORDING, 100, 0).unwrap();
+    let due = sealer.due(1_000)[0];
+    assert!(!due.closes);
+    sealer.close(RECORDING, 100, 1_001).unwrap();
+    journal.seal_segment(RECORDING, 0, &bytes, false).unwrap();
+    sealer.sealed(&due, 100).unwrap();
+    let pending = sealer.due(1_001);
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].closes);
+    assert_eq!(
+        run(&mut sealer, &mut journal, 1_001, reader(&bytes)).unwrap(),
+        1
+    );
+    assert_eq!(journal.records().unwrap()[1].kind, SealKind::ClosedSegment);
+    assert!(sealer.due(1_002).is_empty());
+}
+
+#[test]
+fn a_read_of_the_wrong_length_changes_neither_the_journal_nor_the_schedule() {
+    for length in [50usize, 101] {
+        let mut journal = open(FaultDisk::default());
+        let mut sealer = Sealer::new(INTERVAL);
+        sealer.track(RECORDING, SealSource::Segments, 0).unwrap();
+        sealer.written(RECORDING, 100, 0).unwrap();
+        let failed = run(&mut sealer, &mut journal, 1_000, |_, _, _| {
+            Ok(payload(length, 9))
+        });
+        assert_eq!(
+            failed.unwrap_err().to_string(),
+            IntegrityError::from(sealer::SealerError::ReadLength {
+                recording: RECORDING,
+                expected: 100,
+                got: u64::try_from(length).unwrap(),
+            })
+            .to_string()
+        );
+        assert_eq!(journal.next_counter(), 0);
+        assert_eq!(sealer.backlog(1_000).bytes, 100);
+        assert_eq!(sealer.next_deadline_ns(), Some(1_000));
+        let bytes = payload(100, 9);
+        assert_eq!(
+            run(&mut sealer, &mut journal, 1_000, reader(&bytes)).unwrap(),
+            1
+        );
+    }
+}

@@ -72,6 +72,16 @@ pub enum SealerError {
         /// The due range's start.
         start: u64,
     },
+    /// The bytes read for a due range are not exactly its length.
+    #[error("recording {recording} read {got} bytes for a due range of {expected}")]
+    ReadLength {
+        /// The recording.
+        recording: u64,
+        /// The due range's length.
+        expected: u64,
+        /// The bytes read.
+        got: u64,
+    },
 }
 
 /// One recording's unsealed window.
@@ -278,14 +288,20 @@ impl Sealer {
             });
         }
         window.sealed = sealed_end;
-        // Bytes beyond the sealed end were reported written after `due`
-        // was found, so `due_ns` is no later than the oldest of them.
-        window.since_ns = if window.written > sealed_end {
-            Some(due.due_ns)
-        } else {
+        // A partial seal leaves bytes of `due` itself unsealed: they have
+        // been pending since the window's oldest write, so its age stays.
+        // Otherwise the bytes beyond the sealed end were reported written
+        // after `due` was found, so `due_ns` is no later than the oldest.
+        window.since_ns = if window.written <= sealed_end {
             None
+        } else if sealed_end < due.end {
+            window.since_ns
+        } else {
+            Some(due.due_ns)
         };
-        if window.closed && window.written == sealed_end {
+        // Only a seal that carried the closure untracks the recording; a
+        // close reported after `due` was found stays due.
+        if window.closed && due.closes && window.written == sealed_end {
             self.windows.remove(&recording);
         }
         Ok(())
@@ -334,6 +350,16 @@ pub fn run<D: Disk>(
     let mut appended = 0u64;
     for due in sealer.due(now_ns) {
         let bytes = read(due.recording, due.start, due.end)?;
+        let expected = due.end.checked_sub(due.start).ok_or(IntegrityError::Overflow)?;
+        let got = u64::try_from(bytes.len()).map_err(|_| IntegrityError::Overflow)?;
+        if got != expected {
+            return Err(SealerError::ReadLength {
+                recording: due.recording,
+                expected,
+                got,
+            }
+            .into());
+        }
         let sealed_end = match due.source {
             SealSource::Segments => {
                 if due.start == due.end && !due.closes {
