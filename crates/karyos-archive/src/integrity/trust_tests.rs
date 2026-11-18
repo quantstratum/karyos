@@ -166,10 +166,7 @@ fn the_signed_bytes_are_canonical_and_versioned() {
     assert_eq!(&fields[43..51], &5u64.to_le_bytes());
     assert_eq!(&fields[51..], &head(5).digest);
     assert_eq!(head(5).signed_bytes(Custody::NoSeparation), bytes);
-    assert_ne!(
-        head(5).signed_bytes(Custody::ExternallyEvidenced),
-        bytes
-    );
+    assert_ne!(head(5).signed_bytes(Custody::ExternallyEvidenced), bytes);
 }
 
 #[test]
@@ -669,5 +666,8 @@ fn a_later_lifecycle_entry_never_relaxes_an_earlier_cutoff() {
             ))
             .unwrap();
     }
-    assert_eq!(registry.key(&signer.key_id()).unwrap().retired_from, Some(8));
+    assert_eq!(
+        registry.key(&signer.key_id()).unwrap().retired_from,
+        Some(8)
+    );
 }
