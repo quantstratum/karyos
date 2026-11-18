@@ -182,6 +182,8 @@ fn log_id(term: u64, index: u64) -> OLogId {
     openraft::LogId::new(Clid::new(term), index)
 }
 
+/// The vote kept in C4's `HardState`, never committed: the bit is not
+/// stored, and leader restoration is off ([`OpenRaftCore::config`]).
 fn vote_of(state: &HardState) -> Option<OVote> {
     let voted_for = state.voted_for?;
     Some(OVote {
@@ -268,15 +270,13 @@ impl PartialEq for Request {
     }
 }
 
-/// As for [`Request`].
+/// Two answers are equal when their bytes are ([`crate::openraft_wire`]),
+/// as for [`Request`]: an answer equals its own decoded wire form and any
+/// answer built with the same content (karyos#959 review). Every answer
+/// encodes.
 impl PartialEq for Response {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Append(a), Self::Append(b)) => Arc::ptr_eq(a, b),
-            (Self::Vote(a), Self::Vote(b)) => Arc::ptr_eq(a, b),
-            (Self::TransferLeader(a), Self::TransferLeader(b)) => Arc::ptr_eq(a, b),
-            _ => false,
-        }
+        crate::openraft_wire::response_bytes(self) == crate::openraft_wire::response_bytes(other)
     }
 }
 
@@ -799,6 +799,13 @@ impl<const PRE_VOTE: bool> OpenRaftCore<PRE_VOTE> {
             enable_pre_vote: Some(PRE_VOTE),
             snapshot_policy: SnapshotPolicy::Never,
             backoff: BACKOFF.to_owned(),
+            // The durable vote is C4's `HardState`, which has no place for
+            // OpenRaft's `committed` bit, so a restarted leader comes back
+            // with an uncommitted vote. Leader restoration is off to match:
+            // a restarted leader always stands for a new election, as in
+            // standard Raft, and that is the recovery evaluated here
+            // (karyos#959 review).
+            enable_leader_restore: Some(false),
             ..openraft::Config::default()
         };
         config.validate().ok().map(Arc::new)

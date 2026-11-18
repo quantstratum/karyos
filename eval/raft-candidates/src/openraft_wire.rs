@@ -97,6 +97,14 @@ pub fn request_bytes(request: &Request) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The answer's bytes: equal bytes are an equal answer.
+#[must_use]
+pub fn response_bytes(response: &Response) -> Vec<u8> {
+    let mut out = Vec::new();
+    response_to(&mut out, response);
+    out
+}
+
 fn u64_to(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
@@ -404,6 +412,8 @@ mod tests {
         let bytes = encode(message).unwrap();
         let decoded = decode(&bytes).unwrap();
         assert_eq!(encode(&decoded).unwrap(), bytes);
+        // The values too, not only their bytes (karyos#959 review).
+        assert_eq!(&decoded, message);
         // Every proper prefix is refused, never read past its end.
         for cut in 0..bytes.len() {
             assert!(decode(&bytes[..cut]).is_none(), "prefix {cut}");

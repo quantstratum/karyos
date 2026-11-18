@@ -169,3 +169,42 @@ fn a_bounded_channel_keeps_its_capacity_across_sends() {
     let _ = executor.pump(1000);
     assert_eq!(sent.load(Ordering::SeqCst), 3);
 }
+
+/// The P1 of the karyos#959 review: two tasks blocked on the same full
+/// channel both resume once it drains. The underlying sender parks one
+/// waker, so without the adapter's own registry the first task to block
+/// was never woken again.
+#[test]
+fn every_send_blocked_on_a_full_channel_resumes() {
+    use openraft_rt::mpsc::{Mpsc, MpscReceiver, MpscSender};
+
+    use karyos_raft_eval::executor::channels::SimMpsc;
+
+    let executor = Executor::new(1);
+    let (sender, mut receiver) = SimMpsc::channel::<u64>(0);
+    let done = Arc::new(AtomicU64::new(0));
+    for task in 0..2u64 {
+        let sender = sender.clone();
+        let done = Arc::clone(&done);
+        let _handle = executor.spawn(async move {
+            for value in 0..2u64 {
+                if sender.send(task * 10 + value).await.is_err() {
+                    return;
+                }
+            }
+            done.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+    drop(sender);
+    let _ = executor.pump(1000);
+    let mut received = Vec::new();
+    for _ in 0..16 {
+        while let Ok(value) = receiver.try_recv() {
+            received.push(value);
+        }
+        let _ = executor.pump(1000);
+    }
+    received.sort_unstable();
+    assert_eq!(received, vec![0, 1, 10, 11]);
+    assert_eq!(done.load(Ordering::SeqCst), 2, "both senders finished");
+}

@@ -28,7 +28,44 @@ pub struct SimMpsc;
 /// own and bypassed the capacity). The receiver sees the channel closed
 /// once every clone is dropped, and a weak sender upgrades while one is
 /// alive.
-pub struct SimSender<T>(Arc<Mutex<mpsc::Sender<T>>>);
+///
+/// The underlying sender parks one waker, so every send blocked on a full
+/// channel registers its own waker with the clones, and the waker handed to
+/// the sender wakes them all: draining the channel resumes every blocked
+/// send, not only the last one to register (karyos#959 review).
+pub struct SimSender<T>(Arc<Mutex<MpscShared<T>>>);
+
+/// What a sender's clones share.
+struct MpscShared<T> {
+    sender: mpsc::Sender<T>,
+    blocked: Arc<Blocked>,
+}
+
+/// The wakers of the sends blocked on a full channel.
+#[derive(Default)]
+struct Blocked(Mutex<Vec<Waker>>);
+
+impl Blocked {
+    fn register(&self, waker: &Waker) {
+        let mut wakers = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !wakers.iter().any(|known| known.will_wake(waker)) {
+            wakers.push(waker.clone());
+        }
+    }
+}
+
+impl std::task::Wake for Blocked {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let wakers = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
+        for waker in wakers {
+            waker.wake();
+        }
+    }
+}
 
 impl<T> Clone for SimSender<T> {
     fn clone(&self) -> Self {
@@ -43,7 +80,7 @@ impl<T> fmt::Debug for SimSender<T> {
 }
 
 /// A weak mpsc sender.
-pub struct SimWeakSender<T>(Weak<Mutex<mpsc::Sender<T>>>);
+pub struct SimWeakSender<T>(Weak<Mutex<MpscShared<T>>>);
 
 impl<T> Clone for SimWeakSender<T> {
     fn clone(&self) -> Self {
@@ -62,7 +99,10 @@ impl Mpsc for SimMpsc {
     fn channel<T: OptionalSend>(buffer: usize) -> (Self::Sender<T>, Self::Receiver<T>) {
         let (sender, receiver) = mpsc::channel(buffer);
         (
-            SimSender(Arc::new(Mutex::new(sender))),
+            SimSender(Arc::new(Mutex::new(MpscShared {
+                sender,
+                blocked: Arc::default(),
+            }))),
             SimReceiver(receiver),
         )
     }
@@ -77,8 +117,12 @@ impl<T: OptionalSend> MpscSender<SimMpsc, T> for SimSender<T> {
                 // Polled again after it finished: nothing left to send.
                 return Poll::Pending;
             };
-            let mut sender = shared.lock().unwrap_or_else(PoisonError::into_inner);
-            match sender.poll_ready(cx) {
+            let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
+            let MpscShared { sender, blocked } = &mut *shared;
+            // Registered before polling, so a wake between the two is kept.
+            blocked.register(cx.waker());
+            let all = Waker::from(Arc::clone(blocked));
+            match sender.poll_ready(&mut Context::from_waker(&all)) {
                 Poll::Pending => {
                     msg = Some(value);
                     Poll::Pending
