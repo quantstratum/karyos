@@ -34,6 +34,16 @@ fn anchor(kind: AnchorKind, location: [u8; 32], external: u64, record: &SealReco
     }
 }
 
+/// The stores of these tests: each confirms an anchor whose receipt is
+/// the digest of its external counter, as [`anchor`] builds it.
+struct Receipts;
+
+impl AnchorEvidence for Receipts {
+    fn confirms(&self, anchor: &Anchor) -> bool {
+        anchor.receipt == digest(&anchor.external_counter.to_le_bytes())
+    }
+}
+
 fn externality() -> Externality {
     Externality {
         local_archive: ARCHIVE,
@@ -42,7 +52,7 @@ fn externality() -> Externality {
 }
 
 fn check(records: &[SealRecord], anchors: &[Anchor]) -> AnchorReport {
-    check_anchors(records, JOURNAL, anchors, &registry(), &externality())
+    check_anchors(records, JOURNAL, anchors, &registry(), &externality(), &Receipts)
 }
 
 #[test]
@@ -130,7 +140,14 @@ fn a_local_replica_and_a_circular_pair_are_refused_as_external() {
     let mut externality = externality();
     externality.local_locations.insert(REPLICA);
     let local = anchor(AnchorKind::ReplicaJournal, REPLICA, 0, &records[2]);
-    let report = check_anchors(&records, JOURNAL, &[local], &registry(), &externality);
+    let report = check_anchors(
+        &records,
+        JOURNAL,
+        &[local],
+        &registry(),
+        &externality,
+        &Receipts,
+    );
     assert_eq!(
         report.findings,
         vec![AnchorFinding::Untrusted {
@@ -146,7 +163,7 @@ fn a_local_replica_and_a_circular_pair_are_refused_as_external() {
     };
     pair.anchored_by_this.insert(OPERATOR);
     let circular = anchor(AnchorKind::ReplicaJournal, OPERATOR, 0, &records[2]);
-    let report = check_anchors(&records, JOURNAL, &[circular], &registry(), &pair);
+    let report = check_anchors(&records, JOURNAL, &[circular], &registry(), &pair, &Receipts);
     assert_eq!(
         report.findings,
         vec![AnchorFinding::Untrusted {
@@ -268,7 +285,24 @@ fn anchors_are_published_on_schedule_with_what_a_third_party_needs() {
         LedgerAnchorStore::open(disk, operator_dir, AnchorKind::OperatorExport, OPERATOR).unwrap();
     let anchors = reopened.anchors();
     assert_eq!(anchors.len(), 2);
-    assert_eq!(check(&records, &anchors).anchored_through, Some(5));
+    let report = check_anchors(
+        &records,
+        JOURNAL,
+        &anchors,
+        &registry(),
+        &externality(),
+        &reopened,
+    );
+    assert_eq!(report.anchored_through, Some(5));
+    assert!(report.findings.is_empty());
+    assert_eq!(anchors[0], first);
+    // The store confirms only what it holds, where it holds it.
+    let mut moved = first;
+    moved.external_counter = 1;
+    assert!(!reopened.confirms(&moved));
+    let mut rewritten = first;
+    rewritten.receipt = [0; 32];
+    assert!(!reopened.confirms(&rewritten));
     assert_eq!(
         Anchor::decode(&first.encode()).unwrap().signed,
         first.signed
@@ -293,7 +327,7 @@ fn copy(location: [u8; 32], state: CopyState, enforcement: Enforcement) -> CopyR
 fn the_catalog_states_the_immutability_enforcement_per_copy() {
     let disk = FaultDisk::default();
     let (mut journal, _) = chain(2);
-    let mut copies = CopyCatalog::open(disk.clone(), Path::new(DIR)).unwrap();
+    let mut copies = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut journal).unwrap();
     let local = copy(ARCHIVE, CopyState::Verified, Enforcement::Unsupported);
     let remote = copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock);
     let record = copies.record(local, &mut journal).unwrap();
@@ -301,7 +335,7 @@ fn the_catalog_states_the_immutability_enforcement_per_copy() {
     // Each copy record is chained as a catalog change.
     assert_eq!(record.kind, super::SealKind::Catalog);
     assert_eq!(record.content, digest(&copies.records()[0].encode()));
-    let reopened = CopyCatalog::open(disk, Path::new(DIR)).unwrap();
+    let reopened = CopyCatalog::open(disk, Path::new(DIR), &mut journal).unwrap();
     let current = reopened.current();
     assert_eq!(current[0].enforcement, Enforcement::Unsupported);
     assert_eq!(current[1].enforcement, Enforcement::ObjectLock);
@@ -318,7 +352,7 @@ fn the_catalog_states_the_immutability_enforcement_per_copy() {
 #[test]
 fn an_unverified_or_removed_copy_counts_towards_nothing() {
     let (mut journal, _) = chain(1);
-    let mut copies = CopyCatalog::open(FaultDisk::default(), Path::new(DIR)).unwrap();
+    let mut copies = CopyCatalog::open(FaultDisk::default(), Path::new(DIR), &mut journal).unwrap();
     copies
         .record(
             copy(REPLICA, CopyState::Unverified, Enforcement::Unsupported),
@@ -342,4 +376,86 @@ fn an_unverified_or_removed_copy_counts_towards_nothing() {
         .unwrap();
     assert_eq!(copies.verified_copies(3, 0, 80), 0);
     assert_eq!(copies.current().len(), 1);
+}
+
+#[test]
+fn an_anchor_its_store_does_not_confirm_does_not_count() {
+    let (_, records) = chain(4);
+    // A valid signed head wrapped in invented store metadata.
+    let invented = Anchor {
+        kind: AnchorKind::ObjectLock,
+        location: [9; 32],
+        external_counter: 999,
+        receipt: [0; 32],
+        signed: sign(&records[0]),
+    };
+    let report = check(&records, &[invented]);
+    assert_eq!(
+        report.findings,
+        vec![AnchorFinding::Untrusted {
+            index: 0,
+            reason: AnchorReason::Unconfirmed
+        }]
+    );
+    assert_eq!(report.anchored_through, None);
+    assert!(report.kinds.is_empty());
+}
+
+#[test]
+fn an_ancestry_proof_requires_the_same_archive_and_journal() {
+    let (_, records) = chain(8);
+    let earlier = sign(&records[2]).head;
+    let mut later = sign(&records[6]).head;
+    later.journal_id = JOURNAL + 1;
+    assert!(!proves_ancestry(&earlier, &later, &records[3..=6]));
+    let mut later = sign(&records[6]).head;
+    later.archive_id = [1; 32];
+    assert!(!proves_ancestry(&earlier, &later, &records[3..=6]));
+}
+
+#[test]
+fn a_repeated_anchor_counts_once_and_a_different_one_at_its_counter_conflicts() {
+    let (_, records) = chain(6);
+    let one = anchor(AnchorKind::OperatorExport, OPERATOR, 0, &records[3]);
+    let report = check(&records, &[one, one]);
+    assert!(report.findings.is_empty());
+    assert_eq!(report.anchored_through, Some(3));
+    assert!(!report.is_conflicting());
+    let other = anchor(AnchorKind::OperatorExport, OPERATOR, 0, &records[4]);
+    let report = check(&records, &[one, other]);
+    assert_eq!(
+        report.findings,
+        vec![AnchorFinding::CounterRollback { location: OPERATOR }]
+    );
+}
+
+#[test]
+fn a_copy_whose_journal_append_failed_never_counts() {
+    use super::journal::IntegrityJournal;
+    let probe = FaultDisk::default();
+    IntegrityJournal::open(probe.clone(), Path::new(DIR)).unwrap();
+    // A journal disk that crashes on the first append after opening.
+    let journal_disk = FaultDisk::with_budget(probe.used());
+    let mut journal = IntegrityJournal::open(journal_disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let copies_disk = FaultDisk::default();
+    let mut copies =
+        CopyCatalog::open(copies_disk.clone(), Path::new(DIR), &mut journal).unwrap();
+    let remote = copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock);
+    assert!(copies.record(remote, &mut journal).is_err());
+    assert!(journal_disk.has_crashed());
+    assert_eq!(copies.verified_copies(3, 0, 80), 0);
+    assert!(copies.records().is_empty());
+    // The ledger entry survived, but the reopened catalog filters it out.
+    let mut recovered = IntegrityJournal::open(
+        journal_disk.after_crash(crate::fault::Survives::Synced),
+        Path::new(DIR),
+    )
+    .unwrap()
+    .journal;
+    assert_eq!(recovered.next_counter(), 0);
+    let reopened = CopyCatalog::open(copies_disk, Path::new(DIR), &mut recovered).unwrap();
+    assert_eq!(reopened.verified_copies(3, 0, 80), 0);
+    assert!(reopened.records().is_empty());
 }

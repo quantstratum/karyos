@@ -11,8 +11,8 @@
 //! cannot be hidden by rolling the anchor record back too.
 //!
 //! [`check_anchors`] compares a chain with its anchors and reports, never
-//! resolves: an anchor that is not external, untrusted or of a deferred
-//! kind carries its reason; two anchors that disagree about one position
+//! resolves: an anchor that is not external, untrusted, of a deferred kind
+//! or not confirmed by its store ([`AnchorEvidence`]) carries its reason; two anchors that disagree about one position
 //! are equivocation; a chain shorter than an anchored head is truncation;
 //! a chain whose record at an anchored position differs is a rollback; a
 //! store counter that goes back while the head goes forward, or the other
@@ -185,6 +185,28 @@ pub enum AnchorReason {
     WrongJournal,
     /// The anchored head is not trusted evidence.
     Head(HeadReason),
+    /// The store it names does not confirm holding it at its counter with
+    /// its receipt: the anchor's provenance is unauthenticated.
+    Unconfirmed,
+}
+
+/// Evidence from the external stores themselves: whether the store an
+/// anchor names holds exactly that anchor at its external counter, with
+/// that receipt. A signed head proves only who signed it; where it is
+/// kept, and that it is kept there, is proved by the store, never by the
+/// anchor's own fields.
+pub trait AnchorEvidence {
+    /// Whether the store named by `anchor` (its kind and location)
+    /// confirms holding it at `anchor.external_counter` with
+    /// `anchor.receipt`. A store this evidence does not reach confirms
+    /// nothing.
+    fn confirms(&self, anchor: &Anchor) -> bool;
+}
+
+impl AnchorEvidence for [&dyn AnchorEvidence] {
+    fn confirms(&self, anchor: &Anchor) -> bool {
+        self.iter().any(|store| store.confirms(anchor))
+    }
 }
 
 impl Externality {
@@ -286,7 +308,9 @@ impl AnchorReport {
 
 /// Compares `records`, the chain of journal `journal_id`, with `anchors`.
 /// Each anchor's head is verified under `registry` (a head whose key was
-/// later revoked counts only when an earlier trusted anchor covers it).
+/// later revoked counts only when an earlier trusted anchor covers it),
+/// and its provenance by `evidence`: an anchor its store does not confirm
+/// does not count. The same anchor supplied more than once counts once.
 #[must_use]
 pub fn check_anchors(
     records: &[SealRecord],
@@ -294,6 +318,7 @@ pub fn check_anchors(
     anchors: &[Anchor],
     registry: &KeyRegistry,
     externality: &Externality,
+    evidence: &dyn AnchorEvidence,
 ) -> AnchorReport {
     let mut report = AnchorReport {
         anchored_through: None,
@@ -306,7 +331,12 @@ pub fn check_anchors(
         return report;
     }
     let mut trusted: Vec<&Anchor> = Vec::new();
+    let mut seen: BTreeSet<[u8; ANCHOR_LENGTH]> = BTreeSet::new();
     for (index, anchor) in anchors.iter().enumerate() {
+        // Repeated evidence, as from merged exports, is one anchor.
+        if !seen.insert(anchor.encode()) {
+            continue;
+        }
         let reason = externality.check(anchor).err().or_else(|| {
             (anchor.signed.head.journal_id != journal_id).then_some(AnchorReason::WrongJournal)
         });
@@ -316,6 +346,8 @@ pub fn check_anchors(
                 Some(AnchorReason::Head(reason))
             }
         });
+        let reason =
+            reason.or_else(|| (!evidence.confirms(anchor)).then_some(AnchorReason::Unconfirmed));
         match reason {
             Some(reason) => report
                 .findings
@@ -400,12 +432,17 @@ pub fn check_anchors(
     report
 }
 
-/// Whether `later` extends `earlier`: `between` are the records after
-/// `earlier`'s position up to and including `later`'s, and their counters
-/// and links run from `earlier`'s digest to `later`'s. An anchor proved
-/// this way extends an earlier one rather than merely existing.
+/// Whether `later` extends `earlier`: both name the same Archive and
+/// journal, `between` are the records after `earlier`'s position up to
+/// and including `later`'s, and their counters and links run from
+/// `earlier`'s digest to `later`'s. An anchor proved this way extends an
+/// earlier one rather than merely existing.
 #[must_use]
 pub fn proves_ancestry(earlier: &ChainHead, later: &ChainHead, between: &[SealRecord]) -> bool {
+    // Record digests do not bind the identities, so the heads must.
+    if earlier.archive_id != later.archive_id || earlier.journal_id != later.journal_id {
+        return false;
+    }
     let mut expected = earlier.counter.checked_add(1);
     let mut head = earlier.digest;
     for record in between {
@@ -548,15 +585,43 @@ impl<D: Disk> LedgerAnchorStore<D> {
         })
     }
 
-    /// The anchors stored, oldest first; one that does not decode is
-    /// skipped, and the verifier reports what is missing.
+    /// The anchors stored, oldest first, each with its counter and the
+    /// receipt [`AnchorStore::publish`] returned for it; one that does not
+    /// decode is skipped, and the verifier reports what is missing.
     #[must_use]
     pub fn anchors(&self) -> Vec<Anchor> {
         self.ledger
             .entries()
             .iter()
-            .filter_map(|bytes| Anchor::decode(bytes).ok())
+            .filter_map(|bytes| {
+                Anchor::decode(bytes).ok().map(|stored| Anchor {
+                    receipt: super::digest(bytes),
+                    ..stored
+                })
+            })
             .collect()
+    }
+}
+
+impl<D: Disk> AnchorEvidence for LedgerAnchorStore<D> {
+    fn confirms(&self, anchor: &Anchor) -> bool {
+        if anchor.kind != self.kind || anchor.location != self.location {
+            return false;
+        }
+        let Some(bytes) = usize::try_from(anchor.external_counter)
+            .ok()
+            .and_then(|index| self.ledger.entries().get(index))
+        else {
+            return false;
+        };
+        anchor.receipt == super::digest(bytes)
+            && Anchor::decode(bytes).is_ok_and(|stored| {
+                stored
+                    == Anchor {
+                        receipt: [0; 32],
+                        ..*anchor
+                    }
+            })
     }
 }
 

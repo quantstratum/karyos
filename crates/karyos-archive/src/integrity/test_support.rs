@@ -77,7 +77,7 @@ pub(crate) fn sign(record: &SealRecord) -> SignedHead {
         head,
         key_id: key_id(&key.verifying_key().to_bytes()),
         custody: Custody::NoSeparation,
-        signature: key.sign(&head.signed_bytes()).to_bytes(),
+        signature: key.sign(&head.signed_bytes(Custody::NoSeparation)).to_bytes(),
     }
 }
 

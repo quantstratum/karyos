@@ -27,7 +27,7 @@ use std::path::Path;
 
 use super::journal::{IntegrityError, IntegrityJournal};
 use super::ledger::Ledger;
-use super::{Digest, SealRecord};
+use super::{Digest, SealKind, SealRecord};
 use crate::disk::Disk;
 
 /// The copy catalog's file name in the archive directory.
@@ -229,20 +229,34 @@ pub struct CopyCatalog<D: Disk> {
 }
 
 impl<D: Disk> CopyCatalog<D> {
-    /// Opens the copy catalog of `dir`.
+    /// Opens the copy catalog of `dir`, keeping only the records whose
+    /// catalog change `journal` chains: a record stored before a crash or a
+    /// failed journal append is not committed, so it never counts.
     ///
     /// # Errors
     ///
-    /// As [`Ledger::open`]; [`IntegrityError::Overflow`] for a record that
-    /// does not decode, which the verifier then reports against the chain.
-    pub fn open(disk: D, dir: &Path) -> Result<Self, IntegrityError> {
+    /// As [`Ledger::open`] and [`IntegrityJournal::records`];
+    /// [`IntegrityError::Overflow`] for a record that does not decode,
+    /// which the verifier then reports against the chain.
+    pub fn open(
+        disk: D,
+        dir: &Path,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<Self, IntegrityError> {
         let ledger = Ledger::open(disk, dir, COPIES_FILE)?;
-        let records = ledger
-            .entries()
-            .iter()
-            .map(CopyRecord::decode)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| IntegrityError::Overflow)?;
+        let chained: std::collections::BTreeSet<(u64, u64, Digest)> = journal
+            .records()?
+            .into_iter()
+            .filter(|record| record.kind == SealKind::Catalog)
+            .map(|record| (record.subject, record.start, record.content))
+            .collect();
+        let mut records = Vec::new();
+        for bytes in ledger.entries() {
+            let record = CopyRecord::decode(bytes).map_err(|_| IntegrityError::Overflow)?;
+            if chained.contains(&(record.recording, record.sequence, super::digest(bytes))) {
+                records.push(record);
+            }
+        }
         Ok(Self { ledger, records })
     }
 
@@ -260,12 +274,13 @@ impl<D: Disk> CopyCatalog<D> {
     }
 
     /// Records a copy's new state: the record is stored, then its digest
-    /// is chained in `journal` as a catalog change of its recording. The
-    /// record's sequence is assigned here.
+    /// is chained in `journal` as a catalog change of its recording, and
+    /// only then is it part of the catalog's state. The record's sequence
+    /// is assigned here.
     ///
     /// # Errors
     ///
-    /// The ledger's or the journal's error.
+    /// The ledger's or the journal's error; the state is unchanged then.
     pub fn record(
         &mut self,
         mut record: CopyRecord,
@@ -274,8 +289,9 @@ impl<D: Disk> CopyCatalog<D> {
         record.sequence = self.next_sequence();
         let bytes = record.encode();
         self.ledger.append(bytes)?;
+        let chained = journal.record_catalog_change(record.recording, record.sequence, &bytes)?;
         self.records.push(record);
-        journal.record_catalog_change(record.recording, record.sequence, &bytes)
+        Ok(chained)
     }
 
     /// The latest record of every copy, in the order each copy first
