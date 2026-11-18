@@ -314,7 +314,9 @@ fn an_unknown_key_never_yields_beyond_anchor() {
             head,
             key_id: key_id(&stranger.verifying_key().to_bytes()),
             custody: Custody::Declared,
-            signature: stranger.sign(&head.signed_bytes(Custody::Declared)).to_bytes(),
+            signature: stranger
+                .sign(&head.signed_bytes(Custody::Declared))
+                .to_bytes(),
         }
         .encode(),
     ];

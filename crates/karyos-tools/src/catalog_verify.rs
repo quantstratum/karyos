@@ -29,9 +29,7 @@ use std::path::PathBuf;
 
 use karyos_archive::catalog::list;
 use karyos_archive::disk::{ReadOnly, StdDisk};
-use karyos_archive::integrity::anchor::{
-    ANCHOR_FILE, ANCHOR_LENGTH, Externality, StoredAnchors,
-};
+use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Externality, StoredAnchors};
 use karyos_archive::integrity::journal::read_records;
 use karyos_archive::integrity::ledger::read_entries;
 use karyos_archive::integrity::trust::{
