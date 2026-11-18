@@ -3,6 +3,8 @@ AGENTS.md
 
 # Rust build output
 /target/
+# The Raft candidates' evaluation workspace (its own target directory).
+/eval/raft-candidates/target/
 **/*.rs.bk
 *.pdb
 

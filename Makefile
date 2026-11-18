@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check lint-sync changelog-check lint-linux pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check raft-eval lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -130,6 +130,11 @@ deps-check:
 shipped-graph-check:
 	CARGO="$(CARGO)" scripts/check-shipped-graph.sh
 	CARGO="$(CARGO)" scripts/check-shipped-graph-selftest.sh
+# The Raft candidates' evaluation workspace (eval/raft-candidates, its own
+# lockfile): format, clippy, docs and tests, with the bundled protoc 3.9.0
+# that raft-proto's build script needs (karyos#678).
+raft-eval:
+	CARGO="$(CARGO)" eval/raft-candidates/check.sh
 lint-sync:
 	scripts/check-lint-sync.sh
 
@@ -143,4 +148,4 @@ changelog-check:
 netem:
 	scripts/netem-test.sh
 
-pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check abi-manifest-check lint lint-linux doc test loom build-release test-hooks-absent-check timing-build-check
+pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check

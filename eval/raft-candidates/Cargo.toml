@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# The Raft candidates' evaluation crate: evaluation only, never shipped
+# (quantstratum-docs:
+# karyos/reviews/dependency-admission-raft-candidates-evaluation.md;
+# karyos#677). Its own workspace, lockfile and deny.toml keep the
+# candidates out of the core's graph; make shipped-graph-check proves it.
+
+[workspace]
+
+[package]
+name = "karyos-raft-eval"
+description = "Evaluation adapters of the Raft candidates behind the karyos-sim harness; never shipped."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+repository = "https://github.com/quantstratum/karyos"
+publish = false
+
+[dependencies]
+karyos-sim = { path = "../../crates/karyos-sim" }
+karyos-cluster = { path = "../../crates/karyos-cluster" }
+# Admitted for evaluation: exactly 0.7.0, default features off
+# (no default-logger), protobuf-codec only.
+raft = { version = "=0.7.0", default-features = false, features = ["protobuf-codec"] }
+# raft's own logger crate, already in its graph: RawNode::new takes a
+# slog::Logger, given a discarding one.
+slog = { version = "2.8.2", default-features = false }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+
+[dev-dependencies]
+# The allocation gate's probe (karyos-sim harness::probe) and the
+# counting allocator it needs (ADR-0008).
+karyos-sim = { path = "../../crates/karyos-sim", features = ["alloc-probe"] }
+karyos-sys = { path = "../../crates/karyos-sys", features = ["test-hooks"] }
+
