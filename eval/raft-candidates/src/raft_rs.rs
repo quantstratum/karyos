@@ -423,6 +423,16 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
     }
 }
 
+impl<const PRE_VOTE: bool> crate::process::Wire for RaftCore<PRE_VOTE> {
+    fn encode(message: &eraftpb::Message) -> Option<Vec<u8>> {
+        protobuf::Message::write_to_bytes(message).ok()
+    }
+
+    fn decode(bytes: &[u8]) -> Option<eraftpb::Message> {
+        protobuf::Message::parse_from_bytes(bytes).ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

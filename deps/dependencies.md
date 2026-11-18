@@ -128,6 +128,7 @@ applies them:
   | Crate | Version | Features | Scope |
   | --- | --- | --- | --- |
   | `raft` | `=0.7.0` | default features off; `protobuf-codec` | evaluation only, `karyos-raft-eval` (karyos#678) |
+  | `protobuf` | `=2.28.0` | default features off | evaluation only: `raft-proto`'s codec, already in `raft`'s graph; encodes raft-rs messages between the real processes |
   | `slog` | 2.8.2 | default features off | evaluation only: `raft`'s own logger crate, already in its graph; `RawNode::new` takes a `slog::Logger`, given a discarding one |
 
 - **Versions and features** are exactly the record's: `raft` without

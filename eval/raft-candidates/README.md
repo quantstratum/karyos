@@ -41,5 +41,5 @@ all `--locked`.
 | Allocation | **fails the gate**: W1, 32 clients, seed 1: 113 entries past the warm-up, 5,701 allocations and 2,547 frees, 51 and 23 per entry |
 | Durability, recovery | the harness's C4 checks pass under W4's crashes and torn writes |
 | Storage | raft-rs reads a `MemStorage` mirror of what C4 made durable, so the harness's metered log reads do not see its reads |
-| Real processes | not demonstrated: the harness has no process runner yet, and `LogView` is over the simulated disk only |
+| Real processes | demonstrated: `tests/real_processes.rs` runs three `raft-eval-node` processes, each running `RaftRs` (the type the simulator tests drive, unchanged) through the harness's `drive`, over C4's log on real files (`StdDisk`) and UDP on the loopback; they elect a leader and all apply the same 20 commands in the same order. The runner maps 10 ms of the process clock to a tick: at 1 ms a tick an election times out before a vote's `fsync` and no leader is elected |
 | Panics | raft-rs asserts its own invariants and unwraps its storage lock; none fired in these runs |

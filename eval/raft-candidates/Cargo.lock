@@ -193,9 +193,11 @@ dependencies = [
 name = "karyos-raft-eval"
 version = "0.0.0"
 dependencies = [
+ "karyos-archive",
  "karyos-cluster",
  "karyos-sim",
  "karyos-sys",
+ "protobuf",
  "raft",
  "slog",
 ]

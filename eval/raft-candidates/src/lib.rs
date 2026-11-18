@@ -13,8 +13,11 @@
 //!
 //! - [`raft_rs`]: `raft` 0.7.0 (TiKV's raft-rs), its `RawNode` driven by
 //!   the harness's node.
+//! - [`process`]: the same cores in real processes: C4's log on real
+//!   files, UDP between processes, the monotonic clock.
 //! - [`variant`]: which build of a candidate ran, baseline or patched,
 //!   with its patch record.
 
+pub mod process;
 pub mod raft_rs;
 pub mod variant;
