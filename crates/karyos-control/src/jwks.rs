@@ -77,16 +77,31 @@ impl Default for Budget {
 }
 
 impl Budget {
-    /// A budget of `floor` and `cap` (at least `floor`).
+    /// A budget of `floor` and `cap` (at least `floor`), each at most
+    /// [`Budget::MAX`], so a wait is always a representable deadline.
     #[must_use]
     pub fn new(floor: Duration, cap: Duration) -> Self {
+        let floor = floor.min(Self::MAX);
         Self {
             floor,
-            cap: cap.max(floor),
+            cap: cap.min(Self::MAX).max(floor),
         }
     }
 
+    /// The longest floor or cap: a day.
+    pub const MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
     /// The wait before the next fetch after `failures` failures in a row.
+    /// When the next fetch may start, `failures` failures in a row after
+    /// `now`. A wait past what `Instant` holds (none, with [`Budget::MAX`])
+    /// is the latest it holds.
+    fn next(&self, now: Instant, failures: u32) -> Instant {
+        let wait = self.wait(failures);
+        now.checked_add(wait)
+            .or_else(|| now.checked_add(Self::MAX))
+            .unwrap_or(now)
+    }
+
     fn wait(&self, failures: u32) -> Duration {
         let factor = 1u32.checked_shl(failures.min(16)).unwrap_or(u32::MAX);
         self.floor.saturating_mul(factor).min(self.cap)
@@ -164,7 +179,9 @@ struct State {
     generation: u64,
     /// The set the last finished fetch got, if it succeeded: a waiter on
     /// that fetch may use it even when its lifetime is zero.
-    fetched: Option<(u64, Arc<KeySet>)>,
+    /// With the deadline past which no one may use it, `None` for a zero
+    /// lifetime (that fetch's requests only).
+    fetched: Option<(u64, Arc<KeySet>, Option<Instant>)>,
     next_allowed: Option<Instant>,
     failures: u32,
 }
@@ -277,7 +294,12 @@ impl Jwks {
             let state = self.lock();
             if state.generation != generation {
                 return match &state.fetched {
-                    Some((fetched, set)) if *fetched == state.generation => Ok(Arc::clone(set)),
+                    Some((fetched, set, until))
+                        if *fetched == state.generation
+                            && until.is_none_or(|until| Instant::now() < until) =>
+                    {
+                        Ok(Arc::clone(set))
+                    }
                     _ => Err(KeysError::Unavailable),
                 };
             }
@@ -302,36 +324,42 @@ impl Jwks {
         state.generation = state.generation.wrapping_add(1);
         let now = Instant::now();
         match result {
-            // A response whose `Age` already consumed its lifetime is stale
-            // on receipt: never used, not even by the request that fetched
-            // it. Only an origin response (age zero) of zero lifetime serves
-            // that one request and its waiters.
-            Ok((_, _, freshness)) if freshness.stale_on_receipt() => {
-                state.failures = state.failures.saturating_add(1);
-                let failures = state.failures;
-                state.next_allowed = Some(now + self.issuer.budget.wait(failures));
-                state.fetched = None;
-                Err(KeysError::Unavailable)
-            }
             Ok((uri, set, freshness)) => {
-                let set = Arc::new(set);
-                state.jwks_uri = Some(uri);
-                state.failures = 0;
-                state.next_allowed = Some(now + self.issuer.budget.wait(0));
                 // Its age counts from the request, less what caches held.
                 let born = started.checked_sub(freshness.age).unwrap_or(started);
                 let until = born.checked_add(freshness.lifetime).unwrap_or(born);
+                let positive = !freshness.lifetime.is_zero();
+                // Stale on receipt, or its positive lifetime ran out while
+                // the body was read: never used, not even by the request
+                // that fetched it. Only an origin response of zero
+                // lifetime, not explicitly expired, serves that one
+                // request and its waiters.
+                if freshness.stale_on_receipt() || (positive && now >= until) {
+                    state.failures = state.failures.saturating_add(1);
+                    let failures = state.failures;
+                    state.next_allowed = Some(self.issuer.budget.next(now, failures));
+                    state.fetched = None;
+                    return Err(KeysError::Unavailable);
+                }
+                let set = Arc::new(set);
+                state.jwks_uri = Some(uri);
+                state.failures = 0;
+                state.next_allowed = Some(self.issuer.budget.next(now, 0));
                 state.last = Some(Fresh {
                     set: Arc::clone(&set),
                     until,
                 });
-                state.fetched = Some((state.generation, Arc::clone(&set)));
+                state.fetched = Some((
+                    state.generation,
+                    Arc::clone(&set),
+                    positive.then_some(until),
+                ));
                 Ok(set)
             }
             Err(_) => {
                 state.failures = state.failures.saturating_add(1);
                 let failures = state.failures;
-                state.next_allowed = Some(now + self.issuer.budget.wait(failures));
+                state.next_allowed = Some(self.issuer.budget.next(now, failures));
                 state.fetched = None;
                 Err(KeysError::Unavailable)
             }
@@ -346,7 +374,7 @@ impl Jwks {
         state.generation = state.generation.wrapping_add(1);
         state.failures = state.failures.saturating_add(1);
         let failures = state.failures;
-        state.next_allowed = Some(Instant::now() + self.issuer.budget.wait(failures));
+        state.next_allowed = Some(self.issuer.budget.next(Instant::now(), failures));
         state.fetched = None;
     }
 
@@ -483,6 +511,11 @@ pub struct Freshness {
     /// Its `Age` alone: how long caches held it. Zero for a response from
     /// the origin.
     pub held: Duration,
+    /// Its `Expires` governs its lifetime (no `max-age`, no `no-cache`)
+    /// and is at or before its `Date` (or this clock, without one), or is
+    /// not a date (RFC 9111 §5.3): explicitly expired, never usable, not
+    /// even by the request that fetched it.
+    pub expired: bool,
 }
 
 impl Freshness {
@@ -491,7 +524,9 @@ impl Freshness {
     /// origin serves the request that fetched it, whatever its `Date`
     /// (whose one-second resolution would otherwise decide).
     fn stale_on_receipt(&self) -> bool {
-        if self.lifetime.is_zero() {
+        if self.expired {
+            true
+        } else if self.lifetime.is_zero() {
             !self.held.is_zero()
         } else {
             self.age >= self.lifetime
@@ -543,6 +578,7 @@ impl Freshness {
                 _ => {}
             }
         }
+        let mut expired = false;
         let lifetime = if uncacheable {
             Duration::ZERO
         } else if let Some(seconds) = max_age {
@@ -550,16 +586,22 @@ impl Freshness {
         } else {
             let date = date.or(now_seconds);
             match (text(hyper::header::EXPIRES).map(http_date), date) {
-                (Some(Some(expires)), Some(date)) => {
-                    Duration::from_secs(expires.saturating_sub(date))
+                (Some(Some(expires)), Some(date)) if expires > date => {
+                    Duration::from_secs(expires - date)
                 }
-                _ => Duration::ZERO,
+                // At or before its date, or not a date: already expired.
+                (Some(_), _) => {
+                    expired = true;
+                    Duration::ZERO
+                }
+                (None, _) => Duration::ZERO,
             }
         };
         Self {
             lifetime,
             age,
             held,
+            expired,
         }
     }
 }
@@ -708,6 +750,32 @@ mod tests {
             ("date", "Sun, 06 Nov 1994 09:49:37 GMT"),
         ]);
         assert_eq!(ahead.age, Duration::ZERO);
+        // An `Expires` at or before its `Date` (or this clock, without
+        // one), or not a date, is explicitly expired: never the zero
+        // lifetime exception.
+        for headers in [
+            &[("expires", "Sun, 06 Nov 1994 08:39:37 GMT")][..],
+            &[
+                ("date", "Sun, 06 Nov 1994 08:49:37 GMT"),
+                ("expires", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            ],
+            &[("expires", "0")],
+        ] {
+            let explicit = freshness(headers);
+            assert!(
+                explicit.expired && explicit.stale_on_receipt(),
+                "{headers:?}"
+            );
+        }
+        // `max-age` governs over a past `Expires` (§5.3).
+        assert!(
+            !freshness(&[
+                ("cache-control", "max-age=60"),
+                ("expires", "Sun, 06 Nov 1994 08:39:37 GMT")
+            ])
+            .stale_on_receipt()
+        );
+        assert!(!freshness(&[]).stale_on_receipt());
         // A zero lifetime from the origin serves its request whatever its
         // `Date`; one a cache held does not.
         let origin = freshness(&[
@@ -751,6 +819,13 @@ mod tests {
         assert_eq!(budget.wait(1), Duration::from_secs(60));
         assert_eq!(budget.wait(4), Duration::from_secs(300));
         assert_eq!(budget.wait(u32::MAX), Duration::from_secs(300));
+        // A budget past what a deadline holds is held to a day, so no
+        // deadline overflows.
+        let huge = Budget::new(Duration::MAX, Duration::MAX);
+        assert_eq!(huge.wait(0), Budget::MAX);
+        assert_eq!(huge.wait(u32::MAX), Budget::MAX);
+        let now = Instant::now();
+        assert_eq!(huge.next(now, u32::MAX), now + Budget::MAX);
     }
 
     /// The request that starts a fetch is cancelled while the issuer has

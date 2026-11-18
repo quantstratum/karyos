@@ -400,6 +400,35 @@ fn the_socket_is_private_never_taken_over_and_cleaned_up() {
     let _server = Server::bind(config()).unwrap();
 }
 
+/// karyos#708: an API directory left by a run without a relay group is
+/// brought to the group's modes when the next run has one, and back when
+/// it has none; a mode neither run uses is still refused.
+#[test]
+fn an_existing_directory_follows_the_relay_group_setting() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let _serial = serial();
+    let dir = dir("regroup");
+    let plain = || ApiConfig::new(dir.clone(), vec![(own(), Role::Viewer)]);
+    // A group this process is in: the one its new directories get.
+    let server = Server::bind(plain()).unwrap();
+    let gid = std::fs::metadata(&dir).unwrap().gid();
+    drop(server);
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    let server = Server::bind(plain().with_relay_group(gid)).unwrap();
+    assert_eq!((mode(&dir), mode(server.path())), (0o710, 0o660));
+    assert_eq!(std::fs::metadata(server.path()).unwrap().gid(), gid);
+    drop(server);
+    let server = Server::bind(plain()).unwrap();
+    assert_eq!((mode(&dir), mode(server.path())), (0o700, 0o600));
+    drop(server);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(matches!(
+        Server::bind(plain().with_relay_group(gid)),
+        Err(ServeError::NotPrivate(_))
+    ));
+}
+
 /// The binary: a bad command line exits 2; a good one serves the view of a
 /// running driver until it is killed.
 #[test]

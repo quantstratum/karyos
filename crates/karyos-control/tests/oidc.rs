@@ -129,6 +129,8 @@ struct IssuerState {
     published: Vec<Value>,
     cache_control: String,
     age: Option<String>,
+    /// How long the key set endpoint takes to answer.
+    delay: Duration,
     /// Whether it answers; when not, every route answers 503.
     up: bool,
     /// The challenge of each code given.
@@ -215,6 +217,8 @@ async fn issuer_route(state: Shared, request: Request<Incoming>) -> Response<Rep
             )
         }
         "/jwks" => {
+            let delay = state.lock().unwrap().delay;
+            tokio::time::sleep(delay).await;
             let mut state = state.lock().unwrap();
             state.fetches += 1;
             let mut response = text(StatusCode::OK, json!({"keys": state.published}).to_string());
@@ -288,6 +292,7 @@ fn issuer() -> Shared {
         signer,
         cache_control: "max-age=300".to_owned(),
         age: None,
+        delay: Duration::ZERO,
         up: true,
         codes: HashMap::new(),
         fetches: 0,
@@ -636,6 +641,29 @@ fn an_expired_set_is_never_used() {
         let verified = usize::from(first) + usize::from(usable);
         assert_eq!(lines.lock().unwrap().len(), verified);
     }
+}
+
+/// A set whose positive lifetime runs out while it is fetched (its age
+/// counts from the request) is never handed out, not even to the request
+/// that fetched it: 503.
+#[test]
+fn a_set_that_expires_during_its_fetch_is_not_used() {
+    let state = issuer();
+    let url = state.lock().unwrap().url.clone();
+    let (socket, lines) = agent("during");
+    let address = control(&url, socket, quick());
+    {
+        let mut state = state.lock().unwrap();
+        state.cache_control = "max-age=2".to_owned();
+        state.age = Some("1".to_owned());
+        state.delay = Duration::from_millis(1500);
+    }
+    let token = {
+        let state = state.lock().unwrap();
+        state.signer.token("at+jwt", &state.claims("alice@example"))
+    };
+    assert_eq!(refused(address, &token).0, 503);
+    assert!(lines.lock().unwrap().is_empty());
 }
 
 /// A set's lifetime passing while the issuer is down: 503 from then on;

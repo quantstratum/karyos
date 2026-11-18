@@ -76,7 +76,9 @@ struct Key {
     kid: String,
     material: Material,
     alg: Option<String>,
-    /// `use` is absent or `sig`, and `key_ops`, if present, has `verify`.
+    /// `use` is absent or `sig`, `key_ops`, if present, has `verify`, and
+    /// `alg`, if present, is a string: a present member of another type
+    /// makes the key unusable, never unrestricted.
     for_verification: bool,
 }
 
@@ -191,11 +193,12 @@ impl Key {
                 .as_array()
                 .is_some_and(|ops| ops.iter().any(|op| op.as_str() == Some("verify"))),
         };
+        let alg_valid = object.get("alg").is_none_or(serde_json::Value::is_string);
         Some(Self {
             kid,
             material,
             alg: string(object, "alg").map(str::to_owned),
-            for_verification: use_sig && ops_verify,
+            for_verification: use_sig && ops_verify && alg_valid,
         })
     }
 

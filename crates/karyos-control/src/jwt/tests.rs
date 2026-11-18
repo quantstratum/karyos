@@ -248,6 +248,11 @@ fn algorithm_and_key_mismatches_are_refused() {
     // The key's own alg, use and key_ops.
     for (member, value) in [
         ("alg", json!("ES384")),
+        // A present `alg` that is not a string never makes the key
+        // unrestricted.
+        ("alg", json!(7)),
+        ("alg", json!(null)),
+        ("alg", json!(["ES256"])),
         ("use", json!("enc")),
         ("key_ops", json!(["sign"])),
     ] {

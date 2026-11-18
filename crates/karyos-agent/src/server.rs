@@ -29,7 +29,9 @@
 //!   is `0710` and the socket `0660`, both of that group, which this
 //!   agent's uid must be a member of: the relay's uid joins the group, no
 //!   one else gains anything, and the peer's uid is still checked per
-//!   connection. Without a relay group nothing changes.
+//!   connection. Without a relay group nothing changes. A directory left
+//!   by a run with the other setting (this uid's, `0700` or `0710`) is
+//!   brought to this run's at start; any other mode is refused.
 //! - **Exchange.** One request per connection: a line `KARYOS-AGENT
 //!   <version> <request>`, at most [`MAX_REQUEST`] bytes. The answer is one
 //!   JSON object and a newline, then the agent closes the connection. A
@@ -575,20 +577,26 @@ impl Server {
             None => (0o700, 0o600),
             Some(_) => (0o710, 0o660),
         };
+        let uid = karyos_sys::ipc::own_uid();
         match std::fs::DirBuilder::new().mode(0o700).create(&config.dir) {
-            Ok(()) => {
-                if let Some(gid) = config.relay_group {
-                    std::os::unix::fs::chown(&config.dir, None, Some(gid))?;
-                    std::fs::set_permissions(
-                        &config.dir,
-                        std::fs::Permissions::from_mode(dir_mode),
-                    )?;
-                }
-            }
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        let uid = karyos_sys::ipc::own_uid();
+        // A directory this agent owns in one of its two modes (a new one,
+        // or one left by a run with or without a relay group) is brought
+        // to this run's: the group before opening the mode to it, and the
+        // mode closed before anything else. Anything else is refused below.
+        let existing = std::fs::symlink_metadata(&config.dir)?;
+        if existing.is_dir()
+            && existing.uid() == uid
+            && matches!(existing.mode() & 0o777, 0o700 | 0o710)
+        {
+            if let Some(gid) = config.relay_group {
+                std::os::unix::fs::chown(&config.dir, None, Some(gid))?;
+            }
+            std::fs::set_permissions(&config.dir, std::fs::Permissions::from_mode(dir_mode))?;
+        }
         let dir = std::fs::symlink_metadata(&config.dir)?;
         if !dir.is_dir()
             || dir.uid() != uid
@@ -606,7 +614,7 @@ impl Server {
             Ok(metadata) => {
                 if !metadata.file_type().is_socket()
                     || metadata.uid() != uid
-                    || metadata.mode() & 0o777 != socket_mode
+                    || !matches!(metadata.mode() & 0o777, 0o600 | 0o660)
                 {
                     return Err(ServeError::NotPrivate(
                         "the API socket path holds something other than an API socket",
