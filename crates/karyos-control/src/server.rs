@@ -8,7 +8,7 @@
 //!   relays `capabilities`; `POST /v1/request` relays its body, one API v1
 //!   request without its `KARYOS-AGENT 1` prefix (`guard-close DIR GUARD
 //!   REASON`, `join-get DIR KIND KEY` and so on), at most
-//!   [`relay::MAX_REQUEST`](crate::relay::MAX_REQUEST) bytes. Any other
+//!   [`relay::MAX_REQUEST`] bytes. Any other
 //!   path is `404`, another method on a route `405`.
 //! - **Answers.** The agent's answer is the body, unchanged, with `200`:
 //!   an agent refusal (`forbidden`, `bad request`, `not authorized`) is
