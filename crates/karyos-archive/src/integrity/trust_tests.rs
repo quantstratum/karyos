@@ -23,8 +23,8 @@ use super::journal::{IntegrityError, IntegrityJournal};
 use super::ledger::Ledger;
 use super::sealer::{SealSource, Sealer, run};
 use super::signing::{
-    BacklogPolicy, HeadSigner, HeadSigning, HeadStore, Offered, SignerUnavailable, SigningConfig,
-    SigningConfigError,
+    BacklogPolicy, HeadSigner, HeadSigning, HeadStore, Offered, PollError, SignerUnavailable,
+    SigningConfig, SigningConfigError,
 };
 use super::trust::*;
 use super::{Digest, digest};
@@ -470,7 +470,17 @@ fn a_passed_anchor_interval_raises_the_alarm() {
     assert_eq!(signing.offer(head(0), 0), Offered::Queued);
     assert!(!signing.status(1_000, 1).alarm);
     assert!(signing.status(1_001, 1).alarm);
-    assert_eq!(signing.poll(&mut signer, &mut store, 1_001).unwrap(), 1);
+    assert_eq!(
+        signing
+            .poll(
+                &mut signer,
+                &mut store,
+                &registry_with(&TestSigner::new(9)),
+                1_001
+            )
+            .unwrap(),
+        1
+    );
     assert!(!signing.status(1_500, 1).alarm);
     // Nothing new sealed: no lag, no alarm, however long it is.
     assert!(!signing.status(9_000, 1).alarm);
@@ -509,7 +519,17 @@ fn during_a_signer_outage_sealing_continues_the_backlog_stays_bounded_and_the_la
             },
             now,
         );
-        assert_eq!(signing.poll(&mut signer, &mut store, now).unwrap(), 0);
+        assert_eq!(
+            signing
+                .poll(
+                    &mut signer,
+                    &mut store,
+                    &registry_with(&TestSigner::new(9)),
+                    now
+                )
+                .unwrap(),
+            0
+        );
         let status = signing.status(now, journal.next_counter());
         assert!(status.pending <= 1, "round {round}");
         // Reported before the first signed head.
@@ -521,7 +541,17 @@ fn during_a_signer_outage_sealing_continues_the_backlog_stays_bounded_and_the_la
     assert!(signing.status(5_000, 50).alarm);
     assert_eq!(signing.status(5_000, 50).coalesced, 49);
     signer.available = true;
-    assert_eq!(signing.poll(&mut signer, &mut store, 5_100).unwrap(), 1);
+    assert_eq!(
+        signing
+            .poll(
+                &mut signer,
+                &mut store,
+                &registry_with(&TestSigner::new(9)),
+                5_100
+            )
+            .unwrap(),
+        1
+    );
     assert_eq!(store.heads, signing.signed());
     let status = signing.status(5_100, journal.next_counter());
     assert_eq!((status.coverage_lag_records, status.alarm), (0, false));
@@ -809,7 +839,16 @@ fn a_signed_head_counts_only_once_it_is_recorded_durably() {
     };
     let (records, sealed) = one_seal();
     let _ = signing.offer(sealed, 0);
-    assert!(signing.poll(&mut signer, &mut failing, 10).is_err());
+    assert!(
+        signing
+            .poll(
+                &mut signer,
+                &mut failing,
+                &registry_with(&TestSigner::new(9)),
+                10
+            )
+            .is_err()
+    );
     let status = signing.status(10, 1);
     assert_eq!((status.pending, status.last_signed), (1, None));
     assert!(signing.signed().is_empty());
@@ -817,7 +856,17 @@ fn a_signed_head_counts_only_once_it_is_recorded_durably() {
     let disk = FaultDisk::default();
     let mut heads =
         Ledger::<_, SIGNED_HEAD_LENGTH>::open(disk.clone(), Path::new(DIR), "heads").unwrap();
-    assert_eq!(signing.poll(&mut signer, &mut heads, 20).unwrap(), 1);
+    assert_eq!(
+        signing
+            .poll(
+                &mut signer,
+                &mut heads,
+                &registry_with(&TestSigner::new(9)),
+                20
+            )
+            .unwrap(),
+        1
+    );
     let restarted = disk.after_crash(Survives::Synced);
     let heads = Ledger::<_, SIGNED_HEAD_LENGTH>::open(restarted, Path::new(DIR), "heads").unwrap();
     let registry = registry_with(&signer);
@@ -863,7 +912,17 @@ fn a_restart_keeps_uncovered_records_overdue_until_coverage_advances() {
     let _ = resumed.offer(sealed, 5_000);
     assert!(resumed.status(5_001, 1).alarm);
     let mut store = Store::default();
-    assert_eq!(resumed.poll(&mut signer, &mut store, 5_002).unwrap(), 1);
+    assert_eq!(
+        resumed
+            .poll(
+                &mut signer,
+                &mut store,
+                &registry_with(&TestSigner::new(9)),
+                5_002
+            )
+            .unwrap(),
+        1
+    );
     assert!(!resumed.status(5_002, 1).alarm);
     // Nothing uncovered at the restart: no alarm.
     let covered = HeadSigning::resume(
@@ -923,7 +982,17 @@ fn signing_an_old_head_does_not_hide_newer_records_left_uncovered() {
     assert_eq!(signing.offer(head(0), 0), Offered::Queued);
     assert_eq!(signing.offer(head(1), 100), Offered::Refused);
     signer.available = true;
-    assert_eq!(signing.poll(&mut signer, &mut store, 1_500).unwrap(), 1);
+    assert_eq!(
+        signing
+            .poll(
+                &mut signer,
+                &mut store,
+                &registry_with(&TestSigner::new(9)),
+                1_500
+            )
+            .unwrap(),
+        1
+    );
     // Record 1 has waited since 100, longer than the interval.
     let status = signing.status(1_500, 2);
     assert_eq!(status.coverage_lag_records, 1);
@@ -932,6 +1001,84 @@ fn signing_an_old_head_does_not_hide_newer_records_left_uncovered() {
     // A later head covers it, and its age is that of record 1.
     assert_eq!(signing.offer(head(2), 1_600), Offered::Queued);
     assert_eq!(signing.status(1_600, 3).coverage_lag_ns, 1_500);
-    assert_eq!(signing.poll(&mut signer, &mut store, 1_700).unwrap(), 1);
+    assert_eq!(
+        signing
+            .poll(
+                &mut signer,
+                &mut store,
+                &registry_with(&TestSigner::new(9)),
+                1_700
+            )
+            .unwrap(),
+        1
+    );
     assert!(!signing.status(1_700, 3).alarm);
+}
+
+#[test]
+fn a_signature_from_a_key_the_registry_does_not_trust_covers_nothing() {
+    let config = SigningConfig::new(Some(1_000), BacklogPolicy::Coalesce).unwrap();
+    let mut signing = HeadSigning::new(config, 0);
+    let registry = registry_with(&TestSigner::new(9));
+    // A valid Ed25519 key, never registered.
+    let mut unregistered = TestSigner::new(10);
+    let mut store = Store::default();
+    let (_, sealed) = one_seal();
+    let _ = signing.offer(sealed, 0);
+    assert!(matches!(
+        signing.poll(&mut unregistered, &mut store, &registry, 10),
+        Err(PollError::Untrusted {
+            counter: 0,
+            verdict: HeadVerdict::Invalid(HeadReason::UnknownKey)
+        })
+    ));
+    assert!(store.heads.is_empty());
+    let status = signing.status(2_000, 1);
+    assert_eq!((status.pending, status.last_signed), (1, None));
+    assert!(status.alarm);
+}
+
+#[test]
+fn a_restart_stays_overdue_until_coverage_reaches_the_records_present_then() {
+    let config = SigningConfig::new(
+        Some(1_000),
+        BacklogPolicy::Refuse {
+            capacity: NonZeroUsize::new(1).unwrap(),
+        },
+    )
+    .unwrap();
+    let mut signer = TestSigner::new(9);
+    let registry = registry_with(&signer);
+    let mut journal = IntegrityJournal::open(FaultDisk::default(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    journal.seal_segment(3, 0, b"one", false).unwrap();
+    journal.seal_segment(3, 3, b"two", false).unwrap();
+    let records = journal.records().unwrap();
+    let at = |counter: usize| ChainHead {
+        archive_id: ARCHIVE,
+        journal_id: JOURNAL,
+        counter: records[counter].counter,
+        digest: records[counter].digest(),
+    };
+    let mut resumed = HeadSigning::resume(config, 5_000, &[], &registry, JOURNAL, &records);
+    let mut store = Store::default();
+    assert_eq!(resumed.offer(at(0), 5_000), Offered::Queued);
+    assert_eq!(resumed.offer(at(1), 5_000), Offered::Refused);
+    assert_eq!(
+        resumed
+            .poll(&mut signer, &mut store, &registry, 5_001)
+            .unwrap(),
+        1
+    );
+    // Record 1 was uncovered at the restart and still is.
+    assert!(resumed.status(5_002, 2).alarm);
+    assert_eq!(resumed.offer(at(1), 5_003), Offered::Queued);
+    assert_eq!(
+        resumed
+            .poll(&mut signer, &mut store, &registry, 5_004)
+            .unwrap(),
+        1
+    );
+    assert!(!resumed.status(5_004, 2).alarm);
 }

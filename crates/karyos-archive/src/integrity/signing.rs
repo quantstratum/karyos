@@ -70,6 +70,25 @@ impl<D: Disk> HeadStore for Ledger<D, SIGNED_HEAD_LENGTH> {
     }
 }
 
+/// Why [`HeadSigning::poll`] stopped with heads still pending.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum PollError {
+    /// The signed head could not be recorded.
+    #[error("recording a signed head: {0}")]
+    Store(#[from] IntegrityError),
+    /// The signer returned a signature the registry does not trust (a key
+    /// not registered, retired or revoked, or a signature that does not
+    /// verify): it covers nothing.
+    #[error("the signer's head {counter} is not trusted under the registry: {verdict:?}")]
+    Untrusted {
+        /// The head's counter.
+        counter: u64,
+        /// The registry's verdict.
+        verdict: HeadVerdict,
+    },
+}
+
 /// What happens to a head offered while others are pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -192,9 +211,10 @@ pub struct HeadSigning {
     signed: Vec<SignedHead>,
     started_ns: u64,
     last_signed_ns: Option<u64>,
-    /// Set on a restart: records uncovered then are overdue until signed
-    /// coverage advances, as their age was not kept.
-    carried_overdue: bool,
+    /// Set on a restart to the chain's record count then: those records'
+    /// age was not kept, so any of them still uncovered is overdue until
+    /// signed coverage reaches this boundary.
+    overdue_until: Option<u64>,
     discarded: u64,
     coalesced: u64,
     refused: u64,
@@ -211,7 +231,7 @@ impl HeadSigning {
             signed: Vec::new(),
             started_ns: now_ns,
             last_signed_ns: None,
-            carried_overdue: false,
+            overdue_until: None,
             discarded: 0,
             coalesced: 0,
             refused: 0,
@@ -238,7 +258,7 @@ impl HeadSigning {
         records: &[SealRecord],
     ) -> Self {
         let mut signing = Self::new(config, now_ns);
-        signing.carried_overdue = true;
+        signing.overdue_until = Some(u64::try_from(records.len()).unwrap_or(u64::MAX));
         for bytes in recorded {
             let valid = SignedHead::decode(bytes).ok().filter(|signed| {
                 let head = &signed.head;
@@ -293,19 +313,24 @@ impl HeadSigning {
     }
 
     /// Asks `signer` for every pending head, oldest first, stopping at the
-    /// first that it cannot sign, and records each signed head in `store`
-    /// before it counts as signed. Returns the heads signed.
+    /// first that it cannot sign, verifies each signature under
+    /// `registry` and records the head in `store` before it counts as
+    /// signed. Returns the heads signed.
     ///
     /// # Errors
     ///
-    /// The store's error. The head it failed to record stays pending,
-    /// with every head after it; those recorded before stay signed.
+    /// [`PollError::Untrusted`] when the registry does not trust a
+    /// signature, which is neither recorded nor counted, and
+    /// [`PollError::Store`] for the store's error. The head stays pending
+    /// either way, with every head after it; those recorded before stay
+    /// signed.
     pub fn poll(
         &mut self,
         signer: &mut impl HeadSigner,
         store: &mut impl HeadStore,
+        registry: &KeyRegistry,
         now_ns: u64,
-    ) -> Result<u64, IntegrityError> {
+    ) -> Result<u64, PollError> {
         let mut signed = 0u64;
         while let Some(pending) = self.pending.front().copied() {
             let Ok(signature) = signer.sign(&pending.head) else {
@@ -317,11 +342,17 @@ impl HeadSigning {
                 custody: signer.custody(),
                 signature,
             };
+            let verdict = registry.verify(&head, None);
+            if !matches!(verdict, HeadVerdict::Trusted { .. }) {
+                return Err(PollError::Untrusted {
+                    counter: head.head.counter,
+                    verdict,
+                });
+            }
             store.record(&head)?;
             let _ = self.pending.pop_front();
             self.signed.push(head);
             self.last_signed_ns = Some(now_ns);
-            self.carried_overdue = false;
             signed = signed.saturating_add(1);
         }
         Ok(signed)
@@ -354,7 +385,8 @@ impl HeadSigning {
             coverage_lag_records,
             coverage_lag_ns,
             alarm: coverage_lag_records > 0
-                && (self.carried_overdue || coverage_lag_ns > self.config.anchor_interval_ns.get()),
+                && (self.overdue_until.is_some_and(|until| covered < until)
+                    || coverage_lag_ns > self.config.anchor_interval_ns.get()),
             pending: u64::try_from(self.pending.len()).unwrap_or(u64::MAX),
             coalesced: self.coalesced,
             refused: self.refused,
