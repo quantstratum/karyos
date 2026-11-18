@@ -353,6 +353,24 @@ impl Role {
         matches!(self, Self::Administrator)
     }
 
+    /// Whether the role may apply a legal hold: an operator, a risk
+    /// officer or an administrator. A hold only preserves (M12; the matrix
+    /// is in [`crate::retention`]).
+    #[must_use]
+    pub const fn may_hold(self) -> bool {
+        matches!(
+            self,
+            Self::Operator | Self::RiskOfficer | Self::Administrator
+        )
+    }
+
+    /// Whether the role may release a legal hold or purge: an
+    /// administrator. Both expose or destroy evidence.
+    #[must_use]
+    pub const fn may_release_or_purge(self) -> bool {
+        matches!(self, Self::Administrator)
+    }
+
     /// Whether the role may write the join metadata registry: a registrar
     /// or an administrator (karyos#736).
     #[must_use]
@@ -746,6 +764,32 @@ impl Server {
                     forbidden()
                 }
             }
+            (
+                Some((requester, role)),
+                Request::Retention {
+                    operation,
+                    recording,
+                    reason,
+                },
+            ) => {
+                use crate::retention::Operation;
+                let allowed = match operation {
+                    Operation::Verify => true,
+                    Operation::Hold => role.may_hold(),
+                    _ => role.may_release_or_purge(),
+                };
+                if allowed {
+                    let answer = agent.retention(
+                        operation,
+                        recording,
+                        requester.operator,
+                        reason.as_bytes(),
+                    );
+                    (json::retention_answer(&answer), Served::Operated)
+                } else {
+                    forbidden()
+                }
+            }
             (Some((requester, role)), Request::GapAck { position }) => {
                 if role.may_acknowledge() {
                     let answer = match agent.acknowledge_gap_for(position, requester) {
@@ -942,6 +986,14 @@ enum Request<'a> {
     GapAck {
         position: u64,
     },
+    /// `legal-hold RECORDING [REASON]`, `hold-release RECORDING [REASON]`,
+    /// `purge RECORDING BEFORE [REASON]` and `seal-verify RECORDING`
+    /// (M12).
+    Retention {
+        operation: crate::retention::Operation,
+        recording: u64,
+        reason: &'a str,
+    },
     Limits {
         proposals: &'a str,
     },
@@ -1128,6 +1180,30 @@ fn request(rest: &str) -> Option<Request<'_>> {
                 guard,
                 expected,
                 reason,
+            })
+        }
+        "legal-hold" | "hold-release" | "seal-verify" => {
+            let (recording, reason) = arguments.split_once(' ').unwrap_or((arguments, ""));
+            let operation = match name {
+                "legal-hold" => crate::retention::Operation::Hold,
+                "hold-release" => crate::retention::Operation::Release,
+                _ if reason.is_empty() => crate::retention::Operation::Verify,
+                _ => return Some(Request::BadArguments("seal-verify")),
+            };
+            Some(Request::Retention {
+                operation,
+                recording: number(recording)?,
+                reason,
+            })
+        }
+        "purge" => {
+            let mut fields = arguments.splitn(3, ' ');
+            let recording = number(fields.next()?)?;
+            let before = number(fields.next()?)?;
+            Some(Request::Retention {
+                operation: crate::retention::Operation::Purge { before },
+                recording,
+                reason: fields.next().unwrap_or(""),
             })
         }
         "limits" => Some(Request::Limits {

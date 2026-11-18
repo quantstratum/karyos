@@ -60,6 +60,10 @@ const MTU: core::num::NonZeroU32 = match core::num::NonZeroU32::new(TERM_LENGTH)
     None => core::num::NonZeroU32::MIN,
 };
 
+/// An outcome record's code when the answer never came: the operation may
+/// or may not have taken effect.
+pub const UNKNOWN_OUTCOME: u64 = u64::MAX;
+
 /// What a record says.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -86,6 +90,23 @@ pub enum Kind {
     /// leaves a record, and one that ends without [`Kind::AgentStopped`]
     /// shows, even when nothing else was written.
     AgentStarted,
+    /// A legal hold on recording `guard`, before it is sent (M12).
+    HoldRequest,
+    /// What the hold did.
+    HoldOutcome,
+    /// A hold release on recording `guard`, before it is sent.
+    ReleaseRequest,
+    /// What the release did.
+    ReleaseOutcome,
+    /// A purge of recording `guard` below position `expected`, before it
+    /// is sent.
+    PurgeRequest,
+    /// What the purge did.
+    PurgeOutcome,
+    /// A seal verification of recording `guard`, before it is sent.
+    VerifyRequest,
+    /// What the verification reported: `code` is 0 when it answered.
+    VerifyOutcome,
 }
 
 impl Kind {
@@ -99,6 +120,14 @@ impl Kind {
             Self::GapAcknowledged => 6,
             Self::AgentStopped => 7,
             Self::AgentStarted => 8,
+            Self::HoldRequest => 9,
+            Self::HoldOutcome => 10,
+            Self::ReleaseRequest => 11,
+            Self::ReleaseOutcome => 12,
+            Self::PurgeRequest => 13,
+            Self::PurgeOutcome => 14,
+            Self::VerifyRequest => 15,
+            Self::VerifyOutcome => 16,
         }
     }
 
@@ -112,12 +141,28 @@ impl Kind {
             6 => Self::GapAcknowledged,
             7 => Self::AgentStopped,
             8 => Self::AgentStarted,
+            9 => Self::HoldRequest,
+            10 => Self::HoldOutcome,
+            11 => Self::ReleaseRequest,
+            12 => Self::ReleaseOutcome,
+            13 => Self::PurgeRequest,
+            14 => Self::PurgeOutcome,
+            15 => Self::VerifyRequest,
+            16 => Self::VerifyOutcome,
             _ => return None,
         })
     }
 
     const fn is_request(self) -> bool {
-        matches!(self, Self::CloseRequest | Self::ReopenRequest)
+        matches!(
+            self,
+            Self::CloseRequest
+                | Self::ReopenRequest
+                | Self::HoldRequest
+                | Self::ReleaseRequest
+                | Self::PurgeRequest
+                | Self::VerifyRequest
+        )
     }
 }
 
@@ -356,6 +401,9 @@ pub struct Journal {
     /// Host time of the first failed append.
     failed_at: Option<u64>,
     gap: Option<Gap>,
+    /// The records the open read, for tests.
+    #[cfg(test)]
+    pub(crate) scanned: Vec<JournalRecord>,
 }
 
 impl Journal {
@@ -407,6 +455,8 @@ impl Journal {
             failed_appends: 0,
             failed_at: None,
             gap: scan.gap,
+            #[cfg(test)]
+            scanned: scan.all.clone(),
         };
         let last = scan.last.as_ref().map(|last| last.kind);
         let reason = if cut {
@@ -636,6 +686,9 @@ struct Scan {
     last: Option<JournalRecord>,
     /// The latest unknown interval, unless an acknowledgement follows it.
     gap: Option<Gap>,
+    /// Every record, for tests that read a journal back.
+    #[cfg(test)]
+    all: Vec<JournalRecord>,
 }
 
 /// Reads every frame of `store`, oldest first.
@@ -689,6 +742,8 @@ fn scan(store: &mut SegmentStore<StdDisk>) -> Result<Scan, JournalError> {
                     }
                     _ => {}
                 }
+                #[cfg(test)]
+                found.all.push(record.clone());
                 found.last = Some(record);
             }
             u64::from(length)

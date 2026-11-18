@@ -204,6 +204,8 @@ pub struct Agent {
     started_ns: u64,
     /// The join metadata registry (karyos#736), in memory.
     registry: Registry,
+    /// The Archive's retention operations (M12), once one is attached.
+    retention: Option<Box<dyn crate::retention::RetentionBackend>>,
 }
 
 impl Agent {
@@ -263,6 +265,7 @@ impl Agent {
             next_operation: host_monotonic_ns().max(1),
             started_ns: start,
             registry: Registry::new(start),
+            retention: None,
         }
     }
 
@@ -319,6 +322,40 @@ impl Agent {
             epoch,
             crate::api::MAX_EXPORT_REPLY,
         ))
+    }
+
+    /// Attaches the Archive the retention operations go to (M12).
+    pub fn set_retention(&mut self, backend: Box<dyn crate::retention::RetentionBackend>) {
+        self.retention = Some(backend);
+    }
+
+    /// Makes retention `operation` on `recording` for operator `uid`,
+    /// journalled under the fail-closed rule of [`crate::retention`].
+    pub fn retention(
+        &mut self,
+        operation: crate::retention::Operation,
+        recording: u64,
+        uid: u32,
+        reason: &[u8],
+    ) -> crate::retention::RetentionAnswer {
+        let id = self.next_operation;
+        if self.retention.is_some() {
+            // Checked: at their end the ids keep the last one.
+            self.next_operation = id.checked_add(1).unwrap_or(id);
+        }
+        let command = crate::retention::Command {
+            operation,
+            recording,
+            id,
+            operator: uid,
+            reason,
+        };
+        crate::retention::retention_command(
+            self.journal.as_mut(),
+            self.retention.as_deref_mut(),
+            &command,
+            host_monotonic_ns,
+        )
     }
 
     /// Closes guard `guard` of the driver in `dir` for operator `uid`
