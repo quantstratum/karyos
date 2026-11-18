@@ -27,25 +27,45 @@ make_workspace() {
     "$cargo" generate-lockfile --offline --manifest-path "$work/ws/Cargo.toml" >/dev/null 2>&1
 }
 
-run() {
-    CARGO="$cargo" "$here/check-shipped-graph.sh" \
-        --manifest-path "$work/ws/Cargo.toml" --package shipped >/dev/null 2>&1
-}
-
 failures=0
+# Runs the check and compares, line by line, what it reported with the
+# diagnostics wanted: a negative control passes only when the check failed
+# for the forbidden crate in exactly the graphs named, never for another
+# reason (a cargo failure, an empty tree), which is reported apart
+# (karyos#953 review).
 expect() {
-    local wanted="$1" label="$2"
-    if run; then got=pass; else got=fail; fi
-    if [ "$got" != "$wanted" ]; then
-        echo "check-shipped-graph-selftest: $label: expected $wanted, got $got" >&2
-        failures=1
+    local label="$1"
+    shift
+    local wanted="" graph output rc=0
+    for graph in "$@"; do
+        wanted+="check-shipped-graph: $graph reaches an evaluation-only crate:"$'\n'"  tokio"$'\n'
+    done
+    output="$(CARGO="$cargo" "$here/check-shipped-graph.sh" \
+        --manifest-path "$work/ws/Cargo.toml" --package shipped 2>&1 >/dev/null)" || rc=$?
+    if [ -n "$output" ]; then output+=$'\n'; fi
+    local code=0
+    if [ -n "$wanted" ]; then code=1; fi
+    if [ "$rc" -eq "$code" ] && [ "$output" = "$wanted" ]; then
+        return
     fi
+    failures=1
+    if [ "$rc" -ne 0 ] && ! grep -q 'reaches an evaluation-only crate' <<<"$output"; then
+        echo "check-shipped-graph-selftest: $label: the check failed for another reason (exit $rc):" >&2
+    else
+        echo "check-shipped-graph-selftest: $label: expected (exit $code):" >&2
+        printf '%s\n' "${wanted:-  nothing}" >&2
+        echo "got (exit $rc):" >&2
+    fi
+    printf '%s\n' "${output:-  nothing}" >&2
 }
 
 make_workspace 'tokio = { path = "../../vendor/tokio" }' ''
-expect fail "a plain dependency on tokio"
+expect "a plain dependency on tokio" \
+    "the workspace" "the workspace, every feature" "shipped" "shipped, every feature"
 make_workspace 'tokio = { path = "../../vendor/tokio", optional = true }' 'experimental = ["dep:tokio"]'
-expect fail "an optional tokio behind a nondefault feature"
+# Only the every-feature graphs reach it: they are what this control proves.
+expect "an optional tokio behind a nondefault feature" \
+    "the workspace, every feature" "shipped, every feature"
 make_workspace '' ''
-expect pass "no forbidden dependency"
+expect "no forbidden dependency"
 exit $failures
