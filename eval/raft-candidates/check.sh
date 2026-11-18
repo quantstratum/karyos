@@ -94,7 +94,11 @@ echo "raft-eval: $identity"
 
 # No Tokio in the evaluation graph either (owner item 33: no measured run
 # uses Tokio; karyos#690).
-if "$cargo" tree --locked --target all -e normal,build,dev --prefix none | grep -Eq '^tokio(-[a-z-]+)? '; then
+# The tree is captured first, so a failure to produce it stops the gate,
+# and the search reads a finished string (no pipe for grep to close early;
+# karyos#959 review).
+graph="$("$cargo" tree --locked --target all -e normal,build,dev --prefix none)"
+if grep -Eq '^tokio(-[a-z-]+)? ' <<<"$graph"; then
     echo "raft-eval: Tokio is in the evaluation graph" >&2
     exit 1
 fi

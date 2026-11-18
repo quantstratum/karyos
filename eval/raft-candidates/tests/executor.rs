@@ -137,3 +137,35 @@ fn the_same_seed_reproduces_the_same_interleaving() {
     assert!(first.0.iter().any(|event| matches!(event, Event::Clock(_))));
     assert_ne!(first.2, scenario(8).2);
 }
+
+/// The regression of the karyos#959 review: a bounded channel holds its
+/// buffer plus the one slot of its shared sender, however many sends are
+/// made; past that a send waits for the receiver.
+#[test]
+fn a_bounded_channel_keeps_its_capacity_across_sends() {
+    use openraft_rt::mpsc::{Mpsc, MpscReceiver, MpscSender};
+
+    use karyos_raft_eval::executor::channels::SimMpsc;
+
+    let executor = Executor::new(1);
+    let (sender, mut receiver) = SimMpsc::channel::<u64>(1);
+    let sent = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&sent);
+    let _handle = executor.spawn(async move {
+        for value in 0..100u64 {
+            if sender.send(value).await.is_err() {
+                return;
+            }
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    let _ = executor.pump(1000);
+    assert_eq!(
+        sent.load(Ordering::SeqCst),
+        2,
+        "buffer 1 plus the sender's slot"
+    );
+    assert_eq!(receiver.try_recv().ok(), Some(0));
+    let _ = executor.pump(1000);
+    assert_eq!(sent.load(Ordering::SeqCst), 3);
+}

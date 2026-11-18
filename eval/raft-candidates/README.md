@@ -56,7 +56,7 @@ all `--locked`.
 | W2, W5 | as for `raft`: not demonstrated yet (karyos#679) |
 | Determinism | a seed reproduces its run, and the same calls reproduce every node's executor interleaving (trace digest), asserted |
 | Pre-vote | OpenRaft's own pre-vote handler on the receiving node, reached through the adapter's RPC; never the trait's default, which synthesises a grant; tested against a control without it |
-| Allocation | **fails the gate**: W1, 32 clients, seed 1: 114 entries past the warm-up, 44,710 allocations and 42,590 frees, 393 and 374 per entry |
+| Allocation | **fails the gate**: W1, 32 clients, seed 1: 114 entries past the warm-up, 41,035 allocations and 38,953 frees, 360 and 342 per entry |
 | Adapter settings | RPC answers wait at least 20 ticks (OpenRaft's sequential append stream does not time an RPC out, and its own 2-tick TTL is shorter than a round trip on the slower links); retries back off 2, 4, 8 then up to 20 ticks, scaled to the 2-tick heartbeat instead of OpenRaft's 200 ms default. The same for every workload |
 | Real processes | not demonstrated, as for `raft` |
 

@@ -285,6 +285,10 @@ pub enum Message {
     Response {
         /// The request's number.
         id: u64,
+        /// The request answered, echoed: the sender accepts the answer
+        /// only for the very request it sent under `id`, to that peer
+        /// (karyos#959 review).
+        request: Request,
         /// The answer.
         response: Option<Response>,
     },
@@ -310,11 +314,27 @@ struct Io {
     voting: Vec<oneshot::Sender<()>>,
     /// The last harness index handed to the log.
     handed: Option<u64>,
-    /// RPCs waiting for their answer, by number.
-    waiting: BTreeMap<u64, oneshot::Sender<Option<Response>>>,
+    /// RPCs waiting for their answer, by number: the peer, the request
+    /// and where its answer goes.
+    waiting: BTreeMap<u64, Waiting>,
     next_rpc: u64,
     applied: Option<OLogId>,
     membership: StoredMembershipOf,
+}
+
+/// An RPC waiting for its answer.
+struct Waiting {
+    target: NodeId,
+    request: Request,
+    answer: oneshot::Sender<Option<Response>>,
+}
+
+/// Whether an answer from `from`, echoing `request`, answers `waiting`.
+/// Numbers restart with each incarnation of a node, so a number alone could
+/// match a request of an earlier one: the peer and the request itself
+/// (shared, never rebuilt) must match too.
+fn answers(waiting: &Waiting, from: NodeId, request: &Request) -> bool {
+    waiting.target == from && waiting.request == *request
 }
 
 type Shared = Arc<Mutex<Io>>;
@@ -533,10 +553,18 @@ impl Client {
         {
             let mut io = lock(&self.io);
             // Answers that will never be waited for again.
-            io.waiting.retain(|_, waiting| !waiting.is_canceled());
+            io.waiting
+                .retain(|_, waiting| !waiting.answer.is_canceled());
             let id = io.next_rpc;
             io.next_rpc = id.saturating_add(1);
-            let _ = io.waiting.insert(id, sender);
+            let _ = io.waiting.insert(
+                id,
+                Waiting {
+                    target: self.target,
+                    request: request.clone(),
+                    answer: sender,
+                },
+            );
             io.outbox
                 .push((self.target, Message::Request { id, request }));
         }
@@ -798,9 +826,21 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
 
     fn step(&mut self, from: NodeId, message: Self::Message, _log: &mut LogView<'_>) {
         match message {
-            Message::Response { id, response } => {
-                if let Some(waiting) = lock(&self.io).waiting.remove(&id) {
-                    let _ = waiting.send(response);
+            Message::Response {
+                id,
+                request,
+                response,
+            } => {
+                let mut io = lock(&self.io);
+                // Another peer's, or an earlier incarnation's: dropped.
+                if io
+                    .waiting
+                    .get(&id)
+                    .is_some_and(|waiting| answers(waiting, from, &request))
+                    && let Some(waiting) = io.waiting.remove(&id)
+                {
+                    drop(io);
+                    let _ = waiting.answer.send(response);
                 }
             }
             Message::Request { id, request } => {
@@ -810,6 +850,7 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
                 let io = Arc::clone(&self.io);
                 self.executor.enter(|| {
                     drop(self.executor.spawn(async move {
+                        let echoed = request.clone();
                         let response = match request {
                             Request::Append(rpc) => raft
                                 .append_entries((*rpc).clone())
@@ -832,9 +873,14 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
                                 .ok()
                                 .map(|r| Response::TransferLeader(Arc::new(r))),
                         };
-                        lock(&io)
-                            .outbox
-                            .push((from, Message::Response { id, response }));
+                        lock(&io).outbox.push((
+                            from,
+                            Message::Response {
+                                id,
+                                request: echoed,
+                                response,
+                            },
+                        ));
                     }));
                 });
             }
@@ -957,5 +1003,44 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
         });
         self.pump();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vote_request() -> Request {
+        Request::Vote(Arc::new(VoteRequest::new(
+            OVote {
+                leader_id: openraft::impls::leader_id_std::LeaderId {
+                    term: 1,
+                    voted_for: 0,
+                },
+                committed: false,
+            },
+            None,
+        )))
+    }
+
+    /// The regression of the karyos#959 review: after a restart the RPC
+    /// numbers start again, so an answer to an earlier incarnation's
+    /// request can carry the number of a new one. It is refused, as is an
+    /// answer from another peer; only the request sent, from its peer,
+    /// is answered.
+    #[test]
+    fn an_answer_is_accepted_only_for_the_request_sent_to_that_peer() {
+        let sent = vote_request();
+        let (answer, _receiver) = oneshot::channel();
+        let waiting = Waiting {
+            target: 2,
+            request: sent.clone(),
+            answer,
+        };
+        // The same number, an earlier incarnation's request: an equal
+        // value, but not the request sent.
+        assert!(!answers(&waiting, 2, &vote_request()));
+        assert!(!answers(&waiting, 1, &sent));
+        assert!(answers(&waiting, 2, &sent));
     }
 }

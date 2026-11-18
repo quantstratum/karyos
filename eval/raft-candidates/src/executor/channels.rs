@@ -21,10 +21,14 @@ use openraft_rt::{Oneshot, OneshotSender, OptionalSend, OptionalSync};
 #[derive(Debug, Clone, Copy)]
 pub struct SimMpsc;
 
-/// An mpsc sender. Its clones share one `futures-channel` sender, so
-/// the receiver sees the channel closed once every clone is dropped, and
-/// a weak sender upgrades while one is alive.
-pub struct SimSender<T>(Arc<mpsc::Sender<T>>);
+/// An mpsc sender. Its clones share one `futures-channel` sender, and
+/// every send goes through it: the channel holds at most its buffer plus
+/// that sender's one slot, whatever the number of clones or sends
+/// (karyos#959 review: a fresh underlying sender per send had a slot of its
+/// own and bypassed the capacity). The receiver sees the channel closed
+/// once every clone is dropped, and a weak sender upgrades while one is
+/// alive.
+pub struct SimSender<T>(Arc<Mutex<mpsc::Sender<T>>>);
 
 impl<T> Clone for SimSender<T> {
     fn clone(&self) -> Self {
@@ -39,7 +43,7 @@ impl<T> fmt::Debug for SimSender<T> {
 }
 
 /// A weak mpsc sender.
-pub struct SimWeakSender<T>(Weak<mpsc::Sender<T>>);
+pub struct SimWeakSender<T>(Weak<Mutex<mpsc::Sender<T>>>);
 
 impl<T> Clone for SimWeakSender<T> {
     fn clone(&self) -> Self {
@@ -57,21 +61,36 @@ impl Mpsc for SimMpsc {
 
     fn channel<T: OptionalSend>(buffer: usize) -> (Self::Sender<T>, Self::Receiver<T>) {
         let (sender, receiver) = mpsc::channel(buffer);
-        (SimSender(Arc::new(sender)), SimReceiver(receiver))
+        (
+            SimSender(Arc::new(Mutex::new(sender))),
+            SimReceiver(receiver),
+        )
     }
 }
 
 impl<T: OptionalSend> MpscSender<SimMpsc, T> for SimSender<T> {
     fn send(&self, msg: T) -> impl Future<Output = Result<(), SendError<T>>> + OptionalSend {
-        let mut sender = (*self.0).clone();
-        async move {
-            if poll_fn(|cx| sender.poll_ready(cx)).await.is_err() {
-                return Err(SendError(msg));
+        let shared = Arc::clone(&self.0);
+        let mut msg = Some(msg);
+        poll_fn(move |cx| {
+            let Some(value) = msg.take() else {
+                // Polled again after it finished: nothing left to send.
+                return Poll::Pending;
+            };
+            let mut sender = shared.lock().unwrap_or_else(PoisonError::into_inner);
+            match sender.poll_ready(cx) {
+                Poll::Pending => {
+                    msg = Some(value);
+                    Poll::Pending
+                }
+                Poll::Ready(Err(_)) => Poll::Ready(Err(SendError(value))),
+                Poll::Ready(Ok(())) => Poll::Ready(
+                    sender
+                        .try_send(value)
+                        .map_err(|error| SendError(error.into_inner())),
+                ),
             }
-            sender
-                .try_send(msg)
-                .map_err(|error| SendError(error.into_inner()))
-        }
+        })
     }
 
     fn downgrade(&self) -> SimWeakSender<T> {
