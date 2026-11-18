@@ -7,24 +7,40 @@
 # enforces that with cargo tree rather than review: the normal and build
 # graph of every workspace crate, for every target, and of karyos-tools
 # (which ships karyosd) on its own, must name no candidate, no Tokio and
-# not the evaluation crate.
+# not the evaluation crate. Each graph is checked twice: with the default
+# features, and with every feature, so an optional dependency behind a
+# nondefault feature is caught too (karyos#953 review).
+#
+# Usage: check-shipped-graph.sh [--manifest-path <Cargo.toml> --package <name>]
+# The arguments point the check at another workspace, which
+# check-shipped-graph-selftest.sh uses for its negative controls.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cargo="${CARGO:-cargo}"
 forbidden='^(raft|raft-proto|protobuf-build|openraft|openraft-rt|openraft-rt-tokio|openraft-macros|tokio|karyos-raft-eval)$'
+manifest="$root/Cargo.toml"
+package="karyos-tools"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --manifest-path) manifest="$2"; shift 2 ;;
+        --package) package="$2"; shift 2 ;;
+        *) echo "check-shipped-graph: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
 
 status=0
 check() {
     local label="$1"
     shift
-    local names
-    names="$(cd "$root" && "$cargo" tree "$@" -e normal,build --target all --prefix none --locked | awk '{print $1}' | sort -u)"
+    local tree names found
+    # Captured first: a cargo failure stops the check, never reads as clean.
+    tree="$("$cargo" tree --manifest-path "$manifest" "$@" -e normal,build --target all --prefix none --locked)"
+    names="$(awk '{print $1}' <<<"$tree" | sort -u)"
     if [ -z "$names" ]; then
         echo "check-shipped-graph: cargo tree listed nothing for $label" >&2
         status=1
         return
     fi
-    local found
     found="$(grep -E "$forbidden" <<<"$names" || true)"
     if [ -n "$found" ]; then
         echo "check-shipped-graph: $label reaches an evaluation-only crate:" >&2
@@ -36,5 +52,7 @@ check() {
 }
 
 check "the workspace" --workspace
-check "karyos-tools (karyosd)" -p karyos-tools
+check "the workspace, every feature" --workspace --all-features
+check "$package" -p "$package"
+check "$package, every feature" -p "$package" --all-features
 exit $status

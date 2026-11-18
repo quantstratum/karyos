@@ -93,10 +93,14 @@ applies them:
 - **Enforced by a check, not by review.** `make shipped-graph-check`
   (`scripts/check-shipped-graph.sh`, run by `make pre-push`) runs
   `cargo tree -e normal,build --target all` over the whole workspace and
-  over `karyos-tools`, which ships `karyosd`, and fails if `raft`,
+  over `karyos-tools`, which ships `karyosd`, each with the default
+  features and with `--all-features` (so an optional dependency behind a
+  nondefault feature is caught), and fails if `raft`,
   `raft-proto`, `protobuf-build`, `openraft`, `openraft-rt`,
   `openraft-rt-tokio`, `openraft-macros`, `tokio` or `karyos-raft-eval`
-  appears. The unused `karyos-tools` to `karyos-sim` edge, through which a
+  appears. `scripts/check-shipped-graph-selftest.sh`, run with it, proves
+  the check fails on a plain and on a feature-gated forbidden dependency
+  in a throwaway workspace. The unused `karyos-tools` to `karyos-sim` edge, through which a
   candidate placed in `karyos-sim` would reach `karyosd`, is karyos#926.
 - **Versions and features** are exactly the record's: `raft` without
   default features and with `protobuf-codec` only; `openraft` with default

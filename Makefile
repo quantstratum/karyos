@@ -124,10 +124,12 @@ deps-check:
 	@tmp=$$(mktemp) && python3 scripts/dependency-inventory.py $$tmp && diff -u deps/dependency-inventory.json $$tmp; status=$$?; rm -f $$tmp; exit $$status
 
 # No Raft candidate, no Tokio and not the evaluation crate in any shipped
-# graph (cargo tree, every target): the evaluation-only admission's
+# graph (cargo tree, every target, default and every feature; with
+# negative controls): the evaluation-only admission's
 # conditions 2 and 3 (karyos#677).
 shipped-graph-check:
 	CARGO="$(CARGO)" scripts/check-shipped-graph.sh
+	CARGO="$(CARGO)" scripts/check-shipped-graph-selftest.sh
 lint-sync:
 	scripts/check-lint-sync.sh
 
