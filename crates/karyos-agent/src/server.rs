@@ -14,6 +14,15 @@
 //!   read; the roles bound the guard operations (M10b, item 2 interim:
 //!   [`Role::may_close`], [`Role::may_reopen`], [`Role::may_acknowledge`]),
 //!   and an operation the role may not make is answered `forbidden`.
+//! - **Relays (karyos#708).** The uid of a remote control-plane component
+//!   configured as a relay ([`ApiConfig::with_relays`]) may send
+//!   `KARYOS-AGENT <version> relay PRINCIPAL <request>`: the request is
+//!   served for that principal with the role this agent's principal table
+//!   gives it, per request, never the relay's own role and never one the
+//!   relay names; the journal records the principal's operator id and the
+//!   relay's id as separate fields. Any other uid sending it, or an
+//!   unknown principal, is answered `not authorized`. The local uid mode
+//!   is unchanged.
 //! - **Exchange.** One request per connection: a line `KARYOS-AGENT
 //!   <version> <request>`, at most [`MAX_REQUEST`] bytes. The answer is one
 //!   JSON object and a newline, then the agent closes the connection. A
@@ -71,7 +80,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::api::{API_VERSION, Limit};
+use crate::api::{API_VERSION, Limit, MAX_PRINCIPAL, valid_principal};
 use crate::registry::{self, JoinError, Kind};
 use crate::{Agent, json};
 
@@ -84,6 +93,12 @@ pub const MAX_REQUEST: usize = 256;
 /// The longest `join-put` line, in bytes (karyos#736): an entry's
 /// attributes do not fit [`MAX_REQUEST`].
 pub const MAX_JOIN_REQUEST: usize = 1024;
+/// The word that makes a request a relayed one (karyos#708): `KARYOS-AGENT
+/// <version> relay PRINCIPAL <request>`. The bounds above apply to the
+/// request without its `relay PRINCIPAL ` prefix.
+pub const RELAY: &str = "relay";
+/// The longest `relay PRINCIPAL ` prefix, in bytes.
+const MAX_RELAY_PREFIX: usize = RELAY.len() + MAX_PRINCIPAL + 2;
 /// The read and write timeout of each connection.
 pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
 /// The time a whole reply may take to write: past it, the reply is cut
@@ -359,14 +374,118 @@ pub struct ApiConfig {
     pub dir: PathBuf,
     /// The role of each uid allowed to connect.
     pub roles: Vec<(u32, Role)>,
+    /// The uid of each relay (a remote control-plane component, karyos#708)
+    /// allowed to carry requests for principals, with its relay id, which
+    /// the journal records. A relay has no role of its own for what it
+    /// carries.
+    pub relays: Vec<(u32, u64)>,
+    /// The principals a relay may carry requests for, each with the
+    /// operator id and the role this agent gives it.
+    pub principals: Vec<Principal>,
 }
 
 impl ApiConfig {
-    /// Listening in `dir` for the uids of `roles`.
+    /// Listening in `dir` for the uids of `roles`, with no relay.
     #[must_use]
     pub fn new(dir: PathBuf, roles: Vec<(u32, Role)>) -> Self {
-        Self { dir, roles }
+        Self {
+            dir,
+            roles,
+            relays: Vec::new(),
+            principals: Vec::new(),
+        }
     }
+
+    /// The same, also serving `relays` for `principals` (karyos#708).
+    #[must_use]
+    pub fn with_relays(mut self, relays: Vec<(u32, u64)>, principals: Vec<Principal>) -> Self {
+        self.relays = relays;
+        self.principals = principals;
+        self
+    }
+}
+
+/// A requester a relay may carry requests for (karyos#708): a person or a
+/// service the relay authenticated, named as the relay names it. Its role
+/// is this agent's, looked up per request; nothing the relay sends sets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Principal {
+    /// The name the relay gives it: 1 to [`MAX_PRINCIPAL`] bytes of ASCII
+    /// letters, digits, `.`, `_`, `-`, `@` and `:`.
+    pub name: String,
+    /// The operator id the journal and the driver's audit record for it.
+    pub operator: u32,
+    /// Its role.
+    pub role: Role,
+}
+
+impl Principal {
+    /// Principal `name`, recorded as `operator`, with `role`; `None` for a
+    /// name that is not a valid principal name.
+    #[must_use]
+    pub fn new(name: &str, operator: u32, role: Role) -> Option<Self> {
+        valid_principal(name).then(|| Self {
+            name: name.to_owned(),
+            operator,
+            role,
+        })
+    }
+}
+
+/// Who may call: the local uids' roles, the relays and their principals.
+#[derive(Debug, Clone, Default)]
+struct Callers {
+    roles: Vec<(u32, Role)>,
+    relays: Vec<(u32, u64)>,
+    principals: Vec<Principal>,
+}
+
+/// The requester and role of request `line` from peer `uid`, and the line
+/// to serve; `None` when it is not authorized. A line `KARYOS-AGENT
+/// <version> relay PRINCIPAL <request>` from a relay's uid is the request
+/// `KARYOS-AGENT <version> <request>` for that principal, with the role
+/// this agent gives the principal: the relay's own role, if it has one as
+/// a local uid, does not apply, and the relay cannot name a role. The same
+/// line from any other uid, or for an unknown principal, is not
+/// authorized. Any other line is the local peer's, as before relays.
+fn authorize<'a>(
+    callers: &Callers,
+    uid: Option<u32>,
+    line: &'a str,
+) -> Option<(crate::Requester, Role, std::borrow::Cow<'a, str>)> {
+    let uid = uid?;
+    let mut words = line.splitn(5, ' ');
+    if let (Some(PROTOCOL), Some(version), Some(RELAY)) = (words.next(), words.next(), words.next())
+    {
+        let relay = callers
+            .relays
+            .iter()
+            .find(|(allowed, _)| *allowed == uid)
+            .map(|(_, relay)| *relay)?;
+        let name = words.next()?;
+        let rest = words.next()?;
+        let principal = callers
+            .principals
+            .iter()
+            .find(|principal| valid_principal(name) && principal.name == name)?;
+        return Some((
+            crate::Requester::relayed(principal.operator, relay),
+            principal.role,
+            std::borrow::Cow::Owned(format!("{PROTOCOL} {version} {rest}")),
+        ));
+    }
+    callers
+        .roles
+        .iter()
+        .find(|(allowed, _)| *allowed == uid)
+        .map(|(_, role)| {
+            (
+                crate::Requester::local(uid),
+                *role,
+                std::borrow::Cow::Borrowed(line),
+            )
+        })
 }
 
 /// Why the API could not start.
@@ -418,7 +537,7 @@ pub enum Served {
 pub struct Server {
     listener: UnixListener,
     path: PathBuf,
-    roles: Vec<(u32, Role)>,
+    callers: Callers,
 }
 
 impl Server {
@@ -470,7 +589,11 @@ impl Server {
         Ok(Self {
             listener,
             path,
-            roles: config.roles,
+            callers: Callers {
+                roles: config.roles,
+                relays: config.relays,
+                principals: config.principals,
+            },
         })
     }
 
@@ -510,17 +633,17 @@ impl Server {
         if !ready {
             return Served::Dropped;
         }
-        let peer = karyos_sys::ipc::peer_credentials(stream.as_fd())
+        let uid = karyos_sys::ipc::peer_credentials(stream.as_fd())
             .ok()
-            .and_then(|peer| {
-                let uid = peer.uid.as_raw();
-                self.roles
-                    .iter()
-                    .find(|(allowed, _)| *allowed == uid)
-                    .map(|(_, role)| (uid, *role))
-            });
+            .map(|peer| peer.uid.as_raw());
         let Some(line) = read_request(&stream) else {
             return Served::Dropped;
+        };
+        // The caller's role is the agent's own table's, per request: a
+        // relay's request takes its principal's role, never the relay's.
+        let (peer, line) = match authorize(&self.callers, uid, &line) {
+            Some((requester, role, line)) => (Some((requester, role)), line),
+            None => (None, std::borrow::Cow::Borrowed(line.as_str())),
         };
         let forbidden = || (json::error("forbidden", None), Served::Refused);
         let (answer, served) = match (peer, parse(&line)) {
@@ -538,16 +661,17 @@ impl Server {
             (Some(_), Request::BadArguments(request)) => {
                 (json::bad_arguments(request), Served::Refused)
             }
-            (Some((uid, role)), Request::GuardClose { dir, guard, reason }) => {
+            (Some((requester, role)), Request::GuardClose { dir, guard, reason }) => {
                 if role.may_close() {
-                    let answer = agent.guard_close(Path::new(dir), guard, uid, reason.as_bytes());
+                    let answer =
+                        agent.guard_close_for(Path::new(dir), guard, requester, reason.as_bytes());
                     (json::guard_answer(&answer), Served::Operated)
                 } else {
                     forbidden()
                 }
             }
             (
-                Some((uid, role)),
+                Some((requester, role)),
                 Request::GuardReopen {
                     dir,
                     guard,
@@ -556,16 +680,21 @@ impl Server {
                 },
             ) => {
                 if role.may_reopen() {
-                    let answer =
-                        agent.guard_reopen(Path::new(dir), guard, expected, uid, reason.as_bytes());
+                    let answer = agent.guard_reopen_for(
+                        Path::new(dir),
+                        guard,
+                        expected,
+                        requester,
+                        reason.as_bytes(),
+                    );
                     (json::guard_answer(&answer), Served::Operated)
                 } else {
                     forbidden()
                 }
             }
-            (Some((uid, role)), Request::GapAck { position }) => {
+            (Some((requester, role)), Request::GapAck { position }) => {
                 if role.may_acknowledge() {
-                    let answer = match agent.acknowledge_gap(position, uid) {
+                    let answer = match agent.acknowledge_gap_for(position, requester) {
                         Ok(()) => json::acknowledged(position),
                         Err(crate::journal::JournalError::NoGap) => {
                             json::error("no such unknown interval", None)
@@ -613,7 +742,7 @@ impl Server {
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
             (
-                Some((uid, role)),
+                Some((requester, role)),
                 Request::JoinPut {
                     dir,
                     kind,
@@ -622,7 +751,8 @@ impl Server {
                 },
             ) => {
                 if role.may_register() {
-                    match agent.join_put(Path::new(dir), kind, key, attributes, uid) {
+                    match agent.join_put(Path::new(dir), kind, key, attributes, requester.operator)
+                    {
                         Ok(version) => (
                             json::join_written(
                                 false,
@@ -807,14 +937,17 @@ enum Request<'a> {
 }
 
 /// Reads one request line, up to [`MAX_JOIN_REQUEST`] bytes, the longest
-/// any request may be ([`parse`] holds every other to [`MAX_REQUEST`]);
+/// any request may be ([`parse`] holds every other to [`MAX_REQUEST`]),
+/// and a relay's prefix;
 /// `None` when the client sent none in time or closed first.
 fn read_request(stream: &UnixStream) -> Option<String> {
     let start = std::time::Instant::now();
-    let limit = MAX_JOIN_REQUEST.checked_add(1)?;
+    let limit = MAX_JOIN_REQUEST
+        .checked_add(MAX_RELAY_PREFIX)?
+        .checked_add(1)?;
     let mut stream = stream;
     let mut line = Vec::with_capacity(limit);
-    let mut buffer = [0u8; MAX_JOIN_REQUEST + 1];
+    let mut buffer = [0u8; MAX_JOIN_REQUEST + MAX_RELAY_PREFIX + 1];
     // Within READ_DEADLINE in all: each read gets the time left, so a
     // client sending a byte at a time cannot hold the polling thread.
     while !line.contains(&b'\n') && line.len() < limit {
@@ -1441,6 +1574,98 @@ mod tests {
         ] {
             assert_eq!(parse(bad), Request::Bad, "{bad}");
         }
+    }
+
+    fn callers() -> Callers {
+        Callers {
+            // The relay's uid 990 is also a local administrator.
+            roles: vec![(1000, Role::Viewer), (990, Role::Administrator)],
+            relays: vec![(990, 7)],
+            principals: vec![
+                Principal::new("svc.viewer", 50_001, Role::Viewer).unwrap(),
+                Principal::new("alice@example", 50_002, Role::RiskOfficer).unwrap(),
+            ],
+        }
+    }
+
+    /// A relayed request takes its principal's role from the agent's own
+    /// table (karyos#708): a relay that is an administrator on the local
+    /// socket, or that names a role as the principal, grants nothing.
+    #[test]
+    fn a_relay_cannot_grant_a_role() {
+        let callers = callers();
+        let (requester, role, line) = authorize(
+            &callers,
+            Some(990),
+            "KARYOS-AGENT 1 relay svc.viewer guard-close /d 3 drill\n",
+        )
+        .unwrap();
+        assert_eq!(requester, crate::Requester::relayed(50_001, 7));
+        assert_eq!(role, Role::Viewer);
+        assert!(!role.may_close());
+        assert_eq!(line, "KARYOS-AGENT 1 guard-close /d 3 drill\n");
+        // A role's name is no principal, and a principal's name no role.
+        for name in [
+            "administrator",
+            "svc.viewer:administrator",
+            "role=administrator",
+        ] {
+            let line = format!("KARYOS-AGENT 1 relay {name} gap-ack 1\n");
+            assert_eq!(authorize(&callers, Some(990), &line), None, "{name}");
+        }
+        // The relay's own requests are its local role's, as before.
+        let (requester, role, _) = authorize(&callers, Some(990), "KARYOS-AGENT 1 view\n").unwrap();
+        assert_eq!(
+            (requester, role),
+            (crate::Requester::local(990), Role::Administrator)
+        );
+        let (requester, role, _) = authorize(
+            &callers,
+            Some(990),
+            "KARYOS-AGENT 1 relay alice@example guard-reopen /d 3 9\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (requester, role),
+            (crate::Requester::relayed(50_002, 7), Role::RiskOfficer)
+        );
+    }
+
+    /// Only a relay's uid may relay, only for a known principal, and a
+    /// relayed line keeps its version for the request's own parsing.
+    #[test]
+    fn only_a_relay_relays_for_a_known_principal() {
+        let callers = callers();
+        let line = "KARYOS-AGENT 1 relay svc.viewer view\n";
+        assert_eq!(authorize(&callers, Some(1000), line), None);
+        assert_eq!(authorize(&callers, Some(4242), line), None);
+        assert_eq!(authorize(&callers, None, line), None);
+        for line in [
+            "KARYOS-AGENT 1 relay nobody view\n",
+            "KARYOS-AGENT 1 relay svc.viewer\n",
+            "KARYOS-AGENT 1 relay  view\n",
+        ] {
+            assert_eq!(authorize(&callers, Some(990), line), None, "{line}");
+        }
+        let (_, _, line) = authorize(
+            &callers,
+            Some(990),
+            "KARYOS-AGENT 2 relay svc.viewer view\n",
+        )
+        .unwrap();
+        assert_eq!(parse(&line), Request::Version);
+        // The local uid mode is unchanged: the same line, the same role.
+        let (requester, role, line) =
+            authorize(&callers, Some(1000), "KARYOS-AGENT 1 view\n").unwrap();
+        assert_eq!(
+            (requester, role),
+            (crate::Requester::local(1000), Role::Viewer)
+        );
+        assert_eq!(line, "KARYOS-AGENT 1 view\n");
+        assert_eq!(
+            authorize(&callers, Some(4242), "KARYOS-AGENT 1 view\n"),
+            None
+        );
     }
 
     /// The interim matrix (owner item 2): operators and risk officers

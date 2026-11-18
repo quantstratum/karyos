@@ -19,6 +19,28 @@ members = [
     "crates/karyos-ffi",
     "crates/karyos-bench",
     "crates/karyos-agent",
+    "crates/karyos-control",
+]
+# Every member but the control-plane component (karyos#708): the default
+# build and its graph are unchanged by it (the agent HTTP stack's admission
+# record, condition 2).
+default-members = [
+    "crates/karyos-sys",
+    "crates/karyos-io",
+    "crates/karyos-protocol",
+    "crates/karyos-codec",
+    "crates/karyos-client",
+    "crates/karyos-driver",
+    "crates/karyos-trace",
+    "crates/karyos-archive",
+    "crates/karyos-cluster",
+    "crates/karyos-feed",
+    "crates/karyos-sim",
+    "crates/karyos",
+    "crates/karyos-tools",
+    "crates/karyos-ffi",
+    "crates/karyos-bench",
+    "crates/karyos-agent",
 ]
 
 [workspace.package]

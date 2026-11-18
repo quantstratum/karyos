@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "karyos-control"
+description = "Control-plane component: the agent's API v1 relayed over TLS 1.3 with mutual TLS (M14, karyos#708)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The agent HTTP stack's admission record (quantstratum-docs:
+# karyos/reviews/dependency-admission-agent-http-stack.md, owner decision
+# ACS 71206): these crates, at these versions and features, in this crate
+# only. Nothing depends on it, and it is not a default member.
+[dependencies]
+hyper = { version = "=1.12.0", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "net", "time"] }
+tokio-rustls = { version = "=0.26.6", default-features = false }
+rustls = { version = "=0.23.46", default-features = false, features = ["std"] }
+rustls-graviola = { version = "=0.4.0", default-features = false }
+thiserror.workspace = true
+
+[dev-dependencies]
+# The tests' client and the component's runtime on a thread of its own:
+# the same crates and features as above, nothing more.
+rustls = { version = "=0.23.46", default-features = false, features = ["std"] }
+rustls-graviola = { version = "=0.4.0", default-features = false }
+tokio = { version = "=1.54.1", default-features = false, features = ["rt", "net", "time"] }
+
+[lints]
+workspace = true

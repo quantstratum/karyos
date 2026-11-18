@@ -148,6 +148,11 @@ pub struct JournalRecord {
     pub word: u64,
     /// The operator's reason, at most [`MAX_REASON`] bytes.
     pub reason: Vec<u8>,
+    /// The relay that carried the request for the operator, a remote
+    /// control-plane component's configured relay id (karyos#708); 0 for
+    /// a request made on the local socket, which no relay carried. The
+    /// operator is then the authenticated requester, never the relay.
+    pub relay: u64,
 }
 
 impl JournalRecord {
@@ -165,12 +170,17 @@ impl JournalRecord {
             code: 0,
             word: 0,
             reason: Vec::new(),
+            relay: 0,
         }
     }
 
     /// The record's payload: eleven little-endian words (the layout's
     /// version, the kind, then the fields in declaration order, then the
-    /// reason's length) and the reason, cut to [`MAX_REASON`] bytes.
+    /// reason's length) and the reason, cut to [`MAX_REASON`] bytes; then,
+    /// for a relayed request only, the relay as one more little-endian
+    /// word (karyos#708). A record no relay carried is byte for byte what
+    /// it was before relays, and a reader of the layout that stops at the
+    /// reason reads either.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let reason = self.reason.get(..MAX_REASON).unwrap_or(&self.reason);
@@ -189,6 +199,9 @@ impl JournalRecord {
         ];
         let mut out: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
         out.extend_from_slice(reason);
+        if self.relay != 0 {
+            out.extend_from_slice(&self.relay.to_le_bytes());
+        }
         out
     }
 
@@ -205,7 +218,13 @@ impl JournalRecord {
         }
         let length = usize::try_from(word(10)?).ok()?;
         let start = WORDS.checked_mul(8)?;
-        let reason = payload.get(start..start.checked_add(length)?)?;
+        let end = start.checked_add(length)?;
+        let reason = payload.get(start..end)?;
+        // The relay word, when one follows the reason; nothing else may.
+        let relay = match payload.get(end..)? {
+            [] => 0,
+            tail => u64::from_le_bytes(tail.try_into().ok()?),
+        };
         Some(Self {
             kind: Kind::from_code(word(1)?)?,
             time: word(2)?,
@@ -217,6 +236,7 @@ impl JournalRecord {
             code: word(8)?,
             word: word(9)?,
             reason: reason.to_vec(),
+            relay,
         })
     }
 }
@@ -487,12 +507,29 @@ impl Journal {
         uid: u64,
         now: u64,
     ) -> Result<(), JournalError> {
+        self.acknowledge_gap_relayed(position, uid, 0, now)
+    }
+
+    /// As [`Journal::acknowledge_gap`], for administrator `operator`
+    /// whose request relay `relay` carried (0 for none; karyos#708).
+    ///
+    /// # Errors
+    ///
+    /// As [`Journal::acknowledge_gap`].
+    pub fn acknowledge_gap_relayed(
+        &mut self,
+        position: u64,
+        operator: u64,
+        relay: u64,
+        now: u64,
+    ) -> Result<(), JournalError> {
         if self.gap.map(|gap| gap.position) != Some(position) {
             return Err(JournalError::NoGap);
         }
         let mut record = JournalRecord::new(Kind::GapAcknowledged, now);
         record.expected = position;
-        record.operator = uid;
+        record.operator = operator;
+        record.relay = relay;
         let _ = self.append_durable(&record, now)?;
         self.gap = None;
         Ok(())

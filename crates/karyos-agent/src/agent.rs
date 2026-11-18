@@ -154,6 +154,36 @@ struct Driver {
     attachment: crate::api::Attachment,
 }
 
+/// Who asked for an operation (karyos#708): the operator the journal and
+/// the driver's audit name, and the relay that carried the request, kept
+/// apart so that a relayed request never reads as the relay's own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Requester {
+    /// The operator: the local peer's uid, or a relayed principal's
+    /// operator id from the agent's own principal table.
+    pub operator: u32,
+    /// The relay's configured id; 0 for a request on the local socket.
+    pub relay: u64,
+}
+
+impl Requester {
+    /// The local peer `uid`, which no relay carried.
+    #[must_use]
+    pub const fn local(uid: u32) -> Self {
+        Self {
+            operator: uid,
+            relay: 0,
+        }
+    }
+
+    /// Principal `operator`, whose request relay `relay` carried.
+    #[must_use]
+    pub const fn relayed(operator: u32, relay: u64) -> Self {
+        Self { operator, relay }
+    }
+}
+
 /// The agent. Each driver it is attached to counts one tool against the
 /// driver's `max_tools`; a driver that exits releases it.
 #[derive(Debug)]
@@ -294,7 +324,32 @@ impl Agent {
     /// Closes guard `guard` of the driver in `dir` for operator `uid`
     /// with `reason`, journalled (M10b; see `operations`).
     pub fn guard_close(&mut self, dir: &Path, guard: u64, uid: u32, reason: &[u8]) -> GuardAnswer {
-        self.guard_command(dir, guard, None, uid, reason)
+        self.guard_command(dir, guard, None, Requester::local(uid), reason)
+    }
+
+    /// As [`Agent::guard_close`], for `requester`, whom a relay may have
+    /// carried (karyos#708): the journal records the relay and the
+    /// requester apart.
+    pub fn guard_close_for(
+        &mut self,
+        dir: &Path,
+        guard: u64,
+        requester: Requester,
+        reason: &[u8],
+    ) -> GuardAnswer {
+        self.guard_command(dir, guard, None, requester, reason)
+    }
+
+    /// As [`Agent::guard_reopen`], for `requester` (karyos#708).
+    pub fn guard_reopen_for(
+        &mut self,
+        dir: &Path,
+        guard: u64,
+        expected: u64,
+        requester: Requester,
+        reason: &[u8],
+    ) -> GuardAnswer {
+        self.guard_command(dir, guard, Some(expected), requester, reason)
     }
 
     /// Reopens guard `guard`, closed at `expected`, of the driver in `dir`
@@ -308,7 +363,7 @@ impl Agent {
         uid: u32,
         reason: &[u8],
     ) -> GuardAnswer {
-        self.guard_command(dir, guard, Some(expected), uid, reason)
+        self.guard_command(dir, guard, Some(expected), Requester::local(uid), reason)
     }
 
     fn guard_command(
@@ -316,7 +371,7 @@ impl Agent {
         dir: &Path,
         guard: u64,
         reopen: Option<u64>,
-        uid: u32,
+        requester: Requester,
         reason: &[u8],
     ) -> GuardAnswer {
         if !self.drivers.iter().any(|driver| driver.dir == dir) {
@@ -330,7 +385,8 @@ impl Agent {
             guard,
             reopen,
             operation,
-            operator: uid,
+            operator: requester.operator,
+            relay: requester.relay,
             // Cut once, so the digest covers what is journalled (DESIGN's
             // P2 on #487).
             reason: operations::cut_reason(reason),
@@ -368,8 +424,27 @@ impl Agent {
     /// [`JournalError::NoGap`] when there is no such interval open, and
     /// the journal's errors.
     pub fn acknowledge_gap(&mut self, position: u64, uid: u32) -> Result<(), JournalError> {
+        self.acknowledge_gap_for(position, Requester::local(uid))
+    }
+
+    /// As [`Agent::acknowledge_gap`], for `requester` (karyos#708).
+    ///
+    /// # Errors
+    ///
+    /// As [`Agent::acknowledge_gap`].
+    pub fn acknowledge_gap_for(
+        &mut self,
+        position: u64,
+        requester: Requester,
+    ) -> Result<(), JournalError> {
+        let uid = requester.operator;
         match self.journal.as_mut() {
-            Some(journal) => journal.acknowledge_gap(position, u64::from(uid), host_monotonic_ns()),
+            Some(journal) => journal.acknowledge_gap_relayed(
+                position,
+                u64::from(uid),
+                requester.relay,
+                host_monotonic_ns(),
+            ),
             None => match self.unopened_gap.take_if(|gap| gap.position == position) {
                 // The one operator act nothing durable records: logged at
                 // info on standard error, as the agent logs (DESIGN's P3 on

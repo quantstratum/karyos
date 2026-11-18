@@ -25,6 +25,20 @@ pub struct AgentView {
     pub agent: AgentIdentity,
 }
 
+/// The longest name of a principal a relay carries requests for
+/// (karyos#708), in bytes.
+pub const MAX_PRINCIPAL: usize = 64;
+
+/// Whether `name` is a valid principal name: 1 to [`MAX_PRINCIPAL`] bytes
+/// of ASCII letters, digits, `.`, `_`, `-`, `@` and `:` (karyos#708).
+#[must_use]
+pub fn valid_principal(name: &str) -> bool {
+    (1..=MAX_PRINCIPAL).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-@:".contains(&byte))
+}
+
 /// Whether `id` is an agent id `--agent-id` takes: 1 to 64 bytes of
 /// letters, digits, `.`, `_`, `:`, `/` and `-` (R-CORE-24).
 #[must_use]

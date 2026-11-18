@@ -49,6 +49,30 @@ fn a_record_round_trips() {
     assert_eq!(JournalRecord::decode(&[]), None);
 }
 
+/// A relayed request's record keeps the relay apart from the operator
+/// (karyos#708); a record no relay carried is byte for byte the layout
+/// before relays, and anything but one relay word after the reason is
+/// not a record.
+#[test]
+fn a_relay_is_recorded_apart_from_the_operator() {
+    let local = request(Kind::CloseRequest, 7, 3);
+    assert_eq!(local.encode().len(), WORDS * 8 + b"drill".len());
+    let mut relayed = local.clone();
+    relayed.relay = 7;
+    relayed.operator = 50_001;
+    let bytes = relayed.encode();
+    assert_eq!(bytes.len(), WORDS * 8 + b"drill".len() + 8);
+    let decoded = JournalRecord::decode(&bytes).unwrap();
+    assert_eq!((decoded.operator, decoded.relay), (50_001, 7));
+    assert_eq!(decoded, relayed);
+    let mut torn = bytes.clone();
+    torn.pop();
+    assert_eq!(JournalRecord::decode(&torn), None);
+    let mut longer = bytes;
+    longer.push(0);
+    assert_eq!(JournalRecord::decode(&longer), None);
+}
+
 /// A journal resumes its recording across restarts: records of a run with
 /// every request answered leave no unknown interval.
 #[test]
