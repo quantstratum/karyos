@@ -43,9 +43,12 @@ ignore = [
     { id = "RUSTSEC-2025-0057", reason = "evaluation only, admission record condition 4" },
     # chrono 0.4.45 under openraft and openraft-macros 0.10.0-alpha.37:
     # unmaintained, a non-optional dependency of both. Evaluation scope
-    # only, as a reviewed amendment of the admission (karyos#690; Codex
-    # agreed the route in ACS 77218; the graph's admission still pending).
-    # Removed when openraft drops chrono, at any openraft version change, or
-    # at the comparison's freeze (plan issue 062), whichever comes first.
-    { id = "RUSTSEC-2026-0543", reason = "evaluation only, karyos#690 amendment of the admission" },
+    # only, a reviewed amendment of the admission (karyos#690): Codex agreed
+    # the route in ACS 77218; the owner admitted the graph in
+    # karyos#959 (issuecomment-6976562162). Upstream removed chrono in
+    # databendlabs/openraft#2387 (merged 2026-11-18, not yet released;
+    # 0.10.0 still has it). Removed when an openraft release containing
+    # #2387 is admitted (expected 0.10.1): upgrade, confirm
+    # `cargo tree -i chrono -e normal,build` is empty, drop this entry.
+    { id = "RUSTSEC-2026-0543", reason = "evaluation only; karyos#690 amendment, owner-admitted in karyos#959; removed upstream by openraft#2387, drop on its admitted release" },
 ]

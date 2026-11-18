@@ -68,8 +68,10 @@ evaluation admission, never as a workspace waiver.
 
 - **Path.** `chrono` 0.4.45 is a **non-optional** `[dependencies]` entry
   of `openraft` 0.10.0-alpha.37 and of its proc macro `openraft-macros`
-  0.10.0-alpha.37 (requirement `0.4`, default features), and of
-  `display-more` 0.2.6. Features resolved: `default`, `std`, `alloc`,
+  0.10.0-alpha.37 (requirement `0.4`, default features).
+  `cargo tree -i chrono -e normal,build` shows those two as the only paths
+  (verified at 0.10.0-alpha.37); `display-more` 0.2.6 declares it too but
+  does not reach it in this graph. Features resolved: `default`, `std`, `alloc`,
   `clock`, `now`, `oldtime`, `iana-time-zone`, `wasmbind`, `winapi`,
   `windows-link` (the last three only on wasm32 and Windows targets).
   Targets: every target; on the supported Linux and macOS ones it builds
@@ -87,7 +89,13 @@ evaluation admission, never as a workspace waiver.
 - **The exception.** `deny.toml` here ignores exactly RUSTSEC-2026-0543,
   with this reason; the core's `deny.toml` is untouched.
 - **Provenance.** Codex agreed the route (process only) in ACS 77218;
-  the admission of the affected graph is still pending review.
-- **Re-review or removal.** The ignore goes when `openraft` drops
-  `chrono`, at any change of the `openraft` version, or at the freeze of
-  the comparison (plan issue 062), whichever comes first.
+  the owner admitted the evaluation graph with `chrono`, evaluation scope
+  only, in karyos#959 (issuecomment-6976562162).
+- **Upstream.** databendlabs/openraft#2387, "remove the chrono
+  dependency", merged to main on 2026-11-18 (closes #2384), is not yet
+  released: `openraft` 0.10.0 on crates.io still depends on `chrono`. This
+  stack keeps the admitted baseline, 0.10.0-alpha.37, and does not move to
+  0.10.0.
+- **Removal trigger.** When an `openraft` release containing #2387 is
+  admitted (expected 0.10.1): upgrade, confirm
+  `cargo tree -i chrono -e normal,build` is empty, and drop the ignore.
