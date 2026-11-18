@@ -92,6 +92,13 @@ identity="$version $PROTOC $({ sha256sum "$PROTOC" 2>/dev/null || shasum -a 256 
 "$cargo" clean --locked --release -p raft-proto
 echo "raft-eval: $identity"
 
+# No Tokio in the evaluation graph either (owner item 33: no measured run
+# uses Tokio; karyos#690).
+if "$cargo" tree --locked --target all -e normal,build,dev --prefix none | grep -Eq '^tokio(-[a-z-]+)? '; then
+    echo "raft-eval: Tokio is in the evaluation graph" >&2
+    exit 1
+fi
+
 "$cargo" fmt -- --check
 "$cargo" clippy --all-targets --locked -- -D warnings
 RUSTDOCFLAGS="-D warnings" "$cargo" doc --no-deps --locked

@@ -20,11 +20,14 @@ all `--locked`.
 | Item | Value |
 | --- | --- |
 | `raft` | `=0.7.0`, default features off, `protobuf-codec` (`raft-proto` 0.7.0, `protobuf` 2.28.0) |
-| Variant | baseline: the crates.io release, no local patch (`raft_rs::VARIANT`) |
+| `openraft` | `=0.10.0-alpha.37`, default features off (no `tokio-rt`), with `openraft-rt` `=0.10.0-alpha.37`; `openraft-macros` pinned to 0.10.0-alpha.37 in `Cargo.lock` |
+| Runtime | `executor::SimRuntime`: the bounded, manually pumped executor behind `openraft-rt`'s `AsyncRuntime`; no Tokio anywhere in the graph (`check.sh` fails if one appears) |
+| Variant | baseline for both: the crates.io releases, no local patch (`raft_rs::VARIANT`, `openraft_core::VARIANT`) |
 | Patch records | none |
 | `protoc` (condition 5) | 3.9.0, the prebuilt binary bundled in `protobuf-build` 0.14.1 from crates.io (checksum pinned by `Cargo.lock`); `protoc-osx-x86_64` (SHA-256 `5baf2162793b6608f2361c083c53e276ea84c2ed2adcf400ec07bb524399f4dc`), on macOS aarch64 a native protoc 3.x is preferred (Homebrew's `protobuf@21`, libprotoc 3.21, then a 3.x `protoc` on `PATH`), then that x86_64 binary under Rosetta 2; with none of them `check.sh` fails and says how to get one, it never skips; `protoc-linux-x86_64` or `protoc-linux-aarch_64` on Linux. `PROTOC` overrides it (a path or a command on `PATH`, resolved to an absolute file). `check.sh` refuses anything but 3.1 or later in 3.x before building and prints the version, path and SHA-256 it used. A system `protoc` 4.x or later is refused by `raft-proto` |
 | Toolchain | the repository's `rust-toolchain.toml` (1.99.0) |
 | Advisories ignored here only (condition 4) | RUSTSEC-2024-0437 (`protobuf` 2.28.0), RUSTSEC-2025-0057 (`fxhash` 0.2.1) |
+| Advisory amended in (karyos#690) | RUSTSEC-2026-0543, see below |
 
 ## Findings, `raft` 0.7.0 (karyos#678)
 
@@ -43,3 +46,48 @@ all `--locked`.
 | Storage | raft-rs reads a `MemStorage` mirror of what C4 made durable, so the harness's metered log reads do not see its reads |
 | Real processes | demonstrated: `tests/real_processes.rs` runs three `raft-eval-node` processes, each running `RaftRs` (the type the simulator tests drive, unchanged) through the harness's `drive`, over C4's log on real files (`StdDisk`) and UDP on the loopback; they elect a leader and all apply the same 20 commands in the same order. The runner maps 10 ms of the process clock to a tick: at 1 ms a tick an election times out before a vote's `fsync` and no leader is elected |
 | Panics | raft-rs asserts its own invariants and unwraps its storage lock; none fired in these runs |
+
+## Findings, `openraft` 0.10.0-alpha.37 on the manual executor (karyos#690)
+
+| Gate or workload | Finding |
+| --- | --- |
+| Executor | feasible: every OpenRaft task runs on the node's executor inside the harness's calls, at most 4,096 polls a call; the virtual clock moves only on a tick; no call in the tests hit the budget |
+| W1, W3, W4, W6 | the same results as `raft`, the same cases and seeds: W1, W4 and W6 pass, W3 keeps safety with the leader crash the harness client's gap, W4's lost durable majority a no-leader gap |
+| W2, W5 | as for `raft`: not demonstrated yet (karyos#679) |
+| Determinism | a seed reproduces its run, and the same calls reproduce every node's executor interleaving (trace digest), asserted |
+| Pre-vote | OpenRaft's own pre-vote handler on the receiving node, reached through the adapter's RPC; never the trait's default, which synthesises a grant; tested against a control without it |
+| Allocation | **fails the gate**: W1, 32 clients, seed 1: 114 entries past the warm-up, 44,710 allocations and 42,590 frees, 393 and 374 per entry |
+| Adapter settings | RPC answers wait at least 20 ticks (OpenRaft's sequential append stream does not time an RPC out, and its own 2-tick TTL is shorter than a round trip on the slower links); retries back off 2, 4, 8 then up to 20 ticks, scaled to the 2-tick heartbeat instead of OpenRaft's 200 ms default. The same for every workload |
+| Real processes | not demonstrated, as for `raft` |
+
+## Amendment: RUSTSEC-2026-0543 (`chrono` unmaintained), karyos#690
+
+Published after the admission record, which found no advisory in the
+`openraft` graph. Handled as an explicitly reviewed amendment of that
+evaluation admission, never as a workspace waiver.
+
+- **Path.** `chrono` 0.4.45 is a **non-optional** `[dependencies]` entry
+  of `openraft` 0.10.0-alpha.37 and of its proc macro `openraft-macros`
+  0.10.0-alpha.37 (requirement `0.4`, default features), and of
+  `display-more` 0.2.6. Features resolved: `default`, `std`, `alloc`,
+  `clock`, `now`, `oldtime`, `iana-time-zone`, `wasmbind`, `winapi`,
+  `windows-link` (the last three only on wasm32 and Windows targets).
+  Targets: every target; on the supported Linux and macOS ones it builds
+  `chrono` and `iana-time-zone` (with `core-foundation-sys` on macOS).
+- **Why evaluation still needs it.** Disabling `display-more` does not
+  remove it: `openraft` and `openraft-macros` depend on `chrono` directly
+  and unconditionally, with no feature to turn it off. Removing it means
+  replacing or patching `openraft`, which would no longer be the admitted
+  baseline. The evaluation keeps the baseline and records the advisory as
+  a finding of the comparison and an input to the runtime admission (plan
+  issue 074).
+- **Isolation.** Only this workspace resolves it: no crate of the core
+  depends on `karyos-raft-eval`, and `make shipped-graph-check` refuses
+  `openraft`, `openraft-macros` and `openraft-rt` in every shipped graph.
+- **The exception.** `deny.toml` here ignores exactly RUSTSEC-2026-0543,
+  with this reason; the core's `deny.toml` is untouched.
+- **Provenance.** Codex agreed the route (process only) in ACS 77218;
+  the admission of the affected graph is still pending review.
+- **Re-review or removal.** The ignore goes when `openraft` drops
+  `chrono`, at any change of the `openraft` version, or at the freeze of
+  the comparison (plan issue 062), whichever comes first.

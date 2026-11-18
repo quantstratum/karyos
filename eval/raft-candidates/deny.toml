@@ -41,4 +41,11 @@ ignore = [
     { id = "RUSTSEC-2024-0437", reason = "evaluation only, admission record condition 4" },
     # fxhash 0.2.1 under raft 0.7.0: unmaintained, no safe upgrade.
     { id = "RUSTSEC-2025-0057", reason = "evaluation only, admission record condition 4" },
+    # chrono 0.4.45 under openraft and openraft-macros 0.10.0-alpha.37:
+    # unmaintained, a non-optional dependency of both. Evaluation scope
+    # only, as a reviewed amendment of the admission (karyos#690; Codex
+    # agreed the route in ACS 77218; the graph's admission still pending).
+    # Removed when openraft drops chrono, at any openraft version change, or
+    # at the comparison's freeze (plan issue 062), whichever comes first.
+    { id = "RUSTSEC-2026-0543", reason = "evaluation only, karyos#690 amendment of the admission" },
 ]
