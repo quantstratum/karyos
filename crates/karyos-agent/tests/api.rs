@@ -667,19 +667,23 @@ fn a_relay_under_its_own_uid_reaches_the_socket_through_its_group() {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
+        // Its output (a whole view) can fill a pipe: read it meanwhile.
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = stdout.read_to_string(&mut out).unwrap();
+            out
+        });
         let start = Instant::now();
         while child.try_wait().unwrap().is_none() {
-            assert!(start.elapsed() < Duration::from_secs(30), "relay stuck");
+            if start.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                panic!("relay stuck: {group:?} {uid}");
+            }
             let _ = server.poll(&mut agent).unwrap();
             std::thread::sleep(Duration::from_millis(1));
         }
-        let mut out = String::new();
-        let _ = child
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_string(&mut out)
-            .unwrap();
+        let out = reader.join().unwrap();
         if served {
             assert!(out.contains(r#"ANSWER {"version":1,"drivers""#), "{out}");
         } else {
@@ -706,8 +710,10 @@ fn relay_child() {
                 .unwrap();
             let mut answer = String::new();
             let _ = stream.read_to_string(&mut answer).unwrap();
-            print!("ANSWER {answer}");
+            let _ = write!(std::io::stdout(), "ANSWER {answer}");
         }
-        Err(error) => print!("ERR {:?}", error.kind()),
+        Err(error) => {
+            let _ = write!(std::io::stdout(), "ERR {:?}", error.kind());
+        }
     }
 }
