@@ -1,0 +1,3 @@
+### Added
+
+- The trust bootstrap, the key registry and signed chain heads of the Archive (SPEC.md §8.4, "Trust bootstrap", "Signed heads and custody" and "Key registry"; karyos#663): `karyos_archive::integrity::trust` adds canonical versioned Ed25519 head bytes under an archival domain tag, a key registry whose entries the external authority endorses and whose digests are chained in the integrity journal, registration before first use, retirement, evidence-backed revocation with pre-revocation anchoring, and honest custody labels; `karyos_archive::integrity::signing` adds a coalesce-or-refuse signing backlog that never blocks sealing, the coverage lag and an `anchor_interval` alarm, with an unconfigured interval refused.

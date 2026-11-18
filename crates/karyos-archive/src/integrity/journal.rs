@@ -41,6 +41,9 @@ pub enum IntegrityError {
     /// An earlier append failed part way; reopen the journal to recover.
     #[error("an earlier append failed; the journal must be reopened")]
     Poisoned,
+    /// The key registry refused an entry.
+    #[error("key registry: {0}")]
+    Registry(#[from] super::trust::RegistryError),
     /// The sealing schedule refused a step.
     #[error("sealing schedule: {0}")]
     Schedule(#[from] super::sealer::SealerError),

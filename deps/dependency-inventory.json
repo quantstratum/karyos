@@ -5,7 +5,10 @@
       "cfg-if v1.0.5",
       "cpufeatures v0.3.1",
       "crypto-common v0.2.2",
+      "curve25519-dalek v5.0.0",
       "digest v0.11.3",
+      "ed25519 v3.0.0",
+      "ed25519-dalek v3.0.0",
       "errno v0.3.14",
       "hybrid-array v0.4.15",
       "lazy_static v1.5.1",
@@ -14,6 +17,8 @@
       "pin-project-lite v0.2.17",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
+      "rustc_version v0.4.1",
+      "semver v1.0.28",
       "serde v1.0.229",
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
@@ -22,6 +27,8 @@
       "sharded-slab v0.1.7",
       "signal-hook v0.4.5",
       "signal-hook-registry v1.4.8",
+      "signature v3.0.0",
+      "subtle v2.6.1",
       "syn v3.0.8",
       "thiserror v2.0.21",
       "thiserror-impl v2.0.21",
@@ -34,7 +41,8 @@
       "tracing-subscriber v0.3.23",
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
-      "winnow v1.0.4"
+      "winnow v1.0.4",
+      "zeroize v1.9.2"
     ],
     "aarch64-unknown-linux-gnu": [
       "bitflags v2.13.2",
@@ -42,7 +50,10 @@
       "cfg-if v1.0.5",
       "cpufeatures v0.3.1",
       "crypto-common v0.2.2",
+      "curve25519-dalek v5.0.0",
       "digest v0.11.3",
+      "ed25519 v3.0.0",
+      "ed25519-dalek v3.0.0",
       "errno v0.3.14",
       "hybrid-array v0.4.15",
       "lazy_static v1.5.1",
@@ -52,7 +63,9 @@
       "pin-project-lite v0.2.17",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
+      "rustc_version v0.4.1",
       "rustix v1.1.6",
+      "semver v1.0.28",
       "serde v1.0.229",
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
@@ -61,6 +74,8 @@
       "sharded-slab v0.1.7",
       "signal-hook v0.4.5",
       "signal-hook-registry v1.4.8",
+      "signature v3.0.0",
+      "subtle v2.6.1",
       "syn v3.0.8",
       "thiserror v2.0.21",
       "thiserror-impl v2.0.21",
@@ -73,7 +88,8 @@
       "tracing-subscriber v0.3.23",
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
-      "winnow v1.0.4"
+      "winnow v1.0.4",
+      "zeroize v1.9.2"
     ],
     "x86_64-unknown-linux-gnu": [
       "bitflags v2.13.2",
@@ -81,7 +97,11 @@
       "cfg-if v1.0.5",
       "cpufeatures v0.3.1",
       "crypto-common v0.2.2",
+      "curve25519-dalek v5.0.0",
+      "curve25519-dalek-derive v0.1.1",
       "digest v0.11.3",
+      "ed25519 v3.0.0",
+      "ed25519-dalek v3.0.0",
       "errno v0.3.14",
       "hybrid-array v0.4.15",
       "lazy_static v1.5.1",
@@ -91,7 +111,9 @@
       "pin-project-lite v0.2.17",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
+      "rustc_version v0.4.1",
       "rustix v1.1.6",
+      "semver v1.0.28",
       "serde v1.0.229",
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
@@ -100,6 +122,9 @@
       "sharded-slab v0.1.7",
       "signal-hook v0.4.5",
       "signal-hook-registry v1.4.8",
+      "signature v3.0.0",
+      "subtle v2.6.1",
+      "syn v2.0.119",
       "syn v3.0.8",
       "thiserror v2.0.21",
       "thiserror-impl v2.0.21",
@@ -112,7 +137,8 @@
       "tracing-subscriber v0.3.23",
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
-      "winnow v1.0.4"
+      "winnow v1.0.4",
+      "zeroize v1.9.2"
     ]
   },
   "generated_by": "scripts/dependency-inventory.py",
@@ -355,6 +381,13 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
           "kind": "normal",
           "target": null,
@@ -588,6 +621,13 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+          "kind": "normal",
+          "target": "cfg(target_arch = \"x86_64\")",
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.1",
           "kind": "normal",
           "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))",
@@ -602,6 +642,9 @@
         "runtime": [
           [
             "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
+          ],
+          [
+            "cfg(target_arch = \"x86_64\")"
           ]
         ]
       },
@@ -715,8 +758,72 @@
       "version": "0.2.2"
     },
     {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [
+            "digest"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@3.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "digest",
+        "zeroize"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+      "license": "BSD-3-Clause",
+      "name": "curve25519-dalek",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "5.0.0"
+    },
+    {
       "build_script": false,
       "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+          "kind": "normal",
+          "target": "cfg(all(not(curve25519_dalek_backend = \"fiat\"), not(curve25519_dalek_backend = \"serial\"), target_arch = \"x86_64\"))",
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek-derive@0.1.1",
+      "license": "MIT/Apache-2.0",
+      "name": "curve25519-dalek-derive",
+      "paths": {
+        "build": [
+          [
+            "cfg(all(not(curve25519_dalek_backend = \"fiat\"), not(curve25519_dalek_backend = \"serial\"), target_arch = \"x86_64\"))"
+          ]
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "block-api"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.1",
@@ -740,6 +847,58 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.11.3"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@3.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ed25519@3.0.0",
+      "license": "Apache-2.0 OR MIT",
+      "name": "ed25519",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "3.0.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "zeroize"
+          ],
+          "from": "workspace:karyos-archive@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "zeroize"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@3.0.0",
+      "license": "BSD-3-Clause",
+      "name": "ed25519-dalek",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "3.0.0"
     },
     {
       "build_script": false,
@@ -839,6 +998,32 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.3.14"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+          "kind": "normal",
+          "target": "cfg(curve25519_dalek_backend = \"fiat\")",
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#fiat-crypto@0.3.0",
+      "license": "MIT OR Apache-2.0 OR BSD-1-Clause",
+      "name": "fiat-crypto",
+      "paths": {
+        "runtime": [
+          [
+            "cfg(curve25519_dalek_backend = \"fiat\")"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.0"
     },
     {
       "build_script": false,
@@ -1704,6 +1889,13 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek-derive@0.1.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47",
           "kind": "normal",
           "target": null,
@@ -1842,6 +2034,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek-derive@0.1.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         },
         {
           "features": [],
@@ -2193,6 +2392,30 @@
       "version": "0.8.11"
     },
     {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+          "kind": "build",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#rustc_version@0.4.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "rustc_version",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.1"
+    },
+    {
       "build_script": true,
       "edges": [
         {
@@ -2320,6 +2543,33 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.0.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rustc_version@0.4.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#semver@1.0.28",
+      "license": "MIT OR Apache-2.0",
+      "name": "semver",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.28"
     },
     {
       "build_script": true,
@@ -2558,6 +2808,13 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@3.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
           "from": "workspace:karyos-archive@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
@@ -2684,6 +2941,30 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ed25519@3.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#signature@3.0.0",
+      "license": "Apache-2.0 OR MIT",
+      "name": "signature",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "3.0.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
           "kind": "normal",
           "target": null,
@@ -2711,6 +2992,50 @@
       "edges": [
         {
           "features": [
+            "const-generics"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@3.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "const-generics"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#subtle@2.6.1",
+      "license": "BSD-3-Clause",
+      "name": "subtle",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.6.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "full"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek-derive@0.1.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
             "full"
           ],
           "from": "registry+https://github.com/rust-lang/crates.io-index#zerocopy-derive@0.8.63",
@@ -2732,6 +3057,11 @@
       "license": "MIT OR Apache-2.0",
       "name": "syn",
       "paths": {
+        "build": [
+          [
+            "cfg(all(not(curve25519_dalek_backend = \"fiat\"), not(curve25519_dalek_backend = \"serial\"), target_arch = \"x86_64\"))"
+          ]
+        ],
         "dev": [
           []
         ]
@@ -3750,6 +4080,37 @@
       "proc_macro": true,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.8.63"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@3.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#zeroize@1.9.2",
+      "license": "Apache-2.0 OR MIT",
+      "name": "zeroize",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.9.2"
     },
     {
       "build_script": true,
