@@ -86,10 +86,11 @@ fn agent(dir: &std::path::Path, journal: bool) -> (Agent, Arc<Mutex<Vec<String>>
 fn ask(dir: &std::path::Path, role: Role, agent: &mut Agent, request: &str) -> String {
     let path = dir.join(format!("api-{role:?}"));
     let mut server = Server::bind(ApiConfig::new(
-        path.clone(),
+        path,
         vec![(karyos_sys::ipc::own_uid(), role)],
     ))
     .unwrap();
+    let path = server.path().to_path_buf();
     let line = format!("KARYOS-AGENT 1 {request}\n");
     std::thread::scope(|scope| {
         let client = scope.spawn(move || {
