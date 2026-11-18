@@ -97,10 +97,15 @@ applies them:
   features and with `--all-features` (so an optional dependency behind a
   nondefault feature is caught), and fails if `raft`,
   `raft-proto`, `protobuf-build`, `openraft`, `openraft-rt`,
-  `openraft-rt-tokio`, `openraft-macros`, `tokio` or `karyos-raft-eval`
-  appears. `scripts/check-shipped-graph-selftest.sh`, run with it, proves
-  the check fails on a plain and on a feature-gated forbidden dependency
-  in a throwaway workspace. The unused `karyos-tools` to `karyos-sim` edge, through which a
+  `openraft-rt-tokio`, `openraft-macros` or `karyos-raft-eval` appears
+  anywhere, or `tokio` appears outside the crates it is admitted for
+  (`karyos-control`, the owner-admitted HTTP stack: karyos#704, ACS 71206;
+  a crate reaching Tokio through `karyos-control` is still refused).
+  `scripts/check-shipped-graph-selftest.sh`, run with it, proves in a
+  throwaway workspace that the check fails with exactly the expected
+  diagnostic on a plain, a feature-gated and a transitively admitted
+  Tokio, and on a candidate in the admitted crate, and passes silently on
+  Tokio in the admitted crate and on a clean graph. The unused `karyos-tools` to `karyos-sim` edge, through which a
   candidate placed in `karyos-sim` would reach `karyosd`, is karyos#926.
 - **Versions and features** are exactly the record's: `raft` without
   default features and with `protobuf-codec` only; `openraft` with default
@@ -114,8 +119,9 @@ applies them:
 - **`protoc`.** `raft-proto`'s build script runs `protoc` (a system one,
   or a prebuilt executable bundled in `protobuf-build`); the evaluation
   records the version and origin of the one it used.
-- **Tokio** in any form is excluded. A Tokio probe would need its own
-  record and is reconnaissance only.
+- **Tokio** in any form is excluded from the candidates' graphs and from
+  every shipped graph but `karyos-control`'s. A Tokio probe would need its
+  own record and is reconnaissance only.
 
 ## Resolved graph
 
