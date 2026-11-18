@@ -107,4 +107,19 @@ expect "a candidate in the admitted crate" \
     "$ws" "raft" "$every" "raft"
 make_workspace '' ''
 expect "no forbidden dependency"
+
+# A cargo failure fails the check and shows cargo's own error, `--quiet`
+# notwithstanding: a dependency added after the lockfile makes every
+# `cargo tree --locked` refuse to run (karyos#953 review).
+make_workspace '' ''
+printf 'tokio = { path = "../../vendor/tokio" }\n' >>"$work/ws/admitted/Cargo.toml"
+rc=0
+CARGO="$cargo" "$here/check-shipped-graph.sh" --manifest-path "$work/ws/Cargo.toml" \
+    --package shipped --tokio-admitted admitted >"$work/got" 2>&1 || rc=$?
+if [ "$rc" -eq 0 ] || ! grep -q '^error: ' "$work/got" \
+    || grep -q 'reaches a crate it may not ship' "$work/got"; then
+    echo "check-shipped-graph-selftest: a failing cargo tree: expected a nonzero exit with cargo's error, got (exit $rc):" >&2
+    cat "$work/got" >&2
+    failures=1
+fi
 exit $failures
