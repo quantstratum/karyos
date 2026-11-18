@@ -116,4 +116,20 @@ mod tests {
             }))
         );
     }
+
+    /// No candidate of ADR-0086 is a configuration the harness can run:
+    /// the construction is selected only on E1 or E2 evidence (owner
+    /// decision item 5), so no provisional profile is reachable (#632).
+    #[test]
+    fn no_candidate_profile_is_reachable_before_selection() {
+        for candidate in [
+            "hmac-sha256-t16",
+            "hmac-sha256-t32",
+            "aes128-cmac",
+            "ed25519",
+            "authenticated",
+        ] {
+            assert!(Profile::of(candidate).is_err(), "{candidate} is reachable");
+        }
+    }
 }
