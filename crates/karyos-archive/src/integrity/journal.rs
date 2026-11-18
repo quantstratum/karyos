@@ -146,6 +146,15 @@ impl<D: Disk> IntegrityJournal<D> {
         self.check.next_counter()
     }
 
+    /// Whether an append failed part way: the handle no longer knows how
+    /// many records are on disk, so nothing may be derived from it until
+    /// the journal is reopened.
+    #[must_use]
+    #[inline]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
     /// The record digest of the last record, the chain's head.
     #[must_use]
     #[inline]

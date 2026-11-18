@@ -578,6 +578,8 @@ impl KeyRegistry {
     ///
     /// [`IntegrityError::Registry`] with [`RegistryError::Missing`] when
     /// the journal chains an entry the ledger does not hold,
+    /// [`IntegrityError::Poisoned`] for a journal handle an earlier append
+    /// poisoned, before anything is read or cut;
     /// [`RegistryError::Malformed`] when a chained entry cannot be read,
     /// [`RegistryError::Backdated`] for a registration effective before
     /// the chain record that registers it, as on append, or the refusal
@@ -588,6 +590,12 @@ impl KeyRegistry {
         journal: &mut IntegrityJournal<D>,
         ledger: &mut Ledger<D, REGISTRY_ENTRY_LENGTH>,
     ) -> Result<Self, IntegrityError> {
+        // A poisoned handle reads only the records it knows of: a record
+        // whose sync failed may still be on disk, and its ledger entry
+        // must not be cut. Reopen the journal first.
+        if journal.is_poisoned() {
+            return Err(IntegrityError::Poisoned);
+        }
         let chained: Vec<(u64, u64, Digest)> = journal
             .records()?
             .into_iter()
@@ -735,6 +743,11 @@ impl KeyRegistry {
         journal: &mut IntegrityJournal<D>,
         ledger: &mut Ledger<D, REGISTRY_ENTRY_LENGTH>,
     ) -> Result<(), IntegrityError> {
+        // Nothing is written to the ledger for a journal that cannot chain
+        // it: its record count is unknown until it is reopened.
+        if journal.is_poisoned() {
+            return Err(IntegrityError::Poisoned);
+        }
         check_timing(entry, journal.next_counter())?;
         let mut applied = self.clone();
         applied.apply(entry)?;

@@ -77,6 +77,14 @@ pub enum PollError {
     /// The signed head could not be recorded.
     #[error("recording a signed head: {0}")]
     Store(#[from] IntegrityError),
+    /// The pending head is not this journal's: it names another journal
+    /// or Archive, or its digest is not the chain's record at its counter.
+    /// It is dropped and counted in [`SigningStatus::discarded`].
+    #[error("head {counter} is not a head of this journal's chain")]
+    NotInChain {
+        /// The head's counter.
+        counter: u64,
+    },
     /// The signer returned a signature the registry does not trust (a key
     /// not registered, retired or revoked, or a signature that does not
     /// verify): it covers nothing.
@@ -187,7 +195,8 @@ pub struct SigningStatus {
     pub refused: u64,
     /// The counter of the last signed head.
     pub last_signed: Option<u64>,
-    /// Stored heads not counted on restart because they did not verify.
+    /// Heads not counted because they did not verify, did not belong to
+    /// this journal's chain, or lost trust when the registry changed.
     pub discarded: u64,
 }
 
@@ -204,6 +213,10 @@ struct Pending {
 #[derive(Debug, Clone)]
 pub struct HeadSigning {
     config: SigningConfig,
+    /// The journal whose heads are signed.
+    journal_id: u64,
+    /// The registry's next sequence when coverage was last validated.
+    registry_sequence: u64,
     pending: VecDeque<Pending>,
     /// When the first head refused since the last queued one was offered:
     /// its records stay uncovered until a later head is signed.
@@ -221,11 +234,13 @@ pub struct HeadSigning {
 }
 
 impl HeadSigning {
-    /// Signing that started at `now_ns`.
+    /// Signing of journal `journal_id` that started at `now_ns`.
     #[must_use]
-    pub const fn new(config: SigningConfig, now_ns: u64) -> Self {
+    pub const fn new(config: SigningConfig, journal_id: u64, now_ns: u64) -> Self {
         Self {
             config,
+            journal_id,
+            registry_sequence: 0,
             pending: VecDeque::new(),
             refused_since_ns: None,
             signed: Vec::new(),
@@ -257,18 +272,12 @@ impl HeadSigning {
         journal_id: u64,
         records: &[SealRecord],
     ) -> Self {
-        let mut signing = Self::new(config, now_ns);
+        let mut signing = Self::new(config, journal_id, now_ns);
+        signing.registry_sequence = registry.next_sequence();
         signing.overdue_until = Some(u64::try_from(records.len()).unwrap_or(u64::MAX));
         for bytes in recorded {
             let valid = SignedHead::decode(bytes).ok().filter(|signed| {
-                let head = &signed.head;
-                head.journal_id == journal_id
-                    && head.archive_id == registry.trust().archive_id
-                    && usize::try_from(head.counter)
-                        .ok()
-                        .and_then(|index| records.get(index))
-                        .is_some_and(|record| record.digest() == head.digest)
-                    && matches!(registry.verify(signed, None), HeadVerdict::Trusted { .. })
+                signing.in_chain(&signed.head, records) && trusted(registry, signed)
             });
             match valid {
                 Some(signed) => signing.signed.push(signed),
@@ -329,10 +338,21 @@ impl HeadSigning {
         signer: &mut impl HeadSigner,
         store: &mut impl HeadStore,
         registry: &KeyRegistry,
+        records: &[SealRecord],
         now_ns: u64,
     ) -> Result<u64, PollError> {
+        if registry.next_sequence() != self.registry_sequence {
+            self.revalidate(registry);
+        }
         let mut signed = 0u64;
         while let Some(pending) = self.pending.front().copied() {
+            if !self.in_chain(&pending.head, records) {
+                let _ = self.pending.pop_front();
+                self.discarded = self.discarded.saturating_add(1);
+                return Err(PollError::NotInChain {
+                    counter: pending.head.counter,
+                });
+            }
             let Ok(signature) = signer.sign(&pending.head) else {
                 break;
             };
@@ -358,6 +378,37 @@ impl HeadSigning {
         Ok(signed)
     }
 
+    /// Revalidates the credited heads under `registry` after it changed
+    /// (a retirement or a retrospective revocation): a head it no longer
+    /// trusts covers nothing and is counted in
+    /// [`SigningStatus::discarded`], and the records whose coverage was
+    /// lost are overdue until signed coverage reaches them again, as their
+    /// age was not kept. [`HeadSigning::poll`] does this itself when the
+    /// registry it is given changed.
+    pub fn revalidate(&mut self, registry: &KeyRegistry) {
+        let before = covered(&self.signed);
+        let count = self.signed.len();
+        self.signed.retain(|signed| trusted(registry, signed));
+        let dropped = count.saturating_sub(self.signed.len());
+        self.discarded = self
+            .discarded
+            .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
+        if covered(&self.signed) < before {
+            self.overdue_until = Some(self.overdue_until.map_or(before, |until| until.max(before)));
+        }
+        self.registry_sequence = registry.next_sequence();
+    }
+
+    /// Whether `head` is a head of this journal's chain: this journal, the
+    /// Archive and the digest of the chain's record at its counter.
+    fn in_chain(&self, head: &ChainHead, records: &[SealRecord]) -> bool {
+        head.journal_id == self.journal_id
+            && usize::try_from(head.counter)
+                .ok()
+                .and_then(|index| records.get(index))
+                .is_some_and(|record| record.digest() == head.digest)
+    }
+
     /// The heads signed, oldest first.
     #[must_use]
     #[inline]
@@ -369,9 +420,25 @@ impl HeadSigning {
     /// journal's record count. Counts saturate rather than wrap: they are
     /// a report, never a position.
     #[must_use]
-    pub fn status(&self, now_ns: u64, sealed_records: u64) -> SigningStatus {
-        let last_signed = self.signed.iter().map(|signed| signed.head.counter).max();
+    pub fn status(
+        &self,
+        now_ns: u64,
+        sealed_records: u64,
+        registry: &KeyRegistry,
+    ) -> SigningStatus {
+        // A registry changed since the last validation is applied here
+        // too: a head it no longer trusts is not credited, and the records
+        // it covered are overdue.
+        let current = registry.next_sequence() == self.registry_sequence;
+        let credited = covered(&self.signed);
+        let last_signed = self
+            .signed
+            .iter()
+            .filter(|signed| current || trusted(registry, signed))
+            .map(|signed| signed.head.counter)
+            .max();
         let covered = last_signed.map_or(0, |counter| counter.saturating_add(1));
+        let lost = covered < credited;
         let since = self
             .pending
             .front()
@@ -385,7 +452,8 @@ impl HeadSigning {
             coverage_lag_records,
             coverage_lag_ns,
             alarm: coverage_lag_records > 0
-                && (self.overdue_until.is_some_and(|until| covered < until)
+                && (lost
+                    || self.overdue_until.is_some_and(|until| covered < until)
                     || coverage_lag_ns > self.config.anchor_interval_ns.get()),
             pending: u64::try_from(self.pending.len()).unwrap_or(u64::MAX),
             coalesced: self.coalesced,
@@ -394,4 +462,19 @@ impl HeadSigning {
             discarded: self.discarded,
         }
     }
+}
+
+/// The records the heads cover: one past the highest counter.
+fn covered(signed: &[SignedHead]) -> u64 {
+    signed
+        .iter()
+        .map(|signed| signed.head.counter.saturating_add(1))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether `registry` trusts `signed` (its key, its signature over the
+/// head under its custody, the Archive, retirement and revocation).
+fn trusted(registry: &KeyRegistry, signed: &SignedHead) -> bool {
+    matches!(registry.verify(signed, None), HeadVerdict::Trusted { .. })
 }
