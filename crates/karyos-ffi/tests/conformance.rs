@@ -3039,6 +3039,7 @@ mod archive_host {
                     .arg("--archive")
                     .arg(&archive)
                     .args(["--archive-control", &format!("{REQUESTS},{RESPONSES}")])
+                    .args(["--archive-anchor-interval", "3600s"])
                     .args(["--record", &format!("{RECORDED}:1")])
                     .stdout(Stdio::from(out.try_clone().unwrap()))
                     .stderr(Stdio::from(out))
