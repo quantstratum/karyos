@@ -1278,6 +1278,22 @@ impl<D: Disk> SegmentStore<D> {
 
     /// Syncs the segments finished without a sync, from the first of them
     /// up to the open one.
+    /// Syncs everything written, the segments rolled over unsynced
+    /// included, and keeps the store open: the durable position is then
+    /// the written one. Returns it.
+    ///
+    /// # Errors
+    ///
+    /// As [`SegmentStore::sync`].
+    pub fn sync_all(&mut self) -> Result<u64, SegmentError> {
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        let result = self.sync_behind();
+        self.guard(result)?;
+        self.sync()
+    }
+
     fn sync_behind(&mut self) -> Result<(), SegmentError> {
         let Some(mut base) = self.unsynced_behind else {
             return Ok(());

@@ -353,10 +353,40 @@ pub fn run<D: Disk>(
     sealer: &mut Sealer,
     journal: &mut IntegrityJournal<D>,
     now_ns: u64,
+    read: impl FnMut(u64, u64, u64) -> io::Result<Vec<u8>>,
+) -> Result<u64, IntegrityError> {
+    run_where(sealer, journal, now_ns, |_| true, read)
+}
+
+/// As [`run`], for `recording`'s due ranges only: what one recording's
+/// store can serve, so another recording's failure never stops it.
+///
+/// # Errors
+///
+/// As [`run`].
+pub fn run_recording<D: Disk>(
+    sealer: &mut Sealer,
+    journal: &mut IntegrityJournal<D>,
+    now_ns: u64,
+    recording: u64,
+    read: impl FnMut(u64, u64, u64) -> io::Result<Vec<u8>>,
+) -> Result<u64, IntegrityError> {
+    run_where(sealer, journal, now_ns, |due| due == recording, read)
+}
+
+fn run_where<D: Disk>(
+    sealer: &mut Sealer,
+    journal: &mut IntegrityJournal<D>,
+    now_ns: u64,
+    select: impl Fn(u64) -> bool,
     mut read: impl FnMut(u64, u64, u64) -> io::Result<Vec<u8>>,
 ) -> Result<u64, IntegrityError> {
     let mut appended = 0u64;
-    for due in sealer.due(now_ns) {
+    for due in sealer
+        .due(now_ns)
+        .into_iter()
+        .filter(|due| select(due.recording))
+    {
         let bytes = read(due.recording, due.start, due.end)?;
         let expected = due
             .end

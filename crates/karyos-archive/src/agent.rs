@@ -1489,11 +1489,9 @@ fn run<D>(
             return;
         }
     };
-    if let Err(error) = catalog.settle(now()) {
-        let _ = ready.send(Err(error.into()));
-        return;
-    }
-    let integrity = match config
+    // Collected before the settle, so the stops recovery appends are
+    // chained too, before the start is reported.
+    let mut integrity = match config
         .seal_interval
         .map(|interval| Integrity::open(disk.clone(), &dir, interval, &mut catalog))
     {
@@ -1504,6 +1502,22 @@ fn run<D>(
             return;
         }
     };
+    if let Err(error) = catalog.settle(now()) {
+        let _ = ready.send(Err(error.into()));
+        return;
+    }
+    if let Some(integrity) = integrity.as_mut() {
+        for change in catalog.take_changes() {
+            if let Err(error) = integrity.journal.record_catalog_change(
+                change.recording,
+                change.offset,
+                &change.bytes,
+            ) {
+                let _ = ready.send(Err(error.into()));
+                return;
+            }
+        }
+    }
     if ready.send(Ok(())).is_err() {
         return;
     }
@@ -1632,14 +1646,38 @@ impl<D: Disk> Integrity<D> {
     }
 
     /// Seals what is due, reading from `active`.
+    /// Seals what is due, one recording at a time from its own store. A
+    /// range its store cannot serve (a recorded gap, a failed store) stops
+    /// that recording's sealing only, leaving its unsealed tail for the
+    /// verifier; a failure of the journal itself returns false.
     fn seal(&mut self, active: &mut [Active<D>], now: u64) -> bool {
-        sealer::run(
-            &mut self.sealer,
-            &mut self.journal,
-            now,
-            |id, start, end| read_range(active, id, start, end),
-        )
-        .is_ok()
+        let ids: Vec<u64> = self.tracked.iter().copied().collect();
+        for id in ids {
+            let mut unreadable = false;
+            let sealed = sealer::run_recording(
+                &mut self.sealer,
+                &mut self.journal,
+                now,
+                id,
+                |id, start, end| {
+                    let read = read_range(active, id, start, end);
+                    unreadable = read.is_err();
+                    read
+                },
+            );
+            match sealed {
+                Ok(_) => {}
+                Err(_) if unreadable => self.untrack(id),
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// Stops sealing `id`.
+    fn untrack(&mut self, id: u64) {
+        self.tracked.remove(&id);
+        let _ = self.sealer.untrack(id);
     }
 }
 
@@ -1909,8 +1947,7 @@ impl<D: Disk + Clone> State<D> {
             .filter(|id| active.iter().all(|recording| recording.id != *id))
             .collect();
         for id in gone {
-            integrity.tracked.remove(&id);
-            let _ = integrity.sealer.untrack(id);
+            integrity.untrack(id);
         }
         for recording in &self.active {
             let store = recording.recorder.store();
@@ -1960,9 +1997,10 @@ impl<D: Disk + Clone> State<D> {
                             finish(
                                 recording,
                                 &mut self.catalog,
-                                // Its store failed: its last range stays
-                                // unsealed, which the verifier reports.
-                                None,
+                                // The store is whole: its last range is
+                                // sealed; one it cannot serve stays
+                                // unsealed for the verifier.
+                                self.integrity.as_mut(),
                                 StopReason::Failed(kind),
                                 now,
                             )
@@ -2164,6 +2202,8 @@ impl<D: Disk + Clone> State<D> {
                         first = Err(error);
                     }
                 }
+                // The stops' catalog records are chained before the reply.
+                let _ = self.integrity_duty(now);
                 let _ = reply.send(first);
                 return true;
             }
@@ -2757,27 +2797,39 @@ fn seal_last<D: Disk>(
     recorder: &mut Recorder<D, Box<dyn FrameSource + Send>>,
     now: u64,
 ) -> bool {
-    let Ok(durable) = recorder.sync() else {
+    // Everything durable first, the segments rolled over unsynced
+    // included, so the closing seal ends where the stop will.
+    let durable = recorder
+        .sync()
+        .ok()
+        .and_then(|_| recorder.store_mut().sync_all().ok());
+    let Some(durable) = durable else {
         // The store's own failure, not the journal's: the range stays
         // unsealed and the close reports the failure.
+        integrity.untrack(id);
         return true;
     };
     let start = recorder.store().start();
-    if !integrity.written(id, start, durable, now) {
-        return false;
-    }
-    if integrity.sealer.close(id, durable, now).is_err() {
+    if !integrity.written(id, start, durable, now)
+        || integrity.sealer.close(id, durable, now).is_err()
+    {
         return false;
     }
     let store = recorder.store_mut();
-    let sealed = sealer::run(
+    let mut unreadable = false;
+    let sealed = sealer::run_recording(
         &mut integrity.sealer,
         &mut integrity.journal,
         now,
-        |_, start, end| read_store(store, start, end),
+        id,
+        |_, start, end| {
+            let read = read_store(store, start, end);
+            unreadable = read.is_err();
+            read
+        },
     );
-    integrity.tracked.remove(&id);
-    sealed.is_ok()
+    integrity.untrack(id);
+    sealed.is_ok() || unreadable
 }
 
 /// `recording` and where it ends now.

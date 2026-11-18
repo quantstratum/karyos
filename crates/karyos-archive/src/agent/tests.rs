@@ -3524,3 +3524,89 @@ fn without_a_seal_interval_nothing_is_sealed() {
     assert!(!crate::integrity::journal::IntegrityJournal::<StdDisk>::path(&dir).exists());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The seals and catalog changes of `id` in the archive at `dir`: whether
+/// its sealed ranges cover `[0, end)` closing, each matching `bytes`, and
+/// how many catalog changes are chained for it.
+fn sealed_and_chained(dir: &std::path::Path, id: u64, bytes: &[u8]) -> (bool, usize) {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::{SealKind, verify_chain, verify_range};
+
+    let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    assert!(verify_chain(records.iter()).is_ok());
+    let ranges: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind.is_range() && record.subject == id)
+        .collect();
+    let covered = ranges.first().is_some_and(|first| first.start == 0)
+        && ranges.last().is_some_and(|last| {
+            last.end == bytes.len() as u64 && last.kind == SealKind::ClosedSegment
+        })
+        && ranges.iter().all(|range| {
+            verify_range(range, &bytes[range.start as usize..range.end as usize]).is_ok()
+        });
+    let chained = records
+        .iter()
+        .filter(|record| record.kind == SealKind::Catalog && record.subject == id)
+        .count();
+    (covered, chained)
+}
+
+fn sealing() -> AgentConfig {
+    AgentConfig {
+        idle: Duration::from_millis(1),
+        seal_interval: Some(Duration::from_millis(1)),
+        ..AgentConfig::default()
+    }
+}
+
+/// A shutdown seals each active recording's last range under its own id
+/// and chains its stop before the reply (karyos#961).
+#[test]
+fn a_shutdown_seals_and_chains_every_active_recording() {
+    let dir = temp_dir("sealed-shutdown");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let mut recordings = Vec::new();
+    for fill in 1..=2u8 {
+        let drained = Arc::new(AtomicBool::new(false));
+        let bytes = frames(3, fill);
+        let id = agent
+            .start(start(Chunks {
+                chunks: vec![bytes.clone()].into(),
+                drained: Arc::clone(&drained),
+                ..Chunks::default()
+            }))
+            .unwrap();
+        wait(&drained);
+        recordings.push((id, bytes));
+    }
+    agent.shutdown().unwrap();
+    for (id, bytes) in recordings {
+        assert_eq!(sealed_and_chained(&dir, id, &bytes), (true, 2), "{id}");
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A recording whose source failed, its store whole, has its last range
+/// sealed like any other stop.
+#[test]
+fn a_failed_source_still_seals_its_last_range() {
+    let dir = temp_dir("sealed-failed-source");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let bytes = frames(2, 7);
+    let id = agent
+        .start(start(Chunks {
+            chunks: vec![bytes.clone()].into(),
+            fail: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    agent.shutdown().unwrap();
+    assert_eq!(sealed_and_chained(&dir, id, &bytes), (true, 2));
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -150,8 +150,9 @@ Archive:
                                     seal each recorded byte in the integrity journal within
                                     this time [1s]
   --archive-anchor-interval <duration>
-                                    sign the integrity journal's head at least this often;
-                                    required with --archive, no default
+                                    the anchor interval (SPEC 8.4, X14): required with
+                                    --archive, no default; validated now, it takes effect
+                                    once a head signer runs (karyos#966)
 
 Shutdown:
   --shutdown-linger <duration>      time clients have to leave after SIGTERM or SIGINT [5s]
@@ -303,8 +304,9 @@ pub struct ArchiveOptions {
     pub min_free: u64,
     /// The `seal_interval`: each recorded byte is sealed within it (A10).
     pub seal_interval: Duration,
-    /// The `anchor_interval`, required: the integrity journal's head is
-    /// signed at least this often (A10).
+    /// The `anchor_interval`, required with no default (SPEC.md §8.4,
+    /// X14). Validated and kept; nothing signs heads yet, so it takes
+    /// effect once the head signer of karyos#966 runs.
     pub anchor_interval: Duration,
 }
 
