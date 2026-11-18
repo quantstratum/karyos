@@ -23,6 +23,13 @@
 //!   relay's id as separate fields. Any other uid sending it, or an
 //!   unknown principal, is answered `not authorized`. The local uid mode
 //!   is unchanged.
+//! - **Relay access (karyos#708).** A relay running under its own uid
+//!   cannot reach a `0700` directory and a `0600` socket. With a relay
+//!   group ([`ApiConfig::with_relay_group`]), and only then, the directory
+//!   is `0710` and the socket `0660`, both of that group, which this
+//!   agent's uid must be a member of: the relay's uid joins the group, no
+//!   one else gains anything, and the peer's uid is still checked per
+//!   connection. Without a relay group nothing changes.
 //! - **Exchange.** One request per connection: a line `KARYOS-AGENT
 //!   <version> <request>`, at most [`MAX_REQUEST`] bytes. The answer is one
 //!   JSON object and a newline, then the agent closes the connection. A
@@ -382,6 +389,10 @@ pub struct ApiConfig {
     /// The principals a relay may carry requests for, each with the
     /// operator id and the role this agent gives it.
     pub principals: Vec<Principal>,
+    /// The group whose members may reach the socket (a relay's uid), if
+    /// any: the directory is then `0710` and the socket `0660` of that
+    /// group; without one, `0700` and `0600`.
+    pub relay_group: Option<u32>,
 }
 
 impl ApiConfig {
@@ -393,7 +404,16 @@ impl ApiConfig {
             roles,
             relays: Vec::new(),
             principals: Vec::new(),
+            relay_group: None,
         }
+    }
+
+    /// The same, the directory and socket reachable by `gid`'s members
+    /// (karyos#708): a relay under a uid of its own joins that group.
+    #[must_use]
+    pub const fn with_relay_group(mut self, gid: u32) -> Self {
+        self.relay_group = Some(gid);
+        self
     }
 
     /// The same, also serving `relays` for `principals` (karyos#708).
@@ -549,16 +569,34 @@ impl Server {
     /// socket, or a call that fails.
     pub fn bind(config: ApiConfig) -> Result<Self, ServeError> {
         use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+        // Without a relay group, owner only; with one, the group may
+        // reach the socket and nothing else.
+        let (dir_mode, socket_mode) = match config.relay_group {
+            None => (0o700, 0o600),
+            Some(_) => (0o710, 0o660),
+        };
         match std::fs::DirBuilder::new().mode(0o700).create(&config.dir) {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Some(gid) = config.relay_group {
+                    std::os::unix::fs::chown(&config.dir, None, Some(gid))?;
+                    std::fs::set_permissions(
+                        &config.dir,
+                        std::fs::Permissions::from_mode(dir_mode),
+                    )?;
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
         let uid = karyos_sys::ipc::own_uid();
         let dir = std::fs::symlink_metadata(&config.dir)?;
-        if !dir.is_dir() || dir.uid() != uid || dir.mode() & 0o777 != 0o700 {
+        if !dir.is_dir()
+            || dir.uid() != uid
+            || dir.mode() & 0o777 != dir_mode
+            || config.relay_group.is_some_and(|gid| dir.gid() != gid)
+        {
             return Err(ServeError::NotPrivate(
-                "the API directory is not a private directory of this uid",
+                "the API directory is not a private directory of this uid (and relay group)",
             ));
         }
         let path = config.dir.join(SOCKET_NAME);
@@ -568,7 +606,7 @@ impl Server {
             Ok(metadata) => {
                 if !metadata.file_type().is_socket()
                     || metadata.uid() != uid
-                    || metadata.mode() & 0o777 != 0o600
+                    || metadata.mode() & 0o777 != socket_mode
                 {
                     return Err(ServeError::NotPrivate(
                         "the API socket path holds something other than an API socket",
@@ -584,7 +622,12 @@ impl Server {
             }
         }
         let listener = UnixListener::bind(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        // The group first, then the mode: the socket is never open to a
+        // group it should not be.
+        if let Some(gid) = config.relay_group {
+            std::os::unix::fs::chown(&path, None, Some(gid))?;
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(socket_mode))?;
         listener.set_nonblocking(true)?;
         Ok(Self {
             listener,

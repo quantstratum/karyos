@@ -11,7 +11,7 @@ usage: karyos-agent --api-dir DIR --driver DIR [--driver DIR]... \
 --role UID=ROLE [--role UID=ROLE]... [--refresh-ms MS] [--lag-bytes N] \
 [--lag-refreshes N] [--loss-quiet N] [--archive DIR=REQ,RESP]... \
 [--journal DIR] [--agent-id NAME] [--relay UID=ID]... \
-[--principal NAME=OPERATOR:ROLE]...
+[--principal NAME=OPERATOR:ROLE]... [--relay-group GID]
 
 Serves API v1 (JSON) on DIR/agent.sock to the uids given a role (viewer,
 operator, risk-officer, administrator, registrar), reading each driver's
@@ -32,7 +32,10 @@ of a remote control-plane component (karyos-control) carry requests for
 the principals of --principal, each recorded as its OPERATOR id (not a
 --role uid) with its ROLE; the relay's ID (1 or more) is journalled beside
 the operator. A relayed request is KARYOS-AGENT 1 relay NAME REQUEST; its
-role is the principal's here, never the relay's. Linux only.
+role is the principal's here, never the relay's. --relay-group lets the
+members of GID, which this agent's uid must belong to, reach DIR/agent.sock
+(DIR 0710, the socket 0660, both of GID): a relay under a uid of its own
+joins it; without it DIR is 0700 and the socket 0600. Linux only.
 
 A request is one line: KARYOS-AGENT 1 view, or
 KARYOS-AGENT 1 guard-close DIR GUARD [REASON] (operator, risk-officer),
@@ -74,6 +77,8 @@ pub struct Args {
     /// Each principal a relay may carry: its name, operator id and role
     /// name.
     pub principals: Vec<(String, u32, String)>,
+    /// The group whose members may reach the socket (karyos#708).
+    pub relay_group: Option<u32>,
 }
 
 /// Parses `args` (without the program name); `None` for anything this
@@ -90,6 +95,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
     let mut agent_id = None;
     let mut relays: Vec<(u32, u64)> = Vec::new();
     let mut principals: Vec<(String, u32, String)> = Vec::new();
+    let mut relay_group = None;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
@@ -101,6 +107,9 @@ pub fn parse(args: &[String]) -> Option<Args> {
                     return None;
                 }
                 agent_id = Some(value.clone());
+            }
+            "--relay-group" if relay_group.is_none() => {
+                relay_group = Some(value.parse::<u32>().ok()?);
             }
             "--driver" => drivers.push(PathBuf::from(value)),
             "--role" => {
@@ -189,6 +198,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
             .iter()
             .any(|(_, operator, _)| roles.iter().any(|(uid, _)| uid == operator))
         || (relays.is_empty() != principals.is_empty())
+        || (relay_group.is_some() && relays.is_empty())
     {
         return None;
     }
@@ -203,6 +213,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
         agent_id,
         relays,
         principals,
+        relay_group,
     })
 }
 
@@ -437,6 +448,12 @@ mod exporter_tests {
         ))
         .unwrap();
         assert_eq!(parsed.relays, [(990, 7)]);
+        assert_eq!(parsed.relay_group, None);
+        let grouped = parse(&format!(
+            "{base} --relay 990=7 --principal svc.ops=50001:operator --relay-group 990"
+        ))
+        .unwrap();
+        assert_eq!(grouped.relay_group, Some(990));
         assert_eq!(
             parsed.principals,
             [("svc.ops".to_owned(), 50001, "operator".to_owned())]
@@ -451,6 +468,9 @@ mod exporter_tests {
             "--relay 990=7 --relay 990=8 --principal a=1:viewer",
             "--relay 990=7",
             "--principal a=1:viewer",
+            "--relay-group 990",
+            "--relay 990=7 --principal a=1:viewer --relay-group x",
+            "--relay 990=7 --principal a=1:viewer --relay-group 1 --relay-group 2",
         ] {
             assert_eq!(parse(&format!("{base} {bad}")), None, "{bad}");
         }

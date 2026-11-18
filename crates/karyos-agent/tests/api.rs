@@ -619,3 +619,95 @@ fn a_half_request_is_dropped_within_the_read_deadline() {
     client.read_to_end(&mut answer).unwrap();
     assert!(answer.is_empty());
 }
+
+/// karyos#708: a relay under a uid of its own, as `--relay UID=ID`
+/// allows, reaches the socket through the relay group and only through
+/// it: without the group the kernel refuses it before the agent sees it;
+/// with it, it is served; a uid outside the group still cannot connect.
+/// The agent runs as root and the relay as other uids, so it runs where
+/// the tests are root (the Docker runs) and passes trivially elsewhere.
+#[test]
+fn a_relay_under_its_own_uid_reaches_the_socket_through_its_group() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    use karyos_agent::server::Principal;
+
+    const RELAY: u32 = 64_000;
+    const GROUP: u32 = 64_000;
+    const OTHER: u32 = 64_001;
+    if own() != 0 {
+        return;
+    }
+    let _serial = serial();
+    let (_driver, mut agent, dir) = attached("relay-uid");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (group, uid, gid, served) in [
+        (None, RELAY, GROUP, false),
+        (Some(GROUP), RELAY, GROUP, true),
+        (Some(GROUP), OTHER, OTHER, false),
+    ] {
+        let api = dir.join("api");
+        let _ = std::fs::remove_dir_all(&api);
+        let mut config = ApiConfig::new(api, vec![(own(), Role::Viewer)]).with_relays(
+            vec![(RELAY, 7), (OTHER, 8)],
+            vec![Principal::new("svc.ops", 50_001, Role::Viewer).unwrap()],
+        );
+        if let Some(gid) = group {
+            config = config.with_relay_group(gid);
+        }
+        let mut server = Server::bind(config).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "relay_child", "--ignored", "--nocapture"])
+            .args(["--test-threads", "1"])
+            .env("KARYOS_RELAY_CHILD_SOCKET", server.path())
+            .uid(uid)
+            .gid(gid)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            assert!(start.elapsed() < Duration::from_secs(30), "relay stuck");
+            let _ = server.poll(&mut agent).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut out = String::new();
+        let _ = child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        if served {
+            assert!(out.contains(r#"ANSWER {"version":1,"drivers""#), "{out}");
+        } else {
+            assert!(
+                out.contains("ERR PermissionDenied"),
+                "{group:?} {uid}: {out}"
+            );
+        }
+    }
+}
+
+/// The relay of the test above, run as another uid; does nothing when run
+/// on its own.
+#[test]
+#[ignore = "run by a_relay_under_its_own_uid_reaches_the_socket_through_its_group"]
+fn relay_child() {
+    let Ok(path) = std::env::var("KARYOS_RELAY_CHILD_SOCKET") else {
+        return;
+    };
+    match UnixStream::connect(path) {
+        Ok(mut stream) => {
+            stream
+                .write_all(b"KARYOS-AGENT 1 relay svc.ops view\n")
+                .unwrap();
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer).unwrap();
+            print!("ANSWER {answer}");
+        }
+        Err(error) => print!("ERR {:?}", error.kind()),
+    }
+}

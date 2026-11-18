@@ -16,7 +16,9 @@
 //!   `kid` refuses the set.
 //! - **Freshness (RFC 9111 §4.2, §5.2).** A set's lifetime is its
 //!   `max-age`, else `Expires` minus `Date`, else zero; `no-store` and
-//!   `no-cache` make it zero; `Age` counts towards its age. The lifetime
+//!   `no-cache` make it zero; its age on receipt is the larger of `Age`
+//!   and the time since its `Date` (§4.2.3), so an old `Date` or an
+//!   `Expires` already past is stale on receipt. The lifetime
 //!   is never raised. A set past it is never used, including one already
 //!   past it on receipt (its `Age` consumed the lifetime): every token that
 //!   needs it is refused with [`KeysError::Unavailable`] (`503`) until a fetch
@@ -283,13 +285,18 @@ impl Jwks {
         Err(KeysError::Unavailable)
     }
 
-    /// Makes the one fetch in flight and records how it ended.
+    /// Makes the one fetch in flight and records how it ended. If the
+    /// request that started it is cancelled before it ends, the fetch ends
+    /// as a failure all the same ([`InFlight`]), so a later request may
+    /// start the next one.
     async fn fetch(&self) -> Result<Arc<KeySet>, KeysError> {
+        let guard = InFlight(Some(self));
         let jwks_uri = self.lock().jwks_uri.clone();
         let started = Instant::now();
         let result = tokio::time::timeout(FETCH_DEADLINE, self.fetch_set(jwks_uri))
             .await
             .unwrap_or(Err(FetchError::Deadline));
+        guard.disarm();
         let mut state = self.lock();
         state.in_flight = false;
         state.generation = state.generation.wrapping_add(1);
@@ -329,6 +336,18 @@ impl Jwks {
                 Err(KeysError::Unavailable)
             }
         }
+    }
+
+    /// Ends the fetch in flight as a failure: its waiters get `503`, the
+    /// budget counts it, and the next request may start another.
+    fn abandon(&self) {
+        let mut state = self.lock();
+        state.in_flight = false;
+        state.generation = state.generation.wrapping_add(1);
+        state.failures = state.failures.saturating_add(1);
+        let failures = state.failures;
+        state.next_allowed = Some(Instant::now() + self.issuer.budget.wait(failures));
+        state.fetched = None;
     }
 
     /// The discovery document's `jwks_uri` (when not known yet), then the
@@ -434,21 +453,46 @@ async fn body_within(mut body: Incoming, max: usize) -> Option<Vec<u8>> {
     }
 }
 
+/// The fetch in flight, until it ends: dropped before
+/// [`InFlight::disarm`] (the request that started it was cancelled), it
+/// ends it as a failure ([`Jwks::abandon`]).
+struct InFlight<'a>(Option<&'a Jwks>);
+
+impl InFlight<'_> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if let Some(jwks) = self.0.take() {
+            jwks.abandon();
+        }
+    }
+}
+
 /// A response's freshness lifetime and current age (RFC 9111 §4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Freshness {
     /// How long it is fresh, from its generation.
     pub lifetime: Duration,
-    /// How old it already is (`Age`).
+    /// How old it already is when received (RFC 9111 §4.2.3): the larger
+    /// of its `Age` and its apparent age, the time since its `Date`.
     pub age: Duration,
+    /// Its `Age` alone: how long caches held it. Zero for a response from
+    /// the origin.
+    pub held: Duration,
 }
 
 impl Freshness {
     /// Its age has reached a positive lifetime, or a cache held a response
-    /// of zero lifetime: no request may use it.
+    /// of zero lifetime: no request may use it. A zero lifetime from the
+    /// origin serves the request that fetched it, whatever its `Date`
+    /// (whose one-second resolution would otherwise decide).
     fn stale_on_receipt(&self) -> bool {
         if self.lifetime.is_zero() {
-            !self.age.is_zero()
+            !self.held.is_zero()
         } else {
             self.age >= self.lifetime
         }
@@ -468,9 +512,18 @@ impl Freshness {
                 .and_then(|value| value.to_str().ok())
                 .map(str::trim)
         };
-        let age = text(hyper::header::AGE)
+        let held = text(hyper::header::AGE)
             .and_then(|age| age.parse::<u64>().ok())
             .map_or(Duration::ZERO, Duration::from_secs);
+        let date = text(hyper::header::DATE).and_then(http_date);
+        let now_seconds = unix_seconds(now);
+        // A `Date` ahead of this clock gives no apparent age, never a
+        // negative one.
+        let apparent = match (date, now_seconds) {
+            (Some(date), Some(now)) => Duration::from_secs(now.saturating_sub(date)),
+            _ => Duration::ZERO,
+        };
+        let age = held.max(apparent);
         let mut max_age = None;
         let mut uncacheable = false;
         for directive in headers
@@ -495,9 +548,7 @@ impl Freshness {
         } else if let Some(seconds) = max_age {
             Duration::from_secs(seconds)
         } else {
-            let date = text(hyper::header::DATE)
-                .and_then(http_date)
-                .or_else(|| unix_seconds(now));
+            let date = date.or(now_seconds);
             match (text(hyper::header::EXPIRES).map(http_date), date) {
                 (Some(Some(expires)), Some(date)) => {
                     Duration::from_secs(expires.saturating_sub(date))
@@ -505,7 +556,11 @@ impl Freshness {
                 _ => Duration::ZERO,
             }
         };
-        Self { lifetime, age }
+        Self {
+            lifetime,
+            age,
+            held,
+        }
     }
 }
 
@@ -536,6 +591,13 @@ pub fn http_date(text: &str) -> Option<u64> {
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
     let month = u64::try_from(MONTHS.iter().position(|name| *name == month)?).ok()? + 1;
+    // IMF-fixdate's day is two digits and its year four: a longer year
+    // could overflow the day count below.
+    let digits =
+        |text: &str, len: usize| text.len() == len && text.bytes().all(|b| b.is_ascii_digit());
+    if !digits(day, 2) || !digits(year, 4) {
+        return None;
+    }
     let (day, year): (u64, u64) = (day.parse().ok()?, year.parse().ok()?);
     let mut clock = time.split(':').map(|part| part.parse::<u64>().ok());
     let (Some(Some(hour)), Some(Some(minute)), Some(Some(second)), None) =
@@ -615,6 +677,47 @@ mod tests {
         );
     }
 
+    /// The age counts from `Date` when no `Age` says more (RFC 9111
+    /// §4.2.3): an old `Date`, or an `Expires` already past, is stale on
+    /// receipt; a `Date` ahead of this clock adds nothing.
+    #[test]
+    fn the_age_counts_from_date() {
+        // `now` is 08:49:37.
+        let old = freshness(&[
+            ("cache-control", "max-age=300"),
+            ("date", "Sun, 06 Nov 1994 08:39:37 GMT"),
+        ]);
+        assert_eq!(old.age, Duration::from_secs(600));
+        assert_eq!(old.held, Duration::ZERO);
+        assert!(old.stale_on_receipt());
+        let expired = freshness(&[
+            ("date", "Sun, 06 Nov 1994 08:29:37 GMT"),
+            ("expires", "Sun, 06 Nov 1994 08:39:37 GMT"),
+        ]);
+        assert_eq!(expired.lifetime, Duration::from_secs(600));
+        assert!(expired.stale_on_receipt());
+        let recent = freshness(&[
+            ("cache-control", "max-age=300"),
+            ("date", "Sun, 06 Nov 1994 08:48:37 GMT"),
+            ("age", "30"),
+        ]);
+        assert_eq!(recent.age, Duration::from_secs(60));
+        assert!(!recent.stale_on_receipt());
+        let ahead = freshness(&[
+            ("cache-control", "max-age=300"),
+            ("date", "Sun, 06 Nov 1994 09:49:37 GMT"),
+        ]);
+        assert_eq!(ahead.age, Duration::ZERO);
+        // A zero lifetime from the origin serves its request whatever its
+        // `Date`; one a cache held does not.
+        let origin = freshness(&[
+            ("cache-control", "no-cache"),
+            ("date", "Sun, 06 Nov 1994 08:49:30 GMT"),
+        ]);
+        assert!(!origin.stale_on_receipt());
+        assert!(freshness(&[("cache-control", "no-cache"), ("age", "1")]).stale_on_receipt());
+    }
+
     #[test]
     fn http_dates_parse() {
         assert_eq!(
@@ -631,6 +734,11 @@ mod tests {
             "Sun Nov  6 08:49:37 1994",
             "",
             "x",
+            "Sun, 06 Nov 99999999999999999 08:49:37 GMT",
+            "Sun, 06 Nov 18446744073709551615 08:49:37 GMT",
+            "Sun, 06 Nov 994 08:49:37 GMT",
+            "Sun, 6 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov +994 08:49:37 GMT",
         ] {
             assert_eq!(http_date(bad), None, "{bad}");
         }
@@ -643,5 +751,36 @@ mod tests {
         assert_eq!(budget.wait(1), Duration::from_secs(60));
         assert_eq!(budget.wait(4), Duration::from_secs(300));
         assert_eq!(budget.wait(u32::MAX), Duration::from_secs(300));
+    }
+
+    /// The request that starts a fetch is cancelled while the issuer has
+    /// not answered: the fetch ends as a failure, and the next request
+    /// starts another instead of waiting on one that never ends.
+    #[test]
+    fn a_cancelled_fetch_ends_and_the_next_request_starts_one() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // It accepts connections and never answers.
+            let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let issuer = format!("https://{}", silent.local_addr().unwrap());
+            let jwks = Jwks::new(
+                Issuer::new(&issuer, Vec::new())
+                    .with_budget(Budget::new(Duration::ZERO, Duration::ZERO)),
+            )
+            .unwrap();
+            for generation in 1..=2 {
+                let cancelled =
+                    tokio::time::timeout(Duration::from_millis(50), jwks.keys_for("k")).await;
+                assert!(cancelled.is_err());
+                let state = jwks.lock();
+                assert!(!state.in_flight);
+                assert_eq!(state.generation, generation);
+                assert_eq!(state.failures, u32::try_from(generation).unwrap());
+                assert!(state.fetched.is_none());
+            }
+        });
     }
 }

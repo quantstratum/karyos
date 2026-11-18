@@ -45,7 +45,10 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
             Role::parse(role).and_then(|role| Principal::new(name, *operator, role))
         })
         .collect();
-    let config = ApiConfig::new(args.api_dir, roles).with_relays(args.relays, principals);
+    let mut config = ApiConfig::new(args.api_dir, roles).with_relays(args.relays, principals);
+    if let Some(gid) = args.relay_group {
+        config = config.with_relay_group(gid);
+    }
     let mut server = match Server::bind(config) {
         Ok(server) => server,
         Err(error) => {
