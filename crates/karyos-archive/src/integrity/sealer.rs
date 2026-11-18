@@ -350,7 +350,10 @@ pub fn run<D: Disk>(
     let mut appended = 0u64;
     for due in sealer.due(now_ns) {
         let bytes = read(due.recording, due.start, due.end)?;
-        let expected = due.end.checked_sub(due.start).ok_or(IntegrityError::Overflow)?;
+        let expected = due
+            .end
+            .checked_sub(due.start)
+            .ok_or(IntegrityError::Overflow)?;
         let got = u64::try_from(bytes.len()).map_err(|_| IntegrityError::Overflow)?;
         if got != expected {
             return Err(SealerError::ReadLength {
