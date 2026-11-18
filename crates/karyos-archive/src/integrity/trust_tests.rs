@@ -782,6 +782,22 @@ fn a_chained_registry_entry_missing_from_the_ledger_is_refused() {
     ));
 }
 
+/// A journal of one seal and the head at that seal.
+fn one_seal() -> (Vec<super::SealRecord>, ChainHead) {
+    let mut journal = IntegrityJournal::open(FaultDisk::default(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    journal.seal_segment(3, 0, b"sealed", false).unwrap();
+    let records = journal.records().unwrap();
+    let head = ChainHead {
+        archive_id: ARCHIVE,
+        journal_id: JOURNAL,
+        counter: 0,
+        digest: records[0].digest(),
+    };
+    (records, head)
+}
+
 #[test]
 fn a_signed_head_counts_only_once_it_is_recorded_durably() {
     let config = SigningConfig::new(Some(1_000), BacklogPolicy::Coalesce).unwrap();
@@ -791,7 +807,8 @@ fn a_signed_head_counts_only_once_it_is_recorded_durably() {
         failing: true,
         ..Store::default()
     };
-    let _ = signing.offer(head(0), 0);
+    let (records, sealed) = one_seal();
+    let _ = signing.offer(sealed, 0);
     assert!(signing.poll(&mut signer, &mut failing, 10).is_err());
     let status = signing.status(10, 1);
     assert_eq!((status.pending, status.last_signed), (1, None));
@@ -803,9 +820,91 @@ fn a_signed_head_counts_only_once_it_is_recorded_durably() {
     assert_eq!(signing.poll(&mut signer, &mut heads, 20).unwrap(), 1);
     let restarted = disk.after_crash(Survives::Synced);
     let heads = Ledger::<_, SIGNED_HEAD_LENGTH>::open(restarted, Path::new(DIR), "heads").unwrap();
-    let resumed = HeadSigning::resume(config, 30, heads.entries()).unwrap();
+    let registry = registry_with(&signer);
+    let resumed = HeadSigning::resume(config, 30, heads.entries(), &registry, JOURNAL, &records);
     assert_eq!(resumed.signed(), signing.signed());
-    assert_eq!(resumed.status(30, 1).last_signed, Some(0));
+    let status = resumed.status(30, 1);
+    assert_eq!((status.last_signed, status.discarded), (Some(0), 0));
+}
+
+#[test]
+fn a_recovered_head_that_does_not_verify_covers_nothing() {
+    let config = SigningConfig::new(Some(1_000), BacklogPolicy::Coalesce).unwrap();
+    let mut signer = TestSigner::new(9);
+    let registry = registry_with(&signer);
+    let (records, sealed) = one_seal();
+    let good = signed(&mut signer, sealed);
+    let mut forged_signature = good;
+    forged_signature.signature[0] ^= 1;
+    let mut other_counter = good;
+    other_counter.head.counter = 5;
+    let mut other_journal = good;
+    other_journal.head.journal_id = JOURNAL + 1;
+    let stored: Vec<[u8; SIGNED_HEAD_LENGTH]> = [forged_signature, other_counter, other_journal]
+        .iter()
+        .map(SignedHead::encode)
+        .collect();
+    let resumed = HeadSigning::resume(config, 0, &stored, &registry, JOURNAL, &records);
+    let status = resumed.status(0, 1);
+    assert_eq!((status.last_signed, status.discarded), (None, 3));
+    assert_eq!(status.coverage_lag_records, 1);
+    assert!(status.alarm);
+}
+
+#[test]
+fn a_restart_keeps_uncovered_records_overdue_until_coverage_advances() {
+    let config = SigningConfig::new(Some(1_000), BacklogPolicy::Coalesce).unwrap();
+    let mut signer = TestSigner::new(9);
+    let registry = registry_with(&signer);
+    let (records, sealed) = one_seal();
+    let mut resumed = HeadSigning::resume(config, 5_000, &[], &registry, JOURNAL, &records);
+    // The signer was out before the restart: the alarm stays raised.
+    assert!(resumed.status(5_000, 1).alarm);
+    let _ = resumed.offer(sealed, 5_000);
+    assert!(resumed.status(5_001, 1).alarm);
+    let mut store = Store::default();
+    assert_eq!(resumed.poll(&mut signer, &mut store, 5_002).unwrap(), 1);
+    assert!(!resumed.status(5_002, 1).alarm);
+    // Nothing uncovered at the restart: no alarm.
+    let covered = HeadSigning::resume(
+        config,
+        0,
+        &[signed(&mut signer, sealed).encode()],
+        &registry,
+        JOURNAL,
+        &records,
+    );
+    assert!(!covered.status(0, 1).alarm);
+}
+
+#[test]
+fn replay_refuses_a_registration_effective_before_its_chain_record() {
+    let disk = FaultDisk::default();
+    let mut journal = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut ledger =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+    for start in 0..11u64 {
+        journal.seal_segment(3, start * 4, b"seal", false).unwrap();
+    }
+    // Endorsed effective at 5, but first chained at counter 11: append
+    // refuses it, so it is written past append, as a tampered host would.
+    let signer = TestSigner::new(9);
+    let early = register(&signer.key, Custody::NoSeparation, 5);
+    let bytes = early.encode();
+    ledger.append(bytes).unwrap();
+    journal
+        .record_key_registry(&signer.key_id(), 0, &bytes)
+        .unwrap();
+    assert!(matches!(
+        KeyRegistry::open(trust(), &mut journal, &mut ledger),
+        Err(IntegrityError::Registry(RegistryError::Backdated {
+            effective: 5,
+            next: 11,
+            ..
+        }))
+    ));
 }
 
 #[test]

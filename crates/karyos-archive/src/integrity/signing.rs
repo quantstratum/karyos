@@ -22,12 +22,12 @@
 use std::collections::VecDeque;
 use std::num::{NonZeroU64, NonZeroUsize};
 
-use super::Digest;
 use super::journal::IntegrityError;
 use super::ledger::Ledger;
 use super::trust::{
-    ChainHead, Custody, SIGNATURE_LENGTH, SIGNED_HEAD_LENGTH, SignedHead, TrustDecodeError,
+    ChainHead, Custody, HeadVerdict, KeyRegistry, SIGNATURE_LENGTH, SIGNED_HEAD_LENGTH, SignedHead,
 };
+use super::{Digest, SealRecord};
 use crate::disk::Disk;
 
 /// The signer is unavailable; the head stays pending.
@@ -157,6 +157,8 @@ pub struct SigningStatus {
     /// remain uncovered.
     pub coverage_lag_ns: u64,
     /// Whether records remain uncovered for longer than `anchor_interval`.
+    /// After a restart the age of records left uncovered is unknown, so
+    /// they count as overdue until signed coverage advances.
     pub alarm: bool,
     /// Heads waiting for the signer.
     pub pending: u64,
@@ -166,6 +168,8 @@ pub struct SigningStatus {
     pub refused: u64,
     /// The counter of the last signed head.
     pub last_signed: Option<u64>,
+    /// Stored heads not counted on restart because they did not verify.
+    pub discarded: u64,
 }
 
 /// A head waiting for the signer.
@@ -188,6 +192,10 @@ pub struct HeadSigning {
     signed: Vec<SignedHead>,
     started_ns: u64,
     last_signed_ns: Option<u64>,
+    /// Set on a restart: records uncovered then are overdue until signed
+    /// coverage advances, as their age was not kept.
+    carried_overdue: bool,
+    discarded: u64,
     coalesced: u64,
     refused: u64,
 }
@@ -203,27 +211,51 @@ impl HeadSigning {
             signed: Vec::new(),
             started_ns: now_ns,
             last_signed_ns: None,
+            carried_overdue: false,
+            discarded: 0,
             coalesced: 0,
             refused: 0,
         }
     }
 
     /// Signing resumed at `now_ns` after a restart, with `recorded` the
-    /// entries of the store's ledger, oldest first.
+    /// entries of the store's ledger, oldest first, `records` the chain of
+    /// journal `journal_id` and `registry` its key registry.
     ///
-    /// # Errors
-    ///
-    /// [`TrustDecodeError`] for an entry that cannot be read.
+    /// A stored head counts as coverage only if it decodes, names this
+    /// Archive and journal, matches the chain's record at its counter and
+    /// verifies as trusted under `registry`; any other is counted in
+    /// [`SigningStatus::discarded`] and covers nothing. Records left
+    /// uncovered count as overdue until coverage advances: their age was
+    /// not kept, and a restart must not reset an alarm.
+    #[must_use]
     pub fn resume(
         config: SigningConfig,
         now_ns: u64,
         recorded: &[[u8; SIGNED_HEAD_LENGTH]],
-    ) -> Result<Self, TrustDecodeError> {
+        registry: &KeyRegistry,
+        journal_id: u64,
+        records: &[SealRecord],
+    ) -> Self {
         let mut signing = Self::new(config, now_ns);
+        signing.carried_overdue = true;
         for bytes in recorded {
-            signing.signed.push(SignedHead::decode(bytes)?);
+            let valid = SignedHead::decode(bytes).ok().filter(|signed| {
+                let head = &signed.head;
+                head.journal_id == journal_id
+                    && head.archive_id == registry.trust().archive_id
+                    && usize::try_from(head.counter)
+                        .ok()
+                        .and_then(|index| records.get(index))
+                        .is_some_and(|record| record.digest() == head.digest)
+                    && matches!(registry.verify(signed, None), HeadVerdict::Trusted { .. })
+            });
+            match valid {
+                Some(signed) => signing.signed.push(signed),
+                None => signing.discarded = signing.discarded.saturating_add(1),
+            }
         }
-        Ok(signing)
+        signing
     }
 
     /// Offers a new head at `now_ns`. Never blocks and never calls the
@@ -289,6 +321,7 @@ impl HeadSigning {
             let _ = self.pending.pop_front();
             self.signed.push(head);
             self.last_signed_ns = Some(now_ns);
+            self.carried_overdue = false;
             signed = signed.saturating_add(1);
         }
         Ok(signed)
@@ -306,7 +339,7 @@ impl HeadSigning {
     /// a report, never a position.
     #[must_use]
     pub fn status(&self, now_ns: u64, sealed_records: u64) -> SigningStatus {
-        let last_signed = self.signed.last().map(|signed| signed.head.counter);
+        let last_signed = self.signed.iter().map(|signed| signed.head.counter).max();
         let covered = last_signed.map_or(0, |counter| counter.saturating_add(1));
         let since = self
             .pending
@@ -321,11 +354,12 @@ impl HeadSigning {
             coverage_lag_records,
             coverage_lag_ns,
             alarm: coverage_lag_records > 0
-                && coverage_lag_ns > self.config.anchor_interval_ns.get(),
+                && (self.carried_overdue || coverage_lag_ns > self.config.anchor_interval_ns.get()),
             pending: u64::try_from(self.pending.len()).unwrap_or(u64::MAX),
             coalesced: self.coalesced,
             refused: self.refused,
             last_signed,
+            discarded: self.discarded,
         }
     }
 }

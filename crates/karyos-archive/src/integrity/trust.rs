@@ -579,24 +579,26 @@ impl KeyRegistry {
     /// [`IntegrityError::Registry`] with [`RegistryError::Missing`] when
     /// the journal chains an entry the ledger does not hold,
     /// [`RegistryError::Malformed`] when a chained entry cannot be read,
-    /// or the refusal of [`KeyRegistry::apply`] for a chained entry;
+    /// [`RegistryError::Backdated`] for a registration effective before
+    /// the chain record that registers it, as on append, or the refusal
+    /// of [`KeyRegistry::apply`] for a chained entry;
     /// otherwise the journal's or the ledger's error.
     pub fn open<D: Disk>(
         trust: TrustRoot,
         journal: &mut IntegrityJournal<D>,
         ledger: &mut Ledger<D, REGISTRY_ENTRY_LENGTH>,
     ) -> Result<Self, IntegrityError> {
-        let chained: Vec<(u64, Digest)> = journal
+        let chained: Vec<(u64, u64, Digest)> = journal
             .records()?
             .into_iter()
             .filter(|record| record.kind == super::SealKind::KeyRegistry)
-            .map(|record| (record.start, record.content))
+            .map(|record| (record.counter, record.start, record.content))
             .collect();
         let mut registry = Self::new(trust);
         let mut next = chained.iter().peekable();
         let mut committed = 0usize;
         for (index, bytes) in ledger.entries().iter().enumerate() {
-            let Some(&&(sequence, content)) = next.peek() else {
+            let Some(&&(counter, sequence, content)) = next.peek() else {
                 break;
             };
             if digest(bytes) != content {
@@ -609,11 +611,12 @@ impl KeyRegistry {
             if entry.sequence != sequence {
                 return Err(RegistryError::Missing { sequence }.into());
             }
+            check_timing(&entry, counter)?;
             registry.apply(&entry)?;
             let _ = next.next();
             committed = index.saturating_add(1);
         }
-        if let Some(&(sequence, _)) = next.next() {
+        if let Some(&(_, sequence, _)) = next.next() {
             return Err(RegistryError::Missing { sequence }.into());
         }
         ledger.truncate(committed)?;
@@ -732,19 +735,7 @@ impl KeyRegistry {
         journal: &mut IntegrityJournal<D>,
         ledger: &mut Ledger<D, REGISTRY_ENTRY_LENGTH>,
     ) -> Result<(), IntegrityError> {
-        let next = journal.next_counter();
-        // A key is registered before its first use. A revocation's cutoff
-        // is the independently evidenced compromise point, which is often
-        // discovered after the records it affects, and a retirement only
-        // narrows the key's validity, so neither is refused as backdated.
-        if entry.action == RegistryAction::Register && entry.effective < next {
-            return Err(RegistryError::Backdated {
-                sequence: entry.sequence,
-                effective: entry.effective,
-                next,
-            }
-            .into());
-        }
+        check_timing(entry, journal.next_counter())?;
         let mut applied = self.clone();
         applied.apply(entry)?;
         let bytes = entry.encode();
@@ -809,6 +800,24 @@ impl KeyRegistry {
         }
         HeadVerdict::Trusted { custody }
     }
+}
+
+/// Refuses `entry` if it would take effect before `counter`, the chain
+/// position of the record that registers it: a key is registered before
+/// its first use. A revocation's cutoff is the independently evidenced
+/// compromise point, which is often discovered after the records it
+/// affects, and a retirement only narrows the key's validity, so neither
+/// is refused as backdated. The same check applies on append and on
+/// replay.
+fn check_timing(entry: &RegistryEntry, counter: u64) -> Result<(), RegistryError> {
+    if entry.action == RegistryAction::Register && entry.effective < counter {
+        return Err(RegistryError::Backdated {
+            sequence: entry.sequence,
+            effective: entry.effective,
+            next: counter,
+        });
+    }
+    Ok(())
 }
 
 /// Why a head is not trusted.

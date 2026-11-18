@@ -85,8 +85,11 @@ are `curve25519-dalek` 5.0.0 and `subtle` 2.6.1 (BSD-3-Clause), `ed25519`
 3.0.0, `signature` 3.0.0 and `zeroize` 1.9.2 (Apache-2.0 OR MIT), and the
 build dependencies `rustc_version` 0.4.1 and `semver` 1.0.28 (MIT OR
 Apache-2.0) of `curve25519-dalek`'s build script, which only emits `cfg`
-flags (word size and backend) and compiles no C. It reuses `sha2` for
-SHA-512 inside its own implementation.
+flags (word size and backend) and compiles no C. On x86_64 only,
+`curve25519-dalek` also selects the proc macro `curve25519-dalek-derive`
+0.1.1 (MIT OR Apache-2.0), which generates its SIMD backend's target
+feature variants at compile time and is absent from the aarch64 graph. It
+reuses `sha2` for SHA-512 inside its own implementation.
 
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
 absent from every normal and release build and from the graph shipped to
