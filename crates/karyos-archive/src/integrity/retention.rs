@@ -169,21 +169,113 @@ pub enum PolicyError {
     },
 }
 
-/// The policies in force and what they bind to.
-#[derive(Debug, Clone, Default)]
-pub struct PolicyBook {
-    current: BTreeMap<u64, RetentionPolicy>,
-    bindings: BTreeMap<Selector, u64>,
+/// The policy book's file name in the archive directory.
+pub const POLICIES_FILE: &str = "policies.kyl";
+
+/// The encoded length of a policy book entry, in bytes.
+pub const POLICY_ENTRY_LENGTH: usize = 64;
+
+/// The integrity journal subject of the policy book's bindings, chained as
+/// catalog changes with the entry's sequence as generation.
+pub const POLICY_BOOK_SUBJECT: u64 = u64::MAX;
+
+/// A binding's key: a recording, or a class by its channel's digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Key {
+    Recording(u64),
+    Class(Digest, i32),
 }
 
-impl PolicyBook {
-    /// Records a new policy version, chaining it in `journal`.
+impl Key {
+    fn of(selector: &Selector) -> Self {
+        match selector {
+            Selector::Recording(recording) => Self::Recording(*recording),
+            Selector::Class { channel, stream_id } => Self::Class(digest(channel), *stream_id),
+        }
+    }
+}
+
+/// The policies in force and what they bind to, kept in a ledger whose
+/// entries count only once the integrity journal chains them, so a
+/// restart restores the effective state.
+#[derive(Debug)]
+pub struct PolicyBook<D: Disk> {
+    ledger: Ledger<D, POLICY_ENTRY_LENGTH>,
+    current: BTreeMap<u64, RetentionPolicy>,
+    bindings: BTreeMap<Key, u64>,
+}
+
+impl<D: Disk> PolicyBook<D> {
+    /// Opens the policy book of `dir`, restoring each policy version and
+    /// binding that `journal` chains, in order. An entry stored before a
+    /// crash or a failed journal append is not committed and is skipped.
     ///
     /// # Errors
     ///
-    /// [`IntegrityError::Policy`] for a version that does not rise, with
-    /// nothing written; the journal's error.
-    pub fn record<D: Disk>(
+    /// As [`Ledger::open`] and [`IntegrityJournal::records`].
+    pub fn open(
+        disk: D,
+        dir: &std::path::Path,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<Self, IntegrityError> {
+        let ledger = Ledger::open(disk, dir, POLICIES_FILE)?;
+        let records = journal.records()?;
+        let chained = |kind: SealKind, subject: u64, start: u64, content: Digest| {
+            records.iter().any(|record| {
+                record.kind == kind
+                    && record.subject == subject
+                    && record.start == start
+                    && record.content == content
+            })
+        };
+        let mut book = Self {
+            ledger,
+            current: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+        };
+        let entries = book.ledger.entries().to_vec();
+        for (sequence, entry) in (0u64..).zip(entries.iter()) {
+            match decode_entry(entry) {
+                Some(Entry::Policy(policy))
+                    if book
+                        .current
+                        .get(&policy.policy)
+                        .is_none_or(|current| policy.version > current.version)
+                        && chained(
+                            SealKind::Policy,
+                            policy.policy,
+                            policy.version,
+                            digest(&policy.canonical()),
+                        ) =>
+                {
+                    book.current.insert(policy.policy, policy);
+                }
+                Some(Entry::Binding(key, policy))
+                    if book.current.contains_key(&policy)
+                        && chained(
+                            SealKind::Catalog,
+                            POLICY_BOOK_SUBJECT,
+                            sequence,
+                            digest(entry),
+                        ) =>
+                {
+                    book.bindings.insert(key, policy);
+                }
+                _ => {}
+            }
+        }
+        Ok(book)
+    }
+
+    /// Records a new policy version: stored, then chained in `journal`,
+    /// and only then in force.
+    ///
+    /// # Errors
+    ///
+    /// [`IntegrityError::Policy`] for a version that does not rise over the
+    /// restored state, with nothing written; the ledger's or the journal's
+    /// error.
+    pub fn record(
         &mut self,
         policy: RetentionPolicy,
         journal: &mut IntegrityJournal<D>,
@@ -198,23 +290,40 @@ impl PolicyBook {
             }
             .into());
         }
-        let record =
-            journal.record_policy_version(policy.policy, policy.version, &policy.canonical())?;
+        let canonical = policy.canonical();
+        let mut entry = [0u8; POLICY_ENTRY_LENGTH];
+        for (slot, byte) in entry.iter_mut().zip(core::iter::once(1).chain(canonical)) {
+            *slot = byte;
+        }
+        self.ledger.append(entry)?;
+        let record = journal.record_policy_version(policy.policy, policy.version, &canonical)?;
         self.current.insert(policy.policy, policy);
         Ok(record)
     }
 
-    /// Binds `selector` to `policy`.
+    /// Binds `selector` to `policy`: stored, then chained in `journal`.
     ///
     /// # Errors
     ///
-    /// [`PolicyError::Unknown`] for a policy never recorded.
-    pub fn bind(&mut self, selector: Selector, policy: u64) -> Result<(), PolicyError> {
+    /// [`IntegrityError::Policy`] with [`PolicyError::Unknown`] for a
+    /// policy never recorded; the ledger's or the journal's error.
+    pub fn bind(
+        &mut self,
+        selector: &Selector,
+        policy: u64,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<SealRecord, IntegrityError> {
         if !self.current.contains_key(&policy) {
-            return Err(PolicyError::Unknown { policy });
+            return Err(PolicyError::Unknown { policy }.into());
         }
-        self.bindings.insert(selector, policy);
-        Ok(())
+        let key = Key::of(selector);
+        let entry = encode_binding(key, policy);
+        let sequence =
+            u64::try_from(self.ledger.entries().len()).map_err(|_| IntegrityError::Overflow)?;
+        self.ledger.append(entry)?;
+        let record = journal.record_catalog_change(POLICY_BOOK_SUBJECT, sequence, &entry)?;
+        self.bindings.insert(key, policy);
+        Ok(record)
     }
 
     /// The policy in force for a recording of `channel` and `stream_id`:
@@ -226,14 +335,87 @@ impl PolicyBook {
         channel: &[u8],
         stream_id: i32,
     ) -> Option<&RetentionPolicy> {
-        let class = Selector::Class {
-            channel: channel.to_vec(),
-            stream_id,
-        };
         self.bindings
-            .get(&Selector::Recording(recording))
-            .or_else(|| self.bindings.get(&class))
+            .get(&Key::Recording(recording))
+            .or_else(|| self.bindings.get(&Key::Class(digest(channel), stream_id)))
             .and_then(|policy| self.current.get(policy))
+    }
+}
+
+/// A decoded policy book entry.
+enum Entry {
+    Policy(RetentionPolicy),
+    Binding(Key, u64),
+}
+
+/// A binding entry: kind 2, the selector's tag at 1, the policy at 8, the
+/// recording at 16 or the stream id at 24 and the channel digest at 32.
+fn encode_binding(key: Key, policy: u64) -> [u8; POLICY_ENTRY_LENGTH] {
+    let mut entry = [0u8; POLICY_ENTRY_LENGTH];
+    let (tag, recording, stream_id, channel) = match key {
+        Key::Recording(recording) => (1u8, recording, 0i32, [0u8; 32]),
+        Key::Class(channel, stream_id) => (2u8, 0, stream_id, channel),
+    };
+    let fields: [&[u8]; 7] = [
+        &[2, tag, 0, 0, 0, 0, 0, 0],
+        &policy.to_le_bytes(),
+        &recording.to_le_bytes(),
+        &stream_id.to_le_bytes(),
+        &[0; 4],
+        &channel,
+        &[],
+    ];
+    for (slot, byte) in entry.iter_mut().zip(fields.into_iter().flatten()) {
+        *slot = *byte;
+    }
+    entry
+}
+
+fn decode_entry(entry: &[u8; POLICY_ENTRY_LENGTH]) -> Option<Entry> {
+    let u64_at = |at: usize| {
+        entry
+            .get(at..)
+            .and_then(|rest| rest.first_chunk::<8>())
+            .map(|bytes| u64::from_le_bytes(*bytes))
+    };
+    match entry.first()? {
+        1 => {
+            let purge = match entry.get(30)? {
+                1 => PurgeMode::Manual,
+                2 => PurgeMode::AfterExpiry,
+                _ => return None,
+            };
+            let min_copies = entry
+                .get(25..)
+                .and_then(|rest| rest.first_chunk::<4>())
+                .map(|bytes| u32::from_le_bytes(*bytes))
+                .and_then(NonZeroU32::new)?;
+            Some(Entry::Policy(RetentionPolicy {
+                policy: u64_at(1)?,
+                version: u64_at(9)?,
+                retain_for_ns: u64_at(17)?,
+                min_copies,
+                storage_tier: *entry.get(29)?,
+                purge,
+            }))
+        }
+        2 => {
+            let policy = u64_at(8)?;
+            let key = match entry.get(1)? {
+                1 => Key::Recording(u64_at(16)?),
+                2 => {
+                    let stream_id = entry
+                        .get(24..)
+                        .and_then(|rest| rest.first_chunk::<4>())
+                        .map(|bytes| i32::from_le_bytes(*bytes))?;
+                    let channel = entry.get(32..)?.first_chunk::<32>().copied()?;
+                    Key::Class(channel, stream_id)
+                }
+                _ => return None,
+            };
+            Some(Entry::Binding(key, policy))
+        }
+        _ => None,
     }
 }
 
@@ -404,8 +586,13 @@ pub enum HoldReport {
         evidence: Digest,
     },
     /// In force but not evidenced: the operations journal is unavailable.
-    /// It inhibits purge, survives restart, and is not reported applied.
+    /// Its pending marker is durable, so it inhibits purge and survives
+    /// restart; it is not reported applied.
     PendingNoEvidence,
+    /// In force in this process only: neither the operations journal nor
+    /// the pending marker recorded it, so it does not survive a restart.
+    /// It inhibits purge here and is not reported applied.
+    InMemoryOnly,
 }
 
 /// Why a hold could not be released.
@@ -483,6 +670,22 @@ pub enum PurgeRefusal {
     /// The operations journal could not record the intent: fails closed.
     #[error("the operations journal is unavailable; purge fails closed")]
     JournalUnavailable,
+    /// The store given is another recording's.
+    #[error("the store is recording {store}'s, the request is for {recording}")]
+    WrongStore {
+        /// The request's recording.
+        recording: u64,
+        /// The store's.
+        store: u64,
+    },
+    /// The cutoff falls inside a sealed range, which a purge would split.
+    #[error("the cutoff {before} falls inside the range sealed by record {counter}")]
+    SplitsSeal {
+        /// The cutoff.
+        before: u64,
+        /// The seal record's counter.
+        counter: u64,
+    },
 }
 
 impl PurgeRefusal {
@@ -497,6 +700,8 @@ impl PurgeRefusal {
             Self::NotExpired { .. } => 5,
             Self::BelowMinCopies { .. } => 6,
             Self::JournalUnavailable => 7,
+            Self::WrongStore { .. } => 8,
+            Self::SplitsSeal { .. } => 9,
         }
     }
 }
@@ -534,8 +739,18 @@ pub struct PurgeContext<'a, D: Disk> {
     pub copies: &'a CopyCatalog<D>,
     /// This Archive's location id, whose copy the purge removes.
     pub local: Digest,
+    /// The recording's current start in the store: copies need cover only
+    /// `[start, before)`, never bytes the store never held or already
+    /// purged.
+    pub start: u64,
     /// The current time, in ns of UTC.
     pub now_ns: u64,
+}
+
+/// Holds and intents rebuilt from the operations journal.
+struct Rebuilt {
+    holds: BTreeMap<u64, Hold>,
+    intents: BTreeMap<u64, PurgeRequest>,
 }
 
 /// Retention state: holds and the operations journal.
@@ -563,10 +778,22 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             operations,
             pending,
             holds: BTreeMap::new(),
-            holds_unknown: records.is_none(),
+            holds_unknown: true,
             intents: BTreeMap::new(),
         };
-        for bytes in records.unwrap_or_default() {
+        if let Some(records) = records {
+            let _ = state.replay(records);
+        }
+        state.merge_pending();
+        state
+    }
+
+    /// Rebuilds holds and intents from the operations journal's `records`.
+    /// True when every record decoded; otherwise hold state stays unknown
+    /// and the holds already in force are kept.
+    fn replay(&mut self, records: &[[u8; OPERATION_LENGTH]]) -> bool {
+        let mut state = Self::rebuilt();
+        for bytes in records {
             match Operation::decode(bytes) {
                 Some(Operation::HoldApplied { recording }) => {
                     state.holds.insert(
@@ -604,9 +831,31 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                     state.intents.remove(&id);
                 }
                 Some(Operation::PurgeRejected { .. }) => {}
-                None => state.holds_unknown = true,
+                None => return false,
             }
         }
+        // Holds applied in memory since the journal became unreadable stay
+        // in force over what the journal says.
+        for (recording, hold) in &self.holds {
+            state.holds.entry(*recording).or_insert(*hold);
+        }
+        self.holds = state.holds;
+        self.intents.extend(state.intents);
+        self.holds_unknown = false;
+        true
+    }
+
+    /// The holds and intents an empty journal shows.
+    const fn rebuilt() -> Rebuilt {
+        Rebuilt {
+            holds: BTreeMap::new(),
+            intents: BTreeMap::new(),
+        }
+    }
+
+    /// Adds a pending hold for each recording whose last marker is pending.
+    fn merge_pending(&mut self) {
+        let state = self;
         // A recording whose last marker is pending, and which the journal
         // does not show applied, still inhibits: a hold the journal never
         // evidenced survives the restart.
@@ -623,13 +872,17 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                 state.holds.entry(recording).or_insert(Hold::Pending);
             }
         }
-        state
     }
 
-    /// Marks hold state as readable again, once the operator restored the
-    /// operations journal and recovery rebuilt it.
-    pub const fn holds_readable(&mut self) {
-        self.holds_unknown = false;
+    /// Makes hold state readable again from the restored operations
+    /// journal's `records`: they are replayed and the pending markers
+    /// merged before purges are allowed. False, with purges still
+    /// inhibited, when a record does not decode.
+    #[must_use = "false when hold state is still unknown"]
+    pub fn holds_readable(&mut self, records: &[[u8; OPERATION_LENGTH]]) -> bool {
+        let replayed = self.replay(records);
+        self.merge_pending();
+        replayed
     }
 
     /// The hold on `recording`.
@@ -649,10 +902,12 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
     /// journal's evidence. The pending marker is written first, so a
     /// hold the journal cannot record yet survives a restart.
     pub fn apply_hold(&mut self, recording: u64) -> HoldReport {
+        let mut marked = true;
         if !matches!(self.holds.get(&recording), Some(Hold::Applied { .. })) {
             self.holds.insert(recording, Hold::Pending);
-            // Best effort: the hold is in force in memory either way.
-            let _ = self.pending.append(marker(recording, false));
+            // The hold is in force in memory either way; the marker is what
+            // carries it across a restart.
+            marked = self.pending.append(marker(recording, false)).is_ok();
         }
         if let Some(Hold::Applied { evidence }) = self.holds.get(&recording) {
             return HoldReport::Applied {
@@ -670,7 +925,8 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                 let _ = self.pending.append(marker(recording, true));
                 HoldReport::Applied { evidence }
             }
-            Err(_) => HoldReport::PendingNoEvidence,
+            Err(_) if marked => HoldReport::PendingNoEvidence,
+            Err(_) => HoldReport::InMemoryOnly,
         }
     }
 
@@ -726,7 +982,7 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         if context.now_ns < expires_ns {
             return Err(PurgeRefusal::NotExpired { expires_ns });
         }
-        let start = 0;
+        let start = context.start;
         let verified = context
             .copies
             .current()
@@ -782,7 +1038,16 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         store: &mut SegmentStore<D2>,
         journal: &mut IntegrityJournal<D2>,
     ) -> Result<SealRecord, PurgeError> {
-        if let Err(refusal) = self.check(request, context) {
+        let checked = if request.recording == store.recording() {
+            self.check(request, context)
+                .and_then(|()| Self::cutoff_on_a_seal(request, journal))
+        } else {
+            Err(PurgeRefusal::WrongStore {
+                recording: request.recording,
+                store: store.recording(),
+            })
+        };
+        if let Err(refusal) = checked {
             return Err(self.refuse(request, refusal));
         }
         let intent = Operation::PurgeIntent {
@@ -800,6 +1065,30 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         }
         self.intents.insert(request.id, *request);
         self.complete(request, store, journal)
+    }
+
+    /// Refuses a cutoff inside a sealed range: the purge would make part of
+    /// it unreadable while its purge record covers none of it. An
+    /// unreadable journal refuses as unavailable.
+    fn cutoff_on_a_seal<D2: Disk>(
+        request: &PurgeRequest,
+        journal: &mut IntegrityJournal<D2>,
+    ) -> Result<(), PurgeRefusal> {
+        let records = journal
+            .records()
+            .map_err(|_| PurgeRefusal::JournalUnavailable)?;
+        match records.iter().find(|record| {
+            record.kind.is_range()
+                && record.subject == request.recording
+                && record.start < request.before
+                && request.before < record.end
+        }) {
+            Some(record) => Err(PurgeRefusal::SplitsSeal {
+                before: request.before,
+                counter: record.counter,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Deletes and records an intent already journalled.
@@ -831,7 +1120,11 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                     .unwrap_or(start)
                     .min(start);
                 let sealed = seals_digest(&records, request.recording, first, request.before);
-                store.purge_before(request.before)?;
+                // A floor already past the cutoff deleted the range: only
+                // the record is missing.
+                if store.start() < request.before {
+                    store.purge_before(request.before)?;
+                }
                 journal.record_purge(request.recording, first, request.before, sealed)?
             }
         };

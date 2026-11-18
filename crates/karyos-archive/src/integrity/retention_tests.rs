@@ -204,6 +204,7 @@ fn context<'a>(
         policy: Some(policy),
         copies,
         local: ARCHIVE,
+        start: 0,
         now_ns,
     }
 }
@@ -387,7 +388,7 @@ fn a_release_the_journal_cannot_record_fails_closed() {
     let mut archive = fresh();
     let evidence = match archive.retention.apply_hold(RECORDING) {
         HoldReport::Applied { evidence } => evidence,
-        HoldReport::PendingNoEvidence => panic!("the journal is up"),
+        other => panic!("the journal is up: {other:?}"),
     };
     assert_eq!(
         archive.retention.hold(RECORDING),
@@ -426,7 +427,7 @@ fn an_unknown_hold_at_restart_inhibits_the_purge() {
         retention.release_hold(RECORDING),
         Err(ReleaseError::Unknown)
     );
-    retention.holds_readable();
+    assert!(retention.holds_readable(&[]));
     assert_eq!(
         retention.check(&request(), &context(&policy, &copies, 5_000)),
         Ok(())
@@ -562,7 +563,8 @@ fn without_a_hold_recovery_completes_the_purge_at_every_crash_point() {
 #[test]
 fn policies_are_versioned_chained_and_bound_by_recording_or_class() {
     let mut archive = fresh();
-    let mut book = PolicyBook::default();
+    let dir = Path::new(DIR);
+    let mut book = PolicyBook::open(archive.disk.clone(), dir, &mut archive.journal).unwrap();
     let first = book.record(policy(1_000, 2), &mut archive.journal).unwrap();
     assert_eq!(first.kind, SealKind::Policy);
     assert_eq!(first.content, digest(&policy(1_000, 2).canonical()));
@@ -573,22 +575,56 @@ fn policies_are_versioned_chained_and_bound_by_recording_or_class() {
     let mut other = policy(9, 1);
     other.policy = 2;
     book.record(other, &mut archive.journal).unwrap();
-    book.bind(
-        Selector::Class {
-            channel: b"karyos:ipc".to_vec(),
-            stream_id: 10,
-        },
-        1,
-    )
-    .unwrap();
-    book.bind(Selector::Recording(4), 2).unwrap();
-    assert_eq!(
-        book.bind(Selector::Recording(5), 9),
-        Err(PolicyError::Unknown { policy: 9 })
-    );
+    let class = Selector::Class {
+        channel: b"karyos:ipc".to_vec(),
+        stream_id: 10,
+    };
+    book.bind(&class, 1, &mut archive.journal).unwrap();
+    book.bind(&Selector::Recording(4), 2, &mut archive.journal)
+        .unwrap();
+    assert!(matches!(
+        book.bind(&Selector::Recording(5), 9, &mut archive.journal),
+        Err(super::journal::IntegrityError::Policy(
+            PolicyError::Unknown { policy: 9 }
+        ))
+    ));
     assert_eq!(book.resolve(3, b"karyos:ipc", 10).unwrap().version, 2);
     assert_eq!(book.resolve(4, b"karyos:ipc", 10).unwrap().policy, 2);
     assert!(book.resolve(5, b"karyos:udp", 10).is_none());
+
+    // A restart restores the effective versions and bindings, and an older
+    // version is still refused against them.
+    let mut journal = IntegrityJournal::open(archive.disk.clone(), dir)
+        .unwrap()
+        .journal;
+    let mut restored = PolicyBook::open(archive.disk.clone(), dir, &mut journal).unwrap();
+    assert_eq!(restored.resolve(3, b"karyos:ipc", 10).unwrap().version, 2);
+    assert_eq!(restored.resolve(4, b"karyos:ipc", 10).unwrap().policy, 2);
+    assert!(restored.record(policy(1, 1), &mut journal).is_err());
+}
+
+/// A policy entry stored without its journal record is not committed: a
+/// restart does not restore it.
+#[test]
+fn an_unchained_policy_entry_is_not_restored() {
+    let archive = fresh();
+    let dir = Path::new(DIR);
+    let mut entries =
+        Ledger::<_, POLICY_ENTRY_LENGTH>::open(archive.disk.clone(), dir, POLICIES_FILE).unwrap();
+    let mut entry = [0u8; POLICY_ENTRY_LENGTH];
+    entry[0] = 1;
+    entry[1..31].copy_from_slice(&policy(1, 1).canonical());
+    entries.append(entry).unwrap();
+    let mut journal = IntegrityJournal::open(archive.disk.clone(), dir)
+        .unwrap()
+        .journal;
+    let mut book = PolicyBook::open(archive.disk.clone(), dir, &mut journal).unwrap();
+    assert!(matches!(
+        book.bind(&Selector::Recording(3), 1, &mut journal),
+        Err(super::journal::IntegrityError::Policy(
+            PolicyError::Unknown { .. }
+        ))
+    ));
 }
 
 #[test]
@@ -614,4 +650,176 @@ fn operations_round_trip_through_their_bytes() {
         assert_eq!(Operation::decode(&operation.encode()), Some(operation));
     }
     assert_eq!(Operation::decode(&[0; OPERATION_LENGTH]), None);
+}
+
+/// A purge whose request names another recording than the store is
+/// refused before its intent, and deletes nothing.
+#[test]
+fn a_purge_for_another_recording_than_the_store_is_refused() {
+    let mut archive = fresh();
+    let policy = policy(1_000, 2);
+    let context = context(&policy, &archive.copies, 5_000);
+    let mut other = request();
+    other.recording = RECORDING + 1;
+    let refused = archive
+        .retention
+        .purge(&other, &context, &mut archive.store, &mut archive.journal)
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        PurgeError::Refused {
+            refusal: PurgeRefusal::WrongStore { .. },
+            journalled: true
+        }
+    ));
+    assert_eq!(archive.store.start(), 0);
+    assert!(archive.retention.outstanding().is_empty());
+}
+
+/// A cutoff inside a sealed range is refused: the purge would split it.
+#[test]
+fn a_cutoff_inside_a_sealed_range_is_refused() {
+    let mut archive = fresh();
+    let policy = policy(1_000, 2);
+    let context = context(&policy, &archive.copies, 5_000);
+    let mut split = request();
+    split.before = 192;
+    let refused = archive
+        .retention
+        .purge(&split, &context, &mut archive.store, &mut archive.journal)
+        .unwrap_err();
+    assert!(matches!(
+        refused,
+        PurgeError::Refused {
+            refusal: PurgeRefusal::SplitsSeal { before: 192, .. },
+            ..
+        }
+    ));
+    assert_eq!(archive.store.start(), 0);
+}
+
+/// Copies need cover only the store's current start onwards: once the
+/// copies of the whole recording are gone and copies of what remains
+/// stay, a purge from the store's start counts them.
+#[test]
+fn copies_are_counted_from_the_stores_start() {
+    let mut archive = fresh();
+    let policy = policy(1_000, 2);
+    for location in [REPLICA_A, REPLICA_B] {
+        archive
+            .copies
+            .record(
+                CopyRecord {
+                    sequence: 0,
+                    recording: RECORDING,
+                    start: 0,
+                    end: 384,
+                    location,
+                    digest: digest(b"copy"),
+                    retain_until_ns: 0,
+                    state: CopyState::Removed,
+                    enforcement: Enforcement::ObjectLock,
+                },
+                &mut archive.journal,
+            )
+            .unwrap();
+        archive
+            .copies
+            .record(
+                CopyRecord {
+                    sequence: 0,
+                    recording: RECORDING,
+                    start: 128,
+                    end: 384,
+                    location,
+                    digest: digest(b"copy"),
+                    retain_until_ns: 0,
+                    state: CopyState::Verified,
+                    enforcement: Enforcement::ObjectLock,
+                },
+                &mut archive.journal,
+            )
+            .unwrap();
+    }
+    let mut context = context(&policy, &archive.copies, 5_000);
+    let mut later = request();
+    later.id = 2;
+    assert!(matches!(
+        archive.retention.check(&later, &context),
+        Err(PurgeRefusal::BelowMinCopies { verified: 0, .. })
+    ));
+    context.start = 128;
+    assert_eq!(archive.retention.check(&later, &context), Ok(()));
+}
+
+/// An intent whose range the floor already passed completes with its
+/// record and no second deletion.
+#[test]
+fn recovery_records_an_intent_the_floor_already_passed() {
+    let mut archive = fresh();
+    let intent = Operation::PurgeIntent {
+        id: 1,
+        recording: RECORDING,
+        before: 128,
+        operator: 42,
+        closed_ns: 0,
+    };
+    let mut ops = Ops::open(archive.disk.clone(), Path::new(DIR), OPERATIONS_FILE).unwrap();
+    ops.append(intent.encode()).unwrap();
+    archive.store.sync().unwrap();
+    archive.store.purge_before(BEFORE).unwrap();
+    let mut archive = open(archive.disk);
+    assert_eq!(archive.retention.outstanding().len(), 1);
+    let policy = policy(1_000, 2);
+    let context = context(&policy, &archive.copies, 5_000);
+    let outcomes = archive
+        .retention
+        .recover_purges(&context, |_| true, &mut archive.store, &mut archive.journal)
+        .unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].unwrap().kind, SealKind::Purge);
+    assert!(archive.retention.outstanding().is_empty());
+}
+
+/// A hold neither journal records is in force here but says it does not
+/// survive a restart.
+#[test]
+fn a_hold_no_journal_records_says_it_is_in_memory_only() {
+    let opened = FaultDisk::default();
+    let _ = Markers::open(opened.clone(), Path::new(DIR), PENDING_HOLDS_FILE).unwrap();
+    let disk = FaultDisk::with_budget(opened.used());
+    let markers = Markers::open(disk.clone(), Path::new(DIR), PENDING_HOLDS_FILE).unwrap();
+    let mut retention = Retention::recover(Down, Some(&[]), markers);
+    assert_eq!(retention.apply_hold(RECORDING), HoldReport::InMemoryOnly);
+    assert_eq!(retention.hold(RECORDING), Some(Hold::Pending));
+}
+
+/// Hold state read again replays the journal's holds before purges are
+/// allowed, and an undecodable record keeps them inhibited.
+#[test]
+fn readable_hold_state_replays_the_restored_holds() {
+    let disk = FaultDisk::default();
+    setup(&disk);
+    let markers = Markers::open(disk.clone(), Path::new(DIR), PENDING_HOLDS_FILE).unwrap();
+    let mut retention = Retention::recover(Down, None, markers);
+    let copies = open_copies(&disk);
+    let policy = policy(1_000, 2);
+    assert!(!retention.holds_readable(&[[0xff; OPERATION_LENGTH]]));
+    assert_eq!(
+        retention.check(&request(), &context(&policy, &copies, 5_000)),
+        Err(PurgeRefusal::HoldsUnknown)
+    );
+    let held = Operation::HoldApplied {
+        recording: RECORDING,
+    }
+    .encode();
+    assert!(retention.holds_readable(&[held]));
+    assert!(matches!(
+        retention.hold(RECORDING),
+        Some(Hold::Applied { .. })
+    ));
+    assert_eq!(
+        retention.check(&request(), &context(&policy, &copies, 5_000)),
+        Err(PurgeRefusal::LegalHold)
+    );
 }
