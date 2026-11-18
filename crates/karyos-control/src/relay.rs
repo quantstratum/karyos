@@ -6,10 +6,8 @@
 //! the principal and the request, never a role: the agent gives the
 //! principal its role from its own table.
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The first word of every agent request.
 pub const PROTOCOL: &str = "KARYOS-AGENT";
@@ -26,8 +24,6 @@ pub const MAX_REPLY: usize = 8 << 20;
 /// The time the agent has to answer in all: its own read and write
 /// deadlines are 250 ms each, so this is a bound on a stuck agent only.
 pub const AGENT_DEADLINE: Duration = Duration::from_secs(2);
-/// The longest one read of the answer waits.
-const READ_STEP: Duration = Duration::from_millis(100);
 
 /// Why a request was not relayed, or its answer not had.
 #[derive(Debug, thiserror::Error)]
@@ -84,29 +80,37 @@ pub fn line(principal: &str, request: &str) -> Result<String, RelayError> {
 }
 
 /// Sends `line` to the agent's socket at `socket` and returns its answer,
-/// one JSON object and its newline.
+/// one JSON object and its newline. The whole exchange, the connection
+/// included, is bounded by [`AGENT_DEADLINE`]: the connect is
+/// nonblocking, so an agent whose listen backlog is full, or that never
+/// answers, holds no thread past it.
 ///
 /// # Errors
 ///
 /// [`RelayError::Io`] when the socket cannot be used, and
 /// [`RelayError::Answer`] for an answer too long, cut short or late.
-pub fn relay(socket: &Path, line: &str) -> Result<Vec<u8>, RelayError> {
-    let start = Instant::now();
-    let mut stream = UnixStream::connect(socket)?;
-    // Set once, before the exchange: macOS refuses the option on a socket
-    // whose peer has closed. Each read waits READ_STEP at most, and the
-    // deadline is checked between reads.
-    stream.set_write_timeout(Some(AGENT_DEADLINE))?;
-    stream.set_read_timeout(Some(READ_STEP))?;
-    stream.write_all(line.as_bytes())?;
-    let mut answer = Vec::new();
-    let mut buffer = [0u8; 64 << 10];
-    loop {
-        let left = AGENT_DEADLINE.saturating_sub(start.elapsed());
-        if left.is_zero() {
-            return Err(RelayError::Answer);
+pub async fn relay(socket: &Path, line: &str) -> Result<Vec<u8>, RelayError> {
+    tokio::time::timeout(AGENT_DEADLINE, exchange(socket, line))
+        .await
+        .unwrap_or(Err(RelayError::Answer))
+}
+
+async fn exchange(socket: &Path, line: &str) -> Result<Vec<u8>, RelayError> {
+    let stream = tokio::net::UnixStream::connect(socket).await?;
+    let mut rest = line.as_bytes();
+    while !rest.is_empty() {
+        stream.writable().await?;
+        match stream.try_write(rest) {
+            Ok(written) => rest = rest.get(written..).ok_or(RelayError::Answer)?,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.into()),
         }
-        match stream.read(&mut buffer) {
+    }
+    let mut answer = Vec::new();
+    let mut buffer = vec![0u8; 64 << 10];
+    loop {
+        stream.readable().await?;
+        match stream.try_read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => {
                 answer.extend_from_slice(buffer.get(..read).ok_or(RelayError::Answer)?);
@@ -114,13 +118,7 @@ pub fn relay(socket: &Path, line: &str) -> Result<Vec<u8>, RelayError> {
                     return Err(RelayError::Answer);
                 }
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                ) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -161,5 +159,40 @@ mod tests {
         ] {
             assert!(matches!(line("svc.ops", request), Err(RelayError::Request)));
         }
+    }
+
+    /// An agent that accepts nothing (its backlog filled) or never answers
+    /// holds the relay no longer than its deadline (karyos#708 review).
+    #[test]
+    fn a_stuck_agent_is_bounded_by_the_deadline() {
+        let dir = std::env::temp_dir().join(format!("karyos-relay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // Accepts nothing: connects fill its backlog.
+            let silent = dir.join("silent.sock");
+            let _listener = std::os::unix::net::UnixListener::bind(&silent).unwrap();
+            let mut held = Vec::new();
+            for _ in 0..4096 {
+                match tokio::time::timeout(
+                    Duration::from_millis(50),
+                    tokio::net::UnixStream::connect(&silent),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => held.push(stream),
+                    _ => break,
+                }
+            }
+            let start = std::time::Instant::now();
+            assert!(relay(&silent, "KARYOS-AGENT 1 view\n").await.is_err());
+            assert!(start.elapsed() < AGENT_DEADLINE + Duration::from_millis(500));
+            drop(held);
+        });
     }
 }

@@ -452,8 +452,9 @@ impl Agent {
                 Some(gap) => {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "karyos-agent: info: uid {uid} acknowledged the unknown interval of a \
+                        "karyos-agent: info: {} acknowledged the unknown interval of a \
                          journal that could not be opened, from {} to {}; held in memory only",
+                        acknowledger(requester),
                         gap.from,
                         gap.to,
                     );
@@ -1051,6 +1052,17 @@ fn read_rings(
     guards.cursor = cursor;
     guards.count(scan.delivered, scan.overwritten);
     kept.into_iter().for_each(|entry| guards.push(entry));
+}
+
+/// Who acknowledged an unknown interval, as the agent logs it: `uid U`
+/// for a local request, as before relays; `operator O relay R` for a
+/// relayed one (karyos#708), so the log names the relay and never calls a
+/// principal's operator id a uid.
+fn acknowledger(requester: Requester) -> String {
+    match requester.relay {
+        0 => format!("uid {}", requester.operator),
+        relay => format!("operator {} relay {relay}", requester.operator),
+    }
 }
 
 #[cfg(test)]

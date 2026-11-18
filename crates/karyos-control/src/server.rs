@@ -508,9 +508,8 @@ async fn handle(
     let Ok(line) = relay::line(&principal, &text) else {
         return Ok(refusal(StatusCode::BAD_REQUEST, "bad request"));
     };
-    let socket = shared.agent_socket.clone();
-    match tokio::task::spawn_blocking(move || relay::relay(&socket, &line)).await {
-        Ok(Ok(answer)) => Ok(json(StatusCode::OK, answer)),
-        _ => Ok(refusal(StatusCode::BAD_GATEWAY, "agent unavailable")),
+    match relay::relay(&shared.agent_socket, &line).await {
+        Ok(answer) => Ok(json(StatusCode::OK, answer)),
+        Err(_) => Ok(refusal(StatusCode::BAD_GATEWAY, "agent unavailable")),
     }
 }
