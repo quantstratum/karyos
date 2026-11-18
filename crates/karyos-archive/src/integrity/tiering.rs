@@ -30,9 +30,13 @@ use super::journal::{IntegrityError, IntegrityJournal};
 use super::{Digest, Inconsistency, SealRecord, verify_range};
 use crate::disk::Disk;
 
-/// The key of an offloaded range in object storage.
+/// The key of an offloaded range in object storage. Recording ids are
+/// each archive's own, so the key names the source archive too: two
+/// archives sharing a bucket never write the same key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectKey {
+    /// The source archive's location id.
+    pub archive: Digest,
     /// The recording.
     pub recording: u64,
     /// The range's start.
@@ -42,23 +46,29 @@ pub struct ObjectKey {
 }
 
 impl ObjectKey {
-    /// The key of the range `seal` covers.
+    /// The key of the range `seal` covers in `archive`.
     #[must_use]
     #[inline]
-    pub const fn of(seal: &SealRecord) -> Self {
+    pub const fn of(archive: Digest, seal: &SealRecord) -> Self {
         Self {
+            archive,
             recording: seal.subject,
             start: seal.start,
             end: seal.end,
         }
     }
 
-    /// The object name: `<recording>/<start>-<end>`, in fixed-width hex so
-    /// names sort in range order.
+    /// The object name: `<archive>/<recording>/<start>-<end>`, in
+    /// fixed-width hex so names sort in range order.
     #[must_use]
     pub fn name(&self) -> String {
+        let archive: String = self
+            .archive
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         format!(
-            "{:016x}/{:016x}-{:016x}",
+            "{archive}/{:016x}/{:016x}-{:016x}",
             self.recording, self.start, self.end
         )
     }
@@ -207,10 +217,22 @@ impl Tiering {
                 counter: seal.counter,
             });
         }
-        let after = self.copies_elsewhere(copies, seal).saturating_add(1);
+        // The upload adds a location only when the destination is not this
+        // Archive and holds no verified copy of the range yet.
+        let adds = self.remote != self.local
+            && !copies.current().into_iter().any(|copy| {
+                copy.location == self.remote
+                    && copy.recording == seal.subject
+                    && copy.state == CopyState::Verified
+                    && copy.start <= seal.start
+                    && copy.end >= seal.end
+            });
+        let after = self
+            .copies_elsewhere(copies, seal)
+            .saturating_add(u64::from(adds));
         Self::satisfies(after, min_copies)?;
         verify_range(seal, bytes).map_err(TieringError::LocalMismatch)?;
-        let key = ObjectKey::of(seal);
+        let key = ObjectKey::of(self.local, seal);
         let enforcement = store
             .put(&key, bytes, retain_until_ns)
             .map_err(TieringError::Store)?;
@@ -227,7 +249,9 @@ impl Tiering {
             journal,
         )?;
         Self::satisfies(self.copies_elsewhere(copies, seal), min_copies)?;
-        local.remove(&key).map_err(TieringError::Local)?;
+        // The local copy stops counting before its bytes go: a crash after
+        // the removal never leaves bytes that no longer exist counted.
+        self.uncount_local(copies, journal, seal)?;
         let local_removed = copies.record(
             Self::copy(
                 seal,
@@ -238,11 +262,50 @@ impl Tiering {
             ),
             journal,
         )?;
+        local.remove(&key).map_err(TieringError::Local)?;
         Ok(Offloaded {
             remote,
             local_removed,
             enforcement,
         })
+    }
+
+    /// Stops every verified local copy overlapping `seal`'s range from
+    /// counting: one covering more than the range is removed and its parts
+    /// outside the range recorded verified again.
+    fn uncount_local<D: Disk>(
+        &self,
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+        seal: &SealRecord,
+    ) -> Result<(), TieringError> {
+        let overlapping: Vec<CopyRecord> = copies
+            .current()
+            .into_iter()
+            .filter(|copy| {
+                copy.location == self.local
+                    && copy.recording == seal.subject
+                    && copy.state == CopyState::Verified
+                    && copy.start < seal.end
+                    && seal.start < copy.end
+                    && (copy.start, copy.end) != (seal.start, seal.end)
+            })
+            .collect();
+        for copy in overlapping {
+            copies.record(
+                CopyRecord {
+                    state: CopyState::Removed,
+                    ..copy
+                },
+                journal,
+            )?;
+            for (start, end) in [(copy.start, seal.start), (seal.end, copy.end)] {
+                if start < end {
+                    copies.record(CopyRecord { start, end, ..copy }, journal)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Restores the offloaded range `seal` from `store` for replay,
@@ -262,7 +325,7 @@ impl Tiering {
             });
         }
         let bytes = store
-            .get(&ObjectKey::of(seal))
+            .get(&ObjectKey::of(self.local, seal))
             .map_err(TieringError::Store)?;
         verify_range(seal, &bytes).map_err(TieringError::RemoteMismatch)?;
         Ok(bytes)

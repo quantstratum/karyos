@@ -70,7 +70,7 @@ pub struct ReplicationLag {
     /// The end of the source's sealed ranges.
     pub source_sealed_end: u64,
     /// The end of the ranges this replica verified, contiguously from the
-    /// recording's first verified range.
+    /// source recording's start.
     pub verified_end: u64,
     /// The bytes sealed at the source but not yet verified here.
     pub behind: u64,
@@ -163,6 +163,23 @@ impl Replica {
             });
         }
         if let Err(inconsistency) = verify_range(seal, bytes) {
+            // A copy counted before is no longer one: every verified copy
+            // here overlapping the range stops counting.
+            let counted: Vec<CopyRecord> = copies
+                .current()
+                .into_iter()
+                .filter(|copy| {
+                    copy.location == self.location
+                        && copy.recording == seal.subject
+                        && copy.state == CopyState::Verified
+                        && copy.start < seal.end
+                        && seal.start < copy.end
+                })
+                .collect();
+            for mut copy in counted {
+                copy.state = CopyState::Unverified;
+                copies.record(copy, journal)?;
+            }
             return Ok(Verdict::Corrupt(inconsistency));
         }
         let record = self.record(
@@ -175,12 +192,16 @@ impl Replica {
         Ok(Verdict::Counted(copies.record(record, journal)?))
     }
 
-    /// The replication lag of `recording` against the source's sealed end.
+    /// The replication lag of `recording` against the source, whose
+    /// recording starts at `source_start` and is sealed to
+    /// `source_sealed_end`: only coverage contiguous from the source's
+    /// start counts, so a missing prefix shows.
     #[must_use]
     pub fn lag<D: Disk>(
         &self,
         copies: &CopyCatalog<D>,
         recording: u64,
+        source_start: u64,
         source_sealed_end: u64,
     ) -> ReplicationLag {
         let mut verified: Vec<(u64, u64)> = copies
@@ -194,9 +215,8 @@ impl Replica {
             .map(|copy| (copy.start, copy.end))
             .collect();
         verified.sort_unstable();
-        let mut ranges = verified.into_iter();
-        let mut verified_end = ranges.next().map_or(0, |(_, end)| end);
-        for (start, end) in ranges {
+        let mut verified_end = source_start;
+        for (start, end) in verified {
             if start > verified_end {
                 break;
             }

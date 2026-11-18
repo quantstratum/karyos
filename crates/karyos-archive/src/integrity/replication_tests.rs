@@ -115,7 +115,9 @@ fn a_range_that_arrived_before_its_seal_is_unverified_and_counts_for_nothing() {
     assert_eq!(current[0].state, CopyState::Unverified);
     assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 0);
     assert_eq!(
-        replica().lag(&f.copies, RECORDING, seal.end).verified_end,
+        replica()
+            .lag(&f.copies, RECORDING, 0, seal.end)
+            .verified_end,
         0
     );
 }
@@ -145,7 +147,10 @@ fn a_seal_with_no_arrival_or_of_no_range_is_refused() {
 fn the_replication_lag_is_observable() {
     let mut f = fixture();
     let source_end = f.ranges[1].0.end;
-    assert_eq!(replica().lag(&f.copies, RECORDING, source_end).behind, 32);
+    assert_eq!(
+        replica().lag(&f.copies, RECORDING, 0, source_end).behind,
+        32
+    );
     for (seal, bytes) in f.ranges.clone() {
         replica()
             .arrived(
@@ -159,7 +164,7 @@ fn the_replication_lag_is_observable() {
         let _ = replica()
             .verify(&mut f.copies, &mut f.journal, &seal, &bytes)
             .unwrap();
-        let lag = replica().lag(&f.copies, RECORDING, source_end);
+        let lag = replica().lag(&f.copies, RECORDING, 0, source_end);
         assert_eq!(lag.verified_end, seal.end);
         assert_eq!(lag.behind, source_end - seal.end);
     }
@@ -253,7 +258,7 @@ fn an_offloaded_range_is_restored_byte_for_byte_and_removed_only_after_it_verifi
         )
         .unwrap();
     assert_eq!(offloaded.enforcement, Enforcement::ObjectLock);
-    assert_eq!(local.removed, vec![ObjectKey::of(&seal)]);
+    assert_eq!(local.removed, vec![ObjectKey::of(LOCAL, &seal)]);
     assert_eq!(tiering().copies_elsewhere(&f.copies, &seal), 1);
     assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 1);
 
@@ -370,4 +375,142 @@ fn a_corrupt_local_range_is_never_offloaded() {
         .unwrap_err();
     assert!(matches!(error, TieringError::LocalMismatch(_)));
     assert_eq!(bucket.calls, 0);
+}
+
+#[test]
+fn a_missing_prefix_shows_in_the_lag() {
+    let mut f = fixture();
+    let (seal, bytes) = f.ranges[1].clone();
+    replica()
+        .arrived(
+            &mut f.copies,
+            &mut f.journal,
+            RECORDING,
+            seal.start,
+            seal.end,
+        )
+        .unwrap();
+    let _ = replica()
+        .verify(&mut f.copies, &mut f.journal, &seal, &bytes)
+        .unwrap();
+    let lag = replica().lag(&f.copies, RECORDING, 0, seal.end);
+    assert_eq!((lag.verified_end, lag.behind), (0, 32));
+}
+
+#[test]
+fn a_counted_copy_found_corrupt_stops_counting() {
+    let mut f = fixture();
+    let (seal, bytes) = f.ranges[0].clone();
+    replica()
+        .arrived(
+            &mut f.copies,
+            &mut f.journal,
+            RECORDING,
+            seal.start,
+            seal.end,
+        )
+        .unwrap();
+    let _ = replica()
+        .verify(&mut f.copies, &mut f.journal, &seal, &bytes)
+        .unwrap();
+    assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 1);
+    let mut corrupt = bytes.clone();
+    corrupt[0] ^= 1;
+    let verdict = replica()
+        .verify(&mut f.copies, &mut f.journal, &seal, &corrupt)
+        .unwrap();
+    assert!(matches!(verdict, Verdict::Corrupt(_)));
+    assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 0);
+}
+
+#[test]
+fn offloading_part_of_a_wider_local_copy_splits_it() {
+    let mut f = fixture();
+    let (seal, bytes) = f.ranges[0].clone();
+    let wide = CopyRecord {
+        sequence: 0,
+        recording: RECORDING,
+        start: 0,
+        end: 32,
+        location: LOCAL,
+        digest: seal.content,
+        retain_until_ns: 0,
+        state: CopyState::Verified,
+        enforcement: Enforcement::Unsupported,
+    };
+    f.copies.record(wide, &mut f.journal).unwrap();
+    let _ = tiering()
+        .offload(
+            &seal,
+            &bytes,
+            copies_of(1),
+            0,
+            &mut f.copies,
+            &mut f.journal,
+            &mut Bucket::default(),
+            &mut Local::default(),
+        )
+        .unwrap();
+    // [0, 16) counts only in the bucket; [16, 32) still counts locally.
+    assert_eq!(f.copies.verified_copies(RECORDING, 0, 16), 1);
+    assert_eq!(tiering().copies_elsewhere(&f.copies, &seal), 1);
+    let local: Vec<_> = f
+        .copies
+        .current()
+        .into_iter()
+        .filter(|copy| copy.location == LOCAL && copy.state == CopyState::Verified)
+        .map(|copy| (copy.start, copy.end))
+        .collect();
+    assert_eq!(local, vec![(16, 32)]);
+}
+
+#[test]
+fn an_offload_to_a_location_already_counted_adds_no_copy() {
+    let mut f = fixture();
+    let (seal, bytes) = f.ranges[0].clone();
+    let mut bucket = Bucket::default();
+    let mut local = Local::default();
+    let _ = tiering()
+        .offload(
+            &seal,
+            &bytes,
+            copies_of(1),
+            0,
+            &mut f.copies,
+            &mut f.journal,
+            &mut bucket,
+            &mut local,
+        )
+        .unwrap();
+    let calls = bucket.calls;
+    let error = tiering()
+        .offload(
+            &seal,
+            &bytes,
+            copies_of(2),
+            0,
+            &mut f.copies,
+            &mut f.journal,
+            &mut bucket,
+            &mut local,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        TieringError::BelowMinCopies {
+            verified: 1,
+            required: 2
+        }
+    ));
+    assert_eq!(bucket.calls, calls, "refused before it acts");
+}
+
+#[test]
+fn object_keys_are_scoped_to_their_archive() {
+    let (seal, _) = fixture().ranges[0].clone();
+    let ours = ObjectKey::of(LOCAL, &seal);
+    let theirs = ObjectKey::of(REPLICA, &seal);
+    assert_ne!(ours, theirs);
+    assert_ne!(ours.name(), theirs.name());
+    assert!(ours.name().starts_with(&"0a".repeat(32)));
 }
