@@ -47,9 +47,15 @@ fn main() -> ExitCode {
         Ok(report) => {
             let _ = writeln!(
                 std::io::stdout(),
-                "applied {} {:x}",
+                "applied {} {:x} {}",
                 report.applied,
-                report.digest
+                report.digest,
+                report
+                    .sequence
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
             );
             ExitCode::SUCCESS
         }

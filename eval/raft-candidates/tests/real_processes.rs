@@ -109,13 +109,26 @@ fn run_once() -> Result<(), String> {
     if let Some(stderr) = failed {
         return Err(stderr);
     }
-    assert!(
-        reports[0].starts_with(&format!("applied {COMMANDS} ")),
-        "{reports:?}"
-    );
+    // Every node applied the same sequence (a repeat included), and that
+    // sequence is the commands 1..=COMMANDS in order, each first applied
+    // once in turn; a repeat is only a retried proposal of a command
+    // already applied (karyos#956 review).
     assert!(
         reports.iter().all(|report| *report == reports[0]),
         "{reports:?}"
     );
+    let fields: Vec<&str> = reports[0].split(' ').collect();
+    assert_eq!(fields.len(), 4, "{reports:?}");
+    assert_eq!(fields[0], "applied");
+    assert_eq!(fields[1], COMMANDS.to_string(), "{reports:?}");
+    let sequence: Vec<u64> = fields[3].split(',').map(|n| n.parse().unwrap()).collect();
+    let mut firsts = Vec::new();
+    for &number in &sequence {
+        if firsts.contains(&number) {
+            continue;
+        }
+        firsts.push(number);
+    }
+    assert_eq!(firsts, (1..=COMMANDS).collect::<Vec<_>>(), "{sequence:?}");
     Ok(())
 }

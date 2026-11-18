@@ -86,7 +86,12 @@ esac
 # version or bytes) than the last build's cleans raft-proto first, and the
 # printed provenance always describes the build tested.
 identity="$version $PROTOC $({ sha256sum "$PROTOC" 2>/dev/null || shasum -a 256 "$PROTOC"; } | cut -d' ' -f1)"
-stamp="${CARGO_TARGET_DIR:-$here/target}/raft-eval-protoc"
+# Cargo's effective target directory (CARGO_TARGET_DIR,
+# CARGO_BUILD_TARGET_DIR or build.target-dir alike), so the stamp sits
+# beside the artifacts it describes (karyos#956 review).
+target="$("$cargo" metadata --format-version 1 --no-deps --locked |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
+stamp="$target/raft-eval-protoc"
 if [ "$(cat "$stamp" 2>/dev/null || true)" != "$identity" ]; then
     "$cargo" clean --locked -p raft-proto
     "$cargo" clean --locked --release -p raft-proto

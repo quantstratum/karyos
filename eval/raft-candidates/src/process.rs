@@ -72,12 +72,17 @@ pub struct NodeConfig {
 }
 
 /// What a node applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     /// Distinct commands applied.
     pub applied: u64,
-    /// A digest of the distinct commands in the order applied.
+    /// A digest of every command applied, in the order applied.
     pub digest: u64,
+    /// Every command applied, in the order applied, a repeat included: a
+    /// proposal retried after 100 ms can commit twice, so the test checks
+    /// the sequence itself, not only its distinct commands (karyos#956
+    /// review).
+    pub sequence: Vec<u64>,
 }
 
 /// Why a real-process run stopped.
@@ -164,6 +169,7 @@ pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
     let mut report = Report {
         applied: 0,
         digest: 0,
+        sequence: Vec::new(),
     };
     let mut next = 1u64;
     let mut proposed_at: Option<Instant> = None;
@@ -226,11 +232,12 @@ pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
             &mut log,
             &mut |to, message, _| outbox.push((to, message)),
             &mut |entry: &Entry, _| {
-                if let Some(number) = number_of(&entry.payload)
-                    && seen.insert(number)
-                {
-                    report.applied = report.applied.saturating_add(1);
+                if let Some(number) = number_of(&entry.payload) {
+                    report.sequence.push(number);
                     report.digest = mix(report.digest, number);
+                    if seen.insert(number) {
+                        report.applied = report.applied.saturating_add(1);
+                    }
                 }
             },
             &mut |_| {},
