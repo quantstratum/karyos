@@ -8,8 +8,9 @@
 //! records, per copy, where it is, what state it is in and which
 //! immutability enforcement applies: an immutable file attribute,
 //! object-lock retention, or none where the storage does not support it.
-//! Each record's digest is chained in the integrity journal as a catalog
-//! change, so the copy catalog is covered by the same evidence as the data.
+//! Each record's digest is chained in the integrity journal as a copy
+//! change ([`SealKind::Copy`]), so the copy catalog is covered by the same
+//! evidence as the data, and its state is replayed in journal order.
 //!
 //! Immutability complements the hash chain and proves nothing on its own:
 //! a copy marked immutable is still verified through its seal, and a copy
@@ -229,33 +230,52 @@ pub struct CopyCatalog<D: Disk> {
 }
 
 impl<D: Disk> CopyCatalog<D> {
-    /// Opens the copy catalog of `dir`, keeping only the records whose
-    /// catalog change `journal` chains: a record stored before a crash or a
-    /// failed journal append is not committed, so it never counts.
+    /// Opens the copy catalog of `dir` by replaying, in journal order, the
+    /// copy changes `journal` chains, reading each one's bytes from the
+    /// ledger by its digest. A record stored before a crash or a failed
+    /// journal append is not committed, so it never counts, and a retry
+    /// that stored the same bytes again is applied once.
     ///
     /// # Errors
     ///
     /// As [`Ledger::open`] and [`IntegrityJournal::records`];
-    /// [`IntegrityError::Overflow`] for a record that does not decode,
-    /// which the verifier then reports against the chain.
+    /// [`IntegrityError::Unrecorded`] for a copy change the journal chains
+    /// whose record the ledger does not hold or that does not match the
+    /// journal's record of it.
     pub fn open(
         disk: D,
         dir: &Path,
         journal: &mut IntegrityJournal<D>,
     ) -> Result<Self, IntegrityError> {
         let ledger = Ledger::open(disk, dir, COPIES_FILE)?;
-        let chained: std::collections::BTreeSet<(u64, u64, Digest)> = journal
-            .records()?
-            .into_iter()
-            .filter(|record| record.kind == SealKind::Catalog)
-            .map(|record| (record.subject, record.start, record.content))
+        let stored: std::collections::BTreeMap<Digest, &[u8; COPY_RECORD_LENGTH]> = ledger
+            .entries()
+            .iter()
+            .rev()
+            .map(|bytes| (super::digest(bytes), bytes))
             .collect();
         let mut records = Vec::new();
-        for bytes in ledger.entries() {
-            let record = CopyRecord::decode(bytes).map_err(|_| IntegrityError::Overflow)?;
-            if chained.contains(&(record.recording, record.sequence, super::digest(bytes))) {
-                records.push(record);
+        for change in journal.records()? {
+            if change.kind != SealKind::Copy {
+                continue;
             }
+            let unrecorded = IntegrityError::Unrecorded {
+                counter: change.counter,
+            };
+            let bytes = stored.get(&change.content).ok_or(unrecorded)?;
+            let record = CopyRecord::decode(bytes).map_err(|_| IntegrityError::Unrecorded {
+                counter: change.counter,
+            })?;
+            let expected = u64::try_from(records.len()).unwrap_or(u64::MAX);
+            if record.recording != change.subject
+                || record.sequence != change.start
+                || record.sequence != expected
+            {
+                return Err(IntegrityError::Unrecorded {
+                    counter: change.counter,
+                });
+            }
+            records.push(record);
         }
         Ok(Self { ledger, records })
     }
@@ -274,7 +294,7 @@ impl<D: Disk> CopyCatalog<D> {
     }
 
     /// Records a copy's new state: the record is stored, then its digest
-    /// is chained in `journal` as a catalog change of its recording, and
+    /// is chained in `journal` as a copy change of its recording, and
     /// only then is it part of the catalog's state. The record's sequence
     /// is assigned here.
     ///
@@ -289,7 +309,7 @@ impl<D: Disk> CopyCatalog<D> {
         record.sequence = self.next_sequence();
         let bytes = record.encode();
         self.ledger.append(bytes)?;
-        let chained = journal.record_catalog_change(record.recording, record.sequence, &bytes)?;
+        let chained = journal.record_copy_change(record.recording, record.sequence, &bytes)?;
         self.records.push(record);
         Ok(chained)
     }

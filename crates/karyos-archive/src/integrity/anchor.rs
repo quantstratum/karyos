@@ -201,11 +201,27 @@ pub trait AnchorEvidence {
     /// `anchor.receipt`. A store this evidence does not reach confirms
     /// nothing.
     fn confirms(&self, anchor: &Anchor) -> bool;
+
+    /// The highest head counter that independent evidence proves `anchor`'s
+    /// store held before the anchor's key was revoked, if the evidence
+    /// establishes that ordering for this head (a timestamped receipt, a
+    /// transparency log inclusion before the revocation). Present-day
+    /// storage proves no ordering, so the default is `None`.
+    fn anchored_before_revocation(&self, anchor: &Anchor) -> Option<u64> {
+        let _ = anchor;
+        None
+    }
 }
 
 impl AnchorEvidence for [&dyn AnchorEvidence] {
     fn confirms(&self, anchor: &Anchor) -> bool {
         self.iter().any(|store| store.confirms(anchor))
+    }
+
+    fn anchored_before_revocation(&self, anchor: &Anchor) -> Option<u64> {
+        self.iter()
+            .filter_map(|store| store.anchored_before_revocation(anchor))
+            .max()
     }
 }
 
@@ -266,8 +282,17 @@ pub enum AnchorFinding {
     /// A store's counter and the heads it anchors move in opposite
     /// directions: one of its anchors was rolled back.
     CounterRollback {
-        /// The store.
+        /// The store's kind.
+        kind: AnchorKind,
+        /// The store's location.
         location: Digest,
+    },
+    /// The chain does not hold together from the record at `counter`:
+    /// a counter gap, a broken link or a range gap. No anchor covers it or
+    /// anything after it.
+    BrokenChain {
+        /// The position of the first record that does not chain.
+        counter: u64,
     },
 }
 
@@ -308,9 +333,11 @@ impl AnchorReport {
 
 /// Compares `records`, the chain of journal `journal_id`, with `anchors`.
 /// Each anchor's head is verified under `registry` (a head whose key was
-/// later revoked counts only when an earlier trusted anchor covers it),
-/// and its provenance by `evidence`: an anchor its store does not confirm
-/// does not count. The same anchor supplied more than once counts once.
+/// later revoked counts only when `evidence` proves it was anchored before
+/// the revocation), and its provenance by `evidence`: an anchor its store
+/// does not confirm does not count. The same anchor supplied more than
+/// once counts once. An anchor covers a position only if every record up
+/// to it chains: its counter, link and range follow its predecessor's.
 #[must_use]
 pub fn check_anchors(
     records: &[SealRecord],
@@ -340,7 +367,8 @@ pub fn check_anchors(
         let reason = externality.check(anchor).err().or_else(|| {
             (anchor.signed.head.journal_id != journal_id).then_some(AnchorReason::WrongJournal)
         });
-        let reason = reason.or_else(|| match registry.verify(&anchor.signed, None) {
+        let proved = evidence.anchored_before_revocation(anchor);
+        let reason = reason.or_else(|| match registry.verify(&anchor.signed, proved) {
             HeadVerdict::Trusted { .. } => None,
             HeadVerdict::NotTrustedEvidence(reason) | HeadVerdict::Invalid(reason) => {
                 Some(AnchorReason::Head(reason))
@@ -376,14 +404,14 @@ pub fn check_anchors(
     }
     // Counter rollback: per store, the external counter and the head
     // counter must rise together.
-    let mut by_location: BTreeMap<Digest, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut by_store: BTreeMap<(AnchorKind, Digest), Vec<(u64, u64)>> = BTreeMap::new();
     for anchor in &trusted {
-        by_location
-            .entry(anchor.location)
+        by_store
+            .entry((anchor.kind, anchor.location))
             .or_default()
             .push((anchor.external_counter, anchor.signed.head.counter));
     }
-    for (location, mut pairs) in by_location {
+    for ((kind, location), mut pairs) in by_store {
         pairs.sort_unstable();
         let rolled_back = pairs.windows(2).any(|pair| match pair {
             [(external_a, head_a), (external_b, head_b)] => {
@@ -394,7 +422,19 @@ pub fn check_anchors(
         if rolled_back {
             report
                 .findings
-                .push(AnchorFinding::CounterRollback { location });
+                .push(AnchorFinding::CounterRollback { kind, location });
+        }
+    }
+    // Only the prefix that chains can be covered.
+    let mut check = super::ChainCheck::new();
+    let mut chained = records.len();
+    for (index, record) in records.iter().enumerate() {
+        if check.accept(record).is_err() {
+            chained = index;
+            report.findings.push(AnchorFinding::BrokenChain {
+                counter: u64::try_from(index).unwrap_or(u64::MAX),
+            });
+            break;
         }
     }
     let records_len = u64::try_from(records.len()).unwrap_or(u64::MAX);
@@ -417,6 +457,10 @@ pub fn check_anchors(
             report.findings.push(AnchorFinding::Rollback {
                 counter: head.counter,
             });
+            continue;
+        }
+        if usize::try_from(head.counter).map_or(true, |index| index >= chained) {
+            // Reported once above as a broken chain.
             continue;
         }
         report.kinds.insert(anchor.kind);

@@ -58,6 +58,13 @@ pub enum IntegrityError {
     /// handle appended or cut since it was opened. Nothing was written.
     #[error("the ledger was changed through another handle; reopen it")]
     StaleLedger,
+    /// The journal chains record `counter`, whose bytes its ledger does
+    /// not hold or holds in a form that does not match.
+    #[error("integrity journal record {counter} is chained but missing from its ledger")]
+    Unrecorded {
+        /// The record's counter.
+        counter: u64,
+    },
     /// The key registry refused an entry.
     #[error("key registry: {0}")]
     Registry(#[from] super::trust::RegistryError),
@@ -371,6 +378,28 @@ impl<D: Disk> IntegrityJournal<D> {
             recording,
             generation,
             generation,
+            digest(canonical),
+        )
+    }
+
+    /// Chains a change of a copy of `recording` in the copy catalog:
+    /// `sequence` is the copy record's sequence, `canonical` its canonical
+    /// bytes.
+    ///
+    /// # Errors
+    ///
+    /// As [`IntegrityJournal::append`].
+    pub fn record_copy_change(
+        &mut self,
+        recording: u64,
+        sequence: u64,
+        canonical: &[u8],
+    ) -> Result<SealRecord, IntegrityError> {
+        self.append(
+            SealKind::Copy,
+            recording,
+            sequence,
+            sequence,
             digest(canonical),
         )
     }

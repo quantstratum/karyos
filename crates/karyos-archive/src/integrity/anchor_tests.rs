@@ -17,7 +17,7 @@ use std::path::Path;
 use super::anchor::*;
 use super::copies::*;
 use super::test_support::*;
-use super::trust::HeadReason;
+use super::trust::{HeadReason, RegistryAction, RegistryEntry};
 use super::{SealRecord, digest};
 use crate::fault::FaultDisk;
 
@@ -137,7 +137,10 @@ fn a_store_counter_that_goes_back_is_a_counter_rollback() {
     let report = check(&records, &[later, earlier]);
     assert_eq!(
         report.findings,
-        vec![AnchorFinding::CounterRollback { location: OPERATOR }]
+        vec![AnchorFinding::CounterRollback {
+            kind: AnchorKind::OperatorExport,
+            location: OPERATOR
+        }]
     );
 }
 
@@ -346,8 +349,8 @@ fn the_catalog_states_the_immutability_enforcement_per_copy() {
     let remote = copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock);
     let record = copies.record(local, &mut journal).unwrap();
     copies.record(remote, &mut journal).unwrap();
-    // Each copy record is chained as a catalog change.
-    assert_eq!(record.kind, super::SealKind::Catalog);
+    // Each copy record is chained as a copy change.
+    assert_eq!(record.kind, super::SealKind::Copy);
     assert_eq!(record.content, digest(&copies.records()[0].encode()));
     let reopened = CopyCatalog::open(disk, Path::new(DIR), &mut journal).unwrap();
     let current = reopened.current();
@@ -439,7 +442,10 @@ fn a_repeated_anchor_counts_once_and_a_different_one_at_its_counter_conflicts() 
     let report = check(&records, &[one, other]);
     assert_eq!(
         report.findings,
-        vec![AnchorFinding::CounterRollback { location: OPERATOR }]
+        vec![AnchorFinding::CounterRollback {
+            kind: AnchorKind::OperatorExport,
+            location: OPERATOR
+        }]
     );
 }
 
@@ -471,4 +477,150 @@ fn a_copy_whose_journal_append_failed_never_counts() {
     let reopened = CopyCatalog::open(copies_disk, Path::new(DIR), &mut recovered).unwrap();
     assert_eq!(reopened.verified_copies(3, 0, 80), 0);
     assert!(reopened.records().is_empty());
+}
+
+#[test]
+fn an_anchor_covers_nothing_past_a_record_that_does_not_chain() {
+    let (_, mut records) = chain(10);
+    let low = anchor(AnchorKind::OperatorExport, OPERATOR, 0, &records[1]);
+    let high = anchor(AnchorKind::OperatorExport, OPERATOR, 1, &records[6]);
+    // Record 2 is rewritten; record 6 is byte for byte the anchored one.
+    records[2].content = digest(b"rewritten");
+    let report = check(&records, &[low, high]);
+    assert_eq!(
+        report.findings,
+        vec![AnchorFinding::BrokenChain { counter: 3 }]
+    );
+    assert_eq!(report.anchored_through, Some(1));
+    assert!(report.is_conflicting());
+}
+
+/// Receipts whose store also proves, for every anchor, that it held the
+/// anchored head before `through`'s revocation.
+struct Timestamped;
+
+impl AnchorEvidence for Timestamped {
+    fn confirms(&self, anchor: &Anchor) -> bool {
+        Receipts.confirms(anchor)
+    }
+
+    fn anchored_before_revocation(&self, anchor: &Anchor) -> Option<u64> {
+        Some(anchor.signed.head.counter)
+    }
+}
+
+#[test]
+fn an_anchor_proved_to_predate_its_keys_revocation_still_counts() {
+    use ed25519_dalek::Signer as _;
+    let (_, records) = chain(10);
+    let key = archival_key();
+    let mut revoke = RegistryEntry {
+        action: RegistryAction::Revoke,
+        algorithm: super::trust::Algorithm::Ed25519,
+        custody: super::trust::Custody::Declared,
+        sequence: 1,
+        key_id: super::trust::key_id(&key.verifying_key().to_bytes()),
+        public: key.verifying_key().to_bytes(),
+        effective: 6,
+        evidence: digest(b"compromised at 6"),
+        endorsement: [0; 64],
+    };
+    revoke.endorsement = authority()
+        .sign(&revoke.endorsement_bytes(&ARCHIVE))
+        .to_bytes();
+    let mut revoked = registry();
+    revoked.apply(&revoke).unwrap();
+    let old = anchor(AnchorKind::OperatorExport, OPERATOR, 0, &records[3]);
+    // Present-day storage proves no ordering.
+    let report = check_anchors(
+        &records,
+        JOURNAL,
+        &[old],
+        &revoked,
+        &externality(),
+        &Receipts,
+    );
+    assert_eq!(report.anchored_through, None);
+    // Evidence that the store held it before the revocation does.
+    let report = check_anchors(
+        &records,
+        JOURNAL,
+        &[old],
+        &revoked,
+        &externality(),
+        &Timestamped,
+    );
+    assert_eq!(report.anchored_through, Some(3));
+    assert!(report.findings.is_empty());
+}
+
+#[test]
+fn stores_of_different_kinds_at_one_location_keep_separate_counters() {
+    let (_, records) = chain(6);
+    let export = anchor(AnchorKind::OperatorExport, OPERATOR, 0, &records[2]);
+    let replica = anchor(AnchorKind::ReplicaJournal, OPERATOR, 0, &records[4]);
+    let report = check(&records, &[export, replica]);
+    assert!(report.findings.is_empty());
+    assert_eq!(report.anchored_through, Some(4));
+}
+
+#[test]
+fn copy_state_is_replayed_in_journal_order_once_per_committed_change() {
+    use super::journal::IntegrityJournal;
+    let disk = FaultDisk::default();
+    let (mut journal, _) = chain(1);
+    let mut copies = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut journal).unwrap();
+    copies
+        .record(
+            copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock),
+            &mut journal,
+        )
+        .unwrap();
+    // The removal reaches the ledger, then the journal append fails.
+    let removed = CopyRecord {
+        sequence: 1,
+        ..copy(REPLICA, CopyState::Removed, Enforcement::ObjectLock)
+    };
+    let mut ledger = super::ledger::Ledger::<_, COPY_RECORD_LENGTH>::open(
+        disk.clone(),
+        Path::new(DIR),
+        COPIES_FILE,
+    )
+    .unwrap();
+    ledger.append(removed.encode()).unwrap();
+    let mut reopened = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut journal).unwrap();
+    assert_eq!(reopened.verified_copies(3, 0, 80), 1);
+    // The retry stores the same bytes again and commits.
+    reopened
+        .record(
+            copy(REPLICA, CopyState::Removed, Enforcement::ObjectLock),
+            &mut journal,
+        )
+        .unwrap();
+    let again = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut journal).unwrap();
+    assert_eq!(again.records().len(), 2);
+    assert_eq!(again.next_sequence(), 2);
+    assert_eq!(again.verified_copies(3, 0, 80), 0);
+    // A committed change missing from the ledger is reported, never
+    // replaced by stale state.
+    let mut empty_journal_disk = IntegrityJournal::open(FaultDisk::default(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let lost = FaultDisk::default();
+    let mut lost_copies =
+        CopyCatalog::open(lost.clone(), Path::new(DIR), &mut empty_journal_disk).unwrap();
+    lost_copies
+        .record(
+            copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock),
+            &mut empty_journal_disk,
+        )
+        .unwrap();
+    assert!(matches!(
+        CopyCatalog::open(
+            FaultDisk::default(),
+            Path::new(DIR),
+            &mut empty_journal_disk
+        ),
+        Err(super::journal::IntegrityError::Unrecorded { counter: 0 })
+    ));
 }
