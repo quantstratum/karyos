@@ -51,6 +51,7 @@ pub mod anchor;
 pub mod copies;
 pub mod journal;
 pub mod ledger;
+pub mod retention;
 pub mod sealer;
 pub mod signing;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -60,6 +61,8 @@ pub mod verify;
 
 #[cfg(test)]
 mod anchor_tests;
+#[cfg(test)]
+mod retention_tests;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

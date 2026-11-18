@@ -856,6 +856,12 @@ impl<D: Disk> SegmentStore<D> {
         Ok(store)
     }
 
+    /// The recording this store holds.
+    #[must_use]
+    pub const fn recording(&self) -> u64 {
+        self.recording
+    }
+
     /// The recording's first position.
     #[must_use]
     pub const fn start(&self) -> u64 {

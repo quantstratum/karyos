@@ -297,7 +297,9 @@ pub struct ArchiveOptions {
     pub min_free: u64,
 }
 
-/// The default `--archive-min-free`: 1 GiB.
+/// The default `--archive-min-free`: 1 GiB. A free-space floor that
+/// protects the host; it complements retention (karyos#667) and never
+/// proves it.
 pub const DEFAULT_ARCHIVE_MIN_FREE: u64 = 1 << 30;
 
 /// The verbosity of the control-path log.
