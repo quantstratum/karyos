@@ -59,6 +59,8 @@ struct TestSigner {
     key: SigningKey,
     custody: Custody,
     available: bool,
+    /// The heads it signed.
+    signed: u64,
 }
 
 impl TestSigner {
@@ -67,6 +69,7 @@ impl TestSigner {
             key: key(seed),
             custody: Custody::NoSeparation,
             available: true,
+            signed: 0,
         }
     }
 }
@@ -82,6 +85,7 @@ impl HeadSigner for TestSigner {
         if !self.available {
             return Err(SignerUnavailable);
         }
+        self.signed += 1;
         Ok(self.key.sign(&head.signed_bytes(self.custody)).to_bytes())
     }
 }
@@ -1256,4 +1260,154 @@ fn a_retrospective_revocation_withdraws_the_coverage_it_invalidates() {
     let status = signing.status(20, 6, &registry);
     assert_eq!((status.last_signed, status.discarded), (None, 1));
     assert!(status.alarm);
+}
+
+#[test]
+fn a_stale_registry_handle_cannot_commit_a_second_entry_of_one_sequence() {
+    let disk = FaultDisk::default();
+    let mut journal = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut ledger =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+    let first = TestSigner::new(9);
+    let mut registry = KeyRegistry::new(trust());
+    registry
+        .append(
+            &register(&first.key, Custody::NoSeparation, 0),
+            &mut journal,
+            &mut ledger,
+        )
+        .unwrap();
+    let mut clone = registry.clone();
+    let one = |seed: u8| {
+        entry(
+            &authority(),
+            1,
+            RegistryAction::Register,
+            &key(seed),
+            Custody::NoSeparation,
+            100,
+            [0; 32],
+        )
+    };
+    registry
+        .append(&one(10), &mut journal, &mut ledger)
+        .unwrap();
+    assert!(matches!(
+        clone.append(&one(11), &mut journal, &mut ledger),
+        Err(IntegrityError::Registry(RegistryError::Stale {
+            sequence: 1
+        }))
+    ));
+    assert_eq!(ledger.entries().len(), 2);
+    let reopened = KeyRegistry::open(trust(), &mut journal, &mut ledger).unwrap();
+    assert_eq!(reopened.identity(), registry.identity());
+}
+
+#[test]
+fn coverage_follows_the_registry_contents_not_its_length() {
+    let config = SigningConfig::new(Some(1_000), BacklogPolicy::Coalesce).unwrap();
+    let mut signer = TestSigner::new(9);
+    let lifecycle = |action, cutoff, evidence| {
+        let mut registry = registry_with(&TestSigner::new(9));
+        registry
+            .apply(&entry(
+                &authority(),
+                1,
+                action,
+                &key(9),
+                Custody::NoSeparation,
+                cutoff,
+                evidence,
+            ))
+            .unwrap();
+        registry
+    };
+    let retired = lifecycle(RegistryAction::Retire, 10, [0; 32]);
+    let revoked = lifecycle(RegistryAction::Revoke, 2, digest(b"compromised at 2"));
+    assert_eq!(retired.next_sequence(), revoked.next_sequence());
+    assert_ne!(retired.identity(), revoked.identity());
+    let mut signing = HeadSigning::new(config, JOURNAL, 0);
+    let mut store = Store::default();
+    let _ = signing.offer(head(5), 0);
+    assert_eq!(
+        signing
+            .poll(&mut signer, &mut store, &retired, &seals(), 10)
+            .unwrap(),
+        1
+    );
+    assert_eq!(signing.status(20, 6, &retired).last_signed, Some(5));
+    let status = signing.status(20, 6, &revoked);
+    assert_eq!(status.last_signed, None);
+    assert!(status.alarm);
+}
+
+#[test]
+fn dropping_a_head_not_in_the_chain_keeps_the_age_of_what_it_was_to_cover() {
+    let config = SigningConfig::new(
+        Some(1_000),
+        BacklogPolicy::Refuse {
+            capacity: NonZeroUsize::new(1).unwrap(),
+        },
+    )
+    .unwrap();
+    let registry = registry_with(&TestSigner::new(9));
+    let mut signer = TestSigner::new(9);
+    let mut store = Store::default();
+    let records = seals();
+    let mut signing = HeadSigning::new(config, JOURNAL, 0);
+    let _ = signing.offer(head(0), 0);
+    assert_eq!(
+        signing
+            .poll(&mut signer, &mut store, &registry, &records, 0)
+            .unwrap(),
+        1
+    );
+    let mut bad = head(1);
+    bad.digest = digest(b"not record 1");
+    signer.available = false;
+    assert_eq!(signing.offer(bad, 10), Offered::Queued);
+    assert!(signing.status(1_500, 3, &registry).alarm);
+    assert_eq!(signing.offer(head(2), 2_000), Offered::Refused);
+    signer.available = true;
+    assert!(matches!(
+        signing.poll(&mut signer, &mut store, &registry, &records, 2_001),
+        Err(PollError::NotInChain { counter: 1 })
+    ));
+    // Coverage is still at record 0: records 1 and 2 have waited since 10.
+    let status = signing.status(2_002, 3, &registry);
+    assert_eq!(status.coverage_lag_ns, 1_992);
+    assert!(status.alarm);
+}
+
+#[test]
+fn a_head_of_another_archive_never_reaches_the_signer() {
+    let config = SigningConfig::new(
+        Some(1_000),
+        BacklogPolicy::Refuse {
+            capacity: NonZeroUsize::new(1).unwrap(),
+        },
+    )
+    .unwrap();
+    let registry = registry_with(&TestSigner::new(9));
+    let mut signer = TestSigner::new(9);
+    let mut store = Store::default();
+    let mut elsewhere = head(0);
+    elsewhere.archive_id = [1; 32];
+    let mut signing = HeadSigning::new(config, JOURNAL, 0);
+    let _ = signing.offer(elsewhere, 0);
+    assert!(matches!(
+        signing.poll(&mut signer, &mut store, &registry, &seals(), 10),
+        Err(PollError::NotInChain { counter: 0 })
+    ));
+    assert_eq!(signer.signed, 0);
+    // The queue is free for valid work.
+    assert_eq!(signing.offer(head(0), 20), Offered::Queued);
+    assert_eq!(
+        signing
+            .poll(&mut signer, &mut store, &registry, &seals(), 30)
+            .unwrap(),
+        1
+    );
 }

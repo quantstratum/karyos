@@ -523,6 +523,13 @@ pub enum RegistryError {
         /// The entry's index in the ledger.
         index: u64,
     },
+    /// The registry appending is not the state the journal last committed:
+    /// another handle appended since, or this one is behind.
+    #[error("registry entry {sequence} appended from a stale registry")]
+    Stale {
+        /// The entry's sequence.
+        sequence: u64,
+    },
     /// The sequence space is exhausted.
     #[error("registry sequence overflow")]
     Overflow,
@@ -550,6 +557,11 @@ pub struct KeyState {
 pub struct KeyRegistry {
     trust: TrustRoot,
     next_sequence: u64,
+    /// The sequence and digest of the last entry applied.
+    last: Option<(u64, Digest)>,
+    /// A digest of every entry applied, in order: equal only for the same
+    /// registry contents.
+    identity: Digest,
     keys: std::collections::BTreeMap<Digest, KeyState>,
 }
 
@@ -560,6 +572,8 @@ impl KeyRegistry {
         Self {
             trust,
             next_sequence: 0,
+            last: None,
+            identity: [0; DIGEST_LENGTH],
             keys: std::collections::BTreeMap::new(),
         }
     }
@@ -636,6 +650,14 @@ impl KeyRegistry {
     #[inline]
     pub const fn trust(&self) -> &TrustRoot {
         &self.trust
+    }
+
+    /// A digest of the registry's contents: every entry applied, in order.
+    /// Two registries with the same identity hold the same entries.
+    #[must_use]
+    #[inline]
+    pub const fn identity(&self) -> Digest {
+        self.identity
     }
 
     /// The sequence the next entry must carry.
@@ -725,6 +747,12 @@ impl KeyRegistry {
             }
         }
         self.next_sequence = next;
+        let entry_digest = digest(&entry.encode());
+        self.last = Some((sequence, entry_digest));
+        let mut chained = Vec::with_capacity(2 * DIGEST_LENGTH);
+        chained.extend_from_slice(&self.identity);
+        chained.extend_from_slice(&entry_digest);
+        self.identity = digest(&chained);
         Ok(())
     }
 
@@ -747,6 +775,15 @@ impl KeyRegistry {
         // it: its record count is unknown until it is reopened.
         if journal.is_poisoned() {
             return Err(IntegrityError::Poisoned);
+        }
+        // Compare and swap: only the registry the journal last committed
+        // may append, so two handles cannot each commit an entry of one
+        // sequence.
+        if journal.last_key_registry() != self.last {
+            return Err(RegistryError::Stale {
+                sequence: entry.sequence,
+            }
+            .into());
         }
         check_timing(entry, journal.next_counter())?;
         let mut applied = self.clone();

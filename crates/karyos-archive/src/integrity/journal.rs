@@ -67,6 +67,8 @@ pub struct IntegrityJournal<D: Disk> {
     disk: D,
     file: D::File,
     check: ChainCheck,
+    /// The sequence and digest of the last key registry record chained.
+    last_registry: Option<(u64, Digest)>,
     poisoned: bool,
 }
 
@@ -101,6 +103,7 @@ impl<D: Disk> IntegrityJournal<D> {
         let length = disk.len(&file)?;
         let whole = length / RECORD_LENGTH;
         let mut check = ChainCheck::new();
+        let mut last_registry = None;
         let mut kept = whole;
         let mut buf = [0u8; SEAL_RECORD_LENGTH];
         for index in 0..whole {
@@ -118,6 +121,9 @@ impl<D: Disk> IntegrityJournal<D> {
                 Err(error) => return Err(Inconsistency::Malformed { index, error }.into()),
             };
             check.accept(&record)?;
+            if record.kind == SealKind::KeyRegistry {
+                last_registry = Some((record.start, record.content));
+            }
         }
         let keep = kept
             .checked_mul(RECORD_LENGTH)
@@ -132,6 +138,7 @@ impl<D: Disk> IntegrityJournal<D> {
                 disk,
                 file,
                 check,
+                last_registry,
                 poisoned: false,
             },
             truncated,
@@ -144,6 +151,15 @@ impl<D: Disk> IntegrityJournal<D> {
     #[inline]
     pub const fn next_counter(&self) -> u64 {
         self.check.next_counter()
+    }
+
+    /// The registry sequence and the entry digest of the last key registry
+    /// record chained, if any: what a registry must have applied last to
+    /// append the next entry.
+    #[must_use]
+    #[inline]
+    pub const fn last_key_registry(&self) -> Option<(u64, Digest)> {
+        self.last_registry
     }
 
     /// Whether an append failed part way: the handle no longer knows how
@@ -234,6 +250,9 @@ impl<D: Disk> IntegrityJournal<D> {
             return Err(error.into());
         }
         self.check = next;
+        if kind == SealKind::KeyRegistry {
+            self.last_registry = Some((start, content));
+        }
         Ok(record)
     }
 

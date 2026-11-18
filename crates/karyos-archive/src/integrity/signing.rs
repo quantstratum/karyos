@@ -215,8 +215,8 @@ pub struct HeadSigning {
     config: SigningConfig,
     /// The journal whose heads are signed.
     journal_id: u64,
-    /// The registry's next sequence when coverage was last validated.
-    registry_sequence: u64,
+    /// The registry's identity when coverage was last validated.
+    registry_identity: Digest,
     pending: VecDeque<Pending>,
     /// When the first head refused since the last queued one was offered:
     /// its records stay uncovered until a later head is signed.
@@ -240,7 +240,7 @@ impl HeadSigning {
         Self {
             config,
             journal_id,
-            registry_sequence: 0,
+            registry_identity: [0; super::DIGEST_LENGTH],
             pending: VecDeque::new(),
             refused_since_ns: None,
             signed: Vec::new(),
@@ -273,11 +273,12 @@ impl HeadSigning {
         records: &[SealRecord],
     ) -> Self {
         let mut signing = Self::new(config, journal_id, now_ns);
-        signing.registry_sequence = registry.next_sequence();
+        signing.registry_identity = registry.identity();
         signing.overdue_until = Some(u64::try_from(records.len()).unwrap_or(u64::MAX));
         for bytes in recorded {
             let valid = SignedHead::decode(bytes).ok().filter(|signed| {
-                signing.in_chain(&signed.head, records) && trusted(registry, signed)
+                signing.in_chain(&signed.head, records, &registry.trust().archive_id)
+                    && trusted(registry, signed)
             });
             match valid {
                 Some(signed) => signing.signed.push(signed),
@@ -341,14 +342,25 @@ impl HeadSigning {
         records: &[SealRecord],
         now_ns: u64,
     ) -> Result<u64, PollError> {
-        if registry.next_sequence() != self.registry_sequence {
+        if registry.identity() != self.registry_identity {
             self.revalidate(registry);
         }
         let mut signed = 0u64;
         while let Some(pending) = self.pending.front().copied() {
-            if !self.in_chain(&pending.head, records) {
+            if !self.in_chain(&pending.head, records, &registry.trust().archive_id) {
                 let _ = self.pending.pop_front();
                 self.discarded = self.discarded.saturating_add(1);
+                // The records it was to cover are still uncovered: their
+                // age passes to whatever covers them next.
+                match self.pending.front_mut() {
+                    Some(next) => next.since_ns = next.since_ns.min(pending.since_ns),
+                    None => {
+                        self.refused_since_ns = Some(
+                            self.refused_since_ns
+                                .map_or(pending.since_ns, |since| since.min(pending.since_ns)),
+                        );
+                    }
+                }
                 return Err(PollError::NotInChain {
                     counter: pending.head.counter,
                 });
@@ -396,13 +408,14 @@ impl HeadSigning {
         if covered(&self.signed) < before {
             self.overdue_until = Some(self.overdue_until.map_or(before, |until| until.max(before)));
         }
-        self.registry_sequence = registry.next_sequence();
+        self.registry_identity = registry.identity();
     }
 
-    /// Whether `head` is a head of this journal's chain: this journal, the
-    /// Archive and the digest of the chain's record at its counter.
-    fn in_chain(&self, head: &ChainHead, records: &[SealRecord]) -> bool {
-        head.journal_id == self.journal_id
+    /// Whether `head` is a head of this journal's chain: the Archive, this
+    /// journal and the digest of the chain's record at its counter.
+    fn in_chain(&self, head: &ChainHead, records: &[SealRecord], archive_id: &Digest) -> bool {
+        head.archive_id == *archive_id
+            && head.journal_id == self.journal_id
             && usize::try_from(head.counter)
                 .ok()
                 .and_then(|index| records.get(index))
@@ -429,7 +442,7 @@ impl HeadSigning {
         // A registry changed since the last validation is applied here
         // too: a head it no longer trusts is not credited, and the records
         // it covered are overdue.
-        let current = registry.next_sequence() == self.registry_sequence;
+        let current = registry.identity() == self.registry_identity;
         let credited = covered(&self.signed);
         let last_signed = self
             .signed
