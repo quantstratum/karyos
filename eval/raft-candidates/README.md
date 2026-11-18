@@ -34,7 +34,7 @@ all `--locked`.
 | Gate or workload | Finding |
 | --- | --- |
 | W1 | passes, every skeleton case, four seeds |
-| W2 | not demonstrated: the adapter takes no declared limits yet (karyos#679) |
+| W2 | see karyos#679 below |
 | W3 | safety holds for every fault; every case but the leader crash completes. The leader crash is a liveness gap of the harness's client (it re-targets only on a redirect, and the crashed server 0 never restarts), allowed by the case |
 | W4 | passes; repeated failed flushes (a lost durable majority) are a no-leader gap, as for the reference |
 | W5 | snapshot cases not demonstrated (no compaction or install yet, karyos#679); the retry after a leader change keeps safety and does not show the deduplicated retry |
@@ -53,13 +53,30 @@ all `--locked`.
 | --- | --- |
 | Executor | feasible: every OpenRaft task runs on the node's executor inside the harness's calls, at most 4,096 polls a call; the virtual clock moves only on a tick; no call in the tests hit the budget |
 | W1, W3, W4, W6 | the same results as `raft`, the same cases and seeds: W1, W4 and W6 pass, W3 keeps safety with the leader crash the harness client's gap, W4's lost durable majority a no-leader gap |
-| W2, W5 | as for `raft`: not demonstrated yet (karyos#679) |
+| W2, W5 | see karyos#679 below |
 | Determinism | a seed reproduces its run, and the same calls reproduce every node's executor interleaving (trace digest), asserted |
 | Pre-vote | OpenRaft's own pre-vote handler on the receiving node, reached through the adapter's RPC; never the trait's default, which synthesises a grant; tested against a control without it |
 | Restart of a leader | the durable vote is C4's `HardState`, which has no place for OpenRaft's `committed` bit, so `enable_leader_restore` is off: a restarted leader always stands for a new election, as in standard Raft (a finding for the comparison) |
 | Allocation | **fails the gate**, measured in the simulator only, at head 44dc4c88 (`tests/allocation.rs`, studiom4): W1, 32 clients, seed 1: 114 entries past the warm-up, 38,853 allocations and 32,521 frees, 341 and 286 per entry. All of OpenRaft's tasks run on the calling thread inside the core's calls, so the probe counts them. It also counts the adapter's request encoding in `step`, where `Request::eq` serializes both requests (`openraft_wire::request_bytes`) to correlate an answer; it does not count the real-process path's datagram framing and decoding. The figure moves with the adapter: earlier heads measured 44,710 and 41,035 allocations |
 | Adapter settings | RPC answers wait at least 20 ticks (OpenRaft's sequential append stream does not time an RPC out, and its own 2-tick TTL is shorter than a round trip on the slower links); retries back off 2, 4, 8 then up to 20 ticks, scaled to the 2-tick heartbeat instead of OpenRaft's 200 ms default. The same for every workload |
 | Real processes | demonstrated: three `raft-eval-node openraft` processes run `OpenRaft`, unchanged, on its executor inside the core's calls (no runtime of the process's own), over real files and UDP; its RPCs are encoded by the adapter (`openraft_wire`), since OpenRaft's `serde` feature is not admitted. They elect a leader and apply the same 20 commands in the same order |
+
+## Findings, W2 and W5 on both adapters (karyos#679)
+
+The same cases, limits, schedules and seeds for both; nothing is tuned per
+candidate (the parameters are plan issue 062's to freeze).
+
+| Workload | `raft` 0.7.0 | `openraft` 0.10.0-alpha.37 |
+| --- | --- | --- |
+| W2 limits taken | `recover_with`: one entry per append and at most `in_flight_entries` appends unacknowledged; queue and in-flight bytes refused in `propose` | `recover_with`: `max_payload_entries = in_flight_entries`, one append in flight per follower (its sequential stream); queue and in-flight bytes refused in `propose` |
+| W2 queue burst | refused with typed `Backpressure(Queue)`, nothing else refused; passes | the same; passes |
+| W2 in-flight burst, nominal | pass | pass |
+| W2 slow follower, log-read burst | pass | **fail, typed**: `NotBehind`: the leader commits 787 of the 1,000 entries (842 of 1,024) required while the follower is cut off, so the case cannot establish its slow follower |
+| W2 log-read limit | **not honoured through the harness's metered log**: raft-rs reads its `MemStorage` mirror | **not honoured through the harness's metered log**: OpenRaft reads the adapter's in-memory view |
+| W2 in-flight bytes | not reached at 256 B payloads (`W2::IN_FLIGHT_BYTES`) | the same |
+| W5 snapshot cases | `NotYet`: no compaction or install through the core; refused as `Unsupported`, follow-up plan issue 065 | the same |
+| W5 lost reply, leader change, retry | runs, keeps safety, **retry not shown**: the frozen schedule assumes the reference's leader, server 0 from step 0; moved 30 steps later it shows the retry | runs, keeps safety, **retry not shown**: OpenRaft's first leader need not be server 0 |
+| Reproducibility | every W2 case reproduces from its seed, asserted | the same |
 
 ## Amendment: RUSTSEC-2026-0543 (`chrono` unmaintained), karyos#690
 

@@ -13,7 +13,8 @@
 
 use karyos_raft_eval::openraft_core::OpenRaft;
 use karyos_raft_eval::raft_rs::RaftRs;
-use karyos_sim::harness::core::{ConsensusCore, Unsupported};
+use karyos_sim::harness::core::{ConsensusCore, Limit, Unsupported};
+use karyos_sim::harness::node::Observation;
 use karyos_sim::harness::workloads::{
     self, Failed, Liveness, RunError, W1, W2, W3, W3Fault, W4, W5, W6,
 };
@@ -98,7 +99,9 @@ fn w6_replays_every_seed<C: ConsensusCore>() {
 fn a_seed_reproduces_its_run<C: ConsensusCore>() {
     let mut cases = W1::skeleton().cases();
     cases.extend(W3::skeleton().cases());
-    for case in cases.iter().step_by(3) {
+    let mut cases: Vec<_> = cases.into_iter().step_by(3).collect();
+    cases.extend(W2::skeleton().cases().unwrap());
+    for case in &cases {
         for seed in SEEDS {
             let first = workloads::run::<C>(case, seed).unwrap();
             let second = workloads::run::<C>(case, seed).unwrap();
@@ -107,25 +110,72 @@ fn a_seed_reproduces_its_run<C: ConsensusCore>() {
     }
 }
 
-/// W2 needs declared limits, which this adapter does not take yet
-/// (karyos#679): every case is refused as not demonstrated, never run as
-/// a pass.
-fn w2_is_not_demonstrated_yet<C: ConsensusCore>() {
-    for case in W2::skeleton().cases().unwrap() {
-        assert!(
-            matches!(
-                workloads::run::<C>(&case, 1),
-                Err(RunError::Unsupported(Unsupported))
-            ),
-            "{}",
-            case.name
-        );
+/// W2's skeleton under the declared limits (karyos#679), the same cases
+/// and limits for both cores: the queue's burst is refused with a typed
+/// `Backpressure(Queue)` and nothing else is; every case keeps safety; and
+/// each case passes, or fails with the typed reason this function is told
+/// to expect for that core (`short`: the slow-follower cases whose leader
+/// did not commit the required entries while the follower was cut off).
+fn w2<C: ConsensusCore>(short: &[&str]) {
+    let w2 = W2::skeleton();
+    let cases = w2.cases().unwrap();
+    assert_eq!(cases.len(), 5);
+    for case in &cases {
+        let outcome = workloads::run::<C>(case, 1).unwrap();
+        assert!(outcome.safety.is_ok(), "{}", case.name);
+        let pushed: Vec<_> = outcome
+            .observations
+            .iter()
+            .filter_map(|observation| match observation {
+                Observation::Backpressure { limit, .. } => Some(*limit),
+                _ => None,
+            })
+            .collect();
+        if case.name.contains("burst 4x queue") {
+            assert!(!pushed.is_empty(), "{}", case.name);
+            assert!(
+                pushed.iter().all(|limit| *limit == Limit::Queue),
+                "{}",
+                case.name
+            );
+        } else {
+            assert!(pushed.is_empty(), "{}: {pushed:?}", case.name);
+        }
+        let result = workloads::pass(case, &outcome);
+        if short.iter().any(|name| case.name.contains(name)) {
+            assert!(
+                matches!(result, Err(Failed::NotBehind { .. })),
+                "{}: {result:?}",
+                case.name
+            );
+        } else {
+            assert_eq!(result, Ok(None), "{}", case.name);
+        }
     }
 }
 
-/// W5's snapshot cases need compaction and install, which this adapter
-/// does not take yet (karyos#679), and are refused as not demonstrated;
-/// its retry after a leader change runs, and its retry is not shown.
+fn w2_raft<C: ConsensusCore>() {
+    w2::<C>(&[]);
+}
+
+/// OpenRaft commits fewer entries than W2 requires while the follower is
+/// cut off (787 of 1,000 and 842 of 1,024 at seed 1): the case cannot
+/// establish its slow follower, a typed failure, not a pass.
+fn w2_openraft<C: ConsensusCore>() {
+    w2::<C>(&["slow follower", "log-read burst"]);
+}
+
+/// W5 (karyos#679). Its snapshot cases need compaction and a snapshot
+/// installed through the core, which neither adapter takes: they are
+/// refused as not demonstrated (`Unsupported`), never passed, and wait
+/// for plan issue 065 (snapshot install through the core). Its retry after
+/// a lost reply and a leader change runs and keeps safety; its retry is
+/// not shown for either candidate, because the frozen schedule (reply cut
+/// at step 12, handover from server 0 to 1 at step 22) assumes the
+/// reference's leader, server 0 from step 0, while the candidates elect
+/// their first leader later (raft-rs) or elsewhere (OpenRaft): moved 30
+/// steps later, the same case shows the retry for raft-rs. The schedule is
+/// the comparison's to freeze (plan issue 062), not tuned here.
 fn w5_is_not_demonstrated_yet<C: ConsensusCore>() {
     for case in W5::skeleton().cases().unwrap() {
         let run = workloads::run::<C>(&case, 1);
@@ -182,11 +232,6 @@ macro_rules! suite {
             }
 
             #[test]
-            fn w2_is_not_demonstrated_yet() {
-                super::w2_is_not_demonstrated_yet::<$core>();
-            }
-
-            #[test]
             fn w5_is_not_demonstrated_yet() {
                 super::w5_is_not_demonstrated_yet::<$core>();
             }
@@ -196,3 +241,13 @@ macro_rules! suite {
 
 suite!(raft, RaftRs);
 suite!(openraft, OpenRaft);
+
+#[test]
+fn raft_w2_honours_its_limits() {
+    w2_raft::<RaftRs>();
+}
+
+#[test]
+fn openraft_w2_honours_its_limits_and_reports_a_short_gap() {
+    w2_openraft::<OpenRaft>();
+}

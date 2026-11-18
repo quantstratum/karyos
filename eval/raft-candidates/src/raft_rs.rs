@@ -42,7 +42,8 @@
 
 use karyos_cluster::{Entry, HardState};
 use karyos_sim::harness::core::{
-    ConsensusCore, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
+    ConsensusCore, Limit, Limits, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
+    Unsupported,
 };
 use karyos_sim::net::NodeId;
 use raft::eraftpb::{self, ConfState, Snapshot};
@@ -88,6 +89,30 @@ pub fn election_ticks(id: NodeId, voters: &[NodeId]) -> (usize, usize) {
     let stagger = position.saturating_mul(3);
     let min = ELECTION_TICKS.saturating_add(stagger);
     (min, min.saturating_add(1))
+}
+
+/// The W2 refusal of a proposal of `command` by a leader whose log ends
+/// at `last` and commits `committed`: a command no append could carry
+/// within the in-flight bytes, or one past the queue of proposals held and
+/// not committed. A count that does not fit fails closed, as a full queue.
+///
+/// # Errors
+///
+/// [`Refused::Backpressure`] naming the limit.
+pub fn refuse_past(
+    limits: &Limits,
+    command: &[u8],
+    last: u64,
+    committed: u64,
+) -> Result<(), Refused> {
+    if u64::try_from(command.len()).map_or(true, |bytes| bytes > limits.in_flight_bytes) {
+        return Err(Refused::Backpressure(Limit::InFlightBytes));
+    }
+    let held = last.checked_sub(committed);
+    if held.is_none_or(|held| held >= limits.queue) {
+        return Err(Refused::Backpressure(Limit::Queue));
+    }
+    Ok(())
 }
 
 /// raft-rs's id of harness node `id`: raft-rs refuses 0.
@@ -176,6 +201,8 @@ pub struct RaftCore<const PRE_VOTE: bool> {
     last_tick: Option<u64>,
     /// The clock at the last tick, as the event time of what it proposes.
     now: u64,
+    /// The declared limits (W2), when started with them.
+    limits: Option<Limits>,
 }
 
 impl<const PRE_VOTE: bool> std::fmt::Debug for RaftCore<PRE_VOTE> {
@@ -219,7 +246,12 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
         self.light = None;
     }
 
-    fn build(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Option<RawNode<MemStorage>> {
+    fn build(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: Option<&Limits>,
+        log: &mut LogView<'_>,
+    ) -> Option<RawNode<MemStorage>> {
         let voters: Vec<u64> = peers.iter().copied().map(raft_id).collect();
         let storage = MemStorage::new_with_conf_state(ConfState::from((voters.clone(), vec![])));
         let mut applied = 0;
@@ -252,8 +284,18 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
             heartbeat_tick: HEARTBEAT_TICKS,
             min_election_tick: min,
             max_election_tick: max,
-            max_size_per_msg: MAX_SIZE_PER_MSG,
-            max_inflight_msgs: MAX_INFLIGHT_MSGS,
+            // Under declared limits, one entry per append (raft-rs keeps at
+            // least one whatever the size cap) and at most the in-flight
+            // entries' count of appends unacknowledged: entries in flight
+            // never pass the limit.
+            max_size_per_msg: if limits.is_some() {
+                0
+            } else {
+                MAX_SIZE_PER_MSG
+            },
+            max_inflight_msgs: limits.map_or(Some(MAX_INFLIGHT_MSGS), |limits| {
+                usize::try_from(limits.in_flight_entries).ok()
+            })?,
             check_quorum: true,
             pre_vote: PRE_VOTE,
             applied,
@@ -269,12 +311,29 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
         Self {
-            node: Self::build(id, peers, log),
+            node: Self::build(id, peers, None, log),
             pending: None,
             light: None,
             last_tick: None,
             now: 0,
+            limits: None,
         }
+    }
+
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, Unsupported> {
+        Ok(Self {
+            node: Self::build(id, peers, Some(limits), log),
+            pending: None,
+            light: None,
+            last_tick: None,
+            now: 0,
+            limits: Some(*limits),
+        })
     }
 
     fn propose(&mut self, command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), Refused> {
@@ -284,6 +343,14 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
         };
         if node.raft.state != StateRole::Leader {
             return Err(NotLeader { leader }.into());
+        }
+        if let Some(limits) = self.limits {
+            refuse_past(
+                &limits,
+                &command,
+                node.raft.raft_log.last_index(),
+                node.raft.raft_log.committed,
+            )?;
         }
         // Dropped while it hands its leadership over, or past raft-rs's
         // own uncommitted limit: either way, not taken.
