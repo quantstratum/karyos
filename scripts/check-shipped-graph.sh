@@ -11,8 +11,10 @@
 #   own, must name no candidate and not the evaluation crate;
 # - Tokio is refused from the same roots except the crates it is admitted
 #   for: karyos-control, under the owner-admitted HTTP stack (karyos#704,
-#   ACS 71206). A crate that reaches Tokio through an admitted one is still
-#   refused (karyos#953 review).
+#   ACS 71206). It is checked over the whole workspace with its features
+#   unified, path by path: a crate that reaches Tokio through an admitted
+#   one, or through a feature an admitted one turns on, is still refused
+#   (karyos#953 review).
 #
 # Each graph is checked twice: with the default features, and with every
 # feature, so an optional dependency behind a nondefault feature is caught
@@ -68,22 +70,48 @@ check() {
     fi
 }
 
-# The admitted crates that are members here: cargo refuses to exclude a
-# package that is not one.
-members="$("$cargo" metadata --manifest-path "$manifest" --no-deps --format-version 1 --locked |
-    python3 -c 'import json,sys; print("\n".join(p["name"] for p in json.load(sys.stdin)["packages"]))')"
-excluded=()
-for name in "${admitted[@]}"; do
-    if grep -qx -- "$name" <<<"$members"; then
-        excluded+=(--exclude "$name")
+# Tokio over the whole workspace, its features unified as a workspace
+# build unifies them: every path from Tokio up to a workspace member must
+# end at an admitted crate. A dependency whose optional Tokio feature an
+# admitted crate turns on reaches every other member that uses it, and is
+# refused from that member (karyos#953 review: excluding the admitted
+# crates first missed that). Paths come from cargo's inverted tree without
+# deduplication; a line whose successor is not deeper ends a path, at the
+# member that is its root.
+check_tokio() {
+    local label="$1"
+    shift
+    local names tree roots
+    names="$("$cargo" tree --manifest-path "$manifest" "$@" -e normal,build --target all --prefix none --locked)"
+    if ! awk '{print $1}' <<<"$names" | grep -qx tokio; then
+        return
     fi
-done
+    tree="$("$cargo" tree --manifest-path "$manifest" "$@" -e normal,build --target all \
+        --prefix depth --no-dedupe --locked -i tokio)"
+    roots="$(python3 -c '
+import re, sys
+admitted = set(sys.argv[1:])
+lines = [re.match(r"(\d+)(\S+)", line).groups() for line in sys.stdin.read().splitlines() if line]
+roots = set()
+for at, (depth, name) in enumerate(lines):
+    following = lines[at + 1][0] if at + 1 < len(lines) else "-1"
+    if int(following) <= int(depth) and name not in admitted:
+        roots.add(name)
+print("\n".join(sorted(roots)))
+' ${admitted[@]+"${admitted[@]}"} <<<"$tree")"
+    if [ -n "$roots" ]; then
+        echo "check-shipped-graph: $label reaches a crate it may not ship:" >&2
+        while IFS= read -r name; do
+            echo "  tokio, from $name" >&2
+        done <<<"$roots"
+        status=1
+    fi
+}
 
 check "$candidates" "the workspace" --workspace
 check "$candidates" "the workspace, every feature" --workspace --all-features
-check "$tokio" "the workspace but the Tokio-admitted crates" --workspace ${excluded[@]+"${excluded[@]}"}
-check "$tokio" "the workspace but the Tokio-admitted crates, every feature" \
-    --workspace --all-features ${excluded[@]+"${excluded[@]}"}
+check_tokio "the workspace" --workspace
+check_tokio "the workspace, every feature" --workspace --all-features
 check "$candidates|$tokio" "$package" -p "$package"
 check "$candidates|$tokio" "$package, every feature" -p "$package" --all-features
 exit $status

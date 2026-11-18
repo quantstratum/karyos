@@ -99,12 +99,15 @@ applies them:
   `raft-proto`, `protobuf-build`, `openraft`, `openraft-rt`,
   `openraft-rt-tokio`, `openraft-macros` or `karyos-raft-eval` appears
   anywhere, or `tokio` appears outside the crates it is admitted for
-  (`karyos-control`, the owner-admitted HTTP stack: karyos#704, ACS 71206;
-  a crate reaching Tokio through `karyos-control` is still refused).
+  (`karyos-control`, the owner-admitted HTTP stack: karyos#704, ACS 71206).
+  Tokio is checked in the workspace graph with its features unified, path
+  by path: a crate reaching it through `karyos-control`, or through a
+  shared dependency's feature that `karyos-control` turns on, is still
+  refused.
   `scripts/check-shipped-graph-selftest.sh`, run with it, proves in a
   throwaway workspace that the check fails with exactly the expected
-  diagnostic on a plain, a feature-gated and a transitively admitted
-  Tokio, and on a candidate in the admitted crate, and passes silently on
+  diagnostic on a plain, a feature-gated, a transitively admitted and a
+  feature-unified Tokio, and on a candidate in the admitted crate, and passes silently on
   Tokio in the admitted crate and on a clean graph. The unused `karyos-tools` to `karyos-sim` edge, through which a
   candidate placed in `karyos-sim` would reach `karyosd`, is karyos#926.
 - **Versions and features** are exactly the record's: `raft` without
