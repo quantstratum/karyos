@@ -53,7 +53,7 @@ check() {
     shift 2
     local tree names found
     # Captured first: a cargo failure stops the check, never reads as clean.
-    tree="$("$cargo" tree --manifest-path "$manifest" "$@" -e normal,build --target all --prefix none --locked)"
+    tree="$("$cargo" tree --quiet --manifest-path "$manifest" "$@" -e normal,build --target all --prefix none --locked)"
     names="$(awk '{print $1}' <<<"$tree" | sort -u)"
     if [ -z "$names" ]; then
         echo "check-shipped-graph: cargo tree listed nothing for $label" >&2
@@ -82,11 +82,11 @@ check_tokio() {
     local label="$1"
     shift
     local names tree roots
-    names="$("$cargo" tree --manifest-path "$manifest" "$@" -e normal,build --target all --prefix none --locked)"
+    names="$("$cargo" tree --quiet --manifest-path "$manifest" "$@" -e normal,build --target all --prefix none --locked)"
     if ! awk '{print $1}' <<<"$names" | grep -qx tokio; then
         return
     fi
-    tree="$("$cargo" tree --manifest-path "$manifest" "$@" -e normal,build --target all \
+    tree="$("$cargo" tree --quiet --manifest-path "$manifest" "$@" -e normal,build --target all \
         --prefix depth --no-dedupe --locked -i tokio)"
     roots="$(python3 -c '
 import re, sys
