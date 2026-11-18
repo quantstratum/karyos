@@ -23,7 +23,8 @@
 //! `rand::thread_rng()` from `[min_election_tick, max_election_tick)`.
 //! The adapter sets `max = min + 1`, so the draw has one value and the
 //! run is reproducible from its seed; to keep elections from splitting,
-//! each node's timeout is staggered by its id ([`election_ticks`]).
+//! each node's timeout is staggered by its position in the voter set
+//! ([`election_ticks`]), so no two voters share one.
 //!
 //! **Pre-vote** (SPEC.md §9, "pre-vote") is raft-rs's own `pre_vote`, on
 //! in [`RaftRs`] and off only in [`RaftRsNoPreVote`], the negative
@@ -76,13 +77,15 @@ pub type RaftRs = RaftCore<true>;
 /// pre-vote test, never evaluated.
 pub type RaftRsNoPreVote = RaftCore<false>;
 
-/// Node `id`'s election timeout, `[min, max)` in ticks: one value, so
-/// raft-rs's `thread_rng` draw is deterministic, staggered by id so
-/// elections do not split forever.
+/// Node `id`'s election timeout among `voters`, `[min, max)` in ticks:
+/// one value, so raft-rs's `thread_rng` draw is deterministic, staggered
+/// by the node's position among the voters (and itself) in id order, so
+/// no two voters share a timeout and elections do not split forever,
+/// whatever the ids (karyos#956 review).
 #[must_use]
-pub fn election_ticks(id: NodeId) -> (usize, usize) {
-    // At most 6 extra ticks; the modulus keeps it small for any id.
-    let stagger = usize::try_from(id % 3).unwrap_or(0).saturating_mul(3);
+pub fn election_ticks(id: NodeId, voters: &[NodeId]) -> (usize, usize) {
+    let position = voters.iter().filter(|&&voter| voter < id).count();
+    let stagger = position.saturating_mul(3);
     let min = ELECTION_TICKS.saturating_add(stagger);
     (min, min.saturating_add(1))
 }
@@ -242,7 +245,7 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
         if let Some(state) = log.hard_state() {
             storage.wl().set_hardstate(raft_hard_state(&state));
         }
-        let (min, max) = election_ticks(id);
+        let (min, max) = election_ticks(id, peers);
         let config = Config {
             id: raft_id(id),
             election_tick: ELECTION_TICKS,
@@ -436,6 +439,7 @@ impl<const PRE_VOTE: bool> crate::process::Wire for RaftCore<PRE_VOTE> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn an_entry_round_trips_through_raft_rs_with_its_event_time() {
@@ -459,13 +463,25 @@ mod tests {
 
     #[test]
     fn each_election_timeout_has_one_value_so_the_draw_is_deterministic() {
-        for id in 0..8 {
-            let (min, max) = election_ticks(id);
+        let voters: Vec<NodeId> = (0..8).collect();
+        for &id in &voters {
+            let (min, max) = election_ticks(id, &voters);
             assert!(min >= ELECTION_TICKS);
             assert_eq!(max, min + 1);
         }
-        assert_ne!(election_ticks(0), election_ticks(1));
-        assert_ne!(election_ticks(1), election_ticks(2));
+    }
+
+    /// The karyos#956 review: ids with the same remainder must not share
+    /// a timeout, or synchronized voters split every election.
+    #[test]
+    fn no_two_voters_share_an_election_timeout() {
+        for voters in [vec![0, 3, 6], vec![1, 4, 7, 10, 13], vec![0, 1, 2]] {
+            let ticks: BTreeSet<(usize, usize)> = voters
+                .iter()
+                .map(|&id| election_ticks(id, &voters))
+                .collect();
+            assert_eq!(ticks.len(), voters.len(), "{voters:?}");
+        }
     }
 
     #[test]

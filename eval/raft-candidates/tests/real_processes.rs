@@ -18,19 +18,40 @@ use std::time::{Duration, Instant};
 const NODES: u32 = 3;
 const COMMANDS: u64 = 20;
 
-/// A free loopback port: bound, read, released.
-fn free_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// Distinct free loopback addresses, one per node: every socket stays
+/// bound until all are chosen, so the OS cannot hand out one port twice.
+fn free_addresses() -> Vec<String> {
+    let sockets: Vec<UdpSocket> = (0..NODES)
+        .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
+        .collect();
+    sockets
+        .iter()
+        .map(|socket| socket.local_addr().unwrap().to_string())
+        .collect()
 }
+
+/// Attempts at the run: a port can still be taken by another process
+/// between its release here and a child's bind; only that failure is
+/// retried, with fresh ports (karyos#956 review).
+const ATTEMPTS: usize = 3;
 
 #[test]
 fn three_processes_commit_and_apply_the_same_commands() {
-    let peers: Vec<String> = (0..NODES)
-        .map(|id| format!("{id}=127.0.0.1:{}", free_port()))
+    for attempt in 1..=ATTEMPTS {
+        match run_once() {
+            Ok(()) => return,
+            Err(stderr) if attempt < ATTEMPTS && stderr.contains("in use") => {}
+            Err(stderr) => panic!("{stderr}"),
+        }
+    }
+}
+
+/// One run; `Err` with a failed child's stderr.
+fn run_once() -> Result<(), String> {
+    let peers: Vec<String> = free_addresses()
+        .into_iter()
+        .enumerate()
+        .map(|(id, address)| format!("{id}={address}"))
         .collect();
     let root = std::env::temp_dir().join(format!(
         "karyos-raft-eval-{}-{}",
@@ -51,10 +72,21 @@ fn three_processes_commit_and_apply_the_same_commands() {
         })
         .collect();
     let deadline = Instant::now() + Duration::from_secs(60);
-    while children
-        .iter_mut()
-        .any(|child| child.try_wait().unwrap().is_none())
-    {
+    loop {
+        let statuses: Vec<_> = children
+            .iter_mut()
+            .map(|child| child.try_wait().unwrap())
+            .collect();
+        if statuses.iter().all(Option::is_some) {
+            break;
+        }
+        // A failed child (a port taken) stalls the others: stop them.
+        if statuses.iter().flatten().any(|status| !status.success()) {
+            for child in &mut children {
+                let _ = child.kill();
+            }
+            break;
+        }
         if Instant::now() > deadline {
             for child in &mut children {
                 let _ = child.kill();
@@ -63,19 +95,20 @@ fn three_processes_commit_and_apply_the_same_commands() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let reports: Vec<String> = children
-        .into_iter()
-        .map(|child| {
-            let output = child.wait_with_output().unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout).unwrap().trim().to_owned()
-        })
-        .collect();
+    let mut reports = Vec::new();
+    let mut failed = None;
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        if output.status.success() {
+            reports.push(String::from_utf8(output.stdout).unwrap().trim().to_owned());
+        } else if failed.as_ref().is_none_or(String::is_empty) {
+            failed = Some(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+    }
     let _ = std::fs::remove_dir_all(&root);
+    if let Some(stderr) = failed {
+        return Err(stderr);
+    }
     assert!(
         reports[0].starts_with(&format!("applied {COMMANDS} ")),
         "{reports:?}"
@@ -84,4 +117,5 @@ fn three_processes_commit_and_apply_the_same_commands() {
         reports.iter().all(|report| *report == reports[0]),
         "{reports:?}"
     );
+    Ok(())
 }
