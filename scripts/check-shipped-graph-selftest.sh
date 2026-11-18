@@ -13,10 +13,10 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 make_workspace() {
-    local shipped="$1" features="$2" admitted="${3:-}"
+    local shipped="$1" features="$2" admitted="${3:-}" middle="${4:-}"
     rm -rf "$work/ws" "$work/vendor"
     # Outside the workspace directory, so cargo does not make them members.
-    mkdir -p "$work/ws/shipped/src" "$work/ws/admitted/src" "$work/vendor/shared/src"
+    mkdir -p "$work/ws/shipped/src" "$work/ws/admitted/src" "$work/ws/middle/src" "$work/vendor/shared/src"
     local name
     for name in tokio raft; do
         mkdir -p "$work/vendor/$name/src"
@@ -28,13 +28,16 @@ make_workspace() {
     printf '[package]\nname = "shared"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n[dependencies]\ntokio = { path = "../tokio", optional = true }\n\n[features]\nrt = ["dep:tokio"]\n' \
         >"$work/vendor/shared/Cargo.toml"
     : >"$work/vendor/shared/src/lib.rs"
-    printf '[workspace]\nmembers = ["shipped", "admitted"]\nresolver = "2"\n' >"$work/ws/Cargo.toml"
+    printf '[workspace]\nmembers = ["shipped", "admitted", "middle"]\nresolver = "2"\n' >"$work/ws/Cargo.toml"
     printf '[package]\nname = "shipped"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n[dependencies]\n%s\n\n[features]\n%s\n' \
         "$shipped" "$features" >"$work/ws/shipped/Cargo.toml"
     printf '[package]\nname = "admitted"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n[dependencies]\n%s\n' \
         "$admitted" >"$work/ws/admitted/Cargo.toml"
     : >"$work/ws/shipped/src/lib.rs"
+    printf '[package]\nname = "middle"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n[dependencies]\n%s\n' \
+        "$middle" >"$work/ws/middle/Cargo.toml"
     : >"$work/ws/admitted/src/lib.rs"
+    : >"$work/ws/middle/src/lib.rs"
     "$cargo" generate-lockfile --offline --manifest-path "$work/ws/Cargo.toml" >/dev/null 2>&1
 }
 
@@ -101,6 +104,30 @@ make_workspace 'shared = { path = "../../vendor/shared" }' '' \
     'shared = { path = "../../vendor/shared", features = ["rt"] }'
 expect "tokio through a feature the admitted crate unifies" \
     "$ws" "tokio, from shipped" "$every" "tokio, from shipped"
+# A member between Tokio and the admitted crate ships Tokio too: refused,
+# though the path ends at the admitted crate (karyos#953 review).
+make_workspace '' '' 'middle = { path = "../middle" }' "$tokio_dep"
+expect "tokio through a member the admitted crate uses" \
+    "$ws" "tokio, from middle" "$every" "tokio, from middle"
+# A long cargo tree after the tokio line: a search through a pipe could
+# stop reading early and lose the match under pipefail (karyos#953
+# review). The wrapper appends 200,000 lines to every plain cargo tree.
+cat >"$work/cargo-long" <<WRAPPER
+#!/usr/bin/env bash
+set -euo pipefail
+"$cargo" "\$@"
+if [ "\${1:-}" = tree ] && [[ " \$* " != *" -i "* ]]; then
+    seq 200000 | sed 's/^/filler-crate v0.0./'
+fi
+WRAPPER
+chmod +x "$work/cargo-long"
+make_workspace "$tokio_dep" ''
+saved="$cargo"
+cargo="$work/cargo-long"
+expect "a plain dependency on tokio, behind a long tree" \
+    "$ws" "tokio, from shipped" "$every" "tokio, from shipped" \
+    "shipped" "tokio" "shipped, every feature" "tokio"
+cargo="$saved"
 # A candidate is refused everywhere, the admitted crate included.
 make_workspace '' '' "$raft_dep"
 expect "a candidate in the admitted crate" \

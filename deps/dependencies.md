@@ -100,10 +100,11 @@ applies them:
   `openraft-rt-tokio`, `openraft-macros` or `karyos-raft-eval` appears
   anywhere, or `tokio` appears outside the crates it is admitted for
   (`karyos-control`, the owner-admitted HTTP stack: karyos#704, ACS 71206).
-  Tokio is checked in the workspace graph with its features unified, path
-  by path: a crate reaching it through `karyos-control`, or through a
-  shared dependency's feature that `karyos-control` turns on, is still
-  refused.
+  Tokio is checked in the workspace graph with its features unified:
+  every workspace member from which it is reachable must be admitted, so
+  a crate reaching it through `karyos-control`, through a member that
+  `karyos-control` uses, or through a shared dependency's feature that
+  `karyos-control` turns on, is still refused.
   `scripts/check-shipped-graph-selftest.sh`, run with it, proves in a
   throwaway workspace that the check fails with exactly the expected
   diagnostic on a plain, a feature-gated, a transitively admitted and a
