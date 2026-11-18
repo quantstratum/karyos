@@ -58,7 +58,7 @@ all `--locked`.
 | Pre-vote | OpenRaft's own pre-vote handler on the receiving node, reached through the adapter's RPC; never the trait's default, which synthesises a grant; tested against a control without it |
 | Allocation | **fails the gate**: W1, 32 clients, seed 1: 114 entries past the warm-up, 41,035 allocations and 38,953 frees, 360 and 342 per entry |
 | Adapter settings | RPC answers wait at least 20 ticks (OpenRaft's sequential append stream does not time an RPC out, and its own 2-tick TTL is shorter than a round trip on the slower links); retries back off 2, 4, 8 then up to 20 ticks, scaled to the 2-tick heartbeat instead of OpenRaft's 200 ms default. The same for every workload |
-| Real processes | not demonstrated, as for `raft` |
+| Real processes | demonstrated: three `raft-eval-node openraft` processes run `OpenRaft`, unchanged, on its executor inside the core's calls (no runtime of the process's own), over real files and UDP; its RPCs are encoded by the adapter (`openraft_wire`), since OpenRaft's `serde` feature is not admitted. They elect a leader and apply the same 20 commands in the same order |
 
 ## Amendment: RUSTSEC-2026-0543 (`chrono` unmaintained), karyos#690
 

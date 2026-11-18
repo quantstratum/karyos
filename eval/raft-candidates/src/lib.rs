@@ -15,6 +15,7 @@
 //!   `openraft-rt`'s runtime abstraction (owner item 33).
 //! - [`openraft_core`]: `openraft` 0.10.0-alpha.37, default features off,
 //!   on that executor.
+//! - [`openraft_wire`]: the bytes of its messages between processes.
 //! - [`raft_rs`]: `raft` 0.7.0 (TiKV's raft-rs), its `RawNode` driven by
 //!   the harness's node.
 //! - [`process`]: the same cores in real processes: C4's log on real
@@ -24,6 +25,7 @@
 
 pub mod executor;
 pub mod openraft_core;
+pub mod openraft_wire;
 pub mod process;
 pub mod raft_rs;
 pub mod variant;

@@ -244,17 +244,24 @@ impl fmt::Debug for Response {
     }
 }
 
-/// Two RPCs are equal when they are the same message (a duplicate the
-/// network made shares it).
+/// Two RPCs are equal when their bytes are ([`crate::openraft_wire`]): the
+/// same comparison in the simulator and between real processes. Two that
+/// cannot be encoded are equal only when they are the same message.
 impl PartialEq for Request {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Append(a), Self::Append(b)) => Arc::ptr_eq(a, b),
-            (Self::Vote(a), Self::Vote(b)) | (Self::PreVote(a), Self::PreVote(b)) => {
-                Arc::ptr_eq(a, b)
-            }
-            (Self::TransferLeader(a), Self::TransferLeader(b)) => Arc::ptr_eq(a, b),
-            _ => false,
+        match (
+            crate::openraft_wire::request_bytes(self),
+            crate::openraft_wire::request_bytes(other),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => match (self, other) {
+                (Self::Append(a), Self::Append(b)) => Arc::ptr_eq(a, b),
+                (Self::Vote(a), Self::Vote(b)) | (Self::PreVote(a), Self::PreVote(b)) => {
+                    Arc::ptr_eq(a, b)
+                }
+                (Self::TransferLeader(a), Self::TransferLeader(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            },
         }
     }
 }
@@ -331,8 +338,9 @@ struct Waiting {
 
 /// Whether an answer from `from`, echoing `request`, answers `waiting`.
 /// Numbers restart with each incarnation of a node, so a number alone could
-/// match a request of an earlier one: the peer and the request itself
-/// (shared, never rebuilt) must match too.
+/// match a request of an earlier one: the peer and the request's content
+/// must match too. An earlier answer to an equal request (the same vote,
+/// log position and entries) answers this one as well.
 fn answers(waiting: &Waiting, from: NodeId, request: &Request) -> bool {
     waiting.target == from && waiting.request == *request
 }
@@ -1006,31 +1014,38 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
     }
 }
 
+impl<const PRE_VOTE: bool> crate::process::Wire for OpenRaftCore<PRE_VOTE> {
+    fn encode(message: &Message) -> Option<Vec<u8>> {
+        crate::openraft_wire::encode(message)
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Message> {
+        crate::openraft_wire::decode(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn vote_request() -> Request {
-        Request::Vote(Arc::new(VoteRequest::new(
-            OVote {
-                leader_id: openraft::impls::leader_id_std::LeaderId {
-                    term: 1,
-                    voted_for: 0,
-                },
-                committed: false,
-            },
-            None,
-        )))
-    }
 
     /// The regression of the karyos#959 review: after a restart the RPC
     /// numbers start again, so an answer to an earlier incarnation's
     /// request can carry the number of a new one. It is refused, as is an
     /// answer from another peer; only the request sent, from its peer,
     /// is answered.
+    fn vote_request_of(term: u64) -> Request {
+        Request::Vote(Arc::new(VoteRequest::new(
+            OVote {
+                leader_id: openraft::impls::leader_id_std::LeaderId { term, voted_for: 0 },
+                committed: false,
+            },
+            None,
+        )))
+    }
+
     #[test]
     fn an_answer_is_accepted_only_for_the_request_sent_to_that_peer() {
-        let sent = vote_request();
+        let sent = vote_request_of(2);
         let (answer, _receiver) = oneshot::channel();
         let waiting = Waiting {
             target: 2,
@@ -1039,8 +1054,10 @@ mod tests {
         };
         // The same number, an earlier incarnation's request: an equal
         // value, but not the request sent.
-        assert!(!answers(&waiting, 2, &vote_request()));
+        assert!(!answers(&waiting, 2, &vote_request_of(1)));
         assert!(!answers(&waiting, 1, &sent));
         assert!(answers(&waiting, 2, &sent));
+        // Decoded in another process: the same content answers.
+        assert!(answers(&waiting, 2, &vote_request_of(2)));
     }
 }
