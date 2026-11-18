@@ -32,7 +32,32 @@ if [ -z "${PROTOC:-}" ]; then
     esac
 fi
 export PROTOC
-echo "raft-eval: protoc $("$PROTOC" --version) at $PROTOC"
+# Checked before anything runs: a protoc that cannot run, or is not 3.x,
+# stops the gate (karyos#956 review).
+if ! version="$("$PROTOC" --version 2>&1)"; then
+    echo "raft-eval: protoc at $PROTOC cannot run: $version" >&2
+    exit 1
+fi
+case "$version" in
+    "libprotoc 3."*) ;;
+    *)
+        echo "raft-eval: raft-proto needs protoc 3.x; $PROTOC is $version" >&2
+        exit 1
+        ;;
+esac
+# raft-proto's build script does not rerun when PROTOC changes, so the
+# generated code is tied to the compiler here: a different protoc (path,
+# version or bytes) than the last build's cleans raft-proto first, and the
+# printed provenance always describes the build tested.
+identity="$version $PROTOC $({ sha256sum "$PROTOC" 2>/dev/null || shasum -a 256 "$PROTOC"; } | cut -d' ' -f1)"
+stamp="${CARGO_TARGET_DIR:-$here/target}/raft-eval-protoc"
+if [ "$(cat "$stamp" 2>/dev/null || true)" != "$identity" ]; then
+    "$cargo" clean --locked -p raft-proto
+    "$cargo" clean --locked --release -p raft-proto
+    mkdir -p "$(dirname "$stamp")"
+    printf '%s\n' "$identity" >"$stamp"
+fi
+echo "raft-eval: $identity"
 
 "$cargo" fmt -- --check
 "$cargo" clippy --all-targets --locked -- -D warnings
