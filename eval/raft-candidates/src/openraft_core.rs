@@ -45,7 +45,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_channel::oneshot;
 use futures_util::StreamExt;
@@ -279,12 +281,15 @@ impl PartialEq for Response {
 }
 
 /// The adapter's messages between nodes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Message {
     /// An RPC, numbered by its sender.
     Request {
-        /// The sender's number for it.
+        /// The sender's number for it, unique within its incarnation.
         id: u64,
+        /// The sender's incarnation: drawn at each recovery, so a number
+        /// reused after a restart names a different request.
+        incarnation: u64,
         /// The RPC.
         request: Request,
     },
@@ -292,6 +297,8 @@ pub enum Message {
     Response {
         /// The request's number.
         id: u64,
+        /// The request's incarnation, echoed.
+        incarnation: u64,
         /// The request answered, echoed: the sender accepts the answer
         /// only for the very request it sent under `id`, to that peer
         /// (karyos#959 review).
@@ -299,6 +306,48 @@ pub enum Message {
         /// The answer.
         response: Option<Response>,
     },
+}
+
+/// The incarnation is left out: it is drawn from the wall clock, so the
+/// trace stays a function of the harness's seed. It only decides whether
+/// a stale answer is dropped, which any two distinct draws decide alike.
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request { id, request, .. } => f
+                .debug_struct("Request")
+                .field("id", id)
+                .field("request", request)
+                .finish_non_exhaustive(),
+            Self::Response {
+                id,
+                request,
+                response,
+                ..
+            } => f
+                .debug_struct("Response")
+                .field("id", id)
+                .field("request", request)
+                .field("response", response)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// A fresh incarnation: distinct for every recovery in this process (a
+/// counter) and, through its start from the wall clock's nanoseconds, from
+/// any earlier process of the same node (karyos#959 review).
+fn next_incarnation() -> u64 {
+    static NEXT: OnceLock<AtomicU64> = OnceLock::new();
+    NEXT.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        // The low 64 bits: they change every nanosecond.
+        #[allow(clippy::cast_possible_truncation)]
+        AtomicU64::new(nanos as u64)
+    })
+    .fetch_add(1, Ordering::Relaxed)
 }
 
 /// What OpenRaft's storage, network and state machine share with the
@@ -325,6 +374,8 @@ struct Io {
     /// and where its answer goes.
     waiting: BTreeMap<u64, Waiting>,
     next_rpc: u64,
+    /// This recovery's incarnation, sent with every RPC.
+    incarnation: u64,
     applied: Option<OLogId>,
     membership: StoredMembershipOf,
 }
@@ -336,13 +387,20 @@ struct Waiting {
     answer: oneshot::Sender<Option<Response>>,
 }
 
-/// Whether an answer from `from`, echoing `request`, answers `waiting`.
-/// Numbers restart with each incarnation of a node, so a number alone could
-/// match a request of an earlier one: the peer and the request's content
-/// must match too. An earlier answer to an equal request (the same vote,
-/// log position and entries) answers this one as well.
-fn answers(waiting: &Waiting, from: NodeId, request: &Request) -> bool {
-    waiting.target == from && waiting.request == *request
+/// Whether an answer from `from`, for `incarnation`, echoing `request`,
+/// answers `waiting` (found under the answer's number). Numbers restart
+/// with each incarnation of a node, so the answer must carry this
+/// incarnation: an answer to an earlier one is dropped even when its
+/// request is byte-identical to the one now waiting. The peer and the
+/// echoed request must match too.
+fn answers(
+    waiting: &Waiting,
+    current: u64,
+    from: NodeId,
+    incarnation: u64,
+    request: &Request,
+) -> bool {
+    incarnation == current && waiting.target == from && waiting.request == *request
 }
 
 type Shared = Arc<Mutex<Io>>;
@@ -573,8 +631,15 @@ impl Client {
                     answer: sender,
                 },
             );
-            io.outbox
-                .push((self.target, Message::Request { id, request }));
+            let incarnation = io.incarnation;
+            io.outbox.push((
+                self.target,
+                Message::Request {
+                    id,
+                    incarnation,
+                    request,
+                },
+            ));
         }
         match SimRuntime::timeout(option.hard_ttl().max(RPC_TIMEOUT), receiver).await {
             Ok(Ok(Some(response))) => Ok(response),
@@ -745,7 +810,10 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
         let executor = Executor::new(seed_of(id));
-        let mut io = Io::default();
+        let mut io = Io {
+            incarnation: next_incarnation(),
+            ..Io::default()
+        };
         let mut readable = true;
         if let Some(last) = log.last_index()
             && let Some(end) = last.checked_add(1)
@@ -836,22 +904,28 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
         match message {
             Message::Response {
                 id,
+                incarnation,
                 request,
                 response,
             } => {
                 let mut io = lock(&self.io);
+                let current = io.incarnation;
                 // Another peer's, or an earlier incarnation's: dropped.
                 if io
                     .waiting
                     .get(&id)
-                    .is_some_and(|waiting| answers(waiting, from, &request))
+                    .is_some_and(|waiting| answers(waiting, current, from, incarnation, &request))
                     && let Some(waiting) = io.waiting.remove(&id)
                 {
                     drop(io);
                     let _ = waiting.answer.send(response);
                 }
             }
-            Message::Request { id, request } => {
+            Message::Request {
+                id,
+                incarnation,
+                request,
+            } => {
                 let Some(raft) = self.raft.clone() else {
                     return;
                 };
@@ -885,6 +959,7 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
                             from,
                             Message::Response {
                                 id,
+                                incarnation,
                                 request: echoed,
                                 response,
                             },
@@ -1052,12 +1127,23 @@ mod tests {
             request: sent.clone(),
             answer,
         };
-        // The same number, an earlier incarnation's request: an equal
-        // value, but not the request sent.
-        assert!(!answers(&waiting, 2, &vote_request_of(1)));
-        assert!(!answers(&waiting, 1, &sent));
-        assert!(answers(&waiting, 2, &sent));
+        let (before, now) = (7, 8);
+        // The same number, an earlier incarnation's request: dropped.
+        assert!(!answers(&waiting, now, 2, now, &vote_request_of(1)));
+        // Another peer's: dropped.
+        assert!(!answers(&waiting, now, 1, now, &sent));
+        assert!(answers(&waiting, now, 2, now, &sent));
         // Decoded in another process: the same content answers.
-        assert!(answers(&waiting, 2, &vote_request_of(2)));
+        assert!(answers(&waiting, now, 2, now, &vote_request_of(2)));
+        // The P1 of the karyos#959 review: after a restart the node sends a
+        // byte-identical request under the same number; the answer made
+        // for the earlier incarnation is dropped all the same.
+        assert!(!answers(&waiting, now, 2, before, &vote_request_of(2)));
+    }
+
+    #[test]
+    fn every_recovery_draws_a_new_incarnation() {
+        let draws: BTreeSet<u64> = (0..1000).map(|_| next_incarnation()).collect();
+        assert_eq!(draws.len(), 1000);
     }
 }

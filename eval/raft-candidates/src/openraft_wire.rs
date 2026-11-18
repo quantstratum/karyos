@@ -32,18 +32,25 @@ type OLogId = openraft::LogId<Clid>;
 pub fn encode(message: &Message) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     match message {
-        Message::Request { id, request } => {
+        Message::Request {
+            id,
+            incarnation,
+            request,
+        } => {
             out.push(0);
             u64_to(&mut out, *id);
+            u64_to(&mut out, *incarnation);
             request_to(&mut out, request)?;
         }
         Message::Response {
             id,
+            incarnation,
             request,
             response,
         } => {
             out.push(1);
             u64_to(&mut out, *id);
+            u64_to(&mut out, *incarnation);
             request_to(&mut out, request)?;
             match response {
                 None => out.push(0),
@@ -64,10 +71,12 @@ pub fn decode(bytes: &[u8]) -> Option<Message> {
     let message = match input.u8()? {
         0 => Message::Request {
             id: input.u64()?,
+            incarnation: input.u64()?,
             request: input.request()?,
         },
         1 => Message::Response {
             id: input.u64()?,
+            incarnation: input.u64()?,
             request: input.request()?,
             response: match input.u8()? {
                 0 => None,
@@ -416,10 +425,12 @@ mod tests {
         ] {
             round_trip(&Message::Request {
                 id: 9,
+                incarnation: 0x0102_0304_0506_0708,
                 request: request.clone(),
             });
             round_trip(&Message::Response {
                 id: 9,
+                incarnation: 0x0102_0304_0506_0708,
                 request,
                 response: None,
             });
@@ -434,6 +445,7 @@ mod tests {
         ] {
             round_trip(&Message::Response {
                 id: 1,
+                incarnation: 0x0102_0304_0506_0708,
                 request: append(),
                 response: Some(response),
             });
@@ -444,11 +456,12 @@ mod tests {
     fn a_count_the_input_cannot_hold_is_refused_before_allocating() {
         let mut bytes = encode(&Message::Request {
             id: 1,
+            incarnation: 0x0102_0304_0506_0708,
             request: append(),
         })
         .unwrap();
-        // The entry count follows tag, id, request tag, vote and prev log id.
-        let at = 1 + 8 + 1 + 17 + 17;
+        // The entry count follows tag, id, incarnation, request tag, vote and prev log id.
+        let at = 1 + 8 + 8 + 1 + 17 + 17;
         bytes[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(decode(&bytes).is_none());
     }
