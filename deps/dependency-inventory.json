@@ -17,6 +17,7 @@
       "itoa v1.0.18",
       "lazy_static v1.5.1",
       "libc v0.2.190",
+      "memchr v2.8.3",
       "mio v1.2.5",
       "once_cell v1.21.4",
       "pin-project-lite v0.2.17",
@@ -29,6 +30,7 @@
       "serde v1.0.229",
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
+      "serde_json v1.0.154",
       "serde_spanned v1.1.2",
       "sharded-slab v0.1.7",
       "signal-hook v0.4.5",
@@ -48,10 +50,13 @@
       "tracing v0.1.44",
       "tracing-core v0.1.36",
       "tracing-subscriber v0.3.23",
+      "try-lock v0.2.5",
       "unicode-ident v1.0.26",
       "untrusted v0.9.0",
+      "want v0.3.2",
       "winnow v1.0.4",
-      "zeroize v1.9.2"
+      "zeroize v1.9.2",
+      "zmij v1.0.23"
     ],
     "aarch64-unknown-linux-gnu": [
       "atomic-waker v1.1.2",
@@ -72,6 +77,7 @@
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "linux-raw-sys v0.12.1",
+      "memchr v2.8.3",
       "mio v1.2.5",
       "once_cell v1.21.4",
       "pin-project-lite v0.2.17",
@@ -85,6 +91,7 @@
       "serde v1.0.229",
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
+      "serde_json v1.0.154",
       "serde_spanned v1.1.2",
       "sharded-slab v0.1.7",
       "signal-hook v0.4.5",
@@ -104,10 +111,13 @@
       "tracing v0.1.44",
       "tracing-core v0.1.36",
       "tracing-subscriber v0.3.23",
+      "try-lock v0.2.5",
       "unicode-ident v1.0.26",
       "untrusted v0.9.0",
+      "want v0.3.2",
       "winnow v1.0.4",
-      "zeroize v1.9.2"
+      "zeroize v1.9.2",
+      "zmij v1.0.23"
     ],
     "x86_64-unknown-linux-gnu": [
       "atomic-waker v1.1.2",
@@ -128,6 +138,7 @@
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "linux-raw-sys v0.12.1",
+      "memchr v2.8.3",
       "mio v1.2.5",
       "once_cell v1.21.4",
       "pin-project-lite v0.2.17",
@@ -141,6 +152,7 @@
       "serde v1.0.229",
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
+      "serde_json v1.0.154",
       "serde_spanned v1.1.2",
       "sharded-slab v0.1.7",
       "signal-hook v0.4.5",
@@ -160,10 +172,13 @@
       "tracing v0.1.44",
       "tracing-core v0.1.36",
       "tracing-subscriber v0.3.23",
+      "try-lock v0.2.5",
       "unicode-ident v1.0.26",
       "untrusted v0.9.0",
+      "want v0.3.2",
       "winnow v1.0.4",
-      "zeroize v1.9.2"
+      "zeroize v1.9.2",
+      "zmij v1.0.23"
     ]
   },
   "generated_by": "scripts/dependency-inventory.py",
@@ -276,6 +291,9 @@
       "license": "Apache-2.0 OR MIT",
       "name": "atomic-waker",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -386,6 +404,9 @@
       "license": "MIT",
       "name": "bytes",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -946,6 +967,9 @@
       "license": "MIT OR Apache-2.0",
       "name": "futures-core",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -1067,6 +1091,20 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [
@@ -1168,6 +1206,9 @@
       "license": "MIT OR Apache-2.0",
       "name": "http",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -1199,6 +1240,9 @@
       "license": "MIT",
       "name": "http-body",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -1226,6 +1270,9 @@
       "license": "MIT OR Apache-2.0",
       "name": "httparse",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -1250,6 +1297,9 @@
       "license": "MIT OR Apache-2.0",
       "name": "httpdate",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -1263,6 +1313,18 @@
       "edges": [
         {
           "features": [
+            "client",
+            "http1",
+            "server"
+          ],
+          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "client",
             "http1",
             "server"
           ],
@@ -1280,6 +1342,7 @@
         }
       ],
       "features": [
+        "client",
         "default",
         "http1",
         "server"
@@ -1288,6 +1351,9 @@
       "license": "MIT",
       "name": "hyper",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -1299,6 +1365,15 @@
     {
       "build_script": false,
       "edges": [
+        {
+          "features": [
+            "tokio"
+          ],
+          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
         {
           "features": [
             "tokio"
@@ -1316,6 +1391,9 @@
       "license": "MIT",
       "name": "hyper-util",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -3097,6 +3175,16 @@
             "derive",
             "std"
           ],
+          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "derive",
+            "std"
+          ],
           "from": "workspace:karyos-tools@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
@@ -3251,6 +3339,24 @@
       "build_script": true,
       "edges": [
         {
+          "features": [
+            "std"
+          ],
+          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "std"
+          ],
+          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#criterion@0.7.0",
           "kind": "normal",
@@ -3274,6 +3380,9 @@
       "name": "serde_json",
       "paths": {
         "dev": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -3448,6 +3557,9 @@
       "license": "MIT OR Apache-2.0",
       "name": "smallvec",
       "paths": {
+        "dev": [
+          []
+        ],
         "loom-runtime": [
           []
         ],
@@ -3852,6 +3964,13 @@
         {
           "features": [],
           "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-control@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -3862,6 +3981,9 @@
       "license": "MIT OR Apache-2.0",
       "name": "tokio-rustls",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -4173,6 +4295,33 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#want@0.3.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#try-lock@0.2.5",
+      "license": "MIT",
+      "name": "try-lock",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.5"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#proptest@1.11.0",
           "kind": "normal",
           "target": null,
@@ -4324,6 +4473,33 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "2.5.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#hyper@1.12.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#want@0.3.2",
+      "license": "MIT",
+      "name": "want",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.2"
     },
     {
       "build_script": false,
@@ -5156,6 +5332,9 @@
       "name": "zmij",
       "paths": {
         "dev": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },

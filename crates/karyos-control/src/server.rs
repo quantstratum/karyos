@@ -13,12 +13,26 @@
 //! - **Answers.** The agent's answer is the body, unchanged, with `200`:
 //!   an agent refusal (`forbidden`, `bad request`, `not authorized`) is
 //!   its v1 JSON, as on the local socket. The component's own refusals are
-//!   JSON objects too: `403` `{"error":"not authorized"}` for a
-//!   certificate pinned to no service, `400` `{"error":"bad request"}` for
-//!   a body that is no request, `502` `{"error":"agent unavailable"}` when
-//!   the agent cannot be reached or does not answer.
-//! - **Headers.** None is read but the method, the path and the body's
-//!   length. A header that claims a role or an identity reaches nothing.
+//!   JSON objects too: `401` `{"error":"not authenticated"}` with neither
+//!   a certificate nor a token; `401` `{"error":"invalid token",
+//!   "reason":R}` with `WWW-Authenticate: Bearer error="invalid_token"`
+//!   for a refused token (R is [`jwt::TokenError::reason`]); `503`
+//!   `{"error":"token keys unavailable"}` when no fresh key set can verify
+//!   a token ([`jwks`](crate::jwks)), never a grant; `403`
+//!   `{"error":"not authorized"}` for a certificate pinned to no service;
+//!   `400` `{"error":"bad request"}` for a body that is no request; `502`
+//!   `{"error":"agent unavailable"}` when the agent cannot be reached or
+//!   does not answer.
+//! - **Who.** A request with `Authorization: Bearer TOKEN` is a person's,
+//!   when an issuer is configured ([`Oidc`]): the token is verified
+//!   ([`jwt`]) and its principal relayed, whatever certificate the client
+//!   presented. Any other request is the service's whose pinned
+//!   certificate the client presented. With an issuer configured, a client
+//!   may connect without a certificate (a person's browser or console);
+//!   a certificate it presents must still chain to the client CA.
+//! - **Headers.** None is read but the method, the path, the body's length
+//!   and `Authorization`. A header that claims a role or an identity
+//!   reaches nothing, and so does a role claim in a token.
 //! - **Bounds.** [`HANDSHAKE_TIMEOUT`] for the TLS handshake,
 //!   [`HEADER_TIMEOUT`] for a request's head, [`CONNECTION_DEADLINE`] for
 //!   a connection in all, one request per connection (no keep-alive), and
@@ -42,7 +56,8 @@ use rustls::server::ServerConfig;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
-use crate::relay;
+use crate::jwks::{Jwks, KeysError};
+use crate::{jwt, relay};
 
 /// The time a client has to complete the TLS handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -88,6 +103,49 @@ pub struct ControlConfig {
     pub agent_socket: PathBuf,
     /// The connections served at once.
     pub max_connections: usize,
+    /// The issuer whose agent-audience access tokens people present.
+    pub oidc: Option<Arc<Oidc>>,
+}
+
+/// People's sign-in (owner item 43): the issuer's access tokens, verified
+/// under `policy` with `keys`. The sign-in itself, the authorization code
+/// flow with PKCE, runs in the console, which presents the token.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct Oidc {
+    /// What a token must satisfy.
+    pub policy: jwt::Policy,
+    /// The issuer's key sets.
+    pub keys: Jwks,
+}
+
+impl Oidc {
+    /// Tokens under `policy`, verified with `keys`.
+    #[must_use]
+    pub fn new(policy: jwt::Policy, keys: Jwks) -> Self {
+        Self { policy, keys }
+    }
+
+    /// The principal of bearer `token`, verified now.
+    ///
+    /// # Errors
+    ///
+    /// The token's refusal, or [`KeysError`] when no fresh key set can
+    /// verify it.
+    pub async fn principal(
+        &self,
+        token: &str,
+    ) -> Result<Result<String, jwt::TokenError>, KeysError> {
+        let parsed = match jwt::parse(token, &self.policy) {
+            Ok(parsed) => parsed,
+            Err(error) => return Ok(Err(error)),
+        };
+        let keys = self.keys.keys_for(parsed.kid()).await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs());
+        Ok(jwt::verify(&parsed, &keys, &self.policy, now))
+    }
 }
 
 impl ControlConfig {
@@ -99,7 +157,17 @@ impl ControlConfig {
             services,
             agent_socket,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            oidc: None,
         }
+    }
+
+    /// The same, taking people's tokens with `oidc`. The TLS configuration
+    /// should then not require a client certificate
+    /// ([`crate::tls::ClientAuth::Optional`]).
+    #[must_use]
+    pub fn with_oidc(mut self, oidc: Oidc) -> Self {
+        self.oidc = Some(Arc::new(oidc));
+        self
     }
 
     /// The same, serving `max_connections` at once.
@@ -126,6 +194,7 @@ struct Shared {
     agent_socket: PathBuf,
     max_connections: usize,
     connections: AtomicUsize,
+    oidc: Option<Arc<Oidc>>,
 }
 
 /// One connection's place among [`ControlConfig::max_connections`],
@@ -185,6 +254,7 @@ impl Control {
                 agent_socket: config.agent_socket,
                 max_connections: config.max_connections,
                 connections: AtomicUsize::new(0),
+                oidc: config.oidc,
             }),
         })
     }
@@ -238,9 +308,14 @@ async fn connection(slot: Slot, tcp: TcpStream) {
     else {
         return;
     };
-    let principal = principal(&shared.services, tls.get_ref().1.peer_certificates());
+    let presented = tls.get_ref().1.peer_certificates();
+    let channel = match principal(&shared.services, presented) {
+        Some(name) => Channel::Service(name),
+        None if presented.is_some_and(|chain| !chain.is_empty()) => Channel::Unpinned,
+        None => Channel::Anonymous,
+    };
     let service = hyper::service::service_fn(move |request| {
-        handle(Arc::clone(&shared), principal.clone(), request)
+        handle(Arc::clone(&shared), channel.clone(), request)
     });
     let mut builder = hyper::server::conn::http1::Builder::new();
     let _ = builder
@@ -265,9 +340,28 @@ fn principal(services: &[Service], presented: Option<&[CertificateDer<'_>]>) -> 
         .map(|service| service.name.clone())
 }
 
+/// What the client's certificate made of the connection.
+#[derive(Debug, Clone)]
+enum Channel {
+    /// A pinned service's.
+    Service(String),
+    /// A certificate of the client CA pinned to no service.
+    Unpinned,
+    /// No certificate.
+    Anonymous,
+}
+
 /// A whole body, sent as one frame.
 #[derive(Debug)]
 pub struct Reply(Option<Bytes>);
+
+impl Reply {
+    /// An empty body.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(None)
+    }
+}
 
 impl Body for Reply {
     type Data = Bytes;
@@ -327,10 +421,61 @@ async fn body_within(mut body: Incoming, max: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// Answers one request for `principal`.
+/// A refused token's answer.
+fn invalid_token(error: jwt::TokenError) -> Response<Reply> {
+    let mut response = json(
+        StatusCode::UNAUTHORIZED,
+        format!(
+            "{{\"error\":\"invalid token\",\"reason\":\"{}\"}}\n",
+            error.reason()
+        ),
+    );
+    let _ = response.headers_mut().insert(
+        hyper::header::WWW_AUTHENTICATE,
+        hyper::header::HeaderValue::from_static("Bearer error=\"invalid_token\""),
+    );
+    response
+}
+
+/// The principal a request is relayed for, or the answer refusing it.
+async fn authenticate(
+    shared: &Shared,
+    channel: Channel,
+    authorization: Option<&hyper::header::HeaderValue>,
+) -> Result<String, Box<Response<Reply>>> {
+    let Some(authorization) = authorization else {
+        return match channel {
+            Channel::Service(name) => Ok(name),
+            Channel::Unpinned => Err(Box::new(refusal(StatusCode::FORBIDDEN, "not authorized"))),
+            Channel::Anonymous => Err(Box::new(refusal(
+                StatusCode::UNAUTHORIZED,
+                "not authenticated",
+            ))),
+        };
+    };
+    let token = authorization
+        .to_str()
+        .ok()
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token.trim());
+    let (Some(token), Some(oidc)) = (token, shared.oidc.as_deref()) else {
+        return Err(Box::new(invalid_token(jwt::TokenError::Malformed)));
+    };
+    match oidc.principal(token).await {
+        Ok(Ok(principal)) => Ok(principal),
+        Ok(Err(error)) => Err(Box::new(invalid_token(error))),
+        Err(KeysError::Unavailable) => Err(Box::new(refusal(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "token keys unavailable",
+        ))),
+    }
+}
+
+/// Answers one request on `channel`.
 async fn handle(
     shared: Arc<Shared>,
-    principal: Option<String>,
+    channel: Channel,
     request: Request<Incoming>,
 ) -> Result<Response<Reply>, Infallible> {
     let route = match (request.uri().path(), request.method()) {
@@ -345,8 +490,10 @@ async fn handle(
         }
         _ => return Ok(refusal(StatusCode::NOT_FOUND, "not found")),
     };
-    let Some(principal) = principal else {
-        return Ok(refusal(StatusCode::FORBIDDEN, "not authorized"));
+    let authorization = request.headers().get(hyper::header::AUTHORIZATION);
+    let principal = match authenticate(&shared, channel, authorization).await {
+        Ok(principal) => principal,
+        Err(answer) => return Ok(*answer),
     };
     let text = match route {
         Some(text) => text,

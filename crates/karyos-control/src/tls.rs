@@ -5,7 +5,8 @@
 //! provider, TLS 1.3 only although `tls12` is compiled in, and every
 //! client's certificate verified by `rustls`'s own `rustls-webpki`
 //! verifier against the configured client CA. A client without a
-//! certificate is refused at the handshake.
+//! certificate is refused at the handshake unless an issuer's tokens are
+//! taken ([`ClientAuth::Optional`]).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -70,9 +71,21 @@ pub fn private_key(path: &Path) -> Result<PrivateKeyDer<'static>, TlsError> {
     })
 }
 
+/// Whether a client must present a certificate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClientAuth {
+    /// Every client (services only).
+    Required,
+    /// A client may present none (people with bearer tokens, when an
+    /// issuer is configured); one it presents must still chain to a root.
+    Optional,
+}
+
 /// The server's TLS configuration: TLS 1.3 only, the certificate `chain`
-/// with `key`, and a client certificate required of every client, chained
-/// to one of `client_roots`. Checks the provider's CPU requirements first.
+/// with `key`, and client certificates chained to one of `client_roots`,
+/// required or not as `client_auth` says. Checks the provider's CPU
+/// requirements first.
 ///
 /// # Errors
 ///
@@ -82,6 +95,7 @@ pub fn server_config(
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     client_roots: Vec<CertificateDer<'static>>,
+    client_auth: ClientAuth,
 ) -> Result<Arc<ServerConfig>, TlsError> {
     crate::cpu::check()?;
     let provider = Arc::new(rustls_graviola::default_provider());
@@ -89,9 +103,12 @@ pub fn server_config(
     for root in client_roots {
         roots.add(root)?;
     }
-    let verifier =
-        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider))
-            .build()?;
+    let builder =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), Arc::clone(&provider));
+    let verifier = match client_auth {
+        ClientAuth::Required => builder.build()?,
+        ClientAuth::Optional => builder.allow_unauthenticated().build()?,
+    };
     let mut config = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(verifier)

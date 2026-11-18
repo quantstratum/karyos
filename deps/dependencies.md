@@ -21,9 +21,16 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `signal-hook` | 0.4.5 | crates.io | default features off (no `channel`, `iterator` or `extended-siginfo`); only the safe `signal_hook::flag::register` is used | runtime, `karyos-tools` only (the `karyosd` binary: `SIGTERM` and `SIGINT` set a flag) | all | MIT OR Apache-2.0 | owner decision ACS 13810 (2026-10-16), under ADR-0033 |
 | `tracing` | 0.1.44 | crates.io | default features off (no `std` request, no `attributes` proc macro) | runtime, `karyos-tools` only (control-path logs of `karyosd`, SPEC.md §11) | all | MIT | owner approved phase 1 on 2026-10-15 (Q25, ACS 11869, issue #40); exact resolution owner decision ACS 13810 (2026-10-16), under ADR-0033 |
 | `tracing-subscriber` | 0.3.23 | crates.io | default features off; `fmt`, `std` (no `ansi`, `env-filter`, `regex`, `tracing-log`, `smallvec`) | runtime, `karyos-tools` only (the subscriber the `karyosd` binary installs; no library installs one) | all | MIT | owner decision ACS 13810 (2026-10-16), under ADR-0033 |
-| `serde` | 1.0.229 | crates.io | default features off; `std`, `derive` | runtime, `karyos-tools` only (the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711) |
+| `serde` | 1.0.229 | crates.io | default features off; `std`, `derive` | runtime, `karyos-tools` (the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`); `karyos-control` (the token header, claims and key set, the JWT verification and JWKS retrieval records (quantstratum-docs: karyos/reviews/dependency-admission-jwt-verification.md, dependency-admission-jwks-retrieval.md), owner decision on quantstratum-docs#899 with the Codex half ACS 77226, 2026-11-18) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711); the JWT verification record for `karyos-control` |
 | `toml` | 1.1.8+spec-1.1.0 | crates.io | default features off; `std`, `serde`, `parse` (no `display`: nothing is written) | runtime, `karyos-tools` only (parses the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711) |
-
+| `hyper` | 1.12.0 | crates.io | default features off; `server`, `http1`; `client` for the issuer's discovery document and key set (the JWKS retrieval record) | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all (x86_64 and aarch64 through `graviola`) | MIT | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
+| `hyper-util` | 0.1.21 | crates.io | default features off; `tokio` | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all | MIT | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
+| `tokio` | 1.54.1 | crates.io | default features off; `rt`, `net`, `time` (`hyper` turns on `sync`) | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all | MIT | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
+| `tokio-rustls` | 0.26.6 | crates.io | default features off | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all | MIT OR Apache-2.0 | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
+| `rustls` | 0.23.46 | crates.io | default features off; `std` (`rustls-graviola` turns on `tls12`; TLS 1.3 only is configured) | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all | Apache-2.0 OR ISC OR MIT | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
+| `graviola` | 0.4.2 | crates.io | default features off (its `default` is empty); signature verification and hashing only, no randomness | runtime and dev, `karyos-control` only (karyos#708) | x86_64 and aarch64 only | Apache-2.0 OR ISC OR MIT-0 | the JWT verification and JWKS retrieval records (quantstratum-docs: karyos/reviews/dependency-admission-jwt-verification.md, dependency-admission-jwks-retrieval.md), owner decision on quantstratum-docs#899 with the Codex half ACS 77226, 2026-11-18 |
+| `rustls-graviola` | 0.4.0 | crates.io | default features off | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | x86_64 and aarch64 only | Apache-2.0 OR ISC OR MIT-0 | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
+| `serde_json` | 1.0.154 | crates.io | default features off; `std` | runtime and dev, `karyos-control` only (karyos#708) | all | MIT OR Apache-2.0 | the JWT verification and JWKS retrieval records (quantstratum-docs: karyos/reviews/dependency-admission-jwt-verification.md, dependency-admission-jwks-retrieval.md), owner decision on quantstratum-docs#899 with the Codex half ACS 77226, 2026-11-18 |
 
 The control-plane component `karyos-control` (karyos#708) holds the agent
 HTTP stack admitted by its record (quantstratum-docs:
@@ -58,12 +65,21 @@ typed error (condition 5). JWT verification, JWKS retrieval, OIDC support,
 any outbound TLS client, `axum` and HTTP/2 are not admitted (condition 8);
 the component's tests use `rustls`'s client side, compiled in the
 admitted `rustls` already, as a test client only.
-| `hyper` | 1.12.0 | crates.io | default features off; `server`, `http1` | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all (x86_64 and aarch64 through `graviola`) | MIT | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
-| `hyper-util` | 0.1.21 | crates.io | default features off; `tokio` | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all | MIT | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
-| `tokio` | 1.54.1 | crates.io | default features off; `rt`, `net`, `time` (`hyper` turns on `sync`) | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all | MIT | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
-| `tokio-rustls` | 0.26.6 | crates.io | default features off | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all | MIT OR Apache-2.0 | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
-| `rustls` | 0.23.46 | crates.io | default features off; `std` (`rustls-graviola` turns on `tls12`; TLS 1.3 only is configured) | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | all | Apache-2.0 OR ISC OR MIT | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
-| `rustls-graviola` | 0.4.0 | crates.io | default features off | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | x86_64 and aarch64 only | Apache-2.0 OR ISC OR MIT-0 | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
+
+`karyos-control` also verifies OIDC access tokens and fetches its issuer's
+key set (karyos#708), under the JWT verification and JWKS retrieval
+records (quantstratum-docs:
+karyos/reviews/dependency-admission-jwt-verification.md and
+dependency-admission-jwks-retrieval.md; owner decision on
+quantstratum-docs#899, Codex half ACS 77226, 2026-11-18). That adds
+`graviola` 0.4.2 as a direct dependency, for signature verification and
+hashing only, `serde` and `serde_json` in this crate, and `hyper`'s
+`client` feature. The new transitive crates are `memchr` 2.8.3 (Unlicense
+OR MIT) and `zmij` 1.0.23 (MIT) under `serde_json`, and `try-lock` 0.2.5
+and `want` 0.3.2 (MIT) under `hyper`'s client; `serde_derive`'s graph was
+already in the lockfile. The first implementation's measurements
+(condition 5 of each record) are in those records. No `ring`, `aws-lc-rs`,
+`aws-lc-sys` or `cc` is built: `make control-plane-graph-check`.
 
 `criterion` is pinned to `=0.7.0`. The owner admitted the criterion family
 (Q25), and ADR-0033 allows a compliant exact resolution within an admitted
@@ -171,7 +187,7 @@ and `valuable` (`cfg(tracing_unstable)`, a flag Karyos never sets).
 
 ## Build scripts
 
-Sixteen packages in the graph have build scripts, besides `ring` 0.17.14, which is in the lockfile only and never built (see the control-plane paragraph above). None compiles C or C++ on a
+The packages below have build scripts (the inventory's `build_script` flag lists every one, including those of unsupported targets), besides `ring` 0.17.14, which is in the lockfile only and never built (see the control-plane paragraph above). None compiles C or C++ on a
 supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 
 | Package | Reach | What the build script does |
@@ -192,6 +208,8 @@ supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 | `rustls` 0.23.46 | runtime, `karyos-control` only | Empty `main` unless the `read_buf` feature is on (off here), which emits one cfg on nightly; compiles nothing |
 | `httparse` 1.10.1 | runtime, `karyos-control` only | Runs `rustc --version` to set SIMD cfgs; compiles nothing |
 | `getrandom` 0.4.3 | runtime, `karyos-control` only | Emits a cfg under the memory sanitizer; compiles nothing |
+| `serde_json` 1.0.154 | runtime, `karyos-control` only; dev, under `criterion` | Emits arithmetic-width cfgs from the target; compiles nothing |
+| `zmij` 1.0.23 | runtime, `karyos-control` only, under `serde_json`; dev | Runs `rustc --version` to set cfgs; compiles nothing |
 
 `cc` 1.8.0 and its dependencies are in the graph only as `generator`'s
 build dependency and do nothing on supported targets.

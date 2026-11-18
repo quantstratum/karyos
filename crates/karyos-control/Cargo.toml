@@ -15,15 +15,30 @@ publish.workspace = true
 # ACS 71206): these crates, at these versions and features, in this crate
 # only. Nothing depends on it, and it is not a default member.
 [dependencies]
-hyper = { version = "=1.12.0", default-features = false, features = ["server", "http1"] }
+hyper = { version = "=1.12.0", default-features = false, features = ["server", "http1", "client"] }
 hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
 tokio = { version = "=1.54.1", default-features = false, features = ["rt", "net", "time"] }
 tokio-rustls = { version = "=0.26.6", default-features = false }
 rustls = { version = "=0.23.46", default-features = false, features = ["std"] }
 rustls-graviola = { version = "=0.4.0", default-features = false }
 thiserror.workspace = true
+# The JWT verification and JWKS retrieval records (quantstratum-docs:
+# karyos/reviews/dependency-admission-jwt-verification.md and
+# dependency-admission-jwks-retrieval.md; owner decision on
+# quantstratum-docs#899, Codex ACS 77226): signature verification and
+# hashing (no randomness), the token and key set JSON, and `hyper`'s
+# `client` above for the issuer's discovery document and key set.
+graviola = { version = "=0.4.2", default-features = false }
+serde = { version = "=1.0.229", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# Signing the tests' tokens, as the issuer stand-in does.
+graviola = { version = "=0.4.2", default-features = false }
+hyper = { version = "=1.12.0", default-features = false, features = ["server", "http1", "client"] }
+hyper-util = { version = "=0.1.21", default-features = false, features = ["tokio"] }
+tokio-rustls = { version = "=0.26.6", default-features = false }
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
 # The tests' client and the component's runtime on a thread of its own:
 # the same crates and features as above, nothing more.
 rustls = { version = "=0.23.46", default-features = false, features = ["std"] }

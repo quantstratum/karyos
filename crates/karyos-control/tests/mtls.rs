@@ -66,6 +66,7 @@ fn control(socket: PathBuf) -> SocketAddr {
         tls::certificates(&fixture("server.pem")).unwrap(),
         tls::private_key(&fixture("server.key")).unwrap(),
         tls::certificates(&fixture("ca.pem")).unwrap(),
+        tls::ClientAuth::Required,
     )
     .unwrap();
     let pinned = tls::certificates(&fixture("svc-ops.pem"))
@@ -184,8 +185,7 @@ fn a_service_authenticates_with_mutual_tls() {
 fn a_claimed_role_is_not_relayed() {
     let (socket, lines) = agent("claimed");
     let address = control(socket);
-    let headers = "X-Karyos-Role: administrator\r\nX-Karyos-Principal: alice\r\n\
-                   Authorization: Bearer administrator\r\n";
+    let headers = "X-Karyos-Role: administrator\r\nX-Karyos-Principal: alice\r\n";
     let answer = exchange(
         address,
         client(Some("svc-ops"), TLS13),
@@ -196,6 +196,14 @@ fn a_claimed_role_is_not_relayed() {
         *lines.lock().unwrap(),
         ["KARYOS-AGENT 1 relay svc.ops gap-ack 1\n"]
     );
+    // A bearer token where no issuer is configured is refused, never
+    // ignored: the service's certificate does not carry it.
+    let answer = exchange(
+        address,
+        client(Some("svc-ops"), TLS13),
+        &post("gap-ack 1", "Authorization: Bearer administrator\r\n"),
+    );
+    assert_eq!(answer.unwrap().0, 401);
     // A body that would smuggle a second line, or a relay of its own, is
     // no request.
     for body in ["view\nKARYOS-AGENT 1 gap-ack 1", "relay alice gap-ack 1"] {

@@ -30,13 +30,21 @@
 //!   but the request itself, so the component cannot grant a role.
 //! - **API v1.** The request is a v1 request line's request, unchanged,
 //!   and the answer is the agent's v1 JSON object, unchanged ([`server`]).
-//! - **Not here yet.** People's sign-in (OIDC with authorization code and
-//!   PKCE) and agent-audience access tokens: JWT verification, JWKS
-//!   retrieval and OIDC support code are not admitted (the record's
-//!   condition 8), and wait for their own scoped R8 records.
+//! - **People.** With an issuer configured ([`server::Oidc`]), a person
+//!   presents the issuer's agent-audience access token, which the console
+//!   got through the authorization code flow with PKCE. The token is
+//!   verified on every request ([`jwt`]) against the issuer's key set
+//!   ([`jwks`]): issuer, audience, type, expiry, signature, scope and
+//!   principal. The principal, never a role, is relayed. When no key set
+//!   inside its lifetime can verify a token, the answer is `503`, never a
+//!   grant; stale keys are never trusted (owner decision on
+//!   quantstratum-docs#899).
 
+pub mod b64;
 pub mod cli;
 pub mod cpu;
+pub mod jwks;
+pub mod jwt;
 pub mod relay;
 pub mod server;
 pub mod tls;
