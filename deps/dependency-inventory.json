@@ -1,8 +1,13 @@
 {
   "evaluated": {
     "aarch64-apple-darwin": [
+      "block-buffer v0.12.1",
       "cfg-if v1.0.5",
+      "cpufeatures v0.3.1",
+      "crypto-common v0.2.2",
+      "digest v0.11.3",
       "errno v0.3.14",
+      "hybrid-array v0.4.15",
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "once_cell v1.21.4",
@@ -13,6 +18,7 @@
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
       "serde_spanned v1.1.2",
+      "sha2 v0.11.1",
       "sharded-slab v0.1.7",
       "signal-hook v0.4.5",
       "signal-hook-registry v1.4.8",
@@ -26,13 +32,19 @@
       "tracing v0.1.44",
       "tracing-core v0.1.36",
       "tracing-subscriber v0.3.23",
+      "typenum v1.20.1",
       "unicode-ident v1.0.26",
       "winnow v1.0.4"
     ],
     "aarch64-unknown-linux-gnu": [
       "bitflags v2.13.2",
+      "block-buffer v0.12.1",
       "cfg-if v1.0.5",
+      "cpufeatures v0.3.1",
+      "crypto-common v0.2.2",
+      "digest v0.11.3",
       "errno v0.3.14",
+      "hybrid-array v0.4.15",
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "linux-raw-sys v0.12.1",
@@ -45,6 +57,7 @@
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
       "serde_spanned v1.1.2",
+      "sha2 v0.11.1",
       "sharded-slab v0.1.7",
       "signal-hook v0.4.5",
       "signal-hook-registry v1.4.8",
@@ -58,13 +71,19 @@
       "tracing v0.1.44",
       "tracing-core v0.1.36",
       "tracing-subscriber v0.3.23",
+      "typenum v1.20.1",
       "unicode-ident v1.0.26",
       "winnow v1.0.4"
     ],
     "x86_64-unknown-linux-gnu": [
       "bitflags v2.13.2",
+      "block-buffer v0.12.1",
       "cfg-if v1.0.5",
+      "cpufeatures v0.3.1",
+      "crypto-common v0.2.2",
+      "digest v0.11.3",
       "errno v0.3.14",
+      "hybrid-array v0.4.15",
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "linux-raw-sys v0.12.1",
@@ -77,6 +96,7 @@
       "serde_core v1.0.229",
       "serde_derive v1.0.229",
       "serde_spanned v1.1.2",
+      "sha2 v0.11.1",
       "sharded-slab v0.1.7",
       "signal-hook v0.4.5",
       "signal-hook-registry v1.4.8",
@@ -90,6 +110,7 @@
       "tracing v0.1.44",
       "tracing-core v0.1.36",
       "tracing-subscriber v0.3.23",
+      "typenum v1.20.1",
       "unicode-ident v1.0.26",
       "winnow v1.0.4"
     ]
@@ -255,6 +276,30 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#block-buffer@0.12.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "block-buffer",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.12.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#criterion-plot@0.6.0",
           "kind": "normal",
           "target": null,
@@ -332,6 +377,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#loom@0.7.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -535,6 +587,32 @@
       "build_script": false,
       "edges": [
         {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.1",
+          "kind": "normal",
+          "target": "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))",
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.3.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "cpufeatures",
+      "paths": {
+        "runtime": [
+          [
+            "cfg(any(target_arch = \"aarch64\", target_arch = \"x86_64\", target_arch = \"x86\"))"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
           "features": [
             "cargo_bench_support"
           ],
@@ -611,6 +689,57 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.2.4"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#crypto-common@0.2.2",
+      "license": "MIT OR Apache-2.0",
+      "name": "crypto-common",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.2"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "block-api",
+        "default"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3",
+      "license": "MIT OR Apache-2.0",
+      "name": "digest",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.11.3"
     },
     {
       "build_script": false,
@@ -838,6 +967,37 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#block-buffer@0.12.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#crypto-common@0.2.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#hybrid-array@0.4.15",
+      "license": "MIT OR Apache-2.0",
+      "name": "hybrid-array",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.15"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#toml@1.1.8+spec-1.1.0",
           "kind": "normal",
           "target": null,
@@ -948,6 +1108,34 @@
     {
       "build_script": true,
       "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.3.1",
+          "kind": "normal",
+          "target": "cfg(all(target_arch = \"aarch64\", target_os = \"android\"))",
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.3.1",
+          "kind": "normal",
+          "target": "cfg(all(target_arch = \"aarch64\", target_os = \"linux\"))",
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.3.1",
+          "kind": "normal",
+          "target": "cfg(all(target_arch = \"aarch64\", target_vendor = \"apple\"))",
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#cpufeatures@0.3.1",
+          "kind": "normal",
+          "target": "cfg(all(target_arch = \"loongarch64\", target_os = \"linux\"))",
+          "uses_default_features": false
+        },
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#errno@0.3.14",
@@ -2370,6 +2558,30 @@
       "edges": [
         {
           "features": [],
+          "from": "workspace:karyos-archive@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "sha2",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.11.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
           "kind": "normal",
           "target": null,
@@ -3034,6 +3246,34 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.3.23"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "const-generics"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#hybrid-array@0.4.15",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "const-generics"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#typenum@1.20.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "typenum",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.20.1"
     },
     {
       "build_script": false,

@@ -23,6 +23,7 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `tracing-subscriber` | 0.3.23 | crates.io | default features off; `fmt`, `std` (no `ansi`, `env-filter`, `regex`, `tracing-log`, `smallvec`) | runtime, `karyos-tools` only (the subscriber the `karyosd` binary installs; no library installs one) | all | MIT | owner decision ACS 13810 (2026-10-16), under ADR-0033 |
 | `serde` | 1.0.229 | crates.io | default features off; `std`, `derive` | runtime, `karyos-tools` only (the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711) |
 | `toml` | 1.1.8+spec-1.1.0 | crates.io | default features off; `std`, `serde`, `parse` (no `display`: nothing is written) | runtime, `karyos-tools` only (parses the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711) |
+| `sha2` | 0.11.1 (pinned `=0.11.1`) | crates.io | default features off (no `alloc`, `oid` or `zeroize`); SHA-256 only | runtime, `karyos-archive` only (the seal digests and hash chain of the integrity journal, SPEC.md §8.4, ADR-0051 item 2, karyos#662) | all | MIT OR Apache-2.0 | owner decision ACS 71206 (2026-11-12) on quantstratum-docs `karyos/reviews/dependency-admission-sha2.md`, ADR-0079 row `sha2` (archive), karyos#660 |
 
 `criterion` is pinned to `=0.7.0`. The owner admitted the criterion family
 (Q25), and ADR-0033 allows a compliant exact resolution within an admitted
@@ -66,6 +67,14 @@ reviewed by hand at 1.0.229: each writes a generated module into `OUT_DIR`
 and emits `cfg` flags from `rustc --version`; neither compiles C nor links
 anything.
 
+`sha2` is a dependency of `karyos-archive` only, as its admission record
+scopes it. Its transitive runtime crates, admitted with it, are `digest`
+0.11.3, `block-buffer` 0.12.1, `crypto-common` 0.2.2, `hybrid-array`
+0.4.15, `typenum` 1.20.1 and `cpufeatures` 0.3.1 (all MIT OR
+Apache-2.0); `cfg-if` 1.0.5 and `libc` 0.2.190 (under `cpufeatures`, for
+CPU feature detection on aarch64 Linux and macOS) were already in the
+lockfile. None of these has a build script, so none compiles C.
+
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
 absent from every normal and release build and from the graph shipped to
 users; it is compiled only by `make loom`.
@@ -90,7 +99,10 @@ or build-script change cannot reuse old admission evidence. Reach classes:
 
 - `runtime`: may be linked into Karyos builds. On the supported targets the
   evaluated runtime graph of the library crates is `thiserror`, plus
-  `rustix`, `bitflags` and `linux-raw-sys` on Linux. The `karyos-tools`
+  `rustix`, `bitflags` and `linux-raw-sys` on Linux, plus `karyos-archive`'s
+  `sha2`, `digest`, `block-buffer`, `crypto-common`, `hybrid-array`,
+  `typenum`, `cpufeatures` and `cfg-if` everywhere and `libc` (under
+  `cpufeatures`) on aarch64 Linux and macOS. The `karyos-tools`
   binaries add `signal-hook`, `signal-hook-registry`, `libc`, `errno`,
   `tracing`, `tracing-core`, `pin-project-lite`, `once_cell`,
   `tracing-subscriber`, `sharded-slab`, `lazy_static`, `thread_local` and
@@ -141,7 +153,7 @@ supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 | `quote` 1.0.47 | build | Runs `rustc --version` to set cfgs |
 | `signal-hook` 0.4.5 | runtime, `karyos-tools` only | Empty `main` unless the `extended-siginfo-raw` feature is on, which would compile `extract.c` with the optional `cc` build dependency; Karyos leaves it off, so `cc` is not requested |
 | `rustversion` 1.0.23 | loom | Runs `rustc --version` to generate version constants |
-| `libc` 0.2.190 | runtime, `karyos-tools` only, under `signal-hook` and `signal-hook-registry` on every supported target; loom; dev, under `getrandom` on macOS and Linux `gnu`/`musl` (tests only); also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in library builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
+| `libc` 0.2.190 | runtime, `karyos-archive` under `sha2`'s `cpufeatures` on aarch64 Linux and macOS (CPU feature detection); runtime, `karyos-tools`, under `signal-hook` and `signal-hook-registry` on every supported target; loom; dev, under `getrandom` on macOS and Linux `gnu`/`musl` (tests only); also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in library builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
 | `generator` 0.8.10 | loom | Invokes `cc` to assemble `asm_ppc64le_elf.S` only when the target architecture is `powerpc64`, which Karyos does not support |
 | `valuable` 0.1.1 | loom | Emits atomic-support cfgs from the target name |
 | `getrandom` 0.3.4 | dev | Runs `rustc --version` to choose cfgs (sanitizer and old Windows backends); compiles nothing |

@@ -19,6 +19,7 @@ karyos-codec.workspace = true
 karyos-io.workspace = true
 karyos-sys.workspace = true
 thiserror.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

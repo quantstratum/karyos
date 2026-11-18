@@ -5,7 +5,8 @@
 //!
 //! Built so far: the CRC-32C, the segment store of one recording (A2), the
 //! catalog of an archive directory (A3), the recorder and replay, and the
-//! records of a recording group's journal (A7a). The rest of recording
+//! records of a recording group's journal (A7a), and the sealing and
+//! tamper-evidence hash chain of A10 ([`integrity`]). The rest of recording
 //! groups follows.
 
 #![forbid(unsafe_code)]
@@ -20,6 +21,7 @@ pub mod durable;
 #[cfg(test)]
 mod fault;
 pub mod group;
+pub mod integrity;
 pub mod queue;
 pub mod recorder;
 pub mod segment;
