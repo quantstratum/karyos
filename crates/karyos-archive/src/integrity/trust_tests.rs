@@ -82,7 +82,7 @@ impl HeadSigner for TestSigner {
         if !self.available {
             return Err(SignerUnavailable);
         }
-        Ok(self.key.sign(&head.signed_bytes()).to_bytes())
+        Ok(self.key.sign(&head.signed_bytes(self.custody)).to_bytes())
     }
 }
 
@@ -156,15 +156,20 @@ fn registry_with(signer: &TestSigner) -> KeyRegistry {
 
 #[test]
 fn the_signed_bytes_are_canonical_and_versioned() {
-    let bytes = head(5).signed_bytes();
+    let bytes = head(5).signed_bytes(Custody::NoSeparation);
     assert!(bytes.starts_with(HEAD_DOMAIN));
     let fields = &bytes[HEAD_DOMAIN.len()..];
     assert_eq!(&fields[..2], &TRUST_VERSION.to_le_bytes());
-    assert_eq!(&fields[2..34], &ARCHIVE);
-    assert_eq!(&fields[34..42], &JOURNAL.to_le_bytes());
-    assert_eq!(&fields[42..50], &5u64.to_le_bytes());
-    assert_eq!(&fields[50..], &head(5).digest);
-    assert_eq!(head(5).signed_bytes(), bytes);
+    assert_eq!(fields[2], Custody::NoSeparation as u8);
+    assert_eq!(&fields[3..35], &ARCHIVE);
+    assert_eq!(&fields[35..43], &JOURNAL.to_le_bytes());
+    assert_eq!(&fields[43..51], &5u64.to_le_bytes());
+    assert_eq!(&fields[51..], &head(5).digest);
+    assert_eq!(head(5).signed_bytes(Custody::NoSeparation), bytes);
+    assert_ne!(
+        head(5).signed_bytes(Custody::ExternallyEvidenced),
+        bytes
+    );
 }
 
 #[test]
@@ -407,7 +412,7 @@ fn the_archival_key_signature_over_any_other_purpose_is_refused() {
     let registry = registry_with(&signer);
     // The same fields under another purpose's tag, as a wire key's would.
     let mut wire = b"karyos/wire/guard/v1\0".to_vec();
-    wire.extend_from_slice(&head(2).signed_bytes()[HEAD_DOMAIN.len()..]);
+    wire.extend_from_slice(&head(2).signed_bytes(Custody::NoSeparation)[HEAD_DOMAIN.len()..]);
     let forged = SignedHead {
         head: head(2),
         key_id: signer.key_id(),
@@ -554,4 +559,115 @@ proptest! {
         }
         let _ = RegistryEntry::decode(&array);
     }
+}
+
+#[test]
+fn a_custody_label_changed_after_signing_breaks_the_signature() {
+    let mut signer = TestSigner::new(9);
+    let mut registry = KeyRegistry::new(trust());
+    registry
+        .apply(&register(&signer.key, Custody::ExternallyEvidenced, 0))
+        .unwrap();
+    let mut upgraded = signed(&mut signer, head(1));
+    upgraded.custody = Custody::ExternallyEvidenced;
+    assert_eq!(
+        registry.verify(&upgraded, None),
+        HeadVerdict::Invalid(HeadReason::BadSignature)
+    );
+}
+
+#[test]
+fn an_endorsed_revocation_may_record_a_cutoff_before_its_append() {
+    let disk = FaultDisk::default();
+    let mut journal = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut ledger =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+    let signer = TestSigner::new(9);
+    let mut registry = KeyRegistry::new(trust());
+    registry
+        .append(
+            &register(&signer.key, Custody::NoSeparation, 0),
+            &mut journal,
+            &mut ledger,
+        )
+        .unwrap();
+    let mut start = 0u64;
+    for _ in 0..10 {
+        journal.seal_segment(3, start, b"seal", false).unwrap();
+        start += 4;
+    }
+    let revoke = entry(
+        &authority(),
+        1,
+        RegistryAction::Revoke,
+        &signer.key,
+        Custody::NoSeparation,
+        5,
+        digest(b"compromise evidence at counter 5"),
+    );
+    registry.append(&revoke, &mut journal, &mut ledger).unwrap();
+    assert_eq!(
+        registry.key(&signer.key_id()).unwrap().revoked_from,
+        Some((5, digest(b"compromise evidence at counter 5")))
+    );
+}
+
+#[test]
+fn a_later_lifecycle_entry_never_relaxes_an_earlier_cutoff() {
+    let mut signer = TestSigner::new(9);
+    let mut registry = registry_with(&signer);
+    let first = digest(b"first evidence");
+    for (sequence, cutoff, evidence) in [(1, 10, first), (2, 20, digest(b"second"))] {
+        registry
+            .apply(&entry(
+                &authority(),
+                sequence,
+                RegistryAction::Revoke,
+                &signer.key,
+                Custody::NoSeparation,
+                cutoff,
+                evidence,
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        registry.key(&signer.key_id()).unwrap().revoked_from,
+        Some((10, first))
+    );
+    assert_eq!(
+        registry.verify(&signed(&mut signer, head(15)), Some(30)),
+        HeadVerdict::Invalid(HeadReason::SignedAfterRevocation)
+    );
+    // An earlier cutoff tightens it.
+    registry
+        .apply(&entry(
+            &authority(),
+            3,
+            RegistryAction::Revoke,
+            &signer.key,
+            Custody::NoSeparation,
+            4,
+            digest(b"third"),
+        ))
+        .unwrap();
+    assert_eq!(
+        registry.key(&signer.key_id()).unwrap().revoked_from,
+        Some((4, digest(b"third")))
+    );
+    for (sequence, retired) in [(4, 8), (5, 12)] {
+        registry
+            .apply(&entry(
+                &authority(),
+                sequence,
+                RegistryAction::Retire,
+                &signer.key,
+                Custody::NoSeparation,
+                retired,
+                [0; 32],
+            ))
+            .unwrap();
+    }
+    assert_eq!(registry.key(&signer.key_id()).unwrap().retired_from, Some(8));
 }

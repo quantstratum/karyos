@@ -35,7 +35,8 @@ pub trait HeadSigner {
     /// The custody it declares.
     fn custody(&self) -> Custody;
 
-    /// Signs `head`'s signed bytes.
+    /// Signs `head`'s signed bytes under the custody it declares,
+    /// `head.signed_bytes(self.custody())`.
     ///
     /// # Errors
     ///

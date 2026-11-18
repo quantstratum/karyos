@@ -164,7 +164,7 @@ pub struct ChainHead {
 }
 
 /// The length of a head's signed bytes, after the domain tag.
-const HEAD_FIELDS_LENGTH: usize = 2 + DIGEST_LENGTH + 8 + 8 + DIGEST_LENGTH;
+const HEAD_FIELDS_LENGTH: usize = 2 + 1 + DIGEST_LENGTH + 8 + 8 + DIGEST_LENGTH;
 
 /// The length of a head's signed bytes.
 const HEAD_BYTES_LENGTH: usize = HEAD_DOMAIN.len() + HEAD_FIELDS_LENGTH;
@@ -173,14 +173,17 @@ const HEAD_BYTES_LENGTH: usize = HEAD_DOMAIN.len() + HEAD_FIELDS_LENGTH;
 const ENDORSEMENT_BYTES_LENGTH: usize = ENDORSEMENT_DOMAIN.len() + DIGEST_LENGTH + ENDORSED_LENGTH;
 
 impl ChainHead {
-    /// The canonical signed bytes, version 1: the archival head domain tag,
-    /// then the version `u16`, the Archive id, the journal id `u64`, the
-    /// counter `u64` and the record digest, little-endian.
+    /// The canonical signed bytes, version 1, under the custody the signer
+    /// declares: the archival head domain tag, then the version `u16`, the
+    /// custody code `u8`, the Archive id, the journal id `u64`, the counter
+    /// `u64` and the record digest, little-endian. The custody is signed so
+    /// that a head's declared custody cannot be changed after signing.
     #[must_use]
-    pub fn signed_bytes(&self) -> Vec<u8> {
+    pub fn signed_bytes(&self, custody: Custody) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(HEAD_BYTES_LENGTH);
         bytes.extend_from_slice(HEAD_DOMAIN);
         bytes.extend_from_slice(&TRUST_VERSION.to_le_bytes());
+        bytes.push(custody as u8);
         bytes.extend_from_slice(&self.archive_id);
         bytes.extend_from_slice(&self.journal_id.to_le_bytes());
         bytes.extend_from_slice(&self.counter.to_le_bytes());
@@ -196,9 +199,9 @@ pub struct SignedHead {
     pub head: ChainHead,
     /// The signing key's id.
     pub key_id: Digest,
-    /// The custody the signer declared.
+    /// The custody the signer declared, covered by the signature.
     pub custody: Custody,
-    /// The Ed25519 signature over the head's signed bytes.
+    /// The Ed25519 signature over the head's signed bytes under `custody`.
     pub signature: [u8; SIGNATURE_LENGTH],
 }
 
@@ -617,7 +620,12 @@ impl KeyRegistry {
                     .keys
                     .get_mut(&entry.key_id)
                     .ok_or(RegistryError::UnknownKey { sequence })?;
-                state.retired_from = Some(entry.effective);
+                // A later entry never relaxes an earlier restriction.
+                state.retired_from = Some(
+                    state
+                        .retired_from
+                        .map_or(entry.effective, |retired| retired.min(entry.effective)),
+                );
             }
             RegistryAction::Revoke => {
                 if entry.evidence == [0; DIGEST_LENGTH] {
@@ -627,7 +635,12 @@ impl KeyRegistry {
                     .keys
                     .get_mut(&entry.key_id)
                     .ok_or(RegistryError::UnknownKey { sequence })?;
-                state.revoked_from = Some((entry.effective, entry.evidence));
+                // The earliest evidenced cutoff stands, with its evidence:
+                // a later revocation never makes a head valid again.
+                state.revoked_from = Some(match state.revoked_from {
+                    Some((cutoff, evidence)) if cutoff <= entry.effective => (cutoff, evidence),
+                    _ => (entry.effective, entry.evidence),
+                });
             }
         }
         self.next_sequence = next;
@@ -650,7 +663,11 @@ impl KeyRegistry {
         ledger: &mut Ledger<D, REGISTRY_ENTRY_LENGTH>,
     ) -> Result<(), IntegrityError> {
         let next = journal.next_counter();
-        if entry.effective < next {
+        // A key is registered before its first use. A revocation's cutoff
+        // is the independently evidenced compromise point, which is often
+        // discovered after the records it affects, and a retirement only
+        // narrows the key's validity, so neither is refused as backdated.
+        if entry.action == RegistryAction::Register && entry.effective < next {
             return Err(RegistryError::Backdated {
                 sequence: entry.sequence,
                 effective: entry.effective,
@@ -696,7 +713,7 @@ impl KeyRegistry {
         }
         let valid_signature = VerifyingKey::from_bytes(&state.public).is_ok_and(|key| {
             key.verify_strict(
-                &head.signed_bytes(),
+                &head.signed_bytes(signed.custody),
                 &Signature::from_bytes(&signed.signature),
             )
             .is_ok()
