@@ -473,5 +473,157 @@ fn a_scheduled_scrub_raises_an_event_on_a_mismatch() {
         .unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].at_ns, 1_500);
-    assert_eq!(events[0].range.counter, Some(2));
+    assert!(matches!(
+        &events[0].finding,
+        ScrubFinding::Range(range) if range.counter == Some(2)
+    ));
+}
+
+/// Verifies `records` in place of the scenario's chain.
+fn verify_records(
+    scenario: &Scenario,
+    records: &[SealRecord],
+    journal_fault: Option<super::Inconsistency>,
+    stores: &dyn AnchorEvidence,
+) -> Verification {
+    let externality = Externality {
+        local_archive: ARCHIVE,
+        ..Externality::default()
+    };
+    let evidence = Evidence {
+        records,
+        journal_fault,
+        journal_id: JOURNAL,
+        trust: scenario.trust.as_ref(),
+        registry: &scenario.keys,
+        heads: &scenario.heads,
+        anchors: &scenario.anchors,
+        stores,
+        externality: &externality,
+        written: &scenario.written,
+    };
+    verify(&evidence, |_, start, _| RangeBytes::Bytes(range(start / 8)))
+}
+
+#[test]
+fn a_registry_commitment_missing_from_the_ledger_verifies_nothing() {
+    let mut scenario = Scenario::new();
+    let key = archival_key();
+    let mut revoke = RegistryEntry {
+        action: RegistryAction::Retire,
+        sequence: 1,
+        effective: 2,
+        ..registration()
+    };
+    revoke.endorsement = authority()
+        .sign(&revoke.endorsement_bytes(&ARCHIVE))
+        .to_bytes();
+    // The journal commits the retirement; the ledger supplied lacks it.
+    scenario
+        .journal
+        .record_key_registry(
+            &key_id(&key.verifying_key().to_bytes()),
+            1,
+            &revoke.encode(),
+        )
+        .unwrap();
+    let verification = scenario.verify();
+    assert!(
+        verification
+            .ranges
+            .iter()
+            .all(|range| range.outcome != Outcome::Verified),
+        "{verification:?}"
+    );
+    assert!(
+        verification.ranges[0]
+            .reasons
+            .contains(&Reason::MalformedEvidence)
+    );
+}
+
+#[test]
+fn a_record_rejected_at_its_position_is_never_verified() {
+    let mut scenario = Scenario::new();
+    let mut records = scenario.records();
+    // A copy of range record 2 after the last record: its counter repeats.
+    records.push(records[2]);
+    let held = scenario.anchors.clone();
+    let verification = verify_records(&scenario, &records, None, &Held(&held));
+    assert_eq!(verification.journal_break, Some(7));
+    let last = verification.ranges.last().unwrap();
+    assert_eq!(last.counter, Some(2));
+    assert_eq!(last.outcome, Outcome::Inconsistent);
+    assert_eq!(last.first_inconsistent, Some(7));
+}
+
+#[test]
+fn a_journal_fault_no_range_reaches_is_reported_and_scrubbed() {
+    let mut scenario = Scenario::new();
+    let records = scenario.records();
+    let fault = super::Inconsistency::CounterGap {
+        expected: 7,
+        found: 0,
+    };
+    let held = scenario.anchors.clone();
+    let verification = verify_records(&scenario, &records, Some(fault), &Held(&held));
+    assert_eq!(verification.journal_break, Some(7));
+    let mut scrub = Scrub::new(NonZeroU64::new(1_000).unwrap(), 0);
+    let events = scrub.poll(0, || verification.clone()).unwrap();
+    assert_eq!(
+        events[0].finding,
+        ScrubFinding::Journal {
+            first_inconsistent: 7
+        }
+    );
+}
+
+/// Stores that also prove they held every anchor before any revocation.
+#[derive(Debug)]
+struct Predating<'a>(&'a [Anchor]);
+
+impl AnchorEvidence for Predating<'_> {
+    fn confirms(&self, anchor: &Anchor) -> bool {
+        self.0.contains(anchor)
+    }
+
+    fn held_before_revocation_of(&self, _anchor: &Anchor, _key_id: &super::Digest) -> bool {
+        true
+    }
+}
+
+#[test]
+fn a_revoked_keys_head_needs_an_anchor_proved_to_predate_the_revocation() {
+    let mut scenario = Scenario::new();
+    let key = archival_key();
+    let mut revoke = RegistryEntry {
+        action: RegistryAction::Revoke,
+        sequence: 1,
+        effective: 100,
+        evidence: digest(b"compromised later"),
+        ..registration()
+    };
+    revoke.endorsement = authority()
+        .sign(&revoke.endorsement_bytes(&ARCHIVE))
+        .to_bytes();
+    let bytes = revoke.encode();
+    scenario
+        .journal
+        .record_key_registry(&key_id(&key.verifying_key().to_bytes()), 1, &bytes)
+        .unwrap();
+    scenario.keys.push(bytes);
+    scenario.anchor(6);
+    let records = scenario.records();
+    let held = scenario.anchors.clone();
+    // An anchor that merely exists today proves no ordering.
+    let unproved = verify_records(&scenario, &records, None, &Held(&held));
+    assert_eq!(unproved.coverage.signed_through, None);
+    assert!(
+        unproved
+            .ranges
+            .iter()
+            .all(|range| range.outcome != Outcome::Verified)
+    );
+    let proved = verify_records(&scenario, &records, None, &Predating(&held));
+    assert_eq!(proved.coverage.signed_through, Some(6));
 }

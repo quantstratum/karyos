@@ -299,3 +299,60 @@ fn verify_refuses_bad_arguments_and_a_bad_trust_file() {
     assert!(parse_trust(&format!("archive {}\n", hex(&ARCHIVE))).is_err());
     assert!(parse_trust("colour blue\n").is_err());
 }
+
+#[test]
+fn verify_reports_a_seal_larger_than_its_recording_without_reading_it() {
+    let archive = archive("oversized");
+    let mut journal = IntegrityJournal::open(StdDisk, &archive.dir())
+        .unwrap()
+        .journal;
+    // A corrupt seal declaring far more than the recording holds.
+    journal
+        .append(
+            karyos_archive::integrity::SealKind::OpenSegment,
+            RECORDING,
+            48,
+            u64::MAX / 2,
+            [0; 32],
+        )
+        .unwrap();
+    let (status, out, _) = full(&archive, false);
+    assert_eq!(status, EXIT_INCONSISTENT);
+    assert!(
+        out.contains(&format!(
+            "recording 3 [48, {}) inconsistent seal=7 reasons=shortened_index",
+            u64::MAX / 2
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn verify_reports_a_journal_record_that_does_not_decode() {
+    let archive = archive("malformed");
+    let path = IntegrityJournal::<StdDisk>::path(&archive.dir());
+    let mut bytes = std::fs::read(&path).unwrap();
+    let record = karyos_archive::integrity::SEAL_RECORD_LENGTH;
+    bytes.extend(std::iter::repeat_n(0xFF, record));
+    std::fs::write(&path, bytes).unwrap();
+    let (status, out, _) = full(&archive, false);
+    assert_eq!(status, EXIT_INCONSISTENT);
+    assert!(
+        out.contains("journal inconsistent first_inconsistent=7"),
+        "{out}"
+    );
+    let (_, json_out, _) = full(&archive, true);
+    assert!(
+        json_out.contains("\"journal_first_inconsistent\":7"),
+        "{json_out}"
+    );
+}
+
+#[test]
+fn verify_of_a_directory_that_does_not_exist_is_an_error() {
+    let missing = std::env::temp_dir().join(format!("karyos-verify-absent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing);
+    let (status, out, err) = run(&[&missing], &[]);
+    assert_eq!(status, EXIT_ERROR, "{out}");
+    assert!(err.contains("karyos-verify-absent"), "{err}");
+}

@@ -36,7 +36,7 @@ use super::trust::{
     HeadReason, HeadVerdict, KeyRegistry, REGISTRY_ENTRY_LENGTH, RegistryEntry, SIGNED_HEAD_LENGTH,
     SignedHead, TrustDecodeError, TrustRoot,
 };
-use super::{ChainCheck, Inconsistency, SealKind, SealRecord, digest, verify_range};
+use super::{ChainCheck, Digest, Inconsistency, SealKind, SealRecord, digest, verify_range};
 
 /// A range's integrity outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -187,6 +187,10 @@ pub struct Verification {
     pub coverage: Coverage,
     /// The anchor comparison.
     pub anchors: AnchorReport,
+    /// The position of the first journal record that does not chain or
+    /// does not decode, whether or not a range reaches it: nothing from
+    /// it on is verified.
+    pub journal_break: Option<u64>,
     /// Time evidence, kept apart from integrity.
     pub time: TimeEvidence,
 }
@@ -236,12 +240,19 @@ fn rebuild_registry(
     let mut chained = records
         .iter()
         .filter(|record| record.kind == SealKind::KeyRegistry)
-        .map(|record| record.content);
+        .map(|record| record.content)
+        .peekable();
     for bytes in entries {
-        if chained.next() != Some(digest(bytes)) {
-            reasons.push(Reason::MalformedEvidence);
+        let Some(&content) = chained.peek() else {
+            // Entries after the last commitment never committed.
             break;
+        };
+        if content != digest(bytes) {
+            // Written before a crash or a failed journal append: never
+            // committed, so never part of the registry.
+            continue;
         }
+        let _ = chained.next();
         match RegistryEntry::decode(bytes) {
             Ok(entry) => {
                 if registry.apply(&entry).is_err() {
@@ -260,6 +271,11 @@ fn rebuild_registry(
                 break;
             }
         }
+    }
+    // A commitment whose entry is missing leaves the registry incomplete:
+    // a retirement or revocation it held would be lost.
+    if reasons.is_empty() && chained.next().is_some() {
+        reasons.push(Reason::MalformedEvidence);
     }
     (registry, reasons)
 }
@@ -280,17 +296,21 @@ pub fn verify(
     let records = evidence.records;
     let records_len = u64::try_from(records.len()).unwrap_or(u64::MAX);
     // The chain: where it first breaks, if it does.
+    // Positions, not the records' own counters: a record that repeats or
+    // lowers a counter is rejected at its position in the journal.
     let mut check = ChainCheck::new();
     let mut chain_break: Option<u64> = None;
-    for record in records {
+    for (position, record) in records.iter().enumerate() {
         if check.accept(record).is_err() {
-            chain_break = Some(check.next_counter());
+            chain_break = Some(u64::try_from(position).unwrap_or(u64::MAX));
             break;
         }
     }
     if chain_break.is_none() && evidence.journal_fault.is_some() {
         chain_break = Some(records_len);
     }
+    let chain_break = chain_break;
+    let in_prefix = |position: u64| chain_break.is_none_or(|broken| position < broken);
     // Trust, the registry and the heads.
     let mut global: Vec<Reason> = Vec::new();
     let (registry, registry_reasons) = match evidence.trust {
@@ -331,13 +351,16 @@ pub fn verify(
                 push_unique(&mut global, Reason::MalformedEvidence);
                 continue;
             }
-            match registry.verify(&signed, anchors.anchored_through) {
+            let proved = proved_before_revocation(evidence, registry, &signed.key_id, records)
+                .filter(|_| !anchors.is_conflicting());
+            match registry.verify(&signed, proved) {
                 HeadVerdict::Trusted { .. } => {
                     let counter = signed.head.counter;
-                    let matches = usize::try_from(counter)
-                        .ok()
-                        .and_then(|index| records.get(index))
-                        .is_some_and(|record| record.digest() == signed.head.digest);
+                    let matches = in_prefix(counter)
+                        && usize::try_from(counter)
+                            .ok()
+                            .and_then(|index| records.get(index))
+                            .is_some_and(|record| record.digest() == signed.head.digest);
                     if matches {
                         signed_through =
                             Some(signed_through.map_or(counter, |through| through.max(counter)));
@@ -361,12 +384,22 @@ pub fn verify(
         anchored_through: anchors.anchored_through,
     };
     let signed = |counter: u64| signed_through.is_some_and(|through| counter <= through);
+    // The purges of the accepted prefix, once, by recording.
+    let mut purges: std::collections::BTreeMap<u64, Vec<&SealRecord>> =
+        std::collections::BTreeMap::new();
+    for (position, record) in records.iter().enumerate() {
+        let position = u64::try_from(position).unwrap_or(u64::MAX);
+        if record.kind == SealKind::Purge && in_prefix(position) {
+            purges.entry(record.subject).or_default().push(record);
+        }
+    }
     let mut ranges = Vec::new();
     let mut sealed_ends: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-    for record in records {
+    for (position, record) in records.iter().enumerate() {
         if !record.kind.is_range() {
             continue;
         }
+        let position = u64::try_from(position).unwrap_or(u64::MAX);
         let counter = record.counter;
         let mut report = RangeReport {
             recording: record.subject,
@@ -377,7 +410,7 @@ pub fn verify(
             reasons: Vec::new(),
             first_inconsistent: None,
         };
-        if let Some(broken) = chain_break.filter(|broken| *broken <= counter) {
+        if let Some(broken) = chain_break.filter(|broken| *broken <= position) {
             report.reasons.push(Reason::Corruption);
             report.first_inconsistent = Some(broken);
             ranges.push(report);
@@ -385,13 +418,10 @@ pub fn verify(
         }
         sealed_ends.insert(record.subject, record.end);
         // A later purge record covering this range.
-        let purge = records.iter().find(|purge| {
-            purge.kind == SealKind::Purge
-                && purge.counter > counter
-                && purge.subject == record.subject
-                && purge.start <= record.start
-                && purge.end >= record.end
-                && chain_break.is_none_or(|broken| purge.counter < broken)
+        let purge = purges.get(&record.subject).and_then(|purges| {
+            purges.iter().copied().find(|purge| {
+                purge.counter > counter && purge.start <= record.start && purge.end >= record.end
+            })
         });
         if let Some(purge) = purge {
             if signed(purge.counter) && !global.contains(&Reason::ConflictingAnchors) {
@@ -453,12 +483,68 @@ pub fn verify(
             });
         }
     }
+    let journal_break = chain_break;
     Verification {
         ranges,
         coverage,
         anchors,
+        journal_break,
         time: TimeEvidence::NotEvaluated,
     }
+}
+
+/// The highest chain position an external anchor proves was anchored
+/// before `key_id` was revoked: the anchor counts (confirmed by its store,
+/// trusted, of this journal, matching the chain's record) and its store's
+/// evidence establishes that it held it before that revocation.
+fn proved_before_revocation(
+    evidence: &Evidence<'_>,
+    registry: &KeyRegistry,
+    key_id: &Digest,
+    records: &[SealRecord],
+) -> Option<u64> {
+    evidence
+        .anchors
+        .iter()
+        .filter(|anchor| {
+            let head = &anchor.signed.head;
+            head.journal_id == evidence.journal_id
+                && evidence.externality.check(anchor).is_ok()
+                && evidence.stores.confirms(anchor)
+                && evidence.stores.held_before_revocation_of(anchor, key_id)
+                && {
+                    // The anchor's own head may be from a revoked key: it
+                    // counts on the same kind of proof.
+                    let own = evidence
+                        .stores
+                        .held_before_revocation_of(anchor, &anchor.signed.key_id)
+                        .then_some(head.counter);
+                    matches!(
+                        registry.verify(&anchor.signed, own),
+                        HeadVerdict::Trusted { .. }
+                    )
+                }
+                && usize::try_from(head.counter)
+                    .ok()
+                    .and_then(|index| records.get(index))
+                    .is_some_and(|record| record.digest() == head.digest)
+        })
+        .map(|anchor| anchor.signed.head.counter)
+        .max()
+}
+
+/// What a scrub found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScrubFinding {
+    /// An inconsistent range.
+    Range(RangeReport),
+    /// The journal does not chain or decode from this position, whether or
+    /// not a range reaches it.
+    Journal {
+        /// The first position that does not verify.
+        first_inconsistent: u64,
+    },
 }
 
 /// A mismatch a scrub found.
@@ -466,8 +552,8 @@ pub fn verify(
 pub struct ScrubEvent {
     /// When the scrub ran, in ns.
     pub at_ns: u64,
-    /// The inconsistent range.
-    pub range: RangeReport,
+    /// What it found.
+    pub finding: ScrubFinding,
 }
 
 /// The scrub: reverifies sealed copies every `interval_ns` and raises an
@@ -509,15 +595,25 @@ impl Scrub {
         // means no further scrub.
         self.next_ns = now_ns.saturating_add(self.interval_ns.get());
         let verification = verify();
+        let journal = verification
+            .journal_break
+            .map(|first_inconsistent| ScrubEvent {
+                at_ns: now_ns,
+                finding: ScrubFinding::Journal { first_inconsistent },
+            });
         Some(
-            verification
-                .ranges
+            journal
                 .into_iter()
-                .filter(|range| range.outcome == Outcome::Inconsistent)
-                .map(|range| ScrubEvent {
-                    at_ns: now_ns,
-                    range,
-                })
+                .chain(
+                    verification
+                        .ranges
+                        .into_iter()
+                        .filter(|range| range.outcome == Outcome::Inconsistent)
+                        .map(|range| ScrubEvent {
+                            at_ns: now_ns,
+                            finding: ScrubFinding::Range(range),
+                        }),
+                )
                 .collect(),
         )
     }

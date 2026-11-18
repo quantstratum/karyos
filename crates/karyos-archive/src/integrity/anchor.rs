@@ -211,6 +211,14 @@ pub trait AnchorEvidence: std::fmt::Debug {
         let _ = anchor;
         None
     }
+
+    /// Whether independent evidence proves this store held `anchor` before
+    /// the key `key_id` was revoked. Present-day storage proves no
+    /// ordering, so the default is `false`.
+    fn held_before_revocation_of(&self, anchor: &Anchor, key_id: &Digest) -> bool {
+        let _ = (anchor, key_id);
+        false
+    }
 }
 
 /// Several stores: an anchor is confirmed by any of them.
@@ -223,6 +231,11 @@ impl<E: AnchorEvidence> AnchorEvidence for Vec<E> {
         self.iter()
             .filter_map(|store| store.anchored_before_revocation(anchor))
             .max()
+    }
+
+    fn held_before_revocation_of(&self, anchor: &Anchor, key_id: &Digest) -> bool {
+        self.iter()
+            .any(|store| store.held_before_revocation_of(anchor, key_id))
     }
 }
 

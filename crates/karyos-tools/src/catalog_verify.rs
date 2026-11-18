@@ -19,8 +19,8 @@
 //!
 //! Without `--trust`, every sealed range is `inconsistent` with reason
 //! `untrusted_evidence`. Each `--anchors DIR` adds the anchors of the
-//! store in DIR. Exit status: 0 when no range is inconsistent, 1 when one
-//! is, 2 for an error.
+//! store in DIR. Exit status: 0 when nothing is inconsistent, 1 when a
+//! range or the journal is, 2 for an error.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -64,7 +64,8 @@ Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors DIR]... [--json]
   --json         one JSON object instead of text
   -h, --help     print this text
 
-Exit status: 0 no range inconsistent; 1 a range inconsistent; 2 an error.
+Exit status: 0 nothing inconsistent; 1 a range or the journal inconsistent;
+2 an error.
 ";
 
 /// A parsed `verify` command line.
@@ -214,13 +215,22 @@ impl Stores {
         let Some(store) = self.store(recording) else {
             return RangeBytes::Missing;
         };
+        // A seal is corrupt input: its range is checked against what the
+        // store holds before anything is allocated for it.
+        if start > end || end > store.written() {
+            return RangeBytes::Missing;
+        }
         let Some(length) = end
             .checked_sub(start)
             .and_then(|length| usize::try_from(length).ok())
         else {
             return RangeBytes::Missing;
         };
-        let mut buf = vec![0u8; length];
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(length).is_err() {
+            return RangeBytes::Missing;
+        }
+        buf.resize(length, 0);
         match store.read(start, &mut buf) {
             Ok(()) => RangeBytes::Bytes(buf),
             Err(_) => RangeBytes::Missing,
@@ -270,9 +280,11 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
         .filter(|record| record.kind.is_range())
         .map(|record| record.subject)
         .collect();
-    if let Ok(listing) = list(ReadOnly(StdDisk), dir) {
-        recordings.extend(listing.recordings.iter().map(|recording| recording.id));
-    }
+    // A directory that cannot be listed is an error, never an empty
+    // report; one without a catalog lists as missing.
+    let listing =
+        list(ReadOnly(StdDisk), dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    recordings.extend(listing.recordings.iter().map(|recording| recording.id));
     let mut stores = Stores {
         dir: dir.clone(),
         open: BTreeMap::new(),
@@ -333,6 +345,12 @@ pub fn text(verification: &Verification) -> String {
         }
         out.push('\n');
     }
+    if let Some(first) = verification.journal_break {
+        let _ = writeln!(
+            out,
+            "journal inconsistent first_inconsistent={first}: nothing from this record on is verified"
+        );
+    }
     let coverage = &verification.coverage;
     let through = |value: Option<u64>| value.map_or_else(|| "none".to_owned(), |v| v.to_string());
     let _ = writeln!(
@@ -384,7 +402,8 @@ pub fn json(verification: &Verification) -> String {
     let option = |value: Option<u64>| value.map_or_else(|| "null".to_owned(), |v| v.to_string());
     let _ = writeln!(
         out,
-        "],\"coverage\":{{\"records\":{},\"signed_through\":{},\"anchored_through\":{}}},\"time\":\"not_evaluated\"}}",
+        "],\"journal_first_inconsistent\":{},\"coverage\":{{\"records\":{},\"signed_through\":{},\"anchored_through\":{}}},\"time\":\"not_evaluated\"}}",
+        option(verification.journal_break),
         coverage.records,
         option(coverage.signed_through),
         option(coverage.anchored_through)
@@ -422,10 +441,11 @@ pub fn run_verify(
                 text(&verification)
             };
             let _ = stdout.write_all(report.as_bytes());
-            if verification
-                .ranges
-                .iter()
-                .any(|range| range.outcome == Outcome::Inconsistent)
+            if verification.journal_break.is_some()
+                || verification
+                    .ranges
+                    .iter()
+                    .any(|range| range.outcome == Outcome::Inconsistent)
             {
                 EXIT_INCONSISTENT
             } else {

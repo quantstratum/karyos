@@ -496,6 +496,7 @@ fn an_anchor_covers_nothing_past_a_record_that_does_not_chain() {
 
 /// Receipts whose store also proves, for every anchor, that it held the
 /// anchored head before `through`'s revocation.
+#[derive(Debug)]
 struct Timestamped;
 
 impl AnchorEvidence for Timestamped {
