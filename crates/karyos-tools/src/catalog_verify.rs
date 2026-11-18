@@ -29,7 +29,9 @@ use std::path::PathBuf;
 
 use karyos_archive::catalog::list;
 use karyos_archive::disk::{ReadOnly, StdDisk};
-use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Anchor, Externality};
+use karyos_archive::integrity::anchor::{
+    ANCHOR_FILE, ANCHOR_LENGTH, Externality, StoredAnchors,
+};
 use karyos_archive::integrity::journal::read_records;
 use karyos_archive::integrity::ledger::read_entries;
 use karyos_archive::integrity::trust::{
@@ -252,16 +254,18 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
         }
         None => (None, Externality::default(), 0),
     };
+    // Each store named on the command line is read from the store itself,
+    // which is what confirms an anchor's counter and receipt.
     let mut anchors = Vec::new();
+    let mut anchor_stores = Vec::new();
     for store in &args.anchors {
         let entries: Vec<[u8; ANCHOR_LENGTH]> = read_entries(&mut disk, store, ANCHOR_FILE)
             .map_err(|error| format!("{}: {error}", store.display()))?;
-        anchors.extend(
-            entries
-                .iter()
-                .filter_map(|bytes| Anchor::decode(bytes).ok()),
-        );
+        let stored = StoredAnchors::new(entries);
+        anchors.extend(stored.anchors());
+        anchor_stores.push(stored);
     }
+
     // Every recording the catalog or the chain names, with its written end.
     let mut recordings: BTreeSet<u64> = records
         .iter()
@@ -291,6 +295,7 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
         registry: &keys,
         heads: &heads,
         anchors: &anchors,
+        stores: &anchor_stores,
         externality: &externality,
         written: &written,
     };

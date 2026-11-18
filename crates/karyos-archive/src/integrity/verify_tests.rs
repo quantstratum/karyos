@@ -18,7 +18,17 @@ use std::path::Path;
 
 use ed25519_dalek::{Signer as _, SigningKey};
 
-use super::anchor::{Anchor, AnchorKind, Externality};
+use super::anchor::{Anchor, AnchorEvidence, AnchorKind, Externality};
+
+/// Stores that hold exactly the anchors listed.
+#[derive(Debug)]
+struct Held<'a>(&'a [Anchor]);
+
+impl AnchorEvidence for Held<'_> {
+    fn confirms(&self, anchor: &Anchor) -> bool {
+        self.0.contains(anchor)
+    }
+}
 use super::journal::IntegrityJournal;
 use super::ledger::Ledger;
 use super::test_support::*;
@@ -130,6 +140,7 @@ impl Scenario {
             registry: &self.keys,
             heads: &self.heads,
             anchors: &self.anchors,
+            stores: &Held(&self.anchors),
             externality: &externality,
             written: &self.written,
         };
@@ -258,6 +269,7 @@ fn a_broken_chain_names_its_first_inconsistent_record() {
         registry: &scenario.keys,
         heads: &scenario.heads,
         anchors: &[],
+        stores: &Held(&[]),
         externality: &externality,
         written: &[],
     };
@@ -302,7 +314,7 @@ fn an_unknown_key_never_yields_beyond_anchor() {
             head,
             key_id: key_id(&stranger.verifying_key().to_bytes()),
             custody: Custody::Declared,
-            signature: stranger.sign(&head.signed_bytes()).to_bytes(),
+            signature: stranger.sign(&head.signed_bytes(Custody::Declared)).to_bytes(),
         }
         .encode(),
     ];
@@ -342,6 +354,7 @@ fn an_unknown_algorithm_never_yields_beyond_anchor() {
             registry: &[entry],
             heads: &heads,
             anchors: &[],
+            stores: &Held(&[]),
             externality: &externality,
             written: &[],
         },
@@ -384,7 +397,7 @@ fn conflicting_anchors_never_yield_beyond_anchor() {
     let mut other = sign(&records[5]);
     other.head.digest = digest(b"another head");
     let key = archival_key();
-    other.signature = key.sign(&other.head.signed_bytes()).to_bytes();
+    other.signature = key.sign(&other.head.signed_bytes(other.custody)).to_bytes();
     scenario.anchors.push(Anchor {
         kind: AnchorKind::ReplicaJournal,
         location: [22; 32],

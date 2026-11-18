@@ -31,7 +31,7 @@
 
 use std::num::NonZeroU64;
 
-use super::anchor::{AnchorReport, Externality, check_anchors};
+use super::anchor::{AnchorEvidence, AnchorReport, Externality, check_anchors};
 use super::trust::{
     HeadReason, HeadVerdict, KeyRegistry, REGISTRY_ENTRY_LENGTH, RegistryEntry, SIGNED_HEAD_LENGTH,
     SignedHead, TrustDecodeError, TrustRoot,
@@ -217,6 +217,8 @@ pub struct Evidence<'a> {
     pub heads: &'a [[u8; SIGNED_HEAD_LENGTH]],
     /// The anchors gathered from their stores.
     pub anchors: &'a [super::anchor::Anchor],
+    /// The stores' own confirmation of each anchor's provenance.
+    pub stores: &'a dyn AnchorEvidence,
     /// What counts as external.
     pub externality: &'a Externality,
     /// Each recording's written end, for the unsealed tails.
@@ -306,6 +308,7 @@ pub fn verify(
             evidence.anchors,
             registry,
             evidence.externality,
+            evidence.stores,
         ),
         None => AnchorReport {
             anchored_through: None,

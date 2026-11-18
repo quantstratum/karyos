@@ -36,6 +36,7 @@ fn anchor(kind: AnchorKind, location: [u8; 32], external: u64, record: &SealReco
 
 /// The stores of these tests: each confirms an anchor whose receipt is
 /// the digest of its external counter, as [`anchor`] builds it.
+#[derive(Debug)]
 struct Receipts;
 
 impl AnchorEvidence for Receipts {

@@ -46,6 +46,6 @@ impl HeadSigner for TestKey {
     }
 
     fn sign(&mut self, head: &ChainHead) -> Result<[u8; SIGNATURE_LENGTH], SignerUnavailable> {
-        Ok(self.sign_bytes(&head.signed_bytes()))
+        Ok(self.sign_bytes(&head.signed_bytes(self.custody())))
     }
 }
