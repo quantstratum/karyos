@@ -509,6 +509,20 @@ pub enum RegistryError {
         /// The chain's next counter.
         next: u64,
     },
+    /// The integrity journal chains a registry entry whose bytes are not
+    /// in the registry's ledger, or differ from them.
+    #[error("registry entry {sequence} is chained but missing from the ledger")]
+    Missing {
+        /// The entry's sequence.
+        sequence: u64,
+    },
+    /// A ledger entry that cannot be decoded although the journal chains
+    /// it.
+    #[error("registry entry at ledger index {index} cannot be decoded")]
+    Malformed {
+        /// The entry's index in the ledger.
+        index: u64,
+    },
     /// The sequence space is exhausted.
     #[error("registry sequence overflow")]
     Overflow,
@@ -548,6 +562,62 @@ impl KeyRegistry {
             next_sequence: 0,
             keys: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// Rebuilds the registry under `trust` from the entries the integrity
+    /// journal chains, in chain order, reading their bytes from `ledger`.
+    ///
+    /// A ledger entry is part of the registry only once its digest is
+    /// chained as a key registry record: an entry written before a crash
+    /// or a failed journal append that never committed is skipped, and an
+    /// unchained suffix is cut from the ledger before anything else is
+    /// appended (SPEC.md §8.4, "Key registry": every update has journal
+    /// provenance).
+    ///
+    /// # Errors
+    ///
+    /// [`IntegrityError::Registry`] with [`RegistryError::Missing`] when
+    /// the journal chains an entry the ledger does not hold,
+    /// [`RegistryError::Malformed`] when a chained entry cannot be read,
+    /// or the refusal of [`KeyRegistry::apply`] for a chained entry;
+    /// otherwise the journal's or the ledger's error.
+    pub fn open<D: Disk>(
+        trust: TrustRoot,
+        journal: &mut IntegrityJournal<D>,
+        ledger: &mut Ledger<D, REGISTRY_ENTRY_LENGTH>,
+    ) -> Result<Self, IntegrityError> {
+        let chained: Vec<(u64, Digest)> = journal
+            .records()?
+            .into_iter()
+            .filter(|record| record.kind == super::SealKind::KeyRegistry)
+            .map(|record| (record.start, record.content))
+            .collect();
+        let mut registry = Self::new(trust);
+        let mut next = chained.iter().peekable();
+        let mut committed = 0usize;
+        for (index, bytes) in ledger.entries().iter().enumerate() {
+            let Some(&&(sequence, content)) = next.peek() else {
+                break;
+            };
+            if digest(bytes) != content {
+                // Written, never chained: an append that did not commit.
+                continue;
+            }
+            let entry = RegistryEntry::decode(bytes).map_err(|_| RegistryError::Malformed {
+                index: u64::try_from(index).unwrap_or(u64::MAX),
+            })?;
+            if entry.sequence != sequence {
+                return Err(RegistryError::Missing { sequence }.into());
+            }
+            registry.apply(&entry)?;
+            let _ = next.next();
+            committed = index.saturating_add(1);
+        }
+        if let Some(&(sequence, _)) = next.next() {
+            return Err(RegistryError::Missing { sequence }.into());
+        }
+        ledger.truncate(committed)?;
+        Ok(registry)
     }
 
     /// The trust root.

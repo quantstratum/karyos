@@ -11,14 +11,24 @@
 //! state is bounded by the [`BacklogPolicy`] (coalesce to the latest
 //! unsent head, or refuse an offer visibly), the coverage lag is reported
 //! even before the first signed head, and [`SigningStatus::alarm`] is set
-//! once it exceeds `anchor_interval`, which is required configuration with
-//! no default (X14).
+//! once the oldest record outside signed coverage has waited longer than
+//! `anchor_interval`, which is required configuration with no default
+//! (X14).
+//!
+//! A head counts as signed only once a [`HeadStore`] has recorded it
+//! durably: the Archive records its signed heads, so a signature that was
+//! never stored is never reported as coverage.
 
 use std::collections::VecDeque;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use super::Digest;
-use super::trust::{ChainHead, Custody, SIGNATURE_LENGTH, SignedHead};
+use super::journal::IntegrityError;
+use super::ledger::Ledger;
+use super::trust::{
+    ChainHead, Custody, SIGNATURE_LENGTH, SIGNED_HEAD_LENGTH, SignedHead, TrustDecodeError,
+};
+use crate::disk::Disk;
 
 /// The signer is unavailable; the head stays pending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -42,6 +52,22 @@ pub trait HeadSigner {
     ///
     /// [`SignerUnavailable`] when it cannot sign now.
     fn sign(&mut self, head: &ChainHead) -> Result<[u8; SIGNATURE_LENGTH], SignerUnavailable>;
+}
+
+/// Where signed heads are recorded durably before they count as signed.
+pub trait HeadStore {
+    /// Records `signed` durably.
+    ///
+    /// # Errors
+    ///
+    /// The store's error; the head is not recorded then.
+    fn record(&mut self, signed: &SignedHead) -> Result<(), IntegrityError>;
+}
+
+impl<D: Disk> HeadStore for Ledger<D, SIGNED_HEAD_LENGTH> {
+    fn record(&mut self, signed: &SignedHead) -> Result<(), IntegrityError> {
+        self.append(signed.encode())
+    }
 }
 
 /// What happens to a head offered while others are pending.
@@ -124,10 +150,13 @@ pub enum Offered {
 pub struct SigningStatus {
     /// Records sealed past the last signed head.
     pub coverage_lag_records: u64,
-    /// How long since the last signed head, or since signing started if
-    /// none was signed yet, in ns.
+    /// How long the oldest record outside signed coverage has waited, in
+    /// ns: since the first offer of a head not yet signed, or since the
+    /// last signed head (or the start of signing) for records not offered
+    /// yet. Signing an older head does not reset it while newer records
+    /// remain uncovered.
     pub coverage_lag_ns: u64,
-    /// Whether the lag exceeds `anchor_interval`.
+    /// Whether records remain uncovered for longer than `anchor_interval`.
     pub alarm: bool,
     /// Heads waiting for the signer.
     pub pending: u64,
@@ -139,11 +168,23 @@ pub struct SigningStatus {
     pub last_signed: Option<u64>,
 }
 
+/// A head waiting for the signer.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    head: ChainHead,
+    /// When the oldest record this head covers, and no earlier pending
+    /// head does, was first offered.
+    since_ns: u64,
+}
+
 /// The bounded queue of heads to sign.
 #[derive(Debug, Clone)]
 pub struct HeadSigning {
     config: SigningConfig,
-    pending: VecDeque<ChainHead>,
+    pending: VecDeque<Pending>,
+    /// When the first head refused since the last queued one was offered:
+    /// its records stay uncovered until a later head is signed.
+    refused_since_ns: Option<u64>,
     signed: Vec<SignedHead>,
     started_ns: u64,
     last_signed_ns: Option<u64>,
@@ -158,6 +199,7 @@ impl HeadSigning {
         Self {
             config,
             pending: VecDeque::new(),
+            refused_since_ns: None,
             signed: Vec::new(),
             started_ns: now_ns,
             last_signed_ns: None,
@@ -166,14 +208,36 @@ impl HeadSigning {
         }
     }
 
-    /// Offers a new head. Never blocks and never calls the signer.
-    pub fn offer(&mut self, head: ChainHead) -> Offered {
+    /// Signing resumed at `now_ns` after a restart, with `recorded` the
+    /// entries of the store's ledger, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustDecodeError`] for an entry that cannot be read.
+    pub fn resume(
+        config: SigningConfig,
+        now_ns: u64,
+        recorded: &[[u8; SIGNED_HEAD_LENGTH]],
+    ) -> Result<Self, TrustDecodeError> {
+        let mut signing = Self::new(config, now_ns);
+        for bytes in recorded {
+            signing.signed.push(SignedHead::decode(bytes)?);
+        }
+        Ok(signing)
+    }
+
+    /// Offers a new head at `now_ns`. Never blocks and never calls the
+    /// signer.
+    pub fn offer(&mut self, head: ChainHead, now_ns: u64) -> Offered {
         match self.config.policy {
             BacklogPolicy::Coalesce => {
-                let replaced = self.pending.pop_back().is_some();
+                let replaced = self.pending.pop_back();
                 self.pending.clear();
-                self.pending.push_back(head);
-                if replaced {
+                self.pending.push_back(Pending {
+                    head,
+                    since_ns: replaced.map_or(now_ns, |old| old.since_ns),
+                });
+                if replaced.is_some() {
                     self.coalesced = self.coalesced.saturating_add(1);
                     Offered::Coalesced
                 } else {
@@ -183,9 +247,13 @@ impl HeadSigning {
             BacklogPolicy::Refuse { capacity } => {
                 if self.pending.len() >= capacity.get() {
                     self.refused = self.refused.saturating_add(1);
+                    let _ = self.refused_since_ns.get_or_insert(now_ns);
                     Offered::Refused
                 } else {
-                    self.pending.push_back(head);
+                    // The records of heads refused before this one are
+                    // covered only by it: they have waited since then.
+                    let since_ns = self.refused_since_ns.take().unwrap_or(now_ns);
+                    self.pending.push_back(Pending { head, since_ns });
                     Offered::Queued
                 }
             }
@@ -193,24 +261,37 @@ impl HeadSigning {
     }
 
     /// Asks `signer` for every pending head, oldest first, stopping at the
-    /// first that it cannot sign. Returns the heads signed.
-    pub fn poll(&mut self, signer: &mut impl HeadSigner, now_ns: u64) -> u64 {
+    /// first that it cannot sign, and records each signed head in `store`
+    /// before it counts as signed. Returns the heads signed.
+    ///
+    /// # Errors
+    ///
+    /// The store's error. The head it failed to record stays pending,
+    /// with every head after it; those recorded before stay signed.
+    pub fn poll(
+        &mut self,
+        signer: &mut impl HeadSigner,
+        store: &mut impl HeadStore,
+        now_ns: u64,
+    ) -> Result<u64, IntegrityError> {
         let mut signed = 0u64;
-        while let Some(head) = self.pending.front().copied() {
-            let Ok(signature) = signer.sign(&head) else {
+        while let Some(pending) = self.pending.front().copied() {
+            let Ok(signature) = signer.sign(&pending.head) else {
                 break;
             };
-            self.pending.pop_front();
-            self.signed.push(SignedHead {
-                head,
+            let head = SignedHead {
+                head: pending.head,
                 key_id: signer.key_id(),
                 custody: signer.custody(),
                 signature,
-            });
+            };
+            store.record(&head)?;
+            let _ = self.pending.pop_front();
+            self.signed.push(head);
             self.last_signed_ns = Some(now_ns);
             signed = signed.saturating_add(1);
         }
-        signed
+        Ok(signed)
     }
 
     /// The heads signed, oldest first.
@@ -227,7 +308,13 @@ impl HeadSigning {
     pub fn status(&self, now_ns: u64, sealed_records: u64) -> SigningStatus {
         let last_signed = self.signed.last().map(|signed| signed.head.counter);
         let covered = last_signed.map_or(0, |counter| counter.saturating_add(1));
-        let since = self.last_signed_ns.unwrap_or(self.started_ns);
+        let since = self
+            .pending
+            .front()
+            .map(|pending| pending.since_ns)
+            .or(self.refused_since_ns)
+            .or(self.last_signed_ns)
+            .unwrap_or(self.started_ns);
         let coverage_lag_ns = now_ns.saturating_sub(since);
         let coverage_lag_records = sealed_records.saturating_sub(covered);
         SigningStatus {

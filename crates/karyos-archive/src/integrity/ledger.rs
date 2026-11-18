@@ -108,4 +108,34 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
         self.entries.push(entry);
         Ok(())
     }
+
+    /// Cuts the ledger to its first `keep` entries and syncs it: how a
+    /// reader drops a suffix the chain never recorded before anything is
+    /// appended after it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Ledger::append`].
+    pub fn truncate(&mut self, keep: usize) -> Result<(), IntegrityError> {
+        if self.poisoned {
+            return Err(IntegrityError::Poisoned);
+        }
+        if keep >= self.entries.len() {
+            return Ok(());
+        }
+        let count = u64::try_from(keep).map_err(|_| IntegrityError::Overflow)?;
+        let length = count
+            .checked_mul(Self::LENGTH)
+            .ok_or(IntegrityError::Overflow)?;
+        let cut = self
+            .disk
+            .set_len(&self.file, length)
+            .and_then(|()| self.disk.sync(&self.file));
+        if let Err(error) = cut {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        self.entries.truncate(keep);
+        Ok(())
+    }
 }

@@ -23,12 +23,12 @@ use super::journal::{IntegrityError, IntegrityJournal};
 use super::ledger::Ledger;
 use super::sealer::{SealSource, Sealer, run};
 use super::signing::{
-    BacklogPolicy, HeadSigner, HeadSigning, Offered, SignerUnavailable, SigningConfig,
+    BacklogPolicy, HeadSigner, HeadSigning, HeadStore, Offered, SignerUnavailable, SigningConfig,
     SigningConfigError,
 };
 use super::trust::*;
 use super::{Digest, digest};
-use crate::fault::FaultDisk;
+use crate::fault::{FaultDisk, Survives};
 
 const DIR: &str = "/archive";
 const ARCHIVE: Digest = [7; 32];
@@ -146,6 +146,23 @@ fn signed(signer: &mut TestSigner, head: ChainHead) -> SignedHead {
 }
 
 /// A registry with the test signer's key registered from counter 0.
+/// A store of signed heads in memory, which can be made to fail.
+#[derive(Default)]
+struct Store {
+    heads: Vec<SignedHead>,
+    failing: bool,
+}
+
+impl HeadStore for Store {
+    fn record(&mut self, signed: &SignedHead) -> Result<(), IntegrityError> {
+        if self.failing {
+            return Err(IntegrityError::Poisoned);
+        }
+        self.heads.push(*signed);
+        Ok(())
+    }
+}
+
 fn registry_with(signer: &TestSigner) -> KeyRegistry {
     let mut registry = KeyRegistry::new(trust());
     registry
@@ -449,10 +466,11 @@ fn a_passed_anchor_interval_raises_the_alarm() {
     let config = SigningConfig::new(Some(1_000), BacklogPolicy::Coalesce).unwrap();
     let mut signing = HeadSigning::new(config, 0);
     let mut signer = TestSigner::new(9);
-    assert_eq!(signing.offer(head(0)), Offered::Queued);
+    let mut store = Store::default();
+    assert_eq!(signing.offer(head(0), 0), Offered::Queued);
     assert!(!signing.status(1_000, 1).alarm);
     assert!(signing.status(1_001, 1).alarm);
-    assert_eq!(signing.poll(&mut signer, 1_001), 1);
+    assert_eq!(signing.poll(&mut signer, &mut store, 1_001).unwrap(), 1);
     assert!(!signing.status(1_500, 1).alarm);
     // Nothing new sealed: no lag, no alarm, however long it is.
     assert!(!signing.status(9_000, 1).alarm);
@@ -469,6 +487,7 @@ fn during_a_signer_outage_sealing_continues_the_backlog_stays_bounded_and_the_la
     let config = SigningConfig::new(Some(1_000), BacklogPolicy::Coalesce).unwrap();
     let mut signing = HeadSigning::new(config, 0);
     let mut signer = TestSigner::new(9);
+    let mut store = Store::default();
     signer.available = false;
     let bytes = vec![5u8; 64 * 50];
     for round in 1..=50u64 {
@@ -481,24 +500,29 @@ fn during_a_signer_outage_sealing_continues_the_backlog_stays_bounded_and_the_la
         .unwrap();
         assert_eq!(sealed, 1);
         let counter = journal.next_counter() - 1;
-        let _ = signing.offer(ChainHead {
-            archive_id: ARCHIVE,
-            journal_id: JOURNAL,
-            counter,
-            digest: journal.head(),
-        });
-        assert_eq!(signing.poll(&mut signer, now), 0);
+        let _ = signing.offer(
+            ChainHead {
+                archive_id: ARCHIVE,
+                journal_id: JOURNAL,
+                counter,
+                digest: journal.head(),
+            },
+            now,
+        );
+        assert_eq!(signing.poll(&mut signer, &mut store, now).unwrap(), 0);
         let status = signing.status(now, journal.next_counter());
         assert!(status.pending <= 1, "round {round}");
         // Reported before the first signed head.
         assert_eq!(status.last_signed, None);
         assert_eq!(status.coverage_lag_records, round);
-        assert_eq!(status.coverage_lag_ns, now);
+        // The oldest uncovered record was offered in the first round.
+        assert_eq!(status.coverage_lag_ns, now - 100);
     }
     assert!(signing.status(5_000, 50).alarm);
     assert_eq!(signing.status(5_000, 50).coalesced, 49);
     signer.available = true;
-    assert_eq!(signing.poll(&mut signer, 5_100), 1);
+    assert_eq!(signing.poll(&mut signer, &mut store, 5_100).unwrap(), 1);
+    assert_eq!(store.heads, signing.signed());
     let status = signing.status(5_100, journal.next_counter());
     assert_eq!((status.coverage_lag_records, status.alarm), (0, false));
     let registry = registry_with(&signer);
@@ -519,9 +543,9 @@ fn a_refusing_backlog_refuses_visibly_once_full() {
     )
     .unwrap();
     let mut signing = HeadSigning::new(config, 0);
-    assert_eq!(signing.offer(head(0)), Offered::Queued);
-    assert_eq!(signing.offer(head(1)), Offered::Queued);
-    assert_eq!(signing.offer(head(2)), Offered::Refused);
+    assert_eq!(signing.offer(head(0), 0), Offered::Queued);
+    assert_eq!(signing.offer(head(1), 0), Offered::Queued);
+    assert_eq!(signing.offer(head(2), 0), Offered::Refused);
     let status = signing.status(10, 3);
     assert_eq!((status.pending, status.refused), (2, 1));
 }
@@ -670,4 +694,145 @@ fn a_later_lifecycle_entry_never_relaxes_an_earlier_cutoff() {
         registry.key(&signer.key_id()).unwrap().retired_from,
         Some(8)
     );
+}
+
+#[test]
+fn a_registry_entry_whose_journal_append_never_committed_is_not_replayed() {
+    let disk = FaultDisk::default();
+    let mut journal = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut ledger =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), "keys").unwrap();
+    let first = TestSigner::new(9);
+    let mut registry = KeyRegistry::new(trust());
+    registry
+        .append(
+            &register(&first.key, Custody::NoSeparation, 0),
+            &mut journal,
+            &mut ledger,
+        )
+        .unwrap();
+    // The crash point: the ledger entry is synced, the journal record is
+    // not written.
+    let orphan = TestSigner::new(10);
+    let uncommitted = entry(
+        &authority(),
+        1,
+        RegistryAction::Register,
+        &orphan.key,
+        Custody::NoSeparation,
+        1,
+        [0; 32],
+    );
+    ledger.append(uncommitted.encode()).unwrap();
+
+    let restarted = disk.after_crash(Survives::Synced);
+    let mut journal = IntegrityJournal::open(restarted.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut ledger =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(restarted.clone(), Path::new(DIR), "keys")
+            .unwrap();
+    assert_eq!(ledger.entries().len(), 2);
+    let mut registry = KeyRegistry::open(trust(), &mut journal, &mut ledger).unwrap();
+    assert!(registry.key(&first.key_id()).is_some());
+    assert!(registry.key(&orphan.key_id()).is_none());
+    assert_eq!(registry.next_sequence(), 1);
+    // The unchained suffix is cut before anything is appended after it.
+    assert_eq!(ledger.entries().len(), 1);
+    registry
+        .append(&uncommitted, &mut journal, &mut ledger)
+        .unwrap();
+
+    let again = restarted.after_crash(Survives::Synced);
+    let mut journal = IntegrityJournal::open(again.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut ledger =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(again, Path::new(DIR), "keys").unwrap();
+    let registry = KeyRegistry::open(trust(), &mut journal, &mut ledger).unwrap();
+    assert!(registry.key(&orphan.key_id()).is_some());
+    assert_eq!(registry.next_sequence(), 2);
+}
+
+#[test]
+fn a_chained_registry_entry_missing_from_the_ledger_is_refused() {
+    let disk = FaultDisk::default();
+    let mut journal = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut ledger =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), "keys").unwrap();
+    let signer = TestSigner::new(9);
+    KeyRegistry::new(trust())
+        .append(
+            &register(&signer.key, Custody::NoSeparation, 0),
+            &mut journal,
+            &mut ledger,
+        )
+        .unwrap();
+    let mut empty =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "other").unwrap();
+    assert!(matches!(
+        KeyRegistry::open(trust(), &mut journal, &mut empty),
+        Err(IntegrityError::Registry(RegistryError::Missing {
+            sequence: 0
+        }))
+    ));
+}
+
+#[test]
+fn a_signed_head_counts_only_once_it_is_recorded_durably() {
+    let config = SigningConfig::new(Some(1_000), BacklogPolicy::Coalesce).unwrap();
+    let mut signing = HeadSigning::new(config, 0);
+    let mut signer = TestSigner::new(9);
+    let mut failing = Store {
+        failing: true,
+        ..Store::default()
+    };
+    let _ = signing.offer(head(0), 0);
+    assert!(signing.poll(&mut signer, &mut failing, 10).is_err());
+    let status = signing.status(10, 1);
+    assert_eq!((status.pending, status.last_signed), (1, None));
+    assert!(signing.signed().is_empty());
+
+    let disk = FaultDisk::default();
+    let mut heads =
+        Ledger::<_, SIGNED_HEAD_LENGTH>::open(disk.clone(), Path::new(DIR), "heads").unwrap();
+    assert_eq!(signing.poll(&mut signer, &mut heads, 20).unwrap(), 1);
+    let restarted = disk.after_crash(Survives::Synced);
+    let heads = Ledger::<_, SIGNED_HEAD_LENGTH>::open(restarted, Path::new(DIR), "heads").unwrap();
+    let resumed = HeadSigning::resume(config, 30, heads.entries()).unwrap();
+    assert_eq!(resumed.signed(), signing.signed());
+    assert_eq!(resumed.status(30, 1).last_signed, Some(0));
+}
+
+#[test]
+fn signing_an_old_head_does_not_hide_newer_records_left_uncovered() {
+    let config = SigningConfig::new(
+        Some(1_000),
+        BacklogPolicy::Refuse {
+            capacity: NonZeroUsize::new(1).unwrap(),
+        },
+    )
+    .unwrap();
+    let mut signing = HeadSigning::new(config, 0);
+    let mut signer = TestSigner::new(9);
+    let mut store = Store::default();
+    signer.available = false;
+    assert_eq!(signing.offer(head(0), 0), Offered::Queued);
+    assert_eq!(signing.offer(head(1), 100), Offered::Refused);
+    signer.available = true;
+    assert_eq!(signing.poll(&mut signer, &mut store, 1_500).unwrap(), 1);
+    // Record 1 has waited since 100, longer than the interval.
+    let status = signing.status(1_500, 2);
+    assert_eq!(status.coverage_lag_records, 1);
+    assert_eq!(status.coverage_lag_ns, 1_400);
+    assert!(status.alarm);
+    // A later head covers it, and its age is that of record 1.
+    assert_eq!(signing.offer(head(2), 1_600), Offered::Queued);
+    assert_eq!(signing.status(1_600, 3).coverage_lag_ns, 1_500);
+    assert_eq!(signing.poll(&mut signer, &mut store, 1_700).unwrap(), 1);
+    assert!(!signing.status(1_700, 3).alarm);
 }
