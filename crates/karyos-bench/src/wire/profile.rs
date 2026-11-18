@@ -117,9 +117,13 @@ mod tests {
         );
     }
 
-    /// No candidate of ADR-0086 is a configuration the harness can run:
-    /// the construction is selected only on E1 or E2 evidence (owner
-    /// decision item 5), so no provisional profile is reachable (#632).
+    /// No candidate of ADR-0086 is a configuration the harness can run
+    /// in a build without candidate evaluation: the construction is
+    /// selected only on E1 or E2 evidence (owner decision item 5), so no
+    /// provisional profile is reachable (#632). The opt-in
+    /// `auth-candidates` evaluation build is exempt, since ADR-0086 runs
+    /// the candidates there to produce that evidence.
+    #[cfg(not(feature = "auth-candidates"))]
     #[test]
     fn no_candidate_profile_is_reachable_before_selection() {
         for candidate in [
