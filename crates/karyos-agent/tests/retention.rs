@@ -107,7 +107,7 @@ fn ask(dir: &std::path::Path, role: Role, agent: &mut Agent, request: &str) -> S
             served = server.poll(agent).unwrap();
             std::thread::sleep(Duration::from_millis(1));
         }
-        client.join().unwrap()
+        client.join().unwrap().trim_end().to_owned()
     })
 }
 
