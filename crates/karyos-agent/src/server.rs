@@ -583,30 +583,18 @@ impl Server {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
-        // A directory this agent owns in one of its two modes (a new one,
-        // or one left by a run with or without a relay group) is brought
-        // to this run's: the group before opening the mode to it, and the
-        // mode closed before anything else. Anything else is refused below.
-        let existing = std::fs::symlink_metadata(&config.dir)?;
-        if existing.is_dir()
-            && existing.uid() == uid
-            && matches!(existing.mode() & 0o777, 0o700 | 0o710)
-        {
-            if let Some(gid) = config.relay_group {
-                std::os::unix::fs::chown(&config.dir, None, Some(gid))?;
-            }
-            std::fs::set_permissions(&config.dir, std::fs::Permissions::from_mode(dir_mode))?;
-        }
+        // The directory must be this uid's, in one of the agent's two modes
+        // (a new one, or one left by a run with or without a relay group);
+        // anything else is refused before anything changes.
         let dir = std::fs::symlink_metadata(&config.dir)?;
-        if !dir.is_dir()
-            || dir.uid() != uid
-            || dir.mode() & 0o777 != dir_mode
-            || config.relay_group.is_some_and(|gid| dir.gid() != gid)
-        {
+        if !dir.is_dir() || dir.uid() != uid || !matches!(dir.mode() & 0o777, 0o700 | 0o710) {
             return Err(ServeError::NotPrivate(
-                "the API directory is not a private directory of this uid (and relay group)",
+                "the API directory is not a private directory of this uid",
             ));
         }
+        // A live agent's socket is never taken over, and its directory never
+        // touched: this run binds the socket first, so a second agent that
+        // starts and fails changes nothing of the first's.
         let path = config.dir.join(SOCKET_NAME);
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -629,9 +617,24 @@ impl Server {
                 }
             }
         }
+        // Binding fails if another agent bound it meanwhile.
         let listener = UnixListener::bind(&path)?;
-        // The group first, then the mode: the socket is never open to a
-        // group it should not be.
+        // From here the socket is this run's. Close its mode, then bring
+        // the directory to this run's setting: the group before the mode
+        // opens to it; then open the socket to the group.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        if let Some(gid) = config.relay_group {
+            std::os::unix::fs::chown(&config.dir, None, Some(gid))?;
+        }
+        std::fs::set_permissions(&config.dir, std::fs::Permissions::from_mode(dir_mode))?;
+        let dir = std::fs::symlink_metadata(&config.dir)?;
+        if dir.mode() & 0o777 != dir_mode || config.relay_group.is_some_and(|gid| dir.gid() != gid)
+        {
+            let _ = std::fs::remove_file(&path);
+            return Err(ServeError::NotPrivate(
+                "the API directory could not be given this run's mode and group",
+            ));
+        }
         if let Some(gid) = config.relay_group {
             std::os::unix::fs::chown(&path, None, Some(gid))?;
         }

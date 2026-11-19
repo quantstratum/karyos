@@ -421,6 +421,17 @@ fn an_existing_directory_follows_the_relay_group_setting() {
     drop(server);
     let server = Server::bind(plain()).unwrap();
     assert_eq!((mode(&dir), mode(server.path())), (0o700, 0o600));
+    // A second agent that starts with the other setting while this one
+    // serves fails, and changes nothing of the live agent's.
+    assert!(matches!(
+        Server::bind(plain().with_relay_group(gid)),
+        Err(ServeError::Live(_))
+    ));
+    assert_eq!((mode(&dir), mode(server.path())), (0o700, 0o600));
+    drop(server);
+    let server = Server::bind(plain().with_relay_group(gid)).unwrap();
+    assert!(matches!(Server::bind(plain()), Err(ServeError::Live(_))));
+    assert_eq!((mode(&dir), mode(server.path())), (0o710, 0o660));
     drop(server);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
     assert!(matches!(

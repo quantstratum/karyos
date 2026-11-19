@@ -550,16 +550,21 @@ impl Freshness {
         let held = text(hyper::header::AGE)
             .and_then(|age| age.parse::<u64>().ok())
             .map_or(Duration::ZERO, Duration::from_secs);
-        let date = text(hyper::header::DATE).and_then(http_date);
-        let now_seconds = unix_seconds(now);
+        let date = text(hyper::header::DATE)
+            .and_then(http_date)
+            .map(Duration::from_secs);
+        // This clock to the nanosecond: truncating it to seconds would make
+        // a response look younger, and an `Expires` later, than it is.
+        let now = now.duration_since(SystemTime::UNIX_EPOCH).ok();
         // A `Date` ahead of this clock gives no apparent age, never a
         // negative one.
-        let apparent = match (date, now_seconds) {
-            (Some(date), Some(now)) => Duration::from_secs(now.saturating_sub(date)),
+        let apparent = match (date, now) {
+            (Some(date), Some(now)) => now.saturating_sub(date),
             _ => Duration::ZERO,
         };
         let age = held.max(apparent);
         let mut max_age = None;
+        let mut max_ages = 0_u32;
         let mut uncacheable = false;
         for directive in headers
             .get_all(hyper::header::CACHE_CONTROL)
@@ -573,10 +578,16 @@ impl Freshness {
                 "no-store" | "no-cache" => uncacheable = true,
                 "max-age" => {
                     // An invalid max-age makes the response stale (§4.2.1).
+                    max_ages = max_ages.saturating_add(1);
                     max_age = Some(value.trim().trim_matches('"').parse::<u64>().unwrap_or(0));
                 }
                 _ => {}
             }
+        }
+        // More than one max-age, whether they agree or not, is invalid
+        // metadata: zero (§4.2.1), never the first or the last.
+        if max_ages > 1 {
+            max_age = Some(0);
         }
         let mut expired = false;
         let lifetime = if uncacheable {
@@ -584,11 +595,12 @@ impl Freshness {
         } else if let Some(seconds) = max_age {
             Duration::from_secs(seconds)
         } else {
-            let date = date.or(now_seconds);
-            match (text(hyper::header::EXPIRES).map(http_date), date) {
-                (Some(Some(expires)), Some(date)) if expires > date => {
-                    Duration::from_secs(expires - date)
-                }
+            let date = date.or(now);
+            match (
+                text(hyper::header::EXPIRES).map(|text| http_date(text).map(Duration::from_secs)),
+                date,
+            ) {
+                (Some(Some(expires)), Some(date)) if expires > date => expires - date,
                 // At or before its date, or not a date: already expired.
                 (Some(_), _) => {
                     expired = true;
@@ -604,12 +616,6 @@ impl Freshness {
             expired,
         }
     }
-}
-
-fn unix_seconds(time: SystemTime) -> Option<u64> {
-    time.duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .map(|elapsed| elapsed.as_secs())
 }
 
 /// Seconds since the epoch of IMF-fixdate `text` (RFC 9110 §5.6.7,
@@ -672,12 +678,60 @@ mod tests {
     use super::*;
 
     fn freshness(headers: &[(&'static str, &str)]) -> Freshness {
+        freshness_at(headers, Duration::ZERO)
+    }
+
+    /// At 08:49:37 plus `past`.
+    fn freshness_at(headers: &[(&'static str, &str)], past: Duration) -> Freshness {
         let mut map = hyper::HeaderMap::new();
         for (name, value) in headers {
             let _ = map.append(*name, value.parse().unwrap());
         }
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777) + past;
         Freshness::of(&map, now)
+    }
+
+    /// Without `Date`, an `Expires` counts from this clock to the
+    /// nanosecond, never from its whole second: 900 ms into 08:49:37, an
+    /// `Expires` of 08:49:38 leaves 100 ms, and one of 08:49:37 is
+    /// expired. The apparent age keeps its fraction too.
+    #[test]
+    fn expiry_keeps_sub_second_precision() {
+        let past = Duration::from_millis(900);
+        let soon = freshness_at(&[("expires", "Sun, 06 Nov 1994 08:49:38 GMT")], past);
+        assert_eq!(soon.lifetime, Duration::from_millis(100));
+        assert!(!soon.stale_on_receipt());
+        let now = freshness_at(&[("expires", "Sun, 06 Nov 1994 08:49:37 GMT")], past);
+        assert!(now.expired && now.stale_on_receipt());
+        let dated = freshness_at(
+            &[
+                ("cache-control", "max-age=1"),
+                ("date", "Sun, 06 Nov 1994 08:49:36 GMT"),
+            ],
+            past,
+        );
+        assert_eq!(dated.age, Duration::from_millis(1900));
+        assert!(dated.stale_on_receipt());
+    }
+
+    /// Two `max-age` directives, equal or not, in one field or two, are
+    /// invalid metadata: lifetime zero (RFC 9111 §4.2.1).
+    #[test]
+    fn duplicate_max_ages_are_invalid() {
+        for headers in [
+            &[("cache-control", "max-age=60, max-age=60")][..],
+            &[("cache-control", "max-age=60, max-age=600")],
+            &[
+                ("cache-control", "max-age=60"),
+                ("cache-control", "max-age=600"),
+            ],
+        ] {
+            assert_eq!(freshness(headers).lifetime, Duration::ZERO, "{headers:?}");
+        }
+        assert_eq!(
+            freshness(&[("cache-control", "max-age=60")]).lifetime,
+            Duration::from_secs(60)
+        );
     }
 
     /// The lifetime is the issuer's, never raised; `no-store`, `no-cache`
