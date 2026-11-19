@@ -25,7 +25,7 @@
 //! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
 //! under its own `0.y.z` rule.
 
-#[cfg(feature = "test-hooks")]
+#[cfg(feature = "alloc-count")]
 pub mod alloc_count;
 pub mod applied_epoch;
 pub mod atomic_view;

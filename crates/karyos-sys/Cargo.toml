@@ -15,8 +15,12 @@ categories = ["network-programming", "concurrency"]
 
 [features]
 # Hooks for tests of dependent crates that need a broken invariant; never
-# enabled outside dev-dependencies.
-test-hooks = []
+# enabled outside dev-dependencies. They include the counting allocator.
+test-hooks = ["alloc-count"]
+# The counting global allocator (`alloc_count`), on its own: what the
+# facade's `alloc-count` feature exposes to product test profiles
+# (R-CORE-48, karyos#918). It breaks no invariant.
+alloc-count = []
 
 [dependencies]
 thiserror.workspace = true

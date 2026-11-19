@@ -68,6 +68,58 @@
 //! assert!(!release.is_empty() && protocol > 0);
 //! ```
 
+/// A counting global allocator for test profiles (feature `alloc-count`;
+/// R-CORE-48, karyos#918): a product-layer test binary installs it and
+/// checks that a call allocates nothing, with no `unsafe` of its own and
+/// no internal crate.
+///
+/// The test binary declares, once:
+/// `#[global_allocator] static ALLOCATOR: karyos::alloc_count::CountingAllocator = karyos::alloc_count::CountingAllocator;`
+/// and checks each call:
+///
+/// ```
+/// let mut values: Vec<u64> = Vec::with_capacity(4);
+/// let ((), operations) = karyos::alloc_count::count(|| values.push(1));
+/// assert_eq!(operations, 0, "the push allocated, reallocated or freed");
+/// ```
+///
+/// # The contract
+///
+/// - **What counts.** [`count`](alloc_count::count) runs a call and returns
+///   the number of allocations, reallocations and frees the **calling
+///   thread** made during it; [`count_allocations`](alloc_count::count_allocations)
+///   counts allocations and reallocations alone, for a call that may free
+///   what it retires but must not allocate. `alloc` and `alloc_zeroed` are
+///   allocations, `realloc` is one reallocation (never an allocation plus a
+///   free), `dealloc` is a free. Another thread's operations are never
+///   counted, so tests running in parallel do not disturb each other; a
+///   call that hands work to another thread does not count that work.
+/// - **Installing.** The counts are meaningful only when
+///   [`CountingAllocator`](alloc_count::CountingAllocator) is the binary's
+///   `#[global_allocator]`; otherwise every count is 0. It forwards every
+///   operation to the system allocator unchanged.
+/// - **Reset.** Each `count` starts at 0; nothing carries over between
+///   counts, and there is nothing to uninstall: outside a `count`, the
+///   allocator only forwards.
+/// - **Nesting.** Not supported: an inner `count` resets the thread's
+///   count when it starts and stops counting when it ends, so the outer
+///   count then misses the calls before and after it. Count one call at a
+///   time.
+/// - **Panics.** A panic in the call stops the counting (the thread is
+///   disarmed as the panic unwinds) and propagates; no count is returned.
+/// - **Production.** Unsupported: the feature is for test binaries. When
+///   installed, each operation also reads one thread-local flag and, while
+///   counting, updates a few thread-local counters and two process-wide
+///   atomics (the multi-thread window this surface does not expose).
+///
+/// The surface mirrors `karyos-sys`'s `alloc_count` (the ADR-0008
+/// mechanism the core's own tests use) with these items only; its
+/// multi-thread `window` and byte counts are not part of it.
+#[cfg(feature = "alloc-count")]
+pub mod alloc_count {
+    pub use karyos_sys::alloc_count::{CountingAllocator, count, count_allocations};
+}
+
 /// The core release this facade was built from: the workspace version,
 /// such as `0.1.0-alpha.2` (R-CORE-33, karyos#752).
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
