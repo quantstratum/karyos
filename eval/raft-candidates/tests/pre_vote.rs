@@ -15,6 +15,7 @@
 use std::path::Path;
 
 use karyos_cluster::RaftLog;
+use karyos_raft_eval::openraft_core::{OpenRaft, OpenRaftCore, OpenRaftNoPreVote};
 use karyos_raft_eval::raft_rs::{RaftCore, RaftRs, RaftRsNoPreVote};
 use karyos_sim::disk::SimDisk;
 use karyos_sim::harness::core::{ConsensusCore, LogView, drive};
@@ -108,8 +109,8 @@ impl<C: ConsensusCore> Mini<C> {
 /// Elects a leader, cuts a follower off for long past its election
 /// timeout, lets it back, and returns (the leader and its term before,
 /// the cut follower's term while cut off, the leader and its term after).
-fn isolate_and_return<const PRE_VOTE: bool>() -> ((NodeId, u64), u64, Option<(NodeId, u64)>) {
-    let mut mini = Mini::<RaftCore<PRE_VOTE>>::new();
+fn isolate_and_return<C: ConsensusCore>() -> ((NodeId, u64), u64, Option<(NodeId, u64)>) {
+    let mut mini = Mini::<C>::new();
     mini.run(100);
     let before = mini.leader().unwrap();
     let follower = (0..SERVERS).find(|id| *id != before.0).unwrap();
@@ -121,9 +122,8 @@ fn isolate_and_return<const PRE_VOTE: bool>() -> ((NodeId, u64), u64, Option<(No
     (before, cut_term, mini.leader())
 }
 
-#[test]
-fn a_returning_follower_does_not_depose_the_leader_with_pre_vote() {
-    let (before, cut_term, after) = isolate_and_return::<true>();
+fn with_pre_vote<C: ConsensusCore>() {
+    let (before, cut_term, after) = isolate_and_return::<C>();
     // Cut off, its pre-votes failed and its term never moved.
     assert_eq!(cut_term, before.1);
     assert_eq!(after, Some(before));
@@ -132,16 +132,70 @@ fn a_returning_follower_does_not_depose_the_leader_with_pre_vote() {
 /// The negative control: the same run without pre-vote. Cut off, the
 /// follower campaigns and raises its term; back, its higher term deposes
 /// the leader, and the cluster leads a later term.
-#[test]
-fn without_pre_vote_the_returning_follower_forces_an_election() {
-    let (before, cut_term, after) = isolate_and_return::<false>();
+fn without_pre_vote<C: ConsensusCore>() {
+    let (before, cut_term, after) = isolate_and_return::<C>();
     assert!(cut_term > before.1, "{cut_term} after {before:?}");
     let after = after.unwrap();
     assert!(after.1 > before.1, "{after:?} after {before:?}");
 }
 
 #[test]
-fn the_evaluated_core_runs_with_pre_vote() {
+fn raft_a_returning_follower_does_not_depose_the_leader_with_pre_vote() {
+    with_pre_vote::<RaftRs>();
+}
+
+#[test]
+fn raft_without_pre_vote_the_returning_follower_forces_an_election() {
+    without_pre_vote::<RaftRsNoPreVote>();
+}
+
+/// OpenRaft's pre-vote is its own handler on the receiving node, reached
+/// through the adapter's network, never the trait's default that
+/// synthesises a grant: with that default the cut-off follower's
+/// pre-vote would pass on its own and it would raise its term.
+#[test]
+fn openraft_a_returning_follower_does_not_depose_the_leader_with_pre_vote() {
+    with_pre_vote::<OpenRaft>();
+}
+
+#[test]
+fn openraft_without_pre_vote_the_returning_follower_forces_an_election() {
+    without_pre_vote::<OpenRaftNoPreVote>();
+}
+
+/// The same calls reproduce every node's executor interleaving.
+#[test]
+fn openraft_runs_reproduce_their_executor_interleaving() {
+    let digests = || {
+        let mut mini = Mini::<OpenRaft>::new();
+        mini.run(150);
+        mini.cores
+            .iter()
+            .map(|core| {
+                (
+                    core.executor().trace_digest(),
+                    core.executor().polls(),
+                    core.overruns(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = digests();
+    assert_eq!(first, digests());
+    assert!(
+        first
+            .iter()
+            .all(|(_, polls, overruns)| *polls > 0 && *overruns == 0),
+        "{first:?}"
+    );
+}
+
+#[test]
+fn the_evaluated_cores_run_with_pre_vote() {
+    assert_eq!(
+        std::any::type_name::<OpenRaft>(),
+        std::any::type_name::<OpenRaftCore<true>>()
+    );
     // RaftRs is the pre-vote build; the build without it is only the
     // control above.
     assert_eq!(

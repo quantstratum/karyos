@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `raft` adapter in real processes (plan issue 060, karyos#678: the
-//! same adapter "runs unchanged under `karyos-sim` and in real
-//! processes"): three `raft-eval-node` processes, each running
-//! `RaftRs`, the very type the simulator tests drive, over C4's log on
+//! Both adapters in real processes (plan issues 060 and 076, karyos#678
+//! and karyos#690: each adapter "runs unchanged under `karyos-sim` and in
+//! real processes"): three `raft-eval-node` processes, each running
+//! `RaftRs` or `OpenRaft`, the very types the simulator tests drive, over C4's log on
 //! real files and UDP on the loopback, elect a leader, commit its
 //! commands, and all apply the same commands in the same order.
 
@@ -35,10 +35,9 @@ fn free_addresses() -> Vec<String> {
 /// retried, with fresh ports (karyos#956 review).
 const ATTEMPTS: usize = 3;
 
-#[test]
-fn three_processes_commit_and_apply_the_same_commands() {
+fn three_processes_commit_and_apply_the_same_commands(core: &str) {
     for attempt in 1..=ATTEMPTS {
-        match run_once() {
+        match run_once(core) {
             Ok(()) => return,
             Err(stderr) if attempt < ATTEMPTS && stderr.contains("in use") => {}
             Err(stderr) => panic!("{stderr}"),
@@ -65,17 +64,33 @@ impl Drop for Run {
     }
 }
 
-fn run_once() -> Result<(), String> {
+/// A log directory of this run's own: created here, so it did not exist
+/// before and no other run or file is taken over by the guard's cleanup
+/// (karyos#956 review: a name built from the clock alone could collide).
+fn reserve_root(core: &str) -> std::path::PathBuf {
+    let mut attempt = 0u64;
+    loop {
+        let root = std::env::temp_dir().join(format!(
+            "karyos-raft-eval-{core}-{}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+            }
+            Err(error) => panic!("{}: {error}", root.display()),
+        }
+    }
+}
+
+fn run_once(core: &str) -> Result<(), String> {
     let peers: Vec<String> = free_addresses()
         .into_iter()
         .enumerate()
         .map(|(id, address)| format!("{id}={address}"))
         .collect();
-    let root = std::env::temp_dir().join(format!(
-        "karyos-raft-eval-{}-{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
+    let root = reserve_root(core);
     let mut run = Run {
         children: Vec::new(),
         root: root.clone(),
@@ -84,6 +99,7 @@ fn run_once() -> Result<(), String> {
     // still stops the earlier ones.
     for id in 0..NODES {
         let child = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
+            .arg(core)
             .arg(id.to_string())
             .arg(root.join(format!("node-{id}")))
             .arg(COMMANDS.to_string())
@@ -173,7 +189,7 @@ fn run_once() -> Result<(), String> {
 #[test]
 fn a_malformed_argument_is_a_usage_error() {
     let status = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
-        .args(["0", "/tmp/unused", "many"])
+        .args(["raft", "0", "/tmp/unused", "many"])
         .stderr(Stdio::null())
         .status()
         .unwrap();
@@ -188,4 +204,53 @@ fn a_malformed_argument_is_a_usage_error() {
             .unwrap();
         assert_eq!(status.code(), Some(2));
     }
+}
+
+#[test]
+fn raft_three_processes_commit_and_apply_the_same_commands() {
+    three_processes_commit_and_apply_the_same_commands("raft");
+}
+
+/// OpenRaft on its manually pumped executor, the same `OpenRaft` type the
+/// simulator tests drive: the executor runs its tasks inside the core's
+/// calls, so a process needs no runtime of its own (karyos#690).
+#[test]
+fn openraft_three_processes_commit_and_apply_the_same_commands() {
+    three_processes_commit_and_apply_the_same_commands("openraft");
+}
+
+/// The P1 of the karyos#959 review: a restarted process draws a new
+/// incarnation, whatever the clock. Two processes started one after the
+/// other, as a node restarted twice, never draw the same one.
+#[test]
+fn every_process_draws_its_own_incarnation() {
+    let draw = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
+            .arg("incarnation")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let draws: std::collections::BTreeSet<u64> = (0..3).map(|_| draw()).collect();
+    assert_eq!(draws.len(), 3);
+}
+
+/// The karyos#956 review: a peer off the loopback is refused before any
+/// socket is bound, a usage the runner does not support.
+#[test]
+fn a_peer_off_the_loopback_is_refused() {
+    let output = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
+        .args(["raft", "0", "/tmp/unused", "1", "0=192.0.2.1:7000"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not a loopback address"),
+        "{output:?}"
+    );
 }

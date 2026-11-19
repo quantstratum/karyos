@@ -99,6 +99,10 @@ pub enum ProcessError {
     Deadline(Report),
     /// The configuration does not name this node.
     NotAPeer,
+    /// A peer's address is not on the loopback: the runner is a local
+    /// smoke test and speaks unauthenticated UDP, so it refuses to bind or
+    /// send off the host (karyos#956 review).
+    NotLoopback(std::net::SocketAddr),
 }
 
 impl fmt::Display for ProcessError {
@@ -113,6 +117,9 @@ impl fmt::Display for ProcessError {
                 report.applied
             ),
             Self::NotAPeer => f.write_str("the node is not among its peers"),
+            Self::NotLoopback(address) => {
+                write!(f, "{address} is not a loopback address")
+            }
         }
     }
 }
@@ -150,6 +157,13 @@ fn mix(digest: u64, number: u64) -> u64 {
 ///
 /// [`ProcessError`].
 pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
+    if let Some((_, address)) = config
+        .peers
+        .iter()
+        .find(|(_, address)| !address.ip().is_loopback())
+    {
+        return Err(ProcessError::NotLoopback(*address));
+    }
     let own = config
         .peers
         .iter()
