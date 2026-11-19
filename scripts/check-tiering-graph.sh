@@ -19,8 +19,15 @@ for p in karyos-sys karyos-io karyos-protocol karyos-codec karyos-client \
   check -p "$p"
 done
 check
-tree=$(cargo tree --locked -p karyos-tiering --target all -e normal,build --prefix none) || exit 1
-if printf '%s\n' "$tree" | grep -E '^(ring|aws-lc-rs|aws-lc-sys|cc) '; then
-  echo "native crypto or a C build in karyos-tiering" >&2
-  exit 1
-fi
+# Per target the record measured, rather than `--target all`: the latter
+# also evaluates `cfg(loom)`, under which `karyos-sys` (through
+# `karyos-archive`, whose trait this crate implements) takes `loom` and its
+# `cc` build dependency. That cfg is set only by the model-checking tests,
+# never in a build that ships the client crate.
+for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+  tree=$(cargo tree --locked -p karyos-tiering --target "$target" -e normal,build --prefix none) || exit 1
+  if printf '%s\n' "$tree" | grep -E '^(ring|aws-lc-rs|aws-lc-sys|cc) '; then
+    echo "native crypto or a C build in karyos-tiering ($target)" >&2
+    exit 1
+  fi
+done
