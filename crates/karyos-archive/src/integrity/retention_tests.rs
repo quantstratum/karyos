@@ -326,6 +326,7 @@ fn an_executed_purge_is_in_the_chain_and_the_verifier_reports_it_purged() {
             registry: &keys,
             heads: &heads,
             anchors: &[],
+            anchor_faults: 0,
             stores: &NoStores,
             externality: &externality,
             written: &[],
