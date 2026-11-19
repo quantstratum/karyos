@@ -592,17 +592,16 @@ impl Freshness {
         let mut max_age = None;
         let mut max_ages = 0_u32;
         let mut uncacheable = false;
-        for directive in headers
-            .get_all(hyper::header::CACHE_CONTROL)
-            .iter()
-            .map(|value| value.to_str().ok().and_then(list_members))
-            .flat_map(|members| {
-                // A field that is not text, or has an unterminated quoted
-                // string, is invalid metadata.
-                invalid |= members.is_none();
-                members.unwrap_or_default()
-            })
-        {
+        let mut directives = Vec::new();
+        for value in headers.get_all(hyper::header::CACHE_CONTROL) {
+            // A field that is not text, or has an unterminated quoted
+            // string, is invalid metadata.
+            match value.to_str().ok().and_then(list_members) {
+                Some(members) => directives.extend(members),
+                None => invalid = true,
+            }
+        }
+        for directive in directives {
             let directive = directive.trim();
             let (name, value) = directive.split_once('=').unwrap_or((directive, ""));
             match name.trim().to_ascii_lowercase().as_str() {
