@@ -216,17 +216,31 @@ fn test_log_buffer_loss_a_revoked_reader_whose_data_is_gone_is_revoked() {
     );
     // The publisher runs far past the reader's data.
     let mut publication = buffer.publication().unwrap().unwrap();
+    // Under Miri the run stops once the publisher has written two terms
+    // more than the slots hold, so every slot, the reader's included, was
+    // rewritten (karyos#161); elsewhere it runs the full 2000 messages.
+    let past = (u64::from(buffer.slots) + 2) * u64::from(buffer.term_length());
     let mut appended = 0;
+    let mut bytes = 0u64;
     for sequence in 0..2000 {
+        let data = message(sequence);
         if let AppendOutcome::Appended { .. } = publication
-            .append(&message(sequence), AppendOptions::default())
+            .append(&data, AppendOptions::default())
             .unwrap()
         {
             appended += 1;
+            bytes += data.len() as u64;
         }
         let _ = conductor.duty_cycle().unwrap();
+        if cfg!(miri) && bytes > past {
+            break;
+        }
     }
-    assert!(appended > 1000, "{appended}");
+    if cfg!(miri) {
+        assert!(bytes > past, "{bytes} <= {past}");
+    } else {
+        assert!(appended > 1000, "{appended}");
+    }
     let mut out = vec![0u8; 8192];
     assert!(matches!(
         reader.poll(&mut out),

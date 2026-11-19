@@ -1001,6 +1001,13 @@ mod properties {
         ]
     }
 
+    /// How many steps the in-order property runs: under Miri at most 24,
+    /// which still wraps the largest ring (128 words) since a write may
+    /// carry 520 bytes (karyos#161); elsewhere up to 63.
+    fn step_count() -> std::ops::Range<usize> {
+        if cfg!(miri) { 1..25 } else { 1..64 }
+    }
+
     /// Runs `steps` against a ring whose positions start at `seed`, checking
     /// writes and reads against a FIFO model; returns the records written
     /// and not yet read, with their positions.
@@ -1104,7 +1111,7 @@ mod properties {
         fn written_records_are_read_back_in_order(
             (log_words, extent_words) in geometry(),
             seed in base().prop_map(|position| position.min(u64::MAX - (1 << 20)) & !7),
-            steps in prop::collection::vec(step(2), 1..64),
+            steps in prop::collection::vec(step(2), step_count()),
         ) {
             let memory = Memory::new(log_words, extent_words);
             let words = memory.words();
