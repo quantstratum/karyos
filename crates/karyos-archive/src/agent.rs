@@ -1850,6 +1850,10 @@ struct Signing<D: Disk> {
     /// Whether the backlog coalesces: then a head waiting for the signer
     /// is kept until signed, and newer ones wait behind it.
     coalesce: bool,
+    /// The pending head is one the configured key cannot validly sign
+    /// (it precedes the key's effective counter): it yields to a newer
+    /// head instead of holding coverage back (karyos#966 review).
+    ineligible: bool,
     offered: Option<crate::integrity::Digest>,
     next_ns: u64,
 }
@@ -1902,6 +1906,7 @@ impl<D: Disk + Clone> Signing<D> {
             signer: setup.signer,
             heads,
             coalesce,
+            ineligible: false,
             offered: None,
             next_ns: 0,
         })
@@ -1941,7 +1946,9 @@ impl<D: Disk + Clone> Signing<D> {
             return;
         };
         let sealed = u64::try_from(records.len()).unwrap_or(u64::MAX);
-        let busy = self.coalesce && self.signing.status(now, sealed, &registry).pending > 0;
+        let busy = self.coalesce
+            && !self.ineligible
+            && self.signing.status(now, sealed, &registry).pending > 0;
         if let Some(last) = records.last() {
             let digest = last.digest();
             if !busy && self.offered != Some(digest) {
@@ -1959,12 +1966,24 @@ impl<D: Disk + Clone> Signing<D> {
                 }
             }
         }
-        let _ = self.signing.poll(
+        let polled = self.signing.poll(
             &mut Boxed(self.signer.as_mut()),
             &mut self.heads,
             &registry,
             &records,
             now,
+        );
+        // A head signed before the key becomes valid is never trusted: it
+        // must not hold back the newer heads the key can sign. Temporary
+        // unavailability keeps the head in flight, as above.
+        self.ineligible = matches!(
+            polled,
+            Err(crate::integrity::signing::PollError::Untrusted {
+                verdict: crate::integrity::trust::HeadVerdict::Invalid(
+                    crate::integrity::trust::HeadReason::KeyNotYetValid
+                ),
+                ..
+            })
         );
     }
 }

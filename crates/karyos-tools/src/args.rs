@@ -151,8 +151,9 @@ Archive:
                                     this time [1s]
   --archive-anchor-interval <duration>
                                     the anchor interval (SPEC 8.4, X14): required with
-                                    --archive, no default; heads are signed at least this
-                                    often when a signer is configured
+                                    --archive, no default; recorded as the signing
+                                    configuration's coverage-lag threshold, not yet
+                                    enforced or reported by the daemon (karyos#985)
   --archive-signer <program>        the operator's head signer, run as `<program> sign`:
                                     the head's signed bytes in hex on stdin, the Ed25519
                                     signature in hex on stdout; needs --archive-signer-key
@@ -312,7 +313,8 @@ pub struct ArchiveOptions {
     /// The `seal_interval`: each recorded byte is sealed within it (A10).
     pub seal_interval: Duration,
     /// The `anchor_interval`, required with no default (SPEC.md §8.4,
-    /// X14): heads are signed at least this often when a signer runs.
+    /// X14): the signing configuration's coverage-lag threshold; not yet
+    /// enforced or reported by the daemon (karyos#985).
     pub anchor_interval: Duration,
     /// The head signer, when one is configured (karyos#966).
     pub signer: Option<SignerOption>,
