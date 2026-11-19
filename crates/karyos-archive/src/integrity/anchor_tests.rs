@@ -457,7 +457,12 @@ fn a_copy_whose_journal_append_failed_never_counts() {
     let remote = copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock);
     assert!(copies.record(remote, &mut journal).is_err());
     assert!(journal_disk.has_crashed());
-    assert_eq!(copies.verified_copies(3, 0, 80).unwrap(), 0);
+    // The live catalog withholds its counts: whether the journal holds the
+    // change is unknown until it is reopened.
+    assert!(matches!(
+        copies.verified_copies(3, 0, 80),
+        Err(super::journal::IntegrityError::Poisoned)
+    ));
     assert!(copies.records().is_empty());
     // The ledger entry survived, but the reopened catalog filters it out.
     let mut recovered = IntegrityJournal::open(
