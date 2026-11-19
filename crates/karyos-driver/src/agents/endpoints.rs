@@ -374,6 +374,25 @@ impl<O: SocketOps> Endpoints<O> {
             .map(|entry| entry.local)
     }
 
+    /// Whether an endpoint bound to `bind`, a fixed port, is retiring: its
+    /// socket keeps the address until both halves come back, so a new
+    /// endpoint cannot bind it yet (karyos#994). A port 0 bind never
+    /// conflicts.
+    #[must_use]
+    pub fn retiring_at(&self, bind: std::net::SocketAddr) -> bool {
+        bind.port() != 0
+            && self.entries.iter().any(|entry| {
+                entry.local == bind
+                    && matches!(
+                        entry.state,
+                        State::Detaching {
+                            purpose: Purpose::Retire,
+                            ..
+                        }
+                    )
+            })
+    }
+
     fn index(&self, endpoint: EndpointId) -> Result<usize, EndpointError> {
         self.entries
             .iter()

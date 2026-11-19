@@ -2561,14 +2561,16 @@ fn a_dynamic_publication_holds_its_whole_destination_share_at_admission() {
     });
     // The control endpoint retires with its last publication, and its
     // socket keeps the fixed control port until both agents give its
-    // halves back (`Endpoints::retire`): an add in between fails to bind
-    // with `NetworkEndpoint`, karyos#994. The add is retried until the
-    // endpoint has retired, then taken.
+    // halves back: an add in between is refused as retryable
+    // (`NetworkBusy`, karyos#994), never `NetworkEndpoint`, and taken once
+    // the endpoint has retired.
     let mut added = None;
     until(&mut driver, |driver| {
-        added = driver
-            .add_dynamic_network_publication(aggregate(301, 1), &dynamic, allowlist(), None)
-            .ok();
+        match driver.add_dynamic_network_publication(aggregate(301, 1), &dynamic, allowlist(), None)
+        {
+            Ok(handle) => added = Some(handle),
+            Err(error) => assert_eq!(error, DriverError::NetworkBusy),
+        }
         added.is_some()
     });
 }
