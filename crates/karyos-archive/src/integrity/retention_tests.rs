@@ -91,6 +91,7 @@ fn request() -> PurgeRequest {
             authorised: true,
         },
         closed_ns: 0,
+        source: PurgeSource::Operator,
     }
 }
 
@@ -204,7 +205,6 @@ fn context<'a>(
         policy: Some(policy),
         copies,
         local: ARCHIVE,
-        start: 0,
         now_ns,
     }
 }
@@ -290,7 +290,7 @@ fn a_purge_below_min_copies_is_rejected() {
     let policy = policy(1_000, 2);
     let context = context(&policy, &archive.copies, 5_000);
     assert_eq!(
-        archive.retention.check(&unauthorised, &context),
+        archive.retention.check(&unauthorised, &context, 0),
         Err(PurgeRefusal::NotAuthorised)
     );
 }
@@ -360,7 +360,7 @@ fn a_hold_applies_without_the_operations_journal_but_is_not_reported_applied() {
     let copies = open_copies(&disk);
     let policy = policy(1_000, 2);
     assert_eq!(
-        retention.check(&request(), &context(&policy, &copies, 5_000)),
+        retention.check(&request(), &context(&policy, &copies, 5_000), 0),
         Err(PurgeRefusal::LegalHold)
     );
     // The pending hold survives a restart.
@@ -405,7 +405,11 @@ fn a_release_the_journal_cannot_record_fails_closed() {
         Err(ReleaseError::JournalUnavailable)
     );
     assert!(down.hold(RECORDING).is_some());
-    // With the journal, the evidenced hold releases.
+    // The failed release keeps the hold across a restart; with the journal
+    // back, the evidenced hold releases.
+    drop(down);
+    let mut archive = open(archive.disk.clone());
+    assert!(archive.retention.hold(RECORDING).is_some());
     archive.retention.release_hold(RECORDING).unwrap();
     assert_eq!(archive.retention.hold(RECORDING), None);
     let restarted = open(archive.disk.clone());
@@ -421,7 +425,7 @@ fn an_unknown_hold_at_restart_inhibits_the_purge() {
     let copies = open_copies(&disk);
     let policy = policy(1_000, 2);
     assert_eq!(
-        retention.check(&request(), &context(&policy, &copies, 5_000)),
+        retention.check(&request(), &context(&policy, &copies, 5_000), 0),
         Err(PurgeRefusal::HoldsUnknown)
     );
     assert_eq!(
@@ -430,7 +434,7 @@ fn an_unknown_hold_at_restart_inhibits_the_purge() {
     );
     assert!(retention.holds_readable(&[]));
     assert_eq!(
-        retention.check(&request(), &context(&policy, &copies, 5_000)),
+        retention.check(&request(), &context(&policy, &copies, 5_000), 0),
         Ok(())
     );
 }
@@ -445,6 +449,7 @@ fn recovery_rechecks_the_policy_that_changed_across_the_crash() {
         before: BEFORE,
         operator: 42,
         closed_ns: 0,
+        source: PurgeSource::Operator,
     };
     OperationsJournal::append(
         &mut Ops::open(archive.disk.clone(), Path::new(DIR), OPERATIONS_FILE).unwrap(),
@@ -639,6 +644,7 @@ fn operations_round_trip_through_their_bytes() {
             before: 256,
             operator: 42,
             closed_ns: 7,
+            source: PurgeSource::Operator,
         },
         Operation::PurgeRejected {
             id: 1,
@@ -742,15 +748,15 @@ fn copies_are_counted_from_the_stores_start() {
             )
             .unwrap();
     }
-    let mut context = context(&policy, &archive.copies, 5_000);
+    let context = context(&policy, &archive.copies, 5_000);
     let mut later = request();
     later.id = 2;
     assert!(matches!(
-        archive.retention.check(&later, &context),
+        archive.retention.check(&later, &context, 0),
         Err(PurgeRefusal::BelowMinCopies { verified: 0, .. })
     ));
-    context.start = 128;
-    assert_eq!(archive.retention.check(&later, &context), Ok(()));
+    // From the store's start once the floor is at 128.
+    assert_eq!(archive.retention.check(&later, &context, 128), Ok(()));
 }
 
 /// An intent whose range the floor already passed completes with its
@@ -764,6 +770,7 @@ fn recovery_records_an_intent_the_floor_already_passed() {
         before: 128,
         operator: 42,
         closed_ns: 0,
+        source: PurgeSource::Operator,
     };
     let mut ops = Ops::open(archive.disk.clone(), Path::new(DIR), OPERATIONS_FILE).unwrap();
     ops.append(intent.encode()).unwrap();
@@ -807,7 +814,7 @@ fn readable_hold_state_replays_the_restored_holds() {
     let policy = policy(1_000, 2);
     assert!(!retention.holds_readable(&[[0xff; OPERATION_LENGTH]]));
     assert_eq!(
-        retention.check(&request(), &context(&policy, &copies, 5_000)),
+        retention.check(&request(), &context(&policy, &copies, 5_000), 0),
         Err(PurgeRefusal::HoldsUnknown)
     );
     let held = Operation::HoldApplied {
@@ -820,7 +827,178 @@ fn readable_hold_state_replays_the_restored_holds() {
         Some(Hold::Applied { .. })
     ));
     assert_eq!(
-        retention.check(&request(), &context(&policy, &copies, 5_000)),
+        retention.check(&request(), &context(&policy, &copies, 5_000), 0),
         Err(PurgeRefusal::LegalHold)
     );
+}
+
+/// A release whose record reached the journal while its append reported a
+/// failure leaves its pending marker last: the restart keeps the hold.
+#[test]
+fn a_release_recorded_but_reported_failed_keeps_the_hold_at_restart() {
+    let mut archive = fresh();
+    assert!(matches!(
+        archive.retention.apply_hold(RECORDING),
+        HoldReport::Applied { .. }
+    ));
+    drop(archive.retention);
+    // What a release leaves when its journal append wrote the record and
+    // then reported an error: the pending marker, then the record.
+    let dir = Path::new(DIR);
+    let mut markers = Markers::open(archive.disk.clone(), dir, PENDING_HOLDS_FILE).unwrap();
+    let mut pending = [0u8; MARKER_LENGTH];
+    pending[..8].copy_from_slice(&RECORDING.to_le_bytes());
+    pending[8] = 1;
+    markers.append(pending).unwrap();
+    let mut ops = Ops::open(archive.disk.clone(), dir, OPERATIONS_FILE).unwrap();
+    ops.append(
+        Operation::HoldReleased {
+            recording: RECORDING,
+        }
+        .encode(),
+    )
+    .unwrap();
+    let restarted = open(archive.disk.clone());
+    assert_eq!(restarted.retention.hold(RECORDING), Some(Hold::Pending));
+}
+
+/// A failed replay after a successful one inhibits purges again.
+#[test]
+fn a_failed_replay_inhibits_purges_again() {
+    let disk = FaultDisk::default();
+    setup(&disk);
+    let markers = Markers::open(disk.clone(), Path::new(DIR), PENDING_HOLDS_FILE).unwrap();
+    let mut retention = Retention::recover(Down, Some(&[]), markers);
+    let copies = open_copies(&disk);
+    let policy = policy(1_000, 2);
+    let context = context(&policy, &copies, 5_000);
+    assert_eq!(retention.check(&request(), &context, 0), Ok(()));
+    assert!(!retention.holds_readable(&[[0xff; OPERATION_LENGTH]]));
+    assert_eq!(
+        retention.check(&request(), &context, 0),
+        Err(PurgeRefusal::HoldsUnknown)
+    );
+}
+
+/// A committed policy version missing from the ledger fails the open.
+#[test]
+fn a_committed_policy_missing_from_its_ledger_fails_closed() {
+    let mut archive = fresh();
+    let dir = Path::new(DIR);
+    let mut book = PolicyBook::open(archive.disk.clone(), dir, &mut archive.journal).unwrap();
+    book.record(policy(1_000, 2), &mut archive.journal).unwrap();
+    // The journal chains a later version whose entry never reached the
+    // ledger.
+    let mut lost = policy(9, 2);
+    lost.version = 2;
+    archive
+        .journal
+        .record_policy_version(lost.policy, lost.version, &lost.canonical())
+        .unwrap();
+    let mut journal = IntegrityJournal::open(archive.disk.clone(), dir)
+        .unwrap()
+        .journal;
+    assert!(matches!(
+        PolicyBook::open(archive.disk.clone(), dir, &mut journal),
+        Err(super::journal::IntegrityError::Unrecorded { .. })
+    ));
+}
+
+/// A cutoff that does not start a write, a reused outstanding id and a
+/// scheduled purge under a manual policy are refused before any deletion.
+#[test]
+fn a_purge_off_a_write_start_a_reused_id_or_scheduled_under_manual_is_refused() {
+    let mut archive = fresh();
+    let policy = policy(1_000, 2);
+    let context = context(&policy, &archive.copies, 5_000);
+    let mut odd = request();
+    odd.before = 100;
+    assert!(matches!(
+        archive
+            .retention
+            .purge(&odd, &context, &mut archive.store, &mut archive.journal),
+        Err(PurgeError::Refused {
+            refusal: PurgeRefusal::NotAWriteStart { before: 100 },
+            ..
+        })
+    ));
+    let mut manual = policy;
+    manual.purge = PurgeMode::Manual;
+    let mut scheduled = request();
+    scheduled.source = PurgeSource::Schedule;
+    let manual_context = super::retention::PurgeContext {
+        policy: Some(&manual),
+        ..context
+    };
+    assert_eq!(
+        archive.retention.check(&scheduled, &manual_context, 0),
+        Err(PurgeRefusal::ManualOnly)
+    );
+    assert_eq!(
+        archive.retention.check(&request(), &manual_context, 0),
+        Ok(())
+    );
+    assert_eq!(archive.store.start(), 0);
+
+    // An outstanding intent's id is not reused, even for another cutoff.
+    let mut ops = Ops::open(archive.disk.clone(), Path::new(DIR), OPERATIONS_FILE).unwrap();
+    ops.append(
+        Operation::PurgeIntent {
+            id: 7,
+            recording: RECORDING,
+            before: 128,
+            operator: 42,
+            closed_ns: 0,
+            source: PurgeSource::Operator,
+        }
+        .encode(),
+    )
+    .unwrap();
+    let mut archive = open(archive.disk.clone());
+    let context = self::context(&policy, &archive.copies, 5_000);
+    let mut reused = request();
+    reused.id = 7;
+    assert!(matches!(
+        archive
+            .retention
+            .purge(&reused, &context, &mut archive.store, &mut archive.journal),
+        Err(PurgeError::Refused {
+            refusal: PurgeRefusal::DuplicateId { id: 7 },
+            ..
+        })
+    ));
+    assert_eq!(archive.retention.outstanding()[0].before, 128);
+}
+
+/// Recovery checks the cutoff's boundaries before the floor moves: an
+/// intent inside a sealed range is cancelled, not completed.
+#[test]
+fn recovery_cancels_an_intent_that_would_split_a_seal() {
+    let archive = fresh();
+    let mut ops = Ops::open(archive.disk.clone(), Path::new(DIR), OPERATIONS_FILE).unwrap();
+    ops.append(
+        Operation::PurgeIntent {
+            id: 1,
+            recording: RECORDING,
+            before: 192,
+            operator: 42,
+            closed_ns: 0,
+            source: PurgeSource::Operator,
+        }
+        .encode(),
+    )
+    .unwrap();
+    let mut archive = open(archive.disk.clone());
+    let policy = policy(1_000, 2);
+    let context = context(&policy, &archive.copies, 5_000);
+    let outcomes = archive
+        .retention
+        .recover_purges(&context, |_| true, &mut archive.store, &mut archive.journal)
+        .unwrap();
+    assert!(matches!(
+        outcomes[..],
+        [Err(PurgeRefusal::SplitsSeal { before: 192, .. })]
+    ));
+    assert_eq!(archive.store.start(), 0);
+    assert!(archive.retention.outstanding().is_empty());
 }

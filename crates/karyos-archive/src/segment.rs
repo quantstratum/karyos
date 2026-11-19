@@ -1299,6 +1299,53 @@ impl<D: Disk> SegmentStore<D> {
         Ok(())
     }
 
+    /// Whether `position` starts a write, or is the recording's start or
+    /// its written end: the positions [`SegmentStore::purge_before`] may
+    /// take. Read from the index of the segment holding it.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::Failed`] after an earlier failure; the operating
+    /// system's errors reading the index.
+    pub fn is_write_start(&mut self, position: u64) -> Result<bool, SegmentError> {
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        if position == self.start || position == self.written {
+            return Ok(true);
+        }
+        if position < self.start || position > self.written {
+            return Ok(false);
+        }
+        let base = self.geometry.base_of(position);
+        let opened;
+        let index = match self.current.as_ref().filter(|open| open.base == base) {
+            Some(open) => &open.index,
+            None => {
+                opened = self
+                    .disk
+                    .open_read(&self.dir.join(index_name(self.recording, base)))?;
+                &opened
+            }
+        };
+        let length = self.disk.len(index)?;
+        let mut offset = HEADER;
+        let mut bytes = [0u8; 32];
+        while offset.checked_add(ENTRY).is_some_and(|end| end <= length) {
+            self.disk.read_at(index, offset, &mut bytes)?;
+            match Entry::decode(&bytes) {
+                Some(Ok(entry)) if entry.start == position => return Ok(true),
+                Some(Ok(entry)) if entry.start > position => return Ok(false),
+                Some(Ok(_)) => {}
+                _ => return Ok(false),
+            }
+            offset = offset
+                .checked_add(ENTRY)
+                .ok_or(SegmentError::PositionOverflow)?;
+        }
+        Ok(false)
+    }
+
     /// Moves the recording's start to `position`, a write boundary, and
     /// drops the whole segments below the one holding it; returns the new
     /// start, or the start, unchanged, when `position` is not past it.

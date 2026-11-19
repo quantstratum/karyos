@@ -212,7 +212,9 @@ impl<D: Disk> PolicyBook<D> {
     ///
     /// # Errors
     ///
-    /// As [`Ledger::open`] and [`IntegrityJournal::records`].
+    /// As [`Ledger::open`] and [`IntegrityJournal::records`];
+    /// [`IntegrityError::Unrecorded`] when the journal chains a policy
+    /// version or binding the ledger no longer holds, or holds damaged.
     pub fn open(
         disk: D,
         dir: &std::path::Path,
@@ -234,6 +236,42 @@ impl<D: Disk> PolicyBook<D> {
             bindings: BTreeMap::new(),
         };
         let entries = book.ledger.entries().to_vec();
+        // Every committed policy version and binding must still be in the
+        // ledger, valid: a lost or damaged one could let an older, shorter
+        // retention govern again, so it fails closed.
+        let held: std::collections::BTreeSet<(u16, u64, u64, Digest)> = (0u64..)
+            .zip(entries.iter())
+            .filter_map(|(sequence, entry)| match decode_entry(entry)? {
+                Entry::Policy(policy) => Some((
+                    SealKind::Policy as u16,
+                    policy.policy,
+                    policy.version,
+                    digest(&policy.canonical()),
+                )),
+                Entry::Binding(..) => Some((
+                    SealKind::Catalog as u16,
+                    POLICY_BOOK_SUBJECT,
+                    sequence,
+                    digest(entry),
+                )),
+            })
+            .collect();
+        for record in &records {
+            let committed = record.kind == SealKind::Policy
+                || (record.kind == SealKind::Catalog && record.subject == POLICY_BOOK_SUBJECT);
+            if committed
+                && !held.contains(&(
+                    record.kind as u16,
+                    record.subject,
+                    record.start,
+                    record.content,
+                ))
+            {
+                return Err(IntegrityError::Unrecorded {
+                    counter: record.counter,
+                });
+            }
+        }
         for (sequence, entry) in (0u64..).zip(entries.iter()) {
             match decode_entry(entry) {
                 Some(Entry::Policy(policy))
@@ -446,6 +484,8 @@ pub enum Operation {
         operator: u64,
         /// When the purged range closed, in ns.
         closed_ns: u64,
+        /// Who started it, kept in the reason byte.
+        source: PurgeSource,
     },
     /// A purge refused, with its reason.
     PurgeRejected {
@@ -484,7 +524,12 @@ impl Operation {
                 before,
                 operator,
                 closed_ns,
-            } => (3, 0, [id, recording, before, operator, closed_ns]),
+                source,
+            } => (
+                3,
+                source as u8,
+                [id, recording, before, operator, closed_ns],
+            ),
             Self::PurgeRejected {
                 id,
                 recording,
@@ -523,6 +568,11 @@ impl Operation {
                 before: word(2),
                 operator: word(3),
                 closed_ns: word(4),
+                source: match reason {
+                    0 => PurgeSource::Operator,
+                    1 => PurgeSource::Schedule,
+                    _ => return None,
+                },
             },
             4 => Self::PurgeRejected {
                 id: word(0),
@@ -622,6 +672,16 @@ pub struct Authorisation {
     pub authorised: bool,
 }
 
+/// Who started a purge: the policy's purge mode decides which may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PurgeSource {
+    /// An operator, through the management path.
+    Operator = 0,
+    /// The Archive's own schedule.
+    Schedule = 1,
+}
+
 /// A purge request: delete `recording`'s range before `before`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PurgeRequest {
@@ -635,6 +695,8 @@ pub struct PurgeRequest {
     pub authorisation: Authorisation,
     /// When the range to purge closed, in ns of UTC.
     pub closed_ns: u64,
+    /// Who started it.
+    pub source: PurgeSource,
 }
 
 /// Why a purge is refused. Codes are stable in the operations journal.
@@ -678,6 +740,23 @@ pub enum PurgeRefusal {
         /// The store's.
         store: u64,
     },
+    /// The cutoff is not where a write starts: the recording would begin
+    /// inside a write.
+    #[error("the cutoff {before} is not the start of a write")]
+    NotAWriteStart {
+        /// The cutoff.
+        before: u64,
+    },
+    /// Another purge with this id is outstanding.
+    #[error("purge {id} is already outstanding")]
+    DuplicateId {
+        /// The id.
+        id: u64,
+    },
+    /// The policy purges only on an operator's request; the schedule may
+    /// not.
+    #[error("the policy purges only on an operator's request")]
+    ManualOnly,
     /// The cutoff falls inside a sealed range, which a purge would split.
     #[error("the cutoff {before} falls inside the range sealed by record {counter}")]
     SplitsSeal {
@@ -702,6 +781,9 @@ impl PurgeRefusal {
             Self::JournalUnavailable => 7,
             Self::WrongStore { .. } => 8,
             Self::SplitsSeal { .. } => 9,
+            Self::NotAWriteStart { .. } => 10,
+            Self::DuplicateId { .. } => 11,
+            Self::ManualOnly => 12,
         }
     }
 }
@@ -739,10 +821,6 @@ pub struct PurgeContext<'a, D: Disk> {
     pub copies: &'a CopyCatalog<D>,
     /// This Archive's location id, whose copy the purge removes.
     pub local: Digest,
-    /// The recording's current start in the store: copies need cover only
-    /// `[start, before)`, never bytes the store never held or already
-    /// purged.
-    pub start: u64,
     /// The current time, in ns of UTC.
     pub now_ns: u64,
 }
@@ -789,8 +867,8 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
     }
 
     /// Rebuilds holds and intents from the operations journal's `records`.
-    /// True when every record decoded; otherwise hold state stays unknown
-    /// and the holds already in force are kept.
+    /// True when every record decoded; otherwise hold state becomes unknown,
+    /// inhibiting every purge, and the holds already in force are kept.
     fn replay(&mut self, records: &[[u8; OPERATION_LENGTH]]) -> bool {
         let mut state = Self::rebuilt();
         for bytes in records {
@@ -812,26 +890,29 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                     before,
                     operator,
                     closed_ns,
+                    source,
                 }) => {
-                    state.intents.insert(
+                    // A later intent never replaces an outstanding one.
+                    state.intents.entry(id).or_insert(PurgeRequest {
                         id,
-                        PurgeRequest {
-                            id,
-                            recording,
-                            before,
-                            authorisation: Authorisation {
-                                operator,
-                                authorised: false,
-                            },
-                            closed_ns,
+                        recording,
+                        before,
+                        authorisation: Authorisation {
+                            operator,
+                            authorised: false,
                         },
-                    );
+                        closed_ns,
+                        source,
+                    });
                 }
                 Some(Operation::PurgeDone { id } | Operation::PurgeCancelled { id, .. }) => {
                     state.intents.remove(&id);
                 }
                 Some(Operation::PurgeRejected { .. }) => {}
-                None => return false,
+                None => {
+                    self.holds_unknown = true;
+                    return false;
+                }
             }
         }
         // Holds applied in memory since the journal became unreadable stay
@@ -943,12 +1024,18 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         if !matches!(self.holds.get(&recording), Some(Hold::Applied { .. })) {
             return Err(ReleaseError::NoEvidence { recording });
         }
+        // A pending marker first: a release whose record reaches the
+        // journal but whose append reports a failure leaves this marker
+        // last, so the restart keeps the hold. It fails closed.
+        self.pending
+            .append(marker(recording, false))
+            .map_err(|_| ReleaseError::JournalUnavailable)?;
         self.operations
             .append(&Operation::HoldReleased { recording })
             .map_err(|_| ReleaseError::JournalUnavailable)?;
         self.holds.remove(&recording);
-        // Best effort: a lost marker leaves an applied hold's last marker
-        // resolved already, so nothing re-inhibits.
+        // Best effort: a lost marker keeps the hold pending at restart,
+        // which only inhibits.
         let _ = self.pending.append(marker(recording, true));
         Ok(())
     }
@@ -959,10 +1046,13 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
     /// # Errors
     ///
     /// The [`PurgeRefusal`].
+    /// `start` is the store's current start: copies need cover only
+    /// `[start, before)`.
     pub fn check<D2: Disk>(
         &self,
         request: &PurgeRequest,
         context: &PurgeContext<'_, D2>,
+        start: u64,
     ) -> Result<(), PurgeRefusal> {
         if self.holds_unknown {
             return Err(PurgeRefusal::HoldsUnknown);
@@ -974,6 +1064,9 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             return Err(PurgeRefusal::NotAuthorised);
         }
         let policy = context.policy.ok_or(PurgeRefusal::NoPolicy)?;
+        if policy.purge == PurgeMode::Manual && request.source == PurgeSource::Schedule {
+            return Err(PurgeRefusal::ManualOnly);
+        }
         let expires_ns = request.closed_ns.checked_add(policy.retain_for_ns).ok_or(
             PurgeRefusal::NotExpired {
                 expires_ns: u64::MAX,
@@ -982,7 +1075,6 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         if context.now_ns < expires_ns {
             return Err(PurgeRefusal::NotExpired { expires_ns });
         }
-        let start = context.start;
         let verified = context
             .copies
             .current()
@@ -1038,14 +1130,16 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         store: &mut SegmentStore<D2>,
         journal: &mut IntegrityJournal<D2>,
     ) -> Result<SealRecord, PurgeError> {
-        let checked = if request.recording == store.recording() {
-            self.check(request, context)
-                .and_then(|()| Self::cutoff_on_a_seal(request, journal))
-        } else {
+        let checked = if request.recording != store.recording() {
             Err(PurgeRefusal::WrongStore {
                 recording: request.recording,
                 store: store.recording(),
             })
+        } else if self.intents.contains_key(&request.id) {
+            Err(PurgeRefusal::DuplicateId { id: request.id })
+        } else {
+            self.check(request, context, store.start())
+                .and_then(|()| Self::boundaries(request, store, journal))
         };
         if let Err(refusal) = checked {
             return Err(self.refuse(request, refusal));
@@ -1056,6 +1150,7 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             before: request.before,
             operator: request.authorisation.operator,
             closed_ns: request.closed_ns,
+            source: request.source,
         };
         if self.operations.append(&intent).is_err() {
             return Err(PurgeError::Refused {
@@ -1065,6 +1160,25 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         }
         self.intents.insert(request.id, *request);
         self.complete(request, store, journal)
+    }
+
+    /// The cutoff's boundaries, checked before any floor advances: it
+    /// must start a write in the store and fall outside every sealed
+    /// range. An index or journal that cannot be read refuses.
+    fn boundaries<D2: Disk>(
+        request: &PurgeRequest,
+        store: &mut SegmentStore<D2>,
+        journal: &mut IntegrityJournal<D2>,
+    ) -> Result<(), PurgeRefusal> {
+        if !store
+            .is_write_start(request.before)
+            .map_err(|_| PurgeRefusal::JournalUnavailable)?
+        {
+            return Err(PurgeRefusal::NotAWriteStart {
+                before: request.before,
+            });
+        }
+        Self::cutoff_on_a_seal(request, journal)
     }
 
     /// Refuses a cutoff inside a sealed range: the purge would make part of
@@ -1165,7 +1279,13 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                 outcomes.push(Ok(self.complete(&request, store, journal)?));
                 continue;
             }
-            match self.check(&request, context) {
+            // The floor moves only after the same checks a fresh purge
+            // passes, the boundaries included: a seal or a write may have
+            // come to cover the cutoff since the intent.
+            let checked = self
+                .check(&request, context, store.start())
+                .and_then(|()| Self::boundaries(&request, store, journal));
+            match checked {
                 Ok(()) => outcomes.push(Ok(self.complete(&request, store, journal)?)),
                 Err(refusal) => {
                     // Cancelled only once recorded; otherwise it stays
