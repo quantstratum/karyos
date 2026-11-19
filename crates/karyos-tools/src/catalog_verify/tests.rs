@@ -366,9 +366,15 @@ fn verify_counts_anchors_only_from_the_store_location_the_operator_names() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let status = run_verify(argv, &mut out, &mut err);
     let out = String::from_utf8(out).unwrap();
-    assert_eq!(status, 0, "{out}");
+    // The store's entries claim another location than the operator stated:
+    // nothing is anchored, and the mismatch is reported as evidence.
+    assert_eq!(status, EXIT_INCONSISTENT, "{out}");
     assert!(out.contains("anchored through none"), "{out}");
     assert!(!out.contains(" verified seal="), "{out}");
+    assert!(
+        out.contains("evidence inconsistent reasons=malformed_evidence"),
+        "{out}"
+    );
     let (status, _, err) = run(&[&archive.dir()], &["--anchors", "not-a-location"]);
     assert_eq!(status, EXIT_ERROR);
     assert!(err.contains("--anchors needs HEX=DIR"), "{err}");
