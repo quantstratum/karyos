@@ -105,8 +105,12 @@ abi-manifest-check:
 # The release library has none of the conformance test kit's fault hook
 # (karyos-ffi feature `test-hooks`): no `karyos_test_` symbol and none of
 # its code (karyos#699). After build-release, whose libraries it reads.
+# No shipped build enables the archival test signer (karyos-archive
+# feature `test-hooks`, the ed25519-dalek admission's tests-only
+# `SigningKey`; karyos#973).
 test-hooks-absent-check: build-release
 	scripts/check-test-hooks-absent.sh
+	scripts/check-archive-test-hooks-absent.sh
 
 # The conformance test kit beside the package: karyosd from the same
 # commit, for the suite's archive-replay scenarios (Linux only). Not part
