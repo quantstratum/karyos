@@ -994,8 +994,12 @@ pub struct ExportPage {
     /// The mirror header's `network_journals_refused`
     /// (`trace-network.md` §4 and §5) when the agent attached to this
     /// driver instance, read before this page's journal table read and
-    /// after it: a rise between the two bounds the network journals the
-    /// page may be missing (karyos#931).
+    /// after it. `after - before` is only the increase observed during
+    /// that read: a refusal before the attach, between pages or before
+    /// `before` is not in it, so equal samples do not show complete
+    /// coverage. A nonzero `attach`, or any rise since it seen in a page's
+    /// samples, means a network journal may be missing, and no later
+    /// trace is a final `Complete` for that attach (NT-4, karyos#931).
     pub network_journals_refused: RefusedReads,
 }
 
