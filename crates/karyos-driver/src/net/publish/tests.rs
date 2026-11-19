@@ -2559,8 +2559,11 @@ fn a_dynamic_publication_holds_its_whole_destination_share_at_admission() {
     until(&mut driver, |driver| {
         driver.network_publication_state(&first).is_none()
     });
-    // The control endpoint closed with its last publication and reopens
-    // once its close has ended: the add is taken then, at the latest.
+    // The control endpoint retires with its last publication, and its
+    // socket keeps the fixed control port until both agents give its
+    // halves back (`Endpoints::retire`): an add in between fails to bind
+    // with `NetworkEndpoint`, karyos#994. The add is retried until the
+    // endpoint has retired, then taken.
     let mut added = None;
     until(&mut driver, |driver| {
         added = driver
