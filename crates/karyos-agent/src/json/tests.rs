@@ -580,6 +580,7 @@ fn export_page(records: u64) -> crate::api::ExportPage {
         points: Vec::new(),
         unknown_records: 3,
         unreadable_records: 0,
+        network_journals_refused: crate::api::RefusedReads::default(),
     }
 }
 
@@ -598,7 +599,7 @@ fn an_export_page_is_encoded_whole() {
         "{whole}"
     );
     assert!(
-        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"points":[],"unknown_records":3,"unreadable_records":0}"#),
+        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"points":[],"unknown_records":3,"unreadable_records":0,"network_journals_refused":{"attach":null,"before":0,"after":0}}"#),
         "{whole}"
     );
     assert_eq!(whole.matches(r#"{"seq":"#).count(), 3);
@@ -656,13 +657,22 @@ fn the_largest_record_and_journal_encode_within_their_bounds() {
         "{} > {MAX_RECORD_REPLY}",
         text.len()
     );
+    // A network receiver journal, which carries the most: its join and
+    // every NT-4 fact (karyos#931).
     let mut entry = JournalEntry::open(
         u64::MAX,
         u64::MAX,
-        JournalKind::Subscriber,
+        JournalKind::NetworkReceiver,
         u64::MAX,
         u64::MAX,
     );
+    entry.join = Some(u64::MAX);
+    entry.network = Some(karyos_sys::trace_mirror::NetworkFacts {
+        sender_driver: [u64::MAX; 2],
+        start: Some(u64::MAX),
+        boundary: Some(u64::MAX),
+        first_gap: Some(u64::MAX),
+    });
     entry.state = JournalState::WriterLost;
     entry.registration = u64::MAX;
     entry.stream = u64::MAX;
@@ -703,6 +713,11 @@ fn the_largest_record_and_journal_encode_within_their_bounds() {
         points: Vec::new(),
         unknown_records: 0,
         unreadable_records: 0,
+        network_journals_refused: crate::api::RefusedReads {
+            attach: Some(u64::MAX),
+            before: u64::MAX,
+            after: u64::MAX,
+        },
     };
     // One record and one journal, the most a reply holds past the bound.
     let one = crate::api::ExportPage {
@@ -713,4 +728,71 @@ fn the_largest_record_and_journal_encode_within_their_bounds() {
     assert!(
         reply.len() <= crate::json::EXPORT_REPLY_OVERHEAD + MAX_RECORD_REPLY + MAX_JOURNAL_REPLY
     );
+}
+
+/// karyos#931: a live network journal carries its NT-4 facts, each `null`
+/// when its validity flag is clear, never 0; another kind carries none;
+/// `join` is `null` when the driver recorded none.
+#[test]
+fn a_network_journal_exports_its_facts_with_unknown_as_null() {
+    use crate::api::ExportJournal;
+    use karyos_sys::trace_mirror::{JournalEntry, JournalKind, NetworkFacts};
+
+    let mut receiver = JournalEntry::open(7, 0, JournalKind::NetworkReceiver, 3, 1);
+    receiver.join = Some(4096);
+    receiver.network = Some(NetworkFacts {
+        sender_driver: [11, 12],
+        start: None,
+        boundary: Some(12_345),
+        first_gap: None,
+    });
+    let mut text = String::new();
+    export_journal(
+        &mut Out(&mut text),
+        &ExportJournal::Live(Box::new(receiver)),
+    );
+    assert!(text.contains(r#""join":4096,"#), "{text}");
+    assert!(
+        text.contains(
+            r#""network":{"sender_driver":[11,12],"start":null,"boundary":12345,"first_gap":null}"#
+        ),
+        "{text}"
+    );
+    let unfilled = JournalEntry::open(8, 0, JournalKind::NetworkSender, 3, 1);
+    let mut text = String::new();
+    export_journal(
+        &mut Out(&mut text),
+        &ExportJournal::Live(Box::new(unfilled)),
+    );
+    assert!(text.contains(r#""network":null"#), "{text}");
+    let publisher = JournalEntry::open(9, 5, JournalKind::Publisher, 3, 1);
+    let mut text = String::new();
+    export_journal(
+        &mut Out(&mut text),
+        &ExportJournal::Live(Box::new(publisher)),
+    );
+    assert!(!text.contains("network"), "{text}");
+    assert!(text.contains(r#""join":null"#), "{text}");
+}
+
+/// karyos#931: a page states the mirror's `network_journals_refused` at
+/// the agent's attach (`null` when not recorded) and before and after its
+/// journal table read.
+#[test]
+fn an_export_page_states_the_refused_network_journals() {
+    let mut page = export_page(0);
+    page.network_journals_refused = crate::api::RefusedReads {
+        attach: None,
+        before: 2,
+        after: 3,
+    };
+    assert!(
+        trace_export(&page).ends_with(
+            r#""unreadable_records":0,"network_journals_refused":{"attach":null,"before":2,"after":3}}"#
+        ),
+        "{}",
+        trace_export(&page)
+    );
+    page.network_journals_refused.attach = Some(1);
+    assert!(trace_export(&page).contains(r#"{"attach":1,"before":2,"after":3}"#));
 }

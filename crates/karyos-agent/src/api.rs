@@ -1005,6 +1005,29 @@ pub struct ExportPage {
     /// The records whose journal is `unreadable`: delivered, without their
     /// calibration; a later read of the same records may name it.
     pub unreadable_records: u64,
+    /// The mirror header's `network_journals_refused`
+    /// (`trace-network.md` §4 and §5) when the agent attached to this
+    /// driver instance, read before this page's journal table read and
+    /// after it. `after - before` is only the increase observed during
+    /// that read: a refusal before the attach, between pages or before
+    /// `before` is not in it, so equal samples do not show complete
+    /// coverage. A nonzero `attach`, or any rise since it seen in a page's
+    /// samples, means a network journal may be missing, and no later
+    /// trace is a final `Complete` for that attach (NT-4, karyos#931).
+    pub network_journals_refused: RefusedReads,
+}
+
+/// Three reads of the mirror header's `network_journals_refused`
+/// (karyos#931).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RefusedReads {
+    /// At the agent's attach to the driver instance; `None` when the agent
+    /// has not recorded it (an export read outside an attached driver).
+    pub attach: Option<u64>,
+    /// Before the page's journal table read.
+    pub before: u64,
+    /// After the page's journal table read.
+    pub after: u64,
 }
 
 /// Why an export read is refused (R-CORE-13).

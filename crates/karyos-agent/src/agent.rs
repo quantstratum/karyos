@@ -152,6 +152,9 @@ struct Driver {
     alerts: Alerts,
     catalog: Option<CatalogWatch>,
     attachment: crate::api::Attachment,
+    /// The trace mirror's `network_journals_refused` when the agent last
+    /// attached to this driver (karyos#931).
+    refused_at_attach: Option<u64>,
 }
 
 /// Who asked for an operation (karyos#708): the operator the journal and
@@ -239,6 +242,7 @@ impl Agent {
                     .find(|(archive, _)| archive == dir)
                     .map(|(_, catalog)| CatalogWatch::start(dir.clone(), *catalog)),
                 attachment: crate::api::Attachment::default(),
+                refused_at_attach: None,
             })
             .collect();
         let start = host_monotonic_ns();
@@ -321,7 +325,11 @@ impl Agent {
             count,
             epoch,
             crate::api::MAX_EXPORT_REPLY,
-        ))
+        )
+        .map(|mut page| {
+            page.network_journals_refused.attach = driver.refused_at_attach;
+            page
+        }))
     }
 
     /// Attaches the Archive the retention operations go to (M12).
@@ -800,6 +808,10 @@ impl Driver {
                     self.tool = Some(tool);
                     self.attachment.since_ns = Some(host_monotonic_ns());
                     self.attachment.attaches = self.attachment.attaches.saturating_add(1);
+                    self.refused_at_attach = self
+                        .tool
+                        .as_ref()
+                        .map(|tool| tool.trace_mirror().network_journals_refused());
                 }
                 Err(error) => {
                     // A closed driver stays reported closed until it is
