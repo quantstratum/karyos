@@ -133,6 +133,9 @@ struct IssuerState {
     delay: Duration,
     /// Where its discovery document says the key set is.
     jwks_path: String,
+    /// A key set path it retired but still answers, with a set already
+    /// stale (`max-age=60`, `Age: 120`).
+    retired: Option<String>,
     /// Whether it answers; when not, every route answers 503.
     up: bool,
     /// The challenge of each code given.
@@ -221,6 +224,14 @@ async fn issuer_route(state: Shared, request: Request<Incoming>) -> Response<Rep
                 .to_string(),
             )
         }
+        path if state.lock().unwrap().retired.as_deref() == Some(path) => {
+            let state = state.lock().unwrap();
+            let mut response = text(StatusCode::OK, json!({"keys": state.published}).to_string());
+            let headers = response.headers_mut();
+            let _ = headers.insert("cache-control", "max-age=60".parse().unwrap());
+            let _ = headers.insert("age", "120".parse().unwrap());
+            response
+        }
         path if path == state.lock().unwrap().jwks_path => {
             let delay = state.lock().unwrap().delay;
             tokio::time::sleep(delay).await;
@@ -299,6 +310,7 @@ fn issuer() -> Shared {
         age: None,
         delay: Duration::ZERO,
         jwks_path: "/jwks".to_owned(),
+        retired: None,
         up: true,
         codes: HashMap::new(),
         fetches: 0,
@@ -669,6 +681,31 @@ fn a_moved_key_set_is_discovered_again() {
     };
     assert_eq!(refused(address, &token).0, 200);
     state.lock().unwrap().jwks_path = "/keys/v2".to_owned();
+    assert_eq!(refused(address, &token).0, 503);
+    assert_eq!(refused(address, &token).0, 200);
+    assert_eq!(lines.lock().unwrap().len(), 2);
+}
+
+/// The issuer moves its key set but the old endpoint still answers, with a
+/// set already stale: that fetch is refused (503), and the next budgeted
+/// fetch discovers the new endpoint and verifies again.
+#[test]
+fn a_retired_endpoint_that_answers_stale_sets_is_left() {
+    let state = issuer();
+    let url = state.lock().unwrap().url.clone();
+    let (socket, lines) = agent("retired");
+    let address = control(&url, socket, quick());
+    state.lock().unwrap().cache_control = "no-cache".to_owned();
+    let token = {
+        let state = state.lock().unwrap();
+        state.signer.token("at+jwt", &state.claims("alice@example"))
+    };
+    assert_eq!(refused(address, &token).0, 200);
+    {
+        let mut state = state.lock().unwrap();
+        state.retired = Some("/jwks".to_owned());
+        state.jwks_path = "/keys/v2".to_owned();
+    }
     assert_eq!(refused(address, &token).0, 503);
     assert_eq!(refused(address, &token).0, 200);
     assert_eq!(lines.lock().unwrap().len(), 2);

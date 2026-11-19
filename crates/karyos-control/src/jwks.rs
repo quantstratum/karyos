@@ -337,6 +337,9 @@ impl Jwks {
                 // lifetime, not explicitly expired, serves that one
                 // request and its waiters.
                 if freshness.stale_on_receipt() || (positive && now >= until) {
+                    // An endpoint that answers with sets no one may use may
+                    // be one the issuer retired: discover it again next.
+                    state.jwks_uri = None;
                     state.failures = state.failures.saturating_add(1);
                     let failures = state.failures;
                     state.next_allowed = Some(self.issuer.budget.next(now, failures));
@@ -590,7 +593,7 @@ impl Freshness {
                 "max-age" => {
                     // An invalid max-age makes the response stale (§4.2.1).
                     max_ages = max_ages.saturating_add(1);
-                    let parsed = value.trim().trim_matches('"').parse::<u64>().ok();
+                    let parsed = delta_seconds(value.trim());
                     invalid |= parsed.is_none();
                     max_age = Some(parsed.unwrap_or(0));
                 }
@@ -610,10 +613,16 @@ impl Freshness {
             Duration::from_secs(seconds)
         } else {
             let date = date.or(now);
-            match (
-                text(hyper::header::EXPIRES).map(|text| http_date(text).map(Duration::from_secs)),
-                date,
-            ) {
+            // A present `Expires` that is not text is not a date either:
+            // never the same as an absent one.
+            let expires = headers.get(hyper::header::EXPIRES).map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|text| http_date(text.trim()))
+                    .map(Duration::from_secs)
+            });
+            match (expires, date) {
                 (Some(Some(expires)), Some(date)) if expires > date => expires - date,
                 // At or before its date, or not a date: already expired.
                 (Some(_), _) => {
@@ -631,6 +640,27 @@ impl Freshness {
             invalid,
         }
     }
+}
+
+/// A `max-age` argument (RFC 9111 §1.2.2, §5.2): `delta-seconds`, one or
+/// more ASCII digits, or the same in one pair of double quotes, which §5.2
+/// asks recipients to accept. Nothing else (a sign, stray quotes, spaces
+/// or other characters inside) is a number; `None` makes the metadata
+/// invalid. A value past 2^31 is 2^31 (§1.2.2).
+fn delta_seconds(value: &str) -> Option<u64> {
+    let digits = value
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(value);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    const MAX: u64 = 1 << 31;
+    Some(
+        digits
+            .parse::<u64>()
+            .map_or(MAX, |seconds| seconds.min(MAX)),
+    )
 }
 
 /// Seconds since the epoch of IMF-fixdate `text` (RFC 9110 §5.6.7,
@@ -758,12 +788,32 @@ mod tests {
                 "{headers:?}"
             );
         }
-        for value in ["max-age=abc", "max-age=", "max-age=-1"] {
+        for value in [
+            "max-age=abc",
+            "max-age=",
+            "max-age=-1",
+            "max-age=+60",
+            "max-age=\"60",
+            "max-age=60\"",
+            "max-age=\"\"60\"\"",
+            "max-age=6 0",
+            "max-age=60s",
+            "max-age",
+        ] {
             let malformed = freshness(&[("cache-control", value)]);
             assert!(malformed.invalid && malformed.stale_on_receipt(), "{value}");
         }
         let fine = freshness(&[("cache-control", "max-age=0")]);
         assert!(!fine.invalid && !fine.stale_on_receipt());
+        // One pair of quotes is accepted (§5.2); past 2^31 is 2^31.
+        assert_eq!(
+            freshness(&[("cache-control", "max-age=\"60\"")]).lifetime,
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            freshness(&[("cache-control", "max-age=99999999999999999999999")]).lifetime,
+            Duration::from_secs(1 << 31)
+        );
         assert_eq!(
             freshness(&[("cache-control", "max-age=60")]).lifetime,
             Duration::from_secs(60)
@@ -850,6 +900,7 @@ mod tests {
                 ("expires", "Sun, 06 Nov 1994 08:49:37 GMT"),
             ],
             &[("expires", "0")],
+            &[("expires", "Thu, 31 Apr 2025 00:00:00 GMT")],
         ] {
             let explicit = freshness(headers);
             assert!(
@@ -857,6 +908,18 @@ mod tests {
                 "{headers:?}"
             );
         }
+        // A present `Expires` that is not even text (obs-text) is expired,
+        // never absent.
+        let mut map = hyper::HeaderMap::new();
+        let _ = map.insert(
+            hyper::header::EXPIRES,
+            hyper::header::HeaderValue::from_bytes(b"Sun, 06 Nov 1994 \xff GMT").unwrap(),
+        );
+        let opaque = Freshness::of(
+            &map,
+            SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777),
+        );
+        assert!(opaque.expired && opaque.stale_on_receipt());
         // `max-age` governs over a past `Expires` (§5.3).
         assert!(
             !freshness(&[
