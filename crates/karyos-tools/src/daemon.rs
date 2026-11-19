@@ -805,6 +805,7 @@ mod tests {
             min_free: 0,
             seal_interval: crate::args::DEFAULT_ARCHIVE_SEAL_INTERVAL,
             anchor_interval: std::time::Duration::from_secs(3600),
+            signer: None,
         });
         let daemon = Daemon::start(&options).unwrap();
         // The configured stream and the two control streams.
@@ -842,6 +843,7 @@ mod tests {
             min_free: 0,
             seal_interval: crate::args::DEFAULT_ARCHIVE_SEAL_INTERVAL,
             anchor_interval: std::time::Duration::from_secs(3600),
+            signer: None,
         });
         assert!(matches!(
             Daemon::start(&options),

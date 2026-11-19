@@ -3739,3 +3739,103 @@ fn a_failed_damage_check_leaves_the_recording_open() {
     assert_eq!(settled.len(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// With a signer, the running agent signs the integrity journal's heads
+/// on its control path and records them in `heads.kyh`, trusted under the
+/// registry, the last one covering the chain's last record (karyos#966).
+#[test]
+fn a_signing_agent_records_trusted_heads_covering_the_chain() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::ledger::{Ledger, read_entries};
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+    use crate::integrity::test_key::TestKey;
+    use crate::integrity::trust::{
+        Algorithm, Custody, HEADS_FILE, HeadVerdict, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH,
+        RegistryAction, RegistryEntry, SIGNED_HEAD_LENGTH, SignedHead, TrustRoot, key_id,
+    };
+
+    let dir = temp_dir("signing");
+    let archive = [7u8; 32];
+    let authority = TestKey::from_seed([1; 32]);
+    let archival = TestKey::from_seed([9; 32]);
+    let trust = TrustRoot {
+        archive_id: archive,
+        authorities: vec![authority.public()],
+    };
+    // The operator registers the archival key before the Archive runs.
+    {
+        let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+        let mut keys = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, KEYS_FILE).unwrap();
+        let mut entry = RegistryEntry {
+            action: RegistryAction::Register,
+            algorithm: Algorithm::Ed25519,
+            custody: Custody::Declared,
+            sequence: 0,
+            key_id: key_id(&archival.public()),
+            public: archival.public(),
+            effective: 0,
+            evidence: [0; 32],
+            endorsement: [0; 64],
+        };
+        entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&archive));
+        KeyRegistry::new(trust.clone())
+            .append(&entry, &mut journal, &mut keys)
+            .unwrap();
+    }
+    let signing = ArchiveSigning {
+        trust: trust.clone(),
+        journal_id: 1,
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(archival),
+    };
+    let agent = ArchiveHandle::spawn_signing(StdDisk, &dir, sealing(), signing).unwrap();
+    let _ = sealed_recording(&agent);
+    // Two signing polls, a second apart, after the recording sealed.
+    std::thread::sleep(Duration::from_millis(2_500));
+    agent.shutdown().unwrap();
+
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    let mut disk = StdDisk;
+    let keys: Vec<[u8; REGISTRY_ENTRY_LENGTH]> = read_entries(&mut disk, &dir, KEYS_FILE).unwrap();
+    let registry = KeyRegistry::replay(trust, &records, &keys).unwrap().0;
+    let heads: Vec<[u8; SIGNED_HEAD_LENGTH]> = read_entries(&mut disk, &dir, HEADS_FILE).unwrap();
+    assert!(!heads.is_empty(), "no head was signed");
+    let last = SignedHead::decode(heads.last().unwrap()).unwrap();
+    assert!(matches!(
+        registry.verify(&last, None),
+        HeadVerdict::Trusted { .. }
+    ));
+    let sealed = records
+        .iter()
+        .filter(|record| record.kind.is_range())
+        .map(|record| record.counter)
+        .max()
+        .unwrap();
+    assert!(last.head.counter >= sealed, "the last seal is covered");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Signing without sealing is refused at spawn.
+#[test]
+fn signing_without_a_seal_interval_is_refused() {
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+    use crate::integrity::test_key::TestKey;
+    use crate::integrity::trust::TrustRoot;
+
+    let dir = temp_dir("signing-unsealed");
+    let signing = ArchiveSigning {
+        trust: TrustRoot {
+            archive_id: [7; 32],
+            authorities: Vec::new(),
+        },
+        journal_id: 1,
+        config: SigningConfig::new(Some(1), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(TestKey::from_seed([9; 32])),
+    };
+    assert!(matches!(
+        ArchiveHandle::spawn_signing(StdDisk, &dir, AgentConfig::default(), signing),
+        Err(AgentError::SigningWithoutSealing)
+    ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
