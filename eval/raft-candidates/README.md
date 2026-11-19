@@ -15,6 +15,13 @@ Run it with `make raft-eval` from the repository root (part of
 `make pre-push`), which runs `check.sh`: format, clippy, docs and tests,
 all `--locked`.
 
+**Its lockfile follows the workspace.** This workspace depends on
+workspace crates (`karyos-sim`, `karyos-cluster`), so a PR that changes
+the workspace dependency graph also refreshes `Cargo.lock` here, offline,
+to the workspace's exact pins (`cargo metadata --offline` in this
+directory); `make raft-eval` runs `--locked` and fails otherwise
+(`rules/global_rules.md`, Dependencies).
+
 ## Evaluation manifest
 
 | Item | Value |

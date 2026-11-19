@@ -397,6 +397,10 @@ completion handling (ADR-0008).
   `Cargo.lock` is committed. `make deps-check` (in pre-push) fails on a
   stale inventory.
 - Every cargo build, lint and test command of the gate runs with `--locked`.
+- A PR that changes the workspace dependency graph also refreshes
+  `eval/raft-candidates/Cargo.lock` in the same PR (offline, to the
+  workspace's exact pins): the evaluation workspace depends on workspace
+  crates, and `make raft-eval` (in pre-push) runs `--locked`.
 - `deny.toml` holds the licence allowlist, source policy and advisory
   policy (`make deny`). CI checks licences, bans and sources in one job
   and RustSec advisories in a separate `Advisories` job, because the
