@@ -712,6 +712,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
 
     /// `max_destinations` of a multi-destination publication (MD-6), the
     /// most destinations it holds; `None` for one whose paths are fixed.
+    #[inline]
     #[must_use]
     pub(crate) fn destination_capacity(&self) -> Option<usize> {
         self.fanout.as_deref().map(|fanout| fanout.max())
