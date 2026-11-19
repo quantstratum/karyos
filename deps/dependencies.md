@@ -81,6 +81,63 @@ and compiles no C. None of the crates added with `sha2` has one.
 absent from every normal and release build and from the graph shipped to
 users; it is compiled only by `make loom`.
 
+## Evaluation-only admissions
+
+The two Raft candidates of ADR-0043, `raft` 0.7.0 (with `raft-proto`
+0.7.0) and `openraft` 0.10.0-alpha.37 (with `openraft-rt` and
+`openraft-macros` 0.10.0-alpha.37), are admitted for evaluation only
+(quantstratum-docs:
+karyos/reviews/dependency-admission-raft-candidates-evaluation.md; owner
+decision ACS 71206, 2026-11-12; karyos#677). That record admits nothing to
+a shipped graph, and the runtime admission of the selected core is a
+separate record (plan issue 074). Its conditions, as this repository
+applies them:
+
+- **Mechanism: a separate crate.** The candidates enter only
+  `karyos-raft-eval`, an unpublished crate (`publish = false`) in its own
+  workspace, `eval/raft-candidates`, with its own `Cargo.lock` and
+  `deny.toml`. It is not a member of this workspace, so neither this
+  `Cargo.lock` nor `dependency-inventory.json` lists a candidate, and no
+  crate here may depend on it. The candidates are never a
+  `[dependencies]` entry of `karyos-sim`, `karyos-cluster` or any other
+  crate of the core.
+- **Enforced by a check, not by review.** `make shipped-graph-check`
+  (`scripts/check-shipped-graph.sh`, run by `make pre-push`) runs
+  `cargo tree -e normal,build --target all` over the whole workspace and
+  over `karyos-tools`, which ships `karyosd`, each with the default
+  features and with `--all-features` (so an optional dependency behind a
+  nondefault feature is caught), and fails if `raft`,
+  `raft-proto`, `protobuf-build`, `openraft`, `openraft-rt`,
+  `openraft-rt-tokio`, `openraft-macros` or `karyos-raft-eval` appears
+  anywhere, or `tokio` appears outside the crates it is admitted for
+  (`karyos-control`, the owner-admitted HTTP stack: karyos#704, ACS 71206).
+  Tokio is checked in the workspace graph with its features unified:
+  every workspace member from which it is reachable must be admitted, so
+  a crate reaching it through `karyos-control`, through a member that
+  `karyos-control` uses, or through a shared dependency's feature that
+  `karyos-control` turns on, is still refused.
+  `scripts/check-shipped-graph-selftest.sh`, run with it, proves in a
+  throwaway workspace that the check fails with exactly the expected
+  diagnostic on a plain, a feature-gated, a transitively admitted and a
+  feature-unified Tokio, and on a candidate in the admitted crate, and passes silently on
+  Tokio in the admitted crate and on a clean graph. The unused `karyos-tools` to `karyos-sim` edge, through which a
+  candidate placed in `karyos-sim` would reach `karyosd`, is karyos#926.
+- **Versions and features** are exactly the record's: `raft` without
+  default features and with `protobuf-codec` only; `openraft` with default
+  features off (no Tokio); the evaluation lockfile pins `openraft-macros`
+  to 0.10.0-alpha.37. A change of either is a reviewed change of the
+  record.
+- **Advisories.** RUSTSEC-2024-0437 (`protobuf` 2.28.0) and
+  RUSTSEC-2025-0057 (`fxhash` 0.2.1) in the `raft` graph are ignored only
+  by the evaluation workspace's own `deny.toml`, never by this one; they
+  are findings of the comparison.
+- **`protoc`.** `raft-proto`'s build script runs `protoc` (a system one,
+  or a prebuilt executable bundled in `protobuf-build`); the evaluation
+  records the version and origin of the one it used.
+- **Tokio** in any form is excluded from the candidates' graphs and from
+  every shipped graph but `karyos-control`'s. A Tokio probe would need its
+  own record and is reconnaissance only.
+
 ## Resolved graph
 
 [`dependency-inventory.json`](dependency-inventory.json) lists every external
