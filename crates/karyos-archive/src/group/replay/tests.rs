@@ -150,7 +150,7 @@ fn recorded(
 
 /// Every step until a stop, as `(group_seq, reference_unavailable)`, and
 /// the stop.
-fn steps(cursor: &mut ReplayCursor<FaultDisk>) -> (Vec<(u64, bool)>, Stop) {
+fn steps<D: crate::disk::Disk>(cursor: &mut ReplayCursor<D>) -> (Vec<(u64, bool)>, Stop) {
     let mut events = Vec::new();
     loop {
         match cursor.step().unwrap() {
@@ -741,4 +741,168 @@ fn a_closed_journal_recovers_read_only() {
         Err(JournalError::Segment(crate::segment::SegmentError::Io(error)))
             if error.kind() == std::io::ErrorKind::PermissionDenied
     ));
+}
+
+/// The journal `disk` holds now, as a reader in another process sees it
+/// after the writer's last sync: recovered from what is durable, and its
+/// prefixes recomputed.
+fn read_now(disk: &FaultDisk, header: &JournalHeader<'_>) -> (GroupJournal<FaultDisk>, Recovery) {
+    let mut journal = GroupJournal::recover(
+        disk.after_crash(Survives::Synced),
+        Path::new("/g"),
+        header.group_id,
+        CONFIG,
+    )
+    .unwrap()
+    .journal;
+    let recovery = recover(&mut journal, &Seven, 8).unwrap();
+    (journal, recovery)
+}
+
+/// Appends events `seqs`, each a message and its end, and syncs.
+fn write_events(journal: &mut GroupJournal<FaultDisk>, seqs: std::ops::RangeInclusive<u64>) {
+    for seq in seqs {
+        journal.append(&encode(&message(seq, None))).unwrap();
+        journal
+            .append(&encode(&end(seq, 0, EndOutcome::Complete)))
+            .unwrap();
+    }
+    let _ = journal.sync().unwrap();
+}
+
+/// R-CORE-46 (karyos#881): a follower over a group still being written
+/// gives the complete prefix, waits at its end, resumes from where it
+/// stopped as the prefix advances, without reopening, and ends at the
+/// sealed group's end, having seen what a replay of the closed group sees.
+#[test]
+fn a_follower_resumes_as_the_prefix_advances_and_ends_as_closed_replay_does() {
+    let header = header(Capture::Strict);
+    let disk = FaultDisk::default();
+    let mut writer = GroupJournal::create(disk.clone(), Path::new("/g"), &header, CONFIG).unwrap();
+    write_events(&mut writer, 1..=3);
+    let (journal, recovery) = read_now(&disk, &header);
+    let mut follower = ReplayCursor::open(journal, &recovery, &expected(), ROOM).unwrap();
+    let (mut seen, stop) = steps(&mut follower);
+    assert_eq!(seen, vec![(1, false), (2, false), (3, false)]);
+    assert_eq!(
+        stop,
+        Stop::EndOfPrefix {
+            complete_recording_seq: 3
+        }
+    );
+    // Nothing new yet: following the same prefix gives the same stop.
+    let (journal, recovery) = read_now(&disk, &header);
+    follower.follow(journal, &recovery, &expected()).unwrap();
+    let (none, stop) = steps(&mut follower);
+    assert!(none.is_empty());
+    assert_eq!(
+        stop,
+        Stop::EndOfPrefix {
+            complete_recording_seq: 3
+        }
+    );
+    // The writer goes on; the follower resumes after event 3.
+    write_events(&mut writer, 4..=5);
+    let (journal, recovery) = read_now(&disk, &header);
+    follower.follow(journal, &recovery, &expected()).unwrap();
+    let (more, _) = steps(&mut follower);
+    assert_eq!(more, vec![(4, false), (5, false)]);
+    seen.extend(more);
+    // Sealed: the writer finishes, and the follower ends where a replay
+    // of the closed group ends, having seen the same events.
+    write_events(&mut writer, 6..=6);
+    writer.close().unwrap();
+    let (journal, recovery) = read_now(&disk, &header);
+    follower.follow(journal, &recovery, &expected()).unwrap();
+    let (last, followed_stop) = steps(&mut follower);
+    seen.extend(last);
+    let (journal, recovery) = read_now(&disk, &header);
+    let mut closed = ReplayCursor::open(journal, &recovery, &expected(), ROOM).unwrap();
+    assert_eq!(steps(&mut closed), (seen, followed_stop));
+}
+
+/// A gap is final: no later prefix extends past it, and following one is
+/// refused, the cursor left as it was.
+#[test]
+fn following_past_a_final_stop_is_refused() {
+    let gap = GapMarker {
+        from_seq: 2,
+        to_seq: 2,
+        reason: GapReason::RingFull,
+    };
+    let records = [
+        message(1, None),
+        end(1, 0, EndOutcome::Complete),
+        GroupRecord::Gap(gap),
+    ];
+    let (journal, recovery) = recorded(&header(Capture::BestEffort), &records);
+    let mut cursor = ReplayCursor::open(journal, &recovery, &expected(), ROOM).unwrap();
+    let (_, stopped) = steps(&mut cursor);
+    assert_eq!(stopped, Stop::Gap(gap));
+    let (journal, recovery) = recorded(&header(Capture::BestEffort), &records);
+    assert!(matches!(
+        cursor.follow(journal, &recovery, &expected()),
+        Err(ReplayError::FinalStop { stop: Stop::Gap(_) })
+    ));
+    assert_eq!(stop(&mut cursor), Stop::Gap(gap));
+}
+
+/// A journal whose prefix ends before what the cursor gave is not a later
+/// state of the same recording.
+#[test]
+fn following_a_shorter_prefix_is_refused() {
+    let long = [
+        message(1, None),
+        end(1, 0, EndOutcome::Complete),
+        message(2, None),
+        end(2, 0, EndOutcome::Complete),
+    ];
+    let mut cursor = cursor(&long, Capture::Strict);
+    let _ = steps(&mut cursor);
+    let (journal, recovery) = recorded(&header(Capture::Strict), &long[..2]);
+    assert!(matches!(
+        cursor.follow(journal, &recovery, &expected()),
+        Err(ReplayError::PrefixBehind {
+            replayed: 2,
+            found: 1
+        })
+    ));
+}
+
+/// karyos#881 review P1: a poll of a journal a live writer still owns
+/// recovers it through a read-only disk, which never modifies it. The
+/// follower advances while the writer keeps appending, and the writer's
+/// journal is unchanged by the polls.
+#[test]
+fn a_live_journal_is_polled_read_only() {
+    use crate::disk::ReadOnly;
+
+    let header = header(Capture::Strict);
+    let disk = FaultDisk::default();
+    let mut writer = GroupJournal::create(disk.clone(), Path::new("/g"), &header, CONFIG).unwrap();
+    write_events(&mut writer, 1..=2);
+    let poll = || {
+        let mut journal = GroupJournal::recover(
+            ReadOnly(disk.clone()),
+            Path::new("/g"),
+            header.group_id,
+            CONFIG,
+        )
+        .unwrap()
+        .journal;
+        let recovery = recover(&mut journal, &Seven, 8).unwrap();
+        (journal, recovery)
+    };
+    let (journal, recovery) = poll();
+    let mut follower = ReplayCursor::open(journal, &recovery, &expected(), ROOM).unwrap();
+    let (seen, _) = steps(&mut follower);
+    assert_eq!(seen, vec![(1, false), (2, false)]);
+    // The writer, never closed, goes on appending after the poll.
+    write_events(&mut writer, 3..=4);
+    let (journal, recovery) = poll();
+    follower.follow(journal, &recovery, &expected()).unwrap();
+    let (more, _) = steps(&mut follower);
+    assert_eq!(more, vec![(3, false), (4, false)]);
+    write_events(&mut writer, 5..=5);
+    writer.close().unwrap();
 }
