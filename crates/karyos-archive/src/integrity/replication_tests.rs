@@ -76,7 +76,12 @@ fn a_replica_counts_only_after_verifying_and_never_a_corrupt_range() {
             seal.end,
         )
         .unwrap();
-    assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 0);
+    assert_eq!(
+        f.copies
+            .verified_copies(RECORDING, seal.start, seal.end)
+            .unwrap(),
+        0
+    );
 
     let mut corrupt = bytes.clone();
     corrupt[3] ^= 1;
@@ -84,17 +89,32 @@ fn a_replica_counts_only_after_verifying_and_never_a_corrupt_range() {
         .verify(&mut f.copies, &mut f.journal, &seal, &corrupt)
         .unwrap();
     assert!(matches!(verdict, Verdict::Corrupt(_)));
-    assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 0);
+    assert_eq!(
+        f.copies
+            .verified_copies(RECORDING, seal.start, seal.end)
+            .unwrap(),
+        0
+    );
 
     let verdict = replica()
         .verify(&mut f.copies, &mut f.journal, &seal, &bytes)
         .unwrap();
     assert!(matches!(verdict, Verdict::Counted(_)));
-    assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 1);
+    assert_eq!(
+        f.copies
+            .verified_copies(RECORDING, seal.start, seal.end)
+            .unwrap(),
+        1
+    );
 
     // The count survives a reopen: it is chained, not held in memory.
     let reopened = CopyCatalog::open(f.disk.clone(), Path::new(DIR), &mut f.journal).unwrap();
-    assert_eq!(reopened.verified_copies(RECORDING, seal.start, seal.end), 1);
+    assert_eq!(
+        reopened
+            .verified_copies(RECORDING, seal.start, seal.end)
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -110,13 +130,19 @@ fn a_range_that_arrived_before_its_seal_is_unverified_and_counts_for_nothing() {
             seal.end,
         )
         .unwrap();
-    let current = f.copies.current();
+    let current = f.copies.current().unwrap();
     assert_eq!(current.len(), 1);
     assert_eq!(current[0].state, CopyState::Unverified);
-    assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 0);
+    assert_eq!(
+        f.copies
+            .verified_copies(RECORDING, seal.start, seal.end)
+            .unwrap(),
+        0
+    );
     assert_eq!(
         replica()
             .lag(&f.copies, RECORDING, 0, seal.end)
+            .unwrap()
             .verified_end,
         0
     );
@@ -148,7 +174,10 @@ fn the_replication_lag_is_observable() {
     let mut f = fixture();
     let source_end = f.ranges[1].0.end;
     assert_eq!(
-        replica().lag(&f.copies, RECORDING, 0, source_end).behind,
+        replica()
+            .lag(&f.copies, RECORDING, 0, source_end)
+            .unwrap()
+            .behind,
         32
     );
     for (seal, bytes) in f.ranges.clone() {
@@ -164,7 +193,7 @@ fn the_replication_lag_is_observable() {
         let _ = replica()
             .verify(&mut f.copies, &mut f.journal, &seal, &bytes)
             .unwrap();
-        let lag = replica().lag(&f.copies, RECORDING, 0, source_end);
+        let lag = replica().lag(&f.copies, RECORDING, 0, source_end).unwrap();
         assert_eq!(lag.verified_end, seal.end);
         assert_eq!(lag.behind, source_end - seal.end);
     }
@@ -259,8 +288,13 @@ fn an_offloaded_range_is_restored_byte_for_byte_and_removed_only_after_it_verifi
         .unwrap();
     assert_eq!(offloaded.enforcement, Enforcement::ObjectLock);
     assert_eq!(local.removed, vec![ObjectKey::of(LOCAL, &seal)]);
-    assert_eq!(tiering().copies_elsewhere(&f.copies, &seal), 1);
-    assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 1);
+    assert_eq!(tiering().copies_elsewhere(&f.copies, &seal).unwrap(), 1);
+    assert_eq!(
+        f.copies
+            .verified_copies(RECORDING, seal.start, seal.end)
+            .unwrap(),
+        1
+    );
 
     let restored = tiering().restore(&seal, &mut bucket).unwrap();
     assert_eq!(restored, bytes);
@@ -290,7 +324,7 @@ fn a_remote_copy_that_does_not_verify_is_not_counted_and_nothing_is_removed() {
         .unwrap_err();
     assert!(matches!(error, TieringError::RemoteMismatch(_)));
     assert!(local.removed.is_empty());
-    assert_eq!(tiering().copies_elsewhere(&f.copies, &seal), 0);
+    assert_eq!(tiering().copies_elsewhere(&f.copies, &seal).unwrap(), 0);
     assert!(matches!(
         tiering().restore(&seal, &mut bucket),
         Err(TieringError::RemoteMismatch(_))
@@ -351,7 +385,7 @@ fn an_offload_below_min_copies_is_refused_before_it_acts() {
             &mut local,
         )
         .unwrap();
-    assert_eq!(tiering().copies_elsewhere(&f.copies, &seal), 2);
+    assert_eq!(tiering().copies_elsewhere(&f.copies, &seal).unwrap(), 2);
 }
 
 #[test]
@@ -393,7 +427,7 @@ fn a_missing_prefix_shows_in_the_lag() {
     let _ = replica()
         .verify(&mut f.copies, &mut f.journal, &seal, &bytes)
         .unwrap();
-    let lag = replica().lag(&f.copies, RECORDING, 0, seal.end);
+    let lag = replica().lag(&f.copies, RECORDING, 0, seal.end).unwrap();
     assert_eq!((lag.verified_end, lag.behind), (0, 32));
 }
 
@@ -413,14 +447,24 @@ fn a_counted_copy_found_corrupt_stops_counting() {
     let _ = replica()
         .verify(&mut f.copies, &mut f.journal, &seal, &bytes)
         .unwrap();
-    assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 1);
+    assert_eq!(
+        f.copies
+            .verified_copies(RECORDING, seal.start, seal.end)
+            .unwrap(),
+        1
+    );
     let mut corrupt = bytes.clone();
     corrupt[0] ^= 1;
     let verdict = replica()
         .verify(&mut f.copies, &mut f.journal, &seal, &corrupt)
         .unwrap();
     assert!(matches!(verdict, Verdict::Corrupt(_)));
-    assert_eq!(f.copies.verified_copies(RECORDING, seal.start, seal.end), 0);
+    assert_eq!(
+        f.copies
+            .verified_copies(RECORDING, seal.start, seal.end)
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -452,11 +496,12 @@ fn offloading_part_of_a_wider_local_copy_splits_it() {
         )
         .unwrap();
     // [0, 16) counts only in the bucket; [16, 32) still counts locally.
-    assert_eq!(f.copies.verified_copies(RECORDING, 0, 16), 1);
-    assert_eq!(tiering().copies_elsewhere(&f.copies, &seal), 1);
+    assert_eq!(f.copies.verified_copies(RECORDING, 0, 16).unwrap(), 1);
+    assert_eq!(tiering().copies_elsewhere(&f.copies, &seal).unwrap(), 1);
     let local: Vec<_> = f
         .copies
         .current()
+        .unwrap()
         .into_iter()
         .filter(|copy| copy.location == LOCAL && copy.state == CopyState::Verified)
         .map(|copy| (copy.start, copy.end))

@@ -148,7 +148,7 @@ impl Replica {
                 counter: seal.counter,
             });
         }
-        let arrived = copies.current().into_iter().any(|copy| {
+        let arrived = copies.current()?.into_iter().any(|copy| {
             copy.location == self.location
                 && copy.recording == seal.subject
                 && copy.start <= seal.start
@@ -166,7 +166,7 @@ impl Replica {
             // A copy counted before is no longer one: every verified copy
             // here overlapping the range stops counting.
             let counted: Vec<CopyRecord> = copies
-                .current()
+                .current()?
                 .into_iter()
                 .filter(|copy| {
                     copy.location == self.location
@@ -196,16 +196,19 @@ impl Replica {
     /// recording starts at `source_start` and is sealed to
     /// `source_sealed_end`: only coverage contiguous from the source's
     /// start counts, so a missing prefix shows.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// The copy catalog's error.
     pub fn lag<D: Disk>(
         &self,
         copies: &CopyCatalog<D>,
         recording: u64,
         source_start: u64,
         source_sealed_end: u64,
-    ) -> ReplicationLag {
+    ) -> Result<ReplicationLag, IntegrityError> {
         let mut verified: Vec<(u64, u64)> = copies
-            .current()
+            .current()?
             .into_iter()
             .filter(|copy| {
                 copy.location == self.location
@@ -222,11 +225,11 @@ impl Replica {
             }
             verified_end = verified_end.max(end);
         }
-        ReplicationLag {
+        Ok(ReplicationLag {
             source_sealed_end,
             verified_end,
             behind: source_sealed_end.saturating_sub(verified_end),
-        }
+        })
     }
 
     const fn record(

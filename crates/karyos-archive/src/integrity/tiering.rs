@@ -168,14 +168,21 @@ pub struct Offloaded {
 
 impl Tiering {
     /// The verified copies of `seal`'s range other than the local one.
-    #[must_use]
-    pub fn copies_elsewhere<D: Disk>(&self, copies: &CopyCatalog<D>, seal: &SealRecord) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// The copy catalog's error.
+    pub fn copies_elsewhere<D: Disk>(
+        &self,
+        copies: &CopyCatalog<D>,
+        seal: &SealRecord,
+    ) -> Result<u64, IntegrityError> {
         let local = copies
-            .current()
+            .current()?
             .into_iter()
             .any(|copy| self.is_local_verified(&copy, seal));
-        let all = copies.verified_copies(seal.subject, seal.start, seal.end);
-        all.saturating_sub(u64::from(local))
+        let all = copies.verified_copies(seal.subject, seal.start, seal.end)?;
+        Ok(all.saturating_sub(u64::from(local)))
     }
 
     fn is_local_verified(&self, copy: &CopyRecord, seal: &SealRecord) -> bool {
@@ -220,7 +227,7 @@ impl Tiering {
         // The upload adds a location only when the destination is not this
         // Archive and holds no verified copy of the range yet.
         let adds = self.remote != self.local
-            && !copies.current().into_iter().any(|copy| {
+            && !copies.current()?.into_iter().any(|copy| {
                 copy.location == self.remote
                     && copy.recording == seal.subject
                     && copy.state == CopyState::Verified
@@ -228,7 +235,7 @@ impl Tiering {
                     && copy.end >= seal.end
             });
         let after = self
-            .copies_elsewhere(copies, seal)
+            .copies_elsewhere(copies, seal)?
             .saturating_add(u64::from(adds));
         Self::satisfies(after, min_copies)?;
         verify_range(seal, bytes).map_err(TieringError::LocalMismatch)?;
@@ -248,7 +255,7 @@ impl Tiering {
             ),
             journal,
         )?;
-        Self::satisfies(self.copies_elsewhere(copies, seal), min_copies)?;
+        Self::satisfies(self.copies_elsewhere(copies, seal)?, min_copies)?;
         // The local copy stops counting before its bytes go: a crash after
         // the removal never leaves bytes that no longer exist counted.
         self.uncount_local(copies, journal, seal)?;
@@ -280,7 +287,7 @@ impl Tiering {
         seal: &SealRecord,
     ) -> Result<(), TieringError> {
         let overlapping: Vec<CopyRecord> = copies
-            .current()
+            .current()?
             .into_iter()
             .filter(|copy| {
                 copy.location == self.local
