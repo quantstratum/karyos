@@ -177,7 +177,7 @@ answered by the owner on 2026-11-17, when 0.1.0-alpha.3 was published
 | Which crates, in which order | The facade and everything it depends on, in dependency order: `karyos-sys`, `karyos-protocol`, `karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`, `karyos-cluster`, `karyos`. Every other crate keeps `publish = false` |
 | Version scheme | `0.1.0-alpha.N`, the workspace version, the same for every published crate |
 | Ownership | The owner's crates.io account |
-| Gate that authorises a publication | `CHANGELOG_RELEASE=1 make pre-push` run locally at the release head, plus `cargo publish --dry-run` of each published crate, while hosted CI is off (karyos#623). Once karyos#623 restores hosted CI, the release gates of this file apply in full |
+| Gate that authorised 0.1.0-alpha.3 | For alpha.3 only, a written exception: `CHANGELOG_RELEASE=1 make pre-push` run locally at the release head, plus `cargo publish --dry-run`, while hosted CI was off (karyos#623). Later releases run the full release gates of this file or record their own written exception |
 
 ### Procedure
 
@@ -193,7 +193,12 @@ answered by the owner on 2026-11-17, when 0.1.0-alpha.3 was published
 3. Check the crate names. A name not yet published by the owner account
    must be free on crates.io; a published name must be owned by the
    owner account. Record the result below.
-4. Run `cargo publish --dry-run --locked -p <crate>` for each crate.
+4. Run one dry run over all the published crates together:
+   `cargo publish --dry-run --locked -p karyos-sys -p karyos-protocol -p karyos-codec -p karyos-client -p karyos-io -p karyos-archive -p karyos-cluster -p karyos`.
+   Cargo packages them as one set and verifies each against the others'
+   packaged sources, so it checks the new versions before any is on the
+   index; a separate dry run per crate cannot, because a dependant's new
+   dependency version is not published yet.
 5. Tag the release, then `cargo publish --locked -p <crate>` in the order
    above. Before publishing the next crate, wait until the previous one
    is in the index: `cargo info <crate>@<version>` (or
@@ -222,7 +227,8 @@ crates; the next publication reviews them in its own row.
 
 | Checked | Names | Result |
 | --- | --- | --- |
-| 2026-11-17 | the eight published crates | free before publication; published by the owner account the same day (crates.io `created_at` 2026-11-17, rechecked 2026-11-19) |
+| 2026-11-17 | the eight published crates | free before publication; published the same day (crates.io `created_at` 2026-11-17) |
+| 2026-11-19 | the eight published crates | owned by the owner account: the crates.io owners list of each crate (`cargo owner --list <crate>`) names only `joaquinbejar` |
 
 ## After the tag
 
