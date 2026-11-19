@@ -103,6 +103,9 @@ pub enum IntegrityError {
     /// a copy change since it was opened. Nothing was written.
     #[error("the copy catalog was changed through another handle; reopen it")]
     StaleCatalog,
+    /// A retention policy change was refused.
+    #[error("retention policy: {0}")]
+    Policy(super::retention::PolicyError),
     /// The key registry refused an entry.
     #[error("key registry: {0}")]
     Registry(#[from] super::trust::RegistryError),
