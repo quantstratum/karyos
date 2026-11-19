@@ -38,7 +38,7 @@ karyos-catalog: an Archive's recordings (SPEC.md section 11).
 
 Usage: karyos-catalog list <dir> [--json]
        karyos-catalog list --live DIR=REQ,RESP [--timeout-ms N] [--json]
-       karyos-catalog verify <dir> [--trust FILE] [--anchors DIR]... [--json]
+       karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]... [--json]
 
   list <dir>     the recordings of the catalog in <dir>, read only: no
                  running Archive is needed, and none is disturbed. A

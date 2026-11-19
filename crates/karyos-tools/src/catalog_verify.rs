@@ -36,7 +36,8 @@ use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Externality,
 use karyos_archive::integrity::journal::read_records;
 use karyos_archive::integrity::ledger::read_entries;
 use karyos_archive::integrity::trust::{
-    HEADS_FILE, KEYS_FILE, PUBLIC_KEY_LENGTH, REGISTRY_ENTRY_LENGTH, SIGNED_HEAD_LENGTH, TrustRoot,
+    Custody, HEADS_FILE, KEYS_FILE, PUBLIC_KEY_LENGTH, REGISTRY_ENTRY_LENGTH, SIGNED_HEAD_LENGTH,
+    TrustRoot,
 };
 use karyos_archive::integrity::verify::{Evidence, Outcome, RangeBytes, Verification, verify};
 use karyos_archive::segment::{SegmentStore, SyncPolicy, recorded_geometry};
@@ -365,6 +366,18 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
     }
 }
 
+/// The custody label of the signed coverage, as reported: a test
+/// signer's heads are "no custody separation".
+fn custody_name(custody: Option<Custody>) -> &'static str {
+    match custody {
+        None => "none",
+        Some(Custody::NoSeparation) => "no custody separation",
+        Some(Custody::Declared) => "declared",
+        Some(Custody::ExternallyEvidenced) => "externally evidenced",
+        Some(_) => "unknown",
+    }
+}
+
 /// The report as text: one line per range, then the coverage.
 #[must_use]
 pub fn text(verification: &Verification) -> String {
@@ -402,13 +415,22 @@ pub fn text(verification: &Verification) -> String {
             "journal inconsistent first_inconsistent={first}: nothing from this record on is verified"
         );
     }
+    if !verification.evidence.is_empty() {
+        let reasons: Vec<&str> = verification
+            .evidence
+            .iter()
+            .map(|reason| reason.name())
+            .collect();
+        let _ = writeln!(out, "evidence inconsistent reasons={}", reasons.join(","));
+    }
     let coverage = &verification.coverage;
     let through = |value: Option<u64>| value.map_or_else(|| "none".to_owned(), |v| v.to_string());
     let _ = writeln!(
         out,
-        "coverage: {} records, signed through {}, anchored through {}",
+        "coverage: {} records, signed through {} ({}), anchored through {}",
         coverage.records,
         through(coverage.signed_through),
+        custody_name(coverage.custody),
         through(coverage.anchored_through)
     );
     out.push_str("time evidence: not evaluated by the integrity verifier\n");
@@ -449,14 +471,21 @@ pub fn json(verification: &Verification) -> String {
             statement
         );
     }
+    let evidence: Vec<String> = verification
+        .evidence
+        .iter()
+        .map(|reason| format!("\"{}\"", reason.name()))
+        .collect();
     let coverage = &verification.coverage;
     let option = |value: Option<u64>| value.map_or_else(|| "null".to_owned(), |v| v.to_string());
     let _ = writeln!(
         out,
-        "],\"journal_first_inconsistent\":{},\"coverage\":{{\"records\":{},\"signed_through\":{},\"anchored_through\":{}}},\"time\":\"not_evaluated\"}}",
+        "],\"journal_first_inconsistent\":{},\"evidence\":[{}],\"coverage\":{{\"records\":{},\"signed_through\":{},\"custody\":\"{}\",\"anchored_through\":{}}},\"time\":\"not_evaluated\"}}",
         option(verification.journal_break),
+        evidence.join(","),
         coverage.records,
         option(coverage.signed_through),
+        custody_name(coverage.custody),
         option(coverage.anchored_through)
     );
     out
@@ -501,6 +530,7 @@ pub fn run_verify(
                 return EXIT_ERROR;
             }
             if verification.journal_break.is_some()
+                || !verification.evidence.is_empty()
                 || verification
                     .ranges
                     .iter()

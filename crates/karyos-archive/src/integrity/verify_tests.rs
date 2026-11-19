@@ -193,6 +193,7 @@ fn verified_and_beyond_anchor_are_reached_and_co_occur() {
         Coverage {
             records: 7,
             signed_through: Some(6),
+            custody: Some(Custody::NoSeparation),
             anchored_through: Some(4),
         }
     );
@@ -737,4 +738,71 @@ fn purges_are_matched_to_every_range_they_cover() {
         .map(|range| range.start)
         .collect();
     assert_eq!(purged, [0, 8, 16, 24], "{verification:?}");
+}
+
+#[test]
+fn an_anchor_that_fails_validation_is_reported_not_taken_for_absence() {
+    let mut scenario = Scenario::new();
+    let records = scenario.records();
+    // The only anchor's signature is broken: invalid evidence.
+    let mut anchor = scenario.anchors[0];
+    anchor.signed.signature[0] ^= 1;
+    scenario.anchors = vec![anchor];
+    let held = scenario.anchors.clone();
+    let verification = verify_records(&scenario, &records, None, &Held(&held));
+    assert!(verification.evidence.contains(&Reason::MalformedEvidence));
+    assert!(
+        verification
+            .ranges
+            .iter()
+            .all(|range| range.outcome == Outcome::Inconsistent),
+        "{verification:?}"
+    );
+    // No anchor at all is the ordinary absence.
+    scenario.anchors.clear();
+    let verification = verify_records(&scenario, &records, None, &Held(&[]));
+    assert!(verification.evidence.is_empty());
+    assert!(
+        verification
+            .ranges
+            .iter()
+            .all(|range| range.outcome == Outcome::BeyondAnchor),
+        "{verification:?}"
+    );
+}
+
+#[test]
+fn evidence_faults_are_reported_and_scrubbed_with_no_range_to_expose_them() {
+    let journal = IntegrityJournal::open(FaultDisk::default(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let _ = journal;
+    let trust = trust();
+    let externality = Externality::default();
+    let verification = verify(
+        &Evidence {
+            records: &[],
+            journal_fault: None,
+            journal_id: JOURNAL,
+            trust: Some(&trust),
+            registry: &[],
+            heads: &[],
+            anchors: &[],
+            anchor_faults: 1,
+            stores: &Held(&[]),
+            externality: &externality,
+            written: &[],
+        },
+        |_, _, _| RangeBytes::Missing,
+    );
+    assert!(verification.ranges.is_empty());
+    assert_eq!(verification.evidence, [Reason::MalformedEvidence]);
+    let mut scrub = Scrub::new(NonZeroU64::new(1_000).unwrap(), 0);
+    let events = scrub.poll(0, || verification.clone()).unwrap();
+    assert_eq!(
+        events[0].finding,
+        ScrubFinding::Evidence {
+            reasons: vec![Reason::MalformedEvidence]
+        }
+    );
 }

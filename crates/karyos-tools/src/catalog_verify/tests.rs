@@ -203,7 +203,7 @@ fn verify_reports_verified_beyond_anchor_and_unsealed_ranges() {
     assert_eq!(lines[6], "recording 3 [48, 52) unsealed unverifiable");
     assert_eq!(
         lines[7],
-        "coverage: 7 records, signed through 6, anchored through 4"
+        "coverage: 7 records, signed through 6 (no custody separation), anchored through 4"
     );
     assert_eq!(
         lines[8],
@@ -422,4 +422,40 @@ fn a_store_that_cannot_be_opened_is_an_error_not_a_shortened_index() {
     assert_eq!(status, EXIT_ERROR, "{out}");
     assert!(err.contains("recording 3"), "{err}");
     assert!(!out.contains("shortened_index"), "{out}");
+}
+
+#[test]
+fn verify_reports_the_custody_of_the_signed_coverage() {
+    let archive = archive("custody");
+    let (status, out, _) = full(&archive, false);
+    assert_eq!(status, 0, "{out}");
+    assert!(
+        out.contains("signed through 6 (no custody separation)"),
+        "{out}"
+    );
+    let (_, json_out, _) = full(&archive, true);
+    assert!(
+        json_out.contains("\"custody\":\"no custody separation\""),
+        "{json_out}"
+    );
+}
+
+#[test]
+fn verify_fails_on_a_malformed_anchor_entry_even_with_no_sealed_range() {
+    let root = std::env::temp_dir().join(format!("karyos-verify-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("archive");
+    let store = root.join("anchors");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join(karyos_archive::integrity::anchor::ANCHOR_FILE),
+        vec![0xFF; karyos_archive::integrity::anchor::ANCHOR_LENGTH],
+    )
+    .unwrap();
+    let anchors = format!("{}={}", hex(&OPERATOR), store.display());
+    let (status, out, _) = run(&[&dir], &["--anchors", &anchors]);
+    assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+    assert!(out.contains("evidence inconsistent"), "{out}");
+    let _ = std::fs::remove_dir_all(&root);
 }

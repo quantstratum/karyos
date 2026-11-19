@@ -31,10 +31,12 @@
 
 use std::num::NonZeroU64;
 
-use super::anchor::{AnchorEvidence, AnchorReport, Externality, check_anchors};
+use super::anchor::{
+    AnchorEvidence, AnchorFinding, AnchorReason, AnchorReport, Externality, check_anchors,
+};
 use super::trust::{
-    HeadReason, HeadVerdict, KeyRegistry, REGISTRY_ENTRY_LENGTH, RegistryEntry, RegistryError,
-    SIGNED_HEAD_LENGTH, SignedHead, TrustDecodeError, TrustRoot,
+    Custody, HeadReason, HeadVerdict, KeyRegistry, REGISTRY_ENTRY_LENGTH, RegistryEntry,
+    RegistryError, SIGNED_HEAD_LENGTH, SignedHead, TrustDecodeError, TrustRoot,
 };
 use super::{ChainCheck, Digest, Inconsistency, SealKind, SealRecord, verify_range};
 
@@ -145,6 +147,10 @@ pub struct Coverage {
     pub records: u64,
     /// The highest position a trusted signed head covers.
     pub signed_through: Option<u64>,
+    /// The custody of the signed head that gives `signed_through`, to be
+    /// reported with it: [`Custody::NoSeparation`] is "no custody
+    /// separation" (a test signer on the Archive host).
+    pub custody: Option<Custody>,
     /// The highest position a trusted, consistent external anchor covers.
     pub anchored_through: Option<u64>,
 }
@@ -187,6 +193,10 @@ pub struct Verification {
     pub coverage: Coverage,
     /// The anchor comparison.
     pub anchors: AnchorReport,
+    /// Evidence faults that hold for the whole chain, whether or not a
+    /// sealed range exposes them: untrusted or malformed evidence, unknown
+    /// keys or algorithms, conflicting or invalid anchors.
+    pub evidence: Vec<Reason>,
     /// The position of the first journal record that does not chain or
     /// does not decode, whether or not a range reaches it: nothing from
     /// it on is verified.
@@ -331,7 +341,25 @@ pub fn verify(
     if anchors.is_conflicting() {
         push_unique(&mut global, Reason::ConflictingAnchors);
     }
+    // A supplied anchor that fails validation is a fault of the evidence,
+    // never the ordinary absence of an anchor. One that merely does not
+    // count as external (local, circular, another journal, a deferred
+    // kind) is absence.
+    for finding in &anchors.findings {
+        if let AnchorFinding::Untrusted { reason, .. } = finding {
+            match reason {
+                AnchorReason::Head(HeadReason::UnknownKey) => {
+                    push_unique(&mut global, Reason::UnknownKey);
+                }
+                AnchorReason::Head(_) | AnchorReason::Unconfirmed => {
+                    push_unique(&mut global, Reason::MalformedEvidence);
+                }
+                _ => {}
+            }
+        }
+    }
     let mut signed_through: Option<u64> = None;
+    let mut custody: Option<Custody> = None;
     if let Some(registry) = &registry {
         for bytes in evidence.heads {
             let Ok(signed) = SignedHead::decode(bytes) else {
@@ -345,7 +373,9 @@ pub fn verify(
             let proved = proved_before_revocation(evidence, registry, &signed.key_id, records)
                 .filter(|_| !anchors.is_conflicting());
             match registry.verify(&signed, proved) {
-                HeadVerdict::Trusted { .. } => {
+                HeadVerdict::Trusted {
+                    custody: head_custody,
+                } => {
                     let counter = signed.head.counter;
                     let matches = in_prefix(counter)
                         && usize::try_from(counter)
@@ -353,8 +383,16 @@ pub fn verify(
                             .and_then(|index| records.get(index))
                             .is_some_and(|record| record.digest() == signed.head.digest);
                     if matches {
-                        signed_through =
-                            Some(signed_through.map_or(counter, |through| through.max(counter)));
+                        if signed_through.is_none_or(|through| counter >= through) {
+                            // Equal counters keep the weaker custody.
+                            custody = Some(match (signed_through, custody) {
+                                (Some(through), Some(known)) if through == counter => {
+                                    known.weaker(head_custody)
+                                }
+                                _ => head_custody,
+                            });
+                            signed_through = Some(counter);
+                        }
                     } else {
                         push_unique(&mut global, Reason::Corruption);
                     }
@@ -372,6 +410,7 @@ pub fn verify(
     let coverage = Coverage {
         records: records_len,
         signed_through,
+        custody,
         anchored_through: anchors.anchored_through,
     };
     let signed = |counter: u64| signed_through.is_some_and(|through| counter <= through);
@@ -472,6 +511,7 @@ pub fn verify(
         ranges,
         coverage,
         anchors,
+        evidence: global,
         journal_break,
         time: TimeEvidence::NotEvaluated,
     }
@@ -523,6 +563,12 @@ fn proved_before_revocation(
 pub enum ScrubFinding {
     /// An inconsistent range.
     Range(RangeReport),
+    /// Evidence faults for the whole chain, whether or not a range
+    /// exposes them.
+    Evidence {
+        /// The reasons.
+        reasons: Vec<Reason>,
+    },
     /// The journal does not chain or decode from this position, whether or
     /// not a range reaches it.
     Journal {
@@ -585,9 +631,16 @@ impl Scrub {
                 at_ns: now_ns,
                 finding: ScrubFinding::Journal { first_inconsistent },
             });
+        let evidence = (!verification.evidence.is_empty()).then(|| ScrubEvent {
+            at_ns: now_ns,
+            finding: ScrubFinding::Evidence {
+                reasons: verification.evidence.clone(),
+            },
+        });
         Some(
             journal
                 .into_iter()
+                .chain(evidence)
                 .chain(
                     verification
                         .ranges
@@ -655,19 +708,19 @@ fn purges_by_range<'a>(
         // In chain order, so the earliest covering purge is assigned.
         for purge in purges {
             let low = ranges.partition_point(|(_, range)| range.start < purge.start);
-            let high = ranges.partition_point(|(_, range)| range.end <= purge.end);
+            // A purge covers only ranges sealed before it: ranges of one
+            // recording are in chain order, so this caps the run too.
+            let high = ranges
+                .partition_point(|(_, range)| range.end <= purge.end)
+                .min(ranges.partition_point(|(_, range)| range.counter < purge.counter));
             let mut at = find(&mut next, low);
             while at < high {
-                if let Some(&(position, range)) = ranges.get(at)
-                    && range.counter < purge.counter
-                {
+                if let Some(&(position, _)) = ranges.get(at) {
                     covered.insert(position, purge);
-                    if let Some(slot) = next.get_mut(at) {
-                        *slot = at.saturating_add(1);
-                    }
                 }
-                // A range sealed after this purge stays open for a later
-                // one; a purge never precedes the seal of what it removes.
+                if let Some(slot) = next.get_mut(at) {
+                    *slot = at.saturating_add(1);
+                }
                 at = find(&mut next, at.saturating_add(1));
             }
         }
