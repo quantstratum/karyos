@@ -1056,9 +1056,11 @@ fn a_dynamic_subscription_refuses_a_control_no_register_can_reach() {
 /// and the old binding is gone, so it is a fresh join, not a restart.
 #[test]
 fn a_silent_receiver_is_removed_and_registers_again() {
-    let mut quick = AgentConfig::default();
-    quick.image_liveness_timeout = 500_000_000;
-    quick.sender_heartbeat_interval = 100_000_000;
+    let quick = AgentConfig {
+        image_liveness_timeout: 500_000_000,
+        sender_heartbeat_interval: 100_000_000,
+        ..AgentConfig::default()
+    };
     let mut a = driver_with(ThreadingMode::Shared, quick);
     let mut b = driver(ThreadingMode::Shared);
     let control = SocketAddr::new(LOOPBACK, free_port());
