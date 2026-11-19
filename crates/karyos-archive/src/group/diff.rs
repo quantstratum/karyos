@@ -11,8 +11,9 @@
 //! recovered through [`ReadOnly`], so one that recovery would repair (a
 //! torn tail) is an error, never repaired; it opens no driver.
 //!
-//! **The comparison basis.** Every recorded field is compared, nothing is
-//! excluded (karyos#780). It compares records, never payload bytes: a
+//! **The comparison basis.** Every recorded field of the events is
+//! compared, nothing is excluded (karyos#780); recorded checkpoints are the
+//! stated exception below. It compares records, never payload bytes: a
 //! payload by reference is compared as its reference, and a captured
 //! output by its length and CRC-32C under record version 1 (karyos#675).
 //! The complete prefix is bounded only by incomplete events and gap
@@ -21,8 +22,12 @@
 //! `group_seq`, then the lowest observation index.
 //!
 //! Recorded checkpoints (template 30, A8-2) are compared as records,
-//! matched by `group_seq`: their length, crc32c and format; a difference,
-//! or a checkpoint on one side only, is [`Kind::StateCheckpoint`].
+//! matched by `group_seq`: their length, crc32c and format take part in
+//! equality; their `checkpoint_id` and `position` do not (each journal
+//! numbers and places its own checkpoints), so `Identical` certifies the
+//! same state at the same events, not the same ids. A difference in a
+//! compared field, or a checkpoint on one side only, is
+//! [`Kind::StateCheckpoint`].
 //! [`DiffRequest::from_checkpoint`] opens the left journal at its
 //! checkpoint and the right one at its checkpoint with the same
 //! `group_seq`, each through its store opened read only: what the store's
@@ -74,8 +79,18 @@ pub struct DiffRequest {
     /// The first `group_seq` compared; `None` is the later of the two
     /// journals' first events (or of the events after their checkpoints).
     pub from: Option<u64>,
-    /// The last `group_seq` compared; `None` is the end of the shorter
-    /// complete prefix.
+    /// The last `group_seq` compared. `None` compares up to the end of the
+    /// longer complete prefix, not the shorter: when the events both sides
+    /// hold are equal and one side has further complete events, the
+    /// result is [`Report::Diverged`] with [`Kind::End`] at the first event
+    /// the shorter side lacks. A side that stops at a gap or an incomplete
+    /// event inside that range makes it [`Report::NotComparable`], whichever
+    /// side it is. To compare only the prefix both sides share, give `to`
+    /// explicitly, at or below the shorter prefix's end. From a checkpoint
+    /// (`from_checkpoint`), the range is the one that checkpoint opened, to
+    /// its own end: there a gap or an incomplete event that ends a middle
+    /// range ends the comparison, as the end of a complete prefix does,
+    /// and both sides must end there.
     pub to: Option<u64>,
     /// Compare journals whose manifests differ; otherwise a manifest
     /// difference is [`Report::NotComparable`].
@@ -86,8 +101,10 @@ pub struct DiffRequest {
     pub from_checkpoint: Option<u64>,
 }
 
-/// What differs first.
+/// What differs first. More kinds may be added: a caller's match keeps a
+/// wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Kind {
     /// The event itself.
     InputEvent,
@@ -124,8 +141,10 @@ impl Kind {
 
 /// A diff's result: identical over the compared range, the first
 /// difference as `(group_seq, index, kind)`, not comparable (the inputs
-/// do not cover the range under the stated basis), or an error.
+/// do not cover the range under the stated basis), or an error. More
+/// outcomes may be added: a caller's match keeps a wildcard arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Report {
     /// Identical over the range.
     Identical {
@@ -899,19 +918,38 @@ fn compare<L: Disk, R: Disk>(
             }
             // One side has an event in the range, the other's next event is
             // past it: the event is missing there.
+            // The one-sided event is checked for comparability first, as
+            // a pair is: one that is not comparable makes the range so,
+            // never a divergence.
             (Side::Event(event), Side::Past) => {
+                if let Some(reason) = uncomparable(&event, "left") {
+                    return not_comparable(reason);
+                }
                 return one_sided(&event, "right");
             }
             (Side::Past, Side::Event(event)) => {
+                if let Some(reason) = uncomparable(&event, "right") {
+                    return not_comparable(reason);
+                }
                 return one_sided(&event, "left");
             }
             (Side::Event(event), Side::Stop(stop)) => {
-                return past_start(stop, range, "right")
-                    .unwrap_or_else(|| ended_one_side(&event, stop, "right"));
+                if let Some(report) = past_start(stop, range, "right") {
+                    return report;
+                }
+                if let Some(reason) = uncomparable(&event, "left") {
+                    return not_comparable(reason);
+                }
+                return ended_one_side(&event, stop, "right");
             }
             (Side::Stop(stop), Side::Event(event)) => {
-                return past_start(stop, range, "left")
-                    .unwrap_or_else(|| ended_one_side(&event, stop, "left"));
+                if let Some(report) = past_start(stop, range, "left") {
+                    return report;
+                }
+                if let Some(reason) = uncomparable(&event, "right") {
+                    return not_comparable(reason);
+                }
+                return ended_one_side(&event, stop, "left");
             }
             // Both sides ended, or are past the range.
             (left_end, right_end) => {

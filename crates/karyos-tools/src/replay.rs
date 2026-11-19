@@ -57,8 +57,9 @@ Usage: {command} <left-dir> <left-group> <right-dir> <right-group>
 {indent}[--from-checkpoint <id>]
 
   --from <seq>          the first group_seq compared [the first event]
-  --to <seq>            the last group_seq compared [the end of the shorter
-                        complete prefix]
+  --to <seq>            the last group_seq compared [the end of the longer
+                        complete prefix: an event on one side only is a
+                        divergence; give --to for the shared prefix only]
   --json                one JSON object instead of text
   --accept-manifest     compare journals whose manifests differ
   --from-checkpoint <id>  compare from the event after the left journal's
@@ -249,7 +250,8 @@ impl ReportOutput for Report {
             Self::Identical { .. } => 0,
             Self::Diverged { .. } => 1,
             Self::NotComparable { .. } => 2,
-            Self::Error { .. } => 3,
+            // An error, or an outcome this tool does not know yet.
+            _ => 3,
         }
     }
 
@@ -283,6 +285,7 @@ impl ReportOutput for Report {
             }
             Self::NotComparable { reason } => format!("not comparable: {reason}\n"),
             Self::Error { reason } => format!("error: {reason}\n"),
+            _ => "error: an outcome this version does not know\n".to_owned(),
         }
     }
 
@@ -322,6 +325,15 @@ impl ReportOutput for Report {
                 null(),
                 null(),
                 quoted(reason),
+            ),
+            _ => (
+                "error",
+                null(),
+                null(),
+                null(),
+                null(),
+                null(),
+                quoted("an outcome this version does not know"),
             ),
         };
         let mut out = format!(
