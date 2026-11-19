@@ -538,7 +538,8 @@ impl Agent {
     }
 
     /// Puts a new version of the driver in `dir`'s `kind` `key` with
-    /// `attributes`, for `uid` (karyos#736); its number.
+    /// `attributes`, for `requester` (karyos#736): its operator, and its
+    /// relay apart (karyos#708); its number.
     ///
     /// # Errors
     ///
@@ -549,11 +550,18 @@ impl Agent {
         kind: Kind,
         key: &str,
         attributes: &str,
-        uid: u32,
+        requester: Requester,
     ) -> Result<u64, JoinError> {
         let driver = self.driver_index(dir)?;
         self.registry
-            .put(driver, kind, key, attributes, uid, host_monotonic_ns())
+            .put_relayed(
+                driver,
+                kind,
+                key,
+                attributes,
+                (requester.operator, requester.relay),
+                host_monotonic_ns(),
+            )
             .map_err(JoinError::Refused)
     }
 

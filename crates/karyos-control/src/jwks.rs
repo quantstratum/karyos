@@ -560,9 +560,22 @@ impl Freshness {
                 .and_then(|value| value.to_str().ok())
                 .map(str::trim)
         };
-        let held = text(hyper::header::AGE)
-            .and_then(|age| age.parse::<u64>().ok())
-            .map_or(Duration::ZERO, Duration::from_secs);
+        // `Age` is delta-seconds too: one that is present but not a number,
+        // or past what this cache can count (RFC 9111 §5.1: then it is to
+        // be taken as very old), makes the response stale.
+        let mut invalid = false;
+        let held = match headers.get(hyper::header::AGE) {
+            None => Duration::ZERO,
+            Some(value) => {
+                let seconds = value.to_str().ok().map(str::trim).and_then(|text| {
+                    (!text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()))
+                        .then(|| text.parse::<u64>().ok())
+                        .flatten()
+                });
+                invalid |= seconds.is_none();
+                seconds.map_or(Duration::MAX, Duration::from_secs)
+            }
+        };
         let date = text(hyper::header::DATE)
             .and_then(http_date)
             .map(Duration::from_secs);
@@ -578,13 +591,17 @@ impl Freshness {
         let age = held.max(apparent);
         let mut max_age = None;
         let mut max_ages = 0_u32;
-        let mut invalid = false;
         let mut uncacheable = false;
         for directive in headers
             .get_all(hyper::header::CACHE_CONTROL)
             .iter()
-            .filter_map(|value| value.to_str().ok())
-            .flat_map(|value| value.split(','))
+            .map(|value| value.to_str().ok().and_then(list_members))
+            .flat_map(|members| {
+                // A field that is not text, or has an unterminated quoted
+                // string, is invalid metadata.
+                invalid |= members.is_none();
+                members.unwrap_or_default()
+            })
         {
             let directive = directive.trim();
             let (name, value) = directive.split_once('=').unwrap_or((directive, ""));
@@ -642,6 +659,32 @@ impl Freshness {
     }
 }
 
+/// The members of a comma-separated list field (RFC 9110 §5.6.1), split
+/// only at commas outside a quoted string (§5.6.4, with its `\` quoted
+/// pairs), so a quoted extension value with a comma stays one member;
+/// `None` for an unterminated quoted string.
+fn list_members(field: &str) -> Option<Vec<&str>> {
+    let mut members = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (index, byte) in field.bytes().enumerate() {
+        match (quoted, escaped, byte) {
+            (true, true, _) => escaped = false,
+            (true, false, b'\\') => escaped = true,
+            (_, false, b'"') => quoted = !quoted,
+            (false, _, b',') => {
+                members.push(field.get(start..index)?);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quoted {
+        return None;
+    }
+    members.push(field.get(start..)?);
+    Some(members)
+}
+
 /// A `max-age` argument (RFC 9111 §1.2.2, §5.2): `delta-seconds`, one or
 /// more ASCII digits, or the same in one pair of double quotes, which §5.2
 /// asks recipients to accept. Nothing else (a sign, stray quotes, spaces
@@ -669,7 +712,7 @@ fn delta_seconds(value: &str) -> Option<u64> {
 #[must_use]
 pub fn http_date(text: &str) -> Option<u64> {
     let mut words = text.split(' ');
-    let (Some(_), Some(day), Some(month), Some(year), Some(time), Some("GMT"), None) = (
+    let (Some(weekday), Some(day), Some(month), Some(year), Some(time), Some("GMT"), None) = (
         words.next(),
         words.next(),
         words.next(),
@@ -722,6 +765,12 @@ pub fn http_date(text: &str) -> Option<u64> {
     let doy = (153 * m + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = (era * 146_097 + doe).checked_sub(719_468)?;
+    // Its weekday must be the date's (1970-01-01 was a Thursday): a wrong
+    // or malformed one makes it no date.
+    const WEEKDAYS: [&str; 7] = ["Thu,", "Fri,", "Sat,", "Sun,", "Mon,", "Tue,", "Wed,"];
+    if WEEKDAYS.get(usize::try_from(days % 7).ok()?) != Some(&weekday) {
+        return None;
+    }
     days.checked_mul(86_400)?
         .checked_add(hour * 3600 + minute * 60 + second)
 }
@@ -939,6 +988,30 @@ mod tests {
         assert!(freshness(&[("cache-control", "no-cache"), ("age", "1")]).stale_on_receipt());
     }
 
+    /// A quoted extension value with a comma stays one directive; an
+    /// unterminated quoted string makes the field invalid.
+    #[test]
+    fn cache_control_respects_quoted_strings() {
+        let quoted = freshness(&[("cache-control", "ext=\"a, max-age=600\", max-age=60")]);
+        assert_eq!(quoted.lifetime, Duration::from_secs(60));
+        assert!(!quoted.invalid);
+        let escaped = freshness(&[("cache-control", "ext=\"a\\\", max-age=600\", max-age=60")]);
+        assert_eq!(escaped.lifetime, Duration::from_secs(60));
+        let open = freshness(&[("cache-control", "ext=\"a, max-age=60")]);
+        assert!(open.invalid && open.stale_on_receipt());
+        assert_eq!(list_members("a, b"), Some(vec!["a", " b"]));
+    }
+
+    /// An `Age` past what a u64 holds, or not a number, is stale.
+    #[test]
+    fn an_age_that_overflows_or_is_not_a_number_is_stale() {
+        for age in ["99999999999999999999999", "abc", "-1", "+5", ""] {
+            let stale = freshness(&[("cache-control", "max-age=600"), ("age", age)]);
+            assert!(stale.invalid && stale.stale_on_receipt(), "{age}");
+        }
+        assert!(!freshness(&[("cache-control", "max-age=600"), ("age", "5")]).stale_on_receipt());
+    }
+
     #[test]
     fn http_dates_parse() {
         assert_eq!(
@@ -967,6 +1040,10 @@ mod tests {
             "Mon, 29 Feb 2100 00:00:00 GMT",
             "Wed, 30 Feb 2000 00:00:00 GMT",
             "Sun, 00 Nov 1994 08:49:37 GMT",
+            // The weekday must be the date's, with its comma.
+            "Mon, 06 Nov 1994 08:49:37 GMT",
+            "Xyz, 06 Nov 1994 08:49:37 GMT",
+            "Sun 06 Nov 1994 08:49:37 GMT",
         ] {
             assert_eq!(http_date(bad), None, "{bad}");
         }

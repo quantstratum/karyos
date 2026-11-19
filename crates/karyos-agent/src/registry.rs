@@ -115,8 +115,13 @@ type Key = (usize, Kind, String);
 pub struct Version {
     /// Its number, from 1 per key.
     pub number: u64,
-    /// The uid that put it.
+    /// The uid that put it, or, for a relayed request (karyos#708), the
+    /// principal's operator id.
     pub registered_by: u32,
+    /// The relay that carried the request (karyos#708), by its configured
+    /// id; 0 for a request on the local socket. Kept apart from
+    /// `registered_by`, as the journal keeps it.
+    pub relay: u64,
     /// Host `CLOCK_MONOTONIC` nanoseconds from which it is in force.
     pub valid_from: u64,
     /// Until which it is in force, exclusive; `None` while current.
@@ -333,6 +338,26 @@ impl Registry {
         uid: u32,
         now: u64,
     ) -> Result<u64, Refusal> {
+        self.put_relayed(driver, kind, key, attributes, (uid, 0), now)
+    }
+
+    /// [`Registry::put`] for `by`: the operator (a uid, or a relayed
+    /// principal's operator id) and the relay's id, 0 for none
+    /// (karyos#708).
+    ///
+    /// # Errors
+    ///
+    /// As [`Registry::put`].
+    pub fn put_relayed(
+        &mut self,
+        driver: usize,
+        kind: Kind,
+        key: &str,
+        attributes: &str,
+        by: (u32, u64),
+        now: u64,
+    ) -> Result<u64, Refusal> {
+        let (uid, relay) = by;
         check_key(kind, key)?;
         let attributes = check_attributes(attributes)?;
         let id = (driver, kind, key.to_owned());
@@ -380,6 +405,7 @@ impl Registry {
         entry.versions.push_back(Version {
             number,
             registered_by: uid,
+            relay,
             valid_from: now,
             valid_to: None,
             attributes,
