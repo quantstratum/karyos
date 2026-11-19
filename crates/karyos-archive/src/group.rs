@@ -16,6 +16,7 @@
 
 pub mod capture;
 pub mod checkpoint;
+pub mod diff;
 pub mod gateway;
 pub mod journal;
 pub mod order;

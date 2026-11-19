@@ -17,12 +17,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_archive::disk::StdDisk;
-use karyos_archive::group::journal::MIN_SEGMENT_LENGTH;
+use karyos_archive::group::checkpoint::recorded_end;
+use karyos_archive::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
 use karyos_archive::group::record::{
-    CONTRACT_VERSION, Capture, Clock, EndOutcome, EventEnd, GapMarker, GapReason, JournalHeader,
-    MAX_RECORD, MessageEvent, Outcome, OutcomeObservation, Payload, TimerAction, TimerEvent,
-    TimerObservation,
+    CONTRACT_VERSION, Capture, CheckpointRecord, Clock, EndOutcome, EventEnd, GapMarker, GapReason,
+    GroupRecord, JournalHeader, MAX_RECORD, MessageEvent, Operation, Outcome, OutcomeObservation,
+    Payload, TimerAction, TimerEvent, TimerObservation,
 };
+use karyos_archive::segment::SyncPolicy;
 use karyos_sys::frame::Lane;
 
 use super::*;
@@ -1813,4 +1815,42 @@ fn test_replay_diff_of_several_differences_reports_the_first() {
         ),
         "{report:?}"
     );
+}
+
+/// karyos#919 review P2: an event on one side only whose reference is
+/// unavailable makes the range not comparable, as it does in a pair,
+/// never a divergence at the end.
+#[test]
+fn a_one_sided_event_with_an_unavailable_reference_is_not_comparable() {
+    use karyos_archive::group::record::ReferenceUnavailable;
+
+    let effort = header(Capture::BestEffort, b"m");
+    let shared = [
+        message(1, Payload::Inline(b"a")),
+        end(1, 0, EndOutcome::Complete),
+    ];
+    let mut longer = shared.to_vec();
+    longer.extend([
+        message(
+            2,
+            Payload::Reference {
+                recording_id: 8,
+                length: 10,
+            },
+        ),
+        end(2, 0, EndOutcome::Complete),
+        GroupRecord::Unavailable(ReferenceUnavailable {
+            group_seq: 2,
+            recording_id: 8,
+        }),
+    ]);
+    for (left, right) in [(&longer[..], &shared[..]), (&shared[..], &longer[..])] {
+        let report = run_with((&effort, left), (&effort, right), |_| {});
+        assert_eq!(report.exit_code(), 2, "{report:?}");
+        assert!(
+            report.text().contains("reference is unavailable"),
+            "{}",
+            report.text()
+        );
+    }
 }
