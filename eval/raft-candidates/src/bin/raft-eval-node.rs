@@ -50,7 +50,10 @@ fn config() -> Option<(String, NodeConfig)> {
 fn main() -> ExitCode {
     // `raft-eval-node incarnation`: prints the incarnation this process
     // draws first, so a test can compare two processes (karyos#959).
-    if std::env::args().nth(1).as_deref() == Some("incarnation") {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "incarnation")
+    {
         let _ = writeln!(
             std::io::stdout(),
             "{}",
