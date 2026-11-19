@@ -31,9 +31,20 @@
 //! control. `check_quorum` is on, so a leader that has lost its quorum
 //! steps down.
 //!
-//! **Not taken here:** declared limits, snapshots and compaction (W2 and
-//! W5, karyos#679): their defaults answer `Unsupported`, which the
-//! harness reports as not demonstrated.
+//! **Declared limits** (W2, karyos#679): `recover_with` takes them. One
+//! entry per append (`max_size_per_msg = 0`) and at most
+//! `in_flight_entries` appends unacknowledged (`max_inflight_msgs`); the
+//! queue and the in-flight bytes are refused in `propose`
+//! ([`refuse_past`], the byte cap kept by entry size); an entry cap outside
+//! `1..=MAX_IN_FLIGHT_ENTRIES` is `Unsupported`. Two gaps are findings:
+//! raft-rs frees a window slot when a heartbeat answer arrives while the
+//! window is full (its recovery from lost acknowledgements), so the caps
+//! hold strictly only while acknowledgements are not delayed past a
+//! heartbeat; and log reads come from the `MemStorage` mirror, not the
+//! harness's metered log.
+//!
+//! **Not taken here:** snapshots and compaction (W5, karyos#679): they
+//! answer `Unsupported`, which the harness reports as not demonstrated.
 //!
 //! **Panics.** raft-rs asserts its own invariants (`assert!`, `fatal!`)
 //! and unwraps its `MemStorage` lock. The adapter never panics itself;
@@ -89,6 +100,21 @@ pub fn election_ticks(id: NodeId, voters: &[NodeId]) -> (usize, usize) {
     let stagger = position.saturating_mul(3);
     let min = ELECTION_TICKS.saturating_add(stagger);
     (min, min.saturating_add(1))
+}
+
+/// The largest entry cap either adapter takes: raft-rs allocates its
+/// in-flight window eagerly (`Inflights::new`), so a cap past this would
+/// panic on allocation or, where it does not fit a `usize`, start an inert
+/// core; both adapters refuse it as `Unsupported` before startup
+/// (karyos#963 review). W2's caps are 4 (skeleton) and 64 (manifest).
+pub const MAX_IN_FLIGHT_ENTRIES: u64 = 1 << 16;
+
+/// Whether both adapters take `limits`: an entry cap in
+/// `1..=MAX_IN_FLIGHT_ENTRIES` that fits a `usize`.
+#[must_use]
+pub fn limits_supported(limits: &Limits) -> bool {
+    (1..=MAX_IN_FLIGHT_ENTRIES).contains(&limits.in_flight_entries)
+        && usize::try_from(limits.in_flight_entries).is_ok()
 }
 
 /// The W2 refusal of a proposal of `command` by a leader whose log ends
@@ -340,9 +366,10 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
         limits: &Limits,
         log: &mut LogView<'_>,
     ) -> Result<Self, Unsupported> {
-        // No entry in flight is no replication: refused before startup,
-        // not a core without Raft (karyos#963 review).
-        if limits.in_flight_entries == 0 {
+        // No entry in flight is no replication, and a window too large to
+        // allocate would panic: refused before startup, not a core without
+        // Raft (karyos#963 review).
+        if !limits_supported(limits) {
             return Err(Unsupported);
         }
         Ok(Self {
@@ -590,5 +617,99 @@ mod tests {
     fn the_evaluated_build_is_the_unpatched_release() {
         assert_eq!(VARIANT, Variant::Baseline);
         assert!(VARIANT.patches().is_empty());
+    }
+}
+
+/// raft-rs's in-flight window under a delayed acknowledgement (karyos#963
+/// review): pinned as a finding of the comparison, not enforced by the
+/// adapter.
+#[cfg(test)]
+mod window {
+    use raft::eraftpb::{ConfState, Message, MessageType};
+    use raft::storage::MemStorage;
+    use raft::{Config, RawNode};
+
+    /// Runs every Ready, persisting into the store as `drive` would, and
+    /// returns the messages released.
+    fn drain(node: &mut RawNode<MemStorage>) -> Vec<Message> {
+        let mut out = Vec::new();
+        while node.has_ready() {
+            let mut ready = node.ready();
+            out.extend(ready.take_messages());
+            {
+                let store = node.store().clone();
+                let mut core = store.wl();
+                core.append(ready.entries()).unwrap();
+                if let Some(state) = ready.hs() {
+                    core.set_hardstate(state.clone());
+                }
+            }
+            out.extend(ready.take_persisted_messages());
+            let mut light = node.advance(ready);
+            out.extend(light.take_messages());
+            node.advance_apply();
+        }
+        out
+    }
+
+    fn from_follower(kind: MessageType, term: u64, index: u64) -> Message {
+        let mut message = Message::default();
+        message.set_msg_type(kind);
+        message.from = 2;
+        message.to = 1;
+        message.term = term;
+        message.index = index;
+        message
+    }
+
+    /// With one append allowed in flight, the leader sends command A; a
+    /// heartbeat answer arrives while A's acknowledgement is delayed, and
+    /// raft-rs frees the window's slot and sends command B: two appends
+    /// unacknowledged against a cap of one. This is how raft-rs recovers
+    /// from lost acknowledgements (`handle_heartbeat_response`), so the
+    /// adapter leaves it: the declared in-flight caps hold strictly only
+    /// while acknowledgements are not delayed past a heartbeat.
+    #[test]
+    fn a_heartbeat_answer_frees_a_full_window_slot() {
+        let storage = MemStorage::new_with_conf_state(ConfState::from((vec![1, 2], vec![])));
+        let config = Config {
+            id: 1,
+            max_size_per_msg: 0,
+            max_inflight_msgs: 1,
+            ..Config::default()
+        };
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        let mut node = RawNode::new(&config, storage, &logger).unwrap();
+        node.campaign().unwrap();
+        let _ = drain(&mut node);
+        let term = node.raft.term;
+        node.step(from_follower(MessageType::MsgRequestVoteResponse, term, 0))
+            .unwrap();
+        let _ = drain(&mut node);
+        assert_eq!(node.raft.state, raft::StateRole::Leader);
+        // The follower takes the leader's first entry: replicating.
+        let last = node.raft.raft_log.last_index();
+        node.step(from_follower(MessageType::MsgAppendResponse, term, last))
+            .unwrap();
+        let _ = drain(&mut node);
+        let appends = |messages: &[Message]| {
+            messages
+                .iter()
+                .filter(|m| m.get_msg_type() == MessageType::MsgAppend && !m.entries.is_empty())
+                .count()
+        };
+        node.propose(vec![], b"A".to_vec()).unwrap();
+        node.propose(vec![], b"B".to_vec()).unwrap();
+        let sent = appends(&drain(&mut node));
+        assert_eq!(sent, 1, "the window holds one append");
+        // A's acknowledgement is delayed; a heartbeat answer arrives.
+        node.step(from_follower(MessageType::MsgHeartbeatResponse, term, 0))
+            .unwrap();
+        let more = appends(&drain(&mut node));
+        assert_eq!(
+            sent + more,
+            2,
+            "a second append left before the first was acknowledged"
+        );
     }
 }

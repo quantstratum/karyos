@@ -39,8 +39,17 @@
 //! Terms are OpenRaft's standard leader ids (one leader per term), so an
 //! entry's committed leader id is its term.
 //!
-//! **Not taken here:** declared limits, snapshots and compaction (W2 and
-//! W5, karyos#679).
+//! **Declared limits** (W2, karyos#679): `recover_with` takes them.
+//! `max_payload_entries` is the in-flight entry cap, and OpenRaft's
+//! sequential append stream keeps one append in flight per follower; the
+//! queue and the in-flight bytes are refused in `propose`
+//! ([`crate::raft_rs::refuse_past`], the byte cap kept by entry size); an
+//! entry cap outside `1..=MAX_IN_FLIGHT_ENTRIES` is `Unsupported`. The
+//! log-read limit is not honoured through the harness's metered log:
+//! OpenRaft reads the adapter's in-memory view.
+//!
+//! **Not taken here:** snapshots and compaction (W5, karyos#679): they
+//! answer `Unsupported`, which the harness reports as not demonstrated.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -947,9 +956,10 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
         limits: &Limits,
         log: &mut LogView<'_>,
     ) -> Result<Self, Unsupported> {
-        // OpenRaft refuses `max_payload_entries = 0`: refused here, before
-        // startup, not a core without Raft (karyos#963 review).
-        if limits.in_flight_entries == 0 {
+        // OpenRaft refuses `max_payload_entries = 0`, and both adapters
+        // bound the cap the same way: refused here, before startup, not a
+        // core without Raft (karyos#963 review).
+        if !crate::raft_rs::limits_supported(limits) {
             return Err(Unsupported);
         }
         Ok(Self::start(id, peers, Some(limits), log))

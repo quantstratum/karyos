@@ -12,7 +12,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use karyos_raft_eval::openraft_core::OpenRaft;
-use karyos_raft_eval::raft_rs::RaftRs;
+use karyos_raft_eval::raft_rs::{MAX_IN_FLIGHT_ENTRIES, RaftRs};
 use karyos_sim::harness::core::{ConsensusCore, Limit, Limits, Unsupported};
 use karyos_sim::harness::node::Observation;
 use karyos_sim::harness::workloads::{
@@ -208,25 +208,30 @@ fn w2_byte_cap_binds_before_the_entry_cap<C: ConsensusCore>() {
     );
 }
 
-/// No entry in flight is refused before startup as unsupported limits,
-/// never a core that cannot elect (karyos#963 review).
-fn a_zero_entry_cap_is_unsupported<C: ConsensusCore>() {
-    let w2 = W2 {
-        limits: Limits {
-            in_flight_entries: 0,
+/// An entry cap the adapters cannot take is refused before startup as
+/// unsupported limits, never a core that cannot elect nor a panic on
+/// allocation: none, one past `MAX_IN_FLIGHT_ENTRIES`, and `u64::MAX`
+/// (karyos#963 review). The cap's edge is taken.
+fn an_entry_cap_the_adapters_cannot_take_is_unsupported<C: ConsensusCore>() {
+    let base = W2::skeleton().cases().unwrap().into_iter().next().unwrap();
+    let with = |cap| {
+        let mut case = base.clone();
+        case.limits = Some(Limits {
+            in_flight_entries: cap,
             ..W2::skeleton().limits
-        },
-        ..W2::skeleton()
+        });
+        case
     };
-    let case = w2.cases().unwrap().into_iter().next().unwrap();
-    assert!(
-        matches!(
-            workloads::run::<C>(&case, 1),
-            Err(RunError::Unsupported(Unsupported))
-        ),
-        "{}",
-        case.name
-    );
+    for cap in [0, MAX_IN_FLIGHT_ENTRIES + 1, u64::MAX] {
+        assert!(
+            matches!(
+                workloads::run::<C>(&with(cap), 1),
+                Err(RunError::Unsupported(Unsupported))
+            ),
+            "cap {cap}"
+        );
+    }
+    assert!(workloads::run::<C>(&with(MAX_IN_FLIGHT_ENTRIES), 1).is_ok());
 }
 
 /// W5 (karyos#679). Its snapshot cases need compaction and a snapshot
@@ -301,8 +306,8 @@ macro_rules! suite {
             }
 
             #[test]
-            fn a_zero_entry_cap_is_unsupported() {
-                super::a_zero_entry_cap_is_unsupported::<$core>();
+            fn an_entry_cap_the_adapters_cannot_take_is_unsupported() {
+                super::an_entry_cap_the_adapters_cannot_take_is_unsupported::<$core>();
             }
 
             #[test]
