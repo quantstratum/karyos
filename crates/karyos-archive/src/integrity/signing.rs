@@ -161,6 +161,13 @@ impl SigningConfig {
     pub const fn anchor_interval_ns(&self) -> NonZeroU64 {
         self.anchor_interval_ns
     }
+
+    /// The backlog policy.
+    #[must_use]
+    #[inline]
+    pub const fn policy(&self) -> BacklogPolicy {
+        self.policy
+    }
 }
 
 /// What became of an offered head.

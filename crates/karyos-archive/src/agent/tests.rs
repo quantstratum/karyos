@@ -3839,3 +3839,171 @@ fn signing_without_a_seal_interval_is_refused() {
     ));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The operator's registered archival key in `dir`'s registry, for the
+/// signing duty tests: the trust root and the key.
+fn registered_archival(
+    dir: &Path,
+) -> (
+    crate::integrity::trust::TrustRoot,
+    crate::integrity::test_key::TestKey,
+) {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::ledger::Ledger;
+    use crate::integrity::test_key::TestKey;
+    use crate::integrity::trust::{
+        Algorithm, Custody, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH, RegistryAction,
+        RegistryEntry, TrustRoot, key_id,
+    };
+
+    let archive = [7u8; 32];
+    let authority = TestKey::from_seed([1; 32]);
+    let archival = TestKey::from_seed([9; 32]);
+    let trust = TrustRoot {
+        archive_id: archive,
+        authorities: vec![authority.public()],
+    };
+    let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+    let mut keys = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, dir, KEYS_FILE).unwrap();
+    let mut entry = RegistryEntry {
+        action: RegistryAction::Register,
+        algorithm: Algorithm::Ed25519,
+        custody: Custody::Declared,
+        sequence: 0,
+        key_id: key_id(&archival.public()),
+        public: archival.public(),
+        effective: 0,
+        evidence: [0; 32],
+        endorsement: [0; 64],
+    };
+    entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&archive));
+    KeyRegistry::new(trust.clone())
+        .append(&entry, &mut journal, &mut keys)
+        .unwrap();
+    (trust, archival)
+}
+
+/// A signer that answers a head only on its `asks`-th request for that
+/// same head, and only while `open`: a remote signer slower than sealing.
+struct SlowSigner {
+    key: crate::integrity::test_key::TestKey,
+    asks: u32,
+    open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    seen: std::collections::HashMap<u64, u32>,
+}
+
+impl crate::integrity::signing::HeadSigner for SlowSigner {
+    fn key_id(&self) -> crate::integrity::Digest {
+        self.key.key_id()
+    }
+
+    fn custody(&self) -> crate::integrity::trust::Custody {
+        self.key.custody()
+    }
+
+    fn sign(
+        &mut self,
+        head: &crate::integrity::trust::ChainHead,
+    ) -> Result<[u8; crate::integrity::trust::SIGNATURE_LENGTH], SignerUnavailable> {
+        if !self.open.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(SignerUnavailable);
+        }
+        let asked = self.seen.entry(head.counter).or_insert(0);
+        *asked += 1;
+        if *asked < self.asks {
+            return Err(SignerUnavailable);
+        }
+        self.key.sign(head)
+    }
+}
+
+/// The counters of the heads `dir`'s `heads.kyh` records.
+fn signed_counters(dir: &Path) -> Vec<u64> {
+    use crate::integrity::ledger::read_entries;
+    use crate::integrity::trust::{HEADS_FILE, SIGNED_HEAD_LENGTH, SignedHead};
+    let mut disk = StdDisk;
+    let heads: Vec<[u8; SIGNED_HEAD_LENGTH]> = read_entries(&mut disk, dir, HEADS_FILE).unwrap();
+    heads
+        .iter()
+        .map(|head| SignedHead::decode(head).unwrap().head.counter)
+        .collect()
+}
+
+/// karyos#966 review P1: with the journal's head advancing at every poll
+/// and a signer that needs several asks for one head, the head given to
+/// the signer is kept until it is signed, so coverage progresses; the
+/// newer heads wait behind it and coalesce into the latest.
+#[test]
+fn a_slow_signer_still_signs_while_heads_advance() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+
+    let dir = temp_dir("signing-slow");
+    let (trust, key) = registered_archival(&dir);
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let setup = ArchiveSigning {
+        trust,
+        journal_id: 1,
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(SlowSigner {
+            key,
+            asks: 3,
+            open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            seen: std::collections::HashMap::new(),
+        }),
+    };
+    let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal).unwrap();
+    for poll in 1..=12u64 {
+        let _ = journal
+            .record_policy_version(1, poll, &poll.to_le_bytes())
+            .unwrap();
+        signing.duty(&mut journal, poll * SIGNING_POLL);
+    }
+    let signed = signed_counters(&dir);
+    assert!(signed.len() >= 2, "coverage progressed: {signed:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#966 review P2: a head the backlog refused is offered again at
+/// the next duty, so the final seal is signed once the signer recovers,
+/// without another seal arriving.
+#[test]
+fn a_refused_head_is_offered_again() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+
+    let dir = temp_dir("signing-refused");
+    let (trust, key) = registered_archival(&dir);
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let setup = ArchiveSigning {
+        trust,
+        journal_id: 1,
+        config: SigningConfig::new(
+            Some(60_000_000_000),
+            BacklogPolicy::Refuse {
+                capacity: std::num::NonZeroUsize::MIN,
+            },
+        )
+        .unwrap(),
+        signer: Box::new(SlowSigner {
+            key,
+            asks: 1,
+            open: std::sync::Arc::clone(&open),
+            seen: std::collections::HashMap::new(),
+        }),
+    };
+    let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal).unwrap();
+    // The first head queues; the final one is refused, the backlog full.
+    let _ = journal.record_policy_version(1, 1, b"first").unwrap();
+    signing.duty(&mut journal, SIGNING_POLL);
+    let last = journal.record_policy_version(1, 2, b"final").unwrap();
+    signing.duty(&mut journal, 2 * SIGNING_POLL);
+    // The signer recovers; no seal arrives after.
+    open.store(true, std::sync::atomic::Ordering::Relaxed);
+    signing.duty(&mut journal, 3 * SIGNING_POLL);
+    signing.duty(&mut journal, 4 * SIGNING_POLL);
+    let signed = signed_counters(&dir);
+    assert_eq!(signed.last(), Some(&last.counter), "{signed:?}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

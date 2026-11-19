@@ -73,7 +73,9 @@ use crate::integrity::damage::shortened_below_seal;
 use crate::integrity::journal::{IntegrityError, IntegrityJournal};
 use crate::integrity::ledger::{Ledger, read_entries};
 use crate::integrity::sealer::{self, SealSource, Sealer};
-use crate::integrity::signing::{HeadSigner, HeadSigning, SignerUnavailable, SigningConfig};
+use crate::integrity::signing::{
+    HeadSigner, HeadSigning, Offered, SignerUnavailable, SigningConfig,
+};
 use crate::integrity::trust::{
     ChainHead, HEADS_FILE, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH, SIGNATURE_LENGTH,
     SIGNED_HEAD_LENGTH, TrustRoot,
@@ -1845,6 +1847,9 @@ struct Signing<D: Disk> {
     signing: HeadSigning,
     signer: Box<dyn HeadSigner + Send>,
     heads: Ledger<D, SIGNED_HEAD_LENGTH>,
+    /// Whether the backlog coalesces: then a head waiting for the signer
+    /// is kept until signed, and newer ones wait behind it.
+    coalesce: bool,
     offered: Option<crate::integrity::Digest>,
     next_ns: u64,
 }
@@ -1874,6 +1879,10 @@ impl<D: Disk + Clone> Signing<D> {
         journal: &mut IntegrityJournal<D>,
     ) -> Result<Self, IntegrityError> {
         let heads = Ledger::open(disk.clone(), dir, HEADS_FILE)?;
+        let coalesce = matches!(
+            setup.config.policy(),
+            crate::integrity::signing::BacklogPolicy::Coalesce
+        );
         let records = journal.records()?;
         let registry = Self::registry(&disk, dir, &setup.trust, &records)?;
         let signing = HeadSigning::resume(
@@ -1892,6 +1901,7 @@ impl<D: Disk + Clone> Signing<D> {
             signing,
             signer: setup.signer,
             heads,
+            coalesce,
             offered: None,
             next_ns: 0,
         })
@@ -1911,6 +1921,14 @@ impl<D: Disk + Clone> Signing<D> {
 
     /// Offers the journal's head when it moved and asks the signer, at most
     /// every [`SIGNING_POLL`]. Failures leave heads pending.
+    ///
+    /// Under [`BacklogPolicy::Coalesce`](crate::integrity::signing::BacklogPolicy::Coalesce),
+    /// a head already waiting for the signer is kept until it is signed:
+    /// a newer head is offered only once nothing is pending, so a signer
+    /// slower than the sealing still completes the head it was given, and
+    /// the newer work waiting behind it coalesces into the latest head at
+    /// that point (karyos#966 review). A head the backlog refuses is not
+    /// marked offered, so it is offered again at the next duty.
     fn duty(&mut self, journal: &mut IntegrityJournal<D>, now: u64) {
         if now < self.next_ns {
             return;
@@ -1919,10 +1937,15 @@ impl<D: Disk + Clone> Signing<D> {
         let Ok(records) = journal.records() else {
             return;
         };
+        let Ok(registry) = Self::registry(&self.disk, &self.dir, &self.trust, &records) else {
+            return;
+        };
+        let sealed = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        let busy = self.coalesce && self.signing.status(now, sealed, &registry).pending > 0;
         if let Some(last) = records.last() {
             let digest = last.digest();
-            if self.offered != Some(digest) {
-                let _ = self.signing.offer(
+            if !busy && self.offered != Some(digest) {
+                let offered = self.signing.offer(
                     ChainHead {
                         archive_id: self.trust.archive_id,
                         journal_id: self.journal_id,
@@ -1931,12 +1954,11 @@ impl<D: Disk + Clone> Signing<D> {
                     },
                     now,
                 );
-                self.offered = Some(digest);
+                if !matches!(offered, Offered::Refused) {
+                    self.offered = Some(digest);
+                }
             }
         }
-        let Ok(registry) = Self::registry(&self.disk, &self.dir, &self.trust, &records) else {
-            return;
-        };
         let _ = self.signing.poll(
             &mut Boxed(self.signer.as_mut()),
             &mut self.heads,

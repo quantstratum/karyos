@@ -15,15 +15,17 @@
 //! The agent asks from its control path, which also runs the recorders, so
 //! the program never runs on the asking thread: each request runs on its
 //! own thread, and the signer answers [`SignerUnavailable`] until the
-//! signature is there. A request that takes longer than [`SIGN_TIMEOUT`]
-//! is abandoned and asked again.
+//! signature is there. One request is in flight at a time: a request for
+//! another head, or one past [`SIGN_TIMEOUT`], ends the program (killed and
+//! reaped) before a new one starts, and the program's answer is read up to
+//! [`MAX_ANSWER`] bytes.
 //!
 //! The custody is [`Custody::Declared`]: a signature coming from another
 //! host does not by itself prove custody separation.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -36,11 +38,24 @@ use karyos_archive::integrity::trust::{
 /// How long one signing request may take before it is asked again.
 pub const SIGN_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// A request in flight.
+/// The most of a program's answer read: 128 hex digits and a line end,
+/// with room for a carriage return and spaces.
+pub const MAX_ANSWER: u64 = 256;
+
+/// A request in flight: its program, which this request kills and reaps.
 struct Request {
     bytes: Vec<u8>,
     since: Instant,
+    child: Child,
     answer: Receiver<Option<[u8; SIGNATURE_LENGTH]>>,
+}
+
+impl Request {
+    /// Ends the program, if it still runs, and reaps it.
+    fn end(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// A head signer that runs the operator's signing program.
@@ -48,6 +63,15 @@ pub struct CommandSigner {
     program: PathBuf,
     key_id: Digest,
     request: Option<Request>,
+}
+
+impl Drop for CommandSigner {
+    /// The program of a request still in flight ends with the signer.
+    fn drop(&mut self) {
+        if let Some(request) = self.request.take() {
+            request.end();
+        }
+    }
 }
 
 impl std::fmt::Debug for CommandSigner {
@@ -70,46 +94,57 @@ impl CommandSigner {
         }
     }
 
-    /// Starts a request for `bytes` on its own thread.
+    /// Starts the program for `bytes`: its input is written and its
+    /// answer read on their own thread, never the asking one.
     fn start(&mut self, bytes: Vec<u8>) {
+        let Ok(mut child) = Command::new(&self.program)
+            .arg("sign")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        else {
+            return;
+        };
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        };
         let (sender, answer) = mpsc::sync_channel(1);
-        let program = self.program.clone();
         let input = hex(&bytes);
         let started = std::thread::Builder::new()
             .name("karyosd-signer".to_owned())
             .spawn(move || {
-                let _ = sender.send(run(&program, &input));
+                let _ = sender.send(exchange(stdin, stdout, &input));
             });
         if started.is_ok() {
             self.request = Some(Request {
                 bytes,
                 since: Instant::now(),
+                child,
                 answer,
             });
+        } else {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }
 
-/// Runs `program sign` with `input` on its standard input; the signature
-/// it prints, or `None`.
-fn run(program: &PathBuf, input: &str) -> Option<[u8; SIGNATURE_LENGTH]> {
-    let mut child = Command::new(program)
-        .arg("sign")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    {
-        let mut stdin = child.stdin.take()?;
-        stdin.write_all(input.as_bytes()).ok()?;
-        stdin.write_all(b"\n").ok()?;
-    }
+/// Writes `input` and a newline to the program, then reads its answer, at
+/// most [`MAX_ANSWER`] bytes: the signature it states, or `None`. It ends
+/// when the program closes its output, exits, or is killed.
+fn exchange(
+    mut stdin: std::process::ChildStdin,
+    stdout: std::process::ChildStdout,
+    input: &str,
+) -> Option<[u8; SIGNATURE_LENGTH]> {
+    stdin.write_all(input.as_bytes()).ok()?;
+    stdin.write_all(b"\n").ok()?;
+    drop(stdin);
     let mut output = String::new();
-    child.stdout.take()?.read_to_string(&mut output).ok()?;
-    if !child.wait().ok()?.success() {
-        return None;
-    }
+    stdout.take(MAX_ANSWER).read_to_string(&mut output).ok()?;
     signature(output.trim())
 }
 
@@ -142,25 +177,42 @@ impl HeadSigner for CommandSigner {
 
     fn sign(&mut self, head: &ChainHead) -> Result<[u8; SIGNATURE_LENGTH], SignerUnavailable> {
         let bytes = head.signed_bytes(self.custody());
-        if let Some(request) = self
-            .request
-            .as_ref()
-            .filter(|request| request.bytes == bytes)
-        {
-            match request.answer.try_recv() {
-                Ok(Some(signature)) => {
-                    self.request = None;
-                    return Ok(signature);
+        if let Some(mut request) = self.request.take() {
+            if request.bytes != bytes {
+                // Another head: this request ends, killed and reaped,
+                // before the new one starts.
+                request.end();
+            } else {
+                match request.answer.try_recv() {
+                    // An answer: it counts once the program has exited
+                    // successfully, checked without blocking the asker.
+                    Ok(Some(signature)) => match request.child.try_wait() {
+                        Ok(Some(status)) if status.success() => {
+                            request.end();
+                            return Ok(signature);
+                        }
+                        Ok(None) if request.since.elapsed() < SIGN_TIMEOUT => {
+                            // Not exited yet: keep the answer for the next
+                            // ask by putting it back.
+                            let (sender, answer) = mpsc::sync_channel(1);
+                            let _ = sender.send(Some(signature));
+                            request.answer = answer;
+                            self.request = Some(request);
+                            return Err(SignerUnavailable);
+                        }
+                        _ => request.end(),
+                    },
+                    Ok(None) | Err(TryRecvError::Disconnected) => request.end(),
+                    Err(TryRecvError::Empty) if request.since.elapsed() >= SIGN_TIMEOUT => {
+                        request.end();
+                    }
+                    Err(TryRecvError::Empty) => {
+                        self.request = Some(request);
+                        return Err(SignerUnavailable);
+                    }
                 }
-                Ok(None) | Err(TryRecvError::Disconnected) => self.request = None,
-                Err(TryRecvError::Empty) if request.since.elapsed() >= SIGN_TIMEOUT => {
-                    self.request = None;
-                }
-                Err(TryRecvError::Empty) => return Err(SignerUnavailable),
             }
         }
-        // A request for another head is dropped: the agent asks for the
-        // head it needs now.
         self.start(bytes);
         Err(SignerUnavailable)
     }
@@ -242,6 +294,71 @@ mod tests {
         assert_eq!(signer.sign(&head()), Err(SignerUnavailable));
         assert_eq!(signature("zz"), None);
         assert_eq!(signature(&"0".repeat(127)), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// A program from `script`'s body, run as `sh`.
+    fn script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// karyos#966 review P2: a request for another head ends the program
+    /// still running for the first, killed and reaped, before the next.
+    #[test]
+    fn a_request_for_another_head_ends_the_running_program() {
+        let dir = dir("replaced");
+        let pid = dir.join("pid");
+        let program = script(
+            &dir,
+            "slow",
+            &format!("echo $$ > {}\nexec sleep 30", pid.display()),
+        );
+        let mut signer = CommandSigner::new(program, &[3; 32]);
+        assert_eq!(signer.sign(&head()), Err(SignerUnavailable));
+        let start = Instant::now();
+        while !pid.exists() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let first = std::fs::read_to_string(&pid).unwrap().trim().to_owned();
+        let other = ChainHead {
+            counter: 4,
+            ..head()
+        };
+        assert_eq!(signer.sign(&other), Err(SignerUnavailable));
+        // The first program is gone: `kill -0` finds no such process.
+        let alive = Command::new("kill")
+            .args(["-0", &first])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "the first program still runs");
+        drop(signer);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// karyos#966 review P2: an answer is read up to `MAX_ANSWER` bytes; a
+    /// program that prints more is unavailable, not read without bound.
+    #[test]
+    fn an_oversized_answer_is_not_a_signature() {
+        let dir = dir("oversized");
+        let program = script(
+            &dir,
+            "loud",
+            "read input\nhead -c 100000 /dev/zero | tr '\\0' a\necho",
+        );
+        let mut signer = CommandSigner::new(program, &[3; 32]);
+        let _ = signer.sign(&head());
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            assert_eq!(signer.sign(&head()), Err(SignerUnavailable));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(signer);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
