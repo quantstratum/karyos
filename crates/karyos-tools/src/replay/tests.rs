@@ -17,12 +17,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use karyos_archive::disk::StdDisk;
-use karyos_archive::group::journal::MIN_SEGMENT_LENGTH;
+use karyos_archive::group::checkpoint::recorded_end;
+use karyos_archive::group::journal::{GroupJournal, JournalConfig, MIN_SEGMENT_LENGTH};
 use karyos_archive::group::record::{
-    CONTRACT_VERSION, Capture, Clock, EndOutcome, EventEnd, GapMarker, GapReason, JournalHeader,
-    MAX_RECORD, MessageEvent, Outcome, OutcomeObservation, Payload, TimerAction, TimerEvent,
-    TimerObservation,
+    CONTRACT_VERSION, Capture, CheckpointRecord, Clock, EndOutcome, EventEnd, GapMarker, GapReason,
+    GroupRecord, JournalHeader, MAX_RECORD, MessageEvent, Operation, Outcome, OutcomeObservation,
+    Payload, TimerAction, TimerEvent, TimerObservation,
 };
+use karyos_archive::segment::SyncPolicy;
 use karyos_sys::frame::Lane;
 
 use super::*;
