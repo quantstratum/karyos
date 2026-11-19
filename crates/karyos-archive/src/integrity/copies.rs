@@ -235,15 +235,29 @@ pub struct ImmutableAttribute;
 #[cfg(target_os = "linux")]
 impl ImmutableAttribute {
     /// Clears the attribute of `path`, as a purge must before it removes
-    /// the file, and only once every retention check has passed.
+    /// the file, and only once every retention check has passed. Only a
+    /// cleared attribute is success: a refusal is never reported as a
+    /// release, so a purge never goes on with the file still immutable.
     ///
     /// # Errors
     ///
-    /// The file cannot be opened or its flags changed.
+    /// The file cannot be opened or its flags changed;
+    /// [`std::io::ErrorKind::PermissionDenied`] when this process may not
+    /// change the attribute (`CAP_LINUX_IMMUTABLE`), and
+    /// [`std::io::ErrorKind::Unsupported`] when the file system has none.
     pub fn release(&mut self, path: &Path) -> std::io::Result<()> {
-        karyos_sys::fs::set_immutable(path, false)
-            .map(|_| ())
-            .map_err(std::io::Error::other)
+        use std::io::{Error, ErrorKind};
+        match karyos_sys::fs::set_immutable(path, false).map_err(Error::other)? {
+            karyos_sys::fs::Immutability::Applied => Ok(()),
+            karyos_sys::fs::Immutability::NotPermitted => Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "the immutable attribute may not be cleared",
+            )),
+            karyos_sys::fs::Immutability::Unsupported => Err(Error::new(
+                ErrorKind::Unsupported,
+                "the file system has no immutable attribute",
+            )),
+        }
     }
 }
 
@@ -505,6 +519,32 @@ mod immutable_tests {
                 std::fs::remove_file(&path).unwrap();
             }
             enforcement => assert_eq!(enforcement, Enforcement::Unsupported),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// karyos#958 review P2: a release succeeds only when the attribute
+    /// was cleared; a refusal (no permission, or no such attribute) is a
+    /// typed error, never a release.
+    #[test]
+    fn a_release_that_clears_nothing_is_an_error() {
+        let dir = std::env::temp_dir().join(format!("karyos-copies-rel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sealed.seg");
+        std::fs::write(&path, b"sealed").unwrap();
+        let direct = karyos_sys::fs::set_immutable(&path, false).unwrap();
+        let released = ImmutableAttribute.release(&path);
+        match direct {
+            karyos_sys::fs::Immutability::Applied => released.unwrap(),
+            karyos_sys::fs::Immutability::NotPermitted => assert_eq!(
+                released.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            ),
+            karyos_sys::fs::Immutability::Unsupported => assert_eq!(
+                released.unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            ),
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
