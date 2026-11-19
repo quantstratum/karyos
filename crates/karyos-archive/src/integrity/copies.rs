@@ -222,6 +222,42 @@ impl ImmutabilityBackend for NoImmutability {
     }
 }
 
+/// The backend that sets a sealed segment's immutable file attribute
+/// through `karyos-sys` (Linux, `FS_IMMUTABLE_FL`; karyos#958). Where the
+/// file system has no such attribute, or the process may not set it
+/// (`CAP_LINUX_IMMUTABLE`), it reports [`Enforcement::Unsupported`]: the
+/// catalog then records that no enforcement applies, never a protection
+/// that is not there.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ImmutableAttribute;
+
+#[cfg(target_os = "linux")]
+impl ImmutableAttribute {
+    /// Clears the attribute of `path`, as a purge must before it removes
+    /// the file, and only once every retention check has passed.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be opened or its flags changed.
+    pub fn release(&mut self, path: &Path) -> std::io::Result<()> {
+        karyos_sys::fs::set_immutable(path, false)
+            .map(|_| ())
+            .map_err(std::io::Error::other)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ImmutabilityBackend for ImmutableAttribute {
+    fn enforce(&mut self, path: &Path, _retain_until_ns: u64) -> std::io::Result<Enforcement> {
+        match karyos_sys::fs::set_immutable(path, true).map_err(std::io::Error::other)? {
+            karyos_sys::fs::Immutability::Applied => Ok(Enforcement::ImmutableAttribute),
+            karyos_sys::fs::Immutability::Unsupported
+            | karyos_sys::fs::Immutability::NotPermitted => Ok(Enforcement::Unsupported),
+        }
+    }
+}
+
 /// The copy catalog of an archive directory.
 #[derive(Debug)]
 pub struct CopyCatalog<D: Disk> {
@@ -443,5 +479,33 @@ impl<D: Disk> CopyCatalog<D> {
         locations.sort_unstable();
         locations.dedup();
         Ok(u64::try_from(locations.len()).unwrap_or(u64::MAX))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod immutable_tests {
+    #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
+
+    use super::*;
+
+    /// The backend reports the attribute it set, or that none applies;
+    /// an applied attribute holds until released.
+    #[test]
+    fn the_attribute_backend_reports_what_applies() {
+        let dir = std::env::temp_dir().join(format!("karyos-copies-imm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sealed.seg");
+        std::fs::write(&path, b"sealed").unwrap();
+        let mut backend = ImmutableAttribute;
+        match backend.enforce(&path, u64::MAX).unwrap() {
+            Enforcement::ImmutableAttribute => {
+                assert!(std::fs::remove_file(&path).is_err());
+                backend.release(&path).unwrap();
+                std::fs::remove_file(&path).unwrap();
+            }
+            enforcement => assert_eq!(enforcement, Enforcement::Unsupported),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

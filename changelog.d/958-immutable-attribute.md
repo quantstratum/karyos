@@ -1,0 +1,3 @@
+### Added
+
+- The immutable file attribute for sealed segments (SPEC.md §8.4, "Immutability enforcement"; part of karyos#958): `karyos_sys::fs::set_immutable` sets or clears `FS_IMMUTABLE_FL` on Linux through rustix's safe `ioctl_setflags`, with no new `unsafe`, and answers `Applied`, `Unsupported` (no attribute on that file system) or `NotPermitted` (no `CAP_LINUX_IMMUTABLE`). `karyos_archive::integrity::copies::ImmutableAttribute` is the `ImmutabilityBackend` over it: it records `ImmutableAttribute` only when the attribute was set, and `Unsupported` otherwise, never a protection that is not there.
