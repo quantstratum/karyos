@@ -1082,22 +1082,42 @@ fn a_silent_receiver_is_removed_and_registers_again() {
         .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
         .unwrap();
     super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..16);
-    // Silence: the receiver's driver goes, and only the sender runs.
+    // Silence: the receiver's driver stops being pumped, and only the
+    // sender runs. `b` stays alive, holding its UDP port, so the new
+    // receiver cannot reuse it and meet the old endpoint's quarantine.
     drop(reader);
-    drop(b);
     pump(&mut [&mut a], |drivers| {
         sender(drivers[0]).registrants_timed_out >= 1
     });
     assert_eq!(sender(&a).registrants_timed_out, 1);
-    let mut again = driver(ThreadingMode::Shared);
+    let before = registrations(&a);
+    // Its REGISTER retry interval (`setup_interval`) is far above the
+    // test's runtime, so no retry can be due: the bind below comes from
+    // the first REGISTER by construction, not by timing (karyos#993).
+    let mut again = driver_with(
+        ThreadingMode::Shared,
+        AgentConfig {
+            setup_interval: 600_000_000_000,
+            ..AgentConfig::default()
+        },
+    );
     let _second = again
         .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
         .unwrap();
     let image = image_of(&mut a, &mut again, 10);
+    // Its first REGISTER is the one that binds: one sent (no retry was
+    // due), one new pending entry, no retry and nothing dropped as
+    // quarantined.
+    assert_eq!(receiver(&again).registers_sent, 1);
+    let after = registrations(&a);
+    assert_eq!(after.registered, before.registered + 1);
+    assert_eq!(after.retried, before.retried);
+    assert_eq!(after.dropped_quarantined, before.dropped_quarantined);
     let mut reader = again.subscribe_aggregate(&image, Role::Required).unwrap();
     super::exchange_on(&mut a, &mut again, &mut lane, &mut reader, 16..32);
     let counters = sender(&a);
     assert_eq!(counters.registrants_joined, 2);
     assert_eq!(counters.registrants_timed_out, 1);
     assert_eq!(counters.registrants_restarted, 0);
+    drop(b);
 }

@@ -2560,6 +2560,10 @@ fn each_dropped_register_counts_its_reason_once() {
             sender.register(EndpointId(1), portless, &register_as(5, 7), now),
             None
         );
+        // Each call's increment, read right after it.
+        let counters = sender.registration_counters();
+        assert_eq!(counters.dropped_source, sent);
+        assert_eq!(counters.dropped_not_allowed, sent - 1);
         assert_eq!(
             sender.register(EndpointId(1), outside, &register_as(6, 7), now),
             None
