@@ -1309,9 +1309,10 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
 /// last: the drops and replacements added by karyos#940 and #941, the
 /// unsent replies, the bindings kept for required ids, the CHALLENGEs
 /// left unanswered, and a gauge (0 or 1) for the sticky `overflowed` flag
-/// of either counter set. The two pending-table drop cells are gone: the
-/// bounds replace an entry since karyos#940 and never drop.
-pub(crate) const SENDER_CELLS: [&str; 33] = [
+/// of either counter set. The two pending-table drop cells stay in place,
+/// so no existing cell moves, though they can no longer grow: the bounds
+/// replace an entry since karyos#940 and never drop.
+pub(crate) const SENDER_CELLS: [&str; 35] = [
     "network controls sent",
     "network control send failures",
     "naks received",
@@ -1325,6 +1326,8 @@ pub(crate) const SENDER_CELLS: [&str; 33] = [
     "registrations dropped range",
     "registrations dropped source rate",
     "registrations dropped rate",
+    "registrations dropped pending",
+    "registrations dropped source pending",
     "registrations dropped bound",
     "registrations dropped boot changed",
     "registrations duplicate receiver",
@@ -1416,6 +1419,8 @@ fn sender_values(
         registrations.dropped_not_allowed,
         registrations.dropped_source_rate,
         registrations.dropped_rate,
+        registrations.dropped_pending_full,
+        registrations.dropped_source_pending_full,
         registrations.dropped_bound,
         registrations.dropped_boot_changed,
         registrations.duplicate_receiver,
