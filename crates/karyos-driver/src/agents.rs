@@ -1730,6 +1730,12 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.registration_counters()
     }
 
+    /// The pending registrations for `stream_id` (tests).
+    #[cfg(test)]
+    pub(crate) fn pending_registrations(&self, stream_id: i32) -> usize {
+        self.role.pending_registrations(stream_id)
+    }
+
     /// The send sessions' counters: answers and their rate drops (tests).
     #[cfg(test)]
     pub(crate) fn session_counters(&self) -> crate::sessions::send::SendCounters {
