@@ -728,7 +728,7 @@ impl MirrorTool {
                     registration: recycled.stream,
                     incarnation: recycled.incarnation,
                 },
-                Some(recycled.lane.get()),
+                Some(recycled.lane),
                 through,
             );
         }

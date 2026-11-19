@@ -772,10 +772,14 @@ impl TraceReport {
     pub fn out_of_scope(
         &mut self,
         publication: PublicationKey,
-        lane: Option<u8>,
+        lane: Option<karyos_protocol::frame::Lane>,
         through: Option<u64>,
     ) {
-        self.excluded.push((publication, lane, through));
+        self.excluded.push((
+            publication,
+            lane.map(karyos_protocol::frame::Lane::get),
+            through,
+        ));
     }
 
     /// Declares the message of `publication` at `position` in `lane` out of

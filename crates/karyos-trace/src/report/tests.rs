@@ -796,7 +796,7 @@ fn declared_publication_ranges_are_out_of_scope() {
 #[test]
 fn a_lane_scoped_declaration_leaves_other_lanes_in_scope() {
     let key = PublicationKey::from(PublicationId::from(IDENTITY));
-    let build = |lane: Option<u8>| {
+    let build = |lane: Option<Lane>| {
         let mut other_lane = observation(Point::Publish, 0, 2, 20);
         other_lane.lane = 1;
         let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
@@ -816,7 +816,7 @@ fn a_lane_scoped_declaration_leaves_other_lanes_in_scope() {
         report.drain().unwrap();
         report
     };
-    let report = build(Some(1));
+    let report = build(Some(Lane::try_new(1).unwrap()));
     assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
     assert_eq!(report.trace([2, 1]), TraceAnswer::OutOfScope);
     let report = build(None);
