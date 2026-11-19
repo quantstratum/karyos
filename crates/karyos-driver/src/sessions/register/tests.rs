@@ -260,6 +260,36 @@ fn ipv6_sources_share_their_bounds_per_64() {
     assert_ne!(source_prefix(a), source_prefix(other));
     let v4: IpAddr = "10.0.0.9".parse().unwrap();
     assert_eq!(source_prefix(v4), v4);
+    // Through the registration path (karyos#977 review): `a` and `b`, one
+    // /64, share the per-source pending bound of two, so `b`'s REGISTER
+    // replaces `a`'s oldest entry; `other`, another /64, has its own.
+    let mut r = registrations(Setup {
+        allow: RegistrationPolicy::new(
+            RegistrationAllowlist::new(&[
+                AddressRange::new("2001:db8::".parse().unwrap(), 32).unwrap()
+            ])
+            .unwrap(),
+            false,
+        ),
+        config: RegistrationConfig::default(),
+    });
+    let at = |ip: IpAddr| SocketAddr::new(ip, 40_000);
+    for (from, id) in [(a, 1), (a, 2), (b, 3), (other, 4)] {
+        assert!(
+            matches!(
+                r.register(at(from), &register(id), Capacity::Free, T0),
+                RegisterOutcome::Announce { .. }
+            ),
+            "{from} {id}"
+        );
+    }
+    let ids: Vec<u64> = r
+        .pending()
+        .iter()
+        .map(|entry| entry.receiver.receiver_id)
+        .collect();
+    assert_eq!(ids, [2, 3, 4], "b replaced a's oldest; other kept its own");
+    assert_eq!(r.counters().pending_replaced, 1);
 }
 
 /// Design 3.2 steps 3 and 5 scope the rate and the pending table to the

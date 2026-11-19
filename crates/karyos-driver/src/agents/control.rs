@@ -624,67 +624,31 @@ impl ControlRoutes {
 
     /// Closes `old`'s queue, then its route. A handle already gone counts
     /// as closed.
-    /// Drops what `queue` holds unsent while keeping its destination's
-    /// route: the queue is closed and a new, empty one opened on the same
-    /// route (karyos#977 review). A queue that cannot be closed now, or a
-    /// new one refused, falls back to evicting the destination.
+    /// Drops what `queue` holds unsent while keeping the queue and its
+    /// destination's route (karyos#977 review): the pending frames that
+    /// were never exposed are cancelled in place, so no queue is closed or
+    /// reopened and no queue handle is spent. A queue the backend refuses
+    /// to cancel on (a fault: closed, stale, or the endpoint resetting) is
+    /// evicted, as any faulted destination is.
     fn discard<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, queue: TxQueueId) {
-        let Some(index) = self
-            .entries
-            .iter()
-            .position(|entry| entry.queue == queue && !entry.closing)
-        else {
-            return;
-        };
-        let Some(route) = self.entries.get(index).map(|entry| entry.route) else {
-            return;
-        };
-        let mut closed = false;
-        #[cfg(test)]
-        let held = self.hold_closes;
-        #[cfg(not(test))]
-        let held = false;
-        if !held {
-            loop {
-                match tx.close_queue(queue, &mut self.report) {
-                    Ok(outcome) => {
-                        let returned = outcome.returned;
-                        while self.report.pop_front().is_some() {}
-                        if !outcome.more {
-                            closed = true;
-                            break;
-                        }
-                        if returned == 0 {
-                            break;
-                        }
+        loop {
+            match tx.cancel_pending(queue, &mut self.report) {
+                Ok(outcome) => {
+                    while self.report.pop_front().is_some() {}
+                    if !outcome.more {
+                        return;
                     }
-                    Err(karyos_io::backend::QueueError::UnknownQueue) => {
-                        closed = true;
-                        break;
+                    if outcome.returned == 0 {
+                        // Nothing more can be returned now: what remains
+                        // was exposed, and is not a stale reply waiting.
+                        return;
                     }
-                    Err(_) => break,
                 }
-            }
-        }
-        if !closed {
-            self.evict(tx, queue);
-            return;
-        }
-        match tx.open_queue(TxQueueConfig {
-            authority: Authority::FIRST,
-            route,
-            max_pending: NonZeroU16::new(CONTROL_QUEUE_DEPTH).unwrap_or(NonZeroU16::MIN),
-        }) {
-            Ok(fresh) => {
-                if let Some(entry) = self.entries.get_mut(index) {
-                    entry.queue = fresh;
+                Err(_) => {
+                    while self.report.pop_front().is_some() {}
+                    self.evict(tx, queue);
+                    return;
                 }
-            }
-            Err(_) => {
-                // No queue for the route: the destination goes, as an
-                // eviction would take it.
-                let _ = tx.remove_route(route);
-                self.entries.swap_remove(index);
             }
         }
     }
