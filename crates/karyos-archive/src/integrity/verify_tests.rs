@@ -631,6 +631,16 @@ fn a_revoked_keys_head_needs_an_anchor_proved_to_predate_the_revocation() {
     );
     let proved = verify_records(&scenario, &records, None, &Predating(&held));
     assert_eq!(proved.coverage.signed_through, Some(6));
+    // The same proof counts the anchors: no contradictory verdict.
+    assert_eq!(proved.coverage.anchored_through, Some(6));
+    assert!(proved.evidence.is_empty(), "{proved:?}");
+    assert!(
+        proved
+            .ranges
+            .iter()
+            .all(|range| range.outcome == Outcome::Verified),
+        "{proved:?}"
+    );
 }
 
 #[test]
@@ -805,4 +815,39 @@ fn evidence_faults_are_reported_and_scrubbed_with_no_range_to_expose_them() {
             reasons: vec![Reason::MalformedEvidence]
         }
     );
+}
+
+#[test]
+fn a_chain_wide_fault_qualifies_a_purged_range_too() {
+    let mut scenario = Scenario::new();
+    let records = scenario.records();
+    scenario
+        .journal
+        .record_purge(3, 0, 8, records[1].content)
+        .unwrap();
+    scenario.sign_head();
+    let records = scenario.records();
+    let held = scenario.anchors.clone();
+    let externality = Externality {
+        local_archive: ARCHIVE,
+        ..Externality::default()
+    };
+    let evidence = Evidence {
+        records: &records,
+        journal_fault: None,
+        journal_id: JOURNAL,
+        trust: scenario.trust.as_ref(),
+        registry: &scenario.keys,
+        heads: &scenario.heads,
+        anchors: &held,
+        anchor_faults: 1,
+        stores: &Held(&held),
+        externality: &externality,
+        written: &scenario.written,
+    };
+    let verification = verify(&evidence, |_, start, _| RangeBytes::Bytes(range(start / 8)));
+    let first = &verification.ranges[0];
+    assert_eq!(first.outcome, Outcome::Inconsistent, "{first:?}");
+    assert!(first.reasons.contains(&Reason::MalformedEvidence));
+    assert!(!first.reasons.contains(&Reason::UnauthenticatedPurge));
 }

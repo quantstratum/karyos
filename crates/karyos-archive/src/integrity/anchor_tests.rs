@@ -504,8 +504,8 @@ impl AnchorEvidence for Timestamped {
         Receipts.confirms(anchor)
     }
 
-    fn anchored_before_revocation(&self, anchor: &Anchor) -> Option<u64> {
-        Some(anchor.signed.head.counter)
+    fn held_before_revocation_of(&self, _anchor: &Anchor, _key_id: &Digest) -> bool {
+        true
     }
 }
 

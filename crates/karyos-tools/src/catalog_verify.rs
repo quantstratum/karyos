@@ -31,7 +31,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use karyos_archive::catalog::list;
-use karyos_archive::disk::{ReadOnly, StdDisk};
+use karyos_archive::disk::{Disk as _, ReadOnly, StdDisk};
 use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Externality, StoredAnchors};
 use karyos_archive::integrity::journal::read_records;
 use karyos_archive::integrity::ledger::read_entries;
@@ -229,7 +229,17 @@ impl Stores {
             let store = match recorded_geometry(&mut disk, &self.dir, recording)
                 .map_err(|error| at(&error))?
             {
-                None => None,
+                // No geometry: an absent store only if the recording has no
+                // segment file at all; files whose geometry cannot be
+                // recovered are a damaged store.
+                None => {
+                    let prefix = format!("{recording:016x}-");
+                    let names = disk.list(&self.dir).map_err(|error| at(&error))?;
+                    if names.iter().any(|name| name.starts_with(&prefix)) {
+                        return Err(at(&"segment files whose geometry cannot be recovered"));
+                    }
+                    None
+                }
                 Some(geometry) => Some(
                     SegmentStore::open_verified(
                         disk,
@@ -314,6 +324,12 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
     let mut anchor_stores = Vec::new();
     let mut anchor_faults = 0u64;
     for (location, store) in &args.anchors {
+        // A store named on the command line must be there: a mistyped path
+        // is an error, never an empty store.
+        let ledger = store.join(ANCHOR_FILE);
+        if let Err(error) = disk.open_read(&ledger) {
+            return Err(format!("{}: {error}", ledger.display()));
+        }
         let entries: Vec<[u8; ANCHOR_LENGTH]> = read_entries(&mut disk, store, ANCHOR_FILE)
             .map_err(|error| format!("{}: {error}", store.display()))?;
         let stored = StoredAnchors::new(*location, entries);

@@ -447,10 +447,16 @@ pub fn verify(
             .and_then(|position| purge_of.get(&position))
             .copied();
         if let Some(purge) = purge {
-            if signed(purge.counter) && !global.contains(&Reason::ConflictingAnchors) {
+            if !signed(purge.counter) || global.contains(&Reason::ConflictingAnchors) {
+                report.reasons.push(Reason::UnauthenticatedPurge);
+            }
+            // A chain-wide evidence fault qualifies a purge like any range.
+            for &reason in &global {
+                push_unique(&mut report.reasons, reason);
+            }
+            if report.reasons.is_empty() {
                 report.outcome = Outcome::Purged;
             } else {
-                report.reasons.push(Reason::UnauthenticatedPurge);
                 report.first_inconsistent = Some(purge.counter);
             }
             ranges.push(report);

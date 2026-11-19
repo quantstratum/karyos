@@ -202,19 +202,12 @@ pub trait AnchorEvidence: std::fmt::Debug {
     /// nothing.
     fn confirms(&self, anchor: &Anchor) -> bool;
 
-    /// The highest head counter that independent evidence proves `anchor`'s
-    /// store held before the anchor's key was revoked, if the evidence
-    /// establishes that ordering for this head (a timestamped receipt, a
-    /// transparency log inclusion before the revocation). Present-day
-    /// storage proves no ordering, so the default is `None`.
-    fn anchored_before_revocation(&self, anchor: &Anchor) -> Option<u64> {
-        let _ = anchor;
-        None
-    }
-
     /// Whether independent evidence proves this store held `anchor` before
-    /// the key `key_id` was revoked. Present-day storage proves no
-    /// ordering, so the default is `false`.
+    /// the key `key_id` was revoked (a timestamped receipt, a transparency
+    /// log inclusion before the revocation). It is the one proof of
+    /// ordering: [`check_anchors`] asks it for the anchor's own key, and
+    /// the verifier for the key of a signed head. Present-day storage
+    /// proves no ordering, so the default is `false`.
     fn held_before_revocation_of(&self, anchor: &Anchor, key_id: &Digest) -> bool {
         let _ = (anchor, key_id);
         false
@@ -225,12 +218,6 @@ pub trait AnchorEvidence: std::fmt::Debug {
 impl<E: AnchorEvidence> AnchorEvidence for Vec<E> {
     fn confirms(&self, anchor: &Anchor) -> bool {
         self.iter().any(|store| store.confirms(anchor))
-    }
-
-    fn anchored_before_revocation(&self, anchor: &Anchor) -> Option<u64> {
-        self.iter()
-            .filter_map(|store| store.anchored_before_revocation(anchor))
-            .max()
     }
 
     fn held_before_revocation_of(&self, anchor: &Anchor, key_id: &Digest) -> bool {
@@ -381,7 +368,10 @@ pub fn check_anchors(
         let reason = externality.check(anchor).err().or_else(|| {
             (anchor.signed.head.journal_id != journal_id).then_some(AnchorReason::WrongJournal)
         });
-        let proved = evidence.anchored_before_revocation(anchor);
+        // The same key-specific proof the verifier asks for signed heads.
+        let proved = evidence
+            .held_before_revocation_of(anchor, &anchor.signed.key_id)
+            .then_some(anchor.signed.head.counter);
         let reason = reason.or_else(|| match registry.verify(&anchor.signed, proved) {
             HeadVerdict::Trusted { .. } => None,
             HeadVerdict::NotTrustedEvidence(reason) | HeadVerdict::Invalid(reason) => {

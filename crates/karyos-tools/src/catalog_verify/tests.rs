@@ -465,3 +465,27 @@ fn verify_fails_on_a_malformed_anchor_entry_even_with_no_sealed_range() {
     assert!(out.contains("evidence inconsistent"), "{out}");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn a_store_whose_geometry_cannot_be_recovered_is_an_error_not_an_absent_store() {
+    let archive = archive("geometry");
+    let index = std::fs::read_dir(archive.dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "idx"))
+        .unwrap();
+    std::fs::write(&index, b"").unwrap();
+    let (status, out, err) = full(&archive, false);
+    assert_eq!(status, EXIT_ERROR, "{out}");
+    assert!(err.contains("geometry cannot be recovered"), "{err}");
+}
+
+#[test]
+fn an_anchor_store_named_but_missing_is_an_error() {
+    let archive = archive("missing-store");
+    let absent = archive.dir().join("no-such-store");
+    let anchors = format!("{}={}", hex(&OPERATOR), absent.display());
+    let (status, out, err) = run(&[&archive.dir()], &["--anchors", &anchors]);
+    assert_eq!(status, EXIT_ERROR, "{out}");
+    assert!(err.contains("no-such-store"), "{err}");
+}
