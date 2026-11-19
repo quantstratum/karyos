@@ -2541,7 +2541,7 @@ fn a_dynamic_publication_holds_its_whole_destination_share_at_admission() {
         })
     };
     let allowlist = || {
-        let range = AddressRange::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8).unwrap();
+        let range = AddressRange::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8).unwrap();
         RegistrationAllowlist::new(&[range]).unwrap()
     };
     let first = driver
