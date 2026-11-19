@@ -78,11 +78,12 @@ pub struct Report {
     pub applied: u64,
     /// A digest of every command applied, in the order applied.
     pub digest: u64,
-    /// Every command applied, in the order applied, a repeat included: a
-    /// proposal retried after 100 ms can commit twice, so the test checks
-    /// the sequence itself, not only its distinct commands (karyos#956
-    /// review).
-    pub sequence: Vec<u64>,
+    /// Every command applied, in the order applied, a repeat included,
+    /// with the log index of the entry that carried it: a proposal retried
+    /// after 100 ms can commit twice, at two indexes, while an entry
+    /// applied twice repeats its index; the test tells them apart
+    /// (karyos#956 review).
+    pub sequence: Vec<(u64, u64)>,
 }
 
 /// Why a real-process run stopped.
@@ -233,8 +234,8 @@ pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
             &mut |to, message, _| outbox.push((to, message)),
             &mut |entry: &Entry, _| {
                 if let Some(number) = number_of(&entry.payload) {
-                    report.sequence.push(number);
-                    report.digest = mix(report.digest, number);
+                    report.sequence.push((entry.index, number));
+                    report.digest = mix(mix(report.digest, entry.index), number);
                     if seen.insert(number) {
                         report.applied = report.applied.saturating_add(1);
                     }

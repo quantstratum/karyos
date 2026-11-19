@@ -38,7 +38,7 @@ all `--locked`.
 | W6 | passes, every case, four seeds |
 | Determinism | a seed reproduces its run, observations included: the election timeout range is one tick wide, so raft-rs's `thread_rng` draw has one value; timeouts are staggered by each node's position in the voter set, so no two voters share one |
 | Pre-vote | raft-rs's `pre_vote`, tested against a control without it, which a returning follower deposes |
-| Allocation | **fails the gate**: W1, 32 clients, seed 1: 113 entries past the warm-up, 5,701 allocations and 2,547 frees, 51 and 23 per entry |
+| Allocation | **fails the gate**, measured in the simulator only: W1, 32 clients, seed 1: 113 entries past the warm-up, 5,701 allocations and 2,547 frees, 51 and 23 per entry. Messages pass in memory there, so raft-rs's protobuf encoding and decoding, which ADR-0043's replication boundary includes and the real-process path performs (`src/raft_rs.rs`, `Wire`), is not counted: the full-boundary figure is outstanding |
 | Durability, recovery | the harness's C4 checks pass under W4's crashes and torn writes |
 | Storage | raft-rs reads a `MemStorage` mirror of what C4 made durable, so the harness's metered log reads do not see its reads |
 | Real processes | demonstrated: `tests/real_processes.rs` runs three `raft-eval-node` processes, each running `RaftRs` (the type the simulator tests drive, unchanged) through the harness's `drive`, over C4's log on real files (`StdDisk`) and UDP on the loopback; they elect a leader and all apply the same 20 commands in the same order. The runner maps 10 ms of the process clock to a tick: at 1 ms a tick an election times out before a vote's `fsync` and no leader is elected |

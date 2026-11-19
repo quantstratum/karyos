@@ -109,10 +109,11 @@ fn run_once() -> Result<(), String> {
     if let Some(stderr) = failed {
         return Err(stderr);
     }
-    // Every node applied the same sequence (a repeat included), and that
-    // sequence is the commands 1..=COMMANDS in order, each first applied
-    // once in turn; a repeat is only a retried proposal of a command
-    // already applied (karyos#956 review).
+    // Every node applied the same sequence (a repeat included); each log
+    // entry once, at strictly increasing indexes, so a repeated command is
+    // a retried proposal at another index, never an entry applied twice;
+    // and the commands' first applications are 1..=COMMANDS in order
+    // (karyos#956 review).
     assert!(
         reports.iter().all(|report| *report == reports[0]),
         "{reports:?}"
@@ -121,7 +122,18 @@ fn run_once() -> Result<(), String> {
     assert_eq!(fields.len(), 4, "{reports:?}");
     assert_eq!(fields[0], "applied");
     assert_eq!(fields[1], COMMANDS.to_string(), "{reports:?}");
-    let sequence: Vec<u64> = fields[3].split(',').map(|n| n.parse().unwrap()).collect();
+    let applied: Vec<(u64, u64)> = fields[3]
+        .split(',')
+        .map(|pair| {
+            let (index, number) = pair.split_once(':').unwrap();
+            (index.parse().unwrap(), number.parse().unwrap())
+        })
+        .collect();
+    assert!(
+        applied.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "an entry applied twice or out of order: {applied:?}"
+    );
+    let sequence: Vec<u64> = applied.iter().map(|(_, number)| *number).collect();
     let mut firsts = Vec::new();
     for &number in &sequence {
         if firsts.contains(&number) {

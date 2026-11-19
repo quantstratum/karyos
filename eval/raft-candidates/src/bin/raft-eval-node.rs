@@ -53,7 +53,7 @@ fn main() -> ExitCode {
                 report
                     .sequence
                     .iter()
-                    .map(u64::to_string)
+                    .map(|(index, number)| format!("{index}:{number}"))
                     .collect::<Vec<_>>()
                     .join(",")
             );

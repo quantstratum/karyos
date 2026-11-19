@@ -4,7 +4,17 @@
 //! core behind them (plan issue 060, karyos#678), not only with the
 //! fixture: each mutant wraps the `raft` adapter and breaks one rule the
 //! way a faulty core or adapter would, and the run's checks name it. The
-//! unmutated adapter passes the same case.
+//! unmutated adapter passes the same cases.
+//!
+//! Every check a core can trip has a mutant here: divergent application,
+//! a reply before a durable majority, a C4 contract breach, a leader's
+//! direct commit of an older term's entry, and the truncation of an entry
+//! the cluster applied. Two checks guard what no core controls, so no
+//! core can trip them and their negative cases stay the fixture's
+//! (`crates/karyos-sim/tests/harness.rs`): a release before persistence
+//! (`drive` sends `after_persist` only after the log's sync and the hard
+//! state's save, whatever the core asks), and a durable entry lost across
+//! a crash (C4's log and disk keep it; the core never writes it).
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
@@ -13,7 +23,7 @@
 use karyos_raft_eval::raft_rs::RaftRs;
 use karyos_sim::harness::check::Violation;
 use karyos_sim::harness::core::{ConsensusCore, LogView, Persisted, Ready, Refused};
-use karyos_sim::harness::workloads::{self, Case, W1};
+use karyos_sim::harness::workloads::{self, Case, W1, W3};
 use karyos_sim::net::NodeId;
 
 /// Server 1 applies a different command than the others at each index.
@@ -22,6 +32,10 @@ const DIVERGE: u8 = 0;
 const EARLY: u8 = 1;
 /// Server 0 hands its log entries one index too far.
 const GAP: u8 = 2;
+/// A leader reports as committed an entry of an older term it holds.
+const OLD: u8 = 3;
+/// Server 2 truncates its whole log once the cluster has applied some.
+const TRUNCATE: u8 = 4;
 
 #[derive(Debug)]
 struct Mutant<const KIND: u8> {
@@ -29,6 +43,12 @@ struct Mutant<const KIND: u8> {
     core: RaftRs,
     /// The last index handed out to apply.
     handed: u64,
+    /// As a leader, its last entry of an older term (`OLD`).
+    old: Option<u64>,
+    /// Entries this node has applied (`TRUNCATE`).
+    applied: u64,
+    /// Whether it truncated already (`TRUNCATE`).
+    truncated: bool,
 }
 
 impl<const KIND: u8> Mutant<KIND> {
@@ -71,6 +91,16 @@ impl<const KIND: u8> Mutant<KIND> {
                     entry.index += 1;
                 }
             }
+            TRUNCATE if self.id == 2 => {
+                if !self.truncated && self.applied >= 4 {
+                    // Drops the entries it applied, and appends nothing:
+                    // a core that forgot its log.
+                    ready.truncate_from = Some(1);
+                    ready.entries.clear();
+                    self.truncated = true;
+                }
+                self.applied += u64::try_from(ready.committed.len()).unwrap();
+            }
             _ => {}
         }
         ready
@@ -85,6 +115,9 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
             id,
             core: RaftRs::recover(id, peers, log),
             handed: 0,
+            old: None,
+            applied: 0,
+            truncated: false,
         }
     }
 
@@ -101,6 +134,20 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     }
 
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
+        if KIND == OLD {
+            self.old = None;
+            if self.core.leads() {
+                let term = self.core.term();
+                let mut index = log.last_index();
+                while let Some(at) = index {
+                    if log.term(at).is_some_and(|held| held < term) {
+                        self.old = Some(at);
+                        break;
+                    }
+                    index = at.checked_sub(1).filter(|at| *at >= log.first_index());
+                }
+            }
+        }
         let ready = self.core.ready(log)?;
         Some(self.mutate(ready))
     }
@@ -122,7 +169,11 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     }
 
     fn committed(&self) -> Option<u64> {
-        self.core.committed()
+        let committed = self.core.committed();
+        match (KIND, self.core.leads(), self.old) {
+            (OLD, true, Some(old)) if committed.is_none_or(|at| at < old) => Some(old),
+            _ => committed,
+        }
     }
 }
 
@@ -134,6 +185,21 @@ fn violation<C: ConsensusCore>() -> Violation {
     let case = case();
     let outcome = workloads::run::<C>(&case, 1).unwrap();
     outcome.safety.unwrap_err()
+}
+
+/// The first violation over W3's cases, which change leaders, and the
+/// seeds: a leader holds an older term's uncommitted entries only after
+/// one. The unmutated adapter keeps safety in every one of them (asserted
+/// by `tests/workloads.rs`).
+fn violation_under_faults<C: ConsensusCore>() -> Violation {
+    for case in W3::skeleton().cases() {
+        for seed in [1, 0xC5, 0x0043, 0xDEAD_BEEF] {
+            if let Err(violation) = workloads::run::<C>(&case, seed).unwrap().safety {
+                return violation;
+            }
+        }
+    }
+    panic!("no W3 case and seed tripped a check");
 }
 
 #[test]
@@ -169,6 +235,27 @@ fn a_core_that_breaks_the_log_contract_is_caught() {
     let violation = violation::<Mutant<GAP>>();
     assert!(
         matches!(violation, Violation::Contract { .. }),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_leader_that_commits_an_older_term_entry_directly_is_caught() {
+    let violation = violation_under_faults::<Mutant<OLD>>();
+    assert!(
+        matches!(violation, Violation::OldTermCommit { .. }),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_server_that_truncates_applied_entries_is_caught() {
+    let violation = violation::<Mutant<TRUNCATE>>();
+    assert!(
+        matches!(
+            violation,
+            Violation::CommittedTruncated { .. } | Violation::Contract { .. }
+        ),
         "{violation:?}"
     );
 }
