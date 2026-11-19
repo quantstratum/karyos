@@ -991,6 +991,25 @@ pub struct ExportPage {
     /// The records whose journal is `unreadable`: delivered, without their
     /// calibration; a later read of the same records may name it.
     pub unreadable_records: u64,
+    /// The mirror header's `network_journals_refused`
+    /// (`trace-network.md` §4 and §5) when the agent attached to this
+    /// driver instance, read before this page's journal table read and
+    /// after it: a rise between the two bounds the network journals the
+    /// page may be missing (karyos#931).
+    pub network_journals_refused: RefusedReads,
+}
+
+/// Three reads of the mirror header's `network_journals_refused`
+/// (karyos#931).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RefusedReads {
+    /// At the agent's attach to the driver instance; `None` when the agent
+    /// has not recorded it (an export read outside an attached driver).
+    pub attach: Option<u64>,
+    /// Before the page's journal table read.
+    pub before: u64,
+    /// After the page's journal table read.
+    pub after: u64,
 }
 
 /// Why an export read is refused (R-CORE-13).

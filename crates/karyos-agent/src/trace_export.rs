@@ -309,7 +309,9 @@ pub(crate) fn export_within(
         });
     }
     let mut next = stop.unwrap_or(cursor);
+    let refused_before = mirror.network_journals_refused();
     let (mut journals, unread) = journals(mirror, &records, busy_budget);
+    let refused_after = mirror.network_journals_refused();
     // Records whose journal could not be read are not decodable: the page
     // ends before the first of them, and the reader retries. When that is
     // the page's first record, an entry stayed busy past the budget: the
@@ -384,6 +386,11 @@ pub(crate) fn export_within(
         points,
         unknown_records: u64::try_from(unknown_records).unwrap_or(u64::MAX),
         unreadable_records: u64::try_from(unreadable_records).unwrap_or(u64::MAX),
+        network_journals_refused: crate::api::RefusedReads {
+            attach: None,
+            before: refused_before,
+            after: refused_after,
+        },
     })
 }
 

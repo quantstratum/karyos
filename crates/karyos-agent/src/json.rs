@@ -827,16 +827,25 @@ pub fn trace_export(page: &ExportPage) -> String {
         });
         fields.number("unknown_records", page.unknown_records);
         fields.number("unreadable_records", page.unreadable_records);
+        let refused = page.network_journals_refused;
+        fields.key("network_journals_refused").object(|fields| {
+            fields
+                .key("attach")
+                .option(refused.attach, |out, value| out.number(value));
+            fields.number("before", refused.before);
+            fields.number("after", refused.after);
+        });
     });
     text
 }
 
 /// The bytes of a `trace-export` reply besides its records and journals:
-/// its fields, 256 bytes at most, and its overwritten ranges, at most
+/// its fields, 384 bytes at most (the three `network_journals_refused`
+/// reads included, karyos#931), and its overwritten ranges, at most
 /// `MAX_LOST_RANGES` of at most `LOSS_BYTES` each (malformed records are
 /// counted as the read meets them).
 pub(crate) const EXPORT_REPLY_OVERHEAD: usize =
-    256 + crate::trace_export::MAX_LOST_RANGES * crate::trace_export::LOSS_BYTES;
+    384 + crate::trace_export::MAX_LOST_RANGES * crate::trace_export::LOSS_BYTES;
 
 /// The bytes `record`'s encoding takes in a page, with its separator,
 /// computed without encoding it:
@@ -930,6 +939,33 @@ fn export_journal(out: &mut Out<'_>, journal: &ExportJournal) {
                 },
             );
             fields.number("provenance", entry.provenance);
+            fields
+                .key("join")
+                .option(entry.join, |out, value| out.number(value));
+            if entry.kind.is_network() {
+                // NT-4: a fact whose validity flag is clear is unknown,
+                // `null`, never 0 (karyos#931).
+                // No facts at all (an entry the driver has not filled) is
+                // `null` too.
+                fields.key("network").option(entry.network, |out, facts| {
+                    out.object(|fields| {
+                        fields
+                            .key("sender_driver")
+                            .array(&facts.sender_driver, |out, word| {
+                                out.number(*word);
+                            });
+                        fields
+                            .key("start")
+                            .option(facts.start, |out, value| out.number(value));
+                        fields
+                            .key("boundary")
+                            .option(facts.boundary, |out, value| out.number(value));
+                        fields
+                            .key("first_gap")
+                            .option(facts.first_gap, |out, value| out.number(value));
+                    });
+                });
+            }
             fields.number("payload_words", entry.payload_words);
             fields.number("sequence", entry.sequence);
             fields.number("attempted", entry.attempted);
