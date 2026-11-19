@@ -724,7 +724,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     pub fn tx_demand(&self) -> Vec<(EndpointId, TxDemand)> {
         let route = self.route_demand(self.reliable);
         if let Some(fanout) = self.fanout.as_deref() {
-            let total = if fanout.registration().is_some() {
+            let total = if self.registration.is_some() {
                 (0..fanout.max()).fold(TxDemand::default(), |sum, _| sum.plus(route))
             } else {
                 fanout
@@ -747,7 +747,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     pub fn destination_demand(&self) -> Option<TxDemand> {
         self.fanout
             .as_deref()
-            .filter(|fanout| fanout.registration().is_none())
+            .filter(|_| self.registration.is_none())
             .map(|_| self.route_demand(self.reliable))
     }
 

@@ -480,6 +480,11 @@ impl LaneGate for TargetGate<'_> {
 }
 
 impl Fanout {
+    /// `max_destinations` (MD-6): the most targets it holds.
+    pub(super) const fn max(&self) -> usize {
+        self.max
+    }
+
     /// Names through `post` each live destination due a PATH_HB: it
     /// submitted nothing for `interval` ns at `now` (RP-3, karyos#859);
     /// its wait starts at the first look. `post` says whether it took it.
@@ -919,11 +924,6 @@ impl<T: StreamTerms> Outbound<T> {
         self.fanout = Some(Box::new(fanout));
         self.registration = Some(Box::new(policy));
         Ok(())
-    }
-
-    /// `max_destinations` (MD-6): the most targets it holds.
-    pub(crate) const fn max(&self) -> usize {
-        self.max
     }
 
     /// Its registration policy, for a `control-mode=dynamic` publication.
