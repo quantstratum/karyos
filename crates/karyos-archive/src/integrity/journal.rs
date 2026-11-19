@@ -41,6 +41,26 @@ pub enum IntegrityError {
     /// An earlier append failed part way; reopen the journal to recover.
     #[error("an earlier append failed; the journal must be reopened")]
     Poisoned,
+    /// Another handle holds the file's exclusive lock: one writer per
+    /// journal or ledger file. Nothing was read or written.
+    #[error("the file is open through another handle")]
+    Locked,
+    /// The journal handle does not hold every record on disk: another
+    /// handle appended since it was opened. Nothing was cut or written.
+    #[error("the journal was changed through another handle; reopen it")]
+    StaleJournal,
+    /// A ledger or catalog paired with a journal of another archive
+    /// directory: its entries are not this journal's evidence. Nothing was
+    /// read, cut or written.
+    #[error("the ledger belongs to another archive directory's journal")]
+    ForeignLedger,
+    /// A ledger handle that does not hold every entry on disk: another
+    /// handle appended or cut since it was opened. Nothing was written.
+    #[error("the ledger was changed through another handle; reopen it")]
+    StaleLedger,
+    /// The key registry refused an entry.
+    #[error("key registry: {0}")]
+    Registry(#[from] super::trust::RegistryError),
     /// The sealing schedule refused a step.
     #[error("sealing schedule: {0}")]
     Schedule(#[from] super::sealer::SealerError),
@@ -63,7 +83,12 @@ pub struct Opened<D: Disk> {
 pub struct IntegrityJournal<D: Disk> {
     disk: D,
     file: D::File,
+    /// The archive directory the journal is in.
+    dir: PathBuf,
     check: ChainCheck,
+    /// The identity of the key registry history chained: a running digest
+    /// of every key registry record's entry digest, in chain order.
+    registry_identity: Digest,
     poisoned: bool,
 }
 
@@ -85,19 +110,11 @@ impl<D: Disk> IntegrityJournal<D> {
     /// chain or one before the last cannot be read.
     pub fn open(mut disk: D, dir: &Path) -> Result<Opened<D>, IntegrityError> {
         let path = Self::path(dir);
-        let file = match disk.open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let file = disk.create(&path)?;
-                disk.sync(&file)?;
-                disk.sync_dir(dir)?;
-                file
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let file = open_locked(&mut disk, dir, &path)?;
         let length = disk.len(&file)?;
         let whole = length / RECORD_LENGTH;
         let mut check = ChainCheck::new();
+        let mut registry_identity = super::trust::EMPTY_REGISTRY;
         let mut kept = whole;
         let mut buf = [0u8; SEAL_RECORD_LENGTH];
         for index in 0..whole {
@@ -115,6 +132,10 @@ impl<D: Disk> IntegrityJournal<D> {
                 Err(error) => return Err(Inconsistency::Malformed { index, error }.into()),
             };
             check.accept(&record)?;
+            if record.kind == SealKind::KeyRegistry {
+                registry_identity =
+                    super::trust::extend_identity(&registry_identity, &record.content);
+            }
         }
         let keep = kept
             .checked_mul(RECORD_LENGTH)
@@ -128,7 +149,9 @@ impl<D: Disk> IntegrityJournal<D> {
             journal: Self {
                 disk,
                 file,
+                dir: dir.to_path_buf(),
                 check,
+                registry_identity,
                 poisoned: false,
             },
             truncated,
@@ -141,6 +164,48 @@ impl<D: Disk> IntegrityJournal<D> {
     #[inline]
     pub const fn next_counter(&self) -> u64 {
         self.check.next_counter()
+    }
+
+    /// The identity of the key registry history this journal chains, as
+    /// [`super::trust::KeyRegistry::identity`] computes it: only a registry
+    /// that applied exactly that history may append the next entry.
+    #[must_use]
+    #[inline]
+    pub const fn key_registry_identity(&self) -> Digest {
+        self.registry_identity
+    }
+
+    /// The archive directory the journal is in: its ledgers are the ones
+    /// in the same directory.
+    #[must_use]
+    #[inline]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Whether this handle holds every record on disk: no other handle
+    /// appended since it was opened. Recovery that cuts what the journal
+    /// does not chain requires it.
+    ///
+    /// # Errors
+    ///
+    /// [`IntegrityError::Io`] for the operating system's error.
+    pub fn is_current(&mut self) -> Result<bool, IntegrityError> {
+        let held = self
+            .check
+            .next_counter()
+            .checked_mul(RECORD_LENGTH)
+            .ok_or(IntegrityError::Overflow)?;
+        Ok(self.disk.len(&self.file)? == held)
+    }
+
+    /// Whether an append failed part way: the handle no longer knows how
+    /// many records are on disk, so nothing may be derived from it until
+    /// the journal is reopened.
+    #[must_use]
+    #[inline]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// The record digest of the last record, the chain's head.
@@ -222,6 +287,10 @@ impl<D: Disk> IntegrityJournal<D> {
             return Err(error.into());
         }
         self.check = next;
+        if kind == SealKind::KeyRegistry {
+            self.registry_identity =
+                super::trust::extend_identity(&self.registry_identity, &content);
+        }
         Ok(record)
     }
 
@@ -377,4 +446,53 @@ fn range_end(start: u64, length: usize) -> Result<u64, IntegrityError> {
         .ok()
         .and_then(|length| start.checked_add(length))
         .ok_or(IntegrityError::Overflow)
+}
+
+/// Takes the single-writer lock on a journal or ledger `file`.
+pub(super) fn lock<D: Disk>(disk: &mut D, file: &D::File) -> Result<(), IntegrityError> {
+    disk.lock(file).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            IntegrityError::Locked
+        } else {
+            IntegrityError::Io(error)
+        }
+    })
+}
+
+/// Opens the journal or ledger file `path` in `dir` and takes its
+/// single-writer lock before anything is read or cut, creating it empty if
+/// it does not exist. Creation is exclusive (`create_new`): a file another
+/// opener created first is opened, never truncated.
+pub(super) fn open_locked<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+    path: &Path,
+) -> Result<D::File, IntegrityError> {
+    // Opening loses to a concurrent creation at most once per creator: a
+    // few rounds settle it.
+    for _ in 0..3 {
+        match disk.open(path) {
+            Ok(file) => {
+                lock(disk, &file)?;
+                // The opener may have won the lock from the file's creator
+                // before the creator made it durable: whoever holds the
+                // lock makes the file and its name durable before use.
+                disk.sync(&file)?;
+                disk.sync_dir(dir)?;
+                return Ok(file);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match disk.create_new(path) {
+                Ok(file) => {
+                    lock(disk, &file)?;
+                    disk.sync(&file)?;
+                    disk.sync_dir(dir)?;
+                    return Ok(file);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            },
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(IntegrityError::Locked)
 }

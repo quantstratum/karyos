@@ -24,6 +24,7 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `serde` | 1.0.229 | crates.io | default features off; `std`, `derive` | runtime, `karyos-tools` only (the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711) |
 | `toml` | 1.1.8+spec-1.1.0 | crates.io | default features off; `std`, `serde`, `parse` (no `display`: nothing is written) | runtime, `karyos-tools` only (parses the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711) |
 | `sha2` | 0.11.1 (pinned `=0.11.1`) | crates.io | default features off (no `alloc`, `oid` or `zeroize`); SHA-256 only | runtime, `karyos-archive` only (the seal digests and hash chain of the integrity journal, SPEC.md §8.4, ADR-0051 item 2, karyos#662) | all | MIT OR Apache-2.0 | owner decision ACS 71206 (2026-11-12) on quantstratum-docs `karyos/reviews/dependency-admission-sha2.md`, ADR-0079 row `sha2` (archive), karyos#660 |
+| `ed25519-dalek` | 3.0.0 (pinned `=3.0.0`) | crates.io | default features off; `zeroize` (no `fast`, `batch`, `rand_core`, `pkcs8`, `pem`, `serde`, `digest`, `hazmat` or `legacy_compatibility`); `VerifyingKey::verify_strict` only, `SigningKey` only in tests | runtime, `karyos-archive` only (archival signed heads and the key registry, SPEC.md §8.4, ADR-0051 items 4 and 6, karyos#663); never a wire key | all | BSD-3-Clause | owner decision ACS 71206 (2026-11-12) on quantstratum-docs `karyos/reviews/dependency-admission-ed25519-archival.md`, ADR-0079 (archive scope), karyos#660 |
 
 `criterion` is pinned to `=0.7.0`. The owner admitted the criterion family
 (Q25), and ADR-0033 allows a compliant exact resolution within an admitted
@@ -76,6 +77,19 @@ CPU feature detection on aarch64 Linux and macOS) were already in the
 lockfile. Of these only `libc` has a build script, already admitted with
 `libc` itself: it emits `cfg` flags from `rustc --version` and the target,
 and compiles no C. None of the crates added with `sha2` has one.
+
+`ed25519-dalek` is a dependency of `karyos-archive` only, for the archival
+purpose its admission record scopes; the driver's guard and abort
+authority is not admitted by it. Its transitive crates, admitted with it,
+are `curve25519-dalek` 5.0.0 and `subtle` 2.6.1 (BSD-3-Clause), `ed25519`
+3.0.0, `signature` 3.0.0 and `zeroize` 1.9.2 (Apache-2.0 OR MIT), and the
+build dependencies `rustc_version` 0.4.1 and `semver` 1.0.28 (MIT OR
+Apache-2.0) of `curve25519-dalek`'s build script, which only emits `cfg`
+flags (word size and backend) and compiles no C. On x86_64 only,
+`curve25519-dalek` also selects the proc macro `curve25519-dalek-derive`
+0.1.1 (MIT OR Apache-2.0), which generates its SIMD backend's target
+feature variants at compile time and is absent from the aarch64 graph. It
+reuses `sha2` for SHA-512 inside its own implementation.
 
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
 absent from every normal and release build and from the graph shipped to
@@ -160,7 +174,9 @@ or build-script change cannot reuse old admission evidence. Reach classes:
   evaluated runtime graph of the library crates is `thiserror`, plus
   `rustix`, `bitflags` and `linux-raw-sys` on Linux, plus `karyos-archive`'s
   `sha2`, `digest`, `block-buffer`, `crypto-common`, `hybrid-array`,
-  `typenum`, `cpufeatures` and `cfg-if` everywhere and `libc` (under
+  `typenum`, `cpufeatures` and `cfg-if` everywhere, its `ed25519-dalek`,
+  `curve25519-dalek`, `ed25519`, `signature`, `subtle` and `zeroize`
+  everywhere, and `libc` (under
   `cpufeatures`) on aarch64 Linux and macOS. The `karyos-tools`
   binaries add `signal-hook`, `signal-hook-registry`, `libc`, `errno`,
   `tracing`, `tracing-core`, `pin-project-lite`, `once_cell`,
@@ -201,7 +217,7 @@ and `valuable` (`cfg(tracing_unstable)`, a flag Karyos never sets).
 
 ## Build scripts
 
-Thirteen packages in the graph have build scripts. None compiles C or C++ on a
+Fourteen packages in the graph have build scripts. None compiles C or C++ on a
 supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 
 | Package | Reach | What the build script does |
@@ -211,6 +227,7 @@ supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 | `rustix` 1.1.6 | runtime (Linux) | Runs `rustc` probes to select the backend and set cfgs; no build dependencies |
 | `quote` 1.0.47 | build | Runs `rustc --version` to set cfgs |
 | `signal-hook` 0.4.5 | runtime, `karyos-tools` only | Empty `main` unless the `extended-siginfo-raw` feature is on, which would compile `extract.c` with the optional `cc` build dependency; Karyos leaves it off, so `cc` is not requested |
+| `curve25519-dalek` 5.0.0 | runtime, `karyos-archive` only | Reads the target's pointer width and features through `rustc_version` to emit `curve25519_dalek_bits` and `curve25519_dalek_backend` cfgs; compiles nothing |
 | `rustversion` 1.0.23 | loom | Runs `rustc --version` to generate version constants |
 | `libc` 0.2.190 | runtime, `karyos-archive` under `sha2`'s `cpufeatures` on aarch64 Linux and macOS (CPU feature detection); runtime, `karyos-tools`, under `signal-hook` and `signal-hook-registry` on every supported target; loom; dev, under `getrandom` on macOS and Linux `gnu`/`musl` (tests only); also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in library builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
 | `generator` 0.8.10 | loom | Invokes `cc` to assemble `asm_ppc64le_elf.S` only when the target architecture is `powerpc64`, which Karyos does not support |

@@ -48,10 +48,15 @@
 //! the chain distinguishes them, which is the point.
 
 pub mod journal;
+pub mod ledger;
 pub mod sealer;
+pub mod signing;
+pub mod trust;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod trust_tests;
 
 use sha2::{Digest as _, Sha256};
 
