@@ -375,6 +375,13 @@ fn a_full_table_answers_err_and_keeps_its_destination() {
     });
     assert!(c.network_image(10, 3).is_none());
     assert!(registrations(&a).refused_full >= 1);
+    // The ERR leaves the table as it was (SPEC §13 "Multi-destination
+    // isolation", karyos#645): one destination joined, none refused at a
+    // first SM, none removed.
+    let counters = sender(&a);
+    assert_eq!(counters.registrants_joined, 1);
+    assert_eq!(counters.registrants_refused, 0);
+    assert_eq!(counters.registrants_timed_out, 0);
     super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 16..32);
 }
 

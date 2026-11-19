@@ -1408,3 +1408,79 @@ fn an_idle_multi_destination_publication_keeps_each_path() {
         assert!(counters.path_heartbeats > 0);
     }
 }
+
+/// SPEC §13 "Multi-destination isolation" under `tagged` (karyos#645):
+/// with `fc=tagged:9` and the live receiver in group 9, an optional
+/// destination outside the group whose receiver stops (its driver no
+/// longer runs) is removed with a loss event, reason slow, while the
+/// tagged destination receives every message in order. The `min` and
+/// `max` halves are `under_min_a_stopped_destination_bounds_and_is_not_removed`
+/// and `a_slow_optional_destination_is_removed_without_stalling_the_others`.
+#[test]
+fn test_multi_destination_isolation_tagged_stopped_optional_is_removed() {
+    use crate::agents::data::RemovalReason;
+    use crate::membership::ReceiverIdentity;
+
+    let mut a = driver(ThreadingMode::Shared);
+    let mut frozen = driver(ThreadingMode::Shared);
+    let _ = frozen
+        .add_network_subscription(10, &channel(ANY_PORT, true))
+        .unwrap();
+    let mut live = driver(ThreadingMode::Shared);
+    let _ = live
+        .add_network_subscription_as(
+            10,
+            &channel(ANY_PORT, true),
+            ReceiverIdentity {
+                receiver_id: core::num::NonZeroU64::new(88).unwrap(),
+                group_tag: 9,
+            },
+        )
+        .unwrap();
+    let addresses = [bound(&frozen, 10), bound(&live, 10)];
+    let mut channel = destinations(&addresses, true);
+    channel.flow_control = Some(FlowControl::Tagged(9));
+    let roles = PublicationRoles {
+        strategy: Strategy::Tagged(9),
+        required: Vec::new(),
+        tags: vec![(88, 9)],
+    };
+    let mut receivers = vec![frozen, live];
+    let (publication, images) = connect(&mut a, &mut receivers, &channel, &[], Some(roles));
+    let mut live = receivers.pop().unwrap();
+    let _frozen = receivers.pop().unwrap();
+    let mut reader = live
+        .subscribe_aggregate(&images[1], Role::Required)
+        .unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    pump(&mut [&mut a, &mut live], |_| {
+        while sent < 512 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 512
+    });
+    let mut removed = Vec::new();
+    pump(&mut [&mut a, &mut live], |drivers| {
+        removed = drivers[0].network_removed_destinations(&publication);
+        !removed.is_empty()
+    });
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert_eq!(removed[0].destination, addresses[0]);
+    assert_eq!(removed[0].reason, RemovalReason::Slow);
+}
