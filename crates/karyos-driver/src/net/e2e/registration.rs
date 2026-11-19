@@ -1077,7 +1077,11 @@ fn a_silent_receiver_is_removed_and_registers_again() {
         .unwrap();
     let image = image_of(&mut a, &mut b, 10);
     let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
-    exchange(&mut a, &mut b, &publication, &mut reader, 16);
+    // One publisher handle for both receivers: the lane is exclusive.
+    let mut lane = a
+        .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
+        .unwrap();
+    super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..16);
     // Silence: the receiver's driver goes, and only the sender runs.
     drop(reader);
     drop(b);
@@ -1091,9 +1095,6 @@ fn a_silent_receiver_is_removed_and_registers_again() {
         .unwrap();
     let image = image_of(&mut a, &mut again, 10);
     let mut reader = again.subscribe_aggregate(&image, Role::Required).unwrap();
-    let mut lane = a
-        .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
-        .unwrap();
     super::exchange_on(&mut a, &mut again, &mut lane, &mut reader, 16..32);
     let counters = sender(&a);
     assert_eq!(counters.registrants_joined, 2);
