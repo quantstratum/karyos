@@ -33,7 +33,7 @@ candidates='^(raft|raft-proto|protobuf-build|openraft|openraft-rt|openraft-rt-to
 tokio='^tokio$'
 manifest="$root/Cargo.toml"
 package="karyos-tools"
-admitted=(karyos-control)
+admitted=(karyos-control karyos-tiering)
 admitted_set=0
 while [ $# -gt 0 ]; do
     case "$1" in
