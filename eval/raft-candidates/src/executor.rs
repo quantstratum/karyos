@@ -77,6 +77,9 @@ pub const TRACE_KEPT: usize = 1 << 16;
 struct State {
     /// The tasks, by id; `None` while one is being polled.
     tasks: BTreeMap<u64, Option<Task>>,
+    /// Each live task's waker, made once and reused for every poll, so a
+    /// waiter can recognise the task it already holds (`will_wake`).
+    wakers: BTreeMap<u64, Waker>,
     /// Woken tasks, in wake order, each at most once.
     ready: VecDeque<u64>,
     queued: BTreeSet<u64>,
@@ -255,10 +258,16 @@ impl Executor {
                 };
                 // Below `budget`, so it does not overflow.
                 polls += 1;
-                let waker = Waker::from(Arc::new(TaskWaker {
-                    state: Arc::downgrade(&self.state),
-                    id,
-                }));
+                let waker = lock(&self.state)
+                    .wakers
+                    .entry(id)
+                    .or_insert_with(|| {
+                        Waker::from(Arc::new(TaskWaker {
+                            state: Arc::downgrade(&self.state),
+                            id,
+                        }))
+                    })
+                    .clone();
                 let mut context = Context::from_waker(&waker);
                 let polled = catch_unwind(AssertUnwindSafe(|| task.as_mut().poll(&mut context)));
                 let mut state = lock(&self.state);
@@ -271,10 +280,12 @@ impl Executor {
                     }
                     Ok(Poll::Ready(())) => {
                         let _ = state.tasks.remove(&id);
+                        let _ = state.wakers.remove(&id);
                         state.record(Event::Finished(id));
                     }
                     Err(_) => {
                         let _ = state.tasks.remove(&id);
+                        let _ = state.wakers.remove(&id);
                         state.record(Event::Panicked(id));
                     }
                 }

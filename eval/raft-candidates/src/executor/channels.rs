@@ -46,11 +46,29 @@ struct MpscShared<T> {
 struct Blocked(Mutex<Vec<Waker>>);
 
 impl Blocked {
+    /// Registers a send's task, once: the executor reuses each task's
+    /// waker across polls, so `will_wake` recognises it, and the registry
+    /// holds at most one waker per task blocked on the channel.
     fn register(&self, waker: &Waker) {
         let mut wakers = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if !wakers.iter().any(|known| known.will_wake(waker)) {
             wakers.push(waker.clone());
         }
+    }
+
+    /// Drops a send's registration once it no longer waits: a send that
+    /// completes leaves nothing behind (karyos#959 review).
+    fn unregister(&self, waker: &Waker) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|known| !known.will_wake(waker));
+    }
+
+    /// The registered wakers (tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
     }
 }
 
@@ -122,7 +140,11 @@ impl<T: OptionalSend> MpscSender<SimMpsc, T> for SimSender<T> {
             // Registered before polling, so a wake between the two is kept.
             blocked.register(cx.waker());
             let all = Waker::from(Arc::clone(blocked));
-            match sender.poll_ready(&mut Context::from_waker(&all)) {
+            let ready = sender.poll_ready(&mut Context::from_waker(&all));
+            if ready.is_ready() {
+                blocked.unregister(cx.waker());
+            }
+            match ready {
                 Poll::Pending => {
                     msg = Some(value);
                     Poll::Pending
@@ -374,5 +396,50 @@ impl<T: OptionalSend + OptionalSync> WatchReceiver<SimWatch, T> for SimWatchRece
     fn borrow_and_update(&mut self) -> RwLockReadGuard<'_, T> {
         self.seen = self.shared.version.load(Ordering::SeqCst);
         self.shared.read()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::Executor;
+
+    fn registered<T>(sender: &SimSender<T>) -> usize {
+        sender
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .blocked
+            .len()
+    }
+
+    /// The karyos#959 review: sends that complete leave no registration,
+    /// and a task that blocks over and over holds one, however many polls
+    /// and sends it makes.
+    #[test]
+    fn the_waker_registry_holds_only_blocked_tasks_once() {
+        let executor = Executor::new(1);
+        let (sender, mut receiver) = SimMpsc::channel::<u64>(4);
+        let probe = sender.clone();
+        let _handle = executor.spawn(async move {
+            for value in 0..1_000u64 {
+                if sender.send(value).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut received = 0u64;
+        let mut most = 0usize;
+        for _ in 0..2_000 {
+            let _ = executor.pump(16);
+            most = most.max(registered(&probe));
+            // One read per round: the sender blocks again and again.
+            if receiver.try_recv().is_ok() {
+                received += 1;
+            }
+        }
+        assert_eq!(received, 1_000);
+        assert!(most <= 1, "{most} registrations for one task");
+        assert_eq!(registered(&probe), 0);
     }
 }

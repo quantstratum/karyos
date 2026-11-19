@@ -47,7 +47,6 @@ use std::fmt;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_channel::oneshot;
 use futures_util::StreamExt;
@@ -335,17 +334,23 @@ impl fmt::Debug for Message {
 }
 
 /// A fresh incarnation: distinct for every recovery in this process (a
-/// counter) and, through its start from the wall clock's nanoseconds, from
-/// any earlier process of the same node (karyos#959 review).
-fn next_incarnation() -> u64 {
+/// counter) and, across processes, independent of any clock (karyos#959
+/// review: a wall-clock seed repeats after a rollback or a VM restore).
+/// Each process starts its counter at a 64-bit nonce from the operating
+/// system's entropy: std's `RandomState` keys SipHash from it, with no
+/// dependency beyond std. Two processes of a node collide only if their
+/// counter ranges overlap, about `n·m / 2^64` for `n` and `m` recoveries,
+/// negligible for this evaluation; nothing is persisted, so the
+/// simulator's runs stay a function of their seed (the incarnation is not
+/// in the trace).
+#[must_use]
+pub fn next_incarnation() -> u64 {
     static NEXT: OnceLock<AtomicU64> = OnceLock::new();
     NEXT.get_or_init(|| {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        // The low 64 bits: they change every nanosecond.
-        #[allow(clippy::cast_possible_truncation)]
-        AtomicU64::new(nanos as u64)
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        AtomicU64::new(hasher.finish())
     })
     .fetch_add(1, Ordering::Relaxed)
 }

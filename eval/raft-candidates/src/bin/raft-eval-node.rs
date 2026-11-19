@@ -48,6 +48,16 @@ fn config() -> Option<(String, NodeConfig)> {
 }
 
 fn main() -> ExitCode {
+    // `raft-eval-node incarnation`: prints the incarnation this process
+    // draws first, so a test can compare two processes (karyos#959).
+    if std::env::args().nth(1).as_deref() == Some("incarnation") {
+        let _ = writeln!(
+            std::io::stdout(),
+            "{}",
+            karyos_raft_eval::openraft_core::next_incarnation()
+        );
+        return ExitCode::SUCCESS;
+    }
     let Some((core, config)) = config() else {
         let _ = writeln!(
             std::io::stderr(),

@@ -202,3 +202,24 @@ fn raft_three_processes_commit_and_apply_the_same_commands() {
 fn openraft_three_processes_commit_and_apply_the_same_commands() {
     three_processes_commit_and_apply_the_same_commands("openraft");
 }
+
+/// The P1 of the karyos#959 review: a restarted process draws a new
+/// incarnation, whatever the clock. Two processes started one after the
+/// other, as a node restarted twice, never draw the same one.
+#[test]
+fn every_process_draws_its_own_incarnation() {
+    let draw = || {
+        let output = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
+            .arg("incarnation")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    let draws: std::collections::BTreeSet<u64> = (0..3).map(|_| draw()).collect();
+    assert_eq!(draws.len(), 3);
+}

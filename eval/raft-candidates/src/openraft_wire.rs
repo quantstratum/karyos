@@ -14,7 +14,8 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, TransferLeaderRequest, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, TransferLeaderError, TransferLeaderRequest,
+    VoteRequest, VoteResponse,
 };
 use openraft::{EntryPayload, Membership};
 
@@ -211,10 +212,21 @@ fn response_to(out: &mut Vec<u8>, response: &Response) {
         }
         Response::TransferLeader(answer) => {
             out.push(2);
-            // A refused handover's reason is not carried: its answer is
-            // dropped at the receiver, which the requester sees as a
-            // timeout, as a lost answer.
-            out.push(u8::from(answer.is_ok()));
+            // Each refusal keeps its own code and fields, so it crosses the
+            // wire as the value OpenRaft returned (karyos#959 review).
+            match answer.as_ref() {
+                Ok(()) => out.push(0),
+                Err(TransferLeaderError::VoteChanged { expected, actual }) => {
+                    out.push(1);
+                    vote_to(out, expected);
+                    vote_to(out, actual);
+                }
+                Err(TransferLeaderError::LogNotFlushed { expected, actual }) => {
+                    out.push(2);
+                    log_id_to(out, expected.as_ref());
+                    log_id_to(out, actual.as_ref());
+                }
+            }
         }
     }
 }
@@ -360,12 +372,18 @@ impl Reader<'_> {
                 let last_log_id = self.log_id()?;
                 Response::Vote(Arc::new(VoteResponse::new(vote, last_log_id, granted)))
             }
-            2 => {
-                if !self.bool()? {
-                    return None;
-                }
-                Response::TransferLeader(Arc::new(Ok(())))
-            }
+            2 => Response::TransferLeader(Arc::new(match self.u8()? {
+                0 => Ok(()),
+                1 => Err(TransferLeaderError::VoteChanged {
+                    expected: self.vote()?,
+                    actual: self.vote()?,
+                }),
+                2 => Err(TransferLeaderError::LogNotFlushed {
+                    expected: self.log_id()?,
+                    actual: self.log_id()?,
+                }),
+                _ => return None,
+            })),
             _ => return None,
         })
     }
@@ -452,6 +470,14 @@ mod tests {
             Response::Append(Arc::new(AppendEntriesResponse::HigherVote(vote(8)))),
             Response::Vote(Arc::new(VoteResponse::new(vote(4), None, true))),
             Response::TransferLeader(Arc::new(Ok(()))),
+            Response::TransferLeader(Arc::new(Err(TransferLeaderError::VoteChanged {
+                expected: vote(4),
+                actual: vote(5),
+            }))),
+            Response::TransferLeader(Arc::new(Err(TransferLeaderError::LogNotFlushed {
+                expected: Some(openraft::LogId::new(Clid::new(4), 9)),
+                actual: None,
+            }))),
         ] {
             round_trip(&Message::Response {
                 id: 1,

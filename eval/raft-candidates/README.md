@@ -97,6 +97,10 @@ evaluation admission, never as a workspace waiver.
   released: `openraft` 0.10.0 on crates.io still depends on `chrono`. This
   stack keeps the admitted baseline, 0.10.0-alpha.37, and does not move to
   0.10.0.
-- **Removal trigger.** When an `openraft` release containing #2387 is
-  admitted (expected 0.10.1): upgrade, confirm
-  `cargo tree -i chrono -e normal,build` is empty, and drop the ignore.
+- **Expiry.** The owner's admission, and with it the ignore, ends at the
+  first of: `openraft` dropping `chrono` (a release containing #2387,
+  expected 0.10.1, confirmed by an empty
+  `cargo tree -i chrono -e normal,build`); any change of the `openraft`
+  version, which re-reviews the advisory against the new graph rather
+  than carrying the ignore over; or the comparison's freeze (plan issue
+  062).

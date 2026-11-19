@@ -47,8 +47,9 @@ ignore = [
     # the route in ACS 77218; the owner admitted the graph in
     # karyos#959 (issuecomment-6976562162). Upstream removed chrono in
     # databendlabs/openraft#2387 (merged 2026-11-18, not yet released;
-    # 0.10.0 still has it). Removed when an openraft release containing
-    # #2387 is admitted (expected 0.10.1): upgrade, confirm
-    # `cargo tree -i chrono -e normal,build` is empty, drop this entry.
-    { id = "RUSTSEC-2026-0543", reason = "evaluation only; karyos#690 amendment, owner-admitted in karyos#959; removed upstream by openraft#2387, drop on its admitted release" },
+    # 0.10.0 still has it). The owner's admission ends at the first of:
+    # openraft dropping chrono, any change of the openraft version, or the
+    # comparison's freeze (plan issue 062). At any of them this entry goes:
+    # re-review the advisory against the new graph rather than carry it.
+    { id = "RUSTSEC-2026-0543", reason = "evaluation only; karyos#690 amendment, owner-admitted in karyos#959 for openraft 0.10.0-alpha.37; expires at the first of: openraft drops chrono (openraft#2387), any openraft version change, the comparison's freeze" },
 ]
