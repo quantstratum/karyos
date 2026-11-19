@@ -254,6 +254,16 @@ applies them:
   every shipped graph but `karyos-control`'s. A Tokio probe would need its
   own record and is reconnaissance only.
 
+## Maintainer tools
+
+Tools a maintainer installs to check committed output. They are never a
+dependency of any crate, so they are absent from `Cargo.lock`, the
+resolved graph below and `deps/dependency-inventory.json`.
+
+| Tool | Version | Source | Use | Licence | Admission |
+| --- | --- | --- | --- | --- | --- |
+| `cbindgen` | 0.29.4, exactly (`cargo install cbindgen --version 0.29.4 --locked`) | crates.io | Generates `crates/karyos-ffi/include/karyos.h` from `karyos-ffi` with `crates/karyos-ffi/cbindgen.toml`; `make header-check` (part of `make pre-push`) and the CI job "Generated C header" regenerate it and fail on any difference, and refuse another version (karyos#697) | MPL-2.0, a scoped exception: the tool is never distributed and its output is Karyos source | Owner decision ACS 71206 (2026-11-12) on quantstratum-docs: karyos/reviews/dependency-admission-cbindgen.md (ADR-0083; ADR-0079 catalogue row) |
+
 ## Resolved graph
 
 [`dependency-inventory.json`](dependency-inventory.json) lists every external

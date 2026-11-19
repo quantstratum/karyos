@@ -51,31 +51,36 @@ fn sized_struct<T>(sized: *const T) -> bool {
     !sized.is_null() && sized.cast::<u32>().is_aligned()
 }
 
-/// `karyos_client_options`: a client's options, copied by
-/// `karyos_client_connect`. `size` comes first and is
-/// `sizeof(karyos_client_options)` of the header the caller was built
-/// with; `karyos_client_options_init` fills it and the defaults.
+/// A client's options, copied by karyos_client_connect. Fill it with
+/// karyos_client_options_init, which sets size and the defaults, then set
+/// dir. Zero timeout_ns, max_pending or max_images are invalid. A struct
+/// from an older header of the same major version is accepted: the fields
+/// it lacks take their defaults. A size below that of ABI 0.1.0 is
+/// KARYOS_E_INVALID_ARGUMENT.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ClientOptions {
     /// The struct's size in bytes.
     pub size: u32,
-    /// `KARYOS_IDLE_BUSY_SPIN`, `KARYOS_IDLE_YIELD`, `KARYOS_IDLE_SLEEP` or
-    /// `KARYOS_IDLE_YIELD_THEN_SLEEP` (the default).
+    /// KARYOS_IDLE_BUSY_SPIN, KARYOS_IDLE_YIELD, KARYOS_IDLE_SLEEP or
+    /// KARYOS_IDLE_YIELD_THEN_SLEEP (the default).
     pub idle_strategy: u32,
-    /// The driver's directory, NUL-terminated UTF-8; null for none.
+    /// The driver's directory, NUL-terminated UTF-8.
     pub dir: *const c_char,
-    /// The sleep of `KARYOS_IDLE_SLEEP`, in nanoseconds.
+    /// The sleep of KARYOS_IDLE_SLEEP, in nanoseconds.
     pub idle_sleep_ns: u64,
-    /// The longest wait of a control call, in nanoseconds; not 0.
+    /// The longest wait of a control call, in nanoseconds.
     pub timeout_ns: u64,
-    /// The most requests in flight; not 0.
+    /// The most requests in flight.
     pub max_pending: u32,
-    /// The most images a network subscription attaches; not 0.
+    /// The most images a network subscription attaches.
     pub max_images: u32,
 }
 
-/// `karyos_detail`: what a failed control call adds to its status.
+/// What a failed control call adds to its status. The caller sets size to
+/// sizeof(karyos_detail) of the header it was built with; the library
+/// writes the fields both versions know. A size below that of ABI 0.1.0,
+/// or a null pointer, receives nothing. Untouched on success.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Detail {
@@ -83,9 +88,10 @@ pub struct Detail {
     pub size: u32,
     /// Zero.
     pub reserved: u32,
-    /// A code the status defines, such as the driver's refusal code.
+    /// A code the status defines, such as the driver's refusal code (with
+    /// KARYOS_E_REFUSED, possibly a code this header does not list).
     pub code: u64,
-    /// A value the status defines, such as a length, a version or `errno`.
+    /// A value the status defines, such as a length, a version or errno.
     pub value: u64,
 }
 
@@ -109,7 +115,8 @@ fn init_0_1(size: u32, init: impl FnOnce(usize) -> i32) -> i32 {
     usize::try_from(size).map_or(Status::Unsupported.code(), init)
 }
 
-/// `karyos_accepted`: where an accepted message went.
+/// Where an accepted message went. The caller sets size to
+/// sizeof(karyos_accepted); the rule of karyos_detail applies.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Accepted {
@@ -296,12 +303,9 @@ fn default_options() -> ClientOptions {
     }
 }
 
-/// Writes the ABI version this library implements through `major`, `minor`
-/// and `patch`. Call it before any other function: a different major is
-/// incompatible.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT`, with nothing
-/// written, when a pointer is null or misaligned.
+/// Writes the ABI version this library implements. Returns KARYOS_OK, or
+/// KARYOS_E_INVALID_ARGUMENT with nothing written when a pointer is null or
+/// misaligned.
 ///
 /// # Safety
 ///
@@ -327,9 +331,8 @@ pub unsafe extern "C" fn karyos_abi_version(
     })
 }
 
-/// The static text of `status`: a NUL-terminated string that lives as long
-/// as the library and is never freed. A code that is no status gets a
-/// fixed text.
+/// The static text of a status code; a fixed text for a code that is none.
+/// Never freed.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_status_message(status: i32) -> *const c_char {
     match catch_unwind(|| Status::from_code(status).map_or(UNKNOWN_CODE, Status::message)) {
@@ -360,14 +363,9 @@ pub unsafe extern "C" fn karyos_client_options_init(options: *mut ClientOptions)
     })
 }
 
-/// Fills the first `size` bytes of `options` with the defaults, at most
-/// this version's struct: `size` is the caller's `sizeof`, and its field
-/// `size` is set to the bytes written. The caller's bytes past them are
-/// not touched.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
-/// written.
+/// Fills options with the defaults and its size; the idle strategy is
+/// KARYOS_IDLE_YIELD_THEN_SLEEP. KARYOS_E_INVALID_ARGUMENT for a null or
+/// misaligned pointer.
 ///
 /// # Safety
 ///
@@ -385,16 +383,13 @@ pub unsafe extern "C" fn karyos_client_options_init_sized(
 }
 
 /// Attaches a client to the driver whose admission socket is in
-/// `options->dir`, and writes its handle through `client`. The options
-/// are copied; nothing the caller passes is kept or consumed.
-///
-/// On failure nothing is opened, and `detail`, when not null and its
-/// `size` covers `karyos_detail`, receives the failure's detail:
-/// `KARYOS_E_INCOMPATIBLE_DRIVER` carries the driver's protocol version
-/// in `value` when it admitted the client at another one (0 when it
-/// refused it), `KARYOS_E_REFUSED` and `KARYOS_E_ADMISSION_REFUSED` the
-/// driver's code. `KARYOS_E_UNSUPPORTED` on platforms without a
-/// cross-process client (not Linux).
+/// options->dir and writes its handle. The options are copied; a failed
+/// connect opens nothing and fills detail (may be null).
+/// KARYOS_E_INCOMPATIBLE_DRIVER carries the driver's protocol version in
+/// detail->value when it admitted the client at another one, or when its
+/// refusal states it; 0 when a refusing driver states none (0.1.0-alpha.2
+/// and earlier). KARYOS_E_UNSUPPORTED where no cross-process client exists
+/// (not Linux).
 ///
 /// # Safety
 ///
@@ -470,8 +465,7 @@ pub unsafe extern "C" fn karyos_client_connect(
     })
 }
 
-/// Serves `client` once without waiting: completions, driver events, the
-/// images of network subscriptions. Writes 1 through `served` when
+/// Serves the client once without waiting; writes 1 to served when
 /// anything was served, else 0. Call it regularly.
 ///
 /// # Safety
@@ -496,9 +490,8 @@ pub unsafe extern "C" fn karyos_client_poll(client: u64, served: *mut u32) -> i3
     })
 }
 
-/// Closes `client`; the driver releases what it granted it. A closed
-/// handle answers `KARYOS_E_CLOSED`, a handle in use `KARYOS_E_BUSY` or
-/// `KARYOS_E_REENTRANT` (nothing is closed then).
+/// Closes the client; the driver releases what it granted it. Nothing is
+/// closed when the handle is in use (KARYOS_E_BUSY, KARYOS_E_REENTRANT).
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_client_close(client: u64) -> i32 {
     guard(|| match client::close(Handle::from_raw(client)) {
@@ -507,17 +500,31 @@ pub extern "C" fn karyos_client_close(client: u64) -> i32 {
     })
 }
 
-/// Adds the exclusive publication of `stream_id` on the channel `uri`
-/// (`karyos:ipc` or `karyos:udp`) to `client`, and writes its handle
-/// through `publication`. A control call: it waits for the driver up to
-/// the client's timeout, and holds the client handle meanwhile
-/// (`KARYOS_E_BUSY` to another thread). On failure nothing is opened and
-/// `detail` (may be null) receives the failure's detail. A driver's
-/// refusal is `KARYOS_E_REFUSED` with its CnC code in `code` and its
-/// detail in `value`, such as 24 for a `karyos:udp` publication above the
-/// driver's `max_stream_bytes`, with the lane's bytes. A channel the
-/// driver does not serve (CnC code 13) is `KARYOS_E_UNSUPPORTED_CHANNEL`
-/// instead, with 0 in `code` and the driver's detail in `value`.
+/// Adds the exclusive publication of stream_id on the channel uri
+/// (karyos:ipc or karyos:udp) to the client and writes its handle. A
+/// karyos:udp channel needs a driver that runs its network: an embedded
+/// one created with KARYOS_NETWORK_ON, or karyosd --network on; otherwise
+/// it is refused (KARYOS_E_UNSUPPORTED_CHANNEL). A
+/// control call: it waits for the driver up to the client's timeout and
+/// holds the client handle meanwhile. A failure opens nothing and fills
+/// detail (may be null). A guarded stream's publication binds its guard
+/// and outcome stream (karyos_publication_poll_outcomes) for a client of a
+/// driver in another process; an embedded driver's client is refused one
+/// with KARYOS_E_REFUSED, detail code 6 (invalid publication mode). A
+/// karyos:udp publication whose lanes are above the driver's
+/// max_stream_bytes (karyos_driver_options or karyosd --max-stream-bytes)
+/// is KARYOS_E_REFUSED,
+/// detail code 24 with the lane's bytes in value; no retry of the same
+/// uri succeeds. A karyos:udp publication its endpoint cannot hold
+/// (karyos#859) is KARYOS_E_REFUSED, detail code 4 (resources
+/// unavailable), with detail.value = limit << 56 | capacity << 32 |
+/// needed: limit 1 for TX slots, 2 for queues, 3 for routes; capacity the
+/// endpoint's (24 bits, saturated); needed what it would take with this
+/// publication. A retry can succeed once a removal on that endpoint has
+/// ended, which frees its room. A channel
+/// the driver does not serve (CnC code 13) is
+/// KARYOS_E_UNSUPPORTED_CHANNEL, with 0 in detail.code and the driver's
+/// detail in detail.value, the stream id.
 ///
 /// # Safety
 ///
@@ -536,13 +543,11 @@ pub unsafe extern "C" fn karyos_client_add_publication(
     guard(|| unsafe { add_publication(client, uri, stream_id, false, publication, detail) })
 }
 
-/// Adds a concurrent publication handle of `stream_id` on the channel
-/// `uri` to `client`, and writes its handle through `publication`. The
-/// stream must be a `karyos:ipc` stream the driver configures for
-/// concurrent publishers; the handle has lane 0 only, and the offer and
-/// claim calls of an exclusive publication apply to it. A control call,
-/// as `karyos_client_add_publication`; on failure nothing is opened and
-/// `detail` (may be null) receives the failure's detail.
+/// Adds a concurrent publication handle of stream_id on the karyos:ipc
+/// channel uri to the client and writes its handle. The driver must
+/// configure the stream for concurrent publishers; the handle has lane 0
+/// only, and the offer and claim calls apply to it. A control call, as
+/// karyos_client_add_publication.
 ///
 /// # Safety
 ///
@@ -595,9 +600,10 @@ unsafe fn add_publication(
     }
 }
 
-/// Offers `length` bytes at `data` on `lane` of `publication`, copied into
-/// the term before it returns. On `KARYOS_OK`, `accepted` (may be null)
-/// receives the lane and position. A data-path call: it never waits.
+/// Offers length bytes at data on the lane, copied before it returns; data
+/// may be null when length is 0. On KARYOS_OK, accepted (may be null)
+/// receives the lane and position. KARYOS_E_INVALID_SCHEDULE on a timed
+/// lane, which takes karyos_publication_offer_at only. Never waits.
 ///
 /// # Safety
 ///
@@ -633,18 +639,21 @@ pub unsafe extern "C" fn karyos_publication_offer(
     })
 }
 
-/// `karyos_offer_options`: per-offer options of
-/// `karyos_publication_offer_with`. Only integers: the library reads it by
-/// prefix from the caller's bytes.
+/// Per-offer options of karyos_publication_offer_with. Fill it with
+/// karyos_offer_options_init (reserved_value 0, what
+/// karyos_publication_offer sends), then set reserved_value. The size rule
+/// of karyos_driver_options applies.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OfferOptions {
     /// The struct's size in bytes, set by the caller.
     pub size: u32,
-    /// Zero.
+    /// Zero; anything else is KARYOS_E_INVALID_ARGUMENT.
     pub reserved: u32,
-    /// The value written in every fragment's header; a conflated stream's
-    /// key.
+    /// The value every fragment's header carries, which subscribers read as
+    /// karyos_message_info.reserved_value. On a conflated stream it is the
+    /// message's key, in 0..keys of the stream's table; see
+    /// karyos_publication_offer_with.
     pub reserved_value: i64,
 }
 
@@ -681,14 +690,8 @@ pub unsafe extern "C" fn karyos_offer_options_init(options: *mut OfferOptions) -
     })
 }
 
-/// Fills the first `size` bytes of `options` with the defaults, at most
-/// this version's struct: `size` is the caller's `sizeof`, and its field
-/// `size` is set to the bytes written. The caller's bytes past them are
-/// not touched.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
-/// written.
+/// Fills options with the defaults and its size. KARYOS_E_INVALID_ARGUMENT
+/// for a null or misaligned pointer.
 ///
 /// # Safety
 ///
@@ -705,13 +708,19 @@ pub unsafe extern "C" fn karyos_offer_options_init_sized(
     })
 }
 
-/// As `karyos_publication_offer`, with `options`: the reserved value every
-/// fragment's header carries (subscribers read it as
-/// `karyos_message_info.reserved_value`). On a conflated stream it is the
-/// message's key, in `0..keys` of the stream's table, and the value is at
-/// most its capacity: otherwise `KARYOS_E_CONFLATION`, with nothing
-/// reserved. A null `options`, a `size` below that of ABI 0.1.0 or a
-/// nonzero `reserved` returns `KARYOS_E_INVALID_ARGUMENT`.
+/// As karyos_publication_offer, with options: the reserved value every
+/// fragment's header carries. A null options, a size below that of ABI
+/// 0.1.0, or a nonzero reserved returns KARYOS_E_INVALID_ARGUMENT, and a
+/// timed lane KARYOS_E_INVALID_SCHEDULE.
+///
+/// On a conflated stream the driver is authoritative: a key outside the
+/// table never enters the conflated view, and the driver counts it as a
+/// rejected key. Every publication also refuses such a key, or a value
+/// larger than the capacity, before it appends: KARYOS_E_CONFLATION, with
+/// nothing reserved. The table's shape comes with the log buffer the
+/// publication writes to, for a client of a driver in this process or in
+/// another. Conflation is a view over the log, not a filter on it: an
+/// appended message reaches the stream's subscribers whatever its key.
 ///
 /// # Safety
 ///
@@ -758,13 +767,17 @@ pub unsafe extern "C" fn karyos_publication_offer_with(
     })
 }
 
-/// Offers `length` bytes at `data` on the timed `lane` of `publication`,
-/// with its requested not-before time `tx_time` in the lane's clock domain
-/// (`karyos_clock_now` reads it), copied into the term before it returns.
-/// The lane's handle checks the time first, before anything is reserved;
-/// on a network route the driver's sender holds the message until its
-/// time. On `KARYOS_OK`, `accepted` (may be null) receives the lane and
-/// position. A data-path call: it never waits.
+/// Offers length bytes at data on the timed lane with its requested
+/// not-before time tx_time in the lane's clock domain (karyos_clock_now
+/// reads it), copied before it returns; data may be null when length is 0.
+/// The lane's handle checks the time before anything is reserved; the
+/// driver's sender holds the message until its time, and local readers
+/// read it at its commit. A timed lane is a network publication's: a
+/// driver's stream is never timed (karyos_stream_options).
+/// KARYOS_E_INVALID_SCHEDULE for a lane that is not timed, a time below the
+/// lane's last, one past the horizon or an overflowing deadline. On
+/// KARYOS_OK, accepted (may be null) receives the lane and position. Never
+/// waits.
 ///
 /// # Safety
 ///
@@ -806,13 +819,13 @@ pub(crate) const CLOCK_MONOTONIC: u32 = 0;
 /// `KARYOS_CLOCK_TAI`: the host's `CLOCK_TAI`, Linux only.
 pub(crate) const CLOCK_TAI: u32 = 1;
 
-/// Writes the current time of `domain` (`KARYOS_CLOCK_*`) through `now`:
-/// the time `karyos_publication_offer_at` expects for a lane of that
-/// domain. Callers use it on every platform rather than read the clocks
-/// themselves: on Linux it equals `CLOCK_MONOTONIC` or `CLOCK_TAI`, but on
-/// macOS the monotonic domain has a per-process origin, so a value means
-/// something only within this process (an embedded driver). A data-path
-/// call: it never waits and takes no handle.
+/// Writes the current time of domain (KARYOS_CLOCK_*): the time
+/// karyos_publication_offer_at expects for a lane of that domain. Use it on
+/// every platform rather than read the clocks: on macOS the monotonic
+/// domain has a per-process origin, meaningful only within this process.
+/// KARYOS_E_INVALID_ARGUMENT for an unknown domain or a null or misaligned
+/// now (nothing is written); KARYOS_E_UNSUPPORTED for a domain this
+/// platform cannot read (KARYOS_CLOCK_TAI off Linux). Never waits.
 ///
 /// # Safety
 ///
@@ -838,15 +851,12 @@ pub unsafe extern "C" fn karyos_clock_now(domain: u32, now: *mut u64) -> i32 {
     })
 }
 
-/// Stages a claim of `length` bytes on `lane` of `publication`: writes its
-/// handle through `claim` and, through `buffer`, a pointer to `length`
-/// zeroed bytes the caller fills. The pointer stays valid until
-/// `karyos_claim_commit` releases the claim, `karyos_claim_abort`, or the
-/// close of the publication or of its client; it never points into a term
-/// or a shared mapping.
-/// One claim per publication: another before it is released returns
-/// `KARYOS_E_CLAIM_OUTSTANDING`. Nothing reaches the term before the
-/// commit.
+/// Stages a claim of length bytes on the lane: writes its handle and a
+/// pointer to length zeroed bytes to fill. The pointer is valid until the
+/// commit releases the claim, its abort, or the close of the publication or
+/// of its client, and never points into a term or a shared mapping. One
+/// claim per publication (KARYOS_E_CLAIM_OUTSTANDING). A claim on a timed
+/// lane is staged, and its commit answers KARYOS_E_INVALID_SCHEDULE.
 ///
 /// # Safety
 ///
@@ -879,13 +889,12 @@ pub unsafe extern "C" fn karyos_publication_claim(
     })
 }
 
-/// Commits `claim`: claims `length` in the term, copies the staged bytes
-/// and commits, in one call. On `KARYOS_OK`, `accepted` (may be null)
-/// receives the lane and position, and the claim is released. A data-path
-/// outcome that can clear (`KARYOS_E_BACK_PRESSURED`,
-/// `KARYOS_E_NOT_CONNECTED`, `KARYOS_E_ADMIN_ACTION`,
-/// `KARYOS_E_RATE_LIMITED`, `KARYOS_E_GATED`) keeps the claim staged and
-/// its buffer valid, to retry or abort; any other failure releases it.
+/// Commits the claim: claims in the term, copies the staged bytes and
+/// commits, in one call. KARYOS_OK releases the claim and fills accepted
+/// (may be null). KARYOS_E_BACK_PRESSURED, KARYOS_E_NOT_CONNECTED,
+/// KARYOS_E_ADMIN_ACTION, KARYOS_E_RATE_LIMITED and KARYOS_E_GATED keep it
+/// staged and its buffer valid, to retry or abort; any other failure
+/// releases it, such as KARYOS_E_INVALID_SCHEDULE on a timed lane.
 ///
 /// # Safety
 ///
@@ -902,7 +911,7 @@ pub unsafe extern "C" fn karyos_claim_commit(claim: u64, accepted: *mut Accepted
     })
 }
 
-/// Aborts `claim`: nothing reaches the term, and its buffer is released.
+/// Aborts the claim: nothing reaches the term.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_claim_abort(claim: u64) -> i32 {
     guard(|| match api::publication::abort(Handle::from_raw(claim)) {
@@ -911,9 +920,9 @@ pub extern "C" fn karyos_claim_abort(claim: u64) -> i32 {
     })
 }
 
-/// Closes `publication`, with its outstanding claim, and releases it to
+/// Closes the publication, with its outstanding claim, and releases it to
 /// its client, at once or at the client's next call while another call
-/// holds the client (`karyos.h`, Threads).
+/// holds the client (Threads, above).
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_publication_close(publication: u64) -> i32 {
     guard(
@@ -951,9 +960,9 @@ pub(crate) const OUTCOME_ENDED: u32 = 18;
 /// `KARYOS_OUTCOME_OUTCOMES_LOST`: the final record of a faulted client.
 pub(crate) const OUTCOME_OUTCOMES_LOST: u32 = 19;
 
-/// `karyos_outcome`: one outcome record, handed to the handler for the
-/// call only. `size` is this version's `sizeof(karyos_outcome)`: a handler
-/// built against an older header reads only the fields it knows.
+/// One outcome record of a guarded publication, valid during the handler's
+/// call. size is the library's sizeof(karyos_outcome): read only the fields
+/// it covers.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Outcome {
@@ -981,10 +990,10 @@ pub struct Outcome {
     pub lost: u64,
 }
 
-/// `karyos_outcome_handler`: called once per record with the caller's
-/// `context` and the record, valid only during the call. It must return
-/// normally.
-pub type OutcomeHandler = Option<unsafe extern "C" fn(*mut c_void, *const Outcome)>;
+/// Called once per outcome record with the caller's context and the
+/// record, valid only during the call. It must return normally.
+pub type OutcomeHandler =
+    Option<unsafe extern "C" fn(context: *mut c_void, outcome: *const Outcome)>;
 
 /// The `KARYOS_OUTCOME_*` code of `kind`.
 fn outcome_kind(kind: karyos_sys::outcome_ring::Kind) -> u32 {
@@ -1019,24 +1028,17 @@ fn outcome(sequence: u64, record: &karyos_sys::outcome_ring::Record) -> Outcome 
     }
 }
 
-/// Delivers at most `limit` outcome records of `lane` of `publication` to
-/// `handler`, in sequence order, and writes how many through `delivered`
-/// (may be null), also on failure: a failed poll's status follows the
-/// records delivered before it. A `limit` of 0 delivers nothing. A
-/// data-path call: it never waits and never allocates.
-///
-/// A lane that is not guarded has no records: 0 with `KARYOS_OK`, as has
-/// lane 0 of a concurrent handle, which is never guarded; a lane the
-/// publication does not configure returns `KARYOS_E_INVALID_LANE`. After
-/// the driver's final `KARYOS_OUTCOME_OUTCOMES_LOST` record the stream has
-/// ended: later polls deliver 0 with `KARYOS_OK`, and offers and claims
-/// return `KARYOS_E_OUTCOMES_LOST`. The handler runs while the publication
-/// is held: from it, offering, claiming, polling or closing this
-/// publication, or closing its client, returns `KARYOS_E_REENTRANT`.
-///
-/// A binding stops a poll after a failed handler with the bounded poll of
-/// ADR-0067: a `limit` of 1 in a loop, and no call after the failure. The
-/// failed record is consumed; the ones after it stay undelivered.
+/// Delivers at most limit outcome records of the publication's lane to
+/// handler, in sequence order, and writes their count through delivered
+/// (may be null), also when it fails: a failed poll's status follows the
+/// records delivered before it. Never waits and never allocates. A lane
+/// that is not guarded, and lane 0 of a concurrent handle, deliver 0; a
+/// lane the publication does not configure returns KARYOS_E_INVALID_LANE.
+/// After the final KARYOS_OUTCOME_OUTCOMES_LOST record, polls deliver 0
+/// and offers and claims return KARYOS_E_OUTCOMES_LOST. From the handler,
+/// offering, claiming, polling or closing this publication, or closing its
+/// client, returns KARYOS_E_REENTRANT. To stop after a failed handler
+/// (ADR-0067), poll with a limit of 1 in a loop and stop calling.
 ///
 /// # Safety
 ///
@@ -1089,10 +1091,9 @@ pub(crate) const MESSAGE_END_OF_STREAM: u32 = 1;
 /// `KARYOS_MESSAGE_TRACED`: the message carries a trace extension.
 pub(crate) const MESSAGE_TRACED: u32 = 2;
 
-/// `karyos_message_info`: what the poll knows of a message, handed to the
-/// handler for the call only. `size` is this version's
-/// `sizeof(karyos_message_info)`: a handler built against an older header
-/// reads only the fields it knows.
+/// What the poll knows of a message, valid during the handler's call. size
+/// is the library's sizeof(karyos_message_info): read only the fields it
+/// covers.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct MessageInfo {
@@ -1105,7 +1106,7 @@ pub struct MessageInfo {
     /// The publisher's reserved value.
     pub reserved_value: i64,
     /// The bytes the message takes in the stream, its frames and their
-    /// alignment: its frames end at `position + extent` (a pad, an abort or
+    /// alignment: its frames end at position + extent (a pad, an abort or
     /// a gap may follow before the next message).
     pub extent: u32,
     /// The image's session id; the stream's for a `karyos:ipc` one.
@@ -1116,8 +1117,15 @@ pub struct MessageInfo {
     pub reserved: u32,
 }
 
-/// `karyos_image_change`: an image of a network subscription attached or
-/// retired.
+/// An image of a network subscription attached (available 1) or retired.
+/// A retired image's end follows: a KARYOS_END_* code (defined with
+/// karyos_subscription_end), its seal position and the raw seal reason.
+/// KARYOS_END_END_OF_STREAM is a clean end, KARYOS_END_IMAGE_RETIRED one
+/// without (its publisher timed out, or a lane lost a frame on the way);
+/// KARYOS_END_NONE for an attached image, and for one released unsealed
+/// when its client closed. Set size to sizeof(karyos_image_change): a
+/// caller built against the first version sets 24 and gets no end fields,
+/// one built with them sets at least KARYOS_IMAGE_CHANGE_SIZE_ENDS.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImageChange {
@@ -1136,8 +1144,8 @@ pub struct ImageChange {
     pub end_reason: u32,
     /// Zero.
     pub reserved: u32,
-    /// The end's seal position; 0 with no end, for a seal not positioned
-    /// yet, and for a seal at position 0: 0 alone does not tell them apart.
+    /// 0 with no end, for a seal not positioned yet, and for a seal at
+    /// position 0: 0 alone does not tell them apart.
     pub end_position: u64,
     /// The seal's raw reason code; 0 with no end.
     pub seal_code: u64,
@@ -1152,11 +1160,17 @@ const IMAGE_CHANGE_SIZE_0_1: u32 = 24;
 #[cfg(test)]
 pub(crate) const IMAGE_CHANGE_SIZE_ENDS: u32 = 48;
 
-/// `karyos_message_handler`: called once per message with the caller's
-/// `context`, the message's `length` bytes at `data` (a private copy, valid
-/// only during the call) and its `info`. It must return normally.
-pub type MessageHandler =
-    Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, *const MessageInfo)>;
+/// Called once per message with the caller's context, the message's length
+/// bytes at data (a private copy, never a term or a shared mapping, valid
+/// only during the call) and its info. It must return normally.
+pub type MessageHandler = Option<
+    unsafe extern "C" fn(
+        context: *mut c_void,
+        data: *const u8,
+        length: usize,
+        info: *const MessageInfo,
+    ),
+>;
 
 /// `info` as the C ABI hands it to a handler.
 fn message_info(info: &karyos_client::MessageInfo) -> MessageInfo {
@@ -1179,12 +1193,13 @@ fn message_info(info: &karyos_client::MessageInfo) -> MessageInfo {
     }
 }
 
-/// Adds the subscription of `stream_id` on the channel `uri` (`karyos:ipc`
-/// or `karyos:udp`) to `client`, with its private copy buffer, and writes
-/// its handle through `subscription`. A control call: it waits for the
-/// driver up to the client's timeout, and holds the client handle
-/// meanwhile (`KARYOS_E_BUSY` to another thread). On failure nothing is
-/// opened and `detail` (may be null) receives the failure's detail.
+/// Adds the subscription of stream_id on the channel uri (karyos:ipc or
+/// karyos:udp) to the client and writes its handle; karyos:udp needs a
+/// driver that runs its network, as for karyos_client_add_publication. A
+/// control call: it
+/// waits for the driver up to the client's timeout and holds the client
+/// handle meanwhile. A failure opens nothing and fills detail (may be
+/// null).
 ///
 /// # Safety
 ///
@@ -1242,23 +1257,32 @@ pub(crate) const REJOIN_CLOSE: u32 = 1;
 /// the options name, then merged back into the live stream (F9b).
 pub(crate) const REJOIN_ARCHIVE: u32 = 2;
 
-/// `karyos_subscription_options`: a subscription's role and rejoin policy
-/// (`quantstratum-docs: karyos/design/rejoin-policies.md`), read by
-/// `karyos_client_add_subscription_with`. Only integers: the library reads
-/// it by prefix from the caller's bytes.
+/// A subscription's role and rejoin policy, read by
+/// karyos_client_add_subscription_with. Fill it with
+/// karyos_subscription_options_init (KARYOS_ROLE_REQUIRED,
+/// KARYOS_REJOIN_AT_HEAD: what karyos_client_add_subscription takes), then
+/// set the fields. The size rule of karyos_driver_options applies.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SubscriptionOptions {
     /// The struct's size in bytes, set by the caller.
     pub size: u32,
-    /// `KARYOS_ROLE_*`.
+    /// KARYOS_ROLE_*.
     pub role: u32,
-    /// `KARYOS_REJOIN_*`.
+    /// KARYOS_REJOIN_*.
     pub rejoin: u32,
-    /// Zero.
+    /// Zero; anything else is KARYOS_E_INVALID_ARGUMENT.
     pub reserved: u32,
-    /// For `KARYOS_REJOIN_ARCHIVE`: the Archive handle, of the same
-    /// client; 0 otherwise.
+    /// For KARYOS_REJOIN_ARCHIVE, and 0 for any other policy: the Archive
+    /// handle, of the same client; the rejoin's requester id, at most
+    /// UINT32_MAX, or 0 for one the library assigns (a caller that
+    /// chooses one keeps it unique among the Archive's requesters); the
+    /// stream replays are asked onto; and the policy after a failed merge,
+    /// KARYOS_REJOIN_AT_HEAD or KARYOS_REJOIN_CLOSE. The library assigns
+    /// the Archive handle's own client_id plus 1, then plus 2 and up, one
+    /// per rejoin (KARYOS_E_INVALID_ARGUMENT past UINT32_MAX): space the
+    /// client_ids of Archive handles that share an Archive so their ranges
+    /// do not meet.
     pub archive: u64,
     /// For `KARYOS_REJOIN_ARCHIVE`: the rejoin's requester id, at most
     /// `UINT32_MAX`, or 0 for one the library assigns; 0 otherwise.
@@ -1374,14 +1398,8 @@ pub unsafe extern "C" fn karyos_subscription_options_init(
     })
 }
 
-/// Fills the first `size` bytes of `options` with the defaults, at most
-/// this version's struct: `size` is the caller's `sizeof`, and its field
-/// `size` is set to the bytes written. The caller's bytes past them are
-/// not touched.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
-/// written.
+/// Fills options with the defaults and its size. KARYOS_E_INVALID_ARGUMENT
+/// for a null or misaligned pointer.
 ///
 /// # Safety
 ///
@@ -1398,33 +1416,26 @@ pub unsafe extern "C" fn karyos_subscription_options_init_sized(
     })
 }
 
-/// As `karyos_client_add_subscription`, with the reader's role and rejoin
-/// policy from `options` (filled by `karyos_subscription_options_init`).
-/// Each image of a `karyos:udp` subscription takes the role and the policy.
-/// The options are copied; a struct from an older header of the same major
-/// version is read by its prefix. A null `options`, a `size` below that of
-/// ABI 0.1.0 or between it and that of the Archive fields (40), an unknown
-/// role or policy, or a nonzero `reserved` returns
-/// `KARYOS_E_INVALID_ARGUMENT` and opens nothing.
+/// As karyos_client_add_subscription, with the reader's role and rejoin
+/// policy; each image of a karyos:udp subscription takes both. A null
+/// options, a size below that of ABI 0.1.0 (16) or between it and that of
+/// the Archive fields (40), an unknown role or policy, or a nonzero
+/// reserved returns KARYOS_E_INVALID_ARGUMENT and opens nothing.
 ///
-/// `KARYOS_REJOIN_ARCHIVE` (F9b) recovers an overrun's gap from the
-/// Archive handle `archive`, of the same client, and merges it back into
-/// the live stream, with `secondary` after a failed merge. The Archive
-/// handle lends only its control streams and an id: the rejoin takes its
-/// own request publication and response subscription, which the
-/// subscription owns and its close releases by their drop, so closing the
-/// Archive handle leaves the rejoin working. Each rejoin takes one of the
-/// request stream's publisher slots (`KARYOS_E_REFUSED` when none is
-/// free). An `archive_client_id` of 0 lets the library assign the
-/// requester id; a caller that chooses one keeps it unique among the
-/// Archive's requesters. Replays are asked onto `replay_stream_id`. While
-/// a gap is recovered the caller keeps calling `karyos_client_poll`, so
-/// the replay target's grant completes; `karyos_subscription_rejoin_state`
-/// tells the recovery and a failed merge. A network subscription is
-/// `KARYOS_E_UNSUPPORTED_CHANNEL`, one that names no publication to
-/// recover, an Archive of another client, an Archive field set for
-/// another policy, or a `secondary` other than the two above is
-/// `KARYOS_E_INVALID_ARGUMENT`; nothing stays open.
+/// KARYOS_REJOIN_ARCHIVE recovers an overrun's gap from the Archive handle
+/// and merges it back into the live stream. The Archive handle lends only
+/// its control streams and an id: the rejoin takes its own request
+/// publication and response subscription, which the subscription owns. A
+/// rejoin's Archive streams are released by their drop when the
+/// subscription closes, and closing the Archive handle leaves the rejoin
+/// working. Each rejoin takes one of the request stream's publisher slots
+/// (KARYOS_E_REFUSED when none is free). While a gap is recovered, keep
+/// calling karyos_client_poll, so the replay target's grant completes;
+/// karyos_subscription_rejoin_state tells the recovery and a failed merge.
+/// A network subscription is KARYOS_E_UNSUPPORTED_CHANNEL; one that names
+/// no publication to recover, an Archive of another client, an Archive
+/// field set for another policy, or another secondary is
+/// KARYOS_E_INVALID_ARGUMENT. Nothing stays open on failure.
 ///
 /// # Safety
 ///
@@ -1517,24 +1528,20 @@ unsafe fn read_words<'a>(words: *const u64, count: usize) -> Result<&'a [u64], S
     Ok(unsafe { std::slice::from_raw_parts(words, count) })
 }
 
-/// Adds the exclusive publication of `stream_id` on the `karyos:udp`
-/// channel `uri` whose receivers have configured roles (owner decisions of
-/// 2026-10-21, item 7; karyos#637), and writes its handle through
-/// `publication`. `strategy` is a `KARYOS_STRATEGY_*` and must be the
-/// channel's `fc` (`KARYOS_STRATEGY_MIN` without one), or the driver
-/// refuses with `KARYOS_E_REFUSED`, detail code 17 (`StrategyConflict`);
-/// `tagged_group` is the group of `KARYOS_STRATEGY_TAGGED` and 0 for the
-/// others. `required` holds `required_count` required `receiver_id`s, and
-/// `tags` `tag_count` pairs of words, a `receiver_id` and its tag. An
-/// unknown strategy, a group that does not match it, a `receiver_id` or tag
-/// of 0, a repeated `receiver_id`, or a null list with a count, is
-/// `KARYOS_E_INVALID_ARGUMENT`, as are roles the command ring's largest
-/// record cannot carry. More required, or more tagged, receivers than the
-/// driver's membership holds is `KARYOS_E_REFUSED`, detail code 18
-/// (`InvalidRoles`). A `karyos:ipc` URI is
-/// `KARYOS_E_UNSUPPORTED_CHANNEL`. A control call, as
-/// `karyos_client_add_publication`; on failure nothing is opened and
-/// `detail` (may be null) receives the failure's detail.
+/// As karyos_client_add_publication on a karyos:udp channel, whose
+/// receivers have configured roles (ABI 0.1.2): strategy is a
+/// KARYOS_STRATEGY_* and must be the channel's fc (KARYOS_STRATEGY_MIN
+/// without one), or the driver refuses with KARYOS_E_REFUSED, detail code
+/// 17; tagged_group is the group of KARYOS_STRATEGY_TAGGED and 0 for the
+/// others. required holds required_count required receiver ids, and tags
+/// tag_count pairs of words, a receiver id and its tag (either may be null
+/// with a count of 0). An unknown strategy, a group that does not match
+/// it, a receiver id or tag of 0, a repeated receiver id, a null list with
+/// a count, or roles the command ring's largest record cannot carry is
+/// KARYOS_E_INVALID_ARGUMENT; more required, or more tagged, receivers
+/// than the driver's membership holds is KARYOS_E_REFUSED, detail code 18;
+/// a karyos:ipc URI is
+/// KARYOS_E_UNSUPPORTED_CHANNEL. Nothing is opened on failure.
 ///
 /// # Safety
 ///
@@ -1609,16 +1616,15 @@ pub unsafe extern "C" fn karyos_client_add_publication_with_roles(
     })
 }
 
-/// As `karyos_client_add_subscription_with` on a `karyos:udp` channel,
-/// whose images name the configured receiver identity (MC-1, MC-2; owner
-/// item 7, karyos#637): `receiver_id` (nonzero) in every RB block and
-/// `group_tag` in their SMs, what a publication's required `receiver_id`s
-/// and tagged group name. A `receiver_id` of 0, or an Archive rejoin in
-/// `options` (a network subscription has none), is
-/// `KARYOS_E_INVALID_ARGUMENT`; a `karyos:ipc` URI is
-/// `KARYOS_E_UNSUPPORTED_CHANNEL`; another identity on the same endpoint and
-/// stream is `KARYOS_E_REFUSED`, detail code 15
-/// (`ReceiverIdentityMismatch`). Nothing stays open on failure.
+/// As karyos_client_add_subscription_with on a karyos:udp channel, whose
+/// images name a configured receiver identity (ABI 0.1.2): receiver_id
+/// (nonzero) in every RB block and group_tag in their status messages,
+/// what a publication's required receiver ids and tagged group name. A
+/// receiver_id of 0, or an Archive rejoin in options, is
+/// KARYOS_E_INVALID_ARGUMENT; a karyos:ipc URI is
+/// KARYOS_E_UNSUPPORTED_CHANNEL; another identity on the same endpoint and
+/// stream is KARYOS_E_REFUSED, detail code 15. Nothing stays open on
+/// failure.
 ///
 /// # Safety
 ///
@@ -1691,17 +1697,12 @@ pub(crate) const ADMISSION_NOT_JOINED: u32 = 2;
 /// `KARYOS_ADMISSION_LOST_REQUIRED`.
 pub(crate) const ADMISSION_LOST_REQUIRED: u32 = 3;
 
-/// Writes the admission state of `publication`, a network publication,
-/// through `admission` (owner item 7, karyos#637): `KARYOS_ADMISSION_OPEN`,
-/// `KARYOS_ADMISSION_NOT_JOINED` while a configured required receiver has
-/// not joined, `KARYOS_ADMISSION_LOST_REQUIRED` once one is lost, or
-/// `KARYOS_ADMISSION_UNKNOWN` before the driver reports one, after the
-/// client lapped the driver's broadcast until it does again, and for a
-/// publication that is not a network one. It is the last state the sender
-/// observed, not a list of transitions. Offers keep the existing outcome
-/// mapping: under not joined and lost required they answer
-/// `KARYOS_E_BACK_PRESSURED` once the window is full. A control call on
-/// the publication's client, which it holds for the read.
+/// Writes the admission state of a network publication through admission,
+/// a KARYOS_ADMISSION_* (ABI 0.1.2): the last state its sender observed, as
+/// its client last heard it, not a list of transitions. Offers keep their
+/// outcomes: under not joined and lost required they answer
+/// KARYOS_E_BACK_PRESSURED once the window is full. A null admission is
+/// KARYOS_E_INVALID_ARGUMENT.
 ///
 /// # Safety
 ///
@@ -1761,9 +1762,10 @@ pub(crate) fn merge_code(error: &karyos_client::MergeError) -> u32 {
     }
 }
 
-/// `karyos_subscription_rejoin`: where a subscription's Archive rejoin
-/// stands (F9b). `size` is the caller's `sizeof`: the library writes the
-/// fields it knows of, no more than `size` bytes.
+/// Where a subscription's Archive rejoin stands. size is the caller's
+/// sizeof(karyos_subscription_rejoin); the rule of karyos_detail applies.
+/// recovering is 1 while a gap is asked for or merged; merge_failure is
+/// the last failed merge's KARYOS_MERGE_* code.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SubscriptionRejoin {
@@ -1780,10 +1782,10 @@ pub struct SubscriptionRejoin {
 /// The size of `karyos_subscription_rejoin` in its first version.
 const SUBSCRIPTION_REJOIN_SIZE_0_1: u32 = 16;
 
-/// Writes where `subscription`'s Archive rejoin stands through `state`:
-/// whether it recovers a gap, and its last merge failure. A subscription
-/// that does not rejoin from an Archive reads 0 and
-/// `KARYOS_MERGE_NONE`. A data-path call: it never waits.
+/// Writes where the subscription's Archive rejoin stands. A subscription
+/// that does not rejoin from an Archive reads 0 and KARYOS_MERGE_NONE.
+/// Never waits. A null or misaligned state, or a size below 16, is
+/// KARYOS_E_INVALID_ARGUMENT with nothing written.
 ///
 /// # Safety
 ///
@@ -1841,20 +1843,24 @@ unsafe fn write_rejoin_state(
     unsafe { write_sized(state, SUBSCRIPTION_REJOIN_SIZE_0_1, filled) };
 }
 
-/// Delivers at most `limit` messages of `subscription` to `handler`, each
-/// copied first, and writes how many through `delivered` (may be null),
-/// also on failure: a failed poll's status follows the messages delivered
-/// before it. A `limit` of 0 delivers nothing. A data-path call: it never
-/// waits, and allocates only when a newly adopted image or mapping has a
-/// larger message than any before (`KARYOS_E_SYSTEM` when it cannot,
+/// Delivers at most limit messages to handler, each from a private copy,
+/// and writes their count through delivered (may be null), also when it
+/// fails: a failed poll's status follows the messages delivered before it.
+/// Never waits; it allocates only when a newly attached image or mapping
+/// has a larger message than any before (KARYOS_E_SYSTEM when it cannot,
 /// before anything of that round is delivered: the count covers earlier
-/// rounds). The handler runs while the subscription
-/// is held: from it, polling or closing this subscription, or closing its
-/// client, returns `KARYOS_E_REENTRANT`.
-///
-/// A binding stops a poll after a failed handler with the bounded poll of
-/// ADR-0067: a `limit` of 1 in a loop, and no call after the failure. The
-/// failed message is acknowledged; the ones after it stay undelivered.
+/// rounds). From the handler, polling or closing this subscription, or
+/// closing its client, returns KARYOS_E_REENTRANT. A karyos:ipc
+/// subscription's end is its poll's status, after the messages before it,
+/// and every later poll's: KARYOS_E_CLOSED_BY_OVERRUN once its rejoin
+/// policy closed it, KARYOS_E_CLOSED once its stream's seal is reached or
+/// it was revoked with its client. An overrun it rejoined after, an aborted
+/// block or a skip is KARYOS_OK and the next poll goes on. A karyos:udp
+/// subscription's images end one by one (image changes report them): its
+/// poll answers KARYOS_OK. To stop
+/// after a failed handler (ADR-0067), poll with a limit of 1 in a loop and
+/// stop calling: the failed message is acknowledged, the later ones are
+/// not delivered.
 ///
 /// # Safety
 ///
@@ -1898,15 +1904,11 @@ pub unsafe extern "C" fn karyos_subscription_poll(
     })
 }
 
-/// Takes the oldest queued image change of `subscription` into `change`
-/// and writes 1 through `has`, or writes 0 through `has` when none is
-/// queued (a `karyos:ipc` subscription has none). The queue is bounded:
-/// `karyos_subscription_image_changes_lost` counts what a full queue
-/// dropped.
-///
-/// A null or misaligned `change` or `has`, or a `change` whose `size` is
-/// below this ABI's first `karyos_image_change`, returns
-/// `KARYOS_E_INVALID_ARGUMENT` and takes nothing from the queue.
+/// Takes the oldest queued image change into change and sets has to 1, or
+/// sets has to 0 when none is queued. The queue is bounded. change points
+/// to a karyos_image_change whose size is set: a null one, or one smaller
+/// than this version's first, returns KARYOS_E_INVALID_ARGUMENT and takes
+/// nothing.
 ///
 /// # Safety
 ///
@@ -1977,8 +1979,7 @@ unsafe fn write_image_change(change: *mut ImageChange, next: &karyos_client::Ima
     unsafe { write_sized(change, IMAGE_CHANGE_SIZE_0_1, filled) };
 }
 
-/// Writes through `lost` the image changes `subscription`'s full queue
-/// dropped.
+/// Writes the image changes a full queue dropped through lost.
 ///
 /// # Safety
 ///
@@ -2005,9 +2006,9 @@ pub unsafe extern "C" fn karyos_subscription_image_changes_lost(
     })
 }
 
-/// Closes `subscription` and releases it to its client, at once or at
-/// the client's next call while another call holds the client
-/// (`karyos.h`, Threads).
+/// Closes the subscription and releases it to its client, at once or at
+/// the client's next call while another call holds the client (Threads,
+/// above).
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_subscription_close(subscription: u64) -> i32 {
     guard(
@@ -2018,9 +2019,12 @@ pub extern "C" fn karyos_subscription_close(subscription: u64) -> i32 {
     )
 }
 
-/// `karyos_driver_options`: an embedded driver's options, copied by
-/// `karyos_driver_create`. `size` comes first; every setting it does not
-/// carry is the driver's default.
+/// An embedded driver's options, copied by karyos_driver_create. Fill it
+/// with karyos_driver_options_init, which sets size and the driver's
+/// defaults; every setting it does not carry is the driver's default. A
+/// struct from an older header of the same major version is accepted: the
+/// fields it lacks take their defaults. A size below that of its first
+/// version is KARYOS_E_INVALID_ARGUMENT.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DriverOptions {
@@ -2038,28 +2042,28 @@ pub struct DriverOptions {
     pub broadcast_capacity: u32,
     /// Cells of the counters region.
     pub counters_capacity: u32,
-    /// Zero; anything else is refused (a later minor may use it).
+    /// Zero; anything else is KARYOS_E_INVALID_ARGUMENT.
     pub reserved: u32,
     /// How often the driver advances its heartbeat, in nanoseconds.
     pub heartbeat_interval_ns: u64,
     /// How long a client's heartbeat may stay unchanged, in nanoseconds.
     pub client_liveness_timeout_ns: u64,
-    /// How long a handle has to move to a successor mapping, in
-    /// nanoseconds.
+    /// How long a handle has to move to a successor mapping, in ns.
     pub cutover_deadline_ns: u64,
-    /// How long the host has to call `karyos_driver_startup_complete`, in
-    /// nanoseconds (ABI 0.1.3; 30 s for an older caller's struct).
+    /// How long the host has to call karyos_driver_startup_complete, in
+    /// ns (ABI 0.1.3). Nonzero; the default, and an older struct's, is
+    /// 30 s.
     pub startup_timeout_ns: u64,
-    /// `KARYOS_NETWORK_OFF` (0) or `KARYOS_NETWORK_ON` (1, ABI 0.1.4): the
-    /// driver's network agents with their default configuration, so its
-    /// clients create `karyos:udp` channels. Off for an older caller's
-    /// struct.
+    /// KARYOS_NETWORK_OFF or KARYOS_NETWORK_ON (ABI 0.1.4); off for an
+    /// older struct. Any other value is KARYOS_E_INVALID_ARGUMENT.
     pub network: u32,
     /// Must be zero; a later version may give it a meaning.
     pub reserved0: u32,
     /// The most bytes one stream lane may take, its log buffer region plus
-    /// its conflation table's (ABI 0.1.5, R-CORE-34); 0, the default and an
-    /// older caller's struct's, sets no cap.
+    /// its conflation table's (ABI 0.1.5). 0, the default and an older
+    /// struct's, sets no cap. A stream above it is refused by
+    /// karyos_driver_add_stream, and a client's karyos:udp publication by
+    /// KARYOS_E_REFUSED, detail code 24.
     pub max_stream_bytes: u64,
 }
 
@@ -2114,14 +2118,8 @@ pub unsafe extern "C" fn karyos_driver_options_init(options: *mut DriverOptions)
     })
 }
 
-/// Fills the first `size` bytes of `options` with the defaults, at most
-/// this version's struct: `size` is the caller's `sizeof`, and its field
-/// `size` is set to the bytes written. The caller's bytes past them are
-/// not touched.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
-/// written.
+/// Fills options with the driver's defaults and its size.
+/// KARYOS_E_INVALID_ARGUMENT for a null or misaligned pointer.
 ///
 /// # Safety
 ///
@@ -2138,14 +2136,11 @@ pub unsafe extern "C" fn karyos_driver_options_init_sized(
     })
 }
 
-/// Creates an embedded driver, driven by its caller
-/// (`karyos_driver_do_work`) until `karyos_driver_start` gives it a
-/// thread, and writes its handle through `driver`. The options are copied.
-///
-/// On failure nothing is created, and `detail`, when not null and its
-/// `size` covers `karyos_detail`, receives the failure's detail
-/// (`KARYOS_E_SYSTEM`: an `errno`, or the descriptors needed in `code` and
-/// the soft limit in `value`).
+/// Creates an embedded driver and writes its handle. Its caller drives it
+/// with karyos_driver_do_work until karyos_driver_start gives it a thread.
+/// A failed create creates nothing and fills detail (may be null):
+/// KARYOS_E_SYSTEM carries errno in value, or the descriptors needed in
+/// code and the soft limit in value.
 ///
 /// # Safety
 ///
@@ -2210,8 +2205,9 @@ pub unsafe extern "C" fn karyos_driver_create(
     })
 }
 
-/// Runs one duty cycle of `driver` and writes its work count through
-/// `work`. `KARYOS_E_BUSY` while the driver runs on its own thread.
+/// Runs one duty cycle and writes its work count. KARYOS_E_BUSY while the
+/// driver runs on its own thread; KARYOS_E_INTERNAL once a panic poisoned
+/// it.
 ///
 /// # Safety
 ///
@@ -2235,11 +2231,10 @@ pub unsafe extern "C" fn karyos_driver_do_work(driver: u64, work: *mut u32) -> i
     })
 }
 
-/// Moves `driver` to a thread of its own, which runs its duty cycle and,
-/// when one did no work, idles by `idle_strategy` (`KARYOS_IDLE_*`;
-/// `idle_sleep_ns` for `KARYOS_IDLE_SLEEP`; `KARYOS_IDLE_YIELD_THEN_SLEEP`
-/// is the agents' default, ADR-0066) until `karyos_driver_stop` or the
-/// close. `KARYOS_E_BUSY` when it already runs on one.
+/// Gives the driver a thread of its own, which runs its duty cycle and
+/// idles by idle_strategy (KARYOS_IDLE_*; idle_sleep_ns for
+/// KARYOS_IDLE_SLEEP) after a cycle without work. The agents' default is
+/// KARYOS_IDLE_YIELD_THEN_SLEEP. KARYOS_E_BUSY when it already has one.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_driver_start(driver: u64, idle_strategy: u32, idle_sleep_ns: u64) -> i32 {
     guard(|| {
@@ -2254,9 +2249,9 @@ pub extern "C" fn karyos_driver_start(driver: u64, idle_strategy: u32, idle_slee
     })
 }
 
-/// Stops `driver`'s thread and gives the driver back to its caller.
-/// `KARYOS_E_BUSY` when it does not run on one; `KARYOS_E_INTERNAL` when a
-/// panic on its thread poisoned it.
+/// Stops the driver's thread and gives the driver back to its caller.
+/// KARYOS_E_BUSY when it has none; KARYOS_E_INTERNAL when a panic on it
+/// poisoned the driver.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_driver_stop(driver: u64) -> i32 {
     guard(|| match driver::stop(Handle::from_raw(driver)) {
@@ -2265,11 +2260,10 @@ pub extern "C" fn karyos_driver_stop(driver: u64) -> i32 {
     })
 }
 
-/// Declares `driver`'s startup complete (R-CORE-35): its readiness may
-/// then be ready. Writes 1 through `complete` when startup is complete,
-/// and 0 when `startup_timeout_ns` had already passed: the readiness is
-/// then failed, for good. Calling it again writes the same answer. It
-/// works whether the driver runs on its caller's thread or its own.
+/// Declares the host's startup complete (R-CORE-35): its streams and
+/// whatever else it needs before serving exist. Writes 1 through complete,
+/// or 0 when startup_timeout_ns had already passed: the readiness is then
+/// FAILED for good. It works with or without karyos_driver_start.
 ///
 /// # Safety
 ///
@@ -2293,16 +2287,18 @@ pub unsafe extern "C" fn karyos_driver_startup_complete(driver: u64, complete: *
     })
 }
 
-/// `karyos_readiness`: a driver's readiness (R-CORE-35), written by
-/// `karyos_driver_readiness`. `size` comes first and is set by the caller.
+/// A driver's readiness, written by karyos_driver_readiness. The caller
+/// sets size to sizeof(karyos_readiness); a size below that of ABI 0.1.3
+/// is KARYOS_E_INVALID_ARGUMENT, and a larger one gets the fields this
+/// version knows.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ReadinessOut {
     /// The struct's size in bytes, set by the caller.
     pub size: u32,
-    /// `KARYOS_READINESS_*`.
+    /// KARYOS_READINESS_*.
     pub state: u32,
-    /// `KARYOS_READINESS_REASON_*`.
+    /// KARYOS_READINESS_REASON_*.
     pub reason: u32,
     /// Written as zero.
     pub reserved: u32,
@@ -2313,11 +2309,12 @@ pub struct ReadinessOut {
 /// The size of `karyos_readiness` in ABI 0.1.3, its first version.
 const READINESS_SIZE_0_1_3: u32 = 24;
 
-/// Writes `driver`'s readiness through `out` (R-CORE-35): the state, the
-/// reason, and the uptime. The codes are those of the admission protocol's
-/// readiness probe. It reads the driver's state and its clock, and touches
-/// no data path. A host that never calls `karyos_driver_startup_complete`
-/// reads `KARYOS_READINESS_FAILED` once `startup_timeout_ns` has passed.
+/// Writes the driver's readiness, its reason and its uptime (R-CORE-35).
+/// It reads the driver's state and clock, and touches no data path. A host
+/// that never calls karyos_driver_startup_complete reads
+/// KARYOS_READINESS_FAILED once startup_timeout_ns (30 s by default) has
+/// passed. KARYOS_E_INVALID_ARGUMENT for a null or misaligned out, or a
+/// size below that of ABI 0.1.3.
 ///
 /// # Safety
 ///
@@ -2358,9 +2355,15 @@ pub unsafe extern "C" fn karyos_driver_readiness(driver: u64, out: *mut Readines
     })
 }
 
-/// `karyos_stream_options`: a stream's options, copied by
-/// `karyos_driver_add_stream`: the fields of the Rust `StreamConfig` and
-/// its log buffer, without conflation. `size` comes first.
+/// A stream's options, copied by karyos_driver_add_stream: the driver's
+/// stream configuration and its conflation table. Fill it with
+/// karyos_stream_options_init, then set stream_id. This version takes lane
+/// 0 only (KARYOS_E_INVALID_LANE otherwise); the driver checks the sizes.
+/// The size rule of karyos_driver_options applies, with three layouts: 64
+/// bytes up to claim_deadline_ns (an exclusive stream with no conflation
+/// table), 80 bytes with the conflation fields, and 88 bytes with
+/// publishers. A size between two layouts, or a nonzero reserved, is
+/// KARYOS_E_INVALID_ARGUMENT.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct StreamOptions {
@@ -2382,28 +2385,52 @@ pub struct StreamOptions {
     pub session_id: i32,
     /// The first term's id.
     pub initial_term_id: u32,
-    /// The lane; 0 in this version.
+    /// The lane: 0.
     pub lane: u32,
-    /// `KARYOS_PUBLICATION_*`.
+    /// KARYOS_PUBLICATION_*.
     pub publication_mode: u32,
-    /// Offers allowed with no subscriber attached: 0 or 1.
+    /// Offers allowed with no subscriber attached: 0 or 1. It applies to
+    /// every publication of the stream, exclusive or concurrent, an
+    /// in-process or a remote client's.
     pub allow_unconnected: u32,
-    /// Entries of the stream's schedule ring: 0 for none, or a power of
-    /// two up to `1 << 20` on an exclusive stream.
+    /// Entries of a schedule ring, which would make the lane timed
+    /// (karyos_publication_offer_at). Must be 0: karyos_driver_add_stream
+    /// refuses any other value with KARYOS_E_INVALID_ARGUMENT, since a
+    /// driver's stream has no sender to release the ring, which would take
+    /// its capacity of timed offers and then back pressure for good. A
+    /// timed lane is a network publication's: a driver configures timed
+    /// network streams (karyosd --timed-network), and a client's network
+    /// publication of such a stream is timed.
     pub schedule_capacity: u32,
-    /// `KARYOS_LOSS_*`: what a lost required subscriber does.
+    /// KARYOS_LOSS_*: what a lost required subscriber does.
     pub on_required_loss: u32,
     /// How long a claim may stay open, in nanoseconds.
     pub claim_deadline_ns: u64,
-    /// Keys of the stream's conflation table; 0, with the two below, for
-    /// none (F7b-2b).
+    /// The stream's conflation table (from 80 bytes): its keys, its largest
+    /// value and its update journal, in bytes. All three 0 for none; a
+    /// partial set, or a table the driver cannot build, is
+    /// KARYOS_E_INVALID_ARGUMENT. An offer's reserved value is its key.
     pub conflation_keys: u32,
     /// The largest value of the table, in bytes.
     pub conflation_value_capacity: u32,
     /// Bytes of the table's update journal.
     pub conflation_journal_capacity: u64,
-    /// Concurrent handles at once, at least 1 for
-    /// `KARYOS_PUBLICATION_CONCURRENT`, 0 for exclusive (from 88 bytes).
+    /// Concurrent handles at once (from 88 bytes): 1 to 255 with
+    /// KARYOS_PUBLICATION_CONCURRENT, 0 with KARYOS_PUBLICATION_EXCLUSIVE;
+    /// anything else is KARYOS_E_INVALID_ARGUMENT. Each publisher, like
+    /// each optional or observer reader, takes one spare-slot credit for the
+    /// stream's life, and one spare slot is kept for cleaning: publishers +
+    /// optional and observer readers <= spare_slots - 1 (an exclusive
+    /// stream counts 1 publisher). Past it the stream is refused
+    /// (KARYOS_E_RESOURCES_UNAVAILABLE), or later the reader is. With the
+    /// default 3 spare slots, 2 publishers leave room for no optional
+    /// reader: raise spare_slots for a concurrent stream that also has
+    /// optional readers, such as an Archive's request stream. A concurrent
+    /// handle's offer needs a connected subscriber (KARYOS_E_NOT_CONNECTED
+    /// otherwise) unless the stream allows unconnected offers. Each handle
+    /// reserves with one atomic fetch_add: on an aarch64 CPU without LSE
+    /// atomics, as detected at run time (not the build's target features),
+    /// the driver refuses a concurrent stream, its default.
     pub publishers: u32,
     /// Zero.
     pub reserved: u32,
@@ -2470,14 +2497,9 @@ pub unsafe extern "C" fn karyos_stream_options_init(options: *mut StreamOptions)
     })
 }
 
-/// Fills the first `size` bytes of `options` with the defaults, at most
-/// this version's struct: `size` is the caller's `sizeof`, and its field
-/// `size` is set to the bytes written. The caller's bytes past them are
-/// not touched.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
-/// written.
+/// Fills options with a stream's defaults (stream id 0, the smallest term)
+/// and its size. KARYOS_E_INVALID_ARGUMENT for a null or misaligned
+/// pointer.
 ///
 /// # Safety
 ///
@@ -2494,14 +2516,12 @@ pub unsafe extern "C" fn karyos_stream_options_init_sized(
     })
 }
 
-/// Adds a stream to `driver`, which lives until
-/// `karyos_driver_remove_stream` or the driver's close. The options are
-/// copied. On failure nothing is added, and `detail` receives the
-/// failure's detail (a duplicate stream id: `KARYOS_E_INVALID_ARGUMENT`
-/// with the stream id in `code` and the session id in `value`). A stream
-/// above the driver's `max_stream_bytes` (`karyos_driver_options`, ABI
-/// 0.1.5) is `KARYOS_E_INVALID_ARGUMENT` with its bytes in `code` and the
-/// cap in `value`.
+/// Adds a stream to the driver, until karyos_driver_remove_stream or the
+/// driver's close. A failure adds nothing and fills detail (may be null): a
+/// duplicate stream id is KARYOS_E_INVALID_ARGUMENT with the stream id in
+/// code and the session id in value. A stream above the driver's
+/// max_stream_bytes is KARYOS_E_INVALID_ARGUMENT with the stream's bytes
+/// in code and the cap in value.
 ///
 /// # Safety
 ///
@@ -2567,9 +2587,9 @@ pub unsafe extern "C" fn karyos_driver_add_stream(
     })
 }
 
-/// Removes `driver`'s stream `stream_id`: its publication closes, and its
-/// subscribers read up to its seal. `KARYOS_E_INVALID_ARGUMENT` for a
-/// stream id the driver does not have.
+/// Removes the driver's stream: its publication closes, and its subscribers
+/// read up to its seal. KARYOS_E_INVALID_ARGUMENT for a stream id the
+/// driver does not have.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_driver_remove_stream(driver: u64, stream_id: i32) -> i32 {
     guard(
@@ -2580,22 +2600,29 @@ pub extern "C" fn karyos_driver_remove_stream(driver: u64, stream_id: i32) -> i3
     )
 }
 
-/// `karyos_conflated_handler`: called once per delivered key with the
-/// caller's `context`, the `key`, its latest value's `length` bytes at
-/// `data` (the reader's private copy, valid only during the call), the
-/// value's `version` and its `freshness` (`KARYOS_FRESH`, or the start of
-/// the gap that made it stale). It must return normally.
-pub type ConflatedHandler =
-    Option<unsafe extern "C" fn(*mut c_void, u32, *const u8, usize, u64, u64)>;
+/// Called once per delivered key with the caller's context, the key, its
+/// latest value's length bytes at data (the reader's private copy, never
+/// the shared table, valid only during the call), the value's version and
+/// its freshness (KARYOS_FRESH, or the start of the gap that made it
+/// stale). It must return normally.
+pub type ConflatedHandler = Option<
+    unsafe extern "C" fn(
+        context: *mut c_void,
+        key: u32,
+        data: *const u8,
+        length: usize,
+        version: u64,
+        freshness: u64,
+    ),
+>;
 
-/// Subscribes to the conflation table of `driver`'s stream `stream_id` and
-/// writes the conflated subscription's handle through `conflated`. The
-/// view follows its driver: once the driver is closed it answers
-/// `KARYOS_E_CLOSED`, and is still closed with `karyos_conflated_close`.
-/// `KARYOS_E_INVALID_ARGUMENT` for a stream id the driver does not have,
-/// `KARYOS_E_CONFLATION` for a stream without a conflation table,
-/// `KARYOS_E_CLOSED` for a stream being removed or a closed driver; on
-/// failure nothing is opened.
+/// Subscribes to the conflation table of the driver's stream and writes
+/// the conflated subscription's handle. The view follows its driver: once
+/// the driver is closed it answers KARYOS_E_CLOSED, and is still closed
+/// with karyos_conflated_close. KARYOS_E_INVALID_ARGUMENT for a stream id
+/// the driver does not have, KARYOS_E_CONFLATION for a stream without a
+/// table, KARYOS_E_CLOSED for a stream being removed or a closed driver; a
+/// failure opens nothing.
 ///
 /// # Safety
 ///
@@ -2623,20 +2650,18 @@ pub unsafe extern "C" fn karyos_driver_subscribe_conflated(
     })
 }
 
-/// Adds a view of the conflation table of the `karyos:ipc` stream
-/// `stream_id` to `client` and writes its handle through `conflated`
-/// (F7b-2c). A client attached to a driver in another process takes it;
-/// a client of a driver in this process is refused by its driver
-/// (`KARYOS_E_REFUSED`): take that view with
-/// `karyos_driver_subscribe_conflated`. The view is the client's: closing
-/// the client closes it, and its handle then answers `KARYOS_E_CLOSED`.
-/// Its poll reads with the default retries and its table must be within
-/// the default limits (2^20 keys, 64 KiB values, a 64 MiB journal); the
-/// key budget is each poll's. A control call: it waits for the driver up
-/// to the client's timeout, and holds the client handle meanwhile. On
-/// failure nothing is opened and `detail` (may be null) receives the
-/// failure's detail; another channel than `karyos:ipc` is
-/// `KARYOS_E_UNSUPPORTED_CHANNEL`.
+/// Adds a view of the conflation table of the karyos:ipc stream stream_id
+/// to the client and writes its handle. A client attached to a driver in
+/// another process takes it; a client of a driver in this process is
+/// refused by its driver (KARYOS_E_REFUSED): take that view with
+/// karyos_driver_subscribe_conflated. The view is the client's: closing the
+/// client closes it, and its handle then answers KARYOS_E_CLOSED. There is
+/// no options struct: its poll reads with the default retries, its table
+/// must be within the default limits (2^20 keys, 64 KiB values, a 64 MiB
+/// journal), and the key budget is each poll's. A control call: it waits
+/// for the driver up to the client's timeout and holds the client handle
+/// meanwhile. A failure opens nothing and fills detail (may be null);
+/// another channel is KARYOS_E_UNSUPPORTED_CHANNEL.
 ///
 /// # Safety
 ///
@@ -2676,14 +2701,13 @@ pub unsafe extern "C" fn karyos_client_add_conflated_subscription(
     })
 }
 
-/// Delivers the latest value of at most `key_budget` changed keys of
-/// `conflated` to `handler`, and writes how many through `delivered` (may
-/// be null), also on failure. Intermediate versions may be skipped; a
-/// `key_budget` of 0 delivers nothing. A data-path call: it never waits
-/// and never allocates. Once the table published a terminal invalidation
-/// the view is closed: that poll and every later one return
-/// `KARYOS_E_CLOSED`. The handler runs while the view is held: from it,
-/// polling or closing this view returns `KARYOS_E_REENTRANT`.
+/// Delivers the latest value of at most key_budget changed keys to handler
+/// and writes how many through delivered (may be null), also on failure.
+/// Intermediate versions may be skipped; a key_budget of 0 delivers
+/// nothing. A data-path call: it never waits and never allocates. Once the
+/// table published a terminal invalidation the view is closed: that poll
+/// and every later one return KARYOS_E_CLOSED. From the handler, polling
+/// or closing this view returns KARYOS_E_REENTRANT.
 ///
 /// # Safety
 ///
@@ -2735,9 +2759,9 @@ pub unsafe extern "C" fn karyos_conflated_poll(
     })
 }
 
-/// Closes `conflated`. A client's view is released to its client, at once
-/// or at the client's next call while another call holds the client
-/// (`karyos.h`, Threads).
+/// Closes the conflated subscription. A client's view is released to its
+/// client, at once or at the client's next call while another call holds
+/// the client (Threads, above).
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_conflated_close(conflated: u64) -> i32 {
     guard(
@@ -2748,12 +2772,10 @@ pub extern "C" fn karyos_conflated_close(conflated: u64) -> i32 {
     )
 }
 
-/// Opens a client of `driver` in this process and writes its handle
-/// through `client`. The client follows its driver: `KARYOS_E_INTERNAL`
-/// once the driver is poisoned, `KARYOS_E_CLOSED` once it is closed.
-///
-/// On failure nothing is opened, and `detail` receives the failure's
-/// detail as for `karyos_client_connect`.
+/// Opens a client of the driver in this process and writes its handle. The
+/// client follows its driver: KARYOS_E_INTERNAL once the driver is
+/// poisoned, KARYOS_E_CLOSED once it is closed. A failed connect opens
+/// nothing and fills detail (may be null).
 ///
 /// # Safety
 ///
@@ -2786,10 +2808,10 @@ pub unsafe extern "C" fn karyos_driver_connect(
     })
 }
 
-/// Closes `driver`, stopping its thread first. Its clients stay open, to
-/// be closed, and answer `KARYOS_E_CLOSED` meanwhile. A handle in use
-/// answers `KARYOS_E_BUSY` or `KARYOS_E_REENTRANT` (nothing is closed
-/// then).
+/// Closes the driver, stopping its thread first. Its clients stay open,
+/// answer KARYOS_E_CLOSED, and are closed with karyos_client_close. A
+/// handle in use answers KARYOS_E_BUSY or KARYOS_E_REENTRANT, and nothing
+/// is closed.
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_driver_close(driver: u64) -> i32 {
     guard(|| match driver::close(Handle::from_raw(driver)) {
@@ -2809,10 +2831,12 @@ pub(crate) const RECORDING_STOPPED: u32 = 1;
 /// The size of the first `karyos_archive_options`.
 const ARCHIVE_OPTIONS_SIZE_0_1: u32 = 32;
 
-/// `karyos_archive_options`: the control streams of an Archive and how a
-/// connection to it waits. `size` is the caller's
-/// `sizeof(karyos_archive_options)`; the library reads the fields it
-/// knows of a newer struct, and the defaults past an older one.
+/// The control streams of an Archive and how a connection to it waits.
+/// size is the caller's sizeof(karyos_archive_options); the library reads
+/// the fields it knows of a newer struct, and the defaults past an older
+/// one. reserved must be 0. client_id is this requester's id, at most
+/// UINT32_MAX and unique among the Archive's requesters. deadline_ns is how
+/// long a listing waits; 0 for the client's timeout.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ArchiveOptions {
@@ -2832,10 +2856,14 @@ pub struct ArchiveOptions {
     pub deadline_ns: u64,
 }
 
-/// `karyos_recording`: one recording of a listing, handed to the handler
-/// for the call only. `size` is this version's `sizeof(karyos_recording)`:
-/// a handler built against an older header reads only the fields it
-/// knows.
+/// One recording of a listing, valid only during the handler call. size is
+/// this version's sizeof(karyos_recording): a handler built against an
+/// older header reads only the fields it knows. state is a
+/// KARYOS_RECORDING_* value; stop_reason a KARYOS_STOP_* reason when
+/// stopped, 0 while it records; incomplete 1 when the recording lost
+/// ranges. start_time_ns is in nanoseconds since the Archive agent
+/// started. position is the position written so far, or where it stopped.
+/// channel holds channel_length bytes, not NUL-terminated.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Recording {
@@ -2865,10 +2893,10 @@ pub struct Recording {
     pub channel_length: usize,
 }
 
-/// `karyos_recording_handler`: called once per recording with the
-/// caller's `context` and the recording, valid only during the call. It
-/// must return normally.
-pub type RecordingHandler = Option<unsafe extern "C" fn(*mut c_void, *const Recording)>;
+/// Called once per recording with the caller's context and the recording,
+/// valid only during the call. It must return normally.
+pub type RecordingHandler =
+    Option<unsafe extern "C" fn(context: *mut c_void, recording: *const Recording)>;
 
 /// The `KARYOS_STOP_*` code of `reason`; `None` for a reason a later
 /// Archive version decodes, which has no code here (owner item 41).
@@ -2927,15 +2955,13 @@ fn recording(listed: &karyos_archive::client::list::ListedRecording) -> Option<R
     })
 }
 
-/// Opens a connection of `client` to the Archive whose control streams
-/// `options` names, and writes its handle through `archive`: a concurrent
-/// publication on its request stream and an optional subscription on its
-/// response stream, both the client's. The connection is the client's:
-/// closing the client closes it. A control call: it waits for the driver
-/// up to the client's timeout, and holds the client handle meanwhile. On
-/// failure nothing is opened and `detail` (may be null) receives the
-/// failure's detail; a `client_id` above `UINT32_MAX` or a nonzero
-/// `reserved` is `KARYOS_E_INVALID_ARGUMENT`.
+/// Opens a connection of the client to the Archive whose control streams
+/// options names, and writes its handle: a concurrent publication on its
+/// request stream and an optional subscription on its response stream,
+/// both the client's. Closing the client closes it. A control call: it
+/// waits for the driver up to the client's timeout. A failed connect opens
+/// nothing and fills detail (may be null); a client_id above UINT32_MAX or
+/// a nonzero reserved is KARYOS_E_INVALID_ARGUMENT.
 ///
 /// # Safety
 ///
@@ -2993,22 +3019,18 @@ pub unsafe extern "C" fn karyos_archive_connect(
     })
 }
 
-/// Lists the recordings of `archive`'s catalog whose id is above
-/// `after_id`, at most `limit`, handing each to `handler` in id order, and
-/// writes how many through `delivered` (may be null), also on failure.
-/// Fewer than `limit` means the catalog has no more; the next page starts
-/// after the last id delivered. A `limit` of 0 delivers nothing.
-///
-/// A control call: it serves the client and waits for the whole page up
-/// to the connection's deadline (its options' `deadline_ns`, or the
-/// client's timeout), then hands it over; it allocates at most `limit`
-/// recordings. A page that does not arrive in time is
-/// `KARYOS_E_TIMEOUT` with nothing delivered; an Archive's refusal is
-/// `KARYOS_E_REFUSED` with its response code in `detail`'s `code` (1 an
-/// error, 2 an unknown recording, 3 an unknown replay, 4 an invalid
-/// request, 5 an unsupported schema). The handler runs while the
-/// connection and its client are held: from it, any call on either
-/// returns `KARYOS_E_REENTRANT`, and another thread's `KARYOS_E_BUSY`.
+/// Lists the recordings of the Archive's catalog whose id is above
+/// after_id, at most limit, handing each to handler in id order, and
+/// writes how many through delivered (may be null), also on failure. Fewer
+/// than limit means the catalog has no more; the next page starts after
+/// the last id delivered. A limit of 0 delivers nothing. A control call: it
+/// waits for the whole page up to the connection's deadline, then hands it
+/// over. A page that does not arrive in time is KARYOS_E_TIMEOUT with
+/// nothing delivered; an Archive's refusal is KARYOS_E_REFUSED with its
+/// response code in detail's code (1 an error, 2 an unknown recording, 3
+/// an unknown replay, 4 an invalid request, 5 an unsupported schema). From
+/// the handler, any call on the connection or its client returns
+/// KARYOS_E_REENTRANT; another thread's returns KARYOS_E_BUSY.
 ///
 /// # Safety
 ///
@@ -3066,9 +3088,9 @@ pub unsafe extern "C" fn karyos_archive_list(
     })
 }
 
-/// Closes `archive`: its two streams are removed from its client, at once
-/// or at the client's next call while another call holds the client
-/// (`karyos.h`, Threads).
+/// Closes the Archive connection: its two streams are removed from its
+/// client, at once or at the client's next call while another call holds
+/// the client (Threads, above).
 #[unsafe(no_mangle)]
 pub extern "C" fn karyos_archive_close(archive: u64) -> i32 {
     guard(|| match api::archive::close(Handle::from_raw(archive)) {
@@ -3090,18 +3112,18 @@ pub(crate) const REPLAY_SCALED: u32 = 3;
 /// The size of the first `karyos_replay_options`.
 const REPLAY_OPTIONS_SIZE_0_1: u32 = 48;
 
-/// `karyos_replay_options`: what to replay, and where. `size` is the
-/// caller's `sizeof(karyos_replay_options)`; the library reads the fields
-/// it knows of a newer struct, and the defaults past an older one.
+/// What to replay, and where. Set size to sizeof(karyos_replay_options);
+/// karyos_replay_options_init fills it and the defaults (the whole
+/// recording from position 0 at full rate over karyos:ipc). The rule of
+/// karyos_detail applies to its size.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ReplayOptions {
     /// The struct's size in bytes, set by the caller.
     pub size: u32,
-    /// `KARYOS_REPLAY_FULL`, `_AS_RECORDED` or `_SCALED`.
+    /// KARYOS_REPLAY_FULL, _AS_RECORDED or _SCALED.
     pub rate: u32,
-    /// For `KARYOS_REPLAY_SCALED`, the scale in parts per million of the
-    /// recorded pace, 1 to 100 000 000; 0 otherwise.
+    /// For KARYOS_REPLAY_SCALED, 1 to 100000000; 0 otherwise.
     pub scale_ppm: u32,
     /// The target stream.
     pub target_stream_id: i32,
@@ -3109,10 +3131,10 @@ pub struct ReplayOptions {
     pub recording_id: u64,
     /// The first position replayed.
     pub position: u64,
-    /// Bytes; `UINT64_MAX` to the recording's end.
+    /// Bytes; UINT64_MAX to the recording's end.
     pub length: u64,
-    /// The target channel, NUL-terminated UTF-8 of 1 to 1024 bytes, read
-    /// during the call; null for `karyos:ipc`.
+    /// NUL-terminated UTF-8 of 1 to 1024 bytes, read during the call; NULL
+    /// for karyos:ipc.
     pub target_channel: *const c_char,
 }
 
@@ -3150,14 +3172,7 @@ pub unsafe extern "C" fn karyos_replay_options_init(options: *mut ReplayOptions)
     })
 }
 
-/// Fills the first `size` bytes of `options` with the defaults, at most
-/// this version's struct: `size` is the caller's `sizeof`, and its field
-/// `size` is set to the bytes written. The caller's bytes past them are
-/// not touched.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
-/// written.
+/// Fills options with the defaults and its size.
 ///
 /// # Safety
 ///
@@ -3210,27 +3225,29 @@ unsafe fn replay_spec(
     Ok(spec)
 }
 
-/// Starts a replay on `archive` of what `options` names, and writes its id
-/// through `replay_id` and its target's session id through `session_id`.
-/// The target is a replay target at `options`' `target_stream_id` and that
-/// session, exclusive to its first reader:
-/// `karyos_client_add_replay_subscription` takes it. A replay's end is its
-/// target's seal, which `karyos_subscription_end_state` reads; no answer tells
-/// the requester.
+/// Starts a replay on the Archive connection of what options names, and
+/// writes its id and its target's session id. The target is a replay
+/// target at options' target_stream_id and that session, exclusive to its
+/// first reader: karyos_client_add_replay_subscription takes it. A
+/// replay's end is its target's seal, which karyos_subscription_end_state reads;
+/// no answer tells the requester.
 ///
-/// A control call: it serves the client and waits for the Archive's
-/// answer up to the connection's deadline, and holds the client, then the
-/// Archive handle, meanwhile. The handle's first replay call opens control
-/// streams of its own, with the next requester id the handle hands out: a
-/// host with no publisher left on its request stream refuses it
-/// (`KARYOS_E_REFUSED`).
+/// A control call (Threads, above): it serves the client and waits for the
+/// Archive's answer up to the connection's deadline, holding the client,
+/// then the Archive handle. From a subscription's poll handler, which
+/// holds only its subscription, it is allowed but blocks that poll up to
+/// the deadline, so avoid it. The connection's first replay call opens
+/// control streams of its own, with the next requester id the connection
+/// hands out: a host with no publisher left on its request stream refuses
+/// it (KARYOS_E_REFUSED).
 ///
-/// An Archive's refusal is `KARYOS_E_REFUSED` with its response code in
-/// `detail`'s `code` (as `karyos_archive_list`'s); no answer in time is
-/// `KARYOS_E_TIMEOUT`, and a replay the late answer started is stopped;
-/// 16 requests of the handle waiting is `KARYOS_E_BUSY`. A recording id
-/// of 0, a rate and scale that do not match, or a channel that is not
-/// UTF-8 of 1 to 1024 bytes is `KARYOS_E_INVALID_ARGUMENT`.
+/// An Archive's refusal is KARYOS_E_REFUSED with its response code in
+/// detail's code (as karyos_archive_list's); no answer in time is
+/// KARYOS_E_TIMEOUT, and a replay its late answer started is stopped; 16
+/// of the connection's requests waiting is KARYOS_E_BUSY, as a held handle
+/// is (poll the client and call again). A recording_id of 0, a rate and
+/// scale_ppm that do not match, or a channel that is not UTF-8 of 1 to
+/// 1024 bytes is KARYOS_E_INVALID_ARGUMENT.
 ///
 /// # Safety
 ///
@@ -3283,10 +3300,10 @@ pub unsafe extern "C" fn karyos_archive_replay(
     })
 }
 
-/// Stops replay `replay_id` on `archive`; its target seals
-/// `ImageRetired`. A control call, as `karyos_archive_replay`: a replay
-/// the Archive does not run (ended, or never started) is
-/// `KARYOS_E_REFUSED` with code 3 (an unknown replay) in `detail`.
+/// Stops the replay; its target seals as an image retired. A control call,
+/// as karyos_archive_replay: a replay the Archive does not run (ended, or
+/// never started) is KARYOS_E_REFUSED with code 3 (an unknown replay) in
+/// detail.
 ///
 /// # Safety
 ///
@@ -3315,9 +3332,10 @@ pub unsafe extern "C" fn karyos_archive_stop_replay(
 /// The size of the first `karyos_replay_subscription_options`.
 const REPLAY_SUBSCRIPTION_OPTIONS_SIZE_0_1: u32 = 8;
 
-/// `karyos_replay_subscription_options`: a replay subscription's options;
-/// at ABI 0.1 only its size and a reserved word, so that later fields grow
-/// it without a new function.
+/// A replay subscription's options: at ABI 0.1 only its size and a
+/// reserved word, so later fields grow it without a new function. Set size
+/// to sizeof(karyos_replay_subscription_options);
+/// karyos_replay_subscription_options_init fills it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ReplaySubscriptionOptions {
@@ -3348,14 +3366,7 @@ pub unsafe extern "C" fn karyos_replay_subscription_options_init(
     })
 }
 
-/// Fills the first `size` bytes of `options` with the defaults, at most
-/// this version's struct: `size` is the caller's `sizeof`, and its field
-/// `size` is set to the bytes written. The caller's bytes past them are
-/// not touched.
-///
-/// Returns `KARYOS_OK`, or `KARYOS_E_INVALID_ARGUMENT` for a null or
-/// misaligned pointer, or a `size` below that of ABI 0.1.0, with nothing
-/// written.
+/// Fills options with the defaults and its size.
 ///
 /// # Safety
 ///
@@ -3375,16 +3386,15 @@ pub unsafe extern "C" fn karyos_replay_subscription_options_init_sized(
     })
 }
 
-/// Adds the subscription of the replay target at `stream_id` and
-/// `session_id` (the stream and session `karyos_archive_replay` named) to
-/// `client`, and writes its handle through `subscription`.
-/// `KARYOS_E_NOT_CONNECTED` until the target's grant: a
-/// `karyos_client_poll` completes it, in both driver modes (a started
-/// embedded driver never polls a client), and the caller then calls again.
-/// One target is asked for at a time per client: asking for another
-/// withdraws the one asked for before. The subscription is the client's
-/// and polls as any other; `karyos_subscription_end_state` reads how it ended.
-/// A control call: it holds the client handle.
+/// Adds the subscription of the replay target at stream_id and session_id
+/// (as karyos_archive_replay named them) to the client and writes its
+/// handle. KARYOS_E_NOT_CONNECTED until the target's grant: a
+/// karyos_client_poll completes it, in both driver modes (a started
+/// embedded driver never polls a client), and the caller then calls
+/// again. One target is asked for at a time per client: asking for
+/// another withdraws the one asked for before. options may be NULL for the
+/// defaults. The subscription is the client's and polls as any other. A
+/// control call: it holds the client handle.
 ///
 /// # Safety
 ///
@@ -3449,20 +3459,19 @@ pub(crate) const END_OTHER: u32 = 255;
 /// The size of the first `karyos_subscription_end`.
 const SUBSCRIPTION_END_SIZE_0_1: u32 = 24;
 
-/// `karyos_subscription_end`: how a subscription ended. `size` is the
-/// caller's `sizeof`: the library writes the fields it knows of, no more
-/// than `size` bytes.
+/// How a subscription ended. Set size to sizeof(karyos_subscription_end);
+/// the rule of karyos_detail applies.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SubscriptionEnd {
     /// The struct's size in bytes, set by the caller.
     pub size: u32,
-    /// A `KARYOS_END_*` code.
+    /// A KARYOS_END_* code.
     pub reason: u32,
     /// The seal's position, a revoked reader's position, or an overrun's
     /// first position not delivered; 0 while it has not ended.
     pub position: u64,
-    /// The seal's raw reason code, for a sealed end; 0 otherwise.
+    /// The seal's raw reason code for a sealed end; 0 otherwise.
     pub seal_code: u64,
 }
 
@@ -3486,14 +3495,14 @@ pub(crate) fn end_fields(end: Option<api::subscription::End>) -> (u32, u64, u64)
     }
 }
 
-/// Writes how `subscription` ended through `end`: `KARYOS_END_NONE` while
-/// it has not, else the end a poll saw when it answered `KARYOS_E_CLOSED`
-/// or `KARYOS_E_CLOSED_BY_OVERRUN`. A stream ending cleanly also flags its
-/// last message `KARYOS_MESSAGE_END_OF_STREAM`; this call gives the reason
-/// and position of every end, one no message carries (`ImageRetired`)
+/// Writes how the subscription ended: KARYOS_END_NONE while it has not,
+/// else the end a poll saw when it answered KARYOS_E_CLOSED or
+/// KARYOS_E_CLOSED_BY_OVERRUN. A stream that ends cleanly also flags its
+/// last message KARYOS_MESSAGE_END_OF_STREAM; this call gives the reason
+/// and position of every end, one no message carries (an image retired)
 /// included. A network subscription outlives its images, whose ends its
-/// image changes report, and reads `KARYOS_END_NONE`. A data-path call: it
-/// never waits.
+/// image changes report, and reads KARYOS_END_NONE. A data-path call: it
+/// never waits. A size below 24 is KARYOS_E_INVALID_ARGUMENT.
 ///
 /// # Safety
 ///
