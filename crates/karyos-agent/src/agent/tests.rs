@@ -329,3 +329,15 @@ fn a_streams_holders_are_unknown_while_cells_are_missing() {
         registry::Presence::default()
     );
 }
+
+/// The log line of an acknowledgement with no journal names the relay and
+/// does not call a relayed principal's operator id a uid; a local one
+/// reads as before (karyos#708 review).
+#[test]
+fn an_acknowledgement_log_names_the_relay() {
+    assert_eq!(acknowledger(Requester::local(1000)), "uid 1000");
+    assert_eq!(
+        acknowledger(Requester::relayed(50_001, 7)),
+        "operator 50001 relay 7"
+    );
+}

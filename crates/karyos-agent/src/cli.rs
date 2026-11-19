@@ -10,7 +10,8 @@ pub const USAGE: &str = "\
 usage: karyos-agent --api-dir DIR --driver DIR [--driver DIR]... \
 --role UID=ROLE [--role UID=ROLE]... [--refresh-ms MS] [--lag-bytes N] \
 [--lag-refreshes N] [--loss-quiet N] [--archive DIR=REQ,RESP]... \
-[--journal DIR] [--agent-id NAME]
+[--journal DIR] [--agent-id NAME] [--relay UID=ID]... \
+[--principal NAME=OPERATOR:ROLE]... [--relay-group GID]
 
 Serves API v1 (JSON) on DIR/agent.sock to the uids given a role (viewer,
 operator, risk-officer, administrator, registrar), reading each driver's
@@ -26,7 +27,15 @@ default, it costs one client slot of that driver. Guard operations are
 journalled in the --journal directory, an Archive directory; without
 one, reopens are refused. --agent-id names this agent in its view (1 to
 64 bytes of A-Z a-z 0-9 . _ : / -), as its deployment calls it, for
-example namespace/pod; the agent looks no name up. Linux only.
+example namespace/pod; the agent looks no name up. --relay lets the uid
+of a remote control-plane component (karyos-control) carry requests for
+the principals of --principal, each recorded as its OPERATOR id (not a
+--role uid) with its ROLE; the relay's ID (1 or more) is journalled beside
+the operator. A relayed request is KARYOS-AGENT 1 relay NAME REQUEST; its
+role is the principal's here, never the relay's. --relay-group lets the
+members of GID, which this agent's uid must belong to, reach DIR/agent.sock
+(DIR 0710, the socket 0660, both of GID): a relay under a uid of its own
+joins it; without it DIR is 0700 and the socket 0600. Linux only.
 
 A request is one line: KARYOS-AGENT 1 view, or
 KARYOS-AGENT 1 guard-close DIR GUARD [REASON] (operator, risk-officer),
@@ -63,6 +72,13 @@ pub struct Args {
     pub archives: Vec<(PathBuf, crate::catalog::ArchiveStreams)>,
     /// The agent's own name (R-CORE-24).
     pub agent_id: Option<String>,
+    /// Each relay's uid and relay id (karyos#708).
+    pub relays: Vec<(u32, u64)>,
+    /// Each principal a relay may carry: its name, operator id and role
+    /// name.
+    pub principals: Vec<(String, u32, String)>,
+    /// The group whose members may reach the socket (karyos#708).
+    pub relay_group: Option<u32>,
 }
 
 /// Parses `args` (without the program name); `None` for anything this
@@ -77,6 +93,9 @@ pub fn parse(args: &[String]) -> Option<Args> {
     let mut journal = None;
     let mut archives: Vec<(PathBuf, crate::catalog::ArchiveStreams)> = Vec::new();
     let mut agent_id = None;
+    let mut relays: Vec<(u32, u64)> = Vec::new();
+    let mut principals: Vec<(String, u32, String)> = Vec::new();
+    let mut relay_group = None;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
@@ -88,6 +107,9 @@ pub fn parse(args: &[String]) -> Option<Args> {
                     return None;
                 }
                 agent_id = Some(value.clone());
+            }
+            "--relay-group" if relay_group.is_none() => {
+                relay_group = Some(value.parse::<u32>().ok()?);
             }
             "--driver" => drivers.push(PathBuf::from(value)),
             "--role" => {
@@ -104,6 +126,36 @@ pub fn parse(args: &[String]) -> Option<Args> {
                     return None;
                 }
                 roles.push((uid, role.to_owned()));
+            }
+            "--relay" => {
+                let (uid, id) = value.split_once('=')?;
+                let (uid, id): (u32, u64) = (uid.parse().ok()?, id.parse().ok()?);
+                // A relay id of 0 is the local socket's in the journal.
+                if id == 0
+                    || relays
+                        .iter()
+                        .any(|(taken, other)| *taken == uid || *other == id)
+                {
+                    return None;
+                }
+                relays.push((uid, id));
+            }
+            "--principal" => {
+                let (name, rest) = value.split_once('=')?;
+                let (operator, role) = rest.split_once(':')?;
+                let operator: u32 = operator.parse().ok()?;
+                if !crate::api::valid_principal(name)
+                    || !matches!(
+                        role,
+                        "viewer" | "operator" | "risk-officer" | "administrator" | "registrar"
+                    )
+                    || principals
+                        .iter()
+                        .any(|(taken, id, _)| taken == name || *id == operator)
+                {
+                    return None;
+                }
+                principals.push((name.to_owned(), operator, role.to_owned()));
             }
             "--refresh-ms" => {
                 let millis: u64 = value.parse().ok()?;
@@ -137,9 +189,16 @@ pub fn parse(args: &[String]) -> Option<Args> {
         }
     }
     // An Archive names one of the drivers.
+    // A principal's operator id is not a local uid's, so the journal and
+    // the audit never mistake one for the other; principals need a relay.
     if drivers.is_empty()
         || roles.is_empty()
         || archives.iter().any(|(dir, _)| !drivers.contains(dir))
+        || principals
+            .iter()
+            .any(|(_, operator, _)| roles.iter().any(|(uid, _)| uid == operator))
+        || (relays.is_empty() != principals.is_empty())
+        || (relay_group.is_some() && relays.is_empty())
     {
         return None;
     }
@@ -152,6 +211,9 @@ pub fn parse(args: &[String]) -> Option<Args> {
         journal,
         archives,
         agent_id,
+        relays,
+        principals,
+        relay_group,
     })
 }
 
@@ -371,6 +433,46 @@ mod exporter_tests {
             "--listen 127.0.0.1:1 --driver /d --role 1=viewer",
         ] {
             assert_eq!(parse_exporter(&args(refused)), None, "{refused}");
+        }
+    }
+
+    /// Relays and principals (karyos#708): a principal's operator id may
+    /// not be a local uid's, a relay id is not 0, and one needs the other.
+    #[test]
+    fn relays_and_principals_parse() {
+        let parse =
+            |line: &str| super::parse(&line.split(' ').map(str::to_owned).collect::<Vec<_>>());
+        let base = "--api-dir /a --driver /d --role 1000=viewer";
+        let parsed = parse(&format!(
+            "{base} --relay 990=7 --principal svc.ops=50001:operator"
+        ))
+        .unwrap();
+        assert_eq!(parsed.relays, [(990, 7)]);
+        assert_eq!(parsed.relay_group, None);
+        let grouped = parse(&format!(
+            "{base} --relay 990=7 --principal svc.ops=50001:operator --relay-group 990"
+        ))
+        .unwrap();
+        assert_eq!(grouped.relay_group, Some(990));
+        assert_eq!(
+            parsed.principals,
+            [("svc.ops".to_owned(), 50001, "operator".to_owned())]
+        );
+        for bad in [
+            "--relay 990=0 --principal a=1:viewer",
+            "--relay 990=7 --principal a=1000:viewer",
+            "--relay 990=7 --principal a=1:root",
+            "--relay 990=7 --principal a/b=1:viewer",
+            "--relay 990=7 --principal a=1:viewer --principal a=2:viewer",
+            "--relay 990=7 --principal a=1:viewer --principal b=1:viewer",
+            "--relay 990=7 --relay 990=8 --principal a=1:viewer",
+            "--relay 990=7",
+            "--principal a=1:viewer",
+            "--relay-group 990",
+            "--relay 990=7 --principal a=1:viewer --relay-group x",
+            "--relay 990=7 --principal a=1:viewer --relay-group 1 --relay-group 2",
+        ] {
+            assert_eq!(parse(&format!("{base} {bad}")), None, "{bad}");
         }
     }
 }

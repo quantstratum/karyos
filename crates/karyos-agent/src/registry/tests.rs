@@ -12,6 +12,26 @@ use proptest::prelude::*;
 
 const UID: u32 = 1000;
 
+/// karyos#708: a relayed put records the principal's operator id as its
+/// writer and the relay apart; a local put has no relay.
+#[test]
+fn a_relayed_put_keeps_the_requester_and_the_relay_apart() {
+    let mut registry = Registry::new(10);
+    assert_eq!(
+        registry.put_relayed(0, Kind::Point, "md.tick", "venue=xnas", (50_001, 7), 100),
+        Ok(1)
+    );
+    assert_eq!(
+        registry.put(0, Kind::Point, "md.tick", "venue=xnys", UID, 200),
+        Ok(2)
+    );
+    let entry = registry.get(0, Kind::Point, "md.tick").unwrap();
+    let relayed = entry.at(150).unwrap();
+    assert_eq!((relayed.registered_by, relayed.relay), (50_001, 7));
+    let local = entry.at(200).unwrap();
+    assert_eq!((local.registered_by, local.relay), (UID, 0));
+}
+
 /// A product puts an entry and reads it back; a second put makes version
 /// 2, and an instant before it still joins against version 1.
 #[test]
@@ -370,7 +390,7 @@ fn a_list_pages_one_drivers_keys() {
 fn generations_differ_and_memory_is_bounded() {
     assert_ne!(Registry::new(0).generation(), Registry::new(0).generation());
     assert_eq!(Registry::new(42).since_ns(), 42);
-    assert_eq!(MAX_MEMORY_BYTES, 7_208_960);
+    assert_eq!(MAX_MEMORY_BYTES, 7_241_728);
     const { assert!(MAX_MEMORY_BYTES <= 8 << 20) };
 }
 

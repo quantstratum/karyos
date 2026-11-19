@@ -76,6 +76,8 @@ pub(crate) struct Command<'a> {
     pub(crate) operation: u64,
     /// The operator's uid: the peer that asked.
     pub(crate) operator: u32,
+    /// The relay that carried the request, 0 for none (karyos#708).
+    pub(crate) relay: u64,
     /// The reason, cut to [`MAX_REASON`] bytes once, by [`cut_reason`]:
     /// the digest, the driver and the journal all see the same bytes.
     pub(crate) reason: &'a [u8],
@@ -97,6 +99,7 @@ impl Command<'_> {
             self.reason,
         );
         record.reason = self.reason.to_vec();
+        record.relay = self.relay;
         record
     }
 }

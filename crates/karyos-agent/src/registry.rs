@@ -66,9 +66,10 @@ const VERSION_BYTES: usize = std::mem::size_of::<Version>();
 const KEY_BYTES: usize = 2 * MAX_KEY_BYTES + 3 * std::mem::size_of::<(Key, Entry)>();
 /// The most memory the registry's entries hold:
 /// `MAX_KEYS x (KEY_BYTES + MAX_VERSIONS x (VERSION_BYTES + MAX_ATTRIBUTE_TEXT))`,
-/// in layout bytes; 7 208 960 bytes (6.9 MiB) on 64-bit targets. The
-/// counting allocator measures a registry filled to every bound at
-/// 7 057 552 held and 7 059 375 at its peak (`tests/registry_memory.rs`).
+/// in layout bytes; 7 241 728 bytes (6.9 MiB) on 64-bit targets, with
+/// each version's relay id (karyos#708). The counting allocator checks
+/// that a registry filled to every bound holds no more, held and at its
+/// peak (`tests/registry_memory.rs`).
 pub const MAX_MEMORY_BYTES: usize =
     MAX_KEYS * (KEY_BYTES + MAX_VERSIONS * (VERSION_BYTES + MAX_ATTRIBUTE_TEXT));
 
@@ -115,8 +116,13 @@ type Key = (usize, Kind, String);
 pub struct Version {
     /// Its number, from 1 per key.
     pub number: u64,
-    /// The uid that put it.
+    /// The uid that put it, or, for a relayed request (karyos#708), the
+    /// principal's operator id.
     pub registered_by: u32,
+    /// The relay that carried the request (karyos#708), by its configured
+    /// id; 0 for a request on the local socket. Kept apart from
+    /// `registered_by`, as the journal keeps it.
+    pub relay: u64,
     /// Host `CLOCK_MONOTONIC` nanoseconds from which it is in force.
     pub valid_from: u64,
     /// Until which it is in force, exclusive; `None` while current.
@@ -333,6 +339,26 @@ impl Registry {
         uid: u32,
         now: u64,
     ) -> Result<u64, Refusal> {
+        self.put_relayed(driver, kind, key, attributes, (uid, 0), now)
+    }
+
+    /// [`Registry::put`] for `by`: the operator (a uid, or a relayed
+    /// principal's operator id) and the relay's id, 0 for none
+    /// (karyos#708).
+    ///
+    /// # Errors
+    ///
+    /// As [`Registry::put`].
+    pub fn put_relayed(
+        &mut self,
+        driver: usize,
+        kind: Kind,
+        key: &str,
+        attributes: &str,
+        by: (u32, u64),
+        now: u64,
+    ) -> Result<u64, Refusal> {
+        let (uid, relay) = by;
         check_key(kind, key)?;
         let attributes = check_attributes(attributes)?;
         let id = (driver, kind, key.to_owned());
@@ -380,6 +406,7 @@ impl Registry {
         entry.versions.push_back(Version {
             number,
             registered_by: uid,
+            relay,
             valid_from: now,
             valid_to: None,
             attributes,

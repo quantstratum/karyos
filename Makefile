@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check raft-eval lint-sync changelog-check lint-linux pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check raft-eval lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -127,6 +127,12 @@ deps-inventory:
 deps-check:
 	@tmp=$$(mktemp) && python3 scripts/dependency-inventory.py $$tmp && diff -u deps/dependency-inventory.json $$tmp; status=$$?; rm -f $$tmp; exit $$status
 
+# The control-plane component's graph stays out of the agent's and the
+# default build's, with no native crypto (karyos#708; the agent HTTP
+# stack's admission record, conditions 3 and 4).
+control-plane-graph-check:
+	scripts/check-control-plane-graph.sh
+
 # No Raft candidate and not the evaluation crate in any shipped graph, and
 # no Tokio outside karyos-control's (cargo tree, every target, default and every feature; with
 # negative controls): the evaluation-only admission's
@@ -152,4 +158,4 @@ changelog-check:
 netem:
 	scripts/netem-test.sh
 
-pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check
+pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check

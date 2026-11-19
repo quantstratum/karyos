@@ -294,7 +294,7 @@ fn a_client_negotiates_the_limits() {
         r#""join.value_bytes":{"value":64,"negotiable":false},"#,
         r#""join.key_bytes":{"value":64,"negotiable":false},"#,
         r#""join.list_page":{"value":64,"negotiable":false},"#,
-        r#""join.memory_bytes":{"value":7208960,"negotiable":false}}}"#,
+        r#""join.memory_bytes":{"value":7241728,"negotiable":false}}}"#,
         "\n"
     );
     let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 limits\n");
@@ -398,6 +398,46 @@ fn the_socket_is_private_never_taken_over_and_cleaned_up() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     drop(stale);
     let _server = Server::bind(config()).unwrap();
+}
+
+/// karyos#708: an API directory left by a run without a relay group is
+/// brought to the group's modes when the next run has one, and back when
+/// it has none; a mode neither run uses is still refused.
+#[test]
+fn an_existing_directory_follows_the_relay_group_setting() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let _serial = serial();
+    let dir = dir("regroup");
+    let plain = || ApiConfig::new(dir.clone(), vec![(own(), Role::Viewer)]);
+    // A group this process is in: the one its new directories get.
+    let server = Server::bind(plain()).unwrap();
+    let gid = std::fs::metadata(&dir).unwrap().gid();
+    drop(server);
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dir), 0o700);
+    let server = Server::bind(plain().with_relay_group(gid)).unwrap();
+    assert_eq!((mode(&dir), mode(server.path())), (0o710, 0o660));
+    assert_eq!(std::fs::metadata(server.path()).unwrap().gid(), gid);
+    drop(server);
+    let server = Server::bind(plain()).unwrap();
+    assert_eq!((mode(&dir), mode(server.path())), (0o700, 0o600));
+    // A second agent that starts with the other setting while this one
+    // serves fails, and changes nothing of the live agent's.
+    assert!(matches!(
+        Server::bind(plain().with_relay_group(gid)),
+        Err(ServeError::Live(_))
+    ));
+    assert_eq!((mode(&dir), mode(server.path())), (0o700, 0o600));
+    drop(server);
+    let server = Server::bind(plain().with_relay_group(gid)).unwrap();
+    assert!(matches!(Server::bind(plain()), Err(ServeError::Live(_))));
+    assert_eq!((mode(&dir), mode(server.path())), (0o710, 0o660));
+    drop(server);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+    assert!(matches!(
+        Server::bind(plain().with_relay_group(gid)),
+        Err(ServeError::NotPrivate(_))
+    ));
 }
 
 /// The binary: a bad command line exits 2; a good one serves the view of a
@@ -618,4 +658,102 @@ fn a_half_request_is_dropped_within_the_read_deadline() {
     let mut answer = Vec::new();
     client.read_to_end(&mut answer).unwrap();
     assert!(answer.is_empty());
+}
+
+/// karyos#708: a relay under a uid of its own, as `--relay UID=ID`
+/// allows, reaches the socket through the relay group and only through
+/// it: without the group the kernel refuses it before the agent sees it;
+/// with it, it is served; a uid outside the group still cannot connect.
+/// The agent runs as root and the relay as other uids, so it runs where
+/// the tests are root (the Docker runs) and passes trivially elsewhere.
+#[test]
+fn a_relay_under_its_own_uid_reaches_the_socket_through_its_group() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::process::CommandExt;
+
+    use karyos_agent::server::Principal;
+
+    const RELAY: u32 = 64_000;
+    const GROUP: u32 = 64_000;
+    const OTHER: u32 = 64_001;
+    if own() != 0 {
+        return;
+    }
+    let _serial = serial();
+    let (_driver, mut agent, dir) = attached("relay-uid");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (group, uid, gid, served) in [
+        (None, RELAY, GROUP, false),
+        (Some(GROUP), RELAY, GROUP, true),
+        (Some(GROUP), OTHER, OTHER, false),
+    ] {
+        let api = dir.join("api");
+        let _ = std::fs::remove_dir_all(&api);
+        let mut config = ApiConfig::new(api, vec![(own(), Role::Viewer)]).with_relays(
+            vec![(RELAY, 7), (OTHER, 8)],
+            vec![Principal::new("svc.ops", 50_001, Role::Viewer).unwrap()],
+        );
+        if let Some(gid) = group {
+            config = config.with_relay_group(gid);
+        }
+        let mut server = Server::bind(config).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "relay_child", "--ignored", "--nocapture"])
+            .args(["--test-threads", "1"])
+            .env("KARYOS_RELAY_CHILD_SOCKET", server.path())
+            .uid(uid)
+            .gid(gid)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Its output (a whole view) can fill a pipe: read it meanwhile.
+        let mut stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut out = String::new();
+            let _ = stdout.read_to_string(&mut out).unwrap();
+            out
+        });
+        let start = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if start.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                panic!("relay stuck: {group:?} {uid}");
+            }
+            let _ = server.poll(&mut agent).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let out = reader.join().unwrap();
+        if served {
+            assert!(out.contains(r#"ANSWER {"version":1,"drivers""#), "{out}");
+        } else {
+            assert!(
+                out.contains("ERR PermissionDenied"),
+                "{group:?} {uid}: {out}"
+            );
+        }
+    }
+}
+
+/// The relay of the test above, run as another uid; does nothing when run
+/// on its own.
+#[test]
+#[ignore = "run by a_relay_under_its_own_uid_reaches_the_socket_through_its_group"]
+fn relay_child() {
+    let Ok(path) = std::env::var("KARYOS_RELAY_CHILD_SOCKET") else {
+        return;
+    };
+    match UnixStream::connect(path) {
+        Ok(mut stream) => {
+            stream
+                .write_all(b"KARYOS-AGENT 1 relay svc.ops view\n")
+                .unwrap();
+            let mut answer = String::new();
+            let _ = stream.read_to_string(&mut answer).unwrap();
+            let _ = write!(std::io::stdout(), "ANSWER {answer}");
+        }
+        Err(error) => {
+            let _ = write!(std::io::stdout(), "ERR {:?}", error.kind());
+        }
+    }
 }

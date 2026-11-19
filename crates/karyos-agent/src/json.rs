@@ -1119,6 +1119,14 @@ fn join_version(out: &mut Out<'_>, version: &crate::registry::Version) {
     out.object(|fields| {
         fields.number("number", version.number);
         fields.number("registered_by", version.registered_by);
+        // The relay that carried the put (karyos#708), apart; null for a
+        // put on the local socket.
+        fields.key("relay").option(
+            (version.relay != 0).then_some(version.relay),
+            |out, relay| {
+                out.number(relay);
+            },
+        );
         fields.number("valid_from", version.valid_from);
         fields
             .key("valid_to")

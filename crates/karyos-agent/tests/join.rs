@@ -229,7 +229,7 @@ fn a_registrar_writes_and_a_collector_joins_against_the_right_version() {
     assert_eq!(served, [Served::Join]);
     assert!(
         old.contains(&format!(
-            "\"version\":{{\"number\":1,\"registered_by\":{},\"valid_from\":{},\"valid_to\":{},\"attributes\":{{\"venue\":\"xnas\",\"instrument\":\"aapl\"}}}}",
+            "\"version\":{{\"number\":1,\"registered_by\":{},\"relay\":null,\"valid_from\":{},\"valid_to\":{},\"attributes\":{{\"venue\":\"xnas\",\"instrument\":\"aapl\"}}}}",
             own(),
             from[0],
             from[1]

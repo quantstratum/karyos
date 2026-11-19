@@ -29,7 +29,7 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
 fn serve(args: karyos_agent::cli::Args) -> ExitCode {
     use std::time::{Duration, Instant};
 
-    use karyos_agent::server::{ApiConfig, Role, Server};
+    use karyos_agent::server::{ApiConfig, Principal, Role, Server};
     use karyos_agent::{Agent, AgentConfig};
 
     let roles = args
@@ -37,7 +37,19 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
         .iter()
         .filter_map(|(uid, name)| Role::parse(name).map(|role| (*uid, role)))
         .collect();
-    let mut server = match Server::bind(ApiConfig::new(args.api_dir, roles)) {
+    // Parsed and checked by the command line already.
+    let principals = args
+        .principals
+        .iter()
+        .filter_map(|(name, operator, role)| {
+            Role::parse(role).and_then(|role| Principal::new(name, *operator, role))
+        })
+        .collect();
+    let mut config = ApiConfig::new(args.api_dir, roles).with_relays(args.relays, principals);
+    if let Some(gid) = args.relay_group {
+        config = config.with_relay_group(gid);
+    }
+    let mut server = match Server::bind(config) {
         Ok(server) => server,
         Err(error) => {
             let _ = writeln!(std::io::stderr(), "karyos-agent: {error}");
