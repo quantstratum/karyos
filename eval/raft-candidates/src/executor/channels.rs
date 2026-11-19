@@ -491,10 +491,15 @@ mod tests {
         assert_eq!(registered(&probe), 0);
     }
 
-    struct Flag;
+    /// A task's waker, one per task (`Waker::noop` would make every task
+    /// the same to `will_wake`); it counts its wakes.
+    #[derive(Default)]
+    struct Flag(std::sync::atomic::AtomicUsize);
 
     impl std::task::Wake for Flag {
-        fn wake(self: Arc<Self>) {}
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     /// The remaining part of the karyos#959 review: a send cancelled while
@@ -504,12 +509,12 @@ mod tests {
     fn a_cancelled_blocked_send_leaves_no_registration() {
         let (sender, _receiver) = SimMpsc::channel::<u64>(0);
         let mut first = sender.send(0);
-        let waker = Waker::from(Arc::new(Flag));
+        let waker = Waker::from(Arc::new(Flag::default()));
         let mut context = Context::from_waker(&waker);
         // The channel's one slot is taken: every later send blocks.
         assert!(Pin::new(&mut first).poll(&mut context).is_ready());
         for value in 1..=10 {
-            let waker = Waker::from(Arc::new(Flag));
+            let waker = Waker::from(Arc::new(Flag::default()));
             let mut context = Context::from_waker(&waker);
             let mut send = sender.send(value);
             assert!(Pin::new(&mut send).poll(&mut context).is_pending());
