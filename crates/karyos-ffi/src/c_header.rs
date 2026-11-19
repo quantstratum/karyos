@@ -4,12 +4,9 @@
 //! them (`#define KARYOS_* value`; karyos#697, F8 of quantstratum-docs:
 //! karyos/design/ffi-gap-analysis.md). Each is the C name and value of a
 //! code the boundary uses elsewhere; the tests of `header.rs` compare
-//! every one with its source (a status, an enum, a limit). A doc comment
-//! on the first constant of a group documents the group in the header.
-#![allow(
-    missing_docs,
-    reason = "a group's comment is on its first constant, as in the header"
-)]
+//! every one with its source (a status, an enum, a limit). The doc comment
+//! of a group's first constant documents the group; every other constant
+//! has its own one-line comment, which the header carries too.
 
 /// The ABI version of this header, which karyos_abi_version reports.
 pub const KARYOS_ABI_VERSION_MAJOR: u32 = 0;
@@ -42,18 +39,27 @@ pub const KARYOS_MAX_ARCHIVES: u32 = 64;
 
 /// karyos_recording states.
 pub const KARYOS_RECORDING_RECORDING: u32 = 0;
+/// A karyos_recording state: stopped (see the group above).
 pub const KARYOS_RECORDING_STOPPED: u32 = 1;
 
 /// karyos_recording stop reasons; 0 while it records. A newer library may
 /// add reasons.
 pub const KARYOS_STOP_NORMAL: u32 = 1;
+/// A karyos_recording stop reason: recovered (see the group above).
 pub const KARYOS_STOP_RECOVERED: u32 = 2;
+/// A karyos_recording stop reason: empty (see the group above).
 pub const KARYOS_STOP_EMPTY: u32 = 3;
+/// A karyos_recording stop reason: lapped (see the group above).
 pub const KARYOS_STOP_LAPPED: u32 = 4;
+/// A karyos_recording stop reason: stopped (see the group above).
 pub const KARYOS_STOP_STOPPED: u32 = 5;
+/// A karyos_recording stop reason: shutdown (see the group above).
 pub const KARYOS_STOP_SHUTDOWN: u32 = 6;
+/// A karyos_recording stop reason: source failed (see the group above).
 pub const KARYOS_STOP_SOURCE_FAILED: u32 = 7;
+/// A karyos_recording stop reason: required lapped (see the group above).
 pub const KARYOS_STOP_REQUIRED_LAPPED: u32 = 8;
+/// A karyos_recording stop reason: invalid source (see the group above).
 pub const KARYOS_STOP_INVALID_SOURCE: u32 = 9;
 
 /// The freshness of a conflated value no committed gap covers; any other
@@ -62,25 +68,36 @@ pub const KARYOS_FRESH: u64 = u64::MAX;
 
 /// karyos_message_info flags.
 pub const KARYOS_MESSAGE_END_OF_STREAM: u32 = 1;
+/// A karyos_message_info flag: traced (see the group above).
 pub const KARYOS_MESSAGE_TRACED: u32 = 2;
 
 /// karyos_outcome kinds. A newer library may add kinds: a binding keeps a
 /// record of a kind it does not know.
 pub const KARYOS_OUTCOME_SUBMITTED: u32 = 1;
+/// A karyos_outcome kind: confirmed cancelled (see the group above).
 pub const KARYOS_OUTCOME_CONFIRMED_CANCELLED: u32 = 2;
+/// A karyos_outcome kind: unknown (see the group above).
 pub const KARYOS_OUTCOME_UNKNOWN: u32 = 3;
+/// A karyos_outcome kind: rejected (see the group above).
 pub const KARYOS_OUTCOME_REJECTED: u32 = 4;
+/// A karyos_outcome kind: aborted (see the group above).
 pub const KARYOS_OUTCOME_ABORTED: u32 = 5;
+/// A karyos_outcome kind: range (see the group above).
 pub const KARYOS_OUTCOME_RANGE: u32 = 16;
+/// A karyos_outcome kind: interrupted (see the group above).
 pub const KARYOS_OUTCOME_INTERRUPTED: u32 = 17;
+/// A karyos_outcome kind: ended (see the group above).
 pub const KARYOS_OUTCOME_ENDED: u32 = 18;
+/// A karyos_outcome kind: outcomes lost (see the group above).
 pub const KARYOS_OUTCOME_OUTCOMES_LOST: u32 = 19;
 
 /// A subscriber's role (karyos_subscription_options): a required reader
 /// bounds its publisher and is never lapped; an optional one does not and
 /// may be lapped; an observer is optional and only copies.
 pub const KARYOS_ROLE_REQUIRED: u32 = 0;
+/// A subscriber role: optional (see the group above).
 pub const KARYOS_ROLE_OPTIONAL: u32 = 1;
+/// A subscriber role: observer (see the group above).
 pub const KARYOS_ROLE_OBSERVER: u32 = 2;
 
 /// The strategy of a network publication's receivers
@@ -88,7 +105,9 @@ pub const KARYOS_ROLE_OBSERVER: u32 = 2;
 /// receiver bounds the sender, the fastest, or the receivers of a tagged
 /// group. It must be the channel's fc (KARYOS_STRATEGY_MIN without one).
 pub const KARYOS_STRATEGY_MIN: u32 = 0;
+/// A network publication's receiver strategy: max (see the group above).
 pub const KARYOS_STRATEGY_MAX: u32 = 1;
+/// A network publication's receiver strategy: tagged (see the group above).
 pub const KARYOS_STRATEGY_TAGGED: u32 = 2;
 
 /// A network publication's admission state
@@ -97,8 +116,11 @@ pub const KARYOS_STRATEGY_TAGGED: u32 = 2;
 /// publication), open, a configured required receiver not joined, or one
 /// lost.
 pub const KARYOS_ADMISSION_UNKNOWN: u32 = 0;
+/// A network publication's admission state: open (see the group above).
 pub const KARYOS_ADMISSION_OPEN: u32 = 1;
+/// A network publication's admission state: not joined (see the group above).
 pub const KARYOS_ADMISSION_NOT_JOINED: u32 = 2;
+/// A network publication's admission state: lost required (see the group above).
 pub const KARYOS_ADMISSION_LOST_REQUIRED: u32 = 3;
 
 /// What follows an overrun of an optional or observer reader: delivery
@@ -108,7 +130,9 @@ pub const KARYOS_ADMISSION_LOST_REQUIRED: u32 = 3;
 /// options' Archive fields). Not yet in the C ABI: a snapshot rebuild (a C
 /// callback on the polling thread).
 pub const KARYOS_REJOIN_AT_HEAD: u32 = 0;
+/// What follows an overrun: close (see the group above).
 pub const KARYOS_REJOIN_CLOSE: u32 = 1;
+/// What follows an overrun: archive (see the group above).
 pub const KARYOS_REJOIN_ARCHIVE: u32 = 2;
 
 /// karyos_subscription_rejoin merge failures: none; an epoch change; a
@@ -118,15 +142,25 @@ pub const KARYOS_REJOIN_ARCHIVE: u32 = 2;
 /// failure a newer library knows and this header names no code for; a
 /// binding keeps a code it does not know.
 pub const KARYOS_MERGE_NONE: u32 = 0;
+/// A rejoin merge failure: epoch changed (see the group above).
 pub const KARYOS_MERGE_EPOCH_CHANGED: u32 = 1;
+/// A rejoin merge failure: replay short (see the group above).
 pub const KARYOS_MERGE_REPLAY_SHORT: u32 = 2;
+/// A rejoin merge failure: mismatch (see the group above).
 pub const KARYOS_MERGE_MISMATCH: u32 = 3;
+/// A rejoin merge failure: lane (see the group above).
 pub const KARYOS_MERGE_LANE: u32 = 4;
+/// A rejoin merge failure: replay overrun (see the group above).
 pub const KARYOS_MERGE_REPLAY_OVERRUN: u32 = 5;
+/// A rejoin merge failure: replay revoked (see the group above).
 pub const KARYOS_MERGE_REPLAY_REVOKED: u32 = 6;
+/// A rejoin merge failure: replay (see the group above).
 pub const KARYOS_MERGE_REPLAY: u32 = 7;
+/// A rejoin merge failure: live overrun (see the group above).
 pub const KARYOS_MERGE_LIVE_OVERRUN: u32 = 8;
+/// A rejoin merge failure: live (see the group above).
 pub const KARYOS_MERGE_LIVE: u32 = 9;
+/// A rejoin merge failure: other (see the group above).
 pub const KARYOS_MERGE_OTHER: u32 = 255;
 
 /// The most embedded drivers open at once.
@@ -140,15 +174,19 @@ pub const KARYOS_PROTOCOL_VERSION: u32 = 3;
 /// publication, or up to `publishers` concurrent handles on lane 0
 /// (karyos_client_add_concurrent_publication).
 pub const KARYOS_PUBLICATION_EXCLUSIVE: u32 = 0;
+/// A stream's publication mode: concurrent (see the group above).
 pub const KARYOS_PUBLICATION_CONCURRENT: u32 = 1;
 
 /// The clock domains of a timed lane (karyos_clock_now).
 pub const KARYOS_CLOCK_MONOTONIC: u32 = 0;
+/// A timed lane's clock domain: tai (see the group above).
 pub const KARYOS_CLOCK_TAI: u32 = 1;
 
 /// What a lost required subscriber does (karyos_stream_options).
 pub const KARYOS_LOSS_HOLD: u32 = 0;
+/// What a lost required subscriber does: continue (see the group above).
 pub const KARYOS_LOSS_CONTINUE: u32 = 1;
+/// What a lost required subscriber does: abort (see the group above).
 pub const KARYOS_LOSS_ABORT: u32 = 2;
 
 /// Idle strategies of a control call's wait (karyos_client_options) and of
@@ -157,8 +195,11 @@ pub const KARYOS_LOSS_ABORT: u32 = 2;
 /// wait, and starts again after a wait that found work; it is the default
 /// (karyos ADR-0066), and busy-spin is an explicit low-latency choice.
 pub const KARYOS_IDLE_BUSY_SPIN: u32 = 0;
+/// An idle strategy: yield (see the group above).
 pub const KARYOS_IDLE_YIELD: u32 = 1;
+/// An idle strategy: sleep (see the group above).
 pub const KARYOS_IDLE_SLEEP: u32 = 2;
+/// An idle strategy: yield then sleep (see the group above).
 pub const KARYOS_IDLE_YIELD_THEN_SLEEP: u32 = 3;
 
 /// An embedded driver's network (karyos_driver_options.network, ABI
@@ -172,6 +213,7 @@ pub const KARYOS_IDLE_YIELD_THEN_SLEEP: u32 = 3;
 /// the one karyosd --network documents (quantstratum-docs:
 /// karyos/design/observability-and-tools.md, Binaries).
 pub const KARYOS_NETWORK_OFF: u32 = 0;
+/// An embedded driver's network: on (see the group above).
 pub const KARYOS_NETWORK_ON: u32 = 1;
 
 /// A driver's readiness (R-CORE-35, karyos_driver_readiness), with the
@@ -182,18 +224,26 @@ pub const KARYOS_NETWORK_ON: u32 = 1;
 /// cutover. NOT_READY: not admitting a client now, for the reason given.
 /// FAILED: startup missed its deadline; it does not end.
 pub const KARYOS_READINESS_STARTING: u32 = 1;
+/// A driver readiness: ready (see the group above).
 pub const KARYOS_READINESS_READY: u32 = 2;
+/// A driver readiness: recovering (see the group above).
 pub const KARYOS_READINESS_RECOVERING: u32 = 3;
+/// A driver readiness: not ready (see the group above).
 pub const KARYOS_READINESS_NOT_READY: u32 = 4;
+/// A driver readiness: failed (see the group above).
 pub const KARYOS_READINESS_FAILED: u32 = 5;
 
 /// Why a driver is not ready, or why its startup failed: NONE for
 /// STARTING, READY and RECOVERING; NOT_ADMITTING, FULL or TERMINAL for
 /// NOT_READY; STARTUP_DEADLINE for FAILED.
 pub const KARYOS_READINESS_REASON_NONE: u32 = 0;
+/// A reason a driver is not ready or failed to start: not admitting (see the group above).
 pub const KARYOS_READINESS_REASON_NOT_ADMITTING: u32 = 1;
+/// A reason a driver is not ready or failed to start: full (see the group above).
 pub const KARYOS_READINESS_REASON_FULL: u32 = 2;
+/// A reason a driver is not ready or failed to start: terminal (see the group above).
 pub const KARYOS_READINESS_REASON_TERMINAL: u32 = 3;
+/// A reason a driver is not ready or failed to start: startup deadline (see the group above).
 pub const KARYOS_READINESS_REASON_STARTUP_DEADLINE: u32 = 4;
 
 /// Status codes. 0 is success; 1-99 data-path outcomes, 100-199 usage,
@@ -329,7 +379,9 @@ pub const KARYOS_IMAGE_CHANGE_SIZE_ENDS: u32 = 48;
 /// Replay rates: as fast as the target takes it; at the recorded pace; the
 /// recorded pace scaled by scale_ppm (parts per million, 1 to 100000000).
 pub const KARYOS_REPLAY_FULL: u32 = 1;
+/// A replay rate: as recorded (see the group above).
 pub const KARYOS_REPLAY_AS_RECORDED: u32 = 2;
+/// A replay rate: scaled (see the group above).
 pub const KARYOS_REPLAY_SCALED: u32 = 3;
 
 /// How a subscription ended: not yet; its stream ended cleanly (a replay
@@ -340,9 +392,15 @@ pub const KARYOS_REPLAY_SCALED: u32 = 3;
 /// included, with the raw seal reason in seal_code. A binding keeps an end
 /// code its header does not define, as it keeps a status code.
 pub const KARYOS_END_NONE: u32 = 0;
+/// How a subscription ended: end of stream (see the group above).
 pub const KARYOS_END_END_OF_STREAM: u32 = 1;
+/// How a subscription ended: image retired (see the group above).
 pub const KARYOS_END_IMAGE_RETIRED: u32 = 2;
+/// How a subscription ended: stream removed (see the group above).
 pub const KARYOS_END_STREAM_REMOVED: u32 = 3;
+/// How a subscription ended: revoked (see the group above).
 pub const KARYOS_END_REVOKED: u32 = 4;
+/// How a subscription ended: closed by overrun (see the group above).
 pub const KARYOS_END_CLOSED_BY_OVERRUN: u32 = 5;
+/// How a subscription ended: other (see the group above).
 pub const KARYOS_END_OTHER: u32 = 255;

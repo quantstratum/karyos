@@ -95,6 +95,10 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#ifdef __cplusplus
+#define KARYOS_H_EXTERN_C_OPEN
+extern "C" {
+#endif
 
 /**
  * The ABI version of this header, which karyos_abi_version reports.
@@ -152,6 +156,9 @@
  */
 #define KARYOS_RECORDING_RECORDING 0
 
+/**
+ * A karyos_recording state: stopped (see the group above).
+ */
 #define KARYOS_RECORDING_STOPPED 1
 
 /**
@@ -160,20 +167,44 @@
  */
 #define KARYOS_STOP_NORMAL 1
 
+/**
+ * A karyos_recording stop reason: recovered (see the group above).
+ */
 #define KARYOS_STOP_RECOVERED 2
 
+/**
+ * A karyos_recording stop reason: empty (see the group above).
+ */
 #define KARYOS_STOP_EMPTY 3
 
+/**
+ * A karyos_recording stop reason: lapped (see the group above).
+ */
 #define KARYOS_STOP_LAPPED 4
 
+/**
+ * A karyos_recording stop reason: stopped (see the group above).
+ */
 #define KARYOS_STOP_STOPPED 5
 
+/**
+ * A karyos_recording stop reason: shutdown (see the group above).
+ */
 #define KARYOS_STOP_SHUTDOWN 6
 
+/**
+ * A karyos_recording stop reason: source failed (see the group above).
+ */
 #define KARYOS_STOP_SOURCE_FAILED 7
 
+/**
+ * A karyos_recording stop reason: required lapped (see the group above).
+ */
 #define KARYOS_STOP_REQUIRED_LAPPED 8
 
+/**
+ * A karyos_recording stop reason: invalid source (see the group above).
+ */
 #define KARYOS_STOP_INVALID_SOURCE 9
 
 /**
@@ -187,6 +218,9 @@
  */
 #define KARYOS_MESSAGE_END_OF_STREAM 1
 
+/**
+ * A karyos_message_info flag: traced (see the group above).
+ */
 #define KARYOS_MESSAGE_TRACED 2
 
 /**
@@ -195,20 +229,44 @@
  */
 #define KARYOS_OUTCOME_SUBMITTED 1
 
+/**
+ * A karyos_outcome kind: confirmed cancelled (see the group above).
+ */
 #define KARYOS_OUTCOME_CONFIRMED_CANCELLED 2
 
+/**
+ * A karyos_outcome kind: unknown (see the group above).
+ */
 #define KARYOS_OUTCOME_UNKNOWN 3
 
+/**
+ * A karyos_outcome kind: rejected (see the group above).
+ */
 #define KARYOS_OUTCOME_REJECTED 4
 
+/**
+ * A karyos_outcome kind: aborted (see the group above).
+ */
 #define KARYOS_OUTCOME_ABORTED 5
 
+/**
+ * A karyos_outcome kind: range (see the group above).
+ */
 #define KARYOS_OUTCOME_RANGE 16
 
+/**
+ * A karyos_outcome kind: interrupted (see the group above).
+ */
 #define KARYOS_OUTCOME_INTERRUPTED 17
 
+/**
+ * A karyos_outcome kind: ended (see the group above).
+ */
 #define KARYOS_OUTCOME_ENDED 18
 
+/**
+ * A karyos_outcome kind: outcomes lost (see the group above).
+ */
 #define KARYOS_OUTCOME_OUTCOMES_LOST 19
 
 /**
@@ -218,8 +276,14 @@
  */
 #define KARYOS_ROLE_REQUIRED 0
 
+/**
+ * A subscriber role: optional (see the group above).
+ */
 #define KARYOS_ROLE_OPTIONAL 1
 
+/**
+ * A subscriber role: observer (see the group above).
+ */
 #define KARYOS_ROLE_OBSERVER 2
 
 /**
@@ -230,8 +294,14 @@
  */
 #define KARYOS_STRATEGY_MIN 0
 
+/**
+ * A network publication's receiver strategy: max (see the group above).
+ */
 #define KARYOS_STRATEGY_MAX 1
 
+/**
+ * A network publication's receiver strategy: tagged (see the group above).
+ */
 #define KARYOS_STRATEGY_TAGGED 2
 
 /**
@@ -243,10 +313,19 @@
  */
 #define KARYOS_ADMISSION_UNKNOWN 0
 
+/**
+ * A network publication's admission state: open (see the group above).
+ */
 #define KARYOS_ADMISSION_OPEN 1
 
+/**
+ * A network publication's admission state: not joined (see the group above).
+ */
 #define KARYOS_ADMISSION_NOT_JOINED 2
 
+/**
+ * A network publication's admission state: lost required (see the group above).
+ */
 #define KARYOS_ADMISSION_LOST_REQUIRED 3
 
 /**
@@ -259,8 +338,14 @@
  */
 #define KARYOS_REJOIN_AT_HEAD 0
 
+/**
+ * What follows an overrun: close (see the group above).
+ */
 #define KARYOS_REJOIN_CLOSE 1
 
+/**
+ * What follows an overrun: archive (see the group above).
+ */
 #define KARYOS_REJOIN_ARCHIVE 2
 
 /**
@@ -273,24 +358,54 @@
  */
 #define KARYOS_MERGE_NONE 0
 
+/**
+ * A rejoin merge failure: epoch changed (see the group above).
+ */
 #define KARYOS_MERGE_EPOCH_CHANGED 1
 
+/**
+ * A rejoin merge failure: replay short (see the group above).
+ */
 #define KARYOS_MERGE_REPLAY_SHORT 2
 
+/**
+ * A rejoin merge failure: mismatch (see the group above).
+ */
 #define KARYOS_MERGE_MISMATCH 3
 
+/**
+ * A rejoin merge failure: lane (see the group above).
+ */
 #define KARYOS_MERGE_LANE 4
 
+/**
+ * A rejoin merge failure: replay overrun (see the group above).
+ */
 #define KARYOS_MERGE_REPLAY_OVERRUN 5
 
+/**
+ * A rejoin merge failure: replay revoked (see the group above).
+ */
 #define KARYOS_MERGE_REPLAY_REVOKED 6
 
+/**
+ * A rejoin merge failure: replay (see the group above).
+ */
 #define KARYOS_MERGE_REPLAY 7
 
+/**
+ * A rejoin merge failure: live overrun (see the group above).
+ */
 #define KARYOS_MERGE_LIVE_OVERRUN 8
 
+/**
+ * A rejoin merge failure: live (see the group above).
+ */
 #define KARYOS_MERGE_LIVE 9
 
+/**
+ * A rejoin merge failure: other (see the group above).
+ */
 #define KARYOS_MERGE_OTHER 255
 
 /**
@@ -311,6 +426,9 @@
  */
 #define KARYOS_PUBLICATION_EXCLUSIVE 0
 
+/**
+ * A stream's publication mode: concurrent (see the group above).
+ */
 #define KARYOS_PUBLICATION_CONCURRENT 1
 
 /**
@@ -318,6 +436,9 @@
  */
 #define KARYOS_CLOCK_MONOTONIC 0
 
+/**
+ * A timed lane's clock domain: tai (see the group above).
+ */
 #define KARYOS_CLOCK_TAI 1
 
 /**
@@ -325,8 +446,14 @@
  */
 #define KARYOS_LOSS_HOLD 0
 
+/**
+ * What a lost required subscriber does: continue (see the group above).
+ */
 #define KARYOS_LOSS_CONTINUE 1
 
+/**
+ * What a lost required subscriber does: abort (see the group above).
+ */
 #define KARYOS_LOSS_ABORT 2
 
 /**
@@ -338,10 +465,19 @@
  */
 #define KARYOS_IDLE_BUSY_SPIN 0
 
+/**
+ * An idle strategy: yield (see the group above).
+ */
 #define KARYOS_IDLE_YIELD 1
 
+/**
+ * An idle strategy: sleep (see the group above).
+ */
 #define KARYOS_IDLE_SLEEP 2
 
+/**
+ * An idle strategy: yield then sleep (see the group above).
+ */
 #define KARYOS_IDLE_YIELD_THEN_SLEEP 3
 
 /**
@@ -358,6 +494,9 @@
  */
 #define KARYOS_NETWORK_OFF 0
 
+/**
+ * An embedded driver's network: on (see the group above).
+ */
 #define KARYOS_NETWORK_ON 1
 
 /**
@@ -371,12 +510,24 @@
  */
 #define KARYOS_READINESS_STARTING 1
 
+/**
+ * A driver readiness: ready (see the group above).
+ */
 #define KARYOS_READINESS_READY 2
 
+/**
+ * A driver readiness: recovering (see the group above).
+ */
 #define KARYOS_READINESS_RECOVERING 3
 
+/**
+ * A driver readiness: not ready (see the group above).
+ */
 #define KARYOS_READINESS_NOT_READY 4
 
+/**
+ * A driver readiness: failed (see the group above).
+ */
 #define KARYOS_READINESS_FAILED 5
 
 /**
@@ -386,12 +537,24 @@
  */
 #define KARYOS_READINESS_REASON_NONE 0
 
+/**
+ * A reason a driver is not ready or failed to start: not admitting (see the group above).
+ */
 #define KARYOS_READINESS_REASON_NOT_ADMITTING 1
 
+/**
+ * A reason a driver is not ready or failed to start: full (see the group above).
+ */
 #define KARYOS_READINESS_REASON_FULL 2
 
+/**
+ * A reason a driver is not ready or failed to start: terminal (see the group above).
+ */
 #define KARYOS_READINESS_REASON_TERMINAL 3
 
+/**
+ * A reason a driver is not ready or failed to start: startup deadline (see the group above).
+ */
 #define KARYOS_READINESS_REASON_STARTUP_DEADLINE 4
 
 /**
@@ -612,8 +775,14 @@
  */
 #define KARYOS_REPLAY_FULL 1
 
+/**
+ * A replay rate: as recorded (see the group above).
+ */
 #define KARYOS_REPLAY_AS_RECORDED 2
 
+/**
+ * A replay rate: scaled (see the group above).
+ */
 #define KARYOS_REPLAY_SCALED 3
 
 /**
@@ -627,16 +796,34 @@
  */
 #define KARYOS_END_NONE 0
 
+/**
+ * How a subscription ended: end of stream (see the group above).
+ */
 #define KARYOS_END_END_OF_STREAM 1
 
+/**
+ * How a subscription ended: image retired (see the group above).
+ */
 #define KARYOS_END_IMAGE_RETIRED 2
 
+/**
+ * How a subscription ended: stream removed (see the group above).
+ */
 #define KARYOS_END_STREAM_REMOVED 3
 
+/**
+ * How a subscription ended: revoked (see the group above).
+ */
 #define KARYOS_END_REVOKED 4
 
+/**
+ * How a subscription ended: closed by overrun (see the group above).
+ */
 #define KARYOS_END_CLOSED_BY_OVERRUN 5
 
+/**
+ * How a subscription ended: other (see the group above).
+ */
 #define KARYOS_END_OTHER 255
 
 /**
@@ -1420,10 +1607,6 @@ typedef struct karyos_subscription_end {
      */
     uint64_t seal_code;
 } karyos_subscription_end;
-
-#ifdef __cplusplus
-extern "C" {
-#endif // __cplusplus
 
 /**
  * Writes the ABI version this library implements. Returns KARYOS_OK, or
@@ -2342,11 +2525,12 @@ int32_t karyos_client_add_replay_subscription(uint64_t client,
 int32_t karyos_subscription_end_state(uint64_t subscription,
                                       struct karyos_subscription_end *end);
 
-#ifdef __cplusplus
-}  // extern "C"
-#endif  // __cplusplus
-
 #endif  /* KARYOS_H */
+
+#ifdef KARYOS_H_EXTERN_C_OPEN
+#undef KARYOS_H_EXTERN_C_OPEN
+}  // extern "C"
+#endif
 
 /*
  * Item 48's static inline initialisers: each calls the exported

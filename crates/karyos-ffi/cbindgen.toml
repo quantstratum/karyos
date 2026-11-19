@@ -99,6 +99,11 @@ header = '''
  *   close work from any thread, and the close joins the thread.
  */'''
 trailer = '''
+#ifdef KARYOS_H_EXTERN_C_OPEN
+#undef KARYOS_H_EXTERN_C_OPEN
+}  // extern "C"
+#endif
+
 /*
  * Item 48's static inline initialisers: each calls the exported
  * karyos_*_init_sized with the sizeof this header gives the struct. The
@@ -148,7 +153,17 @@ static inline int32_t karyos_replay_subscription_options_init(
 #endif /* KARYOS_H_INITIALISERS */
 '''
 include_guard = "KARYOS_H"
-cpp_compat = true
+# C linkage for every declaration, the callback typedefs included, rather
+# than cbindgen's `cpp_compat`, which wraps the functions only. The block
+# opens after the includes, inside the include guard, and closes at the
+# start of the trailer, which cbindgen places after the guard: the marker
+# macro closes it only where this inclusion opened it.
+cpp_compat = false
+after_includes = '''
+#ifdef __cplusplus
+#define KARYOS_H_EXTERN_C_OPEN
+extern "C" {
+#endif'''
 no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
 usize_is_size_t = true
