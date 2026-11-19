@@ -599,7 +599,7 @@ fn an_export_page_is_encoded_whole() {
         "{whole}"
     );
     assert!(
-        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"points":[],"unknown_records":3,"unreadable_records":0}"#),
+        whole.ends_with(r#""next":8,"head":8,"journals":[{"journal":10,"table":"unknown"}],"points":[],"unknown_records":3,"unreadable_records":0,"network_journals_refused":{"attach":null,"before":0,"after":0}}"#),
         "{whole}"
     );
     assert_eq!(whole.matches(r#"{"seq":"#).count(), 3);
