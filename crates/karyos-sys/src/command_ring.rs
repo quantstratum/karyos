@@ -1001,9 +1001,12 @@ mod properties {
         ]
     }
 
-    /// How many steps the in-order property runs: under Miri at most 24,
-    /// which still wraps the largest ring (128 words) since a write may
-    /// carry 520 bytes (karyos#161); elsewhere up to 63.
+    /// How many steps the in-order property runs: under Miri at most 24
+    /// (karyos#161), elsewhere up to 63. Under the reduced Miri budget a
+    /// wrap is possible but not guaranteed in a given case; deterministic
+    /// coverage of many wraps with padding comes from
+    /// `fifo_lengths_padding_and_full`.
+    #[must_use]
     fn step_count() -> std::ops::Range<usize> {
         if cfg!(miri) { 1..25 } else { 1..64 }
     }
