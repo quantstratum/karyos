@@ -58,6 +58,17 @@ pub enum IntegrityError {
     /// handle appended or cut since it was opened. Nothing was written.
     #[error("the ledger was changed through another handle; reopen it")]
     StaleLedger,
+    /// The journal chains record `counter`, whose bytes its ledger does
+    /// not hold or holds in a form that does not match.
+    #[error("integrity journal record {counter} is chained but missing from its ledger")]
+    Unrecorded {
+        /// The record's counter.
+        counter: u64,
+    },
+    /// A copy catalog handle behind the journal: another handle recorded
+    /// a copy change since it was opened. Nothing was written.
+    #[error("the copy catalog was changed through another handle; reopen it")]
+    StaleCatalog,
     /// The key registry refused an entry.
     #[error("key registry: {0}")]
     Registry(#[from] super::trust::RegistryError),
@@ -85,7 +96,12 @@ pub struct IntegrityJournal<D: Disk> {
     file: D::File,
     /// The archive directory the journal is in.
     dir: PathBuf,
+    /// This open handle's identity, unique in the process: what a catalog
+    /// replayed from it is bound to.
+    handle: u64,
     check: ChainCheck,
+    /// The copy changes chained: the sequence the next one must carry.
+    copy_changes: u64,
     /// The identity of the key registry history chained: a running digest
     /// of every key registry record's entry digest, in chain order.
     registry_identity: Digest,
@@ -115,6 +131,7 @@ impl<D: Disk> IntegrityJournal<D> {
         let whole = length / RECORD_LENGTH;
         let mut check = ChainCheck::new();
         let mut registry_identity = super::trust::EMPTY_REGISTRY;
+        let mut copy_changes = 0u64;
         let mut kept = whole;
         let mut buf = [0u8; SEAL_RECORD_LENGTH];
         for index in 0..whole {
@@ -132,6 +149,11 @@ impl<D: Disk> IntegrityJournal<D> {
                 Err(error) => return Err(Inconsistency::Malformed { index, error }.into()),
             };
             check.accept(&record)?;
+            if record.kind == SealKind::Copy {
+                copy_changes = copy_changes
+                    .checked_add(1)
+                    .ok_or(IntegrityError::Overflow)?;
+            }
             if record.kind == SealKind::KeyRegistry {
                 registry_identity =
                     super::trust::extend_identity(&registry_identity, &record.content);
@@ -150,7 +172,9 @@ impl<D: Disk> IntegrityJournal<D> {
                 disk,
                 file,
                 dir: dir.to_path_buf(),
+                handle: next_handle(),
                 check,
+                copy_changes,
                 registry_identity,
                 poisoned: false,
             },
@@ -164,6 +188,14 @@ impl<D: Disk> IntegrityJournal<D> {
     #[inline]
     pub const fn next_counter(&self) -> u64 {
         self.check.next_counter()
+    }
+
+    /// The copy changes this journal chains: the sequence the next copy
+    /// change must carry.
+    #[must_use]
+    #[inline]
+    pub const fn copy_changes(&self) -> u64 {
+        self.copy_changes
     }
 
     /// The identity of the key registry history this journal chains, as
@@ -181,6 +213,15 @@ impl<D: Disk> IntegrityJournal<D> {
     #[inline]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// This open handle's identity, unique in the process: state replayed
+    /// through one handle is written back only through the same one, never
+    /// through another handle, whatever its path or storage.
+    #[must_use]
+    #[inline]
+    pub const fn handle(&self) -> u64 {
+        self.handle
     }
 
     /// Whether this handle holds every record on disk: no other handle
@@ -274,10 +315,22 @@ impl<D: Disk> IntegrityJournal<D> {
         };
         let mut next = self.check.clone();
         next.accept(&record)?;
+        let copy_changes = if kind == SealKind::Copy {
+            self.copy_changes
+                .checked_add(1)
+                .ok_or(IntegrityError::Overflow)?
+        } else {
+            self.copy_changes
+        };
         let offset = record
             .counter
             .checked_mul(RECORD_LENGTH)
             .ok_or(IntegrityError::Overflow)?;
+        // Compare and swap on the file length: a handle behind the file
+        // would overwrite a committed record.
+        if self.disk.len(&self.file)? != offset {
+            return Err(IntegrityError::StaleJournal);
+        }
         let written = self
             .disk
             .write_at(&self.file, offset, &record.encode())
@@ -287,6 +340,7 @@ impl<D: Disk> IntegrityJournal<D> {
             return Err(error.into());
         }
         self.check = next;
+        self.copy_changes = copy_changes;
         if kind == SealKind::KeyRegistry {
             self.registry_identity =
                 super::trust::extend_identity(&self.registry_identity, &content);
@@ -371,6 +425,28 @@ impl<D: Disk> IntegrityJournal<D> {
             recording,
             generation,
             generation,
+            digest(canonical),
+        )
+    }
+
+    /// Chains a change of a copy of `recording` in the copy catalog:
+    /// `sequence` is the copy record's sequence, `canonical` its canonical
+    /// bytes.
+    ///
+    /// # Errors
+    ///
+    /// As [`IntegrityJournal::append`].
+    pub fn record_copy_change(
+        &mut self,
+        recording: u64,
+        sequence: u64,
+        canonical: &[u8],
+    ) -> Result<SealRecord, IntegrityError> {
+        self.append(
+            SealKind::Copy,
+            recording,
+            sequence,
+            sequence,
             digest(canonical),
         )
     }
@@ -495,4 +571,11 @@ pub(super) fn open_locked<D: Disk>(
         }
     }
     Err(IntegrityError::Locked)
+}
+
+/// A new journal handle identity.
+fn next_handle() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
