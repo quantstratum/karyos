@@ -4,12 +4,8 @@
 
 A Karyos release is a tag `v<version>` on `main`, with its
 `RELEASE-NOTES-<version>.md` and its `CHANGELOG.md` section. This file
-lists the gates a release runs and how their results are recorded. It
-decides nothing about publishing crates to crates.io: which gate run
-authorises a publication is still open, with the other points of the
-first crates.io publication, and waits on the owner (quantstratum-docs:
-`karyos/issues/M01-safe-ipc-core/005-first-crates-io-alpha-publication.md`,
-point 4, "Release procedure while hosted CI is off").
+lists the gates a release runs and how their results are recorded, and
+the crates.io publication procedure (section "Publishing to crates.io").
 
 ## Evidence
 
@@ -167,6 +163,72 @@ open to anyone until they are published.
 The C++ names (CMake `karyos`; Conan and vcpkg deferred) are not
 registry names and are not checked. Each binding's own release repeats
 the check for its names before it publishes.
+
+## Publishing to crates.io
+
+The core crates are published to crates.io as alpha prereleases
+(quantstratum-docs: `karyos/adr/0068-publish-the-core-crates-to-crates-io-as-alpha.md`).
+The four points that were open before the first publication were
+answered by the owner on 2026-11-17, when 0.1.0-alpha.3 was published
+(karyos#622):
+
+| Point | Answer (2026-11-17) |
+| --- | --- |
+| Which crates, in which order | The facade and everything it depends on, in dependency order: `karyos-sys`, `karyos-protocol`, `karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`, `karyos-cluster`, `karyos`. Every other crate keeps `publish = false` |
+| Version scheme | `0.1.0-alpha.N`, the workspace version, the same for every published crate |
+| Ownership | The owner's crates.io account |
+| Gate that authorised 0.1.0-alpha.3 | For alpha.3 only, a written exception: `CHANGELOG_RELEASE=1 make pre-push` run locally at the release head, plus `cargo publish --dry-run`, while hosted CI was off (karyos#623). Later releases run the full release gates of this file or record their own written exception |
+
+### Procedure
+
+1. Run the gates of "Release gates" at the release head and record each
+   in the Evidence table of the release notes; for a release covered by
+   a written exception (as 0.1.0-alpha.3 was), run at least
+   `CHANGELOG_RELEASE=1 make pre-push` and name the gates not run.
+2. Run the ADR-0033 admission review of the resolved normal and build
+   graph of the published crates, `cargo tree --locked -e normal,build`
+   over the eight packages, and record it below with its date and head.
+   A family outside ADR-0033 and its admitted successors blocks the
+   publication.
+3. Check the crate names. A name not yet published by the owner account
+   must be free on crates.io; a published name must be owned by the
+   owner account. Record the result below.
+4. Run one dry run over all the published crates together:
+   `cargo publish --dry-run --locked -p karyos-sys -p karyos-protocol -p karyos-codec -p karyos-client -p karyos-io -p karyos-archive -p karyos-cluster -p karyos`.
+   Cargo packages them as one set and verifies each against the others'
+   packaged sources, so it checks the new versions before any is on the
+   index; a separate dry run per crate cannot, because a dependant's new
+   dependency version is not published yet.
+5. Tag the release, then `cargo publish --locked -p <crate>` in the order
+   above. Before publishing the next crate, wait until the previous one
+   is in the index: `cargo info <crate>@<version>` (or
+   `cargo search <crate>`) shows the new version. A crate whose
+   dependency is not yet indexed fails to publish; rerun it once the
+   index has it, never skip it.
+6. From a scratch project outside the workspace, `cargo new`, add
+   `karyos = "=<version>"` and run `cargo build`: the published graph
+   resolves and builds from the registry alone. Record the result as an
+   Evidence row.
+
+A published version is never yanked to correct documentation; a
+defect fix is a new `alpha.N`.
+
+### Admission review of the published graph
+
+| Date | Head | Resolved normal and build graph outside the workspace | Result |
+| --- | --- | --- | --- |
+| 2026-11-19 | `v0.1.0-alpha.3` (b7b37d41) | `thiserror` 2.0.21, `thiserror-impl` 2.0.21 (proc macro), `syn` 3.0.8, `quote` 1.0.47, `proc-macro2` 1.0.107, `unicode-ident` 1.0.26; all from crates.io | Admitted: `thiserror` is an ADR-0033 family for every crate; `syn`, `quote`, `proc-macro2` and `unicode-ident` enter only as the build time graph of the `thiserror-impl` proc macro and ship no runtime code. Licences: MIT OR Apache-2.0, and `unicode-ident` adds Unicode-3.0. Build scripts (`thiserror`, `proc-macro2`, `quote`) compile no C or C++ |
+
+Main after `v0.1.0-alpha.3` adds the ADR-0086 wire authentication
+families (`ed25519-dalek`, `sha2` and their graph) to the published
+crates; the next publication reviews them in its own row.
+
+### Crate name check
+
+| Checked | Names | Result |
+| --- | --- | --- |
+| 2026-11-17 | the eight published crates | free before publication; published the same day (crates.io `created_at` 2026-11-17) |
+| 2026-11-19 | the eight published crates | owned by the owner account: the crates.io owners list of each crate (`cargo owner --list <crate>`) names only `joaquinbejar` |
 
 ## After the tag
 
