@@ -87,8 +87,10 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
     ///
     /// # Errors
     ///
-    /// [`IntegrityError::Io`], after which the ledger is poisoned until
-    /// reopened; [`IntegrityError::Poisoned`] after such a failure.
+    /// [`IntegrityError::StaleLedger`] when the file holds entries this
+    /// handle does not, with nothing written; [`IntegrityError::Io`],
+    /// after which the ledger is poisoned until reopened;
+    /// [`IntegrityError::Poisoned`] after such a failure.
     pub fn append(&mut self, entry: [u8; N]) -> Result<(), IntegrityError> {
         if self.poisoned {
             return Err(IntegrityError::Poisoned);
@@ -97,6 +99,11 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
         let offset = count
             .checked_mul(Self::LENGTH)
             .ok_or(IntegrityError::Overflow)?;
+        // Compare and swap on the file length: a handle that does not hold
+        // every entry on disk would overwrite one.
+        if self.disk.len(&self.file)? != offset {
+            return Err(IntegrityError::StaleLedger);
+        }
         let written = self
             .disk
             .write_at(&self.file, offset, &entry)
@@ -115,10 +122,18 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
     ///
     /// # Errors
     ///
-    /// As [`Ledger::append`].
+    /// As [`Ledger::append`]: [`IntegrityError::StaleLedger`] when the file
+    /// holds entries this handle does not, with nothing cut.
     pub fn truncate(&mut self, keep: usize) -> Result<(), IntegrityError> {
         if self.poisoned {
             return Err(IntegrityError::Poisoned);
+        }
+        let held = u64::try_from(self.entries.len())
+            .ok()
+            .and_then(|held| held.checked_mul(Self::LENGTH))
+            .ok_or(IntegrityError::Overflow)?;
+        if self.disk.len(&self.file)? != held {
+            return Err(IntegrityError::StaleLedger);
         }
         if keep >= self.entries.len() {
             return Ok(());

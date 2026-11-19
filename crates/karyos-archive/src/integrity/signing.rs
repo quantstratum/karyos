@@ -213,6 +213,8 @@ struct Pending {
 #[derive(Debug, Clone)]
 pub struct HeadSigning {
     config: SigningConfig,
+    /// The Archive whose heads are signed, pinned for the queue's life.
+    archive_id: Digest,
     /// The journal whose heads are signed.
     journal_id: u64,
     /// The registry's identity when coverage was last validated.
@@ -234,11 +236,19 @@ pub struct HeadSigning {
 }
 
 impl HeadSigning {
-    /// Signing of journal `journal_id` that started at `now_ns`.
+    /// Signing of journal `journal_id` of Archive `archive_id` that
+    /// started at `now_ns`. A registry of another Archive trusts none of
+    /// its heads.
     #[must_use]
-    pub const fn new(config: SigningConfig, journal_id: u64, now_ns: u64) -> Self {
+    pub const fn new(
+        config: SigningConfig,
+        archive_id: Digest,
+        journal_id: u64,
+        now_ns: u64,
+    ) -> Self {
         Self {
             config,
+            archive_id,
             journal_id,
             registry_identity: [0; super::DIGEST_LENGTH],
             pending: VecDeque::new(),
@@ -272,13 +282,12 @@ impl HeadSigning {
         journal_id: u64,
         records: &[SealRecord],
     ) -> Self {
-        let mut signing = Self::new(config, journal_id, now_ns);
+        let mut signing = Self::new(config, registry.trust().archive_id, journal_id, now_ns);
         signing.registry_identity = registry.identity();
         signing.overdue_until = Some(u64::try_from(records.len()).unwrap_or(u64::MAX));
         for bytes in recorded {
             let valid = SignedHead::decode(bytes).ok().filter(|signed| {
-                signing.in_chain(&signed.head, records, &registry.trust().archive_id)
-                    && trusted(registry, signed)
+                signing.in_chain(&signed.head, records) && trusted(registry, signed)
             });
             match valid {
                 Some(signed) => signing.signed.push(signed),
@@ -295,10 +304,13 @@ impl HeadSigning {
             BacklogPolicy::Coalesce => {
                 let replaced = self.pending.pop_back();
                 self.pending.clear();
-                self.pending.push_back(Pending {
-                    head,
-                    since_ns: replaced.map_or(now_ns, |old| old.since_ns),
-                });
+                // The new head covers every record the replaced head did,
+                // and those of a head dropped before it: it inherits the
+                // oldest of their ages.
+                let since_ns = replaced
+                    .map_or(now_ns, |old| old.since_ns.min(now_ns))
+                    .min(self.refused_since_ns.take().unwrap_or(now_ns));
+                self.pending.push_back(Pending { head, since_ns });
                 if replaced.is_some() {
                     self.coalesced = self.coalesced.saturating_add(1);
                     Offered::Coalesced
@@ -347,7 +359,7 @@ impl HeadSigning {
         }
         let mut signed = 0u64;
         while let Some(pending) = self.pending.front().copied() {
-            if !self.in_chain(&pending.head, records, &registry.trust().archive_id) {
+            if !self.in_chain(&pending.head, records) {
                 let _ = self.pending.pop_front();
                 self.discarded = self.discarded.saturating_add(1);
                 // The records it was to cover are still uncovered: their
@@ -413,8 +425,8 @@ impl HeadSigning {
 
     /// Whether `head` is a head of this journal's chain: the Archive, this
     /// journal and the digest of the chain's record at its counter.
-    fn in_chain(&self, head: &ChainHead, records: &[SealRecord], archive_id: &Digest) -> bool {
-        head.archive_id == *archive_id
+    fn in_chain(&self, head: &ChainHead, records: &[SealRecord]) -> bool {
+        head.archive_id == self.archive_id
             && head.journal_id == self.journal_id
             && usize::try_from(head.counter)
                 .ok()

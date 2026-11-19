@@ -41,6 +41,10 @@ pub enum IntegrityError {
     /// An earlier append failed part way; reopen the journal to recover.
     #[error("an earlier append failed; the journal must be reopened")]
     Poisoned,
+    /// A ledger handle that does not hold every entry on disk: another
+    /// handle appended or cut since it was opened. Nothing was written.
+    #[error("the ledger was changed through another handle; reopen it")]
+    StaleLedger,
     /// The key registry refused an entry.
     #[error("key registry: {0}")]
     Registry(#[from] super::trust::RegistryError),
@@ -67,8 +71,9 @@ pub struct IntegrityJournal<D: Disk> {
     disk: D,
     file: D::File,
     check: ChainCheck,
-    /// The sequence and digest of the last key registry record chained.
-    last_registry: Option<(u64, Digest)>,
+    /// The identity of the key registry history chained: a running digest
+    /// of every key registry record's entry digest, in chain order.
+    registry_identity: Digest,
     poisoned: bool,
 }
 
@@ -103,7 +108,7 @@ impl<D: Disk> IntegrityJournal<D> {
         let length = disk.len(&file)?;
         let whole = length / RECORD_LENGTH;
         let mut check = ChainCheck::new();
-        let mut last_registry = None;
+        let mut registry_identity = super::trust::EMPTY_REGISTRY;
         let mut kept = whole;
         let mut buf = [0u8; SEAL_RECORD_LENGTH];
         for index in 0..whole {
@@ -122,7 +127,8 @@ impl<D: Disk> IntegrityJournal<D> {
             };
             check.accept(&record)?;
             if record.kind == SealKind::KeyRegistry {
-                last_registry = Some((record.start, record.content));
+                registry_identity =
+                    super::trust::extend_identity(&registry_identity, &record.content);
             }
         }
         let keep = kept
@@ -138,7 +144,7 @@ impl<D: Disk> IntegrityJournal<D> {
                 disk,
                 file,
                 check,
-                last_registry,
+                registry_identity,
                 poisoned: false,
             },
             truncated,
@@ -153,13 +159,13 @@ impl<D: Disk> IntegrityJournal<D> {
         self.check.next_counter()
     }
 
-    /// The registry sequence and the entry digest of the last key registry
-    /// record chained, if any: what a registry must have applied last to
-    /// append the next entry.
+    /// The identity of the key registry history this journal chains, as
+    /// [`super::trust::KeyRegistry::identity`] computes it: only a registry
+    /// that applied exactly that history may append the next entry.
     #[must_use]
     #[inline]
-    pub const fn last_key_registry(&self) -> Option<(u64, Digest)> {
-        self.last_registry
+    pub const fn key_registry_identity(&self) -> Digest {
+        self.registry_identity
     }
 
     /// Whether an append failed part way: the handle no longer knows how
@@ -251,7 +257,8 @@ impl<D: Disk> IntegrityJournal<D> {
         }
         self.check = next;
         if kind == SealKind::KeyRegistry {
-            self.last_registry = Some((start, content));
+            self.registry_identity =
+                super::trust::extend_identity(&self.registry_identity, &content);
         }
         Ok(record)
     }

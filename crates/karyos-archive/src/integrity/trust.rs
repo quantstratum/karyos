@@ -557,8 +557,6 @@ pub struct KeyState {
 pub struct KeyRegistry {
     trust: TrustRoot,
     next_sequence: u64,
-    /// The sequence and digest of the last entry applied.
-    last: Option<(u64, Digest)>,
     /// A digest of every entry applied, in order: equal only for the same
     /// registry contents.
     identity: Digest,
@@ -572,8 +570,7 @@ impl KeyRegistry {
         Self {
             trust,
             next_sequence: 0,
-            last: None,
-            identity: [0; DIGEST_LENGTH],
+            identity: EMPTY_REGISTRY,
             keys: std::collections::BTreeMap::new(),
         }
     }
@@ -747,12 +744,7 @@ impl KeyRegistry {
             }
         }
         self.next_sequence = next;
-        let entry_digest = digest(&entry.encode());
-        self.last = Some((sequence, entry_digest));
-        let mut chained = Vec::with_capacity(2 * DIGEST_LENGTH);
-        chained.extend_from_slice(&self.identity);
-        chained.extend_from_slice(&entry_digest);
-        self.identity = digest(&chained);
+        self.identity = extend_identity(&self.identity, &digest(&entry.encode()));
         Ok(())
     }
 
@@ -776,10 +768,10 @@ impl KeyRegistry {
         if journal.is_poisoned() {
             return Err(IntegrityError::Poisoned);
         }
-        // Compare and swap: only the registry the journal last committed
-        // may append, so two handles cannot each commit an entry of one
-        // sequence.
-        if journal.last_key_registry() != self.last {
+        // Compare and swap on the whole history: only a registry that
+        // applied exactly the entries the journal chains, in order, may
+        // append, so a stale or divergent handle cannot commit.
+        if journal.key_registry_identity() != self.identity {
             return Err(RegistryError::Stale {
                 sequence: entry.sequence,
             }
@@ -850,6 +842,20 @@ impl KeyRegistry {
         }
         HeadVerdict::Trusted { custody }
     }
+}
+
+/// The identity of a registry with no entries.
+pub const EMPTY_REGISTRY: Digest = [0; DIGEST_LENGTH];
+
+/// The identity of a registry history `identity` extended by the entry
+/// whose canonical bytes have digest `entry_digest`: the SHA-256 of both.
+#[must_use]
+pub fn extend_identity(identity: &Digest, entry_digest: &Digest) -> Digest {
+    let mut chained = [0u8; 2 * DIGEST_LENGTH];
+    let (left, right) = chained.split_at_mut(DIGEST_LENGTH);
+    left.copy_from_slice(identity);
+    right.copy_from_slice(entry_digest);
+    digest(&chained)
 }
 
 /// Refuses `entry` if it would take effect before `counter`, the chain
