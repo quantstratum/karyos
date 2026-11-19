@@ -599,31 +599,30 @@ pub fn publish_due(
     }))
 }
 
-/// An [`AnchorStore`] kept as a [`Ledger`] of encoded anchors in a
-/// directory the Archive does not control: the operator's export
-/// directory, or a mounted replica's. Its counter is the anchor's index
-/// in the ledger and its receipt the digest of the bytes stored.
+/// An [`AnchorStore`] kept as a [`Ledger`] of encoded anchors in the
+/// operator's export directory, which the Archive does not control. Its
+/// counter is the anchor's index in the ledger and its receipt the digest
+/// of the bytes stored.
+///
+/// A file in a directory establishes an operator export and nothing more:
+/// this store is always of kind [`AnchorKind::OperatorExport`], and it
+/// never confirms an anchor labelled as object-lock retention, a Cluster
+/// log or a replica journal, whose evidence only those systems' own
+/// clients can give.
 #[derive(Debug)]
 pub struct LedgerAnchorStore<D: Disk> {
-    kind: AnchorKind,
     location: Digest,
     ledger: Ledger<D, ANCHOR_LENGTH>,
 }
 
 impl<D: Disk> LedgerAnchorStore<D> {
-    /// The anchor file in `dir`, the store `location` of kind `kind`.
+    /// The anchor file in `dir`, the operator export at `location`.
     ///
     /// # Errors
     ///
     /// As [`Ledger::open`].
-    pub fn open(
-        disk: D,
-        dir: &Path,
-        kind: AnchorKind,
-        location: Digest,
-    ) -> Result<Self, IntegrityError> {
+    pub fn open(disk: D, dir: &Path, location: Digest) -> Result<Self, IntegrityError> {
         Ok(Self {
-            kind,
             location,
             ledger: Ledger::open(disk, dir, ANCHOR_FILE)?,
         })
@@ -649,7 +648,7 @@ impl<D: Disk> LedgerAnchorStore<D> {
 
 impl<D: Disk> AnchorEvidence for LedgerAnchorStore<D> {
     fn confirms(&self, anchor: &Anchor) -> bool {
-        if anchor.kind != self.kind || anchor.location != self.location {
+        if anchor.kind != AnchorKind::OperatorExport || anchor.location != self.location {
             return false;
         }
         let Some(bytes) = usize::try_from(anchor.external_counter)
@@ -674,7 +673,7 @@ pub const ANCHOR_FILE: &str = "anchors.kya";
 
 impl<D: Disk> AnchorStore for LedgerAnchorStore<D> {
     fn kind(&self) -> AnchorKind {
-        self.kind
+        AnchorKind::OperatorExport
     }
 
     fn location(&self) -> Digest {
@@ -685,7 +684,7 @@ impl<D: Disk> AnchorStore for LedgerAnchorStore<D> {
         let counter = u64::try_from(self.ledger.entries().len())
             .map_err(|_| std::io::Error::other("anchor counter overflow"))?;
         let anchor = Anchor {
-            kind: self.kind,
+            kind: AnchorKind::OperatorExport,
             location: self.location,
             external_counter: counter,
             receipt: [0; 32],

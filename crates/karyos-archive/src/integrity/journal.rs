@@ -65,6 +65,10 @@ pub enum IntegrityError {
         /// The record's counter.
         counter: u64,
     },
+    /// A copy catalog handle behind the journal: another handle recorded
+    /// a copy change since it was opened. Nothing was written.
+    #[error("the copy catalog was changed through another handle; reopen it")]
+    StaleCatalog,
     /// The key registry refused an entry.
     #[error("key registry: {0}")]
     Registry(#[from] super::trust::RegistryError),
@@ -93,6 +97,8 @@ pub struct IntegrityJournal<D: Disk> {
     /// The archive directory the journal is in.
     dir: PathBuf,
     check: ChainCheck,
+    /// The copy changes chained: the sequence the next one must carry.
+    copy_changes: u64,
     /// The identity of the key registry history chained: a running digest
     /// of every key registry record's entry digest, in chain order.
     registry_identity: Digest,
@@ -122,6 +128,7 @@ impl<D: Disk> IntegrityJournal<D> {
         let whole = length / RECORD_LENGTH;
         let mut check = ChainCheck::new();
         let mut registry_identity = super::trust::EMPTY_REGISTRY;
+        let mut copy_changes = 0u64;
         let mut kept = whole;
         let mut buf = [0u8; SEAL_RECORD_LENGTH];
         for index in 0..whole {
@@ -139,6 +146,9 @@ impl<D: Disk> IntegrityJournal<D> {
                 Err(error) => return Err(Inconsistency::Malformed { index, error }.into()),
             };
             check.accept(&record)?;
+            if record.kind == SealKind::Copy {
+                copy_changes = copy_changes.saturating_add(1);
+            }
             if record.kind == SealKind::KeyRegistry {
                 registry_identity =
                     super::trust::extend_identity(&registry_identity, &record.content);
@@ -158,6 +168,7 @@ impl<D: Disk> IntegrityJournal<D> {
                 file,
                 dir: dir.to_path_buf(),
                 check,
+                copy_changes,
                 registry_identity,
                 poisoned: false,
             },
@@ -171,6 +182,14 @@ impl<D: Disk> IntegrityJournal<D> {
     #[inline]
     pub const fn next_counter(&self) -> u64 {
         self.check.next_counter()
+    }
+
+    /// The copy changes this journal chains: the sequence the next copy
+    /// change must carry.
+    #[must_use]
+    #[inline]
+    pub const fn copy_changes(&self) -> u64 {
+        self.copy_changes
     }
 
     /// The identity of the key registry history this journal chains, as
@@ -294,6 +313,9 @@ impl<D: Disk> IntegrityJournal<D> {
             return Err(error.into());
         }
         self.check = next;
+        if kind == SealKind::Copy {
+            self.copy_changes = self.copy_changes.saturating_add(1);
+        }
         if kind == SealKind::KeyRegistry {
             self.registry_identity =
                 super::trust::extend_identity(&self.registry_identity, &content);

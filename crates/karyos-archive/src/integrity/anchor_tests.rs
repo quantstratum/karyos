@@ -277,13 +277,7 @@ fn anchors_are_published_on_schedule_with_what_a_third_party_needs() {
     let (_, records) = chain(10);
     let disk = FaultDisk::default();
     let operator_dir = Path::new("/operator");
-    let mut store = LedgerAnchorStore::open(
-        disk.clone(),
-        operator_dir,
-        AnchorKind::OperatorExport,
-        OPERATOR,
-    )
-    .unwrap();
+    let mut store = LedgerAnchorStore::open(disk.clone(), operator_dir, OPERATOR).unwrap();
     let every = NonZeroU64::new(4).unwrap();
     let first = publish_due(&mut store, None, Some(&sign(&records[1])), every)
         .unwrap()
@@ -298,8 +292,7 @@ fn anchors_are_published_on_schedule_with_what_a_third_party_needs() {
         .unwrap();
     assert_eq!(second.external_counter, 1);
     // A third party reopens the store and checks the chain against it.
-    let reopened =
-        LedgerAnchorStore::open(disk, operator_dir, AnchorKind::OperatorExport, OPERATOR).unwrap();
+    let reopened = LedgerAnchorStore::open(disk, operator_dir, OPERATOR).unwrap();
     let anchors = reopened.anchors();
     assert_eq!(anchors.len(), 2);
     let report = check_anchors(
@@ -623,4 +616,78 @@ fn copy_state_is_replayed_in_journal_order_once_per_committed_change() {
         ),
         Err(super::journal::IntegrityError::Unrecorded { counter: 0 })
     ));
+}
+
+#[test]
+fn a_poisoned_journal_never_yields_copy_state() {
+    use super::journal::{IntegrityError, IntegrityJournal};
+    let probe = FaultDisk::default();
+    IntegrityJournal::open(probe.clone(), Path::new(DIR)).unwrap();
+    let mut journal = IntegrityJournal::open(FaultDisk::with_budget(probe.used()), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let disk = FaultDisk::default();
+    let mut copies = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut journal).unwrap();
+    assert!(
+        copies
+            .record(
+                copy(REPLICA, CopyState::Removed, Enforcement::Unsupported),
+                &mut journal
+            )
+            .is_err()
+    );
+    assert!(journal.is_poisoned());
+    assert!(matches!(
+        CopyCatalog::open(disk, Path::new(DIR), &mut journal),
+        Err(IntegrityError::Poisoned)
+    ));
+}
+
+#[test]
+fn a_stale_copy_catalog_handle_cannot_record_a_change() {
+    use super::journal::IntegrityError;
+    let disk = FaultDisk::default();
+    let (mut journal, _) = chain(1);
+    let mut first = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut journal).unwrap();
+    let mut second = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut journal).unwrap();
+    first
+        .record(
+            copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock),
+            &mut journal,
+        )
+        .unwrap();
+    assert!(matches!(
+        second.record(
+            copy(REPLICA, CopyState::Removed, Enforcement::ObjectLock),
+            &mut journal
+        ),
+        Err(IntegrityError::StaleCatalog)
+    ));
+    let reopened = CopyCatalog::open(disk, Path::new(DIR), &mut journal).unwrap();
+    assert_eq!(reopened.records().len(), 1);
+    assert_eq!(reopened.verified_copies(3, 0, 80), 1);
+}
+
+#[test]
+fn a_filesystem_store_confirms_only_operator_exports() {
+    let (_, records) = chain(4);
+    let disk = FaultDisk::default();
+    let mut store = LedgerAnchorStore::open(disk, Path::new("/operator"), OPERATOR).unwrap();
+    let published = publish_due(
+        &mut store,
+        None,
+        Some(&sign(&records[2])),
+        NonZeroU64::new(1).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(published.kind, AnchorKind::OperatorExport);
+    assert!(store.confirms(&published));
+    for kind in [
+        AnchorKind::ObjectLock,
+        AnchorKind::ClusterLog,
+        AnchorKind::ReplicaJournal,
+    ] {
+        assert!(!store.confirms(&Anchor { kind, ..published }), "{kind:?}");
+    }
 }

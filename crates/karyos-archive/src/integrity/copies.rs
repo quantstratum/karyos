@@ -238,7 +238,9 @@ impl<D: Disk> CopyCatalog<D> {
     ///
     /// # Errors
     ///
-    /// As [`Ledger::open`] and [`IntegrityJournal::records`];
+    /// [`IntegrityError::Poisoned`] for a journal handle an earlier append
+    /// poisoned, before anything is read; as [`Ledger::open`] and
+    /// [`IntegrityJournal::records`];
     /// [`IntegrityError::Unrecorded`] for a copy change the journal chains
     /// whose record the ledger does not hold or that does not match the
     /// journal's record of it.
@@ -247,6 +249,11 @@ impl<D: Disk> CopyCatalog<D> {
         dir: &Path,
         journal: &mut IntegrityJournal<D>,
     ) -> Result<Self, IntegrityError> {
+        // A poisoned handle reads only the records it knows of: a change
+        // whose sync failed may still be on disk. Reopen the journal first.
+        if journal.is_poisoned() {
+            return Err(IntegrityError::Poisoned);
+        }
         let ledger = Ledger::open(disk, dir, COPIES_FILE)?;
         let stored: std::collections::BTreeMap<Digest, &[u8; COPY_RECORD_LENGTH]> = ledger
             .entries()
@@ -300,13 +307,24 @@ impl<D: Disk> CopyCatalog<D> {
     ///
     /// # Errors
     ///
-    /// The ledger's or the journal's error; the state is unchanged then.
+    /// [`IntegrityError::StaleCatalog`] when another handle recorded a
+    /// change since this one was opened, and [`IntegrityError::Poisoned`]
+    /// for a poisoned journal, with nothing written; otherwise the ledger's
+    /// or the journal's error. The state is unchanged on an error.
     pub fn record(
         &mut self,
         mut record: CopyRecord,
         journal: &mut IntegrityJournal<D>,
     ) -> Result<SealRecord, IntegrityError> {
         record.sequence = self.next_sequence();
+        // Compare and swap: only a catalog that holds every change the
+        // journal chains may record the next one.
+        if journal.is_poisoned() {
+            return Err(IntegrityError::Poisoned);
+        }
+        if journal.copy_changes() != record.sequence {
+            return Err(IntegrityError::StaleCatalog);
+        }
         let bytes = record.encode();
         self.ledger.append(bytes)?;
         let chained = journal.record_copy_change(record.recording, record.sequence, &bytes)?;
