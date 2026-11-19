@@ -18,6 +18,7 @@ karyos-client.workspace = true
 karyos-codec.workspace = true
 karyos-io.workspace = true
 karyos-sys.workspace = true
+karyos-trace.workspace = true
 thiserror.workspace = true
 sha2.workspace = true
 ed25519-dalek.workspace = true

@@ -58,6 +58,7 @@ pub mod signing;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_key;
 pub mod tiering;
+pub mod time;
 pub mod trust;
 pub mod verify;
 
