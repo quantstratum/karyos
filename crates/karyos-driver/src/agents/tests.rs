@@ -622,6 +622,9 @@ fn every_agent_cell_carries_the_counter_its_label_names() {
         registrants_restarted: 24,
         registrants_moved: 25,
         registrants_timed_out: 26,
+        registration_replies_unsent: 32,
+        bindings_reserved: 33,
+        challenges_unbound: 34,
         ..roles::SenderCounters::default()
     };
     let registrations = crate::sessions::register::RegistrationCounters {
@@ -633,13 +636,17 @@ fn every_agent_cell_carries_the_counter_its_label_names() {
         dropped_not_allowed: 11,
         dropped_source_rate: 12,
         dropped_rate: 13,
-        dropped_pending_full: 14,
-        dropped_source_pending_full: 15,
         dropped_bound: 16,
         dropped_boot_changed: 17,
         duplicate_receiver: 18,
         required_pending_replaced: 19,
         expired: 20,
+        dropped_quarantined: 27,
+        dropped_required_lost: 28,
+        dropped_challenge_rate: 29,
+        pending_replaced: 30,
+        source_rates_full: 31,
+        overflowed: true,
         ..crate::sessions::register::RegistrationCounters::default()
     };
     let expected_sender = [
@@ -656,8 +663,6 @@ fn every_agent_cell_carries_the_counter_its_label_names() {
         ("registrations dropped range", 11),
         ("registrations dropped source rate", 12),
         ("registrations dropped rate", 13),
-        ("registrations dropped pending", 14),
-        ("registrations dropped source pending", 15),
         ("registrations dropped bound", 16),
         ("registrations dropped boot changed", 17),
         ("registrations duplicate receiver", 18),
@@ -669,6 +674,15 @@ fn every_agent_cell_carries_the_counter_its_label_names() {
         ("registrants restarted", 24),
         ("registrants moved", 25),
         ("registrants timed out", 26),
+        ("registrations dropped quarantined", 27),
+        ("registrations dropped required lost", 28),
+        ("registrations dropped challenge rate", 29),
+        ("registrations pending replaced", 30),
+        ("registration source table full", 31),
+        ("registration replies unsent", 32),
+        ("receiver bindings reserved", 33),
+        ("challenges unbound", 34),
+        ("sender counters overflowed", 1),
     ];
     let values = sender_values(&sender, &registrations);
     assert_eq!(SENDER_CELLS.len(), expected_sender.len());
@@ -686,6 +700,8 @@ fn every_agent_cell_carries_the_counter_its_label_names() {
         registers_sent: 6,
         registers_unsent: 7,
         registration_refusals: 8,
+        registers_rate_limited: 9,
+        setup_not_from_control: 10,
         ..roles::ReceiverCounters::default()
     };
     let expected_receiver = [
@@ -697,6 +713,9 @@ fn every_agent_cell_carries_the_counter_its_label_names() {
         ("registers sent", 6),
         ("registers unsent", 7),
         ("registration refusals received", 8),
+        ("registers rate limited", 9),
+        ("setup not from control", 10),
+        ("receiver counters overflowed", 0),
     ];
     assert_eq!(RECEIVER_CELLS.len(), expected_receiver.len());
     for ((label, value), (expected_label, expected)) in RECEIVER_CELLS

@@ -87,7 +87,10 @@
 //! mode; the conductor frees them when the network closes and the agents
 //! come back. Sender: `network controls sent`, `network control send
 //! failures`, `naks received`, `status messages received`, `heartbeats
-//! sent`. Receiver: `datagrams received`, `datagrams dropped by backend`,
+//! sent`, then the dynamic registrations' cells listed with
+//! `agents::SENDER_CELLS`, ending with `sender counters overflowed`, a
+//! gauge that is 1 once a sender or registration count saturated
+//! (karyos#977). Receiver: `datagrams received`, `datagrams dropped by backend`,
 //! `invalid frames received`, `status messages sent`, `images retired at
 //! timeout`, and for `control-mode=dynamic` subscriptions (karyos#941)
 //! `registers sent`, `registers unsent` (a rate, the control ring or a
@@ -95,6 +98,9 @@
 //! (ERR REGISTRATION `DESTINATIONS_FULL` from a `control` address). A
 //! dynamic subscription whose REGISTERs are dropped with no reply (the
 //! allowlist, a rate, quarantine) shows only `registers sent` growing.
+//! Then `registers rate limited` (its per-`control` bucket held one
+//! back), `setup not from control` and the gauge `receiver counters
+//! overflowed` (karyos#977).
 //! When no cell is free one is not allocated and `counters unavailable`
 //! counts it.
 //!

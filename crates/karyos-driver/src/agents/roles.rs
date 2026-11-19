@@ -1736,6 +1736,16 @@ fn collect_probe(rtt: &mut RttProbes, probe: &mut PathProbe, replied: bool) {
     }
 }
 
+/// How [`SenderRole::send_with`] sends a control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Now, or dropped.
+    Now,
+    /// Now, or waiting in order while every cached route is closing.
+    Wait,
+    /// Now, on a transient route (karyos#977).
+    Reply,
+}
 /// What one control send did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sent {
@@ -6115,7 +6125,19 @@ impl<T: StreamTerms> SenderRole<T> {
         destination: SocketAddr,
         control: &Control,
     ) -> Sent {
-        self.send_with(halves, endpoint, destination, control, false)
+        self.send_with(halves, endpoint, destination, control, Mode::Now)
+    }
+
+    /// [`SenderRole::send`] of a reply to a REGISTER or a registrant's
+    /// first SM, on a transient control route (karyos#977).
+    fn send_reply<O: SocketOps>(
+        &mut self,
+        halves: &mut [(EndpointId, Half<O>)],
+        endpoint: EndpointId,
+        destination: SocketAddr,
+        control: &Control,
+    ) -> Sent {
+        self.send_with(halves, endpoint, destination, control, Mode::Reply)
     }
 
     /// [`SenderRole::send`] of a control that must reach its destination
@@ -6128,7 +6150,7 @@ impl<T: StreamTerms> SenderRole<T> {
         destination: SocketAddr,
         control: &Control,
     ) -> Sent {
-        self.send_with(halves, endpoint, destination, control, true)
+        self.send_with(halves, endpoint, destination, control, Mode::Wait)
     }
 
     fn send_with<O: SocketOps>(
@@ -6137,7 +6159,7 @@ impl<T: StreamTerms> SenderRole<T> {
         endpoint: EndpointId,
         destination: SocketAddr,
         control: &Control,
-        wait: bool,
+        mode: Mode,
     ) -> Sent {
         let tx = halves.iter_mut().find_map(|(held, half)| match half {
             Half::Tx(tx) if *held == endpoint => Some(tx),
@@ -6159,10 +6181,13 @@ impl<T: StreamTerms> SenderRole<T> {
             return Sent::NotSubmitted;
         };
         slot.endpoint = Some(endpoint);
-        let result = if wait {
-            slot.routes.send_or_wait(tx, destination, control)
-        } else {
-            slot.routes.send(tx, destination, control).map(|()| true)
+        let result = match mode {
+            Mode::Wait => slot.routes.send_or_wait(tx, destination, control),
+            Mode::Now => slot.routes.send(tx, destination, control).map(|()| true),
+            Mode::Reply => slot
+                .routes
+                .send_reply(tx, destination, control)
+                .map(|()| true),
         };
         match result {
             Ok(false) => {
@@ -6306,9 +6331,14 @@ impl<T: StreamTerms> SenderRole<T> {
                 } => {
                     // A registrant's first SM finding the slots taken is
                     // answered with one ERR REGISTRATION (design 3.2).
+                    // Its send failure is counted as the REGISTER's ERR is
+                    // (design 11.2, karyos#977).
                     if let Some((destination, reply)) = self.status(endpoint, source, &status, now)
+                        && !self
+                            .send_reply(halves, endpoint, destination, &reply)
+                            .submitted()
                     {
-                        let _ = self.send(halves, endpoint, destination, &reply);
+                        self.count(|c| &mut c.registration_replies_unsent);
                     }
                 }
                 ControlItem::Incoming {
@@ -6319,7 +6349,9 @@ impl<T: StreamTerms> SenderRole<T> {
                 } => {
                     if let Some((destination, reply)) =
                         self.register(endpoint, source, &register, now)
-                        && !self.send(halves, endpoint, destination, &reply).submitted()
+                        && !self
+                            .send_reply(halves, endpoint, destination, &reply)
+                            .submitted()
                     {
                         self.count(|c| &mut c.registration_replies_unsent);
                     }
@@ -6384,9 +6416,13 @@ impl<T: StreamTerms> SenderRole<T> {
             }
             // A multi-destination publication keeps announcing while one of
             // its destinations has no live member.
+            // A dynamic publication is never announced on the cadence, a
+            // dead required slot included (design 9.2, 11.2; karyos#977).
+            let silent = outbound.is_dynamic();
             for path in outbound.route_endpoints() {
                 self.sessions
                     .set_announcing(path, alias, outbound.announces_destinations());
+                self.sessions.set_silent(path, alias, silent);
             }
         }
         for _ in 0..changes {

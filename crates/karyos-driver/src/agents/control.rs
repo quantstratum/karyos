@@ -288,6 +288,11 @@ struct Destination {
     closing: bool,
     /// The first duty that found it closing, still in flight.
     closing_since: Option<u64>,
+    /// Opened for a reply to a REGISTER or a registrant's first SM, to an
+    /// address the network chose (karyos#977, #942 item 7): such entries
+    /// take at most half the cache and make room only among themselves,
+    /// so a stream of new registrants never evicts a destination's route.
+    transient: bool,
 }
 
 /// How long an evicted control route may stay in flight before it counts
@@ -604,7 +609,7 @@ impl ControlRoutes {
             return;
         }
         while let Some((address, control)) = self.waiting.pop_front() {
-            match self.send_now(tx, address, &control) {
+            match self.send_now(tx, address, &control, false) {
                 Ok(()) => {}
                 Err(ControlSendError::Blocked) => {
                     self.waiting.push_front((address, control));
@@ -659,6 +664,7 @@ impl ControlRoutes {
         &mut self,
         tx: &mut SocketsTx<O>,
         address: SocketAddr,
+        transient: bool,
     ) -> Result<TxQueueId, ControlSendError> {
         // A reset reopened the endpoint: the cached ids are of the old
         // epoch, and every one of them is dead.
@@ -687,6 +693,9 @@ impl ControlRoutes {
             .find(|entry| entry.address == address && !entry.closing)
         {
             entry.used = tick;
+            // A route a destination's own control uses is no longer a
+            // reply's: replies cannot evict it any more.
+            entry.transient &= transient;
             return Ok(entry.queue);
         }
         // At most `max` open entries, and `limit` in all with those closing:
@@ -695,7 +704,26 @@ impl ControlRoutes {
         // ones that closed since make room; with none, the control is
         // refused `Blocked` (neither a failed close nor a limit).
         let open = self.entries.iter().filter(|entry| !entry.closing).count();
-        if open >= self.max
+        if transient {
+            // A transient route makes room only among the transient ones,
+            // which hold at most half the cache (karyos#977).
+            let share = (self.max / 2).max(1);
+            let held = self
+                .entries
+                .iter()
+                .filter(|entry| !entry.closing && entry.transient)
+                .count();
+            if held >= share || open >= self.max {
+                let oldest = self
+                    .entries
+                    .iter()
+                    .filter(|entry| !entry.closing && entry.transient)
+                    .min_by_key(|entry| entry.used)
+                    .map(|entry| entry.queue)
+                    .ok_or(ControlSendError::Blocked)?;
+                self.evict(tx, oldest);
+            }
+        } else if open >= self.max
             && let Some(oldest) = self
                 .entries
                 .iter()
@@ -737,6 +765,7 @@ impl ControlRoutes {
             used: tick,
             closing: false,
             closing_since: None,
+            transient,
         });
         Ok(queue)
     }
@@ -773,7 +802,29 @@ impl ControlRoutes {
         if self.waiting.iter().any(|(at, _)| *at == address) {
             return Err(ControlSendError::Blocked);
         }
-        self.send_now(tx, address, control)
+        self.send_now(tx, address, control, false)
+    }
+
+    /// [`ControlRoutes::send`] of a reply to a REGISTER or to a
+    /// registrant's first SM: its route, when it opens one, is transient
+    /// (karyos#977). Transient routes hold at most half the cache, at
+    /// least one, and make room only by evicting the least recently used
+    /// transient route; with none to evict the reply is refused `Blocked`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlRoutes::send`].
+    pub fn send_reply<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        control: &Control,
+    ) -> Result<(), ControlSendError> {
+        self.send_waiting(tx);
+        if self.waiting.iter().any(|(at, _)| *at == address) {
+            return Err(ControlSendError::Blocked);
+        }
+        self.send_now(tx, address, control, true)
     }
 
     /// [`ControlRoutes::send`], except that a control refused because
@@ -793,7 +844,7 @@ impl ControlRoutes {
     ) -> Result<bool, ControlSendError> {
         self.send_waiting(tx);
         let result = if self.waiting.is_empty() {
-            self.send_now(tx, address, control)
+            self.send_now(tx, address, control, false)
         } else {
             Err(ControlSendError::Blocked)
         };
@@ -826,13 +877,14 @@ impl ControlRoutes {
         tx: &mut SocketsTx<O>,
         address: SocketAddr,
         control: &Control,
+        transient: bool,
     ) -> Result<(), ControlSendError> {
         let mut bytes = [0u8; MAX_CONTROL_LENGTH];
         let length = control
             .encode(&mut bytes)
             .map_err(|_| ControlSendError::Encode)?;
         let encoded = bytes.get(..length).ok_or(ControlSendError::Encode)?;
-        let queue = self.queue(tx, address)?;
+        let queue = self.queue(tx, address, transient)?;
         let claimed = tx
             .claim_tx(queue, encoded.len())
             .ok()

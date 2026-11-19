@@ -704,6 +704,14 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
         Ok(outbound)
     }
 
+    /// Whether it is a `control-mode=dynamic` publication.
+    #[must_use]
+    pub(crate) fn is_dynamic(&self) -> bool {
+        self.fanout
+            .as_deref()
+            .is_some_and(|fanout| fanout.registration().is_some())
+    }
+
     /// Whether it sends over redundant paths.
     #[must_use]
     pub fn is_routed(&self) -> bool {

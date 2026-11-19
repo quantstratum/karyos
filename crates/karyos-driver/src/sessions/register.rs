@@ -315,7 +315,12 @@ impl RegistrationPolicy {
 /// configured to hold: an implementation ceiling far above the design's
 /// defaults (32 and 64), so a configured value is refused as a typed
 /// error and never reaches an allocation that panics or aborts.
-pub const MAX_REGISTRATION_TABLE: usize = 65_536;
+pub const MAX_REGISTRATION_TABLE: usize = 4_096;
+
+/// The longest `join_timeout` and `registration_refusal_interval`, 60 s:
+/// an entry or a refusal held longer only keeps a spoofed source's state
+/// alive (design 11.2, karyos#977).
+pub const MAX_REGISTRATION_INTERVAL: u64 = 60_000_000_000;
 
 /// Why a registration configuration is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -455,11 +460,22 @@ impl RegistrationConfig {
         if self.pending_per_source == 0 || self.pending_per_source > self.pending {
             return bad("pending_per_source");
         }
-        if self.refusal_interval == 0 {
+        if self.refusal_interval == 0 || self.refusal_interval > MAX_REGISTRATION_INTERVAL {
             return bad("refusal_interval");
         }
-        if self.join_timeout == 0 {
+        if self.join_timeout == 0 || self.join_timeout > MAX_REGISTRATION_INTERVAL {
             return bad("join_timeout");
+        }
+        // The table never holds more than the total rate admits within
+        // one `join_timeout` (design 11.2, karyos#942): a larger one is
+        // memory and scan time that can never be used.
+        let reachable = u128::from(self.rate)
+            .checked_mul(u128::from(self.join_timeout))
+            .map(|admitted| admitted / 1_000_000_000);
+        if reachable.is_none_or(|reachable| {
+            u128::try_from(self.pending).map_or(true, |pending| pending > reachable)
+        }) {
+            return bad("pending");
         }
         if self.move_quiet == 0 {
             return bad("move_quiet");
@@ -673,6 +689,20 @@ pub struct Registrations {
     counters: RegistrationCounters,
 }
 
+/// The key of a source's per-source bounds (rates, pending entries,
+/// refusals): an IPv4 address as it is, an IPv6 one cut to its /64, the
+/// smallest prefix a host is normally given, so one host cannot pass the
+/// bounds by drawing addresses from its own /64 (karyos#977, #942 item 8).
+fn source_prefix(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V4(_) => address,
+        IpAddr::V6(v6) => {
+            let bits = u128::from(v6) & !u128::from(u64::MAX);
+            IpAddr::V6(std::net::Ipv6Addr::from(bits))
+        }
+    }
+}
+
 /// Step 1: a unicast address of the endpoint's family (IPv4 when `ipv4`),
 /// nonzero port.
 fn valid_source(source: SocketAddr, ipv4: bool) -> bool {
@@ -818,7 +848,7 @@ impl Registrations {
         // keeps one address from taking the whole total, so filling the
         // table denies no REGISTER the total would admit (karyos#945
         // review).
-        let address = SocketAddr::new(source.ip(), 0);
+        let address = SocketAddr::new(source_prefix(source.ip()), 0);
         let tracked = match self.source_rates.would_admit(address, now) {
             Ok(()) => true,
             Err(RateRefused::Limited) => {
@@ -871,6 +901,8 @@ impl Registrations {
             stream_id: register.stream_id,
             source,
             receiver: register.receiver,
+            // Saturating: a monotonic clock near u64::MAX ns (584 years)
+            // only makes the entry live until the end of time.
             expires: now.saturating_add(self.config.join_timeout),
         };
         let required = policy.is_required(register.receiver.receiver_id);
@@ -883,12 +915,12 @@ impl Registrations {
         };
         let spared = own
             .and_then(|at| policy.reserved.get(at))
-            .is_some_and(|held| held.source.ip() == source.ip());
+            .is_some_and(|held| source_prefix(held.source.ip()) == source_prefix(source.ip()));
         let held = self
             .pending
             .iter()
             .chain(&policy.reserved)
-            .filter(|entry| entry.source.ip() == source.ip())
+            .filter(|entry| source_prefix(entry.source.ip()) == source_prefix(source.ip()))
             .count();
         let crowded =
             held.checked_sub(usize::from(spared)).unwrap_or(held) >= self.config.pending_per_source;
@@ -897,7 +929,7 @@ impl Registrations {
         // out, and it holds no optional entry.
         if required {
             if crowded {
-                self.evict_oldest_at(policy, source.ip(), own);
+                self.evict_oldest_at(policy, source_prefix(source.ip()), own);
                 self.counters.bump(|c| &mut c.required_pending_replaced);
             }
             self.reserve(policy, entry);
@@ -906,10 +938,10 @@ impl Registrations {
         }
         // Step 6: capacity, before any entry is replaced.
         if capacity == Capacity::Full {
-            return self.refuse(source.ip(), source, now);
+            return self.refuse(source_prefix(source.ip()), source, now);
         }
         if crowded {
-            self.evict_oldest_at(policy, source.ip(), None);
+            self.evict_oldest_at(policy, source_prefix(source.ip()), None);
             self.counters.bump(|c| &mut c.pending_replaced);
         }
         if self.pending.len() >= self.config.pending && !self.pending.is_empty() {
@@ -962,12 +994,12 @@ impl Registrations {
         let optional = self
             .pending
             .iter()
-            .position(|entry| entry.source.ip() == address);
+            .position(|entry| source_prefix(entry.source.ip()) == address);
         let reserved = policy
             .reserved
             .iter()
             .enumerate()
-            .find(|(at, entry)| Some(*at) != spare && entry.source.ip() == address)
+            .find(|(at, entry)| Some(*at) != spare && source_prefix(entry.source.ip()) == address)
             .map(|(at, _)| at);
         let expiry = |at: Option<usize>, table: &[PendingRegistration]| {
             at.and_then(|at| table.get(at)).map(|entry| entry.expires)
@@ -994,6 +1026,7 @@ impl Registrations {
     fn expire_reserved(&mut self, policy: &mut RegistrationPolicy, now: u64) {
         let before = policy.reserved.len();
         policy.reserved.retain(|entry| entry.expires > now);
+        // `retain` only shrinks, so this never saturates.
         let removed = before.saturating_sub(policy.reserved.len());
         // A `usize` count fits a `u64` on every supported target.
         let removed = u64::try_from(removed).unwrap_or(u64::MAX);
@@ -1091,7 +1124,7 @@ impl Registrations {
     /// takes the pending entry an admitted REGISTER made, so the driver's
     /// REGISTER total bounds them.
     pub fn admit_challenge(&mut self, source: SocketAddr, now: u64) -> bool {
-        let address = SocketAddr::new(normalized(source).ip(), 0);
+        let address = SocketAddr::new(source_prefix(normalized(source).ip()), 0);
         match self.challenge_rates.admit(address, now) {
             Ok(()) => true,
             Err(RateRefused::Limited) => {
@@ -1141,6 +1174,7 @@ impl Registrations {
     pub fn expire(&mut self, now: u64) {
         let before = self.pending.len();
         self.pending.retain(|entry| entry.expires > now);
+        // `retain` only shrinks, so this never saturates.
         let removed = before.saturating_sub(self.pending.len());
         // A `usize` count fits a `u64` on every supported target.
         let removed = u64::try_from(removed).unwrap_or(u64::MAX);

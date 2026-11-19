@@ -211,7 +211,55 @@ fn limits_are_mandatory_nonzero_bounded_and_named() {
     let mut top = base;
     top.sources = MAX_REGISTRATION_TABLE;
     top.pending = MAX_REGISTRATION_TABLE;
+    top.rate = 1_000;
     assert!(Registrations::new(top, T0).is_ok());
+}
+
+/// Design 11.2 (karyos#977): the pending table holds at most what the
+/// total rate admits within one `join_timeout`, and `join_timeout` and
+/// `refusal_interval` are at most [`MAX_REGISTRATION_INTERVAL`]; each
+/// bound is accepted at its limit and refused one past it.
+#[test]
+fn the_pending_table_and_the_intervals_are_bounded_from_above() {
+    let base = RegistrationConfig::default();
+    let reachable = usize::try_from(base.rate * (base.join_timeout / 1_000_000_000)).unwrap();
+    let cases: [(Change, Change, &str); 3] = [
+        (|c| c.pending = 1280, |c| c.pending = 1281, "pending"),
+        (
+            |c| c.join_timeout = MAX_REGISTRATION_INTERVAL,
+            |c| c.join_timeout = MAX_REGISTRATION_INTERVAL + 1,
+            "join_timeout",
+        ),
+        (
+            |c| c.refusal_interval = MAX_REGISTRATION_INTERVAL,
+            |c| c.refusal_interval = MAX_REGISTRATION_INTERVAL + 1,
+            "refusal_interval",
+        ),
+    ];
+    assert_eq!(reachable, 1280, "the defaults: 256 per second for 5 s");
+    for (at, past, field) in cases {
+        let (mut good, mut bad) = (base, base);
+        at(&mut good);
+        past(&mut bad);
+        assert_eq!(good.validate(), Ok(()), "{field}");
+        assert_eq!(
+            bad.validate(),
+            Err(RegistrationConfigError::InvalidLimit { field })
+        );
+    }
+}
+
+/// #942 item 8 (karyos#977): an IPv6 source's per-source bounds are kept
+/// per /64, so addresses drawn from one /64 share them.
+#[test]
+fn ipv6_sources_share_their_bounds_per_64() {
+    let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+    let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+    let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+    assert_eq!(source_prefix(a), source_prefix(b));
+    assert_ne!(source_prefix(a), source_prefix(other));
+    let v4: IpAddr = "10.0.0.9".parse().unwrap();
+    assert_eq!(source_prefix(v4), v4);
 }
 
 /// Design 3.2 steps 3 and 5 scope the rate and the pending table to the
