@@ -789,6 +789,10 @@ struct Counts {
     fenced_recordings: AtomicU64,
     rejoined_recordings: AtomicU64,
     shortened_indexes: AtomicU64,
+    /// The shortened indexes found at start, kept whole for
+    /// [`ArchiveHandle::shortened_index_reports`]: the event queue may
+    /// drop some before a caller can read it (karyos#671 review).
+    shortened_reports: std::sync::Mutex<Vec<crate::integrity::damage::ShortenedIndex>>,
 }
 
 /// Adds one to `counter`, sticky at `u64::MAX`.
@@ -1170,6 +1174,17 @@ impl ArchiveHandle {
         self.counts.shortened_indexes.load(Ordering::Relaxed)
     }
 
+    /// Every shortened index found at start, with its recording and lost
+    /// range, whatever the event queue dropped (karyos#671 review).
+    #[must_use]
+    pub fn shortened_index_reports(&self) -> Vec<crate::integrity::damage::ShortenedIndex> {
+        self.counts
+            .shortened_reports
+            .lock()
+            .map(|reports| reports.clone())
+            .unwrap_or_default()
+    }
+
     /// Recording events dropped because their queue was full.
     #[must_use]
     pub fn dropped_events(&self) -> u64 {
@@ -1516,31 +1531,52 @@ fn run<D>(
             return;
         }
     };
-    let settled = match catalog.settle(now()) {
-        Ok(settled) => settled,
-        Err(error) => {
-            let _ = ready.send(Err(error.into()));
-            return;
+    // A recording a crash left open recovered at A2's rule; one whose
+    // recovered end falls below its seals lost sealed bytes to media
+    // damage, which the seal chain shows (karyos#671). The check runs
+    // before each stop is written, so a seal read that fails ends the
+    // start with that recording still open: a later start checks it again
+    // (karyos#671 review). Candidates come from the sealed ends the
+    // journal already keeps; the records are read once, only if one is
+    // found.
+    let mut found = Vec::new();
+    let mut records: Option<Vec<crate::integrity::SealRecord>> = None;
+    let settled = catalog.settle_checked(now(), |id, position, reason| {
+        let Some(integrity) = integrity.as_mut() else {
+            return Ok::<_, AgentError>(());
+        };
+        if reason != StopReason::Recovered
+            || !integrity
+                .journal
+                .sealed_end(id)
+                .is_some_and(|end| end > position)
+        {
+            return Ok(());
         }
-    };
+        if records.is_none() {
+            records = Some(integrity.journal.records()?);
+        }
+        if let Some(damage) = records
+            .as_deref()
+            .and_then(|records| shortened_below_seal(records, id, position))
+        {
+            found.push(damage);
+        }
+        Ok(())
+    });
+    drop(records);
+    if let Err(error) = settled {
+        let _ = ready.send(Err(error));
+        return;
+    }
+    if let Ok(mut reports) = outbox.counts.shortened_reports.lock() {
+        reports.extend(found.iter().copied());
+    }
+    for damage in found {
+        count(&outbox.counts.shortened_indexes);
+        outbox.send(Event::IndexShortened(damage));
+    }
     if let Some(integrity) = integrity.as_mut() {
-        // A recording a crash left open recovered at A2's rule; one whose
-        // recovered end falls below its seals lost sealed bytes to media
-        // damage, which the seal chain shows (karyos#671). It is reported
-        // and counted, never taken for an unacknowledged write.
-        if let Ok(records) = integrity.journal.records() {
-            for recovered in settled
-                .iter()
-                .filter(|settled| settled.reason == StopReason::Recovered)
-            {
-                if let Some(damage) =
-                    shortened_below_seal(&records, recovered.id, recovered.position)
-                {
-                    count(&outbox.counts.shortened_indexes);
-                    outbox.send(Event::IndexShortened(damage));
-                }
-            }
-        }
         for change in catalog.take_changes() {
             if let Err(error) = integrity.journal.record_catalog_change(
                 change.recording,

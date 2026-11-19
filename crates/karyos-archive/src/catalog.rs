@@ -987,6 +987,23 @@ impl<D: Disk + Clone> Catalog<D> {
     /// A store's recovery error other than its absence, and the catalog's
     /// write errors.
     pub fn settle(&mut self, now_ns: u64) -> Result<Vec<Settled>, CatalogError> {
+        self.settle_checked(now_ns, |_, _, _| Ok(()))
+    }
+
+    /// [`Catalog::settle`], calling `check` with each recording's id,
+    /// recovered position and stop reason before its stop is written: an
+    /// error from `check` ends the settle with that recording still open,
+    /// so a check that could not run is never skipped by a later start
+    /// (karyos#671 review).
+    ///
+    /// # Errors
+    ///
+    /// As [`Catalog::settle`], and `check`'s.
+    pub fn settle_checked<E: From<CatalogError>>(
+        &mut self,
+        now_ns: u64,
+        mut check: impl FnMut(u64, u64, StopReason) -> Result<(), E>,
+    ) -> Result<Vec<Settled>, E> {
         let open: Vec<(u64, u64, Geometry, SyncPolicy)> = self
             .recordings
             .iter()
@@ -1010,8 +1027,9 @@ impl<D: Disk + Clone> Catalog<D> {
                         !recovered.store.gaps().is_empty(),
                     ),
                     Err(SegmentError::NotFound { .. }) => (start, StopReason::Empty, false),
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(CatalogError::from(error).into()),
                 };
+            check(id, position, reason)?;
             self.stop(id, position, now_ns, reason, incomplete)?;
             settled.push(Settled {
                 id,

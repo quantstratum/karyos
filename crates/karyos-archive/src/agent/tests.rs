@@ -3682,6 +3682,17 @@ fn an_index_shortened_below_its_seals_is_reported_at_restart() {
         }))
     );
     assert_eq!(agent.shortened_indexes(), 1);
+    // Kept whole after start, whatever the event queue dropped (karyos#671
+    // review).
+    assert_eq!(
+        agent.shortened_index_reports(),
+        [ShortenedIndex {
+            recording: id,
+            written: 4096,
+            sealed_end: 8192,
+            counter: 1,
+        }]
+    );
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -3701,5 +3712,30 @@ fn a_recovered_recording_within_its_seals_is_not_reported() {
     assert_eq!(agent.event(Duration::from_millis(200)), None);
     assert_eq!(agent.shortened_indexes(), 0);
     agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#671 review P2: the damage check runs before a recording's stop
+/// is written, so a check that fails ends the settle with the recording
+/// still open, and a later start checks it again.
+#[test]
+fn a_failed_damage_check_leaves_the_recording_open() {
+    use crate::catalog::{Catalog, CatalogError};
+
+    let (dir, id) = crashed_sealed_recording("check-fails");
+    let mut catalog = Catalog::open(StdDisk, &dir).unwrap().catalog;
+    let failed = catalog.settle_checked(0, |_, _, _| Err(CatalogError::IdsExhausted));
+    assert!(matches!(failed, Err(CatalogError::IdsExhausted)));
+    drop(catalog);
+    let mut catalog = Catalog::open(StdDisk, &dir).unwrap().catalog;
+    let mut checked = Vec::new();
+    let settled = catalog
+        .settle_checked(0, |recording, _, _| {
+            checked.push(recording);
+            Ok::<_, CatalogError>(())
+        })
+        .unwrap();
+    assert_eq!(checked, [id], "the recording was still open");
+    assert_eq!(settled.len(), 1);
     std::fs::remove_dir_all(&dir).unwrap();
 }
