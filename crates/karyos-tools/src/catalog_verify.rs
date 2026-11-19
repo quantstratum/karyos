@@ -18,9 +18,12 @@
 //! ```
 //!
 //! Without `--trust`, every sealed range is `inconsistent` with reason
-//! `untrusted_evidence`. Each `--anchors DIR` adds the anchors of the
-//! store in DIR. Exit status: 0 when nothing is inconsistent, 1 when a
-//! range or the journal is, 2 for an error.
+//! `untrusted_evidence`. Each `--anchors LOCATION=DIR` adds the operator
+//! export store in DIR, which the operator identifies by its location
+//! digest outside the export: an anchor counts only if it names that
+//! location. Exit status: 0 when nothing is inconsistent, 1 when a range
+//! or the journal is, 2 for an error, including a report that could not
+//! be written.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -48,7 +51,8 @@ pub const HELP: &str = "\
 karyos-catalog verify: the integrity of an Archive's recordings (SPEC.md
 section 8.4).
 
-Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors DIR]... [--json]
+Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]...
+                             [--json]
 
   verify <dir>   recompute every sealed range's digest, walk the chain,
                  check the signed heads under the trust file and compare
@@ -60,12 +64,15 @@ Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors DIR]... [--json]
   --trust FILE   the trust supplied outside the export: lines
                  `archive HEX`, `authority HEX`, `journal N`, `local HEX`,
                  `anchors HEX`; without it nothing is trusted
-  --anchors DIR  a store of anchors (its anchors.kya), repeatable
+  --anchors HEX=DIR
+                 an operator export store of anchors (DIR/anchors.kya)
+                 at the location HEX (64 hex digits), stated by the
+                 operator; repeatable
   --json         one JSON object instead of text
   -h, --help     print this text
 
 Exit status: 0 nothing inconsistent; 1 a range or the journal inconsistent;
-2 an error.
+2 an error, or a report that could not be written.
 ";
 
 /// A parsed `verify` command line.
@@ -75,8 +82,9 @@ pub struct VerifyArgs {
     pub dir: PathBuf,
     /// The trust file.
     pub trust: Option<PathBuf>,
-    /// The anchor stores.
-    pub anchors: Vec<PathBuf>,
+    /// The operator export anchor stores: each one's location, as the
+    /// operator states it, and its directory.
+    pub anchors: Vec<([u8; 32], PathBuf)>,
     /// JSON output.
     pub json: bool,
 }
@@ -102,9 +110,12 @@ pub fn parse_verify(
                 }
             }
             Some("--anchors") => {
-                anchors.push(PathBuf::from(
-                    args.next().ok_or("--anchors needs a directory")?,
-                ));
+                let value = args.next().ok_or("--anchors needs HEX=DIR")?;
+                let value = value.to_str().ok_or("--anchors HEX=DIR is not text")?;
+                let (location, store) = value
+                    .split_once('=')
+                    .ok_or("--anchors needs HEX=DIR: the store's location, then its directory")?;
+                anchors.push((hex32(location)?, PathBuf::from(store)));
             }
             Some(flag) if flag.starts_with('-') => return Err(format!("unknown option {flag}")),
             _ => {
@@ -193,27 +204,55 @@ pub fn parse_trust(text: &str) -> Result<(TrustRoot, Externality, u64), String> 
 }
 
 /// Opens each recording's store read only, once.
+///
+/// A recording with no segment files has no store (`None`); a store that
+/// cannot be opened, or a read that fails, is an error of the command,
+/// never reported as an index shortened below a seal.
 struct Stores {
     dir: PathBuf,
     open: BTreeMap<u64, Option<SegmentStore<ReadOnly<StdDisk>>>>,
+    /// The first read error, which fails the command.
+    error: Option<String>,
 }
 
 impl Stores {
-    fn store(&mut self, recording: u64) -> Option<&mut SegmentStore<ReadOnly<StdDisk>>> {
-        let dir = self.dir.clone();
-        self.open
-            .entry(recording)
-            .or_insert_with(|| {
-                let mut disk = ReadOnly(StdDisk);
-                let geometry = recorded_geometry(&mut disk, &dir, recording).ok()??;
-                SegmentStore::open_verified(disk, &dir, recording, geometry, SyncPolicy::None).ok()
-            })
-            .as_mut()
+    fn store(
+        &mut self,
+        recording: u64,
+    ) -> Result<Option<&mut SegmentStore<ReadOnly<StdDisk>>>, String> {
+        if !self.open.contains_key(&recording) {
+            let at = |error: &dyn std::fmt::Display| {
+                format!("{} recording {recording}: {error}", self.dir.display())
+            };
+            let mut disk = ReadOnly(StdDisk);
+            let store = match recorded_geometry(&mut disk, &self.dir, recording)
+                .map_err(|error| at(&error))?
+            {
+                None => None,
+                Some(geometry) => Some(
+                    SegmentStore::open_verified(
+                        disk,
+                        &self.dir,
+                        recording,
+                        geometry,
+                        SyncPolicy::None,
+                    )
+                    .map_err(|error| at(&error))?,
+                ),
+            };
+            let _ = self.open.insert(recording, store);
+        }
+        Ok(self.open.get_mut(&recording).and_then(Option::as_mut))
     }
 
     fn read(&mut self, recording: u64, start: u64, end: u64) -> RangeBytes {
-        let Some(store) = self.store(recording) else {
-            return RangeBytes::Missing;
+        let store = match self.store(recording) {
+            Ok(Some(store)) => store,
+            Ok(None) => return RangeBytes::Missing,
+            Err(error) => {
+                let _ = self.error.get_or_insert(error);
+                return RangeBytes::Missing;
+            }
         };
         // A seal is corrupt input: its range is checked against what the
         // store holds before anything is allocated for it.
@@ -233,7 +272,13 @@ impl Stores {
         buf.resize(length, 0);
         match store.read(start, &mut buf) {
             Ok(()) => RangeBytes::Bytes(buf),
-            Err(_) => RangeBytes::Missing,
+            Err(error) => {
+                let _ = self.error.get_or_insert(format!(
+                    "{} recording {recording} [{start}, {end}): {error}",
+                    self.dir.display()
+                ));
+                RangeBytes::Missing
+            }
         }
     }
 }
@@ -266,11 +311,13 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
     // which is what confirms an anchor's counter and receipt.
     let mut anchors = Vec::new();
     let mut anchor_stores = Vec::new();
-    for store in &args.anchors {
+    let mut anchor_faults = 0u64;
+    for (location, store) in &args.anchors {
         let entries: Vec<[u8; ANCHOR_LENGTH]> = read_entries(&mut disk, store, ANCHOR_FILE)
             .map_err(|error| format!("{}: {error}", store.display()))?;
-        let stored = StoredAnchors::new(entries);
+        let stored = StoredAnchors::new(*location, entries);
         anchors.extend(stored.anchors());
+        anchor_faults = anchor_faults.saturating_add(stored.malformed());
         anchor_stores.push(stored);
     }
 
@@ -288,15 +335,14 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
     let mut stores = Stores {
         dir: dir.clone(),
         open: BTreeMap::new(),
+        error: None,
     };
-    let written: Vec<(u64, u64)> = recordings
-        .iter()
-        .filter_map(|&recording| {
-            stores
-                .store(recording)
-                .map(|store| (recording, store.written()))
-        })
-        .collect();
+    let mut written: Vec<(u64, u64)> = Vec::new();
+    for &recording in &recordings {
+        if let Some(store) = stores.store(recording)? {
+            written.push((recording, store.written()));
+        }
+    }
     let evidence = Evidence {
         records: &records,
         journal_fault,
@@ -305,13 +351,18 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
         registry: &keys,
         heads: &heads,
         anchors: &anchors,
+        anchor_faults,
         stores: &anchor_stores,
         externality: &externality,
         written: &written,
     };
-    Ok(verify(&evidence, |recording, start, end| {
+    let verification = verify(&evidence, |recording, start, end| {
         stores.read(recording, start, end)
-    }))
+    });
+    match stores.error {
+        Some(error) => Err(error),
+        None => Ok(verification),
+    }
 }
 
 /// The report as text: one line per range, then the coverage.
@@ -440,7 +491,15 @@ pub fn run_verify(
             } else {
                 text(&verification)
             };
-            let _ = stdout.write_all(report.as_bytes());
+            // A report that could not be written is an error, never a
+            // status automation would read as the evidence's.
+            if let Err(error) = stdout
+                .write_all(report.as_bytes())
+                .and_then(|()| stdout.flush())
+            {
+                let _ = writeln!(stderr, "karyos-catalog: writing the report: {error}");
+                return EXIT_ERROR;
+            }
             if verification.journal_break.is_some()
                 || verification
                     .ranges

@@ -33,10 +33,10 @@ use std::num::NonZeroU64;
 
 use super::anchor::{AnchorEvidence, AnchorReport, Externality, check_anchors};
 use super::trust::{
-    HeadReason, HeadVerdict, KeyRegistry, REGISTRY_ENTRY_LENGTH, RegistryEntry, SIGNED_HEAD_LENGTH,
-    SignedHead, TrustDecodeError, TrustRoot,
+    HeadReason, HeadVerdict, KeyRegistry, REGISTRY_ENTRY_LENGTH, RegistryEntry, RegistryError,
+    SIGNED_HEAD_LENGTH, SignedHead, TrustDecodeError, TrustRoot,
 };
-use super::{ChainCheck, Digest, Inconsistency, SealKind, SealRecord, digest, verify_range};
+use super::{ChainCheck, Digest, Inconsistency, SealKind, SealRecord, verify_range};
 
 /// A range's integrity outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -221,6 +221,8 @@ pub struct Evidence<'a> {
     pub heads: &'a [[u8; SIGNED_HEAD_LENGTH]],
     /// The anchors gathered from their stores.
     pub anchors: &'a [super::anchor::Anchor],
+    /// Complete anchor entries that did not decode.
+    pub anchor_faults: u64,
     /// The stores' own confirmation of each anchor's provenance.
     pub stores: &'a dyn AnchorEvidence,
     /// What counts as external.
@@ -229,55 +231,34 @@ pub struct Evidence<'a> {
     pub written: &'a [(u64, u64)],
 }
 
-/// The registry rebuilt from its entries, and what went wrong doing so.
+/// The registry rebuilt from its entries by the same replay as
+/// [`KeyRegistry::open`] (sequence, commitment and registration timing),
+/// over `records`, the chain prefix the verifier accepted; on any failure,
+/// an empty registry that trusts nothing, and the reason.
 fn rebuild_registry(
     trust: &TrustRoot,
     entries: &[[u8; REGISTRY_ENTRY_LENGTH]],
     records: &[SealRecord],
 ) -> (KeyRegistry, Vec<Reason>) {
-    let mut registry = KeyRegistry::new(trust.clone());
-    let mut reasons = Vec::new();
-    let mut chained = records
-        .iter()
-        .filter(|record| record.kind == SealKind::KeyRegistry)
-        .map(|record| record.content)
-        .peekable();
-    for bytes in entries {
-        let Some(&content) = chained.peek() else {
-            // Entries after the last commitment never committed.
-            break;
-        };
-        if content != digest(bytes) {
-            // Written before a crash or a failed journal append: never
-            // committed, so never part of the registry.
-            continue;
-        }
-        let _ = chained.next();
-        match RegistryEntry::decode(bytes) {
-            Ok(entry) => {
-                if registry.apply(&entry).is_err() {
-                    reasons.push(Reason::MalformedEvidence);
-                    break;
-                }
-            }
-            Err(TrustDecodeError::Unknown {
-                field: "algorithm", ..
-            }) => {
-                reasons.push(Reason::UnknownAlgorithm);
-                break;
-            }
-            Err(_) => {
-                reasons.push(Reason::MalformedEvidence);
-                break;
-            }
+    match KeyRegistry::replay(trust.clone(), records, entries) {
+        Ok((registry, _)) => (registry, Vec::new()),
+        Err(error) => {
+            let unknown_algorithm = matches!(
+                error,
+                RegistryError::Malformed { index }
+                    if usize::try_from(index).ok().and_then(|index| entries.get(index)).is_some_and(|bytes| matches!(
+                        RegistryEntry::decode(bytes),
+                        Err(TrustDecodeError::Unknown { field: "algorithm", .. })
+                    ))
+            );
+            let reason = if unknown_algorithm {
+                Reason::UnknownAlgorithm
+            } else {
+                Reason::MalformedEvidence
+            };
+            (KeyRegistry::new(trust.clone()), vec![reason])
         }
     }
-    // A commitment whose entry is missing leaves the registry incomplete:
-    // a retirement or revocation it held would be lost.
-    if reasons.is_empty() && chained.next().is_some() {
-        reasons.push(Reason::MalformedEvidence);
-    }
-    (registry, reasons)
 }
 
 fn push_unique(reasons: &mut Vec<Reason>, reason: Reason) {
@@ -315,12 +296,22 @@ pub fn verify(
     let mut global: Vec<Reason> = Vec::new();
     let (registry, registry_reasons) = match evidence.trust {
         Some(trust) => {
-            let (registry, reasons) = rebuild_registry(trust, evidence.registry, records);
+            // Only the accepted prefix: a registration in a rejected
+            // suffix never trusts an earlier head.
+            let accepted = chain_break
+                .and_then(|broken| usize::try_from(broken).ok())
+                .map_or(records, |broken| records.get(..broken).unwrap_or(records));
+            let (registry, reasons) = rebuild_registry(trust, evidence.registry, accepted);
             (Some(registry), reasons)
         }
         None => (None, vec![Reason::UntrustedEvidence]),
     };
     global.extend(registry_reasons);
+    // An anchor entry that does not decode is malformed evidence, never
+    // the ordinary absence of an anchor.
+    if evidence.anchor_faults > 0 {
+        push_unique(&mut global, Reason::MalformedEvidence);
+    }
     let anchors = match &registry {
         Some(registry) => check_anchors(
             records,
@@ -384,15 +375,9 @@ pub fn verify(
         anchored_through: anchors.anchored_through,
     };
     let signed = |counter: u64| signed_through.is_some_and(|through| counter <= through);
-    // The purges of the accepted prefix, once, by recording.
-    let mut purges: std::collections::BTreeMap<u64, Vec<&SealRecord>> =
-        std::collections::BTreeMap::new();
-    for (position, record) in records.iter().enumerate() {
-        let position = u64::try_from(position).unwrap_or(u64::MAX);
-        if record.kind == SealKind::Purge && in_prefix(position) {
-            purges.entry(record.subject).or_default().push(record);
-        }
-    }
+    // The purge covering each sealed range of the accepted prefix, found
+    // once for the whole chain.
+    let purge_of = purges_by_range(records, &in_prefix);
     let mut ranges = Vec::new();
     let mut sealed_ends: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     for (position, record) in records.iter().enumerate() {
@@ -418,11 +403,10 @@ pub fn verify(
         }
         sealed_ends.insert(record.subject, record.end);
         // A later purge record covering this range.
-        let purge = purges.get(&record.subject).and_then(|purges| {
-            purges.iter().copied().find(|purge| {
-                purge.counter > counter && purge.start <= record.start && purge.end >= record.end
-            })
-        });
+        let purge = usize::try_from(position)
+            .ok()
+            .and_then(|position| purge_of.get(&position))
+            .copied();
         if let Some(purge) = purge {
             if signed(purge.counter) && !global.contains(&Reason::ConflictingAnchors) {
                 report.outcome = Outcome::Purged;
@@ -617,4 +601,76 @@ impl Scrub {
                 .collect(),
         )
     }
+}
+
+/// For each range record of the accepted prefix, by position, the purge
+/// record that covers it: the earliest one after it whose range contains
+/// it. Each recording's ranges are contiguous in chain order, so a purge
+/// covers a run of them found by binary search, and each range is
+/// assigned once (a next-unassigned forest skips the assigned ones):
+/// `O((ranges + purges) log ranges)` however many purges a recording has.
+fn purges_by_range<'a>(
+    records: &'a [SealRecord],
+    in_prefix: &impl Fn(u64) -> bool,
+) -> std::collections::BTreeMap<usize, &'a SealRecord> {
+    use std::collections::BTreeMap;
+    let mut ranges: BTreeMap<u64, Vec<(usize, &SealRecord)>> = BTreeMap::new();
+    let mut purges: BTreeMap<u64, Vec<&SealRecord>> = BTreeMap::new();
+    for (position, record) in records.iter().enumerate() {
+        if !in_prefix(u64::try_from(position).unwrap_or(u64::MAX)) {
+            break;
+        }
+        if record.kind.is_range() {
+            ranges
+                .entry(record.subject)
+                .or_default()
+                .push((position, record));
+        } else if record.kind == SealKind::Purge {
+            purges.entry(record.subject).or_default().push(record);
+        }
+    }
+    let mut covered = BTreeMap::new();
+    for (recording, purges) in purges {
+        let Some(ranges) = ranges.get(&recording) else {
+            continue;
+        };
+        // next[i]: the first range at or after i not yet assigned.
+        let mut next: Vec<usize> = (0..=ranges.len()).collect();
+        let find = |next: &mut Vec<usize>, mut at: usize| {
+            let mut root = at;
+            while let Some(&up) = next.get(root) {
+                if up == root {
+                    break;
+                }
+                root = up;
+            }
+            while let Some(slot) = next.get_mut(at) {
+                if *slot == root {
+                    break;
+                }
+                at = std::mem::replace(slot, root);
+            }
+            root
+        };
+        // In chain order, so the earliest covering purge is assigned.
+        for purge in purges {
+            let low = ranges.partition_point(|(_, range)| range.start < purge.start);
+            let high = ranges.partition_point(|(_, range)| range.end <= purge.end);
+            let mut at = find(&mut next, low);
+            while at < high {
+                if let Some(&(position, range)) = ranges.get(at)
+                    && range.counter < purge.counter
+                {
+                    covered.insert(position, purge);
+                    if let Some(slot) = next.get_mut(at) {
+                        *slot = at.saturating_add(1);
+                    }
+                }
+                // A range sealed after this purge stays open for a later
+                // one; a purge never precedes the seal of what it removes.
+                at = find(&mut next, at.saturating_add(1));
+            }
+        }
+    }
+    covered
 }

@@ -626,39 +626,64 @@ impl KeyRegistry {
         if !journal.is_current()? {
             return Err(IntegrityError::StaleJournal);
         }
-        let chained: Vec<(u64, u64, Digest)> = journal
-            .records()?
-            .into_iter()
-            .filter(|record| record.kind == super::SealKind::KeyRegistry)
-            .map(|record| (record.counter, record.start, record.content))
-            .collect();
+        let records = journal.records()?;
+        let (registry, committed) = Self::replay(trust, &records, ledger.entries())?;
+        ledger.truncate(committed)?;
+        Ok(registry)
+    }
+
+    /// Replays under `trust` the key registry commitments of `records` (a
+    /// chain, or the prefix of one a verifier accepted), in chain order,
+    /// reading each entry from `entries` by digest: the replay
+    /// [`KeyRegistry::open`] does, shared with offline verification.
+    /// Returns the registry and the number of ledger entries up to the last
+    /// committed one; an entry never committed is skipped.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::Missing`] for a commitment with no entry or one of
+    /// another sequence, [`RegistryError::Malformed`] for a committed entry
+    /// that does not decode, [`RegistryError::Backdated`] for a
+    /// registration effective before its commitment, and the refusal of
+    /// [`KeyRegistry::apply`].
+    pub fn replay(
+        trust: TrustRoot,
+        records: &[super::SealRecord],
+        entries: &[[u8; REGISTRY_ENTRY_LENGTH]],
+    ) -> Result<(Self, usize), RegistryError> {
         let mut registry = Self::new(trust);
-        let mut next = chained.iter().peekable();
+        let mut next = records
+            .iter()
+            .filter(|record| record.kind == super::SealKind::KeyRegistry)
+            .peekable();
         let mut committed = 0usize;
-        for (index, bytes) in ledger.entries().iter().enumerate() {
-            let Some(&&(counter, sequence, content)) = next.peek() else {
+        for (index, bytes) in entries.iter().enumerate() {
+            let Some(&&record) = next.peek() else {
                 break;
             };
-            if digest(bytes) != content {
+            if digest(bytes) != record.content {
                 // Written, never chained: an append that did not commit.
                 continue;
             }
             let entry = RegistryEntry::decode(bytes).map_err(|_| RegistryError::Malformed {
                 index: u64::try_from(index).unwrap_or(u64::MAX),
             })?;
-            if entry.sequence != sequence {
-                return Err(RegistryError::Missing { sequence }.into());
+            if entry.sequence != record.start {
+                return Err(RegistryError::Missing {
+                    sequence: record.start,
+                });
             }
-            check_timing(&entry, counter)?;
+            check_timing(&entry, record.counter)?;
             registry.apply(&entry)?;
             let _ = next.next();
             committed = index.saturating_add(1);
         }
-        if let Some(&(_, sequence, _)) = next.next() {
-            return Err(RegistryError::Missing { sequence }.into());
+        if let Some(record) = next.next() {
+            return Err(RegistryError::Missing {
+                sequence: record.start,
+            });
         }
-        ledger.truncate(committed)?;
-        Ok(registry)
+        Ok((registry, committed))
     }
 
     /// The trust root.

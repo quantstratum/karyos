@@ -658,33 +658,52 @@ impl<D: Disk> LedgerAnchorStore<D> {
     }
 }
 
-/// The anchor file of one store, as read from the store itself by a
-/// verifier: the store an operator names is the external evidence, so an
-/// anchor counts only as the entry at its counter, with the digest of
-/// that entry's bytes as its receipt ([`AnchorStore::publish`]).
+/// The anchor file of one operator export store, as read from the store
+/// itself by a verifier, bound to the location the operator configured
+/// for it outside the export. An anchor counts only if it names that
+/// location and the operator export kind (a directory establishes nothing
+/// else) and is the entry at its counter, with the digest of that entry's
+/// bytes as its receipt ([`AnchorStore::publish`]). An entry's own claim
+/// of where it is stored proves nothing.
 #[derive(Debug, Clone, Default)]
 pub struct StoredAnchors {
+    location: Digest,
     entries: Vec<[u8; ANCHOR_LENGTH]>,
 }
 
 impl StoredAnchors {
-    /// The store whose anchor file holds `entries`, oldest first.
+    /// The operator export store configured at `location`, whose anchor
+    /// file holds `entries`, oldest first.
     #[must_use]
-    pub const fn new(entries: Vec<[u8; ANCHOR_LENGTH]>) -> Self {
-        Self { entries }
+    pub const fn new(location: Digest, entries: Vec<[u8; ANCHOR_LENGTH]>) -> Self {
+        Self { location, entries }
     }
 
-    /// The anchors stored, each with its receipt; one that does not
-    /// decode is skipped, and the verifier reports what is missing.
+    /// The anchors stored, each with its receipt; an entry that does not
+    /// decode is counted by [`StoredAnchors::malformed`].
     #[must_use]
     pub fn anchors(&self) -> Vec<Anchor> {
         stored_anchors(&self.entries)
+    }
+
+    /// The complete entries that do not decode: malformed evidence, which
+    /// the verifier reports rather than treating as no anchor.
+    #[must_use]
+    pub fn malformed(&self) -> u64 {
+        let malformed = self
+            .entries
+            .iter()
+            .filter(|bytes| Anchor::decode(bytes).is_err())
+            .count();
+        u64::try_from(malformed).unwrap_or(u64::MAX)
     }
 }
 
 impl AnchorEvidence for StoredAnchors {
     fn confirms(&self, anchor: &Anchor) -> bool {
-        confirms_entry(&self.entries, anchor)
+        anchor.kind == AnchorKind::OperatorExport
+            && anchor.location == self.location
+            && confirms_entry(&self.entries, anchor)
     }
 }
 

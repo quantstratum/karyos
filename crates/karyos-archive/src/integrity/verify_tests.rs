@@ -140,6 +140,7 @@ impl Scenario {
             registry: &self.keys,
             heads: &self.heads,
             anchors: &self.anchors,
+            anchor_faults: 0,
             stores: &Held(&self.anchors),
             externality: &externality,
             written: &self.written,
@@ -269,6 +270,7 @@ fn a_broken_chain_names_its_first_inconsistent_record() {
         registry: &scenario.keys,
         heads: &scenario.heads,
         anchors: &[],
+        anchor_faults: 0,
         stores: &Held(&[]),
         externality: &externality,
         written: &[],
@@ -356,6 +358,7 @@ fn an_unknown_algorithm_never_yields_beyond_anchor() {
             registry: &[entry],
             heads: &heads,
             anchors: &[],
+            anchor_faults: 0,
             stores: &Held(&[]),
             externality: &externality,
             written: &[],
@@ -498,6 +501,7 @@ fn verify_records(
         registry: &scenario.keys,
         heads: &scenario.heads,
         anchors: &scenario.anchors,
+        anchor_faults: 0,
         stores,
         externality: &externality,
         written: &scenario.written,
@@ -626,4 +630,111 @@ fn a_revoked_keys_head_needs_an_anchor_proved_to_predate_the_revocation() {
     );
     let proved = verify_records(&scenario, &records, None, &Predating(&held));
     assert_eq!(proved.coverage.signed_through, Some(6));
+}
+
+#[test]
+fn offline_replay_refuses_a_registration_effective_before_its_commitment() {
+    let mut journal = IntegrityJournal::open(FaultDisk::default(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    for index in 0..6 {
+        journal
+            .seal_segment(3, index * 8, &range(index), false)
+            .unwrap();
+    }
+    // Endorsed effective at 0, first committed at counter 6.
+    let entry = registration().encode();
+    journal
+        .record_key_registry(
+            &key_id(&archival_key().verifying_key().to_bytes()),
+            0,
+            &entry,
+        )
+        .unwrap();
+    let records = journal.records().unwrap();
+    let heads = [sign(&records[5]).encode()];
+    let trust = trust();
+    let externality = Externality::default();
+    let verification = verify(
+        &Evidence {
+            records: &records,
+            journal_fault: None,
+            journal_id: JOURNAL,
+            trust: Some(&trust),
+            registry: &[entry],
+            heads: &heads,
+            anchors: &[],
+            anchor_faults: 0,
+            stores: &Held(&[]),
+            externality: &externality,
+            written: &[],
+        },
+        |_, start, _| RangeBytes::Bytes(range(start / 8)),
+    );
+    assert_eq!(verification.coverage.signed_through, None);
+    assert!(
+        verification
+            .ranges
+            .iter()
+            .all(|range| range.reasons.contains(&Reason::MalformedEvidence)),
+        "{verification:?}"
+    );
+}
+
+#[test]
+fn a_malformed_anchor_entry_is_malformed_evidence_not_an_absent_anchor() {
+    let scenario = Scenario::new();
+    let mut scenario = scenario;
+    let records = scenario.records();
+    let held = scenario.anchors.clone();
+    let externality = Externality {
+        local_archive: ARCHIVE,
+        ..Externality::default()
+    };
+    let evidence = Evidence {
+        records: &records,
+        journal_fault: None,
+        journal_id: JOURNAL,
+        trust: scenario.trust.as_ref(),
+        registry: &scenario.keys,
+        heads: &scenario.heads,
+        anchors: &[],
+        anchor_faults: 1,
+        stores: &Held(&held),
+        externality: &externality,
+        written: &scenario.written,
+    };
+    let verification = verify(&evidence, |_, start, _| RangeBytes::Bytes(range(start / 8)));
+    assert!(
+        verification
+            .ranges
+            .iter()
+            .all(|range| range.outcome == Outcome::Inconsistent
+                && range.reasons.contains(&Reason::MalformedEvidence)),
+        "{verification:?}"
+    );
+}
+
+#[test]
+fn purges_are_matched_to_every_range_they_cover() {
+    let mut scenario = Scenario::new();
+    let records = scenario.records();
+    // Two purges of recording 3: [0, 16) then [0, 32), after the seals.
+    scenario
+        .journal
+        .record_purge(3, 0, 16, records[1].content)
+        .unwrap();
+    scenario
+        .journal
+        .record_purge(3, 0, 32, records[3].content)
+        .unwrap();
+    scenario.sign_head();
+    let verification = scenario.verify();
+    let purged: Vec<u64> = verification
+        .ranges
+        .iter()
+        .filter(|range| range.outcome == Outcome::Purged)
+        .map(|range| range.start)
+        .collect();
+    assert_eq!(purged, [0, 8, 16, 24], "{verification:?}");
 }

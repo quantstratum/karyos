@@ -16,7 +16,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use karyos_archive::disk::StdDisk;
-use karyos_archive::integrity::anchor::{AnchorKind, LedgerAnchorStore, publish_due};
+use karyos_archive::integrity::anchor::{LedgerAnchorStore, publish_due};
 use karyos_archive::integrity::journal::IntegrityJournal;
 use karyos_archive::integrity::ledger::Ledger;
 use karyos_archive::integrity::signing::HeadSigner as _;
@@ -126,13 +126,7 @@ fn archive(name: &str) -> Archive {
     };
     let mut heads = Ledger::<_, SIGNED_HEAD_LENGTH>::open(StdDisk, &dir, HEADS_FILE).unwrap();
     heads.append(head(6).encode()).unwrap();
-    let mut anchors = LedgerAnchorStore::open(
-        StdDisk,
-        &archive.anchors(),
-        AnchorKind::OperatorExport,
-        OPERATOR,
-    )
-    .unwrap();
+    let mut anchors = LedgerAnchorStore::open(StdDisk, &archive.anchors(), OPERATOR).unwrap();
     publish_due(
         &mut anchors,
         None,
@@ -174,7 +168,7 @@ fn full(archive: &Archive, json: bool) -> (u8, String, String) {
         "--trust".into(),
         trust.into(),
         "--anchors".into(),
-        anchors.into(),
+        format!("{}={}", hex(&OPERATOR), anchors.display()).into(),
     ];
     if json {
         argv.push("--json".into());
@@ -355,4 +349,77 @@ fn verify_of_a_directory_that_does_not_exist_is_an_error() {
     let (status, out, err) = run(&[&missing], &[]);
     assert_eq!(status, EXIT_ERROR, "{out}");
     assert!(err.contains("karyos-verify-absent"), "{err}");
+}
+
+#[test]
+fn verify_counts_anchors_only_from_the_store_location_the_operator_names() {
+    let archive = archive("location");
+    let dir = archive.dir();
+    let elsewhere = [22u8; 32];
+    let argv: Vec<OsString> = vec![
+        dir.into(),
+        "--trust".into(),
+        archive.trust().into(),
+        "--anchors".into(),
+        format!("{}={}", hex(&elsewhere), archive.anchors().display()).into(),
+    ];
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let status = run_verify(argv, &mut out, &mut err);
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(status, 0, "{out}");
+    assert!(out.contains("anchored through none"), "{out}");
+    assert!(!out.contains(" verified seal="), "{out}");
+    let (status, _, err) = run(&[&archive.dir()], &["--anchors", "not-a-location"]);
+    assert_eq!(status, EXIT_ERROR);
+    assert!(err.contains("--anchors needs HEX=DIR"), "{err}");
+}
+
+/// A writer that always fails.
+struct Broken;
+
+impl std::io::Write for Broken {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("closed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("closed"))
+    }
+}
+
+#[test]
+fn a_report_that_cannot_be_written_is_an_error() {
+    let archive = archive("broken-out");
+    let argv: Vec<OsString> = vec![archive.dir().into()];
+    let mut err = Vec::new();
+    assert_eq!(run_verify(argv, &mut Broken, &mut err), EXIT_ERROR);
+    assert!(
+        String::from_utf8(err)
+            .unwrap()
+            .contains("writing the report"),
+        "the error is reported"
+    );
+}
+
+#[test]
+fn a_store_that_cannot_be_opened_is_an_error_not_a_shortened_index() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let archive = archive("unreadable");
+    let segment = std::fs::read_dir(archive.dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "seg"))
+        .unwrap();
+    std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&segment).is_ok() {
+        // Running as a user permissions do not bind (root in a container):
+        // the store cannot be made unreadable this way.
+        std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    let (status, out, err) = full(&archive, false);
+    std::fs::set_permissions(&segment, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(status, EXIT_ERROR, "{out}");
+    assert!(err.contains("recording 3"), "{err}");
+    assert!(!out.contains("shortened_index"), "{out}");
 }
