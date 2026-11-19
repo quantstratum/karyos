@@ -73,14 +73,23 @@
 /// checks that a call allocates nothing, with no `unsafe` of its own and
 /// no internal crate.
 ///
-/// The test binary declares, once:
-/// `#[global_allocator] static ALLOCATOR: karyos::alloc_count::CountingAllocator = karyos::alloc_count::CountingAllocator;`
-/// and checks each call:
+/// The test binary installs it once, then checks each call; the first
+/// count is a positive control proving the allocator is installed:
 ///
 /// ```
-/// let mut values: Vec<u64> = Vec::with_capacity(4);
-/// let ((), operations) = karyos::alloc_count::count(|| values.push(1));
-/// assert_eq!(operations, 0, "the push allocated, reallocated or freed");
+/// use karyos::alloc_count::{CountingAllocator, count};
+///
+/// #[global_allocator]
+/// static ALLOCATOR: CountingAllocator = CountingAllocator;
+///
+/// fn main() {
+///     let ((), operations) = count(|| drop(std::hint::black_box(Box::new(1u64))));
+///     assert_eq!(operations, 2, "one allocation and one free");
+///
+///     let mut values: Vec<u64> = Vec::with_capacity(4);
+///     let ((), operations) = count(|| values.push(1));
+///     assert_eq!(operations, 0, "the push allocated, reallocated or freed");
+/// }
 /// ```
 ///
 /// # The contract
@@ -108,9 +117,13 @@
 /// - **Panics.** A panic in the call stops the counting (the thread is
 ///   disarmed as the panic unwinds) and propagates; no count is returned.
 /// - **Production.** Unsupported: the feature is for test binaries. When
-///   installed, each operation also reads one thread-local flag and, while
-///   counting, updates a few thread-local counters and two process-wide
-///   atomics (the multi-thread window this surface does not expose).
+///   installed, every operation reads two thread-local flags and loads one
+///   process-wide atomic flag (the multi-thread window of `karyos-sys`,
+///   which this surface does not expose); while a `count` runs on the
+///   thread it also updates thread-local counters. The two process-wide
+///   window counters are updated only while that window is open and the
+///   thread is enrolled in it, which this surface cannot do, so a count
+///   made through it never updates them.
 ///
 /// The surface mirrors `karyos-sys`'s `alloc_count` (the ADR-0008
 /// mechanism the core's own tests use) with these items only; its

@@ -18,10 +18,16 @@ fn strict<R>(call: impl FnOnce() -> R) -> Result<R, u64> {
 
 #[test]
 fn a_vec_push_is_caught() {
+    // Positive controls: exact, nonzero counts prove the allocator is
+    // installed, so the zero counts below cannot pass by default.
+    let ((), operations) = count(|| drop(std::hint::black_box(Box::new(1u64))));
+    assert_eq!(operations, 2, "one allocation and one free");
     let mut values: Vec<u64> = Vec::new();
-    assert!(strict(|| values.push(1)).is_err());
-    let ((), allocations) = count_allocations(|| values.push(2));
-    assert!(allocations <= 1, "{allocations}");
+    assert_eq!(strict(|| values.push(1)), Err(1));
+    let mut full: Vec<u64> = Vec::with_capacity(1);
+    full.push(1);
+    let ((), allocations) = count_allocations(|| full.push(2));
+    assert_eq!(allocations, 1, "growing a full Vec is one reallocation");
 }
 
 #[test]
