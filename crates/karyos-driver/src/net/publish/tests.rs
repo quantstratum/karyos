@@ -2559,7 +2559,13 @@ fn a_dynamic_publication_holds_its_whole_destination_share_at_admission() {
     until(&mut driver, |driver| {
         driver.network_publication_state(&first).is_none()
     });
-    let _ = driver
-        .add_dynamic_network_publication(aggregate(301, 1), &dynamic, allowlist(), None)
-        .unwrap();
+    // The control endpoint closed with its last publication and reopens
+    // once its close has ended: the add is taken then, at the latest.
+    let mut added = None;
+    until(&mut driver, |driver| {
+        added = driver
+            .add_dynamic_network_publication(aggregate(301, 1), &dynamic, allowlist(), None)
+            .ok();
+        added.is_some()
+    });
 }
