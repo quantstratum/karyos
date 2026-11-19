@@ -24,15 +24,27 @@ fail() {
     exit 1
 }
 
-command -v "$cbindgen" >/dev/null 2>&1 ||
-    fail "no $cbindgen; install it: cargo install cbindgen --version 0.29.4 --locked"
+# Resolved to an absolute path before any directory change, so the binary
+# run is the one checked here, whatever directory $CBINDGEN is relative to.
+cbindgen="$(command -v "$cbindgen" 2>/dev/null)" ||
+    fail "no ${CBINDGEN:-cbindgen}; install it: cargo install cbindgen --version 0.29.4 --locked"
+case "$cbindgen" in
+/*) ;;
+*) cbindgen="$PWD/$cbindgen" ;;
+esac
 have="$("$cbindgen" --version)"
 [ "$have" = "$want" ] || fail "$have found, $want required"
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
+# cbindgen would run `cargo metadata` itself, without --locked or
+# --offline, which may fetch or update Cargo.lock: the gate stays offline
+# and locked by giving it metadata resolved that way.
+cargo metadata --locked --offline --all-features --format-version 1 \
+    --manifest-path "$crate/Cargo.toml" >"$work/metadata.json" ||
+    fail "cargo metadata --locked --offline failed"
 (cd "$crate" && "$cbindgen" --quiet --config cbindgen.toml --crate karyos-ffi \
-    --output "$work/karyos.h" .)
+    --metadata "$work/metadata.json" --output "$work/karyos.h" .)
 
 if [ "${1:-}" = --write ]; then
     cp "$work/karyos.h" "$header"

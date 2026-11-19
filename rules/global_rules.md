@@ -301,9 +301,12 @@ completion handling (ADR-0008).
 - Functions return an `int32_t` status; outputs go through out-parameters
   checked for null and alignment before any write. No global or
   thread-local error state.
-- `include/karyos.h` is hand-written; `src/header.rs` checks it against
-  `abi.rs` (functions, C types, status codes, ABI version). Change both
-  together.
+- `include/karyos.h` is generated, never edited by hand: cbindgen
+  0.29.4 writes it from `karyos-ffi`'s Rust sources (`src/abi.rs`,
+  `src/c_header.rs`) and `crates/karyos-ffi/cbindgen.toml`. Change those
+  inputs, run `make header`, and commit the header it writes; pre-push
+  regenerates it and fails on any difference, and `src/header.rs` checks
+  it against `abi.rs` (functions, C types, status codes, ABI version).
 - The ABI has its own version (`KARYOS_ABI_VERSION_*`, today 0.1.5).
   `crates/karyos-ffi/abi/manifest.txt` records every struct's size,
   alignment and offsets, every constant and every declaration.
