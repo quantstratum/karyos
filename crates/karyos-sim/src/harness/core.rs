@@ -55,9 +55,9 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::rc::Rc;
 
+use karyos_archive::disk::Disk;
 use karyos_cluster::{Entry, HardState, LogError, RaftLog};
 
-use crate::disk::SimDisk;
 use crate::net::NodeId;
 
 /// A core's read-only view of its node's C4 log: what is written, what is
@@ -69,15 +69,58 @@ use crate::net::NodeId;
 /// instead (`Rc<RefCell<RaftLog>>`; the simulation is single-threaded),
 /// which [`drive`] borrows mutably only between core calls.
 ///
-/// Its reads are disk operations: they count toward [`SimDisk`]'s crash
+/// Its reads are disk operations: they count toward [`SimDisk`](crate::disk::SimDisk)'s crash
 /// budget and appear in its trace, so a budget crash can land in a core's
 /// read. A core handles a read error; it does not unwrap it.
 pub struct LogView<'a> {
-    log: &'a mut RaftLog<SimDisk>,
+    log: &'a mut dyn LogSource,
     /// The duty's read budget, when the log-read limit applies.
     budget: Option<&'a ReadBudget>,
     /// The latest snapshot the node holds, if any (W5).
     base: Option<SnapshotBase>,
+}
+
+/// What a [`LogView`] reads: C4's log over any disk, so the same core runs
+/// over the simulator's disk and over real files (an adapter's real
+/// processes; karyos#956 review).
+trait LogSource {
+    fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, LogError>;
+    fn frame_span(&self, index: u64) -> Option<u64>;
+    fn term(&self, index: u64) -> Option<u64>;
+    fn first_index(&self) -> u64;
+    fn last_index(&self) -> Option<u64>;
+    fn durable_index(&self) -> Option<u64>;
+    fn hard_state(&self) -> Option<HardState>;
+}
+
+impl<D: Disk + Clone> LogSource for RaftLog<D> {
+    fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, LogError> {
+        RaftLog::entries(self, range, max_bytes)
+    }
+
+    fn frame_span(&self, index: u64) -> Option<u64> {
+        RaftLog::frame_span(self, index)
+    }
+
+    fn term(&self, index: u64) -> Option<u64> {
+        RaftLog::term(self, index)
+    }
+
+    fn first_index(&self) -> u64 {
+        RaftLog::first_index(self)
+    }
+
+    fn last_index(&self) -> Option<u64> {
+        RaftLog::last_index(self)
+    }
+
+    fn durable_index(&self) -> Option<u64> {
+        RaftLog::durable_index(self)
+    }
+
+    fn hard_state(&self) -> Option<HardState> {
+        RaftLog::hard_state(self)
+    }
 }
 
 /// A snapshot's base: the last log index it includes and that entry's
@@ -164,7 +207,7 @@ impl From<LogError> for ReadError {
 
 impl<'a> LogView<'a> {
     /// A view of `log`, unmetered.
-    pub fn new(log: &'a mut RaftLog<SimDisk>) -> Self {
+    pub fn new<D: Disk + Clone + 'a>(log: &'a mut RaftLog<D>) -> Self {
         Self {
             log,
             budget: None,
@@ -173,7 +216,10 @@ impl<'a> LogView<'a> {
     }
 
     /// A view of `log` whose reads spend `budget`.
-    pub fn metered(log: &'a mut RaftLog<SimDisk>, budget: Option<&'a ReadBudget>) -> Self {
+    pub fn metered<D: Disk + Clone + 'a>(
+        log: &'a mut RaftLog<D>,
+        budget: Option<&'a ReadBudget>,
+    ) -> Self {
         Self {
             log,
             budget,
@@ -658,9 +704,9 @@ impl From<LogError> for DriveError {
 ///
 /// [`DriveError::Log`] for the log's error at step 2, and
 /// [`DriveError::WorkBudget`] after [`MAX_READIES`] Readys.
-pub fn drive<C: ConsensusCore>(
+pub fn drive<C: ConsensusCore, D: Disk + Clone>(
     core: &mut C,
-    log: &mut RaftLog<SimDisk>,
+    log: &mut RaftLog<D>,
     send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
     apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
@@ -674,9 +720,9 @@ pub fn drive<C: ConsensusCore>(
 /// # Errors
 ///
 /// As [`drive`].
-pub fn drive_metered<C: ConsensusCore>(
+pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
     core: &mut C,
-    log: &mut RaftLog<SimDisk>,
+    log: &mut RaftLog<D>,
     (budget, base): (Option<&ReadBudget>, Option<SnapshotBase>),
     send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
     apply: &mut dyn FnMut(&Entry, Applying),

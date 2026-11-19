@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# The evaluation workspace's cargo-deny policy: the core's (deny.toml at
+# the repository root) plus the two advisories the admission record scopes
+# to this crate only (quantstratum-docs:
+# karyos/reviews/dependency-admission-raft-candidates-evaluation.md,
+# condition 4). They are findings of the comparison, never ignored in the
+# core's graph.
+
+[graph]
+all-features = true
+
+[licenses]
+include-dev = true
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # protobuf 2.28.0 under raft-proto 0.7.0: uncontrolled recursion on
+    # unknown fields; raft 0.7.0 cannot take the fixed 3.7.2.
+    { id = "RUSTSEC-2024-0437", reason = "evaluation only, admission record condition 4" },
+    # fxhash 0.2.1 under raft 0.7.0: unmaintained, no safe upgrade.
+    { id = "RUSTSEC-2025-0057", reason = "evaluation only, admission record condition 4" },
+]

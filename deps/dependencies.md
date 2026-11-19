@@ -136,6 +136,15 @@ applies them:
   feature-unified Tokio, and on a candidate in the admitted crate, and passes silently on
   Tokio in the admitted crate and on a clean graph. The unused `karyos-tools` to `karyos-sim` edge, through which a
   candidate placed in `karyos-sim` would reach `karyosd`, is karyos#926.
+- **Rows, evaluation only** (`eval/raft-candidates/Cargo.toml`; the
+  graph is that workspace's `Cargo.lock`):
+
+  | Crate | Version | Features | Scope |
+  | --- | --- | --- | --- |
+  | `raft` | `=0.7.0` | default features off; `protobuf-codec` | evaluation only, `karyos-raft-eval` (karyos#678) |
+  | `protobuf` | `=2.28.0` | default features off | evaluation only: `raft-proto`'s codec, already in `raft`'s graph; encodes raft-rs messages between the real processes |
+  | `slog` | 2.8.2 | default features off | evaluation only: `raft`'s own logger crate, already in its graph; `RawNode::new` takes a `slog::Logger`, given a discarding one |
+
 - **Versions and features** are exactly the record's: `raft` without
   default features and with `protobuf-codec` only; `openraft` with default
   features off (no Tokio); the evaluation lockfile pins `openraft-macros`
