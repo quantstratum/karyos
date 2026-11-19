@@ -9,6 +9,11 @@
 # out in Keep a Changelog order. The fold is deterministic: fragments in
 # file name order (C collation), sections in a fixed order.
 #
+# A fragment carries no SPDX line: its first non-blank line is the section
+# header. rules/global_rules.md ("Language and writing") exempts fragments
+# from the SPDX rule because this script folds them into CHANGELOG.md and
+# deletes them.
+#
 # --check only validates: each fragment is named <issue>-<slug>.md (issue
 # number, then lowercase words joined by hyphens) and holds one section
 # header; and the branch adds no more lines to CHANGELOG.md than it

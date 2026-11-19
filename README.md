@@ -69,8 +69,13 @@ Requirements: the Rust toolchain pinned in `rust-toolchain.toml` (rustup
 installs it); Python 3 for the dependency inventory check (`make
 deps-check`, part of `make pre-push`); for `make miri`, the nightly
 toolchain pinned in the Makefile with its Miri component (`rustup
-toolchain install <nightly> --component miri`); and Docker to run the
-Linux tests from macOS.
+toolchain install <nightly> --component miri`); Docker to run the
+Linux tests from macOS; and, on Apple Silicon only, a `protoc` 3.x that
+runs for the Raft candidates' evaluation (`make raft-eval`, part of `make
+pre-push`): Homebrew's `protobuf@21` (`brew install protobuf@21`) or
+Rosetta 2 (`softwareupdate --install-rosetta`), which runs the x86_64
+`protoc` 3.9.0 the evaluation's lockfile pins. On Linux the pinned one runs
+natively; `PROTOC` overrides the choice (see `eval/raft-candidates`).
 
 ```sh
 make test            # cargo test --workspace --locked

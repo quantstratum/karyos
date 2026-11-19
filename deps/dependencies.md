@@ -195,6 +195,26 @@ applies them:
   feature-unified Tokio, and on a candidate in the admitted crate, and passes silently on
   Tokio in the admitted crate and on a clean graph. The unused `karyos-tools` to `karyos-sim` edge, through which a
   candidate placed in `karyos-sim` would reach `karyosd`, is karyos#926.
+- **Rows, evaluation only** (`eval/raft-candidates/Cargo.toml`; the
+  graph is that workspace's `Cargo.lock`):
+
+  | Crate | Version | Features | Scope |
+  | --- | --- | --- | --- |
+  | `raft` | `=0.7.0` | default features off; `protobuf-codec` | evaluation only, `karyos-raft-eval` (karyos#678) |
+  | `protobuf` | `=2.28.0` | default features off | evaluation only: `raft-proto`'s codec, already in `raft`'s graph; encodes raft-rs messages between the real processes |
+  | `slog` | 2.8.2 | default features off | evaluation only: `raft`'s own logger crate, already in its graph; `RawNode::new` takes a `slog::Logger`, given a discarding one |
+  | `openraft` | `=0.10.0-alpha.37` | default features off (no `tokio-rt`) | evaluation only, `karyos-raft-eval` (karyos#690) |
+  | `openraft-rt` | `=0.10.0-alpha.37` | default features off | evaluation only: the `AsyncRuntime` the manually pumped executor implements |
+  | `futures-channel` | 0.3.34 | default features off; `std` | evaluation only: the executor's mpsc and oneshot, already in `openraft-rt`'s graph |
+  | `futures-util` | 0.3.34 | default features off; `std` | evaluation only: the executor's async mutex and stream helpers, already in `openraft-rt`'s graph |
+  | `rand` | 0.10.4 | default features off | evaluation only: the executor's seeded `SmallRng` (`openraft-rt`'s `ThreadLocalRng`), already in its graph |
+
+  RUSTSEC-2026-0543 (`chrono` 0.4.45 unmaintained, a non-optional
+  dependency of `openraft` and `openraft-macros`) is ignored only by the
+  evaluation workspace's `deny.toml`, as a reviewed amendment of the
+  admission (karyos#690); `eval/raft-candidates/README.md` records the
+  path, the reason, the review and the removal trigger.
+
 - **Versions and features** are exactly the record's: `raft` without
   default features and with `protobuf-codec` only; `openraft` with default
   features off (no Tokio); the evaluation lockfile pins `openraft-macros`

@@ -47,12 +47,18 @@
 //! [`sealer::Sealer`] schedule), keyed by their recording id; nothing in
 //! the chain distinguishes them, which is the point.
 
+pub mod anchor;
+pub mod copies;
 pub mod journal;
 pub mod ledger;
 pub mod sealer;
 pub mod signing;
 pub mod trust;
 
+#[cfg(test)]
+mod anchor_tests;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -110,6 +116,10 @@ pub enum SealKind {
     /// A purge: `subject` is the recording, `[start, end)` the purged
     /// range, the digest that of the purged segment as sealed.
     Purge = 7,
+    /// A change of a copy's state in the copy catalog: `subject` is the
+    /// recording, `start` and `end` the copy record's sequence, the digest
+    /// that of the copy record's canonical bytes.
+    Copy = 8,
 }
 
 impl SealKind {
@@ -125,6 +135,7 @@ impl SealKind {
             5 => Self::Policy,
             6 => Self::KeyRegistry,
             7 => Self::Purge,
+            8 => Self::Copy,
             _ => return None,
         })
     }
