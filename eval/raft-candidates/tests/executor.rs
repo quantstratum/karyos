@@ -208,3 +208,26 @@ fn every_send_blocked_on_a_full_channel_resumes() {
     assert_eq!(received, vec![0, 1, 10, 11]);
     assert_eq!(done.load(Ordering::SeqCst), 2, "both senders finished");
 }
+
+/// The karyos#959 review: a root future that wakes itself is polled again
+/// before `block_on` moves the clock, even with a timer pending far ahead.
+#[test]
+fn block_on_polls_a_self_woken_root_future_before_moving_the_clock() {
+    let mut runtime = SimRuntime::new(1);
+    let now = runtime.block_on(async {
+        let _timer = SimRuntime::spawn(SimRuntime::sleep(Duration::from_millis(1_000)));
+        let mut yielded = false;
+        std::future::poll_fn(|cx| {
+            if yielded {
+                std::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        <SimRuntime as AsyncRuntime>::Instant::now().millis()
+    });
+    assert_eq!(now, 0, "the clock moved past ready work");
+}

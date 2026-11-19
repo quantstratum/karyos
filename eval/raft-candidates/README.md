@@ -57,7 +57,7 @@ all `--locked`.
 | Determinism | a seed reproduces its run, and the same calls reproduce every node's executor interleaving (trace digest), asserted |
 | Pre-vote | OpenRaft's own pre-vote handler on the receiving node, reached through the adapter's RPC; never the trait's default, which synthesises a grant; tested against a control without it |
 | Restart of a leader | the durable vote is C4's `HardState`, which has no place for OpenRaft's `committed` bit, so `enable_leader_restore` is off: a restarted leader always stands for a new election, as in standard Raft (a finding for the comparison) |
-| Allocation | **fails the gate**, measured in the simulator only, at head 44dc4c88 (`tests/allocation.rs`, studiom4): W1, 32 clients, seed 1: 114 entries past the warm-up, 38,853 allocations and 32,521 frees, 341 and 286 per entry. All of OpenRaft's tasks run on the calling thread inside the core's calls, so the probe counts them; the adapter's wire encoding (`openraft_wire`) runs only in the real-process path and is not counted. The figure moves with the adapter: earlier heads measured 44,710 and 41,035 allocations |
+| Allocation | **fails the gate**, measured in the simulator only, at head 44dc4c88 (`tests/allocation.rs`, studiom4): W1, 32 clients, seed 1: 114 entries past the warm-up, 38,853 allocations and 32,521 frees, 341 and 286 per entry. All of OpenRaft's tasks run on the calling thread inside the core's calls, so the probe counts them. It also counts the adapter's request encoding in `step`, where `Request::eq` serializes both requests (`openraft_wire::request_bytes`) to correlate an answer; it does not count the real-process path's datagram framing and decoding. The figure moves with the adapter: earlier heads measured 44,710 and 41,035 allocations |
 | Adapter settings | RPC answers wait at least 20 ticks (OpenRaft's sequential append stream does not time an RPC out, and its own 2-tick TTL is shorter than a round trip on the slower links); retries back off 2, 4, 8 then up to 20 ticks, scaled to the 2-tick heartbeat instead of OpenRaft's 200 ms default. The same for every workload |
 | Real processes | demonstrated: three `raft-eval-node openraft` processes run `OpenRaft`, unchanged, on its executor inside the core's calls (no runtime of the process's own), over real files and UDP; its RPCs are encoded by the adapter (`openraft_wire`), since OpenRaft's `serde` feature is not admitted. They elect a leader and apply the same 20 commands in the same order |
 
@@ -71,14 +71,13 @@ evaluation admission, never as a workspace waiver.
   of `openraft` 0.10.0-alpha.37 and of its proc macro `openraft-macros`
   0.10.0-alpha.37 (requirement `0.4`, default features).
   `cargo tree -i chrono -e normal,build` shows those two as the only paths
-  (verified at 0.10.0-alpha.37); `display-more` 0.2.6 declares it too but
-  does not reach it in this graph. Features resolved: `default`, `std`, `alloc`,
+  (verified at 0.10.0-alpha.37). `Cargo.lock` resolves `display-more`
+  0.2.7, which has no dependency on `chrono`. Features resolved: `default`, `std`, `alloc`,
   `clock`, `now`, `oldtime`, `iana-time-zone`, `wasmbind`, `winapi`,
   `windows-link` (the last three only on wasm32 and Windows targets).
   Targets: every target; on the supported Linux and macOS ones it builds
   `chrono` and `iana-time-zone` (with `core-foundation-sys` on macOS).
-- **Why evaluation still needs it.** Disabling `display-more` does not
-  remove it: `openraft` and `openraft-macros` depend on `chrono` directly
+- **Why evaluation still needs it.** `openraft` and `openraft-macros` depend on `chrono` directly
   and unconditionally, with no feature to turn it off. Removing it means
   replacing or patching `openraft`, which would no longer be the admitted
   baseline. The evaluation keeps the baseline and records the advisory as

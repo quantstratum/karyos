@@ -126,37 +126,85 @@ impl Mpsc for SimMpsc {
     }
 }
 
+/// A send in flight. It holds its task's registration only while it waits
+/// on a full channel, and gives it back when it completes or is dropped
+/// (cancelled by a timeout or another branch), so no registration outlives
+/// the send that made it (karyos#959 review).
+struct SendFuture<T> {
+    shared: Arc<Mutex<MpscShared<T>>>,
+    msg: Option<T>,
+    /// The waker registered while blocked.
+    registered: Option<Waker>,
+}
+
+impl<T> SendFuture<T> {
+    fn release(&mut self) {
+        if let Some(waker) = self.registered.take() {
+            self.shared
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .blocked
+                .unregister(&waker);
+        }
+    }
+}
+
+impl<T> Unpin for SendFuture<T> {}
+
+impl<T> Future for SendFuture<T> {
+    type Output = Result<(), SendError<T>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let Some(value) = this.msg.take() else {
+            // Polled again after it finished: nothing left to send.
+            return Poll::Pending;
+        };
+        let mut shared = this.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        let MpscShared { sender, blocked } = &mut *shared;
+        // Registered before polling, so a wake between the two is kept; a
+        // new waker replaces the one this send held.
+        if let Some(old) = this.registered.take()
+            && !old.will_wake(cx.waker())
+        {
+            blocked.unregister(&old);
+        }
+        blocked.register(cx.waker());
+        this.registered = Some(cx.waker().clone());
+        let all = Waker::from(Arc::clone(blocked));
+        let ready = sender.poll_ready(&mut Context::from_waker(&all));
+        if ready.is_ready() {
+            blocked.unregister(cx.waker());
+            this.registered = None;
+        }
+        match ready {
+            Poll::Pending => {
+                this.msg = Some(value);
+                Poll::Pending
+            }
+            Poll::Ready(Err(_)) => Poll::Ready(Err(SendError(value))),
+            Poll::Ready(Ok(())) => Poll::Ready(
+                sender
+                    .try_send(value)
+                    .map_err(|error| SendError(error.into_inner())),
+            ),
+        }
+    }
+}
+
+impl<T> Drop for SendFuture<T> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl<T: OptionalSend> MpscSender<SimMpsc, T> for SimSender<T> {
     fn send(&self, msg: T) -> impl Future<Output = Result<(), SendError<T>>> + OptionalSend {
-        let shared = Arc::clone(&self.0);
-        let mut msg = Some(msg);
-        poll_fn(move |cx| {
-            let Some(value) = msg.take() else {
-                // Polled again after it finished: nothing left to send.
-                return Poll::Pending;
-            };
-            let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
-            let MpscShared { sender, blocked } = &mut *shared;
-            // Registered before polling, so a wake between the two is kept.
-            blocked.register(cx.waker());
-            let all = Waker::from(Arc::clone(blocked));
-            let ready = sender.poll_ready(&mut Context::from_waker(&all));
-            if ready.is_ready() {
-                blocked.unregister(cx.waker());
-            }
-            match ready {
-                Poll::Pending => {
-                    msg = Some(value);
-                    Poll::Pending
-                }
-                Poll::Ready(Err(_)) => Poll::Ready(Err(SendError(value))),
-                Poll::Ready(Ok(())) => Poll::Ready(
-                    sender
-                        .try_send(value)
-                        .map_err(|error| SendError(error.into_inner())),
-                ),
-            }
-        })
+        SendFuture {
+            shared: Arc::clone(&self.0),
+            msg: Some(msg),
+            registered: None,
+        }
     }
 
     fn downgrade(&self) -> SimWeakSender<T> {
@@ -441,5 +489,33 @@ mod tests {
         assert_eq!(received, 1_000);
         assert!(most <= 1, "{most} registrations for one task");
         assert_eq!(registered(&probe), 0);
+    }
+
+    struct Flag;
+
+    impl std::task::Wake for Flag {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    /// The remaining part of the karyos#959 review: a send cancelled while
+    /// the channel is full gives its registration back. Ten sends, each
+    /// polled once by its own task's waker and then dropped, leave none.
+    #[test]
+    fn a_cancelled_blocked_send_leaves_no_registration() {
+        let (sender, _receiver) = SimMpsc::channel::<u64>(0);
+        let mut first = sender.send(0);
+        let waker = Waker::from(Arc::new(Flag));
+        let mut context = Context::from_waker(&waker);
+        // The channel's one slot is taken: every later send blocks.
+        assert!(Pin::new(&mut first).poll(&mut context).is_ready());
+        for value in 1..=10 {
+            let waker = Waker::from(Arc::new(Flag));
+            let mut context = Context::from_waker(&waker);
+            let mut send = sender.send(value);
+            assert!(Pin::new(&mut send).poll(&mut context).is_pending());
+            assert_eq!(registered(&sender), 1);
+            drop(send);
+            assert_eq!(registered(&sender), 0);
+        }
     }
 }

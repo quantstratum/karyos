@@ -36,6 +36,7 @@ use std::future::Future;
 use std::ops::{Add, AddAssign, Sub, SubAssign};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::Duration;
@@ -136,6 +137,20 @@ fn lock(state: &Mutex<State>) -> MutexGuard<'_, State> {
     // The executor never panics while it holds its lock; a poisoned lock
     // still holds a consistent state.
     state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The waker `block_on` gives its root future: it records a wake.
+#[derive(Default)]
+struct RootWaker(AtomicBool);
+
+impl Wake for RootWaker {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 struct TaskWaker {
@@ -687,14 +702,19 @@ impl AsyncRuntime for SimRuntime {
         // woken, its clock moves to the next deadline (or by a millisecond).
         let executor = self.executor.clone();
         let mut future = Box::pin(future);
-        let mut context = Context::from_waker(Waker::noop());
+        // The root future's own wakes are kept, so work it made ready at
+        // the current time is polled before the clock moves (karyos#959
+        // review).
+        let woken = Arc::new(RootWaker::default());
+        let waker = Waker::from(Arc::clone(&woken));
+        let mut context = Context::from_waker(&waker);
         loop {
             let polled = executor.enter(|| future.as_mut().poll(&mut context));
             if let Poll::Ready(output) = polled {
                 return output;
             }
             let pumped = executor.pump(DEFAULT_BUDGET);
-            if pumped.polls == 0 {
+            if pumped.polls == 0 && !woken.0.swap(false, Ordering::SeqCst) {
                 let next = executor
                     .next_deadline()
                     .unwrap_or_else(|| executor.now().saturating_add(1));
