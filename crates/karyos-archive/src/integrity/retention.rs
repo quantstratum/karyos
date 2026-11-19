@@ -1134,6 +1134,8 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         let verified = context
             .copies
             .current()
+            // A copy catalog that cannot answer counts nothing: fail closed.
+            .map_err(|_| PurgeRefusal::JournalUnavailable)?
             .into_iter()
             .filter(|copy| {
                 copy.location != context.local
