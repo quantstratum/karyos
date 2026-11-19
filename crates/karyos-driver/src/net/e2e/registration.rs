@@ -367,6 +367,7 @@ fn a_full_table_answers_err_and_keeps_its_destination() {
         .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
         .unwrap();
     super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..16);
+    assert_eq!(occupancy(&mut a, 10), 1, "B alone before C registers");
     let _refused = c
         .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(2))
         .unwrap();
@@ -375,6 +376,15 @@ fn a_full_table_answers_err_and_keeps_its_destination() {
     });
     assert!(c.network_image(10, 3).is_none());
     assert!(registrations(&a).refused_full >= 1);
+    // The ERR leaves the table as it was (SPEC §13 "Multi-destination
+    // isolation", karyos#645): the same one occupied entry, no pending
+    // entry left by C's REGISTER, and by the lifecycle counters one
+    // destination joined, none refused at a first SM, none removed.
+    assert_eq!(occupancy(&mut a, 10), 1, "C's REGISTER left an entry");
+    let counters = sender(&a);
+    assert_eq!(counters.registrants_joined, 1);
+    assert_eq!(counters.registrants_refused, 0);
+    assert_eq!(counters.registrants_timed_out, 0);
     super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 16..32);
 }
 
@@ -397,6 +407,13 @@ fn a_dynamic_subscription_needs_its_identity_and_a_dynamic_channel() {
         b.add_dynamic_network_subscription(10, &unicast, as_receiver(1)),
         Err(DriverError::UnsupportedChannel)
     ));
+}
+
+/// The entries `driver`'s first publication, of `stream_id`, occupies:
+/// its destinations plus its pending registrations.
+fn occupancy(driver: &mut EmbeddedDriver, stream_id: i32) -> usize {
+    let sender = &super::shared(driver).sender;
+    sender.destination_counters(0).len() + sender.pending_registrations(stream_id)
 }
 
 /// `driver`'s sender counters.

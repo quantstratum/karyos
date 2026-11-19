@@ -5314,6 +5314,17 @@ impl<T: StreamTerms> SenderRole<T> {
         self.registrations.counters()
     }
 
+    /// The pending registrations for `stream_id`: REGISTERs answered with
+    /// a SETUP and not yet joined, refused or expired (tests).
+    #[cfg(test)]
+    pub(crate) fn pending_registrations(&self, stream_id: i32) -> usize {
+        self.registrations
+            .pending()
+            .iter()
+            .filter(|entry| entry.stream_id == stream_id)
+            .count()
+    }
+
     /// Stores each publication's changed counts into its CnC cells, at
     /// the end of a duty cycle (M2b).
     pub(crate) fn publish_stream_cells(&mut self) {
