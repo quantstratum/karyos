@@ -17,11 +17,20 @@ categories = ["network-programming", "concurrency"]
 karyos-client.workspace = true
 karyos-archive.workspace = true
 karyos-cluster.workspace = true
+# Only for `alloc-count`: the counting allocator lives there.
+karyos-sys = { workspace = true, optional = true }
 thiserror.workspace = true
+
+[features]
+# `karyos::alloc_count`: a counting global allocator for test profiles
+# (R-CORE-48, karyos#918). Unsupported in production builds.
+alloc-count = ["dep:karyos-sys", "karyos-sys/alloc-count"]
 
 [dev-dependencies]
 # The versions test compares the facade's with the protocol's.
 karyos-protocol.workspace = true
+# The facade with `alloc-count`, for tests/alloc_count.rs.
+karyos = { path = ".", features = ["alloc-count"] }
 
 [lints]
 workspace = true

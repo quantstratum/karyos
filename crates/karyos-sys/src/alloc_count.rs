@@ -3,7 +3,9 @@
 //! A counting global allocator for tests that must prove a call allocates
 //! and frees nothing (`quantstratum-docs: karyos/design/ipc-data-path.md`,
 //! Tests: "a counting allocator showing no allocation and no free inside
-//! the data call that crosses the seal"). Test hook only.
+//! the data call that crosses the seal"). Test support only (feature
+//! `alloc-count`, included in `test-hooks`); a product test profile reaches
+//! it through the facade's `karyos::alloc_count` (R-CORE-48, karyos#918).
 //!
 //! A test binary installs it with
 //! `#[global_allocator] static A: CountingAllocator = CountingAllocator;`
