@@ -25,6 +25,11 @@ enforces what a tool can check; review enforces the rest.
   Apache-2.0` in Rust, `# SPDX-License-Identifier: Apache-2.0` in TOML,
   shell and Makefiles, `<!-- SPDX-License-Identifier: Apache-2.0 -->` in
   Markdown.
+  Exception: a changelog fragment, `changelog.d/<issue>-<slug>.md`, starts
+  with its section header and carries no SPDX line, because
+  `scripts/changelog-assemble.sh` requires the header first and folds the
+  fragment into `CHANGELOG.md` (which has its own SPDX line) and deletes it
+  at release. `changelog.d/README.md` keeps its SPDX line.
 - Live documents cite the specification by section and paragraph name
   (`SPEC.md §10.2`, "Versioning"), never by an unpinned line number.
   Design documents are cited as `quantstratum-docs: karyos/design/<file>.md`.

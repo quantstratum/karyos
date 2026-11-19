@@ -15,7 +15,9 @@ is one file, `changelog.d/<issue>-<slug>.md`, for example
 
 The file holds exactly one section header (`Added`, `Changed`,
 `Deprecated`, `Removed`, `Fixed` or `Security`) and the entries under it,
-written as they will read in `CHANGELOG.md`. A change with entries in two
+written as they will read in `CHANGELOG.md`. A fragment has no SPDX line
+(`rules/global_rules.md`, "Language and writing"): its first line is the
+header. A change with entries in two
 sections uses two files, both named after the issue
 (`634-refresh-cycles.md`, `634-refresh-cycles-fix.md`). A change with no
 issue does not get a fragment until it has one. `make changelog-check`,
