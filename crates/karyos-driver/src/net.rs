@@ -1013,6 +1013,12 @@ impl<T: StreamTerms> Network<T> {
                 .ok_or(DriverError::NetworkEndpoint)?;
             return Ok(entry.endpoint);
         }
+        // An endpoint retiring at this fixed address still holds it: the
+        // add is refused as retryable, and taken once it has retired
+        // (karyos#994).
+        if self.endpoints.retiring_at(bind) {
+            return Err(DriverError::NetworkBusy);
+        }
         let mut config = SocketsConfig::new(bind);
         config.multicast = multicast;
         config.tx_slots = self.endpoint_tables.tx_slots;

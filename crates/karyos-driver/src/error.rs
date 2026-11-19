@@ -140,7 +140,9 @@ pub enum DriverError {
     /// held: the receiver's table is full.
     #[error("too many network subscriptions")]
     NetworkSubscriptionsFull,
-    /// A network agent's command ring is full; retry later.
+    /// A network agent's command ring is full, or an endpoint at the
+    /// fixed address an add needs is still retiring after its last
+    /// publication or subscription went (karyos#994); retry later.
     #[error("network agent busy")]
     NetworkBusy,
     /// The driver's export and occupant ids are exhausted.
