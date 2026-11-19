@@ -3610,3 +3610,96 @@ fn a_failed_source_still_seals_its_last_range() {
     assert_eq!(sealed_and_chained(&dir, id, &bytes), (true, 2));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A recording a crash left open, its writes sealed: written by hand, two
+/// 4 KiB writes, both sealed. The agent's thread needs a `Send` disk, so
+/// this is a real directory; the `FaultDisk` injection is in
+/// `integrity::damage`'s tests. Returns the directory and the recording.
+fn crashed_sealed_recording(name: &str) -> (PathBuf, u64) {
+    use crate::catalog::{Catalog, NewRecording};
+    use crate::integrity::journal::IntegrityJournal;
+
+    let disk = StdDisk;
+    let root = temp_dir(name);
+    let dir = root.as_path();
+    let mut catalog = Catalog::open(disk.clone(), dir).unwrap().catalog;
+    let geometry = Geometry::new(4096, 8192).unwrap();
+    let id = catalog
+        .start(NewRecording {
+            stream_id: 10,
+            session_id: 3,
+            channel: b"karyos:ipc",
+            start: 0,
+            start_time_ns: 0,
+            geometry,
+            policy: SyncPolicy::PerSegment,
+            format: format(),
+            required: false,
+        })
+        .unwrap();
+    let mut store =
+        SegmentStore::create(disk.clone(), dir, id, geometry, SyncPolicy::PerSegment, 0).unwrap();
+    let mut journal = IntegrityJournal::open(disk.clone(), dir).unwrap().journal;
+    for (index, fill) in [1u8, 2].into_iter().enumerate() {
+        let bytes = vec![fill; 4096];
+        let at = index as u64 * 4096;
+        store.append(at, &bytes).unwrap();
+        journal.seal_segment(id, at, &bytes, false).unwrap();
+    }
+    store.sync().unwrap();
+    // The crash: the store and the catalog are left as they are.
+    (root, id)
+}
+
+/// An index shortened by media damage below its seals is reported at a
+/// restart with the lost range, and counted (karyos#671).
+#[test]
+fn an_index_shortened_below_its_seals_is_reported_at_restart() {
+    use crate::disk::Disk as _;
+    use crate::integrity::damage::ShortenedIndex;
+
+    let (dir, id) = crashed_sealed_recording("shortened");
+    let mut disk = StdDisk;
+    // The damage, written by the test: the index loses its second entry.
+    let index = dir.join(format!("{id:016x}-{:016x}.idx", 0));
+    let file = disk.open(&index).unwrap();
+    let length = disk.len(&file).unwrap();
+    disk.set_len(&file, length - 32).unwrap();
+
+    let config = AgentConfig {
+        idle: Duration::from_millis(1),
+        seal_interval: Some(Duration::from_millis(1)),
+        ..AgentConfig::default()
+    };
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+    assert_eq!(
+        agent.event(Duration::from_secs(5)),
+        Some(Event::IndexShortened(ShortenedIndex {
+            recording: id,
+            written: 4096,
+            sealed_end: 8192,
+            counter: 1,
+        }))
+    );
+    assert_eq!(agent.shortened_indexes(), 1);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A recovered recording whose seals end at or below its written end is
+/// not reported: an unindexed tail above the last seal stays an
+/// unacknowledged write.
+#[test]
+fn a_recovered_recording_within_its_seals_is_not_reported() {
+    let (dir, _) = crashed_sealed_recording("within-seals");
+    let config = AgentConfig {
+        idle: Duration::from_millis(1),
+        seal_interval: Some(Duration::from_millis(1)),
+        ..AgentConfig::default()
+    };
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+    assert_eq!(agent.event(Duration::from_millis(200)), None);
+    assert_eq!(agent.shortened_indexes(), 0);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

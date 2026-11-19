@@ -69,6 +69,7 @@ use crate::group::gateway::live::RecordingWord;
 use crate::group::journal::{GroupJournal, JournalConfig, JournalError};
 use crate::group::prefix::{CheckpointHeld, Coverage};
 use crate::group::record::{CONTRACT_VERSION, Capture, Clock, JournalHeader};
+use crate::integrity::damage::shortened_below_seal;
 use crate::integrity::journal::{IntegrityError, IntegrityJournal};
 use crate::integrity::sealer::{self, SealSource, Sealer};
 use crate::recorder::{Ended, FrameSource, Mode, Recorder, RecorderError};
@@ -422,6 +423,11 @@ pub enum Event {
         /// The position its store had written when it failed.
         position: u64,
     },
+    /// At start, a recording a crash left open recovered below what its
+    /// seals cover: media damage shortened its index, and the range
+    /// `[written, sealed_end)` is lost (A10; karyos#671). The verifier
+    /// reports it `inconsistent` with `shortened_index`.
+    IndexShortened(crate::integrity::damage::ShortenedIndex),
 }
 
 /// A replay that ended by itself; its target was told with
@@ -782,6 +788,7 @@ struct Counts {
     refused: AtomicU64,
     fenced_recordings: AtomicU64,
     rejoined_recordings: AtomicU64,
+    shortened_indexes: AtomicU64,
 }
 
 /// Adds one to `counter`, sticky at `u64::MAX`.
@@ -1156,6 +1163,13 @@ impl ArchiveHandle {
         self.replay_ends.try_recv().ok()
     }
 
+    /// Recordings found at start with an index shortened below their seals
+    /// (karyos#671).
+    #[must_use]
+    pub fn shortened_indexes(&self) -> u64 {
+        self.counts.shortened_indexes.load(Ordering::Relaxed)
+    }
+
     /// Recording events dropped because their queue was full.
     #[must_use]
     pub fn dropped_events(&self) -> u64 {
@@ -1502,11 +1516,31 @@ fn run<D>(
             return;
         }
     };
-    if let Err(error) = catalog.settle(now()) {
-        let _ = ready.send(Err(error.into()));
-        return;
-    }
+    let settled = match catalog.settle(now()) {
+        Ok(settled) => settled,
+        Err(error) => {
+            let _ = ready.send(Err(error.into()));
+            return;
+        }
+    };
     if let Some(integrity) = integrity.as_mut() {
+        // A recording a crash left open recovered at A2's rule; one whose
+        // recovered end falls below its seals lost sealed bytes to media
+        // damage, which the seal chain shows (karyos#671). It is reported
+        // and counted, never taken for an unacknowledged write.
+        if let Ok(records) = integrity.journal.records() {
+            for recovered in settled
+                .iter()
+                .filter(|settled| settled.reason == StopReason::Recovered)
+            {
+                if let Some(damage) =
+                    shortened_below_seal(&records, recovered.id, recovered.position)
+                {
+                    count(&outbox.counts.shortened_indexes);
+                    outbox.send(Event::IndexShortened(damage));
+                }
+            }
+        }
         for change in catalog.take_changes() {
             if let Err(error) = integrity.journal.record_catalog_change(
                 change.recording,
