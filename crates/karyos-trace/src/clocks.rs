@@ -133,17 +133,22 @@ impl Calibration {
         Ok(())
     }
 
-    /// Whether `[low, high]` of `from` lies wholly inside the validity.
+    /// Whether `[low, high]` of `from` is a well-formed interval
+    /// (`low <= high`) lying wholly inside the validity; a reversed
+    /// interval is never covered.
     #[must_use]
     pub fn covers(&self, low: i128, high: i128) -> bool {
-        low >= i128::from(self.valid_from) && high <= i128::from(self.valid_to)
+        low <= high && low >= i128::from(self.valid_from) && high <= i128::from(self.valid_to)
     }
 
     /// Converts the interval `[low, high]` of `from` into an interval of
     /// `to` containing every value the model allows: the minimum and
     /// maximum over the corners of the time, offset and drift intervals,
     /// with the drift term rounded outwards.
-    /// Returns `None` when a product does not fit `i128`.
+    /// Returns `None` when any step does not fit `i128`: the difference
+    /// from the reference time, a product with the drift, or a sum with the
+    /// offset, its uncertainty or the drift term. It never panics or wraps,
+    /// for any input.
     #[must_use]
     pub fn convert(&self, low: i128, high: i128) -> Option<(i128, i128)> {
         let reference = i128::from(self.reference);
@@ -154,7 +159,7 @@ impl Calibration {
         let mut lower = i128::MAX;
         let mut upper = i128::MIN;
         for time in [low, high] {
-            let delta = time - reference;
+            let delta = time.checked_sub(reference)?;
             for rate in [drift - drift_uncertainty, drift + drift_uncertainty] {
                 let term = delta.checked_mul(rate)?;
                 let base_low = time.checked_add(offset)?.checked_sub(offset_uncertainty)?;

@@ -32,7 +32,34 @@
 //! and a report with none is refused ([`TimeError::NoRequirement`]).
 //! Integrity outcomes are reported apart, by `integrity::verify`.
 
+use std::num::NonZeroU64;
+
 use karyos_trace::clocks::{Calibration, ClockKey};
+
+/// A declared time coordinate: the identity of an epoch and scale (and its
+/// leap, TAI or smear transformation) that timestamps and UTC intervals are
+/// normalized to before they are compared (SPEC.md §8.4). Two values are
+/// compared only when they carry the same coordinate; 0 is "not stated" and
+/// has no `Coordinate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Coordinate(NonZeroU64);
+
+impl Coordinate {
+    /// The coordinate of `id`, or `None` for 0 ("not stated").
+    #[must_use]
+    pub const fn new(id: u64) -> Option<Self> {
+        match NonZeroU64::new(id) {
+            Some(id) => Some(Self(id)),
+            None => None,
+        }
+    }
+
+    /// Its identity.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
 
 /// Where a UTC-traceable clock gets its time. The values are the reserved
 /// word 0 codes of design/trace-clocks.md.
@@ -136,6 +163,9 @@ pub struct UtcReference {
     /// stated with their uncertainty. Without them the record is
     /// insufficient evidence.
     pub scale_stated: bool,
+    /// The declared coordinate its UTC interval is expressed in; `None`
+    /// when not stated, which is missing evidence.
+    pub coordinate: Option<Coordinate>,
 }
 
 /// What a calibration's target is (`target_kind`, design/trace-clocks.md).
@@ -178,24 +208,42 @@ pub enum Gap {
     Overflow,
     /// An input is missing or "not stated".
     Missing,
+    /// The timestamps and the UTC reference are not normalized to the same
+    /// declared coordinate.
+    CoordinateMismatch,
+    /// The evidence is malformed: a calibration its own validation refuses
+    /// (such as one from a clock to itself), or an interval whose minimum
+    /// is above its maximum.
+    Invalid,
 }
 
 /// The UTC interval a timestamp `t` of the calibration's source clock lies
-/// in, in ns: `[lo - e_B, hi + e_B]`.
+/// in, in ns: `[lo - e_B, hi + e_B]`. `coordinate` is the declared
+/// coordinate `t` is normalized to; it must be the reference's, so the
+/// timestamp and the interval are compared in one coordinate.
 ///
 /// # Errors
 ///
 /// The [`Gap`] that makes it `no_evidence`.
 pub fn utc_interval(
     t: u64,
+    coordinate: Coordinate,
     calibration: &Calibration,
     reference: &UtcReference,
 ) -> Result<(i128, i128), Gap> {
+    if calibration.validate().is_err() {
+        return Err(Gap::Invalid);
+    }
     if reference.clock != calibration.to {
         return Err(Gap::WrongReference);
     }
     if !reference.scale_stated {
         return Err(Gap::ScaleNotStated);
+    }
+    match reference.coordinate {
+        None => return Err(Gap::Missing),
+        Some(declared) if declared != coordinate => return Err(Gap::CoordinateMismatch),
+        Some(_) => {}
     }
     let time = i128::from(t);
     if !calibration.covers(time, time) {
@@ -219,18 +267,22 @@ fn distance(value: i128, (lo, hi): (i128, i128)) -> Result<u64, Gap> {
     u64::try_from(below.max(above)).map_err(|_| Gap::Overflow)
 }
 
-/// The combined bound of a raw timestamp `t`: its larger distance to the
-/// UTC interval it lies in, in ns.
+/// The combined bound of a raw timestamp `t`, normalized to
+/// `coordinate`: its larger distance to the UTC interval it lies in, in ns.
 ///
 /// # Errors
 ///
 /// The [`Gap`] that makes it `no_evidence`.
 pub fn combined_bound(
     t: u64,
+    coordinate: Coordinate,
     calibration: &Calibration,
     reference: &UtcReference,
 ) -> Result<u64, Gap> {
-    distance(i128::from(t), utc_interval(t, calibration, reference)?)
+    distance(
+        i128::from(t),
+        utc_interval(t, coordinate, calibration, reference)?,
+    )
 }
 
 /// The bound of an entry whose timestamps range over `[min, max]`: the
@@ -239,16 +291,21 @@ pub fn combined_bound(
 ///
 /// # Errors
 ///
-/// The [`Gap`] of either end.
+/// [`Gap::Invalid`] when `min > max`, otherwise the [`Gap`] of either end.
 pub fn entry_bound(
     min: u64,
     max: u64,
+    coordinate: Coordinate,
     calibration: &Calibration,
     reference: &UtcReference,
 ) -> Result<u64, Gap> {
+    if min > max {
+        return Err(Gap::Invalid);
+    }
     Ok(
-        combined_bound(min, calibration, reference)?.max(combined_bound(
+        combined_bound(min, coordinate, calibration, reference)?.max(combined_bound(
             max,
+            coordinate,
             calibration,
             reference,
         )?),
@@ -258,7 +315,8 @@ pub fn entry_bound(
 /// The bound of a derived timestamp `derived` made from the raw timestamp
 /// `raw`, such as a clamped `event_time = max(raw, last)`: its own distance
 /// to the UTC interval the raw value lies in, the clamp included. It never
-/// inherits the raw clock's bound.
+/// inherits the raw clock's bound. Both values are normalized to
+/// `coordinate`.
 ///
 /// # Errors
 ///
@@ -266,12 +324,13 @@ pub fn entry_bound(
 pub fn derived_bound(
     derived: u64,
     raw: u64,
+    coordinate: Coordinate,
     calibration: &Calibration,
     reference: &UtcReference,
 ) -> Result<u64, Gap> {
     distance(
         i128::from(derived),
-        utc_interval(raw, calibration, reference)?,
+        utc_interval(raw, coordinate, calibration, reference)?,
     )
 }
 
@@ -364,8 +423,12 @@ pub struct ClockEvidence {
     pub sync_state: SyncState,
     /// Its source.
     pub source: Source,
-    /// Its stated granularity, in ns; `None` when not stated.
+    /// Its stated granularity, in ns; `None` or 0 when not stated
+    /// (design/trace-clocks.md reserves 0 for "not stated").
     pub granularity_ns: Option<u64>,
+    /// The declared coordinate its timestamps are normalized to; `None`
+    /// when not stated.
+    pub coordinate: Option<Coordinate>,
     /// The calibration used, if any.
     pub calibration: Option<CalibrationEvidence>,
     /// The UTC reference used, if any.
@@ -388,14 +451,16 @@ pub fn clock_verdict(evidence: &ClockEvidence, requirement: &Requirement) -> Ver
     if evidence.sync_state == SyncState::Unsynchronised {
         return Verdict::NotMet;
     }
-    let (Some(calibration), Some(reference), Some(granularity)) = (
+    let (Some(calibration), Some(reference), Some(granularity), Some(coordinate)) = (
         evidence.calibration,
         evidence.reference,
         evidence.granularity_ns,
+        evidence.coordinate,
     ) else {
         return Verdict::NoEvidence;
     };
-    if evidence.sync_state == SyncState::NotStated
+    if granularity == 0
+        || evidence.sync_state == SyncState::NotStated
         || evidence.source == Source::NotStated
         || reference.sync_state == SyncState::NotStated
         || reference.source == Source::NotStated
@@ -408,6 +473,7 @@ pub fn clock_verdict(evidence: &ClockEvidence, requirement: &Requirement) -> Ver
     let Ok(bound) = entry_bound(
         evidence.min,
         evidence.max,
+        coordinate,
         &calibration.calibration,
         &reference,
     ) else {

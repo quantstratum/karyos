@@ -14,6 +14,11 @@ use super::*;
 
 const VALID_TO: u64 = 1_000_000_000_000;
 
+/// The declared coordinate the fixtures' timestamps and UTC reference share.
+fn coordinate() -> Coordinate {
+    Coordinate::new(7).unwrap()
+}
+
 fn clock(domain: u64) -> ClockKey {
     ClockKey {
         observer: ObserverId {
@@ -55,6 +60,7 @@ fn reference() -> UtcReference {
         source: Source::Ptp,
         sync_state: SyncState::Synchronised,
         scale_stated: true,
+        coordinate: Some(coordinate()),
     }
 }
 
@@ -63,6 +69,7 @@ fn evidence() -> ClockEvidence {
         sync_state: SyncState::Synchronised,
         source: Source::Ptp,
         granularity_ns: Some(1),
+        coordinate: Some(coordinate()),
         calibration: Some(calibration()),
         reference: Some(reference()),
         min: 1_000,
@@ -90,8 +97,14 @@ fn unknown_source_and_sync_state_codes_are_refused() {
 #[test]
 fn the_combined_bound_is_the_larger_distance_to_the_utc_interval() {
     let cal = calibration().calibration;
-    assert_eq!(utc_interval(1_000, &cal, &reference()), Ok((1_940, 2_060)));
-    assert_eq!(combined_bound(1_000, &cal, &reference()), Ok(1_060));
+    assert_eq!(
+        utc_interval(1_000, coordinate(), &cal, &reference()),
+        Ok((1_940, 2_060))
+    );
+    assert_eq!(
+        combined_bound(1_000, coordinate(), &cal, &reference()),
+        Ok(1_060)
+    );
 }
 
 #[test]
@@ -101,10 +114,13 @@ fn the_bound_is_taken_at_the_minimum_and_maximum_timestamps() {
     // the range its position is.
     let mut cal = calibration().calibration;
     cal.drift_uncertainty = 1_000_000;
-    let at_min = combined_bound(1_000, &cal, &reference()).unwrap();
-    let at_max = combined_bound(500_000, &cal, &reference()).unwrap();
+    let at_min = combined_bound(1_000, coordinate(), &cal, &reference()).unwrap();
+    let at_max = combined_bound(500_000, coordinate(), &cal, &reference()).unwrap();
     assert!(at_max > at_min);
-    assert_eq!(entry_bound(1_000, 500_000, &cal, &reference()), Ok(at_max));
+    assert_eq!(
+        entry_bound(1_000, 500_000, coordinate(), &cal, &reference()),
+        Ok(at_max)
+    );
 }
 
 #[test]
@@ -113,23 +129,23 @@ fn missing_or_invalid_evidence_is_no_evidence_never_a_bound() {
     let mut other = reference();
     other.clock = clock(9);
     assert_eq!(
-        combined_bound(1_000, &cal, &other),
+        combined_bound(1_000, coordinate(), &cal, &other),
         Err(Gap::WrongReference)
     );
     let mut unscaled = reference();
     unscaled.scale_stated = false;
     assert_eq!(
-        combined_bound(1_000, &cal, &unscaled),
+        combined_bound(1_000, coordinate(), &cal, &unscaled),
         Err(Gap::ScaleNotStated)
     );
     let mut short = reference();
     short.valid_to = 1_500;
     assert_eq!(
-        combined_bound(1_000, &cal, &short),
+        combined_bound(1_000, coordinate(), &cal, &short),
         Err(Gap::ReferenceNotValid)
     );
     assert_eq!(
-        combined_bound(VALID_TO + 1, &cal, &reference()),
+        combined_bound(VALID_TO + 1, coordinate(), &cal, &reference()),
         Err(Gap::CalibrationNotValid)
     );
 }
@@ -296,8 +312,8 @@ fn a_leap_boundary_splits_the_entry() {
 fn a_clamped_timestamp_never_carries_the_raw_bound() {
     let cal = calibration().calibration;
     // event_time = max(raw, last): raw 1000 is clamped up to 5000.
-    let raw = combined_bound(1_000, &cal, &reference()).unwrap();
-    let derived = derived_bound(5_000, 1_000, &cal, &reference()).unwrap();
+    let raw = combined_bound(1_000, coordinate(), &cal, &reference()).unwrap();
+    let derived = derived_bound(5_000, 1_000, coordinate(), &cal, &reference()).unwrap();
     assert_ne!(derived, raw);
     assert_eq!(derived, 3_060);
     // Without the raw value's UTC interval it is no_evidence, never the
@@ -305,7 +321,7 @@ fn a_clamped_timestamp_never_carries_the_raw_bound() {
     let mut unscaled = reference();
     unscaled.scale_stated = false;
     assert_eq!(
-        derived_bound(5_000, 1_000, &cal, &unscaled),
+        derived_bound(5_000, 1_000, coordinate(), &cal, &unscaled),
         Err(Gap::ScaleNotStated)
     );
 }
@@ -320,11 +336,107 @@ fn a_clamp_following_a_leader_whose_clock_is_behind_gets_its_own_bound() {
     let leader_last = 3_000;
     let derived = raw.max(leader_last);
     assert_eq!(
-        derived_bound(derived, raw, &cal, &reference()),
-        combined_bound(raw, &cal, &reference())
+        derived_bound(derived, raw, coordinate(), &cal, &reference()),
+        combined_bound(raw, coordinate(), &cal, &reference())
     );
     // And when the leader is ahead the clamp moves it, and its own bound
     // grows with the clamp.
-    let ahead = derived_bound(raw.max(9_000), raw, &cal, &reference()).unwrap();
-    assert!(ahead > combined_bound(raw, &cal, &reference()).unwrap());
+    let ahead = derived_bound(raw.max(9_000), raw, coordinate(), &cal, &reference()).unwrap();
+    assert!(ahead > combined_bound(raw, coordinate(), &cal, &reference()).unwrap());
+}
+
+/// A calibration its own validation refuses, from a clock to itself, is
+/// never evidence, even marked authoritative (karyos#666 review).
+#[test]
+fn an_invalid_calibration_is_no_evidence() {
+    let mut own = calibration();
+    own.calibration.to = own.calibration.from;
+    let mut reference = reference();
+    reference.clock = own.calibration.from;
+    assert_eq!(
+        utc_interval(1_000, coordinate(), &own.calibration, &reference),
+        Err(Gap::Invalid)
+    );
+    let evidence = ClockEvidence {
+        calibration: Some(own),
+        reference: Some(reference),
+        ..evidence()
+    };
+    assert_eq!(
+        clock_verdict(&evidence, &requirement(5_000)),
+        Verdict::NoEvidence
+    );
+}
+
+/// A timestamp and a UTC reference in different declared coordinates are
+/// never compared, and a coordinate not stated is missing evidence.
+#[test]
+fn timestamps_and_utc_are_compared_only_in_one_coordinate() {
+    let cal = calibration().calibration;
+    let other = Coordinate::new(8).unwrap();
+    assert_eq!(
+        combined_bound(1_000, other, &cal, &reference()),
+        Err(Gap::CoordinateMismatch)
+    );
+    assert_eq!(
+        derived_bound(5_000, 1_000, other, &cal, &reference()),
+        Err(Gap::CoordinateMismatch)
+    );
+    let mut unstated = reference();
+    unstated.coordinate = None;
+    assert_eq!(
+        combined_bound(1_000, coordinate(), &cal, &unstated),
+        Err(Gap::Missing)
+    );
+    assert_eq!(Coordinate::new(0), None);
+    for evidence in [
+        ClockEvidence {
+            coordinate: Some(other),
+            ..evidence()
+        },
+        ClockEvidence {
+            coordinate: None,
+            ..evidence()
+        },
+    ] {
+        assert_eq!(
+            clock_verdict(&evidence, &requirement(5_000)),
+            Verdict::NoEvidence,
+            "{evidence:?}"
+        );
+    }
+}
+
+/// Granularity 0 is "not stated" (design/trace-clocks.md): missing
+/// evidence, never a granularity that passes every requirement.
+#[test]
+fn zero_granularity_is_no_evidence() {
+    let zero = ClockEvidence {
+        granularity_ns: Some(0),
+        ..evidence()
+    };
+    assert_eq!(
+        clock_verdict(&zero, &requirement(5_000)),
+        Verdict::NoEvidence
+    );
+}
+
+/// A reversed interval is malformed: never covered, never met.
+#[test]
+fn a_reversed_interval_is_refused() {
+    let cal = calibration().calibration;
+    assert!(!cal.covers(2_000, 1_000));
+    assert_eq!(
+        entry_bound(2_000, 1_000, coordinate(), &cal, &reference()),
+        Err(Gap::Invalid)
+    );
+    let reversed = ClockEvidence {
+        min: 2_000,
+        max: 1_000,
+        ..evidence()
+    };
+    assert_eq!(
+        clock_verdict(&reversed, &requirement(5_000)),
+        Verdict::NoEvidence
+    );
 }

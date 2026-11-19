@@ -303,3 +303,14 @@ fn a_product_equal_to_i128_min_does_not_panic() {
     assert_eq!(ceil_billionths(1), 1);
     assert_eq!(ceil_billionths(-BILLION), -1);
 }
+
+/// The public conversion never panics or wraps: a time whose difference
+/// from the reference does not fit `i128` gives `None` (karyos#666 review).
+#[test]
+fn a_conversion_whose_difference_overflows_is_none() {
+    let mut record = calibration(0, 0);
+    record.reference = 1;
+    assert_eq!(record.convert(i128::MIN, i128::MIN), None);
+    record.reference = 0;
+    assert!(record.convert(0, 0).is_some());
+}
