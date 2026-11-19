@@ -512,7 +512,6 @@ dependencies = [
  "karyos-driver",
  "karyos-io",
  "karyos-protocol",
- "karyos-sim",
  "karyos-sys",
  "karyos-trace",
  "proptest",

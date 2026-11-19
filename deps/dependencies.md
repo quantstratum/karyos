@@ -134,8 +134,8 @@ applies them:
   throwaway workspace that the check fails with exactly the expected
   diagnostic on a plain, a feature-gated, a transitively admitted and a
   feature-unified Tokio, and on a candidate in the admitted crate, and passes silently on
-  Tokio in the admitted crate and on a clean graph. The unused `karyos-tools` to `karyos-sim` edge, through which a
-  candidate placed in `karyos-sim` would reach `karyosd`, is karyos#926.
+  Tokio in the admitted crate and on a clean graph. karyos#926 removed the unused `karyos-tools` to `karyos-sim` edge, so a
+  candidate placed in `karyos-sim` no longer reaches `karyosd` that way.
 - **Rows, evaluation only** (`eval/raft-candidates/Cargo.toml`; the
   graph is that workspace's `Cargo.lock`):
 
