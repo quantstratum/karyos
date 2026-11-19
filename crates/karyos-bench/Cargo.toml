@@ -69,5 +69,11 @@ harness = false
 name = "dedup"
 harness = false
 
+# Item 37's TTL, snapshot triggers and catch-up allowance, one-shot
+# measurements (karyos#932).
+[[bench]]
+name = "item37"
+harness = false
+
 [lints]
 workspace = true
