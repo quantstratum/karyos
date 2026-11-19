@@ -38,6 +38,7 @@ karyos-catalog: an Archive's recordings (SPEC.md section 11).
 
 Usage: karyos-catalog list <dir> [--json]
        karyos-catalog list --live DIR=REQ,RESP [--timeout-ms N] [--json]
+       karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]... [--json]
 
   list <dir>     the recordings of the catalog in <dir>, read only: no
                  running Archive is needed, and none is disturbed. A
@@ -50,6 +51,8 @@ Usage: karyos-catalog list <dir> [--json]
                  listing (default 5000)
   --json         one JSON object instead of text
   -h, --help     print this text
+  verify <dir>   the integrity outcome of every range (SPEC.md section
+                 8.4); karyos-catalog verify --help for its options
 
 Exit status: 0 listed (a directory with no catalog lists nothing); 2 an
 error (arguments, I/O, a damaged catalog or another format version, an

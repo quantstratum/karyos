@@ -3,7 +3,8 @@
 //! `karyos-catalog` (SPEC §11; `quantstratum-docs:
 //! karyos/design/archive-host.md`, H4 and H4b): an Archive's recordings.
 //! `list DIR` reads the catalog offline and read only; `list --live` asks a
-//! running Archive over its control streams. The logic is
+//! running Archive over its control streams; `verify DIR` reports the
+//! integrity of each range ([`karyos_tools::catalog_verify`]). The logic is
 //! [`karyos_tools::catalog`]. See `karyos-catalog --help`.
 
 use std::io::Write;
@@ -22,6 +23,11 @@ fn main() -> ExitCode {
         // A command that is not UTF-8 is no command: an error, not help.
         Some(None) => fail(&"an argument is not UTF-8"),
         Some(Some("list")) => ExitCode::from(catalog::run_list(
+            args,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )),
+        Some(Some("verify")) => ExitCode::from(karyos_tools::catalog_verify::run_verify(
             args,
             &mut std::io::stdout(),
             &mut std::io::stderr(),

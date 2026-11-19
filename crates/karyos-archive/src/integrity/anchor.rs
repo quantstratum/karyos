@@ -195,33 +195,34 @@ pub enum AnchorReason {
 /// that receipt. A signed head proves only who signed it; where it is
 /// kept, and that it is kept there, is proved by the store, never by the
 /// anchor's own fields.
-pub trait AnchorEvidence {
+pub trait AnchorEvidence: std::fmt::Debug {
     /// Whether the store named by `anchor` (its kind and location)
     /// confirms holding it at `anchor.external_counter` with
     /// `anchor.receipt`. A store this evidence does not reach confirms
     /// nothing.
     fn confirms(&self, anchor: &Anchor) -> bool;
 
-    /// The highest head counter that independent evidence proves `anchor`'s
-    /// store held before the anchor's key was revoked, if the evidence
-    /// establishes that ordering for this head (a timestamped receipt, a
-    /// transparency log inclusion before the revocation). Present-day
-    /// storage proves no ordering, so the default is `None`.
-    fn anchored_before_revocation(&self, anchor: &Anchor) -> Option<u64> {
-        let _ = anchor;
-        None
+    /// Whether independent evidence proves this store held `anchor` before
+    /// the key `key_id` was revoked (a timestamped receipt, a transparency
+    /// log inclusion before the revocation). It is the one proof of
+    /// ordering: [`check_anchors`] asks it for the anchor's own key, and
+    /// the verifier for the key of a signed head. Present-day storage
+    /// proves no ordering, so the default is `false`.
+    fn held_before_revocation_of(&self, anchor: &Anchor, key_id: &Digest) -> bool {
+        let _ = (anchor, key_id);
+        false
     }
 }
 
-impl AnchorEvidence for [&dyn AnchorEvidence] {
+/// Several stores: an anchor is confirmed by any of them.
+impl<E: AnchorEvidence> AnchorEvidence for Vec<E> {
     fn confirms(&self, anchor: &Anchor) -> bool {
         self.iter().any(|store| store.confirms(anchor))
     }
 
-    fn anchored_before_revocation(&self, anchor: &Anchor) -> Option<u64> {
+    fn held_before_revocation_of(&self, anchor: &Anchor, key_id: &Digest) -> bool {
         self.iter()
-            .filter_map(|store| store.anchored_before_revocation(anchor))
-            .max()
+            .any(|store| store.held_before_revocation_of(anchor, key_id))
     }
 }
 
@@ -367,7 +368,10 @@ pub fn check_anchors(
         let reason = externality.check(anchor).err().or_else(|| {
             (anchor.signed.head.journal_id != journal_id).then_some(AnchorReason::WrongJournal)
         });
-        let proved = evidence.anchored_before_revocation(anchor);
+        // The same key-specific proof the verifier asks for signed heads.
+        let proved = evidence
+            .held_before_revocation_of(anchor, &anchor.signed.key_id)
+            .then_some(anchor.signed.head.counter);
         let reason = reason.or_else(|| match registry.verify(&anchor.signed, proved) {
             HeadVerdict::Trusted { .. } => None,
             HeadVerdict::NotTrustedEvidence(reason) | HeadVerdict::Invalid(reason) => {
@@ -640,38 +644,99 @@ impl<D: Disk> LedgerAnchorStore<D> {
     /// decode is skipped, and the verifier reports what is missing.
     #[must_use]
     pub fn anchors(&self) -> Vec<Anchor> {
-        self.ledger
-            .entries()
-            .iter()
-            .filter_map(|bytes| {
-                Anchor::decode(bytes).ok().map(|stored| Anchor {
-                    receipt: super::digest(bytes),
-                    ..stored
-                })
-            })
-            .collect()
+        stored_anchors(self.ledger.entries())
     }
 }
 
-impl<D: Disk> AnchorEvidence for LedgerAnchorStore<D> {
+/// The anchor file of one operator export store, as read from the store
+/// itself by a verifier, bound to the location the operator configured
+/// for it outside the export. An anchor counts only if it names that
+/// location and the operator export kind (a directory establishes nothing
+/// else) and is the entry at its counter, with the digest of that entry's
+/// bytes as its receipt ([`AnchorStore::publish`]). An entry's own claim
+/// of where it is stored proves nothing.
+#[derive(Debug, Clone, Default)]
+pub struct StoredAnchors {
+    location: Digest,
+    entries: Vec<[u8; ANCHOR_LENGTH]>,
+}
+
+impl StoredAnchors {
+    /// The operator export store configured at `location`, whose anchor
+    /// file holds `entries`, oldest first.
+    #[must_use]
+    pub const fn new(location: Digest, entries: Vec<[u8; ANCHOR_LENGTH]>) -> Self {
+        Self { location, entries }
+    }
+
+    /// The anchors stored, each with its receipt; an entry that does not
+    /// decode is counted by [`StoredAnchors::malformed`].
+    #[must_use]
+    pub fn anchors(&self) -> Vec<Anchor> {
+        stored_anchors(&self.entries)
+    }
+
+    /// The complete entries that do not decode: malformed evidence, which
+    /// the verifier reports rather than treating as no anchor.
+    #[must_use]
+    pub fn malformed(&self) -> u64 {
+        let malformed = self
+            .entries
+            .iter()
+            .filter(|bytes| Anchor::decode(bytes).is_err())
+            .count();
+        u64::try_from(malformed).unwrap_or(u64::MAX)
+    }
+}
+
+impl AnchorEvidence for StoredAnchors {
     fn confirms(&self, anchor: &Anchor) -> bool {
-        if anchor.kind != AnchorKind::OperatorExport || anchor.location != self.location {
-            return false;
-        }
-        let Some(bytes) = usize::try_from(anchor.external_counter)
-            .ok()
-            .and_then(|index| self.ledger.entries().get(index))
-        else {
-            return false;
-        };
-        anchor.receipt == super::digest(bytes)
-            && Anchor::decode(bytes).is_ok_and(|stored| {
-                stored
-                    == Anchor {
-                        receipt: [0; 32],
-                        ..*anchor
-                    }
+        anchor.kind == AnchorKind::OperatorExport
+            && anchor.location == self.location
+            && confirms_entry(&self.entries, anchor)
+    }
+}
+
+/// The anchors of an anchor file, each with its receipt.
+fn stored_anchors(entries: &[[u8; ANCHOR_LENGTH]]) -> Vec<Anchor> {
+    entries
+        .iter()
+        .filter_map(|bytes| {
+            Anchor::decode(bytes).ok().map(|stored| Anchor {
+                receipt: super::digest(bytes),
+                ..stored
             })
+        })
+        .collect()
+}
+
+/// Whether the entry of `entries` at `anchor`'s counter is `anchor`, with
+/// `anchor`'s receipt the digest of its bytes.
+fn confirms_entry(entries: &[[u8; ANCHOR_LENGTH]], anchor: &Anchor) -> bool {
+    let Some(bytes) = usize::try_from(anchor.external_counter)
+        .ok()
+        .and_then(|index| entries.get(index))
+    else {
+        return false;
+    };
+    anchor.receipt == super::digest(bytes)
+        && Anchor::decode(bytes).is_ok_and(|stored| {
+            stored
+                == Anchor {
+                    receipt: [0; 32],
+                    ..*anchor
+                }
+        })
+}
+
+impl<D: Disk + std::fmt::Debug> AnchorEvidence for LedgerAnchorStore<D>
+where
+    D::File: std::fmt::Debug,
+{
+    fn confirms(&self, anchor: &Anchor) -> bool {
+        anchor.kind == AnchorKind::OperatorExport
+            && anchor.location == self.location
+            && confirms_entry(self.ledger.entries(), anchor)
     }
 }
 

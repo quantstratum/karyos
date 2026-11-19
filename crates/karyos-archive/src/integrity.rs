@@ -53,7 +53,10 @@ pub mod journal;
 pub mod ledger;
 pub mod sealer;
 pub mod signing;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod test_key;
 pub mod trust;
+pub mod verify;
 
 #[cfg(test)]
 mod anchor_tests;
@@ -63,6 +66,8 @@ mod test_support;
 mod tests;
 #[cfg(test)]
 mod trust_tests;
+#[cfg(test)]
+mod verify_tests;
 
 use sha2::{Digest as _, Sha256};
 

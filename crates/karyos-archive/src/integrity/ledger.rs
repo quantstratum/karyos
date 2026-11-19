@@ -11,10 +11,44 @@
 //! append leaves; deciding whether a whole entry is sound is the reader's
 //! job, through the chain.
 
+use std::io;
 use std::path::Path;
 
 use super::journal::IntegrityError;
 use crate::disk::Disk;
+
+/// The whole entries of the ledger `name` in `dir`, read only; a missing
+/// ledger reads as none.
+///
+/// # Errors
+///
+/// The operating system's error.
+pub fn read_entries<D: Disk, const N: usize>(
+    disk: &mut D,
+    dir: &Path,
+    name: &str,
+) -> io::Result<Vec<[u8; N]>> {
+    let file = match disk.open_read(&dir.join(name)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let length = u64::try_from(N).map_err(|_| io::Error::other("entry length"))?;
+    let whole = disk
+        .len(&file)?
+        .checked_div(length)
+        .ok_or_else(|| io::Error::other("zero entry length"))?;
+    let mut entries = Vec::new();
+    for index in 0..whole {
+        let offset = index
+            .checked_mul(length)
+            .ok_or_else(|| io::Error::other("ledger offset overflow"))?;
+        let mut entry = [0u8; N];
+        disk.read_at(&file, offset, &mut entry)?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
 
 /// An append-only file of `N`-byte entries.
 #[derive(Debug)]

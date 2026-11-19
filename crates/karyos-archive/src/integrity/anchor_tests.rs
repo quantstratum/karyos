@@ -36,6 +36,7 @@ fn anchor(kind: AnchorKind, location: [u8; 32], external: u64, record: &SealReco
 
 /// The stores of these tests: each confirms an anchor whose receipt is
 /// the digest of its external counter, as [`anchor`] builds it.
+#[derive(Debug)]
 struct Receipts;
 
 impl AnchorEvidence for Receipts {
@@ -495,6 +496,7 @@ fn an_anchor_covers_nothing_past_a_record_that_does_not_chain() {
 
 /// Receipts whose store also proves, for every anchor, that it held the
 /// anchored head before `through`'s revocation.
+#[derive(Debug)]
 struct Timestamped;
 
 impl AnchorEvidence for Timestamped {
@@ -502,8 +504,8 @@ impl AnchorEvidence for Timestamped {
         Receipts.confirms(anchor)
     }
 
-    fn anchored_before_revocation(&self, anchor: &Anchor) -> Option<u64> {
-        Some(anchor.signed.head.counter)
+    fn held_before_revocation_of(&self, _anchor: &Anchor, _key_id: &super::Digest) -> bool {
+        true
     }
 }
 
