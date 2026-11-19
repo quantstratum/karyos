@@ -1039,6 +1039,27 @@ fn a_cutoff_past_the_seals_or_the_purgeable_floor_is_refused() {
     archive.store.append(384, &chunk(6)).unwrap();
     archive.store.append(448, &chunk(7)).unwrap();
     archive.store.sync().unwrap();
+    // Copies elsewhere cover it, so only the missing seal refuses.
+    for location in [REPLICA_A, REPLICA_B] {
+        archive
+            .copies
+            .record(
+                CopyRecord {
+                    sequence: 0,
+                    recording: RECORDING,
+                    start: 0,
+                    end: 512,
+                    location,
+                    digest: digest(b"copy"),
+                    retain_until_ns: 0,
+                    state: CopyState::Verified,
+                    enforcement: Enforcement::ObjectLock,
+                },
+                &mut archive.journal,
+            )
+            .unwrap();
+    }
+    let context = self::context(&policy, &archive.copies, 5_000);
     let mut unsealed = request();
     unsealed.id = 2;
     unsealed.before = 448;
