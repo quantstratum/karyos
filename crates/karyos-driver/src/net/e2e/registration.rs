@@ -1061,6 +1061,7 @@ fn a_silent_receiver_is_removed_and_registers_again() {
         sender_heartbeat_interval: 100_000_000,
         ..AgentConfig::default()
     };
+    let liveness = std::time::Duration::from_nanos(quick.image_liveness_timeout);
     let mut a = driver_with(ThreadingMode::Shared, quick);
     let mut b = driver(ThreadingMode::Shared);
     let control = SocketAddr::new(LOOPBACK, free_port());
@@ -1086,9 +1087,20 @@ fn a_silent_receiver_is_removed_and_registers_again() {
     // sender runs. `b` stays alive, holding its UDP port, so the new
     // receiver cannot reuse it and meet the old endpoint's quarantine.
     drop(reader);
+    let silent = std::time::Instant::now();
     pump(&mut [&mut a], |drivers| {
         sender(drivers[0]).registrants_timed_out >= 1
     });
+    // Not before the configured liveness timeout (500 ms), counted from
+    // the last SM, which arrived at most one SM interval (10 ms) before
+    // the silence began: 100 ms of slack covers that and the pump's
+    // granularity, far below the timeout, so an earlier retirement fails.
+    let slack = std::time::Duration::from_millis(100);
+    assert!(
+        silent.elapsed() + slack >= liveness,
+        "retired after {:?}, before the {liveness:?} liveness timeout",
+        silent.elapsed()
+    );
     assert_eq!(sender(&a).registrants_timed_out, 1);
     let before = registrations(&a);
     // Its REGISTER retry interval (`setup_interval`) is far above the
