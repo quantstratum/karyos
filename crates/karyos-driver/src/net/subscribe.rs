@@ -423,10 +423,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// M1). One receiving driver is at most one destination of a
     /// publication.
     ///
-    /// Test-only, as the public calls refuse dynamic mode with
-    /// [`DriverError::DynamicRegistrationUnsupported`] until the
-    /// registration defects reported on karyos#644 after it was first
-    /// exposed are fixed: the loopback end-to-end tests drive it here.
+    /// The one call that subscribes in dynamic mode: the other
+    /// subscription calls carry no registration and refuse it with
+    /// [`DriverError::DynamicRegistrationUnsupported`] (karyos#644).
     ///
     /// # Errors
     ///
@@ -438,8 +437,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// on the endpoint registering at another address;
     /// [`DriverError::InvalidRegistrationControl`] for a `control` with a
     /// zero port or an unspecified, multicast or broadcast address.
-    #[cfg(test)]
-    pub(crate) fn add_dynamic_network_subscription(
+    pub fn add_dynamic_network_subscription(
         &mut self,
         stream_id: i32,
         channel: &UdpConfig,
