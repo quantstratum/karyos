@@ -47,6 +47,24 @@ fn three_processes_commit_and_apply_the_same_commands() {
 }
 
 /// One run; `Err` with a failed child's stderr.
+/// The children and their log directory, cleaned up however the run ends:
+/// a panic (a timeout, a failed assertion) kills and reaps every child
+/// still running and removes the logs (karyos#956 review).
+struct Run {
+    children: Vec<std::process::Child>,
+    root: std::path::PathBuf,
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 fn run_once() -> Result<(), String> {
     let peers: Vec<String> = free_addresses()
         .into_iter()
@@ -58,22 +76,28 @@ fn run_once() -> Result<(), String> {
         std::process::id(),
         Instant::now().elapsed().as_nanos()
     ));
-    let mut children: Vec<_> = (0..NODES)
-        .map(|id| {
-            Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
-                .arg(id.to_string())
-                .arg(root.join(format!("node-{id}")))
-                .arg(COMMANDS.to_string())
-                .args(&peers)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap()
-        })
-        .collect();
+    let mut run = Run {
+        children: Vec::new(),
+        root: root.clone(),
+    };
+    // Each child joins the guard as it starts, so a later spawn failing
+    // still stops the earlier ones.
+    for id in 0..NODES {
+        let child = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
+            .arg(id.to_string())
+            .arg(root.join(format!("node-{id}")))
+            .arg(COMMANDS.to_string())
+            .args(&peers)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        run.children.push(child);
+    }
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let statuses: Vec<_> = children
+        let statuses: Vec<_> = run
+            .children
             .iter_mut()
             .map(|child| child.try_wait().unwrap())
             .collect();
@@ -82,22 +106,20 @@ fn run_once() -> Result<(), String> {
         }
         // A failed child (a port taken) stalls the others: stop them.
         if statuses.iter().flatten().any(|status| !status.success()) {
-            for child in &mut children {
+            for child in &mut run.children {
                 let _ = child.kill();
             }
             break;
         }
         if Instant::now() > deadline {
-            for child in &mut children {
-                let _ = child.kill();
-            }
+            // The guard kills, reaps and cleans up.
             panic!("the processes did not finish");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     let mut reports = Vec::new();
     let mut failed = None;
-    for child in children {
+    for child in std::mem::take(&mut run.children) {
         let output = child.wait_with_output().unwrap();
         if output.status.success() {
             reports.push(String::from_utf8(output.stdout).unwrap().trim().to_owned());
@@ -105,7 +127,7 @@ fn run_once() -> Result<(), String> {
             failed = Some(String::from_utf8_lossy(&output.stderr).into_owned());
         }
     }
-    let _ = std::fs::remove_dir_all(&root);
+    drop(run);
     if let Some(stderr) = failed {
         return Err(stderr);
     }

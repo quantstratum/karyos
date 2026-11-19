@@ -16,6 +16,8 @@
 //! (`drive` sends `after_persist` only after the log's sync and the hard
 //! state's save, whatever the core asks), and a durable entry lost across
 //! a crash (C4's log and disk keep it; the core never writes it).
+//! Candidate-backed cases for those two, through a faulty `drive` or disk
+//! under a real core, are karyos#976.
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
