@@ -61,10 +61,12 @@ ordinary policy within its scope. `ring` 0.17.14, `getrandom` 0.2.17,
 never enabled, and the others for targets Karyos does not support; none
 is built. `graviola` panics at its first operation on a CPU without its
 required features; the component checks them at start and refuses with a
-typed error (condition 5). JWT verification, JWKS retrieval, OIDC support,
-any outbound TLS client, `axum` and HTTP/2 are not admitted (condition 8);
-the component's tests use `rustls`'s client side, compiled in the
-admitted `rustls` already, as a test client only.
+typed error (condition 5). That record (condition 8) admits neither JWT
+verification, JWKS retrieval, OIDC support, an outbound TLS client, `axum`
+nor HTTP/2; under it alone the component's tests use `rustls`'s client
+side, compiled in the admitted `rustls` already, as a test client only.
+The production outbound TLS client and JWKS retrieval are admitted by the
+later records below, which are the authority for them.
 
 `karyos-control` also verifies OIDC access tokens and fetches its issuer's
 key set (karyos#708), under the JWT verification and JWKS retrieval

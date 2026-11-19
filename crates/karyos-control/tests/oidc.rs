@@ -131,6 +131,8 @@ struct IssuerState {
     age: Option<String>,
     /// How long the key set endpoint takes to answer.
     delay: Duration,
+    /// Where its discovery document says the key set is.
+    jwks_path: String,
     /// Whether it answers; when not, every route answers 503.
     up: bool,
     /// The challenge of each code given.
@@ -208,15 +210,18 @@ async fn issuer_route(state: Shared, request: Request<Incoming>) -> Response<Rep
     }
     match path.as_str() {
         "/.well-known/openid-configuration" => {
-            let url = state.lock().unwrap().url.clone();
+            let (url, jwks_path) = {
+                let state = state.lock().unwrap();
+                (state.url.clone(), state.jwks_path.clone())
+            };
             text(
                 StatusCode::OK,
-                json!({"issuer": url, "jwks_uri": format!("{url}/jwks"),
+                json!({"issuer": url, "jwks_uri": format!("{url}{jwks_path}"),
                        "code_challenge_methods_supported": ["S256"]})
                 .to_string(),
             )
         }
-        "/jwks" => {
+        path if path == state.lock().unwrap().jwks_path => {
             let delay = state.lock().unwrap().delay;
             tokio::time::sleep(delay).await;
             let mut state = state.lock().unwrap();
@@ -293,6 +298,7 @@ fn issuer() -> Shared {
         cache_control: "max-age=300".to_owned(),
         age: None,
         delay: Duration::ZERO,
+        jwks_path: "/jwks".to_owned(),
         up: true,
         codes: HashMap::new(),
         fetches: 0,
@@ -607,6 +613,9 @@ fn an_expired_set_is_never_used() {
         ("max-age=0", None, true, false),
         ("max-age=0", Some("5"), false, false),
         ("max-age=300, no-cache", None, true, false),
+        // Invalid max-age metadata: never used, not even by its own fetch.
+        ("max-age=abc", None, false, false),
+        ("max-age=60, max-age=60", None, false, false),
         ("max-age=300, must-revalidate", None, true, true),
         ("", None, true, false),
     ] {
@@ -641,6 +650,28 @@ fn an_expired_set_is_never_used() {
         let verified = usize::from(first) + usize::from(usable);
         assert_eq!(lines.lock().unwrap().len(), verified);
     }
+}
+
+/// The issuer moves its key set and retires the old endpoint: the fetch
+/// at the old one fails (503), and the next budgeted fetch discovers the
+/// new one and verifies again, without a restart.
+#[test]
+fn a_moved_key_set_is_discovered_again() {
+    let state = issuer();
+    let url = state.lock().unwrap().url.clone();
+    let (socket, lines) = agent("moved");
+    let address = control(&url, socket, quick());
+    // No lifetime: every token needs a fetch.
+    state.lock().unwrap().cache_control = "no-cache".to_owned();
+    let token = {
+        let state = state.lock().unwrap();
+        state.signer.token("at+jwt", &state.claims("alice@example"))
+    };
+    assert_eq!(refused(address, &token).0, 200);
+    state.lock().unwrap().jwks_path = "/keys/v2".to_owned();
+    assert_eq!(refused(address, &token).0, 503);
+    assert_eq!(refused(address, &token).0, 200);
+    assert_eq!(lines.lock().unwrap().len(), 2);
 }
 
 /// A set whose positive lifetime runs out while it is fetched (its age

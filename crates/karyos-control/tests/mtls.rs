@@ -267,3 +267,17 @@ fn an_unreachable_agent_is_a_bad_gateway() {
     );
     assert_eq!(exchange(address, ops, &get("/v1/request")).unwrap().0, 405);
 }
+
+/// A non-UTF-8 argument (a Unix path may hold one) is a usage error, exit
+/// 2, never a panic.
+#[test]
+fn a_non_utf8_argument_is_a_usage_error() {
+    use std::os::unix::ffi::OsStrExt;
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_karyos-control"))
+        .arg("--agent-socket")
+        .arg(std::ffi::OsStr::from_bytes(b"/tmp/\xff"))
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(2));
+}

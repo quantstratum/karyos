@@ -9,8 +9,12 @@ use std::process::ExitCode;
 use karyos_control::{cli, jwks, jwt, server, tls};
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let Some(args) = cli::parse(&args) else {
+    // A non-UTF-8 argument is a usage error, never a panic.
+    let args: Option<Vec<String>> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.into_string().ok())
+        .collect();
+    let Some(args) = args.as_deref().and_then(cli::parse) else {
         let _ = write!(std::io::stderr(), "{}", cli::USAGE);
         return ExitCode::from(2);
     };

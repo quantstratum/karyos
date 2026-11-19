@@ -32,7 +32,9 @@
 //!   the component's connection limit bounds how many wait.
 //! - **Failures.** A fetch that fails (unreachable, bad TLS, a status but
 //!   200, a wrong issuer, bad JSON, a bound passed) changes nothing of the
-//!   last good set and does not reset its age.
+//!   last good set and does not reset its age. It forgets the `jwks_uri`,
+//!   so the next budgeted fetch discovers it again (an issuer that moved
+//!   its key set is followed, with the same issuer, host and TLS checks).
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -357,6 +359,9 @@ impl Jwks {
                 Ok(set)
             }
             Err(_) => {
+                // The issuer may have moved its key set: the next budgeted
+                // fetch discovers it again, with the same checks.
+                state.jwks_uri = None;
                 state.failures = state.failures.saturating_add(1);
                 let failures = state.failures;
                 state.next_allowed = Some(self.issuer.budget.next(now, failures));
@@ -370,6 +375,7 @@ impl Jwks {
     /// budget counts it, and the next request may start another.
     fn abandon(&self) {
         let mut state = self.lock();
+        state.jwks_uri = None;
         state.in_flight = false;
         state.generation = state.generation.wrapping_add(1);
         state.failures = state.failures.saturating_add(1);
@@ -516,6 +522,10 @@ pub struct Freshness {
     /// not a date (RFC 9111 §5.3): explicitly expired, never usable, not
     /// even by the request that fetched it.
     pub expired: bool,
+    /// Its `max-age` is not a number, or there is more than one (RFC 9111
+    /// §4.2.1): invalid metadata, never usable, not even by the request
+    /// that fetched it.
+    pub invalid: bool,
 }
 
 impl Freshness {
@@ -524,7 +534,7 @@ impl Freshness {
     /// origin serves the request that fetched it, whatever its `Date`
     /// (whose one-second resolution would otherwise decide).
     fn stale_on_receipt(&self) -> bool {
-        if self.expired {
+        if self.expired || self.invalid {
             true
         } else if self.lifetime.is_zero() {
             !self.held.is_zero()
@@ -565,6 +575,7 @@ impl Freshness {
         let age = held.max(apparent);
         let mut max_age = None;
         let mut max_ages = 0_u32;
+        let mut invalid = false;
         let mut uncacheable = false;
         for directive in headers
             .get_all(hyper::header::CACHE_CONTROL)
@@ -579,7 +590,9 @@ impl Freshness {
                 "max-age" => {
                     // An invalid max-age makes the response stale (§4.2.1).
                     max_ages = max_ages.saturating_add(1);
-                    max_age = Some(value.trim().trim_matches('"').parse::<u64>().unwrap_or(0));
+                    let parsed = value.trim().trim_matches('"').parse::<u64>().ok();
+                    invalid |= parsed.is_none();
+                    max_age = Some(parsed.unwrap_or(0));
                 }
                 _ => {}
             }
@@ -587,6 +600,7 @@ impl Freshness {
         // More than one max-age, whether they agree or not, is invalid
         // metadata: zero (§4.2.1), never the first or the last.
         if max_ages > 1 {
+            invalid = true;
             max_age = Some(0);
         }
         let mut expired = false;
@@ -614,6 +628,7 @@ impl Freshness {
             age,
             held,
             expired,
+            invalid,
         }
     }
 }
@@ -653,7 +668,17 @@ pub fn http_date(text: &str) -> Option<u64> {
     else {
         return None;
     };
-    if !(1..=31).contains(&day) || year < 1970 || hour > 23 || minute > 59 || second > 60 {
+    // The month's own days (February's by the Gregorian leap rule): an
+    // impossible date such as 31 April is refused, never normalised.
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=days_in_month).contains(&day) || year < 1970 || hour > 23 || minute > 59 || second > 60
+    {
         return None;
     }
     // Days from the civil date (H. Hinnant's algorithm), from 1970-01-01.
@@ -726,8 +751,19 @@ mod tests {
                 ("cache-control", "max-age=600"),
             ],
         ] {
-            assert_eq!(freshness(headers).lifetime, Duration::ZERO, "{headers:?}");
+            let duplicate = freshness(headers);
+            assert_eq!(duplicate.lifetime, Duration::ZERO, "{headers:?}");
+            assert!(
+                duplicate.invalid && duplicate.stale_on_receipt(),
+                "{headers:?}"
+            );
         }
+        for value in ["max-age=abc", "max-age=", "max-age=-1"] {
+            let malformed = freshness(&[("cache-control", value)]);
+            assert!(malformed.invalid && malformed.stale_on_receipt(), "{value}");
+        }
+        let fine = freshness(&[("cache-control", "max-age=0")]);
+        assert!(!fine.invalid && !fine.stale_on_receipt());
         assert_eq!(
             freshness(&[("cache-control", "max-age=60")]).lifetime,
             Duration::from_secs(60)
@@ -851,6 +887,8 @@ mod tests {
             http_date("Tue, 29 Feb 2028 12:00:00 GMT"),
             Some(1_835_438_400)
         );
+        assert!(http_date("Tue, 29 Feb 2000 00:00:00 GMT").is_some());
+        assert!(http_date("Wed, 30 Apr 2025 00:00:00 GMT").is_some());
         for bad in [
             "Sunday, 06-Nov-94 08:49:37 GMT",
             "Sun Nov  6 08:49:37 1994",
@@ -861,6 +899,11 @@ mod tests {
             "Sun, 06 Nov 994 08:49:37 GMT",
             "Sun, 6 Nov 1994 08:49:37 GMT",
             "Sun, 06 Nov +994 08:49:37 GMT",
+            "Thu, 31 Apr 2025 00:00:00 GMT",
+            "Sat, 29 Feb 2025 00:00:00 GMT",
+            "Mon, 29 Feb 2100 00:00:00 GMT",
+            "Wed, 30 Feb 2000 00:00:00 GMT",
+            "Sun, 00 Nov 1994 08:49:37 GMT",
         ] {
             assert_eq!(http_date(bad), None, "{bad}");
         }
