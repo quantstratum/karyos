@@ -41,10 +41,15 @@ fn certificates(name: &str) -> Vec<CertificateDer<'static>> {
 struct Seen {
     objects: HashMap<String, Vec<u8>>,
     lock_headers: Vec<String>,
+    /// PUTs refused for a missing or wrong `x-amz-checksum-sha256`.
+    bad_checksums: usize,
+    /// The body of a 404, as S3's error document.
+    not_found_body: Vec<u8>,
 }
 
-/// An S3 stand-in: PUT stores, GET answers, over TLS 1.3. Returns its
-/// port.
+/// An S3 stand-in: PUT stores (only with the right SHA-256 checksum, as
+/// S3 checks it and requires one under object lock), GET answers, over
+/// TLS 1.3. Returns its port.
 fn stand_in(seen: Arc<Mutex<Seen>>) -> u16 {
     let config =
         rustls::ServerConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
@@ -76,11 +81,17 @@ fn stand_in(seen: Arc<Mutex<Seen>>) -> u16 {
             let mut lines = head.lines();
             let first = lines.next().unwrap_or_default().to_owned();
             let mut length = 0usize;
+            let mut checksum = None;
             let mut seen = seen.lock().unwrap();
             for line in lines {
                 let lower = line.to_ascii_lowercase();
                 if let Some(value) = lower.strip_prefix("content-length:") {
                     length = value.trim().parse().unwrap_or(0);
+                }
+                if lower.starts_with("x-amz-checksum-sha256:") {
+                    checksum = line
+                        .split_once(':')
+                        .map(|(_, value)| value.trim().to_owned());
                 }
                 if lower.starts_with("x-amz-object-lock") {
                     seen.lock_headers.push(lower);
@@ -93,13 +104,17 @@ fn stand_in(seen: Arc<Mutex<Seen>>) -> u16 {
             let path = parts.next().unwrap_or_default();
             let path = path.split('?').next().unwrap_or_default().to_owned();
             let (status, answer) = match method {
+                "PUT" if checksum.as_deref() != Some(checksum_sha256(&body).as_str()) => {
+                    seen.bad_checksums += 1;
+                    ("400 Bad Request", Vec::new())
+                }
                 "PUT" => {
                     seen.objects.insert(path, body);
                     ("200 OK", Vec::new())
                 }
                 "GET" => match seen.objects.get(&path) {
                     Some(object) => ("200 OK", object.clone()),
-                    None => ("404 Not Found", Vec::new()),
+                    None => ("404 Not Found", seen.not_found_body.clone()),
                 },
                 _ => ("400 Bad Request", Vec::new()),
             };
@@ -210,4 +225,64 @@ fn retention_dates_are_rfc3339_rounded_up() {
     assert_eq!(rfc3339(1_700_000_000_000_000_000), "2023-11-14T22:13:20Z");
     assert_eq!(rfc3339(1), "1970-01-01T00:00:01Z");
     assert_eq!(rfc3339(951_782_400_000_000_000), "2000-02-29T00:00:00Z");
+}
+
+/// karyos#965 review P1: every PUT carries the SHA-256 checksum S3
+/// requires under object lock, in standard base64.
+#[test]
+fn a_put_carries_its_sha256_checksum() {
+    assert_eq!(
+        checksum_sha256(b"abc"),
+        "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="
+    );
+    assert_eq!(base64(b""), "");
+    assert_eq!(base64(b"f"), "Zg==");
+    assert_eq!(base64(b"fo"), "Zm8=");
+    assert_eq!(base64(b"foo"), "Zm9v");
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let port = stand_in(Arc::clone(&seen));
+    let mut store = S3Store::new(config(port, true)).unwrap();
+    store.put(&key(6), b"checked bytes", 0).unwrap();
+    assert_eq!(seen.lock().unwrap().bad_checksums, 0);
+}
+
+/// karyos#965 review P2: the configuration's `Debug` output never shows
+/// the credentials.
+#[test]
+fn the_configuration_debug_redacts_credentials() {
+    let shown = format!("{:?}", config(1, false));
+    assert!(!shown.contains("AKIDEXAMPLE"), "{shown}");
+    assert!(!shown.contains("secret\""), "{shown}");
+    assert!(shown.contains("<redacted>"), "{shown}");
+}
+
+/// karyos#965 review P2: called from inside a Tokio runtime, the
+/// synchronous store returns an error instead of panicking.
+#[test]
+fn a_call_from_a_tokio_runtime_is_an_error() {
+    let port = stand_in(Arc::default());
+    let mut store = S3Store::new(config(port, false)).unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(async { store.get(&key(1)) });
+    assert!(result.is_err());
+}
+
+/// karyos#965 review P3: a 404 whose error document is larger than
+/// `max_object` is still `NotFound`.
+#[test]
+fn a_large_not_found_document_is_still_not_found() {
+    let seen = Arc::new(Mutex::new(Seen {
+        not_found_body: vec![b'x'; 256],
+        ..Seen::default()
+    }));
+    let port = stand_in(seen);
+    let mut small = config(port, false);
+    small.max_object = 8;
+    let mut store = S3Store::new(small).unwrap();
+    assert_eq!(
+        store.get(&key(9)).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
 }

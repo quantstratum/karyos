@@ -43,9 +43,14 @@ pub mod cpu;
 /// How long a signed request stays valid.
 const SIGNED_FOR: Duration = Duration::from_secs(300);
 
+/// The most of an error response's body kept for its message: an error
+/// body never counts against `max_object`, so a large one cannot hide the
+/// status.
+const ERROR_BODY: usize = 4096;
+
 /// An object store's configuration. Nothing here has a default taken from
-/// the environment.
-#[derive(Debug, Clone)]
+/// the environment. Its `Debug` output redacts the credentials.
+#[derive(Clone)]
 pub struct S3Config {
     /// The endpoint, `https://` only.
     pub endpoint: String,
@@ -69,6 +74,23 @@ pub struct S3Config {
     pub timeout: Duration,
     /// The largest object read back, in bytes.
     pub max_object: usize,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("path_style", &self.path_style)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field("roots", &self.roots.len())
+            .field("object_lock", &self.object_lock)
+            .field("timeout", &self.timeout)
+            .field("max_object", &self.max_object)
+            .finish()
+    }
 }
 
 /// Why a store could not be made.
@@ -157,8 +179,11 @@ impl S3Store {
     }
 
     /// Sends `method` to the signed `url` with the signed `headers` and
-    /// `body`, within the timeout: the status and the body, at most
-    /// `max_object` bytes.
+    /// `body`, within the timeout: the status and the body. A successful
+    /// response's body is at most `max_object` bytes, or the call fails;
+    /// an error response's is cut to [`ERROR_BODY`] bytes, so its status
+    /// is never lost. Called from inside a Tokio runtime it returns an
+    /// error, never blocking on (or panicking in) that runtime.
     fn send(
         &self,
         method: hyper::Method,
@@ -166,6 +191,11 @@ impl S3Store {
         headers: &[(String, String)],
         body: Option<Bytes>,
     ) -> io::Result<(StatusCode, Vec<u8>)> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(io::Error::other(
+                "the object store is synchronous: call it outside a Tokio runtime",
+            ));
+        }
         let call = async {
             let host = url
                 .host_str()
@@ -181,7 +211,9 @@ impl S3Store {
                 hyper::client::conn::http1::handshake::<_, Payload>(TokioIo::new(tls))
                     .await
                     .map_err(io::Error::other)?;
-            let driver = tokio::spawn(connection);
+            // The connection's driver lives exactly as long as this call:
+            // a timeout or an error drops the guard, which cancels it.
+            let _driver = AbortOnDrop(tokio::spawn(connection));
             let path = match url.query() {
                 Some(query) => format!("{}?{query}", url.path()),
                 None => url.path().to_owned(),
@@ -205,10 +237,13 @@ impl S3Store {
                 .await
                 .map_err(io::Error::other)?;
             let status = response.status();
-            let bytes = body_within(response.into_body(), self.max_object)
-                .await
-                .ok_or_else(|| io::Error::other("object too large or cut short"))?;
-            driver.abort();
+            let bytes = if status.is_success() {
+                body_within(response.into_body(), self.max_object)
+                    .await
+                    .ok_or_else(|| io::Error::other("object too large or cut short"))?
+            } else {
+                body_prefix(response.into_body(), ERROR_BODY).await
+            };
             Ok::<_, io::Error>((status, bytes))
         };
         self.runtime.block_on(async {
@@ -228,7 +263,16 @@ impl ObjectStore for S3Store {
     ) -> io::Result<Enforcement> {
         let name = key.name();
         let mut action = self.bucket.put_object(Some(&self.credentials), &name);
-        let mut headers = Vec::new();
+        // A SHA-256 checksum of the bytes on every PUT, signed with the
+        // request: S3 requires one (or Content-MD5) for an upload under
+        // object-lock retention, and it checks the bytes it stores.
+        let mut headers = vec![
+            (
+                "x-amz-sdk-checksum-algorithm".to_owned(),
+                "SHA256".to_owned(),
+            ),
+            ("x-amz-checksum-sha256".to_owned(), checksum_sha256(bytes)),
+        ];
         if self.object_lock {
             let until = rfc3339(retain_until_ns);
             headers.push(("x-amz-object-lock-mode".to_owned(), "COMPLIANCE".to_owned()));
@@ -272,6 +316,45 @@ impl ObjectStore for S3Store {
             ))),
         }
     }
+}
+
+/// A spawned task cancelled when this guard drops.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The base64 of `bytes`' SHA-256, as S3's `x-amz-checksum-sha256` takes it.
+#[must_use]
+pub fn checksum_sha256(bytes: &[u8]) -> String {
+    use graviola::hashing::{Hash, Sha256};
+    base64(Sha256::hash(bytes).as_ref())
+}
+
+/// Standard base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3).saturating_mul(4));
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk.first().copied().unwrap_or(0),
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for (index, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
+            if index <= chunk.len() {
+                let six = usize::try_from((n >> shift) & 0x3f).unwrap_or(0);
+                out.push(char::from(ALPHABET.get(six).copied().unwrap_or(b'=')));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// A request body of one frame.
@@ -321,6 +404,20 @@ async fn body_within(mut body: Incoming, max: usize) -> Option<Vec<u8>> {
             }
         }
     }
+}
+
+/// At most the first `max` bytes of `body`, read to its end so the
+/// connection completes; what does not fit is dropped, never an error.
+async fn body_prefix(mut body: Incoming, max: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(Ok(frame)) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+    {
+        if let Ok(data) = frame.into_data() {
+            let room = max.saturating_sub(out.len());
+            out.extend_from_slice(data.get(..room.min(data.len())).unwrap_or_default());
+        }
+    }
+    out
 }
 
 /// `ns` of UTC as an RFC 3339 timestamp to the second, as S3's
