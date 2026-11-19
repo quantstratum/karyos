@@ -11,7 +11,6 @@
 //! append leaves; deciding whether a whole entry is sound is the reader's
 //! job, through the chain.
 
-use std::io;
 use std::path::Path;
 
 use super::journal::IntegrityError;
@@ -22,6 +21,8 @@ use crate::disk::Disk;
 pub struct Ledger<D: Disk, const N: usize> {
     disk: D,
     file: D::File,
+    /// The archive directory the ledger is in.
+    dir: std::path::PathBuf,
     entries: Vec<[u8; N]>,
     poisoned: bool,
 }
@@ -38,17 +39,7 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
     /// [`IntegrityError::Io`] for the operating system's error.
     pub fn open(mut disk: D, dir: &Path, name: &str) -> Result<Self, IntegrityError> {
         let path = dir.join(name);
-        let file = match disk.open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let file = disk.create(&path)?;
-                disk.sync(&file)?;
-                disk.sync_dir(dir)?;
-                file
-            }
-            Err(error) => return Err(error.into()),
-        };
-        super::journal::lock(&mut disk, &file)?;
+        let file = super::journal::open_locked(&mut disk, dir, &path)?;
         let length = disk.len(&file)?;
         let whole = length
             .checked_div(Self::LENGTH)
@@ -72,9 +63,18 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
         Ok(Self {
             disk,
             file,
+            dir: dir.to_path_buf(),
             entries,
             poisoned: false,
         })
+    }
+
+    /// The archive directory the ledger is in: the journal it belongs to
+    /// is the one in the same directory.
+    #[must_use]
+    #[inline]
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     /// The entries, oldest first.

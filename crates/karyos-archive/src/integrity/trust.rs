@@ -590,7 +590,9 @@ impl KeyRegistry {
     /// [`IntegrityError::Registry`] with [`RegistryError::Missing`] when
     /// the journal chains an entry the ledger does not hold,
     /// [`IntegrityError::Poisoned`] for a journal handle an earlier append
-    /// poisoned, before anything is read or cut;
+    /// poisoned, [`IntegrityError::ForeignLedger`] for a ledger of another
+    /// archive directory and [`IntegrityError::StaleJournal`] for a view
+    /// behind the file, before anything is read or cut;
     /// [`RegistryError::Malformed`] when a chained entry cannot be read,
     /// [`RegistryError::Backdated`] for a registration effective before
     /// the chain record that registers it, as on append, or the refusal
@@ -606,6 +608,11 @@ impl KeyRegistry {
         // must not be cut. Reopen the journal first.
         if journal.is_poisoned() {
             return Err(IntegrityError::Poisoned);
+        }
+        // Only the journal's own ledger: another journal's evidence would be
+        // cut as orphans.
+        if ledger.dir() != journal.dir() {
+            return Err(IntegrityError::ForeignLedger);
         }
         // A view behind the file would cut a committed entry as an orphan.
         if !journal.is_current()? {
@@ -771,6 +778,9 @@ impl KeyRegistry {
         // it: its record count is unknown until it is reopened.
         if journal.is_poisoned() {
             return Err(IntegrityError::Poisoned);
+        }
+        if ledger.dir() != journal.dir() {
+            return Err(IntegrityError::ForeignLedger);
         }
         // Compare and swap on the whole history: only a registry that
         // applied exactly the entries the journal chains, in order, may

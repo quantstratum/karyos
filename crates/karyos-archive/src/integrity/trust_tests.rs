@@ -1633,3 +1633,57 @@ fn another_archives_registry_changes_nothing_in_the_signing_queue() {
         (Some(3), 1, 0)
     );
 }
+
+#[test]
+fn a_second_first_opener_never_truncates_what_the_first_created() {
+    use crate::disk::{Disk as _, StdDisk};
+    let dir = std::env::temp_dir().join(format!("karyos-create-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut first = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys").unwrap();
+    first.append([1; REGISTRY_ENTRY_LENGTH]).unwrap();
+    // The losing creator of a race: exclusive creation refuses, it never
+    // truncates.
+    let mut disk = StdDisk;
+    assert_eq!(
+        disk.create_new(&dir.join("keys")).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    // Opening finds the file and its lock, before reading or cutting.
+    assert!(matches!(
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys"),
+        Err(IntegrityError::Locked)
+    ));
+    drop(first);
+    let reopened = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys").unwrap();
+    assert_eq!(reopened.entries(), [[1; REGISTRY_ENTRY_LENGTH]]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_registry_is_recovered_and_appended_only_with_its_journals_own_ledger() {
+    let disk = FaultDisk::default();
+    let mut journal = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    // A populated ledger of another archive directory.
+    let mut foreign =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new("/elsewhere"), "keys").unwrap();
+    foreign.append([7; REGISTRY_ENTRY_LENGTH]).unwrap();
+    assert!(matches!(
+        KeyRegistry::open(trust(), &mut journal, &mut foreign),
+        Err(IntegrityError::ForeignLedger)
+    ));
+    assert_eq!(foreign.entries().len(), 1);
+    let signer = TestSigner::new(9);
+    assert!(matches!(
+        KeyRegistry::new(trust()).append(
+            &register(&signer.key, Custody::NoSeparation, 0),
+            &mut journal,
+            &mut foreign,
+        ),
+        Err(IntegrityError::ForeignLedger)
+    ));
+    assert_eq!(foreign.entries().len(), 1);
+    assert_eq!(journal.next_counter(), 0);
+}
