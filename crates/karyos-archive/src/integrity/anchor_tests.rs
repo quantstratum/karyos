@@ -723,3 +723,24 @@ fn a_stale_journal_view_never_yields_or_records_copy_state() {
     ));
     assert_eq!(copies.verified_copies(3, 0, 80), 1);
 }
+
+#[test]
+fn a_stale_journal_handle_never_overwrites_a_committed_record() {
+    use super::journal::{IntegrityError, IntegrityJournal};
+    let disk = FaultDisk::default();
+    let mut current = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut stale = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    current.seal_segment(3, 0, b"committed", false).unwrap();
+    assert!(matches!(
+        stale.seal_segment(3, 0, b"overwrite", false),
+        Err(IntegrityError::StaleJournal)
+    ));
+    let mut reopened = IntegrityJournal::open(disk, Path::new(DIR))
+        .unwrap()
+        .journal;
+    assert_eq!(reopened.records().unwrap(), current.records().unwrap());
+}

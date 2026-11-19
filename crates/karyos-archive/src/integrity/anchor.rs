@@ -564,8 +564,14 @@ pub trait AnchorStore {
 
 /// Publishes the latest signed head to `store` once `every_records`
 /// records have been signed past the last anchor, returning the anchor
-/// published, if any. Everything a third party needs to check it is in
-/// the anchor: the signed head, the store's counter and the receipt.
+/// published, if any: the signed head, the store's counter and the
+/// receipt. The anchor alone proves nothing to a third party: checking it
+/// ([`check_anchors`]) also needs the trust root and the key registry,
+/// to trust the signed head, and evidence from the store itself
+/// ([`AnchorEvidence`]) that it holds this anchor at that counter, read
+/// from the store and not from the anchor's own fields. For a
+/// [`LedgerAnchorStore`] the receipt is the digest of the stored entry, so
+/// that evidence is read access to the export directory.
 ///
 /// # Errors
 ///

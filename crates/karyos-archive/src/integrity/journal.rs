@@ -147,7 +147,9 @@ impl<D: Disk> IntegrityJournal<D> {
             };
             check.accept(&record)?;
             if record.kind == SealKind::Copy {
-                copy_changes = copy_changes.saturating_add(1);
+                copy_changes = copy_changes
+                    .checked_add(1)
+                    .ok_or(IntegrityError::Overflow)?;
             }
             if record.kind == SealKind::KeyRegistry {
                 registry_identity =
@@ -300,10 +302,22 @@ impl<D: Disk> IntegrityJournal<D> {
         };
         let mut next = self.check.clone();
         next.accept(&record)?;
+        let copy_changes = if kind == SealKind::Copy {
+            self.copy_changes
+                .checked_add(1)
+                .ok_or(IntegrityError::Overflow)?
+        } else {
+            self.copy_changes
+        };
         let offset = record
             .counter
             .checked_mul(RECORD_LENGTH)
             .ok_or(IntegrityError::Overflow)?;
+        // Compare and swap on the file length: a handle behind the file
+        // would overwrite a committed record.
+        if self.disk.len(&self.file)? != offset {
+            return Err(IntegrityError::StaleJournal);
+        }
         let written = self
             .disk
             .write_at(&self.file, offset, &record.encode())
@@ -313,9 +327,7 @@ impl<D: Disk> IntegrityJournal<D> {
             return Err(error.into());
         }
         self.check = next;
-        if kind == SealKind::Copy {
-            self.copy_changes = self.copy_changes.saturating_add(1);
-        }
+        self.copy_changes = copy_changes;
         if kind == SealKind::KeyRegistry {
             self.registry_identity =
                 super::trust::extend_identity(&self.registry_identity, &content);
