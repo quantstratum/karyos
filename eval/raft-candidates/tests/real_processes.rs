@@ -166,3 +166,26 @@ fn run_once() -> Result<(), String> {
     assert_eq!(firsts, (1..=COMMANDS).collect::<Vec<_>>(), "{sequence:?}");
     Ok(())
 }
+
+/// A malformed argument is a usage error, exit 2, never a panic: a count
+/// that does not parse, and on Unix an argument that is not UTF-8
+/// (karyos#956 review).
+#[test]
+fn a_malformed_argument_is_a_usage_error() {
+    let status = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
+        .args(["0", "/tmp/unused", "many"])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(2));
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let status = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
+            .arg(std::ffi::OsStr::from_bytes(b"\xff"))
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(2));
+    }
+}

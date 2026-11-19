@@ -185,10 +185,7 @@ fn the_unmutated_adapter_passes_the_case() {
 fn a_server_that_applies_other_commands_is_caught() {
     let violation = violation::<Mutant<DIVERGE>>();
     assert!(
-        matches!(
-            violation,
-            Violation::DivergentPrefix { .. } | Violation::NotLinearizable(_)
-        ),
+        matches!(violation, Violation::DivergentPrefix { .. }),
         "{violation:?}"
     );
 }
