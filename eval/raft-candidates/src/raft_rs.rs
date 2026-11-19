@@ -31,9 +31,20 @@
 //! control. `check_quorum` is on, so a leader that has lost its quorum
 //! steps down.
 //!
-//! **Not taken here:** declared limits, snapshots and compaction (W2 and
-//! W5, karyos#679): their defaults answer `Unsupported`, which the
-//! harness reports as not demonstrated.
+//! **Declared limits** (W2, karyos#679): `recover_with` takes them. One
+//! entry per append (`max_size_per_msg = 0`) and at most
+//! `in_flight_entries` appends unacknowledged (`max_inflight_msgs`); the
+//! queue and the in-flight bytes are refused in `propose`
+//! ([`refuse_past`], the byte cap kept by entry size); an entry cap outside
+//! `1..=MAX_IN_FLIGHT_ENTRIES` is `Unsupported`. Two gaps are findings:
+//! raft-rs frees a window slot when a heartbeat answer arrives while the
+//! window is full (its recovery from lost acknowledgements), so the caps
+//! hold strictly only while acknowledgements are not delayed past a
+//! heartbeat; and log reads come from the `MemStorage` mirror, not the
+//! harness's metered log.
+//!
+//! **Not taken here:** snapshots and compaction (W5, karyos#679): they
+//! answer `Unsupported`, which the harness reports as not demonstrated.
 //!
 //! **Panics.** raft-rs asserts its own invariants (`assert!`, `fatal!`)
 //! and unwraps its `MemStorage` lock. The adapter never panics itself;
@@ -42,7 +53,8 @@
 
 use karyos_cluster::{Entry, HardState};
 use karyos_sim::harness::core::{
-    ConsensusCore, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
+    ConsensusCore, Limit, Limits, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
+    Unsupported,
 };
 use karyos_sim::net::NodeId;
 use raft::eraftpb::{self, ConfState, Snapshot};
@@ -88,6 +100,59 @@ pub fn election_ticks(id: NodeId, voters: &[NodeId]) -> (usize, usize) {
     let stagger = position.saturating_mul(3);
     let min = ELECTION_TICKS.saturating_add(stagger);
     (min, min.saturating_add(1))
+}
+
+/// The largest entry cap either adapter takes: raft-rs allocates its
+/// in-flight window eagerly (`Inflights::new`), so a cap past this would
+/// panic on allocation or, where it does not fit a `usize`, start an inert
+/// core; both adapters refuse it as `Unsupported` before startup
+/// (karyos#963 review). W2's caps are 4 (skeleton) and 64 (manifest).
+pub const MAX_IN_FLIGHT_ENTRIES: u64 = 1 << 16;
+
+/// Whether both adapters take `limits`: an entry cap in
+/// `1..=MAX_IN_FLIGHT_ENTRIES` that fits a `usize`.
+#[must_use]
+pub fn limits_supported(limits: &Limits) -> bool {
+    (1..=MAX_IN_FLIGHT_ENTRIES).contains(&limits.in_flight_entries)
+        && usize::try_from(limits.in_flight_entries).is_ok()
+}
+
+/// The W2 refusal of a proposal of `command` by a leader whose log ends
+/// at `last` and commits `committed`: a command larger than its share of
+/// the in-flight bytes, or one past the queue of proposals held and not
+/// committed. A count that does not fit fails closed, as a full queue.
+///
+/// Neither candidate meters the bytes it has in flight to a follower:
+/// each caps only the entries (raft-rs one entry per append and at most
+/// `in_flight_entries` appends unacknowledged; OpenRaft one append of at
+/// most `in_flight_entries` entries). So the byte cap is kept by the
+/// entries' size instead: no command passes `in_flight_bytes /
+/// in_flight_entries`, and a follower's full window of entries never
+/// passes `in_flight_bytes` however many commands queue behind it
+/// (karyos#963 review). A command within the cap but over its share is
+/// refused: a finding of the comparison.
+///
+/// # Errors
+///
+/// [`Refused::Backpressure`] naming the limit.
+pub fn refuse_past(
+    limits: &Limits,
+    command: &[u8],
+    last: u64,
+    committed: u64,
+) -> Result<(), Refused> {
+    let share = limits
+        .in_flight_bytes
+        .checked_div(limits.in_flight_entries)
+        .unwrap_or(0);
+    if u64::try_from(command.len()).map_or(true, |bytes| bytes > share) {
+        return Err(Refused::Backpressure(Limit::InFlightBytes));
+    }
+    let held = last.checked_sub(committed);
+    if held.is_none_or(|held| held >= limits.queue) {
+        return Err(Refused::Backpressure(Limit::Queue));
+    }
+    Ok(())
 }
 
 /// raft-rs's id of harness node `id`: raft-rs refuses 0.
@@ -176,6 +241,8 @@ pub struct RaftCore<const PRE_VOTE: bool> {
     last_tick: Option<u64>,
     /// The clock at the last tick, as the event time of what it proposes.
     now: u64,
+    /// The declared limits (W2), when started with them.
+    limits: Option<Limits>,
 }
 
 impl<const PRE_VOTE: bool> std::fmt::Debug for RaftCore<PRE_VOTE> {
@@ -219,7 +286,12 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
         self.light = None;
     }
 
-    fn build(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Option<RawNode<MemStorage>> {
+    fn build(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: Option<&Limits>,
+        log: &mut LogView<'_>,
+    ) -> Option<RawNode<MemStorage>> {
         let voters: Vec<u64> = peers.iter().copied().map(raft_id).collect();
         let storage = MemStorage::new_with_conf_state(ConfState::from((voters.clone(), vec![])));
         let mut applied = 0;
@@ -252,8 +324,22 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
             heartbeat_tick: HEARTBEAT_TICKS,
             min_election_tick: min,
             max_election_tick: max,
-            max_size_per_msg: MAX_SIZE_PER_MSG,
-            max_inflight_msgs: MAX_INFLIGHT_MSGS,
+            // Under declared limits, one entry per append (raft-rs keeps at
+            // least one whatever the size cap) and at most the in-flight
+            // entries' count of appends in raft-rs's window. Not strict:
+            // raft-rs frees a full window's slot when a heartbeat answer
+            // arrives, so with acknowledgements delayed past a heartbeat
+            // more appends, and their bytes, are unacknowledged than the
+            // caps (`window::a_heartbeat_answer_frees_a_full_window_slot`,
+            // karyos#975).
+            max_size_per_msg: if limits.is_some() {
+                0
+            } else {
+                MAX_SIZE_PER_MSG
+            },
+            max_inflight_msgs: limits.map_or(Some(MAX_INFLIGHT_MSGS), |limits| {
+                usize::try_from(limits.in_flight_entries).ok()
+            })?,
             check_quorum: true,
             pre_vote: PRE_VOTE,
             applied,
@@ -269,12 +355,35 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
         Self {
-            node: Self::build(id, peers, log),
+            node: Self::build(id, peers, None, log),
             pending: None,
             light: None,
             last_tick: None,
             now: 0,
+            limits: None,
         }
+    }
+
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, Unsupported> {
+        // No entry in flight is no replication, and a window too large to
+        // allocate would panic: refused before startup, not a core without
+        // Raft (karyos#963 review).
+        if !limits_supported(limits) {
+            return Err(Unsupported);
+        }
+        Ok(Self {
+            node: Self::build(id, peers, Some(limits), log),
+            pending: None,
+            light: None,
+            last_tick: None,
+            now: 0,
+            limits: Some(*limits),
+        })
     }
 
     fn propose(&mut self, command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), Refused> {
@@ -284,6 +393,14 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
         };
         if node.raft.state != StateRole::Leader {
             return Err(NotLeader { leader }.into());
+        }
+        if let Some(limits) = self.limits {
+            refuse_past(
+                &limits,
+                &command,
+                node.raft.raft_log.last_index(),
+                node.raft.raft_log.committed,
+            )?;
         }
         // Dropped while it hands its leadership over, or past raft-rs's
         // own uncommitted limit: either way, not taken.
@@ -504,5 +621,99 @@ mod tests {
     fn the_evaluated_build_is_the_unpatched_release() {
         assert_eq!(VARIANT, Variant::Baseline);
         assert!(VARIANT.patches().is_empty());
+    }
+}
+
+/// raft-rs's in-flight window under a delayed acknowledgement (karyos#963
+/// review): pinned as a finding of the comparison, not enforced by the
+/// adapter.
+#[cfg(test)]
+mod window {
+    use raft::eraftpb::{ConfState, Message, MessageType};
+    use raft::storage::MemStorage;
+    use raft::{Config, RawNode};
+
+    /// Runs every Ready, persisting into the store as `drive` would, and
+    /// returns the messages released.
+    fn drain(node: &mut RawNode<MemStorage>) -> Vec<Message> {
+        let mut out = Vec::new();
+        while node.has_ready() {
+            let mut ready = node.ready();
+            out.extend(ready.take_messages());
+            {
+                let store = node.store().clone();
+                let mut core = store.wl();
+                core.append(ready.entries()).unwrap();
+                if let Some(state) = ready.hs() {
+                    core.set_hardstate(state.clone());
+                }
+            }
+            out.extend(ready.take_persisted_messages());
+            let mut light = node.advance(ready);
+            out.extend(light.take_messages());
+            node.advance_apply();
+        }
+        out
+    }
+
+    fn from_follower(kind: MessageType, term: u64, index: u64) -> Message {
+        let mut message = Message::default();
+        message.set_msg_type(kind);
+        message.from = 2;
+        message.to = 1;
+        message.term = term;
+        message.index = index;
+        message
+    }
+
+    /// With one append allowed in flight, the leader sends command A; a
+    /// heartbeat answer arrives while A's acknowledgement is delayed, and
+    /// raft-rs frees the window's slot and sends command B: two appends
+    /// unacknowledged against a cap of one. This is how raft-rs recovers
+    /// from lost acknowledgements (`handle_heartbeat_response`), so the
+    /// adapter leaves it: the declared in-flight caps hold strictly only
+    /// while acknowledgements are not delayed past a heartbeat.
+    #[test]
+    fn a_heartbeat_answer_frees_a_full_window_slot() {
+        let storage = MemStorage::new_with_conf_state(ConfState::from((vec![1, 2], vec![])));
+        let config = Config {
+            id: 1,
+            max_size_per_msg: 0,
+            max_inflight_msgs: 1,
+            ..Config::default()
+        };
+        let logger = slog::Logger::root(slog::Discard, slog::o!());
+        let mut node = RawNode::new(&config, storage, &logger).unwrap();
+        node.campaign().unwrap();
+        let _ = drain(&mut node);
+        let term = node.raft.term;
+        node.step(from_follower(MessageType::MsgRequestVoteResponse, term, 0))
+            .unwrap();
+        let _ = drain(&mut node);
+        assert_eq!(node.raft.state, raft::StateRole::Leader);
+        // The follower takes the leader's first entry: replicating.
+        let last = node.raft.raft_log.last_index();
+        node.step(from_follower(MessageType::MsgAppendResponse, term, last))
+            .unwrap();
+        let _ = drain(&mut node);
+        let appends = |messages: &[Message]| {
+            messages
+                .iter()
+                .filter(|m| m.get_msg_type() == MessageType::MsgAppend && !m.entries.is_empty())
+                .count()
+        };
+        node.propose(vec![], b"A".to_vec()).unwrap();
+        node.propose(vec![], b"B".to_vec()).unwrap();
+        let sent = appends(&drain(&mut node));
+        assert_eq!(sent, 1, "the window holds one append");
+        // A's acknowledgement is delayed; a heartbeat answer arrives.
+        node.step(from_follower(MessageType::MsgHeartbeatResponse, term, 0))
+            .unwrap();
+        let more = appends(&drain(&mut node));
+        assert_eq!(
+            sent + more,
+            2,
+            "a second append left before the first was acknowledged"
+        );
     }
 }

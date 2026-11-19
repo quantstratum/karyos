@@ -39,8 +39,19 @@
 //! Terms are OpenRaft's standard leader ids (one leader per term), so an
 //! entry's committed leader id is its term.
 //!
-//! **Not taken here:** declared limits, snapshots and compaction (W2 and
-//! W5, karyos#679).
+//! **Declared limits** (W2, karyos#679): `recover_with` takes them.
+//! `max_payload_entries` is the in-flight entry cap, and OpenRaft's
+//! sequential append stream keeps one append in flight per follower while
+//! it is answered (not strict across an RPC timeout, after which the next
+//! append can leave with the first unacknowledged; karyos#975); the
+//! queue and the in-flight bytes are refused in `propose`
+//! ([`crate::raft_rs::refuse_past`], the byte cap kept by entry size); an
+//! entry cap outside `1..=MAX_IN_FLIGHT_ENTRIES` is `Unsupported`. The
+//! log-read limit is not honoured through the harness's metered log:
+//! OpenRaft reads the adapter's in-memory view.
+//!
+//! **Not taken here:** snapshots and compaction (W5, karyos#679): they
+//! answer `Unsupported`, which the harness reports as not demonstrated.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -52,7 +63,8 @@ use futures_channel::oneshot;
 use futures_util::StreamExt;
 use karyos_cluster::{Entry, HardState};
 use karyos_sim::harness::core::{
-    ConsensusCore, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
+    ConsensusCore, Limits, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
+    Unsupported,
 };
 use karyos_sim::harness::reference::{decode_configuration, encode_configuration};
 use karyos_sim::net::NodeId;
@@ -100,6 +112,9 @@ pub const BACKOFF: &str = "2ms, 4ms, 8ms ..20ms";
 /// timeout's upper bound instead. An adapter setting, the same for every
 /// workload.
 pub const RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(ELECTION_MS.1);
+
+/// Entries per append without declared limits.
+pub const DEFAULT_PAYLOAD_ENTRIES: u64 = 300;
 
 /// A client command: the harness's encoded bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,7 +197,7 @@ fn log_id(term: u64, index: u64) -> OLogId {
 }
 
 /// The vote kept in C4's `HardState`, never committed: the bit is not
-/// stored, and leader restoration is off ([`OpenRaftCore::config`]).
+/// stored, and leader restoration is off (`OpenRaftCore::config`).
 fn vote_of(state: &HardState) -> Option<OVote> {
     let voted_for = state.voted_for?;
     Some(OVote {
@@ -732,6 +747,8 @@ pub struct OpenRaftCore<const PRE_VOTE: bool> {
     out: bool,
     /// Calls that ended with tasks still woken: the work budget was hit.
     overruns: u64,
+    /// The declared limits (W2), when started with them.
+    limits: Option<Limits>,
 }
 
 /// `openraft` with pre-vote on: the evaluated core.
@@ -775,52 +792,7 @@ impl<const PRE_VOTE: bool> OpenRaftCore<PRE_VOTE> {
         self.raft.is_some()
     }
 
-    fn pump(&mut self) {
-        if self.executor.pump(PUMP_BUDGET).left > 0 {
-            self.overruns = self.overruns.saturating_add(1);
-        }
-    }
-
-    fn metrics<R>(&self, read: impl FnOnce(&openraft::RaftMetrics<C>) -> R) -> Option<R> {
-        let raft = self.raft.as_ref()?;
-        let metrics = raft.metrics();
-        let current = metrics.borrow_watched();
-        Some(read(&current))
-    }
-
-    fn spawn<F>(&self, future: F)
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
-        drop(self.executor.spawn(future));
-    }
-
-    fn config() -> Option<Arc<openraft::Config>> {
-        let config = openraft::Config {
-            cluster_name: "karyos-c5".to_owned(),
-            heartbeat_interval: HEARTBEAT_MS,
-            election_timeout_min: ELECTION_MS.0,
-            election_timeout_max: ELECTION_MS.1,
-            enable_pre_vote: Some(PRE_VOTE),
-            snapshot_policy: SnapshotPolicy::Never,
-            backoff: BACKOFF.to_owned(),
-            // The durable vote is C4's `HardState`, which has no place for
-            // OpenRaft's `committed` bit, so a restarted leader comes back
-            // with an uncommitted vote. Leader restoration is off to match:
-            // a restarted leader always stands for a new election, as in
-            // standard Raft, and that is the recovery evaluated here
-            // (karyos#959 review).
-            enable_leader_restore: Some(false),
-            ..openraft::Config::default()
-        };
-        config.validate().ok().map(Arc::new)
-    }
-}
-
-impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
-    type Message = Message;
-
-    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+    fn start(id: NodeId, peers: &[NodeId], limits: Option<&Limits>, log: &mut LogView<'_>) -> Self {
         let executor = Executor::new(seed_of(id));
         let mut io = Io {
             incarnation: next_incarnation(),
@@ -856,8 +828,9 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
             last_tick: None,
             out: false,
             overruns: 0,
+            limits: limits.copied(),
         };
-        let Some(config) = Self::config().filter(|_| readable) else {
+        let Some(config) = Self::config(limits).filter(|_| readable) else {
             return core;
         };
         let started: Arc<Mutex<Option<Handle>>> = Arc::new(Mutex::new(None));
@@ -892,7 +865,7 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
         core
     }
 
-    fn propose(&mut self, command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), Refused> {
+    fn propose_command(&mut self, command: Vec<u8>) -> Result<(), Refused> {
         let leader = self
             .metrics(|metrics| metrics.current_leader)
             .flatten()
@@ -903,6 +876,19 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
         let Some(raft) = self.raft.clone() else {
             return Err(NotLeader { leader: None }.into());
         };
+        if let Some(limits) = self.limits {
+            let (last, committed) = self
+                .metrics(|metrics| {
+                    (
+                        metrics.last_log_index.unwrap_or(0),
+                        metrics
+                            .local_committed
+                            .map_or(0, |committed| committed.index),
+                    )
+                })
+                .unwrap_or((0, 0));
+            crate::raft_rs::refuse_past(&limits, &command, last, committed)?;
+        }
         self.executor.enter(|| {
             drop(self.executor.spawn(async move {
                 let _ = raft.client_write_ff(Command(command), None).await;
@@ -910,6 +896,83 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
         });
         self.pump();
         Ok(())
+    }
+
+    fn pump(&mut self) {
+        if self.executor.pump(PUMP_BUDGET).left > 0 {
+            self.overruns = self.overruns.saturating_add(1);
+        }
+    }
+
+    fn metrics<R>(&self, read: impl FnOnce(&openraft::RaftMetrics<C>) -> R) -> Option<R> {
+        let raft = self.raft.as_ref()?;
+        let metrics = raft.metrics();
+        let current = metrics.borrow_watched();
+        Some(read(&current))
+    }
+
+    fn spawn<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        drop(self.executor.spawn(future));
+    }
+
+    fn config(limits: Option<&Limits>) -> Option<Arc<openraft::Config>> {
+        let config = openraft::Config {
+            cluster_name: "karyos-c5".to_owned(),
+            heartbeat_interval: HEARTBEAT_MS,
+            election_timeout_min: ELECTION_MS.0,
+            election_timeout_max: ELECTION_MS.1,
+            enable_pre_vote: Some(PRE_VOTE),
+            snapshot_policy: SnapshotPolicy::Never,
+            backoff: BACKOFF.to_owned(),
+            // Under declared limits, at most the in-flight entries' count
+            // in one append; OpenRaft's sequential append stream keeps one
+            // append in flight per follower while it is answered. Not
+            // strict across RPC timeouts: the adapter fails an RPC after
+            // RPC_TIMEOUT ticks, and OpenRaft then sends the next append
+            // while the first may still be in flight or unacknowledged
+            // (karyos#975).
+            max_payload_entries: limits
+                .map_or(DEFAULT_PAYLOAD_ENTRIES, |limits| limits.in_flight_entries),
+            // The durable vote is C4's `HardState`, which has no place for
+            // OpenRaft's `committed` bit, so a restarted leader comes back
+            // with an uncommitted vote. Leader restoration is off to match:
+            // a restarted leader always stands for a new election, as in
+            // standard Raft, and that is the recovery evaluated here
+            // (karyos#959 review).
+            enable_leader_restore: Some(false),
+            ..openraft::Config::default()
+        };
+        config.validate().ok().map(Arc::new)
+    }
+}
+
+impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
+    type Message = Message;
+
+    fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        Self::start(id, peers, None, log)
+    }
+
+    fn recover_with(
+        id: NodeId,
+        peers: &[NodeId],
+        limits: &Limits,
+        log: &mut LogView<'_>,
+    ) -> Result<Self, Unsupported> {
+        // OpenRaft refuses `max_payload_entries = 0`, and both adapters
+        // bound the cap the same way: refused here, before startup, not a
+        // core without Raft (karyos#963 review).
+        if !crate::raft_rs::limits_supported(limits) {
+            return Err(Unsupported);
+        }
+        Ok(Self::start(id, peers, Some(limits), log))
+    }
+
+    fn propose(&mut self, command: Vec<u8>, _log: &mut LogView<'_>) -> Result<(), Refused> {
+        self.propose_command(command)
     }
 
     fn step(&mut self, from: NodeId, message: Self::Message, _log: &mut LogView<'_>) {
