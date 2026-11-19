@@ -96,6 +96,9 @@ pub struct IntegrityJournal<D: Disk> {
     file: D::File,
     /// The archive directory the journal is in.
     dir: PathBuf,
+    /// This open handle's identity, unique in the process: what a catalog
+    /// replayed from it is bound to.
+    handle: u64,
     check: ChainCheck,
     /// The copy changes chained: the sequence the next one must carry.
     copy_changes: u64,
@@ -169,6 +172,7 @@ impl<D: Disk> IntegrityJournal<D> {
                 disk,
                 file,
                 dir: dir.to_path_buf(),
+                handle: next_handle(),
                 check,
                 copy_changes,
                 registry_identity,
@@ -209,6 +213,15 @@ impl<D: Disk> IntegrityJournal<D> {
     #[inline]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// This open handle's identity, unique in the process: state replayed
+    /// through one handle is written back only through the same one, never
+    /// through another handle, whatever its path or storage.
+    #[must_use]
+    #[inline]
+    pub const fn handle(&self) -> u64 {
+        self.handle
     }
 
     /// Whether this handle holds every record on disk: no other handle
@@ -558,4 +571,11 @@ pub(super) fn open_locked<D: Disk>(
         }
     }
     Err(IntegrityError::Locked)
+}
+
+/// A new journal handle identity.
+fn next_handle() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }

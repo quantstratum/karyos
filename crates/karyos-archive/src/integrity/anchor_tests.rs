@@ -76,7 +76,7 @@ fn an_anchor_covers_its_prefix_and_no_more() {
 }
 
 #[test]
-fn truncation_after_the_last_anchored_head_is_detected() {
+fn truncation_below_an_anchored_head_is_detected() {
     let (_, records) = chain(10);
     let anchored = anchor(AnchorKind::ReplicaJournal, REPLICA, 0, &records[7]);
     let report = check(&records[..5], &[anchored]);
@@ -346,7 +346,7 @@ fn the_catalog_states_the_immutability_enforcement_per_copy() {
     assert_eq!(record.kind, super::SealKind::Copy);
     assert_eq!(record.content, digest(&copies.records()[0].encode()));
     let reopened = CopyCatalog::open(disk, Path::new(DIR), &mut journal).unwrap();
-    let current = reopened.current();
+    let current = reopened.current().unwrap();
     assert_eq!(current[0].enforcement, Enforcement::Unsupported);
     assert_eq!(current[1].enforcement, Enforcement::ObjectLock);
     assert_eq!(reopened.verified_copies(3, 0, 80).unwrap(), 2);
@@ -385,7 +385,7 @@ fn an_unverified_or_removed_copy_counts_towards_nothing() {
         )
         .unwrap();
     assert_eq!(copies.verified_copies(3, 0, 80).unwrap(), 0);
-    assert_eq!(copies.current().len(), 1);
+    assert_eq!(copies.current().unwrap().len(), 1);
 }
 
 #[test]
@@ -724,7 +724,8 @@ fn a_stale_journal_view_never_yields_or_records_copy_state() {
             copy(REPLICA, CopyState::Removed, Enforcement::ObjectLock),
             &mut stale
         ),
-        Err(IntegrityError::StaleJournal)
+        // Not the handle the catalog replayed, and stale besides.
+        Err(IntegrityError::ForeignLedger)
     ));
     assert_eq!(copies.verified_copies(3, 0, 80).unwrap(), 1);
 }
@@ -797,6 +798,7 @@ fn live_copy_counts_are_withheld_after_an_ambiguous_journal_append() {
         copies.verified_copies(3, 0, 80),
         Err(IntegrityError::Poisoned)
     ));
+    assert!(matches!(copies.current(), Err(IntegrityError::Poisoned)));
     assert!(matches!(
         copies.record(
             copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock),
@@ -830,4 +832,33 @@ fn an_operator_export_is_verified_with_read_access_only() {
     }));
     let missing = ExportEvidence::read(&mut ReadOnly(disk), Path::new("/none"), OPERATOR).unwrap();
     assert!(!missing.confirms(&published));
+}
+
+#[test]
+fn a_copy_catalog_records_only_through_the_journal_handle_it_replayed() {
+    use super::journal::{IntegrityError, IntegrityJournal};
+    let (mut replayed, _) = chain(1);
+    let mut copies =
+        CopyCatalog::open(FaultDisk::default(), Path::new(DIR), &mut replayed).unwrap();
+    // Another storage, same path, same copy count, current and unpoisoned.
+    let mut other = IntegrityJournal::open(FaultDisk::default(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    other.seal_segment(3, 0, b"another", false).unwrap();
+    assert_eq!(other.copy_changes(), replayed.copy_changes());
+    assert!(matches!(
+        copies.record(
+            copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock),
+            &mut other
+        ),
+        Err(IntegrityError::ForeignLedger)
+    ));
+    assert_eq!(other.next_counter(), 1);
+    assert!(copies.records().is_empty());
+    copies
+        .record(
+            copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock),
+            &mut replayed,
+        )
+        .unwrap();
 }

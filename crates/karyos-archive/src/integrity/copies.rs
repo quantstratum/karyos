@@ -226,6 +226,9 @@ impl ImmutabilityBackend for NoImmutability {
 #[derive(Debug)]
 pub struct CopyCatalog<D: Disk> {
     ledger: Ledger<D, COPY_RECORD_LENGTH>,
+    /// The journal handle the catalog was replayed from: the only one it
+    /// records through.
+    journal: u64,
     records: Vec<CopyRecord>,
     /// Set when a change reached the ledger but its journal append failed:
     /// whether the journal holds it is unknown until reopened, so the live
@@ -300,6 +303,7 @@ impl<D: Disk> CopyCatalog<D> {
         }
         Ok(Self {
             ledger,
+            journal: journal.handle(),
             records,
             poisoned: false,
         })
@@ -333,6 +337,8 @@ impl<D: Disk> CopyCatalog<D> {
     ///
     /// # Errors
     ///
+    /// [`IntegrityError::ForeignLedger`] for a journal handle other than
+    /// the one the catalog was replayed from;
     /// [`IntegrityError::StaleCatalog`] when another handle recorded a
     /// change since this one was opened, [`IntegrityError::Poisoned`] for
     /// a poisoned journal and [`IntegrityError::StaleJournal`] for one
@@ -347,9 +353,10 @@ impl<D: Disk> CopyCatalog<D> {
         if self.poisoned {
             return Err(IntegrityError::Poisoned);
         }
-        // Bound to the journal it replayed: one of another directory would
-        // chain this change while its own catalog never commits it.
-        if journal.dir() != self.ledger.dir() {
+        // Bound to the journal handle it replayed: any other journal,
+        // whatever its path or storage, would chain this change while this
+        // catalog's own journal never commits it.
+        if journal.handle() != self.journal || journal.dir() != self.ledger.dir() {
             return Err(IntegrityError::ForeignLedger);
         }
         // Compare and swap: only a catalog that holds every change the
@@ -380,8 +387,21 @@ impl<D: Disk> CopyCatalog<D> {
 
     /// The latest record of every copy, in the order each copy first
     /// appeared.
-    #[must_use]
-    pub fn current(&self) -> Vec<CopyRecord> {
+    ///
+    /// # Errors
+    ///
+    /// [`IntegrityError::Poisoned`] after a change whose journal append
+    /// failed: the current state is uncertain until the catalog is
+    /// reopened.
+    pub fn current(&self) -> Result<Vec<CopyRecord>, IntegrityError> {
+        if self.poisoned {
+            return Err(IntegrityError::Poisoned);
+        }
+        Ok(self.latest())
+    }
+
+    /// The latest record of every copy, poisoned or not.
+    fn latest(&self) -> Vec<CopyRecord> {
         let mut current: Vec<CopyRecord> = Vec::new();
         for record in &self.records {
             match current.iter_mut().find(|copy| copy.same_copy(record)) {
@@ -410,7 +430,7 @@ impl<D: Disk> CopyCatalog<D> {
             return Err(IntegrityError::Poisoned);
         }
         let mut locations: Vec<Digest> = self
-            .current()
+            .latest()
             .into_iter()
             .filter(|copy| {
                 copy.recording == recording
