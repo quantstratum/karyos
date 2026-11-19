@@ -134,7 +134,8 @@ impl Calibration {
     }
 
     /// Whether `[low, high]` of `from` lies wholly inside the validity.
-    fn covers(&self, low: i128, high: i128) -> bool {
+    #[must_use]
+    pub fn covers(&self, low: i128, high: i128) -> bool {
         low >= i128::from(self.valid_from) && high <= i128::from(self.valid_to)
     }
 
@@ -143,7 +144,8 @@ impl Calibration {
     /// maximum over the corners of the time, offset and drift intervals,
     /// with the drift term rounded outwards.
     /// Returns `None` when a product does not fit `i128`.
-    fn convert(&self, low: i128, high: i128) -> Option<(i128, i128)> {
+    #[must_use]
+    pub fn convert(&self, low: i128, high: i128) -> Option<(i128, i128)> {
         let reference = i128::from(self.reference);
         let offset = i128::from(self.offset);
         let offset_uncertainty = i128::from(self.offset_uncertainty);
