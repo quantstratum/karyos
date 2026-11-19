@@ -774,8 +774,12 @@ fn declared_publication_ranges_are_out_of_scope() {
                 key,
             )
             .unwrap();
-        report.out_of_scope(key, through);
-        report.out_of_scope(PublicationKey::from(PublicationId::from(IDENTITY_B)), None);
+        report.out_of_scope(key, None, through);
+        report.out_of_scope(
+            PublicationKey::from(PublicationId::from(IDENTITY_B)),
+            None,
+            None,
+        );
         report.drain().unwrap();
         report
     };
@@ -783,6 +787,40 @@ fn declared_publication_ranges_are_out_of_scope() {
     assert_eq!(report.trace([1, 1]), TraceAnswer::OutOfScope);
     assert_eq!(report.trace([2, 1]), TraceAnswer::Final(Verdict::Complete));
     let report = build(None);
+    assert_eq!(report.trace([2, 1]), TraceAnswer::OutOfScope);
+}
+
+/// karyos#185: a declaration that names a lane scopes only that lane's
+/// messages: a recycled subscriber journal of lane 1 leaves lane 0's
+/// message at the same position in scope; one with no lane scopes both.
+#[test]
+fn a_lane_scoped_declaration_leaves_other_lanes_in_scope() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let build = |lane: Option<u8>| {
+        let mut other_lane = observation(Point::Publish, 0, 2, 20);
+        other_lane.lane = 1;
+        let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+        report
+            .add_publisher_source(
+                recorded(
+                    1,
+                    0,
+                    &[observation(Point::Publish, 0, 1, 10), other_lane],
+                    CLOSED,
+                ),
+                host(true),
+                key,
+            )
+            .unwrap();
+        report.out_of_scope(key, lane, Some(32));
+        report.drain().unwrap();
+        report
+    };
+    let report = build(Some(1));
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+    assert_eq!(report.trace([2, 1]), TraceAnswer::OutOfScope);
+    let report = build(None);
+    assert_eq!(report.trace([1, 1]), TraceAnswer::OutOfScope);
     assert_eq!(report.trace([2, 1]), TraceAnswer::OutOfScope);
 }
 
