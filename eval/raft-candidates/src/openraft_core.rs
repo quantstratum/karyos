@@ -41,7 +41,9 @@
 //!
 //! **Declared limits** (W2, karyos#679): `recover_with` takes them.
 //! `max_payload_entries` is the in-flight entry cap, and OpenRaft's
-//! sequential append stream keeps one append in flight per follower; the
+//! sequential append stream keeps one append in flight per follower while
+//! it is answered (not strict across an RPC timeout, after which the next
+//! append can leave with the first unacknowledged; karyos#975); the
 //! queue and the in-flight bytes are refused in `propose`
 //! ([`crate::raft_rs::refuse_past`], the byte cap kept by entry size); an
 //! entry cap outside `1..=MAX_IN_FLIGHT_ENTRIES` is `Unsupported`. The
@@ -927,7 +929,11 @@ impl<const PRE_VOTE: bool> OpenRaftCore<PRE_VOTE> {
             backoff: BACKOFF.to_owned(),
             // Under declared limits, at most the in-flight entries' count
             // in one append; OpenRaft's sequential append stream keeps one
-            // append in flight per follower.
+            // append in flight per follower while it is answered. Not
+            // strict across RPC timeouts: the adapter fails an RPC after
+            // RPC_TIMEOUT ticks, and OpenRaft then sends the next append
+            // while the first may still be in flight or unacknowledged
+            // (karyos#975).
             max_payload_entries: limits
                 .map_or(DEFAULT_PAYLOAD_ENTRIES, |limits| limits.in_flight_entries),
             // The durable vote is C4's `HardState`, which has no place for

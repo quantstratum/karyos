@@ -71,7 +71,7 @@ candidate (the parameters are plan issue 062's to freeze).
 | W2 limits taken | `recover_with`: one entry per append and at most `in_flight_entries` appends unacknowledged; queue and in-flight bytes refused in `propose`; `in_flight_entries = 0` refused as `Unsupported` | `recover_with`: `max_payload_entries = in_flight_entries`, one append in flight per follower (its sequential stream); queue and in-flight bytes refused in `propose`; `in_flight_entries = 0` refused as `Unsupported` |
 | W2 queue burst | refused with typed `Backpressure(Queue)`, nothing else refused; passes | the same; passes |
 | W2 in-flight burst, nominal | pass | pass |
-| W2 in-flight caps under delayed acknowledgements | **not strict**: raft-rs frees a full window's slot when a heartbeat answer arrives (its recovery from lost acknowledgements), so a second append can leave before the first is acknowledged, past both caps; pinned by `window::a_heartbeat_answer_frees_a_full_window_slot`; left to the candidate, since holding it in the adapter would stall a follower whose acknowledgements were lost (karyos#975) | one append in flight per follower, its sequential stream; no slot is freed early |
+| W2 in-flight caps under delayed acknowledgements | **not strict**: raft-rs frees a full window's slot when a heartbeat answer arrives (its recovery from lost acknowledgements), so a second append can leave before the first is acknowledged, past both caps; pinned by `window::a_heartbeat_answer_frees_a_full_window_slot`; left to the candidate, since holding it in the adapter would stall a follower whose acknowledgements were lost (karyos#975) | **not strict across RPC timeouts**: one append in flight per follower while it is answered (its sequential stream), but the adapter fails an RPC after `RPC_TIMEOUT` ticks and OpenRaft then sends the next append while the first may still be in flight or unacknowledged; documented, not tested (karyos#975) |
 | W2 slow follower | pass | **fail, typed**: `NotBehind`: the leader commits 787 of the 1,000 entries required while the follower is cut off, so the case cannot establish its slow follower |
 | W2 log-read burst | **not demonstrated**: safety holds, but the catch-up reads bypass the metered log (next row), so it is never counted a pass | the same (its run also commits only 842 of the 1,024 entries required) |
 | W2 log-read limit | **not honoured through the harness's metered log**: raft-rs reads its `MemStorage` mirror | **not honoured through the harness's metered log**: OpenRaft reads the adapter's in-memory view |
@@ -81,9 +81,9 @@ candidate (the parameters are plan issue 062's to freeze).
 | Reproducibility | every W2 case reproduces from its seed, asserted | the same |
 
 **Inputs to the C5 decision (karyos#691).** Weigh, besides the gates
-above: the in-flight caps are **not strict on `raft` 0.7.0** under
-acknowledgements delayed past a heartbeat (row above), while OpenRaft's
-stream keeps one append in flight; neither candidate meters log reads
+above: the in-flight caps are **strict on neither candidate**: not on
+`raft` 0.7.0 under acknowledgements delayed past a heartbeat (pinned by a
+test), and not on OpenRaft across an RPC timeout (documented); neither candidate meters log reads
 through the harness, so the log-read limit is not demonstrated for
 either; the byte cap is kept by entry size in both (a command over its
 share is refused even within the cap). Tracked in

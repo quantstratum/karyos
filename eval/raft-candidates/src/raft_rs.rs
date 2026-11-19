@@ -326,8 +326,12 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
             max_election_tick: max,
             // Under declared limits, one entry per append (raft-rs keeps at
             // least one whatever the size cap) and at most the in-flight
-            // entries' count of appends unacknowledged: entries in flight
-            // never pass the limit.
+            // entries' count of appends in raft-rs's window. Not strict:
+            // raft-rs frees a full window's slot when a heartbeat answer
+            // arrives, so with acknowledgements delayed past a heartbeat
+            // more appends, and their bytes, are unacknowledged than the
+            // caps (`window::a_heartbeat_answer_frees_a_full_window_slot`,
+            // karyos#975).
             max_size_per_msg: if limits.is_some() {
                 0
             } else {
