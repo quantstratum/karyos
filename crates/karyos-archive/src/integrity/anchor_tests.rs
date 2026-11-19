@@ -691,3 +691,35 @@ fn a_filesystem_store_confirms_only_operator_exports() {
         assert!(!store.confirms(&Anchor { kind, ..published }), "{kind:?}");
     }
 }
+
+#[test]
+fn a_stale_journal_view_never_yields_or_records_copy_state() {
+    use super::journal::{IntegrityError, IntegrityJournal};
+    let disk = FaultDisk::default();
+    let journal_disk = FaultDisk::default();
+    let mut current = IntegrityJournal::open(journal_disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut stale = IntegrityJournal::open(journal_disk, Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut copies = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut current).unwrap();
+    copies
+        .record(
+            copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock),
+            &mut current,
+        )
+        .unwrap();
+    assert!(matches!(
+        CopyCatalog::open(disk, Path::new(DIR), &mut stale),
+        Err(IntegrityError::StaleJournal)
+    ));
+    assert!(matches!(
+        copies.record(
+            copy(REPLICA, CopyState::Removed, Enforcement::ObjectLock),
+            &mut stale
+        ),
+        Err(IntegrityError::StaleJournal)
+    ));
+    assert_eq!(copies.verified_copies(3, 0, 80), 1);
+}

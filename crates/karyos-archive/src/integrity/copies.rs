@@ -239,7 +239,8 @@ impl<D: Disk> CopyCatalog<D> {
     /// # Errors
     ///
     /// [`IntegrityError::Poisoned`] for a journal handle an earlier append
-    /// poisoned, before anything is read; as [`Ledger::open`] and
+    /// poisoned and [`IntegrityError::StaleJournal`] for one behind the
+    /// file, before anything is read; as [`Ledger::open`] and
     /// [`IntegrityJournal::records`];
     /// [`IntegrityError::Unrecorded`] for a copy change the journal chains
     /// whose record the ledger does not hold or that does not match the
@@ -253,6 +254,10 @@ impl<D: Disk> CopyCatalog<D> {
         // whose sync failed may still be on disk. Reopen the journal first.
         if journal.is_poisoned() {
             return Err(IntegrityError::Poisoned);
+        }
+        // A view behind the file would replay stale copy state.
+        if !journal.is_current()? {
+            return Err(IntegrityError::StaleJournal);
         }
         let ledger = Ledger::open(disk, dir, COPIES_FILE)?;
         let stored: std::collections::BTreeMap<Digest, &[u8; COPY_RECORD_LENGTH]> = ledger
@@ -308,8 +313,9 @@ impl<D: Disk> CopyCatalog<D> {
     /// # Errors
     ///
     /// [`IntegrityError::StaleCatalog`] when another handle recorded a
-    /// change since this one was opened, and [`IntegrityError::Poisoned`]
-    /// for a poisoned journal, with nothing written; otherwise the ledger's
+    /// change since this one was opened, [`IntegrityError::Poisoned`] for
+    /// a poisoned journal and [`IntegrityError::StaleJournal`] for one
+    /// behind the file, with nothing written; otherwise the ledger's
     /// or the journal's error. The state is unchanged on an error.
     pub fn record(
         &mut self,
@@ -321,6 +327,9 @@ impl<D: Disk> CopyCatalog<D> {
         // journal chains may record the next one.
         if journal.is_poisoned() {
             return Err(IntegrityError::Poisoned);
+        }
+        if !journal.is_current()? {
+            return Err(IntegrityError::StaleJournal);
         }
         if journal.copy_changes() != record.sequence {
             return Err(IntegrityError::StaleCatalog);
