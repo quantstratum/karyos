@@ -71,6 +71,7 @@ pub mod json;
 )]
 mod model;
 pub mod registry;
+pub mod retention;
 pub mod trace_export;
 #[cfg_attr(
     not(target_os = "linux"),

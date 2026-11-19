@@ -286,3 +286,30 @@ fn gap_reasons_round_trip() {
     }
     assert_eq!(GapReason::from_code(99), GapReason::UncleanStop);
 }
+
+/// The retention kinds (M12) take new codes: every existing code still
+/// decodes to its kind, so an older journal reads unchanged.
+#[test]
+fn the_retention_kinds_keep_the_existing_codes() {
+    let existing = [
+        Kind::CloseRequest,
+        Kind::CloseOutcome,
+        Kind::ReopenRequest,
+        Kind::ReopenOutcome,
+        Kind::UnknownInterval,
+        Kind::GapAcknowledged,
+        Kind::AgentStopped,
+        Kind::AgentStarted,
+    ];
+    for (code, kind) in (1u64..).zip(existing) {
+        assert_eq!(kind.code(), code);
+        assert_eq!(Kind::from_code(code), Some(kind));
+    }
+    for code in 9..=16 {
+        let kind = Kind::from_code(code).unwrap();
+        assert_eq!(kind.code(), code);
+        let record = request(kind, 5, 7);
+        assert_eq!(JournalRecord::decode(&record.encode()), Some(record));
+    }
+    assert_eq!(Kind::from_code(17), None);
+}

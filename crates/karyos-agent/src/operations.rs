@@ -24,10 +24,8 @@ use karyos_client::ipc::{RemoteClient, attach};
 use karyos_sys::guard::GuardState;
 use karyos_sys::host_clock::host_monotonic_ns;
 
+pub use crate::journal::UNKNOWN_OUTCOME;
 use crate::journal::{Journal, JournalRecord, Kind, MAX_REASON};
-
-/// An outcome record's code when the driver's answer never came.
-pub const UNKNOWN_OUTCOME: u64 = u64::MAX;
 /// Requests a one-command client may have pending.
 const MAX_PENDING: usize = 4;
 

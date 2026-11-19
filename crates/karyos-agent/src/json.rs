@@ -277,6 +277,55 @@ pub fn guard_answer(answer: &crate::operations::GuardAnswer) -> String {
     text
 }
 
+/// A retention operation's answer (M12): what the Archive did or refused,
+/// with its code and reason, or each range's integrity outcome as the
+/// Archive named it; the agent adds no verdict of its own.
+#[must_use]
+pub fn retention_answer(answer: &crate::retention::RetentionAnswer) -> String {
+    use crate::retention::RetentionAnswer;
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match answer {
+        RetentionAnswer::Done {
+            operation,
+            evidenced,
+        } => {
+            fields.number("operation", operation);
+            fields.key("evidenced").bool(*evidenced);
+        }
+        RetentionAnswer::Refused {
+            operation,
+            code,
+            reason,
+        } => {
+            fields.string("error", "refused");
+            fields.number("operation", operation);
+            fields.number("code", code);
+            fields.string("reason", reason);
+        }
+        RetentionAnswer::Verified { operation, ranges } => {
+            fields.number("operation", operation);
+            fields.key("ranges").array(ranges, |out, range| {
+                out.object(|fields| {
+                    fields.number("start", range.start);
+                    fields.number("end", range.end);
+                    fields.string("outcome", &range.outcome);
+                    fields
+                        .key("reasons")
+                        .array(&range.reasons, |out, reason| out.string(reason));
+                });
+            });
+        }
+        RetentionAnswer::NoAnswer { operation } => {
+            fields.string("error", "no answer");
+            fields.number("operation", operation);
+        }
+        RetentionAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
+        RetentionAnswer::NoArchive => fields.string("error", "no archive"),
+        RetentionAnswer::Busy => fields.string("error", "busy"),
+    });
+    text
+}
+
 /// The answer to an acknowledged unknown interval (M10b).
 #[must_use]
 pub fn acknowledged(position: u64) -> String {
