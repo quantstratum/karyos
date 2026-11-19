@@ -64,17 +64,33 @@ impl Drop for Run {
     }
 }
 
+/// A log directory of this run's own: created here, so it did not exist
+/// before and no other run or file is taken over by the guard's cleanup
+/// (karyos#956 review: a name built from the clock alone could collide).
+fn reserve_root(core: &str) -> std::path::PathBuf {
+    let mut attempt = 0u64;
+    loop {
+        let root = std::env::temp_dir().join(format!(
+            "karyos-raft-eval-{core}-{}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&root) {
+            Ok(()) => return root,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+            }
+            Err(error) => panic!("{}: {error}", root.display()),
+        }
+    }
+}
+
 fn run_once(core: &str) -> Result<(), String> {
     let peers: Vec<String> = free_addresses()
         .into_iter()
         .enumerate()
         .map(|(id, address)| format!("{id}={address}"))
         .collect();
-    let root = std::env::temp_dir().join(format!(
-        "karyos-raft-eval-{core}-{}-{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
+    let root = reserve_root(core);
     let mut run = Run {
         children: Vec::new(),
         root: root.clone(),
@@ -222,4 +238,19 @@ fn every_process_draws_its_own_incarnation() {
     };
     let draws: std::collections::BTreeSet<u64> = (0..3).map(|_| draw()).collect();
     assert_eq!(draws.len(), 3);
+}
+
+/// The karyos#956 review: a peer off the loopback is refused before any
+/// socket is bound, a usage the runner does not support.
+#[test]
+fn a_peer_off_the_loopback_is_refused() {
+    let output = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
+        .args(["raft", "0", "/tmp/unused", "1", "0=192.0.2.1:7000"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not a loopback address"),
+        "{output:?}"
+    );
 }
