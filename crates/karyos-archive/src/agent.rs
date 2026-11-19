@@ -1736,7 +1736,10 @@ impl<D: Disk> Integrity<D> {
         interval: Duration,
         catalog: &mut Catalog<D>,
         signing: Option<ArchiveSigning>,
-    ) -> Result<Self, IntegrityError> {
+    ) -> Result<Self, IntegrityError>
+    where
+        D: Clone,
+    {
         let interval = u64::try_from(interval.as_nanos())
             .ok()
             .and_then(std::num::NonZeroU64::new)
