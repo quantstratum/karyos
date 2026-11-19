@@ -81,24 +81,15 @@ case "$version" in
         exit 1
         ;;
 esac
-# raft-proto's build script does not rerun when PROTOC changes, so the
-# generated code is tied to the compiler here: a different protoc (path,
-# version or bytes) than the last build's cleans raft-proto first, and the
-# printed provenance always describes the build tested.
+# raft-proto's build script does not rerun when PROTOC changes, and any
+# stamp kept beside its output can drift from it (a direct rebuild with
+# another compiler leaves the stamp behind). So every run regenerates it:
+# raft-proto is cleaned, in both profiles, before anything builds, and
+# the provenance printed is the compiler this run hands to its build
+# script (karyos#956 review).
 identity="$version $PROTOC $({ sha256sum "$PROTOC" 2>/dev/null || shasum -a 256 "$PROTOC"; } | cut -d' ' -f1)"
-# Cargo's intermediate build directory, where raft-proto's generated code
-# lives (build.build-dir, which defaults to the target directory and can be
-# shared by several target directories), so the stamp sits beside the
-# artifacts it describes (karyos#956 review).
-target="$("$cargo" metadata --format-version 1 --no-deps --locked |
-    python3 -c 'import json,sys; d = json.load(sys.stdin); print(d.get("build_directory") or d["target_directory"])')"
-stamp="$target/raft-eval-protoc"
-if [ "$(cat "$stamp" 2>/dev/null || true)" != "$identity" ]; then
-    "$cargo" clean --locked -p raft-proto
-    "$cargo" clean --locked --release -p raft-proto
-    mkdir -p "$(dirname "$stamp")"
-    printf '%s\n' "$identity" >"$stamp"
-fi
+"$cargo" clean --locked -p raft-proto
+"$cargo" clean --locked --release -p raft-proto
 echo "raft-eval: $identity"
 
 "$cargo" fmt -- --check

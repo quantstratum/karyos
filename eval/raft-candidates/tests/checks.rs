@@ -6,18 +6,18 @@
 //! way a faulty core or adapter would, and the run's checks name it. The
 //! unmutated adapter passes the same cases.
 //!
-//! Every check a core can trip has a mutant here: divergent application,
-//! a reply before a durable majority, a C4 contract breach, a leader's
-//! direct commit of an older term's entry, and the truncation of an entry
-//! the cluster applied (C4's log refuses it as a truncation below the
-//! commit, which the run reports as a contract breach). Two checks guard what no core controls, so no
-//! core can trip them and their negative cases stay the fixture's
-//! (`crates/karyos-sim/tests/harness.rs`): a release before persistence
-//! (`drive` sends `after_persist` only after the log's sync and the hard
-//! state's save, whatever the core asks), and a durable entry lost across
-//! a crash (C4's log and disk keep it; the core never writes it).
-//! Candidate-backed cases for those two, through a faulty `drive` or disk
-//! under a real core, are karyos#976.
+//! **Candidate-backed here**, each by one mutant: `DivergentPrefix`
+//! (divergent application), `ReplyBeforeDurableMajority`, `Contract` (a
+//! gapped append), `OldTermCommit`, and `Contract` with
+//! `TruncateBelowCommit` (applied entries truncated: C4's log refuses
+//! it). No other check of `karyos_sim::harness::check::Violation` has a
+//! candidate-backed negative case in this crate; their negative cases,
+//! where they exist, are the fixture's
+//! (`crates/karyos-sim/tests/harness.rs`), and karyos#976
+//! tracks them, by name. Two of them no core can trip through
+//! `ConsensusCore`: `ReleasedBeforePersisted` (`drive` releases only
+//! after the sync and the hard state's save) and `DurableLost` (C4's log
+//! and disk across a crash).
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
