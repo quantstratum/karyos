@@ -121,6 +121,15 @@ impl State {
             self.ready.push_back(id);
         }
     }
+
+    /// Drops a finished task's pending wake: a task that woke itself in
+    /// its last poll leaves no entry for a later pump to skip outside its
+    /// budget (karyos#959 review). The queue then names live tasks only.
+    fn forget_wake(&mut self, id: u64) {
+        if self.queued.remove(&id) {
+            self.ready.retain(|queued| *queued != id);
+        }
+    }
 }
 
 /// SplitMix64: the executor's RNG step and trace hash (a hash: wrapping
@@ -296,11 +305,13 @@ impl Executor {
                     Ok(Poll::Ready(())) => {
                         let _ = state.tasks.remove(&id);
                         let _ = state.wakers.remove(&id);
+                        state.forget_wake(id);
                         state.record(Event::Finished(id));
                     }
                     Err(_) => {
                         let _ = state.tasks.remove(&id);
                         let _ = state.wakers.remove(&id);
+                        state.forget_wake(id);
                         state.record(Event::Panicked(id));
                     }
                 }

@@ -452,10 +452,16 @@ impl<T> Future for Changed<'_, T> {
             return Poll::Ready(Err(RecvError(())));
         }
         shared.waiting.register(&mut this.slot, cx.waker());
-        // A send between the check and the registration is seen now.
+        // A send, or the last sender's drop, between the checks and the
+        // registration is seen now: an unseen final value first, then the
+        // closure (karyos#959 review).
         if changed(this.receiver).is_some() {
             shared.waiting.unregister(&mut this.slot);
             return Poll::Ready(Ok(()));
+        }
+        if shared.senders.load(Ordering::SeqCst) == 0 {
+            shared.waiting.unregister(&mut this.slot);
+            return Poll::Ready(Err(RecvError(())));
         }
         Poll::Pending
     }

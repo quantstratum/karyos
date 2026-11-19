@@ -231,3 +231,19 @@ fn block_on_polls_a_self_woken_root_future_before_moving_the_clock() {
     });
     assert_eq!(now, 0, "the clock moved past ready work");
 }
+
+/// The karyos#959 review: a task that wakes itself in its last poll leaves
+/// no stale entry, so the pump's budget bounds the queue it scans too.
+#[test]
+fn a_task_that_wakes_itself_as_it_finishes_leaves_no_queued_wake() {
+    let executor = Executor::new(1);
+    for _ in 0..100 {
+        let _handle = executor.spawn(std::future::poll_fn(|cx| {
+            cx.waker().wake_by_ref();
+            std::task::Poll::Ready(())
+        }));
+    }
+    let pumped = executor.pump(100);
+    assert_eq!(pumped.polls, 100);
+    assert_eq!(pumped.left, 0, "stale wakes left in the queue");
+}
