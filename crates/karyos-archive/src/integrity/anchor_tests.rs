@@ -349,7 +349,7 @@ fn the_catalog_states_the_immutability_enforcement_per_copy() {
     let current = reopened.current();
     assert_eq!(current[0].enforcement, Enforcement::Unsupported);
     assert_eq!(current[1].enforcement, Enforcement::ObjectLock);
-    assert_eq!(reopened.verified_copies(3, 0, 80), 2);
+    assert_eq!(reopened.verified_copies(3, 0, 80).unwrap(), 2);
     // Storage without support says so rather than proceeding silently.
     let mut backend = NoImmutability;
     use super::copies::ImmutabilityBackend as _;
@@ -369,22 +369,22 @@ fn an_unverified_or_removed_copy_counts_towards_nothing() {
             &mut journal,
         )
         .unwrap();
-    assert_eq!(copies.verified_copies(3, 0, 80), 0);
+    assert_eq!(copies.verified_copies(3, 0, 80).unwrap(), 0);
     copies
         .record(
             copy(REPLICA, CopyState::Verified, Enforcement::Unsupported),
             &mut journal,
         )
         .unwrap();
-    assert_eq!(copies.verified_copies(3, 0, 80), 1);
-    assert_eq!(copies.verified_copies(3, 0, 81), 0);
+    assert_eq!(copies.verified_copies(3, 0, 80).unwrap(), 1);
+    assert_eq!(copies.verified_copies(3, 0, 81).unwrap(), 0);
     copies
         .record(
             copy(REPLICA, CopyState::Removed, Enforcement::Unsupported),
             &mut journal,
         )
         .unwrap();
-    assert_eq!(copies.verified_copies(3, 0, 80), 0);
+    assert_eq!(copies.verified_copies(3, 0, 80).unwrap(), 0);
     assert_eq!(copies.current().len(), 1);
 }
 
@@ -457,7 +457,7 @@ fn a_copy_whose_journal_append_failed_never_counts() {
     let remote = copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock);
     assert!(copies.record(remote, &mut journal).is_err());
     assert!(journal_disk.has_crashed());
-    assert_eq!(copies.verified_copies(3, 0, 80), 0);
+    assert_eq!(copies.verified_copies(3, 0, 80).unwrap(), 0);
     assert!(copies.records().is_empty());
     // The ledger entry survived, but the reopened catalog filters it out.
     let mut recovered = IntegrityJournal::open(
@@ -468,7 +468,7 @@ fn a_copy_whose_journal_append_failed_never_counts() {
     .journal;
     assert_eq!(recovered.next_counter(), 0);
     let reopened = CopyCatalog::open(copies_disk, Path::new(DIR), &mut recovered).unwrap();
-    assert_eq!(reopened.verified_copies(3, 0, 80), 0);
+    assert_eq!(reopened.verified_copies(3, 0, 80).unwrap(), 0);
     assert!(reopened.records().is_empty());
 }
 
@@ -582,7 +582,7 @@ fn copy_state_is_replayed_in_journal_order_once_per_committed_change() {
     .unwrap();
     ledger.append(removed.encode()).unwrap();
     let mut reopened = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut journal).unwrap();
-    assert_eq!(reopened.verified_copies(3, 0, 80), 1);
+    assert_eq!(reopened.verified_copies(3, 0, 80).unwrap(), 1);
     // The retry stores the same bytes again and commits.
     reopened
         .record(
@@ -593,7 +593,7 @@ fn copy_state_is_replayed_in_journal_order_once_per_committed_change() {
     let again = CopyCatalog::open(disk.clone(), Path::new(DIR), &mut journal).unwrap();
     assert_eq!(again.records().len(), 2);
     assert_eq!(again.next_sequence(), 2);
-    assert_eq!(again.verified_copies(3, 0, 80), 0);
+    assert_eq!(again.verified_copies(3, 0, 80).unwrap(), 0);
     // A committed change missing from the ledger is reported, never
     // replaced by stale state.
     let mut empty_journal_disk = IntegrityJournal::open(FaultDisk::default(), Path::new(DIR))
@@ -665,7 +665,7 @@ fn a_stale_copy_catalog_handle_cannot_record_a_change() {
     ));
     let reopened = CopyCatalog::open(disk, Path::new(DIR), &mut journal).unwrap();
     assert_eq!(reopened.records().len(), 1);
-    assert_eq!(reopened.verified_copies(3, 0, 80), 1);
+    assert_eq!(reopened.verified_copies(3, 0, 80).unwrap(), 1);
 }
 
 #[test]
@@ -721,7 +721,7 @@ fn a_stale_journal_view_never_yields_or_records_copy_state() {
         ),
         Err(IntegrityError::StaleJournal)
     ));
-    assert_eq!(copies.verified_copies(3, 0, 80), 1);
+    assert_eq!(copies.verified_copies(3, 0, 80).unwrap(), 1);
 }
 
 #[test]
@@ -743,4 +743,86 @@ fn a_stale_journal_handle_never_overwrites_a_committed_record() {
         .unwrap()
         .journal;
     assert_eq!(reopened.records().unwrap(), current.records().unwrap());
+}
+
+#[test]
+fn a_copy_catalog_is_bound_to_its_own_journal() {
+    use super::journal::{IntegrityError, IntegrityJournal};
+    let disk = FaultDisk::default();
+    let (mut journal, _) = chain(1);
+    assert!(matches!(
+        CopyCatalog::open(disk.clone(), Path::new("/elsewhere"), &mut journal),
+        Err(IntegrityError::ForeignLedger)
+    ));
+    let mut copies = CopyCatalog::open(disk, Path::new(DIR), &mut journal).unwrap();
+    // A current journal of another directory, with the same copy count.
+    let mut other = IntegrityJournal::open(FaultDisk::default(), Path::new("/other"))
+        .unwrap()
+        .journal;
+    assert!(matches!(
+        copies.record(
+            copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock),
+            &mut other
+        ),
+        Err(IntegrityError::ForeignLedger)
+    ));
+    assert_eq!(other.next_counter(), 0);
+    assert!(copies.records().is_empty());
+}
+
+#[test]
+fn live_copy_counts_are_withheld_after_an_ambiguous_journal_append() {
+    use super::journal::{IntegrityError, IntegrityJournal};
+    let probe = FaultDisk::default();
+    IntegrityJournal::open(probe.clone(), Path::new(DIR)).unwrap();
+    let mut journal = IntegrityJournal::open(FaultDisk::with_budget(probe.used()), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut copies = CopyCatalog::open(FaultDisk::default(), Path::new(DIR), &mut journal).unwrap();
+    assert!(
+        copies
+            .record(
+                copy(REPLICA, CopyState::Removed, Enforcement::ObjectLock),
+                &mut journal
+            )
+            .is_err()
+    );
+    assert!(copies.is_poisoned());
+    assert!(matches!(
+        copies.verified_copies(3, 0, 80),
+        Err(IntegrityError::Poisoned)
+    ));
+    assert!(matches!(
+        copies.record(
+            copy(REPLICA, CopyState::Verified, Enforcement::ObjectLock),
+            &mut journal
+        ),
+        Err(IntegrityError::Poisoned)
+    ));
+}
+
+#[test]
+fn an_operator_export_is_verified_with_read_access_only() {
+    use crate::disk::ReadOnly;
+    let (_, records) = chain(4);
+    let disk = FaultDisk::default();
+    let dir = Path::new("/operator");
+    let mut store = LedgerAnchorStore::open(disk.clone(), dir, OPERATOR).unwrap();
+    let published = publish_due(
+        &mut store,
+        None,
+        Some(&sign(&records[2])),
+        NonZeroU64::new(1).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    // The publisher keeps its handle; the verifier reads beside it.
+    let evidence = ExportEvidence::read(&mut ReadOnly(disk.clone()), dir, OPERATOR).unwrap();
+    assert!(evidence.confirms(&published));
+    assert!(!evidence.confirms(&Anchor {
+        location: [9; 32],
+        ..published
+    }));
+    let missing = ExportEvidence::read(&mut ReadOnly(disk), Path::new("/none"), OPERATOR).unwrap();
+    assert!(!missing.confirms(&published));
 }

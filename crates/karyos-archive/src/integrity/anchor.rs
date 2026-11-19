@@ -571,7 +571,8 @@ pub trait AnchorStore {
 /// ([`AnchorEvidence`]) that it holds this anchor at that counter, read
 /// from the store and not from the anchor's own fields. For a
 /// [`LedgerAnchorStore`] the receipt is the digest of the stored entry, so
-/// that evidence is read access to the export directory.
+/// that evidence is read access to the export directory, which
+/// [`ExportEvidence`] reads without writing or locking it.
 ///
 /// # Errors
 ///
@@ -660,6 +661,77 @@ impl<D: Disk> AnchorEvidence for LedgerAnchorStore<D> {
         let Some(bytes) = usize::try_from(anchor.external_counter)
             .ok()
             .and_then(|index| self.ledger.entries().get(index))
+        else {
+            return false;
+        };
+        anchor.receipt == super::digest(bytes)
+            && Anchor::decode(bytes).is_ok_and(|stored| {
+                stored
+                    == Anchor {
+                        receipt: [0; 32],
+                        ..*anchor
+                    }
+            })
+    }
+}
+
+/// The evidence an operator export store gives a verifier with read access
+/// only: its anchor file, read without opening it for writing, without its
+/// lock and without cutting a partial tail, so an active publisher is
+/// neither disturbed nor able to lock the verifier out. It confirms an
+/// anchor exactly as [`LedgerAnchorStore`] does: an operator export at the
+/// location the operator states, and the entry at its counter.
+#[derive(Debug, Clone, Default)]
+pub struct ExportEvidence {
+    location: Digest,
+    entries: Vec<[u8; ANCHOR_LENGTH]>,
+}
+
+impl ExportEvidence {
+    /// Reads the anchor file in `dir` of the operator export at
+    /// `location`; a missing file holds no anchor. A partial last entry,
+    /// one the publisher is still writing, is not read.
+    ///
+    /// # Errors
+    ///
+    /// The operating system's error.
+    pub fn read<D: Disk>(disk: &mut D, dir: &Path, location: Digest) -> std::io::Result<Self> {
+        let file = match disk.open_read(&dir.join(ANCHOR_FILE)) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self {
+                    location,
+                    entries: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let length = u64::try_from(ANCHOR_LENGTH).map_err(std::io::Error::other)?;
+        let whole = disk
+            .len(&file)?
+            .checked_div(length)
+            .ok_or_else(|| std::io::Error::other("zero anchor length"))?;
+        let mut entries = Vec::new();
+        for index in 0..whole {
+            let offset = index
+                .checked_mul(length)
+                .ok_or_else(|| std::io::Error::other("anchor offset overflow"))?;
+            let mut entry = [0u8; ANCHOR_LENGTH];
+            disk.read_at(&file, offset, &mut entry)?;
+            entries.push(entry);
+        }
+        Ok(Self { location, entries })
+    }
+}
+
+impl AnchorEvidence for ExportEvidence {
+    fn confirms(&self, anchor: &Anchor) -> bool {
+        if anchor.kind != AnchorKind::OperatorExport || anchor.location != self.location {
+            return false;
+        }
+        let Some(bytes) = usize::try_from(anchor.external_counter)
+            .ok()
+            .and_then(|index| self.entries.get(index))
         else {
             return false;
         };

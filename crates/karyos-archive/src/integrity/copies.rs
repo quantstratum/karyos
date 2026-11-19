@@ -227,6 +227,10 @@ impl ImmutabilityBackend for NoImmutability {
 pub struct CopyCatalog<D: Disk> {
     ledger: Ledger<D, COPY_RECORD_LENGTH>,
     records: Vec<CopyRecord>,
+    /// Set when a change reached the ledger but its journal append failed:
+    /// whether the journal holds it is unknown until reopened, so the live
+    /// state answers nothing.
+    poisoned: bool,
 }
 
 impl<D: Disk> CopyCatalog<D> {
@@ -259,6 +263,11 @@ impl<D: Disk> CopyCatalog<D> {
         if !journal.is_current()? {
             return Err(IntegrityError::StaleJournal);
         }
+        // Only the journal of this archive directory: another journal's
+        // copy changes are not this catalog's.
+        if journal.dir() != dir {
+            return Err(IntegrityError::ForeignLedger);
+        }
         let ledger = Ledger::open(disk, dir, COPIES_FILE)?;
         let stored: std::collections::BTreeMap<Digest, &[u8; COPY_RECORD_LENGTH]> = ledger
             .entries()
@@ -289,7 +298,19 @@ impl<D: Disk> CopyCatalog<D> {
             }
             records.push(record);
         }
-        Ok(Self { ledger, records })
+        Ok(Self {
+            ledger,
+            records,
+            poisoned: false,
+        })
+    }
+
+    /// Whether a change's journal append failed since the catalog was
+    /// opened: its live state is uncertain until it is reopened.
+    #[must_use]
+    #[inline]
+    pub const fn is_poisoned(&self) -> bool {
+        self.poisoned
     }
 
     /// Every record, oldest first.
@@ -323,6 +344,14 @@ impl<D: Disk> CopyCatalog<D> {
         journal: &mut IntegrityJournal<D>,
     ) -> Result<SealRecord, IntegrityError> {
         record.sequence = self.next_sequence();
+        if self.poisoned {
+            return Err(IntegrityError::Poisoned);
+        }
+        // Bound to the journal it replayed: one of another directory would
+        // chain this change while its own catalog never commits it.
+        if journal.dir() != self.ledger.dir() {
+            return Err(IntegrityError::ForeignLedger);
+        }
         // Compare and swap: only a catalog that holds every change the
         // journal chains may record the next one.
         if journal.is_poisoned() {
@@ -336,7 +365,15 @@ impl<D: Disk> CopyCatalog<D> {
         }
         let bytes = record.encode();
         self.ledger.append(bytes)?;
-        let chained = journal.record_copy_change(record.recording, record.sequence, &bytes)?;
+        let chained = match journal.record_copy_change(record.recording, record.sequence, &bytes) {
+            Ok(chained) => chained,
+            Err(error) => {
+                // The record may or may not be on the journal: the live
+                // counts are uncertain until the catalog is reopened.
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
         self.records.push(record);
         Ok(chained)
     }
@@ -357,8 +394,21 @@ impl<D: Disk> CopyCatalog<D> {
 
     /// The copies of `recording` whose latest state is verified and that
     /// cover `[start, end)`, counted once per location.
-    #[must_use]
-    pub fn verified_copies(&self, recording: u64, start: u64, end: u64) -> u64 {
+    ///
+    /// # Errors
+    ///
+    /// [`IntegrityError::Poisoned`] after a change whose journal append
+    /// failed: the counts are uncertain until the catalog is reopened, and
+    /// no retention decision may rest on them.
+    pub fn verified_copies(
+        &self,
+        recording: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, IntegrityError> {
+        if self.poisoned {
+            return Err(IntegrityError::Poisoned);
+        }
         let mut locations: Vec<Digest> = self
             .current()
             .into_iter()
@@ -372,6 +422,6 @@ impl<D: Disk> CopyCatalog<D> {
             .collect();
         locations.sort_unstable();
         locations.dedup();
-        u64::try_from(locations.len()).unwrap_or(u64::MAX)
+        Ok(u64::try_from(locations.len()).unwrap_or(u64::MAX))
     }
 }
