@@ -1045,3 +1045,56 @@ fn a_dynamic_subscription_refuses_a_control_no_register_can_reach() {
             .is_ok()
     );
 }
+
+/// Design 3.7 and 8 between drivers (karyos#943): a receiver registers,
+/// binds and receives, then goes silent; the sender removes its slot as a
+/// timeout once no SM arrived for `image_liveness_timeout` (500 ms here),
+/// and the same receiver id registering again afterwards from a new
+/// driver binds at its next REGISTER and receives. The second
+/// registration succeeds as soon as the removal is done: it comes from
+/// another port, so the quarantine of the old endpoint does not apply,
+/// and the old binding is gone, so it is a fresh join, not a restart.
+#[test]
+fn a_silent_receiver_is_removed_and_registers_again() {
+    let mut quick = AgentConfig::default();
+    quick.image_liveness_timeout = 500_000_000;
+    quick.sender_heartbeat_interval = 100_000_000;
+    let mut a = driver_with(ThreadingMode::Shared, quick);
+    let mut b = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let publication = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+            None,
+        )
+        .unwrap();
+    let _first = b
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    let image = image_of(&mut a, &mut b, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    exchange(&mut a, &mut b, &publication, &mut reader, 16);
+    // Silence: the receiver's driver goes, and only the sender runs.
+    drop(reader);
+    drop(b);
+    pump(&mut [&mut a], |drivers| {
+        sender(drivers[0]).registrants_timed_out >= 1
+    });
+    assert_eq!(sender(&a).registrants_timed_out, 1);
+    let mut again = driver(ThreadingMode::Shared);
+    let _second = again
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    let image = image_of(&mut a, &mut again, 10);
+    let mut reader = again.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
+        .unwrap();
+    super::exchange_on(&mut a, &mut again, &mut lane, &mut reader, 16..32);
+    let counters = sender(&a);
+    assert_eq!(counters.registrants_joined, 2);
+    assert_eq!(counters.registrants_timed_out, 1);
+    assert_eq!(counters.registrants_restarted, 0);
+}

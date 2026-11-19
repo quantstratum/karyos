@@ -2543,3 +2543,40 @@ fn a_joined_required_id_keeps_no_binding_once_its_own_expires() {
     assert_eq!(join_as(&mut sender, b, 2, 8, later + 10), None);
     assert_eq!(sender.counters().bindings_reserved, 0);
 }
+
+/// Counters once per event (karyos#943 item 4): each REGISTER from a
+/// source schemas 7.3 refuses (port 0) counts `dropped_source` exactly
+/// once, each from outside the allowlist `dropped_not_allowed` exactly
+/// once, neither gets a reply, and an admitted one counts `registered`
+/// exactly once.
+#[test]
+fn each_dropped_register_counts_its_reason_once() {
+    let mut sender = dynamic_sender(4);
+    let portless: SocketAddr = "10.0.0.9:0".parse().unwrap();
+    let outside: SocketAddr = "192.168.0.9:5000".parse().unwrap();
+    for sent in 1..=3u64 {
+        let now = T0 + sent;
+        assert_eq!(
+            sender.register(EndpointId(1), portless, &register_as(5, 7), now),
+            None
+        );
+        assert_eq!(
+            sender.register(EndpointId(1), outside, &register_as(6, 7), now),
+            None
+        );
+        let counters = sender.registration_counters();
+        assert_eq!(counters.dropped_source, sent);
+        assert_eq!(counters.dropped_not_allowed, sent);
+    }
+    assert_eq!(sender.registration_counters().registered, 0);
+    let inside: SocketAddr = "10.0.0.9:5000".parse().unwrap();
+    assert!(
+        sender
+            .register(EndpointId(1), inside, &register_as(5, 7), T0 + 4)
+            .is_some()
+    );
+    let counters = sender.registration_counters();
+    assert_eq!(counters.registered, 1);
+    assert_eq!(counters.dropped_source, 3);
+    assert_eq!(counters.dropped_not_allowed, 3);
+}
