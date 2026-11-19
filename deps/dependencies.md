@@ -31,6 +31,8 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `graviola` | 0.4.2 | crates.io | default features off (its `default` is empty); signature verification and hashing only, no randomness | runtime and dev, `karyos-control` only (karyos#708) | x86_64 and aarch64 only | Apache-2.0 OR ISC OR MIT-0 | the JWT verification and JWKS retrieval records (quantstratum-docs: karyos/reviews/dependency-admission-jwt-verification.md, dependency-admission-jwks-retrieval.md), owner decision on quantstratum-docs#899 with the Codex half ACS 77226, 2026-11-18 |
 | `rustls-graviola` | 0.4.0 | crates.io | default features off | runtime and dev, `karyos-control` only (the control-plane component, karyos#708; not a default member, nothing depends on it) | x86_64 and aarch64 only | Apache-2.0 OR ISC OR MIT-0 | the agent HTTP stack's record (quantstratum-docs: karyos/reviews/dependency-admission-agent-http-stack.md), owner decision ACS 71206, 2026-11-12, under ADR-0083 |
 | `serde_json` | 1.0.154 | crates.io | default features off; `std` | runtime and dev, `karyos-control` only (karyos#708) | all | MIT OR Apache-2.0 | the JWT verification and JWKS retrieval records (quantstratum-docs: karyos/reviews/dependency-admission-jwt-verification.md, dependency-admission-jwks-retrieval.md), owner decision on quantstratum-docs#899 with the Codex half ACS 77226, 2026-11-18 |
+| `sha2` | 0.11.1 (pinned `=0.11.1`) | crates.io | default features off (no `alloc`, `oid` or `zeroize`); SHA-256 only | runtime, `karyos-archive` only (the seal digests and hash chain of the integrity journal, SPEC.md §8.4, ADR-0051 item 2, karyos#662) | all | MIT OR Apache-2.0 | owner decision ACS 71206 (2026-11-12) on quantstratum-docs `karyos/reviews/dependency-admission-sha2.md`, ADR-0079 row `sha2` (archive), karyos#660 |
+| `ed25519-dalek` | 3.0.0 (pinned `=3.0.0`) | crates.io | default features off; `zeroize` (no `fast`, `batch`, `rand_core`, `pkcs8`, `pem`, `serde`, `digest`, `hazmat` or `legacy_compatibility`); `VerifyingKey::verify_strict` only, `SigningKey` only in tests | runtime, `karyos-archive` only (archival signed heads and the key registry, SPEC.md §8.4, ADR-0051 items 4 and 6, karyos#663); never a wire key | all | BSD-3-Clause | owner decision ACS 71206 (2026-11-12) on quantstratum-docs `karyos/reviews/dependency-admission-ed25519-archival.md`, ADR-0079 (archive scope), karyos#660 |
 
 The control-plane component `karyos-control` (karyos#708) holds the agent
 HTTP stack admitted by its record (quantstratum-docs:
@@ -125,9 +127,89 @@ reviewed by hand at 1.0.229: each writes a generated module into `OUT_DIR`
 and emits `cfg` flags from `rustc --version`; neither compiles C nor links
 anything.
 
+`sha2` is a dependency of `karyos-archive` only, as its admission record
+scopes it. Its transitive runtime crates, admitted with it, are `digest`
+0.11.3, `block-buffer` 0.12.1, `crypto-common` 0.2.2, `hybrid-array`
+0.4.15, `typenum` 1.20.1 and `cpufeatures` 0.3.1 (all MIT OR
+Apache-2.0); `cfg-if` 1.0.5 and `libc` 0.2.190 (under `cpufeatures`, for
+CPU feature detection on aarch64 Linux and macOS) were already in the
+lockfile. Of these only `libc` has a build script, already admitted with
+`libc` itself: it emits `cfg` flags from `rustc --version` and the target,
+and compiles no C. None of the crates added with `sha2` has one.
+
+`ed25519-dalek` is a dependency of `karyos-archive` only, for the archival
+purpose its admission record scopes; the driver's guard and abort
+authority is not admitted by it. Its transitive crates, admitted with it,
+are `curve25519-dalek` 5.0.0 and `subtle` 2.6.1 (BSD-3-Clause), `ed25519`
+3.0.0, `signature` 3.0.0 and `zeroize` 1.9.2 (Apache-2.0 OR MIT), and the
+build dependencies `rustc_version` 0.4.1 and `semver` 1.0.28 (MIT OR
+Apache-2.0) of `curve25519-dalek`'s build script, which only emits `cfg`
+flags (word size and backend) and compiles no C. On x86_64 only,
+`curve25519-dalek` also selects the proc macro `curve25519-dalek-derive`
+0.1.1 (MIT OR Apache-2.0), which generates its SIMD backend's target
+feature variants at compile time and is absent from the aarch64 graph. It
+reuses `sha2` for SHA-512 inside its own implementation.
+
 `loom` is declared as a `cfg(loom)` target dependency of `karyos-sys`, so it is
 absent from every normal and release build and from the graph shipped to
 users; it is compiled only by `make loom`.
+
+## Evaluation-only admissions
+
+The two Raft candidates of ADR-0043, `raft` 0.7.0 (with `raft-proto`
+0.7.0) and `openraft` 0.10.0-alpha.37 (with `openraft-rt` and
+`openraft-macros` 0.10.0-alpha.37), are admitted for evaluation only
+(quantstratum-docs:
+karyos/reviews/dependency-admission-raft-candidates-evaluation.md; owner
+decision ACS 71206, 2026-11-12; karyos#677). That record admits nothing to
+a shipped graph, and the runtime admission of the selected core is a
+separate record (plan issue 074). Its conditions, as this repository
+applies them:
+
+- **Mechanism: a separate crate.** The candidates enter only
+  `karyos-raft-eval`, an unpublished crate (`publish = false`) in its own
+  workspace, `eval/raft-candidates`, with its own `Cargo.lock` and
+  `deny.toml`. It is not a member of this workspace, so neither this
+  `Cargo.lock` nor `dependency-inventory.json` lists a candidate, and no
+  crate here may depend on it. The candidates are never a
+  `[dependencies]` entry of `karyos-sim`, `karyos-cluster` or any other
+  crate of the core.
+- **Enforced by a check, not by review.** `make shipped-graph-check`
+  (`scripts/check-shipped-graph.sh`, run by `make pre-push`) runs
+  `cargo tree -e normal,build --target all` over the whole workspace and
+  over `karyos-tools`, which ships `karyosd`, each with the default
+  features and with `--all-features` (so an optional dependency behind a
+  nondefault feature is caught), and fails if `raft`,
+  `raft-proto`, `protobuf-build`, `openraft`, `openraft-rt`,
+  `openraft-rt-tokio`, `openraft-macros` or `karyos-raft-eval` appears
+  anywhere, or `tokio` appears outside the crates it is admitted for
+  (`karyos-control`, the owner-admitted HTTP stack: karyos#704, ACS 71206).
+  Tokio is checked in the workspace graph with its features unified:
+  every workspace member from which it is reachable must be admitted, so
+  a crate reaching it through `karyos-control`, through a member that
+  `karyos-control` uses, or through a shared dependency's feature that
+  `karyos-control` turns on, is still refused.
+  `scripts/check-shipped-graph-selftest.sh`, run with it, proves in a
+  throwaway workspace that the check fails with exactly the expected
+  diagnostic on a plain, a feature-gated, a transitively admitted and a
+  feature-unified Tokio, and on a candidate in the admitted crate, and passes silently on
+  Tokio in the admitted crate and on a clean graph. The unused `karyos-tools` to `karyos-sim` edge, through which a
+  candidate placed in `karyos-sim` would reach `karyosd`, is karyos#926.
+- **Versions and features** are exactly the record's: `raft` without
+  default features and with `protobuf-codec` only; `openraft` with default
+  features off (no Tokio); the evaluation lockfile pins `openraft-macros`
+  to 0.10.0-alpha.37. A change of either is a reviewed change of the
+  record.
+- **Advisories.** RUSTSEC-2024-0437 (`protobuf` 2.28.0) and
+  RUSTSEC-2025-0057 (`fxhash` 0.2.1) in the `raft` graph are ignored only
+  by the evaluation workspace's own `deny.toml`, never by this one; they
+  are findings of the comparison.
+- **`protoc`.** `raft-proto`'s build script runs `protoc` (a system one,
+  or a prebuilt executable bundled in `protobuf-build`); the evaluation
+  records the version and origin of the one it used.
+- **Tokio** in any form is excluded from the candidates' graphs and from
+  every shipped graph but `karyos-control`'s. A Tokio probe would need its
+  own record and is reconnaissance only.
 
 ## Resolved graph
 
@@ -149,7 +231,12 @@ or build-script change cannot reuse old admission evidence. Reach classes:
 
 - `runtime`: may be linked into Karyos builds. On the supported targets the
   evaluated runtime graph of the library crates is `thiserror`, plus
-  `rustix`, `bitflags` and `linux-raw-sys` on Linux. The `karyos-tools`
+  `rustix`, `bitflags` and `linux-raw-sys` on Linux, plus `karyos-archive`'s
+  `sha2`, `digest`, `block-buffer`, `crypto-common`, `hybrid-array`,
+  `typenum`, `cpufeatures` and `cfg-if` everywhere, its `ed25519-dalek`,
+  `curve25519-dalek`, `ed25519`, `signature`, `subtle` and `zeroize`
+  everywhere, and `libc` (under
+  `cpufeatures`) on aarch64 Linux and macOS. The `karyos-tools`
   binaries add `signal-hook`, `signal-hook-registry`, `libc`, `errno`,
   `tracing`, `tracing-core`, `pin-project-lite`, `once_cell`,
   `tracing-subscriber`, `sharded-slab`, `lazy_static`, `thread_local` and
@@ -199,8 +286,9 @@ supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 | `rustix` 1.1.6 | runtime (Linux) | Runs `rustc` probes to select the backend and set cfgs; no build dependencies |
 | `quote` 1.0.47 | build | Runs `rustc --version` to set cfgs |
 | `signal-hook` 0.4.5 | runtime, `karyos-tools` only | Empty `main` unless the `extended-siginfo-raw` feature is on, which would compile `extract.c` with the optional `cc` build dependency; Karyos leaves it off, so `cc` is not requested |
+| `curve25519-dalek` 5.0.0 | runtime, `karyos-archive` only | Reads the target's pointer width and features through `rustc_version` to emit `curve25519_dalek_bits` and `curve25519_dalek_backend` cfgs; compiles nothing |
 | `rustversion` 1.0.23 | loom | Runs `rustc --version` to generate version constants |
-| `libc` 0.2.190 | runtime, `karyos-tools` only, under `signal-hook` and `signal-hook-registry` on every supported target; loom; dev, under `getrandom` on macOS and Linux `gnu`/`musl` (tests only); also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in library builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
+| `libc` 0.2.190 | runtime, `karyos-archive` under `sha2`'s `cpufeatures` on aarch64 Linux and macOS (CPU feature detection); runtime, `karyos-tools`, under `signal-hook` and `signal-hook-registry` on every supported target; loom; dev, under `getrandom` on macOS and Linux `gnu`/`musl` (tests only); also behind `rustix`'s libc backend (`rustix_use_libc` or Miri), never in library builds on supported targets | Runs `rustc --version`; queries `freebsd-version` or `emcc` only on FreeBSD or Emscripten targets; compiles nothing |
 | `generator` 0.8.10 | loom | Invokes `cc` to assemble `asm_ppc64le_elf.S` only when the target architecture is `powerpc64`, which Karyos does not support |
 | `valuable` 0.1.1 | loom | Emits atomic-support cfgs from the target name |
 | `getrandom` 0.3.4 | dev | Runs `rustc --version` to choose cfgs (sanitizer and old Windows backends); compiles nothing |

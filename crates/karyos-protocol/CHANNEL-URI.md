@@ -195,6 +195,7 @@ The common URI rule binds every key added after the sixteen above.
 | Key | Media | Value |
 | --- | --- | --- |
 | `retransmit-window` | udp | `decimal` bytes: positive, a multiple of 32, at most `term-length` / 2; default `term-length` / 2 |
+| `require-abort-ack` | udp | `true` or `false`; default `false`. `true` is `SecurityUnsupported` with class `authenticated` until the authenticated capability is supported |
 
 - **`retransmit-window`** (owner item 63) is fixed at channel creation and
   overrides the driver's repair setting for that channel. It applies only
@@ -207,6 +208,14 @@ The common URI rule binds every key added after the sixteen above.
   required receivers is `sent` minus the window. A smaller window can
   make a hole unrecoverable even for a counted receiver; that loss is
   reported, never silent.
+
+- **`require-abort-ack`** (owner item 8) asks that a remote
+  `SESSION_ABORT` be acknowledged. It belongs to the authenticated
+  capability, so until that capability is supported `true` is refused as
+  `SecurityUnsupported` for the class `authenticated`, the same refusal as
+  `security=authenticated`, and is never downgraded to a channel without
+  the acknowledgement. `false` states no requirement and changes nothing.
+  Any other value is `InvalidValue`.
 
 ### Durations
 

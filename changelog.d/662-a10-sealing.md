@@ -1,0 +1,3 @@
+### Added
+
+- Sealing and the tamper-evidence hash chain of the Archive (SPEC.md §8.4, "Sealing and tamper evidence"; karyos#662): `karyos_archive::integrity` adds the versioned SHA-256 seal record, the append-only integrity journal with a monotonic counter and a link to the previous record, chained catalog changes, policy versions, key registry appends and purges, Cluster log seals bounded by the commit index, the `seal_interval` schedule for open segments, and the observable sealing backlog. A removed, reordered, renumbered or rewritten record and an altered sealed byte are each reported as a named inconsistency, and a crash while sealing leaves a chain recovery continues. CRC-32C stays as corruption detection.

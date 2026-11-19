@@ -353,9 +353,10 @@ enum Key {
     ControlMode,
     Ttl,
     RetransmitWindow,
+    RequireAbortAck,
 }
 
-const KEYS: [(&str, Key); 17] = [
+const KEYS: [(&str, Key); 18] = [
     ("endpoint", Key::Endpoint),
     ("group", Key::Group),
     ("interface", Key::Interface),
@@ -373,6 +374,7 @@ const KEYS: [(&str, Key); 17] = [
     ("control-mode", Key::ControlMode),
     ("ttl", Key::Ttl),
     ("retransmit-window", Key::RetransmitWindow),
+    ("require-abort-ack", Key::RequireAbortAck),
 ];
 
 /// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
@@ -691,6 +693,19 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         })
         .transpose()?
         .unwrap_or_default();
+    // `require-abort-ack` (owner decision item 8) is defined with the
+    // authenticated capability. Until that capability is supported a
+    // request requiring it is refused, typed, and never downgraded to a
+    // channel without the acknowledgement (#648).
+    match get(Key::RequireAbortAck) {
+        None | Some("false") => {}
+        Some("true") => {
+            return Err(ChannelError::SecurityUnsupported {
+                class: "authenticated",
+            });
+        }
+        Some(_) => return Err(invalid(Key::RequireAbortAck, "`true` or `false`")),
+    }
     let retransmit_window = get(Key::RetransmitWindow)
         .map(parse_retransmit_window)
         .transpose()?;

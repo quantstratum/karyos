@@ -469,6 +469,12 @@ fn published_keys_keep_their_meaning() {
                 udp("karyos:udp?endpoint=10.0.0.5:1|retransmit-window=4096").retransmit_window,
                 Some(4096)
             ),
+            Key::RequireAbortAck => assert_eq!(
+                refused("karyos:udp?endpoint=10.0.0.5:1|require-abort-ack=true"),
+                ChannelError::SecurityUnsupported {
+                    class: "authenticated"
+                }
+            ),
         }
         assert_eq!(key.name(), name);
     }
@@ -743,4 +749,45 @@ fn the_retransmit_window_key_is_validated() {
             key: "retransmit-window"
         })
     );
+}
+
+/// `require-abort-ack` is defined and refused while the authenticated
+/// capability is unsupported, never downgraded (owner decision item 8, #648).
+#[test]
+fn require_abort_ack_is_refused_until_authenticated_is_supported() {
+    assert_eq!(
+        refused("karyos:udp?endpoint=10.0.0.5:1|require-abort-ack=true"),
+        ChannelError::SecurityUnsupported {
+            class: "authenticated"
+        }
+    );
+    assert_eq!(
+        refused("karyos:udp?endpoint=10.0.0.5:1|security=trusted|require-abort-ack=true"),
+        ChannelError::SecurityUnsupported {
+            class: "authenticated"
+        }
+    );
+    assert_eq!(
+        udp("karyos:udp?endpoint=10.0.0.5:1|require-abort-ack=false"),
+        udp("karyos:udp?endpoint=10.0.0.5:1")
+    );
+    assert!(matches!(
+        refused("karyos:udp?endpoint=10.0.0.5:1|require-abort-ack=yes"),
+        ChannelError::InvalidValue {
+            key: "require-abort-ack",
+            ..
+        }
+    ));
+    assert!(matches!(
+        refused("karyos:ipc?require-abort-ack=true"),
+        ChannelError::NotApplicable {
+            key: "require-abort-ack"
+        }
+    ));
+    assert!(matches!(
+        refused("karyos:udp?endpoint=10.0.0.5:1|require-abort-ack=true|require-abort-ack=true"),
+        ChannelError::Repeated {
+            key: "require-abort-ack"
+        }
+    ));
 }

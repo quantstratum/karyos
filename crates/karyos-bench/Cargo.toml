@@ -34,6 +34,11 @@ alloc-count = ["karyos-sys/test-hooks"]
 # timing-build-check` requires plain `timing`, and `analyze` makes every
 # run of it report-only, its trusted runs included (ACS 15453).
 synthetic = ["karyos-protocol/test-hooks"]
+# The opt-in authentication candidate evaluation build (ADR-0086, R8
+# evaluation scope): the build in which E1 or E2 hosts run the candidate
+# profiles behind the `Protection` seam. It enables nothing yet; only a
+# build without it is held to "no candidate profile is reachable" (#632).
+auth-candidates = []
 
 [dependencies]
 karyos-sys.workspace = true

@@ -292,7 +292,10 @@ pub enum Payload<'a> {
     /// The payload itself, 0 to [`MAX_INLINE`] bytes.
     Inline(&'a [u8]),
     /// The frames of a recording this Archive keeps: those of
-    /// `[position, position + extent)` in `recording_id`.
+    /// `[position, position + extent)` in `recording_id`. Once the range
+    /// holding them is sealed, their integrity rests on that seal
+    /// ([`crate::integrity::verify_range`]); until then only on the
+    /// segment entry's CRC-32C, which is corruption detection (karyos#662).
     Reference {
         /// The recording, never 0.
         recording_id: u64,

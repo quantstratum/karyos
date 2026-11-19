@@ -4,6 +4,11 @@
 //! B.4): reflected polynomial `0x82F63B78`, initial value and final XOR
 //! `0xFFFF_FFFF`. Karyos computes it itself rather than take a dependency
 //! (quantstratum-docs: karyos/design/archive-gap-analysis.md, A2).
+//!
+//! CRC-32C is corruption detection, not authenticated integrity: anyone
+//! who changes the bytes can recompute it. Integrity is the SHA-256 seal
+//! and its hash chain ([`crate::integrity`], SPEC.md §8.4), which sits
+//! beside this checksum and never replaces it (karyos#662).
 
 /// The reflected Castagnoli polynomial.
 const POLYNOMIAL: u32 = 0x82F6_3B78;
