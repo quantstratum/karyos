@@ -586,12 +586,14 @@ fn challenges_posted(role: &mut super::super::ReceiverRole) -> usize {
     count
 }
 
-/// karyos#941 item 1: an unanswered dynamic subscription backs off, its
-/// interval doubling from `setup_interval` to sixteen times it, and an
-/// ANNOUNCE from its `control` address starts it over: the next REGISTER
-/// is due one `setup_interval` on.
+/// karyos#941 item 1 and karyos#947: an unanswered dynamic subscription
+/// backs off, its interval doubling from `setup_interval` to sixteen times
+/// it (1.6 s), and stays at that cap. An ANNOUNCE from its `control`
+/// address whose CHALLENGE is never answered is no progress: it leaves the
+/// backoff at the cap, so an optional receiver the sender cannot bind does
+/// not register at the base cadence for ever.
 #[test]
-fn an_unanswered_registration_backs_off_and_an_announce_starts_it_over() {
+fn an_unanswered_registration_backs_off_to_the_cap_and_an_announce_leaves_it_there() {
     let config = AgentConfig::default();
     let interval = config.setup_interval;
     let (sender, mut role) = receiver_with(config);
@@ -608,16 +610,17 @@ fn an_unanswered_registration_backs_off_and_an_announce_starts_it_over() {
     }
     assert_eq!(sent_at, [0, 1, 3, 7, 15, 31, 47]);
     let _ = registers_posted(&sender);
-    // An ANNOUNCE from `control` at 48: due again at 49, then the gaps
-    // double again from one interval.
-    intake(&mut role, &events, T0 + 48 * interval).control(control, announce_of_stream());
+    assert_eq!(16 * interval, 1_600_000_000);
+    // An ANNOUNCE from `control` at 48, and again before each REGISTER,
+    // none of them answered: the REGISTERs stay sixteen intervals apart.
     let mut again = Vec::new();
-    for step in 48..=52u64 {
+    for step in 48..=96u64 {
+        intake(&mut role, &events, T0 + step * interval).control(control, announce_of_stream());
         if role.send_registers(&events, T0 + step * interval) == 1 {
             again.push(step);
         }
     }
-    assert_eq!(again, [49, 50, 52]);
+    assert_eq!(again, [63, 79, 95]);
 }
 
 /// karyos#941 item 1: keys registering at one `control` address are

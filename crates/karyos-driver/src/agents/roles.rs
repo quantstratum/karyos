@@ -131,8 +131,8 @@ struct Registering {
     due: u64,
     /// The spacing of its next REGISTER, in ns: `setup_interval`, doubled
     /// after each one up to [`REGISTER_BACKOFF_STEPS`] doublings, and
-    /// `setup_interval` again on an ANNOUNCE from `control` or once its
-    /// image is gone (karyos#941 item 1).
+    /// `setup_interval` again on an accepted ANSWER from `control` or once
+    /// its image is gone (karyos#941 item 1, karyos#947).
     interval: u64,
     /// The registration state it writes for the application (karyos#941
     /// item 3).
@@ -4101,8 +4101,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
     /// on, so REGISTERs cannot starve the CHALLENGE that answers its
     /// publisher's ANNOUNCE (karyos#941 item 1). A key's interval starts at
     /// `setup_interval` and doubles after each REGISTER, sent or not, up to
-    /// [`REGISTER_BACKOFF_STEPS`] doublings; an ANNOUNCE from `control` or
-    /// the loss of its image starts it over. Keys are spread within an
+    /// [`REGISTER_BACKOFF_STEPS`] doublings; an accepted ANSWER from
+    /// `control` or the loss of its image starts it over, an ANNOUNCE does
+    /// not (karyos#947). Keys are spread within an
     /// interval ([`REGISTER_STAGGER`]). The receiver block is this boot's,
     /// with the key's configured `receiver_id`: a receiver id is configured
     /// and stable across restarts (design 2.3; multicast-flow-control.md
@@ -4838,9 +4839,12 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// registers at, port included, so no other host that reaches the
     /// key's port can announce an image of its stream (karyos#941 item 5);
     /// any source on another key, as before. A refused one is counted. An
-    /// ANNOUNCE from `control` shows the key `Announced` and starts its
-    /// REGISTER backoff over, its next REGISTER due one `setup_interval`
-    /// on (karyos#941 items 1 and 3).
+    /// ANNOUNCE from `control` shows the key `Announced` (karyos#941 item
+    /// 3) and leaves its REGISTER backoff as it is: a sender that announces
+    /// but never answers the CHALLENGE, because it cannot bind the
+    /// receiver, makes no progress, so the backoff keeps growing to its
+    /// cap (karyos#947). An accepted ANSWER starts it over
+    /// ([`Self::restart_register_backoff`]), as a bound image does.
     fn setup_from_control(
         &mut self,
         endpoint: EndpointId,
@@ -4850,8 +4854,6 @@ impl<T: StreamTerms> Intake<'_, T> {
     ) -> bool {
         use crate::sessions::register::RegistrationState;
 
-        let setup_interval = self.role.setup_interval;
-        let now = self.now;
         let Some(key) = self
             .role
             .registering
@@ -4864,14 +4866,29 @@ impl<T: StreamTerms> Intake<'_, T> {
             self.role.count(|c| &mut c.setup_not_from_control);
             return false;
         }
-        if announce {
-            if key.status.get() != RegistrationState::Bound {
-                key.status.set(RegistrationState::Announced);
-            }
+        if announce && key.status.get() != RegistrationState::Bound {
+            key.status.set(RegistrationState::Announced);
+        }
+        true
+    }
+
+    /// Starts the REGISTER backoff of the `control-mode=dynamic` key of
+    /// `stream_id` on `endpoint` over, its next REGISTER due one
+    /// `setup_interval` on: its `control` address answered its CHALLENGE
+    /// and an image is being created, progress past the CHALLENGE
+    /// (karyos#941 item 1, karyos#947). Nothing for another key.
+    fn restart_register_backoff(&mut self, endpoint: EndpointId, stream_id: i32) {
+        let setup_interval = self.role.setup_interval;
+        let now = self.now;
+        if let Some(key) = self
+            .role
+            .registering
+            .iter_mut()
+            .find(|key| (key.endpoint, key.stream_id) == (endpoint, stream_id))
+        {
             key.interval = setup_interval;
             key.due = key.due.min(now.saturating_add(setup_interval));
         }
-        true
     }
 
     /// Sends `register` from this endpoint to `control` under the
@@ -5024,8 +5041,8 @@ impl<T: StreamTerms> Intake<'_, T> {
                     return;
                 }
                 // A registering key is set up by its `control` address
-                // alone (karyos#941 item 5); an ANNOUNCE from there starts
-                // its REGISTER backoff over.
+                // alone (karyos#941 item 5); an ANNOUNCE from there leaves
+                // its REGISTER backoff as it is (karyos#947).
                 if !self.setup_from_control(endpoint, announce.alias.stream_id, source, true) {
                     return;
                 }
@@ -5112,6 +5129,7 @@ impl<T: StreamTerms> Intake<'_, T> {
                     // The conductor gone: the driver is stopping.
                     let _ = sessions.events.post(create, event);
                     self.role.count(|c| &mut c.create_image);
+                    self.restart_register_backoff(endpoint, answer.alias.stream_id);
                 }
                 if let AnswerOutcome::PathBound { image, path } = outcome {
                     self.role.count(|c| &mut c.paths_bound);

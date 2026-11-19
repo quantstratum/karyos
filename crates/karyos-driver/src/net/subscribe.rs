@@ -266,6 +266,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// its publisher answered, refused it with ERR REGISTRATION, or bound
     /// it, or nothing has come back from `control` yet. `None` for a
     /// subscription that does not register, or one removed.
+    ///
+    /// Every public path refuses `control-mode=dynamic` until karyos#944
+    /// lifts that refusal, so through the public API this returns `None`
+    /// for now.
     #[must_use]
     pub fn network_registration_state(
         &self,
