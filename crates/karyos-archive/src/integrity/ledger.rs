@@ -11,6 +11,7 @@
 //! append leaves; deciding whether a whole entry is sound is the reader's
 //! job, through the chain.
 
+use std::io;
 use std::path::Path;
 
 use super::journal::IntegrityError;
