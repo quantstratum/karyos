@@ -1,0 +1,3 @@
+### Changed
+
+- Registration limits are refused at driver start where they used to be accepted (karyos#977, design 11.2): `MAX_REGISTRATION_TABLE` falls from 65,536 to 4,096 entries; `registration_pending` must be at most `registration_rate` times `join_timeout` in seconds (1,280 with the defaults, 256 per second for 5 s), since the table can never hold more; and `join_timeout` and `registration_refusal_interval` must be at most 60 s (`MAX_REGISTRATION_INTERVAL`). A configuration past any of them is refused with `RegistrationConfigError::InvalidLimit` naming the field, not clamped: a silently smaller table would change the bounds an operator sized for. The defaults are unchanged and pass.
