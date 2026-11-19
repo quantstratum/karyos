@@ -3622,7 +3622,7 @@ fn crashed_sealed_recording(name: &str) -> (PathBuf, u64) {
     let disk = StdDisk;
     let root = temp_dir(name);
     let dir = root.as_path();
-    let mut catalog = Catalog::open(disk.clone(), dir).unwrap().catalog;
+    let mut catalog = Catalog::open(disk, dir).unwrap().catalog;
     let geometry = Geometry::new(4096, 8192).unwrap();
     let id = catalog
         .start(NewRecording {
@@ -3638,8 +3638,8 @@ fn crashed_sealed_recording(name: &str) -> (PathBuf, u64) {
         })
         .unwrap();
     let mut store =
-        SegmentStore::create(disk.clone(), dir, id, geometry, SyncPolicy::PerSegment, 0).unwrap();
-    let mut journal = IntegrityJournal::open(disk.clone(), dir).unwrap().journal;
+        SegmentStore::create(disk, dir, id, geometry, SyncPolicy::PerSegment, 0).unwrap();
+    let mut journal = IntegrityJournal::open(disk, dir).unwrap().journal;
     for (index, fill) in [1u8, 2].into_iter().enumerate() {
         let bytes = vec![fill; 4096];
         let at = index as u64 * 4096;
