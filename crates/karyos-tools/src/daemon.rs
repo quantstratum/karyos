@@ -803,6 +803,8 @@ mod tests {
                 sync: karyos_archive::segment::SyncPolicy::PerSegment,
             }],
             min_free: 0,
+            seal_interval: crate::args::DEFAULT_ARCHIVE_SEAL_INTERVAL,
+            anchor_interval: std::time::Duration::from_secs(3600),
         });
         let daemon = Daemon::start(&options).unwrap();
         // The configured stream and the two control streams.
@@ -838,6 +840,8 @@ mod tests {
             responses: 101,
             records: Vec::new(),
             min_free: 0,
+            seal_interval: crate::args::DEFAULT_ARCHIVE_SEAL_INTERVAL,
+            anchor_interval: std::time::Duration::from_secs(3600),
         });
         assert!(matches!(
             Daemon::start(&options),

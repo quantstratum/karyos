@@ -63,6 +63,8 @@ impl Daemon {
             .args([
                 "--archive-control",
                 &format!("{REQUESTS},{RESPONSES}"),
+                "--archive-anchor-interval",
+                "3600s",
                 "--archive-min-free",
                 "0",
                 "--stream",

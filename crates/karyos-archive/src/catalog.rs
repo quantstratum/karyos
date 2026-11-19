@@ -355,6 +355,21 @@ pub struct Catalog<D: Disk> {
     recordings: Vec<Recording>,
     next_id: u64,
     failed: bool,
+    /// The changes appended since the last [`Catalog::take_changes`], when
+    /// they are collected for the integrity journal.
+    changes: Option<Vec<CatalogChange>>,
+}
+
+/// One appended catalog record, for the integrity journal to chain
+/// (karyos#961).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogChange {
+    /// The recording the record is about; 0 for one about no recording.
+    pub recording: u64,
+    /// The record's offset in the catalog log, its generation.
+    pub offset: u64,
+    /// The record's bytes as stored: kind, length, payload and CRC.
+    pub bytes: Vec<u8>,
 }
 
 /// A decoded record.
@@ -660,6 +675,7 @@ impl<D: Disk> Catalog<D> {
                 recordings: Vec::new(),
                 next_id: 1,
                 failed: false,
+                changes: None,
             };
             return Ok(Opened {
                 catalog,
@@ -721,6 +737,7 @@ impl<D: Disk> Catalog<D> {
                 recordings: state.recordings,
                 next_id,
                 failed: false,
+                changes: None,
             },
             cut,
             removed_temporary,
@@ -767,8 +784,40 @@ impl<D: Disk> Catalog<D> {
             self.failed = true;
             return Err(error.into());
         }
+        if let Some(changes) = self.changes.as_mut() {
+            let recording = match record {
+                Record::Started(recording) => recording.id,
+                Record::Stopped { id, .. } | Record::Forgotten(id) => *id,
+                Record::NextId(_) => 0,
+            };
+            changes.push(CatalogChange {
+                recording,
+                offset: self.end,
+                bytes,
+            });
+        }
         self.end = end;
         Ok(())
+    }
+
+    /// Collects every record appended from now on for
+    /// [`Catalog::take_changes`], so the integrity journal can chain the
+    /// catalog's start, stop and forget changes.
+    #[inline]
+    pub fn collect_changes(&mut self) {
+        if self.changes.is_none() {
+            self.changes = Some(Vec::new());
+        }
+    }
+
+    /// The records appended since the last call, oldest first; none when
+    /// changes are not collected.
+    #[must_use]
+    pub fn take_changes(&mut self) -> Vec<CatalogChange> {
+        self.changes
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Starts a recording: its `Started` record is durable on return, and

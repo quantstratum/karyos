@@ -62,6 +62,8 @@ impl Daemon {
             .args([
                 "--archive-control",
                 &format!("{REQUESTS},{RESPONSES}"),
+                "--archive-anchor-interval",
+                "3600s",
                 "--archive-min-free",
                 "0",
                 "--stream",
@@ -240,6 +242,18 @@ fn karyos_catalog_lists_a_karyosd_archive_live_and_offline() {
         shown.lines().nth(1).unwrap().contains("  stopped at "),
         "{shown}"
     );
+    // The running Archive sealed what it recorded and chained its catalog
+    // changes, with no integrity call from this test (karyos#961). With no
+    // trust root the evidence is untrusted, never corrupt.
+    let output = Command::new(env!("CARGO_BIN_EXE_karyos-catalog"))
+        .args(["verify", "--json", &offline])
+        .output()
+        .unwrap();
+    let shown = text(&output);
+    assert_eq!(output.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("\"untrusted_evidence\""), "{shown}");
+    assert!(!shown.contains("\"corruption\""), "{shown}");
+    assert!(!shown.contains("\"coverage\":{\"records\":0,"), "{shown}");
     let output = list(&["--live", &live, "--timeout-ms", "500"]);
     assert_eq!(output.status.code(), Some(2));
     assert!(
