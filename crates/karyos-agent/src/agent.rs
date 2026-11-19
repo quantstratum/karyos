@@ -329,13 +329,14 @@ impl Agent {
         self.retention = Some(crate::retention::shared(backend));
     }
 
-    /// Makes retention `operation` on `recording` for operator `uid`,
-    /// journalled under the fail-closed rule of [`crate::retention`].
+    /// Makes retention `operation` on `recording` for `requester`,
+    /// journalled with its operator and relay under the fail-closed rule of
+    /// [`crate::retention`].
     pub fn retention(
         &mut self,
         operation: crate::retention::Operation,
         recording: u64,
-        uid: u32,
+        requester: Requester,
         reason: &[u8],
     ) -> crate::retention::RetentionAnswer {
         let id = self.next_operation;
@@ -347,7 +348,8 @@ impl Agent {
             operation,
             recording,
             id,
-            operator: uid,
+            operator: requester.operator,
+            relay: requester.relay,
             reason,
         };
         crate::retention::retention_command(

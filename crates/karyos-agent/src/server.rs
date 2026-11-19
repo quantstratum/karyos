@@ -779,12 +779,8 @@ impl Server {
                     _ => role.may_release_or_purge(),
                 };
                 if allowed {
-                    let answer = agent.retention(
-                        operation,
-                        recording,
-                        requester.operator,
-                        reason.as_bytes(),
-                    );
+                    let answer =
+                        agent.retention(operation, recording, requester, reason.as_bytes());
                     (json::retention_answer(&answer), Served::Operated)
                 } else {
                     forbidden()

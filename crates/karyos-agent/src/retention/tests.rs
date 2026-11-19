@@ -98,6 +98,7 @@ fn command(operation: Operation, id: u64) -> Command<'static> {
         recording: 7,
         id,
         operator: 1000,
+        relay: 0,
         reason: b"case 12",
     }
 }
@@ -305,4 +306,30 @@ fn a_slow_archive_is_waited_for_at_most_the_bound() {
         || 0,
     );
     assert_eq!(answer, RetentionAnswer::Busy);
+}
+
+/// A relayed operation journals its operator and its relay apart.
+#[test]
+fn a_relayed_operation_journals_the_relay_apart() {
+    let dir = dir("relayed");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    let mut archive = Archive::default();
+    let relayed = Command {
+        relay: 77,
+        ..command(Operation::Hold, 1)
+    };
+    let _ = run(Some(&mut journal), &mut archive, &relayed);
+    journal.stop(200).unwrap();
+    drop(journal);
+    let records = Journal::open(&dir, 300).unwrap().scanned;
+    let request = records
+        .iter()
+        .find(|record| record.kind == Kind::HoldRequest)
+        .unwrap();
+    assert_eq!((request.operator, request.relay), (1000, 77));
+    let outcome = records
+        .iter()
+        .find(|record| record.kind == Kind::HoldOutcome)
+        .unwrap();
+    assert_eq!(outcome.relay, 77);
 }

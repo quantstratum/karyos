@@ -191,8 +191,13 @@ pub struct Command<'a> {
     pub recording: u64,
     /// The operation id.
     pub id: u64,
-    /// The operator's uid.
+    /// The operator: the local peer's uid, or a relayed principal's
+    /// operator id.
     pub operator: u32,
+    /// The relay that carried the request, 0 for none (karyos#708): the
+    /// operator and the relay are journalled apart, as for every relayed
+    /// operation.
+    pub relay: u64,
     /// The reason, at most [`MAX_REASON`] bytes are kept.
     pub reason: &'a [u8],
 }
@@ -218,6 +223,7 @@ impl Command<'_> {
             self.reason(),
         );
         record.reason = self.reason().to_vec();
+        record.relay = self.relay;
         record
     }
 }
