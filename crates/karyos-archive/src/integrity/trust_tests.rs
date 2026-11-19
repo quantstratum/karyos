@@ -285,7 +285,7 @@ fn a_registration_cannot_be_backdated_and_is_chained_in_the_journal() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), KEYS_FILE).unwrap();
     journal
         .seal_segment(3, 0, b"before the key", false)
         .unwrap();
@@ -690,7 +690,7 @@ fn an_endorsed_revocation_may_record_a_cutoff_before_its_append() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), KEYS_FILE).unwrap();
     let signer = TestSigner::new(9);
     let mut registry = KeyRegistry::new(trust());
     registry
@@ -789,7 +789,7 @@ fn a_registry_entry_whose_journal_append_never_committed_is_not_replayed() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), KEYS_FILE).unwrap();
     let first = TestSigner::new(9);
     let mut registry = KeyRegistry::new(trust());
     registry
@@ -818,7 +818,7 @@ fn a_registry_entry_whose_journal_append_never_committed_is_not_replayed() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(restarted.clone(), Path::new(DIR), "keys")
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(restarted.clone(), Path::new(DIR), KEYS_FILE)
             .unwrap();
     assert_eq!(ledger.entries().len(), 2);
     let mut registry = KeyRegistry::open(trust(), &mut journal, &mut ledger).unwrap();
@@ -836,7 +836,7 @@ fn a_registry_entry_whose_journal_append_never_committed_is_not_replayed() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(again, Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(again, Path::new(DIR), KEYS_FILE).unwrap();
     let registry = KeyRegistry::open(trust(), &mut journal, &mut ledger).unwrap();
     assert!(registry.key(&orphan.key_id()).is_some());
     assert_eq!(registry.next_sequence(), 2);
@@ -849,7 +849,7 @@ fn a_chained_registry_entry_missing_from_the_ledger_is_refused() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), KEYS_FILE).unwrap();
     let signer = TestSigner::new(9);
     KeyRegistry::new(trust())
         .append(
@@ -858,8 +858,11 @@ fn a_chained_registry_entry_missing_from_the_ledger_is_refused() {
             &mut ledger,
         )
         .unwrap();
+    // The journal's own ledger, but lost: an empty one in its place.
+    let _ = disk;
     let mut empty =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "other").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(FaultDisk::default(), Path::new(DIR), KEYS_FILE)
+            .unwrap();
     assert!(matches!(
         KeyRegistry::open(trust(), &mut journal, &mut empty),
         Err(IntegrityError::Registry(RegistryError::Missing {
@@ -1007,7 +1010,7 @@ fn replay_refuses_a_registration_effective_before_its_chain_record() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), KEYS_FILE).unwrap();
     for start in 0..11u64 {
         journal.seal_segment(3, start * 4, b"seal", false).unwrap();
     }
@@ -1166,7 +1169,7 @@ fn a_poisoned_journal_never_rebuilds_the_registry_or_cuts_its_ledger() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(FaultDisk::default(), Path::new(DIR), "keys")
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(FaultDisk::default(), Path::new(DIR), KEYS_FILE)
             .unwrap();
     let signer = TestSigner::new(9);
     assert!(
@@ -1269,7 +1272,7 @@ fn a_stale_registry_handle_cannot_commit_a_second_entry_of_one_sequence() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), KEYS_FILE).unwrap();
     let first = TestSigner::new(9);
     let mut registry = KeyRegistry::new(trust());
     registry
@@ -1419,7 +1422,7 @@ fn a_divergent_registry_history_cannot_append_even_with_the_same_last_entry() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), KEYS_FILE).unwrap();
     let registration = |sequence, seed: u8| {
         entry(
             &authority(),
@@ -1466,9 +1469,9 @@ fn a_divergent_registry_history_cannot_append_even_with_the_same_last_entry() {
 fn a_stale_ledger_handle_never_overwrites_a_committed_entry() {
     let disk = FaultDisk::default();
     let mut first =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), KEYS_FILE).unwrap();
     let mut second =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), KEYS_FILE).unwrap();
     first.append([1; REGISTRY_ENTRY_LENGTH]).unwrap();
     assert!(matches!(
         second.append([2; REGISTRY_ENTRY_LENGTH]),
@@ -1478,7 +1481,8 @@ fn a_stale_ledger_handle_never_overwrites_a_committed_entry() {
         second.truncate(0),
         Err(IntegrityError::StaleLedger)
     ));
-    let reopened = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+    let reopened =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), KEYS_FILE).unwrap();
     assert_eq!(reopened.entries(), [[1; REGISTRY_ENTRY_LENGTH]]);
 }
 
@@ -1550,15 +1554,15 @@ fn one_handle_at_a_time_writes_a_journal_or_a_ledger() {
         IntegrityJournal::open(StdDisk, &dir),
         Err(IntegrityError::Locked)
     ));
-    let ledger = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys").unwrap();
+    let ledger = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, KEYS_FILE).unwrap();
     assert!(matches!(
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys"),
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, KEYS_FILE),
         Err(IntegrityError::Locked)
     ));
     // Released with the handle.
     drop((journal, ledger));
     IntegrityJournal::open(StdDisk, &dir).unwrap();
-    Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys").unwrap();
+    Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, KEYS_FILE).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1574,7 +1578,7 @@ fn a_stale_journal_view_never_cuts_a_committed_registry_entry() {
         .unwrap()
         .journal;
     let mut ledger =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), KEYS_FILE).unwrap();
     let signer = TestSigner::new(9);
     KeyRegistry::new(trust())
         .append(
@@ -1640,7 +1644,7 @@ fn a_second_first_opener_never_truncates_what_the_first_created() {
     let dir = std::env::temp_dir().join(format!("karyos-create-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let mut first = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys").unwrap();
+    let mut first = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, KEYS_FILE).unwrap();
     first.append([1; REGISTRY_ENTRY_LENGTH]).unwrap();
     // The losing creator of a race: exclusive creation refuses, it never
     // truncates.
@@ -1651,11 +1655,11 @@ fn a_second_first_opener_never_truncates_what_the_first_created() {
     );
     // Opening finds the file and its lock, before reading or cutting.
     assert!(matches!(
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys"),
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, KEYS_FILE),
         Err(IntegrityError::Locked)
     ));
     drop(first);
-    let reopened = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys").unwrap();
+    let reopened = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, KEYS_FILE).unwrap();
     assert_eq!(reopened.entries(), [[1; REGISTRY_ENTRY_LENGTH]]);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1668,7 +1672,7 @@ fn a_registry_is_recovered_and_appended_only_with_its_journals_own_ledger() {
         .journal;
     // A populated ledger of another archive directory.
     let mut foreign =
-        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new("/elsewhere"), "keys").unwrap();
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new("/elsewhere"), KEYS_FILE).unwrap();
     foreign.append([7; REGISTRY_ENTRY_LENGTH]).unwrap();
     assert!(matches!(
         KeyRegistry::open(trust(), &mut journal, &mut foreign),
@@ -1686,4 +1690,61 @@ fn a_registry_is_recovered_and_appended_only_with_its_journals_own_ledger() {
     ));
     assert_eq!(foreign.entries().len(), 1);
     assert_eq!(journal.next_counter(), 0);
+}
+
+#[test]
+fn a_registry_uses_only_its_journals_designated_ledger_file() {
+    let disk = FaultDisk::default();
+    let mut journal = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    // A path that leaves the directory is never a ledger of it.
+    assert!(matches!(
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(
+            disk.clone(),
+            Path::new(DIR),
+            "/elsewhere/keys.kyk"
+        ),
+        Err(IntegrityError::ForeignLedger)
+    ));
+    assert!(matches!(
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), "../keys.kyk"),
+        Err(IntegrityError::ForeignLedger)
+    ));
+    // Another file of the same directory is not the registry's ledger.
+    let mut other =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "other.kyk").unwrap();
+    other.append([7; REGISTRY_ENTRY_LENGTH]).unwrap();
+    assert!(matches!(
+        KeyRegistry::open(trust(), &mut journal, &mut other),
+        Err(IntegrityError::ForeignLedger)
+    ));
+    let signer = TestSigner::new(9);
+    assert!(matches!(
+        KeyRegistry::new(trust()).append(
+            &register(&signer.key, Custody::NoSeparation, 0),
+            &mut journal,
+            &mut other,
+        ),
+        Err(IntegrityError::ForeignLedger)
+    ));
+    assert_eq!(other.entries().len(), 1);
+    assert_eq!(journal.next_counter(), 0);
+}
+
+#[test]
+fn an_opener_that_wins_a_new_file_makes_its_name_durable() {
+    use crate::disk::Disk as _;
+    let disk = FaultDisk::default();
+    // A creator made the file but crashed or lost the lock before syncing
+    // the directory: the name is not durable yet.
+    let mut creator = disk.clone();
+    let _ = creator.create(&Path::new(DIR).join(KEYS_FILE)).unwrap();
+    let mut ledger =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), Path::new(DIR), KEYS_FILE).unwrap();
+    ledger.append([3; REGISTRY_ENTRY_LENGTH]).unwrap();
+    let restarted = disk.after_crash(Survives::Synced);
+    let reopened =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(restarted, Path::new(DIR), KEYS_FILE).unwrap();
+    assert_eq!(reopened.entries(), [[3; REGISTRY_ENTRY_LENGTH]]);
 }

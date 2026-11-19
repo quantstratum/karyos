@@ -41,6 +41,12 @@ use super::ledger::Ledger;
 use super::{DIGEST_LENGTH, Digest, digest};
 use crate::disk::Disk;
 
+/// The key registry's ledger file name in the archive directory.
+pub const KEYS_FILE: &str = "keys.kyk";
+
+/// The signed heads' ledger file name in the archive directory.
+pub const HEADS_FILE: &str = "heads.kyh";
+
 /// The length of an Ed25519 public key, in bytes.
 pub const PUBLIC_KEY_LENGTH: usize = 32;
 
@@ -590,8 +596,8 @@ impl KeyRegistry {
     /// [`IntegrityError::Registry`] with [`RegistryError::Missing`] when
     /// the journal chains an entry the ledger does not hold,
     /// [`IntegrityError::Poisoned`] for a journal handle an earlier append
-    /// poisoned, [`IntegrityError::ForeignLedger`] for a ledger of another
-    /// archive directory and [`IntegrityError::StaleJournal`] for a view
+    /// poisoned, [`IntegrityError::ForeignLedger`] for a ledger that is not
+    /// the [`KEYS_FILE`] of the journal's archive directory and [`IntegrityError::StaleJournal`] for a view
     /// behind the file, before anything is read or cut;
     /// [`RegistryError::Malformed`] when a chained entry cannot be read,
     /// [`RegistryError::Backdated`] for a registration effective before
@@ -611,7 +617,9 @@ impl KeyRegistry {
         }
         // Only the journal's own ledger: another journal's evidence would be
         // cut as orphans.
-        if ledger.dir() != journal.dir() {
+        // The journal's own registry ledger: its directory's `KEYS_FILE`,
+        // never another file there or one reached through another path.
+        if ledger.dir() != journal.dir() || ledger.name() != KEYS_FILE {
             return Err(IntegrityError::ForeignLedger);
         }
         // A view behind the file would cut a committed entry as an orphan.
@@ -779,7 +787,9 @@ impl KeyRegistry {
         if journal.is_poisoned() {
             return Err(IntegrityError::Poisoned);
         }
-        if ledger.dir() != journal.dir() {
+        // The journal's own registry ledger: its directory's `KEYS_FILE`,
+        // never another file there or one reached through another path.
+        if ledger.dir() != journal.dir() || ledger.name() != KEYS_FILE {
             return Err(IntegrityError::ForeignLedger);
         }
         // Compare and swap on the whole history: only a registry that

@@ -474,6 +474,11 @@ pub(super) fn open_locked<D: Disk>(
         match disk.open(path) {
             Ok(file) => {
                 lock(disk, &file)?;
+                // The opener may have won the lock from the file's creator
+                // before the creator made it durable: whoever holds the
+                // lock makes the file and its name durable before use.
+                disk.sync(&file)?;
+                disk.sync_dir(dir)?;
                 return Ok(file);
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => match disk.create_new(path) {

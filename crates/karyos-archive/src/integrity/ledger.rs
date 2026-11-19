@@ -23,6 +23,8 @@ pub struct Ledger<D: Disk, const N: usize> {
     file: D::File,
     /// The archive directory the ledger is in.
     dir: std::path::PathBuf,
+    /// Its file name in that directory.
+    name: String,
     entries: Vec<[u8; N]>,
     poisoned: bool,
 }
@@ -36,8 +38,18 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
     ///
     /// # Errors
     ///
-    /// [`IntegrityError::Io`] for the operating system's error.
+    /// [`IntegrityError::ForeignLedger`] for a `name` that is not a plain
+    /// file name; [`IntegrityError::Locked`] when another handle holds the
+    /// file; [`IntegrityError::Io`] for the operating system's error.
     pub fn open(mut disk: D, dir: &Path, name: &str) -> Result<Self, IntegrityError> {
+        // A plain file name of `dir`: never a path that reaches a file of
+        // another directory while the handle claims this one.
+        let plain = Path::new(name)
+            .file_name()
+            .is_some_and(|file| file == std::ffi::OsStr::new(name));
+        if !plain {
+            return Err(IntegrityError::ForeignLedger);
+        }
         let path = dir.join(name);
         let file = super::journal::open_locked(&mut disk, dir, &path)?;
         let length = disk.len(&file)?;
@@ -64,6 +76,7 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
             disk,
             file,
             dir: dir.to_path_buf(),
+            name: name.to_owned(),
             entries,
             poisoned: false,
         })
@@ -75,6 +88,13 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
     #[inline]
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The ledger's file name in [`Ledger::dir`].
+    #[must_use]
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// The entries, oldest first.
