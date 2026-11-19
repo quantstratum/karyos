@@ -2517,3 +2517,49 @@ fn a_reincarnated_timed_lane_keeps_its_settings_and_counters() {
     let kept = driver.timed_counters(lanes[1]).unwrap().unwrap();
     assert!(std::sync::Arc::ptr_eq(&cells, &kept), "one set of counters");
 }
+
+/// karyos#915 (design 3.5): a dynamic publication's registrants open
+/// their routes on the sender thread, where no admission runs, so the
+/// publication holds `max_destinations` destinations of its endpoint from
+/// its admission. On an endpoint of 256 TX slots the control reserve
+/// takes 32 and a reliable single-lane dynamic publication of 16
+/// destinations 16 * 9 = 144: a second is refused with the limit, and is
+/// taken once the first's removal has ended.
+#[test]
+fn a_dynamic_publication_holds_its_whole_destination_share_at_admission() {
+    use crate::error::EndpointLimit;
+    use crate::sessions::register::{AddressRange, RegistrationAllowlist};
+
+    let mut driver = small_endpoints();
+    let control = receiver().local_addr().unwrap();
+    let dynamic = UdpConfig {
+        interface: None,
+        ..channel(Destination::MultiDestination {
+            destinations: Vec::new(),
+            control: Some(control),
+            mode: karyos_protocol::channel::ControlMode::Dynamic,
+        })
+    };
+    let allowlist = || {
+        let range = AddressRange::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8).unwrap();
+        RegistrationAllowlist::new(&[range]).unwrap()
+    };
+    let first = driver
+        .add_dynamic_network_publication(aggregate(300, 1), &dynamic, allowlist(), None)
+        .unwrap();
+    assert_eq!(
+        driver.add_dynamic_network_publication(aggregate(301, 1), &dynamic, allowlist(), None),
+        Err(DriverError::EndpointCapacity {
+            limit: EndpointLimit::TxSlots,
+            capacity: 256,
+            needed: 32 + 2 * 16 * 9,
+        })
+    );
+    driver.remove_aggregate(&first).unwrap();
+    until(&mut driver, |driver| {
+        driver.network_publication_state(&first).is_none()
+    });
+    let _ = driver
+        .add_dynamic_network_publication(aggregate(301, 1), &dynamic, allowlist(), None)
+        .unwrap();
+}

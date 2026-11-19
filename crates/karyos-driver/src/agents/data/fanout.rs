@@ -921,6 +921,11 @@ impl<T: StreamTerms> Outbound<T> {
         Ok(())
     }
 
+    /// `max_destinations` (MD-6): the most targets it holds.
+    pub(crate) const fn max(&self) -> usize {
+        self.max
+    }
+
     /// Its registration policy, for a `control-mode=dynamic` publication.
     pub(crate) fn registration(&self) -> Option<&crate::sessions::register::RegistrationPolicy> {
         self.registration.as_deref()
