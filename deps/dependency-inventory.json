@@ -34,8 +34,8 @@
       "idna v1.1.0",
       "idna_adapter v1.2.2",
       "itoa v1.0.18",
-      "jiff v0.2.46",
-      "jiff-core v0.1.8",
+      "jiff v0.2.43",
+      "jiff-core v0.1.5",
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "litemap v0.8.3",
@@ -137,8 +137,8 @@
       "idna v1.1.0",
       "idna_adapter v1.2.2",
       "itoa v1.0.18",
-      "jiff v0.2.46",
-      "jiff-core v0.1.8",
+      "jiff v0.2.43",
+      "jiff-core v0.1.5",
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "linux-raw-sys v0.12.1",
@@ -243,8 +243,8 @@
       "idna v1.1.0",
       "idna_adapter v1.2.2",
       "itoa v1.0.18",
-      "jiff v0.2.46",
-      "jiff-core v0.1.8",
+      "jiff v0.2.43",
+      "jiff-core v0.1.5",
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "linux-raw-sys v0.12.1",
@@ -2337,7 +2337,7 @@
         "alloc",
         "std"
       ],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.46",
+      "id": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
       "license": "Unlicense OR MIT",
       "name": "jiff",
       "paths": {
@@ -2347,21 +2347,21 @@
       },
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.46"
+      "version": "0.2.43"
     },
     {
       "build_script": false,
       "edges": [
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -2373,7 +2373,7 @@
         "std",
         "tz-fat"
       ],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#jiff-core@0.1.8",
+      "id": "registry+https://github.com/rust-lang/crates.io-index#jiff-core@0.1.5",
       "license": "Unlicense OR MIT",
       "name": "jiff-core",
       "paths": {
@@ -2388,14 +2388,14 @@
       },
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.1.8"
+      "version": "0.1.5"
     },
     {
       "build_script": false,
       "edges": [
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
           "kind": "normal",
           "target": "cfg(any())",
           "uses_default_features": true
@@ -2404,7 +2404,7 @@
       "features": [
         "default"
       ],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.46",
+      "id": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
       "license": "Unlicense OR MIT",
       "name": "jiff-static",
       "paths": {
@@ -2416,7 +2416,7 @@
       },
       "proc_macro": true,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.46"
+      "version": "0.2.43"
     },
     {
       "build_script": false,
@@ -2867,14 +2867,14 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-core@0.1.8",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-core@0.1.5",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -3314,7 +3314,7 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
           "kind": "normal",
           "target": "cfg(not(target_has_atomic = \"ptr\"))",
           "uses_default_features": false
@@ -3342,7 +3342,7 @@
       "edges": [
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
           "kind": "normal",
           "target": "cfg(not(target_has_atomic = \"ptr\"))",
           "uses_default_features": false
@@ -3450,7 +3450,7 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -3640,7 +3640,7 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -4581,7 +4581,7 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -5098,7 +5098,7 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.46",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
