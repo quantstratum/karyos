@@ -38,50 +38,79 @@ pub struct SimSender<T>(Arc<Mutex<MpscShared<T>>>);
 /// What a sender's clones share.
 struct MpscShared<T> {
     sender: mpsc::Sender<T>,
-    blocked: Arc<Blocked>,
+    blocked: Arc<Waiters>,
 }
 
-/// The wakers of the sends blocked on a full channel.
+/// The wakers of the futures waiting on a channel (blocked sends, a
+/// watch's waiting receivers). Each registration belongs to the future
+/// that made it, under an id of its own, not to its task: two futures of
+/// one task keep two registrations, and a future gives its own back when
+/// it completes or is dropped (karyos#959 review). It holds at most one
+/// waker per live waiting future.
 #[derive(Default)]
-struct Blocked(Mutex<Vec<Waker>>);
+struct Waiters(Mutex<(u64, Vec<(u64, Waker)>)>);
 
-impl Blocked {
-    /// Registers a send's task, once: the executor reuses each task's
-    /// waker across polls, so `will_wake` recognises it, and the registry
-    /// holds at most one waker per task blocked on the channel.
-    fn register(&self, waker: &Waker) {
-        let mut wakers = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if !wakers.iter().any(|known| known.will_wake(waker)) {
-            wakers.push(waker.clone());
+impl Waiters {
+    /// Registers `waker` for the future whose registration is `slot`: a
+    /// new one, or its existing one updated.
+    fn register(&self, slot: &mut Option<u64>, waker: &Waker) {
+        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let (next, waiting) = &mut *guard;
+        if let Some(id) = *slot
+            && let Some((_, known)) = waiting.iter_mut().find(|(at, _)| *at == id)
+        {
+            if !known.will_wake(waker) {
+                known.clone_from(waker);
+            }
+            return;
+        }
+        // A new future, or one whose registration a wake took.
+        let id = slot.unwrap_or_else(|| {
+            let id = *next;
+            *next = next.wrapping_add(1);
+            id
+        });
+        *slot = Some(id);
+        waiting.push((id, waker.clone()));
+    }
+
+    /// Gives back the registration of the future whose slot it is.
+    fn unregister(&self, slot: &mut Option<u64>) {
+        if let Some(id) = slot.take() {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .1
+                .retain(|(at, _)| *at != id);
         }
     }
 
-    /// Drops a send's registration once it no longer waits: a send that
-    /// completes leaves nothing behind (karyos#959 review).
-    fn unregister(&self, waker: &Waker) {
+    /// Wakes every registered future, and drops their registrations.
+    fn wake_all(&self) {
+        let waiting = std::mem::take(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner).1);
+        for (_, waker) in waiting {
+            waker.wake();
+        }
+    }
+
+    /// The registrations (tests).
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retain(|known| !known.will_wake(waker));
-    }
-
-    /// The registered wakers (tests).
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).len()
+            .1
+            .len()
     }
 }
 
-impl std::task::Wake for Blocked {
+impl std::task::Wake for Waiters {
     fn wake(self: Arc<Self>) {
-        self.wake_by_ref();
+        self.wake_all();
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
-        let wakers = std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner));
-        for waker in wakers {
-            waker.wake();
-        }
+        self.wake_all();
     }
 }
 
@@ -133,18 +162,18 @@ impl Mpsc for SimMpsc {
 struct SendFuture<T> {
     shared: Arc<Mutex<MpscShared<T>>>,
     msg: Option<T>,
-    /// The waker registered while blocked.
-    registered: Option<Waker>,
+    /// Its registration while blocked.
+    slot: Option<u64>,
 }
 
 impl<T> SendFuture<T> {
     fn release(&mut self) {
-        if let Some(waker) = self.registered.take() {
+        if self.slot.is_some() {
             self.shared
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .blocked
-                .unregister(&waker);
+                .unregister(&mut self.slot);
         }
     }
 }
@@ -162,20 +191,12 @@ impl<T> Future for SendFuture<T> {
         };
         let mut shared = this.shared.lock().unwrap_or_else(PoisonError::into_inner);
         let MpscShared { sender, blocked } = &mut *shared;
-        // Registered before polling, so a wake between the two is kept; a
-        // new waker replaces the one this send held.
-        if let Some(old) = this.registered.take()
-            && !old.will_wake(cx.waker())
-        {
-            blocked.unregister(&old);
-        }
-        blocked.register(cx.waker());
-        this.registered = Some(cx.waker().clone());
+        // Registered before polling, so a wake between the two is kept.
+        blocked.register(&mut this.slot, cx.waker());
         let all = Waker::from(Arc::clone(blocked));
         let ready = sender.poll_ready(&mut Context::from_waker(&all));
         if ready.is_ready() {
-            blocked.unregister(cx.waker());
-            this.registered = None;
+            blocked.unregister(&mut this.slot);
         }
         match ready {
             Poll::Pending => {
@@ -203,7 +224,7 @@ impl<T: OptionalSend> MpscSender<SimMpsc, T> for SimSender<T> {
         SendFuture {
             shared: Arc::clone(&self.0),
             msg: Some(msg),
-            registered: None,
+            slot: None,
         }
     }
 
@@ -288,7 +309,7 @@ struct Shared<T> {
     version: AtomicU64,
     senders: AtomicUsize,
     receivers: AtomicUsize,
-    waiting: Mutex<Vec<Waker>>,
+    waiting: Waiters,
 }
 
 impl<T> Shared<T> {
@@ -297,11 +318,7 @@ impl<T> Shared<T> {
     }
 
     fn wake_all(&self) {
-        let waiting =
-            std::mem::take(&mut *self.waiting.lock().unwrap_or_else(PoisonError::into_inner));
-        for waker in waiting {
-            waker.wake();
-        }
+        self.waiting.wake_all();
     }
 
     fn bump(&self) {
@@ -362,7 +379,7 @@ impl Watch for SimWatch {
             version: AtomicU64::new(0),
             senders: AtomicUsize::new(1),
             receivers: AtomicUsize::new(1),
-            waiting: Mutex::new(Vec::new()),
+            waiting: Waiters::default(),
         });
         (
             SimWatchSender(Arc::clone(&shared)),
@@ -406,34 +423,58 @@ impl<T: OptionalSend + OptionalSync> WatchSender<SimWatch, T> for SimWatchSender
     }
 }
 
+/// A receiver waiting for a change. Like a send, it holds its own
+/// registration only while it waits, and gives it back when it completes
+/// or is dropped (karyos#959 review).
+struct Changed<'a, T> {
+    receiver: &'a mut SimWatchReceiver<T>,
+    slot: Option<u64>,
+}
+
+impl<T> Unpin for Changed<'_, T> {}
+
+impl<T> Future for Changed<'_, T> {
+    type Output = Result<(), RecvError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = &mut *self;
+        let shared = Arc::clone(&this.receiver.shared);
+        let changed = |receiver: &mut SimWatchReceiver<T>| {
+            let version = shared.version.load(Ordering::SeqCst);
+            (version != receiver.seen).then(|| receiver.seen = version)
+        };
+        if changed(this.receiver).is_some() {
+            shared.waiting.unregister(&mut this.slot);
+            return Poll::Ready(Ok(()));
+        }
+        if shared.senders.load(Ordering::SeqCst) == 0 {
+            shared.waiting.unregister(&mut this.slot);
+            return Poll::Ready(Err(RecvError(())));
+        }
+        shared.waiting.register(&mut this.slot, cx.waker());
+        // A send between the check and the registration is seen now.
+        if changed(this.receiver).is_some() {
+            shared.waiting.unregister(&mut this.slot);
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    }
+}
+
+impl<T> Drop for Changed<'_, T> {
+    fn drop(&mut self) {
+        if self.slot.is_some() {
+            self.receiver.shared.waiting.unregister(&mut self.slot);
+        }
+    }
+}
+
 impl<T: OptionalSend + OptionalSync> WatchReceiver<SimWatch, T> for SimWatchReceiver<T> {
     async fn changed(&mut self) -> Result<(), RecvError> {
-        poll_fn(|cx: &mut Context<'_>| {
-            let version = self.shared.version.load(Ordering::SeqCst);
-            if version != self.seen {
-                self.seen = version;
-                return Poll::Ready(Ok(()));
-            }
-            if self.shared.senders.load(Ordering::SeqCst) == 0 {
-                return Poll::Ready(Err(RecvError(())));
-            }
-            let mut waiting = self
-                .shared
-                .waiting
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if !waiting.iter().any(|waker| waker.will_wake(cx.waker())) {
-                waiting.push(cx.waker().clone());
-            }
-            drop(waiting);
-            // A send between the check and the registration is seen now.
-            let version = self.shared.version.load(Ordering::SeqCst);
-            if version != self.seen {
-                self.seen = version;
-                return Poll::Ready(Ok(()));
-            }
-            Poll::Pending
-        })
+        Changed {
+            receiver: self,
+            slot: None,
+        }
         .await
     }
 
@@ -522,5 +563,58 @@ mod tests {
             drop(send);
             assert_eq!(registered(&sender), 0);
         }
+    }
+
+    /// The karyos#959 review: two sends of one task each keep their own
+    /// registration, so dropping one leaves the other's in place and it is
+    /// woken when the channel drains.
+    #[test]
+    fn two_sends_of_one_task_keep_their_own_registrations() {
+        let (sender, mut receiver) = SimMpsc::channel::<u64>(0);
+        let flag = Arc::new(Flag::default());
+        let waker = Waker::from(Arc::clone(&flag));
+        let mut context = Context::from_waker(&waker);
+        let mut first = sender.send(0);
+        assert!(Pin::new(&mut first).poll(&mut context).is_ready());
+        let mut kept = sender.send(1);
+        let mut dropped = sender.send(2);
+        assert!(Pin::new(&mut kept).poll(&mut context).is_pending());
+        assert!(Pin::new(&mut dropped).poll(&mut context).is_pending());
+        assert_eq!(registered(&sender), 2);
+        drop(dropped);
+        assert_eq!(registered(&sender), 1);
+        assert_eq!(receiver.try_recv().ok(), Some(0));
+        assert!(
+            flag.0.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "the kept send was woken"
+        );
+        assert!(Pin::new(&mut kept).poll(&mut context).is_ready());
+        assert_eq!(registered(&sender), 0);
+    }
+
+    /// The karyos#959 review: a watch receiver whose wait is cancelled
+    /// gives its registration back.
+    #[test]
+    fn a_cancelled_watch_wait_leaves_no_registration() {
+        use openraft_rt::watch::{Watch, WatchReceiver, WatchSender};
+
+        let (sender, mut receiver) = SimWatch::channel(0u64);
+        for _ in 0..10 {
+            let waker = Waker::from(Arc::new(Flag::default()));
+            let mut context = Context::from_waker(&waker);
+            let mut wait = Box::pin(receiver.changed());
+            assert!(wait.as_mut().poll(&mut context).is_pending());
+            drop(wait);
+        }
+        assert_eq!(sender.0.waiting.len(), 0);
+        sender.send(1).unwrap();
+        let waker = Waker::from(Arc::new(Flag::default()));
+        let mut context = Context::from_waker(&waker);
+        assert!(
+            Box::pin(receiver.changed())
+                .as_mut()
+                .poll(&mut context)
+                .is_ready()
+        );
     }
 }
