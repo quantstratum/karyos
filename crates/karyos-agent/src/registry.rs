@@ -66,9 +66,10 @@ const VERSION_BYTES: usize = std::mem::size_of::<Version>();
 const KEY_BYTES: usize = 2 * MAX_KEY_BYTES + 3 * std::mem::size_of::<(Key, Entry)>();
 /// The most memory the registry's entries hold:
 /// `MAX_KEYS x (KEY_BYTES + MAX_VERSIONS x (VERSION_BYTES + MAX_ATTRIBUTE_TEXT))`,
-/// in layout bytes; 7 208 960 bytes (6.9 MiB) on 64-bit targets. The
-/// counting allocator measures a registry filled to every bound at
-/// 7 057 552 held and 7 059 375 at its peak (`tests/registry_memory.rs`).
+/// in layout bytes; 7 241 728 bytes (6.9 MiB) on 64-bit targets, with
+/// each version's relay id (karyos#708). The counting allocator checks
+/// that a registry filled to every bound holds no more, held and at its
+/// peak (`tests/registry_memory.rs`).
 pub const MAX_MEMORY_BYTES: usize =
     MAX_KEYS * (KEY_BYTES + MAX_VERSIONS * (VERSION_BYTES + MAX_ATTRIBUTE_TEXT));
 

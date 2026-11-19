@@ -294,7 +294,7 @@ fn a_client_negotiates_the_limits() {
         r#""join.value_bytes":{"value":64,"negotiable":false},"#,
         r#""join.key_bytes":{"value":64,"negotiable":false},"#,
         r#""join.list_page":{"value":64,"negotiable":false},"#,
-        r#""join.memory_bytes":{"value":7208960,"negotiable":false}}}"#,
+        r#""join.memory_bytes":{"value":7241728,"negotiable":false}}}"#,
         "\n"
     );
     let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 limits\n");
