@@ -1650,7 +1650,7 @@ fn a_second_first_opener_never_truncates_what_the_first_created() {
     // truncates.
     let mut disk = StdDisk;
     assert_eq!(
-        disk.create_new(&dir.join("keys")).unwrap_err().kind(),
+        disk.create_new(&dir.join(KEYS_FILE)).unwrap_err().kind(),
         std::io::ErrorKind::AlreadyExists
     );
     // Opening finds the file and its lock, before reading or cutting.
