@@ -481,8 +481,8 @@ pub struct TraceReport {
     messages: HashMap<MessageKey, Message>,
     calibrations: Vec<Calibration>,
     /// Publications whose messages at or below a position (every message
-    /// for `None`) are out of scope.
-    excluded: Vec<(PublicationKey, Option<u64>)>,
+    /// for `None`) are out of scope, in one lane or in every lane (`None`).
+    excluded: Vec<(PublicationKey, Option<u8>, Option<u64>)>,
     /// Single messages declared out of scope.
     excluded_messages: HashSet<MessageKey>,
     /// A trace can be `Complete` only with a root `Publish` observed (T6).
@@ -762,14 +762,24 @@ impl TraceReport {
         }
     }
 
-    /// Declares the messages of `publication` at positions at or below
-    /// `through`, or every message of it for `None`, out of the report's
-    /// scope: a journal that could be expected for them may be invisible
-    /// (a tool's recycle log, `quantstratum-docs:
-    /// karyos/design/trace-tool.md`, T5). It never narrows: declarations
-    /// accumulate.
-    pub fn out_of_scope(&mut self, publication: PublicationKey, through: Option<u64>) {
-        self.excluded.push((publication, through));
+    /// Declares the messages of `publication` in `lane` (in every lane for
+    /// `None`) at positions at or below `through`, or every such message
+    /// for `None`, out of the report's scope: a journal that could be
+    /// expected for them may be invisible (a tool's recycle log,
+    /// `quantstratum-docs: karyos/design/trace-tool.md`, T5). A recycled
+    /// journal names its lane, so its boundary scopes only that lane's
+    /// messages (karyos#185). It never narrows: declarations accumulate.
+    pub fn out_of_scope(
+        &mut self,
+        publication: PublicationKey,
+        lane: Option<karyos_protocol::frame::Lane>,
+        through: Option<u64>,
+    ) {
+        self.excluded.push((
+            publication,
+            lane.map(karyos_protocol::frame::Lane::get),
+            through,
+        ));
     }
 
     /// Declares the message of `publication` at `position` in `lane` out of
@@ -1035,8 +1045,10 @@ impl TraceReport {
         position: u64,
         message: &Message,
     ) -> bool {
-        if self.excluded.iter().any(|(excluded, through)| {
-            excluded == publication && through.is_none_or(|through| position <= through)
+        if self.excluded.iter().any(|(excluded, scoped, through)| {
+            excluded == publication
+                && scoped.is_none_or(|scoped| scoped == lane)
+                && through.is_none_or(|through| position <= through)
         }) {
             return true;
         }
