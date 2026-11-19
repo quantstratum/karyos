@@ -805,7 +805,7 @@ impl Server {
                 },
             ) => {
                 if role.may_register() {
-                    match agent.join_put(Path::new(dir), kind, key, attributes, *requester) {
+                    match agent.join_put(Path::new(dir), kind, key, attributes, requester) {
                         Ok(version) => (
                             json::join_written(
                                 false,
