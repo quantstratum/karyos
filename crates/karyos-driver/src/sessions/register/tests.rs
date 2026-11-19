@@ -705,7 +705,9 @@ fn the_sender_cannot_be_used_to_reflect_traffic() {
     // Many spoofed victims: the driver's total bounds the sum.
     let mut c = config(&[range([10, 0, 0, 0], 8)]);
     c.config.sources = 4096;
-    c.config.pending = 4096;
+    // The most the default total rate reaches within one `join_timeout`
+    // (256 per second for 5 s; karyos#977).
+    c.config.pending = 1280;
     let mut r = registrations(c);
     let mut replies = 0;
     for n in 0..4096u64 {
@@ -1157,8 +1159,10 @@ fn sixty_four_addresses_filling_the_rate_table_leave_a_new_address_its_register(
 fn an_untracked_address_is_bound_by_the_driver_total() {
     let mut c = config(&[range([10, 0, 0, 0], 8)]);
     c.config.sources = 1;
-    c.config.pending = 4096;
-    c.config.pending_per_source = 4096;
+    // The most the default total rate reaches within one `join_timeout`
+    // (karyos#977).
+    c.config.pending = 1280;
+    c.config.pending_per_source = 1280;
     let rate = c.config.rate;
     let mut r = registrations(c);
     assert!(matches!(
