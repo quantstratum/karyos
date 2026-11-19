@@ -150,7 +150,7 @@ fn recorded(
 
 /// Every step until a stop, as `(group_seq, reference_unavailable)`, and
 /// the stop.
-fn steps(cursor: &mut ReplayCursor<FaultDisk>) -> (Vec<(u64, bool)>, Stop) {
+fn steps<D: crate::disk::Disk>(cursor: &mut ReplayCursor<D>) -> (Vec<(u64, bool)>, Stop) {
     let mut events = Vec::new();
     loop {
         match cursor.step().unwrap() {
@@ -867,4 +867,42 @@ fn following_a_shorter_prefix_is_refused() {
             found: 1
         })
     ));
+}
+
+/// karyos#881 review P1: a poll of a journal a live writer still owns
+/// recovers it through a read-only disk, which never modifies it. The
+/// follower advances while the writer keeps appending, and the writer's
+/// journal is unchanged by the polls.
+#[test]
+fn a_live_journal_is_polled_read_only() {
+    use crate::disk::ReadOnly;
+
+    let header = header(Capture::Strict);
+    let disk = FaultDisk::default();
+    let mut writer = GroupJournal::create(disk.clone(), Path::new("/g"), &header, CONFIG).unwrap();
+    write_events(&mut writer, 1..=2);
+    let poll = || {
+        let mut journal = GroupJournal::recover(
+            ReadOnly(disk.clone()),
+            Path::new("/g"),
+            header.group_id,
+            CONFIG,
+        )
+        .unwrap()
+        .journal;
+        let recovery = recover(&mut journal, &Seven, 8).unwrap();
+        (journal, recovery)
+    };
+    let (journal, recovery) = poll();
+    let mut follower = ReplayCursor::open(journal, &recovery, &expected(), ROOM).unwrap();
+    let (seen, _) = steps(&mut follower);
+    assert_eq!(seen, vec![(1, false), (2, false)]);
+    // The writer, never closed, goes on appending after the poll.
+    write_events(&mut writer, 3..=4);
+    let (journal, recovery) = poll();
+    follower.follow(journal, &recovery, &expected()).unwrap();
+    let (more, _) = steps(&mut follower);
+    assert_eq!(more, vec![(3, false), (4, false)]);
+    write_events(&mut writer, 5..=5);
+    writer.close().unwrap();
 }

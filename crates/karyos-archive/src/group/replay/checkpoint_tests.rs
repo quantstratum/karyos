@@ -93,6 +93,7 @@ fn gap(from_seq: u64, to_seq: u64) -> Vec<u8> {
 }
 
 /// One step of a journal being written.
+#[derive(Clone)]
 enum Write<'a> {
     Records(Vec<u8>),
     Checkpoint(u64, &'a [u8]),
@@ -1106,4 +1107,53 @@ fn recovery_opens_a_range_as_the_run_does() {
         [2],
         "A's range, between the two stops"
     );
+}
+
+/// karyos#881 review P2: a cursor opened at a checkpoint keeps its range
+/// when it follows a later state of the journal in which a gap closed that
+/// range and another opened: it stops at the gap, as replay from the same
+/// checkpoint of the later journal does, never past it.
+#[test]
+fn following_from_a_checkpoint_keeps_its_range_across_a_gap() {
+    let early = [
+        Write::Records(event(1, EndOutcome::Complete)),
+        Write::Checkpoint(1, b"state at 1"),
+        Write::Records(event(2, EndOutcome::Complete)),
+    ];
+    let before = Recorded::new(Capture::BestEffort, &early);
+    let mut later_writes = early.to_vec();
+    later_writes.extend([
+        Write::Records(gap(3, 3)),
+        Write::Checkpoint(3, b"state at 3"),
+        Write::Records(event(4, EndOutcome::Complete)),
+    ]);
+    let after = Recorded::new(Capture::BestEffort, &later_writes);
+
+    let mut store = before.store();
+    let (recovery, ranges) =
+        crate::group::prefix::recover_ranges(&mut before.journal(), &Held(&store), 8).unwrap();
+    let mut snapshot = vec![0u8; 4096];
+    let (mut cursor, _) = ReplayCursor::open_at_checkpoint(
+        before.journal(),
+        &recovery,
+        &ranges,
+        &mut store,
+        1,
+        &replay_config(),
+        ROOM,
+        &mut snapshot,
+    )
+    .unwrap();
+    // Before its first stop, the cursor follows the later journal.
+    let later_store = after.store();
+    let later = after.recovery(&later_store);
+    cursor
+        .follow(after.journal(), &later, &replay_config())
+        .unwrap();
+    let (_, expected) = after.replay_from_checkpoint(1).unwrap();
+    assert_eq!(steps(cursor), expected);
+    assert!(matches!(
+        expected.last(),
+        Some(Seen::Stop(Stop::Gap(GapMarker { from_seq: 3, .. })))
+    ));
 }

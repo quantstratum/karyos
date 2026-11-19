@@ -969,6 +969,21 @@ impl<D: Disk> ReplayCursor<D> {
     ///   recovering the journal again (a poll) and comparing
     ///   `complete_recording_seq`; it then calls `follow`, and the cursor
     ///   gives the events after the last one it gave.
+    /// - **Polling a live journal.** A poll never recovers the writer's own
+    ///   journal for writing: [`GroupJournal::recover`] repairs a torn tail,
+    ///   which would modify a recording a live writer owns. It recovers
+    ///   through [`crate::disk::ReadOnly`] (or from an isolated, consistent
+    ///   snapshot of the journal), which never writes: when the writer is
+    ///   between writes and the tail would need a repair, that recovery
+    ///   fails (a permission error) instead, and the consumer polls again
+    ///   later.
+    /// - **Late checkpoints (not handled yet).** A writer may publish a
+    ///   checkpoint for an event this cursor already gave, without the
+    ///   complete prefix advancing. A poll that compares only
+    ///   `complete_recording_seq` does not see it, and a `follow` that does
+    ///   gives it after the later events already given, where a closed
+    ///   replay gives it right after its event. Live replay's handling of
+    ///   such checkpoints is karyos#1003.
     /// - **What it gives.** The same events, checkpoints and stops, by the
     ///   same comparison rules, as a cursor opened on `journal` would give
     ///   after the last event this one gave: a consumer cannot tell a
@@ -980,7 +995,10 @@ impl<D: Disk> ReplayCursor<D> {
     ///   replay: following past them is [`ReplayError::FinalStop`]. An
     ///   error ends the follow, and the cursor is left as it was.
     /// - **Cost.** It allocates as [`ReplayCursor::open`] does, for the
-    ///   new journal's lists and the buffer, and reads the journal once.
+    ///   new journal's lists and the buffer. It reads the journal's header
+    ///   and then walks its available records twice, once to count them
+    ///   and once to fill the checkpoint and unavailable-reference lists,
+    ///   also on a poll where nothing changed.
     ///
     /// # Errors
     ///
@@ -1004,19 +1022,24 @@ impl<D: Disk> ReplayCursor<D> {
                 stop: Stop::Incomplete { group_seq },
             });
         }
-        // The range this cursor replays: from the start, the first range
+        // The range this cursor replays, resolved in the new recovery as
+        // `open_at_checkpoint` resolves it: from the start, the first range
         // (or the current one, while it is the only one); from a
-        // checkpoint, the current range it lies in.
-        let current = (
-            recovery.tracker.complete_recording_seq(),
-            recovery.tracker.complete_end(),
-        );
-        let range = match self.opened_at {
-            None => recovery
-                .tracker
-                .first_range()
-                .map_or(current, |first| (first.complete, first.complete_end)),
-            Some(_) => current,
+        // checkpoint, the range that holds it. A range a gap closed keeps
+        // its end; only the current, open range grows.
+        let tracker = &recovery.tracker;
+        let current = (tracker.complete_recording_seq(), tracker.complete_end());
+        let range = match (self.opened_at, tracker.first_range(), tracker.range().start) {
+            (None, first, _) => first.map_or(current, |first| (first.complete, first.complete_end)),
+            (Some(seq), Some(first), Some(_)) if seq <= first.complete => {
+                (first.complete, first.complete_end)
+            }
+            (Some(seq), Some(_), Some(start)) if seq < start.group_seq => {
+                // A middle range, closed by a gap before this follow: its
+                // end is the one the cursor holds.
+                (self.complete_seq, self.complete_end)
+            }
+            (Some(_), _, _) => current,
         };
         if range.0 < self.complete_seq {
             return Err(ReplayError::PrefixBehind {
