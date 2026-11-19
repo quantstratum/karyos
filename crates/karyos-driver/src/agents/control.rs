@@ -624,6 +624,71 @@ impl ControlRoutes {
 
     /// Closes `old`'s queue, then its route. A handle already gone counts
     /// as closed.
+    /// Drops what `queue` holds unsent while keeping its destination's
+    /// route: the queue is closed and a new, empty one opened on the same
+    /// route (karyos#977 review). A queue that cannot be closed now, or a
+    /// new one refused, falls back to evicting the destination.
+    fn discard<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, queue: TxQueueId) {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.queue == queue && !entry.closing)
+        else {
+            return;
+        };
+        let Some(route) = self.entries.get(index).map(|entry| entry.route) else {
+            return;
+        };
+        let mut closed = false;
+        #[cfg(test)]
+        let held = self.hold_closes;
+        #[cfg(not(test))]
+        let held = false;
+        if !held {
+            loop {
+                match tx.close_queue(queue, &mut self.report) {
+                    Ok(outcome) => {
+                        let returned = outcome.returned;
+                        while self.report.pop_front().is_some() {}
+                        if !outcome.more {
+                            closed = true;
+                            break;
+                        }
+                        if returned == 0 {
+                            break;
+                        }
+                    }
+                    Err(karyos_io::backend::QueueError::UnknownQueue) => {
+                        closed = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        if !closed {
+            self.evict(tx, queue);
+            return;
+        }
+        match tx.open_queue(TxQueueConfig {
+            authority: Authority::FIRST,
+            route,
+            max_pending: NonZeroU16::new(CONTROL_QUEUE_DEPTH).unwrap_or(NonZeroU16::MIN),
+        }) {
+            Ok(fresh) => {
+                if let Some(entry) = self.entries.get_mut(index) {
+                    entry.queue = fresh;
+                }
+            }
+            Err(_) => {
+                // No queue for the route: the destination goes, as an
+                // eviction would take it.
+                let _ = tx.remove_route(route);
+                self.entries.swap_remove(index);
+            }
+        }
+    }
+
     fn close<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, old: Destination) -> Closed {
         use karyos_io::backend::{QueueError, RouteError};
 
@@ -884,6 +949,13 @@ impl ControlRoutes {
             .encode(&mut bytes)
             .map_err(|_| ControlSendError::Encode)?;
         let encoded = bytes.get(..length).ok_or(ControlSendError::Encode)?;
+        // A reply that reuses a destination's own route (karyos#977
+        // review): failing, it must not take that route with it.
+        let protected = transient
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.address == address && !entry.closing && !entry.transient);
         let queue = self.queue(tx, address, transient)?;
         let claimed = tx
             .claim_tx(queue, encoded.len())
@@ -902,7 +974,10 @@ impl ControlRoutes {
                     .ok()
             });
         if claimed.is_none() {
-            self.evict(tx, queue);
+            // Nothing was queued: a protected route stays as it was.
+            if !protected {
+                self.evict(tx, queue);
+            }
             return Err(ControlSendError::Claim);
         }
         let _ = tx.flush(
@@ -923,8 +998,13 @@ impl ControlRoutes {
             return Ok(());
         }
         // Not taken now: a control is not worth a retry; dropping the
-        // queue drops it, so no stale control waits.
-        self.evict(tx, queue);
+        // queue drops it, so no stale control waits. A protected route
+        // keeps its route: only its queue is replaced, empty.
+        if protected {
+            self.discard(tx, queue);
+        } else {
+            self.evict(tx, queue);
+        }
         Err(if unknown {
             ControlSendError::Uncertain
         } else {

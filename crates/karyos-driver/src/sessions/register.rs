@@ -466,9 +466,12 @@ impl RegistrationConfig {
         if self.join_timeout == 0 || self.join_timeout > MAX_REGISTRATION_INTERVAL {
             return bad("join_timeout");
         }
-        // The table never holds more than the total rate admits within
-        // one `join_timeout` (design 11.2, karyos#942): a larger one is
-        // memory and scan time that can never be used.
+        // The design's sizing limit (design 11.2, karyos#942): `pending`
+        // at most `rate * join_timeout`, the entries the steady rate
+        // admits within one `join_timeout`. It is a sizing rule, not a
+        // bound the limiter enforces: the rate bucket starts with burst
+        // credit, so a burst can admit entries at once even when
+        // `rate * join_timeout` is below one.
         let reachable = u128::from(self.rate)
             .checked_mul(u128::from(self.join_timeout))
             .map(|admitted| admitted / 1_000_000_000);

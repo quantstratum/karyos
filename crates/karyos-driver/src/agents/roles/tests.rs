@@ -719,6 +719,56 @@ fn registration_replies_never_evict_a_destinations_route() {
     );
 }
 
+/// karyos#977 review P2: a reply that reuses a destination's own route
+/// and is not taken (the socket would block) is dropped without taking
+/// the route: the destination keeps its cached entry, and its next control
+/// goes out on it.
+#[test]
+fn an_unsent_reply_keeps_the_destinations_route() {
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::control::{ControlRoutes, ControlSendError};
+
+    let socket = ScriptedSocket::new();
+    // The destination's control, then the reply that would block, then
+    // the destination's next control.
+    socket.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    socket.push_send(SendResult::Error(Errno::AGAIN));
+    socket.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (mut tx, _rx) = endpoint.split().unwrap();
+    let mut routes = ControlRoutes::new(4);
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_001));
+    routes
+        .send(&mut tx, destination, &challenge_control())
+        .unwrap();
+    let before = routes.entries();
+    let reply = routes.send_reply(&mut tx, destination, &challenge_control());
+    assert!(
+        matches!(
+            reply,
+            Err(ControlSendError::Unsent | ControlSendError::Uncertain)
+        ),
+        "{reply:?}"
+    );
+    assert_eq!(routes.cached(), [destination]);
+    assert_eq!(routes.entries(), before, "no entry evicted or added");
+    assert_eq!(routes.lingering(), 0);
+    routes
+        .send(&mut tx, destination, &challenge_control())
+        .unwrap();
+    assert_eq!(routes.cached(), [destination]);
+}
+
 /// P1-2: after A is reset, the sender's controls on A go out on the new
 /// epoch's routes; none fails on a stale cached id.
 #[test]
