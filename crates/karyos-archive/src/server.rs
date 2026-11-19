@@ -443,6 +443,11 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 },
             ),
             Event::Failed { id, position, .. } => (id, position, Signal::Failed),
+            // No control signal carries it: the control codec has none, and
+            // a new one is a wire change. It is counted by
+            // `ArchiveHandle::shortened_indexes` and reported by the
+            // verifier as `inconsistent` (karyos#671).
+            Event::IndexShortened(_) => return,
         };
         if self.pending.len() >= self.config.max_pending_signals {
             count(&mut self.dropped_signals);
