@@ -228,7 +228,9 @@ mod mapped {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+// Miri cannot execute memfd_create, which creating a shared region needs
+// (karyos#924); the heap-backed tests keep the Miri coverage.
+#[cfg(all(test, target_os = "linux", not(miri)))]
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
 #[allow(clippy::unwrap_used, clippy::panic)]
