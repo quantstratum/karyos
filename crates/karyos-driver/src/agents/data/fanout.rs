@@ -480,6 +480,11 @@ impl LaneGate for TargetGate<'_> {
 }
 
 impl Fanout {
+    /// `max_destinations` (MD-6): the most targets it holds.
+    pub(super) const fn max(&self) -> usize {
+        self.max
+    }
+
     /// Names through `post` each live destination due a PATH_HB: it
     /// submitted nothing for `interval` ns at `now` (RP-3, karyos#859);
     /// its wait starts at the first look. `post` says whether it took it.

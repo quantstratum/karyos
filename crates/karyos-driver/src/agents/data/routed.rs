@@ -714,15 +714,23 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// per route, its lane queues of `STAGED_PER_LANE` slots each and, if
     /// reliable, a repair queue of one slot (the sender enables repairs on
     /// a reliable publication when it takes it, R4). A publication on one path has
-    /// one route, a routed one one per path, a multi-destination one one
-    /// per destination it has now.
+    /// one route, a routed one one per path, a manual multi-destination
+    /// one one per destination it has now, and a dynamic one
+    /// (`control-mode=dynamic`) one per destination it may ever hold,
+    /// `max_destinations`: its registrants take their routes on the sender
+    /// thread, where no admission runs, so its whole share is held from
+    /// its admission (design 3.5, karyos#915).
     #[must_use]
     pub fn tx_demand(&self) -> Vec<(EndpointId, TxDemand)> {
         let route = self.route_demand(self.reliable);
         if let Some(fanout) = self.fanout.as_deref() {
-            let total = fanout
-                .addresses()
-                .fold(TxDemand::default(), |sum, _| sum.plus(route));
+            let total = if self.registration.is_some() {
+                (0..fanout.max()).fold(TxDemand::default(), |sum, _| sum.plus(route))
+            } else {
+                fanout
+                    .addresses()
+                    .fold(TxDemand::default(), |sum, _| sum.plus(route))
+            };
             return vec![(self.endpoint, total)];
         }
         self.route_endpoints()
@@ -733,11 +741,13 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// What one more destination of a multi-destination publication takes
     /// of its endpoint once open (karyos#859): a route with its lane
     /// queues and, if reliable, a repair queue. `None` for one whose paths
-    /// are fixed.
+    /// are fixed, and for a dynamic one, whose every destination is held
+    /// from its admission ([`Self::tx_demand`]).
     #[must_use]
     pub fn destination_demand(&self) -> Option<TxDemand> {
         self.fanout
             .as_deref()
+            .filter(|_| self.registration.is_none())
             .map(|_| self.route_demand(self.reliable))
     }
 
