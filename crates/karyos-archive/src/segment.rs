@@ -1299,6 +1299,22 @@ impl<D: Disk> SegmentStore<D> {
         Ok(())
     }
 
+    /// Whether [`SegmentStore::purge_before`] can take `position` now:
+    /// within `[start, durable]`, with the segment holding it already
+    /// created. Checked before a purge's intent is journalled, so the
+    /// deletion never fails after it.
+    #[must_use]
+    pub fn can_purge_to(&self, position: u64) -> bool {
+        !self.failed
+            && position >= self.start
+            && position <= self.durable
+            && (position == self.start
+                || self
+                    .current
+                    .as_ref()
+                    .is_some_and(|open| self.geometry.base_of(position) <= open.base))
+    }
+
     /// Whether `position` starts a write, or is the recording's start or
     /// its written end: the positions [`SegmentStore::purge_before`] may
     /// take. Read from the index of the segment holding it.

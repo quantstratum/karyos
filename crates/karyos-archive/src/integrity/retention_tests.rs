@@ -450,6 +450,7 @@ fn recovery_rechecks_the_policy_that_changed_across_the_crash() {
         operator: 42,
         closed_ns: 0,
         source: PurgeSource::Operator,
+        from: 0,
     };
     OperationsJournal::append(
         &mut Ops::open(archive.disk.clone(), Path::new(DIR), OPERATIONS_FILE).unwrap(),
@@ -645,6 +646,7 @@ fn operations_round_trip_through_their_bytes() {
             operator: 42,
             closed_ns: 7,
             source: PurgeSource::Operator,
+            from: 0,
         },
         Operation::PurgeRejected {
             id: 1,
@@ -771,6 +773,7 @@ fn recovery_records_an_intent_the_floor_already_passed() {
         operator: 42,
         closed_ns: 0,
         source: PurgeSource::Operator,
+        from: 0,
     };
     let mut ops = Ops::open(archive.disk.clone(), Path::new(DIR), OPERATIONS_FILE).unwrap();
     ops.append(intent.encode()).unwrap();
@@ -785,7 +788,10 @@ fn recovery_records_an_intent_the_floor_already_passed() {
         .recover_purges(&context, |_| true, &mut archive.store, &mut archive.journal)
         .unwrap();
     assert_eq!(outcomes.len(), 1);
-    assert_eq!(outcomes[0].unwrap().kind, SealKind::Purge);
+    let record = outcomes[0].unwrap();
+    assert_eq!(record.kind, SealKind::Purge);
+    // The range the intent recorded, not the floor's later position.
+    assert_eq!((record.start, record.end), (0, 128));
     assert!(archive.retention.outstanding().is_empty());
 }
 
@@ -858,8 +864,13 @@ fn a_release_recorded_but_reported_failed_keeps_the_hold_at_restart() {
         .encode(),
     )
     .unwrap();
-    let restarted = open(archive.disk.clone());
+    let mut restarted = open(archive.disk.clone());
     assert_eq!(restarted.retention.hold(RECORDING), Some(Hold::Pending));
+    // A retry completes the release the journal already holds.
+    restarted.retention.release_hold(RECORDING).unwrap();
+    assert_eq!(restarted.retention.hold(RECORDING), None);
+    let again = open(archive.disk.clone());
+    assert_eq!(again.retention.hold(RECORDING), None);
 }
 
 /// A failed replay after a successful one inhibits purges again.
@@ -950,6 +961,7 @@ fn a_purge_off_a_write_start_a_reused_id_or_scheduled_under_manual_is_refused() 
             operator: 42,
             closed_ns: 0,
             source: PurgeSource::Operator,
+            from: 0,
         }
         .encode(),
     )
@@ -984,6 +996,7 @@ fn recovery_cancels_an_intent_that_would_split_a_seal() {
             operator: 42,
             closed_ns: 0,
             source: PurgeSource::Operator,
+            from: 0,
         }
         .encode(),
     )
@@ -1001,4 +1014,48 @@ fn recovery_cancels_an_intent_that_would_split_a_seal() {
     ));
     assert_eq!(archive.store.start(), 0);
     assert!(archive.retention.outstanding().is_empty());
+}
+
+/// A cutoff past the sealed end, or at a written end whose segment does
+/// not exist yet, is refused before the intent.
+#[test]
+fn a_cutoff_past_the_seals_or_the_purgeable_floor_is_refused() {
+    let mut archive = fresh();
+    let policy = policy(1_000, 2);
+    // The written end, 384, is a segment boundary with no segment yet.
+    let context = context(&policy, &archive.copies, 5_000);
+    let mut at_end = request();
+    at_end.before = 384;
+    assert!(matches!(
+        archive
+            .retention
+            .purge(&at_end, &context, &mut archive.store, &mut archive.journal),
+        Err(PurgeError::Refused {
+            refusal: PurgeRefusal::NotAWriteStart { before: 384 },
+            ..
+        })
+    ));
+    // A write past the seals: the cutoff after it is not sealed.
+    archive.store.append(384, &chunk(6)).unwrap();
+    archive.store.append(448, &chunk(7)).unwrap();
+    archive.store.sync().unwrap();
+    let mut unsealed = request();
+    unsealed.id = 2;
+    unsealed.before = 448;
+    assert!(matches!(
+        archive.retention.purge(
+            &unsealed,
+            &context,
+            &mut archive.store,
+            &mut archive.journal
+        ),
+        Err(PurgeError::Refused {
+            refusal: PurgeRefusal::NotSealed {
+                before: 448,
+                sealed: 384
+            },
+            ..
+        })
+    ));
+    assert_eq!(archive.store.start(), 0);
 }
