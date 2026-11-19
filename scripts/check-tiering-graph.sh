@@ -24,10 +24,17 @@ check
 # `karyos-archive`, whose trait this crate implements) takes `loom` and its
 # `cc` build dependency. That cfg is set only by the model-checking tests,
 # never in a build that ships the client crate.
+# Both selections: the client crate alone, and the whole workspace as the
+# release builds it (`cargo build --workspace`), so a feature another member
+# enables on a shared crate is counted. `cc` (or `cmake`) is how a C build
+# would enter; the other names are native crypto.
 for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
-  tree=$(cargo tree --locked -p karyos-tiering --target "$target" -e normal,build --prefix none) || exit 1
-  if printf '%s\n' "$tree" | grep -E '^(ring|aws-lc-rs|aws-lc-sys|cc) '; then
-    echo "native crypto or a C build in karyos-tiering ($target)" >&2
-    exit 1
-  fi
+  for selection in "-p karyos-tiering" "--workspace"; do
+    # shellcheck disable=SC2086
+    tree=$(cargo tree --locked $selection --target "$target" -e normal,build --prefix none) || exit 1
+    if printf '%s\n' "$tree" | grep -E '^(ring|aws-lc-rs|aws-lc-sys|cc|cmake) '; then
+      echo "native crypto or a C build ($selection, $target)" >&2
+      exit 1
+    fi
+  done
 done
