@@ -1,18 +1,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The check of the hand-written `include/karyos.h` against the Rust
-//! source (quantstratum-docs: karyos/design/ffi-gap-analysis.md §4.6),
-//! until `cbindgen` generates the header: the same exported functions with
-//! the same C types, the same status codes and the same ABI version.
+//! Checks of the generated `include/karyos.h` against the Rust source.
+//! `make header-check` (`scripts/check-header.sh`) proves the committed
+//! header is byte for byte what cbindgen 0.29.4 generates from this crate
+//! and `cbindgen.toml` (karyos#697, F8 of quantstratum-docs:
+//! karyos/design/ffi-gap-analysis.md). These tests need no cbindgen and
+//! run with `cargo test`: the same exported functions with the same C
+//! types, every status code, the ABI version, and every constant of
+//! `c_header.rs` against the value it names (a status, an enum, a limit).
 //!
-//! It reads both files as text and covers the constructs the ABI uses: one
+//! They read both files as text and cover the constructs the ABI uses: one
 //! `#define NAME VALUE` per constant, `typedef struct` declarations with one
 //! field per statement, `typedef void (*name)(...)` callback types matched
 //! with the `pub type Name = Option<unsafe extern "C" fn(...)>` aliases of
 //! `abi.rs`, prototypes whose function pointer parameters use such a
 //! typedef, and the `extern "C" fn` items and `pub struct` items of
 //! `abi.rs` whose types the tables in [`c_type`] and [`c_struct`] know.
-//! Anything else fails the test.
+//! A `struct` keyword before a type name (cbindgen writes
+//! `const struct karyos_detail *`) is dropped. Anything else fails the
+//! test.
 
 use std::collections::BTreeMap;
 
@@ -101,10 +107,12 @@ fn c_type(rust: &str) -> String {
     c.to_owned()
 }
 
-/// A C type with one space before each `*` and single spaces elsewhere.
+/// A C type with one space before each `*` and single spaces elsewhere,
+/// without the `struct` keyword.
 fn normalize(c: &str) -> String {
     c.replace('*', " * ")
         .split_whitespace()
+        .filter(|word| *word != "struct")
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -253,7 +261,15 @@ fn rust_handlers() -> BTreeMap<String, Vec<String>> {
     while let Some(at) = rest.find("\npub type ") {
         rest = &rest[at + "\npub type ".len()..];
         let end = rest.find(';').expect("an alias's end");
-        let alias = rest[..end].split_whitespace().collect::<Vec<_>>().join(" ");
+        // One line, without rustfmt's line breaks and trailing comma.
+        let alias = rest[..end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .replace("< ", "<")
+            .replace("( ", "(")
+            .replace(", )", ")")
+            .replace("), >", ")>");
         let (name, target) = alias.split_once('=').expect("name = type");
         let parameters = target
             .trim()
@@ -261,6 +277,13 @@ fn rust_handlers() -> BTreeMap<String, Vec<String>> {
             .and_then(|target| target.strip_suffix(")>"))
             .expect("a callback alias: Option<unsafe extern \"C\" fn(...)>")
             .split(',')
+            // A parameter's name, which cbindgen writes into the typedef,
+            // is not part of its type.
+            .map(|parameter| {
+                parameter
+                    .split_once(':')
+                    .map_or(parameter, |(_, rust)| rust)
+            })
             .map(|parameter| normalize(&c_type(parameter)))
             .collect();
         handlers.insert(c_type(name), parameters);
@@ -273,8 +296,11 @@ fn header_functions() -> BTreeMap<String, Signature> {
     let code: String = header_handlers()
         .0
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with('#') && *line != "extern \"C\" {" && *line != "}")
+        // cbindgen ends its C++ guard with `}  // extern "C"`.
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code).trim())
+        .filter(|line| {
+            !line.starts_with('#') && *line != "extern \"C\" {" && !line.starts_with('}')
+        })
         .collect::<Vec<_>>()
         .join(" ");
     code.split(';')

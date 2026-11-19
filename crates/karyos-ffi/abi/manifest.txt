@@ -1,9 +1,4 @@
 abi_version=0.1.5
-struct karyos_detail size=24 align=8
-  size offset=0 size=4
-  reserved offset=4 size=4
-  code offset=8 size=8
-  value offset=16 size=8
 struct karyos_client_options size=40 align=8
   size offset=0 size=4
   idle_strategy offset=4 size=4
@@ -12,10 +7,64 @@ struct karyos_client_options size=40 align=8
   timeout_ns offset=24 size=8
   max_pending offset=32 size=4
   max_images offset=36 size=4
+struct karyos_detail size=24 align=8
+  size offset=0 size=4
+  reserved offset=4 size=4
+  code offset=8 size=8
+  value offset=16 size=8
 struct karyos_accepted size=16 align=8
   size offset=0 size=4
   lane offset=4 size=4
   position offset=8 size=8
+struct karyos_offer_options size=16 align=8
+  size offset=0 size=4
+  reserved offset=4 size=4
+  reserved_value offset=8 size=8
+struct karyos_outcome size=72 align=8
+  size offset=0 size=4
+  kind offset=4 size=4
+  lane offset=8 size=4
+  receiver offset=12 size=4
+  sequence offset=16 size=8
+  incarnation offset=24 size=8
+  start offset=32 size=8
+  end offset=40 size=8
+  epoch offset=48 size=8
+  reason offset=56 size=8
+  lost offset=64 size=8
+struct karyos_subscription_options size=40 align=8
+  size offset=0 size=4
+  role offset=4 size=4
+  rejoin offset=8 size=4
+  reserved offset=12 size=4
+  archive offset=16 size=8
+  archive_client_id offset=24 size=8
+  replay_stream_id offset=32 size=4
+  secondary offset=36 size=4
+struct karyos_subscription_rejoin size=16 align=4
+  size offset=0 size=4
+  recovering offset=4 size=4
+  merge_failure offset=8 size=4
+  reserved offset=12 size=4
+struct karyos_message_info size=40 align=8
+  size offset=0 size=4
+  lane offset=4 size=4
+  position offset=8 size=8
+  reserved_value offset=16 size=8
+  extent offset=24 size=4
+  session_id offset=28 size=4
+  flags offset=32 size=4
+  reserved offset=36 size=4
+struct karyos_image_change size=48 align=8
+  size offset=0 size=4
+  session_id offset=4 size=4
+  image_id offset=8 size=8
+  lane offset=16 size=4
+  available offset=20 size=4
+  end_reason offset=24 size=4
+  reserved offset=28 size=4
+  end_position offset=32 size=8
+  seal_code offset=40 size=8
 struct karyos_driver_options size=80 align=8
   size offset=0 size=4
   max_clients offset=4 size=4
@@ -59,55 +108,6 @@ struct karyos_stream_options size=88 align=8
   conflation_journal_capacity offset=72 size=8
   publishers offset=80 size=4
   reserved offset=84 size=4
-struct karyos_offer_options size=16 align=8
-  size offset=0 size=4
-  reserved offset=4 size=4
-  reserved_value offset=8 size=8
-struct karyos_outcome size=72 align=8
-  size offset=0 size=4
-  kind offset=4 size=4
-  lane offset=8 size=4
-  receiver offset=12 size=4
-  sequence offset=16 size=8
-  incarnation offset=24 size=8
-  start offset=32 size=8
-  end offset=40 size=8
-  epoch offset=48 size=8
-  reason offset=56 size=8
-  lost offset=64 size=8
-struct karyos_message_info size=40 align=8
-  size offset=0 size=4
-  lane offset=4 size=4
-  position offset=8 size=8
-  reserved_value offset=16 size=8
-  extent offset=24 size=4
-  session_id offset=28 size=4
-  flags offset=32 size=4
-  reserved offset=36 size=4
-struct karyos_image_change size=48 align=8
-  size offset=0 size=4
-  session_id offset=4 size=4
-  image_id offset=8 size=8
-  lane offset=16 size=4
-  available offset=20 size=4
-  end_reason offset=24 size=4
-  reserved offset=28 size=4
-  end_position offset=32 size=8
-  seal_code offset=40 size=8
-struct karyos_subscription_options size=40 align=8
-  size offset=0 size=4
-  role offset=4 size=4
-  rejoin offset=8 size=4
-  reserved offset=12 size=4
-  archive offset=16 size=8
-  archive_client_id offset=24 size=8
-  replay_stream_id offset=32 size=4
-  secondary offset=36 size=4
-struct karyos_subscription_rejoin size=16 align=4
-  size offset=0 size=4
-  recovering offset=4 size=4
-  merge_failure offset=8 size=4
-  reserved offset=12 size=4
 struct karyos_archive_options size=32 align=8
   size offset=0 size=4
   reserved offset=4 size=4
@@ -278,68 +278,68 @@ const KARYOS_END_STREAM_REMOVED=3
 const KARYOS_END_REVOKED=4
 const KARYOS_END_CLOSED_BY_OVERRUN=5
 const KARYOS_END_OTHER=255
+decl typedef void( *karyos_outcome_handler)(void *context, const struct karyos_outcome *outcome)
+decl typedef void( *karyos_message_handler)(void *context, const uint8_t *data, size_t length, const struct karyos_message_info *info)
+decl typedef void( *karyos_conflated_handler)(void *context, uint32_t key, const uint8_t *data, size_t length, uint64_t version, uint64_t freshness)
+decl typedef void( *karyos_recording_handler)(void *context, const struct karyos_recording *recording)
 decl int32_t karyos_abi_version(uint32_t *major, uint32_t *minor, uint32_t *patch)
 decl const char *karyos_status_message(int32_t status)
-decl int32_t karyos_client_options_init_sized(karyos_client_options *options, size_t size)
-decl static inline int32_t karyos_client_options_init(karyos_client_options *options)
-decl int32_t karyos_client_connect(const karyos_client_options *options, uint64_t *client, karyos_detail *detail)
+decl int32_t karyos_client_options_init_sized(struct karyos_client_options *options, size_t size)
+decl int32_t karyos_client_connect(const struct karyos_client_options *options, uint64_t *client, struct karyos_detail *detail)
 decl int32_t karyos_client_poll(uint64_t client, uint32_t *served)
 decl int32_t karyos_client_close(uint64_t client)
-decl int32_t karyos_client_add_publication(uint64_t client, const char *uri, int32_t stream_id, uint64_t *publication, karyos_detail *detail)
-decl int32_t karyos_client_add_concurrent_publication(uint64_t client, const char *uri, int32_t stream_id, uint64_t *publication, karyos_detail *detail)
-decl int32_t karyos_publication_offer(uint64_t publication, uint32_t lane, const uint8_t *data, size_t length, karyos_accepted *accepted)
-decl int32_t karyos_offer_options_init_sized(karyos_offer_options *options, size_t size)
-decl static inline int32_t karyos_offer_options_init(karyos_offer_options *options)
-decl int32_t karyos_publication_offer_with(uint64_t publication, uint32_t lane, const uint8_t *data, size_t length, const karyos_offer_options *options, karyos_accepted *accepted)
-decl int32_t karyos_publication_offer_at(uint64_t publication, uint32_t lane, const uint8_t *data, size_t length, uint64_t tx_time, karyos_accepted *accepted)
+decl int32_t karyos_client_add_publication(uint64_t client, const char *uri, int32_t stream_id, uint64_t *publication, struct karyos_detail *detail)
+decl int32_t karyos_client_add_concurrent_publication(uint64_t client, const char *uri, int32_t stream_id, uint64_t *publication, struct karyos_detail *detail)
+decl int32_t karyos_publication_offer(uint64_t publication, uint32_t lane, const uint8_t *data, size_t length, struct karyos_accepted *accepted)
+decl int32_t karyos_offer_options_init_sized(struct karyos_offer_options *options, size_t size)
+decl int32_t karyos_publication_offer_with(uint64_t publication, uint32_t lane, const uint8_t *data, size_t length, const struct karyos_offer_options *options, struct karyos_accepted *accepted)
+decl int32_t karyos_publication_offer_at(uint64_t publication, uint32_t lane, const uint8_t *data, size_t length, uint64_t tx_time, struct karyos_accepted *accepted)
 decl int32_t karyos_clock_now(uint32_t domain, uint64_t *now)
 decl int32_t karyos_publication_claim(uint64_t publication, uint32_t lane, uint32_t length, uint64_t *claim, uint8_t * *buffer)
-decl int32_t karyos_claim_commit(uint64_t claim, karyos_accepted *accepted)
+decl int32_t karyos_claim_commit(uint64_t claim, struct karyos_accepted *accepted)
 decl int32_t karyos_claim_abort(uint64_t claim)
 decl int32_t karyos_publication_close(uint64_t publication)
-decl typedef void( *karyos_outcome_handler)(void *context, const karyos_outcome *outcome)
 decl int32_t karyos_publication_poll_outcomes(uint64_t publication, uint32_t lane, karyos_outcome_handler handler, void *context, uint32_t limit, uint32_t *delivered)
-decl typedef void( *karyos_message_handler)(void *context, const uint8_t *data, size_t length, const karyos_message_info *info)
-decl int32_t karyos_client_add_conflated_subscription(uint64_t client, const char *uri, int32_t stream_id, uint64_t *conflated, karyos_detail *detail)
-decl int32_t karyos_client_add_subscription(uint64_t client, const char *uri, int32_t stream_id, uint64_t *subscription, karyos_detail *detail)
-decl int32_t karyos_client_add_publication_with_roles(uint64_t client, const char *uri, int32_t stream_id, uint32_t strategy, uint64_t tagged_group, const uint64_t *required, size_t required_count, const uint64_t *tags, size_t tag_count, uint64_t *publication, karyos_detail *detail)
+decl int32_t karyos_client_add_subscription(uint64_t client, const char *uri, int32_t stream_id, uint64_t *subscription, struct karyos_detail *detail)
+decl int32_t karyos_subscription_options_init_sized(struct karyos_subscription_options *options, size_t size)
+decl int32_t karyos_client_add_subscription_with(uint64_t client, const char *uri, int32_t stream_id, const struct karyos_subscription_options *options, uint64_t *subscription, struct karyos_detail *detail)
+decl int32_t karyos_client_add_publication_with_roles(uint64_t client, const char *uri, int32_t stream_id, uint32_t strategy, uint64_t tagged_group, const uint64_t *required, size_t required_count, const uint64_t *tags, size_t tag_count, uint64_t *publication, struct karyos_detail *detail)
+decl int32_t karyos_client_add_subscription_as(uint64_t client, const char *uri, int32_t stream_id, const struct karyos_subscription_options *options, uint64_t receiver_id, uint64_t group_tag, uint64_t *subscription, struct karyos_detail *detail)
 decl int32_t karyos_publication_network_admission(uint64_t publication, uint32_t *admission)
-decl int32_t karyos_subscription_options_init_sized(karyos_subscription_options *options, size_t size)
-decl static inline int32_t karyos_subscription_options_init(karyos_subscription_options *options)
-decl int32_t karyos_client_add_subscription_with(uint64_t client, const char *uri, int32_t stream_id, const karyos_subscription_options *options, uint64_t *subscription, karyos_detail *detail)
-decl int32_t karyos_client_add_subscription_as(uint64_t client, const char *uri, int32_t stream_id, const karyos_subscription_options *options, uint64_t receiver_id, uint64_t group_tag, uint64_t *subscription, karyos_detail *detail)
-decl int32_t karyos_subscription_rejoin_state(uint64_t subscription, karyos_subscription_rejoin *state)
+decl int32_t karyos_subscription_rejoin_state(uint64_t subscription, struct karyos_subscription_rejoin *state)
 decl int32_t karyos_subscription_poll(uint64_t subscription, karyos_message_handler handler, void *context, uint32_t limit, uint32_t *delivered)
-decl int32_t karyos_subscription_next_image_change(uint64_t subscription, karyos_image_change *change, uint32_t *has)
+decl int32_t karyos_subscription_next_image_change(uint64_t subscription, struct karyos_image_change *change, uint32_t *has)
 decl int32_t karyos_subscription_image_changes_lost(uint64_t subscription, uint64_t *lost)
 decl int32_t karyos_subscription_close(uint64_t subscription)
-decl int32_t karyos_driver_options_init_sized(karyos_driver_options *options, size_t size)
-decl static inline int32_t karyos_driver_options_init(karyos_driver_options *options)
-decl int32_t karyos_driver_create(const karyos_driver_options *options, uint64_t *driver, karyos_detail *detail)
+decl int32_t karyos_driver_options_init_sized(struct karyos_driver_options *options, size_t size)
+decl int32_t karyos_driver_create(const struct karyos_driver_options *options, uint64_t *driver, struct karyos_detail *detail)
 decl int32_t karyos_driver_do_work(uint64_t driver, uint32_t *work)
 decl int32_t karyos_driver_start(uint64_t driver, uint32_t idle_strategy, uint64_t idle_sleep_ns)
 decl int32_t karyos_driver_stop(uint64_t driver)
 decl int32_t karyos_driver_startup_complete(uint64_t driver, uint32_t *complete)
-decl int32_t karyos_driver_readiness(uint64_t driver, karyos_readiness *out)
-decl int32_t karyos_stream_options_init_sized(karyos_stream_options *options, size_t size)
-decl static inline int32_t karyos_stream_options_init(karyos_stream_options *options)
-decl int32_t karyos_driver_add_stream(uint64_t driver, const karyos_stream_options *options, karyos_detail *detail)
+decl int32_t karyos_driver_readiness(uint64_t driver, struct karyos_readiness *out)
+decl int32_t karyos_stream_options_init_sized(struct karyos_stream_options *options, size_t size)
+decl int32_t karyos_driver_add_stream(uint64_t driver, const struct karyos_stream_options *options, struct karyos_detail *detail)
 decl int32_t karyos_driver_remove_stream(uint64_t driver, int32_t stream_id)
-decl typedef void( *karyos_conflated_handler)(void *context, uint32_t key, const uint8_t *data, size_t length, uint64_t version, uint64_t freshness)
 decl int32_t karyos_driver_subscribe_conflated(uint64_t driver, int32_t stream_id, uint64_t *conflated)
+decl int32_t karyos_client_add_conflated_subscription(uint64_t client, const char *uri, int32_t stream_id, uint64_t *conflated, struct karyos_detail *detail)
 decl int32_t karyos_conflated_poll(uint64_t conflated, karyos_conflated_handler handler, void *context, uint32_t key_budget, uint32_t *delivered)
 decl int32_t karyos_conflated_close(uint64_t conflated)
-decl int32_t karyos_driver_connect(uint64_t driver, uint64_t *client, karyos_detail *detail)
+decl int32_t karyos_driver_connect(uint64_t driver, uint64_t *client, struct karyos_detail *detail)
 decl int32_t karyos_driver_close(uint64_t driver)
-decl typedef void( *karyos_recording_handler)(void *context, const karyos_recording *recording)
-decl int32_t karyos_archive_connect(uint64_t client, const karyos_archive_options *options, uint64_t *archive, karyos_detail *detail)
-decl int32_t karyos_archive_list(uint64_t archive, uint64_t after_id, uint32_t limit, karyos_recording_handler handler, void *context, uint32_t *delivered, karyos_detail *detail)
+decl int32_t karyos_archive_connect(uint64_t client, const struct karyos_archive_options *options, uint64_t *archive, struct karyos_detail *detail)
+decl int32_t karyos_archive_list(uint64_t archive, uint64_t after_id, uint32_t limit, karyos_recording_handler handler, void *context, uint32_t *delivered, struct karyos_detail *detail)
 decl int32_t karyos_archive_close(uint64_t archive)
-decl int32_t karyos_replay_options_init_sized(karyos_replay_options *options, size_t size)
+decl int32_t karyos_replay_options_init_sized(struct karyos_replay_options *options, size_t size)
+decl int32_t karyos_archive_replay(uint64_t archive, const struct karyos_replay_options *options, uint64_t *replay_id, int32_t *session_id, struct karyos_detail *detail)
+decl int32_t karyos_archive_stop_replay(uint64_t archive, uint64_t replay_id, struct karyos_detail *detail)
+decl int32_t karyos_replay_subscription_options_init_sized(struct karyos_replay_subscription_options *options, size_t size)
+decl int32_t karyos_client_add_replay_subscription(uint64_t client, int32_t stream_id, int32_t session_id, const struct karyos_replay_subscription_options *options, uint64_t *subscription)
+decl int32_t karyos_subscription_end_state(uint64_t subscription, struct karyos_subscription_end *end)
+decl static inline int32_t karyos_client_options_init(karyos_client_options *options)
+decl static inline int32_t karyos_offer_options_init(karyos_offer_options *options)
+decl static inline int32_t karyos_subscription_options_init(karyos_subscription_options *options)
+decl static inline int32_t karyos_driver_options_init(karyos_driver_options *options)
+decl static inline int32_t karyos_stream_options_init(karyos_stream_options *options)
 decl static inline int32_t karyos_replay_options_init(karyos_replay_options *options)
-decl int32_t karyos_archive_replay(uint64_t archive, const karyos_replay_options *options, uint64_t *replay_id, int32_t *session_id, karyos_detail *detail)
-decl int32_t karyos_archive_stop_replay(uint64_t archive, uint64_t replay_id, karyos_detail *detail)
-decl int32_t karyos_replay_subscription_options_init_sized(karyos_replay_subscription_options *options, size_t size)
 decl static inline int32_t karyos_replay_subscription_options_init(karyos_replay_subscription_options *options)
-decl int32_t karyos_client_add_replay_subscription(uint64_t client, int32_t stream_id, int32_t session_id, const karyos_replay_subscription_options *options, uint64_t *subscription)
-decl int32_t karyos_subscription_end_state(uint64_t subscription, karyos_subscription_end *end)

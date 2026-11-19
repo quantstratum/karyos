@@ -298,7 +298,7 @@ pub(crate) fn connect(client: Handle, options: Options) -> Result<Handle, Failur
 
 /// What a listing hands each recording to: `false` when it cannot take
 /// the recording, which refuses the call.
-pub(crate) type RecordingHandler<'a> = dyn FnMut(&ListedRecording) -> bool + 'a;
+pub(crate) type ListingHandler<'a> = dyn FnMut(&ListedRecording) -> bool + 'a;
 
 /// The recordings of `archive`'s catalog whose id is above `after_id`, in
 /// id order, at most `limit`, each handed to `handler`; returns how many.
@@ -314,7 +314,7 @@ pub(crate) fn list(
     archive: Handle,
     after_id: u64,
     limit: u32,
-    handler: &mut RecordingHandler<'_>,
+    handler: &mut ListingHandler<'_>,
 ) -> Result<u32, Failure> {
     let client = table().with(archive, |entry| entry.client)?;
     match client {
@@ -341,7 +341,7 @@ fn list_entry(
     mut client: Option<&mut AnyClient>,
     after_id: u64,
     limit: u32,
-    handler: &mut RecordingHandler<'_>,
+    handler: &mut ListingHandler<'_>,
 ) -> Result<u32, Failure> {
     // Nothing past the last id, and nothing for a limit of 0.
     let (Some(from_id), Ok(count)) = (after_id.checked_add(1), usize::try_from(limit)) else {

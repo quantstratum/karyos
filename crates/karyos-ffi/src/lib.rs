@@ -25,6 +25,7 @@
 mod abi;
 mod api;
 mod boundary;
+pub mod c_header;
 #[expect(
     dead_code,
     reason = "the other handle kinds get their tables from F3 on"

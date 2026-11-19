@@ -75,7 +75,12 @@ runs for the Raft candidates' evaluation (`make raft-eval`, part of `make
 pre-push`): Homebrew's `protobuf@21` (`brew install protobuf@21`) or
 Rosetta 2 (`softwareupdate --install-rosetta`), which runs the x86_64
 `protoc` 3.9.0 the evaluation's lockfile pins. On Linux the pinned one runs
-natively; `PROTOC` overrides the choice (see `eval/raft-candidates`).
+natively; `PROTOC` overrides the choice (see `eval/raft-candidates`). The
+C header `crates/karyos-ffi/include/karyos.h` is generated: `make
+header-check`, part of `make pre-push`, needs cbindgen at exactly 0.29.4
+(`cargo install cbindgen --version 0.29.4 --locked`, or `CBINDGEN` set to
+its path), a maintainer tool and no dependency of any crate; `make header`
+regenerates the header after a change to `karyos-ffi`'s C surface.
 
 ```sh
 make test            # cargo test --workspace --locked
@@ -84,6 +89,7 @@ make loom            # Loom models of the atomic protocols (karyos-sys)
 make miri            # Miri on karyos-sys (pinned nightly in the Makefile)
 make sim             # deterministic simulator scenarios
 make bench           # benchmark harness (results are indicative only)
+make header          # regenerate the C header with cbindgen 0.29.4
 make pre-push        # the full local gate
 scripts/linux-test.sh                     # cargo test in a Linux container
 scripts/linux-test.sh -p karyos-sys --locked  # any cargo test arguments
