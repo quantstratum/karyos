@@ -1256,7 +1256,7 @@ fn a_retrospective_revocation_withdraws_the_coverage_it_invalidates() {
     assert_eq!(status.last_signed, None);
     assert!(status.alarm);
     // Revalidation drops it, and the records it covered stay overdue.
-    signing.revalidate(&registry);
+    signing.revalidate(&registry).unwrap();
     let status = signing.status(20, 6, &registry);
     assert_eq!((status.last_signed, status.discarded), (None, 1));
     assert!(status.alarm);
@@ -1503,7 +1503,7 @@ fn a_signing_queue_stays_with_the_archive_it_was_made_for() {
     let _ = signing.offer(labelled, 0);
     assert!(matches!(
         signing.poll(&mut signer, &mut store, &other, &seals(), 10),
-        Err(PollError::NotInChain { counter: 0 })
+        Err(PollError::ForeignRegistry)
     ));
     assert_eq!(signer.signed, 0);
     assert!(store.heads.is_empty());
@@ -1537,4 +1537,99 @@ fn coalescing_after_a_dropped_head_keeps_the_age_of_what_it_was_to_cover() {
     let status = signing.status(2_001, 3, &registry);
     assert_eq!(status.coverage_lag_ns, 1_991);
     assert!(status.alarm);
+}
+
+#[test]
+fn one_handle_at_a_time_writes_a_journal_or_a_ledger() {
+    use crate::disk::StdDisk;
+    let dir = std::env::temp_dir().join(format!("karyos-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    assert!(matches!(
+        IntegrityJournal::open(StdDisk, &dir),
+        Err(IntegrityError::Locked)
+    ));
+    let ledger = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys").unwrap();
+    assert!(matches!(
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys"),
+        Err(IntegrityError::Locked)
+    ));
+    // Released with the handle.
+    drop((journal, ledger));
+    IntegrityJournal::open(StdDisk, &dir).unwrap();
+    Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, "keys").unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_stale_journal_view_never_cuts_a_committed_registry_entry() {
+    // The in-memory disk takes no lock: the journal's own check is the
+    // second line of defence.
+    let disk = FaultDisk::default();
+    let mut current = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut stale = IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let mut ledger =
+        Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk, Path::new(DIR), "keys").unwrap();
+    let signer = TestSigner::new(9);
+    KeyRegistry::new(trust())
+        .append(
+            &register(&signer.key, Custody::NoSeparation, 0),
+            &mut current,
+            &mut ledger,
+        )
+        .unwrap();
+    assert!(!stale.is_current().unwrap());
+    assert!(matches!(
+        KeyRegistry::open(trust(), &mut stale, &mut ledger),
+        Err(IntegrityError::StaleJournal)
+    ));
+    assert_eq!(ledger.entries().len(), 1);
+    let reopened = KeyRegistry::open(trust(), &mut current, &mut ledger).unwrap();
+    assert!(reopened.key(&signer.key_id()).is_some());
+}
+
+#[test]
+fn another_archives_registry_changes_nothing_in_the_signing_queue() {
+    let config = SigningConfig::new(Some(1_000), BacklogPolicy::Coalesce).unwrap();
+    let registry = registry_with(&TestSigner::new(9));
+    let mut other = KeyRegistry::new(TrustRoot {
+        archive_id: [8; 32],
+        authorities: trust().authorities,
+    });
+    let mut registration = register(&key(9), Custody::NoSeparation, 0);
+    registration.endorsement = authority()
+        .sign(&registration.endorsement_bytes(&[8; 32]))
+        .to_bytes();
+    other.apply(&registration).unwrap();
+    let mut signer = TestSigner::new(9);
+    let mut store = Store::default();
+    let records = seals();
+    let mut signing = HeadSigning::new(config, ARCHIVE, JOURNAL, 0);
+    let _ = signing.offer(head(3), 0);
+    assert_eq!(
+        signing
+            .poll(&mut signer, &mut store, &registry, &records, 10)
+            .unwrap(),
+        1
+    );
+    let _ = signing.offer(head(4), 20);
+    assert!(matches!(
+        signing.poll(&mut signer, &mut store, &other, &records, 30),
+        Err(PollError::ForeignRegistry)
+    ));
+    assert!(matches!(
+        signing.revalidate(&other),
+        Err(PollError::ForeignRegistry)
+    ));
+    assert_eq!(signer.signed, 1);
+    let status = signing.status(40, 5, &registry);
+    assert_eq!(
+        (status.last_signed, status.pending, status.discarded),
+        (Some(3), 1, 0)
+    );
 }

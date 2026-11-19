@@ -77,6 +77,9 @@ pub enum PollError {
     /// The signed head could not be recorded.
     #[error("recording a signed head: {0}")]
     Store(#[from] IntegrityError),
+    /// The registry is another Archive's: nothing was changed.
+    #[error("the registry is another Archive's")]
+    ForeignRegistry,
     /// The pending head is not this journal's: it names another journal
     /// or Archive, or its digest is not the chain's record at its counter.
     /// It is dropped and counted in [`SigningStatus::discarded`].
@@ -341,6 +344,8 @@ impl HeadSigning {
     ///
     /// # Errors
     ///
+    /// [`PollError::ForeignRegistry`] for a registry of another Archive,
+    /// before anything changes or reaches the signer;
     /// [`PollError::Untrusted`] when the registry does not trust a
     /// signature, which is neither recorded nor counted, and
     /// [`PollError::Store`] for the store's error. The head stays pending
@@ -354,8 +359,12 @@ impl HeadSigning {
         records: &[SealRecord],
         now_ns: u64,
     ) -> Result<u64, PollError> {
+        // Another Archive's registry changes nothing and reaches no signer.
+        if registry.trust().archive_id != self.archive_id {
+            return Err(PollError::ForeignRegistry);
+        }
         if registry.identity() != self.registry_identity {
-            self.revalidate(registry);
+            self.revalidate(registry)?;
         }
         let mut signed = 0u64;
         while let Some(pending) = self.pending.front().copied() {
@@ -409,7 +418,15 @@ impl HeadSigning {
     /// lost are overdue until signed coverage reaches them again, as their
     /// age was not kept. [`HeadSigning::poll`] does this itself when the
     /// registry it is given changed.
-    pub fn revalidate(&mut self, registry: &KeyRegistry) {
+    ///
+    /// # Errors
+    ///
+    /// [`PollError::ForeignRegistry`] for a registry of another Archive
+    /// than the queue's, with nothing changed.
+    pub fn revalidate(&mut self, registry: &KeyRegistry) -> Result<(), PollError> {
+        if registry.trust().archive_id != self.archive_id {
+            return Err(PollError::ForeignRegistry);
+        }
         let before = covered(&self.signed);
         let count = self.signed.len();
         self.signed.retain(|signed| trusted(registry, signed));
@@ -421,6 +438,7 @@ impl HeadSigning {
             self.overdue_until = Some(self.overdue_until.map_or(before, |until| until.max(before)));
         }
         self.registry_identity = registry.identity();
+        Ok(())
     }
 
     /// Whether `head` is a head of this journal's chain: the Archive, this

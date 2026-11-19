@@ -41,6 +41,14 @@ pub enum IntegrityError {
     /// An earlier append failed part way; reopen the journal to recover.
     #[error("an earlier append failed; the journal must be reopened")]
     Poisoned,
+    /// Another handle holds the file's exclusive lock: one writer per
+    /// journal or ledger file. Nothing was read or written.
+    #[error("the file is open through another handle")]
+    Locked,
+    /// The journal handle does not hold every record on disk: another
+    /// handle appended since it was opened. Nothing was cut or written.
+    #[error("the journal was changed through another handle; reopen it")]
+    StaleJournal,
     /// A ledger handle that does not hold every entry on disk: another
     /// handle appended or cut since it was opened. Nothing was written.
     #[error("the ledger was changed through another handle; reopen it")]
@@ -105,6 +113,7 @@ impl<D: Disk> IntegrityJournal<D> {
             }
             Err(error) => return Err(error.into()),
         };
+        lock(&mut disk, &file)?;
         let length = disk.len(&file)?;
         let whole = length / RECORD_LENGTH;
         let mut check = ChainCheck::new();
@@ -166,6 +175,22 @@ impl<D: Disk> IntegrityJournal<D> {
     #[inline]
     pub const fn key_registry_identity(&self) -> Digest {
         self.registry_identity
+    }
+
+    /// Whether this handle holds every record on disk: no other handle
+    /// appended since it was opened. Recovery that cuts what the journal
+    /// does not chain requires it.
+    ///
+    /// # Errors
+    ///
+    /// [`IntegrityError::Io`] for the operating system's error.
+    pub fn is_current(&mut self) -> Result<bool, IntegrityError> {
+        let held = self
+            .check
+            .next_counter()
+            .checked_mul(RECORD_LENGTH)
+            .ok_or(IntegrityError::Overflow)?;
+        Ok(self.disk.len(&self.file)? == held)
     }
 
     /// Whether an append failed part way: the handle no longer knows how
@@ -415,4 +440,15 @@ fn range_end(start: u64, length: usize) -> Result<u64, IntegrityError> {
         .ok()
         .and_then(|length| start.checked_add(length))
         .ok_or(IntegrityError::Overflow)
+}
+
+/// Takes the single-writer lock on a journal or ledger `file`.
+pub(super) fn lock<D: Disk>(disk: &mut D, file: &D::File) -> Result<(), IntegrityError> {
+    disk.lock(file).map_err(|error| {
+        if error.kind() == io::ErrorKind::WouldBlock {
+            IntegrityError::Locked
+        } else {
+            IntegrityError::Io(error)
+        }
+    })
 }

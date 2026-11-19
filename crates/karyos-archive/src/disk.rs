@@ -102,6 +102,20 @@ pub trait Disk {
     ///
     /// The operating system's error.
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Takes an exclusive advisory lock on `file` for as long as this
+    /// handle is open, without waiting: the single-writer ownership of an
+    /// append-only file. A disk with no other writer (the in-memory test
+    /// disk, a read-only disk) has nothing to exclude.
+    ///
+    /// # Errors
+    ///
+    /// [`io::ErrorKind::WouldBlock`] when another handle holds the lock;
+    /// otherwise the operating system's error.
+    fn lock(&mut self, file: &Self::File) -> io::Result<()> {
+        let _ = file;
+        Ok(())
+    }
 }
 
 /// The operating system's files, through the standard library.
@@ -183,6 +197,15 @@ impl Disk for StdDisk {
 
     fn rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
+    }
+
+    fn lock(&mut self, file: &Self::File) -> io::Result<()> {
+        // `flock` on unix: held by this open file description, released
+        // when the handle is dropped or the process exits.
+        file.try_lock().map_err(|error| match error {
+            std::fs::TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
+            std::fs::TryLockError::Error(error) => error,
+        })
     }
 }
 

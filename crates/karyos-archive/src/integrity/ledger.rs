@@ -48,6 +48,7 @@ impl<D: Disk, const N: usize> Ledger<D, N> {
             }
             Err(error) => return Err(error.into()),
         };
+        super::journal::lock(&mut disk, &file)?;
         let length = disk.len(&file)?;
         let whole = length
             .checked_div(Self::LENGTH)

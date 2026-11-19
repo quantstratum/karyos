@@ -607,6 +607,10 @@ impl KeyRegistry {
         if journal.is_poisoned() {
             return Err(IntegrityError::Poisoned);
         }
+        // A view behind the file would cut a committed entry as an orphan.
+        if !journal.is_current()? {
+            return Err(IntegrityError::StaleJournal);
+        }
         let chained: Vec<(u64, u64, Digest)> = journal
             .records()?
             .into_iter()
