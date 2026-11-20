@@ -1471,6 +1471,10 @@ struct Installed<T: StreamTerms = HeapTerms> {
     /// Its subscription's NAK control group: the endpoint joined to it and
     /// the group's address (RC-7, RC-15).
     control_group: Option<(EndpointId, SocketAddr)>,
+    /// Each later path's NAK control group, by path index, set when the
+    /// path is bound from its own subscription entry (RC-15; karyos#1064).
+    /// Allocated with the image, one slot per path.
+    path_groups: Vec<Option<(EndpointId, SocketAddr)>>,
     /// The `receiver_id` it names in every RB block: its key's configured
     /// identity, else derived from its slot.
     receiver_id: u64,
@@ -2299,7 +2303,20 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     .iter()
                     .position(|(held, stream, ..)| (*held, *stream) == (endpoint, stream_id))
                 {
-                    self.groups.swap_remove(index);
+                    let (.., control, _) = self.groups.swap_remove(index);
+                    // A later path's group leaves its images with it
+                    // (karyos#1064): its endpoint is released next.
+                    for image in self
+                        .images
+                        .iter_mut()
+                        .filter(|image| image.key.alias.stream_id == stream_id)
+                    {
+                        for slot in &mut image.path_groups {
+                            if slot.is_some_and(|(held, _)| held == control) {
+                                *slot = None;
+                            }
+                        }
+                    }
                 }
                 Some((reply, configured(found.is_some())))
             }
@@ -3211,6 +3228,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
             uncertain_at: [None; 4],
             founding_gone: false,
             control_group,
+            path_groups: vec![None; paths],
             receiver_id: named,
             group_tag,
         });
@@ -3641,7 +3659,23 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     // group, after the unicast copy and with no report: it
                     // is never retried and raises no route fault. A full
                     // ring skips it, counted.
-                    if let Some((control, group)) = image.control_group {
+                    // Each later path's own group gets one too, once per
+                    // distinct group (karyos#1064).
+                    let founding = image.control_group;
+                    for (index, group) in founding
+                        .iter()
+                        .chain(image.path_groups.iter().flatten())
+                        .enumerate()
+                    {
+                        let (control, group) = *group;
+                        let earlier = founding
+                            .iter()
+                            .chain(image.path_groups.iter().flatten())
+                            .take(index)
+                            .any(|(_, seen)| *seen == group);
+                        if earlier {
+                            continue;
+                        }
                         let copy = ControlItem::Outgoing {
                             endpoint: control,
                             destination: group,
@@ -4295,9 +4329,14 @@ impl<T: StreamTerms> GroupIntake<'_, T> {
         // 2. An image of this receiver bound to that incarnation, through
         // this control group, with that lane.
         let Some(image) = role.images.iter_mut().find(|image| {
-            image
+            (image
                 .control_group
                 .is_some_and(|(control, _)| control == endpoint)
+                || image
+                    .path_groups
+                    .iter()
+                    .flatten()
+                    .any(|(control, _)| *control == endpoint))
                 && image.key.alias == nak.alias
                 && image.identity == nak.identity
         }) else {
@@ -5151,6 +5190,16 @@ impl<T: StreamTerms> Intake<'_, T> {
                     }
                     // The later path is charged and its freshness tracked
                     // from its own joins (RP-1).
+                    // Its own control group, from its subscription
+                    // entry (karyos#1064).
+                    let group = self
+                        .role
+                        .groups
+                        .iter()
+                        .find(|(held, stream, ..)| {
+                            (*held, *stream) == (endpoint, answer.alias.stream_id)
+                        })
+                        .map(|(_, _, control, group)| (*control, *group));
                     let joins = self.role.sessions.paths().joins(image, path);
                     if let (Some(joins), Some(installed)) = (
                         joins,
@@ -5161,6 +5210,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                         // fault (#310 review).
                         if let Some(route) = installed.routes.get_mut(path) {
                             *route = CopyRoute::default();
+                        }
+                        if let Some(slot) = installed.path_groups.get_mut(path) {
+                            *slot = group;
                         }
                         installed.stats.path_bound(
                             path,
