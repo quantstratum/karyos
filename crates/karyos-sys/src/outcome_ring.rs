@@ -760,5 +760,7 @@ impl OutcomeReader {
     }
 }
 
+pub mod shared;
+
 #[cfg(all(test, not(loom)))]
 mod tests;
