@@ -50,7 +50,7 @@ directory); `make raft-eval` runs `--locked` and fails otherwise
 | Pre-vote | raft-rs's `pre_vote`, tested against a control without it, which a returning follower deposes |
 | Allocation | **fails the gate**, measured in the simulator only: W1, 32 clients, seed 1: 113 entries past the warm-up, 5,701 allocations and 2,547 frees, 51 and 23 per entry. Messages pass in memory there, so raft-rs's protobuf encoding and decoding, which ADR-0043's replication boundary includes and the real-process path performs (`src/raft_rs.rs`, `Wire`), is not counted: the full-boundary figure is outstanding |
 | Durability, recovery | the harness's C4 checks pass under W4's crashes and torn writes |
-| Storage | raft-rs reads a `MemStorage` mirror of what C4 made durable, so the harness's metered log reads do not see its reads |
+| Storage | raft-rs reads a `MemStorage` mirror of what C4 made durable; under declared limits the adapter reads each append's logged entries again through the harness's metered log before it leaves, and holds it back when the duty's budget cannot cover them (karyos#975) |
 | Real processes | demonstrated: `tests/real_processes.rs` runs three `raft-eval-node` processes, each running `RaftRs` (the type the simulator tests drive, unchanged) through the harness's `drive`, over C4's log on real files (`StdDisk`) and UDP on the loopback; they elect a leader and all apply the same 20 commands in the same order. The runner maps 10 ms of the process clock to a tick: at 1 ms a tick an election times out before a vote's `fsync` and no leader is elected |
 | Panics | raft-rs asserts its own invariants and unwraps its storage lock; none fired in these runs |
 
@@ -80,8 +80,8 @@ candidate (the parameters are plan issue 062's to freeze).
 | W2 in-flight burst, nominal | pass | pass |
 | W2 in-flight caps under delayed acknowledgements | **not strict**: raft-rs frees a full window's slot when a heartbeat answer arrives (its recovery from lost acknowledgements), so a second append can leave before the first is acknowledged, past both caps; pinned by `window::a_heartbeat_answer_frees_a_full_window_slot`; left to the candidate, since holding it in the adapter would stall a follower whose acknowledgements were lost (karyos#975) | **not strict across RPC timeouts**: one append in flight per follower while it is answered (its sequential stream), but the adapter fails an RPC after `RPC_TIMEOUT` ticks and OpenRaft then sends the next append while the first may still be in flight or unacknowledged; documented, not tested (karyos#975) |
 | W2 slow follower | pass | **fail, typed**: `NotBehind`: the leader commits 787 of the 1,000 entries required while the follower is cut off, so the case cannot establish its slow follower |
-| W2 log-read burst | **not demonstrated**: safety holds, but the catch-up reads bypass the metered log (next row), so it is never counted a pass | the same (its run also commits only 842 of the 1,024 entries required) |
-| W2 log-read limit | **not honoured through the harness's metered log**: raft-rs reads its `MemStorage` mirror | **not honoured through the harness's metered log**: OpenRaft reads the adapter's in-memory view |
+| W2 log-read burst | **pass** on the metered bytes (karyos#975): the follower catches up under the 64 KiB per-duty budget, appends the budget cannot cover held back and resent by raft-rs | **not demonstrated**: safety holds, but the catch-up reads bypass the metered log (next row), so it is never counted a pass (its run also commits only 842 of the 1,024 entries required) |
+| W2 log-read limit | **honoured through the harness's metered log** (karyos#975): each append's logged entries are read back through it and charged | **not honoured through the harness's metered log**: OpenRaft reads the adapter's in-memory view |
 | W2 in-flight bytes | not reached at 256 B payloads by W2 v1 (`W2::IN_FLIGHT_BYTES`). Neither candidate meters a follower's bytes in flight, so the adapter keeps the cap by entry size: a command over `in_flight_bytes / in_flight_entries` is refused with typed `Backpressure(InFlightBytes)`, even within the cap; asserted with 256 B values against 8 entries and 1 KiB | the same |
 | W5 snapshot cases | `NotYet`: no compaction or install through the core; refused as `Unsupported`, follow-up plan issue 065 | the same |
 | W5 lost reply, leader change, retry | runs, keeps safety, **retry not shown**: the frozen schedule assumes the reference's leader, server 0 from step 0; moved 30 steps later it shows the retry | runs, keeps safety, **retry not shown**: OpenRaft's first leader need not be server 0 |
@@ -90,9 +90,10 @@ candidate (the parameters are plan issue 062's to freeze).
 **Inputs to the C5 decision (karyos#691).** Weigh, besides the gates
 above: the in-flight caps are **strict on neither candidate**: not on
 `raft` 0.7.0 under acknowledgements delayed past a heartbeat (pinned by a
-test), and not on OpenRaft across an RPC timeout (documented); neither candidate meters log reads
-through the harness, so the log-read limit is not demonstrated for
-either; the byte cap is kept by entry size in both (a command over its
+test), and not on OpenRaft across an RPC timeout (documented); log
+reads are metered through the harness for raft-rs (karyos#975), not
+yet for OpenRaft, so the log-read limit is demonstrated for raft-rs
+only; the byte cap is kept by entry size in both (a command over its
 share is refused even within the cap). Tracked in
 karyos#975 (the first two).
 

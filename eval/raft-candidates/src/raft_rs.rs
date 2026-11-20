@@ -17,7 +17,14 @@
 //! stays the only durable copy: a restart rebuilds the mirror from it. A
 //! consequence the evaluation reports: raft-rs's reads (entries for a
 //! follower, committed entries to apply) come from the mirror, so the
-//! harness's metered [`LogView`] does not see them.
+//! harness's metered [`LogView`] does not see them on their own. Under
+//! declared limits the adapter therefore reads every entry an outgoing
+//! append carries from C4's log again, through the duty's metered
+//! [`LogView`], before the append leaves (`RaftCore::meter`,
+//! karyos#975): an append whose logged entries the budget cannot cover
+//! is not sent this duty, as if the network lost it, and raft-rs resends
+//! it as it does after a loss. The log-read limit is then the measured
+//! bytes the harness charges, not the mirror's.
 //!
 //! **Determinism.** raft-rs draws each election timeout with
 //! `rand::thread_rng()` from `[min_election_tick, max_election_tick)`.
@@ -40,8 +47,9 @@
 //! raft-rs frees a window slot when a heartbeat answer arrives while the
 //! window is full (its recovery from lost acknowledgements), so the caps
 //! hold strictly only while acknowledgements are not delayed past a
-//! heartbeat; and log reads come from the `MemStorage` mirror, not the
-//! harness's metered log.
+//! heartbeat. Log reads come from the `MemStorage` mirror, and are
+//! charged to the metered log by `RaftCore::meter` before an append
+//! leaves (karyos#975).
 //!
 //! **Not taken here:** snapshots and compaction (W5, karyos#679): they
 //! answer `Unsupported`, which the harness reports as not demonstrated.
@@ -278,6 +286,52 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
         node.store().last_index().ok()
     }
 
+    /// Under declared limits, `messages` with every append whose entries
+    /// C4's log holds read again through the metered `log` (karyos#975):
+    /// an append is kept only when each of its entries the log holds was
+    /// read within the duty's budget and matches the mirror's; otherwise
+    /// it is held back this duty, as a lost message, and raft-rs resends
+    /// it. Entries the log does not hold yet (a leader's own, sent before
+    /// its persistence) are not a log read. Unmetered, `messages` as is.
+    fn meter(
+        &self,
+        messages: Vec<(NodeId, eraftpb::Message)>,
+        log: &mut LogView<'_>,
+    ) -> Vec<(NodeId, eraftpb::Message)> {
+        if self.limits.is_none() {
+            return messages;
+        }
+        messages
+            .into_iter()
+            .filter(|(_, message)| Self::read_back(message, log))
+            .collect()
+    }
+
+    /// Whether `message`'s logged entries were read back through `log`.
+    fn read_back(message: &eraftpb::Message, log: &mut LogView<'_>) -> bool {
+        if message.get_msg_type() != eraftpb::MessageType::MsgAppend {
+            return true;
+        }
+        let (Some(first), Some(last)) = (message.entries.first(), message.entries.last()) else {
+            return true;
+        };
+        let Some(end) = last.index.checked_add(1) else {
+            return false;
+        };
+        let Ok(read) = log.entries(first.index..end, u64::MAX) else {
+            return false;
+        };
+        let matches = read
+            .iter()
+            .zip(&message.entries)
+            .all(|(logged, sent)| *logged == from_raft(sent));
+        // Every entry past what was read must be one the log does not
+        // hold yet: a shorter read cut by the budget is not a read back.
+        let unread = message.entries.get(read.len()).map(|entry| entry.index);
+        let held = unread.is_some_and(|index| log.last_index().is_some_and(|last| index <= last));
+        matches && !held
+    }
+
     /// Stops the core: a mirror write failed, so raft-rs's view of its
     /// storage is no longer the log's.
     fn fault(&mut self) {
@@ -429,8 +483,9 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
         }
     }
 
-    fn ready(&mut self, _log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
-        if let Some(light) = self.light.take() {
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
+        if let Some(mut light) = self.light.take() {
+            light.messages = self.meter(std::mem::take(&mut light.messages), log);
             return Some(light);
         }
         if self.pending.is_some() {
@@ -443,12 +498,14 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
         }
         let mut raw = node.ready();
         let first = raw.entries().first().map(|entry| entry.index);
+        let messages = messages_of(raw.take_messages());
+        let after_persist = messages_of(raw.take_persisted_messages());
         let ready = Ready {
-            messages: messages_of(raw.take_messages()),
+            messages: self.meter(messages, log),
             truncate_from: first.filter(|first| mirrored.is_some_and(|last| *first <= last)),
             entries: raw.entries().iter().map(from_raft).collect(),
             hard_state: raw.hs().map(hard_state_of),
-            after_persist: messages_of(raw.take_persisted_messages()),
+            after_persist: self.meter(after_persist, log),
             committed: raw.take_committed_entries().iter().map(from_raft).collect(),
             snapshot_to: Vec::new(),
         };
@@ -615,6 +672,65 @@ mod tests {
             commit: None,
         };
         assert_eq!(hard_state_of(&raft_hard_state(&empty)), empty);
+    }
+
+    /// karyos#975: an append's logged entries are read back through the
+    /// metered view, and held back when the budget cannot cover them; a
+    /// leader's own entries, not in the log yet, are no log read.
+    #[test]
+    fn an_append_leaves_only_once_its_logged_entries_are_read_within_the_budget() {
+        use karyos_cluster::RaftLog;
+        use karyos_sim::disk::SimDisk;
+        use karyos_sim::harness::core::ReadBudget;
+        use karyos_sim::harness::workloads;
+
+        let entry = |index| Entry {
+            index,
+            term: 1,
+            event_time: index,
+            payload: vec![7; 100],
+        };
+        let mut log = RaftLog::create(
+            SimDisk::new(),
+            std::path::Path::new("log"),
+            workloads::geometry().unwrap(),
+            1,
+        )
+        .unwrap();
+        let _ = log.append(&[entry(1), entry(2)]).unwrap();
+        let _ = log.sync().unwrap();
+        let append = |entries: &[Entry]| {
+            let mut message = eraftpb::Message::default();
+            message.set_msg_type(eraftpb::MessageType::MsgAppend);
+            message.entries = entries.iter().map(to_raft).collect();
+            message
+        };
+        let span = log.frame_span(1).unwrap();
+        let budget = ReadBudget::new();
+        // Both logged entries within the budget: sent, and charged.
+        budget.refill(2 * span);
+        let mut view = LogView::metered(&mut log, Some(&budget));
+        assert!(RaftRs::read_back(&append(&[entry(1), entry(2)]), &mut view));
+        assert_eq!(budget.left(), 0);
+        // One entry's budget for two logged entries: held back.
+        budget.refill(span);
+        let mut view = LogView::metered(&mut log, Some(&budget));
+        assert!(!RaftRs::read_back(
+            &append(&[entry(1), entry(2)]),
+            &mut view
+        ));
+        // Nothing left: held back, nothing read.
+        budget.refill(0);
+        let mut view = LogView::metered(&mut log, Some(&budget));
+        assert!(!RaftRs::read_back(&append(&[entry(2)]), &mut view));
+        // A leader's fresh entry, past the log: no read, sent.
+        assert!(RaftRs::read_back(&append(&[entry(3)]), &mut view));
+        // An entry that differs from the log's: held back.
+        budget.refill(span);
+        let mut view = LogView::metered(&mut log, Some(&budget));
+        let mut other = entry(1);
+        other.payload = vec![8; 100];
+        assert!(!RaftRs::read_back(&append(&[other]), &mut view));
     }
 
     #[test]
