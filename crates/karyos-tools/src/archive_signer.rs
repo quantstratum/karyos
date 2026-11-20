@@ -74,6 +74,10 @@ struct Request {
     worker: std::thread::JoinHandle<()>,
     /// Set to stop the worker's I/O.
     cancel: Arc<AtomicBool>,
+    /// The program was reaped already (off Linux, by `try_wait`): its
+    /// group id may have been reused, so the group is not signalled
+    /// (karyos#1084).
+    reaped: bool,
 }
 
 /// Kills `child`'s process group. On Linux the leader is still unreaped
@@ -91,10 +95,15 @@ fn kill_group(child: &Child) {
 
 /// Ends `child` and everything it started, and joins `worker`: the group
 /// is killed while its leader is still unreaped, then the leader is
-/// reaped and the worker, cancelled, joined.
-fn end(mut child: Child, worker: std::thread::JoinHandle<()>, cancel: &AtomicBool) {
+/// reaped and the worker, cancelled, joined. A leader already `reaped`
+/// is not signalled through its group, whose id may be another's now
+/// (karyos#1084): only a leader that exited successfully after its
+/// output closed is reaped early, so nothing of it still holds the pipe.
+fn end(mut child: Child, worker: std::thread::JoinHandle<()>, cancel: &AtomicBool, reaped: bool) {
     cancel.store(true, Ordering::Release);
-    kill_group(&child);
+    if !reaped {
+        kill_group(&child);
+    }
     let _ = child.kill();
     let _ = child.wait();
     let _ = worker.join();
@@ -119,7 +128,12 @@ impl Request {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
                 if let Some(request) = request {
-                    end(request.child, request.worker, &request.cancel);
+                    end(
+                        request.child,
+                        request.worker,
+                        &request.cancel,
+                        request.reaped,
+                    );
                 }
             });
         match spawned {
@@ -143,7 +157,10 @@ impl Request {
         return karyos_sys::child::exited_unreaped(&self.child);
         #[cfg(not(target_os = "linux"))]
         match self.child.try_wait() {
-            Ok(Some(status)) => Some(status.success()),
+            Ok(Some(status)) => {
+                self.reaped = true;
+                Some(status.success())
+            }
             Ok(None) => None,
             Err(_) => Some(false),
         }
@@ -173,7 +190,12 @@ impl Drop for CommandSigner {
             self.retire(request);
         }
         if let Some(request) = self.retiring.take() {
-            end(request.child, request.worker, &request.cancel);
+            end(
+                request.child,
+                request.worker,
+                &request.cancel,
+                request.reaped,
+            );
         }
     }
 }
@@ -279,6 +301,7 @@ impl CommandSigner {
                 answer,
                 worker,
                 cancel,
+                reaped: false,
             });
         } else {
             // No worker holds the pipes: the group is ended here, its
@@ -712,6 +735,9 @@ mod tests {
     /// signer's group, keeps the output open after the group is killed.
     /// The worker's read is cancelled, so the cleanup still finishes and a
     /// replacement request runs; retries are never blocked by the pipe.
+    /// Linux only: elsewhere the output read blocks until every holder
+    /// closes it, as the module doc says (karyos#1091).
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_descendant_outside_the_group_cannot_block_the_cleanup() {
         let dir = dir("escaped");
@@ -768,6 +794,7 @@ mod tests {
             answer,
             worker: std::thread::spawn(|| {}),
             cancel: Arc::new(AtomicBool::new(false)),
+            reaped: false,
         };
         let start = Instant::now();
         let mut seen = None;
