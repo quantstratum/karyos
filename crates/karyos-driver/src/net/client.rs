@@ -234,7 +234,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             })
         };
         let detail = u64::from(stream_id.cast_unsigned());
-        let channel = match ChannelConfig::parse(uri) {
+        // A publication refuses what only a subscription admits: an
+        // `endpoint` on port 0 (karyos#656).
+        let channel = match ChannelConfig::parse(uri)
+            .and_then(|channel| channel.check_publication().map(|()| channel))
+        {
             Ok(channel) => channel,
             Err(error) => return refuse(ErrorCode::InvalidChannel, error.code()),
         };
@@ -523,10 +527,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(next) = registration.checked_add(1) else {
             return refuse(ErrorCode::IdentitiesExhausted, 0);
         };
-        let added = match identity {
-            Some(identity) => self.add_network_subscription_as(stream_id, &udp, identity),
-            None => self.add_network_subscription(stream_id, &udp),
-        };
+        // A URI's `endpoint=<host>:0` binds an ephemeral port of its own
+        // (karyos#656), unlike the embedded calls, which share a bind
+        // address's endpoint.
+        let added = self.subscribe_network(stream_id, &udp, (identity, None), false, true);
         let handle = match added {
             Ok(handle) => handle,
             Err(error) => return refuse(refusal(&error), refusal_detail(&error, detail)),

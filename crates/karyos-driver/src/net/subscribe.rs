@@ -181,7 +181,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream_id: i32,
         channel: &UdpConfig,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, (None, None), false)
+        self.subscribe_network(stream_id, channel, (None, None), false, false)
     }
 
     /// [`EmbeddedDriver::add_network_subscription`] whose images name the
@@ -201,7 +201,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         channel: &UdpConfig,
         identity: ReceiverIdentity,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, (Some(identity), None), false)
+        self.subscribe_network(stream_id, channel, (Some(identity), None), false, false)
     }
 
     /// [`EmbeddedDriver::add_network_subscription`] with a conflated view
@@ -234,7 +234,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         lane: karyos_sys::frame::Lane,
         config: karyos_sys::conflation::ConflationConfig,
     ) -> Result<NetworkSubscription, DriverError> {
-        self.subscribe_network(stream_id, channel, (None, Some((lane, config))), false)
+        self.subscribe_network(
+            stream_id,
+            channel,
+            (None, Some((lane, config))),
+            false,
+            false,
+        )
     }
 
     /// Stops `subscription`: its images retire, which seals their streams
@@ -452,7 +458,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !crate::agents::roles::answerable(control) {
             return Err(DriverError::InvalidRegistrationControl { control });
         }
-        self.subscribe_network(stream_id, channel, (Some(identity), None), true)
+        self.subscribe_network(stream_id, channel, (Some(identity), None), true, false)
     }
 
     pub(crate) fn subscribe_network(
@@ -467,6 +473,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             )>,
         ),
         dynamic: bool,
+        own_port: bool,
     ) -> Result<NetworkSubscription, DriverError> {
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
         // Redundant paths need sockets isolated per interface; without
@@ -489,7 +496,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             route,
             &later,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
-            channel.reliable,
+            (channel.reliable, own_port),
             (options.0, options.1, register_at(channel)),
         )
     }

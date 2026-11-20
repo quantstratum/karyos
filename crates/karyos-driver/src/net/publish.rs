@@ -55,6 +55,11 @@ use crate::sessions::send::Publication;
 /// until one joins.
 fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAddr>), DriverError> {
     let destination = match &channel.destination {
+        // Port 0 asks a subscription for an ephemeral port; a publication
+        // cannot send to it (karyos#656).
+        Destination::Unicast(address) if address.port() == 0 => {
+            return Err(DriverError::UnsupportedChannel);
+        }
         Destination::Unicast(address) => *address,
         Destination::Multicast { group, .. } => *group,
         // A manual destination set sends from one endpoint (design 2.1),
