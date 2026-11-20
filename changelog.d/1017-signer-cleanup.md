@@ -1,0 +1,3 @@
+### Fixed
+
+- `karyosd --archive`'s head signer keeps ownership and identity while it ends a signing program (karyos#1017): a request whose reaper thread cannot start is kept and retried, and no new program starts meanwhile; the worker reads the program's output without blocking and is cancelled, so a descendant outside the signer's process group that holds the output open no longer blocks every later request; and the program's success is read with `waitid(WNOWAIT)`, so it is reaped only after its process group is killed and the kill can never reach a reused group id. The group test no longer depends on the host reaping orphans.

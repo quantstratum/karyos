@@ -827,6 +827,7 @@ dependencies = [
  "karyos-sys",
  "karyos-trace",
  "proptest",
+ "rustix",
  "serde",
  "signal-hook",
  "toml",
