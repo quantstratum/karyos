@@ -4132,3 +4132,65 @@ fn a_head_before_the_keys_validity_never_pins_the_backlog() {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+/// karyos#1024: with a copy location, a recording that closes sealed is
+/// recorded as a verified local copy over its whole range, with the
+/// enforcement that applies (none here: no immutable attribute without
+/// `CAP_LINUX_IMMUTABLE`, and none off Linux) and its seals' digest.
+#[test]
+fn a_closed_sealed_recording_is_recorded_as_a_local_copy() {
+    use crate::integrity::copies::{CopyCatalog, CopyState, Enforcement};
+    let dir = temp_dir("local-copy");
+    let location = [5u8; 32];
+    let agent =
+        ArchiveHandle::spawn(StdDisk, &dir, sealing().with_copy_location(Some(location))).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    agent.shutdown().unwrap();
+
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    let copies = CopyCatalog::open(StdDisk, &dir, &mut journal).unwrap();
+    let current = copies.current().unwrap();
+    assert_eq!(current.len(), 1, "{current:?}");
+    let copy = current[0];
+    let end = u64::try_from(all.len()).unwrap();
+    assert_eq!(
+        (
+            copy.recording,
+            copy.start,
+            copy.end,
+            copy.location,
+            copy.state
+        ),
+        (id, 0, end, location, CopyState::Verified)
+    );
+    assert_eq!(
+        copy.digest,
+        crate::integrity::retention::seals_digest(&records, id, 0, end)
+    );
+    // No test host grants the attribute: never a protection not there.
+    assert!(matches!(
+        copy.enforcement,
+        Enforcement::Unsupported | Enforcement::ImmutableAttribute
+    ));
+    if copy.enforcement == Enforcement::ImmutableAttribute {
+        // Not expected under test; release so the directory can go.
+        return;
+    }
+    assert_eq!(copies.verified_copies(id, 0, end).unwrap(), 1);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Without a copy location, nothing is recorded as a copy.
+#[test]
+fn without_a_copy_location_no_copy_is_recorded() {
+    use crate::integrity::copies::CopyCatalog;
+    let dir = temp_dir("no-local-copy");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let _ = sealed_recording(&agent);
+    agent.shutdown().unwrap();
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let copies = CopyCatalog::open(StdDisk, &dir, &mut journal).unwrap();
+    assert!(copies.current().unwrap().is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
