@@ -83,6 +83,7 @@ Driver limits:
   --max-trace-points-per-client <n> live application trace points per client [16]
   --max-trace-point-registrations-per-client <n>
                                     trace points a client registers over its life [256]
+  --max-trace-point-copies <n>      driver-written trace point copies, own cells [256]
   --max-trace-journals <n>          entries of the trace journal table [64]
   --max-trace-journal-bytes <size>  bytes of every client trace journal [64m]
   --trace-drain-budget <n>          journal records mirrored per duty cycle [1024]
@@ -733,6 +734,7 @@ const OPTIONS: &[&str] = &[
     "--max-counters-per-client",
     "--max-trace-points-per-client",
     "--max-trace-point-registrations-per-client",
+    "--max-trace-point-copies",
     "--max-trace-journals",
     "--max-trace-journal-bytes",
     "--max-stream-bytes",
@@ -808,6 +810,7 @@ fn apply(options: &mut Options, option: &str, value: &str) -> Option<()> {
         "--max-trace-point-registrations-per-client" => {
             driver.max_trace_point_registrations_per_client = count(value)?;
         }
+        "--max-trace-point-copies" => driver.max_trace_point_copies = count(value)?,
         "--max-trace-journals" => driver.max_trace_journals = count(value)?,
         "--max-trace-journal-bytes" => driver.max_trace_journal_bytes = size(value)?,
         "--max-stream-bytes" => {

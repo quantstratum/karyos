@@ -659,6 +659,8 @@ mod tests {
         let config = DriverConfig {
             counters_capacity,
             position_sample_interval: u64::MAX,
+            // The region is exactly the positions' cells (karyos#869).
+            max_trace_point_copies: 0,
             ..DriverConfig::default()
         };
         EmbeddedDriver::with_config(config).unwrap()

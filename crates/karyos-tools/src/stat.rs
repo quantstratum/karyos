@@ -155,6 +155,11 @@ pub fn report(counters: &CountersReader, client_counters: &CountersReader, now: 
     let mut lanes: BTreeMap<Lane, Positions> = BTreeMap::new();
     for (metadata, value) in &cells {
         let keys = metadata.keys;
+        // The driver's copy of a trace point (karyos#869) is a name, not a
+        // counter: its value is an id.
+        if metadata.type_id == TYPE_TRACE_POINT {
+            continue;
+        }
         if metadata.type_id != TYPE_POSITION {
             groups
                 .entry((keys.stream, keys.lane, keys.kind, keys.participant))

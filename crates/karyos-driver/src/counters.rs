@@ -30,6 +30,7 @@
 //! | `trace point ids exhausted` | event | trace point registrations refused because the instance assigned every id (R-CORE-1, karyos#722) |
 //! | `trace points per client` | gauge | the configured `max_trace_points_per_client`, set at creation (karyos#868) |
 //! | `trace point registrations per client` | gauge | the configured `max_trace_point_registrations_per_client`, set at creation (karyos#868) |
+//! | `trace point copies dropped` | event | trace points registered without a driver-written copy because `max_trace_point_copies` were live (karyos#869) |
 //! | `commands served` | event | commands decoded and executed or refused; malformed records are not commands |
 //! | `commands refused` | event | served commands answered with an `Error` |
 //! | `responses sent` | event | responses written to the broadcast buffer |
@@ -166,7 +167,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 77] = [
+const LABELS: [(u64, &str); 78] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -244,6 +245,7 @@ const LABELS: [(u64, &str); 77] = [
     (TYPE_EVENTS, "trace point ids exhausted"),
     (TYPE_GAUGE, "trace points per client"),
     (TYPE_GAUGE, "trace point registrations per client"),
+    (TYPE_EVENTS, "trace point copies dropped"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -491,6 +493,9 @@ pub(crate) enum Event {
     /// The driver's configured `max_trace_point_registrations_per_client`,
     /// set at creation (karyos#868).
     TracePointRegistrationsPerClient,
+    /// Trace points registered with no driver-written copy, because
+    /// `max_trace_point_copies` copies were live (karyos#869).
+    TracePointCopiesDropped,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -502,6 +507,9 @@ pub(crate) struct DriverCounters {
     /// The conductor loop's spin time cell: fixed, kept here, written from
     /// the meter's shared word (`crate::spin`).
     spin: Counter,
+    /// The cells below it serve the driver's counters and positions; those
+    /// from it on, the trace point copies only (karyos#869).
+    copies_from: usize,
 }
 
 impl DriverCounters {
@@ -518,12 +526,22 @@ impl DriverCounters {
     ///
     /// Returns [`DriverError::InvalidConfig`] when `capacity` cannot hold
     /// the fixed counters or cannot be allocated.
+    #[cfg(test)]
     pub(crate) fn with_capacity(capacity: usize) -> Result<Self, DriverError> {
+        Self::with_copies(capacity, 0)
+    }
+
+    /// As [`DriverCounters::with_capacity`], with `copies` more cells that
+    /// only the trace point copies take (karyos#869).
+    pub(crate) fn with_copies(capacity: usize, copies: usize) -> Result<Self, DriverError> {
         if capacity < FIXED_COUNTERS {
             return Err(DriverError::InvalidConfig);
         }
-        let (manager, reader) = counters(capacity).map_err(|_| DriverError::InvalidConfig)?;
-        Self::allocate(manager, reader)
+        let cells = capacity
+            .checked_add(copies)
+            .ok_or(DriverError::InvalidConfig)?;
+        let (manager, reader) = counters(cells).map_err(|_| DriverError::InvalidConfig)?;
+        Self::allocate(manager, reader, capacity)
     }
 
     /// Allocates the region in a shared region (IPC mode), with `capacity`
@@ -533,15 +551,23 @@ impl DriverCounters {
         instance: u128,
         region: u64,
         capacity: usize,
+        copies: usize,
     ) -> Result<Self, DriverError> {
         if capacity < FIXED_COUNTERS {
             return Err(DriverError::InvalidConfig);
         }
-        let (manager, reader) = karyos_sys::counters::counters_in(instance, region, capacity)?;
-        Self::allocate(manager, reader)
+        let cells = capacity
+            .checked_add(copies)
+            .ok_or(DriverError::InvalidConfig)?;
+        let (manager, reader) = karyos_sys::counters::counters_in(instance, region, cells)?;
+        Self::allocate(manager, reader, capacity)
     }
 
-    fn allocate(mut manager: CountersManager, reader: CountersReader) -> Result<Self, DriverError> {
+    fn allocate(
+        mut manager: CountersManager,
+        reader: CountersReader,
+        copies_from: usize,
+    ) -> Result<Self, DriverError> {
         let counters = LABELS
             .iter()
             .map(|&(type_id, label)| manager.allocate(type_id, label))
@@ -555,6 +581,7 @@ impl DriverCounters {
             reader,
             counters,
             spin,
+            copies_from,
         })
     }
 
@@ -572,7 +599,38 @@ impl DriverCounters {
         label: &str,
         keys: karyos_sys::counters::CounterKeys,
     ) -> Option<Counter> {
-        match self.manager.allocate_keyed(type_id, label, keys) {
+        let limit = self.copies_from;
+        match self
+            .manager
+            .allocate_keyed_where(type_id, label, keys, |index| index < limit)
+        {
+            Ok(counter) => Some(counter),
+            Err(_) => {
+                self.add(Event::CountersUnavailable, 1);
+                None
+            }
+        }
+    }
+
+    /// Allocates a driver-written copy of a client's trace point (karyos#869):
+    /// a cell of type id 8 with the point's `name` as its label, keyed to
+    /// the client, published with its `id` as its value. Clients never
+    /// write this region, so its value is the id the driver assigned.
+    /// `None`, counted in `counters unavailable`, when no cell is free.
+    pub(crate) fn allocate_point_name(
+        &mut self,
+        name: &str,
+        keys: karyos_sys::counters::CounterKeys,
+        id: u16,
+    ) -> Option<Counter> {
+        let copies_from = self.copies_from;
+        match self.manager.allocate_valued_where(
+            karyos_sys::counters::TYPE_TRACE_POINT,
+            name,
+            keys,
+            u64::from(id),
+            |index| index >= copies_from,
+        ) {
             Ok(counter) => Some(counter),
             Err(_) => {
                 self.add(Event::CountersUnavailable, 1);
@@ -596,7 +654,10 @@ impl DriverCounters {
         label: &str,
         keys: karyos_sys::counters::CounterKeys,
     ) -> Option<Counter> {
-        self.manager.allocate_keyed(type_id, label, keys).ok()
+        let limit = self.copies_from;
+        self.manager
+            .allocate_keyed_where(type_id, label, keys, |index| index < limit)
+            .ok()
     }
 
     /// Frees a keyed counter at once (inside a sampling pass).
@@ -802,6 +863,7 @@ mod tests {
                 Event::TracePointRegistrationsPerClient,
                 "trace point registrations per client",
             ),
+            (Event::TracePointCopiesDropped, "trace point copies dropped"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

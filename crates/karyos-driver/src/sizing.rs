@@ -255,10 +255,13 @@ pub fn report(
             "driver counters",
             1,
             pages.region(
-                karyos_sys::counters::structure_length(config.counters_capacity),
+                config
+                    .counters_cells()
+                    .ok()
+                    .and_then(karyos_sys::counters::structure_length),
                 "counters_capacity",
             )?,
-            &["counters_capacity"],
+            &["counters_capacity", "max_trace_point_copies"],
         )?,
         line(
             "client counters",
