@@ -693,20 +693,43 @@ impl ResponseCode {
 }
 
 /// The answer to a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = CONTROL_RESPONSE, check = Self::check)]
 pub struct ControlResponse<'a> {
     /// The request's.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The recording or replay id, or a list's count; 0 on an error.
+    #[field(offset = 8)]
     pub id: u64,
     /// The outcome.
+    #[field(offset = 16, width = 1, with = response_code)]
     pub code: ResponseCode,
     /// Why, on an error: up to [`MAX_RESPONSE_MESSAGE`] bytes; empty when
     /// the code is [`ResponseCode::Ok`].
+    #[field(var, min = 0, max = MAX_RESPONSE_MESSAGE)]
     pub message: &'a str,
 }
 
-impl<'a> ControlResponse<'a> {
+/// [`ResponseCode`] as a block field of the derive (karyos#1029).
+mod response_code {
+    use super::{Block, CodecError, Encoder, ResponseCode, invalid_enum};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<ResponseCode, CodecError> {
+        let raw = block.u8(at)?;
+        ResponseCode::of(raw).ok_or_else(|| invalid_enum("code", raw))
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        code: &ResponseCode,
+    ) -> Result<(), CodecError> {
+        encoder.u8(at, code.code())
+    }
+}
+
+impl ControlResponse<'_> {
     fn check(&self) -> Result<(), CodecError> {
         match self.code {
             ResponseCode::Ok if !self.message.is_empty() => Err(CodecError::LengthOutOfRange {
@@ -719,38 +742,6 @@ impl<'a> ControlResponse<'a> {
             _ if self.id != 0 => Err(out_of_range("id")),
             _ => Ok(()),
         }
-    }
-
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
-        let raw = block.u8(16)?;
-        let code = ResponseCode::of(raw).ok_or_else(|| invalid_enum("code", raw))?;
-        let message = decoder.str("message", 0, MAX_RESPONSE_MESSAGE)?;
-        decoder.finish()?;
-        let response = Self {
-            correlation_id: block.u64(0)?,
-            id: block.u64(8)?,
-            code,
-            message,
-        };
-        response.check()?;
-        Ok(response)
-    }
-
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], [`CodecError::LengthOutOfRange`] for the
-    /// message (it must be empty on success), and
-    /// [`CodecError::ValueOutOfRange`] for an id on an error.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &CONTROL_RESPONSE)?;
-        self.check()?;
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, self.id)?;
-        encoder.u8(16, self.code.code())?;
-        encoder.bytes("message", 0, MAX_RESPONSE_MESSAGE, self.message.as_bytes())?;
-        encoder.finish()
     }
 }
 
