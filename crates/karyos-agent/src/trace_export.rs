@@ -97,7 +97,8 @@ const BUSY_RETRIES: usize = 16;
 
 /// Up to `count` records (at most [`crate::api::EXPORT_MAX`]) of
 /// `mirror`, with the application points they reference named from
-/// `points` (the client counters region, R-CORE-1), of driver instance
+/// `points` (the driver counters region, whose trace point cells the
+/// driver writes; R-CORE-1, karyos#869), of driver instance
 /// `epoch`, from sequence `from` on, in a
 /// reply of at most `max_bytes` plus one record and one journal; `asked` is
 /// the epoch of the reader's cursor, if it has one.
@@ -405,16 +406,13 @@ fn application_point(payload: &[u64]) -> Option<u16> {
 }
 
 /// The application points `records` reference, by id, named from the
-/// client counters region: a point is named only by the single live trace
-/// point cell holding its id, and only when every record referencing the
-/// id is in a live journal of that cell's client. A record in a recycled,
-/// unknown or unreadable journal has no client to check, so its id goes
-/// unnamed. Clients
-/// can write their cells, so two cells claiming one id, or a cell of
-/// another client than the records', leave the point unnamed rather than
-/// misattributed.
-/// A client can still misname its own points by rewriting its cell's
-/// value: naming from a driver-written copy of the ids is karyos#869.
+/// driver's own copy of each trace point in the driver counters region
+/// (karyos#869), which clients never write: a client rewriting its own
+/// cell's value changes no name. A point is named only by the single live
+/// trace point cell holding its id, and only when every record
+/// referencing the id is in a live journal of that cell's client. A record
+/// in a recycled, unknown or unreadable journal has no client to check, so
+/// its id goes unnamed; so does a point whose copy found no free cell.
 fn name_points(
     points: Option<&CountersReader>,
     records: &[ExportRecord],

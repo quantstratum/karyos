@@ -287,6 +287,27 @@ impl ClientCounters {
         Ok((cell, registration, id))
     }
 
+    /// Writes `value` into allocation `registration`'s cell, as a client
+    /// can write its own cells.
+    #[cfg(test)]
+    pub(crate) fn overwrite(&self, registration: u64, value: u64) {
+        if let Some(owned) = self
+            .owned
+            .iter()
+            .find(|owned| owned.counter.registration_id() == registration)
+        {
+            owned.counter.set(value);
+        }
+    }
+
+    /// Whether `client` still holds the trace point allocated as
+    /// `registration`.
+    pub(crate) fn holds_point(&self, client: u64, registration: u64) -> bool {
+        self.owned.iter().any(|owned| {
+            owned.point && owned.client == client && owned.counter.registration_id() == registration
+        })
+    }
+
     /// Frees `client`'s allocation `registration` in `cell` (its
     /// `ReleaseCounter`); `false`, freeing nothing, unless the client owns
     /// exactly that allocation.

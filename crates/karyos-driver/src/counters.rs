@@ -581,6 +581,32 @@ impl DriverCounters {
         }
     }
 
+    /// Allocates a driver-written copy of a client's trace point (karyos#869):
+    /// a cell of type id 8 with the point's `name` as its label, keyed to
+    /// the client, published with its `id` as its value. Clients never
+    /// write this region, so its value is the id the driver assigned.
+    /// `None`, counted in `counters unavailable`, when no cell is free.
+    pub(crate) fn allocate_point_name(
+        &mut self,
+        name: &str,
+        keys: karyos_sys::counters::CounterKeys,
+        id: u16,
+    ) -> Option<Counter> {
+        match self.manager.allocate_valued_where(
+            karyos_sys::counters::TYPE_TRACE_POINT,
+            name,
+            keys,
+            u64::from(id),
+            |_| true,
+        ) {
+            Ok(counter) => Some(counter),
+            Err(_) => {
+                self.add(Event::CountersUnavailable, 1);
+                None
+            }
+        }
+    }
+
     /// Counts an allocation refused without scanning the region, because
     /// an earlier allocation in the same pass already found it full.
     pub(crate) fn count_unavailable(&self) {

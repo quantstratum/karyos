@@ -154,6 +154,14 @@ pub(crate) fn counters(cells: &[Cell], now: u64, changes: &mut Changes) -> Vec<C
 /// head, floor, headroom and each subscriber's lag, as `karyos-stat`
 /// shows them.
 pub(crate) fn sample(cells: &[Cell], consistent: bool, now: u64, changes: &mut Changes) -> Sample {
+    // The driver's copies of trace points (karyos#869) are names, not
+    // metrics, and their labels are the clients' own: they never enter
+    // the sample, so no point can pose as a driver counter.
+    let cells: Vec<&Cell> = cells
+        .iter()
+        .filter(|(metadata, _)| metadata.type_id != karyos_sys::counters::TYPE_TRACE_POINT)
+        .collect();
+    let cells = cells.as_slice();
     let fixed = |name: &str| {
         cells
             .iter()

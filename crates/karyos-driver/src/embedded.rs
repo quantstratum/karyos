@@ -1223,6 +1223,10 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     pub(crate) counters: DriverCounters,
     /// The client counters region and the owner of each allocated cell.
     pub(crate) client_counters: ClientCounters,
+    /// The driver-written copy of each live trace point in the counters
+    /// region (karyos#869): its client, the client cell's registration,
+    /// and the driver's cell, freed once the client's point is gone.
+    pub(crate) point_names: Vec<(u64, u64, karyos_sys::counters::Counter)>,
     /// The clock of claim deadlines and of the admission timeout.
     pub(crate) clock: Box<dyn MonotonicClock>,
     /// The next export id: one checked namespace, never reused, for the
@@ -1660,6 +1664,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(Self {
             counters,
             client_counters,
+            point_names: Vec::new(),
             id,
             driver_id,
             next_trace_number: 1,

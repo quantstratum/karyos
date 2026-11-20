@@ -613,6 +613,20 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.clients.len()
     }
 
+    /// Frees the driver's copy of every trace point its client no longer
+    /// holds (karyos#869).
+    pub(crate) fn sweep_point_names(&mut self) {
+        let mut index = 0;
+        while let Some((client, registration, _)) = self.point_names.get(index) {
+            if self.client_counters.holds_point(*client, *registration) {
+                index += 1;
+            } else {
+                let (_, _, cell) = self.point_names.swap_remove(index);
+                self.counters.free(cell);
+            }
+        }
+    }
+
     /// Releases every client whose close flag is set: its ring, its
     /// admission slot, its untaken hand-over entries, its registrations and
     /// its client counter cells (those of an in-process client once its
@@ -648,6 +662,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 index += 1;
             }
         }
+        // The points of the clients just removed.
+        self.sweep_point_names();
     }
 
     /// Stops serving a faulty client: discards its ring and untaken
@@ -908,6 +924,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // Only the owner's release of its exact allocation: anything
                 // else frees nothing and is a protocol violation.
                 if self.client_counters.release(client, cell, registration) {
+                    self.sweep_point_names();
                     Ok(Response::OperationSucceeded {
                         request: RequestId { client, sequence },
                     })
@@ -2046,9 +2063,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             if name.is_empty() || name.chars().any(char::is_control) {
                 return refuse(ErrorCode::InvalidLabel, 0);
             }
-            self.client_counters
-                .allocate_point(client, name, keys)
-                .map(|(cell, registration, _)| (cell, registration))
+            let allocated = self.client_counters.allocate_point(client, name, keys);
+            if let Ok((_, registration, id)) = allocated {
+                // The driver's own copy, which tools name the point from
+                // (karyos#869): without a free cell the point is unnamed
+                // there, never misnamed.
+                if let Some(cell) = self.counters.allocate_point_name(name, keys, id) {
+                    self.point_names.push((client, registration, cell));
+                }
+            }
+            allocated.map(|(cell, registration, _)| (cell, registration))
         } else {
             self.client_counters
                 .allocate(client, type_id, label.as_str(), keys)
@@ -4494,6 +4518,75 @@ mod tests {
             panic!("not allocated");
         };
         assert_eq!(value, 1, "the first id of the instance");
+    }
+
+    /// The driver's copies of trace points in its counters region
+    /// (karyos#869): label, client and id.
+    fn point_names(driver: &EmbeddedDriver) -> Vec<(String, u64, u64)> {
+        let reader = driver.counters();
+        (0..reader.capacity())
+            .filter_map(|index| match reader.read(index) {
+                karyos_sys::counters::CellRead::Allocated {
+                    metadata, value, ..
+                } if metadata.type_id == karyos_sys::counters::TYPE_TRACE_POINT => Some((
+                    String::from_utf8_lossy(metadata.label()).into_owned(),
+                    metadata.keys.participant,
+                    value,
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// karyos#869: the driver keeps its own copy of each trace point, in a
+    /// region clients never write. A client rewriting its cell's value
+    /// changes the copy neither in name nor in id; the copy goes with the
+    /// point's release.
+    #[test]
+    fn a_trace_points_driver_copy_ignores_a_client_rewrite() {
+        let (mut driver, _stream) = driver_with_stream();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer, _link) = raw_client(&mut driver);
+        write(
+            &mut producer,
+            Command::AllocateCounter {
+                sequence: 1,
+                type_id: karyos_sys::counters::TYPE_TRACE_POINT,
+                label: CounterLabel::new("md.tick").unwrap(),
+                stream: 0,
+                participant: 0,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        let [ref answer] = responses(&mut observer)[..] else {
+            panic!("expected one response");
+        };
+        let (cell, registration) = allocated(answer);
+        assert_eq!(
+            point_names(&driver),
+            vec![("md.tick".to_owned(), client, 1)]
+        );
+        driver.client_counters.overwrite(registration, 99);
+        let karyos_sys::counters::CellRead::Allocated { value, .. } = client_cell(&driver, cell)
+        else {
+            panic!("not allocated");
+        };
+        assert_eq!(value, 99, "the client's own cell is rewritten");
+        let _ = driver.do_work().unwrap();
+        assert_eq!(
+            point_names(&driver),
+            vec![("md.tick".to_owned(), client, 1)]
+        );
+        write(
+            &mut producer,
+            Command::ReleaseCounter {
+                sequence: 2,
+                cell,
+                registration,
+            },
+        );
+        let _ = driver.do_work().unwrap();
+        assert!(point_names(&driver).is_empty());
     }
 
     fn client_cell(driver: &EmbeddedDriver, cell: u64) -> karyos_sys::counters::CellRead {

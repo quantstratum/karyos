@@ -329,7 +329,9 @@ impl Agent {
         };
         Ok(crate::trace_export::export(
             tool.trace_mirror(),
-            Some(tool.client_counters()),
+            // The driver's copy of each point, never a client's cell
+            // (karyos#869).
+            Some(tool.counters()),
             instance,
             from,
             count,
