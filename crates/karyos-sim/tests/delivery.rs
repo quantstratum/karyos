@@ -172,6 +172,33 @@ fn test_delivery_every_replica_gives_the_same_state_and_outcomes() {
     }
 }
 
+/// karyos#927: the leader writes the session bounds into the log, and
+/// every replica applies them as an entry, so a restarted one reads them
+/// from the log.
+#[test]
+fn test_delivery_the_session_bounds_are_a_log_entry_on_every_replica() {
+    for servers in [3, 5] {
+        for seed in scenarios::seeds() {
+            let (mut sim, _) = cluster(seed, servers, vec![values(&[10])], false);
+            sim.run_for(600).unwrap();
+            for id in 0..servers {
+                let server = server(&sim, id);
+                assert!(
+                    server.container().bounds_logged(),
+                    "server {id}, seed {seed}"
+                );
+                assert!(
+                    server.kinds().iter().any(|(_, kind)| *kind == "bounds"),
+                    "server {id}, seed {seed}: {:?}",
+                    server.kinds()
+                );
+                assert_eq!(server.container().sessions().config(), config().dedup);
+            }
+            replicas_agree(&sim, servers);
+        }
+    }
+}
+
 #[test]
 fn test_delivery_a_request_sent_twice_is_applied_once() {
     for servers in [3, 5] {

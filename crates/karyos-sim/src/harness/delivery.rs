@@ -37,6 +37,10 @@
 //!   [`DeliveryServer::with_configurations`] recognises, reach the service
 //!   as configuration changes when they apply. An operator's
 //!   [`Delivery::Change`] goes to the core.
+//! - **Session bounds** (karyos#927). A leader proposes its container's
+//!   session bounds once per leadership while the log it applied carries
+//!   none ([`ServiceContainer::propose_bounds`]), so the bounds are a log
+//!   entry a restarted server reads back.
 //! - **Restart.** A restart reopens the log, recovers the core, and
 //!   rebuilds the container from the committed entries the core hands
 //!   out again, as `ServerNode` rebuilds its service.
@@ -48,7 +52,7 @@ use karyos_archive::segment::Geometry;
 use karyos_cluster::dedup::{Outcome, Request};
 use karyos_cluster::service::{
     Applied, ApplyError, ClusteredService, ContainerConfig, Context, Envelope, NotLeader, Propose,
-    ServiceContainer,
+    ServiceContainer, SessionBounds,
 };
 use karyos_cluster::{Entry, LogError, RaftLog};
 
@@ -262,6 +266,9 @@ pub struct DeliveryServer<C, S> {
     /// and deadline; cleared when its leadership changes, so a new
     /// leader proposes every due timer again (decision D6).
     fired: BTreeSet<(u64, u64)>,
+    /// Whether this server proposed the session bounds in its leadership
+    /// (karyos#927); cleared when its leadership changes.
+    bounds_proposed: bool,
     /// Which of the core's own entries are configuration changes.
     configurations: fn(&[u8]) -> bool,
     /// Every entry applied since the last start: its index and kind.
@@ -309,6 +316,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
             pending: BTreeMap::new(),
             led: None,
             fired: BTreeSet::new(),
+            bounds_proposed: false,
             configurations: |_| false,
             kinds: Vec::new(),
             outcomes: Vec::new(),
@@ -475,6 +483,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         }
         if self.led != now {
             self.fired.clear();
+            self.bounds_proposed = false;
         }
         self.led = now;
     }
@@ -488,6 +497,16 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         };
         if !core.leads() {
             return;
+        }
+        // The session bounds, once per leadership while the log carries
+        // none (karyos#927).
+        if !self.bounds_proposed
+            && self
+                .container
+                .propose_bounds(&mut Proposer::new(core, &mut LogView::new(log)))
+                == Ok(true)
+        {
+            self.bounds_proposed = true;
         }
         let due: Vec<_> = self
             .container
@@ -557,6 +576,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         };
         let kind = match Envelope::decode(&entry.payload) {
             _ if entry.payload.is_empty() => "core",
+            _ if SessionBounds::decode(&entry.payload).is_ok() => "bounds",
             Ok(Envelope::Register { .. }) => "register",
             Ok(Envelope::Close { .. }) => "close",
             Ok(Envelope::Request { .. }) => "request",
@@ -614,6 +634,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         self.outcomes.clear();
         self.kinds.clear();
         self.fired.clear();
+        self.bounds_proposed = false;
         self.halted = None;
         self.running = Some((core, log));
     }
