@@ -218,6 +218,8 @@ enum Seen {
     Event(u64, Vec<u8>),
     /// A checkpoint: its `group_seq` and id.
     Checkpoint(u64, u64),
+    /// A late checkpoint (karyos#1003): its `group_seq` and id.
+    Late(u64, u64),
     Stop(Stop),
 }
 
@@ -230,6 +232,9 @@ fn steps(mut cursor: ReplayCursor<FaultDisk>) -> Vec<Seen> {
                 checkpoint.group_seq,
                 checkpoint.checkpoint_id,
             )),
+            Step::LateCheckpoint(checkpoint) => {
+                seen.push(Seen::Late(checkpoint.group_seq, checkpoint.checkpoint_id));
+            }
             Step::Stop(stop) => {
                 seen.push(Seen::Stop(stop));
                 return seen;
@@ -243,6 +248,7 @@ fn kinds(seen: &[Seen]) -> Vec<String> {
         .map(|seen| match seen {
             Seen::Event(seq, _) => format!("e{seq}"),
             Seen::Checkpoint(seq, id) => format!("c{seq}#{id}"),
+            Seen::Late(seq, id) => format!("late c{seq}#{id}"),
             Seen::Stop(stop) => format!("{stop:?}"),
         })
         .collect()
@@ -746,7 +752,9 @@ fn step_from_skips_checkpoints_below_its_start() {
     loop {
         match cursor.step_from(3).unwrap() {
             Step::Event(event) => seen.push(format!("e{}", event.group_seq())),
-            Step::Checkpoint(checkpoint) => seen.push(format!("c{}", checkpoint.group_seq)),
+            Step::Checkpoint(checkpoint) | Step::LateCheckpoint(checkpoint) => {
+                seen.push(format!("c{}", checkpoint.group_seq));
+            }
             Step::Stop(_) => break,
         }
     }
@@ -1156,4 +1164,83 @@ fn following_from_a_checkpoint_keeps_its_range_across_a_gap() {
         expected.last(),
         Some(Seen::Stop(Stop::Gap(GapMarker { from_seq: 3, .. })))
     ));
+}
+
+/// karyos#1003: a writer records a checkpoint for event 2 after event 3,
+/// once a follower gave event 3. The prefix does not advance, but
+/// `Recovery::checkpoints` does, so a poll sees it; the follow gives it
+/// marked late, before event 4, where a closed replay gives it right
+/// after event 2.
+#[test]
+fn a_late_checkpoint_is_discovered_by_a_poll_and_given_marked_late() {
+    let early = [
+        Write::Records(event(1, EndOutcome::Complete)),
+        Write::Records(event(2, EndOutcome::Complete)),
+        Write::Records(event(3, EndOutcome::Complete)),
+    ];
+    let before = Recorded::new(Capture::BestEffort, &early);
+    let store = before.store();
+    let first = before.recovery(&store);
+    let mut cursor = ReplayCursor::open(before.journal(), &first, &replay_config(), ROOM).unwrap();
+    let mut given = Vec::new();
+    loop {
+        match cursor.step().unwrap() {
+            Step::Event(event) => given.push(event.group_seq()),
+            Step::Stop(Stop::EndOfPrefix { .. }) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(given, [1, 2, 3]);
+
+    let mut with_late = early.to_vec();
+    with_late.push(Write::Checkpoint(2, b"state at 2"));
+    let late = Recorded::new(Capture::BestEffort, &with_late);
+    let late_store = late.store();
+    let poll = late.recovery(&late_store);
+    // The poll: the prefix did not advance, the checkpoints did.
+    assert_eq!(
+        poll.tracker.complete_recording_seq(),
+        first.tracker.complete_recording_seq()
+    );
+    assert_eq!((first.checkpoints, poll.checkpoints), (0, 1));
+    cursor
+        .follow(late.journal(), &poll, &replay_config())
+        .unwrap();
+    // Never due for the event just given: the step gives it, marked.
+    assert_eq!(cursor.due_checkpoint().unwrap(), None);
+    let seen = kinds(&steps(cursor));
+    assert_eq!(
+        seen.first().map(String::as_str),
+        Some("late c2#1"),
+        "{seen:?}"
+    );
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    // The closed replay gives it in place.
+    let closed = kinds(&late.replay_from_start());
+    assert_eq!(&closed[..3], ["e1", "e2", "c2#1"], "{closed:?}");
+}
+
+/// A checkpoint for the last event given, found by a follow, is not late:
+/// it comes where a closed replay gives it.
+#[test]
+fn a_checkpoint_for_the_last_event_given_is_not_late() {
+    let early = [
+        Write::Records(event(1, EndOutcome::Complete)),
+        Write::Records(event(2, EndOutcome::Complete)),
+    ];
+    let before = Recorded::new(Capture::BestEffort, &early);
+    let store = before.store();
+    let first = before.recovery(&store);
+    let mut cursor = ReplayCursor::open(before.journal(), &first, &replay_config(), ROOM).unwrap();
+    while !matches!(cursor.step().unwrap(), Step::Stop(_)) {}
+    let mut with = early.to_vec();
+    with.push(Write::Checkpoint(2, b"state at 2"));
+    let later = Recorded::new(Capture::BestEffort, &with);
+    let later_store = later.store();
+    let poll = later.recovery(&later_store);
+    cursor
+        .follow(later.journal(), &poll, &replay_config())
+        .unwrap();
+    let seen = kinds(&steps(cursor));
+    assert_eq!(seen.first().map(String::as_str), Some("c2#1"), "{seen:?}");
 }

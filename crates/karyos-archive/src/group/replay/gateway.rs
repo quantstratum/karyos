@@ -504,7 +504,9 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
             // Never: an event's checkpoints are compared in its own
             // dispatch, and one opened at a checkpoint gives none before
             // its first event.
-            Ok(Step::Checkpoint(_)) => return self.stop(Err(GatewayError::Ended)),
+            Ok(Step::Checkpoint(_) | Step::LateCheckpoint(_)) => {
+                return self.stop(Err(GatewayError::Ended));
+            }
             Ok(Step::Stop(Stop::EndOfPrefix { .. })) => return self.stop(Ok(Dispatched::End)),
             Ok(Step::Stop(Stop::Gap(gap))) => {
                 return self.stop(Err(GatewayError::NotReproducible {
