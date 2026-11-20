@@ -2797,9 +2797,9 @@ mod incompatible_host {
             dir: PathBuf,
         }
 
-        /// The stub binary: `KARYOS_ADMISSION_STUB`, else the one this
-        /// workspace built beside the test, else built now with cargo in
-        /// the test's own profile, with the `test-hooks` feature it needs.
+        /// The stub binary: `KARYOS_ADMISSION_STUB`, else built (or brought
+        /// up to date) with cargo in the test's own profile, with the
+        /// `test-hooks` feature it needs, once per test process.
         fn binary() -> PathBuf {
             if let Ok(path) = std::env::var("KARYOS_ADMISSION_STUB") {
                 return PathBuf::from(path);
@@ -2807,7 +2807,12 @@ mod incompatible_host {
             let exe = std::env::current_exe().unwrap();
             let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
             let built = profile.join("karyos-admission-stub");
-            if !built.exists() {
+            // Built every run, once per process: a binary left by an earlier
+            // build of another tree is stale (a stub of an older protocol
+            // VERSION admits at this one; karyos#1063). Cargo makes a fresh
+            // binary a no-op.
+            static BUILT: std::sync::Once = std::sync::Once::new();
+            BUILT.call_once(|| {
                 // Cargo names the dev profile's directory `debug`.
                 let name = match profile.file_name().and_then(|name| name.to_str()) {
                     Some("debug") | None => "dev",
@@ -2831,7 +2836,7 @@ mod incompatible_host {
                     .status()
                     .unwrap();
                 assert!(status.success(), "karyos-admission-stub did not build");
-            }
+            });
             built
         }
 
@@ -2971,7 +2976,12 @@ mod archive_host {
             let exe = std::env::current_exe().unwrap();
             let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
             let built = profile.join("karyosd");
-            if !built.exists() {
+            // Built every run, once per process: a binary left by an earlier
+            // build of another tree is stale (a stub of an older protocol
+            // VERSION admits at this one; karyos#1063). Cargo makes a fresh
+            // binary a no-op.
+            static BUILT: std::sync::Once = std::sync::Once::new();
+            BUILT.call_once(|| {
                 // Cargo names the dev profile's directory `debug`.
                 let name = match profile.file_name().and_then(|name| name.to_str()) {
                     Some("debug") | None => "dev",
@@ -2993,7 +3003,7 @@ mod archive_host {
                     .status()
                     .unwrap();
                 assert!(status.success(), "karyosd did not build");
-            }
+            });
             built
         }
 
