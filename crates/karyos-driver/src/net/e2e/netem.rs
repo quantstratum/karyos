@@ -619,6 +619,7 @@ fn multicast_group(label: &str, late: bool) {
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),

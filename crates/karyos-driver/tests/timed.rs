@@ -77,6 +77,7 @@ fn channel() -> UdpConfig {
     UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Unicast(unread.local_addr().unwrap()),
         interface: Some(Interface::Address(std::net::IpAddr::V4(
             std::net::Ipv4Addr::LOCALHOST,

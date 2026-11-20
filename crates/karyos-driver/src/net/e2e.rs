@@ -98,6 +98,7 @@ fn channel(address: SocketAddr, reliable: bool) -> UdpConfig {
     UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),
@@ -868,6 +869,7 @@ fn a_multicast_publication_reaches_every_subscriber() {
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -954,6 +956,7 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -1436,6 +1439,7 @@ fn nak_copies_reach_the_control_group(name: &str, by_uri: bool) {
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: if by_uri { vec![control] } else { Vec::new() },
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -2724,6 +2728,7 @@ fn optional_receiver_closes(
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -3185,6 +3190,7 @@ fn a_slow_optional_receiver_under_min_is_bounded_and_repaired() {
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -3443,6 +3449,7 @@ fn two_paths(
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: vec![
@@ -3658,6 +3665,7 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: vec![

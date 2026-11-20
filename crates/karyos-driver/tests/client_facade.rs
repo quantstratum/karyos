@@ -361,6 +361,7 @@ fn a_network_subscription_reads_two_images_of_one_alias() {
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Unicast(SocketAddr::from((Ipv4Addr::LOCALHOST, port))),
         interface: Some(Interface::Address(Ipv4Addr::LOCALHOST.into())),
         paths: Vec::new(),

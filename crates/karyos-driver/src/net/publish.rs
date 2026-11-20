@@ -656,6 +656,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 });
             }
         }
+        // The channel's `linger` (owner item 16), validated once here, at
+        // channel admission; the URI bounds it to 60 s, and a value built
+        // without the URI is held to the network's own bound.
+        let linger = channel
+            .linger
+            .map(|linger| {
+                u64::try_from(linger.as_nanos())
+                    .ok()
+                    .filter(|&ns| ns <= crate::net::MAX_PUBLICATION_LINGER)
+                    .ok_or(DriverError::InvalidConfig)
+            })
+            .transpose()?;
         // The incarnation's first term id, drawn on the control path before
         // the publication and its SETUP exist (SPEC §4, initial state; §5),
         // shared by every lane; a failed draw refuses the add.
@@ -682,6 +694,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guard,
             roles,
             retransmit_window: channel.retransmit_window,
+            linger,
             registration,
         };
         let added = self.attach_sender(&handle, channel, FIRST_INCARNATION, false);
@@ -1005,6 +1018,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             guard,
             roles,
             retransmit_window,
+            linger: _,
             registration,
         } = channel;
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));

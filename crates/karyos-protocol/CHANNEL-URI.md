@@ -202,6 +202,7 @@ The common URI rule binds every key added after the sixteen above.
 | --- | --- | --- |
 | `retransmit-window` | udp | `decimal` bytes: positive, a multiple of 32, at most `term-length` / 2; default `term-length` / 2 |
 | `nak-control` | udp | `;` list of `socket-address`, one per path; multicast only; default none (the driver's table) |
+| `linger` | udp | duration, 0 to 60 s; default the driver's `publication_linger` (5 s) |
 | `require-abort-ack` | udp | `true` or `false`; default `false`. `true` is `SecurityUnsupported` with class `authenticated` until the authenticated capability is supported |
 
 - **`retransmit-window`** (owner item 63) is fixed at channel creation and
@@ -229,6 +230,17 @@ The common URI rule binds every key added after the sixteen above.
   refused (`ControlGroupConflict`), and a ninth entry is refused
   (`ControlGroupsFull`). Entries stay for the driver's life. Cross-host
   agreement on the groups is a deployment matter: there is no discovery.
+- **`linger`** (owner item 16) is how long a removed publication keeps
+  serving status messages and NAKs and repeating each lane's EOS at its
+  positioned seal before its sender session is removed. It is validated
+  once, at channel admission, and overrides the driver's
+  `publication_linger` for that publication; a reincarnating publication
+  does not linger. A subscription does not use it. The removal and queue
+  cleanup are those of the driver setting
+  (`driver-network-agents.md` §7), with the channel's value in place.
+  `path-skew` (owner item 17) is not a key yet: it is added only with the
+  change that makes sender and receiver consume the same per-channel
+  value, and until then it is an unknown parameter.
 
 - **`require-abort-ack`** (owner item 8) asks that a remote
   `SESSION_ABORT` be acknowledged. It belongs to the authenticated

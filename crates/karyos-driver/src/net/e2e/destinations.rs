@@ -30,6 +30,7 @@ pub(super) fn destinations(destinations: &[SocketAddr], reliable: bool) -> UdpCo
     UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::MultiDestination {
             destinations: destinations.to_vec(),
             control: None,
