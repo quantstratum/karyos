@@ -435,6 +435,8 @@ pub struct DaemonArchive {
     /// The driver's dropped grant audits last seen: a growth is logged, so
     /// a hole in the audit trail is never silent.
     audits_dropped: u64,
+    /// The signing alarm last logged: a change is logged once (karyos#1031).
+    signing_alarm: bool,
 }
 
 impl std::fmt::Debug for DaemonArchive {
@@ -504,6 +506,7 @@ impl DaemonArchive {
             server: ControlServer::new(agent, host, reading, writing),
             requester,
             audits_dropped: 0,
+            signing_alarm: false,
         };
         for record in &options.records {
             archive.requester.ask(Asked::Start(*record), "karyos:ipc");
@@ -548,9 +551,37 @@ impl DaemonArchive {
             );
             self.audits_dropped = dropped;
         }
+        self.report_signing();
         // A request served counts as work, so the idle strategy does not
         // back off while requests arrive.
         work.map(|work| if served { work.max(1) } else { work })
+    }
+
+    /// Logs the head signing's alarm when it changes: records uncovered
+    /// past `--archive-anchor-interval` are a warning with the coverage
+    /// lag, and their coverage again is logged too (karyos#1031).
+    fn report_signing(&mut self) {
+        let Some(lag) = self.server.agent().signing_lag() else {
+            return;
+        };
+        if lag.alarm == self.signing_alarm {
+            return;
+        }
+        self.signing_alarm = lag.alarm;
+        if lag.alarm {
+            tracing::warn!(
+                records = lag.records,
+                lag_ns = lag.ns,
+                pending = lag.pending,
+                "signed coverage is behind the anchor interval"
+            );
+        } else {
+            tracing::info!(
+                records = lag.records,
+                lag_ns = lag.ns,
+                "signed coverage is within the anchor interval again"
+            );
+        }
     }
 
     /// Asks the agent, through the control path, to stop the recordings

@@ -306,10 +306,20 @@ impl<D: Disk> IntegrityJournal<D> {
     /// [`IntegrityError::Io`], or [`IntegrityError::Inconsistent`] for a
     /// record that cannot be read.
     pub fn records(&mut self) -> Result<Vec<SealRecord>, IntegrityError> {
+        self.records_from(0)
+    }
+
+    /// The records from index `from` on, read back from disk: what a
+    /// caller holding the first `from` already lacks (karyos#1031).
+    ///
+    /// # Errors
+    ///
+    /// As [`IntegrityJournal::records`].
+    pub fn records_from(&mut self, from: u64) -> Result<Vec<SealRecord>, IntegrityError> {
         let count = self.next_counter();
         let mut records = Vec::new();
         let mut buf = [0u8; SEAL_RECORD_LENGTH];
-        for index in 0..count {
+        for index in from..count {
             let offset = index
                 .checked_mul(RECORD_LENGTH)
                 .ok_or(IntegrityError::Overflow)?;
