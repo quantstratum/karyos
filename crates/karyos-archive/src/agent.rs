@@ -1919,8 +1919,9 @@ struct State<D: Disk> {
     integrity: Option<Integrity<D>>,
     /// The retention engine (ADR-0088; karyos#967).
     retention: retention::Engine<D>,
-    /// A verification runs on its worker (karyos#1111).
-    verifying: Arc<std::sync::atomic::AtomicBool>,
+    /// The recording a verification reads on its worker (karyos#1111), 0
+    /// for none: recording ids are never 0.
+    verifying: Arc<AtomicU64>,
     /// The integrity journal of each group journal directory, which seals
     /// its groups' journals (karyos#1088); a directory whose journal
     /// failed holds `None` and is not sealed again until restart.

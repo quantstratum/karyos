@@ -190,6 +190,11 @@ impl<D: Disk + Clone> State<D> {
     /// `no_close_time`, so a purge is never early.
     fn purge(&mut self, mut request: PurgeRequest, policy: &RetentionPolicy) -> RetentionAnswer {
         let error = |why: String| RetentionAnswer::Error(why);
+        // The verification worker reads the recording's files: they are
+        // never deleted under it (karyos#1124 review).
+        if self.verifying.load(std::sync::atomic::Ordering::Acquire) == request.recording {
+            return RetentionAnswer::Refused(VERIFICATION_RUNNING.to_owned());
+        }
         if self.replays.reads(request.recording) {
             return error("a replay reads the recording; purge it once the replay ends".to_owned());
         }
@@ -280,7 +285,13 @@ impl<D: Disk + Clone> State<D> {
         };
         if self
             .verifying
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
+            .compare_exchange(
+                0,
+                id,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
         {
             let _ = reply.send(Ok(Err(RetentionAnswer::Error(
                 "a verification runs; retry once it answers".to_owned(),
@@ -300,7 +311,7 @@ impl<D: Disk + Clone> State<D> {
             });
         if let Err(error) = spawned {
             self.verifying
-                .store(false, std::sync::atomic::Ordering::Release);
+                .store(0, std::sync::atomic::Ordering::Release);
             let _ = answer.send(Ok(Err(RetentionAnswer::Error(error.to_string()))));
         }
     }
@@ -350,13 +361,18 @@ impl<D: Disk + Clone> State<D> {
 }
 
 /// Clears the "verification runs" flag when dropped.
-struct Clear(std::sync::Arc<std::sync::atomic::AtomicBool>);
+struct Clear(std::sync::Arc<std::sync::atomic::AtomicU64>);
 
 impl Drop for Clear {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        self.0.store(0, std::sync::atomic::Ordering::Release);
     }
 }
+
+/// The refusal of a purge of a recording a verification reads: retried
+/// once the verification answers. Not journalled: nothing was asked of the
+/// retention engine.
+pub const VERIFICATION_RUNNING: &str = "verification_running";
 
 /// The name of the verification worker's thread.
 pub(super) const VERIFY_THREAD: &str = "karyos-archive-verify";

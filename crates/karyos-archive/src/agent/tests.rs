@@ -4559,3 +4559,53 @@ fn a_policy_without_a_copy_location_is_refused() {
     assert!(matches!(spawned, Err(AgentError::PolicyWithoutCopies)));
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// karyos#1124 review: a purge of a recording a verification reads is
+/// refused `verification_running`, so the worker never reads files being
+/// deleted; once the verification answers, the purge goes to the engine.
+#[test]
+fn a_purge_waits_for_the_verification_of_its_recording() {
+    use crate::integrity::retention::{PurgeMode, RetentionPolicy};
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-while-verifying");
+    let gate = Arc::new(AtomicBool::new(true));
+    let policy = RetentionPolicy {
+        policy: 1,
+        version: 1,
+        retain_for_ns: 3_600_000_000_000,
+        min_copies: std::num::NonZeroU32::MIN,
+        storage_tier: 0,
+        purge: PurgeMode::Manual,
+    };
+    let config = sealing()
+        .with_copy_location(Some([5u8; 32]))
+        .with_retention_policy(Some(policy));
+    let agent = ArchiveHandle::spawn(GatedVerify(Arc::clone(&gate)), &dir, config).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    let verify = agent.post_verify(id).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        RetentionAnswer::Refused(super::retention::VERIFICATION_RUNNING.to_owned())
+    );
+    gate.store(false, Ordering::Release);
+    for _ in 0..5000 {
+        if verify.try_answer().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The flag clears just after the answer is sent.
+    let mut answer = RetentionAnswer::Done;
+    for request in 2..5000 {
+        answer = answered(agent.post_purge(id, end, request, 9));
+        if answer != RetentionAnswer::Refused(super::retention::VERIFICATION_RUNNING.to_owned()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(answer, RetentionAnswer::Refused("not_expired".to_owned()));
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
