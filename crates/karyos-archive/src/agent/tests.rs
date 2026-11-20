@@ -4020,6 +4020,51 @@ fn a_slow_signer_still_signs_while_heads_advance() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// karyos#1095: signing past many records keeps only the uncovered tail
+/// cached, never the whole journal; coverage still reaches the last head.
+#[test]
+fn the_signing_cache_holds_only_the_uncovered_tail() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+
+    let dir = temp_dir("signing-tail");
+    let (trust, key) = registered_archival(&dir);
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let setup = ArchiveSigning {
+        trust,
+        journal_id: 1,
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(SlowSigner {
+            key,
+            asks: 0,
+            open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            seen: std::collections::HashMap::new(),
+        }),
+    };
+    let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal, Arc::default()).unwrap();
+    let polls = 200u64;
+    for poll in 1..=polls {
+        let _ = journal
+            .record_policy_version(1, poll, &poll.to_le_bytes())
+            .unwrap();
+        signing.duty(&mut journal, poll * SIGNING_POLL);
+    }
+    let (base, cached) = signing.cached();
+    let chained = journal.records().unwrap().len();
+    assert!(cached <= 2, "{cached} cached of {chained}");
+    assert_eq!(
+        base + u64::try_from(cached).unwrap(),
+        u64::try_from(chained).unwrap()
+    );
+    let signed = signed_counters(&dir);
+    assert_eq!(
+        signed.last().copied(),
+        Some(u64::try_from(chained).unwrap() - 1),
+        "{signed:?}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// karyos#966 review P2: a head the backlog refused is offered again at
 /// the next duty, so the final seal is signed once the signer recovers,
 /// without another seal arriving.
