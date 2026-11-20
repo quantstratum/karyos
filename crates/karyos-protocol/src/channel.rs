@@ -381,7 +381,7 @@ enum Key {
     Linger,
 }
 
-const KEYS: [(&str, Key); 19] = [
+const KEYS: [(&str, Key); 20] = [
     ("endpoint", Key::Endpoint),
     ("group", Key::Group),
     ("interface", Key::Interface),
