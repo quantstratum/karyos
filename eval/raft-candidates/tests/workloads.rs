@@ -171,9 +171,12 @@ fn w2_raft<C: ConsensusCore>() {
 
 /// OpenRaft commits fewer entries than W2 requires while the follower is
 /// cut off (787 of 1,000 and 842 of 1,024 at seed 1): the case cannot
-/// establish its slow follower, a typed failure, not a pass.
+/// establish its slow follower, a typed failure, not a pass. Its log-read
+/// burst is judged on the metered bytes since karyos#1040 and fails the
+/// same way: the 1,024-entry lag is never reached, so the burst is never
+/// read.
 fn w2_openraft<C: ConsensusCore>() {
-    w2::<C>(&["slow follower"], false);
+    w2::<C>(&["slow follower", "log-read burst"], true);
 }
 
 /// The byte cap reached before the entry cap (karyos#963 review): 256 B

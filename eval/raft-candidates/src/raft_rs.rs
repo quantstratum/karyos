@@ -202,6 +202,30 @@ pub fn from_raft(entry: &eraftpb::Entry) -> Entry {
     }
 }
 
+/// Whether the entries of an outgoing append, `sent`, that C4's log holds
+/// were read back through the metered `log` within the duty's budget and
+/// equal the log's (karyos#975, karyos#1040): both adapters send an append
+/// only when this holds. Entries past the log (a leader's own, sent
+/// before its persistence) are no log read; a read the budget cut short,
+/// a read error or a mismatch is not a read back.
+pub(crate) fn read_back(sent: &[Entry], log: &mut LogView<'_>) -> bool {
+    let (Some(first), Some(last)) = (sent.first(), sent.last()) else {
+        return true;
+    };
+    let Some(end) = last.index.checked_add(1) else {
+        return false;
+    };
+    let Ok(read) = log.entries(first.index..end, u64::MAX) else {
+        return false;
+    };
+    let matches = read.iter().zip(sent).all(|(logged, sent)| logged == sent);
+    // Every entry past what was read must be one the log does not hold
+    // yet: a shorter read cut by the budget is not a read back.
+    let unread = sent.get(read.len()).map(|entry| entry.index);
+    let held = unread.is_some_and(|index| log.last_index().is_some_and(|last| index <= last));
+    matches && !held
+}
+
 /// raft-rs's hard state as C4 stores it.
 fn hard_state_of(state: &eraftpb::HardState) -> HardState {
     HardState {
@@ -312,24 +336,8 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
         if message.get_msg_type() != eraftpb::MessageType::MsgAppend {
             return true;
         }
-        let (Some(first), Some(last)) = (message.entries.first(), message.entries.last()) else {
-            return true;
-        };
-        let Some(end) = last.index.checked_add(1) else {
-            return false;
-        };
-        let Ok(read) = log.entries(first.index..end, u64::MAX) else {
-            return false;
-        };
-        let matches = read
-            .iter()
-            .zip(&message.entries)
-            .all(|(logged, sent)| *logged == from_raft(sent));
-        // Every entry past what was read must be one the log does not
-        // hold yet: a shorter read cut by the budget is not a read back.
-        let unread = message.entries.get(read.len()).map(|entry| entry.index);
-        let held = unread.is_some_and(|index| log.last_index().is_some_and(|last| index <= last));
-        matches && !held
+        let sent: Vec<Entry> = message.entries.iter().map(from_raft).collect();
+        read_back(&sent, log)
     }
 
     /// Stops the core: a mirror write failed, so raft-rs's view of its
