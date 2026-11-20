@@ -20,6 +20,7 @@ karyos-driver.workspace = true
 karyos-trace.workspace = true
 karyos-archive.workspace = true
 karyos-cluster.workspace = true
+rustix.workspace = true
 karyos.workspace = true
 signal-hook.workspace = true
 tracing.workspace = true

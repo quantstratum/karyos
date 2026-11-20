@@ -20,12 +20,30 @@
 //! reaped) before a new one starts, and the program's answer is read up to
 //! [`MAX_ANSWER`] bytes.
 //!
+//! Cleanup (karyos#1017) keeps ownership and identity:
+//!
+//! - **Ownership.** A request being ended is kept by the signer until its
+//!   reaper runs: when the reaper thread cannot start, the request stays
+//!   in the signer, which tries again on the next ask and starts no new
+//!   program meanwhile. Its child and worker are never dropped unended.
+//! - **Cancellable I/O.** The worker reads the program's output without
+//!   blocking, polling it with a short timeout and a cancel flag, so a
+//!   descendant that holds the output open outside the group cannot keep
+//!   the worker, and so the reaper, alive: cancelled, the worker ends.
+//! - **Identity.** The program is never reaped before its group is
+//!   signalled: success is read with `waitid(WNOWAIT)`, which leaves it a
+//!   zombie, and the reaper kills its group first and reaps it after. A
+//!   group whose leader is unreaped cannot be reused, so the kill never
+//!   reaches another group.
+//!
 //! The custody is [`Custody::Declared`]: a signature coming from another
 //! host does not by itself prove custody separation.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -42,6 +60,10 @@ pub const SIGN_TIMEOUT: Duration = Duration::from_secs(60);
 /// with room for a carriage return and spaces.
 pub const MAX_ANSWER: u64 = 256;
 
+/// How long the worker waits for output before it looks at its cancel
+/// flag again.
+const READ_TICK: Duration = Duration::from_millis(10);
+
 /// A request in flight: its program, which this request kills and reaps.
 struct Request {
     bytes: Vec<u8>,
@@ -49,30 +71,69 @@ struct Request {
     child: Child,
     answer: Receiver<Option<[u8; SIGNATURE_LENGTH]>>,
     worker: std::thread::JoinHandle<()>,
+    /// Set to stop the worker's I/O.
+    cancel: Arc<AtomicBool>,
+}
+
+/// Ends `child` and everything it started, and joins `worker`: the group
+/// is killed while its leader is still unreaped, then the leader is
+/// reaped and the worker, cancelled, joined.
+fn end(mut child: Child, worker: std::thread::JoinHandle<()>, cancel: &AtomicBool) {
+    cancel.store(true, Ordering::Release);
+    // The leader is not reaped before this: its group id is still its.
+    let leader = rustix::process::Pid::from_child(&child);
+    let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = worker.join();
 }
 
 impl Request {
-    /// Ends the program and everything it started, off the asking thread:
-    /// a reaper kills the program's process group (so a wrapper's own
-    /// children, which may hold its output open, end too), reaps the
-    /// program and joins the I/O worker. Returns the reaper.
-    fn end(self) -> Option<std::thread::JoinHandle<()>> {
-        let Self {
-            mut child, worker, ..
-        } = self;
-        std::thread::Builder::new()
+    /// Ends the program and everything it started, off the asking thread,
+    /// on a reaper: [`end`]. Returns the reaper, or the request itself
+    /// when no reaper thread could start, so it is never dropped unended
+    /// (`None` only if the thread took it and still failed to report).
+    fn end(self) -> Result<std::thread::JoinHandle<()>, Option<Self>> {
+        let cancel = Arc::clone(&self.cancel);
+        cancel.store(true, Ordering::Release);
+        // The request is moved into the thread only once it exists.
+        let slot = Arc::new(std::sync::Mutex::new(Some(self)));
+        let taken = Arc::clone(&slot);
+        let spawned = std::thread::Builder::new()
             .name("karyosd-signer-reaper".to_owned())
             .spawn(move || {
-                #[cfg(unix)]
-                let _ = Command::new("kill")
-                    .args(["-KILL", "--", &format!("-{}", child.id())])
-                    .stderr(Stdio::null())
-                    .status();
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = worker.join();
-            })
-            .ok()
+                let request = taken
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(request) = request {
+                    end(request.child, request.worker, &request.cancel);
+                }
+            });
+        match spawned {
+            Ok(reaper) => Ok(reaper),
+            // No thread ran, so the request is still in the slot.
+            Err(_) => Err(slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()),
+        }
+    }
+
+    /// Whether the program has exited successfully, read without reaping
+    /// it (`waitid` with `WNOWAIT`): its group id stays its own until the
+    /// reaper has signalled the group.
+    fn succeeded(&self) -> Option<bool> {
+        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+        let pid = Pid::from_child(&self.child);
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+        ) {
+            Ok(Some(status)) => Some(status.exit_status() == Some(0) && status.exited()),
+            Ok(None) => None,
+            Err(_) => Some(false),
+        }
     }
 }
 
@@ -85,13 +146,21 @@ pub struct CommandSigner {
     /// once it has finished, so at most one program, worker and reaper
     /// exist at a time.
     reaper: Option<std::thread::JoinHandle<()>>,
+    /// A request being ended whose reaper could not start yet: kept, and
+    /// retried on the next ask (karyos#1017).
+    retiring: Option<Request>,
 }
 
 impl Drop for CommandSigner {
-    /// The program of a request still in flight ends with the signer.
+    /// The program of a request still in flight ends with the signer; one
+    /// no reaper could take is ended here, its worker cancelled first so
+    /// the join is bounded.
     fn drop(&mut self) {
         if let Some(request) = self.request.take() {
             self.retire(request);
+        }
+        if let Some(request) = self.retiring.take() {
+            end(request.child, request.worker, &request.cancel);
         }
     }
 }
@@ -114,21 +183,41 @@ impl CommandSigner {
             key_id: key_id(public),
             request: None,
             reaper: None,
+            retiring: None,
         }
     }
 
     /// Starts the program for `bytes`: its input is written and its
     /// answer read on their own thread, never the asking one.
-    /// Ends `request` through its reaper, kept until it finishes.
+    /// Ends `request` through its reaper, kept until it finishes; a
+    /// request no reaper could take is kept to be retried.
     fn retire(&mut self, request: Request) {
-        self.reaper = request.end();
+        match request.end() {
+            Ok(reaper) => self.reaper = Some(reaper),
+            Err(kept) => self.retiring = kept,
+        }
     }
 
-    fn start(&mut self, bytes: Vec<u8>) {
+    /// Retries ending a request whose reaper could not start.
+    fn retry_retire(&mut self) {
         if self
             .reaper
             .as_ref()
             .is_some_and(|reaper| !reaper.is_finished())
+        {
+            return;
+        }
+        if let Some(request) = self.retiring.take() {
+            self.retire(request);
+        }
+    }
+
+    fn start(&mut self, bytes: Vec<u8>) {
+        if self.retiring.is_some()
+            || self
+                .reaper
+                .as_ref()
+                .is_some_and(|reaper| !reaper.is_finished())
         {
             // The last program is still being ended: no second one yet.
             return;
@@ -151,22 +240,36 @@ impl CommandSigner {
             let _ = child.wait();
             return;
         };
+        // The output is read without blocking, so the worker can be
+        // cancelled whoever holds the pipe open.
+        let nonblocking = rustix::fs::fcntl_getfl(&stdout).and_then(|flags| {
+            rustix::fs::fcntl_setfl(&stdout, flags | rustix::fs::OFlags::NONBLOCK)
+        });
         let (sender, answer) = mpsc::sync_channel(1);
         let input = hex(&bytes);
-        let started = std::thread::Builder::new()
-            .name("karyosd-signer".to_owned())
-            .spawn(move || {
-                let _ = sender.send(exchange(stdin, stdout, &input));
-            });
-        if let Ok(worker) = started {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        let started = nonblocking.is_ok().then(|| {
+            std::thread::Builder::new()
+                .name("karyosd-signer".to_owned())
+                .spawn(move || {
+                    let _ = sender.send(exchange(stdin, stdout, &input, &stop));
+                })
+        });
+        if let Some(Ok(worker)) = started {
             self.request = Some(Request {
                 bytes,
                 since: Instant::now(),
                 child,
                 answer,
                 worker,
+                cancel,
             });
         } else {
+            // No worker holds the pipes: the group is ended here, its
+            // leader reaped only after.
+            let leader = rustix::process::Pid::from_child(&child);
+            let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -175,16 +278,53 @@ impl CommandSigner {
 
 /// Writes `input` and a newline to the program, then reads its answer, at
 /// most [`MAX_ANSWER`] bytes: the signature it states, or `None`. It ends
-/// when the program closes its output, exits, or is killed.
+/// when the output closes, or once `cancel` is set, whoever holds the
+/// output open.
 fn exchange(
     mut stdin: std::process::ChildStdin,
     stdout: std::process::ChildStdout,
     input: &str,
+    cancel: &AtomicBool,
 ) -> Option<[u8; SIGNATURE_LENGTH]> {
     stdin.write_all(input.as_bytes()).ok()?;
     stdin.write_all(b"\n").ok()?;
     drop(stdin);
-    answer(stdout)
+    answer(Cancellable {
+        output: stdout,
+        cancel,
+    })
+}
+
+/// A non-blocking output read as a blocking one until `cancel` is set:
+/// then it reads as an error, so the reader ends.
+struct Cancellable<'a> {
+    output: std::process::ChildStdout,
+    cancel: &'a AtomicBool,
+}
+
+impl Read for Cancellable<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.cancel.load(Ordering::Acquire) {
+                // Not `Interrupted`, which a reader retries.
+                return Err(std::io::Error::other("cancelled"));
+            }
+            match self.output.read(buf) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut fds = [rustix::event::PollFd::new(
+                        &self.output,
+                        rustix::event::PollFlags::IN,
+                    )];
+                    let tick = rustix::event::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: READ_TICK.subsec_nanos().into(),
+                    };
+                    let _ = rustix::event::poll(&mut fds, Some(&tick));
+                }
+                other => return other,
+            }
+        }
+    }
 }
 
 /// The signature a program's output states: read up to one byte past
@@ -231,6 +371,7 @@ impl HeadSigner for CommandSigner {
 
     fn sign(&mut self, head: &ChainHead) -> Result<[u8; SIGNATURE_LENGTH], SignerUnavailable> {
         let bytes = head.signed_bytes(self.custody());
+        self.retry_retire();
         if let Some(mut request) = self.request.take() {
             if request.bytes != bytes {
                 // Another head: this request ends, killed and reaped,
@@ -240,12 +381,14 @@ impl HeadSigner for CommandSigner {
                 match request.answer.try_recv() {
                     // An answer: it counts once the program has exited
                     // successfully, checked without blocking the asker.
-                    Ok(Some(signature)) => match request.child.try_wait() {
-                        Ok(Some(status)) if status.success() => {
+                    // Peeked, not reaped: the reaper signals the group
+                    // before it reaps the leader (karyos#1017).
+                    Ok(Some(signature)) => match request.succeeded() {
+                        Some(true) => {
                             self.retire(request);
                             return Ok(signature);
                         }
-                        Ok(None) if request.since.elapsed() < SIGN_TIMEOUT => {
+                        None if request.since.elapsed() < SIGN_TIMEOUT => {
                             // Not exited yet: keep the answer for the next
                             // ask by putting it back.
                             let (sender, answer) = mpsc::sync_channel(1);
@@ -437,55 +580,161 @@ mod tests {
         let past = format!("{at_limit} ");
         assert_eq!(answer(past.as_bytes()), None);
     }
-    /// karyos#966 review P2: a signer program whose own child keeps its
-    /// output open is ended with its whole process group, off the asking
-    /// thread, within a bound: the reaper finishes, no process of the group
-    /// remains, and a new program can start.
-    #[test]
-    fn a_wrapper_whose_child_holds_the_output_is_ended_with_its_group() {
-        let dir = dir("group");
-        let pid = dir.join("pid");
-        let program = script(
-            &dir,
-            "wrapper",
-            &format!("echo $$ > {}\nsleep 60 &\nsleep 60", pid.display()),
-        );
-        let mut signer = CommandSigner::new(program, &[3; 32]);
-        assert_eq!(signer.sign(&head()), Err(SignerUnavailable));
-        let start = Instant::now();
-        while !pid.exists() && start.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        std::thread::sleep(Duration::from_millis(200));
-        let group = std::fs::read_to_string(&pid).unwrap().trim().to_owned();
-        // Another head replaces the request: the asking thread returns at
-        // once, and the reaper ends the group.
-        let asked = Instant::now();
-        let other = ChainHead {
-            counter: 4,
-            ..head()
-        };
-        assert_eq!(signer.sign(&other), Err(SignerUnavailable));
-        assert!(
-            asked.elapsed() < Duration::from_secs(1),
-            "the asker blocked"
-        );
-        let reaper = signer.reaper.take().unwrap();
+    /// Waits for `reaper` to finish, at most ten seconds.
+    fn finished(reaper: std::thread::JoinHandle<()>) {
         let start = Instant::now();
         while !reaper.is_finished() && start.elapsed() < Duration::from_secs(10) {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(reaper.is_finished(), "the cleanup did not finish");
         reaper.join().unwrap();
-        // No process of the group remains: `kill -0 -<group>` finds none.
-        let any = Command::new("kill")
-            .args(["-0", "--", &format!("-{group}")])
-            .stderr(Stdio::null())
-            .status()
-            .unwrap()
-            .success();
-        assert!(!any, "a process of the group remains");
+    }
+
+    /// A wrapper that signs `other`'s bytes at once and, for any other
+    /// head, writes its pid to `pid` and runs `hold` holding its output.
+    fn wrapper(
+        dir: &std::path::Path,
+        pid: &std::path::Path,
+        other: &ChainHead,
+        hold: &str,
+    ) -> PathBuf {
+        let expected = hex(&other.signed_bytes(Custody::Declared));
+        let answer = "cd".repeat(SIGNATURE_LENGTH);
+        script(
+            dir,
+            "wrapper",
+            &format!(
+                "read input\nif [ \"$input\" = \"{expected}\" ]; then echo {answer}; exit 0; fi\necho $$ > {}\n{hold}",
+                pid.display()
+            ),
+        )
+    }
+
+    fn wait_for(path: &std::path::Path) -> String {
+        let start = Instant::now();
+        while !path.exists() && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::read_to_string(path).unwrap().trim().to_owned()
+    }
+
+    /// karyos#966 review P2, and karyos#1017's P3: a signer program whose
+    /// own child keeps its output open is ended with its whole process
+    /// group, off the asking thread, within a bound, and a replacement
+    /// request then signs. Nothing here depends on the host reaping
+    /// orphans: the test asserts the cleanup finished and the next request
+    /// ran, not that no zombie of the group remains.
+    #[test]
+    fn a_wrapper_whose_child_holds_the_output_is_ended_with_its_group() {
+        let dir = dir("group");
+        let pid = dir.join("pid");
+        let other = ChainHead {
+            counter: 4,
+            ..head()
+        };
+        let program = wrapper(&dir, &pid, &other, "sleep 60 &\nsleep 60");
+        let mut signer = CommandSigner::new(program, &[3; 32]);
+        assert_eq!(signer.sign(&head()), Err(SignerUnavailable));
+        let _ = wait_for(&pid);
+        // Another head replaces the request: the asking thread returns at
+        // once, and the reaper ends the group.
+        let asked = Instant::now();
+        assert_eq!(signer.sign(&other), Err(SignerUnavailable));
+        assert!(
+            asked.elapsed() < Duration::from_secs(1),
+            "the asker blocked"
+        );
+        finished(signer.reaper.take().unwrap());
+        // The replacement starts and signs.
+        let start = Instant::now();
+        let signed = loop {
+            match signer.sign(&other) {
+                Err(SignerUnavailable) if start.elapsed() < Duration::from_secs(10) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => break result,
+            }
+        };
+        assert_eq!(signed, Ok([0xcd; SIGNATURE_LENGTH]));
         drop(signer);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// karyos#1017 P2: a descendant in a session of its own, outside the
+    /// signer's group, keeps the output open after the group is killed.
+    /// The worker's read is cancelled, so the cleanup still finishes and a
+    /// replacement request runs; retries are never blocked by the pipe.
+    #[test]
+    fn a_descendant_outside_the_group_cannot_block_the_cleanup() {
+        let dir = dir("escaped");
+        let pid = dir.join("pid");
+        let escaped = dir.join("escaped");
+        let other = ChainHead {
+            counter: 4,
+            ..head()
+        };
+        let hold = format!(
+            "perl -e 'use POSIX; POSIX::setsid(); open(my $f, \">\", \"{}\"); print $f \"$$\\n\"; close $f; exec \"sleep\", \"60\"' &\nsleep 60",
+            escaped.display()
+        );
+        let program = wrapper(&dir, &pid, &other, &hold);
+        let mut signer = CommandSigner::new(program, &[3; 32]);
+        assert_eq!(signer.sign(&head()), Err(SignerUnavailable));
+        let _ = wait_for(&pid);
+        let escaped_pid = wait_for(&escaped);
+        assert_eq!(signer.sign(&other), Err(SignerUnavailable));
+        finished(signer.reaper.take().unwrap());
+        let start = Instant::now();
+        let signed = loop {
+            match signer.sign(&other) {
+                Err(SignerUnavailable) if start.elapsed() < Duration::from_secs(10) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => break result,
+            }
+        };
+        assert_eq!(signed, Ok([0xcd; SIGNATURE_LENGTH]));
+        drop(signer);
+        // The escaped descendant is this test's to end.
+        let _ = Command::new("kill")
+            .args(["-KILL", &escaped_pid])
+            .stderr(Stdio::null())
+            .status();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// karyos#1017 P2: success is read without reaping the program, so its
+    /// group id cannot be reused before the reaper signals the group.
+    #[test]
+    fn success_is_read_without_reaping_the_program() {
+        let dir = dir("unreaped");
+        let program = script(&dir, "quick", "exit 0");
+        let mut command = Command::new(&program);
+        let child = command.stdout(Stdio::null()).spawn().unwrap();
+        let (_sender, answer) = mpsc::sync_channel(1);
+        let request = Request {
+            bytes: Vec::new(),
+            since: Instant::now(),
+            child,
+            answer,
+            worker: std::thread::spawn(|| {}),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let start = Instant::now();
+        let mut seen = None;
+        while seen.is_none() && start.elapsed() < Duration::from_secs(10) {
+            seen = request.succeeded();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(seen, Some(true));
+        // Still unreaped: peeking again reads the same exit.
+        assert_eq!(request.succeeded(), Some(true));
+        let Request {
+            mut child, worker, ..
+        } = request;
+        assert!(child.wait().unwrap().success());
+        worker.join().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
