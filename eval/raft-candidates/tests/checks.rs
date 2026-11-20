@@ -8,16 +8,13 @@
 //!
 //! **Candidate-backed here**, each by one mutant: `DivergentPrefix`
 //! (divergent application), `ReplyBeforeDurableMajority`, `Contract` (a
-//! gapped append), `OldTermCommit`, and `Contract` with
+//! gapped append), `OldTermCommit`, `Contract` with
 //! `TruncateBelowCommit` (applied entries truncated: C4's log refuses
-//! it). No other check of `karyos_sim::harness::check::Violation` has a
-//! candidate-backed negative case in this crate; their negative cases,
-//! where they exist, are the fixture's
-//! (`crates/karyos-sim/tests/harness.rs`), and karyos#976
-//! tracks them, by name. Two of them no core can trip through
-//! `ConsensusCore`: `ReleasedBeforePersisted` (`drive` releases only
-//! after the sync and the hard state's save) and `DurableLost` (C4's log
-//! and disk across a crash).
+//! it), and `PositionsOutOfOrder` (a core that reports no last index over
+//! a written log; karyos#976). The other checks of
+//! `karyos_sim::harness::check::Violation` keep their fixture negative
+//! cases (`crates/karyos-sim/tests/harness.rs`); why each has no mutant
+//! here is recorded in `eval/raft-candidates/README.md` (karyos#976).
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
@@ -41,6 +38,9 @@ const GAP: u8 = 2;
 const OLD: u8 = 3;
 /// Server 2 truncates its whole log once the cluster has applied some.
 const TRUNCATE: u8 = 4;
+/// Each server reports no last index while its log holds entries
+/// (karyos#976).
+const UNREPORTED: u8 = 5;
 
 #[derive(Debug)]
 struct Mutant<const KIND: u8> {
@@ -156,7 +156,10 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     }
 
     fn received(&self) -> Option<u64> {
-        self.core.received()
+        match KIND {
+            UNREPORTED => None,
+            _ => self.core.received(),
+        }
     }
 
     fn committed(&self) -> Option<u64> {
@@ -229,6 +232,15 @@ fn a_server_that_truncates_applied_entries_is_caught() {
                 ..
             }
         ),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_core_that_reports_no_last_index_over_a_written_log_is_caught() {
+    let violation = violation::<Mutant<UNREPORTED>>();
+    assert!(
+        matches!(violation, Violation::PositionsOutOfOrder { .. }),
         "{violation:?}"
     );
 }
