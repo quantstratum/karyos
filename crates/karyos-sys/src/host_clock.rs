@@ -92,8 +92,9 @@ mod tests {
     }
 
     /// Two processes read one scale (Linux): a child's reading falls between
-    /// two readings of the parent taken around it.
-    #[cfg(target_os = "linux")]
+    /// two readings of the parent taken around it. Miri cannot spawn a
+    /// process (karyos#924).
+    #[cfg(all(target_os = "linux", not(miri)))]
     #[test]
     fn two_processes_read_one_scale() {
         if std::env::var_os("KARYOS_HOST_CLOCK_CHILD").is_some() {

@@ -111,7 +111,9 @@ mod tests {
 
     /// A directory that exists has some free space reported (a test host
     /// with a full disk would fail other tests first); a path that does
-    /// not exist is an OS error, never zero.
+    /// not exist is an OS error, never zero. Miri cannot call `statvfs`
+    /// (karyos#924).
+    #[cfg(not(miri))]
     #[test]
     #[cfg_attr(miri, ignore = "host syscalls")]
     fn the_free_space_of_a_path_is_read() {

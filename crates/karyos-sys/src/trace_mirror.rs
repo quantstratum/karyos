@@ -1779,7 +1779,8 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    // Miri cannot execute memfd_create (karyos#924).
+    #[cfg(all(target_os = "linux", not(miri)))]
     #[test]
     fn a_tool_reads_the_mirror_read_only() {
         use crate::ipc::{ReadOnlyRegion, RegionKind, SealProfile};

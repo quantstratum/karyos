@@ -541,7 +541,9 @@ fn a_zero_budget_does_nothing() {
 
 /// Tables in shared regions (Linux; `quantstratum-docs:
 /// karyos/design/conflation-end-to-end.md`, Cross-process views).
-#[cfg(target_os = "linux")]
+// Miri cannot execute memfd_create, which creating a shared region needs
+// (karyos#924); the heap-backed tests keep the Miri coverage.
+#[cfg(all(target_os = "linux", not(miri)))]
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
 #[allow(clippy::unwrap_used)]
