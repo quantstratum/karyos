@@ -1235,3 +1235,217 @@ fn a_publication_completed_during_a_read_is_not_lost() {
         (3, Some(1))
     );
 }
+
+/// The control reserve of karyos#840 (R-CORE-21): `per_second` and `burst`
+/// messages.
+fn reserve(per_second: u64, burst: u64) -> Rate {
+    Rate { per_second, burst }
+}
+
+/// R-CORE-21, karyos#840, acceptance 1: under a policy equal to the
+/// reserve, ordinary traffic spends every token of the publication's
+/// bucket, and a cancel (a `SESSION_ABORT`) and a resolution (an `ABORTED`
+/// record) still go through at once, from the control bucket.
+#[test]
+fn ordinary_traffic_spends_its_bucket_and_a_cancel_still_goes_through() {
+    let mut f = Fixture::new(1, Some(rate(2, 2)));
+    f.gate.set_control_reserve(reserve(2, 2), 0).unwrap();
+    for _ in 0..3 {
+        f.stage(0);
+    }
+    f.accept(2);
+    let report = f.serve(0);
+    // Two sent, the third held for its rate: the publication's bucket is
+    // empty.
+    assert_eq!(served(&report, 0), 2 * u64::from(FRAME));
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    assert_eq!(f.gate.control_message_tokens(), Some(2));
+    assert_eq!(
+        f.gate
+            .admit_control(FrameType::SessionAbort, u64::from(FRAME)),
+        ControlAdmission::Admitted
+    );
+    assert_eq!(
+        f.gate
+            .admit_control(FrameType::Aborted, u64::from(MAX_FRAME)),
+        ControlAdmission::Admitted
+    );
+    // Control traffic spent the control bucket alone.
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    assert_eq!(f.gate.control_message_tokens(), Some(0));
+    assert_eq!(f.gate.counts().control_held, 0);
+}
+
+/// R-CORE-21, karyos#840, acceptance 2: control traffic past the reserve
+/// is held until its own bucket refills, never paid from the publication's
+/// bucket however full (no borrowing), so it never goes past the reserve.
+#[test]
+fn control_traffic_beyond_the_reserve_is_held() {
+    let mut f = Fixture::new(1, Some(rate(100, 100)));
+    f.gate.set_control_reserve(reserve(1, 2), 0).unwrap();
+    f.gate.set_now(0);
+    let abort = |gate: &mut GuardGate| gate.admit_control(FrameType::SessionAbort, 32);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Admitted);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Admitted);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Held);
+    assert_eq!(
+        f.gate.admit_control(FrameType::SessionAbortAck, 32),
+        ControlAdmission::Held
+    );
+    // The publication's tokens were not borrowed.
+    assert_eq!(f.gate.message_tokens(), Some(100));
+    // Half a second earns half a token: still held.
+    f.gate.set_now(SECOND / 2);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Held);
+    // A second earns one: one more, then held again.
+    f.gate.set_now(SECOND);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Admitted);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Held);
+    assert_eq!(f.gate.counts().control_held, 4);
+    // Over ten seconds, at most the burst plus the earned tokens leave.
+    let mut sent = 0;
+    for tenth in 11..=110 {
+        f.gate.set_now(tenth * SECOND / 10);
+        while abort(&mut f.gate) == ControlAdmission::Admitted {
+            sent += 1;
+        }
+    }
+    assert_eq!(sent, 10);
+    assert_eq!(f.gate.message_tokens(), Some(100));
+}
+
+/// The control bucket's byte side holds the reserve's messages at the
+/// largest datagram: a full frame per reserved message, no more.
+#[test]
+fn the_control_bucket_charges_bytes_at_the_largest_datagram() {
+    let mut f = Fixture::new(1, None);
+    f.gate.set_control_reserve(reserve(1, 2), 0).unwrap();
+    assert_eq!(
+        f.gate.control_policy(),
+        Some(RatePolicy::of_reserve(&reserve(1, 2), u64::from(MAX_FRAME)))
+    );
+    assert_eq!(f.gate.control_byte_tokens(), Some(2 * u64::from(MAX_FRAME)));
+    // A frame longer than the largest datagram is never paid in one go:
+    // two of them would take more bytes than the burst.
+    let long = u64::from(MAX_FRAME) + 1;
+    assert_eq!(
+        f.gate.admit_control(FrameType::SessionAbort, long),
+        ControlAdmission::Admitted
+    );
+    assert_eq!(
+        f.gate.admit_control(FrameType::SessionAbort, long),
+        ControlAdmission::Held
+    );
+}
+
+/// R-CORE-21, karyos#840, acceptance 3: a policy change, tightening or
+/// loosening, leaves the control bucket's level and its rates as the
+/// reserve sets them.
+#[test]
+fn a_policy_change_leaves_the_control_bucket_as_the_reserve_sets_it() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let mut f = Fixture::new(1, Some(rate(10, 8)));
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    f.gate.set_control_reserve(reserve(2, 4), 0).unwrap();
+    let control = RatePolicy::of_reserve(&reserve(2, 4), u64::from(MAX_FRAME));
+    f.gate.set_now(0);
+    assert_eq!(
+        f.gate
+            .admit_control(FrameType::SessionAbort, u64::from(FRAME)),
+        ControlAdmission::Admitted
+    );
+    let level = (
+        f.gate.control_message_tokens(),
+        f.gate.control_byte_tokens(),
+    );
+    assert_eq!(
+        level,
+        (Some(3), Some(4 * u64::from(MAX_FRAME) - u64::from(FRAME)))
+    );
+    // A tightening to the reserve, then a loosening, then a byte limit: the
+    // publication's bucket follows each, the control bucket none.
+    let tight = rate(2, 4);
+    let loose = rate(50, 40);
+    let bytes = RatePolicy {
+        messages: Rate {
+            per_second: 50,
+            burst: 40,
+        },
+        bytes: Some(Rate {
+            per_second: 4 * u64::from(MAX_FRAME),
+            burst: 4 * u64::from(MAX_FRAME),
+        }),
+    };
+    for (version, policy, tokens) in [(2, tight, 4), (3, loose, 4), (4, bytes, 4)] {
+        publish(slot.words(), 0, version, &policy);
+        f.gate.set_now(0);
+        assert_eq!(f.gate.policy_version(), version);
+        assert_eq!(f.gate.message_tokens(), Some(tokens));
+        assert_eq!(f.gate.control_policy(), Some(control));
+        assert_eq!(
+            (
+                f.gate.control_message_tokens(),
+                f.gate.control_byte_tokens()
+            ),
+            level
+        );
+    }
+    // And it refills at the reserve's rate, not the policy's: one second
+    // earns two messages, capped at the reserve's burst.
+    f.gate.set_now(SECOND);
+    assert_eq!(f.gate.control_message_tokens(), Some(4));
+}
+
+/// Without a reserve, control traffic shares the publication's bucket, and
+/// without a rate either it is not limited; ordinary and unmetered frames
+/// are never charged by `admit_control`.
+#[test]
+fn without_a_reserve_control_traffic_shares_the_publications_bucket() {
+    let mut f = Fixture::new(1, Some(rate(1, 1)));
+    assert_eq!(f.gate.control_policy(), None);
+    assert_eq!(
+        f.gate.admit_control(FrameType::SessionAbort, 32),
+        ControlAdmission::Admitted
+    );
+    assert_eq!(f.gate.message_tokens(), Some(0));
+    assert_eq!(
+        f.gate.admit_control(FrameType::Aborted, 32),
+        ControlAdmission::Held
+    );
+    for frame_type in [
+        FrameType::Data,
+        FrameType::Pad,
+        FrameType::Setup,
+        FrameType::Nak,
+    ] {
+        assert_eq!(
+            f.gate.admit_control(frame_type, 32),
+            ControlAdmission::NotControl
+        );
+    }
+    let mut rateless = Fixture::new(1, None);
+    for _ in 0..1000 {
+        assert_eq!(
+            rateless.gate.admit_control(FrameType::SessionAbort, 32),
+            ControlAdmission::Admitted
+        );
+    }
+}
+
+/// A reserve with a zero rate or burst is refused, and the gate keeps what
+/// it had.
+#[test]
+fn a_zero_reserve_is_refused() {
+    let mut f = Fixture::new(1, None);
+    f.gate.set_control_reserve(reserve(1, 1), 0).unwrap();
+    for zero in [reserve(0, 1), reserve(1, 0)] {
+        assert_eq!(
+            f.gate.set_control_reserve(zero, 0),
+            Err(GateError::InvalidRatePolicy(RatePolicyError::Zero))
+        );
+    }
+    assert_eq!(f.gate.control_message_tokens(), Some(1));
+}

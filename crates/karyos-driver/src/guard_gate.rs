@@ -45,6 +45,17 @@
 //!   exposed again while pending is not charged twice; a head that left
 //!   without exposure, or that an abort or a reopen drops, gets its tokens
 //!   back. Only first sends are charged.
+//! - **Control reserve.** With a reserve ([`GuardGate::set_control_reserve`],
+//!   R-CORE-21), the gate keeps a second bucket, of the reserve's message
+//!   rate and burst and, at the largest datagram, its byte rate and burst.
+//!   Cancel and resolve traffic ([`TrafficClass::Control`]) is charged
+//!   there alone ([`GuardGate::admit_control`]) and ordinary traffic only
+//!   in the publication's bucket, so ordinary traffic never spends what a
+//!   cancel needs. Control traffic never borrows from the publication's
+//!   bucket: once its own is empty, a control frame waits for it to refill,
+//!   so it never goes past the reserve. A policy change never touches the
+//!   control bucket. Without a reserve, control traffic shares the
+//!   publication's bucket, as before R-CORE-21's held-back capacity.
 //! - **Faults.** The sender says which lane it flushes
 //!   ([`LaneGate::flushing`]); an exposure that is not that lane's next
 //!   heads, in order, is a sender fault: denied, and the lane aborts for
@@ -83,9 +94,10 @@ use karyos_io::backend::{Exposure, GateDecision, SenderGate, SenderToken, TxQueu
 use karyos_io::lanes::routes::{MAX_ROUTES, RoutedLaneSender, RoutedStaged};
 use karyos_io::lanes::{LaneGate, LaneSender, Left, StageError, Staged};
 use karyos_sys::applied_epoch::{Applied, AppliedEpoch};
+use karyos_sys::frame::FrameType;
 use karyos_sys::frame::Lane;
 use karyos_sys::guard::{self, GuardState};
-use karyos_sys::rate_limit::{RateLimiter, RatePolicy, RatePolicyError};
+use karyos_sys::rate_limit::{Rate, RateLimiter, RatePolicy, RatePolicyError, TrafficClass};
 use karyos_sys::submission_frontier::{Frontier, SubmissionFrontier};
 
 use crate::guard_streams::{REASON_DRIVER_SHUTDOWN, REASON_GUARD_CLOSED, REASON_PUBLICATION_FAULT};
@@ -197,6 +209,25 @@ pub struct GateCounts {
     /// burst below its largest datagram), each applied as the stricter of
     /// it and the policy in force (R-CORE-21).
     pub policies_refused: u64,
+    /// Control frames held because the control bucket (or, without a
+    /// reserve, the publication's) could not pay for them (R-CORE-21).
+    pub control_held: u64,
+}
+
+/// What [`GuardGate::admit_control`] decided for a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum ControlAdmission {
+    /// Sent now: its tokens were taken from the control bucket (or, without
+    /// a reserve, the publication's; or none, without either).
+    Admitted,
+    /// Its bucket cannot pay for it now: it waits for the bucket to refill
+    /// and is offered again at a later serve, never dropped and never paid
+    /// from the publication's bucket.
+    Held,
+    /// Not cancel or resolve traffic ([`TrafficClass::of`]): ordinary
+    /// traffic goes through the lanes, unmetered traffic through no bucket.
+    NotControl,
 }
 
 /// Adds one to `count`; at its end it keeps its value and `overflows`
@@ -505,6 +536,9 @@ pub struct GuardGate {
     lanes: Vec<State>,
     /// The publication's bucket, shared by its lanes.
     limiter: Option<RateLimiter>,
+    /// The control bucket of the reserve, for cancel and resolve traffic
+    /// alone (R-CORE-21); `None` without a reserve.
+    control: Option<RateLimiter>,
     /// The largest datagram the routes build: a policy's byte burst is
     /// validated against it.
     max_datagram: u64,
@@ -629,6 +663,7 @@ impl GuardGate {
             cell,
             lanes,
             limiter: rate.map(|policy| RateLimiter::new(policy, now)),
+            control: None,
             max_datagram,
             policy: None,
             flushing: None,
@@ -774,6 +809,77 @@ impl GuardGate {
         }
         if let Some(limiter) = &mut self.limiter {
             limiter.refill_at(now);
+        }
+        if let Some(control) = &mut self.control {
+            control.refill_at(now);
+        }
+    }
+
+    /// Holds back `reserve` for cancel and resolve traffic (R-CORE-21): a
+    /// control bucket of the reserve's message rate and burst and, at the
+    /// largest datagram, of its byte rate and burst
+    /// ([`RatePolicy::of_reserve`]), full at clock time `now`. A gate
+    /// built for a reincarnation gets it full too: it bounds only control
+    /// traffic, and a cancel right after a reopen must not wait. A second
+    /// call replaces it.
+    ///
+    /// # Errors
+    ///
+    /// [`GateError::InvalidRatePolicy`] for a zero rate or burst, or a
+    /// largest datagram of 0 bytes; the gate is left as it was.
+    pub fn set_control_reserve(&mut self, reserve: Rate, now: u64) -> Result<(), GateError> {
+        let policy = RatePolicy::of_reserve(&reserve, self.max_datagram);
+        policy
+            .validate(self.max_datagram)
+            .map_err(GateError::InvalidRatePolicy)?;
+        self.control = Some(RateLimiter::new(policy, now));
+        Ok(())
+    }
+
+    /// The control bucket's policy; `None` without a reserve.
+    #[must_use]
+    pub fn control_policy(&self) -> Option<RatePolicy> {
+        self.control.as_ref().map(RateLimiter::policy)
+    }
+
+    /// Whole message tokens the control bucket holds; `None` without a
+    /// reserve.
+    #[must_use]
+    pub fn control_message_tokens(&self) -> Option<u64> {
+        self.control.as_ref().map(RateLimiter::message_tokens)
+    }
+
+    /// Whole byte tokens the control bucket holds; `None` without a
+    /// reserve.
+    #[must_use]
+    pub fn control_byte_tokens(&self) -> Option<u64> {
+        self.control.as_ref().and_then(RateLimiter::byte_tokens)
+    }
+
+    /// Charges a frame of `frame_type` and `length` bytes the sender's
+    /// control budget is about to send, at the clock time of the last
+    /// [`Self::set_now`] (R-CORE-21). A control frame is a whole message:
+    /// one message token and its length in byte tokens. Cancel and resolve
+    /// traffic pays from the control bucket alone and, once it is empty,
+    /// waits ([`ControlAdmission::Held`]): it never borrows the
+    /// publication's tokens, so ordinary traffic keeps its policy and
+    /// control traffic never goes past the reserve. Without a reserve it
+    /// pays from the publication's bucket, and without either it is not
+    /// rate limited. Any other frame is [`ControlAdmission::NotControl`]
+    /// and charges nothing. Constant time, allocation free.
+    pub fn admit_control(&mut self, frame_type: FrameType, length: u64) -> ControlAdmission {
+        if TrafficClass::of(frame_type) != TrafficClass::Control {
+            return ControlAdmission::NotControl;
+        }
+        let bucket = match (&mut self.control, &mut self.limiter) {
+            (Some(control), _) => Some(control),
+            (None, publication) => publication.as_mut(),
+        };
+        if bucket.is_none_or(|bucket| bucket.try_admit_datagram(length, 1)) {
+            ControlAdmission::Admitted
+        } else {
+            bump(&mut self.counts.control_held, &mut self.counts.overflows);
+            ControlAdmission::Held
         }
     }
 

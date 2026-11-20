@@ -460,6 +460,7 @@ fn a_reincarnations_spec_builds_an_empty_gate() {
                     epoch: 2,
                     empty_since,
                     rate: Some(policy),
+                    reserve: None,
                     policy: None,
                     frontier: Default::default(),
                 },
@@ -471,6 +472,59 @@ fn a_reincarnations_spec_builds_an_empty_gate() {
             Some(tokens),
             "empty since {empty_since:?}, now {now}"
         );
+    }
+}
+
+/// R-CORE-21 (karyos#840): a spec's reserve becomes its gate's control
+/// bucket, full, of the reserve at the largest datagram, even for a
+/// reincarnation whose publication bucket starts empty; with none the gate
+/// has no control bucket.
+#[test]
+fn a_specs_reserve_becomes_its_gates_control_bucket() {
+    use karyos_sys::applied_epoch::AppliedEpoch;
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let policy = RatePolicy {
+        messages: Rate {
+            per_second: 4,
+            burst: 4,
+        },
+        bytes: None,
+    };
+    let reserve = Rate {
+        per_second: 2,
+        burst: 3,
+    };
+    for spec_reserve in [Some(reserve), None] {
+        let mut rig = Rig::new(&RepairConfig::default());
+        let word = open_guard();
+        rig.path
+            .guard(
+                super::super::data::GuardSpec {
+                    word: Arc::clone(&word) as Arc<dyn karyos_client::SharedWords>,
+                    cell: Arc::new(AppliedEpoch::new()),
+                    epoch: 2,
+                    empty_since: Some(0),
+                    rate: Some(policy),
+                    reserve: spec_reserve,
+                    policy: None,
+                    frontier: Default::default(),
+                },
+                0,
+            )
+            .unwrap();
+        let gate = rig.path.guard_gate().unwrap();
+        assert_eq!(gate.message_tokens(), Some(0));
+        assert_eq!(
+            gate.control_message_tokens(),
+            spec_reserve.map(|reserve| reserve.burst)
+        );
+        let control = gate.control_policy();
+        assert_eq!(control.map(|control| control.messages), spec_reserve);
+        if let Some(bytes) = control.and_then(|control| control.bytes) {
+            assert_eq!(bytes.burst % 3, 0);
+            assert_eq!(bytes.burst / 3, bytes.per_second / 2);
+        }
     }
 }
 
@@ -494,6 +548,7 @@ fn a_guard_close_stops_every_submission() {
                 epoch: 2,
                 empty_since: None,
                 rate: None,
+                reserve: None,
                 policy: None,
                 frontier: Default::default(),
             },
@@ -615,6 +670,7 @@ fn guarded(
                 epoch: 2,
                 empty_since: None,
                 rate: None,
+                reserve: None,
                 policy: None,
                 frontier: Default::default(),
             },
@@ -716,6 +772,7 @@ fn guard_spec(
             epoch: 2,
             empty_since: None,
             rate,
+            reserve: None,
             policy: None,
             frontier: Default::default(),
         },
