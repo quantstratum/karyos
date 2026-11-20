@@ -539,12 +539,12 @@ fn rate_changes_are_made_by_authority_and_journalled() {
         |role: Role| Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), role)])).unwrap();
 
     // No journal: the safety path goes ahead, the administrator's does not.
-    let mut agent = agent(&dir, false);
+    let mut unjournalled = agent(&dir, false);
     let mut server = bind(Role::Operator);
     let (answer, served) = ask(
         &mut driver,
         &mut server,
-        &mut agent,
+        &mut unjournalled,
         &change(1, "safety", 50),
     );
     assert_eq!(served, [Served::Operated]);
@@ -552,7 +552,7 @@ fn rate_changes_are_made_by_authority_and_journalled() {
         answer.ends_with("\"stream_id\":2,\"session_id\":1,\"version\":2}\n"),
         "{answer}"
     );
-    let view = agent.view();
+    let view = unjournalled.view();
     assert_eq!(view.rates.len(), 1);
     assert_eq!(
         (
@@ -565,7 +565,7 @@ fn rate_changes_are_made_by_authority_and_journalled() {
     let (answer, _) = ask(
         &mut driver,
         &mut server,
-        &mut agent,
+        &mut unjournalled,
         &change(2, "administrator", 200),
     );
     assert_eq!(answer, "{\"error\":\"forbidden\"}\n");
@@ -574,39 +574,39 @@ fn rate_changes_are_made_by_authority_and_journalled() {
     let (answer, _) = ask(
         &mut driver,
         &mut server,
-        &mut agent,
+        &mut unjournalled,
         &change(2, "administrator", 200),
     );
     assert_eq!(answer, "{\"error\":\"journal unavailable\"}\n");
     drop(server);
-    drop(agent);
+    drop(unjournalled);
 
     // With a journal: the administrator's loosening is made; a stale
     // version is refused with the current one.
-    let mut agent = agent(&dir, true);
+    let mut journalled = agent(&dir, true);
     let mut server = bind(Role::Administrator);
     let (answer, _) = ask(
         &mut driver,
         &mut server,
-        &mut agent,
+        &mut journalled,
         &change(2, "administrator", 200),
     );
     assert!(answer.ends_with("\"version\":3}\n"), "{answer}");
     let (answer, _) = ask(
         &mut driver,
         &mut server,
-        &mut agent,
+        &mut journalled,
         &change(2, "safety", 20),
     );
     assert!(answer.starts_with("{\"error\":\"refused\""), "{answer}");
     assert!(answer.ends_with("\"detail\":3}\n"), "{answer}");
-    assert_eq!(agent.view().rates[0].version, 3);
+    assert_eq!(journalled.view().rates[0].version, 3);
     // The driver audited every change sent for this uid: three of them.
     assert_eq!(driver.guard_audit().records.len(), 3);
-    let journal = agent.view().journal.unwrap();
+    let journal = journalled.view().journal.unwrap();
     assert_eq!((journal.failed_appends, journal.gap), (0, None));
-    agent.stop().unwrap();
-    drop(agent);
+    journalled.stop().unwrap();
+    drop(journalled);
     // Every request answered by its outcome: no unknown interval.
     let reopened = Journal::open(&dir.join("journal"), 1).unwrap();
     assert_eq!(reopened.gap(), None);
