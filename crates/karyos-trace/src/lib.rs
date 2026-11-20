@@ -14,10 +14,35 @@
 //! `quantstratum-docs: karyos/design/trace-tool.md`. Seals for long-running
 //! journals, clock calibration and histograms do not exist yet.
 //!
-//! Internal to the Karyos workspace and unstable in alpha, with no
-//! compatibility promise. The supported API is the `karyos` facade,
-//! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
-//! under its own `0.y.z` rule.
+//! # Support
+//!
+//! Published to crates.io for its first consumer, the analysis engine of
+//! karyos-insights (ADR-0068, INS-Q4; karyos#997). Its public analysis
+//! surface is **supported in alpha**, on the same terms as the `karyos`
+//! facade, `karyos-client` and `karyos-archive` (alpha releases may still
+//! break it, and say so in their release notes):
+//!
+//! - the report: [`report`], with [`TraceReport`], [`TraceAnswer`],
+//!   [`PublicationSummary`], [`PublicationKey`], [`JournalClock`],
+//!   [`JournalId`], [`HeldMessage`] and [`HistogramConfig`];
+//! - journal sources: [`source`], with the [`JournalSource`] contract,
+//!   [`SourceState`] and [`SourceLosses`];
+//! - histograms: [`histogram`], with [`Histogram`], [`HistogramCounts`],
+//!   [`SideCounts`], [`Quantile`] and [`HistogramError`];
+//! - clock calibration: [`clocks`], with [`Calibration`], [`latency`],
+//!   [`Latency`], [`ClockKey`], [`Observation`], [`CalibrationError`] and
+//!   [`Unavailable`];
+//! - and the types those signatures name: [`TraceError`], [`Verdict`],
+//!   [`AttributionConfig`], [`ClockProvenance`], [`Collected`],
+//!   [`ObserverId`] and the record types of [`record`] a source yields.
+//!
+//! Everything else is internal and unstable in alpha, with no
+//! compatibility promise: the writers, collectors and journals
+//! ([`journal`]), the trace agents ([`agent`], [`network_agent`]),
+//! sampling ([`sampling`]), id sources ([`ids`]), trace clocks
+//! ([`trace_clock`]) and the attributor's own state ([`attribution`]
+//! beyond [`Verdict`] and [`AttributionConfig`]). The C ABI of
+//! `karyos-ffi` keeps its own `0.y.z` rule.
 
 pub mod agent;
 pub mod attribution;

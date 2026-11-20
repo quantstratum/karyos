@@ -8,7 +8,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-publish.workspace = true
+# Published for its first consumer, karyos-insights (ADR-0068, INS-Q4;
+# karyos#997).
+publish = true
+readme = "README.md"
+keywords = ["tracing", "latency", "histogram", "messaging", "low-latency"]
+categories = ["development-tools::profiling", "network-programming"]
 
 [dependencies]
 karyos-protocol.workspace = true
