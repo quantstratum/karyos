@@ -164,11 +164,15 @@ pub trait MessageSource {
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
-    ) -> Result<(PollSummary, Option<(i32, Lane, u64)>), PollError> {
+    ) -> Result<(PollSummary, Option<ImageReport>), PollError> {
         self.poll_taking(handler, limit)
             .map(|summary| (summary, None))
     }
 }
+
+/// The image a poll's report names: its session, lane and registration
+/// (0 when the source does not know it, ADR-0089).
+pub type ImageReport = (i32, Lane, u64);
 
 /// A network subscription's images, polled in turn: their messages carry
 /// each image's session, and their attaches and retirements are its
@@ -192,7 +196,7 @@ impl<T: TermBytes> MessageSource for Subscription<T> {
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
-    ) -> Result<(PollSummary, Option<(i32, Lane, u64)>), PollError> {
+    ) -> Result<(PollSummary, Option<ImageReport>), PollError> {
         match Subscription::poll_taking(self, handler, limit) {
             // The image that reported more than deliveries: its report,
             // with the deliveries over every image, and its session.
@@ -295,7 +299,7 @@ enum Held {
         resume: u64,
         /// The image's session, lane and registration (0 unknown), for a
         /// network subscription's.
-        image: Option<(i32, Lane, u64)>,
+        image: Option<ImageReport>,
     },
     Ended {
         position: u64,

@@ -845,7 +845,7 @@ impl MessageSource for Images {
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
-    ) -> Result<(PollSummary, Option<(i32, Lane, u64)>), PollError> {
+    ) -> Result<(PollSummary, Option<ImageReport>), PollError> {
         let count = self.images.len();
         for offset in 0..count {
             let index = (self.next + offset) % count;
@@ -2022,7 +2022,7 @@ impl MessageSource for Aliased {
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
-    ) -> Result<(PollSummary, Option<(i32, Lane, u64)>), PollError> {
+    ) -> Result<(PollSummary, Option<ImageReport>), PollError> {
         let count = self.images.len();
         for offset in 0..count {
             let index = (self.next + offset) % count;
