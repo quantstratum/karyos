@@ -71,6 +71,16 @@ fn pair(
     let reader = b
         .subscribe_aggregate(&image.unwrap(), Role::Required)
         .unwrap();
+    // B's image exists once A's data reached it, but A's send session is
+    // established only when B's SM comes back: a removal before that frees
+    // the stream with no EOS (karyos#993). Wait for it.
+    let registration = publication.registration();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[0]
+            .net
+            .as_ref()
+            .is_some_and(|net| net.publication_established(registration))
+    });
     (a, b, publication, reader)
 }
 

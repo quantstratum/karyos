@@ -572,12 +572,27 @@ fn a_silent_connection_is_closed_at_the_hello_timeout() {
         ipc::recv(socket.as_fd(), &mut buffer),
         Ok(Recv::WouldBlock)
     ));
-    clock.now.store(100, Ordering::Relaxed);
-    let _ = driver.do_work().unwrap();
-    assert!(matches!(
-        ipc::recv(socket.as_fd(), &mut buffer),
-        Ok(Recv::PeerClosed)
-    ));
+    // On a loaded host the three duty cycles above may not have taken the
+    // connection yet (karyos#993): its hello timeout then counts from a
+    // later tick. Advance the clock by one timeout per cycle until the
+    // close is seen, within a wall-clock bound.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut now = 0;
+    loop {
+        now += 100;
+        clock.now.store(now, Ordering::Relaxed);
+        let _ = driver.do_work().unwrap();
+        match ipc::recv(socket.as_fd(), &mut buffer) {
+            Ok(Recv::PeerClosed) => break,
+            Ok(Recv::WouldBlock) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never closed at the hello timeout"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

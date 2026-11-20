@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::MutexGuard;
 
 use super::*;
 use crate::api::client;
 
-/// Serializes these tests: together they would open more drivers at once
-/// than the table holds ([`MAX_DRIVERS`]).
-fn serial() -> MutexGuard<'static, ()> {
-    static SERIAL: Mutex<()> = Mutex::new(());
-    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+/// Serializes these tests with every other test that opens drivers:
+/// together they would open more drivers at once than the table holds
+/// ([`MAX_DRIVERS`]), and some of them fill it (karyos#993).
+fn serial() -> crate::test_drivers::Permit {
+    crate::test_drivers::all_drivers()
 }
 
 fn created() -> Handle {

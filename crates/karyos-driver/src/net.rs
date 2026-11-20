@@ -2973,6 +2973,23 @@ impl<T: StreamTerms> Network<T> {
             .collect()
     }
 
+    /// Whether a path of the network publication `registration` has an
+    /// established send session, in Shared mode (tests).
+    #[cfg(test)]
+    pub(crate) fn publication_established(&self, registration: u64) -> bool {
+        let (Some(entry), Agents::Shared(agents)) = (
+            self.publications
+                .iter()
+                .find(|entry| entry.registration == registration),
+            &self.agents,
+        ) else {
+            return false;
+        };
+        entry
+            .paths()
+            .any(|path| agents.sender.session_established(path, entry.alias))
+    }
+
     /// The endpoint of each path of the network publication
     /// `registration`, the founding one first (tests).
     #[cfg(test)]

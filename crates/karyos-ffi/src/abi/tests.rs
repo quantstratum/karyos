@@ -2440,6 +2440,7 @@ fn an_optional_reader_under_close_is_closed_by_its_overrun() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_sealed_stream_closes_its_subscription() {
+    let _drivers = crate::test_drivers::drivers(1);
     const SEALED: i32 = 1010;
     let mut options = core::mem::MaybeUninit::<DriverOptions>::zeroed();
     // SAFETY: a live, aligned, writable `DriverOptions`.
@@ -2814,6 +2815,7 @@ fn an_older_driver_options_struct_takes_the_default_startup_timeout() {
 
 #[test]
 fn a_zero_startup_timeout_is_refused() {
+    let _drivers = crate::test_drivers::drivers(1);
     let mut options = default_driver_options();
     options.startup_timeout_ns = 0;
     let mut driver = 0;
@@ -2827,6 +2829,7 @@ fn a_zero_startup_timeout_is_refused() {
 /// threaded case and the deadline stay native only.
 #[test]
 fn startup_complete_writes_a_live_u32_on_the_callers_thread() {
+    let _drivers = crate::test_drivers::drivers(1);
     use karyos_protocol::admission::probe;
     let driver = readiness_driver(None);
     assert_eq!(complete(driver), (Status::Ok.code(), 1));
@@ -2842,6 +2845,7 @@ fn startup_complete_writes_a_live_u32_on_the_callers_thread() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn readiness_goes_from_starting_to_ready_on_the_callers_thread_and_its_own() {
+    let _drivers = crate::test_drivers::drivers(1);
     use karyos_protocol::admission::probe;
     for threaded in [false, true] {
         let driver = readiness_driver(None);
@@ -2875,6 +2879,7 @@ fn readiness_goes_from_starting_to_ready_on_the_callers_thread_and_its_own() {
 #[test]
 #[cfg_attr(miri, ignore = "timing; covered natively")]
 fn a_startup_past_its_deadline_reads_failed_and_completes_with_zero() {
+    let _drivers = crate::test_drivers::drivers(1);
     use karyos_protocol::admission::probe;
     let driver = readiness_driver(Some(1));
     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -2895,6 +2900,7 @@ fn a_startup_past_its_deadline_reads_failed_and_completes_with_zero() {
 
 #[test]
 fn a_readiness_struct_below_its_first_size_is_refused_and_a_larger_one_gets_the_known_fields() {
+    let _drivers = crate::test_drivers::drivers(1);
     let driver = readiness_driver(None);
     // Below ABI 0.1.3's size: refused, nothing written.
     let mut small = [u64::MAX; 4];
@@ -3004,6 +3010,7 @@ fn network_driver_sized(network: u32, size: u32) -> (i32, u64, u64) {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn an_embedded_driver_with_its_network_carries_a_udp_channel() {
+    let _drivers = crate::test_drivers::drivers(1);
     const STREAM: i32 = 735;
     let (status, driver, client) = network_driver(api::driver::NETWORK_ON);
     assert_eq!(status, Status::Ok.code());
@@ -3138,6 +3145,7 @@ fn refuses_udp(client: u64) {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
+    let _drivers = crate::test_drivers::drivers(1);
     let (status, driver, client) = network_driver(api::driver::NETWORK_OFF);
     assert_eq!(status, Status::Ok.code());
     let _opened = Opened {
@@ -3154,6 +3162,7 @@ fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn an_older_callers_driver_is_ipc_only_whatever_lies_past_its_struct() {
+    let _drivers = crate::test_drivers::drivers(1);
     for size in [DRIVER_OPTIONS_SIZE_0_1, 64] {
         let (status, driver, client) = network_driver_sized(api::driver::NETWORK_ON, size);
         assert_eq!(status, Status::Ok.code(), "size {size}");
@@ -3168,6 +3177,7 @@ fn an_older_callers_driver_is_ipc_only_whatever_lies_past_its_struct() {
 
 #[test]
 fn an_older_driver_options_struct_has_no_network_and_a_bad_value_is_refused() {
+    let _drivers = crate::test_drivers::drivers(1);
     let mut given = default_driver_options();
     given.network = api::driver::NETWORK_ON;
     // ABI 0.1.3's struct ends before the field: off.
@@ -3237,6 +3247,7 @@ fn capped_add_stream_sized(max_stream_bytes: u64, size: u32) -> (i32, Detail) {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_stream_above_the_options_cap_is_refused_with_its_bytes_and_the_cap() {
+    let _drivers = crate::test_drivers::drivers(3);
     let (status, detail) = capped_add_stream(1);
     assert_eq!(status, Status::InvalidArgument.code());
     assert_eq!(detail.value, 1, "the cap");
@@ -3270,6 +3281,7 @@ fn an_older_driver_options_struct_has_no_stream_cap() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn an_older_callers_stream_cap_is_none_whatever_lies_past_its_struct() {
+    let _drivers = crate::test_drivers::drivers(2);
     assert_eq!(capped_add_stream_sized(1, 72).0, Status::Ok.code());
     assert_eq!(
         capped_add_stream_sized(1, size_of_u32::<DriverOptions>()).0,
@@ -3283,6 +3295,7 @@ fn an_older_callers_stream_cap_is_none_whatever_lies_past_its_struct() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_network_publication_above_the_options_cap_is_refused_with_code_24() {
+    let _drivers = crate::test_drivers::drivers(1);
     let mut options = default_driver_options();
     options.network = api::driver::NETWORK_ON;
     options.max_stream_bytes = 1;
@@ -3329,6 +3342,7 @@ fn a_network_publication_above_the_options_cap_is_refused_with_code_24() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_network_publication_its_endpoint_cannot_hold_is_refused_with_its_limit() {
+    let _drivers = crate::test_drivers::drivers(1);
     let mut options = default_driver_options();
     options.network = api::driver::NETWORK_ON;
     // Room for 40 four-lane publications' lanes.

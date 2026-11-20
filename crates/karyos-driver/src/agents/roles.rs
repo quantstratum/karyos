@@ -6777,6 +6777,13 @@ impl<T: StreamTerms> SenderRole<T> {
         self.ignore_naks = false;
     }
 
+    /// Whether the publication `alias` on `endpoint` has an established
+    /// send session: a removal sends its EOS only then (tests).
+    #[cfg(test)]
+    pub(crate) fn session_established(&self, endpoint: EndpointId, alias: Alias) -> bool {
+        self.sessions.is_established(endpoint, alias)
+    }
+
     /// The receivers bound to `alias` on `endpoint` whose SMs arrived
     /// (tests): a path's SMs reach the sender only when the receiver agent
     /// has the alias published on that path's endpoint.

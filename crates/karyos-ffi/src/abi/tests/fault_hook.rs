@@ -66,6 +66,7 @@ fn the_hook_refuses_a_handle_that_names_no_driver() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn each_armed_driver_takes_its_own_fault() {
+    let _drivers = crate::test_drivers::drivers(4);
     let _serial = serial();
     let (a, b) = (invoker(), invoker());
     assert_eq!(karyos_test_panic_next_duty_cycle(a), Status::Ok.code());
@@ -98,6 +99,7 @@ fn each_armed_driver_takes_its_own_fault() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_close_right_after_the_check_leaves_nothing_armed() {
+    let _drivers = crate::test_drivers::drivers(1);
     let _serial = serial();
     let driver = invoker();
     crate::api::driver::AFTER_CHECK.with(|hook| {
@@ -117,6 +119,7 @@ fn a_close_right_after_the_check_leaves_nothing_armed() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn an_arm_racing_a_close_is_never_left_armed() {
+    let _drivers = crate::test_drivers::drivers(1);
     let _serial = serial();
     for _ in 0..200 {
         let driver = invoker();

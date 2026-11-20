@@ -1600,6 +1600,17 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.confirmed_bindings(endpoint, alias)
     }
 
+    /// Whether the publication `alias` on `endpoint` has an established
+    /// send session (tests).
+    #[cfg(test)]
+    pub(crate) fn session_established(
+        &self,
+        endpoint: EndpointId,
+        alias: karyos_protocol::network::Alias,
+    ) -> bool {
+        self.role.session_established(endpoint, alias)
+    }
+
     /// Drops every NAK unread from now on, as a sender that never repairs
     /// (tests).
     #[cfg(test)]
