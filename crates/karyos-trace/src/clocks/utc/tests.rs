@@ -54,8 +54,8 @@ fn words(name: &str) -> [u64; UTC_REFERENCE_WORDS] {
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect();
     let mut out = [0u64; UTC_REFERENCE_WORDS];
-    for (word, chunk) in out.iter_mut().zip(bytes.chunks_exact(8)) {
-        *word = u64::from_le_bytes(chunk.try_into().unwrap());
+    for (word, chunk) in out.iter_mut().zip(bytes.as_chunks::<8>().0) {
+        *word = u64::from_le_bytes(*chunk);
     }
     out
 }
