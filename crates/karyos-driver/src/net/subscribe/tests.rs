@@ -2362,3 +2362,34 @@ fn nak_control_entries_leave_with_their_last_subscription() {
         assert_eq!(b.network_control_groups_in_use(), 0, "{n}");
     }
 }
+
+/// karyos#1086 review: a two-path subscription's `nak-control` enters one
+/// table entry per path, and both leave the table when it closes; a failed
+/// add releases both.
+#[test]
+fn a_two_path_subscriptions_control_groups_leave_together() {
+    let mut b = driver(ThreadingMode::Shared);
+    b.net.as_mut().unwrap().assume_isolated_paths();
+    let at = |last: u8, port: u16| SocketAddr::from(([239, 8, 20, last], port));
+    let channel = UdpConfig {
+        destination: Destination::Multicast {
+            group: at(1, 4000),
+            ttl: None,
+        },
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(LOOPBACK),
+        ],
+        nak_control: vec![at(2, 4001), at(3, 4001)],
+        ..channel(at(1, 4000))
+    };
+    assert_eq!(b.network_control_groups_in_use(), 0);
+    // A host without multicast cannot join: the add fails, and must still
+    // release both entries.
+    if let Ok(subscription) = b.add_network_subscription(40, &channel) {
+        assert_eq!(b.network_control_groups_in_use(), 2);
+        assert!(b.remove_network_subscription(subscription).unwrap());
+    }
+    assert_eq!(b.network_control_groups_in_use(), 0);
+}
