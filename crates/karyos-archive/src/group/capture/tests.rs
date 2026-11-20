@@ -818,10 +818,10 @@ fn the_credit_is_exact_at_the_boundary() {
     sender.send(&records(9), 9).unwrap();
     assert_eq!(sender.admit(), Err(Refusal::RingFull));
     // Drain one more (128 free), then send a smaller event of 120 framed
-    // bytes (4 of payload): 8 free, 128 needed.
+    // bytes (no payload, 116 raw): 8 free, 128 needed.
     assert!(job.duty(0, 1, &none).unwrap());
-    let smaller = event(10, 4, None);
-    assert_eq!(smaller.len(), 112);
+    let smaller = event(10, 0, None);
+    assert_eq!(smaller.len(), 116);
     sender.admit().unwrap();
     sender.send(&smaller, 10).unwrap();
     assert_eq!(sender.admit(), Err(Refusal::RingFull), "8 bytes short");
