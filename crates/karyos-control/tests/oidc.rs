@@ -743,16 +743,44 @@ fn neither_time_nor_the_budget_extends_trust() {
     let url = state.lock().unwrap().url.clone();
     let (socket, _) = agent("lifetime");
     let address = control(&url, socket, quick());
-    state.lock().unwrap().cache_control = "max-age=1".to_owned();
+    // The set's age counts from its request and includes the apparent age
+    // of the issuer's `Date`, which has whole-second resolution: a set of
+    // one second could be up to a second old on receipt and run out during
+    // the fetch on a loaded host (karyos#993). Give it enough lifetime for
+    // the two verifying requests, then wait for the refusal instead of
+    // sleeping a fixed time.
+    let lifetime = Duration::from_secs(5);
+    state.lock().unwrap().cache_control = format!("max-age={}", lifetime.as_secs());
     let token = {
         let state = state.lock().unwrap();
         state.signer.token("at+jwt", &state.claims("alice@example"))
     };
+    let before_fetch = std::time::Instant::now();
     assert_eq!(refused(address, &token).0, 200);
     state.lock().unwrap().up = false;
     assert_eq!(refused(address, &token).0, 200);
-    std::thread::sleep(Duration::from_millis(1100));
-    assert_eq!(refused(address, &token).0, 503);
+    // Past the lifetime, with the issuer down, the set is never used
+    // again: 503. Not before the lifetime, and within a bound generous
+    // enough for a loaded host.
+    let deadline = before_fetch + lifetime + Duration::from_secs(30);
+    loop {
+        let status = refused(address, &token).0;
+        if status == 503 {
+            break;
+        }
+        assert_eq!(status, 200);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the set outlived its lifetime"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // Not before the lifetime, less the up to one second the `Date`
+    // truncation adds to the set's age.
+    assert!(
+        before_fetch.elapsed() >= lifetime - Duration::from_secs(1),
+        "refused inside the lifetime"
+    );
     state.lock().unwrap().up = true;
     assert_eq!(refused(address, &token).0, 200);
 
