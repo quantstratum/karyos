@@ -941,3 +941,174 @@ fn test_server_durable_query_answers_the_durable_position() {
     );
     rig.finish();
 }
+
+/// A fake retention engine: recording 42 is held, so its purge is refused
+/// with `legal_hold`; recording 7 is unknown; a verification of 42 has two
+/// ranges.
+#[derive(Default)]
+struct Engine {
+    calls: Arc<Mutex<Vec<String>>>,
+}
+
+impl RetentionControl for Engine {
+    fn hold(&mut self, recording: u64) -> RetentionAnswer {
+        self.calls.lock().unwrap().push(format!("hold {recording}"));
+        if recording == 7 {
+            RetentionAnswer::UnknownRecording
+        } else {
+            RetentionAnswer::HeldWithoutEvidence
+        }
+    }
+
+    fn release(&mut self, recording: u64) -> RetentionAnswer {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("release {recording}"));
+        RetentionAnswer::Done
+    }
+
+    fn purge(
+        &mut self,
+        recording: u64,
+        before: u64,
+        request_id: u64,
+        operator: u64,
+    ) -> RetentionAnswer {
+        self.calls.lock().unwrap().push(format!(
+            "purge {recording} {before} {request_id} {operator}"
+        ));
+        RetentionAnswer::Refused("legal_hold".to_owned())
+    }
+
+    fn verify(&mut self, recording: u64) -> Result<Vec<control::RangeOutcome>, RetentionAnswer> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("verify {recording}"));
+        let range = |start, end, outcome| control::RangeOutcome {
+            correlation_id: 0,
+            recording_id: recording,
+            start,
+            end,
+            first_inconsistent: control::NO_INCONSISTENT,
+            reasons: 0,
+            outcome,
+        };
+        Ok(vec![
+            range(0, 4096, control::IntegrityOutcome::Verified),
+            range(4096, 8192, control::IntegrityOutcome::Unsealed),
+        ])
+    }
+}
+
+/// ADR-0088 (karyos#967): the retention requests reach the attached
+/// engine with their fields and are answered with its codes and refusal
+/// names verbatim; a verification sends its ranges under the request's
+/// correlation id, then their count. Without an engine each is an error.
+#[test]
+fn retention_requests_reach_the_engine_and_are_answered_verbatim() {
+    let mut rig = Rig::new("retention", Host::default());
+    let mut sent = 0;
+    for request in [
+        ControlMessage::HoldRecording(control::HoldRecording {
+            correlation_id: 1,
+            recording_id: 42,
+        }),
+        ControlMessage::VerifyRecording(control::VerifyRecording {
+            correlation_id: 2,
+            recording_id: 42,
+        }),
+    ] {
+        rig.request(&request);
+        sent += 1;
+        let answers = rig.sent(sent);
+        let answer = response(answers.last().unwrap());
+        assert_eq!(
+            (answer.correlation_id, answer.code, answer.message),
+            (request_id(&request), ResponseCode::Error, NO_RETENTION)
+        );
+    }
+    let engine = Engine::default();
+    let calls = Arc::clone(&engine.calls);
+    rig.server = rig.server.with_retention(Box::new(engine));
+    rig.request(&ControlMessage::HoldRecording(control::HoldRecording {
+        correlation_id: 3,
+        recording_id: 42,
+    }));
+    rig.request(&ControlMessage::HoldRecording(control::HoldRecording {
+        correlation_id: 4,
+        recording_id: 7,
+    }));
+    rig.request(&ControlMessage::ReleaseHold(control::ReleaseHold {
+        correlation_id: 5,
+        recording_id: 42,
+    }));
+    rig.request(&ControlMessage::PurgeRecording(control::PurgeRecording {
+        correlation_id: 6,
+        recording_id: 42,
+        before: 4096,
+        request_id: 9,
+        operator: 1000,
+    }));
+    rig.request(&ControlMessage::VerifyRecording(control::VerifyRecording {
+        correlation_id: 8,
+        recording_id: 42,
+    }));
+    let all = rig.sent(sent + 7);
+    let answers: Vec<_> = all[sent..].iter().map(|bytes| decoded(bytes)).collect();
+    let summary: Vec<(u64, u64, ResponseCode, &str)> = answers[..4]
+        .iter()
+        .map(|message| match message {
+            ControlMessage::ControlResponse(response) => (
+                response.correlation_id,
+                response.id,
+                response.code,
+                response.message,
+            ),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (3, 0, ResponseCode::HeldWithoutEvidence, ""),
+            (4, 0, ResponseCode::UnknownRecording, "no such recording"),
+            (5, 42, ResponseCode::Ok, ""),
+            (6, 0, ResponseCode::Refused, "legal_hold"),
+        ]
+    );
+    let ranges: Vec<_> = answers[4..6]
+        .iter()
+        .map(|message| match message {
+            ControlMessage::RangeOutcome(range) => (range.correlation_id, range.start, range.end),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(ranges, [(8, 0, 4096), (8, 4096, 8192)]);
+    let count = response(&all[sent + 6]);
+    assert_eq!(
+        (count.correlation_id, count.id, count.code),
+        (8, 2, ResponseCode::Ok)
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        [
+            "hold 42",
+            "hold 7",
+            "release 42",
+            "purge 42 4096 9 1000",
+            "verify 42"
+        ]
+    );
+    rig.finish();
+}
+
+fn request_id(message: &ControlMessage<'_>) -> u64 {
+    match message {
+        ControlMessage::HoldRecording(request) | ControlMessage::VerifyRecording(request) => {
+            request.correlation_id
+        }
+        other => panic!("{other:?}"),
+    }
+}

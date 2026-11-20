@@ -105,6 +105,13 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
         config = config.with_agent_id(id);
     }
     let mut agent = Agent::new(config);
+    // The retention operations go to the first configured Archive: they
+    // name a recording, not a driver (karyos#967).
+    if let Some((dir, streams)) = args.archives.first() {
+        agent.set_retention(Box::new(
+            karyos_agent::archive_retention::ArchiveRetention::new(dir.clone(), *streams),
+        ));
+    }
     // Between refreshes the socket is polled every 10 ms, and the stop
     // flag read as often.
     let tick = Duration::from_millis(10).min(args.refresh);

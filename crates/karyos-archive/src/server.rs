@@ -27,6 +27,14 @@
 //!   ([`ServerConfig::max_pending_signals`]); one more is dropped and
 //!   counted.
 //!
+//! - **Retention (ADR-0088, Proposed; karyos#967).** A hold, a release, a
+//!   purge and a seal verification are served by the
+//!   [`RetentionControl`] the host attached
+//!   ([`ControlServer::with_retention`]), on the server's thread, its
+//!   refusal names verbatim. Without one each is answered code 1
+//!   ([`NO_RETENTION`]): the Archive's retention engine and verifier are
+//!   not attached to its control path yet.
+//!
 //! This is the control path: it allocates (the queued answers, the boxed
 //! host objects); the replayed frames do not pass through it.
 
@@ -58,6 +66,57 @@ pub const MAX_REQUEST: usize = 1079;
 /// longest channel (the envelope, its block, and the channel's length and
 /// bytes).
 pub const MAX_ANSWER: usize = 12 + 110 + 2 + MAX_CHANNEL;
+
+/// The message of a retention request's answer when no
+/// [`RetentionControl`] is attached.
+pub const NO_RETENTION: &str = "no retention engine attached";
+
+/// What the Archive's retention engine answered to a hold, a release or a
+/// purge (ADR-0088).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RetentionAnswer {
+    /// Done: a hold applied with evidence, a release, a purge.
+    Done,
+    /// A hold in force whose pending marker is durable, without the
+    /// operations journal's record.
+    HeldWithoutEvidence,
+    /// A hold in force in this process only.
+    HeldInMemoryOnly,
+    /// No such recording.
+    UnknownRecording,
+    /// Refused, for the reason named: `legal_hold`, `not_expired`,
+    /// `below_min_copies`, `no_evidence` and the like, verbatim.
+    Refused(String),
+    /// Failed, for the reason given.
+    Error(String),
+}
+
+/// The Archive's retention engine and verifier, as the control server
+/// reaches them (ADR-0088). Called on the server's thread.
+pub trait RetentionControl: Send {
+    /// Applies a legal hold on `recording`.
+    fn hold(&mut self, recording: u64) -> RetentionAnswer;
+    /// Releases the legal hold on `recording`.
+    fn release(&mut self, recording: u64) -> RetentionAnswer;
+    /// Purges `recording` below `before`, as purge `request_id` for
+    /// `operator`, authorised by the control path (ADR-0088, decision 4).
+    fn purge(
+        &mut self,
+        recording: u64,
+        before: u64,
+        request_id: u64,
+        operator: u64,
+    ) -> RetentionAnswer;
+    /// Verifies `recording`'s seals: each range's outcome, its
+    /// `correlation_id` set by the server; or why not.
+    ///
+    /// # Errors
+    ///
+    /// A [`RetentionAnswer`] other than `Done` for a verification that
+    /// could not run.
+    fn verify(&mut self, recording: u64) -> Result<Vec<control::RangeOutcome>, RetentionAnswer>;
+}
 
 /// The host's side of the Archive: the driver's streams.
 pub trait ArchiveHost {
@@ -236,6 +295,8 @@ pub struct ControlServer<H, Q, R> {
     dropped_signals: u64,
     unencoded: u64,
     unattended: u64,
+    /// The retention engine, once attached (ADR-0088).
+    retention: Option<Box<dyn RetentionControl>>,
 }
 
 impl<H, Q, R> core::fmt::Debug for ControlServer<H, Q, R> {
@@ -262,7 +323,16 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             dropped_signals: 0,
             unencoded: 0,
             unattended: 0,
+            retention: None,
         }
+    }
+
+    /// The server with `retention` serving the retention requests
+    /// (ADR-0088).
+    #[must_use]
+    pub fn with_retention(mut self, retention: Box<dyn RetentionControl>) -> Self {
+        self.retention = Some(retention);
+        self
     }
 
     /// The server with `config`.
@@ -513,8 +583,36 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                     answer,
                 })
             }
+            ControlMessage::HoldRecording(request) => {
+                self.retain(request.correlation_id, request.recording_id, |engine| {
+                    engine.hold(request.recording_id)
+                });
+                None
+            }
+            ControlMessage::ReleaseHold(request) => {
+                self.retain(request.correlation_id, request.recording_id, |engine| {
+                    engine.release(request.recording_id)
+                });
+                None
+            }
+            ControlMessage::PurgeRecording(request) => {
+                self.retain(request.correlation_id, request.recording_id, |engine| {
+                    engine.purge(
+                        request.recording_id,
+                        request.before,
+                        request.request_id,
+                        request.operator,
+                    )
+                });
+                None
+            }
+            ControlMessage::VerifyRecording(request) => {
+                self.verify(request.correlation_id, request.recording_id);
+                None
+            }
             ControlMessage::ControlResponse(ControlResponse { correlation_id, .. })
             | ControlMessage::RecordingDescriptor(RecordingDescriptor { correlation_id, .. })
+            | ControlMessage::RangeOutcome(control::RangeOutcome { correlation_id, .. })
             | ControlMessage::RecordingSignal(RecordingSignal { correlation_id, .. }) => {
                 self.respond(
                     correlation_id,
@@ -524,6 +622,65 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 );
                 None
             }
+        }
+    }
+
+    /// Answers a hold, a release or a purge with what the retention engine
+    /// said, or [`NO_RETENTION`] without one.
+    fn retain(
+        &mut self,
+        correlation_id: u64,
+        recording_id: u64,
+        call: impl FnOnce(&mut dyn RetentionControl) -> RetentionAnswer,
+    ) {
+        let answer = match self.retention.as_deref_mut() {
+            Some(engine) => call(engine),
+            None => RetentionAnswer::Error(NO_RETENTION.to_owned()),
+        };
+        self.answer_retention(correlation_id, recording_id, &answer);
+    }
+
+    fn answer_retention(
+        &mut self,
+        correlation_id: u64,
+        recording_id: u64,
+        answer: &RetentionAnswer,
+    ) {
+        let (code, message) = match answer {
+            RetentionAnswer::Done => (ResponseCode::Ok, ""),
+            RetentionAnswer::HeldWithoutEvidence => (ResponseCode::HeldWithoutEvidence, ""),
+            RetentionAnswer::HeldInMemoryOnly => (ResponseCode::HeldInMemoryOnly, ""),
+            RetentionAnswer::UnknownRecording => {
+                (ResponseCode::UnknownRecording, "no such recording")
+            }
+            RetentionAnswer::Refused(reason) => (ResponseCode::Refused, reason.as_str()),
+            RetentionAnswer::Error(why) => (ResponseCode::Error, why.as_str()),
+        };
+        self.respond(correlation_id, recording_id, code, message);
+    }
+
+    /// One `RangeOutcome` per range, then the count of those sent.
+    fn verify(&mut self, correlation_id: u64, recording_id: u64) {
+        let verified = match self.retention.as_deref_mut() {
+            Some(engine) => engine.verify(recording_id),
+            None => Err(RetentionAnswer::Error(NO_RETENTION.to_owned())),
+        };
+        match verified {
+            Ok(ranges) => {
+                let mut sent = 0u64;
+                for range in ranges {
+                    let range = control::RangeOutcome {
+                        correlation_id,
+                        ..range
+                    };
+                    if self.queue(&ControlMessage::RangeOutcome(range)) {
+                        count(&mut sent);
+                    }
+                }
+                self.respond(correlation_id, sent, ResponseCode::Ok, "");
+            }
+            Err(RetentionAnswer::Done) => self.respond(correlation_id, 0, ResponseCode::Ok, ""),
+            Err(answer) => self.answer_retention(correlation_id, recording_id, &answer),
         }
     }
 
