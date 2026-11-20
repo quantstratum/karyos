@@ -174,7 +174,7 @@ answered by the owner on 2026-11-17, when 0.1.0-alpha.3 was published
 
 | Point | Answer (2026-11-17) |
 | --- | --- |
-| Which crates, in which order | The facade and everything it depends on, in dependency order: `karyos-sys`, `karyos-protocol`, `karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`, `karyos-cluster`, `karyos`. Every other crate keeps `publish = false` |
+| Which crates, in which order | The facade and everything it depends on, in dependency order: `karyos-sys`, `karyos-protocol`, `karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`, `karyos-cluster`, `karyos`; and, from the alpha after 0.1.0-alpha.3, `karyos-trace` after `karyos-protocol` (its one Karyos dependency) for karyos-insights (ADR-0068, INS-Q4; karyos#997). Every other crate keeps `publish = false` |
 | Version scheme | `0.1.0-alpha.N`, the workspace version, the same for every published crate |
 | Ownership | The owner's crates.io account |
 | Gate that authorised 0.1.0-alpha.3 | For alpha.3 only, a written exception: `CHANGELOG_RELEASE=1 make pre-push` run locally at the release head, plus `cargo publish --dry-run`, while hosted CI was off (karyos#623). Later releases run the full release gates of this file or record their own written exception |
@@ -187,14 +187,14 @@ answered by the owner on 2026-11-17, when 0.1.0-alpha.3 was published
    `CHANGELOG_RELEASE=1 make pre-push` and name the gates not run.
 2. Run the ADR-0033 admission review of the resolved normal and build
    graph of the published crates, `cargo tree --locked -e normal,build`
-   over the eight packages, and record it below with its date and head.
+   over the published packages, and record it below with its date and head.
    A family outside ADR-0033 and its admitted successors blocks the
    publication.
 3. Check the crate names. A name not yet published by the owner account
    must be free on crates.io; a published name must be owned by the
    owner account. Record the result below.
 4. Run one dry run over all the published crates together:
-   `cargo publish --dry-run --locked -p karyos-sys -p karyos-protocol -p karyos-codec -p karyos-client -p karyos-io -p karyos-archive -p karyos-cluster -p karyos`.
+   `cargo publish --dry-run --locked -p karyos-sys -p karyos-protocol -p karyos-trace -p karyos-codec -p karyos-client -p karyos-io -p karyos-archive -p karyos-cluster -p karyos`.
    Cargo packages them as one set and verifies each against the others'
    packaged sources, so it checks the new versions before any is on the
    index; a separate dry run per crate cannot, because a dependant's new
@@ -218,6 +218,7 @@ defect fix is a new `alpha.N`.
 | Date | Head | Resolved normal and build graph outside the workspace | Result |
 | --- | --- | --- | --- |
 | 2026-11-19 | `v0.1.0-alpha.3` (b7b37d41) | `thiserror` 2.0.21, `thiserror-impl` 2.0.21 (proc macro), `syn` 3.0.8, `quote` 1.0.47, `proc-macro2` 1.0.107, `unicode-ident` 1.0.26; all from crates.io | Admitted: `thiserror` is an ADR-0033 family for every crate; `syn`, `quote`, `proc-macro2` and `unicode-ident` enter only as the build time graph of the `thiserror-impl` proc macro and ship no runtime code. Licences: MIT OR Apache-2.0, and `unicode-ident` adds Unicode-3.0. Build scripts (`thiserror`, `proc-macro2`, `quote`) compile no C or C++ |
+| 2026-11-20 | main `f468d88a`, `karyos-trace` added (karyos#997) | `karyos-trace` reaches `karyos-protocol` and `karyos-sys` (both published), `thiserror` 2.0.21 and its proc macro graph (`thiserror-impl`, `syn` 3.0.8, `quote` 1.0.47, `proc-macro2` 1.0.107, `unicode-ident` 1.0.26): `cargo tree --locked -e normal,build -p karyos-trace` | Admitted: no package outside the 2026-11-19 row; the published graph gains no family |
 
 Main after `v0.1.0-alpha.3` adds the ADR-0086 wire authentication
 families (`ed25519-dalek`, `sha2` and their graph) to the published
@@ -229,6 +230,7 @@ crates; the next publication reviews them in its own row.
 | --- | --- | --- |
 | 2026-11-17 | the eight published crates | free before publication; published the same day (crates.io `created_at` 2026-11-17) |
 | 2026-11-19 | the eight published crates | owned by the owner account: the crates.io owners list of each crate (`cargo owner --list <crate>`) names only `joaquinbejar` |
+| 2026-11-20 | `karyos-trace` | free: `https://crates.io/api/v1/crates/karyos-trace` answers 404 (karyos#997) |
 
 ## After the tag
 
