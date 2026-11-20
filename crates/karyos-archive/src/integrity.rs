@@ -49,6 +49,7 @@
 
 pub mod anchor;
 pub mod copies;
+pub mod damage;
 pub mod journal;
 pub mod ledger;
 pub mod replication;
