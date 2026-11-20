@@ -96,6 +96,24 @@ either; the byte cap is kept by entry size in both (a command over its
 share is refused even within the cap). Tracked in
 karyos#975 (the first two).
 
+## Candidate-backed negative cases of the harness checks (karyos#976)
+
+`tests/checks.rs` wraps the `raft` adapter in mutants, each breaking one rule, and asserts the check that names it. Where no mutant exists, the check keeps its fixture negative case in `crates/karyos-sim/tests/harness.rs`, for the reason below. The C5 decision (#691) is asked to accept these reasons, or to name the fault injection that closes each.
+
+| Check (`Violation`) | Candidate-backed | Reason when not |
+| --- | --- | --- |
+| `DivergentPrefix`, `ReplyBeforeDurableMajority`, `Contract` (gap), `OldTermCommit`, `Contract` (`TruncateBelowCommit`) | yes (karyos#678) | |
+| `PositionsOutOfOrder` | yes: a core that reports no last index over a written log | |
+| `AppliedNotDurable` | no | `drive` writes and syncs a Ready's entries before it applies that Ready's committed entries, so a core that hands its fresh entries to apply has them durable already (tried: the mutant passes every check). Reaching it needs a faulty `drive` or a disk that acknowledges an unsynced write |
+| `ReleasedBeforePersisted`, `DurableLost` | no | out of a core's reach through `ConsensusCore` (`drive` releases after the sync; C4's log and the disk keep durable entries), as #976 records |
+| `CommittedTruncated` | no | a core can truncate only through C4's log, which refuses below its stored commit (`TruncateBelowCommit`); above it, a server that stored no commit but holds entries the others applied makes raft-rs itself panic (`to_commit … out of range`) before the check runs (tried) |
+| `DivergentResponse` | no | responses are computed by the harness's service from the applied entry, so two servers answer one index differently only if they applied different entries, which `DivergentPrefix` names first |
+| `NotLinearizable` | no | the servers' service, not the core, produces each answer; a mutant that applies consistently altered commands on every server (tried) stays linearizable, since the register is a function of the applied log. Reaching it needs a faulty service or client |
+| `Undecided`, `MalformedHistory` | no | properties of C3 and of the client history the harness records, not of a core |
+| `Unverified` | no | a run property (a crashed server never restarted), set by the case, not the core |
+| `QuorumOfVoters`, `ConfigurationNotFromLog`, `ConfigurationConflict`, `LearnerBehind` | no | membership changes: neither adapter takes a configuration change yet; they become reachable with the membership work held behind the core selection (#681 and the M04/M05 membership items) |
+| `StandbyEffect`, `ReplyAfterFencing`, `OldGenerationReply`, `FeedMismatch`, `VerifiedLost`, `GapMisreported`, `GenerationBack` | no | the standby, lease and promotion path (W6) runs the harness's primary/standby feed and fencing around the core, not inside it; a core-side mutant cannot change what the feed or the lease releases |
+
 ## Amendment: RUSTSEC-2026-0543 (`chrono` unmaintained), karyos#690
 
 Published after the admission record, which found no advisory in the
