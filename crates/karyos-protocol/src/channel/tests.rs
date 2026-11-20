@@ -474,6 +474,10 @@ fn published_keys_keep_their_meaning() {
                     class: "authenticated"
                 }
             ),
+            Key::NakControl => assert_eq!(
+                udp("karyos:udp?group=239.1.1.1:4000|nak-control=239.1.1.2:4001").nak_control,
+                vec![addr("239.1.1.2:4001")]
+            ),
         }
         assert_eq!(key.name(), name);
     }
