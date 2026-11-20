@@ -55,9 +55,12 @@ pub enum Immutability {
 /// # Errors
 ///
 /// [`SysError::Os`] when the file cannot be opened or its flags read or
-/// written for another reason than missing support or permission.
+/// written for another reason than missing support or permission, and
+/// (`EINVAL`) for a path that is not a regular file: it is opened without
+/// blocking (a FIFO would otherwise wait for a writer) and checked with
+/// `fstat` before any `ioctl` reaches it (karyos#958 review).
 pub fn set_immutable(path: &Path, immutable: bool) -> Result<Immutability, SysError> {
-    use rustix::fs::{IFlags, Mode, OFlags, ioctl_getflags, ioctl_setflags, open};
+    use rustix::fs::{FileType, IFlags, Mode, OFlags, fstat, ioctl_getflags, ioctl_setflags, open};
     use rustix::io::Errno;
 
     let os = |operation: &'static str| {
@@ -68,10 +71,14 @@ pub fn set_immutable(path: &Path, immutable: bool) -> Result<Immutability, SysEr
     };
     let file = open(
         path,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )
     .map_err(os("open"))?;
+    let stat = fstat(&file).map_err(os("fstat"))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(os("not a regular file")(Errno::INVAL));
+    }
     let unsupported =
         |errno: Errno| matches!(errno, Errno::NOTTY | Errno::OPNOTSUPP | Errno::INVAL);
     let flags = match ioctl_getflags(&file) {
@@ -150,6 +157,39 @@ mod tests {
             }
         }
         assert!(set_immutable(&dir.join("missing"), true).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// karyos#958 review: a path that is not a regular file is refused
+    /// before any ioctl, and a FIFO does not block the open waiting for a
+    /// writer.
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir =
+            std::env::temp_dir().join(format!("karyos-immutable-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(matches!(
+            set_immutable(&fifo, true),
+            Err(SysError::Os {
+                operation: "not a regular file",
+                ..
+            })
+        ));
+        assert!(matches!(
+            set_immutable(&dir, true),
+            Err(SysError::Os {
+                operation: "not a regular file",
+                ..
+            })
+        ));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
