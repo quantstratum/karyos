@@ -675,6 +675,20 @@ pub enum ReleaseError {
     },
 }
 
+impl ReleaseError {
+    /// The reason's name in a control answer (ADR-0088): `no_evidence`
+    /// and the rest, one per variant.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::NoEvidence { .. } => "no_evidence",
+            Self::JournalUnavailable => "journal_unavailable",
+            Self::Unknown => "holds_unknown",
+            Self::Unconfirmed { .. } => "unconfirmed",
+        }
+    }
+}
+
 /// Who asks for a purge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Authorisation {
@@ -789,6 +803,27 @@ pub enum PurgeRefusal {
 }
 
 impl PurgeRefusal {
+    /// The reason's name in a control answer (ADR-0088): `legal_hold`,
+    /// `not_expired`, `below_min_copies` and the rest, one per variant.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::NotAuthorised => "not_authorised",
+            Self::LegalHold => "legal_hold",
+            Self::HoldsUnknown => "holds_unknown",
+            Self::NoPolicy => "no_policy",
+            Self::NotExpired { .. } => "not_expired",
+            Self::BelowMinCopies { .. } => "below_min_copies",
+            Self::JournalUnavailable => "journal_unavailable",
+            Self::WrongStore { .. } => "wrong_store",
+            Self::NotAWriteStart { .. } => "not_a_write_start",
+            Self::NotSealed { .. } => "not_sealed",
+            Self::DuplicateId { .. } => "duplicate_id",
+            Self::ManualOnly => "manual_only",
+            Self::SplitsSeal { .. } => "splits_seal",
+        }
+    }
+
     /// The reason's code in the operations journal.
     #[must_use]
     pub const fn code(&self) -> u8 {
@@ -1185,6 +1220,25 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             return Err(PurgeRefusal::BelowMinCopies { verified, required });
         }
         Ok(())
+    }
+
+    /// Refuses `request` on an Archive with no purge configuration (no
+    /// policy, no copy catalog; karyos#1093), journalling the refusal as
+    /// [`Retention::purge`] would: holds first, as in
+    /// [`Retention::check`], then `no_policy`. Never deletes.
+    pub fn refuse_unconfigured(&mut self, request: &PurgeRequest) -> PurgeError {
+        let refusal = if self.intents.contains_key(&request.id) {
+            PurgeRefusal::DuplicateId { id: request.id }
+        } else if self.holds_unknown {
+            PurgeRefusal::HoldsUnknown
+        } else if self.holds.contains_key(&request.recording) {
+            PurgeRefusal::LegalHold
+        } else if !request.authorisation.authorised {
+            PurgeRefusal::NotAuthorised
+        } else {
+            PurgeRefusal::NoPolicy
+        };
+        self.refuse(request, refusal)
     }
 
     fn refuse(&mut self, request: &PurgeRequest, refusal: PurgeRefusal) -> PurgeError {

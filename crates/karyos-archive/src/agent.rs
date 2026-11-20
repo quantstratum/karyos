@@ -83,6 +83,7 @@ use crate::integrity::trust::{
 use crate::recorder::{Ended, FrameSource, Mode, Recorder, RecorderError};
 use crate::replay::{Rate, ReplayError, ReplaySource, Step};
 use crate::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
+use crate::server::RetentionAnswer;
 
 /// The agent's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,6 +791,10 @@ enum Command {
     StopReplay(u64, Reply<u64>),
     StartGroup(Box<StartGroup>, Reply<CaptureSender>),
     StopGroup(u64, Reply<u64>),
+    /// A hold, a release or a purge (ADR-0088).
+    Retain(retention::Request, Reply<RetentionAnswer>),
+    /// A seal verification (ADR-0088).
+    Verify(u64, Reply<retention::Verified>),
     Shutdown(Reply<()>),
 }
 
@@ -887,6 +892,8 @@ impl core::fmt::Debug for Command {
             Self::StopReplay(id, _) => f.debug_tuple("StopReplay").field(id).finish(),
             Self::StartGroup(start, _) => f.debug_tuple("StartGroup").field(start).finish(),
             Self::StopGroup(id, _) => f.debug_tuple("StopGroup").field(id).finish(),
+            Self::Retain(request, _) => f.debug_tuple("Retain").field(request).finish(),
+            Self::Verify(id, _) => f.debug_tuple("Verify").field(id).finish(),
             Self::Shutdown(_) => f.write_str("Shutdown"),
         }
     }
@@ -1049,6 +1056,68 @@ impl ArchiveHandle {
     /// store's and the catalog's errors, and [`AgentError::Gone`].
     pub fn stop(&self, id: u64) -> Result<Ended, AgentError> {
         self.call(|reply| Command::Stop(id, reply))
+    }
+
+    /// Applies a legal hold on `recording` through the Archive's retention
+    /// engine (ADR-0088), posted: the hold inhibits purge at once and is
+    /// answered [`RetentionAnswer::Done`] only with the operations
+    /// journal's evidence.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_hold(&self, recording: u64) -> Result<Posted<RetentionAnswer>, AgentError> {
+        self.post(|reply| Command::Retain(retention::Request::Hold(recording), reply))
+    }
+
+    /// Releases the legal hold on `recording` (ADR-0088), posted; a release
+    /// without evidence is refused `no_evidence`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_release(&self, recording: u64) -> Result<Posted<RetentionAnswer>, AgentError> {
+        self.post(|reply| Command::Retain(retention::Request::Release(recording), reply))
+    }
+
+    /// Purges `recording` below `before` as purge `request_id` for
+    /// `operator` (ADR-0088), posted. No purge policy is configured in the
+    /// agent yet (karyos#1093): the purge is refused, `legal_hold` under a
+    /// hold, else `no_policy`, and nothing is deleted.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_purge(
+        &self,
+        recording: u64,
+        before: u64,
+        request_id: u64,
+        operator: u64,
+    ) -> Result<Posted<RetentionAnswer>, AgentError> {
+        self.post(|reply| {
+            Command::Retain(
+                retention::Request::Purge {
+                    recording,
+                    before,
+                    request_id,
+                    operator,
+                },
+                reply,
+            )
+        })
+    }
+
+    /// Verifies `recording`'s seals (ADR-0088), posted: each range's
+    /// outcome, its correlation id 0, or why the verification could not
+    /// run (no integrity journal, an unknown recording, a store or journal
+    /// that cannot be read).
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_verify(&self, recording: u64) -> Result<Posted<retention::Verified>, AgentError> {
+        self.post(|reply| Command::Verify(recording, reply))
     }
 
     /// [`ArchiveHandle::stop`], posted.
@@ -1616,6 +1685,13 @@ fn run<D>(
             return;
         }
     };
+    let retention = match retention::open(&disk, &dir) {
+        Ok(retention) => retention,
+        Err(error) => {
+            let _ = ready.send(Err(error.into()));
+            return;
+        }
+    };
     // Collected before the settle, so the stops recovery appends are
     // chained too, before the start is reported.
     let mut integrity = match config.seal_interval.map(|interval| {
@@ -1712,6 +1788,7 @@ fn run<D>(
         },
         groups: Vec::new(),
         integrity,
+        retention,
     };
     loop {
         let mut worked = false;
@@ -1770,6 +1847,8 @@ struct State<D: Disk> {
     replays: Replays<D>,
     groups: Vec<ActiveGroup<D>>,
     integrity: Option<Integrity<D>>,
+    /// The retention engine (ADR-0088; karyos#967).
+    retention: retention::Engine<D>,
 }
 
 /// The integrity journal of a running Archive and its sealing schedule
@@ -2603,6 +2682,12 @@ impl<D: Disk + Clone> State<D> {
                 };
                 let _ = reply.send(result);
             }
+            Command::Retain(request, reply) => {
+                let _ = reply.send(Ok(self.retain(request)));
+            }
+            Command::Verify(id, reply) => {
+                let _ = reply.send(Ok(self.verify(id)));
+            }
             Command::Shutdown(reply) => {
                 let groups = std::mem::take(&mut self.groups);
                 for group in groups {
@@ -3362,6 +3447,10 @@ fn described<D: Disk>(recording: &Recording, active: &[Active<D>]) -> Described 
         incomplete,
     }
 }
+
+mod retention;
+
+pub use retention::Verified;
 
 #[cfg(test)]
 mod tests;
