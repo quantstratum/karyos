@@ -1,0 +1,330 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The two ends of a replication (ADR-0091; quantstratum-docs:
+//! karyos/design/archive-replication.md section 4; quantstratum/karyos#1072):
+//! [`Sender`], the source's state for one request, which turns the stored
+//! bytes and the range seals into the messages it sends, in order; and
+//! [`Receiver`], the replica's, which stores what arrives as unverified and
+//! counts a range only once its seal verifies on the replica's own bytes.
+//! Either end is driven by its host's control streams.
+
+use crate::control::ResponseCode;
+use crate::disk::Disk;
+use crate::integrity::copies::CopyCatalog;
+use crate::integrity::journal::IntegrityJournal;
+use crate::integrity::replication::{Replica, ReplicationError, Verdict};
+use crate::integrity::{SealKind, SealRecord};
+use crate::segment::{SegmentError, SegmentStore};
+
+use super::{
+    MAX_CHUNK, Mode, ReplicateRecording, ReplicationStatus, RequestRefusal, State, check_request,
+    check_seal,
+};
+
+/// A message the source sends, owned until the host encodes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Outgoing {
+    /// Stored bytes at `start`.
+    Bytes {
+        /// Their position.
+        start: u64,
+        /// At most [`MAX_CHUNK`] of them.
+        bytes: Vec<u8>,
+    },
+    /// A range's seal, sent once its bytes were.
+    Seal(SealRecord),
+    /// The source's status.
+    Status(ReplicationStatus),
+}
+
+/// Why a source refuses a request: the `ControlResponse` code to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// The source holds no such recording: code 2, unknown recording.
+    UnknownRecording,
+    /// The request is off a seal boundary or below the start: code 4.
+    Invalid(RequestRefusal),
+}
+
+impl Refusal {
+    /// The `ControlResponse` code that answers it.
+    #[must_use]
+    pub const fn code(self) -> ResponseCode {
+        match self {
+            Self::UnknownRecording => ResponseCode::UnknownRecording,
+            Self::Invalid(_) => ResponseCode::InvalidRequest,
+        }
+    }
+}
+
+/// The source's state for one request.
+#[derive(Debug)]
+pub struct Sender {
+    request: ReplicateRecording,
+    /// The next position to send.
+    next: u64,
+    /// The end of the last range sent whole with its seal.
+    sent_end: u64,
+    /// Set once a final status was produced: nothing more is sent.
+    done: Option<State>,
+}
+
+impl Sender {
+    /// Accepts `request` for a store starting at `start`, whose range seals
+    /// are `seals`, or refuses it.
+    ///
+    /// # Errors
+    ///
+    /// [`Refusal::UnknownRecording`] when `known` is false, and
+    /// [`Refusal::Invalid`] for a request off a seal boundary or below the
+    /// start. In continuous mode an `until` the seals do not reach yet is
+    /// refused too: the note asks for an existing seal boundary.
+    pub fn accept(
+        request: ReplicateRecording,
+        known: bool,
+        start: u64,
+        seals: &[SealRecord],
+    ) -> Result<Self, Refusal> {
+        if !known {
+            return Err(Refusal::UnknownRecording);
+        }
+        check_request(&request, start, seals).map_err(Refusal::Invalid)?;
+        Ok(Self {
+            request,
+            next: request.from,
+            sent_end: request.from,
+            done: None,
+        })
+    }
+
+    /// The request.
+    #[must_use]
+    pub const fn request(&self) -> &ReplicateRecording {
+        &self.request
+    }
+
+    /// The final state, once reached; nothing more is sent after it.
+    #[must_use]
+    pub const fn done(&self) -> Option<State> {
+        self.done
+    }
+
+    /// Stops it, after the replica's `StopReplication`.
+    pub fn stop(&mut self, store: &SegmentStore<impl Disk>, sealed_end: u64) -> Outgoing {
+        self.finish(State::Stopped, store, sealed_end)
+    }
+
+    /// Sends what is due: for each range seal of the recording that follows
+    /// what was sent, its bytes in chunks then the seal, up to `until`. On
+    /// demand, then a [`State::CaughtUp`] status; when the recording
+    /// `stopped` and everything to its end was sent, [`State::Ended`]; a
+    /// purge past the next position or a gap, [`State::Interrupted`].
+    ///
+    /// # Errors
+    ///
+    /// The store's read error; nothing after the failed read is sent.
+    pub fn poll<D: Disk>(
+        &mut self,
+        store: &mut SegmentStore<D>,
+        seals: &[SealRecord],
+        stopped: bool,
+        out: &mut Vec<Outgoing>,
+    ) -> Result<(), SegmentError> {
+        if self.done.is_some() {
+            return Ok(());
+        }
+        let recording = self.request.recording_id;
+        let sealed_end = sealed_end(seals, recording, store.start());
+        if store.start() > self.next {
+            out.push(self.finish(State::Interrupted, store, sealed_end));
+            return Ok(());
+        }
+        let mut ranges: Vec<&SealRecord> = seals
+            .iter()
+            .filter(|seal| {
+                seal.subject == recording
+                    && matches!(seal.kind, SealKind::OpenSegment | SealKind::ClosedSegment)
+                    && seal.end > self.next
+                    && seal.end <= self.request.until
+            })
+            .collect();
+        ranges.sort_by_key(|seal| seal.start);
+        for seal in ranges {
+            if seal.start != self.next {
+                // A range that does not follow what was sent: a gap.
+                out.push(self.finish(State::Interrupted, store, sealed_end));
+                return Ok(());
+            }
+            let mut from = seal.start;
+            while from < seal.end {
+                let to = seal.end.min(from.saturating_add(MAX_CHUNK as u64));
+                let length = usize::try_from(to.saturating_sub(from))
+                    .map_err(|_| SegmentError::PositionOverflow)?;
+                let mut bytes = vec![0u8; length];
+                store.read(from, &mut bytes)?;
+                out.push(Outgoing::Bytes { start: from, bytes });
+                from = to;
+            }
+            out.push(Outgoing::Seal(*seal));
+            self.next = seal.end;
+            self.sent_end = seal.end;
+        }
+        if self.next == self.request.until {
+            out.push(self.finish(State::CaughtUp, store, sealed_end));
+        } else if stopped && self.next == sealed_end && sealed_end == store.written() {
+            out.push(self.finish(State::Ended, store, sealed_end));
+        } else if self.request.mode == Mode::OnDemand {
+            out.push(self.finish(State::CaughtUp, store, sealed_end));
+        }
+        Ok(())
+    }
+
+    /// A status of the recording as the store holds it now.
+    #[must_use]
+    pub fn status(&self, store: &SegmentStore<impl Disk>, seals: &[SealRecord]) -> Outgoing {
+        let sealed_end = sealed_end(seals, self.request.recording_id, store.start());
+        Outgoing::Status(self.report(State::Streaming, store, sealed_end))
+    }
+
+    fn finish(
+        &mut self,
+        state: State,
+        store: &SegmentStore<impl Disk>,
+        sealed_end: u64,
+    ) -> Outgoing {
+        self.done = Some(state);
+        // An interrupted request names the last range sent whole.
+        let end = if state == State::Interrupted {
+            self.sent_end
+        } else {
+            sealed_end
+        };
+        Outgoing::Status(self.report(state, store, end))
+    }
+
+    fn report(
+        &self,
+        state: State,
+        store: &SegmentStore<impl Disk>,
+        sealed_end: u64,
+    ) -> ReplicationStatus {
+        let source_start = store.start().min(sealed_end);
+        ReplicationStatus {
+            correlation_id: self.request.correlation_id,
+            recording_id: self.request.recording_id,
+            source_start,
+            sealed_end,
+            written: store.written().max(sealed_end),
+            state,
+        }
+    }
+}
+
+/// Where `recording`'s range seals end, from `start`.
+fn sealed_end(seals: &[SealRecord], recording: u64, start: u64) -> u64 {
+    seals
+        .iter()
+        .filter(|seal| seal.subject == recording && seal.kind.is_range())
+        .map(|seal| seal.end)
+        .max()
+        .unwrap_or(start)
+        .max(start)
+}
+
+/// What a replica refuses.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReceiveError {
+    /// Bytes for another recording than the request's.
+    #[error("bytes of recording {got}, replicating {expected}")]
+    OtherRecording {
+        /// The request's recording.
+        expected: u64,
+        /// The message's.
+        got: u64,
+    },
+    /// A seal of another kind or subject.
+    #[error("a seal that does not cover this recording")]
+    ForeignSeal,
+    /// The replica's store refused the bytes (out of order, or failed).
+    #[error(transparent)]
+    Store(#[from] SegmentError),
+    /// The copy catalog or the integrity journal failed.
+    #[error(transparent)]
+    Replication(#[from] ReplicationError),
+}
+
+/// The replica's state for one recording it replicates.
+#[derive(Debug)]
+pub struct Receiver {
+    recording_id: u64,
+    replica: Replica,
+}
+
+impl Receiver {
+    /// Receives `recording_id` as `replica`.
+    #[must_use]
+    pub const fn new(recording_id: u64, replica: Replica) -> Self {
+        Self {
+            recording_id,
+            replica,
+        }
+    }
+
+    /// Stores bytes that arrived at `start` in `store`, the replica's copy
+    /// of the recording, and records them as unverified.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError`]; a store that is not at `start` refuses them.
+    pub fn bytes<D: Disk>(
+        &self,
+        recording_id: u64,
+        start: u64,
+        bytes: &[u8],
+        store: &mut SegmentStore<D>,
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<(), ReceiveError> {
+        if recording_id != self.recording_id {
+            return Err(ReceiveError::OtherRecording {
+                expected: self.recording_id,
+                got: recording_id,
+            });
+        }
+        let end = store.append(start, bytes)?;
+        let _ = self
+            .replica
+            .arrived(copies, journal, recording_id, start, end)?;
+        Ok(())
+    }
+
+    /// Checks `seal` on the replica's own bytes in `store`: only a match
+    /// counts the range.
+    ///
+    /// # Errors
+    ///
+    /// [`ReceiveError::ForeignSeal`], the store's read error, and the
+    /// replica's.
+    pub fn seal<D: Disk>(
+        &self,
+        seal: &SealRecord,
+        store: &mut SegmentStore<D>,
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<Verdict, ReceiveError> {
+        check_seal(seal, self.recording_id).map_err(|_| ReceiveError::ForeignSeal)?;
+        let length = usize::try_from(seal.end.saturating_sub(seal.start))
+            .map_err(|_| SegmentError::PositionOverflow)?;
+        let mut bytes = vec![0u8; length];
+        store.read(seal.start, &mut bytes)?;
+        // The range arrived whole, in however many chunks: recorded as one
+        // arrival, which the seal's check then counts or not.
+        let _ = self
+            .replica
+            .arrived(copies, journal, self.recording_id, seal.start, seal.end)?;
+        Ok(self.replica.verify(copies, journal, seal, &bytes)?)
+    }
+}

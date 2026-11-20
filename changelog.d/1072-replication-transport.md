@@ -1,0 +1,3 @@
+### Added
+
+- `karyos_archive::replication::transport`: the two ends of a replication. `Sender` sends a request's stored bytes in chunks then each range's seal, in order, with the status the design names: caught up, ended, interrupted by a purge or a gap, stopped. It refuses an unknown recording with code 2 and a request off a seal boundary with code 4. `Receiver` stores what arrives and counts a range only once its seal verifies on the replica's own bytes (karyos#1072).

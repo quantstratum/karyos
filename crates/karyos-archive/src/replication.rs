@@ -18,6 +18,8 @@ use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
 
 use crate::integrity::{SEAL_RECORD_LENGTH, SealKind, SealRecord};
 
+pub mod transport;
+
 #[cfg(test)]
 mod tests;
 
