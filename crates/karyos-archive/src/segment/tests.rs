@@ -561,6 +561,37 @@ fn a_recording_survives_a_close_on_disk() {
     assert_eq!(read, bytes);
 }
 
+/// The real disk: a finished segment's cached read handle (karyos#1001)
+/// never serves bytes a truncation replaced.
+#[test]
+fn a_cached_read_handle_follows_a_truncation_on_disk() {
+    let temp = TempDir::new("reader");
+    let dir = temp.0.clone();
+    let geometry = Geometry::new(4096, 8192).unwrap();
+    let bytes = stream(20_000);
+    let mut store =
+        SegmentStore::create(StdDisk, &dir, 3, geometry, SyncPolicy::PerSegment, 100).unwrap();
+    for chunk in bytes.chunks(3000) {
+        store.append(store.written(), chunk).unwrap();
+    }
+    store.sync().unwrap();
+    // Two reads in the first, finished segment: the second through the
+    // cached handle.
+    let mut head = [0u8; 16];
+    store.read(100, &mut head).unwrap();
+    assert_eq!(head[..], bytes[..16]);
+    store.read(1000, &mut head).unwrap();
+    assert_eq!(head[..], bytes[900..916]);
+    // Cut inside it and write different bytes across the next segment.
+    assert_eq!(store.truncate(200).unwrap(), 200);
+    let fresh = vec![0xAA; 9000];
+    store.append(200, &fresh).unwrap();
+    let mut read = vec![0u8; 9100];
+    store.read(100, &mut read).unwrap();
+    assert_eq!(read[..100], bytes[..100]);
+    assert_eq!(read[100..], fresh[..]);
+}
+
 /// The cost of a sync on the real disk (`F_FULLFSYNC` on Apple targets,
 /// `fdatasync` on Linux), beside a write: run by hand with `--ignored
 /// --nocapture`; the numbers go in the PR, a bench workload follows.
