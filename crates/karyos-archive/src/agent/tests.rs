@@ -1377,6 +1377,37 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// karyos#1112: with sealing on, a group whose journal directory is the
+    /// Archive's own is refused, typed and naming the directory, and
+    /// nothing is made.
+    #[test]
+    fn a_group_in_the_archives_directory_is_refused_while_sealing() {
+        let dir = temp_dir("group-archive-dir");
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let before: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        // The same directory spelled another way is the same directory.
+        for spelled in [dir.clone(), dir.join(".")] {
+            match agent.start_group(start_group(&spelled, Some(Capture::Strict))) {
+                Err(AgentError::GroupInArchiveDir { dir: refused }) => assert_eq!(refused, spelled),
+                other => panic!("not refused: {:?}", other.err()),
+            }
+        }
+        let after: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(before.len(), after.len(), "nothing was made");
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A reference its recording stops short of: a strict group ends, a
     /// best-effort one marks it and goes on.
     #[test]

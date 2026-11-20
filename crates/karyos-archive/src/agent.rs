@@ -720,6 +720,18 @@ pub enum AgentError {
     /// continues in a new journal.
     #[error("the group journal holds network images of an earlier run")]
     ImagesOfAnEarlierRun,
+    /// With sealing on, a group's journal directory is the Archive's own:
+    /// the Archive's integrity journal already holds that directory's
+    /// lock, so the group's journal could not be sealed there, silently
+    /// (karyos#1112). Give the group a directory of its own. Nothing is
+    /// made.
+    #[error(
+        "group journal directory {dir:?} is the Archive's own: its journal could not be sealed"
+    )]
+    GroupInArchiveDir {
+        /// The directory refused.
+        dir: PathBuf,
+    },
     /// A recording group's capture settings cannot work.
     #[error(transparent)]
     Capture(#[from] CaptureError),
@@ -2802,6 +2814,12 @@ impl<D: Disk + Clone> State<D> {
         if self.groups.iter().any(|group| group.id == id) {
             return Err(AgentError::GroupCaptured { id });
         }
+        // With sealing on, the Archive's own directory holds its integrity
+        // journal's lock: a group journal there could not be sealed
+        // (karyos#1112). Refused before anything exists.
+        if self.integrity.is_some() && same_dir(&start.dir, &self.dir) {
+            return Err(AgentError::GroupInArchiveDir { dir: start.dir });
+        }
         // Checked before the journal exists, so a refused start leaves
         // none behind.
         capture::validate(start.capture, start.journal.policy).map_err(AgentError::Capture)?;
@@ -3388,6 +3406,16 @@ impl<D: Disk> Integrity<D> {
         if recorded.is_err() {
             self.copies = None;
         }
+    }
+}
+
+/// Whether `a` and `b` name one directory: the same path once both
+/// resolve on the host (links followed), or, when either does not
+/// resolve (a disk in memory), the same path component by component.
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a.components().eq(b.components()),
     }
 }
 
