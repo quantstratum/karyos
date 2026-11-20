@@ -1377,6 +1377,37 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// karyos#1112: with sealing on, a group whose journal directory is the
+    /// Archive's own is refused at its start, naming the directory, and
+    /// leaves no journal behind; with sealing off it starts.
+    #[test]
+    fn a_group_journal_in_the_archives_directory_is_refused_when_sealing() {
+        let dir = temp_dir("group-in-archive");
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let before = std::fs::read_dir(&dir).unwrap().count();
+        match agent.start_group(start_group(&dir, Some(Capture::Strict))) {
+            Err(AgentError::GroupInArchiveDirectory { dir: named }) => assert_eq!(named, dir),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), before);
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let dir = temp_dir("group-in-archive-unsealed");
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        assert!(
+            agent
+                .start_group(start_group(&dir, Some(Capture::Strict)))
+                .is_ok()
+        );
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A reference its recording stops short of: a strict group ends, a
     /// best-effort one marks it and goes on.
     #[test]
