@@ -151,8 +151,16 @@ Archive:
                                     this time [1s]
   --archive-anchor-interval <duration>
                                     the anchor interval (SPEC 8.4, X14): required with
-                                    --archive, no default; validated now, it takes effect
-                                    once a head signer runs (karyos#966)
+                                    --archive, no default; recorded as the signing
+                                    configuration's coverage-lag threshold, not yet
+                                    enforced or reported by the daemon (karyos#985)
+  --archive-signer <program>        the operator's head signer, run as `<program> sign`:
+                                    the head's signed bytes in hex on stdin, the Ed25519
+                                    signature in hex on stdout; needs --archive-signer-key
+                                    and --archive-trust
+  --archive-signer-key <hex>        the signer's 32-byte public key, in hex
+  --archive-trust <file>            the trust file the key registry is replayed under (the
+                                    format of karyos-catalog verify --trust)
 
 Shutdown:
   --shutdown-linger <duration>      time clients have to leave after SIGTERM or SIGINT [5s]
@@ -305,9 +313,23 @@ pub struct ArchiveOptions {
     /// The `seal_interval`: each recorded byte is sealed within it (A10).
     pub seal_interval: Duration,
     /// The `anchor_interval`, required with no default (SPEC.md §8.4,
-    /// X14). Validated and kept; nothing signs heads yet, so it takes
-    /// effect once the head signer of karyos#966 runs.
+    /// X14): the signing configuration's coverage-lag threshold; not yet
+    /// enforced or reported by the daemon (karyos#985).
     pub anchor_interval: Duration,
+    /// The head signer, when one is configured (karyos#966).
+    pub signer: Option<SignerOption>,
+}
+
+/// The head signer of an Archive (`--archive-signer`,
+/// `--archive-signer-key`, `--archive-trust`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignerOption {
+    /// The signing program.
+    pub program: PathBuf,
+    /// The signer's public key.
+    pub public: [u8; 32],
+    /// The trust file.
+    pub trust: PathBuf,
 }
 
 /// The default `--archive-seal-interval`: 1 s.
@@ -578,6 +600,17 @@ where
             "--archive-control" => control(&value).map(|control| archive.control = Some(control)),
             "--record" => record(&value).map(|record| archive.records.push(record)),
             "--archive-min-free" => size(&value).map(|size| archive.min_free = Some(size)),
+            "--archive-signer" => {
+                archive.signer = Some(PathBuf::from(&value));
+                Some(())
+            }
+            "--archive-signer-key" => crate::catalog_verify::hex32(&value)
+                .ok()
+                .map(|key| archive.signer_key = Some(key)),
+            "--archive-trust" => {
+                archive.trust = Some(PathBuf::from(&value));
+                Some(())
+            }
             _ => apply(&mut options, option, &value),
         };
         applied.ok_or_else(|| ArgsError::InvalidValue {
@@ -729,6 +762,9 @@ const OPTIONS: &[&str] = &[
     "--archive-min-free",
     "--archive-seal-interval",
     "--archive-anchor-interval",
+    "--archive-signer",
+    "--archive-signer-key",
+    "--archive-trust",
 ];
 
 /// The static name of a known option.
@@ -1135,6 +1171,9 @@ struct Archive {
     min_free: Option<u64>,
     seal_interval: Option<Duration>,
     anchor_interval: Option<Duration>,
+    signer: Option<PathBuf>,
+    signer_key: Option<[u8; 32]>,
+    trust: Option<PathBuf>,
 }
 
 impl Archive {
@@ -1153,6 +1192,9 @@ impl Archive {
                 (self.min_free.is_some(), "--archive-min-free"),
                 (self.seal_interval.is_some(), "--archive-seal-interval"),
                 (self.anchor_interval.is_some(), "--archive-anchor-interval"),
+                (self.signer.is_some(), "--archive-signer"),
+                (self.signer_key.is_some(), "--archive-signer-key"),
+                (self.trust.is_some(), "--archive-trust"),
             ] {
                 if given {
                     return Err(ArgsError::Needs {
@@ -1173,6 +1215,34 @@ impl Archive {
             option: "--archive",
             needs: "--archive-anchor-interval",
         })?;
+        // The signer, its key and the trust file come together or not at
+        // all.
+        let signer = match (self.signer, self.signer_key, self.trust) {
+            (None, None, None) => None,
+            (Some(program), Some(public), Some(trust)) => Some(SignerOption {
+                program,
+                public,
+                trust,
+            }),
+            (signer, key, _) => {
+                return Err(ArgsError::Needs {
+                    option: if signer.is_some() {
+                        "--archive-signer"
+                    } else if key.is_some() {
+                        "--archive-signer-key"
+                    } else {
+                        "--archive-trust"
+                    },
+                    needs: if signer.is_none() {
+                        "--archive-signer"
+                    } else if key.is_none() {
+                        "--archive-signer-key"
+                    } else {
+                        "--archive-trust"
+                    },
+                });
+            }
+        };
         Ok(Some(ArchiveOptions {
             dir,
             requests,
@@ -1181,6 +1251,7 @@ impl Archive {
             min_free: self.min_free.unwrap_or(DEFAULT_ARCHIVE_MIN_FREE),
             seal_interval: self.seal_interval.unwrap_or(DEFAULT_ARCHIVE_SEAL_INTERVAL),
             anchor_interval,
+            signer,
         }))
     }
 }
@@ -1589,6 +1660,7 @@ mod tests {
                 min_free: DEFAULT_ARCHIVE_MIN_FREE,
                 seal_interval: DEFAULT_ARCHIVE_SEAL_INTERVAL,
                 anchor_interval: Duration::from_secs(3600),
+                signer: None,
             })
         );
         let guarded = options(&[
@@ -1608,6 +1680,69 @@ mod tests {
         assert_eq!(guarded.anchor_interval, Duration::from_secs(600));
         assert_eq!(guarded.seal_interval, Duration::from_millis(250));
         assert_eq!(options(&["--dir", "/run/k"]).archive, None);
+    }
+
+    /// The head signer's three options come together (karyos#966).
+    #[test]
+    fn the_archive_signer_options_come_together() {
+        let base = [
+            "--dir",
+            "d",
+            "--archive",
+            "a",
+            "--archive-control",
+            "1,2",
+            "--archive-anchor-interval",
+            "3600s",
+        ];
+        let key = "03".repeat(32);
+        let with = |extra: &[&str]| {
+            let mut all: Vec<&str> = base.to_vec();
+            all.extend_from_slice(extra);
+            run(&all)
+        };
+        let parsed = options(
+            &[
+                &base[..],
+                &[
+                    "--archive-signer",
+                    "/usr/local/bin/sign-head",
+                    "--archive-signer-key",
+                    &key,
+                    "--archive-trust",
+                    "/etc/karyos/trust",
+                ],
+            ]
+            .concat(),
+        )
+        .archive
+        .unwrap();
+        assert_eq!(
+            parsed.signer,
+            Some(SignerOption {
+                program: PathBuf::from("/usr/local/bin/sign-head"),
+                public: [3; 32],
+                trust: PathBuf::from("/etc/karyos/trust"),
+            })
+        );
+        assert!(matches!(
+            with(&["--archive-signer", "/bin/s"]),
+            Err(ArgsError::Needs {
+                option: "--archive-signer",
+                needs: "--archive-signer-key"
+            })
+        ));
+        assert!(matches!(
+            with(&["--archive-signer-key", &key, "--archive-trust", "t"]),
+            Err(ArgsError::Needs {
+                needs: "--archive-signer",
+                ..
+            })
+        ));
+        assert!(matches!(
+            with(&["--archive-signer-key", "zz"]),
+            Err(ArgsError::InvalidValue { .. })
+        ));
     }
 
     /// The Archive's options need each other, and their values are checked.

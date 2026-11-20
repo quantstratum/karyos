@@ -112,6 +112,33 @@ impl std::fmt::Display for ArchiveStartError {
 
 impl std::error::Error for ArchiveStartError {}
 
+/// The head signing `signer` configures (karyos#966): its trust file read,
+/// the `anchor_interval` applied.
+fn signing(
+    options: &ArchiveOptions,
+    signer: &crate::args::SignerOption,
+) -> Result<karyos_archive::agent::ArchiveSigning, ArchiveStartError> {
+    use karyos_archive::integrity::signing::{BacklogPolicy, SigningConfig};
+    let text = std::fs::read_to_string(&signer.trust).map_err(|error| {
+        ArchiveStartError::Agent(format!("{}: {error}", signer.trust.display()))
+    })?;
+    let (trust, _, journal_id) = crate::catalog_verify::parse_trust(&text).map_err(|error| {
+        ArchiveStartError::Agent(format!("{}: {error}", signer.trust.display()))
+    })?;
+    let interval = u64::try_from(options.anchor_interval.as_nanos()).ok();
+    let config = SigningConfig::new(interval, BacklogPolicy::Coalesce)
+        .map_err(|error| ArchiveStartError::Agent(error.to_string()))?;
+    Ok(karyos_archive::agent::ArchiveSigning {
+        trust,
+        journal_id,
+        config,
+        signer: Box::new(crate::archive_signer::CommandSigner::new(
+            signer.program.clone(),
+            &signer.public,
+        )),
+    })
+}
+
 /// The production host with the daemon's free-space floor in front of it.
 #[derive(Debug)]
 pub struct DaemonHost {
@@ -457,11 +484,16 @@ impl DaemonArchive {
             started: Vec::new(),
             next: 1,
         };
-        let agent = ArchiveHandle::spawn(
-            StdDisk,
-            &options.dir,
-            AgentConfig::default().with_seal_interval(Some(options.seal_interval)),
-        )
+        let config = AgentConfig::default().with_seal_interval(Some(options.seal_interval));
+        let agent = match &options.signer {
+            None => ArchiveHandle::spawn(StdDisk, &options.dir, config),
+            Some(signer) => ArchiveHandle::spawn_signing(
+                StdDisk,
+                &options.dir,
+                config,
+                signing(options, signer)?,
+            ),
+        }
         .map_err(|error| ArchiveStartError::Agent(format!("{error:?}")))?;
         let host = DaemonHost {
             inner: DriverHost::new(driver),

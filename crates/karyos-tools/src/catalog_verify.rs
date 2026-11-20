@@ -135,7 +135,7 @@ pub fn parse_verify(
     }))
 }
 
-fn hex32(text: &str) -> Result<[u8; 32], String> {
+pub(crate) fn hex32(text: &str) -> Result<[u8; 32], String> {
     let bytes = text.as_bytes();
     if bytes.len() != 64 {
         return Err(format!("{text:?} is not 64 hex digits"));

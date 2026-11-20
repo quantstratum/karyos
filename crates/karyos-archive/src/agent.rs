@@ -71,7 +71,15 @@ use crate::group::prefix::{CheckpointHeld, Coverage};
 use crate::group::record::{CONTRACT_VERSION, Capture, Clock, JournalHeader};
 use crate::integrity::damage::shortened_below_seal;
 use crate::integrity::journal::{IntegrityError, IntegrityJournal};
+use crate::integrity::ledger::{Ledger, read_entries};
 use crate::integrity::sealer::{self, SealSource, Sealer};
+use crate::integrity::signing::{
+    HeadSigner, HeadSigning, Offered, SignerUnavailable, SigningConfig,
+};
+use crate::integrity::trust::{
+    ChainHead, HEADS_FILE, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH, SIGNATURE_LENGTH,
+    SIGNED_HEAD_LENGTH, TrustRoot,
+};
 use crate::recorder::{Ended, FrameSource, Mode, Recorder, RecorderError};
 use crate::replay::{Rate, ReplayError, ReplaySource, Step};
 use crate::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
@@ -642,6 +650,10 @@ pub enum AgentError {
     /// The integrity journal failed (A10).
     #[error(transparent)]
     Integrity(#[from] IntegrityError),
+    /// Head signing was asked for without a `seal_interval`: there would
+    /// be no seals to sign.
+    #[error("head signing needs a seal_interval")]
+    SigningWithoutSealing,
     /// No such recording records.
     #[error("recording {id} is not recording")]
     NotRecording {
@@ -871,6 +883,44 @@ impl ArchiveHandle {
         D: Disk + Clone + Send + 'static,
         D::File: Send,
     {
+        Self::spawn_with(disk, dir, config, None)
+    }
+
+    /// As [`ArchiveHandle::spawn`], with the heads of the integrity journal
+    /// signed on the agent's control path by `signing`'s signer and
+    /// recorded in `heads.kyh` (A10; karyos#966). Needs
+    /// [`AgentConfig::seal_interval`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::spawn`]; [`AgentError::SigningWithoutSealing`]
+    /// without a `seal_interval`.
+    pub fn spawn_signing<D>(
+        disk: D,
+        dir: &Path,
+        config: AgentConfig,
+        signing: ArchiveSigning,
+    ) -> Result<Self, AgentError>
+    where
+        D: Disk + Clone + Send + 'static,
+        D::File: Send,
+    {
+        Self::spawn_with(disk, dir, config, Some(signing))
+    }
+
+    fn spawn_with<D>(
+        disk: D,
+        dir: &Path,
+        config: AgentConfig,
+        signing: Option<ArchiveSigning>,
+    ) -> Result<Self, AgentError>
+    where
+        D: Disk + Clone + Send + 'static,
+        D::File: Send,
+    {
+        if signing.is_some() && config.seal_interval.is_none() {
+            return Err(AgentError::SigningWithoutSealing);
+        }
         let (commands, inbox) = mpsc::sync_channel(config.command_capacity);
         let (events_in, events) = mpsc::sync_channel(config.event_capacity);
         let (replay_ends_in, replay_ends) = mpsc::sync_channel(config.event_capacity);
@@ -884,7 +934,7 @@ impl ArchiveHandle {
         };
         let thread = std::thread::Builder::new()
             .name("karyos-archive".to_owned())
-            .spawn(move || run(disk, dir, config, &inbox, &outbox, &ready))?;
+            .spawn(move || run(disk, dir, config, signing, &inbox, &outbox, &ready))?;
         match started.recv() {
             Ok(Ok(())) => Ok(Self {
                 commands,
@@ -1503,6 +1553,7 @@ fn run<D>(
     disk: D,
     dir: PathBuf,
     config: AgentConfig,
+    signing: Option<ArchiveSigning>,
     inbox: &Receiver<Command>,
     outbox: &Outbox,
     ready: &SyncSender<Result<(), AgentError>>,
@@ -1522,7 +1573,7 @@ fn run<D>(
     // chained too, before the start is reported.
     let mut integrity = match config
         .seal_interval
-        .map(|interval| Integrity::open(disk.clone(), &dir, interval, &mut catalog))
+        .map(|interval| Integrity::open(disk.clone(), &dir, interval, &mut catalog, signing))
     {
         None => None,
         Some(Ok(integrity)) => Some(integrity),
@@ -1670,6 +1721,7 @@ struct State<D: Disk> {
 /// The integrity journal of a running Archive and its sealing schedule
 /// (A10; karyos#961).
 struct Integrity<D: Disk> {
+    signing: Option<Signing<D>>,
     journal: IntegrityJournal<D>,
     sealer: Sealer,
     tracked: std::collections::BTreeSet<u64>,
@@ -1685,14 +1737,22 @@ impl<D: Disk> Integrity<D> {
         dir: &Path,
         interval: Duration,
         catalog: &mut Catalog<D>,
-    ) -> Result<Self, IntegrityError> {
+        signing: Option<ArchiveSigning>,
+    ) -> Result<Self, IntegrityError>
+    where
+        D: Clone,
+    {
         let interval = u64::try_from(interval.as_nanos())
             .ok()
             .and_then(std::num::NonZeroU64::new)
             .ok_or(IntegrityError::Overflow)?;
-        let journal = IntegrityJournal::open(disk, dir)?.journal;
+        let mut journal = IntegrityJournal::open(disk.clone(), dir)?.journal;
+        let signing = signing
+            .map(|signing| Signing::open(disk, dir, signing, &mut journal))
+            .transpose()?;
         catalog.collect_changes();
         Ok(Self {
+            signing,
             journal,
             sealer: Sealer::new(interval),
             tracked: std::collections::BTreeSet::new(),
@@ -1748,6 +1808,173 @@ impl<D: Disk> Integrity<D> {
     fn untrack(&mut self, id: u64) {
         self.tracked.remove(&id);
         let _ = self.sealer.untrack(id);
+    }
+}
+
+/// Head signing for a running Archive (A10; karyos#966): the operator's
+/// trust root, the journal's identity in it, the signing configuration and
+/// the signer, which runs off the Archive host (SPEC.md §8.4).
+pub struct ArchiveSigning {
+    /// The trust root the key registry is replayed under.
+    pub trust: TrustRoot,
+    /// The integrity journal's identity within the Archive.
+    pub journal_id: u64,
+    /// The `anchor_interval` and backlog policy.
+    pub config: SigningConfig,
+    /// The signer. It is asked from the agent's control path and must not
+    /// block: one that cannot answer now returns [`SignerUnavailable`].
+    pub signer: Box<dyn HeadSigner + Send>,
+}
+
+impl std::fmt::Debug for ArchiveSigning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArchiveSigning")
+            .field("journal_id", &self.journal_id)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How often the agent offers a new head and asks the signer, at most.
+const SIGNING_POLL: u64 = 1_000_000_000;
+
+/// The running signing state.
+struct Signing<D: Disk> {
+    disk: D,
+    dir: PathBuf,
+    trust: TrustRoot,
+    journal_id: u64,
+    signing: HeadSigning,
+    signer: Box<dyn HeadSigner + Send>,
+    heads: Ledger<D, SIGNED_HEAD_LENGTH>,
+    /// Whether the backlog coalesces: then a head waiting for the signer
+    /// is kept until signed, and newer ones wait behind it.
+    coalesce: bool,
+    offered: Option<crate::integrity::Digest>,
+    next_ns: u64,
+}
+
+/// A boxed signer, as the sized signer [`HeadSigning::poll`] takes.
+struct Boxed<'a>(&'a mut (dyn HeadSigner + Send));
+
+impl HeadSigner for Boxed<'_> {
+    fn key_id(&self) -> crate::integrity::Digest {
+        self.0.key_id()
+    }
+
+    fn custody(&self) -> crate::integrity::trust::Custody {
+        self.0.custody()
+    }
+
+    fn sign(&mut self, head: &ChainHead) -> Result<[u8; SIGNATURE_LENGTH], SignerUnavailable> {
+        self.0.sign(head)
+    }
+}
+
+impl<D: Disk + Clone> Signing<D> {
+    fn open(
+        disk: D,
+        dir: &Path,
+        setup: ArchiveSigning,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<Self, IntegrityError> {
+        let heads = Ledger::open(disk.clone(), dir, HEADS_FILE)?;
+        let coalesce = matches!(
+            setup.config.policy(),
+            crate::integrity::signing::BacklogPolicy::Coalesce
+        );
+        let records = journal.records()?;
+        let registry = Self::registry(&disk, dir, &setup.trust, &records)?;
+        let signing = HeadSigning::resume(
+            setup.config,
+            0,
+            heads.entries(),
+            &registry,
+            setup.journal_id,
+            &records,
+        );
+        Ok(Self {
+            disk,
+            dir: dir.to_path_buf(),
+            trust: setup.trust,
+            journal_id: setup.journal_id,
+            signing,
+            signer: setup.signer,
+            heads,
+            coalesce,
+            offered: None,
+            next_ns: 0,
+        })
+    }
+
+    /// The key registry as the journal chains it now.
+    fn registry(
+        disk: &D,
+        dir: &Path,
+        trust: &TrustRoot,
+        records: &[crate::integrity::SealRecord],
+    ) -> Result<KeyRegistry, IntegrityError> {
+        let mut disk = disk.clone();
+        let entries = read_entries::<D, REGISTRY_ENTRY_LENGTH>(&mut disk, dir, KEYS_FILE)?;
+        Ok(KeyRegistry::replay(trust.clone(), records, &entries)?.0)
+    }
+
+    /// Offers the journal's head when it moved and asks the signer, at most
+    /// every [`SIGNING_POLL`]. Failures leave heads pending.
+    ///
+    /// Under [`BacklogPolicy::Coalesce`](crate::integrity::signing::BacklogPolicy::Coalesce),
+    /// a head already waiting for the signer is kept until it is signed:
+    /// a newer head is offered only once nothing is pending, so a signer
+    /// slower than the sealing still completes the head it was given, and
+    /// the newer work waiting behind it coalesces into the latest head at
+    /// that point (karyos#966 review). A head the backlog refuses is not
+    /// marked offered, so it is offered again at the next duty.
+    fn duty(&mut self, journal: &mut IntegrityJournal<D>, now: u64) {
+        if now < self.next_ns {
+            return;
+        }
+        self.next_ns = now.saturating_add(SIGNING_POLL);
+        let Ok(records) = journal.records() else {
+            return;
+        };
+        let Ok(registry) = Self::registry(&self.disk, &self.dir, &self.trust, &records) else {
+            return;
+        };
+        let sealed = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        let busy = self.coalesce && self.signing.status(now, sealed, &registry).pending > 0;
+        if let Some(last) = records.last() {
+            let digest = last.digest();
+            // Only a head the configured key can validly sign is offered:
+            // one before the key's effective counter (or under a key the
+            // registry does not hold) would never be trusted, and under
+            // either backlog policy it would pin the heads behind it
+            // (karyos#966 review). Not offered, it is not marked, so the
+            // first eligible head is offered as soon as it exists.
+            let eligible = registry
+                .key(&self.signer.key_id())
+                .is_some_and(|key| last.counter >= key.valid_from);
+            if eligible && !busy && self.offered != Some(digest) {
+                let offered = self.signing.offer(
+                    ChainHead {
+                        archive_id: self.trust.archive_id,
+                        journal_id: self.journal_id,
+                        counter: last.counter,
+                        digest,
+                    },
+                    now,
+                );
+                if !matches!(offered, Offered::Refused) {
+                    self.offered = Some(digest);
+                }
+            }
+        }
+        let _ = self.signing.poll(
+            &mut Boxed(self.signer.as_mut()),
+            &mut self.heads,
+            &registry,
+            &records,
+            now,
+        );
     }
 }
 
@@ -2026,6 +2253,11 @@ impl<D: Disk + Clone> State<D> {
         let before = integrity.journal.head();
         ok &= integrity.seal(&mut self.active, now);
         integrity.failed = !ok;
+        // Signing never fails the integrity work: an unavailable signer
+        // leaves heads pending, and anchoring falls behind.
+        if let Some(signing) = integrity.signing.as_mut() {
+            signing.duty(&mut integrity.journal, now);
+        }
         !changes.is_empty() || integrity.journal.head() != before
     }
 
