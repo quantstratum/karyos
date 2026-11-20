@@ -27,8 +27,8 @@ use std::net::SocketAddr;
 use std::num::NonZeroU16;
 
 use karyos_io::backend::{
-    Authority, BackendEpoch, Commit, Exposure, FlushRequest, FlushStop, GateDecision, RouteId,
-    SenderGate, SenderToken, TxBackend, TxFrame, TxItemOutcome, TxOptions, TxQueueConfig,
+    Authority, BackendEpoch, Commit, Exposure, FlushRequest, FlushStop, GateDecision, PendingCause,
+    RouteId, SenderGate, SenderToken, TxBackend, TxFrame, TxItemOutcome, TxOptions, TxQueueConfig,
     TxQueueId, TxReport,
 };
 use karyos_io::sockets::endpoint::SocketsTx;
@@ -968,7 +968,12 @@ impl ControlRoutes {
         while let Some(entry) = self.report.pop_front() {
             sent |= matches!(entry.outcome, TxItemOutcome::Submitted { .. });
             unknown |= matches!(entry.outcome, TxItemOutcome::Unknown);
-            faulted |= matches!(entry.outcome, TxItemOutcome::Faulted(_));
+            faulted |= matches!(
+                entry.outcome,
+                TxItemOutcome::Pending {
+                    cause: PendingCause::Faulted(_)
+                }
+            );
         }
         if sent {
             return Ok(());
