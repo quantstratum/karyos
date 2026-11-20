@@ -136,6 +136,10 @@ struct Session {
     /// Announces even once established: a multi-destination publication
     /// with a destination that has no live member (karyos#630).
     announcing: bool,
+    /// Never announced on the cadence: a dynamic publication, whose only
+    /// ANNOUNCE is the one each REGISTER causes (design 9.2, 11.2;
+    /// karyos#977).
+    silent: bool,
 }
 
 /// The sender's SETUP state of every publication incarnation it sends,
@@ -221,6 +225,7 @@ impl SendSessions {
             last_announce: None,
             established: false,
             announcing: false,
+            silent: false,
         });
         Ok(())
     }
@@ -295,6 +300,14 @@ impl SendSessions {
         }
     }
 
+    /// Whether the publication `alias` on `endpoint` is never announced on
+    /// the cadence: set for a dynamic publication (design 9.2, 11.2).
+    pub fn set_silent(&mut self, endpoint: EndpointId, alias: Alias, silent: bool) {
+        if let Some(session) = self.find_mut(endpoint, alias) {
+            session.silent = silent;
+        }
+    }
+
     /// The SETUP ANNOUNCE of the publication `alias` on `endpoint`, for the
     /// one ANNOUNCE a dynamic registration causes (design 3.2 step 7): it
     /// changes no cadence, and is counted in `announces`.
@@ -314,7 +327,8 @@ impl SendSessions {
     pub fn announce_due(&mut self, now: u64, mut emit: impl FnMut(EndpointId, SetupAnnounce)) {
         let interval = self.setup_interval;
         for session in &mut self.sessions {
-            let due = (!session.established || session.announcing)
+            let due = !session.silent
+                && (!session.established || session.announcing)
                 && session
                     .last_announce
                     .is_none_or(|last| age_ns(now, last) >= interval);

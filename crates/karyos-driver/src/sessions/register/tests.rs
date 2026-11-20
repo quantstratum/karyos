@@ -212,7 +212,85 @@ fn limits_are_mandatory_nonzero_bounded_and_named() {
     let mut top = base;
     top.sources = MAX_REGISTRATION_TABLE;
     top.pending = MAX_REGISTRATION_TABLE;
+    top.rate = 1_000;
     assert!(Registrations::new(top, T0).is_ok());
+}
+
+/// Design 11.2 (karyos#977): the pending table holds at most what the
+/// total rate admits within one `join_timeout`, and `join_timeout` and
+/// `refusal_interval` are at most [`MAX_REGISTRATION_INTERVAL`]; each
+/// bound is accepted at its limit and refused one past it.
+#[test]
+fn the_pending_table_and_the_intervals_are_bounded_from_above() {
+    let base = RegistrationConfig::default();
+    let reachable = usize::try_from(base.rate * (base.join_timeout / 1_000_000_000)).unwrap();
+    let cases: [(Change, Change, &str); 3] = [
+        (|c| c.pending = 1280, |c| c.pending = 1281, "pending"),
+        (
+            |c| c.join_timeout = MAX_REGISTRATION_INTERVAL,
+            |c| c.join_timeout = MAX_REGISTRATION_INTERVAL + 1,
+            "join_timeout",
+        ),
+        (
+            |c| c.refusal_interval = MAX_REGISTRATION_INTERVAL,
+            |c| c.refusal_interval = MAX_REGISTRATION_INTERVAL + 1,
+            "refusal_interval",
+        ),
+    ];
+    assert_eq!(reachable, 1280, "the defaults: 256 per second for 5 s");
+    for (at, past, field) in cases {
+        let (mut good, mut bad) = (base, base);
+        at(&mut good);
+        past(&mut bad);
+        assert_eq!(good.validate(), Ok(()), "{field}");
+        assert_eq!(
+            bad.validate(),
+            Err(RegistrationConfigError::InvalidLimit { field })
+        );
+    }
+}
+
+/// #942 item 8 (karyos#977): an IPv6 source's per-source bounds are kept
+/// per /64, so addresses drawn from one /64 share them.
+#[test]
+fn ipv6_sources_share_their_bounds_per_64() {
+    let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+    let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+    let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+    assert_eq!(source_prefix(a), source_prefix(b));
+    assert_ne!(source_prefix(a), source_prefix(other));
+    let v4: IpAddr = "10.0.0.9".parse().unwrap();
+    assert_eq!(source_prefix(v4), v4);
+    // Through the registration path (karyos#977 review): `a` and `b`, one
+    // /64, share the per-source pending bound of two, so `b`'s REGISTER
+    // replaces `a`'s oldest entry; `other`, another /64, has its own.
+    let mut r = registrations(Setup {
+        allow: RegistrationPolicy::new(
+            RegistrationAllowlist::new(&[
+                AddressRange::new("2001:db8::".parse().unwrap(), 32).unwrap()
+            ])
+            .unwrap(),
+            false,
+        ),
+        config: RegistrationConfig::default(),
+    });
+    let at = |ip: IpAddr| SocketAddr::new(ip, 40_000);
+    for (from, id) in [(a, 1), (a, 2), (b, 3), (other, 4)] {
+        assert!(
+            matches!(
+                r.register(at(from), &register(id), Capacity::Free, T0),
+                RegisterOutcome::Announce { .. }
+            ),
+            "{from} {id}"
+        );
+    }
+    let ids: Vec<u64> = r
+        .pending()
+        .iter()
+        .map(|entry| entry.receiver.receiver_id)
+        .collect();
+    assert_eq!(ids, [2, 3, 4], "b replaced a's oldest; other kept its own");
+    assert_eq!(r.counters().pending_replaced, 1);
 }
 
 /// Design 3.2 steps 3 and 5 scope the rate and the pending table to the
@@ -658,7 +736,9 @@ fn the_sender_cannot_be_used_to_reflect_traffic() {
     // Many spoofed victims: the driver's total bounds the sum.
     let mut c = config(&[range([10, 0, 0, 0], 8)]);
     c.config.sources = 4096;
-    c.config.pending = 4096;
+    // The most the default total rate reaches within one `join_timeout`
+    // (256 per second for 5 s; karyos#977).
+    c.config.pending = 1280;
     let mut r = registrations(c);
     let mut replies = 0;
     for n in 0..4096u64 {
@@ -1110,8 +1190,10 @@ fn sixty_four_addresses_filling_the_rate_table_leave_a_new_address_its_register(
 fn an_untracked_address_is_bound_by_the_driver_total() {
     let mut c = config(&[range([10, 0, 0, 0], 8)]);
     c.config.sources = 1;
-    c.config.pending = 4096;
-    c.config.pending_per_source = 4096;
+    // The most the default total rate reaches within one `join_timeout`
+    // (karyos#977).
+    c.config.pending = 1280;
+    c.config.pending_per_source = 1280;
     let rate = c.config.rate;
     let mut r = registrations(c);
     assert!(matches!(

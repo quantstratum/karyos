@@ -1305,8 +1305,14 @@ impl<O: SocketOps, T: StreamTerms> AgentCore<O, T> {
 /// Then the driver's dynamic registrations (`quantstratum-docs:
 /// karyos/design/multi-destination-unicast.md` section 7; karyos#644):
 /// REGISTERs admitted, retried, answered ERR or not, dropped by reason,
-/// and what registrants' first SMs did.
-pub(crate) const SENDER_CELLS: [&str; 26] = [
+/// and what registrants' first SMs did. The cells of karyos#977 come
+/// last: the drops and replacements added by karyos#940 and #941, the
+/// unsent replies, the bindings kept for required ids, the CHALLENGEs
+/// left unanswered, and a gauge (0 or 1) for the sticky `overflowed` flag
+/// of either counter set. The two pending-table drop cells stay in place,
+/// so no existing cell moves, though they can no longer grow: the bounds
+/// replace an entry since karyos#940 and never drop.
+pub(crate) const SENDER_CELLS: [&str; 35] = [
     "network controls sent",
     "network control send failures",
     "naks received",
@@ -1333,6 +1339,15 @@ pub(crate) const SENDER_CELLS: [&str; 26] = [
     "registrants restarted",
     "registrants moved",
     "registrants timed out",
+    "registrations dropped quarantined",
+    "registrations dropped required lost",
+    "registrations dropped challenge rate",
+    "registrations pending replaced",
+    "registration source table full",
+    "registration replies unsent",
+    "receiver bindings reserved",
+    "challenges unbound",
+    "sender counters overflowed",
 ];
 
 /// A network publication's counters in the CnC, in [`AgentCells`] order
@@ -1368,8 +1383,11 @@ pub(crate) const IMAGE_CELLS: [&str; 3] =
 /// karyos/design/multi-destination-unicast.md` 3.2; karyos#941 item 3):
 /// REGISTERs sent and not sent, and ERR REGISTRATIONs read from a
 /// `control` address. Appended last, so the ids of the cells allocated
-/// after the receiver's move by three; readers find cells by label.
-pub(crate) const RECEIVER_CELLS: [&str; 8] = [
+/// after the receiver's move by three; readers find cells by label. Then
+/// (karyos#977) REGISTERs its per-`control` bucket held back, SETUPs
+/// dropped for not coming from `control`, and a gauge (0 or 1) for its
+/// counters' sticky `overflowed` flag.
+pub(crate) const RECEIVER_CELLS: [&str; 11] = [
     "datagrams received",
     "datagrams dropped by backend",
     "invalid frames received",
@@ -1378,6 +1396,9 @@ pub(crate) const RECEIVER_CELLS: [&str; 8] = [
     "registers sent",
     "registers unsent",
     "registration refusals received",
+    "registers rate limited",
+    "setup not from control",
+    "receiver counters overflowed",
 ];
 
 fn sender_values(
@@ -1411,6 +1432,15 @@ fn sender_values(
         counters.registrants_restarted,
         counters.registrants_moved,
         counters.registrants_timed_out,
+        registrations.dropped_quarantined,
+        registrations.dropped_required_lost,
+        registrations.dropped_challenge_rate,
+        registrations.pending_replaced,
+        registrations.source_rates_full,
+        counters.registration_replies_unsent,
+        counters.bindings_reserved,
+        counters.challenges_unbound,
+        u64::from(counters.overflowed || registrations.overflowed),
     ]
 }
 
@@ -1424,6 +1454,9 @@ fn receiver_values(counters: &roles::ReceiverCounters) -> [u64; RECEIVER_CELLS.l
         counters.registers_sent,
         counters.registers_unsent,
         counters.registration_refusals,
+        counters.registers_rate_limited,
+        counters.setup_not_from_control,
+        u64::from(counters.overflowed),
     ]
 }
 

@@ -615,6 +615,7 @@ impl Fanout {
             .iter()
             .filter(|target| !target.required)
             .count()
+            // Both are at most `max` (64): no overflow.
             .saturating_add(self.retired.len())
     }
 
@@ -1031,6 +1032,8 @@ impl<T: StreamTerms> Outbound<T> {
             .registration
             .as_deref()
             .map_or(0, |policy| policy.required().len());
+        // Validation keeps the required ids at most `max`; saturating
+        // leaves no optional slot if it ever did not.
         fanout.max.saturating_sub(required)
     }
 

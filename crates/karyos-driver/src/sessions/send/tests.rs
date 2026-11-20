@@ -348,3 +348,23 @@ fn the_rate_table_is_bounded() {
         SendSessionError::InvalidConfig
     );
 }
+
+/// Design 9.2 and 11.2 (karyos#977): a silent session, a dynamic
+/// publication's, is never announced on the cadence, established or not,
+/// and its `announces` do not grow; only the one ANNOUNCE a REGISTER
+/// causes counts.
+#[test]
+fn a_silent_publication_is_never_announced_on_the_cadence() {
+    let mut sessions = SendSessions::new(4, INTERVAL, AnswerRate::default()).unwrap();
+    sessions.add(publication(5)).unwrap();
+    sessions.set_silent(EndpointId(1), alias(5), true);
+    sessions.set_announcing(EndpointId(1), alias(5), true);
+    for step in 0..10 {
+        assert!(due(&mut sessions, step * INTERVAL).is_empty());
+    }
+    assert_eq!(sessions.counters().announces, 0);
+    assert!(sessions.announcement(EndpointId(1), alias(5)).is_some());
+    assert_eq!(sessions.counters().announces, 1);
+    sessions.set_silent(EndpointId(1), alias(5), false);
+    assert_eq!(due(&mut sessions, 11 * INTERVAL).len(), 1);
+}
