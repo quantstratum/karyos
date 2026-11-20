@@ -366,6 +366,27 @@ impl HeadSigning {
         records: &[SealRecord],
         now_ns: u64,
     ) -> Result<u64, PollError> {
+        self.poll_from(signer, store, registry, 0, records, now_ns)
+    }
+
+    /// [`HeadSigning::poll`] over `records`, the journal's records from
+    /// counter `base` on (karyos#1095): a caller that keeps only the
+    /// records not yet covered by a signed head passes that tail and its
+    /// first counter. A pending head below `base` is not in the chain it
+    /// sees.
+    ///
+    /// # Errors
+    ///
+    /// As [`HeadSigning::poll`].
+    pub fn poll_from(
+        &mut self,
+        signer: &mut impl HeadSigner,
+        store: &mut impl HeadStore,
+        registry: &KeyRegistry,
+        base: u64,
+        records: &[SealRecord],
+        now_ns: u64,
+    ) -> Result<u64, PollError> {
         // Another Archive's registry changes nothing and reaches no signer.
         if registry.trust().archive_id != self.archive_id {
             return Err(PollError::ForeignRegistry);
@@ -375,7 +396,7 @@ impl HeadSigning {
         }
         let mut signed = 0u64;
         while let Some(pending) = self.pending.front().copied() {
-            if !self.in_chain(&pending.head, records) {
+            if !self.in_chain_from(&pending.head, base, records) {
                 let _ = self.pending.pop_front();
                 self.discarded = self.discarded.saturating_add(1);
                 // The records it was to cover are still uncovered: their
@@ -451,12 +472,29 @@ impl HeadSigning {
     /// Whether `head` is a head of this journal's chain: the Archive, this
     /// journal and the digest of the chain's record at its counter.
     fn in_chain(&self, head: &ChainHead, records: &[SealRecord]) -> bool {
+        self.in_chain_from(head, 0, records)
+    }
+
+    /// [`Self::in_chain`] against the records from counter `base` on.
+    fn in_chain_from(&self, head: &ChainHead, base: u64, records: &[SealRecord]) -> bool {
         head.archive_id == self.archive_id
             && head.journal_id == self.journal_id
-            && usize::try_from(head.counter)
-                .ok()
+            && head
+                .counter
+                .checked_sub(base)
+                .and_then(|index| usize::try_from(index).ok())
                 .and_then(|index| records.get(index))
                 .is_some_and(|record| record.digest() == head.digest)
+    }
+
+    /// The lowest record counter a later poll still reads: the oldest
+    /// pending head's, or `None` when nothing is pending (karyos#1095).
+    #[must_use]
+    pub fn oldest_pending(&self) -> Option<u64> {
+        self.pending
+            .iter()
+            .map(|pending| pending.head.counter)
+            .min()
     }
 
     /// The heads signed, oldest first.

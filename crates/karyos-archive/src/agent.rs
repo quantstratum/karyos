@@ -2007,9 +2007,15 @@ struct Signing<D: Disk> {
     coalesce: bool,
     offered: Option<crate::integrity::Digest>,
     next_ns: u64,
-    /// The journal's records read so far: a poll reads only the new ones
-    /// (karyos#1031).
+    /// The journal's records from counter `base` on: a poll reads only
+    /// the new ones (karyos#1031), and the prefix no pending head needs is
+    /// dropped (karyos#1095), so the cache holds the uncovered tail only.
     records: Vec<crate::integrity::SealRecord>,
+    /// The counter of `records`' first record.
+    base: u64,
+    /// The key registry records chained so far, all of them: the registry
+    /// is replayed from these alone.
+    registry_records: Vec<crate::integrity::SealRecord>,
     /// The key registry as of `records`, replayed again only when a new
     /// key registry record is chained.
     registry: KeyRegistry,
@@ -2057,7 +2063,12 @@ impl<D: Disk + Clone> Signing<D> {
             setup.journal_id,
             &records,
         );
-        Ok(Self {
+        let registry_records = records
+            .iter()
+            .filter(|record| record.kind == crate::integrity::SealKind::KeyRegistry)
+            .copied()
+            .collect();
+        let mut running = Self {
             disk,
             dir: dir.to_path_buf(),
             trust: setup.trust,
@@ -2069,9 +2080,43 @@ impl<D: Disk + Clone> Signing<D> {
             offered: None,
             next_ns: 0,
             records,
+            base: 0,
+            registry_records,
             registry,
             counts,
-        })
+        };
+        running.trim();
+        Ok(running)
+    }
+
+    /// Drops the cached records no later poll reads (karyos#1095): those
+    /// below the oldest pending head, and, with nothing pending, all but
+    /// the last, which the next offer names.
+    fn trim(&mut self) {
+        let Some(last) = self.records.last().map(|record| record.counter) else {
+            return;
+        };
+        let keep_from = self
+            .signing
+            .oldest_pending()
+            .map_or(last, |oldest| oldest.min(last));
+        let drop = keep_from.saturating_sub(self.base);
+        let Ok(drop) = usize::try_from(drop) else {
+            return;
+        };
+        let drop = drop.min(self.records.len());
+        if drop > 0 {
+            let _ = self.records.drain(..drop);
+            self.base = self
+                .base
+                .saturating_add(u64::try_from(drop).unwrap_or(u64::MAX));
+        }
+    }
+
+    /// The records the cache holds (tests).
+    #[cfg(test)]
+    pub(crate) fn cached(&self) -> (u64, usize) {
+        (self.base, self.records.len())
     }
 
     /// The key registry as the journal chains it now.
@@ -2106,7 +2151,9 @@ impl<D: Disk + Clone> Signing<D> {
         }
         let records = &self.records;
         let registry = &self.registry;
-        let sealed = u64::try_from(records.len()).unwrap_or(u64::MAX);
+        let sealed = self
+            .base
+            .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX));
         let busy = self.coalesce && self.signing.status(now, sealed, registry).pending > 0;
         if let Some(last) = records.last() {
             let digest = last.digest();
@@ -2134,10 +2181,11 @@ impl<D: Disk + Clone> Signing<D> {
                 }
             }
         }
-        let _ = self.signing.poll(
+        let _ = self.signing.poll_from(
             &mut Boxed(self.signer.as_mut()),
             &mut self.heads,
             registry,
+            self.base,
             records,
             now,
         );
@@ -2150,13 +2198,16 @@ impl<D: Disk + Clone> Signing<D> {
                 pending: status.pending,
             });
         }
+        self.trim();
     }
 
     /// Reads the records chained since the last poll, and replays the key
     /// registry only when one of them changes it. False when the journal
     /// cannot be read; the cache is then left as it was.
     fn refresh(&mut self, journal: &mut IntegrityJournal<D>) -> bool {
-        let known = u64::try_from(self.records.len()).unwrap_or(u64::MAX);
+        let known = self
+            .base
+            .saturating_add(u64::try_from(self.records.len()).unwrap_or(u64::MAX));
         let Ok(new) = journal.records_from(known) else {
             return false;
         };
@@ -2169,13 +2220,22 @@ impl<D: Disk + Clone> Signing<D> {
         if self.records.try_reserve(new.len()).is_err() {
             return false;
         }
+        if changes_registry {
+            self.registry_records.extend(
+                new.iter()
+                    .filter(|record| record.kind == crate::integrity::SealKind::KeyRegistry)
+                    .copied(),
+            );
+        }
         self.records.extend(new);
         if changes_registry {
-            match Self::registry(&self.disk, &self.dir, &self.trust, &self.records) {
+            match Self::registry(&self.disk, &self.dir, &self.trust, &self.registry_records) {
                 Ok(registry) => self.registry = registry,
                 Err(_) => {
                     // Re-read the whole journal at the next poll.
                     self.records.clear();
+                    self.registry_records.clear();
+                    self.base = 0;
                     return false;
                 }
             }

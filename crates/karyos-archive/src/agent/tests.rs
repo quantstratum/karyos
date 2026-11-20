@@ -3873,6 +3873,90 @@ fn a_signing_agent_records_trusted_heads_covering_the_chain() {
 }
 
 /// Signing without sealing is refused at spawn.
+/// karyos#1095: the signing poll's cache keeps only the records no signed
+/// head covers yet. After many seals and polls that sign each head, the
+/// cache holds the tail from the last head on, not the whole journal.
+#[test]
+fn the_signing_cache_keeps_only_the_uncovered_tail() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::ledger::Ledger;
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+    use crate::integrity::test_key::TestKey;
+    use crate::integrity::trust::{
+        Algorithm, Custody, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH, RegistryAction,
+        RegistryEntry, TrustRoot, key_id,
+    };
+
+    let dir = temp_dir("signing-cache");
+    let archive = [7u8; 32];
+    let authority = TestKey::from_seed([1; 32]);
+    let archival = TestKey::from_seed([9; 32]);
+    let trust = TrustRoot {
+        archive_id: archive,
+        authorities: vec![authority.public()],
+    };
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    {
+        let mut keys = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &dir, KEYS_FILE).unwrap();
+        let mut entry = RegistryEntry {
+            action: RegistryAction::Register,
+            algorithm: Algorithm::Ed25519,
+            custody: Custody::Declared,
+            sequence: 0,
+            key_id: key_id(&archival.public()),
+            public: archival.public(),
+            effective: 0,
+            evidence: [0; 32],
+            endorsement: [0; 64],
+        };
+        entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&archive));
+        KeyRegistry::new(trust)
+            .append(&entry, &mut journal, &mut keys)
+            .unwrap();
+    }
+    let setup = ArchiveSigning {
+        trust: TrustRoot {
+            archive_id: archive,
+            authorities: vec![authority.public()],
+        },
+        journal_id: 1,
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(archival),
+    };
+    let mut signing = Signing::open(
+        StdDisk,
+        &dir,
+        setup,
+        &mut journal,
+        Arc::new(Counts::default()),
+    )
+    .unwrap();
+    let mut now = 0u64;
+    let mut start = 0u64;
+    for _ in 0..40 {
+        // Five seals per poll, then a poll that offers and signs the head.
+        for _ in 0..5 {
+            let _ = journal.seal_segment(3, start, &[1u8; 64], false).unwrap();
+            start += 64;
+        }
+        now += SIGNING_POLL;
+        signing.duty(&mut journal, now);
+        now += SIGNING_POLL;
+        signing.duty(&mut journal, now);
+    }
+    let total = journal.records().unwrap().len();
+    assert!(total > 200, "{total}");
+    let (base, cached) = signing.cached();
+    assert!(cached <= 6, "the cache holds {cached} of {total} records");
+    assert_eq!(
+        usize::try_from(base).unwrap() + cached,
+        total,
+        "the cache is the journal's tail"
+    );
+    assert!(!signing.signing.signed().is_empty(), "heads were signed");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn signing_without_a_seal_interval_is_refused() {
     use crate::integrity::signing::{BacklogPolicy, SigningConfig};
