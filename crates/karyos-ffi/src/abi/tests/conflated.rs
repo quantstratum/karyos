@@ -218,6 +218,7 @@ fn conflated_calls_check_their_arguments() {
 /// Fresh; and it follows its driver's close.
 #[test]
 fn a_conflated_view_delivers_each_keys_latest_value() {
+    let _drivers = crate::test_drivers::drivers(1);
     let driver = c_driver();
     let partial = StreamOptions {
         conflation_journal_capacity: 0,
@@ -382,6 +383,7 @@ fn an_embedded_client_is_refused_a_view() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_view_moves_between_threads() {
+    let _drivers = crate::test_drivers::drivers(1);
     let driver = c_driver();
     let keyed = StreamOptions {
         allow_unconnected: 1,

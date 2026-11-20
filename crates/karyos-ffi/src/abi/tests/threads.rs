@@ -175,6 +175,7 @@ fn a_held_publication_is_busy_for_every_call() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_started_driver_is_stopped_and_closed_from_other_threads() {
+    let _drivers = crate::test_drivers::drivers(1);
     let mut options = core::mem::MaybeUninit::<DriverOptions>::zeroed();
     // SAFETY: a live, aligned, writable `DriverOptions`.
     let status = unsafe {

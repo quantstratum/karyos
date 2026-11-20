@@ -61,6 +61,7 @@ fn c_driver() -> u64 {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_stream_mode_takes_only_its_publishers() {
+    let _drivers = crate::test_drivers::drivers(1);
     let driver = c_driver();
     let exclusive = stream_options_of(SHARED);
     for refused in [
@@ -111,6 +112,7 @@ fn a_stream_mode_takes_only_its_publishers() {
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_c_driver_s_concurrent_stream_takes_its_publishers() {
+    let _drivers = crate::test_drivers::drivers(1);
     let driver = c_driver();
     let shared = concurrent(stream_options_of(SHARED), 2);
     assert_eq!(add_stream(driver, &shared), Status::Ok.code());
