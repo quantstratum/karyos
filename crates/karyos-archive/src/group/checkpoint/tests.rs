@@ -1251,7 +1251,7 @@ fn replay_from_start(
     loop {
         match cursor.step().unwrap() {
             Step::Event(event) => seen.push(event.group_seq()),
-            Step::Checkpoint(_) => {}
+            Step::Checkpoint(_) | Step::LateCheckpoint(_) => {}
             Step::Stop(stop) => return (seen, stop),
         }
     }

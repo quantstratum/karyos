@@ -341,6 +341,14 @@ pub enum Step<'c> {
     /// (A9-2): the replay side writes its own state there and compares it
     /// ([`compare_state`]).
     Checkpoint(CheckpointRecord),
+    /// A checkpoint a writer recorded for an event this cursor had already
+    /// given, followed by a later one, before the cursor saw the record
+    /// (karyos#1003): found by [`ReplayCursor::follow`], it is given
+    /// before any event after the last one given, where a closed replay
+    /// gives it right after its own event, as
+    /// [`Step::Checkpoint`]. Its state is the one after its event, not
+    /// after the events given since.
+    LateCheckpoint(CheckpointRecord),
     /// No event.
     Stop(Stop),
 }
@@ -350,6 +358,7 @@ pub enum Step<'c> {
 enum Next {
     Event { group_seq: u64, incomplete: bool },
     Checkpoint(CheckpointRecord),
+    LateCheckpoint(CheckpointRecord),
     Stop(Stop),
 }
 
@@ -756,7 +765,9 @@ impl<D: Disk> ReplayCursor<D> {
             // A checkpoint below `from` is skipped with its event.
             let below = match next {
                 Next::Event { group_seq, .. } => group_seq < from,
-                Next::Checkpoint(checkpoint) => checkpoint.group_seq < from,
+                Next::Checkpoint(checkpoint) | Next::LateCheckpoint(checkpoint) => {
+                    checkpoint.group_seq < from
+                }
                 Next::Stop(_) => false,
             };
             if !below {
@@ -770,6 +781,7 @@ impl<D: Disk> ReplayCursor<D> {
         match next {
             Next::Stop(stop) => Step::Stop(stop),
             Next::Checkpoint(checkpoint) => Step::Checkpoint(checkpoint),
+            Next::LateCheckpoint(checkpoint) => Step::LateCheckpoint(checkpoint),
             Next::Event {
                 group_seq,
                 incomplete,
@@ -785,6 +797,10 @@ impl<D: Disk> ReplayCursor<D> {
 
     /// Reads the next event's records into the buffer, or the stop.
     fn read_next(&mut self) -> Result<Next, ReplayError> {
+        // A late checkpoint, which a follow found, before any later event.
+        if let Some(checkpoint) = self.take_checkpoint(|seq, last| seq < last)? {
+            return Ok(Next::LateCheckpoint(checkpoint));
+        }
         // A checkpoint right after the event it names.
         if let Some(checkpoint) = self.due_checkpoint()? {
             return Ok(Next::Checkpoint(checkpoint));
@@ -977,17 +993,21 @@ impl<D: Disk> ReplayCursor<D> {
     ///   between writes and the tail would need a repair, that recovery
     ///   fails (a permission error) instead, and the consumer polls again
     ///   later.
-    /// - **Late checkpoints (not handled yet).** A writer may publish a
+    /// - **Late checkpoints (karyos#1003).** A writer may publish a
     ///   checkpoint for an event this cursor already gave, without the
-    ///   complete prefix advancing. A poll that compares only
-    ///   `complete_recording_seq` does not see it, and a `follow` that does
-    ///   gives it after the later events already given, where a closed
-    ///   replay gives it right after its event. Live replay's handling of
-    ///   such checkpoints is karyos#1003.
+    ///   complete prefix advancing. A poll discovers it by comparing
+    ///   [`Recovery::checkpoints`] as well as `complete_recording_seq`.
+    ///   After the `follow`, the cursor gives it as
+    ///   [`Step::LateCheckpoint`], before any event after the last one
+    ///   given: marked late, since a closed replay gives it right after its
+    ///   own event as [`Step::Checkpoint`]. A checkpoint for the last event
+    ///   given is not late: it is given as [`Step::Checkpoint`], where a
+    ///   closed replay gives it.
     /// - **What it gives.** The same events, checkpoints and stops, by the
     ///   same comparison rules, as a cursor opened on `journal` would give
     ///   after the last event this one gave: a consumer cannot tell a
-    ///   followed prefix from a closed one by what it saw.
+    ///   followed prefix from a closed one by what it saw, except for the
+    ///   late checkpoints, which are marked.
     /// - **When it ends.** When the group is sealed (its writer finished),
     ///   the last recovery's prefix is the closed prefix, and the cursor
     ///   stops at its end exactly as a replay of the closed prefix stops.
@@ -1073,11 +1093,22 @@ impl<D: Disk> ReplayCursor<D> {
     /// # Errors
     ///
     /// [`ReplayError::InvalidConfig`] past `usize` checkpoints.
+    /// A late checkpoint ([`Step::LateCheckpoint`]) is never due: the
+    /// next [`ReplayCursor::step`] gives it.
     pub fn due_checkpoint(&mut self) -> Result<Option<CheckpointRecord>, ReplayError> {
+        self.take_checkpoint(|seq, last| seq == last)
+    }
+
+    /// The next recorded checkpoint, taken if `due(its group_seq, the
+    /// last event given)`.
+    fn take_checkpoint(
+        &mut self,
+        due: impl FnOnce(u64, u64) -> bool,
+    ) -> Result<Option<CheckpointRecord>, ReplayError> {
         let Some(checkpoint) = self.checkpoints.get(self.next_checkpoint).copied() else {
             return Ok(None);
         };
-        if checkpoint.group_seq > self.last_seq {
+        if !due(checkpoint.group_seq, self.last_seq) {
             return Ok(None);
         }
         self.next_checkpoint = self

@@ -598,7 +598,7 @@ fn next_from<'c, D: Disk>(
     match cursor.step_from(from) {
         Ok(Step::Event(event)) => Ok(Item::Event(event)),
         Ok(Step::Stop(stop)) => Ok(Item::Stop(stop)),
-        Ok(Step::Checkpoint(checkpoint)) => Err(error(format!(
+        Ok(Step::Checkpoint(checkpoint) | Step::LateCheckpoint(checkpoint)) => Err(error(format!(
             "{side} journal: checkpoint {} out of order",
             checkpoint.checkpoint_id
         ))),

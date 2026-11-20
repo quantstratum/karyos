@@ -959,6 +959,12 @@ pub struct Recovery {
     /// then holds only the journal's start, and cannot take the next
     /// events.
     pub full: bool,
+    /// The checkpoint records the journal holds. A writer may record a
+    /// checkpoint for an event already complete, so a poll of a live
+    /// journal compares this with its previous value, beside
+    /// `complete_recording_seq`, to discover a checkpoint published
+    /// without the prefix advancing (karyos#1003).
+    pub checkpoints: u64,
 }
 
 /// Recomputes the prefixes of a recovered `journal`, every record of it
@@ -1043,6 +1049,7 @@ fn recover_with<D: crate::disk::Disk>(
     let mut tracker = PrefixTracker::try_new(capacity).map_err(allocation)?;
     tracker.reserve_reopen_hold(hold).map_err(allocation)?;
     let mut last_seen = 0u64;
+    let mut checkpoints = 0u64;
     let mut full = false;
     let durable = journal.durable();
     // The current range as last seen: when another opens, it is closed.
@@ -1072,6 +1079,9 @@ fn recover_with<D: crate::disk::Disk>(
             record.role()
         {
             last_seen = seq;
+        }
+        if matches!(record, GroupRecord::Checkpoint(_)) {
+            checkpoints = checkpoints.saturating_add(1);
         }
         if full {
             return true;
@@ -1106,5 +1116,6 @@ fn recover_with<D: crate::disk::Disk>(
         tracker,
         last_seen,
         full,
+        checkpoints,
     })
 }
