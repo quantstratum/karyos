@@ -489,3 +489,143 @@ fn an_anchor_store_named_but_missing_is_an_error() {
     assert_eq!(status, EXIT_ERROR, "{out}");
     assert!(err.contains("no-such-store"), "{err}");
 }
+
+fn usage(args: &[&str]) -> UsageError {
+    parse_verify(args.iter().map(OsString::from)).unwrap_err()
+}
+
+#[test]
+fn each_usage_error_is_typed_and_keeps_its_message() {
+    let location = hex(&OPERATOR);
+    let cases: [(&[&str], UsageError, &str); 9] = [
+        (
+            &["--trust"],
+            UsageError::TrustNeedsFile,
+            "--trust needs a file",
+        ),
+        (
+            &["--trust", "a", "--trust", "b"],
+            UsageError::TrustTwice,
+            "--trust given twice",
+        ),
+        (
+            &["--anchors"],
+            UsageError::AnchorsNeedsValue,
+            "--anchors needs HEX=DIR",
+        ),
+        (
+            &["--anchors", "nodir"],
+            UsageError::AnchorsNoSeparator,
+            "--anchors needs HEX=DIR: the store's location, then its directory",
+        ),
+        (
+            &["--anchors", "00=d"],
+            UsageError::AnchorsLocation(HexError::Length("00".into())),
+            "\"00\" is not 64 hex digits",
+        ),
+        (
+            &["--frob"],
+            UsageError::UnknownOption("--frob".into()),
+            "unknown option --frob",
+        ),
+        (
+            &["a", "b"],
+            UsageError::OneDirectoryOnly,
+            "one directory only",
+        ),
+        (&[], UsageError::NoDirectory, "verify needs a directory"),
+        (
+            &["--trust", "t", &format!("--anchors={location}")],
+            UsageError::UnknownOption(format!("--anchors={location}")),
+            "unknown option --anchors=",
+        ),
+    ];
+    for (args, expected, message) in cases {
+        let error = usage(args);
+        assert_eq!(error, expected, "{args:?}");
+        assert!(error.to_string().starts_with(message), "{error}");
+    }
+    let zz = "z".repeat(64);
+    assert_eq!(
+        usage(&["--anchors", &format!("{zz}=d")]),
+        UsageError::AnchorsLocation(HexError::NotHex(zz.clone()))
+    );
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        let error = parse_verify([OsString::from("--anchors"), OsString::from_vec(vec![0xff])])
+            .unwrap_err();
+        assert_eq!(error, UsageError::AnchorsNotText);
+    }
+}
+
+#[test]
+fn each_trust_file_error_is_typed_with_its_line() {
+    let key = hex(&ARCHIVE);
+    let line = |line, error| TrustError::Line { line, error };
+    let cases = [
+        ("archive\n", line(1, LineError::NoValue("archive".into()))),
+        (
+            "# c\narchive 00\n",
+            line(2, LineError::Hex(HexError::Length("00".into()))),
+        ),
+        (
+            &*format!("archive {key}\njournal x\n"),
+            line(2, LineError::JournalId("x".into())),
+        ),
+        (
+            "colour blue\n",
+            line(1, LineError::UnknownKey("colour".into())),
+        ),
+        (&*format!("authority {key}\n"), TrustError::NoArchive),
+        (&*format!("archive {key}\n"), TrustError::NoAuthority),
+    ];
+    for (text, expected) in cases {
+        assert_eq!(parse_trust(text).unwrap_err(), expected, "{text:?}");
+    }
+    assert_eq!(
+        line(2, LineError::JournalId("x".into())).to_string(),
+        "line 2: \"x\" is not a journal id"
+    );
+}
+
+#[test]
+fn run_checks_errors_keep_their_path_and_source() {
+    let archive = archive("typed-errors");
+    let args = |trust: Option<PathBuf>, anchors: Vec<([u8; 32], PathBuf)>| VerifyArgs {
+        dir: archive.dir(),
+        trust,
+        anchors,
+        json: false,
+    };
+    let missing = archive.root.join("no-such-trust");
+    match run_checks(&args(Some(missing.clone()), Vec::new())) {
+        Err(VerifyError::TrustRead { path, source }) => {
+            assert_eq!(path, missing);
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        }
+        other => panic!("{other:?}"),
+    }
+    let bad = archive.root.join("bad-trust");
+    std::fs::write(&bad, "colour blue\n").unwrap();
+    match run_checks(&args(Some(bad.clone()), Vec::new())) {
+        Err(VerifyError::Trust { path, source }) => {
+            assert_eq!(path, bad);
+            assert_eq!(
+                source,
+                TrustError::Line {
+                    line: 1,
+                    error: LineError::UnknownKey("colour".into())
+                }
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    let store = archive.root.join("no-such-store");
+    match run_checks(&args(None, vec![(OPERATOR, store.clone())])) {
+        Err(VerifyError::Io { path, source }) => {
+            assert_eq!(path, store.join(ANCHOR_FILE));
+            assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+        }
+        other => panic!("{other:?}"),
+    }
+}
