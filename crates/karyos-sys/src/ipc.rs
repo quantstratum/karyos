@@ -1529,7 +1529,7 @@ mod tests {
         ));
         assert!(!readable(b.as_fd()).unwrap());
         drop(a);
-        assert!(readable(b.as_fd()).unwrap());
+        wait_for_peer_close(|| readable(b.as_fd()).unwrap());
         assert!(matches!(
             recv(b.as_fd(), &mut buffer).unwrap(),
             Recv::PeerClosed
@@ -1683,11 +1683,31 @@ mod tests {
             Recv::WouldBlock
         ));
         drop(a);
-        for _ in 0..2 {
-            assert!(matches!(
-                recv(b.as_fd(), &mut buffer).unwrap(),
-                Recv::PeerClosed
-            ));
+        wait_for_peer_close(|| match recv(b.as_fd(), &mut buffer).unwrap() {
+            Recv::PeerClosed => true,
+            Recv::WouldBlock => false,
+            other => panic!("unexpected {other:?}"),
+        });
+        assert!(matches!(
+            recv(b.as_fd(), &mut buffer).unwrap(),
+            Recv::PeerClosed
+        ));
+    }
+
+    /// Polls `closed` until it reports the peer's close, within 10 s.
+    ///
+    /// Dropping one end does not always close it at once: a test of this
+    /// process that spawns a child forks it with a copy of every open
+    /// descriptor, and the copy of the dropped end lives until the child
+    /// execs (karyos#1067). The close is then seen a moment later.
+    fn wait_for_peer_close(mut closed: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the peer's close was never seen"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
