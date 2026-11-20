@@ -805,6 +805,23 @@ struct Counts {
     /// [`ArchiveHandle::shortened_index_reports`]: the event queue may
     /// drop some before a caller can read it (karyos#671 review).
     shortened_reports: std::sync::Mutex<Vec<crate::integrity::damage::ShortenedIndex>>,
+    /// The last signing status, once signing ran (karyos#1031).
+    signing: std::sync::Mutex<Option<SigningLag>>,
+}
+
+/// The coverage lag of the running Archive's head signing, as its last
+/// signing poll left it (SPEC.md §8.4; karyos#1031).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SigningLag {
+    /// Records sealed past the last signed head.
+    pub records: u64,
+    /// How long the oldest uncovered record has waited, in ns.
+    pub ns: u64,
+    /// Whether records stay uncovered past `anchor_interval`.
+    pub alarm: bool,
+    /// Heads waiting for the signer.
+    pub pending: u64,
 }
 
 /// Adds one to `counter`, sticky at `u64::MAX`.
@@ -1247,6 +1264,13 @@ impl ArchiveHandle {
         self.counts.dropped_replay_ends.load(Ordering::Relaxed)
     }
 
+    /// The head signing's coverage lag as its last poll left it; `None`
+    /// without signing, or before its first poll (karyos#1031).
+    #[must_use]
+    pub fn signing_lag(&self) -> Option<SigningLag> {
+        self.counts.signing.lock().ok().and_then(|slot| *slot)
+    }
+
     /// Starts and replays refused at a cap ([`AgentError::Full`]).
     #[must_use]
     pub fn refused(&self) -> u64 {
@@ -1571,10 +1595,16 @@ fn run<D>(
     };
     // Collected before the settle, so the stops recovery appends are
     // chained too, before the start is reported.
-    let mut integrity = match config
-        .seal_interval
-        .map(|interval| Integrity::open(disk.clone(), &dir, interval, &mut catalog, signing))
-    {
+    let mut integrity = match config.seal_interval.map(|interval| {
+        Integrity::open(
+            disk.clone(),
+            &dir,
+            interval,
+            &mut catalog,
+            signing,
+            &outbox.counts,
+        )
+    }) {
         None => None,
         Some(Ok(integrity)) => Some(integrity),
         Some(Err(error)) => {
@@ -1738,6 +1768,7 @@ impl<D: Disk> Integrity<D> {
         interval: Duration,
         catalog: &mut Catalog<D>,
         signing: Option<ArchiveSigning>,
+        counts: &Arc<Counts>,
     ) -> Result<Self, IntegrityError>
     where
         D: Clone,
@@ -1748,7 +1779,7 @@ impl<D: Disk> Integrity<D> {
             .ok_or(IntegrityError::Overflow)?;
         let mut journal = IntegrityJournal::open(disk.clone(), dir)?.journal;
         let signing = signing
-            .map(|signing| Signing::open(disk, dir, signing, &mut journal))
+            .map(|signing| Signing::open(disk, dir, signing, &mut journal, Arc::clone(counts)))
             .transpose()?;
         catalog.collect_changes();
         Ok(Self {
@@ -1852,6 +1883,14 @@ struct Signing<D: Disk> {
     coalesce: bool,
     offered: Option<crate::integrity::Digest>,
     next_ns: u64,
+    /// The journal's records read so far: a poll reads only the new ones
+    /// (karyos#1031).
+    records: Vec<crate::integrity::SealRecord>,
+    /// The key registry as of `records`, replayed again only when a new
+    /// key registry record is chained.
+    registry: KeyRegistry,
+    /// Where each poll publishes the status.
+    counts: Arc<Counts>,
 }
 
 /// A boxed signer, as the sized signer [`HeadSigning::poll`] takes.
@@ -1877,6 +1916,7 @@ impl<D: Disk + Clone> Signing<D> {
         dir: &Path,
         setup: ArchiveSigning,
         journal: &mut IntegrityJournal<D>,
+        counts: Arc<Counts>,
     ) -> Result<Self, IntegrityError> {
         let heads = Ledger::open(disk.clone(), dir, HEADS_FILE)?;
         let coalesce = matches!(
@@ -1904,6 +1944,9 @@ impl<D: Disk + Clone> Signing<D> {
             coalesce,
             offered: None,
             next_ns: 0,
+            records,
+            registry,
+            counts,
         })
     }
 
@@ -1934,14 +1977,13 @@ impl<D: Disk + Clone> Signing<D> {
             return;
         }
         self.next_ns = now.saturating_add(SIGNING_POLL);
-        let Ok(records) = journal.records() else {
+        if !self.refresh(journal) {
             return;
-        };
-        let Ok(registry) = Self::registry(&self.disk, &self.dir, &self.trust, &records) else {
-            return;
-        };
+        }
+        let records = &self.records;
+        let registry = &self.registry;
         let sealed = u64::try_from(records.len()).unwrap_or(u64::MAX);
-        let busy = self.coalesce && self.signing.status(now, sealed, &registry).pending > 0;
+        let busy = self.coalesce && self.signing.status(now, sealed, registry).pending > 0;
         if let Some(last) = records.last() {
             let digest = last.digest();
             // Only a head the configured key can validly sign is offered:
@@ -1971,10 +2013,50 @@ impl<D: Disk + Clone> Signing<D> {
         let _ = self.signing.poll(
             &mut Boxed(self.signer.as_mut()),
             &mut self.heads,
-            &registry,
-            &records,
+            registry,
+            records,
             now,
         );
+        let status = self.signing.status(now, sealed, registry);
+        if let Ok(mut slot) = self.counts.signing.lock() {
+            *slot = Some(SigningLag {
+                records: status.coverage_lag_records,
+                ns: status.coverage_lag_ns,
+                alarm: status.alarm,
+                pending: status.pending,
+            });
+        }
+    }
+
+    /// Reads the records chained since the last poll, and replays the key
+    /// registry only when one of them changes it. False when the journal
+    /// cannot be read; the cache is then left as it was.
+    fn refresh(&mut self, journal: &mut IntegrityJournal<D>) -> bool {
+        let known = u64::try_from(self.records.len()).unwrap_or(u64::MAX);
+        let Ok(new) = journal.records_from(known) else {
+            return false;
+        };
+        if new.is_empty() {
+            return true;
+        }
+        let changes_registry = new
+            .iter()
+            .any(|record| record.kind == crate::integrity::SealKind::KeyRegistry);
+        if self.records.try_reserve(new.len()).is_err() {
+            return false;
+        }
+        self.records.extend(new);
+        if changes_registry {
+            match Self::registry(&self.disk, &self.dir, &self.trust, &self.records) {
+                Ok(registry) => self.registry = registry,
+                Err(_) => {
+                    // Re-read the whole journal at the next poll.
+                    self.records.clear();
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 

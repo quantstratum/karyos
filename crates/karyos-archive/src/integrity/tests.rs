@@ -712,3 +712,17 @@ fn a_read_of_the_wrong_length_changes_neither_the_journal_nor_the_schedule() {
         );
     }
 }
+
+/// karyos#1031: `records_from` reads only the records past those a caller
+/// holds, so a poll that keeps them never rereads the journal.
+#[test]
+fn records_from_reads_only_the_new_records() {
+    let (mut journal, records) = super::test_support::chain(5);
+    assert_eq!(journal.records_from(0).unwrap(), records);
+    assert_eq!(journal.records_from(3).unwrap(), records[3..]);
+    assert!(journal.records_from(5).unwrap().is_empty());
+    journal.seal_segment(3, 40, b"more", false).unwrap();
+    let new = journal.records_from(5).unwrap();
+    assert_eq!(new.len(), 1);
+    assert_eq!(new[0].start, 40);
+}
