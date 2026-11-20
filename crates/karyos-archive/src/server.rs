@@ -27,13 +27,13 @@
 //!   ([`ServerConfig::max_pending_signals`]); one more is dropped and
 //!   counted.
 //!
-//! - **Retention (ADR-0088, Proposed; karyos#967).** A hold, a release, a
-//!   purge and a seal verification are served by the
-//!   [`RetentionControl`] the host attached
-//!   ([`ControlServer::with_retention`]), on the server's thread, its
-//!   refusal names verbatim. Without one each is answered code 1
-//!   ([`NO_RETENTION`]): the Archive's retention engine and verifier are
-//!   not attached to its control path yet.
+//! - **Retention (ADR-0088; karyos#967).** A hold, a release, a purge and
+//!   a seal verification are posted to the agent, whose retention engine
+//!   and verifier answer them like any other command
+//!   ([`ArchiveHandle::post_hold`] and the rest). A host that attaches its
+//!   own [`RetentionControl`] ([`ControlServer::with_retention`]) is
+//!   served by it instead, on the server's thread, its refusal names
+//!   verbatim.
 //!
 //! This is the control path: it allocates (the queued answers, the boxed
 //! host objects); the replayed frames do not pass through it.
@@ -272,6 +272,18 @@ enum Waiting {
         correlation_id: u64,
         replay_id: u64,
         answer: Posted<u64>,
+    },
+    /// A hold, a release or a purge (ADR-0088).
+    Retain {
+        correlation_id: u64,
+        recording_id: u64,
+        answer: Posted<RetentionAnswer>,
+    },
+    /// A seal verification (ADR-0088).
+    Verify {
+        correlation_id: u64,
+        recording_id: u64,
+        answer: Posted<agent::Verified>,
     },
     /// A durability query (schema 4, R-CORE-12).
     Durable {
@@ -583,32 +595,40 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                     answer,
                 })
             }
-            ControlMessage::HoldRecording(request) => {
-                self.retain(request.correlation_id, request.recording_id, |engine| {
-                    engine.hold(request.recording_id)
-                });
-                None
-            }
-            ControlMessage::ReleaseHold(request) => {
-                self.retain(request.correlation_id, request.recording_id, |engine| {
-                    engine.release(request.recording_id)
-                });
-                None
-            }
-            ControlMessage::PurgeRecording(request) => {
-                self.retain(request.correlation_id, request.recording_id, |engine| {
+            ControlMessage::HoldRecording(request) => self.retain(
+                request.correlation_id,
+                request.recording_id,
+                |engine| engine.hold(request.recording_id),
+                |agent| agent.post_hold(request.recording_id),
+            ),
+            ControlMessage::ReleaseHold(request) => self.retain(
+                request.correlation_id,
+                request.recording_id,
+                |engine| engine.release(request.recording_id),
+                |agent| agent.post_release(request.recording_id),
+            ),
+            ControlMessage::PurgeRecording(request) => self.retain(
+                request.correlation_id,
+                request.recording_id,
+                |engine| {
                     engine.purge(
                         request.recording_id,
                         request.before,
                         request.request_id,
                         request.operator,
                     )
-                });
-                None
-            }
+                },
+                |agent| {
+                    agent.post_purge(
+                        request.recording_id,
+                        request.before,
+                        request.request_id,
+                        request.operator,
+                    )
+                },
+            ),
             ControlMessage::VerifyRecording(request) => {
-                self.verify(request.correlation_id, request.recording_id);
-                None
+                self.verify(request.correlation_id, request.recording_id)
             }
             ControlMessage::ControlResponse(ControlResponse { correlation_id, .. })
             | ControlMessage::RecordingDescriptor(RecordingDescriptor { correlation_id, .. })
@@ -625,19 +645,27 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
         }
     }
 
-    /// Answers a hold, a release or a purge with what the retention engine
-    /// said, or [`NO_RETENTION`] without one.
+    /// Answers a hold, a release or a purge with what the attached
+    /// [`RetentionControl`] said, now; without one, posts it to the
+    /// agent's retention engine and answers when it does.
     fn retain(
         &mut self,
         correlation_id: u64,
         recording_id: u64,
         call: impl FnOnce(&mut dyn RetentionControl) -> RetentionAnswer,
-    ) {
-        let answer = match self.retention.as_deref_mut() {
-            Some(engine) => call(engine),
-            None => RetentionAnswer::Error(NO_RETENTION.to_owned()),
-        };
-        self.answer_retention(correlation_id, recording_id, &answer);
+        post: impl FnOnce(&ArchiveHandle) -> Result<Posted<RetentionAnswer>, AgentError>,
+    ) -> Option<Waiting> {
+        if let Some(engine) = self.retention.as_deref_mut() {
+            let answer = call(engine);
+            self.answer_retention(correlation_id, recording_id, &answer);
+            return None;
+        }
+        let posted = post(&self.agent);
+        self.posted(correlation_id, posted, |answer| Waiting::Retain {
+            correlation_id,
+            recording_id,
+            answer,
+        })
     }
 
     fn answer_retention(
@@ -659,12 +687,29 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
         self.respond(correlation_id, recording_id, code, message);
     }
 
+    /// Verifies through the attached [`RetentionControl`] now, or posts
+    /// the verification to the agent.
+    fn verify(&mut self, correlation_id: u64, recording_id: u64) -> Option<Waiting> {
+        if let Some(engine) = self.retention.as_deref_mut() {
+            let verified = engine.verify(recording_id);
+            self.answer_verified(correlation_id, recording_id, verified);
+            return None;
+        }
+        let posted = self.agent.post_verify(recording_id);
+        self.posted(correlation_id, posted, |answer| Waiting::Verify {
+            correlation_id,
+            recording_id,
+            answer,
+        })
+    }
+
     /// One `RangeOutcome` per range, then the count of those sent.
-    fn verify(&mut self, correlation_id: u64, recording_id: u64) {
-        let verified = match self.retention.as_deref_mut() {
-            Some(engine) => engine.verify(recording_id),
-            None => Err(RetentionAnswer::Error(NO_RETENTION.to_owned())),
-        };
+    fn answer_verified(
+        &mut self,
+        correlation_id: u64,
+        recording_id: u64,
+        verified: agent::Verified,
+    ) {
         match verified {
             Ok(ranges) => {
                 let mut sent = 0u64;
@@ -952,6 +997,44 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 }
                 Some(Err(error)) => {
                     self.respond(correlation_id, 0, ResponseCode::Error, &error.to_string());
+                    true
+                }
+            },
+            Waiting::Retain {
+                correlation_id,
+                recording_id,
+                answer,
+            } => match answer.try_answer() {
+                None => self.wait(Waiting::Retain {
+                    correlation_id,
+                    recording_id,
+                    answer,
+                }),
+                Some(Ok(answer)) => {
+                    self.answer_retention(correlation_id, recording_id, &answer);
+                    true
+                }
+                Some(Err(error)) => {
+                    self.refuse(correlation_id, &error);
+                    true
+                }
+            },
+            Waiting::Verify {
+                correlation_id,
+                recording_id,
+                answer,
+            } => match answer.try_answer() {
+                None => self.wait(Waiting::Verify {
+                    correlation_id,
+                    recording_id,
+                    answer,
+                }),
+                Some(Ok(verified)) => {
+                    self.answer_verified(correlation_id, recording_id, verified);
+                    true
+                }
+                Some(Err(error)) => {
+                    self.refuse(correlation_id, &error);
                     true
                 }
             },

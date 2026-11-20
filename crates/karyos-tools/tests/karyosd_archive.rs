@@ -557,3 +557,56 @@ fn the_management_agent_lists_a_karyosd_archive() {
     let _ = std::fs::remove_dir_all(&archive);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// ADR-0088 (karyos#967): the management agent's retention backend holds,
+/// purges and releases a karyosd Archive's recording through its control
+/// streams, answered by the Archive's own retention engine: the hold is
+/// evidenced, a purge under it is refused `legal_hold`, the release is
+/// done, and with no purge policy configured a purge is refused
+/// `no_policy`.
+#[test]
+fn the_retention_backend_holds_a_karyosd_recording() {
+    use karyos_agent::archive_retention::ArchiveRetention;
+    use karyos_agent::catalog::ArchiveStreams;
+    use karyos_agent::retention::{RetentionBackend, RetentionReply};
+
+    let dir = dir("retention");
+    let archive = dir.with_extension("archive");
+    let _ = std::fs::remove_dir_all(&archive);
+    std::fs::create_dir_all(&archive).unwrap();
+    let path = dir.with_extension("log");
+    let mut daemon = Daemon::start(
+        &dir,
+        &archive,
+        &["--record", &format!("{STREAM}:{SESSION}")],
+        &path,
+    );
+    drop(connect(&dir));
+    let mut backend = ArchiveRetention::new(dir.clone(), ArchiveStreams::new(REQUESTS, RESPONSES))
+        .with_deadline(Duration::from_secs(10));
+    let refused = |reason: &str| RetentionReply::Refused {
+        code: 8,
+        reason: reason.to_owned(),
+    };
+    let fmt = |reply: RetentionReply| format!("{reply:?}");
+    assert_eq!(
+        fmt(backend.hold(1, 1, 1000)),
+        fmt(RetentionReply::Done { evidenced: true })
+    );
+    assert_eq!(
+        fmt(backend.purge(1, 64, 2, 1000)),
+        fmt(refused("legal_hold"))
+    );
+    assert_eq!(
+        fmt(backend.release(1, 3, 1000)),
+        fmt(RetentionReply::Done { evidenced: true })
+    );
+    assert_eq!(
+        fmt(backend.purge(1, 64, 4, 1000)),
+        fmt(refused("no_policy"))
+    );
+    assert!(daemon.stop().success());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&archive);
+    let _ = std::fs::remove_dir_all(&dir);
+}

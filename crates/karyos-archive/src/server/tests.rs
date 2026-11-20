@@ -1005,7 +1005,8 @@ impl RetentionControl for Engine {
 /// ADR-0088 (karyos#967): the retention requests reach the attached
 /// engine with their fields and are answered with its codes and refusal
 /// names verbatim; a verification sends its ranges under the request's
-/// correlation id, then their count. Without an engine each is an error.
+/// correlation id, then their count. Without one attached, the agent's
+/// engine answers: here the recording is unknown.
 #[test]
 fn retention_requests_reach_the_engine_and_are_answered_verbatim() {
     let mut rig = Rig::new("retention", Host::default());
@@ -1026,7 +1027,11 @@ fn retention_requests_reach_the_engine_and_are_answered_verbatim() {
         let answer = response(answers.last().unwrap());
         assert_eq!(
             (answer.correlation_id, answer.code, answer.message),
-            (request_id(&request), ResponseCode::Error, NO_RETENTION)
+            (
+                request_id(&request),
+                ResponseCode::UnknownRecording,
+                "no such recording"
+            )
         );
     }
     let engine = Engine::default();
@@ -1109,6 +1114,150 @@ fn request_id(message: &ControlMessage<'_>) -> u64 {
         ControlMessage::HoldRecording(request) | ControlMessage::VerifyRecording(request) => {
             request.correlation_id
         }
+        ControlMessage::ReleaseHold(request) => request.correlation_id,
+        ControlMessage::PurgeRecording(request) => request.correlation_id,
         other => panic!("{other:?}"),
     }
+}
+
+/// ADR-0088 (karyos#967): without an attached engine, the agent's own
+/// retention engine and verifier answer through the control streams. A
+/// hold is evidenced (code 0) and blocks a purge (`legal_hold`); a release
+/// is done once, then refused `no_evidence`; with no policy configured a
+/// purge is refused `no_policy`; a verification reports the recording's
+/// sealed ranges, with no trust root `untrusted_evidence`.
+#[test]
+fn the_agents_engine_answers_retention_requests() {
+    let agent = AgentConfig {
+        seal_interval: Some(Duration::from_millis(1)),
+        ..AgentConfig::default()
+    };
+    let mut rig = Rig::with(
+        "agent-retention",
+        Host::of(frames(2, 2), false),
+        agent,
+        ServerConfig::default(),
+    );
+    rig.request(&start(1));
+    rig.sent(2);
+    for _ in 0..5000 {
+        if rig.server.agent().describe(1).unwrap().durable == 192 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let purge = |correlation_id| {
+        ControlMessage::PurgeRecording(control::PurgeRecording {
+            correlation_id,
+            recording_id: 1,
+            before: 96,
+            request_id: correlation_id,
+            operator: 9,
+        })
+    };
+    let expected = [
+        (
+            ControlMessage::HoldRecording(control::HoldRecording {
+                correlation_id: 2,
+                recording_id: 1,
+            }),
+            ResponseCode::Ok,
+            "",
+        ),
+        (purge(3), ResponseCode::Refused, "legal_hold"),
+        (
+            ControlMessage::ReleaseHold(control::ReleaseHold {
+                correlation_id: 4,
+                recording_id: 1,
+            }),
+            ResponseCode::Ok,
+            "",
+        ),
+        (
+            ControlMessage::ReleaseHold(control::ReleaseHold {
+                correlation_id: 5,
+                recording_id: 1,
+            }),
+            ResponseCode::Refused,
+            "no_evidence",
+        ),
+        (purge(6), ResponseCode::Refused, "no_policy"),
+        (
+            ControlMessage::HoldRecording(control::HoldRecording {
+                correlation_id: 7,
+                recording_id: 99,
+            }),
+            ResponseCode::UnknownRecording,
+            "no such recording",
+        ),
+    ];
+    let mut sent = 2;
+    for (request, code, message) in expected {
+        rig.request(&request);
+        sent += 1;
+        let answers = rig.sent(sent);
+        let answer = response(answers.last().unwrap());
+        assert_eq!(
+            (answer.correlation_id, answer.code, answer.message),
+            (request_id(&request), code, message)
+        );
+    }
+    // Once the agent sealed both frames.
+    let verify = ControlMessage::VerifyRecording(control::VerifyRecording {
+        correlation_id: 8,
+        recording_id: 1,
+    });
+    let mut ranges = Vec::new();
+    for _ in 0..5000 {
+        rig.request(&verify);
+        let before = rig.responses.sent.lock().unwrap().len();
+        let mut answers = Vec::new();
+        for _ in 0..5000 {
+            rig.server.duty();
+            answers = rig.responses.sent.lock().unwrap().clone();
+            if answers
+                .get(before..)
+                .unwrap()
+                .iter()
+                .any(|bytes| matches!(decoded(bytes), ControlMessage::ControlResponse(_)))
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        ranges = answers
+            .get(before..)
+            .unwrap()
+            .iter()
+            .filter_map(|bytes| match decoded(bytes) {
+                ControlMessage::RangeOutcome(range) => Some(range),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let done = response(answers.last().unwrap());
+        assert_eq!((done.correlation_id, done.code), (8, ResponseCode::Ok));
+        assert_eq!(done.id, u64::try_from(ranges.len()).unwrap());
+        if ranges.last().is_some_and(|range| {
+            range.outcome != control::IntegrityOutcome::Unsealed && range.end == 192
+        }) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(!ranges.is_empty());
+    for range in &ranges {
+        assert_eq!((range.correlation_id, range.recording_id), (8, 1));
+        // No trust root: untrusted evidence (bit 0), never corruption
+        // (bit 6), and so never verified.
+        assert_eq!(
+            range.outcome,
+            control::IntegrityOutcome::Inconsistent,
+            "{range:?}"
+        );
+        assert_ne!(range.reasons & 1, 0, "{range:?}");
+        assert_eq!(range.reasons & (1 << 6), 0, "{range:?}");
+    }
+    assert_eq!(ranges.first().unwrap().start, 0);
+    assert_eq!(ranges.last().unwrap().end, 192);
+    rig.finish();
 }

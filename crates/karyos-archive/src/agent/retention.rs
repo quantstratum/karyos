@@ -1,0 +1,366 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! The agent's retention backend (ADR-0088; karyos#967): holds, releases
+//! and purges through the Archive's [`Retention`] engine, and seal
+//! verification through [`verify::verify`], on the agent's thread, where
+//! the segment stores, the integrity journal and the signed heads live.
+//!
+//! - **State.** The operations journal ([`OPERATIONS_FILE`]) and the
+//!   pending-holds ledger ([`PENDING_HOLDS_FILE`]) in the archive
+//!   directory, opened and replayed at start ([`Retention::recover`]).
+//! - **Purge.** No policy and no copy catalog are configured in the agent
+//!   yet (karyos#1093): a purge is refused before anything is deleted,
+//!   holds first (`legal_hold`), else `no_policy`, the refusal journalled.
+//! - **Verify.** The evidence is the integrity journal's records, the
+//!   signed heads and the key registry with the trust root head signing
+//!   was given, and the recording's written end. No anchors are gathered:
+//!   the agent keeps none. Without an integrity journal there is nothing
+//!   to verify and the answer is an error.
+
+use std::path::Path;
+
+use crate::catalog::Recording;
+use crate::control::{self, IntegrityOutcome, NO_INCONSISTENT};
+use crate::disk::Disk;
+use crate::integrity::anchor::{Anchor, AnchorEvidence, Externality};
+use crate::integrity::journal::IntegrityError;
+use crate::integrity::ledger::{Ledger, read_entries};
+use crate::integrity::retention::{
+    Authorisation, HoldReport, MARKER_LENGTH, OPERATION_LENGTH, OPERATIONS_FILE,
+    PENDING_HOLDS_FILE, PurgeError, PurgeRequest, PurgeSource, Retention,
+};
+use crate::integrity::trust::{KEYS_FILE, REGISTRY_ENTRY_LENGTH};
+use crate::integrity::verify::{self, Evidence, Outcome, RangeBytes, Reason};
+use crate::segment::{SegmentStore, SyncPolicy};
+use crate::server::RetentionAnswer;
+
+use super::{Active, State, read_store};
+
+/// The agent's retention engine: the operations journal as its journal.
+pub(super) type Engine<D> = Retention<Ledger<D, OPERATION_LENGTH>, D>;
+
+/// A hold, a release or a purge, as posted to the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Request {
+    Hold(u64),
+    Release(u64),
+    Purge {
+        recording: u64,
+        before: u64,
+        request_id: u64,
+        operator: u64,
+    },
+}
+
+/// A verification's answer: each range's outcome, or why it could not run.
+pub type Verified = Result<Vec<control::RangeOutcome>, RetentionAnswer>;
+
+/// Opens the retention engine of the archive in `dir`.
+pub(super) fn open<D: Disk + Clone>(disk: &D, dir: &Path) -> Result<Engine<D>, IntegrityError> {
+    let operations = Ledger::<D, OPERATION_LENGTH>::open(disk.clone(), dir, OPERATIONS_FILE)?;
+    let pending = Ledger::<D, MARKER_LENGTH>::open(disk.clone(), dir, PENDING_HOLDS_FILE)?;
+    let records = operations.entries().to_vec();
+    Ok(Retention::recover(operations, Some(&records), pending))
+}
+
+/// The store anchors would be confirmed by: the agent keeps none.
+#[derive(Debug)]
+struct NoAnchors;
+
+impl AnchorEvidence for NoAnchors {
+    fn confirms(&self, _anchor: &Anchor) -> bool {
+        false
+    }
+}
+
+/// A [`Reason`]'s bit in a `RangeOutcome` (ADR-0088): the verifier's order.
+const fn reason_bit(reason: Reason) -> u32 {
+    let bit = match reason {
+        Reason::UntrustedEvidence => 0,
+        Reason::UnknownKey => 1,
+        Reason::UnknownAlgorithm => 2,
+        Reason::MalformedEvidence => 3,
+        Reason::MissingEvidence => 4,
+        Reason::ConflictingAnchors => 5,
+        Reason::Corruption => 6,
+        Reason::ShortenedIndex => 7,
+        Reason::UnauthenticatedPurge => 8,
+        Reason::NoAnchor => 9,
+    };
+    1 << bit
+}
+
+/// An [`Outcome`]'s wire outcome.
+const fn outcome(outcome: Outcome) -> IntegrityOutcome {
+    match outcome {
+        Outcome::Verified => IntegrityOutcome::Verified,
+        Outcome::BeyondAnchor => IntegrityOutcome::BeyondAnchor,
+        Outcome::Unsealed => IntegrityOutcome::Unsealed,
+        Outcome::Purged => IntegrityOutcome::Purged,
+        Outcome::Inconsistent => IntegrityOutcome::Inconsistent,
+    }
+}
+
+/// The wire range of `report`, its correlation id left for the server.
+fn range(report: &verify::RangeReport) -> control::RangeOutcome {
+    let outcome = outcome(report.outcome);
+    control::RangeOutcome {
+        correlation_id: 0,
+        recording_id: report.recording,
+        start: report.start,
+        end: report.end,
+        first_inconsistent: match outcome {
+            IntegrityOutcome::Inconsistent => report.first_inconsistent.unwrap_or(NO_INCONSISTENT),
+            _ => NO_INCONSISTENT,
+        },
+        reasons: report
+            .reasons
+            .iter()
+            .fold(0, |bits, reason| bits | reason_bit(*reason)),
+        outcome,
+    }
+}
+
+/// The answer of a hold.
+const fn held(report: HoldReport) -> RetentionAnswer {
+    match report {
+        HoldReport::Applied { .. } => RetentionAnswer::Done,
+        HoldReport::PendingNoEvidence => RetentionAnswer::HeldWithoutEvidence,
+        HoldReport::InMemoryOnly => RetentionAnswer::HeldInMemoryOnly,
+    }
+}
+
+/// The answer of a refused or failed purge.
+fn purge_failed(error: &PurgeError) -> RetentionAnswer {
+    match error {
+        PurgeError::Refused { refusal, .. } => RetentionAnswer::Refused(refusal.name().to_owned()),
+        other => RetentionAnswer::Error(other.to_string()),
+    }
+}
+
+impl<D: Disk + Clone> State<D> {
+    /// Serves a hold, a release or a purge.
+    pub(super) fn retain(&mut self, request: Request) -> RetentionAnswer {
+        let recording = match request {
+            Request::Hold(recording) | Request::Release(recording) => recording,
+            Request::Purge { recording, .. } => recording,
+        };
+        if self.catalog.get(recording).is_none() {
+            return RetentionAnswer::UnknownRecording;
+        }
+        match request {
+            Request::Hold(recording) => held(self.retention.apply_hold(recording)),
+            Request::Release(recording) => match self.retention.release_hold(recording) {
+                Ok(()) => RetentionAnswer::Done,
+                Err(error) => RetentionAnswer::Refused(error.name().to_owned()),
+            },
+            Request::Purge {
+                recording,
+                before,
+                request_id,
+                operator,
+            } => {
+                // The control path authorises (ADR-0088, decision 4).
+                let request = PurgeRequest {
+                    id: request_id,
+                    recording,
+                    before,
+                    authorisation: Authorisation {
+                        operator,
+                        authorised: true,
+                    },
+                    closed_ns: 0,
+                    source: PurgeSource::Operator,
+                };
+                purge_failed(&self.retention.refuse_unconfigured(&request))
+            }
+        }
+    }
+
+    /// Verifies `id`'s seals: every range of the recording the verifier
+    /// reports, sealed ranges in chain order, then its unsealed tail.
+    pub(super) fn verify(&mut self, id: u64) -> Verified {
+        let Some(recording) = self.catalog.get(id).cloned() else {
+            return Err(RetentionAnswer::UnknownRecording);
+        };
+        let end = super::described(&recording, &self.active).end;
+        let Some(integrity) = self.integrity.as_mut() else {
+            return Err(RetentionAnswer::Error(
+                "no integrity journal: the Archive seals nothing".to_owned(),
+            ));
+        };
+        let records = integrity
+            .journal
+            .records()
+            .map_err(|error| RetentionAnswer::Error(error.to_string()))?;
+        let (trust, journal_id, heads) = match integrity.signing.as_ref() {
+            Some(signing) => (
+                Some(signing.trust.clone()),
+                signing.journal_id,
+                signing.heads.entries().to_vec(),
+            ),
+            None => (None, 0, Vec::new()),
+        };
+        let mut disk = self.disk.clone();
+        let registry = if trust.is_some() {
+            read_entries::<D, REGISTRY_ENTRY_LENGTH>(&mut disk, &self.dir, KEYS_FILE)
+                .map_err(|error| RetentionAnswer::Error(error.to_string()))?
+        } else {
+            Vec::new()
+        };
+        let mut stopped = if self.active.iter().any(|active| active.id == id) {
+            None
+        } else {
+            open_stopped(&self.disk, &self.dir, &recording)?
+        };
+        let externality = Externality::default();
+        let evidence = Evidence {
+            records: &records,
+            journal_fault: None,
+            journal_id,
+            trust: trust.as_ref(),
+            registry: &registry,
+            heads: &heads,
+            anchors: &[],
+            anchor_faults: 0,
+            stores: &NoAnchors,
+            externality: &externality,
+            written: &[(id, end)],
+        };
+        let active = &mut self.active;
+        let verification = verify::verify(&evidence, |recording, start, end| {
+            // Only this recording's ranges are reported: another's are
+            // never read.
+            if recording != id {
+                return RangeBytes::Missing;
+            }
+            let read = match stopped.as_mut() {
+                Some(store) => read_store(store, start, end),
+                None => read_active(active, id, start, end),
+            };
+            read.map_or(RangeBytes::Missing, RangeBytes::Bytes)
+        });
+        Ok(verification
+            .ranges
+            .iter()
+            .filter(|report| report.recording == id)
+            .map(range)
+            .collect())
+    }
+}
+
+/// Reads `[start, end)` of active recording `id`.
+fn read_active<D: Disk>(
+    active: &mut [Active<D>],
+    id: u64,
+    start: u64,
+    end: u64,
+) -> std::io::Result<Vec<u8>> {
+    super::read_range(active, id, start, end)
+}
+
+/// Opens a stopped recording's store for reading, changing nothing; `None`
+/// for a recording that wrote no segment.
+fn open_stopped<D: Disk + Clone>(
+    disk: &D,
+    dir: &Path,
+    recording: &Recording,
+) -> Result<Option<SegmentStore<D>>, RetentionAnswer> {
+    match SegmentStore::open_verified(
+        disk.clone(),
+        dir,
+        recording.id,
+        recording.geometry,
+        SyncPolicy::None,
+    ) {
+        Ok(store) => Ok(Some(store)),
+        Err(crate::segment::SegmentError::NotFound { .. }) => Ok(None),
+        Err(error) => Err(RetentionAnswer::Error(error.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_names_are_the_adr_names() {
+        use crate::integrity::retention::{PurgeRefusal, ReleaseError};
+        let purges = [
+            (PurgeRefusal::NotAuthorised, "not_authorised"),
+            (PurgeRefusal::LegalHold, "legal_hold"),
+            (PurgeRefusal::HoldsUnknown, "holds_unknown"),
+            (PurgeRefusal::NoPolicy, "no_policy"),
+            (PurgeRefusal::NotExpired { expires_ns: 1 }, "not_expired"),
+            (
+                PurgeRefusal::BelowMinCopies {
+                    verified: 0,
+                    required: 1,
+                },
+                "below_min_copies",
+            ),
+            (PurgeRefusal::JournalUnavailable, "journal_unavailable"),
+            (
+                PurgeRefusal::WrongStore {
+                    recording: 1,
+                    store: 2,
+                },
+                "wrong_store",
+            ),
+            (
+                PurgeRefusal::NotAWriteStart { before: 1 },
+                "not_a_write_start",
+            ),
+            (
+                PurgeRefusal::NotSealed {
+                    before: 1,
+                    sealed: 0,
+                },
+                "not_sealed",
+            ),
+            (PurgeRefusal::DuplicateId { id: 1 }, "duplicate_id"),
+            (PurgeRefusal::ManualOnly, "manual_only"),
+            (
+                PurgeRefusal::SplitsSeal {
+                    before: 1,
+                    counter: 0,
+                },
+                "splits_seal",
+            ),
+        ];
+        for (refusal, name) in purges {
+            assert_eq!(refusal.name(), name);
+        }
+        let releases = [
+            (ReleaseError::NoEvidence { recording: 1 }, "no_evidence"),
+            (ReleaseError::JournalUnavailable, "journal_unavailable"),
+            (ReleaseError::Unknown, "holds_unknown"),
+            (ReleaseError::Unconfirmed { recording: 1 }, "unconfirmed"),
+        ];
+        for (error, name) in releases {
+            assert_eq!(error.name(), name);
+        }
+    }
+
+    #[test]
+    fn reason_bits_follow_the_verifier_order() {
+        let reasons = [
+            Reason::UntrustedEvidence,
+            Reason::UnknownKey,
+            Reason::UnknownAlgorithm,
+            Reason::MalformedEvidence,
+            Reason::MissingEvidence,
+            Reason::ConflictingAnchors,
+            Reason::Corruption,
+            Reason::ShortenedIndex,
+            Reason::UnauthenticatedPurge,
+            Reason::NoAnchor,
+        ];
+        let mut all = 0;
+        for (bit, reason) in reasons.into_iter().enumerate() {
+            assert_eq!(reason_bit(reason), 1 << bit, "{}", reason.name());
+            all |= reason_bit(reason);
+        }
+        assert_eq!(all, control::RANGE_REASONS);
+    }
+}
