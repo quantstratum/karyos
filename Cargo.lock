@@ -643,6 +643,7 @@ dependencies = [
  "karyos-sys",
  "karyos-trace",
  "proptest",
+ "signal-hook",
  "thiserror",
 ]
 

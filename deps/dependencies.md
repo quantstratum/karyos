@@ -18,7 +18,7 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `loom` | 0.7.2 | crates.io | default features off | model checking, only under `--cfg loom` | all | MIT | ADR-0033 (`loom`, dev only) |
 | `proptest` | 1.11.0 | crates.io | default features off; `std` | dev-dependency of `karyos-sys`, `karyos-protocol`, `karyos-io`, `karyos-archive`, `karyos-tools` and `karyos-agent` (tests only; `karyos-agent` for the properties of the join request parser, the join registry and the exporter's HTTP head parser, untrusted-input parsers under ADR-0062, karyos#893, coordinator approved 2026-10-30, ACS 37404; `karyos-tools` for the properties of the compat JSON reader, an untrusted-input parser under ADR-0062, karyos#732, coordinator approved 2026-10-29, ACS 37060; `karyos-archive` for the segment store's crash-point properties of A2, quantstratum-docs: karyos/design/archive-gap-analysis.md, coordinator approved 2026-10-17, ACS 16727; `karyos-protocol` added for the layout properties of issue #10, coordinator approved 2026-10-15; `karyos-io` for the backend slot, queue and report properties of P2.3, quantstratum-docs: karyos/design/sockets-backend.md section 12, coordinator approved 2026-10-16, ACS 14546) | all | MIT OR Apache-2.0 | ADR-0033 (`proptest`, dev only); owner confirmed phase 1 on 2026-10-15 (Q25, issue #40) |
 | `criterion` | 0.7.0 (pinned `=0.7.0`) | crates.io | default features off; `cargo_bench_support` | microbenchmarks only, dev-dependency of `karyos-bench` | all | Apache-2.0 OR MIT | owner approved 2026-10-15 (Q25, issue #12); exact resolution 0.7.0 under ADR-0033, coordinator decision 2026-10-15 (ACS 13315) |
-| `signal-hook` | 0.4.5 | crates.io | default features off (no `channel`, `iterator` or `extended-siginfo`); only the safe `signal_hook::flag::register` is used | runtime, `karyos-tools` only (the `karyosd` binary: `SIGTERM` and `SIGINT` set a flag) | all | MIT OR Apache-2.0 | owner decision ACS 13810 (2026-10-16), under ADR-0033 |
+| `signal-hook` | 0.4.5 | crates.io | default features off (no `channel`, `iterator` or `extended-siginfo`); only the safe `signal_hook::flag::register` is used | runtime, `karyos-tools` (the `karyosd` binary: `SIGTERM` and `SIGINT` set a flag) and `karyos-agent` (the `karyos-agent` binary's bounded clean stop, karyos#710); a package edge, so `karyos-agent`'s library graph has it too, though no library code calls it | all | MIT OR Apache-2.0 | owner decision ACS 13810 (2026-10-16), under ADR-0033; widened to `karyos-agent` by owner decision ACS 71206 (2026-11-12) on quantstratum-docs `karyos/reviews/dependency-admission-signal-hook-agent.md` |
 | `tracing` | 0.1.44 | crates.io | default features off (no `std` request, no `attributes` proc macro) | runtime, `karyos-tools` only (control-path logs of `karyosd`, SPEC.md §11) | all | MIT | owner approved phase 1 on 2026-10-15 (Q25, ACS 11869, issue #40); exact resolution owner decision ACS 13810 (2026-10-16), under ADR-0033 |
 | `tracing-subscriber` | 0.3.23 | crates.io | default features off; `fmt`, `std` (no `ansi`, `env-filter`, `regex`, `tracing-log`, `smallvec`) | runtime, `karyos-tools` only (the subscriber the `karyosd` binary installs; no library installs one) | all | MIT | owner decision ACS 13810 (2026-10-16), under ADR-0033 |
 | `serde` | 1.0.229 | crates.io | default features off; `std`, `derive` | runtime, `karyos-tools` (the `karyosd` configuration file, R-CORE-43; re-exported by `karyos_tools::config`); `karyos-control` (the token header, claims and key set, the JWT verification and JWKS retrieval records (quantstratum-docs: karyos/reviews/dependency-admission-jwt-verification.md, dependency-admission-jwks-retrieval.md), owner decision on quantstratum-docs#899 with the Codex half ACS 77226, 2026-11-18) | all | MIT OR Apache-2.0 | ADR-0033 (`serde`, `toml`: Configuration, tools); exact resolution under ADR-0033, coordinator decision 2026-10-29 (ACS 35711); the JWT verification record for `karyos-control` |
@@ -117,8 +117,12 @@ build script compiles C with `cc` on every build. A move to 0.8 or later
 therefore needs a deliberate change and a fresh check of this rule.
 
 `signal-hook`, `tracing` and `tracing-subscriber` are dependencies of
-`karyos-tools` only, so they reach the operational binaries and no library
-crate (owner decision ACS 13810, 2026-10-16). Their transitive runtime
+`karyos-tools`, so they reach the operational binaries (owner decision ACS
+13810, 2026-10-16). `signal-hook` is also a dependency of the
+`karyos-agent` package (owner item 55, ACS 71206): Cargo has no
+binary-only dependency, so `karyos-agent`'s library graph gains
+`signal-hook`, `signal-hook-registry`, `libc` and `errno`, though only its
+binary registers a flag; nothing depends on `karyos-agent`. Their transitive runtime
 crates, all admitted under the same decision and ADR-0033, are:
 `signal-hook-registry` 1.4.8 (MIT OR Apache-2.0), `libc` 0.2.190 (MIT OR
 Apache-2.0) and `errno` 0.3.14 (MIT OR Apache-2.0) under `signal-hook`;
@@ -318,9 +322,10 @@ rather than repeated here.
 
 On x86_64 and aarch64 Linux `rustix` uses its `linux_raw` backend: system
 calls through Rust inline assembly and the pure-Rust `linux-raw-sys`
-bindings, with no `libc`. The `karyosd` binary links `libc` through
-`signal-hook-registry`, which installs the `sigaction` handler; no library
-crate does. Its `libc` backend (`errno`, `libc`) is selected
+bindings, with no `libc`. The `karyosd` and `karyos-agent` binaries link
+`libc` through `signal-hook-registry`, which installs the `sigaction`
+handler; no library code installs one, and `karyos-agent`'s library has
+the edge only as a package dependency. Its `libc` backend (`errno`, `libc`) is selected
 only by `--cfg rustix_use_libc`, which Karyos never sets, or under Miri.
 
 Effective target conditions that exclude packages from the supported
