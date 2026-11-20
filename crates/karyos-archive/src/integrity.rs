@@ -66,6 +66,8 @@ pub mod verify;
 #[cfg(test)]
 mod anchor_tests;
 #[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
 mod replication_tests;
 #[cfg(test)]
 mod retention_tests;
