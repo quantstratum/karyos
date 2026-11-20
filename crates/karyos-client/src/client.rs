@@ -2733,7 +2733,7 @@ impl<T: TermBytes> Images<T> {
             let mut declined = false;
             image
                 .poll_taking(
-                    |bytes, mut info: MessageInfo| {
+                    |bytes: &[u8], mut info: MessageInfo| {
                         info.image = Some(registration);
                         let taken = handler(bytes, info);
                         declined = !taken;

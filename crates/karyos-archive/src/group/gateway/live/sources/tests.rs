@@ -2028,7 +2028,7 @@ impl MessageSource for Aliased {
             let index = (self.next + offset) % count;
             let registration = self.registrations[index];
             let summary = self.images[index].poll_taking(
-                &mut |bytes, mut info: MessageInfo| {
+                &mut |bytes: &[u8], mut info: MessageInfo| {
                     info.image = Some(registration);
                     handler(bytes, info)
                 },
