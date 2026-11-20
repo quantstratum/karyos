@@ -313,3 +313,53 @@ fn the_retention_kinds_keep_the_existing_codes() {
     }
     assert_eq!(Kind::from_code(17), None);
 }
+
+/// karyos#985: each durable append seals the recording to its durable end,
+/// across a restart, and the sealed bytes verify against their seals.
+#[test]
+fn durable_appends_are_sealed_and_verify() {
+    use karyos_archive::integrity::journal::read_records;
+    use karyos_archive::integrity::{SealKind, verify_chain, verify_range};
+    use karyos_archive::segment::{SegmentStore, SyncPolicy};
+
+    let dir = dir("sealed");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    let recording = journal.recording();
+    let _ = journal
+        .append_durable(&request(Kind::CloseRequest, 11, 3), 11)
+        .unwrap();
+    journal.stop(12).unwrap();
+    assert_eq!(journal.failed_seals(), 0);
+    drop(journal);
+    let mut journal = Journal::open(&dir, 20).unwrap();
+    let _ = journal
+        .append_durable(&request(Kind::ReopenRequest, 21, 3), 21)
+        .unwrap();
+    assert_eq!(journal.failed_seals(), 0);
+    drop(journal);
+
+    let (records, fault) = read_records(&mut StdDisk, &dir).unwrap();
+    assert_eq!(fault, None);
+    verify_chain(&records).unwrap();
+    let ranges: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind == SealKind::OpenSegment && record.subject == recording)
+        .collect();
+    assert!(ranges.len() >= 4, "{ranges:?}");
+    assert_eq!(ranges[0].start, 0);
+    let mut store = SegmentStore::recover(
+        StdDisk,
+        &dir,
+        recording,
+        karyos_archive::segment::Geometry::with_default_length(TERM_LENGTH).unwrap(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap()
+    .store;
+    assert_eq!(ranges.last().unwrap().end, store.written());
+    for range in ranges {
+        let mut bytes = vec![0u8; usize::try_from(range.end - range.start).unwrap()];
+        store.read(range.start, &mut bytes).unwrap();
+        verify_range(range, &bytes).unwrap();
+    }
+}

@@ -27,6 +27,13 @@
 //!   record's time to now. The latest unknown interval stays open
 //!   ([`Journal::gap`]), across restarts, until an administrator
 //!   acknowledges it with a [`Kind::GapAcknowledged`] record naming it.
+//! - **Sealing** (A10; karyos#985). The integrity journal lives in the
+//!   operations journal's own directory, in this process: each durable
+//!   append seals the recording up to its durable end
+//!   ([`IntegrityJournal::seal_segment`]), so `karyos-catalog verify` of
+//!   the directory reports its ranges. A seal that fails stops the sealing
+//!   until the agent restarts, and counts in [`Journal::failed_seals`]; the
+//!   journal itself goes on, its later ranges shown unsealed.
 
 #[cfg(test)]
 mod tests;
@@ -37,6 +44,7 @@ use karyos_archive::catalog::{
     Catalog, CatalogError, NewRecording, SourceIncarnation, StreamFormat,
 };
 use karyos_archive::disk::StdDisk;
+use karyos_archive::integrity::journal::IntegrityJournal;
 use karyos_archive::queue::{QueueConfig, QueueError, QueueSource};
 use karyos_archive::recorder::{Mode, Recorder, RecorderError};
 use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
@@ -401,6 +409,12 @@ pub struct Journal {
     /// Host time of the first failed append.
     failed_at: Option<u64>,
     gap: Option<Gap>,
+    /// The integrity journal sealing the recording; `None` once a seal
+    /// failed.
+    integrity: Option<IntegrityJournal<StdDisk>>,
+    failed_seals: u64,
+    /// The bytes of one seal, reused.
+    seal_buf: Vec<u8>,
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
@@ -449,12 +463,20 @@ impl Journal {
         )?;
         let buffer = usize::try_from(TERM_LENGTH).map_err(|_| QueueError::Exhausted)?;
         let recorder = Recorder::new(store, source, Mode::Required, buffer, MAX_QUEUED)?;
+        // An integrity journal that cannot be opened leaves the journal
+        // unsealed, counted, never unavailable.
+        let integrity = IntegrityJournal::open(StdDisk, dir)
+            .ok()
+            .map(|opened| opened.journal);
         let mut journal = Self {
             recorder: Some(recorder),
             recording,
             failed_appends: 0,
             failed_at: None,
             gap: scan.gap,
+            failed_seals: u64::from(integrity.is_none()),
+            integrity,
+            seal_buf: Vec::new(),
             #[cfg(test)]
             scanned: scan.all.clone(),
         };
@@ -505,6 +527,14 @@ impl Journal {
     #[must_use]
     pub const fn failed_at(&self) -> Option<u64> {
         self.failed_at
+    }
+
+    /// Seals that failed (or an integrity journal that could not be
+    /// opened) since the agent started: the journal's later ranges are
+    /// unsealed.
+    #[must_use]
+    pub const fn failed_seals(&self) -> u64 {
+        self.failed_seals
     }
 
     /// Whether an append failed: the journal then refuses every append.
@@ -612,8 +642,38 @@ impl Journal {
         if result.is_err() {
             self.recorder = None;
             self.count_failure(now);
+        } else if durable {
+            self.seal();
         }
         result
+    }
+
+    /// Seals the recording from where its seals end to its durable end.
+    fn seal(&mut self) {
+        let (Some(recorder), Some(integrity)) = (self.recorder.as_mut(), self.integrity.as_mut())
+        else {
+            return;
+        };
+        let start = integrity
+            .sealed_end(self.recording)
+            .unwrap_or(recorder.store().start());
+        let end = recorder.store().durable();
+        let sealed = (|| {
+            if end <= start {
+                return Ok(());
+            }
+            let length = usize::try_from(end.saturating_sub(start)).map_err(|_| ())?;
+            self.seal_buf.resize(length, 0);
+            recorder.read(start, &mut self.seal_buf).map_err(|_| ())?;
+            integrity
+                .seal_segment(self.recording, start, &self.seal_buf, false)
+                .map(|_| ())
+                .map_err(|_| ())
+        })();
+        if sealed.is_err() {
+            self.integrity = None;
+            self.failed_seals = self.failed_seals.saturating_add(1);
+        }
     }
 
     /// Records the agent's clean stop, durably, as its last record: the
