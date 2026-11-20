@@ -260,8 +260,23 @@ impl ImmutableAttribute {
     /// change the attribute (`CAP_LINUX_IMMUTABLE`), and
     /// [`std::io::ErrorKind::Unsupported`] when the file system has none.
     pub fn release(&mut self, path: &Path) -> std::io::Result<()> {
+        clear_attribute(path)
+    }
+}
+
+/// Clears `path`'s immutable attribute: `Ok` only when it is clear now.
+#[cfg(target_os = "linux")]
+fn clear_attribute(path: &Path) -> std::io::Result<()> {
+    released(karyos_sys::fs::set_immutable(path, false).map_err(std::io::Error::other)?)
+}
+
+/// What a clearing outcome means for the inherent release: only a clear
+/// attribute is a release.
+#[cfg(target_os = "linux")]
+fn released(outcome: karyos_sys::fs::Immutability) -> std::io::Result<()> {
+    {
         use std::io::{Error, ErrorKind};
-        match karyos_sys::fs::set_immutable(path, false).map_err(Error::other)? {
+        match outcome {
             karyos_sys::fs::Immutability::Applied => Ok(()),
             karyos_sys::fs::Immutability::NotPermitted => Err(Error::new(
                 ErrorKind::PermissionDenied,
@@ -294,7 +309,16 @@ impl ImmutabilityBackend for ImmutableAttribute {
     /// system with no attribute has nothing to release: its segments were
     /// recorded [`Enforcement::Unsupported`], and a purge goes on.
     fn release(&mut self, path: &Path) -> std::io::Result<()> {
-        match Self::release(self, path) {
+        backend_released(clear_attribute(path))
+    }
+}
+
+/// What the inherent release's result means for the backend: a file
+/// system with no attribute has nothing to release.
+#[cfg(target_os = "linux")]
+fn backend_released(result: std::io::Result<()>) -> std::io::Result<()> {
+    {
+        match result {
             Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
             other => other,
         }
@@ -572,29 +596,49 @@ mod immutable_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// karyos#958 review P2: a release succeeds only when the attribute
-    /// was cleared; a refusal (no permission, or no such attribute) is a
-    /// typed error, never a release.
+    /// karyos#958 review P2, made deterministic (karyos#1094): a release
+    /// succeeds only when the attribute is clear; a refusal (no permission,
+    /// or no such attribute) is a typed error, never a release. The
+    /// backend's release treats a file system with no attribute as having
+    /// nothing to release. Every outcome is checked without the file
+    /// system, whose support differs between hosts and containers.
     #[test]
     fn a_release_that_clears_nothing_is_an_error() {
+        use karyos_sys::fs::Immutability;
+        use std::io::ErrorKind;
+        assert!(released(Immutability::Applied).is_ok());
+        assert_eq!(
+            released(Immutability::NotPermitted).unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            released(Immutability::Unsupported).unwrap_err().kind(),
+            ErrorKind::Unsupported
+        );
+        assert!(backend_released(released(Immutability::Applied)).is_ok());
+        assert!(backend_released(released(Immutability::Unsupported)).is_ok());
+        assert_eq!(
+            backend_released(released(Immutability::NotPermitted))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PermissionDenied
+        );
+    }
+
+    /// On whatever file system the test runs, a release that succeeds
+    /// leaves the attribute clear.
+    #[test]
+    fn a_successful_release_leaves_the_attribute_clear() {
         let dir = std::env::temp_dir().join(format!("karyos-copies-rel-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sealed.seg");
         std::fs::write(&path, b"sealed").unwrap();
-        let direct = karyos_sys::fs::set_immutable(&path, false).unwrap();
-        let released = ImmutableAttribute.release(&path);
-        match direct {
-            karyos_sys::fs::Immutability::Applied => released.unwrap(),
-            karyos_sys::fs::Immutability::NotPermitted => assert_eq!(
-                released.unwrap_err().kind(),
-                std::io::ErrorKind::PermissionDenied
-            ),
-            karyos_sys::fs::Immutability::Unsupported => assert_eq!(
-                released.unwrap_err().kind(),
-                std::io::ErrorKind::Unsupported
-            ),
-            _ => assert!(released.is_err()),
+        if ImmutableAttribute::release(&mut ImmutableAttribute, &path).is_ok() {
+            assert_eq!(
+                karyos_sys::fs::set_immutable(&path, false).unwrap(),
+                karyos_sys::fs::Immutability::Applied
+            );
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
