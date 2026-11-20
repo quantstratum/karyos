@@ -420,6 +420,7 @@ mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::indexing_slicing,
+        clippy::panic,
         reason = "tests, as ADR-0007 allows"
     )]
 
@@ -444,7 +445,39 @@ mod tests {
         );
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        settle(&path);
         path
+    }
+
+    /// Waits until `path`, just written, can be executed (karyos#1063).
+    /// A test thread that forks while another holds the file open for
+    /// writing gives its child a copy of that descriptor until the child
+    /// execs, and an exec of the file meanwhile fails with `ETXTBSY`. The
+    /// probe runs the program with the argument `probe`, which every test
+    /// program answers by exiting at once.
+    fn settle(path: &std::path::Path) {
+        let start = Instant::now();
+        loop {
+            match Command::new(path)
+                .arg("probe")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                    return;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && start.elapsed() < Duration::from_secs(10) =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("{} does not run: {error}", path.display()),
+            }
+        }
     }
 
     fn dir(name: &str) -> PathBuf {
@@ -497,8 +530,13 @@ mod tests {
     fn script(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$1\" = probe ] && exit 0\n{body}\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        settle(&path);
         path
     }
 
