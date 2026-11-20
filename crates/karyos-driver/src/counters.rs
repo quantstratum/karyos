@@ -28,6 +28,8 @@
 //! | `clients faulty` | event | clients retired for a protocol violation, at the first retirement |
 //! | `fetches abandoned at leave` | event | remote clients that left with a fetch outstanding (one it abandoned, or exports not detached): a clean leave, their exports charged until the exit proof (karyos#851) |
 //! | `trace point ids exhausted` | event | trace point registrations refused because the instance assigned every id (R-CORE-1, karyos#722) |
+//! | `trace points per client` | gauge | the configured `max_trace_points_per_client`, set at creation (karyos#868) |
+//! | `trace point registrations per client` | gauge | the configured `max_trace_point_registrations_per_client`, set at creation (karyos#868) |
 //! | `commands served` | event | commands decoded and executed or refused; malformed records are not commands |
 //! | `commands refused` | event | served commands answered with an `Error` |
 //! | `responses sent` | event | responses written to the broadcast buffer |
@@ -164,7 +166,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 75] = [
+const LABELS: [(u64, &str); 77] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -240,6 +242,8 @@ const LABELS: [(u64, &str); 75] = [
     (TYPE_EVENTS, "clients closed before their exit"),
     (TYPE_EVENTS, "fetches abandoned at leave"),
     (TYPE_EVENTS, "trace point ids exhausted"),
+    (TYPE_GAUGE, "trace points per client"),
+    (TYPE_GAUGE, "trace point registrations per client"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -479,6 +483,14 @@ pub(crate) enum Event {
     /// the instance assigned every id, which is never reused (R-CORE-1,
     /// karyos#722). Last, so no other counter's id moves.
     TracePointIdsExhausted,
+    /// The driver's configured `max_trace_points_per_client`, set at
+    /// creation, so a tool reports the bound this driver enforces
+    /// (karyos#868). After the earlier counters, so none of their ids
+    /// moves.
+    TracePointsPerClient,
+    /// The driver's configured `max_trace_point_registrations_per_client`,
+    /// set at creation (karyos#868).
+    TracePointRegistrationsPerClient,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -785,6 +797,11 @@ mod tests {
             ),
             (Event::FetchesAbandonedAtLeave, "fetches abandoned at leave"),
             (Event::TracePointIdsExhausted, "trace point ids exhausted"),
+            (Event::TracePointsPerClient, "trace points per client"),
+            (
+                Event::TracePointRegistrationsPerClient,
+                "trace point registrations per client",
+            ),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

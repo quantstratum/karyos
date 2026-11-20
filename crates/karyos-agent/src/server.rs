@@ -87,6 +87,10 @@
 //!   future dimension, such as the page
 //!   sizes of R-CORE-13 and R-CORE-14, enters [`LIMITS`] as a new entry,
 //!   negotiable or not, and a v1 client that does not name it is unaffected.
+//!   `trace.points_per_client` and `trace.point_registrations_per_client`
+//!   are the attached drivers' configured bounds ([`Agent::limits`];
+//!   karyos#868), the smallest over several, and the driver's defaults
+//!   when no attached driver publishes them.
 
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -805,15 +809,18 @@ impl Server {
                     forbidden()
                 }
             }
-            (Some(_), Request::Limits { proposals }) => match negotiate(&LIMITS, proposals) {
-                Ok(effective) => match request_within(&line, &LIMITS, &effective) {
-                    None => (json::limits(&LIMITS, &effective), Served::Limits),
-                    Some(limit) => (json::above_bound(&limit), Served::Refused),
-                },
-                Err(Refusal::Above(limit)) => (json::above_bound(&limit), Served::Refused),
-                Err(Refusal::Unknown(name)) => (json::unknown_dimension(name), Served::Refused),
-                Err(Refusal::Bad) => (json::error("bad request", None), Served::Refused),
-            },
+            (Some(_), Request::Limits { proposals }) => {
+                let limits = agent.limits();
+                match negotiate(&limits, proposals) {
+                    Ok(effective) => match request_within(&line, &limits, &effective) {
+                        None => (json::limits(&limits, &effective), Served::Limits),
+                        Some(limit) => (json::above_bound(&limit), Served::Refused),
+                    },
+                    Err(Refusal::Above(limit)) => (json::above_bound(&limit), Served::Refused),
+                    Err(Refusal::Unknown(name)) => (json::unknown_dimension(name), Served::Refused),
+                    Err(Refusal::Bad) => (json::error("bad request", None), Served::Refused),
+                }
+            }
             (
                 Some(_),
                 Request::TraceBuckets {

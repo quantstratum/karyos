@@ -1640,6 +1640,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let spin_word = Arc::new(std::sync::atomic::AtomicU64::new(0));
         counters.set(Event::DriverPid, u64::from(std::process::id()));
         counters.set(
+            Event::TracePointsPerClient,
+            u64::try_from(config.max_trace_points_per_client).unwrap_or(u64::MAX),
+        );
+        counters.set(
+            Event::TracePointRegistrationsPerClient,
+            u64::try_from(config.max_trace_point_registrations_per_client).unwrap_or(u64::MAX),
+        );
+        counters.set(
             Event::DriverStartedAt,
             karyos_sys::host_clock::host_monotonic_ns(),
         );
