@@ -1674,7 +1674,8 @@ fn run<D>(
     outbox: &Outbox,
     ready: &SyncSender<Result<(), AgentError>>,
 ) where
-    D: Disk + Clone,
+    D: Disk + Clone + Send + 'static,
+    D::File: Send,
 {
     let epoch = Instant::now();
     let now = || u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
@@ -1790,6 +1791,7 @@ fn run<D>(
         group_seals: std::collections::BTreeMap::new(),
         integrity,
         retention,
+        verifying: Arc::default(),
     };
     loop {
         let mut worked = false;
@@ -1850,6 +1852,8 @@ struct State<D: Disk> {
     integrity: Option<Integrity<D>>,
     /// The retention engine (ADR-0088; karyos#967).
     retention: retention::Engine<D>,
+    /// A verification runs on its worker (karyos#1111).
+    verifying: Arc<std::sync::atomic::AtomicBool>,
     /// The integrity journal of each group journal directory, which seals
     /// its groups' journals (karyos#1088); a directory whose journal
     /// failed holds `None` and is not sealed again until restart.
@@ -2421,7 +2425,10 @@ fn fail_recording<D: Disk>(
     }
 }
 
-impl<D: Disk + Clone> State<D> {
+impl<D: Disk + Clone + Send + 'static> State<D>
+where
+    D::File: Send,
+{
     /// Each recording's duty; those that end or fail leave the set.
     /// Returns whether any moved.
     /// Chains the catalog's changes and seals what is due (A10). A
@@ -2692,9 +2699,7 @@ impl<D: Disk + Clone> State<D> {
             Command::Retain(request, reply) => {
                 let _ = reply.send(Ok(self.retain(request)));
             }
-            Command::Verify(id, reply) => {
-                let _ = reply.send(Ok(self.verify(id)));
-            }
+            Command::Verify(id, reply) => self.verify(id, reply),
             Command::Shutdown(reply) => {
                 let groups = std::mem::take(&mut self.groups);
                 for group in groups {

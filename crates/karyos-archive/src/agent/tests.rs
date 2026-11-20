@@ -4277,3 +4277,132 @@ fn a_local_copy_claims_the_attribute_only_when_every_file_took_it() {
         Enforcement::Unsupported
     );
 }
+
+/// A disk whose reads on the verification worker's thread wait while its
+/// gate is shut (karyos#1111): every other thread reads at once.
+#[derive(Clone)]
+struct GatedVerify(Arc<AtomicBool>);
+
+impl GatedVerify {
+    fn wait(&self) {
+        let on_worker = std::thread::current().name() == Some(super::retention::VERIFY_THREAD);
+        while on_worker && self.0.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+impl Disk for GatedVerify {
+    type File = std::fs::File;
+
+    fn create(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        StdDisk.create(path)
+    }
+
+    fn create_new(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        StdDisk.create_new(path)
+    }
+
+    fn open(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        StdDisk.open(path)
+    }
+
+    fn open_read(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        StdDisk.open_read(path)
+    }
+
+    fn write_at(&mut self, file: &Self::File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        StdDisk.write_at(file, offset, bytes)
+    }
+
+    fn read_at(&mut self, file: &Self::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.wait();
+        StdDisk.read_at(file, offset, buf)
+    }
+
+    fn len(&mut self, file: &Self::File) -> std::io::Result<u64> {
+        StdDisk.len(file)
+    }
+
+    fn set_len(&mut self, file: &Self::File, len: u64) -> std::io::Result<()> {
+        StdDisk.set_len(file, len)
+    }
+
+    fn sync(&mut self, file: &Self::File) -> std::io::Result<()> {
+        StdDisk.sync(file)
+    }
+
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        StdDisk.sync_dir(dir)
+    }
+
+    fn list(&mut self, dir: &Path) -> std::io::Result<Vec<String>> {
+        StdDisk.list(dir)
+    }
+
+    fn remove(&mut self, path: &Path) -> std::io::Result<()> {
+        StdDisk.remove(path)
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        StdDisk.rename(from, to)
+    }
+
+    fn lock(&mut self, file: &Self::File) -> std::io::Result<()> {
+        StdDisk.lock(file)
+    }
+}
+
+/// karyos#1111: a verification runs off the agent's thread. While its
+/// worker's reads are held, a replay of the same recording runs to its
+/// end and a second verification is refused to retry; once released, the
+/// verification answers the recording's sealed ranges.
+#[test]
+fn a_verification_never_holds_a_replay() {
+    let dir = temp_dir("verify-worker");
+    let gate = Arc::new(AtomicBool::new(true));
+    let agent = ArchiveHandle::spawn(GatedVerify(Arc::clone(&gate)), &dir, sealing()).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    let verify = agent.post_verify(id).unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Seen::default()));
+    let replay = agent.replay(replay_of(id, end, Sink::new(&seen))).unwrap();
+    assert_eq!(
+        replay_ended(&agent),
+        ReplayEnded {
+            id: replay,
+            position: end,
+            outcome: ReplayOutcome::Complete
+        }
+    );
+    assert_eq!(seen.lock().unwrap().bytes, all);
+    assert!(verify.try_answer().is_none(), "the verification is held");
+    let second = agent.post_verify(id).unwrap();
+    let mut refused = None;
+    for _ in 0..5000 {
+        refused = second.try_answer();
+        if refused.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(matches!(
+        refused,
+        Some(Ok(Err(crate::server::RetentionAnswer::Error(_))))
+    ));
+    gate.store(false, Ordering::Release);
+    let mut verified = None;
+    for _ in 0..5000 {
+        verified = verify.try_answer();
+        if verified.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let ranges = verified.unwrap().unwrap().unwrap();
+    assert!(!ranges.is_empty());
+    assert_eq!(ranges.first().unwrap().start, 0);
+    assert_eq!(ranges.last().unwrap().end, end);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

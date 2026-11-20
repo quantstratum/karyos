@@ -34,7 +34,7 @@ use crate::integrity::verify::{self, Evidence, Outcome, RangeBytes, Reason};
 use crate::segment::{SegmentStore, SyncPolicy};
 use crate::server::RetentionAnswer;
 
-use super::{Active, State, read_store};
+use super::{State, read_store};
 
 /// The agent's retention engine: the operations journal as its journal.
 pub(super) type Engine<D> = Retention<Ledger<D, OPERATION_LENGTH>, D>;
@@ -177,9 +177,52 @@ impl<D: Disk + Clone> State<D> {
         }
     }
 
-    /// Verifies `id`'s seals: every range of the recording the verifier
-    /// reports, sealed ranges in chain order, then its unsealed tail.
-    pub(super) fn verify(&mut self, id: u64) -> Verified {
+    /// Verifies `id`'s seals off the agent's thread (karyos#1111): the
+    /// evidence is gathered here, then a worker reads the sealed ranges
+    /// through a read-only view of the recording's store and answers
+    /// `reply` itself, so a long verification never holds the recorders
+    /// or the replays. One verification runs at a time; another is
+    /// answered with an error to retry.
+    pub(super) fn verify(&mut self, id: u64, reply: super::Reply<Verified>)
+    where
+        D: Send + 'static,
+        D::File: Send,
+    {
+        let gathered = self.gather(id);
+        let work = match gathered {
+            Ok(work) => work,
+            Err(answer) => {
+                let _ = reply.send(Ok(Err(answer)));
+                return;
+            }
+        };
+        if self
+            .verifying
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let _ = reply.send(Ok(Err(RetentionAnswer::Error(
+                "a verification runs; retry once it answers".to_owned(),
+            ))));
+            return;
+        }
+        let verifying = std::sync::Arc::clone(&self.verifying);
+        let (worker_reply, answer) = (reply.clone(), reply);
+        let spawned = std::thread::Builder::new()
+            .name(VERIFY_THREAD.to_owned())
+            .spawn(move || {
+                let verified = work.run();
+                verifying.store(false, std::sync::atomic::Ordering::Release);
+                let _ = worker_reply.send(Ok(verified));
+            });
+        if let Err(error) = spawned {
+            self.verifying
+                .store(false, std::sync::atomic::Ordering::Release);
+            let _ = answer.send(Ok(Err(RetentionAnswer::Error(error.to_string()))));
+        }
+    }
+
+    /// The evidence of a verification of `id`, read on the agent's thread.
+    fn gather(&mut self, id: u64) -> Result<Verification<D>, RetentionAnswer> {
         let Some(recording) = self.catalog.get(id).cloned() else {
             return Err(RetentionAnswer::UnknownRecording);
         };
@@ -208,37 +251,70 @@ impl<D: Disk + Clone> State<D> {
         } else {
             Vec::new()
         };
-        let mut stopped = if self.active.iter().any(|active| active.id == id) {
-            None
-        } else {
-            open_stopped(&self.disk, &self.dir, &recording)?
-        };
+        Ok(Verification {
+            disk: self.disk.clone(),
+            dir: self.dir.clone(),
+            recording,
+            end,
+            records,
+            trust,
+            journal_id,
+            heads,
+            registry,
+        })
+    }
+}
+
+/// The name of the verification worker's thread.
+pub(super) const VERIFY_THREAD: &str = "karyos-archive-verify";
+
+/// A verification's evidence, owned, for its worker.
+struct Verification<D: Disk> {
+    disk: D,
+    dir: std::path::PathBuf,
+    recording: Recording,
+    end: u64,
+    records: Vec<crate::integrity::SealRecord>,
+    trust: Option<crate::integrity::trust::TrustRoot>,
+    journal_id: u64,
+    heads: Vec<[u8; crate::integrity::trust::SIGNED_HEAD_LENGTH]>,
+    registry: Vec<[u8; REGISTRY_ENTRY_LENGTH]>,
+}
+
+impl<D: Disk + Clone> Verification<D> {
+    /// Verifies, reading the recording's sealed ranges through a read-only
+    /// view of its store: every range the verifier reports, sealed ranges
+    /// in chain order, then its unsealed tail. A recording that still
+    /// records is read below its seals only, which are durable, so the
+    /// view never reads what its recorder is writing.
+    fn run(self) -> Verified {
+        let id = self.recording.id;
+        let mut store = open_stopped(&self.disk, &self.dir, &self.recording)?;
         let externality = Externality::default();
         let evidence = Evidence {
-            records: &records,
+            records: &self.records,
             journal_fault: None,
-            journal_id,
-            trust: trust.as_ref(),
-            registry: &registry,
-            heads: &heads,
+            journal_id: self.journal_id,
+            trust: self.trust.as_ref(),
+            registry: &self.registry,
+            heads: &self.heads,
             anchors: &[],
             anchor_faults: 0,
             stores: &NoAnchors,
             externality: &externality,
-            written: &[(id, end)],
+            written: &[(id, self.end)],
         };
-        let active = &mut self.active;
         let verification = verify::verify(&evidence, |recording, start, end| {
             // Only this recording's ranges are reported: another's are
             // never read.
             if recording != id {
                 return RangeBytes::Missing;
             }
-            let read = match stopped.as_mut() {
-                Some(store) => read_store(store, start, end),
-                None => read_active(active, id, start, end),
-            };
-            read.map_or(RangeBytes::Missing, RangeBytes::Bytes)
+            store
+                .as_mut()
+                .ok_or_else(|| std::io::Error::other("no segment"))
+                .and_then(|store| read_store(store, start, end))
+                .map_or(RangeBytes::Missing, RangeBytes::Bytes)
         });
         Ok(verification
             .ranges
@@ -247,16 +323,6 @@ impl<D: Disk + Clone> State<D> {
             .map(range)
             .collect())
     }
-}
-
-/// Reads `[start, end)` of active recording `id`.
-fn read_active<D: Disk>(
-    active: &mut [Active<D>],
-    id: u64,
-    start: u64,
-    end: u64,
-) -> std::io::Result<Vec<u8>> {
-    super::read_range(active, id, start, end)
 }
 
 /// Opens a stopped recording's store for reading, changing nothing; `None`
