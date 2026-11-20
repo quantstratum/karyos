@@ -1620,6 +1620,7 @@ fn installed_image_with(
         uncertain_at: [None; 4],
         founding_gone: false,
         control_group: None,
+        path_groups: Vec::new(),
         receiver_id: super::receiver_id(super::SlotRef {
             slot: 0,
             generation: 1,
