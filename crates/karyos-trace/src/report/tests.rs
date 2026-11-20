@@ -94,7 +94,7 @@ fn ranged_agent<C: TraceClock>(
     let publication = PublicationId::from(IDENTITY);
     let id = match subscriber_join {
         None => report.add_publisher(collector, provenance, publication),
-        Some(join) => report.add_subscriber(collector, provenance, publication, join),
+        Some(join) => report.add_subscriber(collector, provenance, publication, Lane::ZERO, join),
     }
     .unwrap();
     (agent, id)
@@ -388,6 +388,7 @@ fn test_trace_an_open_publisher_keeps_the_answer_provisional() {
             collector_sb,
             ClockProvenance::StdMonotonic,
             PublicationId::from(IDENTITY_B),
+            Lane::ZERO,
             0,
         )
         .unwrap();
@@ -471,6 +472,7 @@ fn test_trace_registration_after_a_final_answer_is_refused() {
             collector,
             ClockProvenance::StdMonotonic,
             PublicationId::from(IDENTITY),
+            Lane::ZERO,
             0
         ),
         Err(TraceError::MembershipFrozen)
@@ -619,7 +621,13 @@ fn host_clocks_calibrate_only_within_the_driver_time_namespace() {
             .add_publisher_source(recorded(1, 0, &[publish], CLOSED), publisher, key)
             .unwrap();
         report
-            .add_subscriber_source(recorded(2, 0, &[poll], closed_at(65)), subscriber, key, 0)
+            .add_subscriber_source(
+                recorded(2, 0, &[poll], closed_at(65)),
+                subscriber,
+                key,
+                Lane::ZERO,
+                0,
+            )
             .unwrap();
         report.drain().unwrap();
         assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
@@ -661,7 +669,7 @@ fn a_lost_journal_makes_its_traces_incomplete() {
         )
         .unwrap();
     report
-        .add_subscriber_source(recorded(2, 0, &[], lost), host(true), key, 0)
+        .add_subscriber_source(recorded(2, 0, &[], lost), host(true), key, Lane::ZERO, 0)
         .unwrap();
     report.drain().unwrap();
     assert_eq!(
@@ -683,6 +691,7 @@ fn a_lost_journal_makes_its_traces_incomplete() {
             ),
             host(true),
             key,
+            Lane::ZERO,
             0,
         )
         .unwrap();
@@ -730,6 +739,7 @@ fn observations_below_a_source_start_are_out_of_scope() {
             ),
             host(true),
             key,
+            Lane::ZERO,
             0,
         )
         .unwrap();
@@ -847,6 +857,7 @@ fn an_open_source_keeps_its_traces_provisional() {
             ),
             host(true),
             key,
+            Lane::ZERO,
             0,
         )
         .unwrap();
@@ -875,7 +886,13 @@ fn required_roots_put_rootless_complete_traces_out_of_scope() {
             &[]
         };
         report
-            .add_subscriber_source(recorded(2, 0, polls, closed_at(1)), host(true), key, 0)
+            .add_subscriber_source(
+                recorded(2, 0, polls, closed_at(1)),
+                host(true),
+                key,
+                Lane::ZERO,
+                0,
+            )
             .unwrap();
         if required {
             report.require_roots();
@@ -1000,6 +1017,7 @@ fn network_report(
             recorded(2, 0, &polls, closed_at(1 << 20)),
             host(true),
             key(),
+            Lane::ZERO,
             0,
         )
         .unwrap();
@@ -1170,7 +1188,13 @@ fn a_parking_overflow_puts_the_publication_out_of_scope() {
     // The subscriber was expected for trace 1 and never polled it: final
     // Incomplete. Trace 3 lies past its boundary.
     report
-        .add_subscriber_source(recorded(2, 0, &[], closed_at(65)), host(true), key(), 0)
+        .add_subscriber_source(
+            recorded(2, 0, &[], closed_at(65)),
+            host(true),
+            key(),
+            Lane::ZERO,
+            0,
+        )
         .unwrap();
     // An open sender journal with one fragment more than the area holds,
     // of a message whose Publish never comes.
@@ -1406,6 +1430,7 @@ fn a_poll_first_names_the_message() {
             ),
             host(true),
             key(),
+            Lane::ZERO,
             0,
         )
         .unwrap();
@@ -1559,7 +1584,7 @@ fn a_gap_then_a_later_trace(epoch_after: u64) -> TraceReport {
     }
     polls.attempted = 4;
     report
-        .add_subscriber_source(polls, host(true), key, 0)
+        .add_subscriber_source(polls, host(true), key, Lane::ZERO, 0)
         .unwrap();
     report.drain().unwrap();
     report
@@ -1620,4 +1645,51 @@ fn a_drop_range_overflow_loses_no_attribution() {
             TraceAnswer::Final(Verdict::Incomplete)
         );
     }
+}
+
+/// karyos#992: a subscriber journal is expected only for messages of its
+/// own lane. On a two-lane aggregate, a lane-0 subscriber that polled the
+/// lane-0 message is not expected for the lane-1 message at the same
+/// position, which stays `Complete`; a lane-1 subscriber that polled
+/// nothing leaves the lane-1 message `Incomplete` and lane 0's alone.
+#[test]
+fn a_subscriber_journal_is_expected_only_for_its_lane() {
+    let key = PublicationKey::from(PublicationId::from(IDENTITY));
+    let build = |lane: Lane, polls: &[crate::record::TraceRecord]| {
+        let mut other_lane = observation(Point::Publish, 0, 2, 20);
+        other_lane.lane = 1;
+        let mut report = TraceReport::new(ATTRIBUTION, HISTOGRAM);
+        report
+            .add_publisher_source(
+                recorded(
+                    1,
+                    0,
+                    &[observation(Point::Publish, 0, 1, 10), other_lane],
+                    CLOSED,
+                ),
+                host(true),
+                key,
+            )
+            .unwrap();
+        report
+            .add_subscriber_source(
+                recorded(2, 0, polls, closed_at(65)),
+                host(true),
+                key,
+                lane,
+                0,
+            )
+            .unwrap();
+        report.drain().unwrap();
+        report
+    };
+    let report = build(Lane::ZERO, &[observation(Point::SubscriberPoll, 0, 1, 30)]);
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+    assert_eq!(report.trace([2, 1]), TraceAnswer::Final(Verdict::Complete));
+    let report = build(Lane::try_new(1).unwrap(), &[]);
+    assert_eq!(report.trace([1, 1]), TraceAnswer::Final(Verdict::Complete));
+    assert_eq!(
+        report.trace([2, 1]),
+        TraceAnswer::Final(Verdict::Incomplete)
+    );
 }

@@ -84,6 +84,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use karyos_protocol::frame::Lane;
+
 use crate::attribution::{AttributionConfig, Attributor, Verdict, combine};
 use crate::clocks::{Calibration, ClockKey, Observation, latency};
 use crate::error::TraceError;
@@ -168,8 +170,10 @@ impl From<ClockProvenance> for JournalClock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Publisher,
+    /// A subscriber journal of one lane, expected from `join` on.
     Subscriber {
         join: u64,
+        lane: u8,
     },
     /// A network journal of one lane, expected from `start` on.
     Network {
@@ -248,7 +252,14 @@ impl Journal {
         }
         let from = match self.kind {
             Kind::Publisher => return Some(false),
-            Kind::Subscriber { join } => join,
+            Kind::Subscriber { join, lane: own } => {
+                // A subscriber journal records one lane's deliveries: it is
+                // never expected for another lane's message (karyos#992).
+                if own != lane {
+                    return Some(false);
+                }
+                join
+            }
             Kind::Network {
                 lane: own, start, ..
             } => {
@@ -588,9 +599,9 @@ impl TraceReport {
         self.add_publisher_source(collector, provenance.into(), publication.into())
     }
 
-    /// Registers the journal of a subscription of `publication` that joined
-    /// at stream position `join`, stamped by a clock of `provenance` in
-    /// this process.
+    /// Registers the journal of a subscription of `lane` of `publication`
+    /// that joined at stream position `join`, stamped by a clock of
+    /// `provenance` in this process.
     ///
     /// # Errors
     ///
@@ -600,9 +611,10 @@ impl TraceReport {
         collector: TraceCollector,
         provenance: ClockProvenance,
         publication: PublicationId,
+        lane: Lane,
         join: u64,
     ) -> Result<JournalId, TraceError> {
-        self.add_subscriber_source(collector, provenance.into(), publication.into(), join)
+        self.add_subscriber_source(collector, provenance.into(), publication.into(), lane, join)
     }
 
     /// Registers a publisher journal of `publication` read through
@@ -621,10 +633,11 @@ impl TraceReport {
         self.add(Box::new(source), clock, Kind::Publisher, publication)
     }
 
-    /// Registers a subscriber journal of `publication` that joined at
-    /// stream position `join`, read through `source` and stamped by
-    /// `clock` (T1). Publication and join come from the journal's
-    /// registration, never from its records (T4).
+    /// Registers a subscriber journal of `lane` of `publication` that
+    /// joined at stream position `join`, read through `source` and stamped
+    /// by `clock` (T1). Publication, lane and join come from the journal's
+    /// registration, never from its records (T4). It is expected only for
+    /// messages of its lane (karyos#992).
     ///
     /// # Errors
     ///
@@ -634,12 +647,16 @@ impl TraceReport {
         source: impl JournalSource + 'static,
         clock: JournalClock,
         publication: PublicationKey,
+        lane: Lane,
         join: u64,
     ) -> Result<JournalId, TraceError> {
         self.add(
             Box::new(source),
             clock,
-            Kind::Subscriber { join },
+            Kind::Subscriber {
+                join,
+                lane: lane.get(),
+            },
             publication,
         )
     }

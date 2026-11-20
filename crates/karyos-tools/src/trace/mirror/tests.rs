@@ -6,6 +6,7 @@
 // the driver, so every case runs on every platform. The Linux tests of
 // `tests/karyos_trace.rs` run the same cases against a real driver.
 
+use karyos_protocol::frame::Lane;
 use karyos_protocol::journal::{Append, DropRange, Stamp, Taken, record_journal};
 use karyos_protocol::trace_hook::NetSide;
 use karyos_sys::trace_mirror::{
@@ -345,7 +346,13 @@ fn compare(messages: &[(u64, u64, u64, u64)], publisher: usize, subscriber: usiz
         .add_publisher(publishing.collector.take().unwrap(), host, PUBLICATION)
         .unwrap();
     let sub_id = collected
-        .add_subscriber(polling.collector.take().unwrap(), host, PUBLICATION, 0)
+        .add_subscriber(
+            polling.collector.take().unwrap(),
+            host,
+            PUBLICATION,
+            Lane::ZERO,
+            0,
+        )
         .unwrap();
     collected.closed(pub_id, None);
     collected.closed(sub_id, Some(boundary));
@@ -547,7 +554,13 @@ fn a_mirror_and_a_collector_agree_on_network_journals() {
                 .add_publisher(publishing.collector.take().unwrap(), host, PUBLICATION)
                 .unwrap(),
             collected
-                .add_subscriber(polling.collector.take().unwrap(), host, PUBLICATION, 0)
+                .add_subscriber(
+                    polling.collector.take().unwrap(),
+                    host,
+                    PUBLICATION,
+                    Lane::ZERO,
+                    0,
+                )
                 .unwrap(),
             collected
                 .add_network(

@@ -697,7 +697,13 @@ impl MirrorTool {
                     // A subscriber entry always has its join; without one it
                     // is taken as expected from the stream's start.
                     let join = tracked.entry.join.unwrap_or(0);
-                    report.add_subscriber_source(source, clock, publication, join)?;
+                    report.add_subscriber_source(
+                        source,
+                        clock,
+                        publication,
+                        tracked.entry.lane,
+                        join,
+                    )?;
                 }
                 JournalKind::NetworkSender | JournalKind::NetworkReceiver => {
                     let side = if tracked.entry.kind == JournalKind::NetworkSender {
