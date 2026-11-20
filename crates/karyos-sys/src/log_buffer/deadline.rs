@@ -203,6 +203,28 @@ impl ConcurrentDeadlines {
         self.scan(buffer, &mut scan_now)
     }
 
+    /// A guard close's pass (karyos#1102): [`Self::service_with`] with every
+    /// observation already expired, then the marked blocks and the span
+    /// served again after the scan, so a block the scan observes is aborted
+    /// in this same call. No observation dated by the pass's `u64::MAX`
+    /// clock is left for a later deadline service to read as the clock
+    /// going back (review of #1120); only a span walk cut short by its
+    /// budget remains, and a walk in progress reads no timer again.
+    pub(super) fn abort_all<T: TermBytes>(
+        &mut self,
+        buffer: &LogBuffer<T>,
+        report: &mut DeadlineReport,
+    ) -> Result<(), SysError> {
+        let mut clock = || u64::MAX;
+        self.service_with(buffer, &mut clock, 0, report, &mut || {})?;
+        let mut now = Now {
+            clock: &mut clock,
+            value: None,
+        };
+        self.serve_marked(buffer, &mut now, 0, report)?;
+        self.walk(buffer, &mut now, 0, report)
+    }
+
     /// The stream position of the frontier: every block below it is
     /// terminal.
     pub(super) fn frontier_position<T: TermBytes>(&self, buffer: &LogBuffer<T>) -> u64 {

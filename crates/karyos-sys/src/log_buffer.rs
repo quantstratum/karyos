@@ -4897,8 +4897,9 @@ impl<O: BufferOwner> Conductor<O> {
     /// Aborts a concurrent buffer's outstanding claims now, whatever their
     /// deadlines (a guard close, karyos#1102): one deadline service call in
     /// which every observation is expired at once. Blocks the call's scan
-    /// observes for the first time are aborted by the next call, so a
-    /// caller repeats it while the report's `waiting` is set, as the
+    /// observes for the first time are aborted in the same call; only a
+    /// span walk its budget cut short is left, so a caller repeats it while
+    /// the report's `waiting` is set, as the
     /// exclusive walker repeats [`Conductor::abort_admitted_claim`]. Each
     /// abort is the deadline's compare-exchange against the writer's mark
     /// or commit, so exactly one wins.
@@ -4920,9 +4921,7 @@ impl<O: BufferOwner> Conductor<O> {
             });
         }
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        let result =
-            self.deadlines
-                .service_with(buffer, &mut || u64::MAX, 0, &mut report, &mut || {});
+        let result = self.deadlines.abort_all(buffer, &mut report);
         if result.is_ok() {
             self.release_ended_publishers();
         }
