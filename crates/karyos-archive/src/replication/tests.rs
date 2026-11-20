@@ -331,7 +331,9 @@ mod transport {
         let mut sender =
             Sender::accept(request(0, u64::MAX, Mode::OnDemand), true, 0, &seals).unwrap();
         let mut out = Vec::new();
-        sender.poll(&mut store, &seals, false, &mut out).unwrap();
+        sender
+            .poll(&mut store, &seals, false, usize::MAX, &mut out)
+            .unwrap();
         // Bytes before their seal, in chunks of at most 16 KiB.
         let chunks = out
             .iter()
@@ -360,7 +362,9 @@ mod transport {
         let mut sender =
             Sender::accept(request(0, u64::MAX, Mode::OnDemand), true, 0, &seals).unwrap();
         let mut out = Vec::new();
-        sender.poll(&mut store, &seals, false, &mut out).unwrap();
+        sender
+            .poll(&mut store, &seals, false, usize::MAX, &mut out)
+            .unwrap();
         let (verdicts, _, counted) = deliver(&out, &replica_dir, true, (0, 100));
         assert!(matches!(verdicts[0], Verdict::Corrupt(_)));
         assert_eq!(counted, 0);
@@ -382,7 +386,9 @@ mod transport {
         let mut sender =
             Sender::accept(request(100, 40_100, Mode::Continuous), true, 0, &seals).unwrap();
         let mut out = Vec::new();
-        sender.poll(&mut store, &seals, false, &mut out).unwrap();
+        sender
+            .poll(&mut store, &seals, false, usize::MAX, &mut out)
+            .unwrap();
         assert!(matches!(
             out.first(),
             Some(Outgoing::Bytes { start: 100, .. })
@@ -416,13 +422,107 @@ mod transport {
             Sender::accept(request(0, u64::MAX, Mode::Continuous), true, 0, &seals[..1]).unwrap();
         let mut out = Vec::new();
         sender
-            .poll(&mut store, &seals[..1], false, &mut out)
+            .poll(&mut store, &seals[..1], false, usize::MAX, &mut out)
             .unwrap();
         assert_eq!(sender.done(), None, "continuous keeps going");
         out.clear();
-        sender.poll(&mut store, &seals, true, &mut out).unwrap();
+        sender
+            .poll(&mut store, &seals, true, usize::MAX, &mut out)
+            .unwrap();
         assert!(
             matches!(out.last(), Some(Outgoing::Status(status)) if status.state == State::Ended)
+        );
+    }
+
+    /// A poll sends at most its budget; the rest follows at the next.
+    #[test]
+    fn a_poll_buffers_no_more_than_its_budget() {
+        let (_dirs, source_dir, replica_dir) = dirs("budget");
+        let (mut store, seals) = source(&source_dir);
+        let mut sender =
+            Sender::accept(request(0, u64::MAX, Mode::OnDemand), true, 0, &seals).unwrap();
+        let mut all = Vec::new();
+        let mut polls = 0;
+        while sender.done().is_none() {
+            let mut out = Vec::new();
+            sender
+                .poll(&mut store, &seals, false, MAX_CHUNK, &mut out)
+                .unwrap();
+            let bytes: usize = out
+                .iter()
+                .map(|message| match message {
+                    Outgoing::Bytes { bytes, .. } => bytes.len(),
+                    _ => 0,
+                })
+                .sum();
+            assert!(bytes <= MAX_CHUNK, "{bytes}");
+            all.extend(out);
+            polls += 1;
+            assert!(polls < 100);
+        }
+        assert!(polls >= 3, "{polls}");
+        let (verdicts, status, counted) = deliver(&all, &replica_dir, false, (100, 40_100));
+        assert_eq!(verdicts.len(), 3);
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| matches!(verdict, Verdict::Counted(_)))
+        );
+        assert_eq!(status.unwrap().state, State::CaughtUp);
+        assert_eq!(counted, 1);
+    }
+
+    /// ADR-0094: a purge past the next position interrupts the request,
+    /// whose status names the store's start above the last range sent;
+    /// it decodes, and the same order in another state does not (P-7).
+    #[test]
+    fn an_interrupted_status_names_the_start_after_a_purge() {
+        let interrupted = ReplicationStatus {
+            correlation_id: 7,
+            recording_id: 3,
+            source_start: 8192,
+            sealed_end: 4096,
+            written: 12_288,
+            state: State::Interrupted,
+        };
+        let mut buf = [0u8; 64];
+        let length = interrupted.encode(&mut buf).unwrap();
+        // P-7, as design/archive-replication.md section 5 publishes it.
+        assert_eq!(
+            buf[..length].to_vec(),
+            super::hex(
+                "0600670001002900350000000700000000000000030000000000000000200000000000000010000000000000003000000000000005"
+            )
+        );
+        let mut state_one = super::hex(
+            "0600670001002900350000000700000000000000030000000000000000200000000000000010000000000000003000000000000001",
+        );
+        assert_eq!(
+            ReplicationMessage::decode(&state_one),
+            Err(CodecError::ValueOutOfRange {
+                field: "sealed_end"
+            })
+        );
+        // An unknown state is refused before the order.
+        let last = state_one.len() - 1;
+        state_one[last] = 9;
+        assert!(matches!(
+            ReplicationMessage::decode(&state_one),
+            Err(CodecError::InvalidEnum { field: "state", .. })
+        ));
+        assert_eq!(
+            ReplicationMessage::decode(&buf[..length]).unwrap(),
+            ReplicationMessage::ReplicationStatus(interrupted)
+        );
+        let streaming = ReplicationStatus {
+            state: State::Streaming,
+            ..interrupted
+        };
+        assert_eq!(
+            streaming.encode(&mut buf),
+            Err(CodecError::ValueOutOfRange {
+                field: "sealed_end"
+            })
         );
     }
 }

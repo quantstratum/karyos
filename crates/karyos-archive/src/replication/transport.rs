@@ -116,11 +116,14 @@ impl Sender {
         self.finish(State::Stopped, store, sealed_end)
     }
 
-    /// Sends what is due: for each range seal of the recording that follows
-    /// what was sent, its bytes in chunks then the seal, up to `until`. On
-    /// demand, then a [`State::CaughtUp`] status; when the recording
-    /// `stopped` and everything to its end was sent, [`State::Ended`]; a
-    /// purge past the next position or a gap, [`State::Interrupted`].
+    /// Sends what is due, at most `budget` bytes of recording per call
+    /// (at least one chunk), so nothing is buffered without bound: for
+    /// each range seal that follows what was sent, its bytes in chunks
+    /// then the seal, up to `until`. A range cut by the budget goes on at
+    /// the next call. On demand, then a [`State::CaughtUp`] status; when
+    /// the recording `stopped` and everything to its end was sent,
+    /// [`State::Ended`]; a purge past the next position or a gap,
+    /// [`State::Interrupted`].
     ///
     /// # Errors
     ///
@@ -130,6 +133,7 @@ impl Sender {
         store: &mut SegmentStore<D>,
         seals: &[SealRecord],
         stopped: bool,
+        budget: usize,
         out: &mut Vec<Outgoing>,
     ) -> Result<(), SegmentError> {
         if self.done.is_some() {
@@ -146,34 +150,41 @@ impl Sender {
             .filter(|seal| {
                 seal.subject == recording
                     && matches!(seal.kind, SealKind::OpenSegment | SealKind::ClosedSegment)
-                    && seal.end > self.next
+                    && seal.end > self.sent_end
                     && seal.end <= self.request.until
             })
             .collect();
         ranges.sort_by_key(|seal| seal.start);
+        let mut left = budget.max(MAX_CHUNK);
         for seal in ranges {
-            if seal.start != self.next {
+            if seal.start != self.sent_end {
                 // A range that does not follow what was sent: a gap.
                 out.push(self.finish(State::Interrupted, store, sealed_end));
                 return Ok(());
             }
-            let mut from = seal.start;
-            while from < seal.end {
-                let to = seal.end.min(from.saturating_add(MAX_CHUNK as u64));
-                let length = usize::try_from(to.saturating_sub(from))
+            while self.next < seal.end {
+                if left == 0 {
+                    return Ok(());
+                }
+                let chunk = MAX_CHUNK.min(left) as u64;
+                let to = seal.end.min(self.next.saturating_add(chunk));
+                let length = usize::try_from(to.saturating_sub(self.next))
                     .map_err(|_| SegmentError::PositionOverflow)?;
                 let mut bytes = vec![0u8; length];
-                store.read(from, &mut bytes)?;
-                out.push(Outgoing::Bytes { start: from, bytes });
-                from = to;
+                store.read(self.next, &mut bytes)?;
+                out.push(Outgoing::Bytes {
+                    start: self.next,
+                    bytes,
+                });
+                left = left.saturating_sub(length);
+                self.next = to;
             }
             out.push(Outgoing::Seal(*seal));
-            self.next = seal.end;
             self.sent_end = seal.end;
         }
-        if self.next == self.request.until {
+        if self.sent_end == self.request.until {
             out.push(self.finish(State::CaughtUp, store, sealed_end));
-        } else if stopped && self.next == sealed_end && sealed_end == store.written() {
+        } else if stopped && self.sent_end == sealed_end && sealed_end == store.written() {
             out.push(self.finish(State::Ended, store, sealed_end));
         } else if self.request.mode == Mode::OnDemand {
             out.push(self.finish(State::CaughtUp, store, sealed_end));
@@ -210,13 +221,20 @@ impl Sender {
         store: &SegmentStore<impl Disk>,
         sealed_end: u64,
     ) -> ReplicationStatus {
-        let source_start = store.start().min(sealed_end);
+        // The store's start as it is: after a purge an interrupted
+        // status names it above the last range sent (ADR-0094).
+        let written = store.written().max(sealed_end);
+        let source_start = if state == State::Interrupted {
+            store.start().min(written)
+        } else {
+            store.start().min(sealed_end)
+        };
         ReplicationStatus {
             correlation_id: self.request.correlation_id,
             recording_id: self.request.recording_id,
             source_start,
             sealed_end,
-            written: store.written().max(sealed_end),
+            written,
             state,
         }
     }
