@@ -603,7 +603,9 @@ fn offer_outcome(outcome: SysOfferOutcome, lane: Lane, base: u64) -> ConcurrentO
         },
         SysOfferOutcome::BackPressured => ConcurrentOfferOutcome::BackPressured,
         SysOfferOutcome::AdminAction => ConcurrentOfferOutcome::AdminAction,
-        SysOfferOutcome::Closed => ConcurrentOfferOutcome::Closed,
+        // No concurrent guarded handle exists yet (karyos#1102 part c): a
+        // gate seal ends the handle as any seal does.
+        SysOfferOutcome::Closed | SysOfferOutcome::Gated => ConcurrentOfferOutcome::Closed,
     }
 }
 
@@ -629,7 +631,7 @@ fn claim_outcome<'a, T: TermBytes>(
             lane,
             position: base + position,
         },
-        SysClaimOutcome::Closed => end.concurrent_claim(),
+        SysClaimOutcome::Closed | SysClaimOutcome::Gated => end.concurrent_claim(),
     }
 }
 

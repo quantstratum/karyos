@@ -104,6 +104,11 @@ pub enum ConcurrentOfferOutcome {
     /// The buffer is sealed: this handle reserves nothing again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
     Closed,
+    /// The buffer is sealed by a guard close, a missed deadline or a
+    /// schedule violation: this handle reserves nothing again, and reports
+    /// it as the exclusive [`AppendOutcome::Gated`] does (GC-8; karyos#1102,
+    /// ADR-0092). Pre-1.0 addition.
+    Gated,
 }
 
 impl From<AppendOutcome> for ConcurrentOfferOutcome {
@@ -112,10 +117,8 @@ impl From<AppendOutcome> for ConcurrentOfferOutcome {
             AppendOutcome::Appended { position } => Self::Appended { position },
             AppendOutcome::BackPressured => Self::BackPressured,
             AppendOutcome::AdminAction => Self::AdminAction,
-            // GC-7: a concurrent buffer is never guarded or scheduled, so
-            // it is never sealed with a gate reason; a gate seal reads as
-            // closed here.
-            AppendOutcome::Closed | AppendOutcome::Gated => Self::Closed,
+            AppendOutcome::Closed => Self::Closed,
+            AppendOutcome::Gated => Self::Gated,
         }
     }
 }
@@ -141,6 +144,9 @@ pub enum ConcurrentClaimOutcome<'a, O: BufferOwner> {
     /// The buffer is sealed: this handle reserves nothing again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
     Closed,
+    /// The buffer is sealed with a gate reason, as
+    /// [`ConcurrentOfferOutcome::Gated`]. Pre-1.0 addition.
+    Gated,
 }
 
 /// A claimed block of a concurrent handle: it mutably borrows the handle;
@@ -523,7 +529,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         }
         self.resolve_claim();
         if self.state == HandleState::Closed {
-            return Ok(ConcurrentOfferOutcome::Closed);
+            return Ok(self.ended_offer());
         }
         if payload.is_empty() {
             return Err(SysError::EmptyMessage);
@@ -548,7 +554,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         let (count, slot, start) = match self.reserve(reserved, pause, true)? {
             Reserved::Own { count, slot, start } => (count, slot, start),
             Reserved::Outcome(_) if self.observe_seal() => {
-                return Ok(ConcurrentOfferOutcome::Closed);
+                return Ok(self.ended_offer());
             }
             Reserved::Outcome(outcome) => return Ok(outcome.into()),
         };
@@ -625,7 +631,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
     ) -> Result<ConcurrentClaimOutcome<'_, O>, SysError> {
         self.resolve_claim();
         if self.state == HandleState::Closed {
-            return Ok(ConcurrentClaimOutcome::Closed);
+            return Ok(self.ended_claim());
         }
         if length == 0 {
             return Err(SysError::EmptyMessage);
@@ -649,7 +655,7 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         let (count, slot, start) = match self.reserve(reserved, pause, false)? {
             Reserved::Own { count, slot, start } => (count, slot, start),
             Reserved::Outcome(_) if self.observe_seal() => {
-                return Ok(ConcurrentClaimOutcome::Closed);
+                return Ok(self.ended_claim());
             }
             Reserved::Outcome(AppendOutcome::BackPressured) => {
                 return Ok(ConcurrentClaimOutcome::BackPressured);
@@ -846,6 +852,27 @@ impl<O: BufferOwner> ConcurrentPublication<O> {
         }
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         buffer.terminal_seal_reason()
+    }
+
+    /// The outcome of an offer once the handle is closed: `Gated` for a
+    /// gate seal, `Closed` otherwise (GC-8).
+    fn ended_offer(&self) -> ConcurrentOfferOutcome {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if buffer.observed_seal_reason().is_gate() {
+            ConcurrentOfferOutcome::Gated
+        } else {
+            ConcurrentOfferOutcome::Closed
+        }
+    }
+
+    /// As [`Self::ended_offer`], for a claim.
+    fn ended_claim<'a>(&self) -> ConcurrentClaimOutcome<'a, O> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if buffer.observed_seal_reason().is_gate() {
+            ConcurrentClaimOutcome::Gated
+        } else {
+            ConcurrentClaimOutcome::Closed
+        }
     }
 
     /// After an attempt that was not granted: if the buffer is sealed,
