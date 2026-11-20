@@ -87,11 +87,9 @@ pub(crate) fn merge(
             .find(|held| (held.data_group, held.interface) == (entry.data_group, entry.interface));
         match held {
             Some(held) if held.control_group == entry.control_group => continue,
-            Some(held) => {
+            Some(_) => {
                 return Err(DriverError::ControlGroupConflict {
                     data_group: entry.data_group,
-                    held: held.control_group,
-                    control: entry.control_group,
                 });
             }
             None => {}
@@ -237,8 +235,6 @@ mod tests {
             ),
             Err(DriverError::ControlGroupConflict {
                 data_group: SocketAddr::from(([239, 1, 1, 1], 4000)),
-                held: SocketAddr::from(([239, 1, 1, 2], 4001)),
-                control: SocketAddr::from(([239, 1, 1, 9], 4001)),
             })
         );
         assert_eq!(table, before);

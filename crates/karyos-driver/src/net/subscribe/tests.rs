@@ -2234,8 +2234,6 @@ fn nak_control_maps_through_the_driver_table() {
         net.map_nak_control(&multicast(at(1, 4000), vec![at(3, 4001)], Vec::new())),
         Err(DriverError::ControlGroupConflict {
             data_group: at(1, 4000),
-            held: at(2, 4001),
-            control: at(3, 4001),
         })
     );
     // Two paths, each its own group, each its own entry.

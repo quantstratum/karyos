@@ -234,14 +234,12 @@ pub enum DriverError {
     /// A channel's `nak-control` maps a data group on a path to another
     /// control group than the driver's table already holds for it (owner
     /// item 8, karyos#654): one driver, one mapping.
-    #[error("nak-control {control} conflicts with {held} for data group {data_group}")]
+    /// Only the data group is carried: the error stays `Copy` and small;
+    /// the table holds the other mapping.
+    #[error("nak-control conflicts with the control group held for data group {data_group}")]
     ControlGroupConflict {
         /// The channel's data group endpoint.
         data_group: std::net::SocketAddr,
-        /// The control group the table holds for it on that path.
-        held: std::net::SocketAddr,
-        /// The control group the channel asked for.
-        control: std::net::SocketAddr,
     },
     /// A channel's `nak-control` needs more entries than the driver's
     /// control group table has free: it holds at most
