@@ -383,6 +383,8 @@ struct NetPublication {
     channel: Option<SenderChannel>,
     /// Removed for its next incarnation: no linger, and its removal ends
     /// in a [`Reincarnation`].
+    /// The channel's `linger` in ns; `None` for the network's.
+    linger: Option<u64>,
     reincarnating: bool,
     /// The destinations its sender removed, with why, the newest
     /// `max_destinations`, oldest first (karyos#630), and how many older
@@ -422,6 +424,9 @@ pub(crate) struct SenderChannel {
     /// The channel's `retransmit-window`, checked against its term;
     /// `None` keeps the driver's repair setting.
     pub(crate) retransmit_window: Option<u32>,
+    /// The channel's `linger` in ns, at most [`MAX_PUBLICATION_LINGER`];
+    /// `None` keeps the network's `publication_linger` (karyos#652).
+    pub(crate) linger: Option<u64>,
     /// A `control-mode=dynamic` publication's registration policy
     /// (karyos#644); `None` otherwise.
     pub(crate) registration: Option<crate::sessions::register::RegistrationPolicy>,
@@ -2177,6 +2182,7 @@ impl<T: StreamTerms> Network<T> {
             max_destinations: self.max_destinations,
             limited: None,
             trace_closes: Vec::new(),
+            linger: channel.linger,
             channel: Some(channel),
             reincarnating: false,
             removed_destinations: std::collections::VecDeque::with_capacity(self.max_destinations),
@@ -3205,7 +3211,12 @@ fn post_removals<T: StreamTerms>(
         let (endpoint, alias, registration) = (entry.endpoint, entry.alias, entry.registration);
         // A reincarnating publication's guard closed its log: no EOS is
         // due, so it does not linger.
-        let linger = if entry.reincarnating { 0 } else { linger };
+        let linger = if entry.reincarnating {
+            0
+        } else {
+            // The channel's own `linger`, else the network's (karyos#652).
+            entry.linger.unwrap_or(linger)
+        };
         let posted = links.sender.post(|reply| AgentCommand::RemovePublication {
             reply,
             endpoint,

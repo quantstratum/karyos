@@ -936,6 +936,63 @@ fn paired_paths_follow_their_grammar() {
     ] {
         assert_eq!(refused(uri), ChannelError::NotApplicable { key }, "{uri}");
     }
+/// karyos#652 (owner item 16): `linger` is a duration of the URI grammar,
+/// 0 to 60 s, on a udp channel only; absent, the driver's setting stays.
+#[test]
+fn linger_is_a_bounded_duration() {
+    assert_eq!(udp("karyos:udp?endpoint=10.0.0.5:1").linger, None);
+    for (text, expected) in [
+        ("0s", Duration::ZERO),
+        ("0ns", Duration::ZERO),
+        ("250ms", Duration::from_millis(250)),
+        ("5s", Duration::from_secs(5)),
+        ("60s", Duration::from_secs(60)),
+        ("60000000us", Duration::from_secs(60)),
+    ] {
+        assert_eq!(
+            udp(&format!("karyos:udp?endpoint=10.0.0.5:1|linger={text}")).linger,
+            Some(expected),
+            "{text}"
+        );
+    }
+    for text in ["61s", "60000000001ns"] {
+        assert_eq!(
+            refused(&format!("karyos:udp?endpoint=10.0.0.5:1|linger={text}")),
+            ChannelError::InvalidValue {
+                key: "linger",
+                reason: "above 60 s"
+            },
+            "{text}"
+        );
+    }
+    for (text, error) in [
+        ("5", DurationError::MissingUnit),
+        ("5m", DurationError::UnknownUnit),
+        ("05s", DurationError::NotDecimal),
+    ] {
+        assert_eq!(
+            refused(&format!("karyos:udp?endpoint=10.0.0.5:1|linger={text}")),
+            ChannelError::InvalidDuration {
+                key: "linger",
+                error
+            },
+            "{text}"
+        );
+    }
+    assert_eq!(
+        refused("karyos:ipc?linger=1s"),
+        ChannelError::NotApplicable { key: "linger" }
+    );
+    assert_eq!(
+        refused("karyos:udp?endpoint=10.0.0.5:1|linger=1s|linger=2s"),
+        ChannelError::Repeated { key: "linger" }
+    );
+    // `path-skew` is not a key until sender and receiver both consume it
+    // (owner item 17): refused as unknown, never sender-only.
+    assert!(matches!(
+        refused("karyos:udp?endpoint=10.0.0.5:1|path-skew=1ms"),
+        ChannelError::UnknownParameter { .. }
+    ));
 }
 
 /// karyos#656 (owner decision item 26): port 0 is admitted for `endpoint`

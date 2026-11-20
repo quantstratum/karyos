@@ -12,6 +12,7 @@
 //! monotonic clock, whatever the driver clock is): each test bounds what
 //! it waits for by the linger it set.
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use karyos_client::OfferOutcome;
@@ -677,6 +678,7 @@ fn a_removed_two_path_publication_ends_at_its_eos_on_both_paths() {
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: vec![
@@ -940,4 +942,56 @@ fn a_reincarnation_does_not_wait_for_the_linger() {
         )
     });
     assert_eq!(a.trace_identity(lane).unwrap().incarnation, 2);
+}
+
+/// karyos#652: a channel's `linger` overrides the network's
+/// `publication_linger` for that publication. The network lingers 30 s;
+/// the channel's 300 ms frees the stream after its own linger, with its
+/// EOS repeated through it, long before the network's would end.
+#[test]
+fn a_channels_linger_overrides_the_networks() {
+    let linger = Duration::from_millis(300);
+    let (mut a, mut b) = (lingering(30_000 * MS), lingering(30_000 * MS));
+    let _ = b
+        .add_network_subscription(10, &channel(ANY_PORT, true))
+        .unwrap();
+    let mut sending = channel(bound(&b, 10), true);
+    sending.linger = Some(linger);
+    let publication = a
+        .add_network_publication(aggregate(10, 3, 1), &sending)
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 3);
+        image.is_some()
+    });
+    let mut reader = b
+        .subscribe_aggregate(&image.unwrap(), Role::Required)
+        .unwrap();
+    offer_all(&mut a, &publication, 1, 2);
+    let removed = Instant::now();
+    a.remove_aggregate(&publication).unwrap();
+    let (terminal, ends, seen) = read_to_end(&mut a, &mut b, &mut reader);
+    assert_eq!(seen[0], 2);
+    assert!(terminal.clean && closed_at_eos(ends[0]), "{ends:?}");
+    pump(&mut [&mut a, &mut b], |drivers| {
+        stream_state(drivers[0], &publication, 0) == StreamState::Freed
+    });
+    let elapsed = removed.elapsed();
+    assert!(elapsed >= linger, "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    assert!(eos_sent(&a) >= 2, "repeated through the linger");
+}
+
+/// karyos#652: a `linger` above the network's bound, built without the
+/// URI, is refused at channel admission.
+#[test]
+fn a_channel_linger_above_the_bound_is_refused_at_admission() {
+    let mut a = lingering(200 * MS);
+    let mut sending = channel(SocketAddr::new(ANY_PORT.ip(), 9), true);
+    sending.linger = Some(Duration::from_secs(61));
+    assert!(matches!(
+        a.add_network_publication(aggregate(10, 3, 1), &sending),
+        Err(crate::error::DriverError::InvalidConfig)
+    ));
 }

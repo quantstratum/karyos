@@ -237,6 +237,7 @@ fn measure(label: &str, reliable: bool, count: usize) {
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -538,6 +539,7 @@ fn measure_drivers(label: &str, reliable: bool, count: usize, streams: usize, dr
     let channel = UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),

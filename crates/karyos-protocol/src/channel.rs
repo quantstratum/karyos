@@ -327,7 +327,15 @@ pub struct UdpConfig {
     /// table as configured. The driver enters each into that one table,
     /// which refuses a conflicting mapping.
     pub nak_control: Vec<SocketAddr>,
+    /// How long a removed publication keeps answering status messages and
+    /// NAKs and repeating its EOS (`linger`, owner item 16): 0 to
+    /// [`MAX_LINGER`]. `None` keeps the driver's `publication_linger`,
+    /// whose default is 5 s. A subscription does not use it.
+    pub linger: Option<Duration>,
 }
+
+/// The longest `linger` (owner item 16): 60 s, the driver's own bound.
+pub const MAX_LINGER: Duration = Duration::from_secs(60);
 
 /// A validated channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +378,7 @@ enum Key {
     RetransmitWindow,
     RequireAbortAck,
     NakControl,
+    Linger,
 }
 
 const KEYS: [(&str, Key); 19] = [
@@ -392,6 +401,7 @@ const KEYS: [(&str, Key); 19] = [
     ("retransmit-window", Key::RetransmitWindow),
     ("require-abort-ack", Key::RequireAbortAck),
     ("nak-control", Key::NakControl),
+    ("linger", Key::Linger),
 ];
 
 /// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
@@ -725,6 +735,7 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
     let retransmit_window = get(Key::RetransmitWindow)
         .map(parse_retransmit_window)
         .transpose()?;
+    let linger = get(Key::Linger).map(parse_linger).transpose()?;
     if retransmit_window.is_some() && !reliable {
         return Err(ChannelError::Conflict {
             first: Key::Reliable.name(),
@@ -740,6 +751,7 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         security,
         retransmit_window,
         nak_control,
+        linger,
     })
 }
 
@@ -934,6 +946,18 @@ fn parse_retransmit_window(value: &str) -> Result<u32, ChannelError> {
                 "not a positive multiple of 32 within a term",
             )
         })
+}
+
+/// A `linger` value: a duration of the URI grammar, 0 to [`MAX_LINGER`].
+fn parse_linger(value: &str) -> Result<Duration, ChannelError> {
+    let linger = parse_duration(value).map_err(|error| ChannelError::InvalidDuration {
+        key: Key::Linger.name(),
+        error,
+    })?;
+    if linger > MAX_LINGER {
+        return Err(invalid(Key::Linger, "above 60 s"));
+    }
+    Ok(linger)
 }
 
 /// The alignment of a `retransmit-window`: a frame's.

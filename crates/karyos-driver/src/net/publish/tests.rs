@@ -68,6 +68,7 @@ fn channel(destination: Destination) -> UdpConfig {
     UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
+        linger: None,
         destination,
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),
