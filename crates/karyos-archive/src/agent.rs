@@ -718,6 +718,26 @@ pub enum AgentError {
     /// A recording group's journal already holds network images of an
     /// earlier run, which this run's could repeat (ADR-0089): the group
     /// continues in a new journal.
+    ///
+    /// **What an operator sees.** After a restart of the host (or of the
+    /// driver it records from), the restart of a group whose journal
+    /// recorded any network image fails with this error, and nothing is
+    /// written: the earlier journal stays as it was, complete and
+    /// replayable. A group that recorded IPC streams only is not refused.
+    /// The reason is that an image is named by its driver registration,
+    /// which is unique within one driver incarnation only: a new run may
+    /// reuse a registration of the earlier one, and replay would then
+    /// merge two different images.
+    ///
+    /// **How to continue.** Start the group as new
+    /// ([`StartGroup::with_new`]) in a journal of its own: one journal
+    /// holds one group per directory, so either give it a new directory
+    /// ([`StartGroup::dir`]), keeping the group id, or keep the directory
+    /// and give it a new group id. To keep `group_seq` continuous for
+    /// consumers, set [`NewGroup::first_group_seq`] to the earlier
+    /// journal's `complete_recording_seq` plus one, as its replay reports
+    /// it (`Stop::EndOfPrefix`). Keep the earlier journal while anything may
+    /// still replay it; retention handles it like any other journal.
     #[error("the group journal holds network images of an earlier run")]
     ImagesOfAnEarlierRun,
     /// A recording group's capture settings cannot work.
