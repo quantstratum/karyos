@@ -940,6 +940,8 @@ fn paired_paths_follow_their_grammar() {
     ] {
         assert_eq!(refused(uri), ChannelError::NotApplicable { key }, "{uri}");
     }
+}
+
 /// karyos#652 (owner item 16): `linger` is a duration of the URI grammar,
 /// 0 to 60 s, on a udp channel only; absent, the driver's setting stays.
 #[test]
