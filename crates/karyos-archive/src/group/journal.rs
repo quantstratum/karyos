@@ -520,6 +520,22 @@ impl<D: Disk> GroupJournal<D> {
         self.store.written()
     }
 
+    /// Reads the journal's bytes at `position`, for sealing them (A10;
+    /// karyos#1088).
+    pub(crate) fn read_bytes(
+        &mut self,
+        position: u64,
+        buf: &mut [u8],
+    ) -> Result<(), crate::segment::SegmentError> {
+        self.store.read(position, buf)
+    }
+
+    /// Where the journal's store starts.
+    #[must_use]
+    pub(crate) const fn start(&self) -> u64 {
+        self.store.start()
+    }
+
     /// The end of what a sync made durable.
     #[must_use]
     pub const fn durable(&self) -> u64 {

@@ -629,3 +629,171 @@ fn run_checks_errors_keep_their_path_and_source() {
         other => panic!("{other:?}"),
     }
 }
+
+/// A groups directory the running Archive sealed (karyos#1088): one
+/// group whose journal holds timer events, made durable and sealed by the
+/// agent, then signed and anchored at its last seal by the operator.
+/// Returns the directory and the group journal's segment file.
+fn sealed_groups(name: &str) -> (Archive, PathBuf) {
+    use karyos_archive::agent::{AgentConfig, ArchiveHandle, NewGroup, StartGroup};
+    use karyos_archive::group::capture::CaptureConfig;
+    use karyos_archive::group::journal::JournalConfig;
+    use karyos_archive::group::record::{
+        Capture, EndOutcome, EventEnd, GroupRecord, MAX_RECORD, TimerEvent,
+    };
+
+    const GROUP: u64 = 5;
+    let root = std::env::temp_dir().join(format!("karyos-verify-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let archive = Archive { root };
+    let groups = archive.dir();
+    std::fs::create_dir_all(&groups).unwrap();
+    std::fs::create_dir_all(archive.anchors()).unwrap();
+    let host = archive.root.join("host");
+    std::fs::create_dir_all(&host).unwrap();
+    let config =
+        AgentConfig::default().with_seal_interval(Some(std::time::Duration::from_millis(1)));
+    let agent = ArchiveHandle::spawn(StdDisk, &host, config).unwrap();
+    let start = StartGroup::new(
+        GROUP,
+        groups.clone(),
+        JournalConfig::new(
+            karyos_archive::group::journal::MIN_SEGMENT_LENGTH,
+            SyncPolicy::Every { interval_ns: 0 },
+        ),
+        CaptureConfig::new(1 << 16, 4096, 64),
+    )
+    .with_new(NewGroup::new(1, 4096, Capture::Strict, b"m".to_vec()));
+    let mut sender = agent.start_group(start).unwrap();
+    let mut out = vec![0u8; MAX_RECORD];
+    for seq in 1..=3u64 {
+        let mut bytes = Vec::new();
+        for record in [
+            GroupRecord::Timer(TimerEvent {
+                group_seq: seq,
+                logical_time: seq,
+                timer_id: 1,
+            }),
+            GroupRecord::End(EventEnd {
+                group_seq: seq,
+                observations: 0,
+                outcome: EndOutcome::Complete,
+            }),
+        ] {
+            let length = record.encode(&mut out).unwrap();
+            bytes.extend_from_slice(&out[..length]);
+        }
+        sender.admit().unwrap();
+        sender.send(&bytes, seq).unwrap();
+    }
+    assert_eq!(
+        sender
+            .waiter()
+            .wait_durable(3, std::time::Duration::from_secs(5)),
+        Ok(3)
+    );
+    // A duty after the durability seals it.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    agent.shutdown().unwrap();
+
+    // The operator's key, signed head and anchor, as for an archive.
+    let mut journal = IntegrityJournal::open(StdDisk, &groups).unwrap().journal;
+    let authority = TestKey::from_seed([1; 32]);
+    let mut signer = TestKey::from_seed([9; 32]);
+    let mut entry = RegistryEntry {
+        action: RegistryAction::Register,
+        algorithm: Algorithm::Ed25519,
+        custody: Custody::NoSeparation,
+        sequence: 0,
+        key_id: signer.key_id(),
+        public: signer.public(),
+        // Effective from the next record: the journal holds the group's
+        // seals already.
+        effective: u64::try_from(journal.records().unwrap().len()).unwrap(),
+        evidence: [0; 32],
+        endorsement: [0; 64],
+    };
+    entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&ARCHIVE));
+    let trust = TrustRoot {
+        archive_id: ARCHIVE,
+        authorities: vec![authority.public()],
+    };
+    let mut keys = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &groups, KEYS_FILE).unwrap();
+    KeyRegistry::new(trust)
+        .append(&entry, &mut journal, &mut keys)
+        .unwrap();
+    let records = journal.records().unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.subject == GROUP && record.kind.is_range()),
+        "the agent sealed the group journal"
+    );
+    let last = records.last().unwrap();
+    let head = ChainHead {
+        archive_id: ARCHIVE,
+        journal_id: 0,
+        counter: last.counter,
+        digest: last.digest(),
+    };
+    let signed = SignedHead {
+        head,
+        key_id: signer.key_id(),
+        custody: Custody::NoSeparation,
+        signature: signer.sign(&head).unwrap(),
+    };
+    let mut heads = Ledger::<_, SIGNED_HEAD_LENGTH>::open(StdDisk, &groups, HEADS_FILE).unwrap();
+    heads.append(signed.encode()).unwrap();
+    let mut anchors = LedgerAnchorStore::open(StdDisk, &archive.anchors(), OPERATOR).unwrap();
+    publish_due(
+        &mut anchors,
+        None,
+        Some(&signed),
+        std::num::NonZeroU64::new(1).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    std::fs::write(
+        archive.trust(),
+        format!(
+            "archive {}\nauthority {}\njournal 0\n",
+            hex(&ARCHIVE),
+            hex(&authority.public())
+        ),
+    )
+    .unwrap();
+    let segment = std::fs::read_dir(&groups)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "seg"))
+        .unwrap();
+    (archive, segment)
+}
+
+/// karyos#1088: `karyos-catalog verify` of a groups directory the Archive
+/// sealed reports the group journal's ranges verified, and a tampered
+/// byte in it inconsistent.
+#[test]
+fn verify_reports_a_sealed_group_journal_and_its_tampering() {
+    let (archive, segment) = sealed_groups("groups");
+    let (status, out, err) = full(&archive, false);
+    assert_eq!((status, err.as_str()), (0, ""), "{out}");
+    let ranges: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("recording 5 "))
+        .collect();
+    assert!(!ranges.is_empty(), "{out}");
+    assert!(
+        ranges.iter().all(|line| line.contains(" verified ")),
+        "{out}"
+    );
+
+    let mut bytes = std::fs::read(&segment).unwrap();
+    // A byte inside the first sealed range (the data file holds the
+    // journal's bytes from position 0): a digest mismatch.
+    bytes[20] ^= 0xff;
+    std::fs::write(&segment, &bytes).unwrap();
+    let (status, out, _) = full(&archive, false);
+    assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+    assert!(out.contains(" inconsistent "), "{out}");
+}

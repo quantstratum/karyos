@@ -1090,6 +1090,11 @@ impl<D: Disk> CaptureJob<D> {
         Ok(())
     }
 
+    /// The group journal, for sealing it (karyos#1088).
+    pub(crate) fn journal_mut(&mut self) -> &mut GroupJournal<D> {
+        &mut self.journal
+    }
+
     /// Closes the journal (syncing it); the group records nothing more.
     /// Returns the journal's durable position.
     ///

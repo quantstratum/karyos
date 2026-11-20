@@ -1787,6 +1787,7 @@ fn run<D>(
             turn: 0,
         },
         groups: Vec::new(),
+        group_seals: std::collections::BTreeMap::new(),
         integrity,
         retention,
     };
@@ -1849,6 +1850,10 @@ struct State<D: Disk> {
     integrity: Option<Integrity<D>>,
     /// The retention engine (ADR-0088; karyos#967).
     retention: retention::Engine<D>,
+    /// The integrity journal of each group journal directory, which seals
+    /// its groups' journals (karyos#1088); a directory whose journal
+    /// failed holds `None` and is not sealed again until restart.
+    group_seals: std::collections::BTreeMap<PathBuf, Option<IntegrityJournal<D>>>,
 }
 
 /// The integrity journal of a running Archive and its sealing schedule
@@ -2277,6 +2282,8 @@ fn checkpoint_duty<D: Disk>(
 #[derive(Debug)]
 struct ActiveGroup<D: Disk> {
     id: u64,
+    /// Its journal's directory.
+    dir: PathBuf,
     job: CaptureJob<D>,
     /// Its checkpoints, when it keeps them.
     checkpoints: Option<GroupWriter<D>>,
@@ -2979,6 +2986,7 @@ impl<D: Disk + Clone> State<D> {
         // A new ring holds no reference to a recording that failed.
         self.groups.push(ActiveGroup {
             id,
+            dir: start.dir.clone(),
             job,
             checkpoints,
             cleared: self.failures,
@@ -3019,6 +3027,9 @@ impl<D: Disk + Clone> State<D> {
                     store: Some(checkpoints.writer.store()),
                 };
                 group.job.refresh(&coverage);
+            }
+            if self.integrity.is_some() {
+                seal_group(&mut self.group_seals, group, &self.disk);
             }
             // A group that read its ring empty, or that reads nothing
             // more, holds no reference to an earlier failure.
@@ -3377,6 +3388,50 @@ impl<D: Disk> Integrity<D> {
         if recorded.is_err() {
             self.copies = None;
         }
+    }
+}
+
+/// Seals `group`'s journal from where its seals end to its durable end,
+/// in at most 1 MiB pieces, in the integrity journal of its directory,
+/// opened at the first seal (A10; karyos#1088): `karyos-catalog verify` of
+/// that directory then reports its ranges. A failure stops the sealing of
+/// that directory until restart; the groups go on.
+fn seal_group<D: Disk + Clone>(
+    seals: &mut std::collections::BTreeMap<PathBuf, Option<IntegrityJournal<D>>>,
+    group: &mut ActiveGroup<D>,
+    disk: &D,
+) {
+    const CHUNK: u64 = 1 << 20;
+    let entry = seals.entry(group.dir.clone()).or_insert_with(|| {
+        IntegrityJournal::open(disk.clone(), &group.dir)
+            .ok()
+            .map(|opened| opened.journal)
+    });
+    let Some(integrity) = entry.as_mut() else {
+        return;
+    };
+    let journal = group.job.journal_mut();
+    let mut from = integrity.sealed_end(group.id).unwrap_or(journal.start());
+    let end = journal.durable();
+    let mut buf = Vec::new();
+    let mut failed = false;
+    while from < end {
+        let to = end.min(from.saturating_add(CHUNK));
+        let Ok(length) = usize::try_from(to.saturating_sub(from)) else {
+            failed = true;
+            break;
+        };
+        buf.resize(length, 0);
+        if journal.read_bytes(from, &mut buf).is_err()
+            || integrity.seal_segment(group.id, from, &buf, false).is_err()
+        {
+            failed = true;
+            break;
+        }
+        from = to;
+    }
+    if failed {
+        *entry = None;
     }
 }
 

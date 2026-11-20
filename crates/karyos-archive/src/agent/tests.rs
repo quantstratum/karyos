@@ -1327,6 +1327,56 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// karyos#1088: with sealing on, a group's journal is sealed in the
+    /// integrity journal of its directory, and its sealed bytes verify.
+    #[test]
+    fn a_group_journal_is_sealed_in_its_directory() {
+        use crate::group::journal::GroupJournal;
+        use crate::integrity::journal::read_records;
+        use crate::integrity::{SealKind, verify_chain, verify_range};
+        let dir = temp_dir("group-sealed");
+        let groups = groups_dir(&dir);
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        let mut sender = agent
+            .start_group(start_group(&groups, Some(Capture::Strict)))
+            .unwrap();
+        sender.admit().unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        let waiter = sender.waiter();
+        assert_eq!(agent.stop(recording).unwrap().position, 3000);
+        assert_eq!(waiter.wait_durable(1, Duration::from_secs(5)), Ok(1));
+        // A duty after the event's durability seals it.
+        std::thread::sleep(Duration::from_millis(50));
+        agent.shutdown().unwrap();
+
+        let (records, fault) = read_records(&mut StdDisk, &groups).unwrap();
+        assert_eq!(fault, None);
+        verify_chain(&records).unwrap();
+        let ranges: Vec<_> = records
+            .iter()
+            .filter(|record| record.kind == SealKind::OpenSegment && record.subject == GROUP)
+            .collect();
+        assert!(!ranges.is_empty(), "the group journal is sealed");
+        assert_eq!(ranges[0].start, 0);
+        let mut journal =
+            GroupJournal::recover(StdDisk, &groups, GROUP, start_group(&groups, None).journal)
+                .unwrap()
+                .journal;
+        for range in ranges {
+            let mut bytes = vec![0u8; usize::try_from(range.end - range.start).unwrap()];
+            journal.read_bytes(range.start, &mut bytes).unwrap();
+            verify_range(range, &bytes).unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A reference its recording stops short of: a strict group ends, a
     /// best-effort one marks it and goes on.
     #[test]
