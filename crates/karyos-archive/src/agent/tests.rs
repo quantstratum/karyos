@@ -3792,6 +3792,10 @@ fn a_signing_agent_records_trusted_heads_covering_the_chain() {
     let _ = sealed_recording(&agent);
     // Two signing polls, a second apart, after the recording sealed.
     std::thread::sleep(Duration::from_millis(2_500));
+    // The polls published their status (karyos#1031): read incrementally,
+    // the last seal is covered and nothing is overdue.
+    let lag = agent.signing_lag().unwrap();
+    assert!(!lag.alarm, "{lag:?}");
     agent.shutdown().unwrap();
 
     let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
