@@ -474,6 +474,10 @@ pub struct GuardSpec {
     pub epoch: u64,
     /// The publication's rate policy.
     pub rate: Option<karyos_sys::rate_limit::RatePolicy>,
+    /// The control reserve its gate holds back for cancel and resolve
+    /// traffic (R-CORE-21): the largest of its lanes' reserves, rate and
+    /// burst apart; `None` without one.
+    pub reserve: Option<karyos_sys::rate_limit::Rate>,
     /// When the gate's bucket was empty: `None` for the publication's first
     /// incarnation, whose bucket starts full; for a reincarnation, the time
     /// it began on the network's clock (host monotonic nanoseconds,
@@ -495,6 +499,7 @@ impl std::fmt::Debug for GuardSpec {
         f.debug_struct("GuardSpec")
             .field("epoch", &self.epoch)
             .field("rate", &self.rate)
+            .field("reserve", &self.reserve)
             .finish_non_exhaustive()
     }
 }
@@ -888,6 +893,9 @@ impl<T: StreamTerms> Outbound<T> {
         let mut gate = gate;
         if let Some(since) = spec.empty_since {
             gate.empty_bucket_since(since, now);
+        }
+        if let Some(reserve) = spec.reserve {
+            gate.set_control_reserve(reserve, now)?;
         }
         gate.set_frontier(frontier);
         if let Some(slot) = spec.policy {

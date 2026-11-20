@@ -24,7 +24,15 @@
 //!
 //! The authoritative buckets live in the driver, at the sender gate; a
 //! client keeps its own copy only to reject earlier.
+//!
+//! R-CORE-21's control reserve is capacity held back for cancel and resolve
+//! traffic ([`TrafficClass::Control`]): the gate keeps a separate control
+//! bucket of the reserve ([`RatePolicy::of_reserve`]), which only that
+//! traffic spends, while ordinary traffic spends only the publication's
+//! buckets. A client's copy sees ordinary traffic only: the driver builds
+//! every control frame, so no handle ever offers one.
 
+use crate::frame::FrameType;
 use crate::host_clock::age_ns;
 
 /// Nanoseconds per second: the scale of a level in nano-tokens.
@@ -89,6 +97,46 @@ impl RatePolicy {
             }
         }
         Ok(())
+    }
+}
+
+/// How a frame a publication sends is charged at its sender gate
+/// (R-CORE-21; `quantstratum-docs: karyos/design/guards-and-abort.md`,
+/// The control reserve).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrafficClass {
+    /// The publication's messages (DATA, and PAD that fills a term): the
+    /// publication's buckets alone.
+    Ordinary,
+    /// Cancel and resolve traffic: the abort protocol's frames
+    /// (`SESSION_ABORT`, its resends under G3, and `SESSION_ABORT_ACK`) and
+    /// the canonical record of an aborted extent (`ABORTED`), which resolves
+    /// the outcome of the positions it names. The control bucket alone.
+    Control,
+    /// Session, repair and liveness frames (SETUP, NAK, SM, ERR, RTTM,
+    /// RSP_SETUP, PATH_HB, GUARD): never charged to a rate bucket, bounded by
+    /// the sender's repair and control budgets instead.
+    Unmetered,
+}
+
+impl TrafficClass {
+    /// The class of a frame of type `frame_type`.
+    #[must_use]
+    pub const fn of(frame_type: FrameType) -> Self {
+        match frame_type {
+            FrameType::Data | FrameType::Pad => Self::Ordinary,
+            FrameType::SessionAbort | FrameType::SessionAbortAck | FrameType::Aborted => {
+                Self::Control
+            }
+            FrameType::Nak
+            | FrameType::Sm
+            | FrameType::Err
+            | FrameType::Setup
+            | FrameType::Rttm
+            | FrameType::RspSetup
+            | FrameType::PathHb
+            | FrameType::Guard => Self::Unmetered,
+        }
     }
 }
 
@@ -169,6 +217,22 @@ impl RatePolicy {
                     && bytes.per_second >= reserve.per_second.saturating_mul(frame)
                     && bytes.burst >= reserve.burst.saturating_mul(frame)
             }
+        }
+    }
+
+    /// The control bucket's policy for `reserve` at frames of `frame` bytes
+    /// (R-CORE-21): `reserve` messages, and a byte bucket of `reserve`
+    /// messages of `frame` bytes each, its rate and its burst, the same
+    /// products [`Self::keeps`] weighs, saturated at `u64::MAX`, a stated
+    /// cap no frame reaches.
+    #[must_use]
+    pub const fn of_reserve(reserve: &Rate, frame: u64) -> Self {
+        Self {
+            messages: *reserve,
+            bytes: Some(Rate {
+                per_second: reserve.per_second.saturating_mul(frame),
+                burst: reserve.burst.saturating_mul(frame),
+            }),
         }
     }
 }

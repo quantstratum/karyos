@@ -338,3 +338,53 @@ fn a_policy_change_clamps_and_never_grants_tokens() {
     limiter.refill_at(200_000_000);
     assert_eq!(limiter.message_tokens(), 12);
 }
+
+/// R-CORE-21, karyos#840: the abort protocol's frames and the aborted
+/// extent's record are cancel and resolve traffic, DATA and PAD ordinary,
+/// and session, repair and liveness frames are never charged.
+#[test]
+fn frames_are_classified_for_the_control_reserve() {
+    use crate::frame::FrameType;
+
+    for (frame_type, class) in [
+        (FrameType::Data, TrafficClass::Ordinary),
+        (FrameType::Pad, TrafficClass::Ordinary),
+        (FrameType::SessionAbort, TrafficClass::Control),
+        (FrameType::SessionAbortAck, TrafficClass::Control),
+        (FrameType::Aborted, TrafficClass::Control),
+        (FrameType::Nak, TrafficClass::Unmetered),
+        (FrameType::Sm, TrafficClass::Unmetered),
+        (FrameType::Err, TrafficClass::Unmetered),
+        (FrameType::Setup, TrafficClass::Unmetered),
+        (FrameType::Rttm, TrafficClass::Unmetered),
+        (FrameType::RspSetup, TrafficClass::Unmetered),
+        (FrameType::PathHb, TrafficClass::Unmetered),
+        (FrameType::Guard, TrafficClass::Unmetered),
+    ] {
+        assert_eq!(TrafficClass::of(frame_type), class, "{frame_type:?}");
+    }
+}
+
+/// The control bucket's policy is the reserve in messages and the reserve's
+/// messages of a full frame in bytes, which every policy that keeps the
+/// reserve holds at least; its products saturate.
+#[test]
+fn the_reserve_policy_is_what_keeps_weighs() {
+    let reserve = Rate {
+        per_second: 10,
+        burst: 4,
+    };
+    let control = RatePolicy::of_reserve(&reserve, 65_536);
+    assert_eq!(control, policy(10, 4, Some((655_360, 262_144))));
+    assert!(control.keeps(&reserve, 65_536));
+    assert!(!policy(10, 4, Some((655_359, 262_144))).keeps(&reserve, 65_536));
+    assert_eq!(control.validate(65_536), Ok(()));
+    let huge = RatePolicy::of_reserve(&reserve, u64::MAX);
+    assert_eq!(
+        huge.bytes,
+        Some(Rate {
+            per_second: u64::MAX,
+            burst: u64::MAX,
+        })
+    );
+}

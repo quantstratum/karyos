@@ -1,0 +1,3 @@
+### Added
+
+- The sender gate holds R-CORE-21's control reserve back as capacity: a guarded publication with a reserve gets a separate control bucket of the reserve's message rate and burst and, at the largest datagram, its byte rate and burst. Cancel and resolve traffic (`SESSION_ABORT`, `SESSION_ABORT_ACK` and `ABORTED`, classified by `TrafficClass`) is charged there alone through `GuardGate::admit_control`, ordinary traffic only in the publication's buckets; control traffic past the reserve waits for its own bucket and never borrows the publication's, and a policy change leaves the control bucket as the reserve sets it (karyos#840).

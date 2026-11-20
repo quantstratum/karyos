@@ -905,6 +905,15 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let rate = handle
             .streams()
             .find_map(|stream| self.stream_ref(stream).ok()?.guarded.as_ref()?.rate);
+        // The control bucket holds back the largest of the lanes' reserves,
+        // rate and burst apart, so it keeps every lane's (R-CORE-21).
+        let reserve = handle
+            .streams()
+            .filter_map(|stream| self.stream_ref(stream).ok()?.guarded.as_ref()?.reserve)
+            .reduce(|a, b| karyos_sys::rate_limit::Rate {
+                per_second: a.per_second.max(b.per_second),
+                burst: a.burst.max(b.burst),
+            });
         // The gate reads word 0: the guard's word in the guard words.
         let (words, index) = self.guards.view(guard.guard)?;
         let word = Arc::new(crate::shared_words::WordAt::new(words, index))
@@ -944,6 +953,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 cell,
                 epoch,
                 rate,
+                reserve,
                 empty_since,
                 policy: Some(slot as Arc<dyn karyos_client::SharedWords>),
                 frontier,
