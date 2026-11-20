@@ -1777,3 +1777,80 @@ fn a_corrupt_frame_is_refused_on_read() {
         }
     }
 }
+
+/// karyos#990: the committed log is sealed through its integrity journal,
+/// never past the commit's entry.
+#[test]
+fn the_committed_log_is_sealed_up_to_the_commit() {
+    use karyos_archive::integrity::SealKind;
+    use karyos_archive::integrity::journal::read_records;
+    let dir = TempDir::new("sealed");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
+    let batch: Vec<Entry> = (1..=4)
+        .map(|index| entry(index, 1, &[index as u8; 2012]))
+        .collect();
+    log.append(&batch).unwrap();
+    log.sync().unwrap();
+    let third_end =
+        log.frame_span(1).unwrap() + log.frame_span(2).unwrap() + log.frame_span(3).unwrap();
+    log.save_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: Some(3),
+    })
+    .unwrap();
+    let (records, fault) = read_records(&mut StdDisk, &dir.0).unwrap();
+    assert_eq!(fault, None);
+    let sealed: Vec<(u64, u64)> = records
+        .iter()
+        .filter(|record| record.kind == SealKind::ClusterLog)
+        .map(|record| (record.start, record.end))
+        .collect();
+    assert_eq!(sealed, [(0, third_end)]);
+    // The next commit seals on from there.
+    log.save_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: Some(4),
+    })
+    .unwrap();
+    let (records, _) = read_records(&mut StdDisk, &dir.0).unwrap();
+    assert_eq!(
+        records.last().map(|record| (record.start, record.end)),
+        Some((third_end, log.written()))
+    );
+    drop(log);
+    assert_eq!(open(StdDisk, &dir.0, small()).last_index(), Some(4));
+}
+
+/// karyos#990: a log whose recovered end falls below its seals, as when
+/// media damage loses a sealed segment, is refused at the takeover,
+/// naming the lost range, and nothing is written.
+#[test]
+fn a_log_recovered_below_its_seals_is_refused_naming_the_range() {
+    let dir = TempDir::new("shortened");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
+    let batch: Vec<Entry> = (1..=8)
+        .map(|index| entry(index, 1, &[index as u8; 2012]))
+        .collect();
+    log.append(&batch).unwrap();
+    log.sync().unwrap();
+    log.save_hard_state(HardState {
+        current_term: 1,
+        voted_for: None,
+        commit: Some(8),
+    })
+    .unwrap();
+    let written = log.written();
+    drop(log);
+    std::fs::remove_file(data_file(&dir.0, 4096)).unwrap();
+    std::fs::remove_file(index_file(&dir.0, 4096)).unwrap();
+    let before = listing(&dir.0);
+    match RaftLog::open(StdDisk, &dir.0, small()) {
+        Err(LogError::ShortenedBelowSeal(damage)) => {
+            assert_eq!(damage.lost(), (4096, written));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(listing(&dir.0), before);
+}
