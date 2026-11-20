@@ -750,10 +750,9 @@ fn holding(seed: u64, servers: u32, held: usize, clients: u32) -> (MovableSim, V
         );
     }
     let ids = (servers..servers + clients)
-        .map(|id| {
+        .inspect(|&id| {
             let client = DeliveryClient::new(id, LEADER, values(&[1]));
             assert_eq!(sim.add_node(Movable::Client(client), 0, 0).unwrap(), id);
-            id
         })
         .collect();
     (sim, ids)
