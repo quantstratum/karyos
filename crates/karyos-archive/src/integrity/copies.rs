@@ -210,6 +210,20 @@ pub trait ImmutabilityBackend {
     /// The storage's error; a storage that cannot enforce returns
     /// `Ok(Enforcement::Unsupported)` instead.
     fn enforce(&mut self, path: &Path, retain_until_ns: u64) -> std::io::Result<Enforcement>;
+
+    /// Releases the immutability of `path`, as a purge does right before
+    /// it deletes the file, once every retention check passed
+    /// (karyos#995). Success means the file can be removed as far as this
+    /// backend is concerned; a backend that enforces nothing releases
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// The storage's error, when the enforcement is still in place.
+    fn release(&mut self, path: &Path) -> std::io::Result<()> {
+        let _ = path;
+        Ok(())
+    }
 }
 
 /// The backend for storage with no immutability: it states so.
@@ -273,6 +287,16 @@ impl ImmutabilityBackend for ImmutableAttribute {
             // Anything else, an outcome a newer karyos-sys adds included,
             // records no enforcement: never a protection that is not there.
             _ => Ok(Enforcement::Unsupported),
+        }
+    }
+
+    /// The inherent [`ImmutableAttribute::release`], except that a file
+    /// system with no attribute has nothing to release: its segments were
+    /// recorded [`Enforcement::Unsupported`], and a purge goes on.
+    fn release(&mut self, path: &Path) -> std::io::Result<()> {
+        match Self::release(self, path) {
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => Ok(()),
+            other => other,
         }
     }
 }
@@ -438,6 +462,26 @@ impl<D: Disk> CopyCatalog<D> {
         };
         self.records.push(record);
         Ok(chained)
+    }
+
+    /// Enforces immutability on the closed, sealed segment file `path`
+    /// through `backend` and records `record`, the segment's copy, with
+    /// the enforcement that applies (karyos#995): never one that is not
+    /// there. A backend error records nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`IntegrityError::Io`] from the backend; then as
+    /// [`CopyCatalog::record`].
+    pub fn record_enforced(
+        &mut self,
+        mut record: CopyRecord,
+        path: &Path,
+        backend: &mut dyn ImmutabilityBackend,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<SealRecord, IntegrityError> {
+        record.enforcement = backend.enforce(path, record.retain_until_ns)?;
+        self.record(record, journal)
     }
 
     /// The latest record of every copy, in the order each copy first
