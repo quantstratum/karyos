@@ -2806,9 +2806,14 @@ mod incompatible_host {
             }
             let exe = std::env::current_exe().unwrap();
             let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
-            let built = profile.join("karyos-admission-stub");
+            // Its own target directory: rebuilding into the shared one would
+            // replace a binary another test built with other features.
+            let target = profile.parent().unwrap().join("conformance");
+            let built = target
+                .join(profile.file_name().unwrap())
+                .join("karyos-admission-stub");
             // Built every run, once per process: a binary left by an earlier
-            // build of another tree is stale (a stub of an older protocol
+            // build is stale (a stub of an older protocol
             // VERSION admits at this one; karyos#1063). Cargo makes a fresh
             // binary a no-op.
             static BUILT: std::sync::Once = std::sync::Once::new();
@@ -2832,7 +2837,7 @@ mod incompatible_host {
                         "--profile",
                         name,
                     ])
-                    .env("CARGO_TARGET_DIR", profile.parent().unwrap())
+                    .env("CARGO_TARGET_DIR", &target)
                     .status()
                     .unwrap();
                 assert!(status.success(), "karyos-admission-stub did not build");
@@ -2975,9 +2980,12 @@ mod archive_host {
             }
             let exe = std::env::current_exe().unwrap();
             let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
-            let built = profile.join("karyosd");
+            // Its own target directory: rebuilding into the shared one would
+            // replace a binary another test built with other features.
+            let target = profile.parent().unwrap().join("conformance");
+            let built = target.join(profile.file_name().unwrap()).join("karyosd");
             // Built every run, once per process: a binary left by an earlier
-            // build of another tree is stale (a stub of an older protocol
+            // build is stale (a stub of an older protocol
             // VERSION admits at this one; karyos#1063). Cargo makes a fresh
             // binary a no-op.
             static BUILT: std::sync::Once = std::sync::Once::new();
@@ -2999,7 +3007,7 @@ mod archive_host {
                         "--profile",
                         name,
                     ])
-                    .env("CARGO_TARGET_DIR", profile.parent().unwrap())
+                    .env("CARGO_TARGET_DIR", &target)
                     .status()
                     .unwrap();
                 assert!(status.success(), "karyosd did not build");
