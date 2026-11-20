@@ -18,6 +18,8 @@ use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
 
 use crate::integrity::{SEAL_RECORD_LENGTH, SealKind, SealRecord};
 
+pub mod transport;
+
 #[cfg(test)]
 mod tests;
 
@@ -359,8 +361,16 @@ impl ReplicationStatus {
         Ok(status)
     }
 
+    /// `source_start <= sealed_end <= written`, except that an interrupted
+    /// status may name a start above the last range sent, after a purge:
+    /// there `source_start <= written` (ADR-0094).
     fn ordered(&self) -> Result<(), CodecError> {
-        if self.source_start <= self.sealed_end && self.sealed_end <= self.written {
+        let start_ok = if self.state == State::Interrupted {
+            self.source_start <= self.written
+        } else {
+            self.source_start <= self.sealed_end
+        };
+        if start_ok && self.sealed_end <= self.written {
             Ok(())
         } else {
             Err(out_of_range("sealed_end"))
