@@ -97,7 +97,12 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use karyos_archive::crc32c::{Crc32c, crc32c};
-use karyos_archive::disk::Disk;
+use karyos_archive::disk::{Disk, ReadOnly};
+use karyos_archive::integrity::damage::{ShortenedIndex, shortened_below_seal};
+use karyos_archive::integrity::journal::{
+    IntegrityError, IntegrityJournal, JOURNAL_FILE, read_records,
+};
+use karyos_archive::integrity::{SealKind, SealRecord, digest};
 use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 
 use crate::file::{self, Read};
@@ -107,6 +112,8 @@ use crate::snapshot::SnapshotStore;
 
 /// The A2 recording id of the log.
 pub const LOG_RECORDING: u64 = 1;
+/// The most bytes one seal of the committed log reads at a time.
+const SEAL_CHUNK: u64 = 1 << 20;
 /// The file keeping the log's first index.
 pub const FIRST_INDEX_FILE: &str = "first-index";
 /// A frame's header length.
@@ -337,6 +344,17 @@ pub enum LogError {
     /// The segment store's error.
     #[error(transparent)]
     Store(#[from] SegmentError),
+    /// The integrity journal's error (karyos#990).
+    #[error(transparent)]
+    Integrity(#[from] IntegrityError),
+    /// The recovered log ends below what its seals cover: committed,
+    /// sealed bytes were lost to media damage, never an unacknowledged
+    /// write (karyos#990). Nothing was written.
+    #[error(
+        "the log ends at {} below its seals: [{}, {}) lost, from seal {}",
+        .0.written, .0.written, .0.sealed_end, .0.counter
+    )]
+    ShortenedBelowSeal(ShortenedIndex),
     /// The disk's error.
     #[error(transparent)]
     Io(#[from] io::Error),
@@ -420,6 +438,42 @@ pub struct RaftLog<D: Disk + Clone> {
     mark_file: D::File,
     mark_slot: usize,
     mark: Slot,
+    /// The integrity journal sealing the committed log (karyos#990).
+    integrity: IntegrityJournal<D>,
+    /// The seal subject of the log's bytes since its last install: each
+    /// install starts the next one, since it cuts sealed bytes.
+    epoch: u64,
+    /// The bytes of one seal, reused.
+    seal_buf: Vec<u8>,
+}
+
+/// The seal subject the log's latest cluster log record names: 0 before
+/// any.
+fn current_epoch(records: &[SealRecord]) -> u64 {
+    records
+        .iter()
+        .rev()
+        .find(|record| record.kind == SealKind::ClusterLog)
+        .map_or(0, |record| record.subject)
+}
+
+/// The integrity journal in `dir` and the current seal subject.
+fn open_integrity<D: Disk>(disk: D, dir: &Path) -> Result<(IntegrityJournal<D>, u64), LogError> {
+    let mut journal = IntegrityJournal::open(disk, dir)?.journal;
+    let epoch = current_epoch(&journal.records()?);
+    Ok((journal, epoch))
+}
+
+/// Refuses a log recovered to `written` below what the current subject's
+/// seals in `dir` cover, reading the journal only; returns that subject,
+/// so the open reads the journal's records once (karyos#990 review).
+fn check_seals<D: Disk + Clone>(disk: &D, dir: &Path, written: u64) -> Result<u64, LogError> {
+    let (records, _) = read_records(&mut ReadOnly(disk.clone()), dir)?;
+    let epoch = current_epoch(&records);
+    match shortened_below_seal(&records, epoch, written) {
+        Some(damage) => Err(LogError::ShortenedBelowSeal(damage)),
+        None => Ok(epoch),
+    }
 }
 
 /// What [`RaftLog::open`] found.
@@ -492,7 +546,10 @@ impl<D: Disk + Clone> RaftLog<D> {
         let names = disk.list(dir)?;
         let prefix = format!("{LOG_RECORDING:016x}-");
         if names.iter().any(|name| {
-            name.starts_with(&prefix) || name == FIRST_INDEX_FILE || name == HARD_STATE_FILE
+            name.starts_with(&prefix)
+                || name == FIRST_INDEX_FILE
+                || name == HARD_STATE_FILE
+                || name == JOURNAL_FILE
         }) {
             return Err(LogError::Exists);
         }
@@ -530,6 +587,7 @@ impl<D: Disk + Clone> RaftLog<D> {
             SyncPolicy::PerSegment,
             0,
         )?;
+        let (integrity, epoch) = open_integrity(disk.clone(), dir)?;
         Ok(Self {
             store,
             disk,
@@ -542,6 +600,9 @@ impl<D: Disk + Clone> RaftLog<D> {
             mark_file,
             mark_slot,
             mark,
+            integrity,
+            epoch,
+            seal_buf: Vec::new(),
         })
     }
 
@@ -633,6 +694,7 @@ impl<D: Disk + Clone> RaftLog<D> {
             if base.is_none() {
                 check_mark(mark.durable, None)?;
             }
+            check_seals(&disk, dir, 0)?;
             if let Some(commit) = hard_state.and_then(|state| state.commit)
                 && base.is_none_or(|base| commit > base)
             {
@@ -704,6 +766,14 @@ impl<D: Disk + Clone> RaftLog<D> {
             )?
         };
         let last = index_after(first_index, walk.entries.len());
+        // Where the log will end, checked against its seals before any
+        // other check: a sealed range lost is named as such (karyos#990).
+        let end = if stale {
+            kept.start
+        } else {
+            walk.torn.map_or(kept.written, |(position, _)| position)
+        };
+        let epoch = check_seals(&disk, dir, end)?;
         if let (Some((_, index)), Some(commit)) =
             (walk.torn, hard_state.and_then(|state| state.commit))
             && index <= commit
@@ -743,6 +813,8 @@ impl<D: Disk + Clone> RaftLog<D> {
         if stale {
             store.truncate(kept.start)?;
         }
+        // The subject check_seals read: the journal's records are read once.
+        let integrity = IntegrityJournal::open(disk.clone(), dir)?.journal;
         let mut log = Self {
             store,
             disk,
@@ -755,6 +827,9 @@ impl<D: Disk + Clone> RaftLog<D> {
             mark_file,
             mark_slot,
             mark,
+            integrity,
+            epoch,
+            seal_buf: Vec::new(),
         };
         if first_index != stored_first {
             file::replace(
@@ -904,6 +979,13 @@ impl<D: Disk + Clone> RaftLog<D> {
         let first = base_index
             .checked_add(1)
             .ok_or(LogError::TooLarge { index: base_index })?;
+        // The cut removes sealed bytes: the log's bytes from it on are
+        // sealed under the next subject, started before anything is cut.
+        let cut = self
+            .entries
+            .first()
+            .map_or(self.store.written(), |&(start, _)| start);
+        self.begin_epoch(cut)?;
         if let Err(error) = file::replace(
             &mut self.disk,
             &self.dir,
@@ -1359,13 +1441,73 @@ impl<D: Disk + Clone> RaftLog<D> {
         match file::replace(&mut self.disk, &self.dir, HARD_STATE_FILE, &state.encode()) {
             Ok(()) => {
                 self.hard_state = Some(state);
-                Ok(())
             }
             Err(error) => {
                 self.poisoned = true;
-                Err(LogError::Io(error))
+                return Err(LogError::Io(error));
             }
         }
+        let sealed = self.seal_committed();
+        if sealed.is_err() {
+            self.poisoned = true;
+        }
+        sealed
+    }
+
+    /// Seals the log's bytes up to the end of the stored commit's entry,
+    /// from where the current subject's seals end (karyos#990): never a
+    /// byte Raft may still truncate. Committed bytes are durable, so they
+    /// read back as written.
+    fn seal_committed(&mut self) -> Result<(), LogError> {
+        let Some(commit) = self.hard_state.and_then(|state| state.commit) else {
+            return Ok(());
+        };
+        let Some(slot) = self.slot(commit).filter(|&slot| slot < self.entries.len()) else {
+            return Ok(());
+        };
+        let end = match slot.checked_add(1).and_then(|next| self.entries.get(next)) {
+            Some(&(next, _)) => next,
+            None => self.store.written(),
+        };
+        let mut start = match self.integrity.sealed_end(self.epoch) {
+            Some(start) => start,
+            None => self.store.start(),
+        };
+        // Bytes a purge removed before they were sealed cannot be sealed:
+        // the seals go on under the next subject, from the store's start.
+        if start < self.store.start() {
+            self.begin_epoch(self.store.start())?;
+            start = self.store.start();
+        }
+        while start < end {
+            let chunk_end = end.min(start.saturating_add(SEAL_CHUNK));
+            let length = usize::try_from(chunk_end.saturating_sub(start))
+                .map_err(|_| LogError::TooLarge { index: commit })?;
+            self.seal_buf.resize(length, 0);
+            self.store.read(start, &mut self.seal_buf)?;
+            self.integrity
+                .seal_cluster_log(self.epoch, start, &self.seal_buf, chunk_end)?;
+            start = chunk_end;
+        }
+        Ok(())
+    }
+
+    /// Starts the next seal subject at `at`, with an empty range there, so
+    /// a reopened log checks its end against the new subject's seals.
+    fn begin_epoch(&mut self, at: u64) -> Result<(), LogError> {
+        let next = self
+            .epoch
+            .checked_add(1)
+            .ok_or(LogError::TooLarge { index: self.epoch })?;
+        if let Err(error) = self
+            .integrity
+            .append(SealKind::ClusterLog, next, at, at, digest(&[]))
+        {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        self.epoch = next;
+        Ok(())
     }
 }
 
