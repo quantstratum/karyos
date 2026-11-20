@@ -1908,8 +1908,9 @@ fn many_small_commits_leave_one_seal_per_chunk() {
 #[allow(clippy::print_stderr, reason = "a measurement reports its numbers")]
 fn measure_the_commit_path() {
     let dir = TempDir::new("commit-path");
-    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
-    let commits = 2000u64;
+    let geometry = Geometry::new(64 * 1024, 1024 * 1024).unwrap();
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry, 1).unwrap();
+    let commits = 500u64;
     let mut saving = std::time::Duration::ZERO;
     for index in 1..=commits {
         log.append(&[entry(index, 1, &[7; 256])]).unwrap();
