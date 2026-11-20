@@ -840,6 +840,7 @@ dependencies = [
  "rustix",
  "serde",
  "signal-hook",
+ "thiserror",
  "toml",
  "tracing",
  "tracing-subscriber",
