@@ -331,6 +331,7 @@ pub fn latency(a: &Observation, b: &Observation, calibrations: &[Calibration]) -
     bounded(b_low - a_high, b_high - a_low)
 }
 
+pub mod record;
 pub mod utc;
 
 #[cfg(test)]
