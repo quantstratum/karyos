@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check codec-derive-check raft-eval lint-sync changelog-check lint-linux pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri miri-sys-log-buffer miri-sys-rest miri-ffi build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check codec-derive-check raft-eval lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -71,8 +71,17 @@ timing-build-check:
 	! $${CARGO_TARGET_DIR:-target}/release/karyos-bench measure --plan synthetic --plan-only >/dev/null 2>&1
 	$${CARGO_TARGET_DIR:-target}/release/karyos-bench measure --plan synthetic --plan-only 2>&1 | grep -q "needs the synthetic build"
 
-miri:
-	$(CARGO) +$(MIRI_TOOLCHAIN) miri test -p karyos-sys --lib --locked
+# Miri in three parts that CI runs as separate jobs (karyos#161): the full
+# run takes about 10 h on a shared Linux host, beyond one job's 6 h limit.
+miri: miri-sys-log-buffer miri-sys-rest miri-ffi
+
+miri-sys-log-buffer:
+	$(CARGO) +$(MIRI_TOOLCHAIN) miri test -p karyos-sys --lib --locked log_buffer::
+
+miri-sys-rest:
+	$(CARGO) +$(MIRI_TOOLCHAIN) miri test -p karyos-sys --lib --locked -- --skip log_buffer::
+
+miri-ffi:
 	$(CARGO) +$(MIRI_TOOLCHAIN) miri test -p karyos-ffi --locked
 
 build-release:

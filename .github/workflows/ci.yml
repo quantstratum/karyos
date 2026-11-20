@@ -81,14 +81,22 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: make loom
 
+  # One job per part (karyos#161): `make miri` takes about 10 h on a shared
+  # Linux host, karyos-sys alone near the 6 h job limit, so karyos-sys runs
+  # as two shards: its log buffer tests and the rest.
   miri:
-    name: Miri (karyos-sys)
+    name: Miri (${{ matrix.part }})
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [miri-sys-log-buffer, miri-sys-rest, miri-ffi]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: rustup toolchain install nightly-2026-10-11 --profile minimal --component miri,rust-src
-      - run: make miri
+      - run: make ${{ matrix.part }}
 
   deny:
     name: Licences and sources
