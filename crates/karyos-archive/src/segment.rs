@@ -1430,6 +1430,27 @@ impl<D: Disk> SegmentStore<D> {
         Ok(files)
     }
 
+    /// The data files of every segment that holds a byte below `position`,
+    /// lowest first, the one `position` falls inside included: the files a
+    /// purge before `position` reads its range's close time from
+    /// (karyos#1093). Empty at or below the start.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::PositionOverflow`].
+    pub fn segment_files_holding_below(
+        &self,
+        position: u64,
+    ) -> Result<Vec<std::path::PathBuf>, SegmentError> {
+        if position <= self.start {
+            return Ok(Vec::new());
+        }
+        let last = self.geometry.base_of(position.saturating_sub(1));
+        let mut files = self.segment_files_below(last)?;
+        files.push(self.dir.join(data_name(self.recording, last)));
+        Ok(files)
+    }
+
     /// The data files of every segment that holds a byte of the
     /// recording, lowest first: what a closed recording's copy covers
     /// (karyos#1024).

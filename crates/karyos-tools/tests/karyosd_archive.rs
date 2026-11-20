@@ -610,3 +610,67 @@ fn the_retention_backend_holds_a_karyosd_recording() {
     let _ = std::fs::remove_dir_all(&archive);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// karyos#1093: with `--archive-retain-for`, `--archive-purge`,
+/// `--archive-min-copies` and `--archive-copy-location`, a karyosd
+/// Archive's purges run through its retention policy over the control
+/// streams: refused `legal_hold` under a hold, then `not_expired` before
+/// the retention ran.
+#[test]
+fn a_karyosd_retention_policy_refuses_an_early_purge() {
+    use karyos_agent::archive_retention::ArchiveRetention;
+    use karyos_agent::catalog::ArchiveStreams;
+    use karyos_agent::retention::{RetentionBackend, RetentionReply};
+
+    let dir = dir("policy");
+    let archive = dir.with_extension("archive");
+    let _ = std::fs::remove_dir_all(&archive);
+    std::fs::create_dir_all(&archive).unwrap();
+    let path = dir.with_extension("log");
+    let location = "05".repeat(32);
+    let mut daemon = Daemon::start(
+        &dir,
+        &archive,
+        &[
+            "--record",
+            &format!("{STREAM}:{SESSION}"),
+            "--archive-copy-location",
+            &location,
+            "--archive-retain-for",
+            "3600s",
+            "--archive-purge",
+            "manual",
+            "--archive-min-copies",
+            "1",
+        ],
+        &path,
+    );
+    drop(connect(&dir));
+    let mut backend = ArchiveRetention::new(dir.clone(), ArchiveStreams::new(REQUESTS, RESPONSES))
+        .with_deadline(Duration::from_secs(10));
+    let refused = |reason: &str| RetentionReply::Refused {
+        code: 8,
+        reason: reason.to_owned(),
+    };
+    let fmt = |reply: RetentionReply| format!("{reply:?}");
+    assert_eq!(
+        fmt(backend.hold(1, 1, 1000)),
+        fmt(RetentionReply::Done { evidenced: true })
+    );
+    assert_eq!(
+        fmt(backend.purge(1, 64, 2, 1000)),
+        fmt(refused("legal_hold"))
+    );
+    assert_eq!(
+        fmt(backend.release(1, 3, 1000)),
+        fmt(RetentionReply::Done { evidenced: true })
+    );
+    assert_eq!(
+        fmt(backend.purge(1, 64, 4, 1000)),
+        fmt(refused("not_expired"))
+    );
+    assert!(daemon.stop().success());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&archive);
+    let _ = std::fs::remove_dir_all(&dir);
+}

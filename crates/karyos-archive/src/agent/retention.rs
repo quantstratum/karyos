@@ -27,7 +27,8 @@ use crate::integrity::journal::IntegrityError;
 use crate::integrity::ledger::{Ledger, read_entries};
 use crate::integrity::retention::{
     Authorisation, HoldReport, MARKER_LENGTH, OPERATION_LENGTH, OPERATIONS_FILE,
-    PENDING_HOLDS_FILE, PurgeError, PurgeRequest, PurgeSource, Retention,
+    PENDING_HOLDS_FILE, PurgeContext, PurgeError, PurgeRequest, PurgeSource, Retention,
+    RetentionPolicy,
 };
 use crate::integrity::trust::{KEYS_FILE, REGISTRY_ENTRY_LENGTH};
 use crate::integrity::verify::{self, Evidence, Outcome, RangeBytes, Reason};
@@ -172,8 +173,93 @@ impl<D: Disk + Clone> State<D> {
                     closed_ns: 0,
                     source: PurgeSource::Operator,
                 };
-                purge_failed(&self.retention.refuse_unconfigured(&request))
+                match self.config.retention_policy {
+                    Some(policy) => self.purge(request, &policy),
+                    None => purge_failed(&self.retention.refuse_unconfigured(&request)),
+                }
             }
+        }
+    }
+
+    /// Runs `request` through [`Retention::purge`] under `policy`
+    /// (karyos#1093): against the recording's own store, the active one or
+    /// the stopped one reopened, the copy catalog counting the verified
+    /// copies elsewhere. The range's close time is the last modification
+    /// of the newest segment holding bytes below the cutoff, which is no
+    /// earlier than when the range closed, so a purge is never early; a
+    /// disk that keeps no times fails the purge closed.
+    fn purge(&mut self, mut request: PurgeRequest, policy: &RetentionPolicy) -> RetentionAnswer {
+        let error = |why: String| RetentionAnswer::Error(why);
+        if self.replays.reads(request.recording) {
+            return error("a replay reads the recording; purge it once the replay ends".to_owned());
+        }
+        let Some(recording) = self.catalog.get(request.recording).cloned() else {
+            return RetentionAnswer::UnknownRecording;
+        };
+        let mut stopped = None;
+        let store = match self
+            .active
+            .iter_mut()
+            .find(|active| active.id == request.recording)
+        {
+            Some(active) => active.recorder.store_mut(),
+            None => {
+                match SegmentStore::recover(
+                    self.disk.clone(),
+                    &self.dir,
+                    recording.id,
+                    recording.geometry,
+                    recording.policy,
+                ) {
+                    Ok(recovered) => stopped.insert(recovered.store),
+                    Err(error_) => return error(error_.to_string()),
+                }
+            }
+        };
+        let mut disk = self.disk.clone();
+        let mut closed_ns = 0u64;
+        match store.segment_files_holding_below(request.before) {
+            Ok(files) => {
+                for file in files {
+                    match disk.modified(&file) {
+                        Ok(at) => closed_ns = closed_ns.max(at),
+                        Err(why) => {
+                            return error(format!(
+                                "the close time of {} is unknown: {why}",
+                                file.display()
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(why) => return error(why.to_string()),
+        }
+        request.closed_ns = closed_ns;
+        let Some(integrity) = self.integrity.as_mut() else {
+            return error("no integrity journal: the Archive seals nothing".to_owned());
+        };
+        let Some((copies, local)) = integrity.copies.as_ref() else {
+            return error("the copy catalog is unavailable".to_owned());
+        };
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| u64::try_from(since.as_nanos()).ok());
+        let Some(now_ns) = now_ns else {
+            return error("the UTC time is unavailable".to_owned());
+        };
+        let context = PurgeContext {
+            policy: Some(policy),
+            copies,
+            local: *local,
+            now_ns,
+        };
+        match self
+            .retention
+            .purge(&request, &context, store, &mut integrity.journal)
+        {
+            Ok(_) => RetentionAnswer::Done,
+            Err(failed) => purge_failed(&failed),
         }
     }
 
