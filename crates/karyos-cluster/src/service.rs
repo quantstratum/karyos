@@ -256,7 +256,10 @@ fn check_request(request: &Request) -> Result<(), CodecError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Envelope<'a> {
-    /// A client opens a session; its epoch is the entry's index.
+    /// A client opens a session; its epoch is the entry's index. Propose
+    /// it with [`ServiceContainer::propose`], which holds it until the
+    /// session bounds apply (ADR-0087), never as raw bytes through
+    /// [`Propose::propose`] (karyos#1062).
     Register {
         /// The client's stable identity.
         client: u64,
@@ -332,7 +335,9 @@ impl<'a> Envelope<'a> {
         }
     }
 
-    /// The message's bytes.
+    /// The message's bytes. A host proposes them through
+    /// [`ServiceContainer::propose`], not by handing these bytes to
+    /// [`Propose::propose`] (karyos#1062).
     ///
     /// # Errors
     ///
@@ -427,6 +432,16 @@ impl NotLeader {
 /// share.
 pub trait Propose {
     /// Appends `payload` as a new entry, if this node leads.
+    ///
+    /// **A host's obligation (ADR-0087, karyos#1062):** service entries
+    /// go through [`ServiceContainer::propose`], never straight to this
+    /// method. The container holds a leader's `Register` back until the
+    /// log's session bounds have applied; bytes proposed here directly
+    /// bypass that gate, and a registration committed ahead of the first
+    /// `SessionBounds` entry can stop the cluster with
+    /// [`ApplyError::BoundsDiffer`] on a replica with other startup
+    /// bounds. The core cannot tell a registration from any other
+    /// payload, so the gate is not enforced below the container.
     ///
     /// # Errors
     ///
