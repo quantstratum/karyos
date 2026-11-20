@@ -112,8 +112,13 @@ use crate::snapshot::SnapshotStore;
 
 /// The A2 recording id of the log.
 pub const LOG_RECORDING: u64 = 1;
-/// The most bytes one seal of the committed log reads at a time.
-const SEAL_CHUNK: u64 = 1 << 20;
+/// The most bytes one seal of the committed log reads at a time, and the
+/// committed bytes a commit advance waits for before it seals: the
+/// journal holds one record per chunk of committed log, not one per
+/// commit advance (karyos#1050). Up to one chunk of committed tail stays
+/// unsealed between seals; [`RaftLog::seal`] seals it, and a purge does
+/// before it removes anything.
+pub const SEAL_CHUNK: u64 = 1 << 20;
 /// The file keeping the log's first index.
 pub const FIRST_INDEX_FILE: &str = "first-index";
 /// A frame's header length.
@@ -1283,6 +1288,12 @@ impl<D: Disk + Clone> RaftLog<D> {
             .ok()
             .and_then(|kept| self.first_index.checked_add(kept))
             .ok_or(LogError::TooLarge { index: below })?;
+        // The committed tail a commit advance left unsealed is sealed
+        // before any of it is removed (karyos#1050).
+        if let Err(error) = self.seal_committed(true) {
+            self.poisoned = true;
+            return Err(error);
+        }
         let purged = self.store.purge_before(position);
         let _ = self.poison_on(purged)?;
         if let Err(error) = file::replace(
@@ -1447,7 +1458,24 @@ impl<D: Disk + Clone> RaftLog<D> {
                 return Err(LogError::Io(error));
             }
         }
-        let sealed = self.seal_committed();
+        let sealed = self.seal_committed(false);
+        if sealed.is_err() {
+            self.poisoned = true;
+        }
+        sealed
+    }
+
+    /// Seals the committed log's tail, however short, as a clean close
+    /// does (karyos#1050): a commit advance seals only whole
+    /// [`SEAL_CHUNK`]s.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::Poisoned`]; the store's and the journal's errors, which
+    /// poison the log.
+    pub fn seal(&mut self) -> Result<(), LogError> {
+        self.check_writable()?;
+        let sealed = self.seal_committed(true);
         if sealed.is_err() {
             self.poisoned = true;
         }
@@ -1457,8 +1485,9 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// Seals the log's bytes up to the end of the stored commit's entry,
     /// from where the current subject's seals end (karyos#990): never a
     /// byte Raft may still truncate. Committed bytes are durable, so they
-    /// read back as written.
-    fn seal_committed(&mut self) -> Result<(), LogError> {
+    /// read back as written. Unless `all`, only whole [`SEAL_CHUNK`]s are
+    /// sealed, and a shorter tail waits (karyos#1050).
+    fn seal_committed(&mut self, all: bool) -> Result<(), LogError> {
         let Some(commit) = self.hard_state.and_then(|state| state.commit) else {
             return Ok(());
         };
@@ -1481,6 +1510,9 @@ impl<D: Disk + Clone> RaftLog<D> {
         }
         while start < end {
             let chunk_end = end.min(start.saturating_add(SEAL_CHUNK));
+            if !all && chunk_end.saturating_sub(start) < SEAL_CHUNK {
+                break;
+            }
             let length = usize::try_from(chunk_end.saturating_sub(start))
                 .map_err(|_| LogError::TooLarge { index: commit })?;
             self.seal_buf.resize(length, 0);

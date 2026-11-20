@@ -1799,6 +1799,14 @@ fn the_committed_log_is_sealed_up_to_the_commit() {
         commit: Some(3),
     })
     .unwrap();
+    // Less than a chunk committed: nothing sealed until a seal is asked.
+    let (records, _) = read_records(&mut StdDisk, &dir.0).unwrap();
+    assert!(
+        records
+            .iter()
+            .all(|record| record.kind != SealKind::ClusterLog || record.start == record.end)
+    );
+    log.seal().unwrap();
     let (records, fault) = read_records(&mut StdDisk, &dir.0).unwrap();
     assert_eq!(fault, None);
     let sealed: Vec<(u64, u64)> = records
@@ -1814,6 +1822,7 @@ fn the_committed_log_is_sealed_up_to_the_commit() {
         commit: Some(4),
     })
     .unwrap();
+    log.seal().unwrap();
     let (records, _) = read_records(&mut StdDisk, &dir.0).unwrap();
     assert_eq!(
         records.last().map(|record| (record.start, record.end)),
@@ -1841,6 +1850,7 @@ fn a_log_recovered_below_its_seals_is_refused_naming_the_range() {
         commit: Some(8),
     })
     .unwrap();
+    log.seal().unwrap();
     let written = log.written();
     drop(log);
     std::fs::remove_file(data_file(&dir.0, 4096)).unwrap();
@@ -1853,4 +1863,68 @@ fn a_log_recovered_below_its_seals_is_refused_naming_the_range() {
         other => panic!("{other:?}"),
     }
     assert_eq!(listing(&dir.0), before);
+}
+
+/// karyos#1050: the seal journal grows by committed bytes per chunk, not
+/// by commit advances: many small commits leave about one record per
+/// `SEAL_CHUNK` of committed log.
+#[test]
+fn many_small_commits_leave_one_seal_per_chunk() {
+    use karyos_archive::integrity::SealKind;
+    use karyos_archive::integrity::journal::read_records;
+    use karyos_cluster::log::SEAL_CHUNK;
+    let dir = TempDir::new("chunks");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
+    let commits = 1000u64;
+    for index in 1..=commits {
+        log.append(&[entry(index, 1, &[7; 4000])]).unwrap();
+        log.sync().unwrap();
+        log.save_hard_state(HardState {
+            current_term: 1,
+            voted_for: None,
+            commit: Some(index),
+        })
+        .unwrap();
+    }
+    let (records, _) = read_records(&mut StdDisk, &dir.0).unwrap();
+    let seals = records
+        .iter()
+        .filter(|record| record.kind == SealKind::ClusterLog && record.start < record.end)
+        .count() as u64;
+    let chunks = log.written() / SEAL_CHUNK;
+    assert_eq!(seals, chunks, "{seals} seals for {} bytes", log.written());
+    assert!(seals < commits / 100);
+    // The tail is sealed on request, and the log still opens.
+    log.seal().unwrap();
+    drop(log);
+    assert_eq!(open(StdDisk, &dir.0, small()).last_index(), Some(commits));
+}
+
+/// The commit path's cost (karyos#1050): `save_hard_state` per commit
+/// advance, one small entry each, on the real disk. Run by hand with
+/// `--ignored --nocapture`; the numbers go in the PR.
+#[test]
+#[ignore = "a measurement, run by hand"]
+#[allow(clippy::print_stderr, reason = "a measurement reports its numbers")]
+fn measure_the_commit_path() {
+    let dir = TempDir::new("commit-path");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
+    let commits = 2000u64;
+    let mut saving = std::time::Duration::ZERO;
+    for index in 1..=commits {
+        log.append(&[entry(index, 1, &[7; 256])]).unwrap();
+        log.sync().unwrap();
+        let started = std::time::Instant::now();
+        log.save_hard_state(HardState {
+            current_term: 1,
+            voted_for: None,
+            commit: Some(index),
+        })
+        .unwrap();
+        saving += started.elapsed();
+    }
+    eprintln!(
+        "commit path: {commits} save_hard_state calls, {:?} each on average",
+        saving / u32::try_from(commits).unwrap()
+    );
 }
