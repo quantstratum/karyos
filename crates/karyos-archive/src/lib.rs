@@ -26,6 +26,7 @@ pub mod group;
 pub mod integrity;
 pub mod queue;
 pub mod recorder;
+pub mod replication;
 pub mod segment;
 pub mod server;
 
