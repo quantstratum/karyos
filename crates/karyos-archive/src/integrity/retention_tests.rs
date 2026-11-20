@@ -22,6 +22,7 @@ use super::test_support::{ARCHIVE, DIR, JOURNAL, archival_key, authority, sign, 
 use super::trust::*;
 use super::verify::{Evidence, Outcome, RangeBytes, verify};
 use super::{Digest, SealKind, digest};
+use crate::disk::Disk as _;
 use crate::fault::{FaultDisk, Survives};
 use crate::segment::{Geometry, SegmentStore, SyncPolicy};
 
@@ -1079,4 +1080,117 @@ fn a_cutoff_past_the_seals_or_the_purgeable_floor_is_refused() {
         })
     ));
     assert_eq!(archive.store.start(), 0);
+}
+
+/// A backend that records each release, and fails them while `fail` is
+/// set (karyos#995).
+#[derive(Clone, Default)]
+struct Releases {
+    released: std::sync::Arc<std::sync::Mutex<Vec<std::path::PathBuf>>>,
+    fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl super::copies::ImmutabilityBackend for Releases {
+    fn enforce(&mut self, _: &Path, _: u64) -> io::Result<Enforcement> {
+        Ok(Enforcement::ImmutableAttribute)
+    }
+
+    fn release(&mut self, path: &Path) -> io::Result<()> {
+        if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "immutable"));
+        }
+        self.released.lock().unwrap().push(path.to_path_buf());
+        Ok(())
+    }
+}
+
+#[test]
+fn a_purge_releases_each_removed_segment_only_after_its_checks_pass() {
+    let mut archive = fresh();
+    let releases = Releases::default();
+    archive
+        .retention
+        .set_immutability(Box::new(releases.clone()));
+    let expected = archive.store.segment_files_below(BEFORE).unwrap();
+    assert!(!expected.is_empty(), "the purge removes whole segments");
+    // Refused: nothing released.
+    assert!(archive.purge(&policy(1_000, 2), 999).is_err());
+    assert!(releases.released.lock().unwrap().is_empty());
+    // A release that fails stops the purge before any deletion.
+    releases
+        .fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let failed = archive.purge(&policy(1_000, 2), 5_000).unwrap_err();
+    assert!(
+        matches!(&failed, PurgeError::Release { path, .. } if *path == expected[0]),
+        "{failed:?}"
+    );
+    assert_eq!(archive.store.start(), 0);
+    for path in &expected {
+        assert!(
+            archive.disk.clone().open_read(path).is_ok(),
+            "{path:?} kept"
+        );
+    }
+    // Once releasable, recovery completes the intent, releasing first.
+    releases
+        .fail
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    let policy = policy(1_000, 2);
+    let context = context(&policy, &archive.copies, 5_000);
+    let outcomes = archive
+        .retention
+        .recover_purges(&context, |_| true, &mut archive.store, &mut archive.journal)
+        .unwrap();
+    assert!(matches!(outcomes[..], [Ok(_)]), "{outcomes:?}");
+    assert_eq!(archive.store.start(), BEFORE);
+    assert_eq!(*releases.released.lock().unwrap(), expected);
+}
+
+#[test]
+fn a_sealed_segment_is_recorded_with_the_enforcement_that_applies() {
+    let mut archive = fresh();
+    let path = archive.store.segment_files_below(BEFORE).unwrap()[0].clone();
+    let record = CopyRecord {
+        sequence: 0,
+        recording: RECORDING,
+        start: 0,
+        end: 128,
+        location: [44; 32],
+        digest: digest(b"segment"),
+        retain_until_ns: 0,
+        state: CopyState::Verified,
+        enforcement: Enforcement::Unsupported,
+    };
+    let before = archive.copies.records().len();
+    archive
+        .copies
+        .record_enforced(
+            record,
+            &path,
+            &mut Releases::default(),
+            &mut archive.journal,
+        )
+        .unwrap();
+    assert_eq!(
+        archive.copies.records()[before].enforcement,
+        Enforcement::ImmutableAttribute
+    );
+    let mut none = super::copies::NoImmutability;
+    archive
+        .copies
+        .record_enforced(
+            CopyRecord {
+                location: [45; 32],
+                ..record
+            },
+            &path,
+            &mut none,
+            &mut archive.journal,
+        )
+        .unwrap();
+    assert_eq!(
+        archive.copies.records()[before + 1].enforcement,
+        Enforcement::Unsupported
+    );
 }

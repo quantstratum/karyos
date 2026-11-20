@@ -1396,6 +1396,34 @@ impl<D: Disk> SegmentStore<D> {
     /// [`SegmentError::Failed`] after an earlier failure; the operating
     /// system's errors, after which the store fails until recovered.
     pub fn purge_before(&mut self, position: u64) -> Result<u64, SegmentError> {
+        self.purge_before_inner(position)
+    }
+
+    /// The data files of the whole segments [`SegmentStore::purge_before`]
+    /// at `position` removes, lowest first: what a purge must release
+    /// from an immutability enforcement before it deletes them
+    /// (karyos#995). Empty at or below the start.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::PositionOverflow`].
+    pub fn segment_files_below(
+        &self,
+        position: u64,
+    ) -> Result<Vec<std::path::PathBuf>, SegmentError> {
+        let floor_base = self.geometry.base_of(position);
+        let mut base = self.geometry.base_of(self.start);
+        let mut files = Vec::new();
+        while base < floor_base {
+            files.push(self.dir.join(data_name(self.recording, base)));
+            base = base
+                .checked_add(self.geometry.segment_length)
+                .ok_or(SegmentError::PositionOverflow)?;
+        }
+        Ok(files)
+    }
+
+    fn purge_before_inner(&mut self, position: u64) -> Result<u64, SegmentError> {
         if self.failed {
             return Err(SegmentError::Failed);
         }

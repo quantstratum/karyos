@@ -48,7 +48,7 @@ use std::num::NonZeroU32;
 
 use sha2::{Digest as _, Sha256};
 
-use super::copies::CopyCatalog;
+use super::copies::{CopyCatalog, ImmutabilityBackend};
 use super::journal::{IntegrityError, IntegrityJournal};
 use super::ledger::Ledger;
 use super::{Digest, SealKind, SealRecord, digest};
@@ -832,6 +832,25 @@ pub enum PurgeError {
     /// The operations journal failed after the deletion.
     #[error("purge: operations journal: {0}")]
     Operations(io::Error),
+    /// A segment's immutability could not be released before its deletion
+    /// (karyos#995): nothing was deleted, and the intent stays outstanding
+    /// for [`Retention::recover_purges`].
+    #[error("purge: releasing the immutability of {path}: {error}", path = path.display())]
+    Release {
+        /// The segment file.
+        path: std::path::PathBuf,
+        /// The backend's error.
+        error: io::Error,
+    },
+}
+
+/// The immutability backend a purge releases segments through.
+struct Releaser(Box<dyn ImmutabilityBackend + Send>);
+
+impl std::fmt::Debug for Releaser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Releaser")
+    }
 }
 
 /// What a purge decision needs to know besides the request.
@@ -868,9 +887,21 @@ pub struct Retention<J, D: Disk> {
     /// Recordings whose release the journal holds, though a pending
     /// marker may still reinstate their hold: a retry only resolves it.
     released: std::collections::BTreeSet<u64>,
+    /// The backend a purge releases each segment's immutability through
+    /// before deleting it; none releases nothing.
+    immutability: Option<Releaser>,
 }
 
 impl<J: OperationsJournal, D: Disk> Retention<J, D> {
+    /// Sets the backend a purge releases each segment's immutability
+    /// through (karyos#995): only after every retention check passed and
+    /// the intent is journalled, right before the deletion. Without it, a
+    /// purge releases nothing, which suits a store whose segments were
+    /// never made immutable.
+    pub fn set_immutability(&mut self, backend: Box<dyn ImmutabilityBackend + Send>) {
+        self.immutability = Some(Releaser(backend));
+    }
+
     /// Rebuilds retention state at start from the operations journal's
     /// records (`None` when they cannot be read) and the pending markers.
     /// Unreadable hold state inhibits every purge until a later
@@ -889,6 +920,7 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             intents: BTreeMap::new(),
             froms: BTreeMap::new(),
             released: std::collections::BTreeSet::new(),
+            immutability: None,
         };
         if let Some(records) = records {
             let _ = state.replay(records);
@@ -1308,12 +1340,14 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                 // A floor already past the cutoff deleted the range: only
                 // the record is missing.
                 if store.start() < request.before {
+                    self.release(store, request.before)?;
                     store.purge_before(request.before)?;
                 }
                 journal.record_purge(request.recording, first, request.before, sealed)?
             }
         };
         if store.start() < request.before {
+            self.release(store, request.before)?;
             store.purge_before(request.before)?;
         }
         self.operations
@@ -1322,6 +1356,25 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         self.intents.remove(&request.id);
         self.froms.remove(&request.id);
         Ok(record)
+    }
+
+    /// Releases the immutability of every segment a purge below `before`
+    /// removes, lowest first; the first failure stops it, before any
+    /// deletion.
+    fn release<D2: Disk>(
+        &mut self,
+        store: &SegmentStore<D2>,
+        before: u64,
+    ) -> Result<(), PurgeError> {
+        let Some(Releaser(backend)) = self.immutability.as_mut() else {
+            return Ok(());
+        };
+        for path in store.segment_files_below(before)? {
+            backend
+                .release(&path)
+                .map_err(|error| PurgeError::Release { path, error })?;
+        }
+        Ok(())
     }
 
     /// Completes or cancels every outstanding purge intent after a crash.
