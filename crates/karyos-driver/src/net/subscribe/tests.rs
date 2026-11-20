@@ -2332,3 +2332,32 @@ fn path_skew_is_validated_at_admission_and_shared_by_a_key() {
         Err(DriverError::InvalidConfig)
     ));
 }
+
+/// karyos#1086: the control group entries channels' `nak-control` adds
+/// leave the driver's table with their last subscription, so channels
+/// naming nine distinct groups in turn never exhaust its eight entries; a
+/// failed add releases what it counted, and the count is visible.
+#[test]
+fn nak_control_entries_leave_with_their_last_subscription() {
+    let mut b = driver(ThreadingMode::Shared);
+    let at = |n: u8, last: u8, port: u16| SocketAddr::from(([239, 8, n, last], port));
+    let multicast = |n: u8| UdpConfig {
+        destination: Destination::Multicast {
+            group: at(n, 1, 4000),
+            ttl: None,
+        },
+        interface: None,
+        nak_control: vec![at(n, 2, 4001)],
+        ..channel(at(n, 1, 4000))
+    };
+    assert_eq!(b.network_control_groups_in_use(), 0);
+    for n in 0..9u8 {
+        // A host without multicast cannot join: the add fails, and must
+        // still release what it counted.
+        if let Ok(subscription) = b.add_network_subscription(i32::from(n) + 10, &multicast(n)) {
+            assert_eq!(b.network_control_groups_in_use(), 1, "{n}");
+            assert!(b.remove_network_subscription(subscription).unwrap());
+        }
+        assert_eq!(b.network_control_groups_in_use(), 0, "{n}");
+    }
+}

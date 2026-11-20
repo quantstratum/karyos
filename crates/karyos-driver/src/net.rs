@@ -546,6 +546,9 @@ struct NetSubscription {
     /// The routes the channel asked for its later paths: a second handle
     /// of the key must ask for the same ones.
     later_routes: [Option<(SocketAddr, MulticastConfig)>; LATER_PATHS],
+    /// The control group entries its channel's `nak-control` holds in the
+    /// driver's table, released with the key (karyos#1086).
+    control_held: control_group::Held,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
 }
@@ -844,6 +847,9 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     guard_deregister_failures: u64,
     /// The NAK control groups of multicast data groups (RC-15).
     control_groups: ControlGroups,
+    /// The users of each entry a channel's `nak-control` added
+    /// (karyos#1086).
+    control_group_uses: control_group::Uses,
     /// Control group joins that failed: those keys run without peer
     /// suppression input (RC-15).
     control_join_failures: u64,
@@ -983,6 +989,7 @@ impl<T: StreamTerms> Network<T> {
             },
             guard_deregister_failures: 0,
             control_groups: config.nak_control_groups,
+            control_group_uses: [None; MAX_CONTROL_GROUPS],
             control_join_failures: 0,
             solicit_endpoint_failures: 0,
             paths_isolated: <OsSocket as karyos_io::sockets::ops::SocketOps>::isolates_paths(),
@@ -1322,6 +1329,7 @@ impl<T: StreamTerms> Network<T> {
             later: held,
             later_controls,
             later_routes,
+            control_held: [false; MAX_CONTROL_GROUPS],
             users: 1,
         });
         Ok(handle)
@@ -1373,11 +1381,11 @@ impl<T: StreamTerms> Network<T> {
     pub(crate) fn map_nak_control(
         &mut self,
         channel: &karyos_protocol::channel::UdpConfig,
-    ) -> Result<(), DriverError> {
+    ) -> Result<control_group::Held, DriverError> {
         use karyos_protocol::channel::{Destination, Interface};
         let Destination::Multicast { group, .. } = channel.destination else {
             return if channel.nak_control.is_empty() {
-                Ok(())
+                Ok([false; MAX_CONTROL_GROUPS])
             } else {
                 Err(DriverError::UnsupportedChannel)
             };
@@ -1404,6 +1412,7 @@ impl<T: StreamTerms> Network<T> {
         }
         control_group::merge(
             &mut self.control_groups,
+            &mut self.control_group_uses,
             interfaces
                 .into_iter()
                 .zip(channel.nak_control.iter())
@@ -1413,6 +1422,35 @@ impl<T: StreamTerms> Network<T> {
                     control_group: *control,
                 }),
         )
+    }
+
+    /// Keeps `held`, what [`Self::map_nak_control`] counted for the
+    /// channel of `subscription`, on its key; a key that already holds its
+    /// entries (a second handle) releases them at once (karyos#1086).
+    pub(crate) fn keep_control_groups(
+        &mut self,
+        subscription: NetworkSubscription,
+        held: control_group::Held,
+    ) {
+        let first = self.subscriptions.iter_mut().find(|entry| {
+            (entry.endpoint, entry.stream_id) == (subscription.endpoint, subscription.stream_id)
+                && entry.users == 1
+        });
+        match first {
+            Some(entry) => entry.control_held = held,
+            None => self.release_control_groups(&held),
+        }
+    }
+
+    /// Releases `held` (karyos#1086).
+    pub(crate) fn release_control_groups(&mut self, held: &control_group::Held) {
+        control_group::release(&mut self.control_groups, &mut self.control_group_uses, held);
+    }
+
+    /// The entries of the NAK control group table in use: configured, and
+    /// added by channels' `nak-control` while a channel holds them.
+    pub(crate) fn control_groups_in_use(&self) -> usize {
+        self.control_groups.iter().flatten().count()
     }
 
     /// The driver's NAK control group table, as configured and as
@@ -1614,6 +1652,7 @@ impl<T: StreamTerms> Network<T> {
                     })
                     .map_err(|_| DriverError::NetworkBusy)?;
                 let entry = self.subscriptions.swap_remove(index);
+                self.release_control_groups(&entry.control_held);
                 if let Some(control) = entry.control {
                     release(&mut self.send_endpoints, control);
                 }
