@@ -21,7 +21,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 image="${KARYOS_LINUX_IMAGE:-rust:1.99}"
-tree="$(basename "$root" | tr -c 'A-Za-z0-9_.-\n' '-')"
+tree="$(basename "$root" | tr -c 'A-Za-z0-9_.\n-' '-')"
 sum="$(printf '%s' "$root" | cksum | cut -d ' ' -f 1)"
 target="${KARYOS_LINUX_TARGET:-karyos-linux-target-$tree-$sum}"
 # KARYOS_LINUX_PLATFORM selects another container platform, for example
