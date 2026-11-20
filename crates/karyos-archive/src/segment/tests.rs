@@ -582,14 +582,15 @@ fn a_cached_read_handle_follows_a_truncation_on_disk() {
     assert_eq!(head[..], bytes[..16]);
     store.read(1000, &mut head).unwrap();
     assert_eq!(head[..], bytes[900..916]);
-    // Cut inside it and write different bytes across the next segment.
-    assert_eq!(store.truncate(200).unwrap(), 200);
+    // Cut inside it, at a write's start, and write different bytes
+    // across the next segment.
+    assert_eq!(store.truncate(3100).unwrap(), 3100);
     let fresh = vec![0xAA; 9000];
-    store.append(200, &fresh).unwrap();
-    let mut read = vec![0u8; 9100];
+    store.append(3100, &fresh).unwrap();
+    let mut read = vec![0u8; 12_000];
     store.read(100, &mut read).unwrap();
-    assert_eq!(read[..100], bytes[..100]);
-    assert_eq!(read[100..], fresh[..]);
+    assert_eq!(read[..3000], bytes[..3000]);
+    assert_eq!(read[3000..], fresh[..]);
 }
 
 /// The cost of a sync on the real disk (`F_FULLFSYNC` on Apple targets,
