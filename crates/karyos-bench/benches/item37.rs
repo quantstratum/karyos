@@ -305,8 +305,10 @@ fn catch_up() -> Result<(), Failed> {
         }
         let took = started.elapsed();
         let rate = gib_per_second(DEFAULT_ALLOWANCE, took);
+        #[allow(clippy::cast_precision_loss, reason = "a printed rate")]
+        let per_entry = took.as_secs_f64() * 1e6 / (entries.max(1) as f64);
         say(&format!(
-            "catch-up payload {payload} B: {entries} entries in 1 GiB, written and synced in {wrote:?}; read back in {took:?} ({rate:.2} GiB/s, {} MiB of payload)",
+            "catch-up payload {payload} B: {entries} entries in 1 GiB, written and synced in {wrote:?}; read back in {took:?} ({rate:.2} GiB/s, {per_entry:.2} µs per entry, {} MiB of payload)",
             read >> 20
         ))?;
     }

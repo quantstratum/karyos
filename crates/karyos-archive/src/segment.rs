@@ -529,6 +529,11 @@ pub struct SegmentStore<D: Disk> {
     written: u64,
     durable: u64,
     current: Option<Open<D::File>>,
+    /// The last finished segment [`SegmentStore::read`] opened, by base:
+    /// kept so a scan reads each segment through one handle instead of
+    /// opening its file for every read (karyos#1001). Dropped before any
+    /// segment file is created, cut or removed.
+    reader: Option<(u64, D::File)>,
     /// The lost ranges, in order: reads inside them are refused.
     gaps: Vec<(u64, u64)>,
     /// Finished segments the interval policy syncs at its next tick.
@@ -840,6 +845,7 @@ impl<D: Disk> SegmentStore<D> {
             written: start,
             durable: start,
             current: None,
+            reader: None,
             gaps: Vec::new(),
             finished: Vec::new(),
             unsynced_behind: None,
@@ -901,6 +907,7 @@ impl<D: Disk> SegmentStore<D> {
     /// Creates the segment at `base` (its index header naming `start`),
     /// then makes its files and their directory entries durable.
     fn open_new(&mut self, base: u64, start: u64) -> Result<Open<D::File>, SegmentError> {
+        self.reader = None;
         let data_path = self.dir.join(data_name(self.recording, base));
         let index_path = self.dir.join(index_name(self.recording, base));
         let data = self.disk.create(&data_path)?;
@@ -1438,6 +1445,7 @@ impl<D: Disk> SegmentStore<D> {
         if position == self.start {
             return Ok(self.start);
         }
+        self.reader = None;
         let floor_base = self.geometry.base_of(position);
         // The floor's segment must exist: at the written position's end of
         // a segment, the next one is not created yet.
@@ -1570,6 +1578,7 @@ impl<D: Disk> SegmentStore<D> {
     /// at `base`, which end at `position` (see [`SegmentStore::truncate`]
     /// for the order).
     fn cut(&mut self, base: u64, entries: u64, position: u64) -> Result<(), SegmentError> {
+        self.reader = None;
         self.sync_behind()?;
         self.sync_open()?;
         let index_path = self.dir.join(index_name(self.recording, base));
@@ -1675,11 +1684,16 @@ impl<D: Disk> SegmentStore<D> {
                 .ok_or(SegmentError::PositionOverflow)?;
             match self.current.as_ref().filter(|open| open.base == base) {
                 Some(open) => self.disk.read_at(&open.data, offset, chunk)?,
-                None => {
-                    let path = self.dir.join(data_name(self.recording, base));
-                    let file = self.disk.open_read(&path)?;
-                    self.disk.read_at(&file, offset, chunk)?;
-                }
+                None => match self.reader.as_ref().filter(|(at, _)| *at == base) {
+                    Some((_, file)) => self.disk.read_at(file, offset, chunk)?,
+                    None => {
+                        self.reader = None;
+                        let path = self.dir.join(data_name(self.recording, base));
+                        let file = self.disk.open_read(&path)?;
+                        self.disk.read_at(&file, offset, chunk)?;
+                        self.reader = Some((base, file));
+                    }
+                },
             }
             position = position
                 .checked_add(u64::try_from(take).map_err(|_| SegmentError::PositionOverflow)?)
@@ -1809,6 +1823,7 @@ impl<D: Disk> SegmentStore<D> {
                 entries: kept.entries,
                 dirty: false,
             }),
+            reader: None,
             gaps,
             finished: Vec::new(),
             unsynced_behind: None,
