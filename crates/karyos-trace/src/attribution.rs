@@ -21,9 +21,18 @@
 //! filtering, replay or mixing of journals. Verdicts derived from any other
 //! feed are meaningless.
 //!
-//! All state is preallocated: up to `max_traces` trace entries and
-//! `max_intervals` loss intervals; overflow only marks more traces
-//! incomplete.
+//! All state is preallocated: up to `max_traces` trace entries,
+//! `max_intervals` loss intervals and as many held drop ranges; overflow
+//! only marks more traces incomplete.
+//!
+//! **Drop ranges** (karyos#150, trace-attribution.md, "Narrowing with a
+//! declared span and drop ranges"). A loss with no retained neighbour on
+//! one side (before the first record, or the tail) marks the cohort,
+//! unless the journal's held drop ranges ([`Attributor::set_ranges`])
+//! cover every lost sequence in one clock and epoch, that of the neighbour
+//! on the other side: it is then the interval of their collection times.
+//! Below `lost_before`, or where the source lost records itself, nothing
+//! narrows.
 
 use karyos_protocol::journal::Stamp;
 
@@ -53,6 +62,24 @@ pub enum Verdict {
     /// A loss may have removed an observation, or the trace could not be
     /// followed. Final as soon as it is reached.
     Incomplete,
+}
+
+/// A drop range the journal still holds, its sequences counted as the
+/// attributor's feed counts them (from the source's start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldRange {
+    /// First dropped sequence.
+    pub first: u64,
+    /// Last dropped sequence.
+    pub last: u64,
+    /// Collection time of the first drop.
+    pub first_time: u64,
+    /// Collection time of the last drop.
+    pub last_time: u64,
+    /// Clock domain of both times.
+    pub clock: u64,
+    /// Calibration epoch of both times.
+    pub epoch: u64,
 }
 
 /// What [`Attributor::observe`] did with one collected item.
@@ -127,6 +154,7 @@ struct Interval {
 /// The last retained record: its sequence and collection stamp.
 #[derive(Debug, Clone, Copy)]
 struct Retained {
+    clock: u64,
     epoch: u64,
     time: u64,
 }
@@ -150,6 +178,14 @@ pub struct Attributor {
     taken: u64,
     /// Whether [`Collected::Closed`] was observed.
     closed: bool,
+    /// The journal's held drop ranges, at most `max_intervals`.
+    ranges: Vec<HeldRange>,
+    /// Every sequence below it may have been lost unseen.
+    lost_before: Option<u64>,
+    /// Whether the source lost records after the journal stored them.
+    mirror_loss: Vec<(u64, u64)>,
+    /// The horizon a tail loss was already bounded to by drop ranges.
+    tail_bounded: Option<u64>,
 }
 
 impl Attributor {
@@ -171,6 +207,14 @@ impl Attributor {
         intervals
             .try_reserve_exact(config.max_intervals)
             .map_err(|_| TraceError::Attribution)?;
+        let mut ranges = Vec::new();
+        ranges
+            .try_reserve_exact(config.max_intervals)
+            .map_err(|_| TraceError::Attribution)?;
+        let mut mirror_loss = Vec::new();
+        mirror_loss
+            .try_reserve_exact(config.max_intervals)
+            .map_err(|_| TraceError::Attribution)?;
         Ok(Self {
             config,
             entries,
@@ -182,7 +226,71 @@ impl Attributor {
             next_sequence: 0,
             taken: 0,
             closed: false,
+            ranges,
+            lost_before: None,
+            mirror_loss,
+            tail_bounded: None,
         })
+    }
+
+    /// Sets the journal's loss accounting the narrowing may use: its held
+    /// drop ranges, `lost_before` and the ranges the source itself lost,
+    /// all counted from the feed's start. More ranges than the table holds
+    /// are not kept, which only narrows less; a mirror loss beyond it marks
+    /// the cohort.
+    pub fn set_ranges(
+        &mut self,
+        ranges: &[HeldRange],
+        lost_before: Option<u64>,
+        mirror: &[(u64, u64)],
+    ) {
+        self.ranges.clear();
+        let room = self.config.max_intervals;
+        self.ranges.extend(ranges.iter().take(room).copied());
+        self.lost_before = lost_before;
+        self.mirror_loss.clear();
+        self.mirror_loss.extend(mirror.iter().take(room).copied());
+        if mirror.len() > room {
+            self.mark_cohort();
+        }
+    }
+
+    /// The collection interval of the lost sequences `[from, to)` when held
+    /// drop ranges cover every one in `clock` and `epoch`: `None` when any
+    /// is uncovered, below `lost_before`, lost by the source, or in another
+    /// clock or epoch.
+    fn covered(&self, from: u64, to: u64, clock: u64, epoch: u64) -> Option<(u64, u64)> {
+        if from >= to || self.lost_before.is_some_and(|below| from < below) {
+            return None;
+        }
+        let last = to.checked_sub(1)?;
+        if self
+            .mirror_loss
+            .iter()
+            .any(|&(first, end)| first <= last && from <= end)
+        {
+            return None;
+        }
+        let mut cursor = from;
+        let (mut low, mut high) = (u64::MAX, 0);
+        // Each step moves `cursor` past one range, so at most one pass per
+        // held range.
+        for _ in 0..=self.ranges.len() {
+            if cursor > last {
+                return Some((low, high));
+            }
+            let range = self
+                .ranges
+                .iter()
+                .find(|range| range.first <= cursor && cursor <= range.last)?;
+            if range.clock != clock || range.epoch != epoch {
+                return None;
+            }
+            low = low.min(range.first_time);
+            high = high.max(range.last_time);
+            cursor = range.last.checked_add(1)?;
+        }
+        (cursor > last).then_some((low, high))
     }
 
     /// Marks every tracked trace and every trace first retained later.
@@ -193,21 +301,31 @@ impl Attributor {
         }
     }
 
-    /// Applies a loss between the previous retained record and one at
-    /// `(epoch, time)`.
-    fn apply_loss(&mut self, epoch: u64, time: u64) {
+    /// Applies a loss of the sequences `[from, sequence)` between the
+    /// previous retained record and one at `sequence`, stamped `collected`.
+    fn apply_loss(&mut self, from: u64, sequence: u64, collected: Stamp, bounded: bool) {
+        let (clock, epoch, time) = (collected.clock, collected.epoch, collected.time);
         let Some(previous) = self.previous else {
             // Before the first retained record: earlier epochs may be lost
-            // too.
-            self.mark_cohort();
+            // too, unless held drop ranges cover every lost sequence in this
+            // record's epoch.
+            match self.covered(from, sequence, clock, epoch) {
+                Some((low, _)) if bounded => self.apply_interval(epoch, low, time),
+                _ => self.mark_cohort(),
+            }
             return;
         };
-        if previous.epoch != epoch {
+        if previous.epoch != epoch || previous.clock != clock {
             // Spanning epochs: not comparable.
             self.mark_cohort();
             return;
         }
-        let (low, high) = (previous.time, time);
+        self.apply_interval(epoch, previous.time, time);
+    }
+
+    /// Marks the traces a loss in `[low, high]` of `epoch` could have
+    /// touched, and keeps the interval for traces first retained later.
+    fn apply_interval(&mut self, epoch: u64, low: u64, high: u64) {
         let span = self.config.span;
         for entry in &mut self.entries {
             if entry.window_overlaps(epoch, low, high, span) || entry.first_epoch < epoch {
@@ -262,9 +380,16 @@ impl Attributor {
                 ref record,
                 collected,
             } => {
+                let from = self.next_sequence;
                 self.next_sequence = sequence.checked_add(1).unwrap_or(sequence);
                 self.taken += 1;
-                self.on_record(gap.is_some(), record.ids.trace_id, collected)
+                self.on_record(
+                    gap.is_some(),
+                    from,
+                    sequence,
+                    record.ids.trace_id,
+                    collected,
+                )
             }
             Collected::Corrupt { sequence, .. } => {
                 self.next_sequence = sequence.checked_add(1).unwrap_or(sequence);
@@ -282,15 +407,28 @@ impl Attributor {
         }
     }
 
-    fn on_record(&mut self, gap: bool, trace_id: [u64; 2], collected: Stamp) -> Observed {
+    fn on_record(
+        &mut self,
+        gap: bool,
+        from: u64,
+        sequence: u64,
+        trace_id: [u64; 2],
+        collected: Stamp,
+    ) -> Observed {
         let (epoch, time) = (collected.epoch, collected.time);
         let lost = gap || self.pending_loss;
         if lost {
-            self.apply_loss(epoch, time);
+            // A corrupt record has no stamp a drop range could cover.
+            let bounded = !self.pending_loss;
+            self.apply_loss(from, sequence, collected, bounded);
             self.pending_loss = false;
         }
         self.advance_frontier(epoch, time);
-        self.previous = Some(Retained { epoch, time });
+        self.previous = Some(Retained {
+            clock: collected.clock,
+            epoch,
+            time,
+        });
         if trace_id == [0, 0] {
             return Observed::Unattributed;
         }
@@ -347,7 +485,34 @@ impl Attributor {
     /// cohort.
     pub fn observe_snapshot(&mut self, attempted: u64, stored: u64) {
         if self.taken >= stored && attempted > self.next_sequence {
-            self.mark_cohort();
+            self.tail_loss(attempted);
+        }
+    }
+
+    /// A tail loss of `[next_sequence, attempted)`: the interval of the held
+    /// drop ranges that cover it in the last record's clock and epoch, else
+    /// the incarnation cohort. Applied once per horizon.
+    fn tail_loss(&mut self, attempted: u64) {
+        if self.tail_bounded == Some(attempted) {
+            return;
+        }
+        let bounded = match self.previous {
+            Some(previous) if !self.pending_loss => self
+                .covered(
+                    self.next_sequence,
+                    attempted,
+                    previous.clock,
+                    previous.epoch,
+                )
+                .map(|(_, high)| (previous.epoch, previous.time, high)),
+            _ => None,
+        };
+        match bounded {
+            Some((epoch, low, high)) => {
+                self.apply_interval(epoch, low, high);
+                self.tail_bounded = Some(attempted);
+            }
+            None => self.mark_cohort(),
         }
     }
 
@@ -386,8 +551,10 @@ impl Attributor {
         if !self.closed {
             return Err(TraceError::NotClosed);
         }
-        if attempted != self.next_sequence || self.pending_loss {
+        if self.pending_loss || attempted < self.next_sequence {
             self.mark_cohort();
+        } else if attempted > self.next_sequence {
+            self.tail_loss(attempted);
         }
         let cohort = self.cohort;
         Ok(self.entries.iter().map(move |entry| {

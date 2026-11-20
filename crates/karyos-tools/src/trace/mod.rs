@@ -47,7 +47,7 @@ pub fn run(options: &Options, stop: &AtomicBool, out: &mut dyn Write, err: &mut 
             return EXIT_ATTACH;
         }
     };
-    let mut mirror = mirror::MirrorTool::new(tool.instance());
+    let mut mirror = mirror::MirrorTool::new(tool.instance()).with_span(options.span);
     let mut last: Option<String> = None;
     let mut scan = 0u64;
     loop {

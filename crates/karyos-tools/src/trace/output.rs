@@ -119,9 +119,13 @@ pub fn render(tool: &MirrorTool, report: &TraceReport) -> Result<String, Histogr
             "  latency Publish to SubscriberPoll: {}",
             latency(histogram(&publication))?
         );
+        let complete = match tool.span() {
+            Some(span) => format!("complete under the declared span of {span} ns"),
+            None => "complete".to_owned(),
+        };
         let _ = writeln!(
             out,
-            "  traces: complete {}, incomplete {}, provisional {}, out of scope {}",
+            "  traces: {complete} {}, incomplete {}, provisional {}, out of scope {}",
             summary.complete, summary.incomplete, summary.provisional, summary.out_of_scope
         );
     }

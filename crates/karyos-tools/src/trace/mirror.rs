@@ -415,6 +415,9 @@ pub struct MirrorTool {
     refused_rises: u64,
     /// That count of scans could not rise further.
     refused_rises_overflowed: bool,
+    /// The declared attribution span `D` in nanoseconds (`--trace-span`);
+    /// `None` when none was declared, and `D` is unbounded.
+    span: Option<u64>,
 }
 
 impl MirrorTool {
@@ -438,7 +441,24 @@ impl MirrorTool {
             refused: None,
             refused_rises: 0,
             refused_rises_overflowed: false,
+            span: None,
         }
+    }
+
+    /// The tool with a declared attribution span `D` of `span` nanoseconds
+    /// (quantstratum-docs: karyos/design/trace-attribution.md, "Narrowing
+    /// with a declared span and drop ranges"). A complete verdict then holds
+    /// under that declaration.
+    #[must_use]
+    pub fn with_span(mut self, span: Option<u64>) -> Self {
+        self.span = span;
+        self
+    }
+
+    /// The declared attribution span, if any.
+    #[must_use]
+    pub fn span(&self) -> Option<u64> {
+        self.span
     }
 
     /// Scans the ring from the cursor, then reads the table and the recycle
@@ -676,7 +696,7 @@ impl MirrorTool {
             .max(1);
         let mut report = TraceReport::new(
             AttributionConfig {
-                span: u64::MAX,
+                span: self.span.unwrap_or(u64::MAX),
                 max_traces,
                 max_intervals: MAX_INTERVALS,
             },
