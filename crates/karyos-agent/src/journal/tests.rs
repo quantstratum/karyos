@@ -363,3 +363,25 @@ fn durable_appends_are_sealed_and_verify() {
         verify_range(range, &bytes).unwrap();
     }
 }
+
+/// R-CORE-21 (karyos#740): a rate change's records, kinds 17 and 18, read
+/// back with the stream word, the version replaced and the version after;
+/// the request is one an outcome must answer.
+#[test]
+fn rate_change_records_round_trip() {
+    let mut record = request(Kind::RateRequest, 7, 3);
+    record.guard = (1_u64 << 32) | 2;
+    record.expected = 4;
+    assert_eq!(
+        JournalRecord::decode(&record.encode()),
+        Some(record.clone())
+    );
+    assert_eq!(record.encode()[8], 17);
+    assert!(Kind::RateRequest.is_request());
+    let mut outcome = request(Kind::RateOutcome, 8, 3);
+    outcome.expected = 4;
+    outcome.word = 5;
+    assert_eq!(outcome.encode()[8], 18);
+    assert!(!Kind::RateOutcome.is_request());
+    assert_eq!(JournalRecord::decode(&outcome.encode()), Some(outcome));
+}

@@ -23,6 +23,52 @@ pub struct AgentView {
     pub journal: Option<JournalView>,
     /// The agent itself (R-CORE-24; karyos#728).
     pub agent: AgentIdentity,
+    /// The rate policy version of each guarded stream this agent changed,
+    /// as the driver last answered it (R-CORE-21, karyos#740), at most
+    /// [`MAX_RATE_VIEWS`], the least recently answered dropped first. It
+    /// is what this agent observed, not a read of the driver.
+    pub rates: Vec<RateView>,
+}
+
+/// The most streams [`AgentView::rates`] holds.
+pub const MAX_RATE_VIEWS: usize = 256;
+
+/// A guarded stream's rate policy version, as a rate change's answer
+/// named it (R-CORE-21, karyos#740).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RateView {
+    /// The driver's directory.
+    pub dir: std::path::PathBuf,
+    /// The wire stream id.
+    pub stream_id: i32,
+    /// The session id.
+    pub session_id: i32,
+    /// The policy version.
+    pub version: u64,
+    /// The operation whose answer named it.
+    pub operation: u64,
+}
+
+impl RateView {
+    /// The version `version` of stream `stream_id`/`session_id` of the
+    /// driver in `dir`, answered to `operation`.
+    #[must_use]
+    pub const fn new(
+        dir: std::path::PathBuf,
+        stream_id: i32,
+        session_id: i32,
+        version: u64,
+        operation: u64,
+    ) -> Self {
+        Self {
+            dir,
+            stream_id,
+            session_id,
+            version,
+            operation,
+        }
+    }
 }
 
 /// The longest name of a principal a relay carries requests for
@@ -157,7 +203,7 @@ pub enum CapabilityState {
 
 /// The capability names of API v1, a closed list: a later agent may add
 /// names, and a client ignores the ones it does not know.
-pub const CAPABILITIES: [&str; 11] = [
+pub const CAPABILITIES: [&str; 12] = [
     "view",
     "guard-close",
     "guard-reopen",
@@ -169,6 +215,7 @@ pub const CAPABILITIES: [&str; 11] = [
     "trace-export",
     "join-registry",
     "join-put",
+    "rate-change",
 ];
 
 /// The byte bound of a `trace-buckets` reply (R-CORE-23). A reply holds

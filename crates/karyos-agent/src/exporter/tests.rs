@@ -144,6 +144,7 @@ fn view() -> AgentView {
         drivers: vec![attached, closed],
         journal: None,
         agent: crate::api::AgentIdentity::new(None, 1, 1),
+        rates: Vec::new(),
     }
 }
 
