@@ -116,7 +116,9 @@ fn a_seed_reproduces_its_run<C: ConsensusCore>() {
 /// each case passes, or fails with the typed reason this function is told
 /// to expect for that core (`short`: the slow-follower cases whose leader
 /// did not commit the required entries while the follower was cut off).
-fn w2<C: ConsensusCore>(short: &[&str]) {
+/// `metered`: the core's catch-up reads go through the harness's metered
+/// `LogView`, so its log-read burst passes or fails on the bytes charged.
+fn w2<C: ConsensusCore>(short: &[&str], metered: bool) {
     let w2 = W2::skeleton();
     let cases = w2.cases().unwrap();
     assert_eq!(cases.len(), 5);
@@ -141,12 +143,13 @@ fn w2<C: ConsensusCore>(short: &[&str]) {
         } else {
             assert!(pushed.is_empty(), "{}: {pushed:?}", case.name);
         }
-        // Not demonstrated, whatever its result (karyos#963 review): a
-        // lagging follower catches up from the adapter's own mirror of the
-        // log, never through the harness's metered `LogView`, so a read
-        // past `log_read_bytes` would go unseen. Its safety is asserted
-        // above; it is never counted a pass.
-        if case.name.contains("log-read burst") {
+        // Unmetered, not demonstrated whatever its result (karyos#963
+        // review): a lagging follower catches up from the adapter's own
+        // mirror of the log, never through the harness's metered
+        // `LogView`, so a read past `log_read_bytes` would go unseen. Its
+        // safety is asserted above; it is never counted a pass. Metered
+        // (raft-rs since karyos#975), it is judged like any other case.
+        if !metered && case.name.contains("log-read burst") {
             continue;
         }
         let result = workloads::pass(case, &outcome);
@@ -163,14 +166,14 @@ fn w2<C: ConsensusCore>(short: &[&str]) {
 }
 
 fn w2_raft<C: ConsensusCore>() {
-    w2::<C>(&[]);
+    w2::<C>(&[], true);
 }
 
 /// OpenRaft commits fewer entries than W2 requires while the follower is
 /// cut off (787 of 1,000 and 842 of 1,024 at seed 1): the case cannot
 /// establish its slow follower, a typed failure, not a pass.
 fn w2_openraft<C: ConsensusCore>() {
-    w2::<C>(&["slow follower"]);
+    w2::<C>(&["slow follower"], false);
 }
 
 /// The byte cap reached before the entry cap (karyos#963 review): 256 B
