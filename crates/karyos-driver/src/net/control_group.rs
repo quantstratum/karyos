@@ -5,7 +5,7 @@
 //! RC-7, RC-15). The driver holds one mapping, seeded from
 //! [`NetworkConfig::nak_control_groups`](super::NetworkConfig); a
 //! channel's `nak-control` key (owner item 8, karyos#654) adds its paths'
-//! entries to that same table ([`merge`]), so two subscribers of one
+//! entries to that same table (`merge`), so two subscribers of one
 //! driver never disagree about its topology. Cross-host agreement on the
 //! groups is the deployment's: there is no discovery.
 //!
