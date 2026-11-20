@@ -311,7 +311,8 @@ fn the_retention_kinds_keep_the_existing_codes() {
         let record = request(kind, 5, 7);
         assert_eq!(JournalRecord::decode(&record.encode()), Some(record));
     }
-    assert_eq!(Kind::from_code(17), None);
+    // 17 and 18 are the rate change's (karyos#740); 19 is no kind yet.
+    assert_eq!(Kind::from_code(19), None);
 }
 
 /// karyos#985: each durable append seals the recording to its durable end,
