@@ -1,0 +1,3 @@
+### Changed
+
+- Recording group records are schema 3 version 2 (ADR-0089, karyos#672): the message, lifecycle and loss events carry `image`, the registration of the network image they came from (0 for none), so two images of one `karyos:udp` alias are recorded, delivered and replayed as two. Version 1 journals are still read, as image 0, with the coarse identity of before. The Gateway's `Event::Message`, `Event::Loss` and `Event::Lifecycle` gain `image`; the client's `ImageStop` and `SubscriptionError::Poll` gain `image: Option<u64>`, `MessageInfo` gains `image`, and `ImageChange` gains `registration` (with `ImageChange::with_registration`). `wire.group_record` is 2.

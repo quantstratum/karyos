@@ -1126,6 +1126,7 @@ fn a_reopened_range_does_not_claim_old_events_durable() {
             recording_id: 7,
             length: 10,
         },
+        image: 0,
     }));
     first.extend(encode(&GroupRecord::End(EventEnd {
         group_seq: 1,

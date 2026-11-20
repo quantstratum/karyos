@@ -247,6 +247,7 @@ impl<T: TermBytes> LaneState<T> {
                 extension: info.extension,
                 session_id,
                 lane,
+                image: None,
             };
             taken = Some(info);
             handler(bytes, lane, info);

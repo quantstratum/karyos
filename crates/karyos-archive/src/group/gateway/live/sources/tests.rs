@@ -845,14 +845,15 @@ impl MessageSource for Images {
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
-    ) -> Result<(PollSummary, Option<(i32, Lane)>), PollError> {
+    ) -> Result<(PollSummary, Option<(i32, Lane, u64)>), PollError> {
         let count = self.images.len();
         for offset in 0..count {
             let index = (self.next + offset) % count;
             let summary = self.images[index].poll_taking(&mut *handler, limit)?;
             if summary != PollSummary::default() {
                 self.next = (index + 1) % count;
-                return Ok((summary, Some(fan_images()[index])));
+                let (session, lane) = fan_images()[index];
+                return Ok((summary, Some((session, lane, 0))));
             }
         }
         Ok((PollSummary::default(), None))
@@ -951,10 +952,12 @@ fn seen(event: &Event<'_>) -> (&'static str, u16) {
         Event::Lifecycle {
             source,
             kind: LifecycleKind::ImageAvailable,
+            ..
         } => ("available", source.0),
         Event::Lifecycle {
             source,
             kind: LifecycleKind::ImageUnavailable,
+            ..
         } => ("unavailable", source.0),
         _ => ("other", u16::MAX),
     }
@@ -1922,6 +1925,7 @@ fn the_message_size_is_the_records() {
             end_of_stream: false,
             extension: extension.as_ref(),
             payload,
+            image: 0,
         })
         .encode(&mut out)
         .unwrap();
@@ -1983,4 +1987,231 @@ fn a_message_that_exactly_fills_the_buffer_fits() {
         );
         assert_eq!(message, Some(delivered), "{max_event}");
     }
+}
+
+/// A network subscription's stand-in whose images all share one session
+/// and lane, an alias collision: each message and report names its
+/// image's registration, as the client's network subscription does
+/// (ADR-0089).
+struct Aliased {
+    images: Vec<ClientSubscription>,
+    registrations: Vec<u64>,
+    next: usize,
+    changes: Arc<std::sync::Mutex<std::collections::VecDeque<ImageChange>>>,
+}
+
+impl MessageSource for Aliased {
+    fn poll_taking(
+        &mut self,
+        handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        limit: MessageLimit,
+    ) -> Result<PollSummary, PollError> {
+        self.poll_reporting(handler, limit)
+            .map(|(summary, _)| summary)
+    }
+
+    fn next_image_change(&mut self) -> Option<ImageChange> {
+        self.changes.lock().unwrap().pop_front()
+    }
+
+    fn fan_in(&self) -> bool {
+        true
+    }
+
+    fn poll_reporting(
+        &mut self,
+        handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
+        limit: MessageLimit,
+    ) -> Result<(PollSummary, Option<(i32, Lane, u64)>), PollError> {
+        let count = self.images.len();
+        for offset in 0..count {
+            let index = (self.next + offset) % count;
+            let registration = self.registrations[index];
+            let summary = self.images[index].poll_taking(
+                &mut |bytes, mut info: MessageInfo| {
+                    info.image = Some(registration);
+                    handler(bytes, info)
+                },
+                limit,
+            )?;
+            if summary != PollSummary::default() {
+                self.next = (index + 1) % count;
+                return Ok((summary, Some((1, Lane::ZERO, registration))));
+            }
+        }
+        Ok((PollSummary::default(), None))
+    }
+}
+
+/// What a handler saw of an image: the event's kind, its image and a
+/// message's payload.
+fn of_image(event: &Event<'_>) -> (&'static str, u64, Vec<u8>) {
+    match event {
+        Event::Message {
+            image,
+            payload: MessagePayload::Bytes(bytes),
+            ..
+        } => ("message", *image, bytes.to_vec()),
+        Event::Lifecycle {
+            kind: LifecycleKind::ImageAvailable,
+            image,
+            ..
+        } => ("available", *image, Vec::new()),
+        Event::Lifecycle { image, .. } => ("lifecycle", *image, Vec::new()),
+        _ => ("other", u64::MAX, Vec::new()),
+    }
+}
+
+/// ADR-0089 decision 7 (karyos#672): two images of one `karyos:udp` alias,
+/// one session and lane, registrations 101 and 202. Live, the handler
+/// tells them apart by image; the journal records each event with its
+/// image; replay presents the same events with the same images, so no
+/// message of one is delivered as the other's. The same journal read as
+/// version 1 records has no image: the coarse identity, image 0 for both,
+/// which is what replay then reports.
+#[test]
+fn two_images_of_one_alias_replay_as_two_sources() {
+    use crate::group::prefix::recover;
+    use crate::group::replay::gateway::{GatewayConfig, ReplayGateway};
+    use crate::group::replay::{CursorConfig, ReplayConfig, ReplayCursor};
+
+    let disk = FaultDisk::default();
+    let header = JournalHeader {
+        group_id: 1,
+        first_group_seq: 1,
+        inline_threshold: 64,
+        contract_version: 1,
+        clock: Clock::HostMonotonic,
+        capture: Capture::Strict,
+        reopen_hold: 0,
+        manifest: b"m",
+    };
+    let journal =
+        GroupJournal::create(disk.clone(), Path::new("/g"), &header, journal_config()).unwrap();
+    let (sender, job) = capture(
+        CaptureConfig {
+            ring_capacity: 1 << 16,
+            max_event: 1000,
+            in_flight: 64,
+        },
+        journal,
+        &NoRecordings,
+    )
+    .unwrap();
+    let clock: Clocked = Box::new(|| 1000);
+    let mut gateway = Gateway::new(Idle, clock, sender, Capture::Strict, 1, 1000, 8).unwrap();
+    gateway.set_inline_threshold(64);
+    let (mut images, mut publications, mut conductors) = (Vec::new(), Vec::new(), Vec::new());
+    for _ in 0..2 {
+        let buffer = log_of(1, Lane::ZERO, 64 * 1024);
+        let mut conductor = buffer.conductor_owned().unwrap();
+        images.push(ClientSubscription::new(
+            conductor.subscribe(Role::Required).unwrap(),
+        ));
+        publications.push(buffer.publication_owned().unwrap().unwrap());
+        conductors.push(conductor);
+    }
+    let changes: Arc<std::sync::Mutex<std::collections::VecDeque<ImageChange>>> = Arc::default();
+    let source = Aliased {
+        images,
+        registrations: vec![101, 202],
+        next: 0,
+        changes: Arc::clone(&changes),
+    };
+    let _ = gateway
+        .add_subscription(Box::new(source), IDENTITY, Arc::new(RecordingWord::new()))
+        .unwrap();
+    for (id, registration) in [(10, 101), (11, 202)] {
+        changes.lock().unwrap().push_back(
+            ImageChange::new(id, 1, Lane::ZERO, true).with_registration(Some(registration)),
+        );
+    }
+    for (image, payload) in [(0, b"a"), (1, b"b"), (0, b"c")] {
+        let _ = publications[image]
+            .append(payload, AppendOptions::default())
+            .unwrap();
+    }
+    let mut live = Vec::new();
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| live.push(of_image(event));
+    while let Ok(Dispatched::Event { .. }) = gateway.dispatch(&mut handler) {}
+    let expected = vec![
+        ("available", 101, Vec::new()),
+        ("available", 202, Vec::new()),
+        ("message", 101, b"a".to_vec()),
+        ("message", 202, b"b".to_vec()),
+        ("message", 101, b"c".to_vec()),
+    ];
+    assert_eq!(live, expected);
+    drop(gateway);
+    drop(conductors);
+    let bytes = records(job, &disk);
+    let recorded: Vec<(i32, u64)> = decoded(&bytes)
+        .into_iter()
+        .filter_map(|record| match record {
+            GroupRecord::Lifecycle(event) => Some((event.session_id, event.image)),
+            GroupRecord::Message(message) => Some((message.session_id, message.image)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(recorded, [(1, 101), (1, 202), (1, 101), (1, 202), (1, 101)]);
+    // Read as version 1, the records carry no image: both images are one
+    // coarse source.
+    let coarse: Vec<u64> = bytes
+        .iter()
+        .filter_map(|record| {
+            let template = u16::from_le_bytes([record[2], record[3]]);
+            if !matches!(template, 2 | 5) {
+                return None;
+            }
+            let block = usize::from(u16::from_le_bytes([record[6], record[7]]));
+            let mut old = record[..12 + block - 8].to_vec();
+            old.extend_from_slice(&record[12 + block..]);
+            old[4..6].copy_from_slice(&1u16.to_le_bytes());
+            old[6..8].copy_from_slice(&u16::try_from(block - 8).unwrap().to_le_bytes());
+            let length = u32::try_from(old.len()).unwrap();
+            old[8..12].copy_from_slice(&length.to_le_bytes());
+            match GroupRecord::decode(&old).unwrap() {
+                GroupRecord::Message(message) => Some(message.image),
+                GroupRecord::Lifecycle(event) => Some(event.image),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(coarse, [0, 0, 0, 0, 0]);
+    // Replay of the version 2 journal: the same events, the same images.
+    let mut journal = GroupJournal::recover(disk.clone(), Path::new("/g"), 1, journal_config())
+        .unwrap()
+        .journal;
+    let recovery = recover(&mut journal, &NoRecordings, 64).unwrap();
+    let cursor = ReplayCursor::open(
+        journal,
+        &recovery,
+        &ReplayConfig {
+            manifest: b"m",
+            accept_manifest: false,
+        },
+        CursorConfig {
+            bytes: 4 * MAX_RECORD,
+            records: 8,
+        },
+    )
+    .unwrap();
+    let mut replay = ReplayGateway::new(
+        cursor,
+        &GatewayConfig {
+            publications: &[],
+            subscriptions: &[(2, 1, Lane::ZERO)],
+            network: &[2],
+            conflated: &[],
+            max_claim: 0,
+            max_payload: 0,
+            present_unavailable: false,
+        },
+        None,
+    )
+    .unwrap();
+    let mut replayed = Vec::new();
+    let mut handler = |event: &Event<'_>, _: &mut dyn Effects| replayed.push(of_image(event));
+    while let Ok(Dispatched::Event { .. }) = replay.dispatch(&mut handler) {}
+    assert_eq!(replayed, expected);
 }

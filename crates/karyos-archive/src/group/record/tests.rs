@@ -29,14 +29,19 @@ fn encoded(record: &GroupRecord<'_>) -> Vec<u8> {
 }
 
 /// A record built from the tables, independent of the code: schema 3,
-/// `template` and version 1 as literals, the block, then each variable
+/// `template` and version 2 as literals, the block, then each variable
 /// field with its length prefix.
 fn vector(template: u16, block: &[u8], fields: &[&[u8]]) -> Vec<u8> {
+    versioned(2, template, block, fields)
+}
+
+/// As [`vector`], at `version`.
+fn versioned(version: u16, template: u16, block: &[u8], fields: &[&[u8]]) -> Vec<u8> {
     let length = 12 + block.len() + fields.iter().map(|field| 2 + field.len()).sum::<usize>();
     let mut out = Vec::new();
     out.extend_from_slice(&3u16.to_le_bytes());
     out.extend_from_slice(&template.to_le_bytes());
-    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&u16::try_from(block.len()).unwrap().to_le_bytes());
     out.extend_from_slice(&u32::try_from(length).unwrap().to_le_bytes());
     out.extend_from_slice(block);
@@ -114,7 +119,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
         (
             vector(
                 2,
-                &Fields::new(67)
+                &Fields::new(75)
                     .u64(0, 1)
                     .u64(8, 1_000)
                     .u64(16, 2)
@@ -128,6 +133,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                     .u8(64, 1)
                     .u8(65, 1)
                     .u8(66, 3)
+                    .u64(67, 0x1122_3344)
                     .0,
                 &[b"abc", &EXTENSION_BYTES],
             ),
@@ -144,12 +150,13 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 end_of_stream: true,
                 extension: Some(&EXTENSION_BYTES),
                 payload: Payload::Inline(b"abc"),
+                image: 0x1122_3344,
             }),
         ),
         (
             vector(
                 2,
-                &Fields::new(67)
+                &Fields::new(75)
                     .u64(0, 2)
                     .u64(8, 2_000)
                     .u64(16, 2)
@@ -182,6 +189,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                     recording_id: 9,
                     length: 5000,
                 },
+                image: 0,
             }),
         ),
         (
@@ -225,7 +233,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
         (
             vector(
                 5,
-                &Fields::new(43)
+                &Fields::new(51)
                     .u64(0, 5)
                     .u64(8, 6_000)
                     .u64(16, 3)
@@ -235,6 +243,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                     .u8(40, 3)
                     .u8(41, 2)
                     .u8(42, 2)
+                    .u64(43, 0x0bad)
                     .0,
                 &[],
             ),
@@ -247,6 +256,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 session_id: 3,
                 lane: lane(2),
                 kind: LifecycleKind::SubscriptionEnded(EndReason::Overrun),
+                image: 0x0bad,
             }),
         ),
         (
@@ -462,7 +472,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
         (
             vector(
                 7,
-                &Fields::new(60)
+                &Fields::new(68)
                     .u64(0, 10)
                     .u64(8, 10_000)
                     .u64(16, 2)
@@ -475,6 +485,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                     .u8(57, 1)
                     .u8(58, 1)
                     .u8(59, 6)
+                    .u64(60, 42)
                     .0,
                 &[],
             ),
@@ -492,12 +503,13 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                     outcome: OverrunOutcome::ResumedAtHead,
                     fallback: Some(FallbackReason::MergeFailed),
                 },
+                image: 42,
             }),
         ),
         (
             vector(
                 7,
-                &Fields::new(60)
+                &Fields::new(68)
                     .u64(0, 11)
                     .u64(8, 11_000)
                     .u64(16, 2)
@@ -524,12 +536,13 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 session_id: 3,
                 lane: lane(1),
                 loss: Loss::Skipped(SkipReason::LocalGap(LocalGapReason::RangeUnavailable)),
+                image: 0,
             }),
         ),
         (
             vector(
                 2,
-                &Fields::new(67)
+                &Fields::new(75)
                     .u64(0, 12)
                     .u64(8, 12_000)
                     .u64(16, 2)
@@ -559,6 +572,7 @@ fn goldens() -> Vec<(Vec<u8>, GroupRecord<'static>)> {
                 end_of_stream: false,
                 extension: None,
                 payload: Payload::Unavailable { length: 70_000 },
+                image: 0,
             }),
         ),
         (
@@ -697,6 +711,7 @@ fn samples() -> Vec<GroupRecord<'static>> {
         end_of_stream: false,
         extension: Some(&EXTENSION_BYTES),
         payload: Payload::Inline(&[7; MAX_INLINE]),
+        image: 0,
     }));
     samples.push(GroupRecord::Message(MessageEvent {
         group_seq: 9,
@@ -711,6 +726,7 @@ fn samples() -> Vec<GroupRecord<'static>> {
         end_of_stream: true,
         extension: None,
         payload: Payload::Inline(b""),
+        image: 0,
     }));
     samples.push(GroupRecord::Conflated(ConflatedEvent {
         group_seq: 1,
@@ -748,6 +764,7 @@ fn samples() -> Vec<GroupRecord<'static>> {
             session_id: 1,
             lane: lane(1),
             kind,
+            image: 0,
         }));
     }
     let positioned = Outcome::Accepted {
@@ -851,6 +868,7 @@ fn samples() -> Vec<GroupRecord<'static>> {
             session_id: i32::MAX,
             lane: lane(3),
             loss,
+            image: 0,
         })
     };
     let reasons = [
@@ -935,7 +953,16 @@ fn every_truncation_is_refused() {
 #[test]
 fn unsupported_tuples_are_refused() {
     let (bytes, _) = goldens().remove(0);
-    for (at, value) in [(0, 1u16), (0, 2), (2, 8), (2, 15), (2, 23), (2, 30), (4, 2)] {
+    for (at, value) in [
+        (0, 1u16),
+        (0, 2),
+        (2, 8),
+        (2, 15),
+        (2, 23),
+        (2, 30),
+        (4, 3),
+        (4, 0),
+    ] {
         let mut mutated = bytes.clone();
         mutated[at..at + 2].copy_from_slice(&value.to_le_bytes());
         assert!(
@@ -1204,6 +1231,7 @@ fn invalid_values_are_not_encoded() {
             end_of_stream: false,
             extension: None,
             payload,
+            image: 0,
         })
     };
     let outcome = |operation, outcome| {
@@ -1404,6 +1432,7 @@ proptest! {
             end_of_stream,
             extension: traced.then_some(&EXTENSION_BYTES),
             payload,
+            image: 0,
         });
         let bytes = encoded(&record);
         prop_assert_eq!(GroupRecord::decode(&bytes).unwrap(), record);
@@ -1597,7 +1626,7 @@ fn every_invalid_a7d_field_is_refused() {
         out_of_range("length")
     );
     let (bytes, _) = goldens().remove(UNCAPTURED);
-    let valued = vector(2, &bytes[12..12 + 67], &[b"x", b""]);
+    let valued = vector(2, &bytes[12..12 + 75], &[b"x", b""]);
     assert!(matches!(
         refused(&valued),
         CodecError::LengthOutOfRange { field: "value", .. }
@@ -1628,6 +1657,7 @@ fn invalid_a7d_values_are_not_encoded() {
             session_id: 0,
             lane: lane(0),
             loss,
+            image: 0,
         })
     };
     let resumed = Loss::Overrun {
@@ -1664,6 +1694,7 @@ fn invalid_a7d_values_are_not_encoded() {
                 end_of_stream: false,
                 extension: None,
                 payload: Payload::Unavailable { length: 100 },
+                image: 0,
             }),
             "length",
         ),
@@ -1707,6 +1738,7 @@ fn loss_codes_follow_the_tables() {
             session_id: 0,
             lane: lane(0),
             loss,
+            image: 0,
         }))
     };
     let codes = |bytes: Vec<u8>| (bytes[12 + 57], bytes[12 + 58], bytes[12 + 59]);
@@ -1900,4 +1932,55 @@ fn a_header_above_the_hold_cap_does_not_encode() {
             field: "reopen_hold"
         }
     );
+}
+
+/// ADR-0089 (karyos#672): a version 1 record still decodes, the three
+/// event templates' shorter blocks read as `image` 0, and every other
+/// template unchanged; a version 1 envelope with a version 2 block, or a
+/// version 3, is refused.
+#[test]
+fn version_1_records_decode_with_no_image() {
+    for (bytes, record) in goldens() {
+        let template = u16::from_le_bytes([bytes[2], bytes[3]]);
+        let block = usize::from(u16::from_le_bytes([bytes[6], bytes[7]]));
+        let shorter = if matches!(template, 2 | 5 | 7) { 8 } else { 0 };
+        // The block without its trailing `image`, then the fields as they were.
+        let fields_at = 12 + block;
+        let mut fields: Vec<&[u8]> = Vec::new();
+        let mut at = fields_at;
+        while at < bytes.len() {
+            let length = usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+            fields.push(&bytes[at + 2..at + 2 + length]);
+            at += 2 + length;
+        }
+        let old = versioned(1, template, &bytes[12..12 + block - shorter], &fields);
+        let decoded = GroupRecord::decode(&old).unwrap();
+        let expected = match record {
+            GroupRecord::Message(message) => GroupRecord::Message(MessageEvent {
+                image: 0,
+                ..message
+            }),
+            GroupRecord::Lifecycle(event) => {
+                GroupRecord::Lifecycle(LifecycleEvent { image: 0, ..event })
+            }
+            GroupRecord::Loss(loss) => GroupRecord::Loss(LossEvent { image: 0, ..loss }),
+            other => other,
+        };
+        assert_eq!(decoded, expected, "template {template}");
+        // Written again, it is version 2.
+        assert_eq!(
+            u16::from_le_bytes([encoded(&decoded)[4], encoded(&decoded)[5]]),
+            2
+        );
+        if shorter != 0 {
+            let mixed = versioned(1, template, &bytes[12..12 + block], &fields);
+            assert!(GroupRecord::decode(&mixed).is_err(), "template {template}");
+        }
+        let mut later = bytes.clone();
+        later[4] = 3;
+        assert!(matches!(
+            GroupRecord::decode(&later),
+            Err(CodecError::UnsupportedSchema { .. })
+        ));
+    }
 }

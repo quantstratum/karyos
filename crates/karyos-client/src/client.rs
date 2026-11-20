@@ -376,6 +376,9 @@ pub enum SubscriptionError {
     Poll {
         /// The image's session id, for a network subscription.
         session_id: Option<i32>,
+        /// The image's registration, for a network subscription
+        /// (ADR-0089).
+        image: Option<u64>,
         /// Messages delivered by this poll, the failed image's included.
         delivered: u32,
         /// The failure.
@@ -415,6 +418,10 @@ pub struct ImageChange {
     pub lane: karyos_sys::frame::Lane,
     /// Attached (`true`) or retired (`false`).
     pub available: bool,
+    /// The image's registration, the driver's name for it (ADR-0089):
+    /// stable for the image's life, unlike `image_id`, which is this
+    /// client's attach id. `None` from a source that does not know it.
+    pub registration: Option<u64>,
     /// How a retired image's stream ended, when it ended with a terminal
     /// seal: `None` for an attached image, and for one released unsealed
     /// (its client closed first).
@@ -462,8 +469,16 @@ impl ImageChange {
             session_id,
             lane,
             available,
+            registration: None,
             end: None,
         }
+    }
+
+    /// The change with the image's `registration` (ADR-0089).
+    #[must_use]
+    pub const fn with_registration(mut self, registration: Option<u64>) -> Self {
+        self.registration = registration;
+        self
     }
 
     /// The change with a retired image's `end`.
@@ -482,6 +497,9 @@ pub struct ImageStop {
     pub session_id: Option<i32>,
     /// The image's lane, for a network subscription.
     pub lane: Option<karyos_sys::frame::Lane>,
+    /// The image's registration, for a network subscription (ADR-0089):
+    /// it tells two images of one alias apart, which `session_id` does not.
+    pub image: Option<u64>,
     /// Its poll's summary.
     pub summary: PollSummary,
 }
@@ -1162,6 +1180,8 @@ struct InboxState<T: TermBytes> {
 #[derive(Debug)]
 struct Image<T: TermBytes> {
     id: u64,
+    /// Its aggregate registration (ADR-0089).
+    registration: u64,
     session_id: i32,
     /// Its lane, read when it was attached.
     lane: karyos_sys::frame::Lane,
@@ -2100,6 +2120,7 @@ impl<C: Connection> Client<C> {
                 };
                 let image = Image {
                     id: slot.id,
+                    registration: slot.image,
                     session_id: slot.session_id,
                     lane,
                     subscription,
@@ -2411,11 +2432,13 @@ impl<T: TermBytes> Subscription<T> {
                     stopped: stopped(&summary).then_some(ImageStop {
                         session_id: None,
                         lane: None,
+                        image: None,
                         summary,
                     }),
                 }),
                 Err(error) => Err(SubscriptionError::Poll {
                     session_id: None,
+                    image: None,
                     delivered: error.summary.delivered,
                     error,
                 }),
@@ -2543,11 +2566,13 @@ impl<T: TermBytes> Subscription<T> {
                     stopped: stopped(&summary).then_some(ImageStop {
                         session_id: None,
                         lane: None,
+                        image: None,
                         summary,
                     }),
                 }),
                 Err(error) => Err(SubscriptionError::Poll {
                     session_id: None,
+                    image: None,
                     delivered: error.summary.delivered,
                     error,
                 }),
@@ -2594,6 +2619,7 @@ impl<T: TermBytes> Images<T> {
                 session_id: image.session_id,
                 lane: image.lane,
                 available,
+                registration: Some(image.registration),
                 end: if available {
                     None
                 } else {
@@ -2678,11 +2704,16 @@ impl<T: TermBytes> Images<T> {
         limit: MessageLimit,
         hold: bool,
     ) -> Result<SubscriptionPoll, SubscriptionError> {
-        self.poll_each(limit, |image, limit| {
+        self.poll_each(limit, |image, limit, registration| {
+            // Each message names the image it came from (ADR-0089).
+            let mut named = |bytes: &[u8], mut info: MessageInfo| {
+                info.image = Some(registration);
+                handler(bytes, info);
+            };
             if hold {
-                image.poll_holding(&mut *handler, limit)
+                image.poll_holding(&mut named, limit)
             } else {
-                image.poll(&mut *handler, limit)
+                image.poll(&mut named, limit)
             }
             .map(|summary| (summary, false))
         })
@@ -2698,11 +2729,12 @@ impl<T: TermBytes> Images<T> {
         limit: MessageLimit,
     ) -> Result<SubscriptionPoll, SubscriptionError> {
         self.adopt();
-        self.poll_each(limit, |image, limit| {
+        self.poll_each(limit, |image, limit, registration| {
             let mut declined = false;
             image
                 .poll_taking(
-                    |bytes, info| {
+                    |bytes, mut info: MessageInfo| {
+                        info.image = Some(registration);
                         let taken = handler(bytes, info);
                         declined = !taken;
                         taken
@@ -2726,6 +2758,7 @@ impl<T: TermBytes> Images<T> {
         mut poll: impl FnMut(
             &mut ClientSubscription<T>,
             MessageLimit,
+            u64,
         ) -> Result<(PollSummary, bool), PollError>,
     ) -> Result<SubscriptionPoll, SubscriptionError> {
         // The callers adopt first, or not (`poll_adopted`).
@@ -2752,6 +2785,7 @@ impl<T: TermBytes> Images<T> {
             let Some(Image {
                 session_id,
                 lane,
+                registration,
                 subscription: image,
                 ..
             }) = self.images.get_mut(index)
@@ -2762,7 +2796,7 @@ impl<T: TermBytes> Images<T> {
                 .checked_add(1)
                 .and_then(|next| next.checked_rem(count))
                 .unwrap_or(0);
-            match poll(image, MessageLimit::new(remaining)) {
+            match poll(image, MessageLimit::new(remaining), *registration) {
                 Ok((summary, declined)) => {
                     // Within the limit, a u32.
                     if let Some(delivered) = result.delivered.checked_add(summary.delivered) {
@@ -2773,6 +2807,7 @@ impl<T: TermBytes> Images<T> {
                         result.stopped = Some(ImageStop {
                             session_id: Some(*session_id),
                             lane: Some(*lane),
+                            image: Some(*registration),
                             summary,
                         });
                     }
@@ -2785,6 +2820,7 @@ impl<T: TermBytes> Images<T> {
                 Err(error) => {
                     return Err(SubscriptionError::Poll {
                         session_id: Some(*session_id),
+                        image: Some(*registration),
                         delivered: result
                             .delivered
                             .checked_add(error.summary.delivered)
@@ -2911,6 +2947,7 @@ mod tests {
         }
         Image {
             id,
+            registration: id,
             session_id: session,
             lane: Lane::ZERO,
             subscription,
@@ -3092,6 +3129,7 @@ mod tests {
         if let Kind::Images(images) = &mut subscription.kind {
             images.images.push(Image {
                 id: 1,
+                registration: 1,
                 session_id: 1,
                 lane: Lane::ZERO,
                 subscription: held,
@@ -3126,6 +3164,7 @@ mod tests {
         if let Kind::Images(images) = &mut subscription.kind {
             images.images.push(Image {
                 id: 1,
+                registration: 1,
                 session_id: 1,
                 lane: Lane::ZERO,
                 subscription: held,

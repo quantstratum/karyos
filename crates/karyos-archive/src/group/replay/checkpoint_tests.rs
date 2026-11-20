@@ -575,6 +575,7 @@ fn replay_from_a_checkpoint_never_gives_an_event_past_its_prefix() {
             recording_id: 7,
             length: 10,
         },
+        image: 0,
     }));
     waiting.extend(encode(&GroupRecord::End(EventEnd {
         group_seq: 4,
@@ -672,6 +673,7 @@ fn an_oversized_event_past_the_prefix_gives_the_stop() {
             recording_id: 7,
             length: 10,
         },
+        image: 0,
     }));
     for index in 0..3 {
         big.extend(encode(&GroupRecord::TimerOperation(TimerObservation {

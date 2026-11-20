@@ -88,6 +88,7 @@ fn message(seq: u64, recording: Option<u64>) -> GroupRecord<'static> {
             },
             None => Payload::Inline(b"x"),
         },
+        image: 0,
     })
 }
 
@@ -487,6 +488,7 @@ fn an_uncaptured_message_and_a_loss_are_events() {
         end_of_stream: false,
         extension: None,
         payload: Payload::Unavailable { length: 70_000 },
+        image: 0,
     });
     let loss = GroupRecord::Loss(LossEvent {
         group_seq: 2,
@@ -499,6 +501,7 @@ fn an_uncaptured_message_and_a_loss_are_events() {
         session_id: 1,
         lane: Lane::ZERO,
         loss: Loss::Aborted,
+        image: 0,
     });
     let records = [
         uncaptured,

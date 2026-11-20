@@ -33,7 +33,7 @@ frame = 1
 c_abi = "0.1.6"
 archive_control = 1
 cluster_log = 1
-group_record = 1
+group_record = 2
 capture_contract = 1
 archive_durable = 1
 config = 1
@@ -124,14 +124,14 @@ surface = "group_record"
 from = "0.1.0-alpha.2"
 to = "main"
 outcome = "not_covered"
-reason = "group records written by 0.1.0-alpha.2 and read by main are not tested"
+reason = "group records written by 0.1.0-alpha.2 (version 1) and read by main, which still reads version 1 as image 0 (ADR-0089, karyos#672), are not tested across builds"
 
 [[entry]]
 surface = "group_record"
 from = "main"
 to = "0.1.0-alpha.2"
 outcome = "not_covered"
-reason = "group records written by main and read by 0.1.0-alpha.2 are not tested"
+reason = "group records written by main (version 2, karyos#672) and read by 0.1.0-alpha.2, which reads version 1 only, are not tested"
 
 [[entry]]
 surface = "capture_contract"

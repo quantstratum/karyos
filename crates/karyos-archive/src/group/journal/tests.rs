@@ -68,6 +68,7 @@ fn message(seq: u64, payload: &[u8]) -> Vec<u8> {
         end_of_stream: false,
         extension: None,
         payload: Payload::Inline(payload),
+        image: 0,
     }))
 }
 

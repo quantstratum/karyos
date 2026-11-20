@@ -122,6 +122,7 @@ fn event_at(
             },
             None => Payload::Inline(&value),
         },
+        image: 0,
     });
     let end = GroupRecord::End(EventEnd {
         group_seq: seq,
@@ -707,6 +708,7 @@ fn an_uncaptured_message_is_delivered() {
         end_of_stream: false,
         extension: None,
         payload: Payload::Unavailable { length: 70_000 },
+        image: 0,
     });
     let end = GroupRecord::End(EventEnd {
         group_seq: 1,

@@ -202,11 +202,13 @@ fn report(
             stopped: (stopped(&summary) || summary.rejoin.is_some()).then_some(ImageStop {
                 session_id: None,
                 lane: None,
+                image: None,
                 summary,
             }),
         }),
         Err(error) => Err(SubscriptionError::Poll {
             session_id: None,
+            image: None,
             delivered: error.summary.delivered,
             error,
         }),

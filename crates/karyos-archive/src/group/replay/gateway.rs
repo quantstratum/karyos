@@ -589,6 +589,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                         end_of_stream: message.end_of_stream,
                         extension: message.extension,
                         payload,
+                        image: message.image,
                     }),
                     _ => None,
                 }
@@ -618,6 +619,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
             .map(|source| Event::Lifecycle {
                 source: SubscriptionId(source),
                 kind: lifecycle.kind,
+                image: lifecycle.image,
             }),
             GroupRecord::External(external) => Some(Event::External {
                 kind: external.kind,
@@ -636,6 +638,7 @@ impl<D: Disk + Clone> GroupGateway for ReplayGateway<D> {
                 from: loss.from,
                 lost_to: loss.lost_to,
                 resume: loss.resume,
+                image: loss.image,
             }),
             _ => None,
         };
