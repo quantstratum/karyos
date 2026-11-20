@@ -1446,7 +1446,7 @@ proptest! {
     #[test]
     fn arbitrary_blocks_of_every_template_never_panic(
         template in 0usize..15,
-        block in proptest::collection::vec(any::<u8>(), 72),
+        block in proptest::collection::vec(any::<u8>(), 80),
         value in proptest::collection::vec(any::<u8>(), 0..16),
     ) {
         let templates = [

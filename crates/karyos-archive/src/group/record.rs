@@ -119,7 +119,7 @@ const fn version_1(template: &Template) -> Template {
 pub const CAPTURE_POSITION: u64 = u64::MAX;
 
 /// The longest record of any template.
-pub const MAX_RECORD: usize = 12 + 67 + 2 + 65_535 + 2 + 64;
+pub const MAX_RECORD: usize = 12 + 75 + 2 + 65_535 + 2 + 64;
 
 fn invalid_enum(field: &'static str, value: impl Into<u64>) -> CodecError {
     CodecError::InvalidEnum {

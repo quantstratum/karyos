@@ -215,7 +215,7 @@ fn events_go_through_the_ring_into_the_journal_and_its_prefixes() {
 fn an_admitted_event_always_fits_the_ring() {
     let none = Recordings::default();
     // A ring of 2048 bytes takes messages of up to 248 bytes: an event of
-    // 108 bytes of records and up to 140 of payload.
+    // 116 bytes of records and up to 132 of payload.
     let (mut sender, mut job) = new(
         Capture::Strict,
         SyncPolicy::PerSegment,
@@ -228,7 +228,7 @@ fn an_admitted_event_always_fits_the_ring() {
     while seq <= 400 {
         match sender.admit() {
             Ok(()) => {
-                let records = event(seq, length % 141, None);
+                let records = event(seq, length % 133, None);
                 assert!(records.len() <= 248, "{}", records.len());
                 sender.send(&records, seq).unwrap();
                 sent += 1;
@@ -804,8 +804,8 @@ fn a_reference_sent_before_its_recording_ended_and_read_after_is_settled() {
 fn the_credit_is_exact_at_the_boundary() {
     let none = Recordings::default();
     let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(1024, 120, 1024));
-    // 108 bytes of records and 12 of payload: 120, framed 128.
-    let records = |seq| event(seq, 12, None);
+    // 116 bytes of records and 4 of payload: 120, framed 128.
+    let records = |seq| event(seq, 4, None);
     assert_eq!(records(1).len(), 120);
     for seq in 1..=8 {
         sender.admit().unwrap();
