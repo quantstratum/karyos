@@ -730,3 +730,38 @@ fn every_agent_cell_carries_the_counter_its_label_names() {
         assert_eq!((*label, value), (expected_label, expected));
     }
 }
+
+/// karyos#1016: the overflow gauges follow each sticky flag on its own.
+/// The sender's is 1 when either the sender's or the registrations'
+/// counters saturated, and 0 with neither; the receiver's is 1 when its
+/// counters saturated.
+#[test]
+fn each_overflow_flag_sets_its_gauge() {
+    let at = |labels: &[&str], label: &str| labels.iter().position(|held| *held == label).unwrap();
+    let sender_at = at(&SENDER_CELLS, "sender counters overflowed");
+    let receiver_at = at(&RECEIVER_CELLS, "receiver counters overflowed");
+    for (sender_flag, registrations_flag) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let sender = roles::SenderCounters {
+            overflowed: sender_flag,
+            ..roles::SenderCounters::default()
+        };
+        let registrations = crate::sessions::register::RegistrationCounters {
+            overflowed: registrations_flag,
+            ..crate::sessions::register::RegistrationCounters::default()
+        };
+        assert_eq!(
+            sender_values(&sender, &registrations)[sender_at],
+            u64::from(sender_flag || registrations_flag),
+            "sender {sender_flag}, registrations {registrations_flag}"
+        );
+    }
+    for flag in [false, true] {
+        let receiver = roles::ReceiverCounters {
+            overflowed: flag,
+            ..roles::ReceiverCounters::default()
+        };
+        assert_eq!(receiver_values(&receiver)[receiver_at], u64::from(flag));
+    }
+}

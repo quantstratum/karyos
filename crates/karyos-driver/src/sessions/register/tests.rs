@@ -293,6 +293,64 @@ fn ipv6_sources_share_their_bounds_per_64() {
     assert_eq!(r.counters().pending_replaced, 1);
 }
 
+/// karyos#1016: the per-source rate and the refusal interval are keyed on
+/// an IPv6 source's /64 too. Two addresses of one /64 spend one bucket
+/// and one refusal; an address of another /64 keeps its own allowance.
+#[test]
+fn ipv6_rates_and_refusals_are_kept_per_64() {
+    let a: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+    let b: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+    let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+    let at = |ip: IpAddr| SocketAddr::new(ip, 40_000);
+    let fresh = || {
+        registrations(Setup {
+            allow: RegistrationPolicy::new(
+                RegistrationAllowlist::new(&[
+                    AddressRange::new("2001:db8::".parse().unwrap(), 32).unwrap()
+                ])
+                .unwrap(),
+                false,
+            ),
+            config: RegistrationConfig::default(),
+        })
+    };
+    // Rate: the burst of one /64 is spent by `a` and `b` together.
+    let mut r = fresh();
+    let burst = RegistrationConfig::default().source_rate;
+    for n in 0..burst {
+        let from = if n % 2 == 0 { a } else { b };
+        assert!(
+            !matches!(
+                r.register(at(from), &register(n + 1), Capacity::Free, T0),
+                RegisterOutcome::Drop(RegisterDrop::SourceRate)
+            ),
+            "REGISTER {n} within the burst"
+        );
+    }
+    assert_eq!(
+        r.register(at(b), &register(1_000), Capacity::Free, T0),
+        RegisterOutcome::Drop(RegisterDrop::SourceRate)
+    );
+    assert!(matches!(
+        r.register(at(other), &register(1_001), Capacity::Free, T0),
+        RegisterOutcome::Announce { .. }
+    ));
+    // Refusal: one ERR per /64 per interval.
+    let mut r = fresh();
+    assert!(matches!(
+        r.register(at(a), &register(1), Capacity::Full, T0),
+        RegisterOutcome::Refuse { .. }
+    ));
+    assert_eq!(
+        r.register(at(b), &register(2), Capacity::Full, T0 + 1),
+        RegisterOutcome::Drop(RegisterDrop::RefusalLimited)
+    );
+    assert!(matches!(
+        r.register(at(other), &register(3), Capacity::Full, T0 + 1),
+        RegisterOutcome::Refuse { .. }
+    ));
+}
+
 /// Design 3.2 steps 3 and 5 scope the rate and the pending table to the
 /// driver: two dynamic publications share them, each with its own
 /// allowlist.

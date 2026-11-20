@@ -480,6 +480,25 @@ fn event_ring() -> (super::SessionEnd, super::super::chain::SessionLink) {
     super::super::chain::session_rings(std::num::NonZeroUsize::new(4).unwrap())
 }
 
+/// A CHALLENGE told apart by `nonce`.
+fn challenge_with(nonce: u64) -> Control {
+    Control::Challenge(karyos_protocol::network::RspChallenge {
+        alias: alias(),
+        identity: identity(),
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [nonce, nonce],
+        },
+    })
+}
+
+/// `control` as it goes on the wire.
+fn encoded(control: &Control) -> Vec<u8> {
+    let mut bytes = [0u8; karyos_protocol::network::MAX_CONTROL_LENGTH];
+    let length = control.encode(&mut bytes).unwrap();
+    bytes[..length].to_vec()
+}
+
 fn challenge_control() -> Control {
     Control::Challenge(karyos_protocol::network::RspChallenge {
         alias: alias(),
@@ -725,6 +744,8 @@ fn registration_replies_never_evict_a_destinations_route() {
 /// goes out on it.
 #[test]
 fn an_unsent_reply_keeps_the_destinations_route() {
+    use std::sync::{Arc, Mutex};
+
     use karyos_io::backend::InstanceId;
     use karyos_io::sockets::endpoint::SocketsEndpoint;
     use karyos_io::sockets::ops::{Errno, SendResult};
@@ -733,6 +754,15 @@ fn an_unsent_reply_keeps_the_destinations_route() {
     use super::super::control::{ControlRoutes, ControlSendError};
 
     let socket = ScriptedSocket::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    socket
+        .observer()
+        .set_send_hook(Box::new(move |_, datagrams| {
+            for datagram in datagrams {
+                record.lock().unwrap().push(datagram.to_vec());
+            }
+        }));
     // The destination's control, then the reply that would block, then
     // the destination's next control.
     socket.push_send(SendResult::Sent {
@@ -749,10 +779,10 @@ fn an_unsent_reply_keeps_the_destinations_route() {
     let mut routes = ControlRoutes::new(4);
     let destination = SocketAddr::from(([127, 0, 0, 1], 41_001));
     routes
-        .send(&mut tx, destination, &challenge_control())
+        .send(&mut tx, destination, &challenge_with(1))
         .unwrap();
     let before = routes.entries();
-    let reply = routes.send_reply(&mut tx, destination, &challenge_control());
+    let reply = routes.send_reply(&mut tx, destination, &challenge_with(2));
     assert!(
         matches!(
             reply,
@@ -764,9 +794,65 @@ fn an_unsent_reply_keeps_the_destinations_route() {
     assert_eq!(routes.entries(), before, "no entry evicted or added");
     assert_eq!(routes.lingering(), 0);
     routes
-        .send(&mut tx, destination, &challenge_control())
+        .send(&mut tx, destination, &challenge_with(3))
         .unwrap();
     assert_eq!(routes.cached(), [destination]);
+    // The cancelled reply is gone (karyos#1016): the last datagram
+    // submitted is the destination's next control, not the stale reply.
+    let last = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last, encoded(&challenge_with(3)));
+    assert_ne!(last, encoded(&challenge_with(2)));
+}
+
+/// karyos#1016: a reply on a destination's own route whose send latches a
+/// queue fault (`EMSGSIZE`) does not leave that fault in place: the queue
+/// is evicted, and the destination's next control goes out on a fresh one
+/// instead of stopping at the fault.
+#[test]
+fn a_faulted_reply_does_not_leave_the_destinations_queue_faulted() {
+    use std::sync::{Arc, Mutex};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::ops::{Errno, SendResult};
+    use karyos_io::sockets::scripted::ScriptedSocket;
+
+    use super::super::control::{ControlRoutes, ControlSendError};
+
+    let socket = ScriptedSocket::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    socket
+        .observer()
+        .set_send_hook(Box::new(move |_, datagrams| {
+            for datagram in datagrams {
+                record.lock().unwrap().push(datagram.to_vec());
+            }
+        }));
+    socket.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    socket.push_send(SendResult::Error(Errno::MSGSIZE));
+    socket.push_send(SendResult::Sent {
+        sent: 1,
+        error: None,
+    });
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (mut tx, _rx) = endpoint.split().unwrap();
+    let mut routes = ControlRoutes::new(4);
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_001));
+    routes
+        .send(&mut tx, destination, &challenge_with(1))
+        .unwrap();
+    let reply = routes.send_reply(&mut tx, destination, &challenge_with(2));
+    assert!(matches!(reply, Err(ControlSendError::Unsent)), "{reply:?}");
+    routes
+        .send(&mut tx, destination, &challenge_with(3))
+        .unwrap();
+    assert_eq!(routes.cached(), [destination]);
+    let last = seen.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(last, encoded(&challenge_with(3)));
 }
 
 /// P1-2: after A is reset, the sender's controls on A go out on the new
