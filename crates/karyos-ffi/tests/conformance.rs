@@ -3190,6 +3190,10 @@ mod archive_host {
 /// fails. A 2 s timeout keeps the test short.
 #[cfg(target_os = "linux")]
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "reads the suite's files, which Miri's isolation forbids"
+)]
 fn the_runner_keeps_its_karyosd_client_served_between_scenarios() {
     use std::time::{Duration, Instant};
     let closed = statuses()["KARYOS_E_CLOSED"];
