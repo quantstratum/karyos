@@ -3956,7 +3956,7 @@ fn a_slow_signer_still_signs_while_heads_advance() {
             seen: std::collections::HashMap::new(),
         }),
     };
-    let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal).unwrap();
+    let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal, Arc::default()).unwrap();
     for poll in 1..=12u64 {
         let _ = journal
             .record_policy_version(1, poll, &poll.to_le_bytes())
@@ -3997,7 +3997,7 @@ fn a_refused_head_is_offered_again() {
             seen: std::collections::HashMap::new(),
         }),
     };
-    let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal).unwrap();
+    let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal, Arc::default()).unwrap();
     // The first head queues; the final one is refused, the backlog full.
     let _ = journal.record_policy_version(1, 1, b"first").unwrap();
     signing.duty(&mut journal, SIGNING_POLL);
@@ -4101,7 +4101,8 @@ fn a_head_before_the_keys_validity_never_pins_the_backlog() {
                 effective,
             }),
         };
-        let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal).unwrap();
+        let mut signing =
+            Signing::open(StdDisk, &dir, setup, &mut journal, Arc::default()).unwrap();
         let mut poll = 1u64;
         // Heads before the key's validity: none is signed or held.
         while journal.records().unwrap().last().unwrap().counter < effective - 1 {
