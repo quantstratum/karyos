@@ -52,14 +52,14 @@ surface = "admission"
 from = "main"
 to = "0.1.0-alpha.2"
 outcome = "refuse"
-reason = "IncompatibleVersion: the 0.1.0-alpha.2 driver refuses main's protocol (observed at protocol 3; protocol 4 since karyos#740 pending observation (Linux run, M4 Docker down); observed: AttachError::IncompatibleVersion { driver: None }; a 0.1.0-alpha.2 driver's refusal states no version, karyos#879)"
+reason = "IncompatibleVersion: the 0.1.0-alpha.2 driver refuses main's protocol (observed at protocol 3; protocol 4 since karyos#740 pending observation; observed: AttachError::IncompatibleVersion { driver: None }; a 0.1.0-alpha.2 driver's refusal states no version, karyos#879)"
 
 [[entry]]
 surface = "admission"
 from = "0.1.0-alpha.2"
 to = "main"
 outcome = "refuse"
-reason = "IncompatibleVersion: the main driver refuses protocol 2 and states its own protocol (observed at 3; 4 since karyos#740 pending observation (Linux run, M4 Docker down)) in its refusal (karyos#879), which a 0.1.0-alpha.2 client does not read (observed: AttachError::IncompatibleVersion { driver: None })"
+reason = "IncompatibleVersion: the main driver refuses protocol 2 and states its own protocol (observed at 3; 4 since karyos#740 pending observation) in its refusal (karyos#879), which a 0.1.0-alpha.2 client does not read (observed: AttachError::IncompatibleVersion { driver: None })"
 
 # Frame: the same frame version, 1, on both sides, which is not enough by
 # itself (R-CORE-36). Observed by scripts/compat-test.sh (its run, head
@@ -92,14 +92,14 @@ surface = "c_abi"
 from = "0.1.0-alpha.2"
 to = "main"
 outcome = "interoperate"
-reason = "observed by scripts/compat-test.sh: a 0.1.1 header's client on the main library (observed at 0.1.5; 0.1.6 since karyos#740 pending observation (Linux run, M4 Docker down)) accepts it (same 0.1 line, a higher patch) and runs a driver"
+reason = "observed by scripts/compat-test.sh: a 0.1.1 header's client on the main library (observed at 0.1.5; 0.1.6 since karyos#740 pending observation) accepts it (same 0.1 line, a higher patch) and runs a driver"
 
 [[entry]]
 surface = "c_abi"
 from = "main"
 to = "0.1.0-alpha.2"
 outcome = "refuse"
-reason = "observed by scripts/compat-test.sh: a main header's client (observed at 0.1.5; 0.1.6 since karyos#740 pending observation (Linux run, M4 Docker down)) on the 0.1.1 library refuses it at karyos_abi_version (patch 1 below the header's)"
+reason = "observed by scripts/compat-test.sh: a main header's client (observed at 0.1.5; 0.1.6 since karyos#740 pending observation) on the 0.1.1 library refuses it at karyos_abi_version (patch 1 below the header's)"
 
 # The Archive's control messages are reached only through an attached
 # client, which admission refuses for this pair.
