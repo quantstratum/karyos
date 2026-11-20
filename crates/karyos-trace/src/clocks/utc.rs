@@ -28,8 +28,15 @@ pub const UTC_REFERENCE_TYPE: u64 = 2;
 const SECOND: i128 = 1_000_000_000;
 /// Femtoseconds per nanosecond.
 const FS_PER_NS: i128 = 1_000_000;
-/// The newest Bulletin C this build knows (July 2025).
-const NEWEST_BULLETIN: u64 = 70;
+/// The newest Bulletin C this build knows: number 72, of 6 July 2026,
+/// which announces no leap second at the end of December 2026 (TAI minus
+/// UTC stays 37 s). A record naming a newer bulletin is `no_evidence`.
+///
+/// Updating it: when the IERS publishes a Bulletin C (each January and
+/// July, <https://datacenter.iers.org/data/16/bulletinc-NNN.txt>), set
+/// this to its number, append its leap to [`LEAPS`] if it announces one,
+/// and extend `the_newest_bulletin_covers_its_half_year` to it.
+const NEWEST_BULLETIN: u64 = 72;
 /// TAI minus UTC, in seconds, from 1972-01-01.
 const FIRST_OFFSET: i64 = 10;
 /// Each leap: its date (year, month; the first UTC day after it) and TAI
@@ -414,7 +421,10 @@ impl Table {
             return None;
         }
         // Bulletin C 69 is January 2025; one every half-year. It covers to
-        // the end of the half-year it is issued in.
+        // the end of the half-year it is issued in. That is conservative: a
+        // bulletin announces whether a leap ends that half-year, so UTC is
+        // in fact known one half-year further, to the next possible leap;
+        // the table claims only what the bulletin states.
         let half = 4050_i64
             .checked_add(i64::try_from(bulletin).ok()?)?
             .checked_sub(69)?;

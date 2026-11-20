@@ -257,3 +257,17 @@ fn a_smear_meets_utc_at_both_ends() {
         }
     }
 }
+
+/// The newest Bulletin C this build knows covers to the end of its
+/// half-year, with every leap; a newer number is no evidence (karyos#991
+/// review).
+#[test]
+fn the_newest_bulletin_covers_its_half_year() {
+    let table = super::Table::new(72).unwrap();
+    assert_eq!(table.end, super::u_of(2027, 1));
+    assert_eq!(table.count, 27);
+    let earlier = super::Table::new(71).unwrap();
+    assert_eq!(earlier.end, super::u_of(2026, 7));
+    assert!(super::Table::new(73).is_none());
+    assert!(super::Table::new(0).is_none());
+}
