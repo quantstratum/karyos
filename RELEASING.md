@@ -121,6 +121,12 @@ item 44; karyos#700). At the release head, on each host:
    procedure) are met, there is no key, and no signed artifact is
    published.
 
+`make libkaryos-release-check` runs steps 1 and 2 into
+`target/release-artifacts`; CI's "libkaryos release artifact" job runs it
+on every push for x86_64 and aarch64 Linux, so a commit that breaks the
+artifact or its conformance run fails before a release. It signs and
+publishes nothing.
+
 The soname policy is owner item 48's ruling: the soname carries `0.y`
 before 1.0 and the major from 1.0 on (`scripts/package-libkaryos.sh`).
 The ABI manifest, `share/karyos/abi-manifest.txt` in the package and

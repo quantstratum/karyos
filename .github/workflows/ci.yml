@@ -73,6 +73,27 @@ jobs:
       - run: rustup show active-toolchain
       - run: make lint test build-release
 
+  # libkaryos as its own artifact (owner item 44; karyos#700): the two
+  # release archives built from the commit, libkaryos without karyosd,
+  # and the conformance suite run against the libkaryos archive. Nothing
+  # is signed or published here; that is the release key custodian's.
+  libkaryos-artifact:
+    name: libkaryos release artifact (${{ matrix.name }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu-24.04
+            runner: ubuntu-24.04
+          - name: ubuntu-24.04-arm
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: rustup toolchain install
+      - run: make libkaryos-release-check
+
   loom:
     name: Loom models
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
