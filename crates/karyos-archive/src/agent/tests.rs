@@ -4194,3 +4194,36 @@ fn without_a_copy_location_no_copy_is_recorded() {
     assert!(copies.current().unwrap().is_empty());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// karyos#1024 review: a local copy records the immutable attribute only
+/// over a non-empty file list that every file took; an empty list (as an
+/// unreadable one becomes) or one refused file records none.
+#[test]
+fn a_local_copy_claims_the_attribute_only_when_every_file_took_it() {
+    use crate::integrity::copies::{Enforcement, ImmutabilityBackend};
+    use std::path::{Path, PathBuf};
+
+    struct Takes(Vec<bool>);
+    impl ImmutabilityBackend for Takes {
+        fn enforce(&mut self, _path: &Path, _until: u64) -> std::io::Result<Enforcement> {
+            Ok(if self.0.pop().unwrap_or(false) {
+                Enforcement::ImmutableAttribute
+            } else {
+                Enforcement::Unsupported
+            })
+        }
+    }
+    let files = [PathBuf::from("a"), PathBuf::from("b")];
+    assert_eq!(
+        super::local_enforcement(&mut Takes(vec![true, true]), &[]),
+        Enforcement::Unsupported
+    );
+    assert_eq!(
+        super::local_enforcement(&mut Takes(vec![true, true]), &files),
+        Enforcement::ImmutableAttribute
+    );
+    assert_eq!(
+        super::local_enforcement(&mut Takes(vec![true, false]), &files),
+        Enforcement::Unsupported
+    );
+}

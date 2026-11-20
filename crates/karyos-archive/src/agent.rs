@@ -3213,6 +3213,8 @@ fn stop<D: Disk>(
         integrity.failed = !sealed;
     }
     let start = recorder.store().start();
+    // A list that cannot be read is no file list: the copy then records
+    // no enforcement (karyos#1024 review).
     let files = recorder.store().segment_files().unwrap_or_default();
     let ended = recorder.close(reason)?;
     catalog.stop(id, ended.position, now, ended.reason, ended.incomplete)?;
@@ -3220,6 +3222,33 @@ fn stop<D: Disk>(
         integrity.record_local_copy(id, start, ended.position, &files);
     }
     Ok(ended)
+}
+
+/// The enforcement a local copy of `files` records: the immutable
+/// attribute only when the list is not empty and every file took it,
+/// [`Enforcement::Unsupported`] otherwise, so an empty or unreadable file
+/// list never records a protection that is not there (karyos#1024
+/// review).
+///
+/// [`Enforcement::Unsupported`]: crate::integrity::copies::Enforcement::Unsupported
+fn local_enforcement(
+    backend: &mut impl crate::integrity::copies::ImmutabilityBackend,
+    files: &[PathBuf],
+) -> crate::integrity::copies::Enforcement {
+    use crate::integrity::copies::Enforcement;
+    if files.is_empty() {
+        return Enforcement::Unsupported;
+    }
+    let mut enforcement = Enforcement::ImmutableAttribute;
+    for file in files {
+        if !matches!(
+            backend.enforce(file, 0),
+            Ok(Enforcement::ImmutableAttribute)
+        ) {
+            enforcement = Enforcement::Unsupported;
+        }
+    }
+    enforcement
 }
 
 impl<D: Disk> Integrity<D> {
@@ -3231,7 +3260,7 @@ impl<D: Disk> Integrity<D> {
     /// that of the range's seals, as a purge records them. A failure
     /// leaves the copy unrecorded and stops recording copies.
     fn record_local_copy(&mut self, id: u64, start: u64, end: u64, files: &[PathBuf]) {
-        use crate::integrity::copies::{CopyRecord, CopyState, Enforcement, ImmutabilityBackend};
+        use crate::integrity::copies::{CopyRecord, CopyState};
         if end <= start {
             return;
         }
@@ -3242,15 +3271,7 @@ impl<D: Disk> Integrity<D> {
         let mut backend = crate::integrity::copies::ImmutableAttribute;
         #[cfg(not(target_os = "linux"))]
         let mut backend = crate::integrity::copies::NoImmutability;
-        let mut enforcement = Enforcement::ImmutableAttribute;
-        for file in files {
-            if !matches!(
-                backend.enforce(file, 0),
-                Ok(Enforcement::ImmutableAttribute)
-            ) {
-                enforcement = Enforcement::Unsupported;
-            }
-        }
+        let enforcement = local_enforcement(&mut backend, files);
         let recorded = self.journal.records().and_then(|records| {
             let digest = crate::integrity::retention::seals_digest(&records, id, start, end);
             copies.record(
