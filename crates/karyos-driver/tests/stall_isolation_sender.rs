@@ -120,6 +120,7 @@ fn channel(address: SocketAddr) -> UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
         linger: None,
+        path_skew: None,
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),

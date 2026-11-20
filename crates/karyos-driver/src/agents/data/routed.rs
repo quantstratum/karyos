@@ -879,6 +879,12 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
     /// Sets when its paths leave the live set (RP-8); a single-path
     /// publication has none.
     pub(crate) fn set_path_policy(&mut self, policy: PathPolicy) {
+        // The channel's `path-skew` stands for the policy's window
+        // (karyos#1056).
+        let policy = PathPolicy {
+            skew_window: self.path_skew.unwrap_or(policy.skew_window),
+            ..policy
+        };
         if let Some(routed) = self.routed.as_deref_mut() {
             routed.policy = policy;
             // Its NAK copies arrive on every path: sized here, when the

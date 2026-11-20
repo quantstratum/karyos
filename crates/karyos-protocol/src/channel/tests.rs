@@ -482,6 +482,10 @@ fn published_keys_keep_their_meaning() {
                 udp("karyos:udp?endpoint=10.0.0.5:1|linger=250ms").linger,
                 Some(Duration::from_millis(250))
             ),
+            Key::PathSkew => assert_eq!(
+                udp("karyos:udp?endpoint=10.0.0.5:1|path-skew=250us").path_skew,
+                Some(Duration::from_micros(250))
+            ),
         }
         assert_eq!(key.name(), name);
     }
@@ -993,12 +997,6 @@ fn linger_is_a_bounded_duration() {
         refused("karyos:udp?endpoint=10.0.0.5:1|linger=1s|linger=2s"),
         ChannelError::Repeated { key: "linger" }
     );
-    // `path-skew` is not a key until sender and receiver both consume it
-    // (owner item 17): refused as unknown, never sender-only.
-    assert!(matches!(
-        refused("karyos:udp?endpoint=10.0.0.5:1|path-skew=1ms"),
-        ChannelError::UnknownParameter { .. }
-    ));
 }
 
 /// karyos#656 (owner decision item 26): port 0 is admitted for `endpoint`
@@ -1147,5 +1145,56 @@ fn nak_control_maps_each_path() {
     assert_eq!(
         refused("karyos:ipc?nak-control=239.1.1.2:4001"),
         ChannelError::NotApplicable { key: "nak-control" }
+    );
+}
+
+/// karyos#1056 (owner item 17): `path-skew` is a duration of the URI
+/// grammar, 0 to 1 s, on a udp channel only; absent, the driver's settings
+/// stay.
+#[test]
+fn path_skew_is_a_bounded_duration() {
+    assert_eq!(udp("karyos:udp?endpoint=10.0.0.5:1").path_skew, None);
+    for (text, expected) in [
+        ("0ns", Duration::ZERO),
+        ("1ms", Duration::from_millis(1)),
+        ("1s", Duration::from_secs(1)),
+        ("1000000us", Duration::from_secs(1)),
+    ] {
+        assert_eq!(
+            udp(&format!(
+                "karyos:udp?group=239.1.1.1:1|paths=eth1;eth2|path-skew={text}"
+            ))
+            .path_skew,
+            Some(expected),
+            "{text}"
+        );
+    }
+    for text in ["2s", "1000000001ns"] {
+        assert_eq!(
+            refused(&format!("karyos:udp?endpoint=10.0.0.5:1|path-skew={text}")),
+            ChannelError::InvalidValue {
+                key: "path-skew",
+                reason: "above 1 s"
+            },
+            "{text}"
+        );
+    }
+    for (text, error) in [
+        ("1", DurationError::MissingUnit),
+        ("1h", DurationError::UnknownUnit),
+        ("01ms", DurationError::NotDecimal),
+    ] {
+        assert_eq!(
+            refused(&format!("karyos:udp?endpoint=10.0.0.5:1|path-skew={text}")),
+            ChannelError::InvalidDuration {
+                key: "path-skew",
+                error
+            },
+            "{text}"
+        );
+    }
+    assert_eq!(
+        refused("karyos:ipc?path-skew=1ms"),
+        ChannelError::NotApplicable { key: "path-skew" }
     );
 }

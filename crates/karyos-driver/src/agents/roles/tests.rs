@@ -170,6 +170,7 @@ fn add_publication(
             conflated: None,
             solicit_from: None,
             register_at: None,
+            path_skew: None,
         })
         .unwrap();
     let (outbound, log) = outbound(a, destination);
@@ -951,6 +952,7 @@ fn a_duplicate_subscription_keeps_the_smaller_limit() {
             conflated: None,
             solicit_from: None,
             register_at: None,
+            path_skew: None,
         };
         assert!(matches!(
             role.command(command),

@@ -68,6 +68,7 @@ fn channel(address: SocketAddr) -> UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
         linger: None,
+        path_skew: None,
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),
@@ -1175,6 +1176,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         identity: None,
         conflated: None,
         register_at: None,
+        path_skew: None,
         registration: None,
         users: 1,
     }
@@ -2284,4 +2286,49 @@ fn nak_control_maps_through_the_driver_table() {
     net.map_nak_control(&multicast(at(40, 4000), Vec::new(), Vec::new()))
         .unwrap();
     assert_eq!(*net.control_groups(), before);
+}
+
+/// karyos#1056: a channel's `path-skew` is checked once at admission, for
+/// a subscription and a publication alike, and every handle of one key
+/// asks for the same one.
+#[test]
+fn path_skew_is_validated_at_admission_and_shared_by_a_key() {
+    use crate::error::DriverError;
+
+    let mut b = driver(ThreadingMode::Shared);
+    let skewed = |skew: Duration| UdpConfig {
+        path_skew: Some(skew),
+        ..channel(ANY_PORT)
+    };
+    let _first = b
+        .add_network_subscription(10, &skewed(Duration::from_millis(2)))
+        .unwrap();
+    // The same key with another skew, or with none, is refused.
+    assert_eq!(
+        b.add_network_subscription(10, &skewed(Duration::from_millis(3))),
+        Err(DriverError::UnsupportedChannel)
+    );
+    assert_eq!(
+        b.add_network_subscription(10, &channel(ANY_PORT)),
+        Err(DriverError::UnsupportedChannel)
+    );
+    // The same one is a second handle of the key.
+    let _second = b
+        .add_network_subscription(10, &skewed(Duration::from_millis(2)))
+        .unwrap();
+    // Above 1 s, built without the URI: refused on both sides.
+    assert_eq!(
+        b.add_network_subscription(11, &skewed(Duration::from_secs(2))),
+        Err(DriverError::InvalidConfig)
+    );
+    assert!(matches!(
+        b.add_network_publication(
+            aggregate(12, 3, 1),
+            &UdpConfig {
+                path_skew: Some(Duration::from_secs(2)),
+                ..channel(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9))
+            }
+        ),
+        Err(DriverError::InvalidConfig)
+    ));
 }

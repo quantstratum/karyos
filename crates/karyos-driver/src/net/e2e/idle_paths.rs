@@ -46,6 +46,7 @@ fn channel(group: SocketAddr, paths: Vec<Interface>) -> UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
         linger: None,
+        path_skew: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths,

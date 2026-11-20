@@ -47,6 +47,24 @@ use crate::guards::{GuardHandle, GuardRate};
 use crate::membership::{PublicationRoles, Strategy};
 use crate::sessions::send::Publication;
 
+/// `channel`'s `path-skew` in ns, at most
+/// [`MAX_SKEW_WINDOW`](crate::paths::MAX_SKEW_WINDOW); `None` without one.
+///
+/// # Errors
+///
+/// [`DriverError::InvalidConfig`] above the bound.
+pub(crate) fn skew_ns(channel: &UdpConfig) -> Result<Option<u64>, DriverError> {
+    channel
+        .path_skew
+        .map(|skew| {
+            u64::try_from(skew.as_nanos())
+                .ok()
+                .filter(|&ns| ns <= crate::paths::MAX_SKEW_WINDOW)
+                .ok_or(DriverError::InvalidConfig)
+        })
+        .transpose()
+}
+
 /// Where a channel sends, and the local address its endpoint binds: one
 /// per path for a channel with `paths`, the founding path first (control
 /// path, may allocate). A `control-mode=dynamic` channel is served only
@@ -647,6 +665,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // The channel's `retransmit-window` (owner item 63), fixed here, at
         // channel creation: at most half the term. Its other bounds, nonzero
         // and a multiple of 32, are the URI's.
+        // The channel's `path-skew` (owner item 17), validated once here,
+        // at channel admission: the URI bounds it to 1 s, and a value built
+        // without the URI is held to the driver's own bound.
+        let path_skew = skew_ns(channel)?;
         if let Some(window) = channel.retransmit_window {
             let term_length = config.stream.buffer.term_length.get();
             if window > term_length / 2 {
@@ -695,6 +717,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             roles,
             retransmit_window: channel.retransmit_window,
             linger,
+            path_skew,
             registration,
         };
         let added = self.attach_sender(&handle, channel, FIRST_INCARNATION, false);
@@ -1019,6 +1042,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             roles,
             retransmit_window,
             linger: _,
+            path_skew,
             registration,
         } = channel;
         let mut readers = Vec::with_capacity(usize::from(handle.lanes()));
@@ -1182,6 +1206,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     outbound.set_cells(cells);
                 }
                 outbound.set_retransmit_window(retransmit_window);
+                outbound.set_path_skew(path_skew);
                 Ok(outbound)
             })
             .map_err(|_| DriverError::InvalidConfig)

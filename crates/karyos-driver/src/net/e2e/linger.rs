@@ -679,6 +679,7 @@ fn a_removed_two_path_publication_ends_at_its_eos_on_both_paths() {
         retransmit_window: None,
         nak_control: Vec::new(),
         linger: None,
+        path_skew: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: vec![

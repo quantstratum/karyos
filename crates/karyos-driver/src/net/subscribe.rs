@@ -485,8 +485,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // A conflated view of an unreliable channel needs its fail-safe to
         // close the view before the far-window close ends the image
         // (karyos#658).
+        // The channel's `path-skew` (owner item 17), validated once here,
+        // at channel admission (karyos#1056).
+        let path_skew = super::publish::skew_ns(channel)?;
         if options.1.is_some() && !channel.reliable {
-            net.unreliable_view_bound()
+            net.unreliable_view_bound(path_skew)
                 .map_err(DriverError::BarrierAckTimeout)?;
         }
         let route = receive_route(channel, dynamic)?;
@@ -500,7 +503,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             &later,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
             (channel.reliable, own_port),
-            (options.0, options.1, register_at(channel)),
+            (options.0, options.1, register_at(channel), path_skew),
         )
     }
 

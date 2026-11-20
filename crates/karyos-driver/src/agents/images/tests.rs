@@ -97,6 +97,8 @@ struct Setup {
     /// Concurrent handles on each lane of the publication's log, in place
     /// of the exclusive publication.
     concurrent: Option<u8>,
+    /// The channel's `path-skew` in ns, on both sides (karyos#1056).
+    path_skew: Option<u64>,
 }
 
 impl Setup {
@@ -129,6 +131,7 @@ impl Default for Setup {
             roles: None,
             conflated: None,
             concurrent: None,
+            path_skew: None,
         }
     }
 }
@@ -259,6 +262,7 @@ impl Rig {
                 conflated: setup.conflated,
                 solicit_from: None,
                 register_at: None,
+                path_skew: setup.path_skew,
             })
             .unwrap();
         // The log's terms stay small: a refused size is only announced.
@@ -283,6 +287,8 @@ impl Rig {
             ),
         };
         rig.log = Some(log);
+        let mut outbound = outbound;
+        outbound.set_path_skew(setup.path_skew);
         rig.links
             .sender
             .post(|reply| AgentCommand::AddPublication {
@@ -380,6 +386,7 @@ impl Rig {
                     conflated: setup.conflated,
                     solicit_from: None,
                     register_at: None,
+                    path_skew: setup.path_skew,
                 })
                 .unwrap();
         }
@@ -395,6 +402,8 @@ impl Rig {
             setup.reliable,
         );
         rig.log = Some(log);
+        let mut outbound = outbound;
+        outbound.set_path_skew(setup.path_skew);
         rig.links
             .sender
             .post(|reply| AgentCommand::AddPublication {
@@ -576,6 +585,7 @@ impl Rig {
                 conflated: setup.conflated,
                 solicit_from: None,
                 register_at: None,
+                path_skew: setup.path_skew,
             })
             .unwrap();
         self.round(true);
@@ -3815,6 +3825,26 @@ fn a_multicast_nak_fires_at_the_skew_deadline_plus_its_delay() {
     assert!(
         (window + delay..=window + delay + MS).contains(&wait),
         "NAK {wait} ns after detection, window {window} ns, delay {delay} ns"
+    );
+}
+
+/// karyos#1056: a channel's `path-skew` replaces the receiver's
+/// `path_skew_window` for its images: the gap is NAKed one channel window
+/// (5 ms here, five times the driver's) after detection, not one driver
+/// window.
+#[test]
+fn a_channels_path_skew_sets_the_skew_deadline() {
+    let window = 5 * MS;
+    assert_ne!(window, crate::paths::PathConfig::default().path_skew_window);
+    let (wait, _) = skew_wait_under_duplicates(Setup {
+        reliable: true,
+        repairs: false,
+        path_skew: Some(window),
+        ..Setup::default()
+    });
+    assert!(
+        (window..=window + MS).contains(&wait),
+        "NAK {wait} ns after detection, window {window} ns"
     );
 }
 

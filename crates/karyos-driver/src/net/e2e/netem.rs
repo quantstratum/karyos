@@ -620,6 +620,7 @@ fn multicast_group(label: &str, late: bool) {
         retransmit_window: None,
         nak_control: Vec::new(),
         linger: None,
+        path_skew: None,
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
