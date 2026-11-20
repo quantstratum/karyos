@@ -303,6 +303,17 @@ pub enum DriverError {
         /// The stream id.
         stream: u64,
     },
+    /// Every handle slot of a guarded concurrent stream's incarnation was
+    /// issued (ADR-0092 decision 3): a slot is freed only when the
+    /// incarnation ends, and a handle beyond `H` is never admitted
+    /// unguarded.
+    #[error("stream {stream} has issued all {handles} guarded handle slots")]
+    GuardHandleSlotsExhausted {
+        /// The stream id.
+        stream: u64,
+        /// `H`, its handle slots.
+        handles: u64,
+    },
     /// A lane of a guarded network publication that a guard close sealed
     /// is between incarnations after the reopen: the old incarnation's
     /// session is removed, and its alias stays quarantined for

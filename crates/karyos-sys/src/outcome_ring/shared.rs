@@ -337,6 +337,25 @@ impl SharedOutcomeWriter {
         Err(OutcomeError::Layout)
     }
 
+    /// Faults every live handle, in slot order, each with its
+    /// `OutcomesLost` record and an unknown lost count: the walker was
+    /// lapped (a broken invariant), so nothing more is recorded for them.
+    /// Every fault finds room: a produced record leaves at most `H * C_m +
+    /// C_r` unread, and each fault adds one within the extra `H`.
+    ///
+    /// # Errors
+    ///
+    /// [`OutcomeError::Layout`] for a ring shorter than its capacity and
+    /// [`OutcomeError::Exhausted`] when a sequence would overflow.
+    pub fn abandon(&mut self, ring: &[AtomicU64]) -> Result<(), OutcomeError> {
+        for slot in 0..self.handles.len() {
+            if self.handles.get(slot).is_some_and(HandleState::live) {
+                self.fault(ring, slot)?;
+            }
+        }
+        Ok(())
+    }
+
     /// The minimum consumed count of the live handles.
     fn minimum(&self) -> Option<u64> {
         self.handles

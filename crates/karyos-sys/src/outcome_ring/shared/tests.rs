@@ -207,6 +207,28 @@ fn invalid_counts_detach_and_slot_reuse() {
     );
 }
 
+/// A lapped walker abandons every live handle, in slot order, at a full
+/// ring: each `OutcomesLost` record fits the extra `H`; a detached handle
+/// is left alone.
+#[test]
+fn abandon_faults_every_live_handle_within_the_extra_room() {
+    let (mut writer, ring, cells) = writer_at(19, [4, 4, 4]);
+    let refs = [&cells[0], &cells[1], &cells[2]];
+    writer.detach(2);
+    // 15 unread against the minimum 4: no ordinary room left.
+    writer.abandon(&ring).unwrap();
+    assert_eq!(kind_and_handle(&ring, 20), (19, 1));
+    assert_eq!(kind_and_handle(&ring, 21), (19, 2));
+    assert_eq!(
+        (writer.faulted(0), writer.faulted(1), writer.faulted(2)),
+        (true, true, false)
+    );
+    assert_eq!(
+        writer.produce(&ring, &refs, message(0)),
+        Ok(SharedProduced::Unread)
+    );
+}
+
 fn write_record(ring: &[AtomicU64], sequence: u64, word1: u64, start: u64) {
     let fields = [
         word1,

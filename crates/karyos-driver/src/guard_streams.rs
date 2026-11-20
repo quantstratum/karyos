@@ -22,6 +22,14 @@
 //!   is anyway (a broken invariant), the bound handle's outcome stream is
 //!   abandoned with an unknown lost count, and the handle ends with
 //!   `OutcomesLost`.
+//! - **Concurrent streams (ADR-0092).** A concurrent stream is guarded
+//!   with `H` handle slots, its publisher slot count. Its first guarded
+//!   handle creates one shared outcome ring (layout version 3) bound to
+//!   the guard's open epoch and to that handle's client; a handle of any
+//!   other client is refused (`GC-7-client`), and one beyond `H` too. The
+//!   walker writes every record into the shared ring through one
+//!   [`SharedOutcomeWriter`], against one consumed cell per slot; each
+//!   handle keeps the records of the blocks it reserved itself.
 //! - **Network lanes.** A guarded network publication's lane is submitted
 //!   by its sender gate, not at commit ("Trusted sockets in Phase 2"). The
 //!   gate publishes its submission frontier
@@ -42,6 +50,9 @@ use std::sync::Arc;
 use karyos_client::ConsumedCell;
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBuffer, PollOutcome, SealReason, Subscription};
+use karyos_sys::outcome_ring::shared::{
+    MAX_HANDLES, SharedBinding, SharedOutcomeWriter, SharedProduced,
+};
 use karyos_sys::outcome_ring::{Kind, LOST_UNKNOWN, OutcomeError, OutcomeWriter, Produced, Record};
 use karyos_sys::submission_frontier::{Final, SubmissionFrontier};
 use karyos_sys::term_bytes::TermBytes;
@@ -78,6 +89,70 @@ pub(crate) struct Bound {
     pub(crate) writer: OutcomeWriter,
 }
 
+/// [`MAX_HANDLES`] as a length: the walker's cell table is this long.
+const SLOTS: usize = 64;
+const _: () = assert!(MAX_HANDLES == 64);
+
+/// The client that holds a concurrent guarded incarnation's handles
+/// (ADR-0092 decision 2): every handle of the incarnation is its.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client handles bind slots in karyos#1102 (c) and (d)"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShareClient {
+    /// A handle issued in the driver's process.
+    InProcess,
+    /// A remote client, by its client id.
+    Remote(u64),
+}
+
+/// The shared outcome ring of a concurrent guarded incarnation
+/// (ADR-0092), created by its first guarded handle.
+#[derive(Debug)]
+struct Shared {
+    /// The client whose handles the incarnation admits.
+    client: ShareClient,
+    /// The open epoch the ring is bound to.
+    epoch: u64,
+    /// What the ring's header names.
+    binding: SharedBinding,
+    ring: Arc<Words>,
+    /// The consumed cell of each slot issued so far, in slot order.
+    cells: Vec<Arc<Words>>,
+    /// Stands in for the cells of slots not issued yet, which the writer
+    /// never reads (they are not attached).
+    unissued: Words,
+    writer: SharedOutcomeWriter,
+}
+
+/// A handle slot of a concurrent guarded incarnation's shared ring, as
+/// its handle binds it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the client handles bind slots in karyos#1102 (c) and (d)"
+    )
+)]
+#[derive(Debug, Clone)]
+pub(crate) struct SharedSlot {
+    /// The slot index, 0 to `H - 1`.
+    pub(crate) slot: usize,
+    /// The shared ring, written by the driver only.
+    pub(crate) ring: Arc<Words>,
+    /// The slot's consumed cell, written by its handle.
+    pub(crate) cell: Arc<Words>,
+    /// What the ring's header names.
+    pub(crate) binding: SharedBinding,
+    /// The sequence the handle reads after: it starts there, and its
+    /// cell holds it.
+    pub(crate) consumed: u64,
+}
+
 /// A guarded stream's driver state.
 #[derive(Debug)]
 pub(crate) struct GuardedStream<T: TermBytes> {
@@ -112,6 +187,17 @@ pub(crate) struct GuardedStream<T: TermBytes> {
     network: Option<(Arc<SubmissionFrontier>, Lane)>,
     /// The block read and not decided yet: the walk resumes with it.
     pending: Option<Block>,
+    /// `H`, a concurrent stream's handle slots; `None` for an exclusive
+    /// stream.
+    handles: Option<u64>,
+    /// A concurrent stream's shared ring, once its first guarded handle
+    /// was issued.
+    shared: Option<Shared>,
+    /// Blocks a guard close aborted on a concurrent stream, not labelled
+    /// yet: its abort reports a count, not positions, so the walker labels
+    /// that many aborted blocks `GUARD_CLOSED`, the first it reads after
+    /// the close.
+    close_aborts: u64,
 }
 
 /// One block the walker read.
@@ -167,7 +253,158 @@ impl<T: TermBytes> GuardedStream<T> {
             guard_aborted: Vec::new(),
             network: None,
             pending: None,
+            handles: None,
+            shared: None,
+            close_aborts: 0,
         }
+    }
+
+    /// Makes the stream a concurrent one with `handles` slots (`H`, 1 to
+    /// [`MAX_HANDLES`]): its handles share one ring (ADR-0092).
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::InvalidConfig`] for `handles` outside that range.
+    pub(crate) fn with_handles(mut self, handles: u64) -> Result<Self, DriverError> {
+        if handles == 0 || handles > MAX_HANDLES {
+            return Err(DriverError::InvalidConfig);
+        }
+        self.handles = Some(handles);
+        Ok(self)
+    }
+
+    /// `H`, for a concurrent stream.
+    pub(crate) fn handles(&self) -> Option<u64> {
+        self.handles
+    }
+
+    /// Admits a concurrent guarded handle of `client` under open epoch
+    /// `epoch` into the next slot of the incarnation's shared ring,
+    /// creating the ring, on the heap, at the first one: bound to `epoch`
+    /// and to guard word `guard_index`, with the current rate policy and,
+    /// for a reincarnation, its start (`reincarnated_at`) in its header.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::InvalidPublicationMode`] for an exclusive stream;
+    /// [`DriverError::Sys`] with `InvalidPublicationMode` (reason
+    /// `GC-7-client`) for a client other than the ring's (ADR-0092
+    /// decision 2); [`DriverError::GuardHandleSlotsExhausted`] once `H`
+    /// slots were issued; [`DriverError::GuardNotOpen`] for an epoch other
+    /// than the ring's; [`DriverError::Outcomes`] for a ring too large to
+    /// size. Nothing changes on error.
+    pub(crate) fn attach_shared(
+        &mut self,
+        stream: u64,
+        client: ShareClient,
+        epoch: u64,
+        guard_index: usize,
+        reincarnated_at: Option<u64>,
+    ) -> Result<SharedSlot, DriverError> {
+        let handles = self.handles.ok_or(DriverError::InvalidPublicationMode)?;
+        if let Some(shared) = &self.shared {
+            if shared.client != client {
+                return Err(DriverError::Sys(
+                    karyos_sys::error::SysError::InvalidPublicationMode {
+                        reason: "GC-7-client",
+                    },
+                ));
+            }
+            if shared.epoch != epoch {
+                return Err(DriverError::GuardNotOpen {
+                    guard: self.guard.id(),
+                });
+            }
+        }
+        let slot = self.shared.as_ref().map_or(0, |shared| shared.cells.len());
+        if u64::try_from(slot).ok().is_none_or(|slot| slot >= handles) {
+            return Err(DriverError::GuardHandleSlotsExhausted { stream, handles });
+        }
+        if self.shared.is_none() {
+            self.shared = Some(self.new_shared(client, epoch, guard_index, reincarnated_at)?);
+        }
+        let shared = self
+            .shared
+            .as_mut()
+            .ok_or(DriverError::InvalidPublicationMode)?;
+        // Within the `H` cells reserved with the ring: no allocation.
+        let consumed = shared.writer.attach(slot).map_err(DriverError::Outcomes)?;
+        let cell = Arc::new(Words::heap(1));
+        cell.cell()
+            .store(consumed, karyos_sys::sync::Ordering::Release);
+        shared.cells.push(Arc::clone(&cell));
+        Ok(SharedSlot {
+            slot,
+            ring: Arc::clone(&shared.ring),
+            cell,
+            binding: shared.binding,
+            consumed,
+        })
+    }
+
+    /// The shared ring of a first concurrent guarded handle.
+    fn new_shared(
+        &self,
+        client: ShareClient,
+        epoch: u64,
+        guard_index: usize,
+        reincarnated_at: Option<u64>,
+    ) -> Result<Shared, DriverError> {
+        let layout = || DriverError::Outcomes(OutcomeError::Layout);
+        let binding = SharedBinding {
+            messages: self.messages,
+            ranges: 1,
+            guard_index: u64::try_from(guard_index).map_err(|_| layout())?,
+            epoch,
+            handles: self.handles.ok_or_else(layout)?,
+        };
+        let words = binding
+            .capacity()
+            .and_then(|capacity| usize::try_from(capacity).ok())
+            .and_then(karyos_sys::outcome_ring::ring_words)
+            .ok_or_else(layout)?;
+        let ring = Words::heap(words);
+        karyos_sys::outcome_ring::shared::init(ring.words(), &binding)
+            .map_err(DriverError::Outcomes)?;
+        if let Some(at) = reincarnated_at {
+            karyos_sys::outcome_ring::set_reincarnated_at(ring.words(), at);
+        }
+        if let Some(policy) = &self.rate {
+            karyos_sys::rate_policy_slot::publish(
+                ring.words(),
+                karyos_sys::rate_policy_slot::OUTCOME_SLOT,
+                self.rate_version,
+                policy,
+            );
+        }
+        let writer = SharedOutcomeWriter::new(&binding).map_err(DriverError::Outcomes)?;
+        let slots = usize::try_from(binding.handles).map_err(|_| layout())?;
+        let mut cells = Vec::new();
+        cells.try_reserve_exact(slots).map_err(|_| layout())?;
+        Ok(Shared {
+            client,
+            epoch,
+            binding,
+            ring: Arc::new(ring),
+            cells,
+            unissued: Words::heap(1),
+            writer,
+        })
+    }
+
+    /// Detaches handle `slot` from the shared ring: it leaves the room
+    /// minimum, its blocks' records are still written, and its slot is not
+    /// issued again in this incarnation (ADR-0092 decisions 3 and 8).
+    pub(crate) fn detach_shared(&mut self, slot: usize) {
+        if let Some(shared) = &mut self.shared {
+            shared.writer.detach(slot);
+        }
+    }
+
+    /// Counts `aborted` blocks a guard close aborted on a concurrent
+    /// stream (`Conductor::abort_marked_claims`).
+    pub(crate) fn note_close_aborts(&mut self, aborted: u32) {
+        self.close_aborts = self.close_aborts.saturating_add(u64::from(aborted));
     }
 
     /// From now on its messages are decided by `frontier`'s `lane`: the
@@ -256,6 +493,12 @@ impl<T: TermBytes> GuardedStream<T> {
     ///
     /// [`DriverError::Outcomes`] for a ring that refuses the record.
     pub(crate) fn abandon_all(&mut self) -> Result<(), crate::error::DriverError> {
+        if let Some(shared) = &mut self.shared {
+            shared
+                .writer
+                .abandon(shared.ring.words())
+                .map_err(crate::error::DriverError::Outcomes)?;
+        }
         for bound in &mut self.bounds {
             bound
                 .writer
@@ -315,6 +558,14 @@ impl<T: TermBytes> GuardedStream<T> {
     pub(crate) fn set_rate(&mut self, policy: karyos_sys::rate_limit::RatePolicy, version: u64) {
         self.rate = Some(policy);
         self.rate_version = version;
+        if let Some(shared) = &self.shared {
+            karyos_sys::rate_policy_slot::publish(
+                shared.ring.words(),
+                karyos_sys::rate_policy_slot::OUTCOME_SLOT,
+                version,
+                &policy,
+            );
+        }
         for bound in &self.bounds {
             karyos_sys::rate_policy_slot::publish(
                 bound.ring.words(),
@@ -370,6 +621,10 @@ impl<T: TermBytes> GuardedStream<T> {
                                 let _ = self.guard_aborted.swap_remove(index);
                                 REASON_GUARD_CLOSED
                             }
+                            None if self.close_aborts > 0 => {
+                                self.close_aborts = self.close_aborts.saturating_sub(1);
+                                REASON_GUARD_CLOSED
+                            }
                             None => REASON_WRITER_ABORTED,
                         };
                         // Positions stay below 2^63 (the stream position
@@ -418,6 +673,28 @@ impl<T: TermBytes> GuardedStream<T> {
                 reason,
                 lost: 0,
             };
+            if let Some(shared) = &mut self.shared {
+                let record = Record {
+                    epoch: shared.epoch,
+                    ..record
+                };
+                let mut cells = [shared.unissued.cell(); SLOTS];
+                for (cell, issued) in cells.iter_mut().zip(&shared.cells) {
+                    *cell = issued.cell();
+                }
+                match shared
+                    .writer
+                    .produce(shared.ring.words(), &cells, record)
+                    .map_err(crate::error::DriverError::Outcomes)?
+                {
+                    SharedProduced::Written(_) => walked.written += 1,
+                    SharedProduced::Unread => walked.lost += 1,
+                }
+                if self.ended {
+                    return Ok(walked);
+                }
+                continue;
+            }
             match self.ring_for(position) {
                 Some(bound) => {
                     let record = Record {
