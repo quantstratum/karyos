@@ -27,8 +27,9 @@ use std::net::SocketAddr;
 use std::num::NonZeroU16;
 
 use karyos_io::backend::{
-    Authority, BackendEpoch, Commit, Exposure, FlushRequest, GateDecision, RouteId, SenderGate,
-    SenderToken, TxBackend, TxFrame, TxItemOutcome, TxOptions, TxQueueConfig, TxQueueId, TxReport,
+    Authority, BackendEpoch, Commit, Exposure, FlushRequest, FlushStop, GateDecision, RouteId,
+    SenderGate, SenderToken, TxBackend, TxFrame, TxItemOutcome, TxOptions, TxQueueConfig,
+    TxQueueId, TxReport,
 };
 use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
@@ -622,14 +623,13 @@ impl ControlRoutes {
         }
     }
 
-    /// Closes `old`'s queue, then its route. A handle already gone counts
-    /// as closed.
-    /// Drops what `queue` holds unsent while keeping the queue and its
-    /// destination's route (karyos#977 review): the pending frames that
-    /// were never exposed are cancelled in place, so no queue is closed or
-    /// reopened and no queue handle is spent. A queue the backend refuses
-    /// to cancel on (a fault: closed, stale, or the endpoint resetting) is
-    /// evicted, as any faulted destination is.
+    /// Drops what `queue` holds unsent, under ordinary backpressure, while
+    /// keeping the queue and its destination's route (karyos#977 review):
+    /// the pending frames that were never exposed are cancelled in place,
+    /// so no queue is closed or reopened and no queue handle is spent. A
+    /// queue whose flush latched a fault never comes here: it is evicted
+    /// (karyos#1016). A queue the backend refuses to cancel on (closed,
+    /// stale, or the endpoint resetting) is evicted too.
     fn discard<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, queue: TxQueueId) {
         loop {
             match tx.cancel_pending(queue, &mut self.report) {
@@ -653,6 +653,8 @@ impl ControlRoutes {
         }
     }
 
+    /// Closes `old`'s queue, then its route. A handle already gone counts
+    /// as closed.
     fn close<O: SocketOps>(&mut self, tx: &mut SocketsTx<O>, old: Destination) -> Closed {
         use karyos_io::backend::{QueueError, RouteError};
 
@@ -944,7 +946,7 @@ impl ControlRoutes {
             }
             return Err(ControlSendError::Claim);
         }
-        let _ = tx.flush(
+        let flushed = tx.flush(
             FlushRequest {
                 queue,
                 max_datagrams: NonZeroU16::MIN,
@@ -953,18 +955,29 @@ impl ControlRoutes {
             &mut ControlGate,
             &mut self.report,
         );
+        // A send error latches a fault on the queue (an `EMSGSIZE`, say),
+        // which a cancellation does not clear: the next control on it
+        // would stop at the fault and be dropped (karyos#1016). Such a
+        // queue is evicted even on a protected route; only ordinary
+        // backpressure keeps the queue and cancels in place.
+        let mut faulted = matches!(
+            flushed.stop,
+            FlushStop::Faulted(_) | FlushStop::Queue(_) | FlushStop::Failed(_)
+        );
         let (mut sent, mut unknown) = (false, false);
         while let Some(entry) = self.report.pop_front() {
             sent |= matches!(entry.outcome, TxItemOutcome::Submitted { .. });
             unknown |= matches!(entry.outcome, TxItemOutcome::Unknown);
+            faulted |= matches!(entry.outcome, TxItemOutcome::Faulted(_));
         }
         if sent {
             return Ok(());
         }
-        // Not taken now: a control is not worth a retry; dropping the
-        // queue drops it, so no stale control waits. A protected route
-        // keeps its route: only its queue is replaced, empty.
-        if protected {
+        // Not taken now: a control is not worth a retry. Under ordinary
+        // backpressure a protected route keeps its queue and route, and
+        // the unsent reply is cancelled in place; otherwise the queue is
+        // evicted, so no stale control waits.
+        if protected && !faulted {
             self.discard(tx, queue);
         } else {
             self.evict(tx, queue);
