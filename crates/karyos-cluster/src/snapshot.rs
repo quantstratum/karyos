@@ -66,6 +66,7 @@ use karyos_archive::crc32c::{Crc32c, crc32c};
 use karyos_archive::disk::Disk;
 use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
 
+use crate::dedup::DedupConfig;
 use crate::file::{self, Read};
 
 #[cfg(test)]
@@ -88,6 +89,11 @@ pub const DEFAULT_EVERY_ENTRIES: u64 = 1 << 20;
 /// The log bytes between snapshots (design S2; item 37's initial value,
 /// to be measured).
 pub const DEFAULT_EVERY_BYTES: u64 = 256 << 20;
+/// The log bytes between snapshots of [`SnapshotConfig::large`]: 1 GiB,
+/// above the sessions section of a full [`DedupConfig::large`] table
+/// (512 MiB of replies plus metadata, karyos#1002), so a snapshot never
+/// writes more than the log it lets go.
+pub const LARGE_EVERY_BYTES: u64 = 1 << 30;
 
 const SECTION_MAGIC: [u8; 4] = *b"KRSN";
 /// The largest single write of a section's bytes: what a scan of the
@@ -106,6 +112,11 @@ const MANIFEST_MAX: usize = MANIFEST_HEADER + MANIFEST_ENTRY * 16 + 4;
 const _: () = assert!(MAX_KEEP == 16);
 
 /// Snapshot retention and timing.
+///
+/// The byte trigger must rise with the session table it snapshots: a
+/// deployment on [`DedupConfig::large`] uses [`SnapshotConfig::large`],
+/// and [`SnapshotConfig::check_sessions`] refuses a byte trigger below the
+/// table's reserved bytes (karyos#1002).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SnapshotConfig {
@@ -131,7 +142,45 @@ impl Default for SnapshotConfig {
     }
 }
 
+/// A byte trigger below the session table's reserved bytes: every
+/// snapshot of a full table would write more than the log it lets go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("every_bytes {every_bytes} is below the sessions section's {sessions_bytes} bytes")]
+pub struct TriggerBelowSessions {
+    /// The configured byte trigger.
+    pub every_bytes: u64,
+    /// The session table's reserved bytes (`u64::MAX` on overflow).
+    pub sessions_bytes: u64,
+}
+
 impl SnapshotConfig {
+    /// The defaults with the byte trigger of the large session profile,
+    /// [`LARGE_EVERY_BYTES`]: the snapshot configuration to pair with
+    /// [`DedupConfig::large`].
+    #[must_use]
+    pub fn large() -> Self {
+        Self::default().with_every_bytes(LARGE_EVERY_BYTES)
+    }
+
+    /// Checks the byte trigger against the session table `dedup`
+    /// describes: refused when `every_bytes` is below
+    /// [`DedupConfig::reserved_bytes`], the size of a full table's
+    /// sessions section before framing.
+    ///
+    /// # Errors
+    ///
+    /// [`TriggerBelowSessions`] when the trigger is below that size.
+    pub fn check_sessions(&self, dedup: &DedupConfig) -> Result<(), TriggerBelowSessions> {
+        let sessions_bytes = dedup.reserved_bytes().unwrap_or(u64::MAX);
+        if self.every_bytes < sessions_bytes {
+            return Err(TriggerBelowSessions {
+                every_bytes: self.every_bytes,
+                sessions_bytes,
+            });
+        }
+        Ok(())
+    }
+
     /// Keeping `keep` snapshots.
     #[must_use]
     pub fn with_keep(mut self, keep: u32) -> Self {

@@ -125,3 +125,27 @@ fn the_log_floor_stays_put_when_it_cannot_place_an_entry() {
     assert_eq!(config.log_floor(60, 50, position), 60);
     assert_eq!(config.log_floor(0, u64::MAX, position), u64::MAX);
 }
+
+#[test]
+fn the_byte_trigger_rises_with_the_large_session_profile() {
+    let large = DedupConfig::large();
+    let sessions = large.reserved_bytes().expect("fits");
+    assert!(sessions > DEFAULT_EVERY_BYTES);
+    assert_eq!(
+        SnapshotConfig::default().check_sessions(&large),
+        Err(TriggerBelowSessions {
+            every_bytes: DEFAULT_EVERY_BYTES,
+            sessions_bytes: sessions,
+        })
+    );
+    assert_eq!(SnapshotConfig::large().check_sessions(&large), Ok(()));
+    assert_eq!(
+        SnapshotConfig::default().check_sessions(&DedupConfig::default()),
+        Ok(())
+    );
+    // Exactly the sessions bytes is enough; one byte fewer is not.
+    let at = SnapshotConfig::default().with_every_bytes(sessions);
+    assert_eq!(at.check_sessions(&large), Ok(()));
+    let below = SnapshotConfig::default().with_every_bytes(sessions - 1);
+    assert!(below.check_sessions(&large).is_err());
+}
