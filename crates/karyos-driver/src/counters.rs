@@ -526,6 +526,7 @@ impl DriverCounters {
     ///
     /// Returns [`DriverError::InvalidConfig`] when `capacity` cannot hold
     /// the fixed counters or cannot be allocated.
+    #[cfg(test)]
     pub(crate) fn with_capacity(capacity: usize) -> Result<Self, DriverError> {
         Self::with_copies(capacity, 0)
     }
