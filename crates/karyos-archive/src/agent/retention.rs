@@ -210,8 +210,10 @@ impl<D: Disk + Clone> State<D> {
         let spawned = std::thread::Builder::new()
             .name(VERIFY_THREAD.to_owned())
             .spawn(move || {
+                // Cleared on every exit, a panic's unwind included, so a
+                // failed verification never blocks the next one.
+                let _clear = Clear(verifying);
                 let verified = work.run();
-                verifying.store(false, std::sync::atomic::Ordering::Release);
                 let _ = worker_reply.send(Ok(verified));
             });
         if let Err(error) = spawned {
@@ -262,6 +264,15 @@ impl<D: Disk + Clone> State<D> {
             heads,
             registry,
         })
+    }
+}
+
+/// Clears the "verification runs" flag when dropped.
+struct Clear(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for Clear {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
 
