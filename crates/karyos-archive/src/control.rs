@@ -16,6 +16,62 @@
 //! value exists, and `encode` writes into the caller's buffer. Nothing
 //! allocates. A derive macro is to generate these from schema definitions;
 //! these hand-written ones become its vectors.
+//!
+//! The derive refuses, when the crate compiles, a field past its
+//! template's block and two fields that overlap (karyos#1066). A message
+//! within its block compiles:
+//!
+//! ```
+//! use karyos_codec_derive::Message;
+//! const T: karyos_codec::Template = karyos_codec::Template {
+//!     schema_id: 9, template_id: 1, version: 1, block_length: 12, max_length: 24,
+//! };
+//! #[derive(Message)]
+//! #[message(template = T)]
+//! struct M {
+//!     #[field(offset = 0)]
+//!     a: u64,
+//!     #[field(offset = 8)]
+//!     b: u32,
+//! }
+//! # let _ = M { a: 0, b: 0 }.encode(&mut [0u8; 24]);
+//! ```
+//!
+//! A field past the block does not:
+//!
+//! ```compile_fail
+//! use karyos_codec_derive::Message;
+//! const T: karyos_codec::Template = karyos_codec::Template {
+//!     schema_id: 9, template_id: 1, version: 1, block_length: 12, max_length: 24,
+//! };
+//! #[derive(Message)]
+//! #[message(template = T)]
+//! struct M {
+//!     #[field(offset = 0)]
+//!     a: u64,
+//!     #[field(offset = 8)]
+//!     b: u64,
+//! }
+//! # let _ = M { a: 0, b: 0 }.encode(&mut [0u8; 24]);
+//! ```
+//!
+//! Nor do two fields that overlap:
+//!
+//! ```compile_fail
+//! use karyos_codec_derive::Message;
+//! const T: karyos_codec::Template = karyos_codec::Template {
+//!     schema_id: 9, template_id: 1, version: 1, block_length: 12, max_length: 24,
+//! };
+//! #[derive(Message)]
+//! #[message(template = T)]
+//! struct M {
+//!     #[field(offset = 0)]
+//!     a: u64,
+//!     #[field(offset = 4)]
+//!     b: u32,
+//! }
+//! # let _ = M { a: 0, b: 0 }.encode(&mut [0u8; 24]);
+//! ```
 
 use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
 use karyos_codec_derive::Message;

@@ -79,6 +79,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         .iter()
         .map(field)
         .collect::<syn::Result<Vec<_>>>()?;
+    overlaps(&fields)?;
     let ident = &input.ident;
     let reads = fields.iter().map(|field| {
         let Field {
@@ -108,7 +109,21 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         };
         quote! { encoder.#method(#offset, #value)?; }
     });
+    let ends = fields.iter().map(|field| {
+        let message = format!(
+            "field `{}` runs past the template's block length",
+            field.name
+        );
+        let end = field.offset.saturating_add(size(&field.method));
+        quote! {
+            ::core::assert!(#end <= #template.block_length as usize, #message);
+        }
+    });
     Ok(quote! {
+        // Every field within the block, checked when the crate compiles
+        // (karyos#1066).
+        const _: () = { #(#ends)* };
+
         impl #ident {
             fn decode(
                 block: ::karyos_codec::Block<'_>,
@@ -196,6 +211,33 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
     })
 }
 
+/// The width in bytes of a field read by `method`.
+fn size(method: &Ident) -> usize {
+    match method.to_string().as_str() {
+        "u8" => 1,
+        "u16" => 2,
+        "u32" | "i32" => 4,
+        _ => 8,
+    }
+}
+
+/// Refuses two fields whose byte ranges overlap, naming both.
+fn overlaps(fields: &[Field]) -> syn::Result<()> {
+    for (index, first) in fields.iter().enumerate() {
+        let first_end = first.offset.saturating_add(size(&first.method));
+        for second in fields.iter().skip(index.saturating_add(1)) {
+            let second_end = second.offset.saturating_add(size(&second.method));
+            if first.offset < second_end && second.offset < first_end {
+                return Err(syn::Error::new_spanned(
+                    &second.name,
+                    format!("fields `{}` and `{}` overlap", first.name, second.name),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The `Block` and `Encoder` method that reads and writes `ty`.
 fn method(ty: &Type) -> syn::Result<Ident> {
     const SUPPORTED: [&str; 5] = ["u8", "u16", "u32", "u64", "i32"];
@@ -277,6 +319,11 @@ mod tests {
                 "expected `offset = N` or `check = PATH`",
             ),
         ];
+        let overlap: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(offset = 0)] a: u64, #[field(offset = 4)] b: u32 }
+        };
+        assert_eq!(error(overlap), "fields `a` and `b` overlap");
         for (input, expected) in cases {
             assert_eq!(error(input), expected);
         }
