@@ -46,9 +46,11 @@
 //! append can leave with the first unacknowledged; karyos#975); the
 //! queue and the in-flight bytes are refused in `propose`
 //! ([`crate::raft_rs::refuse_past`], the byte cap kept by entry size); an
-//! entry cap outside `1..=MAX_IN_FLIGHT_ENTRIES` is `Unsupported`. The
-//! log-read limit is not honoured through the harness's metered log:
-//! OpenRaft reads the adapter's in-memory view.
+//! entry cap outside `1..=MAX_IN_FLIGHT_ENTRIES` is `Unsupported`.
+//! OpenRaft reads the adapter's in-memory view; under declared limits an
+//! outgoing append's logged entries are read back through the harness's
+//! metered log before it leaves, and an append the duty's budget cannot
+//! cover is held back as lost (karyos#1040).
 //!
 //! **Not taken here:** snapshots and compaction (W5, karyos#679): they
 //! answer `Unsupported`, which the harness reports as not demonstrated.
@@ -1055,14 +1057,31 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
         self.pump();
     }
 
-    fn ready(&mut self, _log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
+    fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
         if self.out {
             return None;
         }
         self.pump();
         let mut io = lock(&self.io);
+        let mut messages = std::mem::take(&mut io.outbox);
+        // Under declared limits, an append leaves only once its logged
+        // entries were read back through the metered log (karyos#1040);
+        // one held back is lost to its peer, and its RPC times out and is
+        // retried, as after a loss on the network.
+        if self.limits.is_some() {
+            messages.retain(|(_, message)| match message {
+                Message::Request {
+                    request: Request::Append(rpc),
+                    ..
+                } => {
+                    let sent: Option<Vec<Entry>> = rpc.entries.iter().map(to_harness).collect();
+                    sent.is_some_and(|sent| crate::raft_rs::read_back(&sent, log))
+                }
+                _ => true,
+            });
+        }
         let ready = Ready {
-            messages: std::mem::take(&mut io.outbox),
+            messages,
             truncate_from: io.truncate_from.take(),
             entries: std::mem::take(&mut io.entries),
             hard_state: io.hard_state.take(),
