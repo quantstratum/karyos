@@ -386,3 +386,46 @@ fn rate_change_records_round_trip() {
     assert!(!Kind::RateOutcome.is_request());
     assert_eq!(JournalRecord::decode(&outcome.encode()), Some(outcome));
 }
+
+/// karyos#1071: an unsealed journal larger than one chunk is sealed in
+/// chunks, each read on its own, and the chunks verify.
+#[test]
+fn a_large_unsealed_journal_is_sealed_in_bounded_chunks() {
+    use karyos_archive::integrity::journal::{IntegrityJournal, read_records};
+    use karyos_archive::integrity::{SealKind, verify_chain};
+
+    let dir = dir("chunked");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    // Appends that are not durable leave the journal unsealed past its
+    // first records.
+    for time in 11..200 {
+        let _ = journal
+            .append(&request(Kind::CloseRequest, time, 3), time)
+            .unwrap();
+    }
+    drop(journal);
+    // A journal from before sealing: its integrity journal is gone.
+    std::fs::remove_file(IntegrityJournal::<StdDisk>::path(&dir)).unwrap();
+    let chunk = 512;
+    let mut journal = Journal::open_chunked(&dir, 300, chunk).unwrap();
+    let _ = journal
+        .append_durable(&request(Kind::CloseOutcome, 301, 3), 301)
+        .unwrap();
+    assert_eq!(journal.failed_seals(), 0);
+    // The buffer never held more than a chunk.
+    assert!(
+        journal.seal_capacity() <= 512 * 2,
+        "{}",
+        journal.seal_capacity()
+    );
+    drop(journal);
+    let (records, fault) = read_records(&mut StdDisk, &dir).unwrap();
+    assert_eq!(fault, None);
+    verify_chain(&records).unwrap();
+    let ranges: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind == SealKind::OpenSegment)
+        .collect();
+    assert!(ranges.len() > 4, "{}", ranges.len());
+    assert!(ranges.iter().all(|range| range.end - range.start <= chunk));
+}

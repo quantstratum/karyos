@@ -60,6 +60,8 @@ pub const MAX_REASON: usize = 128;
 const VERSION: u64 = 1;
 /// The fixed words of a record before its reason.
 const WORDS: usize = 11;
+/// The most bytes one seal reads (karyos#1071).
+const SEAL_CHUNK: u64 = 1 << 20;
 /// Bytes queued at most before the recorder takes them.
 const MAX_QUEUED: u64 = 1 << 20;
 /// The journal's largest frame: a term.
@@ -426,6 +428,8 @@ pub struct Journal {
     failed_seals: u64,
     /// The bytes of one seal, reused.
     seal_buf: Vec<u8>,
+    /// The most bytes one seal reads.
+    seal_chunk: u64,
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
@@ -442,6 +446,15 @@ impl Journal {
     /// [`JournalError`] when the directory's catalog or the recording
     /// cannot be opened, or the unknown interval cannot be recorded.
     pub fn open(dir: &Path, now: u64) -> Result<Self, JournalError> {
+        Self::open_chunked(dir, now, SEAL_CHUNK)
+    }
+
+    /// [`Journal::open`] with seals of at most `seal_chunk` bytes.
+    pub(crate) fn open_chunked(
+        dir: &Path,
+        now: u64,
+        seal_chunk: u64,
+    ) -> Result<Self, JournalError> {
         let geometry = Geometry::with_default_length(TERM_LENGTH)?;
         std::fs::create_dir_all(dir).map_err(CatalogError::Io)?;
         let mut catalog = Catalog::open(StdDisk, dir)?.catalog;
@@ -488,6 +501,7 @@ impl Journal {
             failed_seals: u64::from(integrity.is_none()),
             integrity,
             seal_buf: Vec::new(),
+            seal_chunk,
             #[cfg(test)]
             scanned: scan.all.clone(),
         };
@@ -669,17 +683,22 @@ impl Journal {
             .sealed_end(self.recording)
             .unwrap_or(recorder.store().start());
         let end = recorder.store().durable();
+        // At most `seal_chunk` bytes at a time: a journal from before
+        // sealing is sealed in pieces, never read whole (karyos#1071).
+        let chunk = self.seal_chunk.max(1);
         let sealed = (|| {
-            if end <= start {
-                return Ok(());
+            let mut from = start;
+            while from < end {
+                let to = end.min(from.saturating_add(chunk));
+                let length = usize::try_from(to.saturating_sub(from)).map_err(|_| ())?;
+                self.seal_buf.resize(length, 0);
+                recorder.read(from, &mut self.seal_buf).map_err(|_| ())?;
+                integrity
+                    .seal_segment(self.recording, from, &self.seal_buf, false)
+                    .map_err(|_| ())?;
+                from = to;
             }
-            let length = usize::try_from(end.saturating_sub(start)).map_err(|_| ())?;
-            self.seal_buf.resize(length, 0);
-            recorder.read(start, &mut self.seal_buf).map_err(|_| ())?;
-            integrity
-                .seal_segment(self.recording, start, &self.seal_buf, false)
-                .map(|_| ())
-                .map_err(|_| ())
+            Ok::<(), ()>(())
         })();
         if sealed.is_err() {
             self.integrity = None;
@@ -700,6 +719,12 @@ impl Journal {
     pub fn stop(&mut self, now: u64) -> Result<(), JournalError> {
         let _ = self.append_durable(&JournalRecord::new(Kind::AgentStopped, now), now)?;
         Ok(())
+    }
+
+    /// Tests: the seal buffer's capacity.
+    #[cfg(test)]
+    pub(crate) fn seal_capacity(&self) -> usize {
+        self.seal_buf.capacity()
     }
 
     /// Tests: the journal as an append failure leaves it.
