@@ -35,6 +35,7 @@ pub fn free_bytes(path: &Path) -> Result<u64, SysError> {
 /// What setting or clearing a file's immutable attribute came to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
+#[non_exhaustive]
 pub enum Immutability {
     /// The attribute is now as asked.
     Applied,
@@ -112,6 +113,7 @@ mod tests {
     /// with a full disk would fail other tests first); a path that does
     /// not exist is an OS error, never zero.
     #[test]
+    #[cfg_attr(miri, ignore = "host syscalls")]
     fn the_free_space_of_a_path_is_read() {
         let dir = std::env::temp_dir();
         assert!(free_bytes(&dir).unwrap() > 0);
@@ -129,6 +131,7 @@ mod tests {
     /// made immutable refuses writes and removal until released. Without
     /// support or `CAP_LINUX_IMMUTABLE` the typed answer says so.
     #[test]
+    #[cfg_attr(miri, ignore = "host syscalls")]
     fn the_immutable_attribute_is_set_and_released_or_reported() {
         let dir = std::env::temp_dir().join(format!("karyos-immutable-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -163,6 +166,7 @@ mod tests {
     /// before any ioctl, and a FIFO does not block the open waiting for a
     /// writer.
     #[test]
+    #[cfg_attr(miri, ignore = "host syscalls")]
     fn a_fifo_is_refused_without_blocking() {
         let dir =
             std::env::temp_dir().join(format!("karyos-immutable-fifo-{}", std::process::id()));
@@ -176,8 +180,18 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        // The open runs on its own thread with a bound: a missing
+        // O_NONBLOCK makes this fail on the timeout instead of hanging.
+        let (sender, outcome) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        let _ = std::thread::spawn(move || {
+            let _ = sender.send(set_immutable(&path, true));
+        });
+        let refused = outcome
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
         assert!(matches!(
-            set_immutable(&fifo, true),
+            refused,
             Err(SysError::Os {
                 operation: "not a regular file",
                 ..

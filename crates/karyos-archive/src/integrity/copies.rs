@@ -257,6 +257,10 @@ impl ImmutableAttribute {
                 ErrorKind::Unsupported,
                 "the file system has no immutable attribute",
             )),
+            // An outcome a newer karyos-sys adds is not a release.
+            _ => Err(Error::other(
+                "an immutability outcome this version does not know",
+            )),
         }
     }
 }
@@ -266,8 +270,9 @@ impl ImmutabilityBackend for ImmutableAttribute {
     fn enforce(&mut self, path: &Path, _retain_until_ns: u64) -> std::io::Result<Enforcement> {
         match karyos_sys::fs::set_immutable(path, true).map_err(std::io::Error::other)? {
             karyos_sys::fs::Immutability::Applied => Ok(Enforcement::ImmutableAttribute),
-            karyos_sys::fs::Immutability::Unsupported
-            | karyos_sys::fs::Immutability::NotPermitted => Ok(Enforcement::Unsupported),
+            // Anything else, an outcome a newer karyos-sys adds included,
+            // records no enforcement: never a protection that is not there.
+            _ => Ok(Enforcement::Unsupported),
         }
     }
 }
@@ -545,6 +550,7 @@ mod immutable_tests {
                 released.unwrap_err().kind(),
                 std::io::ErrorKind::Unsupported
             ),
+            _ => assert!(released.is_err()),
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
