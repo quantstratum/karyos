@@ -76,6 +76,7 @@ fn channel() -> UdpConfig {
     let unread = Box::leak(Box::new(std::net::UdpSocket::bind("127.0.0.1:0").unwrap()));
     UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Unicast(unread.local_addr().unwrap()),
         interface: Some(Interface::Address(std::net::IpAddr::V4(
             std::net::Ipv4Addr::LOCALHOST,

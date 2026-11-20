@@ -66,6 +66,7 @@ fn aggregate(stream_id: i32, session_id: i32, lanes: usize) -> AggregateConfig {
 fn channel(address: SocketAddr) -> UdpConfig {
     UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),
@@ -2188,4 +2189,99 @@ fn a_default_interface_publication_does_not_share_the_solicit_endpoint() {
     assert_eq!(solicit.len(), 1, "{solicit:?}");
     // The publication's, the subscription's and the SOLICIT endpoint.
     assert_eq!(driver.network_held_endpoints(), 3);
+}
+
+/// karyos#654 (owner item 8): a channel's `nak-control` enters its paths'
+/// groups into the driver's one control group table, beside the
+/// configured entries; the same mapping again is accepted, a conflicting
+/// one and a ninth entry are refused, typed, and a refusal leaves the
+/// table as it was.
+#[test]
+fn nak_control_maps_through_the_driver_table() {
+    use crate::error::DriverError;
+    use crate::net::{ControlGroup, MAX_CONTROL_GROUPS};
+
+    let at = |last: u8, port: u16| SocketAddr::from(([239, 7, 0, last], port));
+    let mut table = [None; MAX_CONTROL_GROUPS];
+    table[0] = Some(ControlGroup {
+        data_group: at(1, 4000),
+        interface: None,
+        control_group: at(2, 4001),
+    });
+    let mut driver = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(NetworkConfig {
+            threading: ThreadingMode::Shared,
+            nak_control_groups: table,
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let net = driver.net.as_mut().unwrap();
+    let multicast = |group, control: Vec<SocketAddr>, paths: Vec<Interface>| UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        nak_control: control,
+        paths,
+        ..channel(group)
+    };
+    // The configured mapping, repeated by a URI: accepted, nothing added.
+    net.map_nak_control(&multicast(at(1, 4000), vec![at(2, 4001)], Vec::new()))
+        .unwrap();
+    assert_eq!(net.control_groups().iter().flatten().count(), 1);
+    // A conflicting one on the same driver.
+    assert_eq!(
+        net.map_nak_control(&multicast(at(1, 4000), vec![at(3, 4001)], Vec::new())),
+        Err(DriverError::ControlGroupConflict {
+            data_group: at(1, 4000),
+            held: at(2, 4001),
+            control: at(3, 4001),
+        })
+    );
+    // Two paths, each its own group, each its own entry.
+    let paths = vec![
+        Interface::Address(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+        Interface::Address(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+    ];
+    net.map_nak_control(&multicast(
+        at(10, 4000),
+        vec![at(11, 4001), at(12, 4001)],
+        paths.clone(),
+    ))
+    .unwrap();
+    let held: Vec<_> = net.control_groups().iter().flatten().copied().collect();
+    assert_eq!(held.len(), 3);
+    assert!(held.contains(&ControlGroup {
+        data_group: at(10, 4000),
+        interface: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+        control_group: at(12, 4001),
+    }));
+    // Fill the table to its eight entries, then a ninth is refused.
+    for last in 20..25 {
+        net.map_nak_control(&multicast(
+            at(last, 4000),
+            vec![at(last + 100, 4001)],
+            Vec::new(),
+        ))
+        .unwrap();
+    }
+    assert_eq!(
+        net.control_groups().iter().flatten().count(),
+        MAX_CONTROL_GROUPS
+    );
+    let before = *net.control_groups();
+    assert_eq!(
+        net.map_nak_control(&multicast(at(30, 4000), vec![at(130, 4001)], Vec::new())),
+        Err(DriverError::ControlGroupsFull)
+    );
+    assert_eq!(*net.control_groups(), before);
+    // A count that is not one per path, built without the URI.
+    assert_eq!(
+        net.map_nak_control(&multicast(at(10, 4000), vec![at(11, 4001)], paths)),
+        Err(DriverError::UnsupportedChannel)
+    );
+    // A channel without the key changes nothing.
+    net.map_nak_control(&multicast(at(40, 4000), Vec::new(), Vec::new()))
+        .unwrap();
+    assert_eq!(*net.control_groups(), before);
 }

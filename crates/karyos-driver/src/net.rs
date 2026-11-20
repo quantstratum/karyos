@@ -1303,6 +1303,71 @@ impl<T: StreamTerms> Network<T> {
     /// Whether this driver can isolate the sockets of redundant paths
     /// ([`SocketOps::isolates_paths`]); a channel with `paths` is refused
     /// while it cannot.
+    /// Enters `channel`'s `nak-control` groups, one per path, into the
+    /// driver's one control group table (owner item 8, karyos#654), all
+    /// or none, before the subscription joins its group; a channel
+    /// without the key changes nothing. Entries stay for the driver's
+    /// life: the table is the driver's topology, not a subscription's.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::ControlGroupConflict`],
+    /// [`DriverError::ControlGroupsFull`], [`DriverError::InvalidConfig`],
+    /// or [`DriverError::UnsupportedChannel`] for a key on a channel that
+    /// is not multicast, a path named by interface name, or a count that
+    /// is not one per path (a hand-built channel).
+    pub(crate) fn map_nak_control(
+        &mut self,
+        channel: &karyos_protocol::channel::UdpConfig,
+    ) -> Result<(), DriverError> {
+        use karyos_protocol::channel::{Destination, Interface};
+        let Destination::Multicast { group, .. } = channel.destination else {
+            return if channel.nak_control.is_empty() {
+                Ok(())
+            } else {
+                Err(DriverError::UnsupportedChannel)
+            };
+        };
+        // Each path's interface as `hold_control_group` looks it up: an
+        // address, `None` for the unspecified one or no interface.
+        let interface = |one: Option<&Interface>| match one {
+            None => Ok(None),
+            Some(Interface::Address(address)) if address.is_unspecified() => Ok(None),
+            Some(Interface::Address(address)) => Ok(Some(*address)),
+            Some(_) => Err(DriverError::UnsupportedChannel),
+        };
+        let interfaces = if channel.paths.is_empty() {
+            vec![interface(channel.interface.as_ref())?]
+        } else {
+            channel
+                .paths
+                .iter()
+                .map(|path| interface(Some(path)))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if interfaces.len() != channel.nak_control.len() && !channel.nak_control.is_empty() {
+            return Err(DriverError::UnsupportedChannel);
+        }
+        control_group::merge(
+            &mut self.control_groups,
+            interfaces
+                .into_iter()
+                .zip(channel.nak_control.iter())
+                .map(|(interface, control)| ControlGroup {
+                    data_group: group,
+                    interface,
+                    control_group: *control,
+                }),
+        )
+    }
+
+    /// The driver's NAK control group table, as configured and as
+    /// channels' `nak-control` keys extended it (tests).
+    #[cfg(test)]
+    pub(crate) fn control_groups(&self) -> &ControlGroups {
+        &self.control_groups
+    }
+
     pub(crate) fn paths_isolated(&self) -> bool {
         self.paths_isolated
     }

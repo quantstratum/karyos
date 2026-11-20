@@ -97,6 +97,7 @@ fn aggregate(stream_id: i32, session_id: i32, lanes: usize) -> AggregateConfig {
 fn channel(address: SocketAddr, reliable: bool) -> UdpConfig {
     UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),
@@ -866,6 +867,7 @@ fn a_multicast_publication_reaches_every_subscriber() {
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 1)), port);
     let channel = UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -951,6 +953,7 @@ fn colliding_aliases_on_one_multicast_group_keep_two_images_apart() {
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), free_port());
     let channel = UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -1382,25 +1385,40 @@ fn the_network_keeps_its_own_clock() {
 #[cfg(target_os = "linux")]
 #[test]
 fn multicast_cycles_run_on_the_network_clock() {
+    nak_copies_reach_the_control_group("multicast_cycles_run_on_the_network_clock", false);
+}
+
+/// karyos#654: the same NAK copies reach the control group when the
+/// channel names it with `nak-control` and the driver's table starts
+/// empty: the key maps through that one table.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_channels_nak_control_carries_its_naks() {
+    nak_copies_reach_the_control_group("a_channels_nak_control_carries_its_naks", true);
+}
+
+/// The body of the two tests above: the control group configured in the
+/// driver's table, or named by the channel's `nak-control` (`by_uri`).
+#[cfg(target_os = "linux")]
+fn nak_copies_reach_the_control_group(name: &str, by_uri: bool) {
     use std::io::Write as _;
 
     use crate::net::{ControlGroup, MAX_CONTROL_GROUPS};
 
     if let Err(why) = multicast_probe() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIPPED multicast_cycles_run_on_the_network_clock: {why}"
-        );
+        let _ = writeln!(std::io::stderr(), "SKIPPED {name}: {why}");
         return;
     }
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)), free_port());
     let control = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), free_port());
     let mut table = [None; MAX_CONTROL_GROUPS];
-    table[0] = Some(ControlGroup {
-        data_group: group,
-        interface: None,
-        control_group: control,
-    });
+    if !by_uri {
+        table[0] = Some(ControlGroup {
+            data_group: group,
+            interface: None,
+            control_group: control,
+        });
+    }
     let frozen = || {
         EmbeddedDriver::with_clock(
             DriverConfig {
@@ -1417,6 +1435,7 @@ fn multicast_cycles_run_on_the_network_clock() {
     };
     let channel = UdpConfig {
         retransmit_window: None,
+        nak_control: if by_uri { vec![control] } else { Vec::new() },
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -2704,6 +2723,7 @@ fn optional_receiver_closes(
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), port);
     let channel = UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -3164,6 +3184,7 @@ fn a_slow_optional_receiver_under_min_is_bounded_and_repaired() {
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 5)), port);
     let channel = UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),
@@ -3421,6 +3442,7 @@ fn two_paths(
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 4)), free_port());
     let channel = UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: vec![
@@ -3635,6 +3657,7 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 3)), port);
     let channel = UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: vec![

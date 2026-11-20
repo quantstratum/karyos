@@ -29,6 +29,7 @@ use crate::membership::{PublicationRoles, Strategy};
 pub(super) fn destinations(destinations: &[SocketAddr], reliable: bool) -> UdpConfig {
     UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::MultiDestination {
             destinations: destinations.to_vec(),
             control: None,

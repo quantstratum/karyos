@@ -201,6 +201,7 @@ The common URI rule binds every key added after the sixteen above.
 | Key | Media | Value |
 | --- | --- | --- |
 | `retransmit-window` | udp | `decimal` bytes: positive, a multiple of 32, at most `term-length` / 2; default `term-length` / 2 |
+| `nak-control` | udp | `;` list of `socket-address`, one per path; multicast only; default none (the driver's table) |
 | `require-abort-ack` | udp | `true` or `false`; default `false`. `true` is `SecurityUnsupported` with class `authenticated` until the authenticated capability is supported |
 
 - **`retransmit-window`** (owner item 63) is fixed at channel creation and
@@ -214,6 +215,20 @@ The common URI rule binds every key added after the sixteen above.
   required receivers is `sent` minus the window. A smaller window can
   make a hole unrecoverable even for a counted receiver; that loss is
   reported, never silent.
+
+- **`nak-control`** (owner item 8) names each path's NAK control group:
+  one multicast `socket-address` per path, in the order of `paths`, or
+  exactly one for a channel without `paths`, so a path never maps
+  ambiguously; another count is `InvalidValue`. Each is of the data
+  group's family, on a nonzero port, not the data group itself, and none
+  repeats. It applies only with `group`; elsewhere it is `NotApplicable`.
+  The driver enters each (data group, path interface, control group) into
+  its one control group table, the same table its configuration seeds,
+  bounded at eight entries: a mapping the table already holds is
+  accepted, a different control group for a held data group and path is
+  refused (`ControlGroupConflict`), and a ninth entry is refused
+  (`ControlGroupsFull`). Entries stay for the driver's life. Cross-host
+  agreement on the groups is a deployment matter: there is no discovery.
 
 - **`require-abort-ack`** (owner item 8) asks that a remote
   `SESSION_ABORT` be acknowledged. It belongs to the authenticated
