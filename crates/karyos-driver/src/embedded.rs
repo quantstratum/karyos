@@ -894,6 +894,8 @@ struct Incarnation {
     generation: Generation,
     guard: crate::guards::GuardHandle,
     messages: u64,
+    /// `H` of a concurrent stream.
+    handles: Option<u64>,
     rate: Option<karyos_sys::rate_limit::RatePolicy>,
     /// The rate policy's version and control reserve, kept across the
     /// incarnation (R-CORE-21).
@@ -2369,12 +2371,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// the message bucket returns `RateLimited` early, and the sender
     /// gate's bucket is authoritative.
     ///
+    /// A concurrent stream is guarded with `H` handle slots, its publisher
+    /// slot count: its guarded handles share one outcome ring, each with
+    /// its own quota of `messages` (ADR-0092).
+    ///
     /// # Errors
     ///
-    /// [`DriverError::InvalidPublicationMode`] for a concurrent stream
-    /// (GC-7); [`DriverError::InvalidConfig`] for a stream already guarded,
-    /// one with an issued handle, `messages` of 0, or `messages` reserved
-    /// messages that do not fit half a term (the publication window, so
+    /// [`DriverError::InvalidPublicationMode`] for an image;
+    /// [`DriverError::InvalidConfig`] for a stream already guarded,
+    /// one with an issued handle, a concurrent stream of more than 64
+    /// publisher slots, `messages` of 0, or `H * messages` reserved
+    /// messages (`messages` on an exclusive stream) that do not fit half a
+    /// term (the publication window, so
     /// the walker's retained span never needs more than the rotation and
     /// spare slots can hold); [`DriverError::UnknownGuard`]; and
     /// [`DriverError::GuardWalkerUnavailable`] when the walker, which holds
@@ -2401,21 +2409,31 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let registration = self.stream_ref(stream)?.aggregate.registration;
         let held = self.rate_policies.get(&registration).copied();
         let found = self.active_stream(stream)?;
-        if !matches!(
-            found.config.publication,
-            karyos_sys::log_buffer::PublicationMode::Exclusive
-        ) {
-            return Err(DriverError::InvalidPublicationMode);
-        }
+        // A concurrent stream's handles share one ring of `H` slots, its
+        // publisher slot count (ADR-0092 decision 3).
+        let handles = match found.config.publication {
+            karyos_sys::log_buffer::PublicationMode::Exclusive => None,
+            karyos_sys::log_buffer::PublicationMode::Concurrent { publishers, .. } => {
+                let handles = u64::from(publishers);
+                if handles > karyos_sys::outcome_ring::shared::MAX_HANDLES {
+                    return Err(DriverError::InvalidConfig);
+                }
+                Some(handles)
+            }
+            _ => return Err(DriverError::InvalidPublicationMode),
+        };
+        // Every handle's `C_m` reserved messages at once fit half a term.
         let window = u64::from(found.config.term_length.get() / 2);
         let fits = messages
             .checked_mul(u64::from(found.config.max_reserved))
+            .and_then(|span| span.checked_mul(handles.unwrap_or(1)))
             .is_some_and(|span| span <= window);
-        // An exclusive handle already issued, not a subscriber, rules it out.
+        // A publication handle already issued, not a subscriber, rules it
+        // out.
         let issued = found
             .members
             .iter()
-            .any(|member| matches!(member.kind, MemberKind::Exclusive));
+            .any(|member| matches!(member.kind, MemberKind::Exclusive | MemberKind::Concurrent));
         if found.guarded.is_some() || issued || messages == 0 || !fits {
             return Err(DriverError::InvalidConfig);
         }
@@ -2500,7 +2518,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             })?;
         let scratch = usize::try_from(found.buffer.max_message_length())
             .map_err(|_| DriverError::InvalidConfig)?;
-        let mut guarded = crate::guard_streams::GuardedStream::new(
+        let guarded = crate::guard_streams::GuardedStream::new(
             guard,
             messages,
             (
@@ -2510,6 +2528,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             walker,
             scratch,
         );
+        let mut guarded = match handles {
+            Some(handles) => guarded.with_handles(handles)?,
+            None => guarded,
+        };
         // It joins at the aggregate's version, never at 1 on its own, so
         // one `expected` names every lane (R-CORE-21); one guarded without
         // a rate is audited moving from no rate to it.
@@ -3671,6 +3693,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             generation: found.generation,
             guard: guarded.guard,
             messages: guarded.messages,
+            handles: guarded.handles(),
             rate: guarded.rate,
             rate_version: guarded.rate_version,
             reserve: guarded.reserve,
@@ -3719,13 +3742,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         fresh: Fresh<T>,
     ) -> Result<(), DriverError> {
         let found = self.stream(handle)?;
-        let mut guarded = crate::guard_streams::GuardedStream::new(
+        let guarded = crate::guard_streams::GuardedStream::new(
             plan.guard,
             plan.messages,
             (plan.rate, plan.reserve),
             fresh.walker,
             fresh.scratch,
         );
+        let mut guarded = match plan.handles {
+            Some(handles) => guarded.with_handles(handles)?,
+            None => guarded,
+        };
         // The policy at its version, then the publication's slot, which
         // already holds it: a reincarnation publishes nothing to its gate.
         if let Some(policy) = plan.rate {
@@ -4016,6 +4043,66 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         Ok(Some((client, bound)))
     }
 
+    /// Admits a concurrent guarded handle of `client` into the next slot of
+    /// stream `stream`'s shared outcome ring (ADR-0092), creating the ring
+    /// at the incarnation's first one, bound to the guard's open epoch.
+    /// Refused, with nothing changed, on a stream a guard close sealed,
+    /// while the guard is not open, and as
+    /// [`crate::guard_streams::GuardedStream::attach_shared`] refuses.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the client handles bind it in karyos#1102 (c) and (d)"
+        )
+    )]
+    pub(crate) fn attach_concurrent_guard(
+        &mut self,
+        stream: StreamHandle,
+        client: crate::guard_streams::ShareClient,
+    ) -> Result<crate::guard_streams::SharedSlot, DriverError> {
+        let found = self.stream_ref(stream)?;
+        let guard = found
+            .guarded
+            .as_ref()
+            .map(|guarded| guarded.guard)
+            .ok_or(DriverError::InvalidPublicationMode)?;
+        let state = self.guards.state(guard)?;
+        if !state.open {
+            return Err(DriverError::GuardNotOpen { guard: guard.id() });
+        }
+        if found.conductor.seal_reason() == Some(SealReason::GuardClosed) {
+            return Err(DriverError::GuardSealed { stream: found.id });
+        }
+        let (_, index) = self.guards.view(guard)?;
+        let reincarnated_at =
+            (found.incarnation > FIRST_INCARNATION).then_some(found.reincarnated_at);
+        let found = self.stream(stream)?;
+        let id = found.id;
+        found
+            .guarded
+            .as_mut()
+            .ok_or(DriverError::InvalidPublicationMode)?
+            .attach_shared(id, client, state.epoch, index, reincarnated_at)
+    }
+
+    /// Detaches slot `slot` of stream `stream`'s shared ring: its handle is
+    /// gone (ADR-0092 decision 8).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the client handles bind it in karyos#1102 (c) and (d)"
+        )
+    )]
+    pub(crate) fn detach_concurrent_guard(&mut self, stream: StreamHandle, slot: usize) {
+        if let Ok(found) = self.stream(stream)
+            && let Some(guarded) = found.guarded.as_mut()
+        {
+            guarded.detach_shared(slot);
+        }
+    }
+
     /// Issues a concurrent publication handle on one of the stream's `P`
     /// publisher slots (`quantstratum-docs: karyos/design/client-concurrent-publication.md`).
     /// The handle holds a stream lease until dropped; dropping it frees its
@@ -4034,6 +4121,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream: StreamHandle,
     ) -> Result<ClientConcurrentPublication<T>, DriverError> {
         let stream = self.active_stream(stream)?;
+        // A guarded stream's handle binds a slot of its shared ring, which
+        // the client handle does not do yet (karyos#1102 (c)): never
+        // issued unguarded.
+        if stream.guarded.is_some() {
+            return Err(DriverError::Sys(
+                karyos_sys::error::SysError::InvalidPublicationMode { reason: "GC-7" },
+            ));
+        }
         stream.issuing()?;
         let inner = stream
             .conductor
@@ -5710,6 +5805,29 @@ fn seal_conflation_terminal<E>(
 /// Aborts a guarded stream's admitted claim for its guard close and
 /// records the block, so the walker labels it `GUARD_CLOSED`.
 fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), DriverError> {
+    // A concurrent stream's claims: each call aborts what earlier calls
+    // observed, so it repeats while blocks are still observed, at most
+    // `CLOSE_ABORT_PASSES` times here; the walker's duty repeats it after.
+    if matches!(
+        stream.config.publication,
+        karyos_sys::log_buffer::PublicationMode::Concurrent { .. }
+    ) {
+        for _ in 0..CLOSE_ABORT_PASSES {
+            let report = stream.conductor.abort_marked_claims().map_err(|failed| {
+                if let Some(guarded) = &mut stream.guarded {
+                    guarded.note_close_aborts(failed.report.aborted);
+                }
+                DriverError::Sys(failed.error)
+            })?;
+            if let Some(guarded) = &mut stream.guarded {
+                guarded.note_close_aborts(report.aborted);
+            }
+            if !report.waiting {
+                break;
+            }
+        }
+        return Ok(());
+    }
     // The outstanding claim: its commit and this abort race on the block's
     // decision word, and exactly one wins.
     if let karyos_sys::log_buffer::ClaimDeadline::Aborted { position, .. } =
@@ -5720,6 +5838,10 @@ fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), Dri
     }
     Ok(())
 }
+
+/// The passes of one guard close's concurrent claim abort: the first
+/// observes, the second aborts, a third catches a block claimed between.
+const CLOSE_ABORT_PASSES: u32 = 3;
 
 /// The CnC cells of one network publication or image (M2b), keyed by
 /// its stream's `registration`, all or none: when the region has no room
@@ -6770,6 +6892,8 @@ mod aggregate_subscriber_tests;
 mod aggregate_tests;
 #[cfg(test)]
 mod initial_term_id_tests;
+#[cfg(test)]
+mod shared_guard_tests;
 #[cfg(test)]
 mod stream_cap_tests;
 
