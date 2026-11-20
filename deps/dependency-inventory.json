@@ -2,7 +2,6 @@
   "evaluated": {
     "aarch64-apple-darwin": [
       "atomic-waker v1.1.2",
-      "bitflags v2.13.2",
       "block-buffer v0.12.1",
       "bytes v1.12.2",
       "cfg-if v1.0.5",
@@ -49,7 +48,6 @@
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
       "rustc_version v0.4.1",
-      "rustix v1.1.6",
       "rustls v0.23.46",
       "rustls-graviola v0.4.0",
       "rustls-pki-types v1.16.0",
@@ -491,7 +489,9 @@
           []
         ],
         "runtime": [
-          []
+          [
+            "cfg(target_os = \"linux\")"
+          ]
         ]
       },
       "proc_macro": false,
@@ -2818,10 +2818,12 @@
       "paths": {
         "runtime": [
           [
-            "cfg(all(any(target_os = \"linux\", target_os = \"android\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))"
+            "cfg(all(any(target_os = \"linux\", target_os = \"android\"), any(rustix_use_libc, miri, not(all(target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\")))))))",
+            "cfg(target_os = \"linux\")"
           ],
           [
-            "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))"
+            "cfg(all(not(rustix_use_libc), not(miri), target_os = \"linux\", any(target_endian = \"little\", any(target_arch = \"s390x\", target_arch = \"powerpc\")), any(target_arch = \"arm\", all(target_arch = \"aarch64\", target_pointer_width = \"64\"), target_arch = \"riscv64\", all(rustix_use_experimental_asm, target_arch = \"powerpc\"), all(rustix_use_experimental_asm, target_arch = \"powerpc64\"), all(rustix_use_experimental_asm, target_arch = \"s390x\"), all(rustix_use_experimental_asm, target_arch = \"mips\"), all(rustix_use_experimental_asm, target_arch = \"mips32r6\"), all(rustix_use_experimental_asm, target_arch = \"mips64\"), all(rustix_use_experimental_asm, target_arch = \"mips64r6\"), target_arch = \"x86\", all(target_arch = \"x86_64\", target_pointer_width = \"64\"))))",
+            "cfg(target_os = \"linux\")"
           ]
         ]
       },
@@ -4150,23 +4152,6 @@
         },
         {
           "features": [
-            "event",
-            "fs",
-            "mm",
-            "net",
-            "param",
-            "process",
-            "rand",
-            "std",
-            "time"
-          ],
-          "from": "workspace:karyos-tools@0.1.0-alpha.3",
-          "kind": "normal",
-          "target": null,
-          "uses_default_features": false
-        },
-        {
-          "features": [
             "net",
             "std"
           ],
@@ -4193,7 +4178,9 @@
       "name": "rustix",
       "paths": {
         "runtime": [
-          []
+          [
+            "cfg(target_os = \"linux\")"
+          ]
         ]
       },
       "proc_macro": false,

@@ -26,12 +26,13 @@
 //!   reaper runs: when the reaper thread cannot start, the request stays
 //!   in the signer, which tries again on the next ask and starts no new
 //!   program meanwhile. Its child and worker are never dropped unended.
-//! - **Cancellable I/O.** The worker reads the program's output without
+//! - **Cancellable I/O** (Linux). The worker reads the program's output without
 //!   blocking, polling it with a short timeout and a cancel flag, so a
 //!   descendant that holds the output open outside the group cannot keep
 //!   the worker, and so the reaper, alive: cancelled, the worker ends.
-//! - **Identity.** The program is never reaped before its group is
-//!   signalled: success is read with `waitid(WNOWAIT)`, which leaves it a
+//! - **Identity** (Linux, through `karyos_sys::child`; elsewhere success
+//!   is read with `try_wait` and the output read blocks). The program is
+//!   never reaped before its group is signalled: success is read with `waitid(WNOWAIT)`, which leaves it a
 //!   zombie, and the reaper kills its group first and reaps it after. A
 //!   group whose leader is unreaped cannot be reused, so the kill never
 //!   reaches another group.
@@ -75,14 +76,25 @@ struct Request {
     cancel: Arc<AtomicBool>,
 }
 
+/// Kills `child`'s process group. On Linux the leader is still unreaped
+/// here, so the group id is still its (`karyos_sys::child`); elsewhere
+/// through `kill`.
+fn kill_group(child: &Child) {
+    #[cfg(target_os = "linux")]
+    let _ = karyos_sys::child::kill_group(child);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Ends `child` and everything it started, and joins `worker`: the group
 /// is killed while its leader is still unreaped, then the leader is
 /// reaped and the worker, cancelled, joined.
 fn end(mut child: Child, worker: std::thread::JoinHandle<()>, cancel: &AtomicBool) {
     cancel.store(true, Ordering::Release);
-    // The leader is not reaped before this: its group id is still its.
-    let leader = rustix::process::Pid::from_child(&child);
-    let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
+    kill_group(&child);
     let _ = child.kill();
     let _ = child.wait();
     let _ = worker.join();
@@ -123,14 +135,15 @@ impl Request {
     /// Whether the program has exited successfully, read without reaping
     /// it (`waitid` with `WNOWAIT`): its group id stays its own until the
     /// reaper has signalled the group.
-    fn succeeded(&self) -> Option<bool> {
-        use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
-        let pid = Pid::from_child(&self.child);
-        match waitid(
-            WaitId::Pid(pid),
-            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
-        ) {
-            Ok(Some(status)) => Some(status.exit_status() == Some(0) && status.exited()),
+    ///
+    /// Elsewhere than Linux it is read with `try_wait`, which reaps: the
+    /// identity guarantee is Linux's, where `karyosd` runs.
+    fn succeeded(&mut self) -> Option<bool> {
+        #[cfg(target_os = "linux")]
+        return karyos_sys::child::exited_unreaped(&self.child);
+        #[cfg(not(target_os = "linux"))]
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(status.success()),
             Ok(None) => None,
             Err(_) => Some(false),
         }
@@ -242,9 +255,11 @@ impl CommandSigner {
         };
         // The output is read without blocking, so the worker can be
         // cancelled whoever holds the pipe open.
-        let nonblocking = rustix::fs::fcntl_getfl(&stdout).and_then(|flags| {
-            rustix::fs::fcntl_setfl(&stdout, flags | rustix::fs::OFlags::NONBLOCK)
-        });
+        #[cfg(target_os = "linux")]
+        let nonblocking = karyos_sys::child::set_nonblocking(&stdout);
+        // Elsewhere the read blocks, and ends when the output closes.
+        #[cfg(not(target_os = "linux"))]
+        let nonblocking: std::io::Result<()> = Ok(());
         let (sender, answer) = mpsc::sync_channel(1);
         let input = hex(&bytes);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -268,8 +283,7 @@ impl CommandSigner {
         } else {
             // No worker holds the pipes: the group is ended here, its
             // leader reaped only after.
-            let leader = rustix::process::Pid::from_child(&child);
-            let _ = rustix::process::kill_process_group(leader, rustix::process::Signal::KILL);
+            kill_group(&child);
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -311,15 +325,10 @@ impl Read for Cancellable<'_> {
             }
             match self.output.read(buf) {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    let mut fds = [rustix::event::PollFd::new(
-                        &self.output,
-                        rustix::event::PollFlags::IN,
-                    )];
-                    let tick = rustix::event::Timespec {
-                        tv_sec: 0,
-                        tv_nsec: READ_TICK.subsec_nanos().into(),
-                    };
-                    let _ = rustix::event::poll(&mut fds, Some(&tick));
+                    #[cfg(target_os = "linux")]
+                    karyos_sys::child::wait_readable(&self.output, READ_TICK);
+                    #[cfg(not(target_os = "linux"))]
+                    std::thread::sleep(READ_TICK);
                 }
                 other => return other,
             }
@@ -744,6 +753,7 @@ mod tests {
 
     /// karyos#1017 P2: success is read without reaping the program, so its
     /// group id cannot be reused before the reaper signals the group.
+    #[cfg(target_os = "linux")]
     #[test]
     fn success_is_read_without_reaping_the_program() {
         let dir = dir("unreaped");
@@ -751,7 +761,7 @@ mod tests {
         let mut command = Command::new(&program);
         let child = command.stdout(Stdio::null()).spawn().unwrap();
         let (_sender, answer) = mpsc::sync_channel(1);
-        let request = Request {
+        let mut request = Request {
             bytes: Vec::new(),
             since: Instant::now(),
             child,

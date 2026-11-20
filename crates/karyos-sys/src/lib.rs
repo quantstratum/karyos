@@ -30,6 +30,8 @@ pub mod alloc_count;
 pub mod applied_epoch;
 pub mod atomic_view;
 pub mod broadcast;
+#[cfg(target_os = "linux")]
+pub mod child;
 #[cfg(not(loom))]
 mod cnc_store;
 pub mod command_ring;
