@@ -579,13 +579,12 @@ fn a_receiver_back_at_a_new_port_moves_after_the_quiet_time() {
     assert_eq!(sender(&a).registrants_restarted, 0);
 }
 
-/// Every public publication and subscription call refuses a
-/// `control-mode=dynamic` channel with
-/// [`DriverError::DynamicRegistrationUnsupported`]: dynamic mode stays
-/// unreachable from outside the crate until the registration defects
-/// reported on karyos#644 are fixed.
+/// Every publication and subscription call that carries no registration
+/// refuses a `control-mode=dynamic` channel with
+/// [`DriverError::DynamicRegistrationUnsupported`]: only the dynamic
+/// calls, public since karyos#644, take it.
 #[test]
-fn every_public_call_refuses_dynamic_mode() {
+fn every_call_without_a_registration_refuses_dynamic_mode() {
     use karyos_client::schedule::{ScheduleClock, ScheduleOptions};
     use karyos_sys::conflation::ConflationConfig;
     use karyos_sys::frame::Lane;
