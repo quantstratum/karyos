@@ -832,3 +832,54 @@ fn test_container_a_restored_replica_builds_its_table_from_the_logged_bounds() {
     assert_eq!(restored.sessions(), writer.sessions());
     assert_eq!(restored.service(), writer.service());
 }
+
+/// karyos#927 review P2: only the log's first `SessionBounds` entry
+/// counts. A later one, as a new leader proposes before applying the one
+/// it inherited, delivers nothing whatever it carries: it neither
+/// replaces the first on a fresh table nor stops a table under sessions.
+#[test]
+fn test_container_a_later_bounds_entry_never_replaces_the_first() {
+    let other = config().dedup.with_window(2);
+    // Before any registration: the second does not replace the first.
+    let mut fresh = container();
+    assert_eq!(
+        fresh.apply(&bounds_entry(1, 0, config().dedup)),
+        Ok(Applied::Nothing)
+    );
+    assert_eq!(
+        fresh.apply(&bounds_entry(2, 0, other)),
+        Ok(Applied::Nothing)
+    );
+    assert_eq!(fresh.sessions().config(), config().dedup);
+    // After a registration: no stop either.
+    let Applied::Registered(Ok(_)) = fresh
+        .apply(&entry(3, 1, Envelope::Register { client: 7 }))
+        .unwrap()
+    else {
+        panic!("not registered");
+    };
+    assert_eq!(
+        fresh.apply(&bounds_entry(4, 2, other)),
+        Ok(Applied::Nothing)
+    );
+    assert_eq!(fresh.applied(), Some(4));
+    assert_eq!(fresh.sessions().config(), config().dedup);
+}
+
+/// karyos#927 review P1: bounds whose sizes fit `usize` but cannot be
+/// allocated are a typed refusal, never an abort, and the entry is not
+/// applied.
+#[test]
+fn test_container_bounds_past_what_can_be_allocated_stop_it() {
+    // u32::MAX × u32::MAX slots fit a 64-bit usize, but not an allocation.
+    let huge = DedupConfig::default()
+        .with_sessions(u32::MAX)
+        .with_window(u32::MAX)
+        .with_response_bytes(1);
+    let mut container = container();
+    assert_eq!(
+        container.apply(&bounds_entry(1, 0, huge)),
+        Err(ApplyError::BoundsUnheld(ConfigError::TooLarge))
+    );
+    assert_eq!(container.applied(), None);
+}

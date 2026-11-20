@@ -60,13 +60,21 @@
 //! | `SessionBounds` | 1 | sessions 4, window 4, response bytes 4, ttl 8 | 32 |
 //!
 //! Every field of 0 is `ValueOutOfRange`. The container applies a
-//! `SessionBounds` entry against its table's [`DedupConfig`]: equal bounds
-//! deliver nothing, as any core entry; different bounds rebuild a table
-//! still fresh (no registration applied) from the logged ones, and stop
-//! the container ([`ApplyError::BoundsDiffer`]) once a registration has
-//! applied, never rebuilding under live sessions. A leader proposes the
-//! bounds through [`ServiceContainer::propose_bounds`] while the log it
-//! applied carries none.
+//! `SessionBounds` entry against its table's [`DedupConfig`]. The first
+//! such entry in the log is the cluster's bounds: equal bounds deliver
+//! nothing, as any core entry; different bounds rebuild a table still
+//! fresh (no registration applied) from the logged ones, and stop the
+//! container ([`ApplyError::BoundsDiffer`]) once a registration has
+//! applied, never rebuilding under live sessions. Every later
+//! `SessionBounds` entry, whatever it carries, delivers nothing: a new
+//! leader that proposed its own bounds before applying an inherited entry
+//! never replaces or contradicts the first (karyos#927 review). A leader
+//! proposes the bounds through [`ServiceContainer::propose_bounds`] while
+//! the log it applied carries none, and accepts no registration until
+//! they apply. A log written before karyos#927 carries no bounds entry:
+//! its registrations apply under the replica's configured bounds, as
+//! before, and a bounds entry that later differs from them stops the
+//! container as above.
 
 #[cfg(test)]
 mod golden;
@@ -827,16 +835,17 @@ impl<S: ClusteredService> ServiceContainer<S> {
         })
     }
 
-    /// Applies a `SessionBounds` entry: equal bounds deliver nothing; a
-    /// fresh table is rebuilt from different ones, keeping its log time;
-    /// a table that has applied a registration stops.
+    /// Applies a `SessionBounds` entry. Only the log's first counts: equal
+    /// bounds deliver nothing; a fresh table is rebuilt from different
+    /// ones, keeping its log time; a table that has applied a registration
+    /// stops. A later one delivers nothing, whatever it carries.
     fn apply_bounds(
         &mut self,
         entry: &Entry,
         bounds: SessionBounds,
     ) -> Result<Applied<'_>, ApplyError> {
         let table = self.sessions.config();
-        if bounds.config != table {
+        if !self.bounds_logged && bounds.config != table {
             if !self.fresh {
                 return Err(ApplyError::BoundsDiffer {
                     logged: bounds.config,

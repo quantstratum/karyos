@@ -269,6 +269,17 @@ pub struct DeliveryServer<C, S> {
     /// Whether this server proposed the session bounds in its leadership
     /// (karyos#927); cleared when its leadership changes.
     bounds_proposed: bool,
+    /// Registrations taken while leading before the session bounds
+    /// applied (karyos#927): proposed once they apply. At most
+    /// `held_capacity`; one more is answered `NotLeader` naming this
+    /// server, so its client retries. On a loss of leadership each is
+    /// answered, never dropped silently (D5).
+    deferred: Vec<Taker>,
+    /// The most registrations held: the session table's size by default.
+    held_capacity: usize,
+    /// Whether this server proposes the session bounds as a leader (a
+    /// test turns it off to hold registrations deterministically).
+    proposes_bounds: bool,
     /// Which of the core's own entries are configuration changes.
     configurations: fn(&[u8]) -> bool,
     /// Every entry applied since the last start: its index and kind.
@@ -317,6 +328,13 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
             led: None,
             fired: BTreeSet::new(),
             bounds_proposed: false,
+            deferred: Vec::with_capacity(
+                usize::try_from(config.dedup.sessions)
+                    .unwrap_or(usize::MAX)
+                    .min(4096),
+            ),
+            held_capacity: usize::try_from(config.dedup.sessions).unwrap_or(usize::MAX),
+            proposes_bounds: true,
             configurations: |_| false,
             kinds: Vec::new(),
             outcomes: Vec::new(),
@@ -335,9 +353,32 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         self
     }
 
+    /// The registrations held until the session bounds apply.
+    #[must_use]
+    pub fn held_registrations(&self) -> usize {
+        self.deferred.len()
+    }
+
+    /// Holds at most `capacity` registrations before the session bounds
+    /// apply (karyos#927 review).
+    #[must_use]
+    pub fn with_held_registrations(mut self, capacity: usize) -> Self {
+        self.held_capacity = capacity;
+        self.deferred = Vec::with_capacity(capacity.min(4096));
+        self
+    }
+
+    /// Never proposes the session bounds: registrations stay held, for a
+    /// test of the holding itself.
+    #[must_use]
+    pub fn without_bounds_proposal(mut self) -> Self {
+        self.proposes_bounds = false;
+        self
+    }
+
     /// Every entry applied since the last start, with its index and its
-    /// kind: `register`, `close`, `request`, `timer`, `configuration` or
-    /// `core`.
+    /// kind: `register`, `close`, `request`, `timer`, `configuration`,
+    /// `bounds` or `core`.
     #[must_use]
     pub fn kinds(&self) -> &[(u64, &'static str)] {
         &self.kinds
@@ -441,6 +482,24 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
     ) {
         let taker = Taker { reply_to, client };
         match &message {
+            // No registration before the cluster's session bounds have
+            // applied (karyos#927 review): a registration under this
+            // replica's own configuration could apply under other limits on
+            // a replica with other startup bounds. A leader holds it until
+            // the bounds apply, then proposes it; a follower forwards it as
+            // ever, and the leader holds it.
+            Delivery::Register
+                if !self.container.bounds_logged()
+                    && self.running.as_ref().is_some_and(|(core, _)| core.leads()) =>
+            {
+                if self.deferred.len() < self.held_capacity {
+                    self.deferred.push(taker);
+                } else {
+                    out.push(taker.wrap(Delivery::NotLeader {
+                        leader: Some(self.id),
+                    }));
+                }
+            }
             Delivery::Register => {
                 let envelope = Envelope::Register {
                     client: u64::from(client),
@@ -484,6 +543,18 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         if self.led != now {
             self.fired.clear();
             self.bounds_proposed = false;
+            // A held registration is answered, never dropped silently:
+            // proposing it now forwards it to the leader this core knows,
+            // or answers NotLeader with that hint. A server that leads
+            // again keeps it held until the bounds apply.
+            if now.is_none() {
+                for taker in std::mem::take(&mut self.deferred) {
+                    let envelope = Envelope::Register {
+                        client: u64::from(taker.client),
+                    };
+                    self.propose(taker, envelope, Delivery::Register, out);
+                }
+            }
         }
         self.led = now;
     }
@@ -500,7 +571,8 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         }
         // The session bounds, once per leadership while the log carries
         // none (karyos#927).
-        if !self.bounds_proposed
+        if self.proposes_bounds
+            && !self.bounds_proposed
             && self
                 .container
                 .propose_bounds(&mut Proposer::new(core, &mut LogView::new(log)))
@@ -635,6 +707,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         self.kinds.clear();
         self.fired.clear();
         self.bounds_proposed = false;
+        self.deferred.clear();
         self.halted = None;
         self.running = Some((core, log));
     }
@@ -662,6 +735,15 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> Node<Delivery<C::Message>>
             core.tick(now, &mut LogView::new(log));
         }
         self.propose_due(now);
+        // The registrations held for the bounds go once they apply.
+        if self.container.bounds_logged() && !self.deferred.is_empty() {
+            for taker in std::mem::take(&mut self.deferred) {
+                let envelope = Envelope::Register {
+                    client: u64::from(taker.client),
+                };
+                self.propose(taker, envelope, Delivery::Register, out);
+            }
+        }
         self.duty(out);
     }
 
@@ -696,6 +778,7 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> Node<Delivery<C::Message>>
     fn crash(&mut self) {
         self.running = None;
         self.pending.clear();
+        self.deferred.clear();
         self.led = None;
         match self.disk.after_crash(self.survives) {
             Ok(disk) => self.disk = disk,

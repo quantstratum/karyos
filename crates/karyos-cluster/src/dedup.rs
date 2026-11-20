@@ -226,8 +226,9 @@ pub enum ConfigError {
     /// A bound is zero.
     #[error("{0} is zero")]
     Zero(&'static str),
-    /// The reply bytes overflow this platform's address space.
-    #[error("sessions × window × response bytes overflows")]
+    /// The table overflows this platform's address space, or its
+    /// allocation is refused (fallibly reserved, never an abort).
+    #[error("sessions × window × response bytes overflows or cannot be allocated")]
     TooLarge,
 }
 
@@ -378,13 +379,23 @@ impl SessionTable {
         let bytes = usize::try_from(config.response_bytes).map_err(|_| ConfigError::TooLarge)?;
         let slots = sessions.checked_mul(window).ok_or(ConfigError::TooLarge)?;
         let reply_bytes = slots.checked_mul(bytes).ok_or(ConfigError::TooLarge)?;
+        // Reserved fallibly: a size that fits `usize` may still exceed what
+        // `Vec` or the host can allocate, which is a typed refusal, never an
+        // abort (karyos#927 review).
+        fn filled<T: Clone>(length: usize, value: T) -> Result<Vec<T>, ConfigError> {
+            let mut out = Vec::new();
+            out.try_reserve_exact(length)
+                .map_err(|_| ConfigError::TooLarge)?;
+            out.resize(length, value);
+            Ok(out)
+        }
         Ok(Self {
             config,
             now: 0,
             registered: None,
-            sessions: vec![Session::default(); sessions],
-            stored: vec![Stored::Empty; slots],
-            replies: vec![0; reply_bytes],
+            sessions: filled(sessions, Session::default())?,
+            stored: filled(slots, Stored::Empty)?,
+            replies: filled(reply_bytes, 0)?,
         })
     }
 

@@ -683,3 +683,129 @@ fn test_delivery_a_new_leader_proposes_due_timers_again_and_a_duplicate_firing_i
         }
     }
 }
+
+/// karyos#927 review P1: no registration applies before the session
+/// bounds. With clients registering from the start, on every replica of
+/// every seed the log holds the bounds entry before any registration (a
+/// Register a leader takes before the bounds apply is held and proposed
+/// after them), every client still registers, and the sessions run under
+/// the logged bounds.
+#[test]
+fn test_delivery_no_registration_applies_before_the_session_bounds() {
+    for servers in [3, 5] {
+        for seed in scenarios::seeds() {
+            let (mut sim, clients) = cluster(
+                seed,
+                servers,
+                vec![values(&[1]), values(&[2]), values(&[3])],
+                false,
+            );
+            sim.run_for(1200).unwrap();
+            for id in 0..servers {
+                let server = server(&sim, id);
+                let kinds = server.kinds();
+                let bounds = kinds.iter().position(|(_, kind)| *kind == "bounds");
+                let first_register = kinds.iter().position(|(_, kind)| *kind == "register");
+                if let Some(register) = first_register {
+                    assert!(
+                        bounds.is_some_and(|bounds| bounds < register),
+                        "server {id}, seed {seed}: a registration before the bounds: {kinds:?}"
+                    );
+                }
+                assert_eq!(server.container().sessions().config(), config().dedup);
+            }
+            for &id in &clients {
+                assert!(
+                    client(&sim, id).epoch().is_some(),
+                    "client {id}, seed {seed} never registered"
+                );
+            }
+            replicas_agree(&sim, servers);
+        }
+    }
+}
+
+/// `servers` deposable servers that never propose the session bounds, so a
+/// leader holds every registration, each holding at most `held`; and
+/// `clients` clients registering with the leader.
+fn holding(seed: u64, servers: u32, held: usize, clients: u32) -> (MovableSim, Vec<NodeId>) {
+    let mut sim = MovableSim::new("delivery", seed, LinkConfig::default()).unwrap();
+    for id in 0..servers {
+        let server = DeliveryServer::new(
+            id,
+            (0..servers).collect(),
+            SimDisk::new(),
+            Survives::Synced,
+            Geometry::new(4096, 4096).unwrap(),
+            AppendService::default(),
+            config(),
+        )
+        .unwrap()
+        .with_held_registrations(held)
+        .without_bounds_proposal();
+        assert_eq!(
+            sim.add_node(Movable::Server(Box::new(server)), 0, 0)
+                .unwrap(),
+            id
+        );
+    }
+    let ids = (servers..servers + clients)
+        .map(|id| {
+            let client = DeliveryClient::new(id, LEADER, values(&[1]));
+            assert_eq!(sim.add_node(Movable::Client(client), 0, 0).unwrap(), id);
+            id
+        })
+        .collect();
+    (sim, ids)
+}
+
+/// karyos#927 review: a leader holds at most its configured number of
+/// registrations before the bounds apply; one more is answered NotLeader
+/// naming the leader, so its client retries, and none is held past the
+/// bound.
+#[test]
+fn test_delivery_held_registrations_are_bounded() {
+    for seed in scenarios::seeds() {
+        let (mut sim, clients) = holding(seed, 3, 1, 3);
+        run_until(&mut sim, 2000, |sim| {
+            movable_server(sim, LEADER).held_registrations() == 1
+        });
+        sim.run_for(300).unwrap();
+        assert_eq!(movable_server(&sim, LEADER).held_registrations(), 1);
+        let refused = clients
+            .iter()
+            .filter(|&&id| movable_client(&sim, id).retries() > 0)
+            .count();
+        assert!(
+            refused >= 2,
+            "seed {seed}: the clients past the bound retry"
+        );
+        assert!(
+            clients
+                .iter()
+                .all(|&id| movable_client(&sim, id).epoch().is_none()),
+            "seed {seed}: no registration before the bounds"
+        );
+    }
+}
+
+/// karyos#927 review: a leader that loses its leadership answers every
+/// registration it held, never dropping one silently.
+#[test]
+fn test_delivery_held_registrations_are_answered_on_leadership_loss() {
+    for seed in scenarios::seeds() {
+        restore();
+        let (mut sim, clients) = holding(seed, 3, 4, 1);
+        let client = clients[0];
+        run_until(&mut sim, 2000, |sim| {
+            movable_server(sim, LEADER).held_registrations() == 1
+        });
+        let before = movable_client(&sim, client).retries();
+        depose(LEADER);
+        run_until(&mut sim, 200, |sim| {
+            movable_server(sim, LEADER).held_registrations() == 0
+                && movable_client(sim, client).retries() > before
+        });
+        restore();
+    }
+}
