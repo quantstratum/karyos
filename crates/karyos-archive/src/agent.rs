@@ -669,6 +669,24 @@ pub enum AgentError {
     /// The integrity journal failed (A10).
     #[error(transparent)]
     Integrity(#[from] IntegrityError),
+    /// No time evidence is kept: no integrity journal, or no
+    /// `time-evidence/` directory the host made (karyos#1128).
+    #[error("this Archive keeps no time evidence")]
+    NoTimeEvidence,
+    /// A time evidence entry for a range its recording's seals do not
+    /// cover yet: an entry follows its range's seal (ADR-0095).
+    #[error("recording {recording} is sealed to {sealed}, below the entry's end {end}")]
+    TimeEvidenceUnsealed {
+        /// The recording.
+        recording: u64,
+        /// The entry's end.
+        end: u64,
+        /// Where its seals end.
+        sealed: u64,
+    },
+    /// The entries could not be written.
+    #[error(transparent)]
+    TimeEvidence(#[from] crate::integrity::time_evidence::StoreError),
     /// Head signing was asked for without a `seal_interval`: there would
     /// be no seals to sign.
     #[error("head signing needs a seal_interval")]
@@ -827,6 +845,8 @@ enum Command {
     Retain(retention::Request, Reply<RetentionAnswer>),
     /// A seal verification (ADR-0088).
     Verify(u64, Reply<retention::Verified>),
+    /// A time evidence entry to record (karyos#1128).
+    TimeEvidence(Box<crate::integrity::time_evidence::Entry>, Reply<u64>),
     Shutdown(Reply<()>),
 }
 
@@ -926,6 +946,7 @@ impl core::fmt::Debug for Command {
             Self::StopGroup(id, _) => f.debug_tuple("StopGroup").field(id).finish(),
             Self::Retain(request, _) => f.debug_tuple("Retain").field(request).finish(),
             Self::Verify(id, _) => f.debug_tuple("Verify").field(id).finish(),
+            Self::TimeEvidence(entry, _) => f.debug_tuple("TimeEvidence").field(entry).finish(),
             Self::Shutdown(_) => f.write_str("Shutdown"),
         }
     }
@@ -1150,6 +1171,24 @@ impl ArchiveHandle {
     /// As [`ArchiveHandle::post_start`].
     pub fn post_verify(&self, recording: u64) -> Result<Posted<retention::Verified>, AgentError> {
         self.post(|reply| Command::Verify(recording, reply))
+    }
+
+    /// Records a time evidence entry (ADR-0095; karyos#1128), durable and
+    /// sealed in `time-evidence/` on return. The host computes it for a
+    /// range of a clock's timestamps; the Archive takes it only once that
+    /// range is sealed, so an entry never names unsealed bytes. Returns the
+    /// entry's position in the entries' store.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::NoTimeEvidence`], [`AgentError::TimeEvidenceUnsealed`],
+    /// [`AgentError::TimeEvidence`] (a refused entry or a store failure),
+    /// and [`AgentError::Gone`].
+    pub fn record_time_evidence(
+        &self,
+        entry: crate::integrity::time_evidence::Entry,
+    ) -> Result<u64, AgentError> {
+        self.call(|reply| Command::TimeEvidence(Box::new(entry), reply))
     }
 
     /// [`ArchiveHandle::stop`], posted.
@@ -1896,6 +1935,9 @@ struct State<D: Disk> {
 /// (A10; karyos#961).
 struct Integrity<D: Disk> {
     signing: Option<Signing<D>>,
+    /// The time evidence entries and their journal's signing, when the
+    /// host made `time-evidence/` (karyos#1128).
+    evidence: Option<Evidence<D>>,
     /// The copy catalog and this Archive's location in it, when
     /// `copy_location` is set; dropped at its first failure.
     copies: Option<(
@@ -1929,11 +1971,17 @@ impl<D: Disk> Integrity<D> {
             .and_then(std::num::NonZeroU64::new)
             .ok_or(IntegrityError::Overflow)?;
         let mut journal = IntegrityJournal::open(disk.clone(), dir)?.journal;
-        let signing = signing
-            .map(|signing| {
-                Signing::open(disk.clone(), dir, signing, &mut journal, Arc::clone(counts))
-            })
-            .transpose()?;
+        let (signing, shared) = match signing {
+            Some(setup) => {
+                let parts = (setup.trust.clone(), setup.journal_id, setup.config);
+                let signing =
+                    Signing::open(disk.clone(), dir, setup, &mut journal, Arc::clone(counts))?;
+                let signer = Arc::clone(&signing.signer);
+                (Some(signing), Some((parts, signer)))
+            }
+            None => (None, None),
+        };
+        let evidence = Self::open_evidence(disk.clone(), dir, shared)?;
         let copies = location
             .map(|location| {
                 crate::integrity::copies::CopyCatalog::open(disk, dir, &mut journal)
@@ -1943,12 +1991,49 @@ impl<D: Disk> Integrity<D> {
         catalog.collect_changes();
         Ok(Self {
             signing,
+            evidence,
             copies,
             journal,
             sealer: Sealer::new(interval),
             tracked: std::collections::BTreeSet::new(),
             failed: false,
         })
+    }
+
+    /// The time evidence entries in `dir`'s `time-evidence/`, when the host
+    /// made it, signed by the Archive's signer when it has one.
+    fn open_evidence(
+        mut disk: D,
+        dir: &Path,
+        shared: Option<(
+            (TrustRoot, u64, crate::integrity::signing::SigningConfig),
+            SharedSigner,
+        )>,
+    ) -> Result<Option<Evidence<D>>, IntegrityError>
+    where
+        D: Clone,
+    {
+        use crate::integrity::time_evidence::{DIR, EntryStore, StoreError, entries_dir};
+        if !disk.list(dir)?.iter().any(|name| name == DIR) {
+            return Ok(None);
+        }
+        let mut store = EntryStore::open(disk.clone(), dir).map_err(|error| match error {
+            StoreError::Integrity(error) => error,
+            other => IntegrityError::Io(std::io::Error::other(other.to_string())),
+        })?;
+        let signing = shared
+            .map(|(parts, signer)| {
+                Signing::open_shared(
+                    disk,
+                    &entries_dir(dir),
+                    parts,
+                    signer,
+                    store.journal_mut(),
+                    Arc::default(),
+                )
+            })
+            .transpose()?;
+        Ok(Some(Evidence { store, signing }))
     }
 
     /// Reports `recording` durable to `durable`, tracking it first.
@@ -2036,7 +2121,9 @@ struct Signing<D: Disk> {
     trust: TrustRoot,
     journal_id: u64,
     signing: HeadSigning,
-    signer: Box<dyn HeadSigner + Send>,
+    /// The one signer, shared with the time evidence journal's signing
+    /// (karyos#1128).
+    signer: SharedSigner,
     heads: Ledger<D, SIGNED_HEAD_LENGTH>,
     /// Whether the backlog coalesces: then a head waiting for the signer
     /// is kept until signed, and newer ones wait behind it.
@@ -2059,6 +2146,24 @@ struct Signing<D: Disk> {
     /// Where each poll publishes the status.
     counts: Arc<Counts>,
 }
+
+/// The time evidence entries of a running Archive (ADR-0095).
+struct Evidence<D: Disk> {
+    store: crate::integrity::time_evidence::EntryStore<D>,
+    /// Signs and anchors the entries' journal with the Archive's signer,
+    /// on the same schedule and trust root.
+    signing: Option<Signing<D>>,
+}
+
+/// What a journal's signing is configured with, besides its signer.
+struct SigningSetup {
+    trust: TrustRoot,
+    journal_id: u64,
+    config: crate::integrity::signing::SigningConfig,
+}
+
+/// The Archive's signer, shared by the journals it signs.
+type SharedSigner = Arc<std::sync::Mutex<Box<dyn HeadSigner + Send>>>;
 
 /// A boxed signer, as the sized signer [`HeadSigning::poll`] takes.
 struct Boxed<'a>(&'a mut (dyn HeadSigner + Send));
@@ -2095,6 +2200,32 @@ impl<D: Disk + Clone> Signing<D> {
         journal: &mut IntegrityJournal<D>,
         counts: Arc<Counts>,
     ) -> Result<Self, IntegrityError> {
+        let signer = Arc::new(std::sync::Mutex::new(setup.signer));
+        Self::open_shared(
+            disk,
+            dir,
+            (setup.trust, setup.journal_id, setup.config),
+            signer,
+            journal,
+            counts,
+        )
+    }
+
+    /// [`Signing::open`] of the journal in `dir` with a signer another
+    /// journal's signing shares.
+    fn open_shared(
+        disk: D,
+        dir: &Path,
+        (trust, journal_id, config): (TrustRoot, u64, crate::integrity::signing::SigningConfig),
+        signer: SharedSigner,
+        journal: &mut IntegrityJournal<D>,
+        counts: Arc<Counts>,
+    ) -> Result<Self, IntegrityError> {
+        let setup = SigningSetup {
+            trust,
+            journal_id,
+            config,
+        };
         let heads = Ledger::open(disk.clone(), dir, HEADS_FILE)?;
         let coalesce = matches!(
             setup.config.policy(),
@@ -2117,7 +2248,7 @@ impl<D: Disk + Clone> Signing<D> {
             trust: setup.trust,
             journal_id: setup.journal_id,
             signing,
-            signer: setup.signer,
+            signer,
             heads,
             coalesce,
             offered: None,
@@ -2169,6 +2300,9 @@ impl<D: Disk + Clone> Signing<D> {
             .and_then(|len| self.base.checked_add(len))
             .unwrap_or(u64::MAX);
         let busy = self.coalesce && self.signing.status(now, sealed, registry).pending > 0;
+        let Ok(mut signer) = self.signer.lock() else {
+            return;
+        };
         if let Some(last) = records.last() {
             let digest = last.digest();
             // Only a head the configured key can validly sign is offered:
@@ -2178,7 +2312,7 @@ impl<D: Disk + Clone> Signing<D> {
             // (karyos#966 review). Not offered, it is not marked, so the
             // first eligible head is offered as soon as it exists.
             let eligible = registry
-                .key(&self.signer.key_id())
+                .key(&signer.key_id())
                 .is_some_and(|key| last.counter >= key.valid_from);
             if eligible && !busy && self.offered != Some(digest) {
                 let offered = self.signing.offer(
@@ -2196,7 +2330,7 @@ impl<D: Disk + Clone> Signing<D> {
             }
         }
         let _ = self.signing.poll_from(
-            &mut Boxed(self.signer.as_mut()),
+            &mut Boxed(signer.as_mut()),
             &mut self.heads,
             registry,
             self.base,
@@ -2564,6 +2698,11 @@ where
         if let Some(signing) = integrity.signing.as_mut() {
             signing.duty(&mut integrity.journal, now);
         }
+        if let Some(evidence) = integrity.evidence.as_mut()
+            && let Some(signing) = evidence.signing.as_mut()
+        {
+            signing.duty(evidence.store.journal_mut(), now);
+        }
         !changes.is_empty() || integrity.journal.head() != before
     }
 
@@ -2791,6 +2930,9 @@ where
                 let _ = reply.send(Ok(self.retain(request)));
             }
             Command::Verify(id, reply) => self.verify(id, reply),
+            Command::TimeEvidence(entry, reply) => {
+                let _ = reply.send(self.record_time_evidence(&entry));
+            }
             Command::Shutdown(reply) => {
                 let groups = std::mem::take(&mut self.groups);
                 for group in groups {
@@ -3093,6 +3235,28 @@ where
             cleared: self.failures,
         });
         Ok(sender)
+    }
+
+    /// Records `entry` once its range is sealed (karyos#1128).
+    fn record_time_evidence(
+        &mut self,
+        entry: &crate::integrity::time_evidence::Entry,
+    ) -> Result<u64, AgentError> {
+        let Some(integrity) = self.integrity.as_mut() else {
+            return Err(AgentError::NoTimeEvidence);
+        };
+        let sealed = integrity.journal.sealed_end(entry.recording).unwrap_or(0);
+        let Some(evidence) = integrity.evidence.as_mut() else {
+            return Err(AgentError::NoTimeEvidence);
+        };
+        if entry.end > sealed {
+            return Err(AgentError::TimeEvidenceUnsealed {
+                recording: entry.recording,
+                end: entry.end,
+                sealed,
+            });
+        }
+        Ok(evidence.store.append(entry)?)
     }
 
     /// Each group's job: drains its ring into its journal and advances its
