@@ -181,6 +181,7 @@ fn failures_carry_their_detail() {
     assert_eq!(os, Failure::with(Status::System, 0, 12));
     let poll = SubscriptionError::Poll {
         session_id: None,
+        image: None,
         delivered: 0,
         error: karyos_client::PollError::new(
             karyos_client::PollSummary::default(),
