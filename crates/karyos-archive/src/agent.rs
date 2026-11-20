@@ -134,9 +134,26 @@ pub struct AgentConfig {
     /// range when the recording stops, and the catalog's changes are
     /// chained there too. `None` keeps no integrity journal.
     pub seal_interval: Option<Duration>,
+    /// This Archive's location id in the copy catalog (karyos#1024): with
+    /// it, each recording that closes sealed is recorded as a verified
+    /// local copy, its segments made immutable where the file system and
+    /// the process allow it, and the enforcement that applies recorded.
+    /// `None` records no copy. Needs `seal_interval`.
+    pub copy_location: Option<crate::integrity::Digest>,
 }
 
 impl AgentConfig {
+    /// This configuration with `copy_location` set (karyos#1024).
+    #[must_use]
+    #[inline]
+    pub const fn with_copy_location(
+        mut self,
+        copy_location: Option<crate::integrity::Digest>,
+    ) -> Self {
+        self.copy_location = copy_location;
+        self
+    }
+
     /// This configuration with `seal_interval` set (A10).
     #[must_use]
     #[inline]
@@ -163,6 +180,7 @@ impl Default for AgentConfig {
             group_budget: 64,
             checkpoint_budget: 256 * 1024,
             seal_interval: None,
+            copy_location: None,
         }
     }
 }
@@ -1608,6 +1626,7 @@ fn run<D>(
             &mut catalog,
             signing,
             &outbox.counts,
+            config.copy_location,
         )
     }) {
         None => None,
@@ -1757,6 +1776,12 @@ struct State<D: Disk> {
 /// (A10; karyos#961).
 struct Integrity<D: Disk> {
     signing: Option<Signing<D>>,
+    /// The copy catalog and this Archive's location in it, when
+    /// `copy_location` is set; dropped at its first failure.
+    copies: Option<(
+        crate::integrity::copies::CopyCatalog<D>,
+        crate::integrity::Digest,
+    )>,
     journal: IntegrityJournal<D>,
     sealer: Sealer,
     tracked: std::collections::BTreeSet<u64>,
@@ -1774,6 +1799,7 @@ impl<D: Disk> Integrity<D> {
         catalog: &mut Catalog<D>,
         signing: Option<ArchiveSigning>,
         counts: &Arc<Counts>,
+        location: Option<crate::integrity::Digest>,
     ) -> Result<Self, IntegrityError>
     where
         D: Clone,
@@ -1784,11 +1810,20 @@ impl<D: Disk> Integrity<D> {
             .ok_or(IntegrityError::Overflow)?;
         let mut journal = IntegrityJournal::open(disk.clone(), dir)?.journal;
         let signing = signing
-            .map(|signing| Signing::open(disk, dir, signing, &mut journal, Arc::clone(counts)))
+            .map(|signing| {
+                Signing::open(disk.clone(), dir, signing, &mut journal, Arc::clone(counts))
+            })
+            .transpose()?;
+        let copies = location
+            .map(|location| {
+                crate::integrity::copies::CopyCatalog::open(disk, dir, &mut journal)
+                    .map(|copies| (copies, location))
+            })
             .transpose()?;
         catalog.collect_changes();
         Ok(Self {
             signing,
+            copies,
             journal,
             sealer: Sealer::new(interval),
             tracked: std::collections::BTreeSet::new(),
@@ -3171,12 +3206,93 @@ fn stop<D: Disk>(
     // Cleared first: a Gateway stops naming the recording before the close
     // and the catalog's stop, which take time.
     drop(word);
-    if let Some(integrity) = integrity.filter(|integrity| !integrity.failed) {
-        integrity.failed = !seal_last(integrity, id, &mut recorder, now);
+    let mut integrity = integrity.filter(|integrity| !integrity.failed);
+    let mut sealed = false;
+    if let Some(integrity) = integrity.as_deref_mut() {
+        sealed = seal_last(integrity, id, &mut recorder, now);
+        integrity.failed = !sealed;
     }
+    let start = recorder.store().start();
+    // A list that cannot be read is no file list: the copy then records
+    // no enforcement (karyos#1024 review).
+    let files = recorder.store().segment_files().unwrap_or_default();
     let ended = recorder.close(reason)?;
     catalog.stop(id, ended.position, now, ended.reason, ended.incomplete)?;
+    if let Some(integrity) = integrity.filter(|_| sealed) {
+        integrity.record_local_copy(id, start, ended.position, &files);
+    }
     Ok(ended)
+}
+
+/// The enforcement a local copy of `files` records: the immutable
+/// attribute only when the list is not empty and every file took it,
+/// [`Enforcement::Unsupported`] otherwise, so an empty or unreadable file
+/// list never records a protection that is not there (karyos#1024
+/// review).
+///
+/// [`Enforcement::Unsupported`]: crate::integrity::copies::Enforcement::Unsupported
+fn local_enforcement(
+    backend: &mut impl crate::integrity::copies::ImmutabilityBackend,
+    files: &[PathBuf],
+) -> crate::integrity::copies::Enforcement {
+    use crate::integrity::copies::Enforcement;
+    if files.is_empty() {
+        return Enforcement::Unsupported;
+    }
+    let mut enforcement = Enforcement::ImmutableAttribute;
+    for file in files {
+        if !matches!(
+            backend.enforce(file, 0),
+            Ok(Enforcement::ImmutableAttribute)
+        ) {
+            enforcement = Enforcement::Unsupported;
+        }
+    }
+    enforcement
+}
+
+impl<D: Disk> Integrity<D> {
+    /// Records recording `id`, closed and sealed over `[start, end)`, as a
+    /// verified local copy: each segment file in `files` is made
+    /// immutable through the platform's backend, and the copy records
+    /// [`Enforcement::ImmutableAttribute`] only when every file took it,
+    /// [`Enforcement::Unsupported`] otherwise (karyos#1024). Its digest is
+    /// that of the range's seals, as a purge records them. A failure
+    /// leaves the copy unrecorded and stops recording copies.
+    fn record_local_copy(&mut self, id: u64, start: u64, end: u64, files: &[PathBuf]) {
+        use crate::integrity::copies::{CopyRecord, CopyState};
+        if end <= start {
+            return;
+        }
+        let Some((copies, location)) = self.copies.as_mut() else {
+            return;
+        };
+        #[cfg(target_os = "linux")]
+        let mut backend = crate::integrity::copies::ImmutableAttribute;
+        #[cfg(not(target_os = "linux"))]
+        let mut backend = crate::integrity::copies::NoImmutability;
+        let enforcement = local_enforcement(&mut backend, files);
+        let recorded = self.journal.records().and_then(|records| {
+            let digest = crate::integrity::retention::seals_digest(&records, id, start, end);
+            copies.record(
+                CopyRecord {
+                    sequence: 0,
+                    recording: id,
+                    start,
+                    end,
+                    location: *location,
+                    digest,
+                    retain_until_ns: 0,
+                    state: CopyState::Verified,
+                    enforcement,
+                },
+                &mut self.journal,
+            )
+        });
+        if recorded.is_err() {
+            self.copies = None;
+        }
+    }
 }
 
 /// Seals the last range of `id` before its store closes: everything

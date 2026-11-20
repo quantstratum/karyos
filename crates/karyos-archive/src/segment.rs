@@ -1430,6 +1430,23 @@ impl<D: Disk> SegmentStore<D> {
         Ok(files)
     }
 
+    /// The data files of every segment that holds a byte of the
+    /// recording, lowest first: what a closed recording's copy covers
+    /// (karyos#1024).
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::PositionOverflow`].
+    pub fn segment_files(&self) -> Result<Vec<std::path::PathBuf>, SegmentError> {
+        if self.written <= self.start {
+            return Ok(Vec::new());
+        }
+        let last = self.geometry.base_of(self.written.saturating_sub(1));
+        let mut files = self.segment_files_below(last)?;
+        files.push(self.dir.join(data_name(self.recording, last)));
+        Ok(files)
+    }
+
     fn purge_before_inner(&mut self, position: u64) -> Result<u64, SegmentError> {
         if self.failed {
             return Err(SegmentError::Failed);
