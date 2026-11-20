@@ -388,3 +388,134 @@ fn print_the_large_vectors() {
         println!("{label} {text}");
     }
 }
+
+/// B-1, `SessionBounds` of the default profile: 64 sessions, 64 replies
+/// of 8 KiB, 60 s.
+const B1: &str = "05 00 01 00 01 00 14 00 20 00 00 00
+    40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00";
+
+/// The golden vectors of schema 5 version 1, the core's own entries
+/// (karyos#927): B-1 and B-2 are reproduced byte for byte, B-3 to B-12
+/// refused as stated. Schema 2's vectors above are unchanged.
+#[test]
+fn test_schema_5_golden_vectors_b1_to_b12() {
+    let b1 = SessionBounds::new(DedupConfig::default());
+    assert_eq!(b1.to_vec().unwrap(), hex(B1), "B-1 encode");
+    assert_eq!(SessionBounds::decode(&hex(B1)), Ok(b1), "B-1 decode");
+    let b2 = SessionBounds::new(
+        DedupConfig::default()
+            .with_sessions(u32::MAX)
+            .with_window(u32::MAX)
+            .with_response_bytes(u32::MAX)
+            .with_ttl(u64::MAX),
+    );
+    let b2_bytes = hex("05 00 01 00 01 00 14 00 20 00 00 00
+        ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff");
+    assert_eq!(b2.to_vec().unwrap(), b2_bytes, "B-2 encode");
+    assert_eq!(SessionBounds::decode(&b2_bytes), Ok(b2), "B-2 decode");
+    for (label, text, field) in [
+        (
+            "B-3",
+            "05 00 01 00 01 00 14 00 20 00 00 00
+             00 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00",
+            "sessions",
+        ),
+        (
+            "B-4",
+            "05 00 01 00 01 00 14 00 20 00 00 00
+             40 00 00 00 00 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00",
+            "window",
+        ),
+        (
+            "B-5",
+            "05 00 01 00 01 00 14 00 20 00 00 00
+             40 00 00 00 40 00 00 00 00 00 00 00 00 58 47 f8 0d 00 00 00",
+            "response_bytes",
+        ),
+        (
+            "B-6",
+            "05 00 01 00 01 00 14 00 20 00 00 00
+             40 00 00 00 40 00 00 00 00 20 00 00 00 00 00 00 00 00 00 00",
+            "ttl",
+        ),
+    ] {
+        let refused = Err(CodecError::ValueOutOfRange { field });
+        assert_eq!(SessionBounds::decode(&hex(text)), refused, "{label} decode");
+    }
+    // The same rules on encoding.
+    for (label, config, field) in [
+        ("B-3", DedupConfig::default().with_sessions(0), "sessions"),
+        ("B-4", DedupConfig::default().with_window(0), "window"),
+        (
+            "B-5",
+            DedupConfig::default().with_response_bytes(0),
+            "response_bytes",
+        ),
+        ("B-6", DedupConfig::default().with_ttl(0), "ttl"),
+    ] {
+        assert_eq!(
+            SessionBounds::new(config).to_vec(),
+            Err(CodecError::ValueOutOfRange { field }),
+            "{label} encode"
+        );
+    }
+    let unsupported = |schema, template, version| {
+        Err::<SessionBounds, _>(CodecError::UnsupportedSchema {
+            schema,
+            template,
+            version,
+        })
+    };
+    for (label, text, expected) in [
+        (
+            "B-7",
+            "05 00 01 00 02 00 14 00 20 00 00 00
+             40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00",
+            unsupported(5, 1, 2),
+        ),
+        (
+            "B-8",
+            "05 00 02 00 01 00 14 00 20 00 00 00
+             40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00",
+            unsupported(5, 2, 1),
+        ),
+        (
+            "B-9",
+            "05 00 00 00 01 00 14 00 20 00 00 00
+             40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00",
+            unsupported(5, 0, 1),
+        ),
+        (
+            "B-10",
+            "05 00 01 00 01 00 10 00 20 00 00 00
+             40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00",
+            unsupported(5, 1, 1),
+        ),
+        (
+            "B-11",
+            "05 00 01 00 01 00 14 00 1f 00 00 00
+             40 00 00 00 40 00 00 00 00 20 00 00 00 58 47 f8 0d 00 00 00",
+            Err(CodecError::MessageLength {
+                declared: 31,
+                actual: 32,
+            }),
+        ),
+        (
+            "B-12",
+            "02 00 01 00 01 00 08 00 14 00 00 00 08 07 06 05 04 03 02 01",
+            unsupported(2, 1, 1),
+        ),
+    ] {
+        assert_eq!(SessionBounds::decode(&hex(text)), expected, "{label}");
+    }
+    // Schema 2's decoder refuses B-1: the bounds are not a schema 2
+    // template.
+    assert_eq!(
+        Envelope::decode(&hex(B1)),
+        Err(CodecError::UnsupportedSchema {
+            schema: 5,
+            template: 1,
+            version: 1
+        })
+    );
+}

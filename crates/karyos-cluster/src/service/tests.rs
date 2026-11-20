@@ -636,3 +636,250 @@ fn test_container_the_same_log_gives_every_replica_the_same_state_and_replies() 
         assert_eq!(runs[0].0.values, [10, 30, 10]);
     }
 }
+
+/// A core that records what it is asked to propose.
+#[derive(Debug, Default)]
+struct Recorder {
+    leads: bool,
+    proposed: Vec<Vec<u8>>,
+}
+
+impl Propose for Recorder {
+    fn propose(&mut self, payload: Vec<u8>) -> Result<(), NotLeader> {
+        if !self.leads {
+            return Err(NotLeader::new(None));
+        }
+        self.proposed.push(payload);
+        Ok(())
+    }
+}
+
+fn bounds_entry(index: u64, event_time: u64, config: DedupConfig) -> Entry {
+    Entry {
+        index,
+        term: 1,
+        event_time,
+        payload: SessionBounds::new(config).to_vec().unwrap(),
+    }
+}
+
+/// karyos#927: a leader writes its table's bounds into the log while the
+/// log carries none, and not once they have applied.
+#[test]
+fn test_container_a_leader_proposes_the_bounds_until_they_apply() {
+    let mut container = container();
+    let mut follower = Recorder::default();
+    assert_eq!(
+        container.propose_bounds(&mut follower),
+        Err(NotLeader::new(None))
+    );
+    let mut leader = Recorder {
+        leads: true,
+        ..Recorder::default()
+    };
+    assert_eq!(container.propose_bounds(&mut leader), Ok(true));
+    assert_eq!(
+        SessionBounds::decode(&leader.proposed[0]),
+        Ok(SessionBounds::new(config().dedup))
+    );
+    assert!(!container.bounds_logged());
+    let first = Entry {
+        index: 1,
+        term: 1,
+        event_time: 5,
+        payload: leader.proposed[0].clone(),
+    };
+    assert_eq!(container.apply(&first), Ok(Applied::Nothing));
+    assert!(container.bounds_logged());
+    assert_eq!(container.propose_bounds(&mut leader), Ok(false));
+    assert_eq!(leader.proposed.len(), 1);
+}
+
+/// Equal bounds deliver nothing to the service, as a core entry, and
+/// move the log time; a second copy, as two leaders write, is the same.
+#[test]
+fn test_container_equal_bounds_deliver_nothing() {
+    let mut container = registered();
+    let before = container.sessions().clone();
+    assert_eq!(
+        container.apply(&bounds_entry(2, 10, config().dedup)),
+        Ok(Applied::Nothing)
+    );
+    assert_eq!(
+        container.apply(&bounds_entry(3, 20, config().dedup)),
+        Ok(Applied::Nothing)
+    );
+    assert_eq!(container.applied(), Some(3));
+    assert_eq!(container.sessions().log_time(), 20);
+    assert_eq!(container.sessions().config(), before.config());
+    assert_eq!(container.sessions().live_sessions(), 1);
+    assert!(container.service().seen.is_empty());
+}
+
+/// Different bounds on a fresh table rebuild it from the log, keeping
+/// the log time; registration then advertises the logged bounds.
+#[test]
+fn test_container_different_bounds_rebuild_a_fresh_table() {
+    let mut container = container();
+    let empty = Entry {
+        index: 1,
+        term: 1,
+        event_time: 7,
+        payload: Vec::new(),
+    };
+    assert_eq!(container.apply(&empty), Ok(Applied::Nothing));
+    let logged = config().dedup.with_sessions(2).with_ttl(500);
+    assert_eq!(
+        container.apply(&bounds_entry(2, 3, logged)),
+        Ok(Applied::Nothing)
+    );
+    assert_eq!(container.sessions().config(), logged);
+    assert_eq!(container.sessions().log_time(), 7);
+    let Applied::Registered(Ok(registered)) = container
+        .apply(&entry(3, 8, Envelope::Register { client: 7 }))
+        .unwrap()
+    else {
+        panic!("not registered");
+    };
+    assert_eq!(registered.config, logged);
+}
+
+/// Different bounds once a registration applied stop the container, on
+/// every replica at the same index, and nothing applies past them.
+#[test]
+fn test_container_different_bounds_under_a_session_stop_it() {
+    let logged = config().dedup.with_window(2);
+    let mut container = registered();
+    assert_eq!(
+        container.apply(&bounds_entry(2, 0, logged)),
+        Err(ApplyError::BoundsDiffer {
+            logged,
+            table: config().dedup,
+        })
+    );
+    assert_eq!(container.applied(), Some(1), "the entry was not applied");
+    assert_eq!(container.sessions().config(), config().dedup);
+    assert_eq!(
+        container.apply(&entry(3, 0, request(1, &append(1)))),
+        Err(ApplyError::OutOfOrder {
+            index: 3,
+            last: Some(1)
+        })
+    );
+}
+
+/// Bounds a replica cannot hold stop it, as any entry it cannot apply.
+#[test]
+fn test_container_bounds_that_cannot_be_held_stop_it() {
+    let huge = DedupConfig::default()
+        .with_sessions(u32::MAX)
+        .with_window(u32::MAX)
+        .with_response_bytes(u32::MAX);
+    // 2^96 reply bytes overflow any address space, before allocation.
+    let mut container = container();
+    assert_eq!(
+        container.apply(&bounds_entry(1, 0, huge)),
+        Err(ApplyError::BoundsUnheld(ConfigError::TooLarge))
+    );
+    assert_eq!(container.applied(), None);
+}
+
+/// karyos#927: a restored replica, built with other bounds, reads its
+/// table's bounds from the log it replays, and then gives the same
+/// replies and state as the replica that wrote them.
+#[test]
+fn test_container_a_restored_replica_builds_its_table_from_the_logged_bounds() {
+    let mut writer = container();
+    let mut leader = Recorder {
+        leads: true,
+        ..Recorder::default()
+    };
+    assert_eq!(writer.propose_bounds(&mut leader), Ok(true));
+    let mut log = vec![Entry {
+        index: 1,
+        term: 1,
+        event_time: 0,
+        payload: leader.proposed[0].clone(),
+    }];
+    log.push(entry(2, 1, Envelope::Register { client: 7 }));
+    let command = append(9);
+    log.push(Entry {
+        index: 3,
+        term: 1,
+        event_time: 2,
+        payload: Envelope::Request {
+            request: Request::new(7, 2, 0, 0),
+            command: &command,
+        }
+        .to_vec()
+        .unwrap(),
+    });
+    for entry in &log {
+        let _ = writer.apply(entry).unwrap();
+    }
+    // Built with the default profile, not the writer's bounds.
+    let mut restored = ServiceContainer::new(
+        Register::default(),
+        ContainerConfig::default().with_timers(2),
+    )
+    .unwrap();
+    assert_ne!(restored.sessions().config(), config().dedup);
+    for entry in &log {
+        let _ = restored.apply(entry).unwrap();
+    }
+    assert_eq!(restored.sessions().config(), config().dedup);
+    assert!(restored.bounds_logged());
+    assert_eq!(restored.sessions(), writer.sessions());
+    assert_eq!(restored.service(), writer.service());
+}
+
+/// karyos#927 review P2: only the log's first `SessionBounds` entry
+/// counts. A later one, as a new leader proposes before applying the one
+/// it inherited, delivers nothing whatever it carries: it neither
+/// replaces the first on a fresh table nor stops a table under sessions.
+#[test]
+fn test_container_a_later_bounds_entry_never_replaces_the_first() {
+    let other = config().dedup.with_window(2);
+    // Before any registration: the second does not replace the first.
+    let mut fresh = container();
+    assert_eq!(
+        fresh.apply(&bounds_entry(1, 0, config().dedup)),
+        Ok(Applied::Nothing)
+    );
+    assert_eq!(
+        fresh.apply(&bounds_entry(2, 0, other)),
+        Ok(Applied::Nothing)
+    );
+    assert_eq!(fresh.sessions().config(), config().dedup);
+    // After a registration: no stop either.
+    let Applied::Registered(Ok(_)) = fresh
+        .apply(&entry(3, 1, Envelope::Register { client: 7 }))
+        .unwrap()
+    else {
+        panic!("not registered");
+    };
+    assert_eq!(
+        fresh.apply(&bounds_entry(4, 2, other)),
+        Ok(Applied::Nothing)
+    );
+    assert_eq!(fresh.applied(), Some(4));
+    assert_eq!(fresh.sessions().config(), config().dedup);
+}
+
+/// karyos#927 review P1: bounds whose sizes fit `usize` but cannot be
+/// allocated are a typed refusal, never an abort, and the entry is not
+/// applied.
+#[test]
+fn test_container_bounds_past_what_can_be_allocated_stop_it() {
+    // u32::MAX × u32::MAX slots fit a 64-bit usize, but not an allocation.
+    let huge = DedupConfig::default()
+        .with_sessions(u32::MAX)
+        .with_window(u32::MAX)
+        .with_response_bytes(1);
+    let mut container = container();
+    assert_eq!(
+        container.apply(&bounds_entry(1, 0, huge)),
+        Err(ApplyError::BoundsUnheld(ConfigError::TooLarge))
+    );
+    assert_eq!(container.applied(), None);
+}

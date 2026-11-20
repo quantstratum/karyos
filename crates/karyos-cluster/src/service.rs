@@ -48,6 +48,33 @@
 //!
 //! A client or an epoch of 0, and a lowest unanswered sequence past the
 //! sequence plus one, are `ValueOutOfRange`.
+//!
+//! **The core's own entries** (karyos#927) are outside schema 2, which
+//! stays as it is: they are schema [`CORE_SCHEMA_ID`] (5) version 1, over
+//! the same envelope. Its one template is [`SessionBounds`], the session
+//! table's bounds (`S`, `K`, `R` and TTL, item 37 of the decisions of
+//! 2026-10-21), carried in the log so that a replica reads them from it:
+//!
+//! | Template | Id | Block | Maximum |
+//! | --- | --- | --- | --- |
+//! | `SessionBounds` | 1 | sessions 4, window 4, response bytes 4, ttl 8 | 32 |
+//!
+//! Every field of 0 is `ValueOutOfRange`. The container applies a
+//! `SessionBounds` entry against its table's [`DedupConfig`]. The first
+//! such entry in the log is the cluster's bounds: equal bounds deliver
+//! nothing, as any core entry; different bounds rebuild a table still
+//! fresh (no registration applied) from the logged ones, and stop the
+//! container ([`ApplyError::BoundsDiffer`]) once a registration has
+//! applied, never rebuilding under live sessions. Every later
+//! `SessionBounds` entry, whatever it carries, delivers nothing: a new
+//! leader that proposed its own bounds before applying an inherited entry
+//! never replaces or contradicts the first (karyos#927 review). A leader
+//! proposes the bounds through [`ServiceContainer::propose_bounds`] while
+//! the log it applied carries none, and accepts no registration until
+//! they apply. A log written before karyos#927 carries no bounds entry:
+//! its registrations apply under the replica's configured bounds, as
+//! before, and a bounds entry that later differs from them stops the
+//! container as above.
 
 #[cfg(test)]
 mod golden;
@@ -69,6 +96,19 @@ pub const VERSION: u16 = 1;
 pub const MAX_COMMAND: usize = 65535;
 /// The longest configuration a `Configuration` carries.
 pub const MAX_CONFIGURATION: usize = 4096;
+
+/// Schema 5, the core's own entries (karyos#927).
+pub const CORE_SCHEMA_ID: u16 = 5;
+/// The only version of schema 5.
+pub const CORE_VERSION: u16 = 1;
+/// `SessionBounds`, template 1 of schema 5: a 20-byte block.
+pub const SESSION_BOUNDS: Template = Template {
+    schema_id: CORE_SCHEMA_ID,
+    template_id: 1,
+    version: CORE_VERSION,
+    block_length: 20,
+    max_length: ENVELOPE_LENGTH as u32 + 20,
+};
 
 const fn template(template_id: u16, block_length: u16, variable: u32) -> Template {
     Template {
@@ -98,6 +138,105 @@ fn nonzero(field: &'static str, value: u64) -> Result<u64, CodecError> {
         Err(CodecError::ValueOutOfRange { field })
     } else {
         Ok(value)
+    }
+}
+
+/// `value`, or `ValueOutOfRange` naming `field` when it is 0.
+fn nonzero32(field: &'static str, value: u32) -> Result<u32, CodecError> {
+    if value == 0 {
+        Err(CodecError::ValueOutOfRange { field })
+    } else {
+        Ok(value)
+    }
+}
+
+/// The session table's bounds as a core's own entry: schema 5 version 1,
+/// template 1 (karyos#927).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionBounds {
+    /// The bounds the log carries.
+    pub config: DedupConfig,
+}
+
+impl SessionBounds {
+    /// The entry for `config`.
+    #[must_use]
+    pub fn new(config: DedupConfig) -> Self {
+        Self { config }
+    }
+
+    /// Encodes into `out`; returns the message's length, 32.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`] for a short `out`, and
+    /// [`CodecError::ValueOutOfRange`] for a bound of 0.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let config = self.config;
+        let mut encoder = Encoder::new(out, &SESSION_BOUNDS)?;
+        encoder.u32(0, nonzero32("sessions", config.sessions)?)?;
+        encoder.u32(4, nonzero32("window", config.window)?)?;
+        encoder.u32(8, nonzero32("response_bytes", config.response_bytes)?)?;
+        encoder.u64(12, nonzero("ttl", config.ttl)?)?;
+        encoder.finish()
+    }
+
+    /// The message's bytes.
+    ///
+    /// # Errors
+    ///
+    /// As [`SessionBounds::encode`], but never `Truncated`.
+    pub fn to_vec(&self) -> Result<Vec<u8>, CodecError> {
+        let mut out = vec![0; usize::try_from(SESSION_BOUNDS.max_length).unwrap_or(usize::MAX)];
+        let length = self.encode(&mut out)?;
+        out.truncate(length);
+        Ok(out)
+    }
+
+    /// Decodes exactly one `SessionBounds` message from `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::UnsupportedSchema`] for any tuple but schema 5,
+    /// template 1, version 1, [`CodecError::ValueOutOfRange`] for a bound
+    /// of 0, and every other [`CodecError`] the envelope can raise.
+    pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
+        let envelope = karyos_codec::Envelope::read(bytes)?;
+        if envelope.schema_id != CORE_SCHEMA_ID
+            || envelope.version != CORE_VERSION
+            || envelope.template_id != SESSION_BOUNDS.template_id
+        {
+            return Err(CodecError::UnsupportedSchema {
+                schema: envelope.schema_id,
+                template: envelope.template_id,
+                version: envelope.version,
+            });
+        }
+        let (block, decoder) = Decoder::new(bytes, &SESSION_BOUNDS)?;
+        let config = DedupConfig::default()
+            .with_sessions(nonzero32("sessions", block.u32(0)?)?)
+            .with_window(nonzero32("window", block.u32(4)?)?)
+            .with_response_bytes(nonzero32("response_bytes", block.u32(8)?)?)
+            .with_ttl(nonzero("ttl", block.u64(12)?)?);
+        decoder.finish()?;
+        Ok(Self { config })
+    }
+}
+
+/// A decoded entry: the service's (schema 2) or the core's (schema 5).
+enum Decoded<'a> {
+    Service(Envelope<'a>),
+    Bounds(SessionBounds),
+}
+
+impl<'a> Decoded<'a> {
+    fn of(bytes: &'a [u8]) -> Result<Self, CodecError> {
+        if karyos_codec::Envelope::read(bytes)?.schema_id == CORE_SCHEMA_ID {
+            Ok(Self::Bounds(SessionBounds::decode(bytes)?))
+        } else {
+            Ok(Self::Service(Envelope::decode(bytes)?))
+        }
     }
 }
 
@@ -501,10 +640,24 @@ pub enum ApplyError {
         /// The last applied.
         last: Option<u64>,
     },
-    /// Its payload is not a schema 2 message: a safety stop (see
-    /// [`ServiceContainer::apply`]).
-    #[error("not a schema 2 message: {0}")]
+    /// Its payload is neither a schema 2 message nor a core's own entry
+    /// of schema 5: a safety stop (see [`ServiceContainer::apply`]).
+    #[error("not a schema 2 or schema 5 message: {0}")]
     Envelope(CodecError),
+    /// A `SessionBounds` entry differs from the bounds of a table that
+    /// has applied a registration: a safety stop, never a rebuild under
+    /// live sessions (karyos#927).
+    #[error("the logged session bounds {logged:?} differ from the table's {table:?}")]
+    BoundsDiffer {
+        /// The bounds the entry carries.
+        logged: DedupConfig,
+        /// The table's.
+        table: DedupConfig,
+    },
+    /// A `SessionBounds` entry names bounds this replica cannot hold: a
+    /// safety stop.
+    #[error("the logged session bounds cannot be held: {0}")]
+    BoundsUnheld(ConfigError),
 }
 
 /// The container: a service, its session table and its timers, applying
@@ -515,6 +668,11 @@ pub struct ServiceContainer<S> {
     sessions: SessionTable,
     timers: Timers,
     applied: Option<u64>,
+    /// No registration applied yet: the table may still be rebuilt from
+    /// logged bounds. Snapshot install (karyos#065) clears it.
+    fresh: bool,
+    /// A `SessionBounds` entry has applied.
+    bounds_logged: bool,
 }
 
 impl<S: ClusteredService> ServiceContainer<S> {
@@ -534,6 +692,8 @@ impl<S: ClusteredService> ServiceContainer<S> {
                 bound: timers,
             },
             applied: None,
+            fresh: true,
+            bounds_logged: false,
         })
     }
 
@@ -553,6 +713,35 @@ impl<S: ClusteredService> ServiceContainer<S> {
     #[must_use]
     pub fn applied(&self) -> Option<u64> {
         self.applied
+    }
+
+    /// Whether a `SessionBounds` entry has applied.
+    #[must_use]
+    pub fn bounds_logged(&self) -> bool {
+        self.bounds_logged
+    }
+
+    /// Proposes the table's bounds as a `SessionBounds` entry through
+    /// `core` while none has applied; a leader calls it in each
+    /// leadership, so the first leader of a cluster writes the bounds into
+    /// its log. `Ok(false)` when the log already carries them. A second
+    /// copy, from two leaders, applies as equal bounds and delivers
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`NotLeader`] when `core` does not lead.
+    pub fn propose_bounds<P: Propose>(&self, core: &mut P) -> Result<bool, NotLeader> {
+        if self.bounds_logged {
+            return Ok(false);
+        }
+        // A table's bounds are never 0 (`SessionTable::new`), so this
+        // always encodes.
+        let Ok(payload) = SessionBounds::new(self.sessions.config()).to_vec() else {
+            return Ok(false);
+        };
+        core.propose(payload)?;
+        Ok(true)
     }
 
     /// The deadline `timer` is scheduled for, if it is.
@@ -575,8 +764,9 @@ impl<S: ClusteredService> ServiceContainer<S> {
     ///
     /// # Errors
     ///
-    /// [`ApplyError`] for an entry out of order or a payload that is not
-    /// a schema 2 message. That is a safety stop, not a recoverable error:
+    /// [`ApplyError`] for an entry out of order, a payload that is not
+    /// a schema 2 or schema 5 message, or logged bounds that differ from
+    /// a table that has applied a registration. That is a safety stop, not a recoverable error:
     /// every replica applies the same committed entries, so every replica
     /// stops at the same index for the same reason, and none applies past
     /// it. The entry is never delivered, and the container applies nothing
@@ -594,9 +784,15 @@ impl<S: ClusteredService> ServiceContainer<S> {
         let envelope = if entry.payload.is_empty() {
             None
         } else {
-            Some(Envelope::decode(&entry.payload).map_err(ApplyError::Envelope)?)
+            match Decoded::of(&entry.payload).map_err(ApplyError::Envelope)? {
+                Decoded::Service(envelope) => Some(envelope),
+                Decoded::Bounds(bounds) => return self.apply_bounds(entry, bounds),
+            }
         };
         self.applied = Some(entry.index);
+        if matches!(envelope, Some(Envelope::Register { .. })) {
+            self.fresh = false;
+        }
         let Self {
             service,
             sessions,
@@ -637,5 +833,32 @@ impl<S: ClusteredService> ServiceContainer<S> {
                 Applied::Configured
             }
         })
+    }
+
+    /// Applies a `SessionBounds` entry. Only the log's first counts: equal
+    /// bounds deliver nothing; a fresh table is rebuilt from different
+    /// ones, keeping its log time; a table that has applied a registration
+    /// stops. A later one delivers nothing, whatever it carries.
+    fn apply_bounds(
+        &mut self,
+        entry: &Entry,
+        bounds: SessionBounds,
+    ) -> Result<Applied<'_>, ApplyError> {
+        let table = self.sessions.config();
+        if !self.bounds_logged && bounds.config != table {
+            if !self.fresh {
+                return Err(ApplyError::BoundsDiffer {
+                    logged: bounds.config,
+                    table,
+                });
+            }
+            let mut rebuilt = SessionTable::new(bounds.config).map_err(ApplyError::BoundsUnheld)?;
+            rebuilt.observe(self.sessions.log_time());
+            self.sessions = rebuilt;
+        }
+        self.applied = Some(entry.index);
+        self.bounds_logged = true;
+        self.sessions.observe(entry.event_time);
+        Ok(Applied::Nothing)
     }
 }
