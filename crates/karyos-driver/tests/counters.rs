@@ -65,13 +65,25 @@ fn counters_track_clients_commands_and_streams() {
     let all = snapshot(&driver);
     assert_eq!(all["commands served"].0, TYPE_EVENTS);
     assert_eq!(all["streams active"].0, TYPE_GAUGE);
-    // Every counter starts at 0 but the identity the driver sets at
-    // creation: its process id and its start time.
+    // Every counter starts at 0 but what the driver sets at creation: its
+    // process id, its start time and its configured trace point bounds
+    // (karyos#868).
     assert_eq!(all["driver pid"].1, u64::from(std::process::id()));
     assert_ne!(all["driver started at"].1, 0);
+    assert_eq!(all["trace points per client"], (TYPE_GAUGE, 16));
+    assert_eq!(
+        all["trace point registrations per client"],
+        (TYPE_GAUGE, 256)
+    );
     assert!(
         all.iter()
-            .filter(|(label, _)| !matches!(label.as_str(), "driver pid" | "driver started at"))
+            .filter(|(label, _)| !matches!(
+                label.as_str(),
+                "driver pid"
+                    | "driver started at"
+                    | "trace points per client"
+                    | "trace point registrations per client"
+            ))
             .all(|(_, &(_, value))| value == 0)
     );
 

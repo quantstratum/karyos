@@ -132,6 +132,12 @@ impl AgentConfig {
     }
 }
 
+/// The driver gauge of its configured `max_trace_points_per_client`.
+const TRACE_POINTS_PER_CLIENT: &str = "trace points per client";
+/// The driver gauge of its configured
+/// `max_trace_point_registrations_per_client`.
+const TRACE_POINT_REGISTRATIONS_PER_CLIENT: &str = "trace point registrations per client";
+
 /// One watched driver.
 #[derive(Debug)]
 struct Driver {
@@ -763,6 +769,50 @@ impl Agent {
                 .collect(),
             more,
         })
+    }
+
+    /// The `limits` dimensions (R-CORE-38) as this agent answers them:
+    /// [`crate::server::LIMITS`], with `trace.points_per_client` and
+    /// `trace.point_registrations_per_client` the attached drivers'
+    /// configured bounds (karyos#868). Each driver publishes its bounds as
+    /// the gauges `trace points per client` and `trace point registrations
+    /// per client`; over several attached drivers the smallest is the
+    /// bound, so a client within it is within every one. With no attached
+    /// driver that publishes one, it is the driver's default.
+    #[must_use]
+    pub fn limits(&self) -> [crate::api::Limit; crate::server::LIMITS.len()] {
+        let mut limits = crate::server::LIMITS;
+        for (name, label) in [
+            ("trace.points_per_client", TRACE_POINTS_PER_CLIENT),
+            (
+                "trace.point_registrations_per_client",
+                TRACE_POINT_REGISTRATIONS_PER_CLIENT,
+            ),
+        ] {
+            let configured = self
+                .drivers
+                .iter()
+                .filter(|driver| driver.tool.is_some())
+                .filter_map(|driver| driver.sample.as_ref())
+                .filter_map(|sample| {
+                    sample
+                        .counters
+                        .iter()
+                        .find(|counter| {
+                            counter.stream == 0
+                                && counter.type_id == karyos_sys::counters::TYPE_GAUGE
+                                && counter.label == label
+                        })
+                        .map(|counter| counter.value)
+                })
+                .min();
+            if let Some(configured) = configured
+                && let Some(limit) = limits.iter_mut().find(|limit| limit.name == name)
+            {
+                limit.bound = Some(configured);
+            }
+        }
+        limits
     }
 
     /// What the agent knows, as API v1.

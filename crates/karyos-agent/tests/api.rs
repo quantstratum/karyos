@@ -39,8 +39,12 @@ fn dir(name: &str) -> PathBuf {
 }
 
 fn driver(dir: &Path) -> IpcDriver {
+    driver_with(dir, DriverConfig::default())
+}
+
+fn driver_with(dir: &Path, config: DriverConfig) -> IpcDriver {
     EmbeddedDriver::with_ipc(
-        DriverConfig::default(),
+        config,
         IpcConfig {
             dir: dir.to_path_buf(),
             max_pending_hellos: 4,
@@ -60,9 +64,14 @@ fn driver(dir: &Path) -> IpcDriver {
 
 /// An agent attached to a running driver in `name`'s directory.
 fn attached(name: &str) -> (IpcDriver, Agent, PathBuf) {
+    attached_with(name, DriverConfig::default())
+}
+
+/// As [`attached`], the driver configured with `config`.
+fn attached_with(name: &str, config: DriverConfig) -> (IpcDriver, Agent, PathBuf) {
     let dir = dir(name);
     std::fs::create_dir_all(&dir).unwrap();
-    let mut driver = driver(&dir.join("driver"));
+    let mut driver = driver_with(&dir.join("driver"), config);
     let mut agent = Agent::new(
         AgentConfig::new(vec![dir.join("driver")]).with_attach_timeout(Duration::from_secs(5)),
     );
@@ -757,4 +766,32 @@ fn relay_child() {
             let _ = write!(std::io::stdout(), "ERR {:?}", error.kind());
         }
     }
+}
+
+/// karyos#868: `limits` answers the attached driver's configured trace
+/// point bounds, which it publishes as gauges, not the driver's defaults.
+#[test]
+fn limits_report_the_drivers_configured_trace_bounds() {
+    let _serial = serial();
+    let config = DriverConfig {
+        max_trace_points_per_client: 3,
+        max_trace_point_registrations_per_client: 40,
+        ..DriverConfig::default()
+    };
+    let (_driver, mut agent, dir) = attached_with("trace-bounds", config);
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let (answer, served) = ask(&mut server, &mut agent, "KARYOS-AGENT 1 limits\n");
+    assert_eq!(served, vec![Served::Limits]);
+    assert!(
+        answer.contains(r#""trace.points_per_client":{"value":3,"negotiable":false}"#),
+        "{answer}"
+    );
+    assert!(
+        answer
+            .contains(r#""trace.point_registrations_per_client":{"value":40,"negotiable":false}"#),
+        "{answer}"
+    );
+    drop(server);
+    let _ = std::fs::remove_dir_all(&dir);
 }
