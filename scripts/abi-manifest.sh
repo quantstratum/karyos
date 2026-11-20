@@ -32,8 +32,9 @@ trap 'rm -rf "$work"' EXIT
 probe="$work/probe.c"
 
 # The declarations, from the header without comments, preprocessor lines
-# or its C++ guard, cut into statements at the top level (a `;`, or the
-# `}` that ends an inline function's body), whitespace collapsed:
+# or its C++ guards (the `extern "C"` open and its close), cut into
+# statements at the top level (a `;`, or the `}` that ends an inline
+# function's body), whitespace collapsed:
 #
 #   S NAME FIELD...   a `typedef struct NAME { ... } NAME;`, its fields
 #   D TEXT            any other declaration (a prototype, a callback or
@@ -44,7 +45,7 @@ probe="$work/probe.c"
 # never skipped.
 awk '
     BEGIN { cpp = 0 }
-    /^#ifdef __cplusplus/ { cpp = 1; next }
+    /^#ifdef (__cplusplus|KARYOS_H_EXTERN_C_OPEN)/ { cpp = 1; next }
     cpp && /^#endif/ { cpp = 0; next }
     cpp { next }
     { text = text $0 "\n" }
