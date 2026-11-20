@@ -4,7 +4,7 @@
 # 2026-10-21 item 15): `syn`, `quote` and `proc-macro2` stay compiler-side.
 # No crate's runtime graph (normal edges, proc macros left out, every
 # target and every feature) holds them, checked per workspace crate; and
-# one `syn` major is built, the one `thiserror-impl` already brings.
+# the derive brings no `syn` major of its own.
 # Negative controls: the derive crate's own graph holds `syn`, and
 # karyos-archive reaches the derive crate as a proc macro.
 set -u
@@ -31,10 +31,12 @@ printf '%s\n' "$archive" | grep -qE '^karyos-codec-derive ' || {
   echo "negative control: karyos-archive does not reach the derive crate" >&2
   exit 1
 }
-# Built `syn` majors: `syn` 2 is in the lock only behind `cfg(any())`.
-majors=$(cargo tree --locked --workspace --all-features -e normal,build \
-  --prefix none --format '{p}' | grep -E '^syn v' | sed 's/^syn v\([0-9]*\).*/\1/' | sort -u)
-if [ "$majors" != "3" ]; then
-  echo "built syn majors: $(echo "$majors" | tr '\n' ' ')" >&2
+# No `syn` major of its own: the derive's `syn` is the one `thiserror-impl`
+# already builds on every host. (On x86_64, `curve25519-dalek-derive`
+# also builds `syn` 2; that pair predates the derive.)
+version=$(printf '%s\n' "$derive" | sed -n 's/^syn v\([0-9.]*\).*/\1/p' | head -n 1)
+cargo tree --locked --workspace --all-features -e normal,build --prefix none \
+  -i "syn@$version" | grep -qE '^thiserror-impl ' || {
+  echo "the derive's syn $version is a major no other crate builds" >&2
   exit 1
-fi
+}

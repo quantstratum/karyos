@@ -148,7 +148,7 @@ control-plane-graph-check:
 tiering-graph-check:
 	scripts/check-tiering-graph.sh
 
-# The codec derive's crates stay compiler-side, with one built `syn` major
+# The codec derive's crates stay compiler-side and add no `syn` major
 # (karyos#661; owner decision 2026-10-21 item 15).
 codec-derive-check:
 	scripts/check-codec-derive-graph.sh
