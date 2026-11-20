@@ -390,7 +390,7 @@ fn field_error(result: Result<ControlMessage<'_>, CodecError>) -> &'static str {
 fn an_unknown_control_code_is_an_invalid_enum() {
     let samples = samples();
     for (sample, at, byte, field) in [
-        (9, 16, 6u8, "code"),
+        (9, 16, 9u8, "code"),
         (5, 40, 4, "rate"),
         (13, 24, 4, "signal"),
         (11, 108, 10, "stop_reason"),
@@ -436,7 +436,7 @@ fn every_invalid_field_is_refused_by_name() {
         (&replay_full, 32, 1, "scale_ppm"),
         (&replay_full, 8, 0, "recording_id"),
         (&replay_scaled, 35, 0xFF, "scale_ppm"),
-        (&ok, 16, 6, "code"),
+        (&ok, 16, 9, "code"),
         (&error, 8, 1, "id"),
         (&recording, 108, 10, "stop_reason"),
         (&recording, 24, 0, "stop"),
