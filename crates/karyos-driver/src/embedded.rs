@@ -266,6 +266,13 @@ pub struct DriverConfig {
     /// or dropped: since ids are never reused, it keeps one client from
     /// using up the instance's ids. Beyond it, `ResourcesUnavailable`.
     pub max_trace_point_registrations_per_client: usize,
+    /// Driver-written copies of live trace points (karyos#869), which
+    /// tools name exported points from. They take cells of their own, past
+    /// `counters_capacity`, so they never use the cells of the driver's
+    /// counters or positions; a point registered past this bound gets no
+    /// copy (it is exported unnamed) and is counted in `trace point copies
+    /// dropped`. 0 keeps no copies.
+    pub max_trace_point_copies: usize,
     /// Entries of the trace mirror's journal table (`quantstratum-docs:
     /// karyos/design/trace-journal-region.md`): the open client trace
     /// journals plus the ended ones whose records the mirror's ring still
@@ -412,6 +419,20 @@ impl DriverConfig {
     }
 }
 
+impl DriverConfig {
+    /// The cells of the driver counters region: `counters_capacity` plus
+    /// the trace point copies' own `max_trace_point_copies`.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError::InvalidConfig`] when the sum overflows.
+    pub fn counters_cells(&self) -> Result<usize, DriverError> {
+        self.counters_capacity
+            .checked_add(self.max_trace_point_copies)
+            .ok_or(DriverError::InvalidConfig)
+    }
+}
+
 impl Default for DriverConfig {
     fn default() -> Self {
         Self {
@@ -445,6 +466,7 @@ impl Default for DriverConfig {
             max_counters_per_client: 64,
             max_trace_points_per_client: 16,
             max_trace_point_registrations_per_client: 256,
+            max_trace_point_copies: 1024,
             max_trace_journals: 64,
             trace_recycle_log_entries: 64,
             // Provisional until the trace overhead numbers of P11.
@@ -1522,7 +1544,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     let counters = DriverCounters::new_in(
                         instance,
                         crate::admission::COUNTERS_REGION,
-                        config.counters_capacity,
+                        config.counters_cells()?,
                     )?;
                     let diagnostics =
                         crate::diagnostics::Diagnostics::new_in(&mut admission, &config)?;
@@ -1557,7 +1579,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
                 None => (
                     broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
-                    DriverCounters::with_capacity(config.counters_capacity)?,
+                    DriverCounters::with_capacity(config.counters_cells()?)?,
                     ClientCounters::new(
                         config.client_counters_capacity,
                         config.max_counters_per_client,
@@ -1576,7 +1598,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let _ = ipc;
             (
                 broadcast(config.broadcast_capacity).map_err(|_| DriverError::InvalidConfig)?,
-                DriverCounters::with_capacity(config.counters_capacity)?,
+                DriverCounters::with_capacity(config.counters_cells()?)?,
                 ClientCounters::new(
                     config.client_counters_capacity,
                     config.max_counters_per_client,

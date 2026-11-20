@@ -30,6 +30,7 @@
 //! | `trace point ids exhausted` | event | trace point registrations refused because the instance assigned every id (R-CORE-1, karyos#722) |
 //! | `trace points per client` | gauge | the configured `max_trace_points_per_client`, set at creation (karyos#868) |
 //! | `trace point registrations per client` | gauge | the configured `max_trace_point_registrations_per_client`, set at creation (karyos#868) |
+//! | `trace point copies dropped` | event | trace points registered without a driver-written copy because `max_trace_point_copies` were live (karyos#869) |
 //! | `commands served` | event | commands decoded and executed or refused; malformed records are not commands |
 //! | `commands refused` | event | served commands answered with an `Error` |
 //! | `responses sent` | event | responses written to the broadcast buffer |
@@ -166,7 +167,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 77] = [
+const LABELS: [(u64, &str); 78] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -244,6 +245,7 @@ const LABELS: [(u64, &str); 77] = [
     (TYPE_EVENTS, "trace point ids exhausted"),
     (TYPE_GAUGE, "trace points per client"),
     (TYPE_GAUGE, "trace point registrations per client"),
+    (TYPE_EVENTS, "trace point copies dropped"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -491,6 +493,9 @@ pub(crate) enum Event {
     /// The driver's configured `max_trace_point_registrations_per_client`,
     /// set at creation (karyos#868).
     TracePointRegistrationsPerClient,
+    /// Trace points registered with no driver-written copy, because
+    /// `max_trace_point_copies` copies were live (karyos#869).
+    TracePointCopiesDropped,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -828,6 +833,7 @@ mod tests {
                 Event::TracePointRegistrationsPerClient,
                 "trace point registrations per client",
             ),
+            (Event::TracePointCopiesDropped, "trace point copies dropped"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();

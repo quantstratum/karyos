@@ -2066,9 +2066,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             let allocated = self.client_counters.allocate_point(client, name, keys);
             if let Ok((_, registration, id)) = allocated {
                 // The driver's own copy, which tools name the point from
-                // (karyos#869): without a free cell the point is unnamed
-                // there, never misnamed.
-                if let Some(cell) = self.counters.allocate_point_name(name, keys, id) {
+                // (karyos#869), within its own bound so it never takes a
+                // cell of the driver's counters: past it, or without a
+                // free cell, the point is unnamed there, never misnamed.
+                if self.point_names.len() >= self.config.max_trace_point_copies {
+                    self.counters.add(Event::TracePointCopiesDropped, 1);
+                } else if let Some(cell) = self.counters.allocate_point_name(name, keys, id) {
                     self.point_names.push((client, registration, cell));
                 }
             }
@@ -4587,6 +4590,52 @@ mod tests {
         );
         let _ = driver.do_work().unwrap();
         assert!(point_names(&driver).is_empty());
+    }
+
+    /// karyos#869: the copies have cells of their own, past
+    /// `counters_capacity`, and a bound: past `max_trace_point_copies` a
+    /// point gets no copy and is counted, and a released copy makes room.
+    #[test]
+    fn trace_point_copies_are_bounded_apart_from_the_driver_counters() {
+        let config = crate::DriverConfig {
+            max_trace_point_copies: 1,
+            ..crate::DriverConfig::default()
+        };
+        let mut driver = EmbeddedDriver::with_config(config).unwrap();
+        assert_eq!(
+            driver.counters().capacity(),
+            config.counters_capacity + 1,
+            "the copies' cells are added to the driver's own"
+        );
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer, _link) = raw_client(&mut driver);
+        let point = |sequence, label: &str| Command::AllocateCounter {
+            sequence,
+            type_id: karyos_sys::counters::TYPE_TRACE_POINT,
+            label: CounterLabel::new(label).unwrap(),
+            stream: 0,
+            participant: 0,
+        };
+        write(&mut producer, point(1, "first"));
+        write(&mut producer, point(2, "second"));
+        let _ = driver.do_work().unwrap();
+        let answers = responses(&mut observer);
+        assert_eq!(answers.len(), 2, "{answers:?}");
+        assert_eq!(point_names(&driver), vec![("first".to_owned(), client, 1)]);
+        assert_eq!(driver.counters.value(Event::TracePointCopiesDropped), 1);
+        let (cell, registration) = allocated(&answers[0]);
+        write(
+            &mut producer,
+            Command::ReleaseCounter {
+                sequence: 3,
+                cell,
+                registration,
+            },
+        );
+        write(&mut producer, point(4, "third"));
+        let _ = driver.do_work().unwrap();
+        let _ = driver.do_work().unwrap();
+        assert_eq!(point_names(&driver), vec![("third".to_owned(), client, 3)]);
     }
 
     fn client_cell(driver: &EmbeddedDriver, cell: u64) -> karyos_sys::counters::CellRead {
