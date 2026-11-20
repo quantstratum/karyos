@@ -52,7 +52,7 @@ use karyos_archive::segment::Geometry;
 use karyos_cluster::dedup::{Outcome, Request};
 use karyos_cluster::service::{
     Applied, ApplyError, ClusteredService, ContainerConfig, Context, Envelope, NotLeader, Propose,
-    ServiceContainer, SessionBounds,
+    ProposeRefused, ServiceContainer, SessionBounds,
 };
 use karyos_cluster::{Entry, LogError, RaftLog};
 
@@ -185,6 +185,10 @@ impl<'a, 'l, C: ConsensusCore> Proposer<'a, 'l, C> {
 }
 
 impl<C: ConsensusCore> Propose for Proposer<'_, '_, C> {
+    fn leads(&self) -> bool {
+        self.core.leads()
+    }
+
     fn propose(&mut self, payload: Vec<u8>) -> Result<(), NotLeader> {
         self.core
             .propose(payload, self.log)
@@ -444,20 +448,41 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
         let Some((core, log)) = self.running.as_mut() else {
             return;
         };
-        // A message schema 2 refuses (a zero client or epoch, a command too
-        // long) is never proposed, and is not answered.
-        let Ok(payload) = envelope.to_vec() else {
-            return;
-        };
         let mut view = LogView::new(log);
-        let refused = match Proposer::new(core, &mut view).propose(payload) {
+        let refused = match self
+            .container
+            .propose(&envelope, &mut Proposer::new(core, &mut view))
+        {
             Ok(()) => {
                 if let Some(key) = pending_of(&envelope) {
                     let _ = self.pending.insert(key, taker);
                 }
                 return;
             }
-            Err(refused) => refused.leader.and_then(|leader| u32::try_from(leader).ok()),
+            // No registration before the cluster's session bounds have
+            // applied (ADR-0087; the container's gate since karyos#1053):
+            // a registration under this replica's own configuration could
+            // apply under other limits on a replica with other startup
+            // bounds. This host holds it, bounded, until the bounds apply;
+            // past the bound it answers NotLeader naming itself, so the
+            // client retries.
+            Err(ProposeRefused::BoundsPending) => {
+                if self.deferred.len() < self.held_capacity {
+                    self.deferred.push(taker);
+                } else {
+                    out.push(taker.wrap(Delivery::NotLeader {
+                        leader: Some(self.id),
+                    }));
+                }
+                return;
+            }
+            // A message schema 2 refuses (a zero client or epoch, a command
+            // too long) is never proposed, and is not answered.
+            Err(ProposeRefused::Codec(_)) => return,
+            Err(ProposeRefused::NotLeader(refused)) => {
+                refused.leader.and_then(|leader| u32::try_from(leader).ok())
+            }
+            Err(_) => None,
         };
         match refused {
             // Forwarded once: a message that came forwarded is answered.
@@ -482,24 +507,6 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
     ) {
         let taker = Taker { reply_to, client };
         match &message {
-            // No registration before the cluster's session bounds have
-            // applied (karyos#927 review): a registration under this
-            // replica's own configuration could apply under other limits on
-            // a replica with other startup bounds. A leader holds it until
-            // the bounds apply, then proposes it; a follower forwards it as
-            // ever, and the leader holds it.
-            Delivery::Register
-                if !self.container.bounds_logged()
-                    && self.running.as_ref().is_some_and(|(core, _)| core.leads()) =>
-            {
-                if self.deferred.len() < self.held_capacity {
-                    self.deferred.push(taker);
-                } else {
-                    out.push(taker.wrap(Delivery::NotLeader {
-                        leader: Some(self.id),
-                    }));
-                }
-            }
             Delivery::Register => {
                 let envelope = Envelope::Register {
                     client: u64::from(client),
