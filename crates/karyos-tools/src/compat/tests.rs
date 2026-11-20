@@ -96,7 +96,7 @@ fn an_unknown_tuple_or_field_is_not_covered() {
     let matrix = matrix().unwrap();
     let main = this_side();
     let mut future = main.clone();
-    future.tuple.admission = Some(4);
+    future.tuple.admission = Some(karyos_protocol::admission::VERSION + 1);
     let decision = decide(&matrix, &future, &main);
     assert_eq!(decision.outcome, Outcome::NotCovered);
     assert_eq!(decision.exit(), EXIT_NOT_COVERED);

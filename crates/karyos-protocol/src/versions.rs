@@ -14,4 +14,4 @@ pub const C_ABI_MAJOR: u32 = 0;
 /// The C ABI version's minor number.
 pub const C_ABI_MINOR: u32 = 1;
 /// The C ABI version's patch number.
-pub const C_ABI_PATCH: u32 = 5;
+pub const C_ABI_PATCH: u32 = 6;

@@ -13,7 +13,7 @@ pub const KARYOS_ABI_VERSION_MAJOR: u32 = 0;
 /// The ABI minor version.
 pub const KARYOS_ABI_VERSION_MINOR: u32 = 1;
 /// The ABI patch version.
-pub const KARYOS_ABI_VERSION_PATCH: u32 = 5;
+pub const KARYOS_ABI_VERSION_PATCH: u32 = 6;
 
 /// No handle names an object with this value.
 pub const KARYOS_NULL_HANDLE: u64 = 0;
@@ -168,7 +168,7 @@ pub const KARYOS_MAX_DRIVERS: u32 = 8;
 
 /// The protocol version an embedded client and its driver speak: both come
 /// from this library's build.
-pub const KARYOS_PROTOCOL_VERSION: u32 = 3;
+pub const KARYOS_PROTOCOL_VERSION: u32 = 4;
 
 /// Publication modes of a stream (karyos_stream_options): one exclusive
 /// publication, or up to `publishers` concurrent handles on lane 0

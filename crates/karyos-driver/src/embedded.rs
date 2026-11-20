@@ -568,6 +568,22 @@ pub struct StreamHandle {
     stream: u64,
 }
 
+/// Who asks for a rate policy change (R-CORE-21), for the decision and the
+/// audit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RateBy {
+    /// The authority asked for.
+    pub(crate) authority: crate::guards::RateAuthority,
+    /// The requester's operation id.
+    pub(crate) operation: u64,
+    /// The requester.
+    pub(crate) requester: crate::guards::Requester,
+    /// The command's parameters digest (`karyos_protocol::cnc::rate_parameters`);
+    /// `None` for the embedded API, whose record carries the authority's
+    /// code instead.
+    pub(crate) parameters: Option<u64>,
+}
+
 /// The configuration of an aggregate publication of one to four lanes
 /// (SPEC.md §7.4; `quantstratum-docs: karyos/design/aggregate-ownership.md`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2558,11 +2574,35 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         policy: karyos_sys::rate_limit::RatePolicy,
         by: (crate::guards::RateAuthority, u64),
     ) -> Result<u64, DriverError> {
+        self.change_rate_by(
+            stream,
+            expected,
+            policy,
+            RateBy {
+                authority: by.0,
+                operation: by.1,
+                requester: crate::guards::Requester::InProcess,
+                parameters: None,
+            },
+        )
+    }
+
+    /// [`Self::change_rate_policy`] for the requester `by` names: the
+    /// in-process caller, or an admitted client over CnC (`RateChange`,
+    /// karyos#740), whose parameters digest goes to the audit record.
+    pub(crate) fn change_rate_by(
+        &mut self,
+        stream: StreamHandle,
+        expected: u64,
+        policy: karyos_sys::rate_limit::RatePolicy,
+        by: RateBy,
+    ) -> Result<u64, DriverError> {
         let aggregate = self.stream_ref(stream)?.aggregate;
         if aggregate.lanes > 1 {
             match self.aggregate_of(aggregate.registration) {
                 Ok(handle) => {
-                    return self.change_aggregate_rate_policy(&handle, expected, policy, by);
+                    let streams: Vec<StreamHandle> = handle.streams().collect();
+                    return self.change_rate_in(&streams, expected, policy, by);
                 }
                 Err(error) => {
                     // A lane of it could not be found: refused, audited for
@@ -2582,12 +2622,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     }
                     let now = self.clock.now();
                     for guard in guards {
-                        self.guards.audit_rate(
+                        self.guards.audit_rate_with(
                             guard,
                             (version, version),
-                            (by.1, crate::guards::Requester::InProcess, by.0),
+                            (by.operation, by.requester, by.authority),
                             Err(&error),
-                            now,
+                            (now, by.parameters),
                         );
                     }
                     return Err(error);
@@ -2617,7 +2657,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         by: (crate::guards::RateAuthority, u64),
     ) -> Result<u64, DriverError> {
         let streams: Vec<StreamHandle> = aggregate.streams().collect();
-        self.change_rate_in(&streams, expected, policy, by)
+        self.change_rate_in(
+            &streams,
+            expected,
+            policy,
+            RateBy {
+                authority: by.0,
+                operation: by.1,
+                requester: crate::guards::Requester::InProcess,
+                parameters: None,
+            },
+        )
     }
 
     /// Changes the rate policy of the publication `streams` are the lanes
@@ -2630,9 +2680,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         streams: &[StreamHandle],
         expected: u64,
         policy: karyos_sys::rate_limit::RatePolicy,
-        (authority, operation): (crate::guards::RateAuthority, u64),
+        by: RateBy,
     ) -> Result<u64, DriverError> {
-        use crate::guards::{RateChangeError, Requester};
+        use crate::guards::RateChangeError;
+        let authority = by.authority;
 
         let now = self.clock.now();
         // Every lane looked up first, whatever their order, a retiring one
@@ -2726,12 +2777,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         let after = decided.as_ref().map_or(current, |next| *next);
         for guard in guards {
-            self.guards.audit_rate(
+            self.guards.audit_rate_with(
                 guard,
                 (current, after),
-                (operation, Requester::InProcess, authority),
+                (by.operation, by.requester, authority),
                 decided.as_ref().map(|_| ()),
-                now,
+                (now, by.parameters),
             );
         }
         decided

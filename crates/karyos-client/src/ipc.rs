@@ -1310,6 +1310,26 @@ impl RemoteClient {
             .guard_reopen(guard, expected, operation, operator, reason)
     }
 
+    /// Changes the rate policy of the guarded stream `stream` from version
+    /// `expected`, as [`ClientConductor::rate_change`]; it completes as
+    /// [`Outcome::RateState`](crate::Outcome::RateState).
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::rate_change`].
+    pub fn rate_change(
+        &mut self,
+        stream: karyos_protocol::cnc::StreamKey,
+        expected: u64,
+        policy: karyos_sys::rate_limit::RatePolicy,
+        authority: karyos_protocol::cnc::RateAuthority,
+        operation: u64,
+        operator: Option<u32>,
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .rate_change(stream, expected, policy, authority, operation, operator)
+    }
+
     /// Requests a trace journal of `layout` observing `registration` with
     /// the clock `provenance` word, as [`ClientConductor::trace_journal`];
     /// it completes as

@@ -307,7 +307,7 @@ completion handling (ADR-0008).
   inputs, run `make header`, and commit the header it writes; pre-push
   regenerates it and fails on any difference, and `src/header.rs` checks
   it against `abi.rs` (functions, C types, status codes, ABI version).
-- The ABI has its own version (`KARYOS_ABI_VERSION_*`, today 0.1.5).
+- The ABI has its own version (`KARYOS_ABI_VERSION_*`, today 0.1.6).
   `crates/karyos-ffi/abi/manifest.txt` records every struct's size,
   alignment and offsets, every constant and every declaration.
   `make abi-manifest-check` (in pre-push) fails when the header no longer

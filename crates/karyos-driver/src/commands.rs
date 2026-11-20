@@ -1420,6 +1420,24 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 (operation, operator, parameters),
                 Some(expected),
             ),
+            // A rate policy change (R-CORE-21, karyos#740): local control,
+            // on the same G1 trust as the guard commands.
+            Command::RateChange {
+                stream,
+                expected,
+                authority,
+                operation,
+                operator,
+                parameters,
+                policy,
+                ..
+            } => self.rate_command(
+                client,
+                request,
+                stream,
+                (expected, policy),
+                (authority, operation, operator, parameters),
+            ),
             // Network channels by URI (W5b, net/client.rs).
             Command::AddNetworkPublication {
                 stream_id,
@@ -1554,6 +1572,76 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     detail,
                 }
             }
+        }
+    }
+
+    /// Serves `RateChange` (R-CORE-21, karyos#740; `quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, Rate limit transitions): the
+    /// change of [`EmbeddedDriver::change_rate_policy`], requested by the
+    /// client, or by the operator it names (`NO_OPERATOR`: none), and
+    /// audited as that path audits, with the command's parameters digest
+    /// in the record. Either authority rests on admission (G1), as
+    /// `GuardReopen` does: an admitted client's uid was proved equal to the
+    /// driver's, so it may act as the driver owner's administrator.
+    ///
+    /// The key names the active local stream of that key, as
+    /// [`EmbeddedDriver::stream_handle`] finds it; an image has no rate
+    /// policy, so none is looked for. A key with none is refused with
+    /// `UnknownStream`, and is not audited: it names no guard. The answer
+    /// is `RateState` with the version after the change, or `Error` whose
+    /// detail is the current version for `RateVersionMismatch`, and the
+    /// stream key word for every other code.
+    fn rate_command(
+        &mut self,
+        client: u64,
+        request: RequestId,
+        stream: StreamKey,
+        (expected, policy): (u64, karyos_sys::rate_limit::RatePolicy),
+        asked: (karyos_protocol::cnc::RateAuthority, u64, u64, u64),
+    ) -> Response {
+        let (authority, operation, operator, parameters) = asked;
+        let key_word = u64::from(stream.stream_id.cast_unsigned())
+            | (u64::from(stream.session_id.cast_unsigned()) << 32);
+        let refuse = |code: ErrorCode, detail: u64| Response::Error {
+            request,
+            code,
+            detail,
+        };
+        let Some(handle) = self.stream_handle(stream) else {
+            return refuse(ErrorCode::UnknownStream, key_word);
+        };
+        let requester = match operator {
+            karyos_protocol::cnc::NO_OPERATOR => crate::guards::Requester::Client(client),
+            uid => crate::guards::Requester::Operator { client, uid },
+        };
+        let authority = match authority {
+            karyos_protocol::cnc::RateAuthority::Safety => crate::guards::RateAuthority::Safety,
+            karyos_protocol::cnc::RateAuthority::Administrator => {
+                crate::guards::RateAuthority::Administrator
+            }
+        };
+        let by = crate::embedded::RateBy {
+            authority,
+            operation,
+            requester,
+            parameters: Some(parameters),
+        };
+        match self.change_rate_by(handle, expected, policy, by) {
+            Ok(version) => Response::RateState {
+                request,
+                stream,
+                version,
+            },
+            Err(error) => match error {
+                DriverError::RateChange(crate::guards::RateChangeError::VersionMismatch {
+                    current,
+                    ..
+                }) => refuse(ErrorCode::RateVersionMismatch, current),
+                DriverError::UnknownStream { .. } | DriverError::StreamRetiring { .. } => {
+                    refuse(ErrorCode::UnknownStream, key_word)
+                }
+                other => refuse(crate::guards::error_code(&other), key_word),
+            },
         }
     }
 
@@ -5728,6 +5816,200 @@ mod tests {
                     crate::guards::AuditOutcome::Refused(ErrorCode::UnknownGuard)
                 ),
             ]
+        );
+    }
+
+    /// karyos#740 (R-CORE-21): `RateChange` from an admitted client. The
+    /// safety path tightens and an administrator loosens, the version
+    /// moves, a stale version, a loosening on the safety path, a policy
+    /// below the reserve and an invalid policy come back with their codes
+    /// and details, an unknown key is `UnknownStream`, and every request
+    /// that names the guarded stream is audited with the client (or its
+    /// operator) and the command's digest.
+    #[test]
+    fn a_rate_change_command_moves_the_version_and_is_audited() {
+        use crate::guards::{AuditOutcome, GuardRate, RateAuthority, Requester};
+        use karyos_protocol::cnc::{RateAuthority as Wire, rate_parameters};
+        use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+        let (mut driver, stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        let policy = |per_second, burst| RatePolicy {
+            messages: Rate { per_second, burst },
+            bytes: None,
+        };
+        driver
+            .guard_stream(
+                stream,
+                guard,
+                4,
+                Some(GuardRate::publication(policy(100, 10)).with_reserve(Rate {
+                    per_second: 5,
+                    burst: 2,
+                })),
+            )
+            .unwrap();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let key = StreamKey {
+            stream_id: 2,
+            session_id: 1,
+        };
+        let key_word = 2 | (1 << 32);
+        let none = karyos_protocol::cnc::NO_OPERATOR;
+        let asks = [
+            // (sequence, expected, authority, operator, policy)
+            (1, 1, Wire::Safety, none, policy(50, 10)),
+            (2, 1, Wire::Safety, none, policy(40, 10)),
+            (3, 2, Wire::Safety, 1000, policy(60, 10)),
+            (4, 2, Wire::Safety, none, policy(4, 10)),
+            (5, 2, Wire::Administrator, 1000, policy(200, 20)),
+            (6, 3, Wire::Administrator, none, policy(0, 0)),
+        ];
+        let digest =
+            |(_, expected, authority, operator, policy): (u64, u64, Wire, u64, RatePolicy),
+             operation| {
+                rate_parameters(key, expected, authority, operation, operator, &policy)
+            };
+        for ask in asks {
+            let (sequence, expected, authority, operator, policy) = ask;
+            write(
+                &mut producer,
+                Command::RateChange {
+                    sequence,
+                    stream: key,
+                    expected,
+                    authority,
+                    operation: 90 + sequence,
+                    operator,
+                    parameters: digest(ask, 90 + sequence),
+                    policy,
+                },
+            );
+        }
+        let unknown = StreamKey {
+            stream_id: 9,
+            session_id: 1,
+        };
+        write(
+            &mut producer,
+            Command::RateChange {
+                sequence: 7,
+                stream: unknown,
+                expected: 3,
+                authority: Wire::Administrator,
+                operation: 97,
+                operator: none,
+                parameters: 0,
+                policy: policy(10, 10),
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..8 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        let request = |sequence| RequestId { client, sequence };
+        let error = |sequence, code, detail| Response::Error {
+            request: request(sequence),
+            code,
+            detail,
+        };
+        let state = |sequence, version| Response::RateState {
+            request: request(sequence),
+            stream: key,
+            version,
+        };
+        for expected in [
+            state(1, 2),
+            error(2, ErrorCode::RateVersionMismatch, 2),
+            error(3, ErrorCode::RateNotATightening, key_word),
+            error(4, ErrorCode::RateReserveCrossed, key_word),
+            state(5, 3),
+            error(6, ErrorCode::RateInvalidPolicy, key_word),
+            error(7, ErrorCode::UnknownStream, 9 | (1 << 32)),
+        ] {
+            assert!(answers.contains(&expected), "{expected:?} in {answers:?}");
+        }
+        let audit: Vec<_> = driver
+            .guard_audit()
+            .records
+            .iter()
+            .map(|record| {
+                (
+                    record.operation,
+                    record.before,
+                    record.after,
+                    record.requester,
+                    record.outcome,
+                    record.parameters,
+                )
+            })
+            .collect();
+        let by = Requester::Client(client);
+        let operator = Requester::Operator { client, uid: 1000 };
+        let refused = AuditOutcome::Refused;
+        assert_eq!(
+            audit,
+            [
+                (
+                    91,
+                    1,
+                    2,
+                    by,
+                    AuditOutcome::RateChanged {
+                        authority: RateAuthority::Safety
+                    },
+                    digest(asks[0], 91)
+                ),
+                (
+                    92,
+                    2,
+                    2,
+                    by,
+                    refused(ErrorCode::RateVersionMismatch),
+                    digest(asks[1], 92)
+                ),
+                (
+                    93,
+                    2,
+                    2,
+                    operator,
+                    refused(ErrorCode::RateNotATightening),
+                    digest(asks[2], 93)
+                ),
+                (
+                    94,
+                    2,
+                    2,
+                    by,
+                    refused(ErrorCode::RateReserveCrossed),
+                    digest(asks[3], 94)
+                ),
+                (
+                    95,
+                    2,
+                    3,
+                    operator,
+                    AuditOutcome::RateChanged {
+                        authority: RateAuthority::Administrator
+                    },
+                    digest(asks[4], 95)
+                ),
+                (
+                    96,
+                    3,
+                    3,
+                    by,
+                    refused(ErrorCode::RateInvalidPolicy),
+                    digest(asks[5], 96)
+                ),
+            ]
+        );
+        // The embedded API sees the version the commands left.
+        assert_eq!(
+            driver.change_rate_policy(stream, 3, policy(200, 20), (RateAuthority::Safety, 98)),
+            Ok(3)
         );
     }
 
