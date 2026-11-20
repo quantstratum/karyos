@@ -1171,6 +1171,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         solicit: None,
         later: paths,
         later_routes: [None; crate::net::LATER_PATHS],
+        control_held: [false; crate::net::MAX_CONTROL_GROUPS],
         identity: None,
         conflated: None,
         register_at: None,
@@ -2283,4 +2284,33 @@ fn nak_control_maps_through_the_driver_table() {
     net.map_nak_control(&multicast(at(40, 4000), Vec::new(), Vec::new()))
         .unwrap();
     assert_eq!(*net.control_groups(), before);
+}
+
+/// karyos#1086: the control group entries channels' `nak-control` adds
+/// leave the driver's table with their last subscription, so channels
+/// naming nine distinct groups in turn never exhaust its eight entries; a
+/// failed add releases what it counted, and the count is visible.
+#[test]
+fn nak_control_entries_leave_with_their_last_subscription() {
+    let mut b = driver(ThreadingMode::Shared);
+    let at = |n: u8, last: u8, port: u16| SocketAddr::from(([239, 8, n, last], port));
+    let multicast = |n: u8| UdpConfig {
+        destination: Destination::Multicast {
+            group: at(n, 1, 4000),
+            ttl: None,
+        },
+        interface: None,
+        nak_control: vec![at(n, 2, 4001)],
+        ..channel(at(n, 1, 4000))
+    };
+    assert_eq!(b.network_control_groups_in_use(), 0);
+    for n in 0..9u8 {
+        // A host without multicast cannot join: the add fails, and must
+        // still release what it counted.
+        if let Ok(subscription) = b.add_network_subscription(i32::from(n) + 10, &multicast(n)) {
+            assert_eq!(b.network_control_groups_in_use(), 1, "{n}");
+            assert!(b.remove_network_subscription(subscription).unwrap());
+        }
+        assert_eq!(b.network_control_groups_in_use(), 0, "{n}");
+    }
 }
