@@ -607,7 +607,6 @@ fn address_forms_follow_the_grammar() {
         "karyos:udp?endpoint=010.0.0.5:1",
         "karyos:udp?endpoint=10.0.0.5:1|interface=fe80::1%2",
         "karyos:udp?endpoint=10.0.0.5:1|interface=[::1]",
-        "karyos:udp?endpoint=10.0.0.5:1|paths=eth1@10.0.0.5:1",
         "karyos:udp?destinations=10.0.0.5:1;;10.0.0.6:1",
     ] {
         assert!(
@@ -790,4 +789,149 @@ fn require_abort_ack_is_refused_until_authenticated_is_supported() {
             key: "require-abort-ack"
         }
     ));
+}
+
+/// karyos#635 (owner item 11): paired unicast paths, `interface@endpoint`
+/// per element, are their own destination form, with the grammar of
+/// CHANNEL-URI.md section 6.
+#[test]
+fn paired_paths_follow_their_grammar() {
+    let channel = udp("karyos:udp?paths=eth1@10.0.0.5:40123;eth2@10.1.0.5:40123");
+    assert_eq!(
+        channel.paths,
+        vec![
+            Interface::Name("eth1".to_owned()),
+            Interface::Name("eth2".to_owned())
+        ]
+    );
+    assert_eq!(
+        channel.destination,
+        Destination::PairedPaths {
+            endpoints: vec![addr("10.0.0.5:40123"), addr("10.1.0.5:40123")]
+        }
+    );
+    // IPv6, with a numeric scope id, and an address as the interface.
+    let channel = udp("karyos:udp?paths=fe80::2@[fe80::1%2]:40123;eth2@[fd00::5]:40123");
+    assert_eq!(
+        channel.paths[0],
+        Interface::Address("fe80::2".parse().unwrap())
+    );
+    assert_eq!(
+        channel.destination,
+        Destination::PairedPaths {
+            endpoints: vec![addr("[fe80::1%2]:40123"), addr("[fd00::5]:40123")]
+        }
+    );
+    // One pair is a path count inside the bound.
+    assert!(matches!(
+        udp("karyos:udp?paths=eth1@10.0.0.5:1").destination,
+        Destination::PairedPaths { .. }
+    ));
+    for (uri, reason) in [
+        (
+            "karyos:udp?paths=eth1@10.0.0.5:1;eth1@10.0.0.6:1",
+            "a path repeats",
+        ),
+        (
+            "karyos:udp?paths=eth1@10.0.0.5:1;eth2@10.0.0.5:1",
+            "an endpoint repeats",
+        ),
+        (
+            "karyos:udp?paths=eth1@10.0.0.5:1;eth2@[::ffff:10.0.0.5]:1",
+            "an endpoint repeats",
+        ),
+        (
+            "karyos:udp?paths=eth1@10.0.0.5:1;eth2@[fd00::5]:1",
+            "endpoints of two address families",
+        ),
+        (
+            "karyos:udp?paths=eth1@10.0.0.5:1;eth2@10.0.0.6:1;eth3@10.0.0.7:1;eth4@10.0.0.8:1;eth5@10.0.0.9:1",
+            "more than 4 paths",
+        ),
+        (
+            "karyos:udp?paths=eth1@10.0.0.5:1;eth2",
+            "paired and unpaired paths",
+        ),
+        ("karyos:udp?paths=eth1@239.1.1.1:1", "a multicast address"),
+        ("karyos:udp?paths=eth1@10.0.0.5:0", "port 0"),
+        ("karyos:udp?paths=eth1@0.0.0.0:1", "unspecified address"),
+        ("karyos:udp?paths=eth1@10.0.0.5", "not an address and port"),
+        (
+            "karyos:udp?paths=eth1@[fe80::1%eth0]:1",
+            "not an address and port",
+        ),
+        (
+            "karyos:udp?paths=eth/1@10.0.0.5:1",
+            "not an address or an interface name",
+        ),
+    ] {
+        assert_eq!(
+            refused(uri),
+            ChannelError::InvalidValue {
+                key: "paths",
+                reason
+            },
+            "{uri}"
+        );
+    }
+    // No other destination key goes with paired paths, in either order.
+    for (uri, other) in [
+        (
+            "karyos:udp?paths=eth1@10.0.0.5:1|destinations=10.0.0.6:1",
+            "destinations",
+        ),
+        (
+            "karyos:udp?destinations=10.0.0.6:1|paths=eth1@10.0.0.5:1",
+            "destinations",
+        ),
+        (
+            "karyos:udp?endpoint=10.0.0.6:1|paths=eth1@10.0.0.5:1",
+            "endpoint",
+        ),
+        (
+            "karyos:udp?paths=eth1@10.0.0.5:1|group=239.1.1.1:1",
+            "group",
+        ),
+        (
+            "karyos:udp?control=10.0.0.6:1|paths=eth1@10.0.0.5:1",
+            "control",
+        ),
+    ] {
+        assert_eq!(
+            refused(uri),
+            ChannelError::Conflict {
+                first: "paths",
+                second: other
+            },
+            "{uri}"
+        );
+    }
+    // Nor does `destinations` with unpaired paths, in either order.
+    for uri in [
+        "karyos:udp?paths=10.0.0.1;10.0.0.2|destinations=10.0.0.6:1",
+        "karyos:udp?destinations=10.0.0.6:1|paths=10.0.0.1;10.0.0.2",
+    ] {
+        assert_eq!(
+            refused(uri),
+            ChannelError::Conflict {
+                first: "paths",
+                second: "destinations"
+            },
+            "{uri}"
+        );
+    }
+    // `interface` still conflicts with `paths`; `ttl` and `fc` do not apply.
+    assert_eq!(
+        refused("karyos:udp?paths=eth1@10.0.0.5:1|interface=10.0.0.1"),
+        ChannelError::Conflict {
+            first: "interface",
+            second: "paths"
+        }
+    );
+    for (uri, key) in [
+        ("karyos:udp?paths=eth1@10.0.0.5:1|ttl=1", "ttl"),
+        ("karyos:udp?paths=eth1@10.0.0.5:1|fc=min", "fc"),
+    ] {
+        assert_eq!(refused(uri), ChannelError::NotApplicable { key }, "{uri}");
+    }
 }
