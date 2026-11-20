@@ -1171,6 +1171,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         solicit: None,
         later: paths,
         later_routes: [None; crate::net::LATER_PATHS],
+        control_held: [false; crate::net::MAX_CONTROL_GROUPS],
         identity: None,
         conflated: None,
         register_at: None,
