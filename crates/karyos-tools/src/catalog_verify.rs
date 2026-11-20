@@ -81,7 +81,8 @@ Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]...
   --time-anchors HEX=DIR
                  an operator export store of the anchors of
                  <dir>/time-evidence's own journal, as --anchors;
-                 repeatable; without it --anchors serves both
+                 repeatable; required with --time-requirement, since
+                 that journal has its own anchor store
   --json         one JSON object instead of text
   -h, --help     print this text
 
@@ -104,8 +105,8 @@ pub struct VerifyArgs {
     /// The operator's time requirement; `None` reports no time verdict
     /// (karyos#1065).
     pub time_requirement: Option<Requirement>,
-    /// The anchor stores of the entries' own journal; empty uses
-    /// `anchors`.
+    /// The anchor stores of the entries' own journal, required with a
+    /// time requirement.
     pub time_anchors: Vec<([u8; 32], PathBuf)>,
 }
 
@@ -140,6 +141,10 @@ pub enum UsageError {
     /// No directory.
     #[error("verify needs a directory")]
     NoDirectory,
+    /// `--time-requirement` without `--time-anchors`: the entries' journal
+    /// has its own anchor store (ADR-0095).
+    #[error("--time-requirement needs --time-anchors, the entries' own anchor store")]
+    TimeAnchorsRequired,
     /// A `--time-requirement` that is not `NS:GRAN`.
     #[error("--time-requirement needs NS:GRAN, two numbers of nanoseconds")]
     TimeRequirement,
@@ -358,6 +363,9 @@ pub fn parse_verify(
         }
     }
     let dir = dir.ok_or(UsageError::NoDirectory)?;
+    if time_requirement.is_some() && time_anchors.is_empty() {
+        return Err(UsageError::TimeAnchorsRequired);
+    }
     Ok(Some(VerifyArgs {
         dir,
         trust,
@@ -399,11 +407,7 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
     let verified: Vec<(u64, u64)> = if entries.is_empty() {
         Vec::new()
     } else {
-        let anchors = if args.time_anchors.is_empty() {
-            args.anchors.clone()
-        } else {
-            args.time_anchors.clone()
-        };
+        let anchors = args.time_anchors.clone();
         let checked = run_checks(&VerifyArgs {
             dir: dir.clone(),
             anchors,
