@@ -736,6 +736,18 @@ pub enum AgentError {
         /// The group.
         id: u64,
     },
+    /// With sealing on, a group journal in the Archive's own directory:
+    /// that directory's integrity journal is the Archive's, held under its
+    /// lock, so the group's journal could not be sealed (karyos#1112).
+    /// Refused before the journal exists; put the group's journal in a
+    /// directory of its own.
+    #[error(
+        "group journal directory {dir:?} is the Archive's own: its journal cannot be sealed there"
+    )]
+    GroupInArchiveDirectory {
+        /// The directory.
+        dir: PathBuf,
+    },
     /// A journal whose recovery would cut it to nothing, dropping more
     /// than the header's own write: a damaged header that events
     /// followed, not one torn while it was written. Neither a restart nor
@@ -2801,6 +2813,11 @@ impl<D: Disk + Clone> State<D> {
         let id = start.group_id;
         if self.groups.iter().any(|group| group.id == id) {
             return Err(AgentError::GroupCaptured { id });
+        }
+        // Sealing on: the Archive's directory holds its own integrity
+        // journal, which a group's cannot share (karyos#1112).
+        if self.integrity.is_some() && start.dir == self.dir {
+            return Err(AgentError::GroupInArchiveDirectory { dir: start.dir });
         }
         // Checked before the journal exists, so a refused start leaves
         // none behind.
