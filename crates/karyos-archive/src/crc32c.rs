@@ -74,11 +74,8 @@ impl Crc32c {
     pub fn update(&mut self, bytes: &[u8]) {
         let [t0, t1, t2, t3, t4, t5, t6, t7] = &*TABLES;
         let mut crc = self.0;
-        let mut words = bytes.chunks_exact(8);
-        for word in &mut words {
-            let mut eight = [0u8; 8];
-            eight.copy_from_slice(word);
-            let [b0, b1, b2, b3, b4, b5, b6, b7] = eight;
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &[b0, b1, b2, b3, b4, b5, b6, b7] in words {
             let low = crc ^ u32::from_le_bytes([b0, b1, b2, b3]);
             let [l0, l1, l2, l3] = low.to_le_bytes();
             crc = lookup(t7, u32::from(l0))
@@ -90,7 +87,7 @@ impl Crc32c {
                 ^ lookup(t1, u32::from(b6))
                 ^ lookup(t0, u32::from(b7));
         }
-        for &byte in words.remainder() {
+        for &byte in rest {
             crc = (crc >> 8) ^ lookup(t0, crc ^ u32::from(byte));
         }
         self.0 = crc;
