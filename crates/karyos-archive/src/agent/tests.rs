@@ -1264,6 +1264,7 @@ mod groups {
                     recording_id: recording,
                     length: 10,
                 },
+                image: 0,
             }),
             GroupRecord::End(EventEnd {
                 group_seq: seq,
@@ -1832,6 +1833,7 @@ mod groups {
                         recording_id: recording,
                         length: 10,
                     },
+                    image: 0,
                 }),
                 GroupRecord::End(EventEnd {
                     group_seq: 1,

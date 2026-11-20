@@ -63,6 +63,10 @@ pub enum Event<'a> {
         extension: Option<&'a [u8; EXTENSION]>,
         /// Its payload.
         payload: MessagePayload<'a>,
+        /// The registration of the network image it came from, 0 for a
+        /// source that is no network image (ADR-0089): two images of one
+        /// alias are two.
+        image: u64,
     },
     /// What a subscription's poll reported instead of a message: an
     /// overrun, a skipped range or an aborted block (section 5).
@@ -77,6 +81,9 @@ pub enum Event<'a> {
         lost_to: u64,
         /// Where delivery resumed.
         resume: u64,
+        /// The registration of the network image the loss was on, 0 for
+        /// none (ADR-0089).
+        image: u64,
     },
     /// A conflated view's value.
     Conflated {
@@ -102,6 +109,9 @@ pub enum Event<'a> {
         source: SubscriptionId,
         /// What it announced.
         kind: LifecycleKind,
+        /// The registration of the network image it names, 0 for none
+        /// (ADR-0089).
+        image: u64,
     },
     /// An input from outside Karyos, delivered by
     /// [`GroupGateway::deliver_external`].

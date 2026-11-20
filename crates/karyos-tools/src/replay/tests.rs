@@ -96,6 +96,7 @@ fn message(seq: u64, payload: Payload<'static>) -> GroupRecord<'static> {
         end_of_stream: false,
         extension: None,
         payload,
+        image: 0,
     })
 }
 

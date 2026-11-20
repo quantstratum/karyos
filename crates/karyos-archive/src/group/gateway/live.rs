@@ -43,7 +43,7 @@ use crate::group::record::{
 
 mod sources;
 
-pub use sources::{ConflatedSource, MessageSource, RecordingWord, SourceIdentity};
+pub use sources::{ConflatedSource, ImageReport, MessageSource, RecordingWord, SourceIdentity};
 
 #[cfg(test)]
 mod tests;

@@ -68,6 +68,7 @@ fn message(seq: u64, payload: &[u8]) -> Vec<u8> {
         end_of_stream: false,
         extension: None,
         payload: Payload::Inline(payload),
+        image: 0,
     }))
 }
 
@@ -452,7 +453,7 @@ fn a_tail_shorter_than_an_envelope_is_padding() {
         config(SyncPolicy::None),
     )
     .unwrap();
-    let records = events(&[Some(65_535), Some(65_265), None]);
+    let records = events(&[Some(65_535), Some(65_249), None]);
     for record in &records {
         journal.append(record).unwrap();
     }

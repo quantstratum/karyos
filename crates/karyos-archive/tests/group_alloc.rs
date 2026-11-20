@@ -46,6 +46,7 @@ fn journal() -> [GroupRecord<'static>; 5] {
             end_of_stream: false,
             extension: None,
             payload: Payload::Inline(b"payload"),
+            image: 0,
         }),
         GroupRecord::Outcome(OutcomeObservation {
             group_seq: 1,

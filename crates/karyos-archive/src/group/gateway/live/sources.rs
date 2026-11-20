@@ -152,7 +152,8 @@ pub trait MessageSource {
         None
     }
 
-    /// [`MessageSource::poll_taking`], with the session and lane of the
+    /// [`MessageSource::poll_taking`], with the session, lane and
+    /// registration (0 when the source does not know it, ADR-0089) of the
     /// image whose report the summary carries, when it names one.
     ///
     /// # Errors
@@ -163,11 +164,15 @@ pub trait MessageSource {
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
-    ) -> Result<(PollSummary, Option<(i32, Lane)>), PollError> {
+    ) -> Result<(PollSummary, Option<ImageReport>), PollError> {
         self.poll_taking(handler, limit)
             .map(|summary| (summary, None))
     }
 }
+
+/// The image a poll's report names: its session, lane and registration
+/// (0 when the source does not know it, ADR-0089).
+pub type ImageReport = (i32, Lane, u64);
 
 /// A network subscription's images, polled in turn: their messages carry
 /// each image's session, and their attaches and retirements are its
@@ -191,12 +196,15 @@ impl<T: TermBytes> MessageSource for Subscription<T> {
         &mut self,
         handler: &mut dyn FnMut(&[u8], MessageInfo) -> bool,
         limit: MessageLimit,
-    ) -> Result<(PollSummary, Option<(i32, Lane)>), PollError> {
+    ) -> Result<(PollSummary, Option<ImageReport>), PollError> {
         match Subscription::poll_taking(self, handler, limit) {
             // The image that reported more than deliveries: its report,
             // with the deliveries over every image, and its session.
             Ok(poll) => {
-                let session = poll.stopped.and_then(|stop| stop.session_id.zip(stop.lane));
+                let session = poll.stopped.and_then(|stop| {
+                    let (session, lane) = stop.session_id.zip(stop.lane)?;
+                    Some((session, lane, stop.image.unwrap_or(0)))
+                });
                 let mut summary = poll.stopped.map(|stop| stop.summary).unwrap_or_default();
                 summary.delivered = poll.delivered;
                 Ok((summary, session))
@@ -289,8 +297,9 @@ enum Held {
         from: u64,
         lost_to: u64,
         resume: u64,
-        /// The image's session and lane, for a network subscription's.
-        image: Option<(i32, Lane)>,
+        /// The image's session, lane and registration (0 unknown), for a
+        /// network subscription's.
+        image: Option<ImageReport>,
     },
     Ended {
         position: u64,
@@ -302,6 +311,8 @@ enum Held {
         session_id: i32,
         lane: Lane,
         available: bool,
+        /// Its registration, 0 when the source does not know it.
+        registration: u64,
     },
 }
 
@@ -717,6 +728,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                 session_id: change.session_id,
                 lane: change.lane,
                 available: change.available,
+                registration: change.registration.unwrap_or(0),
             };
             slot.held = Some(held);
             return self.deliver_held(index, held, now, handler).map(Some);
@@ -820,7 +832,8 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                 resume,
                 image,
             } => {
-                let (session_id, lane) = image.unwrap_or((identity.session_id, identity.lane));
+                let (session_id, lane, image) =
+                    image.unwrap_or((identity.session_id, identity.lane, 0));
                 let first = |group_seq: u64, out: &mut [u8]| {
                     GroupRecord::Loss(LossEvent {
                         group_seq,
@@ -833,6 +846,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                         session_id,
                         lane,
                         loss,
+                        image,
                     })
                     .encode(out)
                     .map_err(|_| Refusal::TooLarge)
@@ -843,6 +857,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                     from,
                     lost_to,
                     resume,
+                    image,
                 };
                 self.dispatch_event(&event, now, &first, handler)
             }
@@ -858,26 +873,31 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                         session_id: identity.session_id,
                         lane: identity.lane,
                         kind,
+                        image: 0,
                     })
                     .encode(out)
                     .map_err(|_| Refusal::TooLarge)
                 };
-                self.dispatch_event(&Event::Lifecycle { source, kind }, now, &first, handler)
+                let event = Event::Lifecycle {
+                    source,
+                    kind,
+                    image: 0,
+                };
+                self.dispatch_event(&event, now, &first, handler)
             }
             Held::Image {
                 session_id,
                 lane,
                 available,
+                registration,
             } => {
                 let kind = if available {
                     LifecycleKind::ImageAvailable
                 } else {
                     LifecycleKind::ImageUnavailable
                 };
-                // The image's session and lane. Replay finds a network
-                // subscription by its stream alone, so two images of one
-                // alias with one session are told apart only by the image
-                // id (owner note item 20).
+                // The image's session, lane and registration: replay keys
+                // a network image by them (ADR-0089).
                 let first = |group_seq: u64, out: &mut [u8]| {
                     GroupRecord::Lifecycle(LifecycleEvent {
                         group_seq,
@@ -888,11 +908,17 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                         session_id,
                         lane,
                         kind,
+                        image: registration,
                     })
                     .encode(out)
                     .map_err(|_| Refusal::TooLarge)
                 };
-                self.dispatch_event(&Event::Lifecycle { source, kind }, now, &first, handler)
+                let event = Event::Lifecycle {
+                    source,
+                    kind,
+                    image: registration,
+                };
+                self.dispatch_event(&event, now, &first, handler)
             }
         };
         if !matches!(result, Err(GatewayError::Refused(_)))
@@ -957,6 +983,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                 end_of_stream: info.end_of_stream,
                 extension,
                 payload,
+                image: info.image.unwrap_or(0),
             })
             .encode(out)
             .map_err(|_| Refusal::TooLarge)
@@ -995,7 +1022,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
                     lost_to: end,
                     resume: end,
                     // The message's image's.
-                    image: Some((info.session_id, info.lane)),
+                    image: Some((info.session_id, info.lane, info.image.unwrap_or(0))),
                 },
                 now,
                 handler,
@@ -1012,6 +1039,7 @@ impl<P: Port, C: FnMut() -> u64> Gateway<P, C> {
             end_of_stream: info.end_of_stream,
             extension: info.extension.as_ref(),
             payload: MessagePayload::Bytes(bytes),
+            image: info.image.unwrap_or(0),
         };
         self.dispatch_event(&event, now, &placed, handler)
     }

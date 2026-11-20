@@ -80,6 +80,7 @@ fn message(seq: u64, recording: Option<u64>) -> GroupRecord<'static> {
             },
             None => Payload::Inline(b"x"),
         },
+        image: 0,
     })
 }
 
@@ -886,6 +887,7 @@ fn a_loss_event_and_an_uncaptured_payload_complete_alone() {
                     outcome: OverrunOutcome::ResumedAtHead,
                     fallback: None,
                 },
+                image: 0,
             }),
             end(1, EndOutcome::Complete),
             GroupRecord::Message(MessageEvent {
@@ -901,6 +903,7 @@ fn a_loss_event_and_an_uncaptured_payload_complete_alone() {
                 end_of_stream: false,
                 extension: None,
                 payload: Payload::Unavailable { length: 70_000 },
+                image: 0,
             }),
             end(2, EndOutcome::Complete),
         ],

@@ -65,6 +65,7 @@ fn message(seq: u64, stream_id: i32, payload: Payload<'static>) -> GroupRecord<'
         end_of_stream: false,
         extension: None,
         payload,
+        image: 0,
     })
 }
 
@@ -217,6 +218,7 @@ fn each_event_is_presented_as_recorded_then_the_end() {
             session_id: 3,
             lane: Lane::ZERO,
             loss: Loss::Aborted,
+            image: 0,
         }),
         end(4, 0, EndOutcome::Complete),
         GroupRecord::Lifecycle(LifecycleEvent {
@@ -228,6 +230,7 @@ fn each_event_is_presented_as_recorded_then_the_end() {
             session_id: 3,
             lane: Lane::ZERO,
             kind: LifecycleKind::ImageAvailable,
+            image: 0,
         }),
         end(5, 0, EndOutcome::Complete),
     ]);
@@ -255,6 +258,7 @@ fn each_event_is_presented_as_recorded_then_the_end() {
                 end_of_stream: false,
                 extension: None,
                 payload: MessagePayload::Bytes(b"hi"),
+                image: 0,
             }
         ),
         format!("{:?} at 20", Event::Timer { timer: TimerId(4) }),
@@ -273,6 +277,7 @@ fn each_event_is_presented_as_recorded_then_the_end() {
                 from: 64,
                 lost_to: 128,
                 resume: 128,
+                image: 0,
             }
         ),
         format!(
@@ -280,6 +285,7 @@ fn each_event_is_presented_as_recorded_then_the_end() {
             Event::Lifecycle {
                 source,
                 kind: LifecycleKind::ImageAvailable,
+                image: 0,
             }
         ),
     ];

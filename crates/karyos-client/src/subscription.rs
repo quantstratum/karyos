@@ -56,6 +56,10 @@ pub struct MessageInfo {
     pub session_id: i32,
     /// The lane of the image it came from.
     pub lane: Lane,
+    /// The registration of the network image it came from, the driver's
+    /// name for that image (ADR-0089): `None` for a stream that is not an
+    /// image of a network subscription. Two images of one alias have two.
+    pub image: Option<u64>,
 }
 
 impl MessageInfo {
@@ -846,6 +850,7 @@ impl<T: TermBytes> ClientSubscription<T> {
                         extension,
                         session_id: inner.buffer().config().session_id,
                         lane: inner.buffer().lane(),
+                        image: None,
                     };
                     if let Some(trace) = &mut self.trace {
                         let decoded = info.trace();

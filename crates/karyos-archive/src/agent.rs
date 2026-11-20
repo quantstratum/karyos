@@ -696,6 +696,11 @@ pub enum AgentError {
     /// A recording group's journal could not be made, recovered or closed.
     #[error(transparent)]
     Journal(#[from] JournalError),
+    /// A recording group's journal already holds network images of an
+    /// earlier run, which this run's could repeat (ADR-0089): the group
+    /// continues in a new journal.
+    #[error("the group journal holds network images of an earlier run")]
+    ImagesOfAnEarlierRun,
     /// A recording group's capture settings cannot work.
     #[error(transparent)]
     Capture(#[from] CaptureError),
@@ -2835,6 +2840,7 @@ impl<D: Disk + Clone> State<D> {
             capture::capture(start.capture, journal, &coverage).map_err(|error| match error {
                 CaptureSetup::Config(error) => AgentError::Capture(error),
                 CaptureSetup::Journal(error) => AgentError::Journal(error),
+                CaptureSetup::ImagesOfAnEarlierRun => AgentError::ImagesOfAnEarlierRun,
             })?;
         let checkpoints = match (store, &start.checkpoints) {
             (Some(store), Some(config)) => {

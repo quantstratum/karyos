@@ -235,6 +235,24 @@ pub fn capture<D: Disk>(
         .reopen_hold()
         .map_err(CaptureSetup::Journal)?
         .unwrap_or(0);
+    // ADR-0089 decision 5: a journal is one run's, so the registrations its
+    // records carry never repeat (one driver incarnation assigns them from
+    // one counter, and a network source is the Gateway's for its life).
+    let mut imaged = false;
+    journal
+        .walk(0, |_, _, record| {
+            imaged |= match record {
+                GroupRecord::Message(message) => message.image != 0,
+                GroupRecord::Lifecycle(event) => event.image != 0,
+                GroupRecord::Loss(loss) => loss.image != 0,
+                _ => false,
+            };
+            !imaged
+        })
+        .map_err(CaptureSetup::Journal)?;
+    if imaged {
+        return Err(CaptureSetup::ImagesOfAnEarlierRun);
+    }
     let recovery =
         prefix::recover(&mut journal, coverage, config.in_flight).map_err(CaptureSetup::Journal)?;
     if recovery.full {
@@ -371,6 +389,13 @@ pub enum CaptureSetup {
     /// The journal could not be read.
     #[error(transparent)]
     Journal(JournalError),
+    /// The journal already holds events of network images (ADR-0089): an
+    /// image's registration is unique within one driver incarnation only,
+    /// and a new capture run may be another's, so its images could repeat
+    /// a registration of the earlier run's and replay would merge them.
+    /// Such a group continues in a new journal.
+    #[error("the journal holds network images of an earlier run")]
+    ImagesOfAnEarlierRun,
 }
 
 /// The journal's capture mode, from its header.

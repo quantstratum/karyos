@@ -122,6 +122,7 @@ fn event_at(
             },
             None => Payload::Inline(&value),
         },
+        image: 0,
     });
     let end = GroupRecord::End(EventEnd {
         group_seq: seq,
@@ -214,7 +215,7 @@ fn events_go_through_the_ring_into_the_journal_and_its_prefixes() {
 fn an_admitted_event_always_fits_the_ring() {
     let none = Recordings::default();
     // A ring of 2048 bytes takes messages of up to 248 bytes: an event of
-    // 108 bytes of records and up to 140 of payload.
+    // 116 bytes of records and up to 132 of payload.
     let (mut sender, mut job) = new(
         Capture::Strict,
         SyncPolicy::PerSegment,
@@ -227,7 +228,7 @@ fn an_admitted_event_always_fits_the_ring() {
     while seq <= 400 {
         match sender.admit() {
             Ok(()) => {
-                let records = event(seq, length % 141, None);
+                let records = event(seq, length % 133, None);
                 assert!(records.len() <= 248, "{}", records.len());
                 sender.send(&records, seq).unwrap();
                 sent += 1;
@@ -707,6 +708,7 @@ fn an_uncaptured_message_is_delivered() {
         end_of_stream: false,
         extension: None,
         payload: Payload::Unavailable { length: 70_000 },
+        image: 0,
     });
     let end = GroupRecord::End(EventEnd {
         group_seq: 1,
@@ -802,8 +804,8 @@ fn a_reference_sent_before_its_recording_ended_and_read_after_is_settled() {
 fn the_credit_is_exact_at_the_boundary() {
     let none = Recordings::default();
     let (mut sender, mut job) = new(Capture::Strict, UNSYNCED, settings(1024, 120, 1024));
-    // 108 bytes of records and 12 of payload: 120, framed 128.
-    let records = |seq| event(seq, 12, None);
+    // 116 bytes of records and 4 of payload: 120, framed 128.
+    let records = |seq| event(seq, 4, None);
     assert_eq!(records(1).len(), 120);
     for seq in 1..=8 {
         sender.admit().unwrap();
@@ -816,10 +818,10 @@ fn the_credit_is_exact_at_the_boundary() {
     sender.send(&records(9), 9).unwrap();
     assert_eq!(sender.admit(), Err(Refusal::RingFull));
     // Drain one more (128 free), then send a smaller event of 120 framed
-    // bytes (4 of payload): 8 free, 128 needed.
+    // bytes (no payload, 116 raw): 8 free, 128 needed.
     assert!(job.duty(0, 1, &none).unwrap());
-    let smaller = event(10, 4, None);
-    assert_eq!(smaller.len(), 112);
+    let smaller = event(10, 0, None);
+    assert_eq!(smaller.len(), 116);
     sender.admit().unwrap();
     sender.send(&smaller, 10).unwrap();
     assert_eq!(sender.admit(), Err(Refusal::RingFull), "8 bytes short");
@@ -1266,4 +1268,48 @@ fn the_uncovered_list_is_reserved_at_start() {
         "{}",
         job.uncovered.capacity()
     );
+}
+
+/// ADR-0089 decision 5 (review of #1090): registrations are unique within
+/// one driver incarnation only, so a capture never continues a journal
+/// that already holds network images: a new run, possibly over a restarted
+/// driver, could repeat a registration and replay would merge two images.
+/// A journal whose events carry no image continues as before.
+#[test]
+fn a_journal_with_network_images_is_not_continued_by_another_run() {
+    let none = Recordings::default();
+    for (image, continued) in [(0u64, true), (7, false)] {
+        let disk = FaultDisk::default();
+        let mut journal = journal(disk.clone(), Capture::Strict, UNSYNCED);
+        let message = GroupRecord::Message(MessageEvent {
+            group_seq: 1,
+            logical_time: 1,
+            incarnation: 1,
+            position: 0,
+            extent: 64,
+            stream_id: 1,
+            session_id: 1,
+            lane: Lane::ZERO,
+            reserved_value: 0,
+            end_of_stream: false,
+            extension: None,
+            payload: Payload::Inline(b"x"),
+            image,
+        });
+        let end = GroupRecord::End(EventEnd {
+            group_seq: 1,
+            observations: 0,
+            outcome: EndOutcome::Complete,
+        });
+        let mut out = vec![0u8; MAX_RECORD];
+        for record in [message, end] {
+            let length = record.encode(&mut out).unwrap();
+            journal.append(&out[..length]).unwrap();
+        }
+        let result = capture(settings(4096, 400, 8), journal, &none);
+        assert_eq!(result.is_ok(), continued, "image {image}");
+        if !continued {
+            assert!(matches!(result, Err(CaptureSetup::ImagesOfAnEarlierRun)));
+        }
+    }
 }

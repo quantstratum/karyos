@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A recording group's journal records, schema 3 version 1, written by hand
+//! A recording group's journal records, schema 3 version 2, written by hand
 //! on the `karyos-codec` runtime (`quantstratum-docs:
 //! karyos/design/recording-group-records.md`, phase 3 batch A7a; SPEC
 //! §8.3, ADR-0024).
@@ -19,6 +19,11 @@
 //! borrows the decoded input; [`GroupRecord::decode`] validates a whole
 //! record before any value exists, and `encode` writes into the caller's
 //! buffer. Nothing allocates.
+//!
+//! Version 2 (ADR-0089, karyos#672) adds `image`, the registration of the
+//! network image a source's event came from (0 for none), at the end of the
+//! message, lifecycle and loss events' blocks. Version 1 records are still
+//! read, as `image` 0; every record is written at version 2.
 
 use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
 use karyos_sys::frame::{FRAME_ALIGNMENT, Lane};
@@ -31,8 +36,11 @@ mod tests;
 /// The recording group schema's id: schema 1 is the Archive's control
 /// schema, and 2 is reserved for Cluster.
 pub const SCHEMA_ID: u16 = 3;
-/// The only version of schema 3.
-pub const VERSION: u16 = 1;
+/// The version of schema 3 this build writes (ADR-0089).
+pub const VERSION: u16 = 2;
+/// The version before image identity, still read: its records decode with
+/// `image` 0.
+pub const VERSION_1: u16 = 1;
 /// The only capture contract version.
 pub const CONTRACT_VERSION: u16 = 1;
 /// The largest inline value: the largest variable field.
@@ -59,17 +67,17 @@ const fn template(template_id: u16, block_length: u16, max_length: u32) -> Templ
 /// `JournalHeader`, template 1.
 pub const JOURNAL_HEADER: Template = template(1, 32, 12 + 32 + 2 + 4096);
 /// `MessageEvent`, template 2.
-pub const MESSAGE_EVENT: Template = template(2, 67, 12 + 67 + 2 + 65_535 + 2 + 64);
+pub const MESSAGE_EVENT: Template = template(2, 75, 12 + 75 + 2 + 65_535 + 2 + 64);
 /// `ConflatedEvent`, template 3.
 pub const CONFLATED_EVENT: Template = template(3, 45, 12 + 45 + 2 + 65_535);
 /// `TimerEvent`, template 4.
 pub const TIMER_EVENT: Template = template(4, 24, 12 + 24);
 /// `LifecycleEvent`, template 5.
-pub const LIFECYCLE_EVENT: Template = template(5, 43, 12 + 43);
+pub const LIFECYCLE_EVENT: Template = template(5, 51, 12 + 51);
 /// `ExternalEvent`, template 6.
 pub const EXTERNAL_EVENT: Template = template(6, 20, 12 + 20 + 2 + 65_535);
 /// `LossEvent`, template 7.
-pub const LOSS_EVENT: Template = template(7, 60, 12 + 60);
+pub const LOSS_EVENT: Template = template(7, 68, 12 + 68);
 /// `OutcomeObservation`, template 11.
 pub const OUTCOME_OBSERVATION: Template = template(11, 59, 12 + 59);
 /// `TimerObservation`, template 12.
@@ -88,12 +96,30 @@ pub const GAP_MARKER: Template = template(21, 17, 12 + 17);
 pub const REFERENCE_UNAVAILABLE: Template = template(22, 16, 12 + 16);
 /// `Checkpoint`, template 30.
 pub const CHECKPOINT: Template = template(30, 40, 12 + 40);
+
+/// `template` as version 1 wrote it: the same, but for the three event
+/// blocks without `image` (8 bytes shorter) and the envelope's version.
+const fn version_1(template: &Template) -> Template {
+    let shorter = matches!(template.template_id, 2 | 5 | 7);
+    let (block_length, max_length) = if shorter {
+        (template.block_length - 8, template.max_length - 8)
+    } else {
+        (template.block_length, template.max_length)
+    };
+    Template {
+        schema_id: SCHEMA_ID,
+        template_id: template.template_id,
+        version: VERSION_1,
+        block_length,
+        max_length,
+    }
+}
 /// A checkpoint record's `position` in a replay's capture: the replay's
 /// digest only, its bytes stored nowhere (A9-2).
 pub const CAPTURE_POSITION: u64 = u64::MAX;
 
 /// The longest record of any template.
-pub const MAX_RECORD: usize = 12 + 67 + 2 + 65_535 + 2 + 64;
+pub const MAX_RECORD: usize = 12 + 75 + 2 + 65_535 + 2 + 64;
 
 fn invalid_enum(field: &'static str, value: impl Into<u64>) -> CodecError {
     CodecError::InvalidEnum {
@@ -350,6 +376,9 @@ pub struct MessageEvent<'a> {
     pub extension: Option<&'a [u8; EXTENSION]>,
     /// The payload.
     pub payload: Payload<'a>,
+    /// The registration of the network image the message came from, 0 for
+    /// none (ADR-0089).
+    pub image: u64,
 }
 
 /// A trace extension's length: `karyos_sys::frame::EXTENSION_LENGTH`.
@@ -377,7 +406,7 @@ fn extent(extent: u32, length: u32) -> Result<u32, CodecError> {
 }
 
 impl<'a> MessageEvent<'a> {
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
+    fn decode(block: Block<'a>, mut decoder: Decoder<'a>, v2: bool) -> Result<Self, CodecError> {
         let recording_id = block.u64(32)?;
         let length = block.u32(48)?;
         let flags = block.u8(66)?;
@@ -438,6 +467,7 @@ impl<'a> MessageEvent<'a> {
             end_of_stream: flags & FLAG_END_OF_STREAM != 0,
             extension,
             payload,
+            image: if v2 { block.u64(67)? } else { 0 },
         })
     }
 
@@ -488,6 +518,7 @@ impl<'a> MessageEvent<'a> {
         encoder.u8(64, self.lane.get())?;
         encoder.u8(65, kind)?;
         encoder.u8(66, flags)?;
+        encoder.u64(67, self.image)?;
         encoder.bytes("value", 0, MAX_INLINE, value)?;
         let extension = self.extension.map_or(&[][..], |extension| &extension[..]);
         encoder.bytes("extension", 0, EXTENSION, extension)?;
@@ -659,10 +690,13 @@ pub struct LifecycleEvent {
     pub lane: Lane,
     /// What happened.
     pub kind: LifecycleKind,
+    /// The registration of the network image the event names, 0 for none
+    /// (ADR-0089).
+    pub image: u64,
 }
 
 impl LifecycleEvent {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+    fn decode(block: Block<'_>, decoder: Decoder<'_>, v2: bool) -> Result<Self, CodecError> {
         decoder.finish()?;
         let reason = block.u8(42)?;
         let kind = match (block.u8(40)?, reason) {
@@ -685,6 +719,7 @@ impl LifecycleEvent {
             session_id: block.i32(36)?,
             lane: lane(block.u8(41)?)?,
             kind,
+            image: if v2 { block.u64(43)? } else { 0 },
         })
     }
 
@@ -712,6 +747,7 @@ impl LifecycleEvent {
         encoder.u8(40, kind)?;
         encoder.u8(41, self.lane.get())?;
         encoder.u8(42, reason)?;
+        encoder.u64(43, self.image)?;
         encoder.finish()
     }
 }
@@ -802,6 +838,9 @@ pub struct LossEvent {
     pub lane: Lane,
     /// What was lost, and how it resolved.
     pub loss: Loss,
+    /// The registration of the network image the loss was on, 0 for none
+    /// (ADR-0089).
+    pub image: u64,
 }
 
 impl OverrunOutcome {
@@ -908,7 +947,7 @@ impl LossEvent {
         Ok(())
     }
 
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+    fn decode(block: Block<'_>, decoder: Decoder<'_>, v2: bool) -> Result<Self, CodecError> {
         decoder.finish()?;
         let (outcome, reason) = (block.u8(58)?, block.u8(59)?);
         let loss = match block.u8(57)? {
@@ -937,6 +976,7 @@ impl LossEvent {
             session_id: block.i32(52)?,
             lane: lane(block.u8(56)?)?,
             loss,
+            image: if v2 { block.u64(60)? } else { 0 },
         };
         event.positions()?;
         Ok(event)
@@ -972,6 +1012,7 @@ impl LossEvent {
         encoder.u8(57, kind)?;
         encoder.u8(58, outcome)?;
         encoder.u8(59, reason)?;
+        encoder.u64(60, self.image)?;
         encoder.finish()
     }
 }
@@ -1930,7 +1971,7 @@ impl<'a> GroupRecord<'a> {
     /// # Errors
     ///
     /// [`CodecError::UnsupportedSchema`] for any tuple but schema 3,
-    /// version 1 and a listed template, and every other [`CodecError`] the
+    /// version 1 or 2 and a listed template, and every other [`CodecError`] the
     /// record's fields can raise.
     pub fn decode(buf: &'a [u8]) -> Result<Self, CodecError> {
         let envelope = Envelope::read(buf)?;
@@ -1939,7 +1980,8 @@ impl<'a> GroupRecord<'a> {
             template: envelope.template_id,
             version: envelope.version,
         };
-        if envelope.schema_id != SCHEMA_ID || envelope.version != VERSION {
+        let v2 = envelope.version == VERSION;
+        if envelope.schema_id != SCHEMA_ID || !(v2 || envelope.version == VERSION_1) {
             return Err(unsupported);
         }
         let template = match envelope.template_id {
@@ -1961,15 +2003,17 @@ impl<'a> GroupRecord<'a> {
             30 => &CHECKPOINT,
             _ => return Err(unsupported),
         };
+        let earlier = version_1(template);
+        let template = if v2 { template } else { &earlier };
         let (block, decoder) = Decoder::new(buf, template)?;
         Ok(match envelope.template_id {
             1 => Self::Header(JournalHeader::decode(block, decoder)?),
-            2 => Self::Message(MessageEvent::decode(block, decoder)?),
+            2 => Self::Message(MessageEvent::decode(block, decoder, v2)?),
             3 => Self::Conflated(ConflatedEvent::decode(block, decoder)?),
             4 => Self::Timer(TimerEvent::decode(block, decoder)?),
-            5 => Self::Lifecycle(LifecycleEvent::decode(block, decoder)?),
+            5 => Self::Lifecycle(LifecycleEvent::decode(block, decoder, v2)?),
             6 => Self::External(ExternalEvent::decode(block, decoder)?),
-            7 => Self::Loss(LossEvent::decode(block, decoder)?),
+            7 => Self::Loss(LossEvent::decode(block, decoder, v2)?),
             11 => Self::Outcome(OutcomeObservation::decode(block, decoder)?),
             12 => Self::TimerOperation(TimerObservation::decode(block, decoder)?),
             13 => Self::ExternalObservation(ExternalObservation::decode(block, decoder)?),
