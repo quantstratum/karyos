@@ -2587,3 +2587,22 @@ fn each_dropped_register_counts_its_reason_once() {
     assert_eq!(counters.dropped_source, 3);
     assert_eq!(counters.dropped_not_allowed, 3);
 }
+
+/// Design 3.5 (MD-6, karyos#917): a multi-destination publication's
+/// `Membership` holds a Pending entry and a member per destination, so
+/// at `max_destinations` 64 its `max_pending` (16 by default) and
+/// `max_receivers` reach 64.
+#[test]
+fn a_multi_destination_membership_holds_every_destination_pending() {
+    let config = AgentConfig {
+        max_destinations: 64,
+        ..AgentConfig::default()
+    };
+    let sender = dynamic_sender_config(&config, 64, &[]);
+    let membership = sender.publications[0].membership().unwrap().config();
+    assert_eq!(membership.max_pending, 64);
+    assert!(membership.max_receivers >= 64);
+    let small = dynamic_sender(4);
+    let membership = small.publications[0].membership().unwrap().config();
+    assert_eq!(membership.max_pending, 16, "the default stays");
+}

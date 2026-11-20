@@ -5493,6 +5493,16 @@ impl<T: StreamTerms> SenderRole<T> {
                 if let Some(roles) = roles.as_deref() {
                     config.strategy = roles.strategy;
                 }
+                // Design 3.5 (MD-6, karyos#917): every destination can
+                // CHALLENGE at once, so a multi-destination publication's
+                // table holds a Pending entry and a member per destination.
+                if let Some(destinations) = outbound
+                    .destination_capacity()
+                    .and_then(|max| u16::try_from(max).ok())
+                {
+                    config.max_pending = config.max_pending.max(destinations);
+                    config.max_receivers = config.max_receivers.max(destinations);
+                }
                 Membership::new(
                     config,
                     publication.identity,
