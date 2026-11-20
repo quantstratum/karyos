@@ -13,12 +13,13 @@ mod support {
 
 use support::abi;
 
-/// 0.1.5: the driver options' stream cap (karyos#818) on 0.1.4's embedded
+/// 0.1.6: `KARYOS_PROTOCOL_VERSION` 4 (karyos#740, the rate change
+/// command) on 0.1.5's driver options' stream cap (karyos#818), 0.1.4's embedded
 /// network (karyos#735), 0.1.3's readiness calls (karyos#794) and 0.1.2's
 /// roles calls (karyos#637).
 #[test]
-fn the_abi_version_is_0_1_5() {
-    assert_eq!(abi::abi_version(), (0, [0, 1, 5]));
+fn the_abi_version_is_0_1_6() {
+    assert_eq!(abi::abi_version(), (0, [0, 1, 6]));
 }
 
 #[test]

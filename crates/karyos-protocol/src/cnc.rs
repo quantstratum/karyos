@@ -35,16 +35,18 @@
 //! | `0x11` | `AddImageSubscription` | sequence | image registration (nonzero) | role as `AddSubscription` | lane as `AddPublication` |
 //! | `0x12` | `AddNetworkPublicationWithRoles` | sequence | stream id as `AddNetworkPublication` | flags as `AddNetworkPublication` | channel URI length |
 //! | `0x13` | `AddNetworkSubscriptionAs` | sequence | stream id as `AddNetworkSubscription` | role as `AddSubscription` | channel URI length |
+//! | `0x14` | `RateChange` | sequence | stream and session as above | expected version | authority, operation id, operator uid, parameters digest, then the policy (see below) |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
-//! | `0x84` | `Error` | client | sequence | code (1 to 18 and 24, see [`ErrorCode`]) | detail |
+//! | `0x84` | `Error` | client | sequence | code (see [`ErrorCode`]) | detail |
 //! | `0x85` | `CounterAllocated` | client | sequence | cell | registration |
 //! | `0x86` | `JournalReady` | client | sequence | journal number | hand-over key |
 //! | `0x87` | `CutoverState` | client | sequence | registration | state: 0 current, 1 successor, 2 fenced, 3 closed |
 //! | `0x88` | `ConflatedReady` | client | sequence | registration | hand-over key |
 //! | `0x89` | `GuardState` | client | sequence | guard | guard word (`karyos_sys::guard`) |
 //! | `0x8A` | `NetworkSubscriptionReady` | client | sequence | registration | bound family, port and scope (see below) |
+//! | `0x8B` | `RateState` | client | sequence | stream and session as `AddPublication` | the policy version after the change |
 //!
 //! `NetworkSubscriptionReady` is exactly six words: client, sequence,
 //! registration, then the subscription's bound local address in words 3
@@ -100,6 +102,40 @@
 //! own caller. The driver answers `GuardState` with the guard's word after
 //! the transition, or `Error` with `UnknownGuard`, `GuardNotClosedAt`
 //! (detail: the current guard word), `GuardExhausted` or `NotAuthorized`.
+//!
+//! `RateChange` and `RateState` (R-CORE-21, karyos#740; admission
+//! [`VERSION`](crate::admission::VERSION) 4; `quantstratum-docs:
+//! karyos/design/guards-and-abort.md`, Rate limit transitions): an
+//! admitted client changes a guarded stream's rate policy from the version
+//! it expects, on the driver's control path. `RateChange` is exactly
+//! eleven words:
+//!
+//! | Word | Meaning |
+//! | --- | --- |
+//! | 0 | sequence |
+//! | 1 | stream id (low 32) and session id (high 32), as `AddPublication` |
+//! | 2 | the policy version the change replaces (compare and set) |
+//! | 3 | authority: 0 the safety path, 1 an administrator; any other value is refused |
+//! | 4 | operation id, for the audit record |
+//! | 5 | operator uid, as `GuardClose` ([`NO_OPERATOR`]: none) |
+//! | 6 | parameters digest, [`rate_parameters`] |
+//! | 7 | messages per second |
+//! | 8 | message burst |
+//! | 9 | bytes per second; 0 for no byte limit |
+//! | 10 | byte burst; 0 exactly when word 9 is 0, else refused |
+//!
+//! A zero message rate or burst decodes: it is the driver's to refuse,
+//! with `RateInvalidPolicy`, as it refuses any policy the stream cannot
+//! take. The authority rests on admission (G1), as `GuardReopen` does: an
+//! admitted client's uid equals the driver's, so the administrator
+//! authority is the driver owner's. The driver answers `RateState`, whose
+//! word 2 is the stream key word the command named (not a registration:
+//! the key is what the client knows and what it named) and word 3 the
+//! policy version after the change (the current one when the policy named
+//! is the one in force), or `Error` with `RateVersionMismatch` (detail:
+//! the current version), `RateNotATightening`, `RateReserveCrossed`,
+//! `RateNotSet`, `RateInvalidPolicy`, `RatePolicyConflict` or
+//! `UnknownStream` (detail: the stream key word).
 //!
 //! The lane word of `AddPublication`, `AddConcurrentPublication` and
 //! `AddSubscription` (`quantstratum-docs: karyos/design/aggregate-ownership.md`,
@@ -349,6 +385,7 @@ const ADD_NETWORK_SUBSCRIPTION: u32 = 0x10;
 const ADD_IMAGE_SUBSCRIPTION: u32 = 0x11;
 const ADD_NETWORK_PUBLICATION_WITH_ROLES: u32 = 0x12;
 const ADD_NETWORK_SUBSCRIPTION_AS: u32 = 0x13;
+const RATE_CHANGE: u32 = 0x14;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -359,6 +396,9 @@ const CUTOVER_STATE: u32 = 0x87;
 const CONFLATED_READY: u32 = 0x88;
 const GUARD_STATE: u32 = 0x89;
 const NETWORK_SUBSCRIPTION_READY: u32 = 0x8A;
+const RATE_STATE: u32 = 0x8B;
+/// Words of an encoded `RateChange`.
+const RATE_CHANGE_WORDS: usize = 11;
 
 /// Whether `epoch` is one a guard can be closed at (`karyos_sys::guard`).
 const fn closed_epoch(epoch: u64) -> bool {
@@ -379,6 +419,7 @@ const CONCURRENT: u64 = 2;
 
 // Every command fits the bound.
 const _: () = assert!(REPORT_LOSS_WORDS * 8 <= MAX_COMMAND_LENGTH);
+const _: () = assert!(RATE_CHANGE_WORDS * 8 <= MAX_COMMAND_LENGTH);
 
 /// Errors decoding or encoding CnC messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -1007,6 +1048,144 @@ pub enum Command {
         /// [`guard_parameters`] of the request, for the audit record.
         parameters: u64,
     },
+    /// Change a guarded stream's rate policy from version `expected`
+    /// (R-CORE-21, local control, G1).
+    RateChange {
+        /// Request sequence.
+        sequence: u64,
+        /// The stream, by key.
+        stream: StreamKey,
+        /// The policy version the change replaces.
+        expected: u64,
+        /// Who changes it.
+        authority: RateAuthority,
+        /// The requester's operation id, for the audit record.
+        operation: u64,
+        /// The operator uid the requester acts for; [`NO_OPERATOR`] for none.
+        operator: u64,
+        /// [`rate_parameters`] of the request, for the audit record.
+        parameters: u64,
+        /// The new policy.
+        policy: karyos_sys::rate_limit::RatePolicy,
+    },
+}
+
+/// Who a `RateChange` asks as (R-CORE-21): word 3 of the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RateAuthority {
+    /// The safety path: only a provable tightening that keeps the control
+    /// reserve. Wire value 0.
+    Safety,
+    /// An administrator: any valid policy above the reserve. Wire value 1.
+    Administrator,
+}
+
+impl RateAuthority {
+    /// The wire value.
+    #[must_use]
+    pub const fn code(self) -> u64 {
+        match self {
+            Self::Safety => 0,
+            Self::Administrator => 1,
+        }
+    }
+
+    /// The authority of wire value `code`; `None` for a reserved value.
+    #[must_use]
+    pub const fn from_code(code: u64) -> Option<Self> {
+        match code {
+            0 => Some(Self::Safety),
+            1 => Some(Self::Administrator),
+            _ => None,
+        }
+    }
+}
+
+/// The four policy words of a `RateChange` (words 7 to 10); `None` for a
+/// byte limit of zero rate or burst, which the wire cannot carry (0 means
+/// no byte limit).
+fn policy_words(policy: &karyos_sys::rate_limit::RatePolicy) -> Option<[u64; 4]> {
+    let (rate, burst) = match policy.bytes {
+        None => (0, 0),
+        Some(bytes) if bytes.per_second != 0 && bytes.burst != 0 => (bytes.per_second, bytes.burst),
+        Some(_) => return None,
+    };
+    Some([
+        policy.messages.per_second,
+        policy.messages.burst,
+        rate,
+        burst,
+    ])
+}
+
+/// The policy of a `RateChange`'s words 7 to 10; `None` when exactly one of
+/// the byte words is zero.
+const fn policy_from(words: [u64; 4]) -> Option<karyos_sys::rate_limit::RatePolicy> {
+    let [messages_rate, messages_burst, bytes_rate, bytes_burst] = words;
+    let bytes = match (bytes_rate, bytes_burst) {
+        (0, 0) => None,
+        (0, _) | (_, 0) => return None,
+        (per_second, burst) => Some(karyos_sys::rate_limit::Rate { per_second, burst }),
+    };
+    Some(karyos_sys::rate_limit::RatePolicy {
+        messages: karyos_sys::rate_limit::Rate {
+            per_second: messages_rate,
+            burst: messages_burst,
+        },
+        bytes,
+    })
+}
+
+/// 64-bit FNV-1a over `words`, each as eight little-endian bytes, then
+/// `tail`.
+fn fnv1a(words: &[u64], tail: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    words
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .chain(tail.iter().copied())
+        .fold(OFFSET, |hash, byte| {
+            // FNV-1a multiplies modulo 2^64 by definition. ADR-0007's rule
+            // against wrapping covers positions, lengths and counters, whose
+            // overflow is an error; a hash has no overflow to report.
+            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
+        })
+}
+
+/// The parameters digest of a `RateChange`: 64-bit FNV-1a, as
+/// [`guard_parameters`], over the stream key word, the expected version,
+/// the authority's wire value, the operation id, the operator word and
+/// the policy's four words (messages per second, message burst, bytes per
+/// second, byte burst; 0 and 0 for no byte limit), each as eight
+/// little-endian bytes. A correlation aid for the audit record, not a
+/// security digest.
+#[must_use]
+pub fn rate_parameters(
+    stream: StreamKey,
+    expected: u64,
+    authority: RateAuthority,
+    operation: u64,
+    operator: u64,
+    policy: &karyos_sys::rate_limit::RatePolicy,
+) -> u64 {
+    let bytes = policy
+        .bytes
+        .map_or((0, 0), |bytes| (bytes.per_second, bytes.burst));
+    fnv1a(
+        &[
+            stream_word(stream),
+            expected,
+            authority.code(),
+            operation,
+            operator,
+            policy.messages.per_second,
+            policy.messages.burst,
+            bytes.0,
+            bytes.1,
+        ],
+        &[],
+    )
 }
 
 /// The operator word of a guard command that acts for no operator: the
@@ -1033,18 +1212,7 @@ pub fn guard_parameters(
     operator: u64,
     reason: &[u8],
 ) -> u64 {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0100_0000_01b3;
-    [guard, expected, operation, operator]
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .chain(reason.iter().copied())
-        .fold(OFFSET, |hash, byte| {
-            // FNV-1a multiplies modulo 2^64 by definition. ADR-0007's rule
-            // against wrapping covers positions, lengths and counters, whose
-            // overflow is an error; a hash has no overflow to report.
-            (hash ^ u64::from(byte)).wrapping_mul(PRIME)
-        })
+    fnv1a(&[guard, expected, operation, operator], reason)
 }
 
 /// The admission state of a network publication, as its sender last
@@ -1360,6 +1528,15 @@ pub enum Response {
         /// Its state.
         state: CutoverState,
     },
+    /// A stream's rate policy version after a `RateChange`.
+    RateState {
+        /// The request.
+        request: RequestId,
+        /// The stream, by the key the command named.
+        stream: StreamKey,
+        /// The policy version after the change.
+        version: u64,
+    },
     /// A guard's state after a `GuardClose` or `GuardReopen`.
     GuardState {
         /// The request.
@@ -1498,6 +1675,7 @@ impl Command {
             Self::AddImageSubscription { .. } => ADD_IMAGE_SUBSCRIPTION,
             Self::AddNetworkPublicationWithRoles { .. } => ADD_NETWORK_PUBLICATION_WITH_ROLES,
             Self::AddNetworkSubscriptionAs { .. } => ADD_NETWORK_SUBSCRIPTION_AS,
+            Self::RateChange { .. } => RATE_CHANGE,
         }
     }
 
@@ -1523,7 +1701,8 @@ impl Command {
             | Self::AddNetworkSubscription { sequence, .. }
             | Self::AddImageSubscription { sequence, .. }
             | Self::AddNetworkPublicationWithRoles { sequence, .. }
-            | Self::AddNetworkSubscriptionAs { sequence, .. } => sequence,
+            | Self::AddNetworkSubscriptionAs { sequence, .. }
+            | Self::RateChange { sequence, .. } => sequence,
         }
     }
 
@@ -1677,6 +1856,41 @@ impl Command {
                 }
                 write_words(
                     &[sequence, guard, expected, operation, operator, parameters],
+                    out,
+                )
+            }
+            Self::RateChange {
+                sequence,
+                stream,
+                expected,
+                authority,
+                operation,
+                operator,
+                parameters,
+                ref policy,
+            } => {
+                let reserved = CncError::Reserved {
+                    type_id: RATE_CHANGE,
+                };
+                if !operator_word(operator) {
+                    return Err(reserved);
+                }
+                let [messages_rate, messages_burst, bytes_rate, bytes_burst] =
+                    policy_words(policy).ok_or(reserved)?;
+                write_words(
+                    &[
+                        sequence,
+                        stream_word(stream),
+                        expected,
+                        authority.code(),
+                        operation,
+                        operator,
+                        parameters,
+                        messages_rate,
+                        messages_burst,
+                        bytes_rate,
+                        bytes_burst,
+                    ],
                     out,
                 )
             }
@@ -1965,6 +2179,38 @@ impl Command {
                     operation,
                     operator,
                     parameters,
+                })
+            }
+            RATE_CHANGE => {
+                let [
+                    sequence,
+                    stream,
+                    expected,
+                    authority,
+                    operation,
+                    operator,
+                    parameters,
+                    messages_rate,
+                    messages_burst,
+                    bytes_rate,
+                    bytes_burst,
+                ] = read_words::<RATE_CHANGE_WORDS>(type_id, bytes)?;
+                let reserved = CncError::Reserved { type_id };
+                let authority = RateAuthority::from_code(authority).ok_or(reserved)?;
+                if !operator_word(operator) {
+                    return Err(reserved);
+                }
+                let policy = policy_from([messages_rate, messages_burst, bytes_rate, bytes_burst])
+                    .ok_or(reserved)?;
+                Ok(Self::RateChange {
+                    sequence,
+                    stream: stream_from(stream),
+                    expected,
+                    authority,
+                    operation,
+                    operator,
+                    parameters,
+                    policy,
                 })
             }
             ADD_NETWORK_PUBLICATION | ADD_NETWORK_SUBSCRIPTION => {
@@ -2383,6 +2629,7 @@ impl Response {
             Self::CutoverState { .. } => CUTOVER_STATE,
             Self::ConflatedReady { .. } => CONFLATED_READY,
             Self::GuardState { .. } => GUARD_STATE,
+            Self::RateState { .. } => RATE_STATE,
             Self::NetworkSubscriptionReady { .. } => NETWORK_SUBSCRIPTION_READY,
         }
     }
@@ -2400,6 +2647,7 @@ impl Response {
             | Self::CutoverState { request, .. }
             | Self::ConflatedReady { request, .. }
             | Self::GuardState { request, .. }
+            | Self::RateState { request, .. }
             | Self::NetworkSubscriptionReady { request, .. } => request,
         }
     }
@@ -2499,6 +2747,19 @@ impl Response {
                     karyos_sys::guard::encode(state).ok_or(CncError::Reserved {
                         type_id: GUARD_STATE,
                     })?,
+                ],
+                out,
+            ),
+            Self::RateState {
+                request,
+                stream,
+                version,
+            } => write_words(
+                &[
+                    request.client,
+                    request.sequence,
+                    stream_word(stream),
+                    version,
                 ],
                 out,
             ),
@@ -2608,6 +2869,14 @@ impl Response {
                     request: RequestId { client, sequence },
                     guard,
                     state,
+                })
+            }
+            RATE_STATE => {
+                let [client, sequence, stream, version] = read_words::<4>(type_id, bytes)?;
+                Ok(Self::RateState {
+                    request: RequestId { client, sequence },
+                    stream: stream_from(stream),
+                    version,
                 })
             }
             _ => Err(CncError::UnknownType { type_id }),
@@ -3092,7 +3361,7 @@ mod tests {
     #[test]
     fn an_unknown_response_or_event_type_is_a_typed_decode_error() {
         let bytes = [0u8; 16];
-        for type_id in [NETWORK_SUBSCRIPTION_READY + 1, ADD_IMAGE_SUBSCRIPTION] {
+        for type_id in [RATE_STATE + 1, ADD_IMAGE_SUBSCRIPTION] {
             assert_eq!(
                 Response::decode(type_id, &bytes),
                 Err(CncError::UnknownType { type_id })
@@ -4433,7 +4702,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(0x14, &out[..length]),
+            Command::decode(RATE_CHANGE + 1, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         // A lane word of 4 or more, or with any bit above the lane, is
@@ -5069,6 +5338,236 @@ mod journal_tests {
         assert_eq!(ErrorCode::from_wire(u64::MAX), None);
     }
 
+    fn rate_change(policy: karyos_sys::rate_limit::RatePolicy) -> Command {
+        let stream = StreamKey {
+            stream_id: -2,
+            session_id: 7,
+        };
+        Command::RateChange {
+            sequence: 9,
+            stream,
+            expected: 3,
+            authority: RateAuthority::Administrator,
+            operation: 41,
+            operator: 1000,
+            parameters: rate_parameters(stream, 3, RateAuthority::Administrator, 41, 1000, &policy),
+            policy,
+        }
+    }
+
+    fn rate_policy(
+        messages: (u64, u64),
+        bytes: Option<(u64, u64)>,
+    ) -> karyos_sys::rate_limit::RatePolicy {
+        karyos_sys::rate_limit::RatePolicy {
+            messages: karyos_sys::rate_limit::Rate {
+                per_second: messages.0,
+                burst: messages.1,
+            },
+            bytes: bytes
+                .map(|(per_second, burst)| karyos_sys::rate_limit::Rate { per_second, burst }),
+        }
+    }
+
+    /// karyos#740: `RateChange` is type 0x14, eleven words in the
+    /// documented order, and round trips with and without a byte limit.
+    #[test]
+    fn a_rate_change_round_trips_word_for_word() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        for (policy, bytes) in [
+            (rate_policy((100, 10), None), [0, 0]),
+            (rate_policy((100, 10), Some((4096, 2048))), [4096, 2048]),
+        ] {
+            let command = rate_change(policy);
+            assert_eq!(command.type_id(), 0x14);
+            assert_eq!(command.sequence(), 9);
+            let length = command.encode(&mut out).unwrap();
+            assert_eq!(length, 88);
+            let Command::RateChange { parameters, .. } = command else {
+                unreachable!()
+            };
+            let stream_word = u64::from((-2i32).cast_unsigned()) | (7 << 32);
+            assert_eq!(
+                words_of(&out[..length]),
+                [
+                    9,
+                    stream_word,
+                    3,
+                    1,
+                    41,
+                    1000,
+                    parameters,
+                    100,
+                    10,
+                    bytes[0],
+                    bytes[1]
+                ]
+            );
+            assert_eq!(Command::decode(0x14, &out[..length]), Ok(command));
+        }
+    }
+
+    /// karyos#740: a reserved authority, an operator word no uid can be, or
+    /// a byte limit with one zero word is refused at decode; a policy the
+    /// wire cannot carry is refused at encode; a wrong length is refused.
+    #[test]
+    fn a_rate_change_refuses_reserved_values() {
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let command = rate_change(rate_policy((100, 10), Some((4096, 2048))));
+        let length = command.encode(&mut out).unwrap();
+        let reserved: Result<Command, CncError> = Err(CncError::Reserved { type_id: 0x14 });
+        let refused: Result<usize, CncError> = Err(CncError::Reserved { type_id: 0x14 });
+        let with = |word: usize, value: u64| {
+            let mut bytes = out;
+            bytes[word * 8..word * 8 + 8].copy_from_slice(&value.to_le_bytes());
+            bytes
+        };
+        for authority in [2, 3, u64::MAX] {
+            assert_eq!(
+                Command::decode(0x14, &with(3, authority)[..length]),
+                reserved
+            );
+        }
+        assert!(matches!(
+            Command::decode(0x14, &with(3, 0)[..length]),
+            Ok(Command::RateChange {
+                authority: RateAuthority::Safety,
+                ..
+            })
+        ));
+        for operator in [u64::from(u32::MAX) + 1, NO_OPERATOR - 1] {
+            assert_eq!(
+                Command::decode(0x14, &with(5, operator)[..length]),
+                reserved
+            );
+        }
+        assert_eq!(Command::decode(0x14, &with(9, 0)[..length]), reserved);
+        assert_eq!(Command::decode(0x14, &with(10, 0)[..length]), reserved);
+        // Both zero: no byte limit.
+        let mut none = with(9, 0);
+        none[80..88].copy_from_slice(&0u64.to_le_bytes());
+        assert!(matches!(
+            Command::decode(0x14, &none[..length]),
+            Ok(Command::RateChange {
+                policy: karyos_sys::rate_limit::RatePolicy { bytes: None, .. },
+                ..
+            })
+        ));
+        // A zero message rate decodes: the driver refuses it.
+        assert!(Command::decode(0x14, &with(7, 0)[..length]).is_ok());
+        for short in [length - 8, length + 8] {
+            assert!(matches!(
+                Command::decode(0x14, &out[..short]),
+                Err(CncError::WrongLength { .. })
+            ));
+        }
+        for bytes in [(0, 2048), (4096, 0)] {
+            assert_eq!(
+                rate_change(rate_policy((100, 10), Some(bytes))).encode(&mut out),
+                refused
+            );
+        }
+        let Command::RateChange { policy, .. } = command else {
+            unreachable!()
+        };
+        let bad = Command::RateChange {
+            sequence: 1,
+            stream: StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            expected: 1,
+            authority: RateAuthority::Safety,
+            operation: 1,
+            operator: u64::from(u32::MAX) + 1,
+            parameters: 0,
+            policy,
+        };
+        assert_eq!(bad.encode(&mut out), refused);
+        assert_eq!(RateAuthority::from_code(2), None);
+    }
+
+    /// karyos#740: `RateState` is type 0x8B, four words: client, sequence,
+    /// the stream key word and the version.
+    #[test]
+    fn a_rate_state_round_trips_word_for_word() {
+        let state = Response::RateState {
+            request: RequestId {
+                client: 4,
+                sequence: 9,
+            },
+            stream: StreamKey {
+                stream_id: 2,
+                session_id: 1,
+            },
+            version: 5,
+        };
+        assert_eq!(state.type_id(), 0x8B);
+        let mut out = [0u8; MAX_RESPONSE_LENGTH];
+        let length = state.encode(&mut out).unwrap();
+        assert_eq!(words_of(&out[..length]), [4, 9, 2 | (1 << 32), 5]);
+        assert_eq!(Response::decode(0x8B, &out[..length]), Ok(state));
+        assert!(matches!(
+            Response::decode(0x8B, &out[..length - 8]),
+            Err(CncError::WrongLength { .. })
+        ));
+    }
+
+    /// The rate parameters digest binds every field asked: changing any one
+    /// changes it.
+    #[test]
+    fn the_rate_digest_covers_every_field() {
+        let stream = StreamKey {
+            stream_id: 2,
+            session_id: 1,
+        };
+        let policy = rate_policy((100, 10), Some((4096, 2048)));
+        let base = rate_parameters(stream, 3, RateAuthority::Safety, 41, NO_OPERATOR, &policy);
+        let other_stream = StreamKey {
+            session_id: stream.session_id + 1,
+            ..stream
+        };
+        for digest in [
+            rate_parameters(
+                other_stream,
+                3,
+                RateAuthority::Safety,
+                41,
+                NO_OPERATOR,
+                &policy,
+            ),
+            rate_parameters(stream, 4, RateAuthority::Safety, 41, NO_OPERATOR, &policy),
+            rate_parameters(
+                stream,
+                3,
+                RateAuthority::Administrator,
+                41,
+                NO_OPERATOR,
+                &policy,
+            ),
+            rate_parameters(stream, 3, RateAuthority::Safety, 42, NO_OPERATOR, &policy),
+            rate_parameters(stream, 3, RateAuthority::Safety, 41, 0, &policy),
+            rate_parameters(
+                stream,
+                3,
+                RateAuthority::Safety,
+                41,
+                NO_OPERATOR,
+                &rate_policy((100, 10), None),
+            ),
+            rate_parameters(
+                stream,
+                3,
+                RateAuthority::Safety,
+                41,
+                NO_OPERATOR,
+                &rate_policy((100, 11), Some((4096, 2048))),
+            ),
+        ] {
+            assert_ne!(digest, base);
+        }
+    }
+
     /// The operator word is a uid, root's 0 included, or NO_OPERATOR; a
     /// word no uid can be is refused both ways.
     #[test]
@@ -5323,6 +5822,7 @@ mod properties {
             ADD_NETWORK_PUBLICATION,
             ADD_NETWORK_SUBSCRIPTION,
             ADD_IMAGE_SUBSCRIPTION,
+            RATE_CHANGE,
         ],
     };
 
@@ -5342,6 +5842,7 @@ mod properties {
             CONFLATED_READY,
             GUARD_STATE,
             NETWORK_SUBSCRIPTION_READY,
+            RATE_STATE,
         ],
     };
 
@@ -5776,6 +6277,42 @@ mod properties {
                         }
                     }
                 ),
+            (
+                any::<(u64, u64, u64, u64)>(),
+                stream(),
+                any::<bool>(),
+                prop_oneof![Just(NO_OPERATOR), (0..=u64::from(u32::MAX))],
+                any::<(u64, u64)>(),
+                prop::option::of((1..=u64::MAX, 1..=u64::MAX)),
+            )
+                .prop_map(
+                    |(
+                        (sequence, expected, operation, parameters),
+                        stream,
+                        administrator,
+                        operator,
+                        (per_second, burst),
+                        bytes,
+                    )| Command::RateChange {
+                        sequence,
+                        stream,
+                        expected,
+                        authority: if administrator {
+                            RateAuthority::Administrator
+                        } else {
+                            RateAuthority::Safety
+                        },
+                        operation,
+                        operator,
+                        parameters,
+                        policy: karyos_sys::rate_limit::RatePolicy {
+                            messages: karyos_sys::rate_limit::Rate { per_second, burst },
+                            bytes: bytes.map(|(per_second, burst)| {
+                                karyos_sys::rate_limit::Rate { per_second, burst }
+                            }),
+                        },
+                    }
+                ),
         ]
     }
 
@@ -5891,6 +6428,13 @@ mod properties {
                     request,
                     registration,
                     bound,
+                }
+            }),
+            (request(), stream(), any::<u64>()).prop_map(|(request, stream, version)| {
+                Response::RateState {
+                    request,
+                    stream,
+                    version,
                 }
             }),
         ]

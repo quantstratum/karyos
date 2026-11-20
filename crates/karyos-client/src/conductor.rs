@@ -122,6 +122,11 @@ pub enum ConductorError {
     /// (open) epoch, or one above `karyos_sys::guard::MAX_EPOCH`.
     #[error("not a closed guard epoch")]
     InvalidGuardEpoch,
+    /// A rate change names a byte limit with a zero rate or burst, which
+    /// the command cannot carry: its byte words are 0 only for no byte
+    /// limit (karyos#740).
+    #[error("a byte limit with a zero rate or burst")]
+    InvalidRatePolicy,
 }
 
 /// The operator word of a guard command for `operator`.
@@ -192,6 +197,15 @@ pub enum Outcome<T: TermBytes = HeapTerms> {
         guard: u64,
         /// Its state after the transition.
         state: karyos_sys::guard::GuardState,
+    },
+    /// A guarded stream's rate policy version after a rate change
+    /// (R-CORE-21, karyos#740): the new version, or the current one when
+    /// the policy named is the one in force.
+    RateState {
+        /// The stream, by the key the request named.
+        stream: karyos_protocol::cnc::StreamKey,
+        /// The policy version.
+        version: u64,
     },
     /// The command succeeded.
     Succeeded,
@@ -394,6 +408,8 @@ enum Kind {
     QueryCutover,
     /// A guard close or reopen (M10).
     Guard,
+    /// A rate policy change (R-CORE-21, karyos#740).
+    RateChange,
 }
 
 impl Kind {
@@ -1454,6 +1470,57 @@ impl<T: TermBytes> ClientConductor<T> {
         })
     }
 
+    /// Changes the rate policy of the guarded stream `stream` from version
+    /// `expected` to `policy` (R-CORE-21, karyos#740; `quantstratum-docs:
+    /// karyos/design/guards-and-abort.md`, Rate limit transitions), under
+    /// `authority`: the safety path takes only a provable tightening that
+    /// keeps the control reserve, an administrator any valid policy above
+    /// it. The client acts for itself, or for operator `operator` (a uid;
+    /// `None`, sent as `NO_OPERATOR`, for none). The driver audits it with
+    /// `operation`, the client (and the operator) and the request's
+    /// digest, `karyos_protocol::cnc::rate_parameters`. Returns the request
+    /// sequence. It completes as [`Outcome::RateState`] with the version
+    /// after the change, or is refused with `RateVersionMismatch` (detail:
+    /// the current version), `RateNotATightening`, `RateReserveCrossed`,
+    /// `RateNotSet`, `RateInvalidPolicy`, `RatePolicyConflict` or
+    /// `UnknownStream`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConductorError::InvalidRatePolicy`] for a byte limit with
+    /// a zero rate or burst, and the other [`ConductorError`]s of a
+    /// submission; nothing is submitted on error.
+    pub fn rate_change(
+        &mut self,
+        stream: karyos_protocol::cnc::StreamKey,
+        expected: u64,
+        policy: karyos_sys::rate_limit::RatePolicy,
+        authority: karyos_protocol::cnc::RateAuthority,
+        operation: u64,
+        operator: Option<u32>,
+    ) -> Result<u64, ConductorError> {
+        if policy
+            .bytes
+            .is_some_and(|bytes| bytes.per_second == 0 || bytes.burst == 0)
+        {
+            return Err(ConductorError::InvalidRatePolicy);
+        }
+        let operator = operator_word(operator);
+        let parameters = karyos_protocol::cnc::rate_parameters(
+            stream, expected, authority, operation, operator, &policy,
+        );
+        self.submit(Kind::RateChange, None, |sequence| Command::RateChange {
+            sequence,
+            stream,
+            expected,
+            authority,
+            operation,
+            operator,
+            parameters,
+            policy,
+        })
+    }
+
     /// Loss reports of this client's subscriptions dropped because the
     /// queue was full: the local count, complete whether or not the client
     /// counter `loss reports dropped` could be allocated.
@@ -2010,6 +2077,12 @@ impl<T: TermBytes> ClientConductor<T> {
             (Kind::Guard, Response::GuardState { guard, state, .. }) => {
                 Outcome::GuardState { guard, state }
             }
+            (
+                Kind::RateChange,
+                Response::RateState {
+                    stream, version, ..
+                },
+            ) => Outcome::RateState { stream, version },
             (
                 Kind::AddNetworkSubscription,
                 Response::NetworkSubscriptionReady {

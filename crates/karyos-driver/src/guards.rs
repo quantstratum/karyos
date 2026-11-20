@@ -437,15 +437,30 @@ impl Guards {
     pub(crate) fn audit_rate(
         &mut self,
         handle: GuardHandle,
-        (before, after): (u64, u64),
-        (operation, requester, authority): (u64, Requester, RateAuthority),
+        versions: (u64, u64),
+        asked: (u64, Requester, RateAuthority),
         result: Result<(), &DriverError>,
         time: u64,
     ) {
-        let parameters = match authority {
+        self.audit_rate_with(handle, versions, asked, result, (time, None));
+    }
+
+    /// [`Self::audit_rate`] with the command's parameters digest, when a
+    /// `RateChange` gave one (karyos#740): the record carries it as given,
+    /// as a guard command's; without one it carries the authority's code,
+    /// 1 the safety path and 2 an administrator.
+    pub(crate) fn audit_rate_with(
+        &mut self,
+        handle: GuardHandle,
+        (before, after): (u64, u64),
+        (operation, requester, authority): (u64, Requester, RateAuthority),
+        result: Result<(), &DriverError>,
+        (time, digest): (u64, Option<u64>),
+    ) {
+        let parameters = digest.unwrap_or(match authority {
             RateAuthority::Safety => 1,
             RateAuthority::Administrator => 2,
-        };
+        });
         let outcome = match result {
             Ok(()) if before == after => AuditOutcome::RateUnchanged { authority },
             Ok(()) => AuditOutcome::RateChanged { authority },

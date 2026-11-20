@@ -274,6 +274,139 @@ fn a_remote_client_closes_and_reopens_a_guard_for_an_operator() {
     serve_until(&mut driver, |driver| driver.clients() == 0);
 }
 
+/// karyos#740 (R-CORE-21): a remote client changes a guarded stream's rate
+/// policy over the control path. A tightening on the safety path and a
+/// loosening by an administrator complete as the new version; a stale
+/// version is refused with the current one; a byte limit the command
+/// cannot carry is refused before sending; the driver audits the client,
+/// the operator and the request's digest.
+#[test]
+fn a_remote_client_changes_a_rate_policy_by_version() {
+    use karyos_driver::guards::Requester;
+    use karyos_driver::{AuditOutcome, GuardRate, RateAuthority};
+    use karyos_protocol::cnc::{NO_OPERATOR, RateAuthority as Wire, rate_parameters};
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+    let dir = dir("rate-change");
+    let mut driver = system_driver(&dir);
+    let stream = driver.add_stream(shared_stream_config()).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let policy = |per_second, burst| RatePolicy {
+        messages: Rate { per_second, burst },
+        bytes: None,
+    };
+    driver
+        .guard_stream(
+            stream,
+            guard,
+            4,
+            Some(GuardRate::publication(policy(100, 10))),
+        )
+        .unwrap();
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let id = client.client();
+    let complete = |driver: &mut IpcDriver, client: &mut RemoteClient, sequence: u64| {
+        let mut done: Vec<Completion> = Vec::new();
+        let start = Instant::now();
+        while done.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(5), "timed out");
+            let _ = driver.do_work().unwrap();
+            let _ = client.poll(usize::MAX, |completion| done.push(completion));
+        }
+        assert_eq!(done[0].sequence, sequence);
+        done.remove(0).outcome
+    };
+    let key = StreamKey {
+        stream_id: 2,
+        session_id: 1,
+    };
+    let sequence = client
+        .rate_change(key, 1, policy(50, 10), Wire::Safety, 60, Some(1000))
+        .unwrap();
+    assert!(matches!(
+        complete(&mut driver, &mut client, sequence),
+        Outcome::RateState { stream, version: 2 } if stream == key
+    ));
+    let sequence = client
+        .rate_change(key, 1, policy(40, 10), Wire::Safety, 61, None)
+        .unwrap();
+    assert!(matches!(
+        complete(&mut driver, &mut client, sequence),
+        Outcome::Refused {
+            code: ErrorCode::RateVersionMismatch,
+            detail: 2
+        }
+    ));
+    let sequence = client
+        .rate_change(key, 2, policy(200, 20), Wire::Administrator, 62, None)
+        .unwrap();
+    assert!(matches!(
+        complete(&mut driver, &mut client, sequence),
+        Outcome::RateState { version: 3, .. }
+    ));
+    let mut zero_bytes = policy(10, 10);
+    zero_bytes.bytes = Some(Rate {
+        per_second: 0,
+        burst: 4096,
+    });
+    assert_eq!(
+        client.rate_change(key, 3, zero_bytes, Wire::Administrator, 63, None),
+        Err(karyos_client::ConductorError::InvalidRatePolicy)
+    );
+    let audit: Vec<_> = driver
+        .guard_audit()
+        .records
+        .iter()
+        .map(|record| {
+            (
+                record.operation,
+                record.requester,
+                record.outcome,
+                record.parameters,
+            )
+        })
+        .collect();
+    let operator = Requester::Operator {
+        client: id,
+        uid: 1000,
+    };
+    assert_eq!(
+        audit,
+        [
+            (
+                60,
+                operator,
+                AuditOutcome::RateChanged {
+                    authority: RateAuthority::Safety
+                },
+                rate_parameters(key, 1, Wire::Safety, 60, 1000, &policy(50, 10))
+            ),
+            (
+                61,
+                Requester::Client(id),
+                AuditOutcome::Refused(ErrorCode::RateVersionMismatch),
+                rate_parameters(key, 1, Wire::Safety, 61, NO_OPERATOR, &policy(40, 10))
+            ),
+            (
+                62,
+                Requester::Client(id),
+                AuditOutcome::RateChanged {
+                    authority: RateAuthority::Administrator
+                },
+                rate_parameters(
+                    key,
+                    2,
+                    Wire::Administrator,
+                    62,
+                    NO_OPERATOR,
+                    &policy(200, 20)
+                )
+            ),
+        ]
+    );
+    drop(client);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+}
+
 /// A remote client maps the client counters region writable: a counter it
 /// writes is read by the driver, and while it lives the client does not
 /// send `Leave`, so its cell stays charged; once it is gone, `Leave`
@@ -380,12 +513,23 @@ fn hellos_that_break_the_profile_are_refused() {
     );
     // Version 2, an alpha.2 client's (karyos#637: version 3 since the
     // roles commands).
-    assert_eq!(VERSION, 3);
+    assert_eq!(VERSION, 4);
     assert_eq!(
         raw_hello(
             &mut driver,
             &dir,
             &encode(&Message::Hello { version: 2 }),
+            Some(&own)
+        ),
+        refused(refusal::INCOMPATIBLE_VERSION)
+    );
+    // Version 3, an alpha.3 client's (karyos#740: version 4 since the rate
+    // change command).
+    assert_eq!(
+        raw_hello(
+            &mut driver,
+            &dir,
+            &encode(&Message::Hello { version: 3 }),
             Some(&own)
         ),
         refused(refusal::INCOMPATIBLE_VERSION)
@@ -397,7 +541,7 @@ fn hellos_that_break_the_profile_are_refused() {
     );
     assert_eq!(driver.clients(), 0);
     // Each refusal reached the error log, keyed by its code: three
-    // profile refusals and three version refusals (P7 o3).
+    // profile refusals and four version refusals (P7 o3).
     let mut occurrences = std::collections::HashMap::new();
     let _ = driver.error_log().scan(&mut 0, |record| {
         assert_eq!(
@@ -409,7 +553,7 @@ fn hellos_that_break_the_profile_are_refused() {
     assert_eq!(occurrences.get(&[0, refusal::PROFILE]), Some(&3));
     assert_eq!(
         occurrences.get(&[0, refusal::INCOMPATIBLE_VERSION]),
-        Some(&3)
+        Some(&4)
     );
     assert_eq!(occurrences.len(), 2);
 }
