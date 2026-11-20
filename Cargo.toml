@@ -20,6 +20,7 @@ members = [
     "crates/karyos-bench",
     "crates/karyos-agent",
     "crates/karyos-control",
+    "crates/karyos-tiering",
 ]
 # Every member but the control-plane component (karyos#708): the default
 # build and its graph are unchanged by it (the agent HTTP stack's admission

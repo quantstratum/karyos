@@ -9,9 +9,11 @@
       "crypto-common v0.2.2",
       "curve25519-dalek v5.0.0",
       "digest v0.11.3",
+      "displaydoc v0.2.7",
       "ed25519 v3.0.0",
       "ed25519-dalek v3.0.0",
       "errno v0.3.14",
+      "form_urlencoded v1.2.2",
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
@@ -22,13 +24,27 @@
       "hybrid-array v0.4.15",
       "hyper v1.12.0",
       "hyper-util v0.1.21",
+      "icu_collections v2.4.0",
+      "icu_locale_core v2.4.0",
+      "icu_normalizer v2.4.0",
+      "icu_normalizer_data v2.4.0",
+      "icu_properties v2.4.0",
+      "icu_properties_data v2.4.0",
+      "icu_provider v2.4.0",
+      "idna v1.1.0",
+      "idna_adapter v1.2.2",
       "itoa v1.0.18",
+      "jiff v0.2.43",
+      "jiff-core v0.1.5",
       "lazy_static v1.5.1",
       "libc v0.2.190",
+      "litemap v0.8.3",
       "memchr v2.8.3",
       "mio v1.2.5",
       "once_cell v1.21.4",
+      "percent-encoding v2.3.2",
       "pin-project-lite v0.2.17",
+      "potential_utf v0.1.6",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
       "rustc_version v0.4.1",
@@ -36,6 +52,7 @@
       "rustls-graviola v0.4.0",
       "rustls-pki-types v1.16.0",
       "rustls-webpki v0.103.17",
+      "rusty-s3 v0.11.0",
       "semver v1.0.28",
       "serde v1.0.229",
       "serde_core v1.0.229",
@@ -49,11 +66,14 @@
       "signature v3.0.0",
       "smallvec v1.16.3",
       "socket2 v0.6.5",
+      "stable_deref_trait v1.2.1",
       "subtle v2.6.1",
       "syn v3.0.8",
+      "synstructure v0.14.0",
       "thiserror v2.0.21",
       "thiserror-impl v2.0.21",
       "thread_local v1.1.10",
+      "tinystr v0.8.5",
       "tokio v1.54.1",
       "tokio-rustls v0.26.6",
       "toml v1.1.8+spec-1.1.0",
@@ -66,9 +86,20 @@
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
       "untrusted v0.9.0",
+      "url v2.5.8",
+      "utf8_iter v1.1.0",
+      "utf_types v1.0.0",
       "want v0.3.2",
       "winnow v1.0.4",
+      "writeable v0.6.4",
+      "yoke v0.8.4",
+      "yoke-derive v0.8.4",
+      "zerofrom v0.1.8",
+      "zerofrom-derive v0.1.8",
       "zeroize v1.9.2",
+      "zerotrie v0.2.5",
+      "zerovec v0.11.9",
+      "zerovec-derive v0.11.7",
       "zmij v1.0.23"
     ],
     "aarch64-unknown-linux-gnu": [
@@ -81,9 +112,11 @@
       "crypto-common v0.2.2",
       "curve25519-dalek v5.0.0",
       "digest v0.11.3",
+      "displaydoc v0.2.7",
       "ed25519 v3.0.0",
       "ed25519-dalek v3.0.0",
       "errno v0.3.14",
+      "form_urlencoded v1.2.2",
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
@@ -94,14 +127,28 @@
       "hybrid-array v0.4.15",
       "hyper v1.12.0",
       "hyper-util v0.1.21",
+      "icu_collections v2.4.0",
+      "icu_locale_core v2.4.0",
+      "icu_normalizer v2.4.0",
+      "icu_normalizer_data v2.4.0",
+      "icu_properties v2.4.0",
+      "icu_properties_data v2.4.0",
+      "icu_provider v2.4.0",
+      "idna v1.1.0",
+      "idna_adapter v1.2.2",
       "itoa v1.0.18",
+      "jiff v0.2.43",
+      "jiff-core v0.1.5",
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "linux-raw-sys v0.12.1",
+      "litemap v0.8.3",
       "memchr v2.8.3",
       "mio v1.2.5",
       "once_cell v1.21.4",
+      "percent-encoding v2.3.2",
       "pin-project-lite v0.2.17",
+      "potential_utf v0.1.6",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
       "rustc_version v0.4.1",
@@ -110,6 +157,7 @@
       "rustls-graviola v0.4.0",
       "rustls-pki-types v1.16.0",
       "rustls-webpki v0.103.17",
+      "rusty-s3 v0.11.0",
       "semver v1.0.28",
       "serde v1.0.229",
       "serde_core v1.0.229",
@@ -123,11 +171,14 @@
       "signature v3.0.0",
       "smallvec v1.16.3",
       "socket2 v0.6.5",
+      "stable_deref_trait v1.2.1",
       "subtle v2.6.1",
       "syn v3.0.8",
+      "synstructure v0.14.0",
       "thiserror v2.0.21",
       "thiserror-impl v2.0.21",
       "thread_local v1.1.10",
+      "tinystr v0.8.5",
       "tokio v1.54.1",
       "tokio-rustls v0.26.6",
       "toml v1.1.8+spec-1.1.0",
@@ -140,9 +191,20 @@
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
       "untrusted v0.9.0",
+      "url v2.5.8",
+      "utf8_iter v1.1.0",
+      "utf_types v1.0.0",
       "want v0.3.2",
       "winnow v1.0.4",
+      "writeable v0.6.4",
+      "yoke v0.8.4",
+      "yoke-derive v0.8.4",
+      "zerofrom v0.1.8",
+      "zerofrom-derive v0.1.8",
       "zeroize v1.9.2",
+      "zerotrie v0.2.5",
+      "zerovec v0.11.9",
+      "zerovec-derive v0.11.7",
       "zmij v1.0.23"
     ],
     "x86_64-unknown-linux-gnu": [
@@ -156,9 +218,11 @@
       "curve25519-dalek v5.0.0",
       "curve25519-dalek-derive v0.1.1",
       "digest v0.11.3",
+      "displaydoc v0.2.7",
       "ed25519 v3.0.0",
       "ed25519-dalek v3.0.0",
       "errno v0.3.14",
+      "form_urlencoded v1.2.2",
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
@@ -169,14 +233,28 @@
       "hybrid-array v0.4.15",
       "hyper v1.12.0",
       "hyper-util v0.1.21",
+      "icu_collections v2.4.0",
+      "icu_locale_core v2.4.0",
+      "icu_normalizer v2.4.0",
+      "icu_normalizer_data v2.4.0",
+      "icu_properties v2.4.0",
+      "icu_properties_data v2.4.0",
+      "icu_provider v2.4.0",
+      "idna v1.1.0",
+      "idna_adapter v1.2.2",
       "itoa v1.0.18",
+      "jiff v0.2.43",
+      "jiff-core v0.1.5",
       "lazy_static v1.5.1",
       "libc v0.2.190",
       "linux-raw-sys v0.12.1",
+      "litemap v0.8.3",
       "memchr v2.8.3",
       "mio v1.2.5",
       "once_cell v1.21.4",
+      "percent-encoding v2.3.2",
       "pin-project-lite v0.2.17",
+      "potential_utf v0.1.6",
       "proc-macro2 v1.0.107",
       "quote v1.0.47",
       "rustc_version v0.4.1",
@@ -185,6 +263,7 @@
       "rustls-graviola v0.4.0",
       "rustls-pki-types v1.16.0",
       "rustls-webpki v0.103.17",
+      "rusty-s3 v0.11.0",
       "semver v1.0.28",
       "serde v1.0.229",
       "serde_core v1.0.229",
@@ -198,12 +277,15 @@
       "signature v3.0.0",
       "smallvec v1.16.3",
       "socket2 v0.6.5",
+      "stable_deref_trait v1.2.1",
       "subtle v2.6.1",
       "syn v2.0.119",
       "syn v3.0.8",
+      "synstructure v0.14.0",
       "thiserror v2.0.21",
       "thiserror-impl v2.0.21",
       "thread_local v1.1.10",
+      "tinystr v0.8.5",
       "tokio v1.54.1",
       "tokio-rustls v0.26.6",
       "toml v1.1.8+spec-1.1.0",
@@ -216,9 +298,20 @@
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
       "untrusted v0.9.0",
+      "url v2.5.8",
+      "utf8_iter v1.1.0",
+      "utf_types v1.0.0",
       "want v0.3.2",
       "winnow v1.0.4",
+      "writeable v0.6.4",
+      "yoke v0.8.4",
+      "yoke-derive v0.8.4",
+      "zerofrom v0.1.8",
+      "zerofrom-derive v0.1.8",
       "zeroize v1.9.2",
+      "zerotrie v0.2.5",
+      "zerovec v0.11.9",
+      "zerovec-derive v0.11.7",
       "zmij v1.0.23"
     ]
   },
@@ -1053,6 +1146,65 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_collections@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_locale_core@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_properties@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_provider@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tinystr@0.8.5",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerotrie@0.2.5",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#displaydoc@0.2.7",
+      "license": "MIT OR Apache-2.0",
+      "name": "displaydoc",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.7"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@3.0.0",
           "kind": "normal",
           "target": null,
@@ -1259,6 +1411,35 @@
       "build_script": false,
       "edges": [
         {
+          "features": [
+            "alloc"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#form_urlencoded@1.2.2",
+      "license": "MIT OR Apache-2.0",
+      "name": "form_urlencoded",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.2.2"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#hyper@1.12.0",
           "kind": "normal",
@@ -1402,6 +1583,13 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rusty-s3@0.11.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "workspace:karyos-control@0.1.0-alpha.3",
           "kind": "dev",
           "target": null,
@@ -1410,6 +1598,13 @@
         {
           "features": [],
           "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -1673,6 +1868,16 @@
           "uses_default_features": false
         },
         {
+          "features": [
+            "client",
+            "http1"
+          ],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#hyper-util@0.1.21",
           "kind": "normal",
@@ -1721,6 +1926,15 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [
+            "tokio"
+          ],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [
@@ -1740,6 +1954,269 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.1.21"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_properties@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#icu_collections@2.4.0",
+      "license": "Unicode-3.0",
+      "name": "icu_collections",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.4.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "zerovec"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_properties@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_provider@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "zerovec"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#icu_locale_core@2.4.0",
+      "license": "Unicode-3.0",
+      "name": "icu_locale_core",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.4.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#idna_adapter@1.2.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "compiled_data"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer@2.4.0",
+      "license": "Unicode-3.0",
+      "name": "icu_normalizer",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.4.0"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer_data@2.4.0",
+      "license": "Unicode-3.0",
+      "name": "icu_normalizer_data",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.4.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#idna_adapter@1.2.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "compiled_data"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#icu_properties@2.4.0",
+      "license": "Unicode-3.0",
+      "name": "icu_properties",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.4.0"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_properties@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#icu_properties_data@2.4.0",
+      "license": "Unicode-3.0",
+      "name": "icu_properties_data",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.4.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_properties@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "baked"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#icu_provider@2.4.0",
+      "license": "Unicode-3.0",
+      "name": "icu_provider",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.4.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "alloc",
+            "compiled_data"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc",
+        "compiled_data",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#idna@1.1.0",
+      "license": "MIT OR Apache-2.0",
+      "name": "idna",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.1.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#idna@1.1.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "compiled_data"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#idna_adapter@1.2.2",
+      "license": "Apache-2.0 OR MIT",
+      "name": "idna_adapter",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.2.2"
     },
     {
       "build_script": false,
@@ -1842,6 +2319,104 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.0.18"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "std"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rusty-s3@0.11.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
+      "license": "Unlicense OR MIT",
+      "name": "jiff",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.43"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc",
+        "default",
+        "std",
+        "tz-fat"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#jiff-core@0.1.5",
+      "license": "Unlicense OR MIT",
+      "name": "jiff-core",
+      "paths": {
+        "build": [
+          [
+            "cfg(any())"
+          ]
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.5"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
+          "kind": "normal",
+          "target": "cfg(any())",
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
+      "license": "Unlicense OR MIT",
+      "name": "jiff-static",
+      "paths": {
+        "build": [
+          [
+            "cfg(any())"
+          ]
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.43"
     },
     {
       "build_script": false,
@@ -2261,10 +2836,48 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_locale_core@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#litemap@0.8.3",
+      "license": "Unicode-3.0",
+      "name": "litemap",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.3"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#generator@0.8.10",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-core@0.1.5",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         },
         {
           "features": [],
@@ -2282,6 +2895,11 @@
       "license": "MIT OR Apache-2.0",
       "name": "log",
       "paths": {
+        "build": [
+          [
+            "cfg(any())"
+          ]
+        ],
         "loom-runtime": [
           []
         ],
@@ -2591,6 +3209,50 @@
       "build_script": false,
       "edges": [
         {
+          "features": [
+            "alloc"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#form_urlencoded@1.2.2",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rusty-s3@0.11.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#percent-encoding@2.3.2",
+      "license": "MIT OR Apache-2.0",
+      "name": "percent-encoding",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.3.2"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#hyper-util@0.1.21",
           "kind": "normal",
@@ -2637,6 +3299,99 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.2.17"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [
+            "require-cas"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#portable-atomic-util@0.2.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
+          "kind": "normal",
+          "target": "cfg(not(target_has_atomic = \"ptr\"))",
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "require-cas"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#portable-atomic@1.15.0",
+      "license": "Apache-2.0 OR MIT",
+      "name": "portable-atomic",
+      "paths": {
+        "runtime": [
+          [
+            "cfg(not(target_has_atomic = \"ptr\"))"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.15.0"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
+          "kind": "normal",
+          "target": "cfg(not(target_has_atomic = \"ptr\"))",
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#portable-atomic-util@0.2.8",
+      "license": "Apache-2.0 OR MIT",
+      "name": "portable-atomic-util",
+      "paths": {
+        "runtime": [
+          [
+            "cfg(not(target_has_atomic = \"ptr\"))"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.8"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "zerovec"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_collections@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "zerovec"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#potential_utf@0.1.6",
+      "license": "Unicode-3.0",
+      "name": "potential_utf",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.6"
     },
     {
       "build_script": false,
@@ -2688,6 +3443,20 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#displaydoc@0.2.7",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47",
           "kind": "normal",
           "target": null,
@@ -2709,6 +3478,13 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#synstructure@0.14.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@2.0.21",
           "kind": "normal",
           "target": null,
@@ -2716,7 +3492,28 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#yoke-derive@0.8.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#zerocopy-derive@0.8.63",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerofrom-derive@0.1.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerovec-derive@0.11.7",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -2836,6 +3633,20 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#displaydoc@0.2.7",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#syn@2.0.119",
           "kind": "normal",
           "target": null,
@@ -2850,6 +3661,13 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#synstructure@0.14.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@2.0.21",
           "kind": "normal",
           "target": null,
@@ -2857,7 +3675,28 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#yoke-derive@0.8.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#zerocopy-derive@0.8.63",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerofrom-derive@0.1.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerovec-derive@0.11.7",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -3363,6 +4202,15 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [
+            "std"
+          ],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [
@@ -3397,6 +4245,13 @@
         {
           "features": [],
           "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -3513,6 +4368,34 @@
       "proc_macro": true,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.0.23"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "graviola"
+          ],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "graviola"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#rusty-s3@0.11.0",
+      "license": "BSD-2-Clause",
+      "name": "rusty-s3",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.11.0"
     },
     {
       "build_script": false,
@@ -3644,6 +4527,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [
@@ -3685,6 +4575,13 @@
             "result"
           ],
           "from": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff@0.2.43",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4029,6 +4926,22 @@
           "uses_default_features": true
         },
         {
+          "features": [
+            "const_generics"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#idna@1.1.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#tracing-subscriber@0.3.23",
           "kind": "normal",
@@ -4097,6 +5010,30 @@
       "build_script": false,
       "edges": [
         {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#yoke@0.8.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#stable_deref_trait@1.2.1",
+      "license": "MIT OR Apache-2.0",
+      "name": "stable_deref_trait",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.2.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
           "features": [
             "const-generics"
           ],
@@ -4158,6 +5095,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         }
       ],
       "features": [
@@ -4176,6 +5120,9 @@
         "build": [
           [
             "cfg(all(not(curve25519_dalek_backend = \"fiat\"), not(curve25519_dalek_backend = \"serial\"), target_arch = \"x86_64\"))"
+          ],
+          [
+            "cfg(any())"
           ]
         ],
         "dev": [
@@ -4193,6 +5140,20 @@
           "features": [
             "clone-impls",
             "derive",
+            "extra-traits",
+            "parsing",
+            "printing",
+            "visit"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#synstructure@0.14.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "clone-impls",
+            "derive",
             "parsing",
             "printing",
             "proc-macro"
@@ -4201,6 +5162,42 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [
+            "extra-traits"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerovec-derive@0.11.7",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "fold",
+            "visit"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#yoke-derive@0.8.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
+            "fold",
+            "visit"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerofrom-derive@0.1.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#displaydoc@0.2.7",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         },
         {
           "features": [],
@@ -4214,9 +5211,12 @@
         "clone-impls",
         "default",
         "derive",
+        "extra-traits",
+        "fold",
         "parsing",
         "printing",
-        "proc-macro"
+        "proc-macro",
+        "visit"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#syn@3.0.8",
       "license": "MIT OR Apache-2.0",
@@ -4232,6 +5232,40 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "3.0.8"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#yoke-derive@0.8.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerofrom-derive@0.1.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "proc-macro"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#synstructure@0.14.0",
+      "license": "MIT",
+      "name": "synstructure",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.14.0"
     },
     {
       "build_script": true,
@@ -4295,6 +5329,13 @@
         {
           "features": [],
           "from": "workspace:karyos-sys@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4383,6 +5424,32 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_locale_core@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "zerovec"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#tinystr@0.8.5",
+      "license": "Unicode-3.0",
+      "name": "tinystr",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.5"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#criterion@0.7.0",
           "kind": "normal",
           "target": null,
@@ -4423,6 +5490,17 @@
             "time"
           ],
           "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "net",
+            "rt",
+            "time"
+          ],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4490,6 +5568,13 @@
         {
           "features": [],
           "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4962,6 +6047,97 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.9.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "std"
+          ],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rusty-s3@0.11.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+      "license": "MIT OR Apache-2.0",
+      "name": "url",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "2.5.8"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_collections@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#idna@1.1.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#utf8_iter@1.1.0",
+      "license": "Apache-2.0 OR MIT",
+      "name": "utf8_iter",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.1.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#utf8_iter@1.1.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#utf_types@1.0.0",
+      "license": "Apache-2.0 OR MIT",
+      "name": "utf_types",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.0"
     },
     {
       "build_script": true,
@@ -5755,6 +6931,115 @@
       "version": "0.57.1"
     },
     {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_locale_core@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_provider@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#writeable@0.6.4",
+      "license": "Unicode-3.0",
+      "name": "writeable",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.6.4"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "derive"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_collections@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_provider@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerotrie@0.2.5",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerovec@0.11.9",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "derive",
+        "zerofrom"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#yoke@0.8.4",
+      "license": "Unicode-3.0",
+      "name": "yoke",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.4"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#yoke@0.8.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#yoke-derive@0.8.4",
+      "license": "Unicode-3.0",
+      "name": "yoke-derive",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.4"
+    },
+    {
       "build_script": true,
       "edges": [
         {
@@ -5829,6 +7114,88 @@
       "build_script": false,
       "edges": [
         {
+          "features": [
+            "derive"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_collections@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_provider@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#yoke@0.8.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerotrie@0.2.5",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerovec@0.11.9",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "derive"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#zerofrom@0.1.8",
+      "license": "Unicode-3.0",
+      "name": "zerofrom",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.8"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerofrom@0.1.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#zerofrom-derive@0.1.8",
+      "license": "Unicode-3.0",
+      "name": "zerofrom-derive",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.8"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
           "kind": "normal",
@@ -5855,6 +7222,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#rusty-s3@0.11.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         }
       ],
       "features": [
@@ -5875,6 +7249,144 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.9.2"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "yoke",
+            "zerofrom"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_properties@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_provider@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "yoke",
+        "zerofrom"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#zerotrie@0.2.5",
+      "license": "Unicode-3.0",
+      "name": "zerotrie",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.5"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "derive",
+            "yoke"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_collections@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "derive",
+            "yoke"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_properties@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "derive"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_provider@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_locale_core@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer@2.4.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#potential_utf@0.1.6",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#tinystr@0.8.5",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "derive",
+        "yoke"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#zerovec@0.11.9",
+      "license": "Unicode-3.0",
+      "name": "zerovec",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.11.9"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#zerovec@0.11.9",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#zerovec-derive@0.11.7",
+      "license": "Unicode-3.0",
+      "name": "zerovec-derive",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.11.7"
     },
     {
       "build_script": true,

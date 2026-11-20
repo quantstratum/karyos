@@ -133,6 +133,12 @@ deps-check:
 control-plane-graph-check:
 	scripts/check-control-plane-graph.sh
 
+# The object storage client stays out of every data-path graph and the
+# default build's, with no native crypto (karyos#965; the object storage
+# admission record, conditions 3 and 4).
+tiering-graph-check:
+	scripts/check-tiering-graph.sh
+
 # No Raft candidate and not the evaluation crate in any shipped graph, and
 # no Tokio outside karyos-control's (cargo tree, every target, default and every feature; with
 # negative controls): the evaluation-only admission's
@@ -158,4 +164,4 @@ changelog-check:
 netem:
 	scripts/netem-test.sh
 
-pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check
+pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check tiering-graph-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check
