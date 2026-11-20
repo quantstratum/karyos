@@ -133,7 +133,13 @@ the two differ. Rules on top of the syntax:
   refused. An `interface` is an unbracketed address and carries no zone.
   An IPv4-mapped address (`[::ffff:10.0.0.5]:1`) is accepted and kept as
   written; in a list it repeats its IPv4 spelling (section 3).
-- **Ports.** Port 0 is refused on every existing key. A port may have
+- **Ports.** Port 0 is refused on every existing key except `endpoint`,
+  where it names an ephemeral port for a unicast subscription (owner
+  decision item 26, karyos#656): the driver binds before the subscription
+  is ready, reports the bound port, and keeps it across a reset. A
+  publication refuses `endpoint` on port 0 (`InvalidValue`), and
+  `endpoint` on port 0 with `paths` is a `Conflict`, since each path binds
+  its own socket. A port may have
   leading zeros (`:040123` is port 40123); this is the address parser's
   syntax and is part of the published form.
 - **Unspecified addresses.** `0.0.0.0` and `::` are refused in a socket

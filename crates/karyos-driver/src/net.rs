@@ -993,19 +993,21 @@ impl<T: StreamTerms> Network<T> {
         bind: SocketAddr,
         multicast: Option<MulticastConfig>,
     ) -> Result<EndpointId, DriverError> {
-        self.hold_for(bind, multicast, EndpointPurpose::Data)
+        self.hold_for(bind, multicast, EndpointPurpose::Data, true)
     }
 
     /// [`Self::hold_endpoint`] for `purpose`: an entry of another purpose
-    /// at the same address is never shared.
+    /// at the same address is never shared, and with `share` false no
+    /// entry is (a new endpoint each time).
     fn hold_for(
         &mut self,
         bind: SocketAddr,
         multicast: Option<MulticastConfig>,
         purpose: EndpointPurpose,
+        share: bool,
     ) -> Result<EndpointId, DriverError> {
         if let Some(entry) = self.send_endpoints.iter_mut().find(|entry| {
-            (entry.bind, entry.multicast, entry.purpose) == (bind, multicast, purpose)
+            share && (entry.bind, entry.multicast, entry.purpose) == (bind, multicast, purpose)
         }) {
             entry.users = entry
                 .users
@@ -1074,7 +1076,7 @@ impl<T: StreamTerms> Network<T> {
         (bind, multicast): (SocketAddr, Option<MulticastConfig>),
         later: &[(SocketAddr, MulticastConfig)],
         max_term_length: u32,
-        reliable: bool,
+        (reliable, own_port): (bool, bool),
         (identity, conflated, register_at): (
             Option<crate::membership::ReceiverIdentity>,
             Option<(Lane, karyos_sys::conflation::ConflationConfig)>,
@@ -1082,7 +1084,12 @@ impl<T: StreamTerms> Network<T> {
         ),
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
-        let endpoint = self.hold_endpoint(bind, multicast)?;
+        // A URI subscription on port 0 (`own_port`) asks for an ephemeral
+        // port of its own (karyos#656): never another's endpoint, which an
+        // address with port 0 would otherwise match. The embedded calls
+        // keep sharing a bind address's endpoint, port 0 included.
+        let ephemeral = own_port && bind.port() == 0 && multicast.is_none();
+        let endpoint = self.hold_for(bind, multicast, EndpointPurpose::Data, !ephemeral)?;
         let handle = NetworkSubscription {
             endpoint,
             stream_id,
@@ -1374,7 +1381,12 @@ impl<T: StreamTerms> Network<T> {
             SocketAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             SocketAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
         };
-        match self.hold_for(SocketAddr::new(any, 0), None, EndpointPurpose::Solicit) {
+        match self.hold_for(
+            SocketAddr::new(any, 0),
+            None,
+            EndpointPurpose::Solicit,
+            true,
+        ) {
             Ok(endpoint) => Some(endpoint),
             Err(_) => {
                 if let Some(count) = self.solicit_endpoint_failures.checked_add(1) {

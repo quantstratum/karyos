@@ -137,6 +137,16 @@ fn operator_word(operator: Option<u32>) -> u64 {
 /// The channel URI `uri` for a command: it parses (SPEC §5) and fits.
 /// Also whether it names an IPC channel.
 fn channel_uri(uri: &str) -> Result<(ChannelUri, bool), ConductorError> {
+    channel_uri_for(uri, false)
+}
+
+/// [`channel_uri`] for a publication: it also refuses what only a
+/// subscription admits, an `endpoint` on port 0 (karyos#656).
+fn publication_uri(uri: &str) -> Result<(ChannelUri, bool), ConductorError> {
+    channel_uri_for(uri, true)
+}
+
+fn channel_uri_for(uri: &str, publication: bool) -> Result<(ChannelUri, bool), ConductorError> {
     if uri.is_empty() {
         return Err(ConductorError::EmptyUri);
     }
@@ -144,6 +154,12 @@ fn channel_uri(uri: &str) -> Result<(ChannelUri, bool), ConductorError> {
         return Err(ConductorError::UriTooLong);
     }
     let channel = karyos_protocol::channel::ChannelConfig::parse(uri)
+        .and_then(|channel| {
+            if publication {
+                channel.check_publication()?;
+            }
+            Ok(channel)
+        })
         .map_err(|error| ConductorError::InvalidChannel { code: error.code() })?;
     let ipc = matches!(channel.media, karyos_protocol::channel::Media::Ipc);
     Ok((ChannelUri::new(uri).ok_or(ConductorError::UriTooLong)?, ipc))
@@ -824,7 +840,7 @@ impl<T: TermBytes> ClientConductor<T> {
         stream_id: i32,
         allow_unconnected: bool,
     ) -> Result<u64, ConductorError> {
-        let (uri, _) = channel_uri(uri)?;
+        let (uri, _) = publication_uri(uri)?;
         let request = Request::Publication {
             stream: StreamKey {
                 stream_id,
@@ -867,7 +883,7 @@ impl<T: TermBytes> ClientConductor<T> {
         allow_unconnected: bool,
         roles: &PublicationRoles,
     ) -> Result<u64, ConductorError> {
-        let (uri, _) = channel_uri(uri)?;
+        let (uri, _) = publication_uri(uri)?;
         if !roles.is_well_formed() {
             return Err(ConductorError::InvalidRoles);
         }
@@ -908,7 +924,7 @@ impl<T: TermBytes> ClientConductor<T> {
         stream_id: i32,
         allow_unconnected: bool,
     ) -> Result<u64, ConductorError> {
-        let (uri, _) = channel_uri(uri)?;
+        let (uri, _) = publication_uri(uri)?;
         let request = Request::ConcurrentPublication {
             stream: StreamKey {
                 stream_id,

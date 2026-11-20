@@ -1501,7 +1501,7 @@ fn a_network_publication_is_connected_while_a_receivers_sms_are_live() {
     // publication can name the port the kernel chose; its driver is not
     // driven until it subscribes, so until then it sends no SMs.
     let mut b = driver();
-    // A channel URI refuses port 0: the URI's channel, rebound on port 0.
+    // The URI's channel, rebound on port 0.
     let Ok(karyos_protocol::channel::ChannelConfig {
         media: karyos_protocol::channel::Media::Udp(mut receive),
         ..
@@ -1793,6 +1793,58 @@ fn a_network_subscription_reports_its_bound_ipv4_address() {
         panic!("not a network subscription: {outcome:?}");
     };
     assert_eq!(bound, Some(SocketAddr::from((Ipv4Addr::LOCALHOST, port))));
+}
+
+/// karyos#656: a unicast subscription on port 0 binds before it is ready
+/// and reports the port the kernel chose; two get distinct ports. A
+/// publication on port 0 is refused on the client side.
+#[test]
+fn a_unicast_subscription_on_port_zero_reports_its_ephemeral_port() {
+    let mut driver = driver();
+    let mut client = driver.connect().unwrap();
+    let uri = "karyos:udp?endpoint=127.0.0.1:0";
+    let first = client
+        .add_network_subscription(uri, 10, SubscriberRole::Required)
+        .unwrap();
+    let second = client
+        .add_network_subscription(uri, 11, SubscriberRole::Required)
+        .unwrap();
+    let mut outcomes = Vec::new();
+    run(
+        &mut [&mut driver],
+        &mut [&mut client],
+        &mut outcomes,
+        |outcomes, _| {
+            [first, second]
+                .iter()
+                .all(|sequence| outcomes.iter().any(|(_, found, _)| found == sequence))
+        },
+    );
+    let mut ports = Vec::new();
+    for (sequence, stream_id) in [(first, 10), (second, 11)] {
+        let outcome = take(&mut outcomes, sequence);
+        let Outcome::NetworkSubscription { bound, .. } = outcome else {
+            panic!("not a network subscription: {outcome:?}");
+        };
+        let Some(bound) = bound else {
+            panic!("no bound address");
+        };
+        assert_eq!(bound.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_ne!(bound.port(), 0);
+        // The ready reply's address is the bound socket's.
+        assert_eq!(driver.network_subscription_address(stream_id), Some(bound));
+        ports.push(bound.port());
+    }
+    assert_ne!(ports.first(), ports.get(1));
+    let code = karyos_protocol::channel::ChannelConfig::parse(uri)
+        .unwrap()
+        .check_publication()
+        .unwrap_err()
+        .code();
+    assert_eq!(
+        client.add_network_publication(uri, 12, true),
+        Err(karyos_client::ConductorError::InvalidChannel { code })
+    );
 }
 
 /// Decision row 26 over IPv6 loopback, where the host has it: the bound

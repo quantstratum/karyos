@@ -155,7 +155,6 @@ fn addresses_are_checked() {
     for (uri, key) in [
         ("karyos:udp?endpoint=239.1.1.1:1", "endpoint"),
         ("karyos:udp?group=10.0.0.5:1", "group"),
-        ("karyos:udp?endpoint=10.0.0.5:0", "endpoint"),
         ("karyos:udp?endpoint=0.0.0.0:1", "endpoint"),
         ("karyos:udp?endpoint=10.0.0.5", "endpoint"),
         ("karyos:udp?endpoint=host:1", "endpoint"),
@@ -603,7 +602,6 @@ fn address_forms_follow_the_grammar() {
         "karyos:udp?endpoint=::1:40123",
         "karyos:udp?endpoint=[fe80::1%eth0]:40123",
         "karyos:udp?endpoint=[::]:1",
-        "karyos:udp?endpoint=[::1]:0",
         "karyos:udp?endpoint=010.0.0.5:1",
         "karyos:udp?endpoint=10.0.0.5:1|interface=fe80::1%2",
         "karyos:udp?endpoint=10.0.0.5:1|interface=[::1]",
@@ -934,4 +932,78 @@ fn paired_paths_follow_their_grammar() {
     ] {
         assert_eq!(refused(uri), ChannelError::NotApplicable { key }, "{uri}");
     }
+}
+
+/// karyos#656 (owner decision item 26): port 0 is admitted for `endpoint`
+/// alone, the ephemeral port of a unicast subscription; a publication
+/// refuses it, and so does every other address key, at parse time.
+#[test]
+fn port_zero_is_an_endpoint_role_only() {
+    for uri in [
+        "karyos:udp?endpoint=10.0.0.5:0",
+        "karyos:udp?endpoint=[::1]:0",
+    ] {
+        let channel = ChannelConfig::parse(uri).unwrap();
+        let Media::Udp(udp) = &channel.media else {
+            panic!("not udp: {uri}");
+        };
+        assert!(
+            matches!(udp.destination, Destination::Unicast(address) if address.port() == 0),
+            "{uri}"
+        );
+        assert!(
+            matches!(
+                channel.check_publication(),
+                Err(ChannelError::InvalidValue {
+                    key: "endpoint",
+                    ..
+                })
+            ),
+            "{uri}"
+        );
+    }
+    // A named port is a publication's as before.
+    ChannelConfig::parse("karyos:udp?endpoint=10.0.0.5:1")
+        .unwrap()
+        .check_publication()
+        .unwrap();
+    // The other address rules still hold on port 0.
+    for uri in [
+        "karyos:udp?endpoint=0.0.0.0:0",
+        "karyos:udp?endpoint=239.1.1.1:0",
+    ] {
+        assert!(
+            matches!(
+                refused(uri),
+                ChannelError::InvalidValue {
+                    key: "endpoint",
+                    ..
+                }
+            ),
+            "{uri}"
+        );
+    }
+    // Groups, destinations and control keep refusing port 0.
+    for (uri, key) in [
+        ("karyos:udp?group=239.1.1.1:0", "group"),
+        ("karyos:udp?destinations=10.0.0.5:0", "destinations"),
+        (
+            "karyos:udp?destinations=10.0.0.5:1;10.0.0.6:0",
+            "destinations",
+        ),
+        ("karyos:udp?control=10.0.0.5:0", "control"),
+    ] {
+        assert!(
+            matches!(refused(uri), ChannelError::InvalidValue { key: found, .. } if found == key),
+            "{uri}"
+        );
+    }
+    // Each path binds its own socket, so port 0 with paths is refused.
+    assert_eq!(
+        refused("karyos:udp?endpoint=10.0.0.5:0|paths=10.0.0.1;10.0.0.2"),
+        ChannelError::Conflict {
+            first: "endpoint",
+            second: "paths"
+        }
+    );
 }

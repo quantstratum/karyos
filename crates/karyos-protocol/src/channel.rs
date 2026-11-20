@@ -468,6 +468,27 @@ impl Key {
 }
 
 impl ChannelConfig {
+    /// Checks the channel for a publication: an `endpoint` on port 0,
+    /// which only a unicast subscription admits (an ephemeral port, owner
+    /// decision item 26), is refused. Groups, destinations and `control`
+    /// refuse port 0 at parse time already.
+    ///
+    /// # Errors
+    ///
+    /// [`ChannelError::InvalidValue`] for `endpoint` on port 0.
+    pub fn check_publication(&self) -> Result<(), ChannelError> {
+        match &self.media {
+            Media::Udp(UdpConfig {
+                destination: Destination::Unicast(address),
+                ..
+            }) if address.port() == 0 => Err(invalid(
+                Key::Endpoint,
+                "port 0, which only a subscription admits",
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Parses and validates a channel URI.
     ///
     /// # Errors
@@ -638,6 +659,16 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         None => get(Key::Paths).map(parse_paths).transpose()?,
     }
     .unwrap_or_default();
+    // Each path binds its own socket: on port 0 each would get another
+    // port, and a sender names one (karyos#656).
+    if !paths.is_empty()
+        && matches!(&destination, Destination::Unicast(address) if address.port() == 0)
+    {
+        return Err(ChannelError::Conflict {
+            first: Key::Endpoint.name(),
+            second: Key::Paths.name(),
+        });
+    }
     if interface.is_some() && !paths.is_empty() {
         return Err(ChannelError::Conflict {
             first: Key::Interface.name(),
@@ -708,9 +739,7 @@ fn parse_destination(
     ttl: Option<u8>,
 ) -> Result<Destination, ChannelError> {
     Ok(match keys {
-        (Some(endpoint), None, None, None) => {
-            Destination::Unicast(parse_unicast(Key::Endpoint, endpoint)?)
-        }
+        (Some(endpoint), None, None, None) => Destination::Unicast(parse_endpoint(endpoint)?),
         (None, Some(group), None, None) => {
             let group = parse_address(Key::Group, group)?;
             if !group.ip().is_multicast() {
@@ -958,6 +987,26 @@ fn parse_address(key: Key, value: &str) -> Result<SocketAddr, ChannelError> {
     }
     if address.ip().is_unspecified() {
         return Err(invalid(key, "unspecified address"));
+    }
+    Ok(address)
+}
+
+/// An `endpoint` value: a unicast socket address whose port may be 0, the
+/// one role that admits it (owner decision item 26, karyos#656). Port 0
+/// asks for an ephemeral port on a unicast subscription; a publication
+/// refuses it ([`ChannelConfig::check_publication`]).
+fn parse_endpoint(value: &str) -> Result<SocketAddr, ChannelError> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| invalid(Key::Endpoint, "not an address and port"))?;
+    if address.port() != 0 {
+        return parse_unicast(Key::Endpoint, value);
+    }
+    if address.ip().is_unspecified() {
+        return Err(invalid(Key::Endpoint, "unspecified address"));
+    }
+    if address.ip().is_multicast() {
+        return Err(invalid(Key::Endpoint, "a multicast address"));
     }
     Ok(address)
 }
