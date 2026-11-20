@@ -385,6 +385,20 @@ impl SessionTable {
         let bytes = usize::try_from(config.response_bytes).map_err(|_| ConfigError::TooLarge)?;
         let slots = sessions.checked_mul(window).ok_or(ConfigError::TooLarge)?;
         let reply_bytes = slots.checked_mul(bytes).ok_or(ConfigError::TooLarge)?;
+        // Every table's byte size is checked before anything is reserved:
+        // a table past what `Vec` can address is refused untouched, so a
+        // host that overcommits memory never sees the smaller tables
+        // filled first (karyos#1026).
+        fn addressable<T>(length: usize) -> Result<(), ConfigError> {
+            length
+                .checked_mul(size_of::<T>())
+                .filter(|bytes| isize::try_from(*bytes).is_ok())
+                .map(|_| ())
+                .ok_or(ConfigError::TooLarge)
+        }
+        addressable::<Session>(sessions)?;
+        addressable::<Stored>(slots)?;
+        addressable::<u8>(reply_bytes)?;
         // Reserved fallibly: a size that fits `usize` may still exceed what
         // `Vec` or the host can allocate, which is a typed refusal, never an
         // abort (karyos#927 review).

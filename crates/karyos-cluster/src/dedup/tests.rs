@@ -595,3 +595,15 @@ fn each_session_bound_is_refused_at_its_edge() {
         session(1)
     );
 }
+
+/// karyos#1026: bounds past what `Vec` can address are refused before any
+/// table is reserved, whatever the host's overcommit policy: the session
+/// slots alone (`u32::MAX` of them) would fit, the reply slots do not.
+#[test]
+fn bounds_past_the_address_space_reserve_nothing() {
+    let huge = DedupConfig::default()
+        .with_sessions(u32::MAX)
+        .with_window(u32::MAX)
+        .with_response_bytes(1);
+    assert_eq!(SessionTable::new(huge).err(), Some(ConfigError::TooLarge));
+}
