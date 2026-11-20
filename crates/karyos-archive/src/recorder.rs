@@ -365,6 +365,16 @@ impl<D: Disk, S: FrameSource> Recorder<D, S> {
         &mut self.store
     }
 
+    /// Reads `buf.len()` bytes of the store from `position`, as a writer
+    /// that seals what it recorded reads them back (A10; karyos#985).
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentStore::read`]'s.
+    pub fn read(&mut self, position: u64, buf: &mut [u8]) -> Result<(), SegmentError> {
+        self.store.read(position, buf)
+    }
+
     /// Whether the recording lost ranges so far (an async lap resumed).
     #[must_use]
     pub const fn incomplete(&self) -> bool {
