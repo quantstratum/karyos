@@ -465,12 +465,14 @@ fn open_integrity<D: Disk>(disk: D, dir: &Path) -> Result<(IntegrityJournal<D>, 
 }
 
 /// Refuses a log recovered to `written` below what the current subject's
-/// seals in `dir` cover, reading the journal only.
-fn check_seals<D: Disk + Clone>(disk: &D, dir: &Path, written: u64) -> Result<(), LogError> {
+/// seals in `dir` cover, reading the journal only; returns that subject,
+/// so the open reads the journal's records once (karyos#990 review).
+fn check_seals<D: Disk + Clone>(disk: &D, dir: &Path, written: u64) -> Result<u64, LogError> {
     let (records, _) = read_records(&mut ReadOnly(disk.clone()), dir)?;
-    match shortened_below_seal(&records, current_epoch(&records), written) {
+    let epoch = current_epoch(&records);
+    match shortened_below_seal(&records, epoch, written) {
         Some(damage) => Err(LogError::ShortenedBelowSeal(damage)),
-        None => Ok(()),
+        None => Ok(epoch),
     }
 }
 
@@ -771,7 +773,7 @@ impl<D: Disk + Clone> RaftLog<D> {
         } else {
             walk.torn.map_or(kept.written, |(position, _)| position)
         };
-        check_seals(&disk, dir, end)?;
+        let epoch = check_seals(&disk, dir, end)?;
         if let (Some((_, index)), Some(commit)) =
             (walk.torn, hard_state.and_then(|state| state.commit))
             && index <= commit
@@ -811,7 +813,8 @@ impl<D: Disk + Clone> RaftLog<D> {
         if stale {
             store.truncate(kept.start)?;
         }
-        let (integrity, epoch) = open_integrity(disk.clone(), dir)?;
+        // The subject check_seals read: the journal's records are read once.
+        let integrity = IntegrityJournal::open(disk.clone(), dir)?.journal;
         let mut log = Self {
             store,
             disk,
