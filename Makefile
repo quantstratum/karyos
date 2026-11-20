@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri miri-sys-log-buffer miri-sys-rest miri-ffi build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check codec-derive-check raft-eval lint-sync changelog-check lint-linux pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri miri-sys-log-buffer miri-sys-rest miri-ffi build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit libkaryos-release-check abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check codec-derive-check raft-eval lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -135,6 +135,21 @@ test-hooks-absent-check: build-release
 # of the release package (owner item 44), and not part of pre-push.
 libkaryos-testkit: libkaryos
 	CARGO="$(CARGO)" scripts/package-testkit.sh $(LIBKARYOS_DIR)
+
+# The release artifacts of libkaryos and karyosd, built as two separate
+# archives from a clean tree (scripts/release-libkaryos.sh), checked
+# against their SHA256SUMS, and the conformance suite run against the
+# libkaryos archive itself, not a build tree (scripts/conformance-package.sh;
+# owner item 44, karyos#700). Signs and publishes nothing: signing
+# (scripts/sign-release.sh) and publication are the release key
+# custodian's steps. Into RELEASE_ARTIFACTS_DIR, by default
+# target/release-artifacts. Needs a clean git tree; not part of pre-push.
+RELEASE_ARTIFACTS_DIR ?= $(CURDIR)/target/release-artifacts
+libkaryos-release-check:
+	rm -rf $(RELEASE_ARTIFACTS_DIR)
+	CARGO="$(CARGO)" scripts/release-libkaryos.sh $(RELEASE_ARTIFACTS_DIR)
+	set -- $(RELEASE_ARTIFACTS_DIR)/libkaryos-*.tar.gz && [ $$# -eq 1 ] && [ -f "$$1" ] && \
+		CARGO="$(CARGO)" scripts/conformance-package.sh "$$1"
 
 deny:
 	$(CARGO) deny check
