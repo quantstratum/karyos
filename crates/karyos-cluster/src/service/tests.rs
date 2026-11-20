@@ -652,6 +652,10 @@ impl Propose for Recorder {
         self.proposed.push(payload);
         Ok(())
     }
+
+    fn leads(&self) -> bool {
+        self.leads
+    }
 }
 
 fn bounds_entry(index: u64, event_time: u64, config: DedupConfig) -> Entry {
@@ -882,4 +886,51 @@ fn test_container_bounds_past_what_can_be_allocated_stop_it() {
         Err(ApplyError::BoundsUnheld(ConfigError::TooLarge))
     );
     assert_eq!(container.applied(), None);
+}
+
+/// ADR-0087 (karyos#1053): a leader whose log has not applied the session
+/// bounds proposes no registration, so its first `SessionBounds` entry
+/// precedes every `Register`; once they apply, registrations go through.
+/// A follower's registration reaches its core, which refuses it with the
+/// leader's hint. Other envelopes are never held.
+#[test]
+fn test_container_a_leader_proposes_no_registration_before_the_bounds_apply() {
+    let mut container = container();
+    let mut core = Recorder {
+        leads: true,
+        proposed: Vec::new(),
+    };
+    let register = Envelope::Register { client: 9 };
+    assert_eq!(
+        container.propose(&register, &mut core),
+        Err(ProposeRefused::BoundsPending)
+    );
+    assert!(core.proposed.is_empty());
+    // A request is not a registration: never held.
+    let close = Envelope::Close {
+        client: 9,
+        epoch: 1,
+    };
+    assert_eq!(container.propose(&close, &mut core), Ok(()));
+    assert_eq!(core.proposed.len(), 1);
+    // The leader proposes the bounds; nothing else reached its log first.
+    assert_eq!(container.propose_bounds(&mut core), Ok(true));
+    assert_eq!(core.proposed.len(), 2);
+    // A follower's registration goes to its core, which refuses it.
+    let mut follower = Recorder::default();
+    assert_eq!(
+        container.propose(&register, &mut follower),
+        Err(ProposeRefused::NotLeader(NotLeader::new(None)))
+    );
+    // Once the bounds apply, the registration is proposed after them.
+    let bounds = bounds_entry(1, 0, container.sessions().config());
+    let _ = container.apply(&bounds).unwrap();
+    assert!(container.bounds_logged());
+    assert_eq!(container.propose(&register, &mut core), Ok(()));
+    let last = core.proposed.last().unwrap();
+    assert_eq!(Envelope::decode(last).unwrap(), register);
+    assert_eq!(
+        SessionBounds::decode(&core.proposed[1]).unwrap().config,
+        container.sessions().config()
+    );
 }

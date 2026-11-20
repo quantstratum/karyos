@@ -432,6 +432,34 @@ pub trait Propose {
     ///
     /// [`NotLeader`] when it does not, with the leader it knows of.
     fn propose(&mut self, payload: Vec<u8>) -> Result<(), NotLeader>;
+
+    /// Whether this node leads now, as far as it knows. The container's
+    /// registration gate ([`ServiceContainer::propose`]) holds a
+    /// registration back only on a leader; a follower's goes to
+    /// [`Propose::propose`], which refuses it with the leader's hint. The
+    /// default, `true`, applies the gate on every node: conservative, the
+    /// answer is retryable either way.
+    fn leads(&self) -> bool {
+        true
+    }
+}
+
+/// A proposal [`ServiceContainer::propose`] did not make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProposeRefused {
+    /// This node does not lead.
+    #[error(transparent)]
+    NotLeader(#[from] NotLeader),
+    /// A registration on a leader whose log has not applied the session
+    /// bounds yet (ADR-0087, karyos#1053): nothing was proposed. The host
+    /// holds it until [`ServiceContainer::bounds_logged`], or answers its
+    /// client with a retryable refusal; it never proposes it earlier.
+    #[error("the session bounds have not applied yet")]
+    BoundsPending,
+    /// The envelope does not encode (schema 2 refuses it): never proposed.
+    #[error(transparent)]
+    Codec(#[from] CodecError),
 }
 
 /// The user's state machine (SPEC.md §9). Every method sees only its
@@ -742,6 +770,30 @@ impl<S: ClusteredService> ServiceContainer<S> {
         };
         core.propose(payload)?;
         Ok(true)
+    }
+
+    /// Proposes `envelope` through `core`, enforcing ADR-0087's gate: a
+    /// leader proposes no `Register` until the log's session bounds have
+    /// applied, so no registration precedes the first `SessionBounds`
+    /// entry a leader writes (karyos#1053). Every other envelope, and a
+    /// registration once the bounds applied or on a follower, goes to
+    /// `core` as is.
+    ///
+    /// # Errors
+    ///
+    /// [`ProposeRefused::BoundsPending`] for a registration held back,
+    /// [`ProposeRefused::NotLeader`] when `core` does not lead, and
+    /// [`ProposeRefused::Codec`] for an envelope schema 2 refuses.
+    pub fn propose<P: Propose>(
+        &self,
+        envelope: &Envelope<'_>,
+        core: &mut P,
+    ) -> Result<(), ProposeRefused> {
+        if matches!(envelope, Envelope::Register { .. }) && !self.bounds_logged && core.leads() {
+            return Err(ProposeRefused::BoundsPending);
+        }
+        core.propose(envelope.to_vec()?)?;
+        Ok(())
     }
 
     /// The deadline `timer` is scheduled for, if it is.
