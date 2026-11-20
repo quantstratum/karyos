@@ -269,6 +269,15 @@ pub enum Destination {
         /// How receivers are learned.
         mode: ControlMode,
     },
+    /// Paired unicast paths (owner item 11, karyos#635): one logical
+    /// receiver reached over each path, path `i` sending from
+    /// `UdpConfig::paths[i]` to `endpoints[i]`. Parsed and validated;
+    /// a driver refuses it until unicast paths pass on real sockets
+    /// (karyos#624).
+    PairedPaths {
+        /// Each path's receiver endpoint, in the order of `paths`.
+        endpoints: Vec<SocketAddr>,
+    },
 }
 
 /// Parameters every channel accepts. `None` keeps the stream's or the
@@ -567,66 +576,41 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
             _ => Err(invalid(Key::ControlMode, "`manual` or `dynamic`")),
         })
         .transpose()?;
-    let destination = match (
+    // Paired paths (`interface@endpoint` elements) are their own
+    // destination form: no other destination key goes with them.
+    let paired = get(Key::Paths).is_some_and(|list| list.contains('@'));
+    if paired {
+        let other = [Key::Endpoint, Key::Group, Key::Destinations, Key::Control]
+            .into_iter()
+            .find(|&key| get(key).is_some());
+        if let Some(other) = other {
+            return Err(ChannelError::Conflict {
+                first: Key::Paths.name(),
+                second: other.name(),
+            });
+        }
+    } else if get(Key::Paths).is_some() && get(Key::Destinations).is_some() {
+        // `destinations` fans out to several receivers, `paths` carries
+        // one over several routes: never both (owner item 11).
+        return Err(ChannelError::Conflict {
+            first: Key::Paths.name(),
+            second: Key::Destinations.name(),
+        });
+    }
+    let (paired_paths, destination) = match (
         get(Key::Endpoint),
         get(Key::Group),
         get(Key::Destinations),
         get(Key::Control),
     ) {
-        (Some(endpoint), None, None, None) => {
-            Destination::Unicast(parse_unicast(Key::Endpoint, endpoint)?)
-        }
-        (None, Some(group), None, None) => {
-            let group = parse_address(Key::Group, group)?;
-            if !group.ip().is_multicast() {
-                return Err(invalid(Key::Group, "not a multicast address"));
-            }
-            Destination::Multicast { group, ttl }
-        }
-        (None, None, destinations, control) if named > 0 => {
-            let destinations = destinations
-                .map(|list| {
-                    let parsed = list
-                        .split(';')
-                        .map(|one| parse_unicast(Key::Destinations, one))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if parsed.len() > MAX_URI_DESTINATIONS {
-                        return Err(invalid(Key::Destinations, "too many destinations"));
-                    }
-                    if repeats(&parsed) {
-                        return Err(invalid(Key::Destinations, "a destination repeats"));
-                    }
-                    Ok(parsed)
-                })
+        (None, None, None, None) if paired => {
+            let (paths, endpoints) = get(Key::Paths)
+                .map(parse_paired_paths)
                 .transpose()?
                 .unwrap_or_default();
-            let control = control
-                .map(|value| parse_unicast(Key::Control, value))
-                .transpose()?;
-            let mode = match (mode, control.is_some()) {
-                (Some(ControlMode::Dynamic), false) => {
-                    return Err(ChannelError::Conflict {
-                        first: Key::ControlMode.name(),
-                        second: Key::Control.name(),
-                    });
-                }
-                (Some(mode), _) => mode,
-                (None, true) => ControlMode::Dynamic,
-                (None, false) => ControlMode::Manual,
-            };
-            if mode == ControlMode::Manual && destinations.is_empty() {
-                return Err(ChannelError::Conflict {
-                    first: Key::ControlMode.name(),
-                    second: Key::Destinations.name(),
-                });
-            }
-            Destination::MultiDestination {
-                destinations,
-                control,
-                mode,
-            }
+            (Some(paths), Destination::PairedPaths { endpoints })
         }
-        _ => return Err(ChannelError::Destination),
+        keys => (None, parse_destination(keys, named, mode, ttl)?),
     };
     let multicast = matches!(destination, Destination::Multicast { .. });
     let multi = matches!(destination, Destination::MultiDestination { .. });
@@ -649,22 +633,11 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
     let interface = get(Key::Interface)
         .map(|value| parse_interface(Key::Interface, value))
         .transpose()?;
-    let paths = get(Key::Paths)
-        .map(|list| {
-            let parsed = list
-                .split(';')
-                .map(|one| parse_interface(Key::Paths, one))
-                .collect::<Result<Vec<_>, _>>()?;
-            if parsed.len() > MAX_PATHS {
-                return Err(invalid(Key::Paths, "more than 4 paths"));
-            }
-            if repeats(&parsed) {
-                return Err(invalid(Key::Paths, "a path repeats"));
-            }
-            Ok(parsed)
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let paths = match paired_paths {
+        Some(paths) => Some(paths),
+        None => get(Key::Paths).map(parse_paths).transpose()?,
+    }
+    .unwrap_or_default();
     if interface.is_some() && !paths.is_empty() {
         return Err(ChannelError::Conflict {
             first: Key::Interface.name(),
@@ -724,6 +697,121 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         security,
         retransmit_window,
     })
+}
+
+/// The destination named by `endpoint`, `group`, `destinations` and
+/// `control` (`keys`, in that order), without paired paths.
+fn parse_destination(
+    keys: (Option<&str>, Option<&str>, Option<&str>, Option<&str>),
+    named: usize,
+    mode: Option<ControlMode>,
+    ttl: Option<u8>,
+) -> Result<Destination, ChannelError> {
+    Ok(match keys {
+        (Some(endpoint), None, None, None) => {
+            Destination::Unicast(parse_unicast(Key::Endpoint, endpoint)?)
+        }
+        (None, Some(group), None, None) => {
+            let group = parse_address(Key::Group, group)?;
+            if !group.ip().is_multicast() {
+                return Err(invalid(Key::Group, "not a multicast address"));
+            }
+            Destination::Multicast { group, ttl }
+        }
+        (None, None, destinations, control) if named > 0 => {
+            let destinations = destinations
+                .map(|list| {
+                    let parsed = list
+                        .split(';')
+                        .map(|one| parse_unicast(Key::Destinations, one))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if parsed.len() > MAX_URI_DESTINATIONS {
+                        return Err(invalid(Key::Destinations, "too many destinations"));
+                    }
+                    if repeats(&parsed) {
+                        return Err(invalid(Key::Destinations, "a destination repeats"));
+                    }
+                    Ok(parsed)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let control = control
+                .map(|value| parse_unicast(Key::Control, value))
+                .transpose()?;
+            let mode = match (mode, control.is_some()) {
+                (Some(ControlMode::Dynamic), false) => {
+                    return Err(ChannelError::Conflict {
+                        first: Key::ControlMode.name(),
+                        second: Key::Control.name(),
+                    });
+                }
+                (Some(mode), _) => mode,
+                (None, true) => ControlMode::Dynamic,
+                (None, false) => ControlMode::Manual,
+            };
+            if mode == ControlMode::Manual && destinations.is_empty() {
+                return Err(ChannelError::Conflict {
+                    first: Key::ControlMode.name(),
+                    second: Key::Destinations.name(),
+                });
+            }
+            Destination::MultiDestination {
+                destinations,
+                control,
+                mode,
+            }
+        }
+        _ => return Err(ChannelError::Destination),
+    })
+}
+
+/// An unpaired `paths` value: one to [`MAX_PATHS`] interfaces,
+/// `;`-separated, none repeated.
+fn parse_paths(list: &str) -> Result<Vec<Interface>, ChannelError> {
+    let parsed = list
+        .split(';')
+        .map(|one| parse_interface(Key::Paths, one))
+        .collect::<Result<Vec<_>, _>>()?;
+    if parsed.len() > MAX_PATHS {
+        return Err(invalid(Key::Paths, "more than 4 paths"));
+    }
+    if repeats(&parsed) {
+        return Err(invalid(Key::Paths, "a path repeats"));
+    }
+    Ok(parsed)
+}
+
+/// A paired `paths` value (owner item 11, karyos#635): one to
+/// [`MAX_PATHS`] `interface@socket-address` elements, `;`-separated, every
+/// element paired. No interface and no endpoint repeats (compared in
+/// canonical form), and every endpoint is unicast, of one address family,
+/// on a nonzero port and not unspecified.
+fn parse_paired_paths(list: &str) -> Result<(Vec<Interface>, Vec<SocketAddr>), ChannelError> {
+    let mut paths = Vec::new();
+    let mut endpoints = Vec::new();
+    for one in list.split(';') {
+        let (interface, endpoint) = one
+            .split_once('@')
+            .ok_or_else(|| invalid(Key::Paths, "paired and unpaired paths"))?;
+        paths.push(parse_interface(Key::Paths, interface)?);
+        endpoints.push(parse_unicast(Key::Paths, endpoint)?);
+    }
+    if paths.len() > MAX_PATHS {
+        return Err(invalid(Key::Paths, "more than 4 paths"));
+    }
+    if repeats(&paths) {
+        return Err(invalid(Key::Paths, "a path repeats"));
+    }
+    if repeats(&endpoints) {
+        return Err(invalid(Key::Paths, "an endpoint repeats"));
+    }
+    if endpoints
+        .windows(2)
+        .any(|pair| matches!(pair, [a, b] if a.is_ipv4() != b.is_ipv4()))
+    {
+        return Err(invalid(Key::Paths, "endpoints of two address families"));
+    }
+    Ok((paths, endpoints))
 }
 
 /// Whether an item of `items` appears twice, comparing in the canonical

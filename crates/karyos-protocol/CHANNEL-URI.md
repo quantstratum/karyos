@@ -98,7 +98,7 @@ compile without its own case.
 | `mtu` | ipc, udp | `decimal`, at most 8192, with room for a frame header and payload |
 | `term-length` | ipc, udp | `decimal`, a power of two from 65536 to 1073741824 |
 | `reliable` | udp | `true` or `false`; default `true` |
-| `paths` | udp | 1 to 4 `interface` elements separated by `;`, none repeated |
+| `paths` | udp | 1 to 4 `interface` elements separated by `;`, none repeated; or 1 to 4 paired `interface@socket-address` elements (section 6) |
 | `lanes` | ipc, udp | `decimal`, 1 to 4 |
 | `guard` | ipc, udp | 1 to 64 bytes of `A-Z a-z 0-9 . _ -` |
 | `trace` | ipc, udp | `off`, `all` or `sampled:` `decimal`, at least 1 |
@@ -247,10 +247,44 @@ A key with a duration value reports a grammar refusal as
 `ChannelError::InvalidDuration`, naming the key and carrying the
 `DurationError`.
 
-## 6. Pending extensions
+## 6. Paired unicast paths
 
-Paired unicast path endpoints (`paths` elements of the form
-interface `@` endpoint, owner item 11) extend the `paths` key and are
-recorded here by the change that implements them, with their IPv6,
-cardinality and conflict rules, before any code accepts them. Until then,
-an `@` in a `paths` element is refused as an invalid interface.
+Paired unicast path endpoints (owner item 11, karyos#635) extend the
+`paths` key. They carry one logical receiver over several routes: path
+`i` sends from its interface to its own endpoint.
+
+```text
+paths       = path *( ";" path )        ; 1 to 4 elements
+path        = interface "@" socket-address
+```
+
+- **Form.** A `paths` value with an `@` in any element is paired, and
+  every element must then be paired: a mixture is `InvalidValue`
+  ("paired and unpaired paths"). The `@` splits each element at its first
+  occurrence; an `interface` never contains one (section 4).
+- **Interface.** As section 4's `interface`: an unbracketed address
+  (no zone) or a name of `A-Z a-z 0-9 . _ -`, up to 15 bytes.
+- **Endpoint.** As section 4's `socket-address` for `endpoint`: unicast,
+  not unspecified, port not 0; IPv6 in brackets, a zone only as a numeric
+  scope id (`eth1@[fe80::1%2]:40123`).
+- **Cardinality.** 1 to 4 elements, as unpaired `paths`; more is
+  `InvalidValue` ("more than 4 paths").
+- **Duplicates.** No interface repeats ("a path repeats") and no endpoint
+  repeats ("an endpoint repeats"), each compared in the canonical form of
+  section 3, so an IPv4-mapped spelling repeats its IPv4 address.
+- **Family.** Every endpoint is of one address family; two families are
+  `InvalidValue` ("endpoints of two address families").
+- **Destination.** Paired paths are the channel's destination form
+  (`Destination::PairedPaths`, the endpoints in the order of `paths`): with
+  `endpoint`, `group`, `destinations` or `control` the URI is a `Conflict`
+  of `paths` and that key, whatever their order. Unpaired `paths` with
+  `destinations` is also a `Conflict` of `paths` and `destinations`:
+  `destinations` fans out to several receivers, `paths` carries one.
+  `interface` with `paths` stays a `Conflict`; `ttl`, `fc` and
+  `control-mode` do not apply.
+- **Interfaces that do not exist** are the driver's to refuse; the URI
+  cannot know the host's interfaces.
+- **Not served yet.** A driver refuses a paired-paths channel,
+  `UnsupportedChannel`, for a publication and a subscription, until
+  unicast paths pass on real sockets (karyos#624). The grammar is recorded
+  and parsed first, as the common URI rule requires.

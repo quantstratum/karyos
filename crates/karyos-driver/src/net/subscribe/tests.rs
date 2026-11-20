@@ -1002,6 +1002,26 @@ fn unicast_paths_are_refused() {
         driver.add_network_subscription(6, &channel),
         Err(crate::error::DriverError::UnsupportedChannel)
     );
+    // Paired unicast paths parse (karyos#635) and stay refused, typed,
+    // for a subscription and a publication, until unicast paths pass on
+    // real sockets (karyos#624), even where paths are taken as isolated.
+    let Ok(karyos_protocol::channel::ChannelConfig {
+        media: karyos_protocol::channel::Media::Udp(paired),
+        ..
+    }) = karyos_protocol::channel::ChannelConfig::parse(
+        "karyos:udp?paths=127.0.0.1@127.0.0.1:9;127.0.0.2@127.0.0.2:9",
+    )
+    else {
+        panic!("paired paths do not parse");
+    };
+    assert_eq!(
+        driver.add_network_subscription(7, &paired),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    assert!(matches!(
+        driver.add_network_publication(aggregate(7, 3, 1), &paired),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    ));
 }
 
 /// #294 tests: an unsubscription the receiver's full ring refuses waits,
