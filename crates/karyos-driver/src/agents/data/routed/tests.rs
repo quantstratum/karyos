@@ -765,6 +765,20 @@ fn a_nak_copy_on_the_other_path_is_absorbed() {
     assert_eq!(outbound.repair().unwrap().absorb_counts().absorbed, 1);
 }
 
+/// karyos#1056: a channel's `path-skew` replaces the path policy's skew
+/// window for absorbing NAK copies, set before the policy is applied.
+#[test]
+fn a_channels_path_skew_sets_the_absorb_window() {
+    let (mut outbound, _log, _halves, _seen, _observer_b) = repair_rig();
+    let policy = super::super::PathPolicy::default().skew_window;
+    let window = policy * 5;
+    outbound.set_path_skew(Some(window));
+    outbound.set_path_policy(super::super::PathPolicy::default());
+    let _ = outbound.nak_on(&first_nak(), MEMBER, (0, true), 10);
+    assert!(outbound.absorbs(&first_nak(), 1, 10 + window));
+    assert!(!outbound.absorbs(&first_nak(), 1, 11 + window), "past it");
+}
+
 /// A reset of one route while another still holds a reliable lane's
 /// copies does not rewind: the other route sends them, and the reset
 /// route rejoins at the selection point (RP-9).

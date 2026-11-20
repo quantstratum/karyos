@@ -375,6 +375,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     /// The channel's `retransmit-window`, overriding the driver's repair
     /// setting when its repair path is built; `None` keeps that setting.
     retransmit_window: Option<u32>,
+    /// The channel's `path-skew` in ns, in place of the path policy's
+    /// skew window (karyos#1056).
+    path_skew: Option<u64>,
     /// The largest datagram, the channel MTU.
     mtu: usize,
     /// The largest datagram's aligned charge.
@@ -642,6 +645,7 @@ impl<T: StreamTerms> Outbound<T> {
             readers,
             reliable,
             retransmit_window: None,
+            path_skew: None,
             receivers_live: false,
             mtu: usize::try_from(mtu).map_err(|_| OutboundError::Mtu)?,
             max_frame: u64::from(max_charge),
@@ -813,6 +817,13 @@ impl<T: StreamTerms> Outbound<T> {
             }
         }
         self.membership = Some(membership);
+    }
+
+    /// Sets the channel's `path-skew` in ns (karyos#1056): the window in
+    /// which a NAK's copy on another path is absorbed, in place of the
+    /// path policy's. Set before the publication is added.
+    pub fn set_path_skew(&mut self, skew: Option<u64>) {
+        self.path_skew = skew;
     }
 
     /// Sets the channel's `retransmit-window` (control path), applied when

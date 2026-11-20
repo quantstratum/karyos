@@ -332,10 +332,19 @@ pub struct UdpConfig {
     /// [`MAX_LINGER`]. `None` keeps the driver's `publication_linger`,
     /// whose default is 5 s. A subscription does not use it.
     pub linger: Option<Duration>,
+    /// How long a receiver waits for a gap's datagram on another path
+    /// before it NAKs or seals it, and how long the sender absorbs a NAK's
+    /// copy on another path (`path-skew`, owner item 17): 0 to
+    /// [`MAX_PATH_SKEW`]. Both sides of the channel use it; `None` keeps
+    /// the driver's settings, whose default is 1 ms.
+    pub path_skew: Option<Duration>,
 }
 
 /// The longest `linger` (owner item 16): 60 s, the driver's own bound.
 pub const MAX_LINGER: Duration = Duration::from_secs(60);
+
+/// The longest `path-skew` (owner item 17): 1 s, the driver's own bound.
+pub const MAX_PATH_SKEW: Duration = Duration::from_secs(1);
 
 /// A validated channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,9 +388,10 @@ enum Key {
     RequireAbortAck,
     NakControl,
     Linger,
+    PathSkew,
 }
 
-const KEYS: [(&str, Key); 20] = [
+const KEYS: [(&str, Key); 21] = [
     ("endpoint", Key::Endpoint),
     ("group", Key::Group),
     ("interface", Key::Interface),
@@ -402,6 +412,7 @@ const KEYS: [(&str, Key); 20] = [
     ("require-abort-ack", Key::RequireAbortAck),
     ("nak-control", Key::NakControl),
     ("linger", Key::Linger),
+    ("path-skew", Key::PathSkew),
 ];
 
 /// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
@@ -732,6 +743,18 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         }
         Some(_) => return Err(invalid(Key::RequireAbortAck, "`true` or `false`")),
     }
+    let path_skew = get(Key::PathSkew)
+        .map(|value| {
+            let skew = parse_duration(value).map_err(|error| ChannelError::InvalidDuration {
+                key: Key::PathSkew.name(),
+                error,
+            })?;
+            if skew > MAX_PATH_SKEW {
+                return Err(invalid(Key::PathSkew, "above 1 s"));
+            }
+            Ok(skew)
+        })
+        .transpose()?;
     let retransmit_window = get(Key::RetransmitWindow)
         .map(parse_retransmit_window)
         .transpose()?;
@@ -752,6 +775,7 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         retransmit_window,
         nak_control,
         linger,
+        path_skew,
     })
 }
 

@@ -427,6 +427,9 @@ pub(crate) struct SenderChannel {
     /// The channel's `linger` in ns, at most [`MAX_PUBLICATION_LINGER`];
     /// `None` keeps the network's `publication_linger` (karyos#652).
     pub(crate) linger: Option<u64>,
+    /// The channel's `path-skew` in ns; `None` keeps the sender's
+    /// `path_policy.skew_window` (karyos#1056).
+    pub(crate) path_skew: Option<u64>,
     /// A `control-mode=dynamic` publication's registration policy
     /// (karyos#644); `None` otherwise.
     pub(crate) registration: Option<crate::sessions::register::RegistrationPolicy>,
@@ -493,6 +496,17 @@ enum EndpointPurpose {
     Solicit,
 }
 
+/// What every handle of one subscription key shares, as
+/// [`Network::add_subscription`] takes it: the receiver identity, the
+/// conflated lane and view configuration, the dynamic `control` address
+/// and the channel's `path-skew` in ns.
+pub(crate) type KeyOptions = (
+    Option<crate::membership::ReceiverIdentity>,
+    Option<(Lane, karyos_sys::conflation::ConflationConfig)>,
+    Option<SocketAddr>,
+    Option<u64>,
+);
+
 /// A network subscription of this driver (W3): the receiver holds one
 /// entry per endpoint and stream, so the handles of one key are counted
 /// (#283 P2).
@@ -516,6 +530,9 @@ struct NetSubscription {
     /// The `control` address of a `control-mode=dynamic` key, which every
     /// handle of it shares (design 3.2; karyos#644).
     register_at: Option<SocketAddr>,
+    /// The channel's `path-skew` in ns, which every handle of the key
+    /// shares (karyos#1056).
+    path_skew: Option<u64>,
     /// The key's registration state, which its receiver writes
     /// (karyos#941 item 3); with `register_at` only.
     registration: Option<std::sync::Arc<crate::sessions::register::RegistrationStatus>>,
@@ -845,6 +862,10 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     /// deadlines ([`crate::agents::BarrierAckBound::FarWindow`]), checked
     /// at start for the conflated subscriptions of unreliable channels.
     unreliable_view_bound: Result<(), crate::agents::BarrierAckBound>,
+    /// `barrier_ack_timeout` and the receiver's path settings, for the
+    /// far-window check of a channel with its own `path-skew`
+    /// (karyos#1056).
+    view_bound_inputs: (u64, crate::paths::PathConfig),
     /// Conflated views built from now on are not attached (tests).
     #[cfg(test)]
     defer_view_attach: bool,
@@ -966,6 +987,10 @@ impl<T: StreamTerms> Network<T> {
             path_failures: 0,
             views: NetworkViewCounters::default(),
             cells: Vec::new(),
+            view_bound_inputs: (
+                config.agents.barrier_ack_timeout,
+                crate::agents::roles::receiver_path_config(&config.agents),
+            ),
             unreliable_view_bound: crate::agents::conflated_gate::check_far_window(
                 config.agents.barrier_ack_timeout,
                 &crate::agents::roles::image_skip_config(
@@ -1082,11 +1107,7 @@ impl<T: StreamTerms> Network<T> {
         later: &[(SocketAddr, MulticastConfig)],
         max_term_length: u32,
         (reliable, own_port): (bool, bool),
-        (identity, conflated, register_at): (
-            Option<crate::membership::ReceiverIdentity>,
-            Option<(Lane, karyos_sys::conflation::ConflationConfig)>,
-            Option<SocketAddr>,
-        ),
+        (identity, conflated, register_at, path_skew): KeyOptions,
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
         // A URI subscription on port 0 (`own_port`) asks for an ephemeral
@@ -1136,6 +1157,12 @@ impl<T: StreamTerms> Network<T> {
             }
             // It registers at one `control` address, or at none.
             if entry.register_at != register_at {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::UnsupportedChannel);
+            }
+            // Its images wait one skew window: a second handle must ask
+            // for the same one (karyos#1056).
+            if entry.path_skew != path_skew {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::UnsupportedChannel);
             }
@@ -1199,6 +1226,7 @@ impl<T: StreamTerms> Network<T> {
                 conflated: conflated.map(|(lane, _)| lane),
                 solicit_from: solicit,
                 register_at: register_at.zip(registration.clone()),
+                path_skew,
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
@@ -1253,6 +1281,7 @@ impl<T: StreamTerms> Network<T> {
                     conflated: conflated.map(|(lane, _)| lane),
                     solicit_from: solicit,
                     register_at: None,
+                    path_skew,
                 });
             if posted.is_err() {
                 release(&mut self.send_endpoints, path);
@@ -1270,6 +1299,7 @@ impl<T: StreamTerms> Network<T> {
             identity,
             conflated,
             register_at,
+            path_skew,
             registration,
             later: held,
             later_routes,
@@ -1383,8 +1413,26 @@ impl<T: StreamTerms> Network<T> {
     /// # Errors
     ///
     /// [`crate::agents::BarrierAckBound::FarWindow`] when it does not.
-    pub(crate) fn unreliable_view_bound(&self) -> Result<(), crate::agents::BarrierAckBound> {
-        self.unreliable_view_bound
+    pub(crate) fn unreliable_view_bound(
+        &self,
+        path_skew: Option<u64>,
+    ) -> Result<(), crate::agents::BarrierAckBound> {
+        let Some(skew) = path_skew else {
+            return self.unreliable_view_bound;
+        };
+        // A channel's own `path-skew`: the check at this subscription's
+        // admission, with that skew (karyos#1056, the #658 note).
+        let (timeout, paths) = self.view_bound_inputs;
+        crate::agents::conflated_gate::check_far_window(
+            timeout,
+            &crate::agents::roles::image_skip_config(
+                &crate::paths::PathConfig {
+                    path_skew_window: skew,
+                    ..paths
+                },
+                false,
+            ),
+        )
     }
 
     /// One channel with `paths` refused: the sockets cannot be isolated.

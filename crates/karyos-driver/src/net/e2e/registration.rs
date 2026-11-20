@@ -30,6 +30,7 @@ fn dynamic(control: SocketAddr) -> UdpConfig {
         retransmit_window: None,
         nak_control: Vec::new(),
         linger: None,
+        path_skew: None,
         destination: Destination::MultiDestination {
             destinations: Vec::new(),
             control: Some(control),

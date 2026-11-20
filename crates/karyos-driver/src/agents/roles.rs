@@ -828,6 +828,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// Per subscription key, the endpoint its SOLICITs leave from (plan
     /// 164), allocated at creation.
     solicit_from: Vec<(EndpointId, i32, EndpointId)>,
+    /// Per subscription key, its channel's `path-skew` in ns (karyos#1056),
+    /// allocated at creation: its images' skew window.
+    skews: Vec<(EndpointId, i32, u64)>,
     /// The `control-mode=dynamic` subscription keys (design 3.2;
     /// karyos#644). Allocated at creation: at most one per subscription
     /// key.
@@ -2040,6 +2043,7 @@ pub(super) fn roles<T: StreamTerms>(
             group_start: 0,
             identities: Vec::with_capacity(config.subscriptions),
             solicit_from: Vec::with_capacity(config.subscriptions),
+            skews: Vec::with_capacity(config.subscriptions),
             registering: Vec::with_capacity(config.subscriptions),
             register_rates,
             setup_interval: config.setup_interval,
@@ -2197,6 +2201,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
                 conflated,
                 solicit_from,
                 register_at,
+                path_skew,
             } => {
                 let held = self
                     .subscriptions
@@ -2235,6 +2240,10 @@ impl<T: StreamTerms> ReceiverRole<T> {
                         // And the endpoint its SOLICITs leave from.
                         if let Some(from) = solicit_from {
                             self.solicit_from.push((endpoint, stream_id, from));
+                        }
+                        // And its channel's skew window.
+                        if let Some(skew) = path_skew {
+                            self.skews.push((endpoint, stream_id, skew));
                         }
                         // And the address it registers at, due at once.
                         if let Some((control, status)) = register_at {
@@ -2289,6 +2298,8 @@ impl<T: StreamTerms> ReceiverRole<T> {
                     self.conflated
                         .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
                     self.solicit_from
+                        .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
+                    self.skews
                         .retain(|(held, stream, _)| (*held, *stream) != (endpoint, stream_id));
                     self.registering
                         .retain(|key| (key.endpoint, key.stream_id) != (endpoint, stream_id));
@@ -3097,10 +3108,20 @@ impl<T: StreamTerms> ReceiverRole<T> {
             receiver_boot_id: self.sessions.boot_id(),
             receiver_id: named,
         };
+        // Its channel's `path-skew`, else the receiver's (karyos#1056).
+        let skew = self
+            .skews
+            .iter()
+            .find(|(held, stream, _)| (*held, *stream) == (key.endpoint, key.alias.stream_id))
+            .map_or(self.path_config.path_skew_window, |(.., skew)| *skew);
+        let skewed = PathConfig {
+            path_skew_window: skew,
+            ..self.path_config
+        };
         // A multicast image times its NAKs by cycle (RC-2).
         let loss = ImageLoss::new(
             LossConfig {
-                skew_window_ns: self.path_config.path_skew_window,
+                skew_window_ns: skew,
                 unicast_retry_slack_ns: self.unicast_retry_slack,
                 ..LossConfig::default()
             },
@@ -3120,7 +3141,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
         let Ok(loss) = loss else {
             return Err(Some(chain.retire));
         };
-        let skip_config = image_skip_config(&self.path_config, reliable);
+        let skip_config = image_skip_config(&skewed, reliable);
         let Ok(skip) = SkipPolicy::new(skip_config, usize::from(chain.lane_count)) else {
             return Err(Some(chain.retire));
         };

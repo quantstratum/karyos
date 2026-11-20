@@ -677,6 +677,12 @@ pub enum AgentCommand<O: SocketOps, T: StreamTerms = HeapTerms> {
             std::net::SocketAddr,
             std::sync::Arc<crate::sessions::register::RegistrationStatus>,
         )>,
+        /// The channel's `path-skew` in ns (karyos#1056): its images' skew
+        /// window for loss detection and the skip policy, in place of the
+        /// receiver's `path_skew_window`. `None` keeps that. A second
+        /// subscription of the key keeps the first's (the conductor
+        /// refuses another).
+        path_skew: Option<u64>,
     },
     /// Receiver only: `alias` on `endpoint` is a local publication, so
     /// controls for it go to the sender (the pre-filter of DN-4). Answer
