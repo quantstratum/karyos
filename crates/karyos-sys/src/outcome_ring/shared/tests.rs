@@ -286,3 +286,57 @@ fn the_quota_and_corrupt_handle_fields() {
         Err(OutcomeError::Corrupt { sequence: 1 })
     );
 }
+
+/// rev-claude's case on #1105: the other handles run a full ring past a
+/// faulted handle that has not polled. Its `OutcomesLost` record is written
+/// over, and its poll still ends cleanly, as at that record (lost count
+/// unknown), never `Corrupt`; a head that is not a later round of the
+/// expected sequence stays corrupt.
+#[test]
+fn a_faulted_handle_lapped_by_the_others_ends_cleanly() {
+    let ring = ring(&O1);
+    init(&ring, &O1).unwrap();
+    let mut writer = SharedOutcomeWriter::new(&O1).unwrap();
+    for slot in 0..3 {
+        assert_eq!(writer.attach(slot), Ok(0));
+    }
+    let cells = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    // Slot 1 never polls; slots 0 and 2 read every record at once. Two full
+    // rings of records: slot 1 is faulted after 15, then lapped.
+    for _ in 0..36 {
+        let refs = [&cells[0], &cells[1], &cells[2]];
+        let _ = writer.produce(&ring, &refs, message(0)).unwrap();
+        let written = writer.written();
+        cells[0].store(written, Ordering::Relaxed);
+        cells[2].store(written, Ordering::Relaxed);
+    }
+    assert!(writer.faulted(1) && !writer.faulted(0) && !writer.faulted(2));
+    assert!(
+        writer.written() > 16 + 18,
+        "slot 1's OutcomesLost was overwritten"
+    );
+    let mut lapped = SharedOutcomeReader::attach(&ring.as_slice(), 1, 1, 0).unwrap();
+    let mut seen = Vec::new();
+    let read = lapped
+        .poll(&ring.as_slice(), &cells[1], 64, |sequence, record| {
+            seen.push((sequence, record));
+        })
+        .unwrap();
+    assert_eq!(read, 1);
+    assert!(lapped.ended());
+    let [(_, SharedRecord::Delivered(end))] = seen.as_slice() else {
+        panic!("one delivered end: {seen:?}");
+    };
+    assert_eq!((end.kind, end.lost), (Kind::OutcomesLost, LOST_UNKNOWN));
+    // A head that is no later round of the expected sequence is corrupt.
+    let ring = self::ring(&O1);
+    init(&ring, &O1).unwrap();
+    // Sequence 4's slot holds 7: neither pending (0) nor a later round.
+    ring[slot_base(18, 4).unwrap()].store(7, Ordering::Relaxed);
+    let mut reader = SharedOutcomeReader::attach(&ring.as_slice(), 1, 0, 3).unwrap();
+    let cell = AtomicU64::new(0);
+    assert_eq!(
+        reader.poll(&ring.as_slice(), &cell, 4, |_, _| {}),
+        Err(OutcomeError::Corrupt { sequence: 4 })
+    );
+}

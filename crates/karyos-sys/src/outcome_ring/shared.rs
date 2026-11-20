@@ -24,7 +24,10 @@
 //!   `(lane, start)` pairs it reserved, every range-side record, and the
 //!   `OutcomesLost` record that names it, which ends its stream; it skips
 //!   every other record. Its consumed count is the last sequence it read,
-//!   delivered or skipped.
+//!   delivered or skipped. A faulted handle leaves the minimum, so the
+//!   others may lap it: a reader that finds a later round's record in the
+//!   slot it expects was faulted, and its stream ends there as at its
+//!   overwritten `OutcomesLost` record, the lost count unknown.
 
 use super::{
     CAPACITY, EPOCH, GUARD_INDEX, HEADER_WORDS, Kind, LOST_UNKNOWN, MESSAGES, OutcomeError, RANGES,
@@ -382,6 +385,22 @@ impl SharedOutcomeWriter {
     }
 }
 
+/// The end a lapped handle reads in place of its overwritten
+/// `OutcomesLost` record: the same kind, the lost count unknown.
+const fn lapped_end() -> Record {
+    Record {
+        kind: Kind::OutcomesLost,
+        lane: 0,
+        receiver: 0,
+        incarnation: 0,
+        start: 0,
+        end: 0,
+        epoch: 0,
+        reason: 0,
+        lost: LOST_UNKNOWN,
+    }
+}
+
 /// What a handle's reader made of one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedRecord {
@@ -511,6 +530,18 @@ impl SharedOutcomeReader {
                     None => head == 0,
                 };
                 if pending {
+                    break;
+                }
+                if head > sequence && (head - sequence).is_multiple_of(self.capacity) {
+                    // Lapped: the writer never overwrites a record a live
+                    // handle has not read (its room check counts every live
+                    // handle), so this handle was faulted and left the
+                    // minimum, and its `OutcomesLost` record was written
+                    // over (ADR-0092 decision 7). Its stream ends here, as
+                    // at that record, with the lost count unknown.
+                    self.ended = true;
+                    handler(sequence, SharedRecord::Delivered(lapped_end()));
+                    read += 1;
                     break;
                 }
                 return Err(corrupt);
