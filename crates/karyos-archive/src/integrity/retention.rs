@@ -800,6 +800,10 @@ pub enum PurgeRefusal {
         /// The seal record's counter.
         counter: u64,
     },
+    /// The recording has no recorded close time (ADR-0093): it still
+    /// records, or it stopped before close times were recorded.
+    #[error("the recording has no recorded close time")]
+    NoCloseTime,
 }
 
 impl PurgeRefusal {
@@ -821,6 +825,7 @@ impl PurgeRefusal {
             Self::DuplicateId { .. } => "duplicate_id",
             Self::ManualOnly => "manual_only",
             Self::SplitsSeal { .. } => "splits_seal",
+            Self::NoCloseTime => "no_close_time",
         }
     }
 
@@ -841,6 +846,7 @@ impl PurgeRefusal {
             Self::DuplicateId { .. } => 11,
             Self::ManualOnly => 12,
             Self::NotSealed { .. } => 13,
+            Self::NoCloseTime => 14,
         }
     }
 }
@@ -1227,6 +1233,14 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
     /// [`Retention::purge`] would: holds first, as in
     /// [`Retention::check`], then `no_policy`. Never deletes.
     pub fn refuse_unconfigured(&mut self, request: &PurgeRequest) -> PurgeError {
+        self.refuse_after_holds(request, PurgeRefusal::NoPolicy)
+    }
+
+    /// Refuses `request` with `last`, journalled, unless a refusal that
+    /// comes first in [`Retention::check`] applies: a duplicate id, unknown
+    /// holds, a hold, no authorisation. Never deletes. Used for what the
+    /// check cannot see: no policy, no close time (ADR-0093).
+    pub fn refuse_after_holds(&mut self, request: &PurgeRequest, last: PurgeRefusal) -> PurgeError {
         let refusal = if self.intents.contains_key(&request.id) {
             PurgeRefusal::DuplicateId { id: request.id }
         } else if self.holds_unknown {
@@ -1236,7 +1250,7 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         } else if !request.authorisation.authorised {
             PurgeRefusal::NotAuthorised
         } else {
-            PurgeRefusal::NoPolicy
+            last
         };
         self.refuse(request, refusal)
     }

@@ -170,6 +170,11 @@ pub struct Stop {
     /// The recording lost ranges (an async recording lapped and resumed):
     /// its segments hold gap entries there.
     pub incomplete: bool,
+    /// When it closed, in ns of UTC (ADR-0093): the host's realtime clock
+    /// when the stop was appended, never below an earlier stop's in the
+    /// catalog. `None` for a stop from before ADR-0093, which a purge
+    /// refuses `no_close_time`.
+    pub closed_utc_ns: Option<u64>,
 }
 
 /// What a replay of a recording needs of the recorded stream's
@@ -358,6 +363,18 @@ pub struct Catalog<D: Disk> {
     /// The changes appended since the last [`Catalog::take_changes`], when
     /// they are collected for the integrity journal.
     changes: Option<Vec<CatalogChange>>,
+    /// The realtime clock a stop's close time is read from (ADR-0093).
+    utc: fn() -> u64,
+}
+
+/// The host's `CLOCK_REALTIME` in ns since the Unix epoch; 0 when it
+/// cannot be read, which records no close time.
+fn realtime_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_nanos()).ok())
+        .unwrap_or(0)
 }
 
 /// One appended catalog record, for the integrity journal to chain
@@ -482,6 +499,9 @@ impl Record {
                 payload.bytes(&stop.position.to_le_bytes());
                 payload.bytes(&stop.time_ns.to_le_bytes());
                 payload.bytes(&[stop.reason.code(), u8::from(stop.incomplete)]);
+                if let Some(closed) = stop.closed_utc_ns {
+                    payload.bytes(&closed.to_le_bytes());
+                }
                 STOPPED
             }
             Self::NextId(next) => {
@@ -565,6 +585,12 @@ impl Record {
                         0 => false,
                         1 => true,
                         _ => return None,
+                    },
+                    // ADR-0093: optional, and never 0.
+                    closed_utc_ns: if input.0.is_empty() {
+                        None
+                    } else {
+                        Some(input.u64().filter(|closed| *closed != 0)?)
                     },
                 },
             },
@@ -676,6 +702,7 @@ impl<D: Disk> Catalog<D> {
                 next_id: 1,
                 failed: false,
                 changes: None,
+                utc: realtime_ns,
             };
             return Ok(Opened {
                 catalog,
@@ -738,6 +765,7 @@ impl<D: Disk> Catalog<D> {
                 next_id,
                 failed: false,
                 changes: None,
+                utc: realtime_ns,
             },
             cut,
             removed_temporary,
@@ -880,11 +908,20 @@ impl<D: Disk> Catalog<D> {
         if recording.stop.is_some() {
             return Err(CatalogError::AlreadyStopped { id });
         }
+        // ADR-0093: never below an earlier close in the catalog.
+        let high_water = self
+            .recordings
+            .iter()
+            .filter_map(|recording| recording.stop.and_then(|stop| stop.closed_utc_ns))
+            .max()
+            .unwrap_or(0);
+        let closed = (self.utc)().max(high_water);
         let stop = Stop {
             position,
             time_ns,
             reason,
             incomplete,
+            closed_utc_ns: (closed != 0).then_some(closed),
         };
         self.append(&Record::Stopped { id, stop })?;
         if let Some(recording) = self
@@ -895,6 +932,12 @@ impl<D: Disk> Catalog<D> {
             recording.stop = Some(stop);
         }
         Ok(())
+    }
+
+    /// Reads stops' close times from `utc` instead of the realtime clock.
+    #[cfg(test)]
+    pub(crate) fn set_utc(&mut self, utc: fn() -> u64) {
+        self.utc = utc;
     }
 
     /// Forgets the stopped recording `id` (its files are the caller's):

@@ -154,6 +154,7 @@ fn samples() -> Vec<ControlMessage<'static>> {
                 time_ns: 6,
                 reason: StopReason::Failed(FailKind::Invalid),
                 incomplete: true,
+                closed_utc_ns: None,
             }),
             geometry: geometry(),
             source: source(),

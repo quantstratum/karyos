@@ -27,8 +27,8 @@ use crate::integrity::journal::IntegrityError;
 use crate::integrity::ledger::{Ledger, read_entries};
 use crate::integrity::retention::{
     Authorisation, HoldReport, MARKER_LENGTH, OPERATION_LENGTH, OPERATIONS_FILE,
-    PENDING_HOLDS_FILE, PurgeContext, PurgeError, PurgeRequest, PurgeSource, Retention,
-    RetentionPolicy,
+    PENDING_HOLDS_FILE, PurgeContext, PurgeError, PurgeRefusal, PurgeRequest, PurgeSource,
+    Retention, RetentionPolicy,
 };
 use crate::integrity::trust::{KEYS_FILE, REGISTRY_ENTRY_LENGTH};
 use crate::integrity::verify::{self, Evidence, Outcome, RangeBytes, Reason};
@@ -182,12 +182,12 @@ impl<D: Disk + Clone> State<D> {
     }
 
     /// Runs `request` through [`Retention::purge`] under `policy`
-    /// (karyos#1093): against the recording's own store, the active one or
-    /// the stopped one reopened, the copy catalog counting the verified
-    /// copies elsewhere. The range's close time is the last modification
-    /// of the newest segment holding bytes below the cutoff, which is no
-    /// earlier than when the range closed, so a purge is never early; a
-    /// disk that keeps no times fails the purge closed.
+    /// (karyos#1093): against the stopped recording's store reopened, the
+    /// copy catalog counting the verified copies elsewhere. The range's
+    /// close time is the stop's recorded `closed_utc_ns` (ADR-0093), raised
+    /// by the newest modification time of the segments holding bytes below
+    /// the cutoff; without a recorded one the purge is refused
+    /// `no_close_time`, so a purge is never early.
     fn purge(&mut self, mut request: PurgeRequest, policy: &RetentionPolicy) -> RetentionAnswer {
         let error = |why: String| RetentionAnswer::Error(why);
         if self.replays.reads(request.recording) {
@@ -196,39 +196,35 @@ impl<D: Disk + Clone> State<D> {
         let Some(recording) = self.catalog.get(request.recording).cloned() else {
             return RetentionAnswer::UnknownRecording;
         };
-        let mut stopped = None;
-        let store = match self
-            .active
-            .iter_mut()
-            .find(|active| active.id == request.recording)
-        {
-            Some(active) => active.recorder.store_mut(),
-            None => {
-                match SegmentStore::recover(
-                    self.disk.clone(),
-                    &self.dir,
-                    recording.id,
-                    recording.geometry,
-                    recording.policy,
-                ) {
-                    Ok(recovered) => stopped.insert(recovered.store),
-                    Err(error_) => return error(error_.to_string()),
-                }
-            }
+        // ADR-0093: the close time is the one the stop recorded, chained in
+        // the integrity journal; a recording that still records, or one
+        // stopped before close times were recorded, has none.
+        let Some(recorded) = recording.stop.and_then(|stop| stop.closed_utc_ns) else {
+            return purge_failed(
+                &self
+                    .retention
+                    .refuse_after_holds(&request, PurgeRefusal::NoCloseTime),
+            );
         };
+        let mut store = match SegmentStore::recover(
+            self.disk.clone(),
+            &self.dir,
+            recording.id,
+            recording.geometry,
+            recording.policy,
+        ) {
+            Ok(recovered) => recovered.store,
+            Err(why) => return error(why.to_string()),
+        };
+        // A segment's modification time may only raise it, never lower it;
+        // one that cannot be read adds nothing.
         let mut disk = self.disk.clone();
-        let mut closed_ns = 0u64;
+        let mut closed_ns = recorded;
         match store.segment_files_holding_below(request.before) {
             Ok(files) => {
                 for file in files {
-                    match disk.modified(&file) {
-                        Ok(at) => closed_ns = closed_ns.max(at),
-                        Err(why) => {
-                            return error(format!(
-                                "the close time of {} is unknown: {why}",
-                                file.display()
-                            ));
-                        }
+                    if let Ok(at) = disk.modified(&file) {
+                        closed_ns = closed_ns.max(at);
                     }
                 }
             }
@@ -256,7 +252,7 @@ impl<D: Disk + Clone> State<D> {
         };
         match self
             .retention
-            .purge(&request, &context, store, &mut integrity.journal)
+            .purge(&request, &context, &mut store, &mut integrity.journal)
         {
             Ok(_) => RetentionAnswer::Done,
             Err(failed) => purge_failed(&failed),

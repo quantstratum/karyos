@@ -4421,7 +4421,8 @@ fn answered<T>(posted: Result<Posted<T>, AgentError>) -> T {
 
 /// karyos#1093: with a retention policy, a purge runs through the
 /// retention engine against the recording's store: refused `legal_hold`
-/// under a hold, `not_expired` before its retention ran, and
+/// under a hold, `not_expired` before its retention ran (a backdated
+/// segment time included: ADR-0093), `no_close_time` while it records, and
 /// `below_min_copies` without a verified copy elsewhere; with one, and the
 /// retention run, the recording is purged.
 #[test]
@@ -4458,6 +4459,38 @@ fn a_configured_policy_purges_through_the_engine() {
     assert_eq!(
         answered(agent.post_purge(id, end, 2, 9)),
         refused("not_expired")
+    );
+    // ADR-0093: a backdated segment time never makes a purge early; the
+    // recorded close time stands.
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|extension| extension == "seg") {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        answered(agent.post_purge(id, end, 5, 9)),
+        refused("not_expired")
+    );
+    // A recording that still records has no close time.
+    let drained = Arc::new(AtomicBool::new(false));
+    let live = agent
+        .start(start(Chunks {
+            chunks: vec![frames(1, 9)].into(),
+            drained: Arc::clone(&drained),
+            ..Chunks::default()
+        }))
+        .unwrap();
+    wait(&drained);
+    assert_eq!(
+        answered(agent.post_purge(live, 96, 6, 9)),
+        refused("no_close_time")
     );
     agent.shutdown().unwrap();
 

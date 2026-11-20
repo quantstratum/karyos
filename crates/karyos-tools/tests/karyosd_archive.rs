@@ -614,8 +614,8 @@ fn the_retention_backend_holds_a_karyosd_recording() {
 /// karyos#1093: with `--archive-retain-for`, `--archive-purge`,
 /// `--archive-min-copies` and `--archive-copy-location`, a karyosd
 /// Archive's purges run through its retention policy over the control
-/// streams: refused `legal_hold` under a hold, then `not_expired` before
-/// the retention ran.
+/// streams: refused `legal_hold` under a hold, then `no_close_time` while
+/// the recording records (ADR-0093).
 #[test]
 fn a_karyosd_retention_policy_refuses_an_early_purge() {
     use karyos_agent::archive_retention::ArchiveRetention;
@@ -667,7 +667,7 @@ fn a_karyosd_retention_policy_refuses_an_early_purge() {
     );
     assert_eq!(
         fmt(backend.purge(1, 64, 4, 1000)),
-        fmt(refused("not_expired"))
+        fmt(refused("no_close_time"))
     );
     assert!(daemon.stop().success());
     let _ = std::fs::remove_file(&path);
