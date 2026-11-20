@@ -321,6 +321,12 @@ pub struct UdpConfig {
     /// channel creation otherwise. `None` keeps the driver's setting,
     /// whose default is half a term.
     pub retransmit_window: Option<u32>,
+    /// Each path's NAK control group (`nak-control`, owner item 8): one
+    /// per path in the order of `paths`, or one for a channel without
+    /// `paths`; multicast only. Empty keeps the driver's control group
+    /// table as configured. The driver enters each into that one table,
+    /// which refuses a conflicting mapping.
+    pub nak_control: Vec<SocketAddr>,
 }
 
 /// A validated channel.
@@ -363,9 +369,10 @@ enum Key {
     Ttl,
     RetransmitWindow,
     RequireAbortAck,
+    NakControl,
 }
 
-const KEYS: [(&str, Key); 18] = [
+const KEYS: [(&str, Key); 19] = [
     ("endpoint", Key::Endpoint),
     ("group", Key::Group),
     ("interface", Key::Interface),
@@ -384,6 +391,7 @@ const KEYS: [(&str, Key); 18] = [
     ("ttl", Key::Ttl),
     ("retransmit-window", Key::RetransmitWindow),
     ("require-abort-ack", Key::RequireAbortAck),
+    ("nak-control", Key::NakControl),
 ];
 
 /// Whether `name` is kebab-case (`CHANNEL-URI.md` section 2): words of
@@ -669,6 +677,10 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
             second: Key::Paths.name(),
         });
     }
+    let nak_control = get(Key::NakControl)
+        .map(|list| parse_nak_control(list, &destination, paths.len()))
+        .transpose()?
+        .unwrap_or_default();
     if interface.is_some() && !paths.is_empty() {
         return Err(ChannelError::Conflict {
             first: Key::Interface.name(),
@@ -727,6 +739,7 @@ fn parse_udp<'a>(get: &impl Fn(Key) -> Option<&'a str>) -> Result<UdpConfig, Cha
         flow_control,
         security,
         retransmit_window,
+        nak_control,
     })
 }
 
@@ -1017,6 +1030,44 @@ fn parse_unicast(key: Key, value: &str) -> Result<SocketAddr, ChannelError> {
         return Err(invalid(key, "a multicast address"));
     }
     Ok(address)
+}
+
+/// A `nak-control` value: one multicast control group endpoint per path,
+/// `;`-separated, in the order of `paths` (one without `paths`), of the
+/// data group's family, on a nonzero port, other than the data group, none
+/// repeated. Only a multicast channel has one.
+fn parse_nak_control(
+    list: &str,
+    destination: &Destination,
+    paths: usize,
+) -> Result<Vec<SocketAddr>, ChannelError> {
+    let Destination::Multicast { group, .. } = destination else {
+        return Err(ChannelError::NotApplicable {
+            key: Key::NakControl.name(),
+        });
+    };
+    let parsed = list
+        .split(';')
+        .map(|one| parse_address(Key::NakControl, one))
+        .collect::<Result<Vec<_>, _>>()?;
+    if parsed.len() != paths.max(1) {
+        return Err(invalid(Key::NakControl, "not one control group per path"));
+    }
+    for control in &parsed {
+        if !control.ip().is_multicast() {
+            return Err(invalid(Key::NakControl, "not a multicast address"));
+        }
+        if control.is_ipv4() != group.is_ipv4() {
+            return Err(invalid(Key::NakControl, "not the group's address family"));
+        }
+        if control == group {
+            return Err(invalid(Key::NakControl, "the data group itself"));
+        }
+    }
+    if repeats(&parsed) {
+        return Err(invalid(Key::NakControl, "a control group repeats"));
+    }
+    Ok(parsed)
 }
 
 fn parse_interface(key: Key, value: &str) -> Result<Interface, ChannelError> {

@@ -474,6 +474,10 @@ fn published_keys_keep_their_meaning() {
                     class: "authenticated"
                 }
             ),
+            Key::NakControl => assert_eq!(
+                udp("karyos:udp?group=239.1.1.1:4000|nak-control=239.1.1.2:4001").nak_control,
+                vec![addr("239.1.1.2:4001")]
+            ),
         }
         assert_eq!(key.name(), name);
     }
@@ -1005,5 +1009,80 @@ fn port_zero_is_an_endpoint_role_only() {
             first: "endpoint",
             second: "paths"
         }
+    );
+}
+
+/// karyos#654 (owner item 8): `nak-control` names one multicast control
+/// group per path, in the order of `paths`, on a multicast channel only.
+#[test]
+fn nak_control_maps_each_path() {
+    let at = |text: &str| text.parse::<SocketAddr>().unwrap();
+    assert!(
+        udp("karyos:udp?group=239.1.1.1:4000")
+            .nak_control
+            .is_empty()
+    );
+    assert_eq!(
+        udp("karyos:udp?group=239.1.1.1:4000|nak-control=239.1.1.2:4001").nak_control,
+        vec![at("239.1.1.2:4001")]
+    );
+    assert_eq!(
+        udp("karyos:udp?group=239.1.1.1:4000|paths=10.0.0.1;10.0.0.2|nak-control=239.1.1.2:4001;239.1.1.3:4001")
+            .nak_control,
+        vec![at("239.1.1.2:4001"), at("239.1.1.3:4001")]
+    );
+    for (uri, reason) in [
+        // Ambiguous: not one group per path.
+        (
+            "karyos:udp?group=239.1.1.1:4000|paths=10.0.0.1;10.0.0.2|nak-control=239.1.1.2:4001",
+            "not one control group per path",
+        ),
+        (
+            "karyos:udp?group=239.1.1.1:4000|nak-control=239.1.1.2:4001;239.1.1.3:4001",
+            "not one control group per path",
+        ),
+        (
+            "karyos:udp?group=239.1.1.1:4000|paths=10.0.0.1;10.0.0.2|nak-control=239.1.1.2:4001;239.1.1.2:4001",
+            "a control group repeats",
+        ),
+        (
+            "karyos:udp?group=239.1.1.1:4000|nak-control=10.0.0.2:4001",
+            "not a multicast address",
+        ),
+        (
+            "karyos:udp?group=239.1.1.1:4000|nak-control=[ff02::1]:4001",
+            "not the group's address family",
+        ),
+        (
+            "karyos:udp?group=239.1.1.1:4000|nak-control=239.1.1.1:4000",
+            "the data group itself",
+        ),
+        (
+            "karyos:udp?group=239.1.1.1:4000|nak-control=239.1.1.2:0",
+            "port 0",
+        ),
+    ] {
+        assert_eq!(
+            refused(uri),
+            ChannelError::InvalidValue {
+                key: "nak-control",
+                reason
+            },
+            "{uri}"
+        );
+    }
+    for uri in [
+        "karyos:udp?endpoint=10.0.0.5:1|nak-control=239.1.1.2:4001",
+        "karyos:udp?destinations=10.0.0.5:1|nak-control=239.1.1.2:4001",
+    ] {
+        assert_eq!(
+            refused(uri),
+            ChannelError::NotApplicable { key: "nak-control" },
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        refused("karyos:ipc?nak-control=239.1.1.2:4001"),
+        ChannelError::NotApplicable { key: "nak-control" }
     );
 }

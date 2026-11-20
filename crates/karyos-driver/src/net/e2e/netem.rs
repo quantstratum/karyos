@@ -618,6 +618,7 @@ fn multicast_group(label: &str, late: bool) {
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 9)), free_port());
     let channel = UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Multicast { group, ttl: None },
         interface: None,
         paths: Vec::new(),

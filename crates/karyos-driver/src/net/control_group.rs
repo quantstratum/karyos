@@ -2,11 +2,12 @@
 
 //! The NAK control groups of multicast channels (`quantstratum-docs:
 //! karyos/design/reliable-transport.md`, "Control group configuration";
-//! RC-7, RC-15). The design makes `nak_control_group` a channel setting;
-//! until the owner approves a URI key for it, the driver holds the
-//! mapping in [`NetworkConfig::nak_control_groups`](super::NetworkConfig)
-//! (coordinator decision, ACS 16103), and a URI key will map onto the same
-//! table.
+//! RC-7, RC-15). The driver holds one mapping, seeded from
+//! [`NetworkConfig::nak_control_groups`](super::NetworkConfig); a
+//! channel's `nak-control` key (owner item 8, karyos#654) adds its paths'
+//! entries to that same table (`merge`), so two subscribers of one
+//! driver never disagree about its topology. Cross-host agreement on the
+//! groups is the deployment's: there is no discovery.
 //!
 //! - **Entries.** Each maps a data group endpoint, on a path's interface,
 //!   to its control group endpoint. A data group with no entry runs with
@@ -60,6 +61,47 @@ pub(crate) fn validate(table: &ControlGroups) -> Result<(), DriverError> {
             return Err(DriverError::InvalidConfig);
         }
     }
+    Ok(())
+}
+
+/// Adds `entries` (data group, path interface, control group) to `table`,
+/// all or none: an entry the table already holds is kept, one that maps
+/// a held data group and interface to another control group is a
+/// conflict, and the rest take free slots. The result must still
+/// [`validate`].
+///
+/// # Errors
+///
+/// [`DriverError::ControlGroupConflict`], [`DriverError::ControlGroupsFull`],
+/// or [`DriverError::InvalidConfig`] when the merged table does not
+/// validate.
+pub(crate) fn merge(
+    table: &mut ControlGroups,
+    entries: impl IntoIterator<Item = ControlGroup>,
+) -> Result<(), DriverError> {
+    let mut merged = *table;
+    for entry in entries {
+        let held = merged
+            .iter()
+            .flatten()
+            .find(|held| (held.data_group, held.interface) == (entry.data_group, entry.interface));
+        match held {
+            Some(held) if held.control_group == entry.control_group => continue,
+            Some(_) => {
+                return Err(DriverError::ControlGroupConflict {
+                    data_group: entry.data_group,
+                });
+            }
+            None => {}
+        }
+        let slot = merged
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(DriverError::ControlGroupsFull)?;
+        *slot = Some(entry);
+    }
+    validate(&merged)?;
+    *table = merged;
     Ok(())
 }
 
@@ -165,6 +207,50 @@ mod tests {
         assert_eq!(
             lookup(&table, SocketAddr::from(([239, 9, 9, 9], 4000)), None),
             None
+        );
+    }
+
+    /// karyos#654: a merge keeps held entries, refuses a conflict and a
+    /// ninth entry, and changes nothing when it refuses.
+    #[test]
+    fn a_merge_is_all_or_none() {
+        let mut table: ControlGroups = [None; MAX_CONTROL_GROUPS];
+        table[0] = group([239, 1, 1, 1], [239, 1, 1, 2], 4001);
+        let entry = |data: [u8; 4], control: [u8; 4]| ControlGroup {
+            data_group: SocketAddr::from((data, 4000)),
+            interface: None,
+            control_group: SocketAddr::from((control, 4001)),
+        };
+        merge(&mut table, [entry([239, 1, 1, 1], [239, 1, 1, 2])]).unwrap();
+        assert_eq!(table.iter().flatten().count(), 1);
+        let before = table;
+        // A new entry first, then a conflict: neither lands.
+        assert_eq!(
+            merge(
+                &mut table,
+                [
+                    entry([239, 1, 3, 1], [239, 1, 3, 2]),
+                    entry([239, 1, 1, 1], [239, 1, 1, 9]),
+                ]
+            ),
+            Err(DriverError::ControlGroupConflict {
+                data_group: SocketAddr::from(([239, 1, 1, 1], 4000)),
+            })
+        );
+        assert_eq!(table, before);
+        // An entry the table refuses on validation (a unicast control).
+        assert_eq!(
+            merge(&mut table, [entry([239, 1, 4, 1], [10, 0, 0, 1])]),
+            Err(DriverError::InvalidConfig)
+        );
+        assert_eq!(table, before);
+        for n in 2..=8 {
+            merge(&mut table, [entry([239, 2, n, 1], [239, 2, n, 2])]).unwrap();
+        }
+        assert_eq!(table.iter().flatten().count(), MAX_CONTROL_GROUPS);
+        assert_eq!(
+            merge(&mut table, [entry([239, 3, 0, 1], [239, 3, 0, 2])]),
+            Err(DriverError::ControlGroupsFull)
         );
     }
 }

@@ -50,6 +50,7 @@ fn driver() -> EmbeddedDriver {
 fn channel(address: SocketAddr) -> UdpConfig {
     UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::Unicast(address),
         interface: Some(Interface::Address(LOOPBACK)),
         paths: Vec::new(),

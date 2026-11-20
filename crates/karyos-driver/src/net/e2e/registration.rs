@@ -28,6 +28,7 @@ use crate::sessions::register::{AddressRange, RegistrationAllowlist};
 fn dynamic(control: SocketAddr) -> UdpConfig {
     UdpConfig {
         retransmit_window: None,
+        nak_control: Vec::new(),
         destination: Destination::MultiDestination {
             destinations: Vec::new(),
             control: Some(control),

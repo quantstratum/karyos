@@ -491,6 +491,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         let route = receive_route(channel, dynamic)?;
         let later = later_routes(channel)?;
+        // The channel's NAK control groups join the driver's one table
+        // first, so the subscription's join finds them (karyos#654).
+        net.map_nak_control(channel)?;
         net.add_subscription(
             stream_id,
             route,
