@@ -1062,3 +1062,91 @@ fn a_dynamic_subscription_refuses_a_control_no_register_can_reach() {
             .is_ok()
     );
 }
+
+/// Design 3.7 and 8 between drivers (karyos#943): a receiver registers,
+/// binds and receives, then goes silent; the sender removes its slot as a
+/// timeout once no SM arrived for `image_liveness_timeout` (500 ms here),
+/// and the same receiver id registering again afterwards from a new
+/// driver binds at its next REGISTER and receives. The second
+/// registration succeeds as soon as the removal is done: it comes from
+/// another port, so the quarantine of the old endpoint does not apply,
+/// and the old binding is gone, so it is a fresh join, not a restart.
+#[test]
+fn a_silent_receiver_is_removed_and_registers_again() {
+    let quick = AgentConfig {
+        image_liveness_timeout: 500_000_000,
+        sender_heartbeat_interval: 100_000_000,
+        ..AgentConfig::default()
+    };
+    let liveness = std::time::Duration::from_nanos(quick.image_liveness_timeout);
+    let mut a = driver_with(ThreadingMode::Shared, quick);
+    let mut b = driver(ThreadingMode::Shared);
+    let control = SocketAddr::new(LOOPBACK, free_port());
+    let publication = a
+        .add_dynamic_network_publication(
+            aggregate(10, 3, 1),
+            &reliable(control),
+            allowlist([127, 0, 0, 0], 8),
+            None,
+        )
+        .unwrap();
+    let _first = b
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    let image = image_of(&mut a, &mut b, 10);
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    // One publisher handle for both receivers: the lane is exclusive.
+    let mut lane = a
+        .publication(publication.lane(karyos_sys::frame::Lane::ZERO).unwrap())
+        .unwrap();
+    super::exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..16);
+    // Silence: the receiver's driver stops being pumped, and only the
+    // sender runs. `b` stays alive, holding its UDP port, so the new
+    // receiver cannot reuse it and meet the old endpoint's quarantine.
+    drop(reader);
+    let silent = std::time::Instant::now();
+    pump(&mut [&mut a], |drivers| {
+        sender(drivers[0]).registrants_timed_out >= 1
+    });
+    // Not before the configured liveness timeout (500 ms), counted from
+    // the last SM, which arrived at most one SM interval (10 ms) before
+    // the silence began: 100 ms of slack covers that and the pump's
+    // granularity, far below the timeout, so an earlier retirement fails.
+    let slack = std::time::Duration::from_millis(100);
+    assert!(
+        silent.elapsed() + slack >= liveness,
+        "retired after {:?}, before the {liveness:?} liveness timeout",
+        silent.elapsed()
+    );
+    assert_eq!(sender(&a).registrants_timed_out, 1);
+    let before = registrations(&a);
+    // Its REGISTER retry interval (`setup_interval`) is far above the
+    // test's runtime, so no retry can be due: the bind below comes from
+    // the first REGISTER by construction, not by timing (karyos#993).
+    let mut again = driver_with(
+        ThreadingMode::Shared,
+        AgentConfig {
+            setup_interval: 600_000_000_000,
+            ..AgentConfig::default()
+        },
+    );
+    let _second = again
+        .add_dynamic_network_subscription(10, &subscribed(control), as_receiver(1))
+        .unwrap();
+    let image = image_of(&mut a, &mut again, 10);
+    // Its first REGISTER is the one that binds: one sent (no retry was
+    // due), one new pending entry, no retry and nothing dropped as
+    // quarantined.
+    assert_eq!(receiver(&again).registers_sent, 1);
+    let after = registrations(&a);
+    assert_eq!(after.registered, before.registered + 1);
+    assert_eq!(after.retried, before.retried);
+    assert_eq!(after.dropped_quarantined, before.dropped_quarantined);
+    let mut reader = again.subscribe_aggregate(&image, Role::Required).unwrap();
+    super::exchange_on(&mut a, &mut again, &mut lane, &mut reader, 16..32);
+    let counters = sender(&a);
+    assert_eq!(counters.registrants_joined, 2);
+    assert_eq!(counters.registrants_timed_out, 1);
+    assert_eq!(counters.registrants_restarted, 0);
+    drop(b);
+}

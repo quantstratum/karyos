@@ -182,11 +182,12 @@ type Change = fn(&mut RegistrationConfig);
 fn limits_are_mandatory_nonzero_bounded_and_named() {
     let base = RegistrationConfig::default();
     assert_eq!(base.validate(), Ok(()));
-    let cases: [(Change, &str); 10] = [
+    let cases: [(Change, &str); 11] = [
         (|c| c.rate = 0, "rate"),
         (|c| c.sources = 0, "sources"),
         (|c| c.sources = MAX_REGISTRATION_TABLE + 1, "sources"),
         (|c| c.pending = 0, "pending"),
+        (|c| c.pending = MAX_REGISTRATION_TABLE + 1, "pending"),
         (|c| c.pending = usize::MAX, "pending"),
         (|c| c.pending_per_source = 0, "pending_per_source"),
         (
@@ -1162,4 +1163,21 @@ fn a_challenge_after_join_timeout_takes_no_entry() {
     }
     assert_eq!(r.counters().expired, 2);
     assert_eq!(r.counters().challenged, 0);
+}
+
+/// The documented [`RegistrationConfigError::InvalidLimit`] of
+/// `with_required` (karyos#943): one id more than
+/// [`MAX_REGISTRATION_TABLE`] reserved entries hold is refused naming
+/// `required`, and the most that fit are accepted.
+#[test]
+fn more_required_ids_than_the_table_holds_are_refused_naming_required() {
+    let most = u64::try_from(MAX_REGISTRATION_TABLE / REQUIRED_PENDING_PER_ID).unwrap();
+    let fit: Vec<u64> = (1..=most).collect();
+    let over: Vec<u64> = (1..=most + 1).collect();
+    let base = || allow(&[range([10, 0, 0, 0], 8)]);
+    assert!(base().with_required(&fit).is_ok());
+    assert_eq!(
+        base().with_required(&over).map(|_| ()),
+        Err(RegistrationConfigError::InvalidLimit { field: "required" })
+    );
 }
