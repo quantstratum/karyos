@@ -169,6 +169,12 @@ impl DedupConfig {
     /// The large profile, item 37's initial values: 1024 sessions, 64
     /// replies of 8 KiB, 60 s, 512 MiB of replies per replica before
     /// metadata ([`DedupConfig::reserved_bytes`]). Never the default.
+    ///
+    /// Its sessions section is larger than the default snapshot byte
+    /// trigger ([`crate::snapshot::DEFAULT_EVERY_BYTES`], 256 MiB): pair it
+    /// with [`crate::snapshot::SnapshotConfig::large`], and check any other
+    /// snapshot configuration with
+    /// [`crate::snapshot::SnapshotConfig::check_sessions`] (karyos#1002).
     #[must_use]
     pub fn large() -> Self {
         Self::default().with_sessions(LARGE_SESSIONS)
