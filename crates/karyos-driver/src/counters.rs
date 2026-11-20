@@ -507,6 +507,9 @@ pub(crate) struct DriverCounters {
     /// The conductor loop's spin time cell: fixed, kept here, written from
     /// the meter's shared word (`crate::spin`).
     spin: Counter,
+    /// The cells below it serve the driver's counters and positions; those
+    /// from it on, the trace point copies only (karyos#869).
+    copies_from: usize,
 }
 
 impl DriverCounters {
@@ -524,11 +527,20 @@ impl DriverCounters {
     /// Returns [`DriverError::InvalidConfig`] when `capacity` cannot hold
     /// the fixed counters or cannot be allocated.
     pub(crate) fn with_capacity(capacity: usize) -> Result<Self, DriverError> {
+        Self::with_copies(capacity, 0)
+    }
+
+    /// As [`DriverCounters::with_capacity`], with `copies` more cells that
+    /// only the trace point copies take (karyos#869).
+    pub(crate) fn with_copies(capacity: usize, copies: usize) -> Result<Self, DriverError> {
         if capacity < FIXED_COUNTERS {
             return Err(DriverError::InvalidConfig);
         }
-        let (manager, reader) = counters(capacity).map_err(|_| DriverError::InvalidConfig)?;
-        Self::allocate(manager, reader)
+        let cells = capacity
+            .checked_add(copies)
+            .ok_or(DriverError::InvalidConfig)?;
+        let (manager, reader) = counters(cells).map_err(|_| DriverError::InvalidConfig)?;
+        Self::allocate(manager, reader, capacity)
     }
 
     /// Allocates the region in a shared region (IPC mode), with `capacity`
@@ -538,15 +550,23 @@ impl DriverCounters {
         instance: u128,
         region: u64,
         capacity: usize,
+        copies: usize,
     ) -> Result<Self, DriverError> {
         if capacity < FIXED_COUNTERS {
             return Err(DriverError::InvalidConfig);
         }
-        let (manager, reader) = karyos_sys::counters::counters_in(instance, region, capacity)?;
-        Self::allocate(manager, reader)
+        let cells = capacity
+            .checked_add(copies)
+            .ok_or(DriverError::InvalidConfig)?;
+        let (manager, reader) = karyos_sys::counters::counters_in(instance, region, cells)?;
+        Self::allocate(manager, reader, capacity)
     }
 
-    fn allocate(mut manager: CountersManager, reader: CountersReader) -> Result<Self, DriverError> {
+    fn allocate(
+        mut manager: CountersManager,
+        reader: CountersReader,
+        copies_from: usize,
+    ) -> Result<Self, DriverError> {
         let counters = LABELS
             .iter()
             .map(|&(type_id, label)| manager.allocate(type_id, label))
@@ -560,6 +580,7 @@ impl DriverCounters {
             reader,
             counters,
             spin,
+            copies_from,
         })
     }
 
@@ -577,7 +598,11 @@ impl DriverCounters {
         label: &str,
         keys: karyos_sys::counters::CounterKeys,
     ) -> Option<Counter> {
-        match self.manager.allocate_keyed(type_id, label, keys) {
+        let limit = self.copies_from;
+        match self
+            .manager
+            .allocate_keyed_where(type_id, label, keys, |index| index < limit)
+        {
             Ok(counter) => Some(counter),
             Err(_) => {
                 self.add(Event::CountersUnavailable, 1);
@@ -597,12 +622,13 @@ impl DriverCounters {
         keys: karyos_sys::counters::CounterKeys,
         id: u16,
     ) -> Option<Counter> {
+        let copies_from = self.copies_from;
         match self.manager.allocate_valued_where(
             karyos_sys::counters::TYPE_TRACE_POINT,
             name,
             keys,
             u64::from(id),
-            |_| true,
+            |index| index >= copies_from,
         ) {
             Ok(counter) => Some(counter),
             Err(_) => {
@@ -627,7 +653,10 @@ impl DriverCounters {
         label: &str,
         keys: karyos_sys::counters::CounterKeys,
     ) -> Option<Counter> {
-        self.manager.allocate_keyed(type_id, label, keys).ok()
+        let limit = self.copies_from;
+        self.manager
+            .allocate_keyed_where(type_id, label, keys, |index| index < limit)
+            .ok()
     }
 
     /// Frees a keyed counter at once (inside a sampling pass).

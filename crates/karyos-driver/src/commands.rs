@@ -4619,6 +4619,7 @@ mod tests {
         write(&mut producer, point(1, "first"));
         write(&mut producer, point(2, "second"));
         let _ = driver.do_work().unwrap();
+        let _ = driver.do_work().unwrap();
         let answers = responses(&mut observer);
         assert_eq!(answers.len(), 2, "{answers:?}");
         assert_eq!(point_names(&driver), vec![("first".to_owned(), client, 1)]);

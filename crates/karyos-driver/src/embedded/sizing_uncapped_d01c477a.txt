@@ -1,6 +1,6 @@
 configured shared regions:
   broadcast buffer                                                1 x          36864 =            36864  [broadcast_capacity]
-  driver counters                                                 1 x         266240 =           266240  [counters_capacity]
+  driver counters                                                 1 x         331776 =           331776  [counters_capacity, max_trace_point_copies]
   client counters                                                 1 x         266240 =           266240  [client_counters_capacity]
   error log                                                       1 x         266240 =           266240  [error_log_records]
   loss report                                                     1 x          36864 =            36864  [loss_report_records]
@@ -17,8 +17,8 @@ configured heap budgets:
 retained across a cutover or restart:
   stream 2:1 (declared 0): retained generations                   2 x         401408 =           802816  [max_retained_generations, stream term_length]
   stream 3:1 (declared 1): retained generations                   2 x         401408 =           802816  [max_retained_generations, stream term_length]
-configured steady state: 70500352 bytes
-restart peak:            72105984 bytes
+configured steady state: 70565888 bytes
+restart peak:            72171520 bytes
 the restart peak assumes no reconfigure_stream or reconfigure_aggregate since start: a retained predecessor has its stream's current geometry; after a reconfiguration, size with the largest geometry the stream has had.
 cgroup: every region is a shared memfd, mapped in whole pages and charged once to the cgroup of the process that first touches each page; the figures are mapped pages, a ceiling.
 excluded:

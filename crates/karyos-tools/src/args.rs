@@ -83,7 +83,7 @@ Driver limits:
   --max-trace-points-per-client <n> live application trace points per client [16]
   --max-trace-point-registrations-per-client <n>
                                     trace points a client registers over its life [256]
-  --max-trace-point-copies <n>      driver-written trace point copies, own cells [1024]
+  --max-trace-point-copies <n>      driver-written trace point copies, own cells [256]
   --max-trace-journals <n>          entries of the trace journal table [64]
   --max-trace-journal-bytes <size>  bytes of every client trace journal [64m]
   --trace-drain-budget <n>          journal records mirrored per duty cycle [1024]

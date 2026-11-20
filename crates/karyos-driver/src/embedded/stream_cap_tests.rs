@@ -298,6 +298,9 @@ fn a_refused_lane_takes_no_region_id() {
 /// captured on Linux (`rust:1.99`) with this test's body run at
 /// `d01c477a`. A change to the uncapped report must be deliberate: it
 /// regenerates the file the same way, and says so.
+///
+/// Regenerated for karyos#869: the driver counters region holds
+/// `max_trace_point_copies` (256) more cells, the trace point copies'.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_uncapped_report_is_unchanged() {
