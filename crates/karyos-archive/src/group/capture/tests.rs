@@ -1269,3 +1269,47 @@ fn the_uncovered_list_is_reserved_at_start() {
         job.uncovered.capacity()
     );
 }
+
+/// ADR-0089 decision 5 (review of #1090): registrations are unique within
+/// one driver incarnation only, so a capture never continues a journal
+/// that already holds network images: a new run, possibly over a restarted
+/// driver, could repeat a registration and replay would merge two images.
+/// A journal whose events carry no image continues as before.
+#[test]
+fn a_journal_with_network_images_is_not_continued_by_another_run() {
+    let none = Recordings::default();
+    for (image, continued) in [(0u64, true), (7, false)] {
+        let disk = FaultDisk::default();
+        let mut journal = journal(disk.clone(), Capture::Strict, UNSYNCED);
+        let message = GroupRecord::Message(MessageEvent {
+            group_seq: 1,
+            logical_time: 1,
+            incarnation: 1,
+            position: 0,
+            extent: 64,
+            stream_id: 1,
+            session_id: 1,
+            lane: Lane::ZERO,
+            reserved_value: 0,
+            end_of_stream: false,
+            extension: None,
+            payload: Payload::Inline(b"x"),
+            image,
+        });
+        let end = GroupRecord::End(EventEnd {
+            group_seq: 1,
+            observations: 0,
+            outcome: EndOutcome::Complete,
+        });
+        let mut out = vec![0u8; MAX_RECORD];
+        for record in [message, end] {
+            let length = record.encode(&mut out).unwrap();
+            journal.append(&out[..length]).unwrap();
+        }
+        let result = capture(settings(4096, 400, 8), journal, &none);
+        assert_eq!(result.is_ok(), continued, "image {image}");
+        if !continued {
+            assert!(matches!(result, Err(CaptureSetup::ImagesOfAnEarlierRun)));
+        }
+    }
+}
