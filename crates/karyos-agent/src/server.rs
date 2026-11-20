@@ -49,7 +49,12 @@
 //!   role (R-CORE-24); the join metadata registry's (karyos#736) `join-put
 //!   DIR KIND KEY NAME=VALUE...` and `join-retire DIR KIND KEY`, for a
 //!   registrar or an administrator, and `join-get DIR KIND KEY [AT_NS]`
-//!   and `join-list DIR [KIND KEY]`, for every role. A `join-put` line may
+//!   and `join-list DIR [KIND KEY]`, for every role; `rate-change DIR
+//!   STREAM_ID SESSION_ID EXPECTED AUTHORITY MSG_RATE MSG_BURST BYTE_RATE
+//!   BYTE_BURST [REASON]` (R-CORE-21, karyos#740; a byte rate and burst
+//!   of 0 and 0 for no byte limit), AUTHORITY `safety` for an operator, a
+//!   risk officer or an administrator and `administrator` for an
+//!   administrator only. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
@@ -895,6 +900,37 @@ impl Server {
                     Err(error) => (json::join_refusal("join-list", error), Served::Refused),
                 }
             }
+            (
+                Some((requester, role)),
+                Request::RateChange {
+                    dir,
+                    stream,
+                    expected,
+                    authority,
+                    policy,
+                    reason,
+                },
+            ) => {
+                // The safety path only tightens: a closer's. Any other
+                // change is an administrator's (R-CORE-21).
+                let allowed = match authority {
+                    karyos_protocol::cnc::RateAuthority::Safety => {
+                        role.may_close() || role.may_acknowledge()
+                    }
+                    karyos_protocol::cnc::RateAuthority::Administrator => role.may_acknowledge(),
+                };
+                if allowed {
+                    let answer = agent.rate_change_for(
+                        Path::new(dir),
+                        crate::operations::RateChange::new(stream, expected, policy, authority),
+                        requester,
+                        reason.as_bytes(),
+                    );
+                    (json::rate_answer(&answer), Served::Operated)
+                } else {
+                    forbidden()
+                }
+            }
             (Some(_), Request::JoinTooLong) => (
                 json::join_refusal(
                     "join-put",
@@ -1004,6 +1040,16 @@ enum Request<'a> {
         from: u64,
         count: usize,
         epoch: Option<u128>,
+    },
+    /// `rate-change DIR STREAM_ID SESSION_ID EXPECTED AUTHORITY MSG_RATE
+    /// MSG_BURST BYTE_RATE BYTE_BURST [REASON]` (R-CORE-21, karyos#740).
+    RateChange {
+        dir: &'a str,
+        stream: karyos_protocol::cnc::StreamKey,
+        expected: u64,
+        authority: karyos_protocol::cnc::RateAuthority,
+        policy: karyos_sys::rate_limit::RatePolicy,
+        reason: &'a str,
     },
     /// `join-put DIR KIND KEY NAME=VALUE...` (karyos#736).
     JoinPut {
@@ -1147,6 +1193,43 @@ fn join_request<'a>(name: &str, arguments: &'a str) -> Option<Request<'a>> {
     }
 }
 
+/// A `rate-change` request's arguments: a byte rate and burst of 0 and 0
+/// is no byte limit, as on the wire.
+fn rate_change(arguments: &str) -> Option<Request<'_>> {
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+    let mut fields = arguments.splitn(10, ' ');
+    let dir = fields.next().filter(|dir| !dir.is_empty())?;
+    let stream = karyos_protocol::cnc::StreamKey {
+        stream_id: fields.next()?.parse().ok()?,
+        session_id: fields.next()?.parse().ok()?,
+    };
+    let number = |word: Option<&str>| word?.parse::<u64>().ok();
+    let expected = number(fields.next())?;
+    let authority = match fields.next()? {
+        "safety" => karyos_protocol::cnc::RateAuthority::Safety,
+        "administrator" => karyos_protocol::cnc::RateAuthority::Administrator,
+        _ => return None,
+    };
+    let messages = Rate {
+        per_second: number(fields.next())?,
+        burst: number(fields.next())?,
+    };
+    let bytes = Rate {
+        per_second: number(fields.next())?,
+        burst: number(fields.next())?,
+    };
+    let reason = fields.next().unwrap_or("");
+    let bytes = (bytes.per_second != 0 || bytes.burst != 0).then_some(bytes);
+    Some(Request::RateChange {
+        dir,
+        stream,
+        expected,
+        authority,
+        policy: RatePolicy { messages, bytes },
+        reason,
+    })
+}
+
 /// A v1 request and its arguments.
 fn request(rest: &str) -> Option<Request<'_>> {
     let (name, arguments) = rest.split_once(' ').unwrap_or((rest, ""));
@@ -1178,6 +1261,7 @@ fn request(rest: &str) -> Option<Request<'_>> {
                 reason,
             })
         }
+        "rate-change" => rate_change(arguments).or(Some(Request::BadArguments("rate-change"))),
         "legal-hold" | "hold-release" | "seal-verify" => {
             let (recording, reason) = arguments.split_once(' ').unwrap_or((arguments, ""));
             let operation = match name {
@@ -1652,6 +1736,64 @@ mod tests {
             "read.timeout_ms=1  write.timeout_ms=1",
         ] {
             assert_eq!(negotiate(&LIMITS, bad), Err(Refusal::Bad), "{bad}");
+        }
+    }
+
+    /// R-CORE-21 (karyos#740): a rate change's stream, version, authority
+    /// and policy, a byte rate and burst of 0 and 0 being no byte limit;
+    /// malformed arguments get the request's own typed error.
+    #[test]
+    fn rate_change_requests_parse_with_their_policy() {
+        use karyos_protocol::cnc::{RateAuthority, StreamKey};
+        use karyos_sys::rate_limit::{Rate, RatePolicy};
+        let stream = StreamKey {
+            stream_id: 7,
+            session_id: -2,
+        };
+        assert_eq!(
+            parse("KARYOS-AGENT 1 rate-change /run/a 7 -2 3 safety 100 10 0 0 incident 4\n"),
+            Request::RateChange {
+                dir: "/run/a",
+                stream,
+                expected: 3,
+                authority: RateAuthority::Safety,
+                policy: RatePolicy {
+                    messages: Rate {
+                        per_second: 100,
+                        burst: 10,
+                    },
+                    bytes: None,
+                },
+                reason: "incident 4",
+            }
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 rate-change /run/a 7 -2 3 administrator 100 10 4096 2048"),
+            Request::RateChange {
+                dir: "/run/a",
+                stream,
+                expected: 3,
+                authority: RateAuthority::Administrator,
+                policy: RatePolicy {
+                    messages: Rate {
+                        per_second: 100,
+                        burst: 10,
+                    },
+                    bytes: Some(Rate {
+                        per_second: 4096,
+                        burst: 2048,
+                    }),
+                },
+                reason: "",
+            }
+        );
+        for line in [
+            "KARYOS-AGENT 1 rate-change /run/a 7 -2 3 root 100 10 0 0",
+            "KARYOS-AGENT 1 rate-change /run/a 7 -2 3 safety 100 10 0",
+            "KARYOS-AGENT 1 rate-change /run/a x -2 3 safety 100 10 0 0",
+            "KARYOS-AGENT 1 rate-change  7 -2 3 safety 100 10 0 0",
+        ] {
+            assert_eq!(parse(line), Request::BadArguments("rate-change"), "{line}");
         }
     }
 

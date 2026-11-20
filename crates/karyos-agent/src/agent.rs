@@ -19,7 +19,7 @@ use crate::api::{
 use crate::catalog::{CatalogConfig, CatalogWatch};
 use crate::journal::{Gap, GapReason, Journal, JournalError, UNOPENED_POSITION};
 use crate::model::{self, Cell, Follower};
-use crate::operations::{self, GuardAnswer};
+use crate::operations::{self, GuardAnswer, RateAnswer};
 use crate::registry::{self, JoinError, Kind, Registry};
 use crate::trace_window::{TraceWindow, WindowConfig};
 
@@ -209,6 +209,9 @@ pub struct Agent {
     registry: Registry,
     /// The Archive's retention operations (M12), once one is attached.
     retention: Option<crate::retention::SharedBackend>,
+    /// The rate policy versions rate changes were answered with
+    /// (karyos#740), least recently answered first.
+    rates: Vec<crate::api::RateView>,
 }
 
 impl Agent {
@@ -270,6 +273,7 @@ impl Agent {
             started_ns: start,
             registry: Registry::new(start),
             retention: None,
+            rates: Vec::new(),
         }
     }
 
@@ -441,6 +445,81 @@ impl Agent {
             timeout: self.config.guard_timeout,
         };
         operations::guard_command(self.journal.as_mut(), &command)
+    }
+
+    /// Makes rate policy `change` on a guarded stream of the driver in
+    /// `dir`, for
+    /// `requester` (R-CORE-21, karyos#740; see `operations`). The driver
+    /// decides whether the safety path may take it; an administrator's
+    /// change is refused unless its request is journalled durably first.
+    /// A version the driver answers is kept for [`Agent::view`].
+    pub fn rate_change_for(
+        &mut self,
+        dir: &Path,
+        change: operations::RateChange,
+        requester: Requester,
+        reason: &[u8],
+    ) -> RateAnswer {
+        let operations::RateChange {
+            stream,
+            expected,
+            policy,
+            authority,
+        } = change;
+        if !self.drivers.iter().any(|driver| driver.dir == dir) {
+            return RateAnswer::UnknownDriver;
+        }
+        let operation = self.next_operation;
+        // Checked: at their end the ids keep the last one.
+        self.next_operation = operation.checked_add(1).unwrap_or(operation);
+        let command = operations::RateCommand {
+            dir,
+            stream,
+            expected,
+            policy,
+            authority,
+            operation,
+            operator: requester.operator,
+            relay: requester.relay,
+            reason: operations::cut_reason(reason),
+            timeout: self.config.guard_timeout,
+        };
+        let answer = operations::rate_command(self.journal.as_mut(), &command);
+        if let RateAnswer::State {
+            operation,
+            stream,
+            version,
+        } = answer
+        {
+            self.note_rate(dir, stream, version, operation);
+        }
+        answer
+    }
+
+    /// Keeps `version` as stream `stream`'s, most recent last, within
+    /// [`crate::api::MAX_RATE_VIEWS`].
+    fn note_rate(
+        &mut self,
+        dir: &Path,
+        stream: karyos_protocol::cnc::StreamKey,
+        version: u64,
+        operation: u64,
+    ) {
+        self.rates.retain(|rate| {
+            !(rate.dir == dir
+                && rate.stream_id == stream.stream_id
+                && rate.session_id == stream.session_id)
+        });
+        if self.rates.len() >= crate::api::MAX_RATE_VIEWS && !self.rates.is_empty() {
+            self.rates.remove(0);
+        }
+        self.rates.push(crate::api::RateView::new(
+            dir.to_path_buf(),
+            stream.stream_id,
+            stream.session_id,
+            version,
+            operation,
+        ));
     }
 
     /// Stops the agent's journal cleanly: its `agent stopped` record, durable
@@ -698,6 +777,7 @@ impl Agent {
                 std::process::id(),
                 self.started_ns,
             ),
+            rates: self.rates.clone(),
         }
     }
 
@@ -743,6 +823,9 @@ impl Agent {
                     "view" | "trace-window" | "limits" | "trace-buckets" | "trace-export"
                     | "join-registry" => (None, true),
                     "join-put" => (None, register),
+                    // The safety path is a closer's; an administrator's
+                    // change needs the journal, which the answer reports.
+                    "rate-change" => (None, close || acknowledge),
                     // A name added to CAPABILITIES must be classified here.
                     _ => (Some("not_configured"), true),
                 };

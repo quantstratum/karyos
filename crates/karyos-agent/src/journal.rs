@@ -115,6 +115,12 @@ pub enum Kind {
     VerifyRequest,
     /// What the verification reported: `code` is 0 when it answered.
     VerifyOutcome,
+    /// A rate policy change of stream `guard` (its stream word) from
+    /// version `expected`, before it is sent (R-CORE-21, karyos#740).
+    RateRequest,
+    /// What the change did: the version after it in `word`, or the
+    /// refusal's code in `code` and its detail in `word`.
+    RateOutcome,
 }
 
 impl Kind {
@@ -136,6 +142,8 @@ impl Kind {
             Self::PurgeOutcome => 14,
             Self::VerifyRequest => 15,
             Self::VerifyOutcome => 16,
+            Self::RateRequest => 17,
+            Self::RateOutcome => 18,
         }
     }
 
@@ -157,6 +165,8 @@ impl Kind {
             14 => Self::PurgeOutcome,
             15 => Self::VerifyRequest,
             16 => Self::VerifyOutcome,
+            17 => Self::RateRequest,
+            18 => Self::RateOutcome,
             _ => return None,
         })
     }
@@ -170,6 +180,7 @@ impl Kind {
                 | Self::ReleaseRequest
                 | Self::PurgeRequest
                 | Self::VerifyRequest
+                | Self::RateRequest
         )
     }
 }

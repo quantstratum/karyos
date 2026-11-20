@@ -131,6 +131,15 @@ pub fn view(view: &AgentView) -> String {
                 journal_view(out, journal)
             });
         agent_identity(fields.key("agent"), &view.agent);
+        fields.key("rates").array(&view.rates, |out, rate| {
+            out.object(|fields| {
+                fields.string("dir", &rate.dir.to_string_lossy());
+                fields.number("stream_id", rate.stream_id);
+                fields.number("session_id", rate.session_id);
+                fields.number("version", rate.version);
+                fields.number("operation", rate.operation);
+            });
+        });
     });
     text
 }
@@ -273,6 +282,47 @@ pub fn guard_answer(answer: &crate::operations::GuardAnswer) -> String {
         GuardAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
         GuardAnswer::UnknownDriver => fields.string("error", "unknown driver"),
         GuardAnswer::Unattached => fields.string("error", "driver unavailable"),
+    });
+    text
+}
+
+/// A rate change's answer (R-CORE-21, karyos#740): the stream's policy
+/// version after it, or why it was not made, as [`guard_answer`] writes
+/// its errors.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn rate_answer(answer: &crate::operations::RateAnswer) -> String {
+    use crate::operations::RateAnswer;
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match *answer {
+        RateAnswer::State {
+            operation,
+            stream,
+            version,
+        } => {
+            fields.number("operation", operation);
+            fields.number("stream_id", stream.stream_id);
+            fields.number("session_id", stream.session_id);
+            fields.number("version", version);
+        }
+        RateAnswer::Refused {
+            operation,
+            code,
+            detail,
+        } => {
+            fields.string("error", "refused");
+            fields.number("operation", operation);
+            fields.number("code", code);
+            fields.number("detail", detail);
+        }
+        RateAnswer::NoAnswer { operation } => {
+            fields.string("error", "no answer");
+            fields.number("operation", operation);
+        }
+        RateAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
+        RateAnswer::UnknownDriver => fields.string("error", "unknown driver"),
+        RateAnswer::InvalidPolicy => fields.string("error", "invalid policy"),
+        RateAnswer::Unattached => fields.string("error", "driver unavailable"),
     });
     text
 }

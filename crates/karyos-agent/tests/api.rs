@@ -166,7 +166,8 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"limits","state":"served","reason":null},{"name":"trace-buckets","state":"served","reason":null},"#,
             r#"{"name":"trace-export","state":"served","reason":null},"#,
             r#"{"name":"join-registry","state":"served","reason":null},"#,
-            r#"{"name":"join-put","state":"forbidden","reason":"role"}]}"#,
+            r#"{"name":"join-put","state":"forbidden","reason":"role"},"#,
+            r#"{"name":"rate-change","state":"forbidden","reason":"role"}]}"#,
             "\n"
         )
     );

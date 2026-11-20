@@ -15,14 +15,22 @@
 //!   and leaves after it, so it holds no client slot between operations.
 //!   No answer within the timeout is an unknown outcome, journalled as
 //!   such ([`UNKNOWN_OUTCOME`]).
+//! - **Rate change (R-CORE-21, karyos#740).** A rate policy change on a
+//!   guarded stream: the safety path (a tightening) goes ahead whatever
+//!   the journal does, as a close; an administrator's change needs its
+//!   request durable first, as a reopen. Its records carry the stream in
+//!   `guard`, the version it replaces in `expected` and the version after
+//!   it in `word` (for a refusal, the refusal's detail).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use karyos_client::Outcome;
 use karyos_client::ipc::{RemoteClient, attach};
+use karyos_protocol::cnc::{RateAuthority, StreamKey};
 use karyos_sys::guard::GuardState;
 use karyos_sys::host_clock::host_monotonic_ns;
+use karyos_sys::rate_limit::RatePolicy;
 
 pub use crate::journal::UNKNOWN_OUTCOME;
 use crate::journal::{Journal, JournalRecord, Kind, MAX_REASON};
@@ -200,5 +208,203 @@ fn complete(client: &mut RemoteClient, sequence: u64, timeout: Duration) -> Opti
             return None;
         }
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// What a rate policy change came to (R-CORE-21, karyos#740).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RateAnswer {
+    /// The driver answered with the stream's policy version after it.
+    State {
+        /// The operation id, as journalled and audited.
+        operation: u64,
+        /// The stream.
+        stream: StreamKey,
+        /// Its policy version.
+        version: u64,
+    },
+    /// The driver refused it with this control error code and detail
+    /// (for `RateVersionMismatch`, the current version).
+    Refused {
+        /// The operation id.
+        operation: u64,
+        /// The error code.
+        code: u64,
+        /// Its detail.
+        detail: u64,
+    },
+    /// An administrator's change with no durable request record: not
+    /// sent.
+    JournalUnavailable,
+    /// No configured driver has that directory.
+    UnknownDriver,
+    /// The policy names a byte limit with a zero rate or burst: not sent.
+    InvalidPolicy,
+    /// The agent could not attach to the driver: not sent.
+    Unattached,
+    /// Sent, and no answer came: it may or may not have taken effect.
+    NoAnswer {
+        /// The operation id.
+        operation: u64,
+    },
+}
+
+/// A rate policy change as asked: the stream, the version it replaces,
+/// the new policy and the authority it is asked under (R-CORE-21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RateChange {
+    /// The guarded stream.
+    pub stream: StreamKey,
+    /// The policy version the change replaces.
+    pub expected: u64,
+    /// The new policy.
+    pub policy: RatePolicy,
+    /// The safety path or an administrator.
+    pub authority: RateAuthority,
+}
+
+impl RateChange {
+    /// A change of `stream` from version `expected` to `policy` under
+    /// `authority`.
+    #[must_use]
+    pub const fn new(
+        stream: StreamKey,
+        expected: u64,
+        policy: RatePolicy,
+        authority: RateAuthority,
+    ) -> Self {
+        Self {
+            stream,
+            expected,
+            policy,
+            authority,
+        }
+    }
+}
+
+/// One rate policy change to make.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RateCommand<'a> {
+    pub(crate) dir: &'a Path,
+    pub(crate) stream: StreamKey,
+    /// The policy version the change replaces.
+    pub(crate) expected: u64,
+    pub(crate) policy: RatePolicy,
+    pub(crate) authority: RateAuthority,
+    pub(crate) operation: u64,
+    /// The operator's uid: the peer that asked.
+    pub(crate) operator: u32,
+    /// The relay that carried the request, 0 for none (karyos#708).
+    pub(crate) relay: u64,
+    /// The reason, cut by [`cut_reason`]. Journalled only: the command
+    /// carries no reason, and its digest does not cover one.
+    pub(crate) reason: &'a [u8],
+    pub(crate) timeout: Duration,
+}
+
+/// The journal's word for `stream`: the stream id in the low half, the
+/// session id in the high half, as the command's own digest has it.
+#[must_use]
+pub fn stream_word(stream: StreamKey) -> u64 {
+    u64::from(stream.stream_id.cast_unsigned())
+        | (u64::from(stream.session_id.cast_unsigned()) << 32)
+}
+
+impl RateCommand<'_> {
+    fn record(&self, kind: Kind, now: u64) -> JournalRecord {
+        let mut record = JournalRecord::new(kind, now);
+        record.guard = stream_word(self.stream);
+        record.expected = self.expected;
+        record.operation = self.operation;
+        record.operator = u64::from(self.operator);
+        record.parameters = karyos_protocol::cnc::rate_parameters(
+            self.stream,
+            self.expected,
+            self.authority,
+            self.operation,
+            u64::from(self.operator),
+            &self.policy,
+        );
+        record.reason = self.reason.to_vec();
+        record.relay = self.relay;
+        record
+    }
+}
+
+/// Makes `command`, journalled in `journal` when there is one: a request
+/// record before it is sent, an outcome record (the version after it in
+/// `word`, or the refusal's code) after.
+///
+/// The safety path only tightens, so it is never delayed by the journal,
+/// as a guard close is not; an administrator's change may loosen, so its
+/// request must be durable first, as a reopen's, or it is refused unsent.
+pub(crate) fn rate_command(journal: Option<&mut Journal>, command: &RateCommand<'_>) -> RateAnswer {
+    if command
+        .policy
+        .bytes
+        .is_some_and(|bytes| bytes.per_second == 0 || bytes.burst == 0)
+    {
+        return RateAnswer::InvalidPolicy;
+    }
+    let mut journal = journal;
+    let record = command.record(Kind::RateRequest, host_monotonic_ns());
+    match (command.authority, journal.as_deref_mut()) {
+        (RateAuthority::Administrator, None) => return RateAnswer::JournalUnavailable,
+        (RateAuthority::Administrator, Some(journal)) => {
+            if journal.append_durable(&record, record.time).is_err() {
+                return RateAnswer::JournalUnavailable;
+            }
+        }
+        (RateAuthority::Safety, Some(journal)) => {
+            let _ = journal.append(&record, record.time);
+        }
+        (RateAuthority::Safety, None) => {}
+    }
+    let answer = send_rate(command);
+    if let Some(journal) = journal {
+        let mut record = command.record(Kind::RateOutcome, host_monotonic_ns());
+        match answer {
+            RateAnswer::State { version, .. } => record.word = version,
+            RateAnswer::Refused { code, detail, .. } => {
+                record.code = code;
+                record.word = detail;
+            }
+            _ => record.code = UNKNOWN_OUTCOME,
+        }
+        let _ = journal.append(&record, record.time);
+    }
+    answer
+}
+
+/// Sends `command` as a one-command client and waits for its answer.
+fn send_rate(command: &RateCommand<'_>) -> RateAnswer {
+    let Ok(mut client) = attach(command.dir, command.timeout, MAX_PENDING) else {
+        return RateAnswer::Unattached;
+    };
+    let operation = command.operation;
+    let Ok(sequence) = client.rate_change(
+        command.stream,
+        command.expected,
+        command.policy,
+        command.authority,
+        operation,
+        Some(command.operator),
+    ) else {
+        return RateAnswer::Unattached;
+    };
+    match complete(&mut client, sequence, command.timeout) {
+        Some(Outcome::RateState { stream, version }) => RateAnswer::State {
+            operation,
+            stream,
+            version,
+        },
+        Some(Outcome::Refused { code, detail }) => RateAnswer::Refused {
+            operation,
+            code: code.code(),
+            detail,
+        },
+        _ => RateAnswer::NoAnswer { operation },
     }
 }

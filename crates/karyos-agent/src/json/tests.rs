@@ -277,6 +277,13 @@ fn every_field() -> AgentView {
             }],
         }),
         agent: crate::api::AgentIdentity::new(Some("ns/pod-0".to_owned()), 4242, 99),
+        rates: vec![crate::api::RateView::new(
+            std::path::PathBuf::from("/run/a"),
+            7,
+            -2,
+            3,
+            11,
+        )],
     }
 }
 
@@ -296,13 +303,14 @@ fn a_journal_that_could_not_open_is_written_with_its_error() {
             alerts: Vec::new(),
         }),
         agent: crate::api::AgentIdentity::new(None, 7, 1),
+        rates: Vec::new(),
     };
     assert_eq!(
         view(&agent),
         concat!(
             r#"{"version":1,"drivers":[],"journal":{"recording":null,"unsealed":true,"#,
             r#""unavailable":true,"error":"no such directory","failed_appends":0,"#,
-            r#""gap":null,"alerts":[]},"agent":{"id":null,"pid":7,"started_ns":1}}"#
+            r#""gap":null,"alerts":[]},"agent":{"id":null,"pid":7,"started_ns":1},"rates":[]}"#
         )
     );
 }
@@ -346,7 +354,8 @@ const V1: &str = concat!(
     r#"],"journal":{"recording":4,"unsealed":true,"unavailable":false,"error":null,"failed_appends":2,"#,
     r#""gap":{"position":96,"from":10,"to":70,"reason":"unclean_stop"},"#,
     r#""alerts":[{"kind":"journal_gap","stream":0,"lane":0,"participant":96,"value":60,"since":70}]},"#,
-    r#""agent":{"id":"ns/pod-0","pid":4242,"started_ns":99}}"#,
+    r#""agent":{"id":"ns/pod-0","pid":4242,"started_ns":99},"#,
+    r#""rates":[{"dir":"/run/a","stream_id":7,"session_id":-2,"version":3,"operation":11}]}"#,
 );
 
 #[test]
@@ -387,7 +396,8 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "trace-buckets",
             "trace-export",
             "join-registry",
-            "join-put"
+            "join-put",
+            "rate-change"
         ]
     );
     let known = Capability {

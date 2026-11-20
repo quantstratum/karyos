@@ -498,3 +498,144 @@ fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
     let journal = agent.view().journal.unwrap();
     assert_eq!((journal.gap, journal.alerts.len()), (None, 0));
 }
+
+/// R-CORE-21 (karyos#740): a rate change through the agent's socket. An
+/// operator's safety path tightening reaches the driver and answers with
+/// the new version, kept in the view; an operator may not take the
+/// administrator's path; an administrator's loosening without a journal is
+/// refused unsent; with one it is made, journalled before and after, and
+/// a stale version is refused with the current one.
+#[test]
+fn rate_changes_are_made_by_authority_and_journalled() {
+    use karyos_driver::GuardRate;
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+    let _serial = serial();
+    let dir = dir("rate");
+    let driver_dir = dir.join("driver");
+    let mut driver = driver(&driver_dir);
+    let stream = driver.add_stream(stream_config()).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    driver
+        .guard_stream(
+            stream,
+            guard,
+            4,
+            Some(GuardRate::publication(RatePolicy {
+                messages: Rate {
+                    per_second: 100,
+                    burst: 10,
+                },
+                bytes: None,
+            })),
+        )
+        .unwrap();
+    let change = |expected: u64, authority: &str, rate: u64| {
+        format!(
+            "KARYOS-AGENT 1 rate-change {} 2 1 {expected} {authority} {rate} 10 0 0 incident\n",
+            driver_dir.display()
+        )
+    };
+    let bind =
+        |role: Role| Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), role)])).unwrap();
+
+    // No journal: the safety path goes ahead, the administrator's does not.
+    let mut unjournalled = agent(&dir, false);
+    let mut server = bind(Role::Operator);
+    let (answer, served) = ask(
+        &mut driver,
+        &mut server,
+        &mut unjournalled,
+        &change(1, "safety", 50),
+    );
+    assert_eq!(served, [Served::Operated]);
+    assert!(
+        answer.ends_with("\"stream_id\":2,\"session_id\":1,\"version\":2}\n"),
+        "{answer}"
+    );
+    let view = unjournalled.view();
+    assert_eq!(view.rates.len(), 1);
+    assert_eq!(
+        (
+            view.rates[0].stream_id,
+            view.rates[0].session_id,
+            view.rates[0].version
+        ),
+        (2, 1, 2)
+    );
+    let (answer, _) = ask(
+        &mut driver,
+        &mut server,
+        &mut unjournalled,
+        &change(2, "administrator", 200),
+    );
+    assert_eq!(answer, "{\"error\":\"forbidden\"}\n");
+    drop(server);
+    let mut server = bind(Role::Administrator);
+    let (answer, _) = ask(
+        &mut driver,
+        &mut server,
+        &mut unjournalled,
+        &change(2, "administrator", 200),
+    );
+    assert_eq!(answer, "{\"error\":\"journal unavailable\"}\n");
+    drop(server);
+    drop(unjournalled);
+
+    // With a journal: the administrator's loosening is made; a stale
+    // version is refused with the current one.
+    let mut journalled = agent(&dir, true);
+    let mut server = bind(Role::Administrator);
+    let (answer, _) = ask(
+        &mut driver,
+        &mut server,
+        &mut journalled,
+        &change(2, "administrator", 200),
+    );
+    assert!(answer.ends_with("\"version\":3}\n"), "{answer}");
+    let (answer, _) = ask(
+        &mut driver,
+        &mut server,
+        &mut journalled,
+        &change(2, "safety", 20),
+    );
+    assert!(answer.starts_with("{\"error\":\"refused\""), "{answer}");
+    assert!(answer.ends_with("\"detail\":3}\n"), "{answer}");
+    assert_eq!(journalled.view().rates[0].version, 3);
+    // The driver audited every change sent for this uid: three of them.
+    assert_eq!(driver.guard_audit().records.len(), 3);
+    let journal = journalled.view().journal.unwrap();
+    assert_eq!((journal.failed_appends, journal.gap), (0, None));
+    journalled.stop().unwrap();
+    drop(journalled);
+    // Every request answered by its outcome: no unknown interval.
+    let reopened = Journal::open(&dir.join("journal"), 1).unwrap();
+    assert_eq!(reopened.gap(), None);
+}
+
+/// Stream 2, session 1: the stream the rate test guards.
+fn stream_config() -> karyos_driver::StreamConfig {
+    use karyos_driver::{LossPolicy, StreamConfig};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+    StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 3,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id: 2,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication: PublicationMode::Exclusive,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    }
+}
