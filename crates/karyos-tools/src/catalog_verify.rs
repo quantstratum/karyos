@@ -28,9 +28,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
+use std::io;
 use std::path::PathBuf;
 
-use karyos_archive::catalog::list;
+use karyos_archive::catalog::{CatalogError, list};
 use karyos_archive::disk::{Disk as _, ReadOnly, StdDisk};
 use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Externality, StoredAnchors};
 use karyos_archive::integrity::journal::read_records;
@@ -40,7 +41,7 @@ use karyos_archive::integrity::trust::{
     TrustRoot,
 };
 use karyos_archive::integrity::verify::{Evidence, Outcome, RangeBytes, Verification, verify};
-use karyos_archive::segment::{SegmentStore, SyncPolicy, recorded_geometry};
+use karyos_archive::segment::{SegmentError, SegmentStore, SyncPolicy, recorded_geometry};
 
 use crate::catalog::EXIT_ERROR;
 
@@ -90,14 +91,182 @@ pub struct VerifyArgs {
     pub json: bool,
 }
 
+/// A command line `verify` refuses.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum UsageError {
+    /// `--trust` with no file after it.
+    #[error("--trust needs a file")]
+    TrustNeedsFile,
+    /// `--trust` given more than once.
+    #[error("--trust given twice")]
+    TrustTwice,
+    /// `--anchors` with no value after it.
+    #[error("--anchors needs HEX=DIR")]
+    AnchorsNeedsValue,
+    /// An `--anchors` value that is not text.
+    #[error("--anchors HEX=DIR is not text")]
+    AnchorsNotText,
+    /// An `--anchors` value with no `=`.
+    #[error("--anchors needs HEX=DIR: the store's location, then its directory")]
+    AnchorsNoSeparator,
+    /// An `--anchors` location that is not 64 hex digits.
+    #[error(transparent)]
+    AnchorsLocation(HexError),
+    /// An unknown option.
+    #[error("unknown option {0}")]
+    UnknownOption(String),
+    /// More than one directory.
+    #[error("one directory only")]
+    OneDirectoryOnly,
+    /// No directory.
+    #[error("verify needs a directory")]
+    NoDirectory,
+}
+
+/// A value that is not 64 hex digits.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum HexError {
+    /// Not 64 characters long.
+    #[error("{0:?} is not 64 hex digits")]
+    Length(String),
+    /// A character that is not a hex digit.
+    #[error("{0:?} is not hex")]
+    NotHex(String),
+}
+
+/// A malformed line of a trust file.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum LineError {
+    /// A key with no value.
+    #[error("{0:?} has no value")]
+    NoValue(String),
+    /// A key whose value is not 64 hex digits.
+    #[error(transparent)]
+    Hex(HexError),
+    /// A `journal` value that is not a journal id.
+    #[error("{0:?} is not a journal id")]
+    JournalId(String),
+    /// An unknown key.
+    #[error("unknown key {0:?}")]
+    UnknownKey(String),
+}
+
+/// A trust file `verify` refuses.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TrustError {
+    /// A malformed line, numbered from 1.
+    #[error("line {line}: {error}")]
+    Line {
+        /// The line number, from 1.
+        line: usize,
+        /// What is wrong with it.
+        error: LineError,
+    },
+    /// No `archive` line.
+    #[error("the trust file names no archive")]
+    NoArchive,
+    /// No `authority` line.
+    #[error("the trust file names no authority")]
+    NoAuthority,
+}
+
+/// A recording's store that cannot be opened or read.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum StoreError {
+    /// The segment store refused.
+    #[error(transparent)]
+    Segment(SegmentError),
+    /// The directory could not be listed.
+    #[error(transparent)]
+    Io(io::Error),
+    /// Segment files are there, but their geometry cannot be recovered.
+    #[error("segment files whose geometry cannot be recovered")]
+    UnrecoverableGeometry,
+}
+
+/// The errors of `karyos-catalog verify`, each with its context; they
+/// are formatted only by [`run_verify`].
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum VerifyError {
+    /// The command line.
+    #[error("{0} (karyos-catalog verify --help for the usage)")]
+    Usage(#[from] UsageError),
+    /// The trust file could not be read.
+    #[error("{}: {source}", path.display())]
+    TrustRead {
+        /// The trust file.
+        path: PathBuf,
+        /// The read error.
+        source: io::Error,
+    },
+    /// The trust file is malformed.
+    #[error("{}: {source}", path.display())]
+    Trust {
+        /// The trust file.
+        path: PathBuf,
+        /// What is wrong with it.
+        source: TrustError,
+    },
+    /// An I/O error on a file or directory of the archive or an anchor
+    /// store.
+    #[error("{}: {source}", path.display())]
+    Io {
+        /// The file or directory.
+        path: PathBuf,
+        /// The I/O error.
+        source: io::Error,
+    },
+    /// The catalog could not be listed.
+    #[error("{}: {source}", dir.display())]
+    Catalog {
+        /// The archive directory.
+        dir: PathBuf,
+        /// The catalog error.
+        source: CatalogError,
+    },
+    /// A recording's store could not be opened.
+    #[error("{} recording {recording}: {source}", dir.display())]
+    Store {
+        /// The archive directory.
+        dir: PathBuf,
+        /// The recording.
+        recording: u64,
+        /// The store error.
+        source: StoreError,
+    },
+    /// A range of a recording could not be read.
+    #[error("{} recording {recording} [{start}, {end}): {source}", dir.display())]
+    Read {
+        /// The archive directory.
+        dir: PathBuf,
+        /// The recording.
+        recording: u64,
+        /// The range's start.
+        start: u64,
+        /// The range's end.
+        end: u64,
+        /// The read error.
+        source: SegmentError,
+    },
+    /// The report could not be written.
+    #[error("writing the report: {0}")]
+    ReportWrite(io::Error),
+}
+
 /// Parses the arguments after `verify`: `Ok(None)` for `--help`.
 ///
 /// # Errors
 ///
-/// The usage error, as text.
+/// The usage error.
 pub fn parse_verify(
     args: impl IntoIterator<Item = OsString>,
-) -> Result<Option<VerifyArgs>, String> {
+) -> Result<Option<VerifyArgs>, UsageError> {
     let (mut dir, mut trust, mut anchors, mut json) = (None, None, Vec::new(), false);
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -105,28 +274,33 @@ pub fn parse_verify(
             Some("-h" | "--help") => return Ok(None),
             Some("--json") => json = true,
             Some("--trust") => {
-                let value = args.next().ok_or("--trust needs a file")?;
+                let value = args.next().ok_or(UsageError::TrustNeedsFile)?;
                 if trust.replace(PathBuf::from(value)).is_some() {
-                    return Err("--trust given twice".into());
+                    return Err(UsageError::TrustTwice);
                 }
             }
             Some("--anchors") => {
-                let value = args.next().ok_or("--anchors needs HEX=DIR")?;
-                let value = value.to_str().ok_or("--anchors HEX=DIR is not text")?;
+                let value = args.next().ok_or(UsageError::AnchorsNeedsValue)?;
+                let value = value.to_str().ok_or(UsageError::AnchorsNotText)?;
                 let (location, store) = value
                     .split_once('=')
-                    .ok_or("--anchors needs HEX=DIR: the store's location, then its directory")?;
-                anchors.push((hex32(location)?, PathBuf::from(store)));
+                    .ok_or(UsageError::AnchorsNoSeparator)?;
+                anchors.push((
+                    hex32(location).map_err(UsageError::AnchorsLocation)?,
+                    PathBuf::from(store),
+                ));
             }
-            Some(flag) if flag.starts_with('-') => return Err(format!("unknown option {flag}")),
+            Some(flag) if flag.starts_with('-') => {
+                return Err(UsageError::UnknownOption(flag.to_owned()));
+            }
             _ => {
                 if dir.replace(PathBuf::from(arg)).is_some() {
-                    return Err("one directory only".into());
+                    return Err(UsageError::OneDirectoryOnly);
                 }
             }
         }
     }
-    let dir = dir.ok_or("verify needs a directory")?;
+    let dir = dir.ok_or(UsageError::NoDirectory)?;
     Ok(Some(VerifyArgs {
         dir,
         trust,
@@ -135,15 +309,15 @@ pub fn parse_verify(
     }))
 }
 
-pub(crate) fn hex32(text: &str) -> Result<[u8; 32], String> {
+pub(crate) fn hex32(text: &str) -> Result<[u8; 32], HexError> {
     let bytes = text.as_bytes();
     if bytes.len() != 64 {
-        return Err(format!("{text:?} is not 64 hex digits"));
+        return Err(HexError::Length(text.to_owned()));
     }
     let mut out = [0u8; 32];
     for (slot, pair) in out.iter_mut().zip(bytes.as_chunks::<2>().0) {
-        let pair = std::str::from_utf8(pair).map_err(|_| format!("{text:?} is not hex"))?;
-        *slot = u8::from_str_radix(pair, 16).map_err(|_| format!("{text:?} is not hex"))?;
+        let pair = std::str::from_utf8(pair).map_err(|_| HexError::NotHex(text.to_owned()))?;
+        *slot = u8::from_str_radix(pair, 16).map_err(|_| HexError::NotHex(text.to_owned()))?;
     }
     Ok(out)
 }
@@ -152,8 +326,8 @@ pub(crate) fn hex32(text: &str) -> Result<[u8; 32], String> {
 ///
 /// # Errors
 ///
-/// The first malformed line, as text.
-pub fn parse_trust(text: &str) -> Result<(TrustRoot, Externality, u64), String> {
+/// The first malformed line, or a missing archive or authority.
+pub fn parse_trust(text: &str) -> Result<(TrustRoot, Externality, u64), TrustError> {
     let mut archive = None;
     let mut authorities: Vec<[u8; PUBLIC_KEY_LENGTH]> = Vec::new();
     let mut journal = 0u64;
@@ -163,35 +337,35 @@ pub fn parse_trust(text: &str) -> Result<(TrustRoot, Externality, u64), String> 
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let at = |error: String| format!("line {}: {error}", number.saturating_add(1));
+        let at = |error: LineError| TrustError::Line {
+            line: number.saturating_add(1),
+            error,
+        };
+        let hex = |value: &str| hex32(value).map_err(|error| at(LineError::Hex(error)));
         let (key, value) = line
             .split_once(char::is_whitespace)
-            .ok_or_else(|| at(format!("{line:?} has no value")))?;
+            .ok_or_else(|| at(LineError::NoValue(line.to_owned())))?;
         let value = value.trim();
         match key {
-            "archive" => archive = Some(hex32(value).map_err(at)?),
-            "authority" => authorities.push(hex32(value).map_err(at)?),
+            "archive" => archive = Some(hex(value)?),
+            "authority" => authorities.push(hex(value)?),
             "journal" => {
                 journal = value
                     .parse()
-                    .map_err(|_| at(format!("{value:?} is not a journal id")))?;
+                    .map_err(|_| at(LineError::JournalId(value.to_owned())))?;
             }
             "local" => {
-                externality
-                    .local_locations
-                    .insert(hex32(value).map_err(at)?);
+                externality.local_locations.insert(hex(value)?);
             }
             "anchors" => {
-                externality
-                    .anchored_by_this
-                    .insert(hex32(value).map_err(at)?);
+                externality.anchored_by_this.insert(hex(value)?);
             }
-            other => return Err(at(format!("unknown key {other:?}"))),
+            other => return Err(at(LineError::UnknownKey(other.to_owned()))),
         }
     }
-    let archive_id = archive.ok_or("the trust file names no archive")?;
+    let archive_id = archive.ok_or(TrustError::NoArchive)?;
     if authorities.is_empty() {
-        return Err("the trust file names no authority".into());
+        return Err(TrustError::NoAuthority);
     }
     externality.local_archive = archive_id;
     Ok((
@@ -213,30 +387,34 @@ struct Stores {
     dir: PathBuf,
     open: BTreeMap<u64, Option<SegmentStore<ReadOnly<StdDisk>>>>,
     /// The first read error, which fails the command.
-    error: Option<String>,
+    error: Option<VerifyError>,
 }
 
 impl Stores {
     fn store(
         &mut self,
         recording: u64,
-    ) -> Result<Option<&mut SegmentStore<ReadOnly<StdDisk>>>, String> {
+    ) -> Result<Option<&mut SegmentStore<ReadOnly<StdDisk>>>, VerifyError> {
         if !self.open.contains_key(&recording) {
-            let at = |error: &dyn std::fmt::Display| {
-                format!("{} recording {recording}: {error}", self.dir.display())
+            let at = |source: StoreError| VerifyError::Store {
+                dir: self.dir.clone(),
+                recording,
+                source,
             };
             let mut disk = ReadOnly(StdDisk);
             let store = match recorded_geometry(&mut disk, &self.dir, recording)
-                .map_err(|error| at(&error))?
+                .map_err(|error| at(StoreError::Segment(error)))?
             {
                 // No geometry: an absent store only if the recording has no
                 // segment file at all; files whose geometry cannot be
                 // recovered are a damaged store.
                 None => {
                     let prefix = format!("{recording:016x}-");
-                    let names = disk.list(&self.dir).map_err(|error| at(&error))?;
+                    let names = disk
+                        .list(&self.dir)
+                        .map_err(|error| at(StoreError::Io(error)))?;
                     if names.iter().any(|name| name.starts_with(&prefix)) {
-                        return Err(at(&"segment files whose geometry cannot be recovered"));
+                        return Err(at(StoreError::UnrecoverableGeometry));
                     }
                     None
                 }
@@ -248,7 +426,7 @@ impl Stores {
                         geometry,
                         SyncPolicy::None,
                     )
-                    .map_err(|error| at(&error))?,
+                    .map_err(|error| at(StoreError::Segment(error)))?,
                 ),
             };
             let _ = self.open.insert(recording, store);
@@ -284,10 +462,13 @@ impl Stores {
         match store.read(start, &mut buf) {
             Ok(()) => RangeBytes::Bytes(buf),
             Err(error) => {
-                let _ = self.error.get_or_insert(format!(
-                    "{} recording {recording} [{start}, {end}): {error}",
-                    self.dir.display()
-                ));
+                let _ = self.error.get_or_insert(VerifyError::Read {
+                    dir: self.dir.clone(),
+                    recording,
+                    start,
+                    end,
+                    source: error,
+                });
                 RangeBytes::Missing
             }
         }
@@ -298,10 +479,14 @@ impl Stores {
 ///
 /// # Errors
 ///
-/// An I/O error or a malformed trust file, as text.
-pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
+/// An I/O error, a malformed trust file, or a store that cannot be
+/// opened or read.
+pub fn run_checks(args: &VerifyArgs) -> Result<Verification, VerifyError> {
     let dir = &args.dir;
-    let at = |error: std::io::Error| format!("{}: {error}", dir.display());
+    let at = |source: io::Error| VerifyError::Io {
+        path: dir.clone(),
+        source,
+    };
     let mut disk = ReadOnly(StdDisk);
     let (records, journal_fault) = read_records(&mut disk, dir).map_err(at)?;
     let keys: Vec<[u8; REGISTRY_ENTRY_LENGTH]> =
@@ -310,10 +495,15 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
         read_entries(&mut disk, dir, HEADS_FILE).map_err(at)?;
     let (trust, externality, journal_id) = match &args.trust {
         Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let text = std::fs::read_to_string(path).map_err(|source| VerifyError::TrustRead {
+                path: path.clone(),
+                source,
+            })?;
             let (trust, externality, journal) =
-                parse_trust(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+                parse_trust(&text).map_err(|source| VerifyError::Trust {
+                    path: path.clone(),
+                    source,
+                })?;
             (Some(trust), externality, journal)
         }
         None => (None, Externality::default(), 0),
@@ -327,11 +517,17 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
         // A store named on the command line must be there: a mistyped path
         // is an error, never an empty store.
         let ledger = store.join(ANCHOR_FILE);
-        if let Err(error) = disk.open_read(&ledger) {
-            return Err(format!("{}: {error}", ledger.display()));
+        if let Err(source) = disk.open_read(&ledger) {
+            return Err(VerifyError::Io {
+                path: ledger,
+                source,
+            });
         }
         let entries: Vec<[u8; ANCHOR_LENGTH]> = read_entries(&mut disk, store, ANCHOR_FILE)
-            .map_err(|error| format!("{}: {error}", store.display()))?;
+            .map_err(|source| VerifyError::Io {
+                path: store.clone(),
+                source,
+            })?;
         let stored = StoredAnchors::new(*location, entries);
         anchors.extend(stored.anchors());
         anchor_faults = anchor_faults.saturating_add(stored.malformed());
@@ -346,8 +542,10 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, String> {
         .collect();
     // A directory that cannot be listed is an error, never an empty
     // report; one without a catalog lists as missing.
-    let listing =
-        list(ReadOnly(StdDisk), dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    let listing = list(ReadOnly(StdDisk), dir).map_err(|source| VerifyError::Catalog {
+        dir: dir.clone(),
+        source,
+    })?;
     recordings.extend(listing.recordings.iter().map(|recording| recording.id));
     let mut stores = Stores {
         dir: dir.clone(),
@@ -521,13 +719,7 @@ pub fn run_verify(
             let _ = stdout.write_all(HELP.as_bytes());
             return 0;
         }
-        Err(error) => {
-            let _ = writeln!(
-                stderr,
-                "karyos-catalog: {error} (karyos-catalog verify --help for the usage)"
-            );
-            return EXIT_ERROR;
-        }
+        Err(error) => return report_error(stderr, &VerifyError::Usage(error)),
     };
     match run_checks(&parsed) {
         Ok(verification) => {
@@ -542,8 +734,7 @@ pub fn run_verify(
                 .write_all(report.as_bytes())
                 .and_then(|()| stdout.flush())
             {
-                let _ = writeln!(stderr, "karyos-catalog: writing the report: {error}");
-                return EXIT_ERROR;
+                return report_error(stderr, &VerifyError::ReportWrite(error));
             }
             if verification.journal_break.is_some()
                 || !verification.evidence.is_empty()
@@ -557,11 +748,15 @@ pub fn run_verify(
                 0
             }
         }
-        Err(error) => {
-            let _ = writeln!(stderr, "karyos-catalog: {error}");
-            EXIT_ERROR
-        }
+        Err(error) => report_error(stderr, &error),
     }
+}
+
+/// Prints `error` to `stderr`, the one place an error becomes text, and
+/// returns its exit status.
+fn report_error(stderr: &mut dyn io::Write, error: &VerifyError) -> u8 {
+    let _ = writeln!(stderr, "karyos-catalog: {error}");
+    EXIT_ERROR
 }
 
 #[cfg(test)]
