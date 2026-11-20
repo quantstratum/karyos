@@ -922,10 +922,7 @@ impl Server {
                 if allowed {
                     let answer = agent.rate_change_for(
                         Path::new(dir),
-                        stream,
-                        expected,
-                        policy,
-                        authority,
+                        crate::operations::RateChange::new(stream, expected, policy, authority),
                         requester,
                         reason.as_bytes(),
                     );

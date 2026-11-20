@@ -447,8 +447,8 @@ impl Agent {
         operations::guard_command(self.journal.as_mut(), &command)
     }
 
-    /// Changes the rate policy of guarded stream `stream` of the driver in
-    /// `dir` from version `expected` to `policy` under `authority`, for
+    /// Makes rate policy `change` on a guarded stream of the driver in
+    /// `dir`, for
     /// `requester` (R-CORE-21, karyos#740; see `operations`). The driver
     /// decides whether the safety path may take it; an administrator's
     /// change is refused unless its request is journalled durably first.
@@ -456,13 +456,16 @@ impl Agent {
     pub fn rate_change_for(
         &mut self,
         dir: &Path,
-        stream: karyos_protocol::cnc::StreamKey,
-        expected: u64,
-        policy: karyos_sys::rate_limit::RatePolicy,
-        authority: karyos_protocol::cnc::RateAuthority,
+        change: operations::RateChange,
         requester: Requester,
         reason: &[u8],
     ) -> RateAnswer {
+        let operations::RateChange {
+            stream,
+            expected,
+            policy,
+            authority,
+        } = change;
         if !self.drivers.iter().any(|driver| driver.dir == dir) {
             return RateAnswer::UnknownDriver;
         }

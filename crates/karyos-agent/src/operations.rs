@@ -250,6 +250,40 @@ pub enum RateAnswer {
     },
 }
 
+/// A rate policy change as asked: the stream, the version it replaces,
+/// the new policy and the authority it is asked under (R-CORE-21).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RateChange {
+    /// The guarded stream.
+    pub stream: StreamKey,
+    /// The policy version the change replaces.
+    pub expected: u64,
+    /// The new policy.
+    pub policy: RatePolicy,
+    /// The safety path or an administrator.
+    pub authority: RateAuthority,
+}
+
+impl RateChange {
+    /// A change of `stream` from version `expected` to `policy` under
+    /// `authority`.
+    #[must_use]
+    pub const fn new(
+        stream: StreamKey,
+        expected: u64,
+        policy: RatePolicy,
+        authority: RateAuthority,
+    ) -> Self {
+        Self {
+            stream,
+            expected,
+            policy,
+            authority,
+        }
+    }
+}
+
 /// One rate policy change to make.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RateCommand<'a> {
