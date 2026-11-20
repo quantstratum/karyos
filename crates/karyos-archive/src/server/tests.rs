@@ -1125,7 +1125,8 @@ fn request_id(message: &ControlMessage<'_>) -> u64 {
 /// hold is evidenced (code 0) and blocks a purge (`legal_hold`); a release
 /// is done once, then refused `no_evidence`; with no policy configured a
 /// purge is refused `no_policy`; a verification reports the recording's
-/// sealed ranges, with no trust root `untrusted_evidence`.
+/// sealed ranges once it stopped, with no trust root
+/// `untrusted_evidence`.
 #[test]
 fn the_agents_engine_answers_retention_requests() {
     let agent = AgentConfig {
@@ -1202,7 +1203,14 @@ fn the_agents_engine_answers_retention_requests() {
             (request_id(&request), code, message)
         );
     }
-    // Once the agent sealed both frames.
+    // Stopped, its last range sealed as its segment closes; the verifier
+    // reads it from the store reopened for reading.
+    rig.request(&ControlMessage::StopRecording(control::StopRecording {
+        correlation_id: 20,
+        recording_id: 1,
+    }));
+    let stopped = rig.sent(sent + 2);
+    assert_eq!(response(stopped.get(sent).unwrap()).code, ResponseCode::Ok);
     let verify = ControlMessage::VerifyRecording(control::VerifyRecording {
         correlation_id: 8,
         recording_id: 1,
