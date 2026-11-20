@@ -4,9 +4,13 @@
 //! `karyos-codec` runtime (`quantstratum-docs:
 //! karyos/design/archive-control-codec.md`, phase 3 batch A1; ADR-0036).
 //!
-//! Schema 1 holds five requests ([`StartRecording`], [`StopRecording`],
-//! [`ListRecordings`], [`Replay`], [`StopReplay`]) and three responses
-//! ([`ControlResponse`], [`RecordingDescriptor`], [`RecordingSignal`]).
+//! Schema 1 holds nine requests ([`StartRecording`], [`StopRecording`],
+//! [`ListRecordings`], [`Replay`], [`StopReplay`], and the retention
+//! requests [`HoldRecording`], [`ReleaseHold`], [`PurgeRecording`] and
+//! [`VerifyRecording`]) and four responses ([`ControlResponse`],
+//! [`RecordingDescriptor`], [`RecordingSignal`], [`RangeOutcome`]). The
+//! retention templates follow ADR-0088 (quantstratum-docs, Proposed;
+//! karyos#967).
 //! Each message is a plain value whose text fields borrow the decoded
 //! input; [`ControlMessage::decode`] validates a whole message before any
 //! value exists, and `encode` writes into the caller's buffer. Nothing
@@ -64,6 +68,20 @@ pub const CONTROL_RESPONSE: Template = template(101, 17, 12 + 17 + 2 + 256);
 pub const RECORDING_DESCRIPTOR: Template = template(102, 110, 12 + 110 + 2 + 1024);
 /// `RecordingSignal`, template 103.
 pub const RECORDING_SIGNAL: Template = template(103, 27, 12 + 27);
+/// `HoldRecording`, template 6 (ADR-0088).
+pub const HOLD_RECORDING: Template = template(6, 16, 12 + 16);
+/// `ReleaseHold`, template 7 (ADR-0088).
+pub const RELEASE_HOLD: Template = template(7, 16, 12 + 16);
+/// `PurgeRecording`, template 8 (ADR-0088).
+pub const PURGE_RECORDING: Template = template(8, 40, 12 + 40);
+/// `VerifyRecording`, template 9 (ADR-0088).
+pub const VERIFY_RECORDING: Template = template(9, 16, 12 + 16);
+/// `RangeOutcome`, template 104 (ADR-0088).
+pub const RANGE_OUTCOME: Template = template(104, 45, 12 + 45);
+/// The reason bits a [`RangeOutcome`] may set: bits 0 to 9.
+pub const RANGE_REASONS: u32 = (1 << 10) - 1;
+/// A [`RangeOutcome`]'s `first_inconsistent` when there is none.
+pub const NO_INCONSISTENT: u64 = u64::MAX;
 
 fn invalid_enum(field: &'static str, value: impl Into<u64>) -> CodecError {
     CodecError::InvalidEnum {
@@ -215,6 +233,247 @@ fn list_count(field: &'static str, count: u32) -> Result<u32, CodecError> {
     }
 }
 
+/// A request naming one recording: [`HoldRecording`], [`ReleaseHold`] and
+/// [`VerifyRecording`] share this block (ADR-0088).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordingRequest {
+    /// Echoed in the response.
+    pub correlation_id: u64,
+    /// The recording, never 0.
+    pub recording_id: u64,
+}
+
+impl RecordingRequest {
+    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+        decoder.finish()?;
+        Ok(Self {
+            correlation_id: block.u64(0)?,
+            recording_id: id("recording_id", block.u64(8)?)?,
+        })
+    }
+
+    fn encode(&self, out: &mut [u8], template: &Template) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, template)?;
+        encoder.u64(0, self.correlation_id)?;
+        encoder.u64(8, id("recording_id", self.recording_id)?)?;
+        encoder.finish()
+    }
+}
+
+/// Requests a legal hold on a recording, template 6 (ADR-0088): answered
+/// by a [`ControlResponse`] with code 0 (applied with evidence),
+/// [`ResponseCode::HeldWithoutEvidence`],
+/// [`ResponseCode::HeldInMemoryOnly`] or
+/// [`ResponseCode::UnknownRecording`].
+pub type HoldRecording = RecordingRequest;
+/// Requests the release of a recording's legal hold, template 7: answered
+/// with code 0 or [`ResponseCode::Refused`].
+pub type ReleaseHold = RecordingRequest;
+/// Requests a seal verification of a recording, template 9: one
+/// [`RangeOutcome`] per range, then a [`ControlResponse`] whose `id` is
+/// the count sent.
+pub type VerifyRecording = RecordingRequest;
+
+/// Requests a purge of a recording below a position, template 8
+/// (ADR-0088): answered with code 0 or [`ResponseCode::Refused`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PurgeRecording {
+    /// Echoed in the response.
+    pub correlation_id: u64,
+    /// The recording, never 0.
+    pub recording_id: u64,
+    /// The first position kept.
+    pub before: u64,
+    /// The purge's id, unique among the Archive's outstanding purges,
+    /// never 0.
+    pub request_id: u64,
+    /// The operator the requester authenticated, never 0.
+    pub operator: u64,
+}
+
+impl PurgeRecording {
+    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+        decoder.finish()?;
+        Ok(Self {
+            correlation_id: block.u64(0)?,
+            recording_id: id("recording_id", block.u64(8)?)?,
+            before: block.u64(16)?,
+            request_id: id("request_id", block.u64(24)?)?,
+            operator: id("operator", block.u64(32)?)?,
+        })
+    }
+
+    /// Encodes into `out`; returns the message's length.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
+    /// a recording, request or operator id of 0.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, &PURGE_RECORDING)?;
+        encoder.u64(0, self.correlation_id)?;
+        encoder.u64(8, id("recording_id", self.recording_id)?)?;
+        encoder.u64(16, self.before)?;
+        encoder.u64(24, id("request_id", self.request_id)?)?;
+        encoder.u64(32, id("operator", self.operator)?)?;
+        encoder.finish()
+    }
+}
+
+/// A range's integrity outcome, the verifier's verbatim (SPEC.md §8.4,
+/// "Verification"; ADR-0088).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IntegrityOutcome {
+    /// 1.
+    Verified,
+    /// 2.
+    BeyondAnchor,
+    /// 3.
+    Unsealed,
+    /// 4.
+    Purged,
+    /// 5.
+    Inconsistent,
+}
+
+impl IntegrityOutcome {
+    /// The wire code.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Verified => 1,
+            Self::BeyondAnchor => 2,
+            Self::Unsealed => 3,
+            Self::Purged => 4,
+            Self::Inconsistent => 5,
+        }
+    }
+
+    /// The outcome of wire code `code`.
+    #[must_use]
+    pub const fn of(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::Verified),
+            2 => Some(Self::BeyondAnchor),
+            3 => Some(Self::Unsealed),
+            4 => Some(Self::Purged),
+            5 => Some(Self::Inconsistent),
+            _ => None,
+        }
+    }
+
+    /// Its name, as the verifier and the agent write it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::BeyondAnchor => "beyond_anchor",
+            Self::Unsealed => "unsealed",
+            Self::Purged => "purged",
+            Self::Inconsistent => "inconsistent",
+        }
+    }
+}
+
+/// The names of the reason bits of a [`RangeOutcome`], bit 0 first, in the
+/// order of `integrity::verify::Reason` (ADR-0088).
+pub const REASON_NAMES: [&str; 10] = [
+    "untrusted_evidence",
+    "unknown_key",
+    "unknown_algorithm",
+    "malformed_evidence",
+    "missing_evidence",
+    "conflicting_anchors",
+    "corruption",
+    "shortened_index",
+    "unauthenticated_purge",
+    "no_anchor",
+];
+
+/// One range's verification outcome, template 104 (ADR-0088).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeOutcome {
+    /// The verify request's.
+    pub correlation_id: u64,
+    /// The recording, never 0.
+    pub recording_id: u64,
+    /// The range's start.
+    pub start: u64,
+    /// Its end, exclusive, at least `start`.
+    pub end: u64,
+    /// The counter of the first inconsistent record, [`NO_INCONSISTENT`]
+    /// for none; always none unless the outcome is inconsistent.
+    pub first_inconsistent: u64,
+    /// The reasons, a bit set within [`RANGE_REASONS`].
+    pub reasons: u32,
+    /// The outcome.
+    pub outcome: IntegrityOutcome,
+}
+
+impl RangeOutcome {
+    fn check(&self) -> Result<(), CodecError> {
+        if self.end < self.start {
+            return Err(out_of_range("end"));
+        }
+        if self.reasons & !RANGE_REASONS != 0 {
+            return Err(out_of_range("reasons"));
+        }
+        if self.outcome != IntegrityOutcome::Inconsistent
+            && self.first_inconsistent != NO_INCONSISTENT
+        {
+            return Err(out_of_range("first_inconsistent"));
+        }
+        id("recording_id", self.recording_id).map(|_| ())
+    }
+
+    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+        decoder.finish()?;
+        let raw = block.u8(44)?;
+        let outcome = IntegrityOutcome::of(raw).ok_or_else(|| invalid_enum("outcome", raw))?;
+        let range = Self {
+            correlation_id: block.u64(0)?,
+            recording_id: block.u64(8)?,
+            start: block.u64(16)?,
+            end: block.u64(24)?,
+            first_inconsistent: block.u64(32)?,
+            reasons: block.u32(40)?,
+            outcome,
+        };
+        range.check()?;
+        Ok(range)
+    }
+
+    /// The names of its reasons, bit 0 first.
+    pub fn reason_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        REASON_NAMES
+            .iter()
+            .enumerate()
+            .filter(|&(bit, _)| self.reasons & (1 << bit) != 0)
+            .map(|(_, name)| *name)
+    }
+
+    /// Encodes into `out`; returns the message's length.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
+    /// an end below the start, a reserved reason bit, a first inconsistent
+    /// record on another outcome, or a recording id of 0.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
+        let mut encoder = Encoder::new(out, &RANGE_OUTCOME)?;
+        self.check()?;
+        encoder.u64(0, self.correlation_id)?;
+        encoder.u64(8, self.recording_id)?;
+        encoder.u64(16, self.start)?;
+        encoder.u64(24, self.end)?;
+        encoder.u64(32, self.first_inconsistent)?;
+        encoder.u32(40, self.reasons)?;
+        encoder.u8(44, self.outcome.code())?;
+        encoder.finish()
+    }
+}
+
 /// The pace of a replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -334,10 +593,20 @@ pub enum ResponseCode {
     InvalidRequest,
     /// The request's schema, template or version is not supported.
     UnsupportedSchema,
+    /// A hold is in force and its pending marker durable; the operations
+    /// journal did not record it (ADR-0088).
+    HeldWithoutEvidence,
+    /// A hold is in force in this process only (ADR-0088).
+    HeldInMemoryOnly,
+    /// The Archive refused a release or a purge; the message names the
+    /// reason (ADR-0088).
+    Refused,
 }
 
 impl ResponseCode {
-    const fn code(self) -> u8 {
+    /// The wire code.
+    #[must_use]
+    pub const fn code(self) -> u8 {
         match self {
             Self::Ok => 0,
             Self::Error => 1,
@@ -345,6 +614,9 @@ impl ResponseCode {
             Self::UnknownReplay => 3,
             Self::InvalidRequest => 4,
             Self::UnsupportedSchema => 5,
+            Self::HeldWithoutEvidence => 6,
+            Self::HeldInMemoryOnly => 7,
+            Self::Refused => 8,
         }
     }
 
@@ -356,6 +628,9 @@ impl ResponseCode {
             3 => Some(Self::UnknownReplay),
             4 => Some(Self::InvalidRequest),
             5 => Some(Self::UnsupportedSchema),
+            6 => Some(Self::HeldWithoutEvidence),
+            7 => Some(Self::HeldInMemoryOnly),
+            8 => Some(Self::Refused),
             _ => None,
         }
     }
@@ -667,12 +942,22 @@ pub enum ControlMessage<'a> {
     Replay(Replay<'a>),
     /// Template 5.
     StopReplay(StopReplay),
+    /// Template 6.
+    HoldRecording(HoldRecording),
+    /// Template 7.
+    ReleaseHold(ReleaseHold),
+    /// Template 8.
+    PurgeRecording(PurgeRecording),
+    /// Template 9.
+    VerifyRecording(VerifyRecording),
     /// Template 101.
     ControlResponse(ControlResponse<'a>),
     /// Template 102.
     RecordingDescriptor(RecordingDescriptor<'a>),
     /// Template 103.
     RecordingSignal(RecordingSignal),
+    /// Template 104.
+    RangeOutcome(RangeOutcome),
 }
 
 impl<'a> ControlMessage<'a> {
@@ -714,6 +999,26 @@ impl<'a> ControlMessage<'a> {
                 let (block, decoder) = Decoder::new(buf, &STOP_REPLAY)?;
                 Self::StopReplay(StopReplay::decode(block, decoder)?)
             }
+            6 => {
+                let (block, decoder) = Decoder::new(buf, &HOLD_RECORDING)?;
+                Self::HoldRecording(RecordingRequest::decode(block, decoder)?)
+            }
+            7 => {
+                let (block, decoder) = Decoder::new(buf, &RELEASE_HOLD)?;
+                Self::ReleaseHold(RecordingRequest::decode(block, decoder)?)
+            }
+            8 => {
+                let (block, decoder) = Decoder::new(buf, &PURGE_RECORDING)?;
+                Self::PurgeRecording(PurgeRecording::decode(block, decoder)?)
+            }
+            9 => {
+                let (block, decoder) = Decoder::new(buf, &VERIFY_RECORDING)?;
+                Self::VerifyRecording(RecordingRequest::decode(block, decoder)?)
+            }
+            104 => {
+                let (block, decoder) = Decoder::new(buf, &RANGE_OUTCOME)?;
+                Self::RangeOutcome(RangeOutcome::decode(block, decoder)?)
+            }
             101 => {
                 let (block, decoder) = Decoder::new(buf, &CONTROL_RESPONSE)?;
                 Self::ControlResponse(ControlResponse::decode(block, decoder)?)
@@ -745,6 +1050,11 @@ impl<'a> ControlMessage<'a> {
             Self::ControlResponse(message) => message.encode(out),
             Self::RecordingDescriptor(message) => message.encode(out),
             Self::RecordingSignal(message) => message.encode(out),
+            Self::HoldRecording(message) => message.encode(out, &HOLD_RECORDING),
+            Self::ReleaseHold(message) => message.encode(out, &RELEASE_HOLD),
+            Self::PurgeRecording(message) => message.encode(out),
+            Self::VerifyRecording(message) => message.encode(out, &VERIFY_RECORDING),
+            Self::RangeOutcome(message) => message.encode(out),
         }
     }
 }

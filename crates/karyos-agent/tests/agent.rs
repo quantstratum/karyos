@@ -750,3 +750,200 @@ fn an_export_cursor_survives_the_agent_and_not_the_driver() {
         })
     );
 }
+
+/// karyos#967 (ADR-0088, Proposed) end to end: the agent's Archive
+/// retention backend reaches an Archive over a driver's control streams.
+/// A fake Archive on this thread answers a hold as applied without
+/// evidence (code 6), refuses a purge under a hold with `legal_hold`
+/// (code 8), and answers a verification with two ranges; each comes back
+/// verbatim. A purge for uid 0 is refused by the backend and never sent.
+#[test]
+fn the_retention_backend_reaches_an_archive_over_its_control_streams() {
+    use karyos_agent::archive_retention::ArchiveRetention;
+    use karyos_agent::catalog::ArchiveStreams;
+    use karyos_agent::retention::{RangeOutcome, RetentionBackend, RetentionReply};
+    use karyos_archive::control::{
+        ControlMessage, ControlResponse, IntegrityOutcome, NO_INCONSISTENT,
+        RangeOutcome as WireRange, ResponseCode,
+    };
+    use karyos_archive::server::MAX_ANSWER;
+    use karyos_client::{MessageLimit, OfferOutcome};
+    use karyos_driver::{LossPolicy, StreamConfig};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    const REQUESTS: i32 = 100;
+    const RESPONSES: i32 = 101;
+    let stream = |stream_id, publication| StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 6,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    };
+    let _serial = serial();
+    let dir = dir("retention");
+    let mut driver = driver(&dir, DriverConfig::default(), 4);
+    let requests = driver
+        .add_stream(stream(
+            REQUESTS,
+            PublicationMode::Concurrent {
+                publishers: 2,
+                allow_non_lse: true,
+            },
+        ))
+        .unwrap();
+    let responses = driver
+        .add_stream(stream(RESPONSES, PublicationMode::Exclusive))
+        .unwrap();
+    let mut reading = driver.subscribe(requests, Role::Optional).unwrap();
+    let mut answering = driver.publication(responses).unwrap();
+    let mut out = vec![0u8; MAX_ANSWER];
+    // Runs `call` on a thread of its own while this thread serves the
+    // driver and answers as the fake Archive.
+    let mut serve = |call: Box<dyn FnOnce() -> String + Send>, driver: &mut IpcDriver| {
+        let worker = std::thread::spawn(call);
+        let start = Instant::now();
+        while !worker.is_finished() {
+            assert!(start.elapsed() < Duration::from_secs(30), "no answer");
+            let _ = driver.do_work().unwrap();
+            let mut asked = Vec::new();
+            let _ = reading.poll(
+                |bytes, _| {
+                    if let Ok(message) = ControlMessage::decode(bytes) {
+                        let mut copy = vec![0u8; MAX_ANSWER];
+                        let length = message.encode(&mut copy).unwrap();
+                        copy.truncate(length);
+                        asked.push(copy);
+                    }
+                },
+                MessageLimit::new(8),
+            );
+            for bytes in asked {
+                let answers: Vec<ControlMessage<'_>> = match ControlMessage::decode(&bytes).unwrap()
+                {
+                    ControlMessage::HoldRecording(hold) => {
+                        vec![ControlMessage::ControlResponse(ControlResponse {
+                            correlation_id: hold.correlation_id,
+                            id: 0,
+                            code: ResponseCode::HeldWithoutEvidence,
+                            message: "",
+                        })]
+                    }
+                    ControlMessage::PurgeRecording(purge) => {
+                        assert_eq!(
+                            (purge.before, purge.request_id, purge.operator),
+                            (4096, 9, 1000)
+                        );
+                        vec![ControlMessage::ControlResponse(ControlResponse {
+                            correlation_id: purge.correlation_id,
+                            id: 0,
+                            code: ResponseCode::Refused,
+                            message: "legal_hold",
+                        })]
+                    }
+                    ControlMessage::VerifyRecording(verify) => {
+                        let range = |start, end, reasons, outcome| {
+                            ControlMessage::RangeOutcome(WireRange {
+                                correlation_id: verify.correlation_id,
+                                recording_id: verify.recording_id,
+                                start,
+                                end,
+                                first_inconsistent: NO_INCONSISTENT,
+                                reasons,
+                                outcome,
+                            })
+                        };
+                        vec![
+                            range(0, 4096, 0, IntegrityOutcome::Verified),
+                            range(4096, 8192, 1 << 9, IntegrityOutcome::BeyondAnchor),
+                            ControlMessage::ControlResponse(ControlResponse {
+                                correlation_id: verify.correlation_id,
+                                id: 2,
+                                code: ResponseCode::Ok,
+                                message: "",
+                            }),
+                        ]
+                    }
+                    other => panic!("{other:?}"),
+                };
+                for message in answers {
+                    let length = message.encode(&mut out).unwrap();
+                    while !matches!(
+                        answering.offer(&out[..length]),
+                        Ok(OfferOutcome::Accepted { .. })
+                    ) {
+                        let _ = driver.do_work().unwrap();
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        worker.join().unwrap()
+    };
+    let backend = ArchiveRetention::new(dir.clone(), ArchiveStreams::new(REQUESTS, RESPONSES))
+        .with_deadline(Duration::from_secs(10));
+    let mut hold = backend.clone();
+    let answer = serve(
+        Box::new(move || format!("{:?}", hold.hold(42, 1, 1000))),
+        &mut driver,
+    );
+    assert_eq!(
+        answer,
+        format!("{:?}", RetentionReply::Done { evidenced: false })
+    );
+    let mut purge = backend.clone();
+    let answer = serve(
+        Box::new(move || format!("{:?}", purge.purge(42, 4096, 9, 1000))),
+        &mut driver,
+    );
+    assert_eq!(
+        answer,
+        format!(
+            "{:?}",
+            RetentionReply::Refused {
+                code: 8,
+                reason: "legal_hold".to_owned()
+            }
+        )
+    );
+    let mut verify = backend.clone();
+    let answer = serve(
+        Box::new(move || format!("{:?}", verify.verify(42))),
+        &mut driver,
+    );
+    let expected = vec![
+        RangeOutcome {
+            start: 0,
+            end: 4096,
+            outcome: "verified".to_owned(),
+            reasons: Vec::new(),
+        },
+        RangeOutcome {
+            start: 4096,
+            end: 8192,
+            outcome: "beyond_anchor".to_owned(),
+            reasons: vec!["no_anchor".to_owned()],
+        },
+    ];
+    assert_eq!(answer, format!("{:?}", Some(expected)));
+    let mut root = backend;
+    assert!(matches!(
+        root.purge(42, 4096, 9, 0),
+        RetentionReply::Refused { code: 4, .. }
+    ));
+}

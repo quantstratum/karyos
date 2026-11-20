@@ -348,7 +348,7 @@ fn only_the_supported_tuples_decode() {
     let bytes = encoded(&samples()[3]);
     // Another schema, version or template (one unlisted below 100 and one
     // above), and another block length.
-    for (at, value) in [(0, 2u8), (4, 2), (2, 6), (2, 104), (6, 17)] {
+    for (at, value) in [(0, 2u8), (4, 2), (2, 10), (2, 105), (6, 17)] {
         let mut bad = bytes.clone();
         bad[at] = value;
         assert!(
@@ -390,7 +390,7 @@ fn field_error(result: Result<ControlMessage<'_>, CodecError>) -> &'static str {
 fn an_unknown_control_code_is_an_invalid_enum() {
     let samples = samples();
     for (sample, at, byte, field) in [
-        (9, 16, 6u8, "code"),
+        (9, 16, 9u8, "code"),
         (5, 40, 4, "rate"),
         (13, 24, 4, "signal"),
         (11, 108, 10, "stop_reason"),
@@ -436,7 +436,7 @@ fn every_invalid_field_is_refused_by_name() {
         (&replay_full, 32, 1, "scale_ppm"),
         (&replay_full, 8, 0, "recording_id"),
         (&replay_scaled, 35, 0xFF, "scale_ppm"),
-        (&ok, 16, 6, "code"),
+        (&ok, 16, 9, "code"),
         (&error, 8, 1, "id"),
         (&recording, 108, 10, "stop_reason"),
         (&recording, 24, 0, "stop"),
@@ -820,4 +820,262 @@ proptest! {
     fn arbitrary_bytes_never_panic(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
         let _ = ControlMessage::decode(&bytes);
     }
+}
+
+/// The retention vectors R-1 to R-6 of archive-control-codec.md section 6
+/// (ADR-0088, Proposed; karyos#967): each message encodes to its vector,
+/// and the vector decodes to the message.
+#[test]
+fn the_retention_vectors_encode_and_decode() {
+    let vectors = [
+        (
+            ControlMessage::HoldRecording(HoldRecording {
+                correlation_id: 1,
+                recording_id: 42,
+            }),
+            "01 00 06 00 01 00 10 00 1c 00 00 00
+             01 00 00 00 00 00 00 00
+             2a 00 00 00 00 00 00 00",
+        ),
+        (
+            ControlMessage::ReleaseHold(ReleaseHold {
+                correlation_id: 2,
+                recording_id: 42,
+            }),
+            "01 00 07 00 01 00 10 00 1c 00 00 00
+             02 00 00 00 00 00 00 00
+             2a 00 00 00 00 00 00 00",
+        ),
+        (
+            ControlMessage::PurgeRecording(PurgeRecording {
+                correlation_id: 3,
+                recording_id: 42,
+                before: 4096,
+                request_id: 9,
+                operator: 1000,
+            }),
+            "01 00 08 00 01 00 28 00 34 00 00 00
+             03 00 00 00 00 00 00 00
+             2a 00 00 00 00 00 00 00
+             00 10 00 00 00 00 00 00
+             09 00 00 00 00 00 00 00
+             e8 03 00 00 00 00 00 00",
+        ),
+        (
+            ControlMessage::VerifyRecording(VerifyRecording {
+                correlation_id: 4,
+                recording_id: 42,
+            }),
+            "01 00 09 00 01 00 10 00 1c 00 00 00
+             04 00 00 00 00 00 00 00
+             2a 00 00 00 00 00 00 00",
+        ),
+        (
+            ControlMessage::RangeOutcome(RangeOutcome {
+                correlation_id: 4,
+                recording_id: 42,
+                start: 0,
+                end: 4096,
+                first_inconsistent: NO_INCONSISTENT,
+                reasons: (1 << 6) | (1 << 7),
+                outcome: IntegrityOutcome::Inconsistent,
+            }),
+            "01 00 68 00 01 00 2d 00 39 00 00 00
+             04 00 00 00 00 00 00 00
+             2a 00 00 00 00 00 00 00
+             00 00 00 00 00 00 00 00
+             00 10 00 00 00 00 00 00
+             ff ff ff ff ff ff ff ff
+             c0 00 00 00
+             05",
+        ),
+        (
+            ControlMessage::ControlResponse(ControlResponse {
+                correlation_id: 3,
+                id: 0,
+                code: ResponseCode::Refused,
+                message: "legal_hold",
+            }),
+            "01 00 65 00 01 00 11 00 29 00 00 00
+             03 00 00 00 00 00 00 00
+             00 00 00 00 00 00 00 00
+             08
+             0a 00
+             6c 65 67 61 6c 5f 68 6f 6c 64",
+        ),
+    ];
+    for (message, vector) in vectors {
+        let bytes = hex(vector);
+        assert_eq!(encoded(&message), bytes, "{message:?}");
+        assert_eq!(ControlMessage::decode(&bytes).unwrap(), message);
+        // Truncated at every boundary, it is refused.
+        for cut in 0..bytes.len() {
+            assert!(
+                ControlMessage::decode(&bytes[..cut]).is_err(),
+                "{message:?} at {cut}"
+            );
+        }
+    }
+    let r5 = ControlMessage::decode(Vec::leak(hex("01 00 68 00 01 00 2d 00 39 00 00 00
+         04 00 00 00 00 00 00 00 2a 00 00 00 00 00 00 00
+         00 00 00 00 00 00 00 00 00 10 00 00 00 00 00 00
+         ff ff ff ff ff ff ff ff c0 00 00 00 05")))
+    .unwrap();
+    let ControlMessage::RangeOutcome(range) = r5 else {
+        panic!("{r5:?}");
+    };
+    assert_eq!(
+        range.reason_names().collect::<Vec<_>>(),
+        ["corruption", "shortened_index"]
+    );
+    assert_eq!(range.outcome.name(), "inconsistent");
+}
+
+/// ADR-0088's field rules: identifiers of 0, an end below the start, a
+/// reserved reason bit, a first inconsistent record on another outcome
+/// and an unknown outcome are refused, encoding and decoding.
+#[test]
+fn the_retention_templates_refuse_invalid_fields() {
+    let purge = PurgeRecording {
+        correlation_id: 3,
+        recording_id: 42,
+        before: 4096,
+        request_id: 9,
+        operator: 1000,
+    };
+    let bytes = encoded(&ControlMessage::PurgeRecording(purge));
+    let mut out = vec![0u8; 128];
+    for (field, offset, bad) in [
+        (
+            "recording_id",
+            8,
+            PurgeRecording {
+                recording_id: 0,
+                ..purge
+            },
+        ),
+        (
+            "request_id",
+            24,
+            PurgeRecording {
+                request_id: 0,
+                ..purge
+            },
+        ),
+        (
+            "operator",
+            32,
+            PurgeRecording {
+                operator: 0,
+                ..purge
+            },
+        ),
+    ] {
+        assert_eq!(
+            bad.encode(&mut out),
+            Err(CodecError::ValueOutOfRange { field })
+        );
+        let mut zeroed = bytes.clone();
+        zeroed[12 + offset..12 + offset + 8].fill(0);
+        assert_eq!(
+            ControlMessage::decode(&zeroed),
+            Err(CodecError::ValueOutOfRange { field })
+        );
+    }
+    let hold = ControlMessage::HoldRecording(HoldRecording {
+        correlation_id: 1,
+        recording_id: 0,
+    });
+    assert_eq!(
+        hold.encode(&mut out),
+        Err(CodecError::ValueOutOfRange {
+            field: "recording_id"
+        })
+    );
+    let range = RangeOutcome {
+        correlation_id: 4,
+        recording_id: 42,
+        start: 10,
+        end: 20,
+        first_inconsistent: NO_INCONSISTENT,
+        reasons: 0,
+        outcome: IntegrityOutcome::Verified,
+    };
+    for (field, bad) in [
+        ("end", RangeOutcome { end: 9, ..range }),
+        (
+            "reasons",
+            RangeOutcome {
+                reasons: 1 << 10,
+                ..range
+            },
+        ),
+        (
+            "first_inconsistent",
+            RangeOutcome {
+                first_inconsistent: 3,
+                ..range
+            },
+        ),
+        (
+            "recording_id",
+            RangeOutcome {
+                recording_id: 0,
+                ..range
+            },
+        ),
+    ] {
+        assert_eq!(
+            bad.encode(&mut out),
+            Err(CodecError::ValueOutOfRange { field })
+        );
+    }
+    // An inconsistent range may name its first inconsistent record.
+    let inconsistent = RangeOutcome {
+        first_inconsistent: 3,
+        outcome: IntegrityOutcome::Inconsistent,
+        ..range
+    };
+    let bytes = encoded(&ControlMessage::RangeOutcome(inconsistent));
+    assert_eq!(
+        ControlMessage::decode(&bytes).unwrap(),
+        ControlMessage::RangeOutcome(inconsistent)
+    );
+    // Every outcome code round trips; 0 and 6 are no outcome.
+    for code in 1..=5 {
+        assert_eq!(IntegrityOutcome::of(code).unwrap().code(), code);
+    }
+    for code in [0u8, 6] {
+        assert_eq!(
+            with_byte(&bytes, 44, code),
+            Err(CodecError::InvalidEnum {
+                field: "outcome",
+                value: u64::from(code)
+            })
+        );
+    }
+    // A reserved reason bit on the wire.
+    assert_eq!(
+        with_byte(&bytes, 41, 0x04),
+        Err(CodecError::ValueOutOfRange { field: "reasons" })
+    );
+    // The new codes need an id of 0, as every non-zero code does.
+    for code in [
+        ResponseCode::HeldWithoutEvidence,
+        ResponseCode::HeldInMemoryOnly,
+        ResponseCode::Refused,
+    ] {
+        let response = ControlResponse {
+            correlation_id: 1,
+            id: 42,
+            code,
+            message: "",
+        };
+        assert_eq!(
+            response.encode(&mut out),
+            Err(CodecError::ValueOutOfRange { field: "id" })
+        );
+        assert_eq!(ResponseCode::of(code.code()), Some(code));
+    }
+    assert_eq!(ResponseCode::of(9), None);
 }
