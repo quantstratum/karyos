@@ -358,6 +358,10 @@ pub struct ChannelConfig {
 /// A channel's media.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "a channel is parsed once at admission and never held in bulk; boxing `Udp` would change the public pattern every caller matches"
+)]
 pub enum Media {
     /// Shared memory on this host.
     Ipc,
