@@ -523,6 +523,9 @@ struct NetSubscription {
     /// own receiver entry (redundant-paths.md; the first path is
     /// `endpoint`).
     later: [Option<EndpointId>; LATER_PATHS],
+    /// Each later path's NAK control group endpoint, joined from the
+    /// driver's table for that path's interface (RC-15; karyos#1064).
+    later_controls: [Option<EndpointId>; LATER_PATHS],
     /// The routes the channel asked for its later paths: a second handle
     /// of the key must ask for the same ones.
     later_routes: [Option<(SocketAddr, MulticastConfig)>; LATER_PATHS],
@@ -1216,8 +1219,12 @@ impl<T: StreamTerms> Network<T> {
         // the subscription with the paths it has, counted.
         let mut held = [None; LATER_PATHS];
         let mut later_routes = [None; LATER_PATHS];
-        for ((slot, route), (bind, config)) in
-            held.iter_mut().zip(later_routes.iter_mut()).zip(later)
+        let mut later_controls = [None; LATER_PATHS];
+        for (((slot, route), control_slot), (bind, config)) in held
+            .iter_mut()
+            .zip(later_routes.iter_mut())
+            .zip(later_controls.iter_mut())
+            .zip(later)
         {
             *route = Some((*bind, *config));
             let Ok(path) = self.hold_endpoint(*bind, Some(*config)) else {
@@ -1238,6 +1245,13 @@ impl<T: StreamTerms> Network<T> {
                 self.count_path_failure();
                 continue;
             }
+            // Its own NAK control group, if the table names one for its
+            // interface (karyos#1064), as the first path's.
+            let path_control = if reliable {
+                self.hold_control_group(*bind, *config)
+            } else {
+                None
+            };
             let posted = self
                 .links
                 .receiver
@@ -1248,7 +1262,7 @@ impl<T: StreamTerms> Network<T> {
                     max_term_length,
                     reliable,
                     multicast: true,
-                    control_group: None,
+                    control_group: path_control,
                     identity,
                     conflated: conflated.map(|(lane, _)| lane),
                     solicit_from: solicit,
@@ -1256,10 +1270,14 @@ impl<T: StreamTerms> Network<T> {
                 });
             if posted.is_err() {
                 release(&mut self.send_endpoints, path);
+                if let Some((control, _)) = path_control {
+                    release(&mut self.send_endpoints, control);
+                }
                 self.count_path_failure();
                 continue;
             }
             *slot = Some(path);
+            *control_slot = path_control.map(|(control, _)| control);
         }
         self.subscriptions.push(NetSubscription {
             endpoint,
@@ -1272,6 +1290,7 @@ impl<T: StreamTerms> Network<T> {
             register_at,
             registration,
             later: held,
+            later_controls,
             later_routes,
             users: 1,
         });
@@ -1555,6 +1574,9 @@ impl<T: StreamTerms> Network<T> {
                 }
                 for path in entry.later.into_iter().flatten() {
                     release(&mut self.send_endpoints, path);
+                }
+                for control in entry.later_controls.into_iter().flatten() {
+                    release(&mut self.send_endpoints, control);
                 }
             }
         }

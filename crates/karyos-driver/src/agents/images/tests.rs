@@ -539,6 +539,29 @@ impl Rig {
             }
         }
         assert!(opened);
+        // Its own control group (karyos#1064), sending to itself as the
+        // first path's does.
+        let control_group = setup.control_group.then(|| {
+            let control = self
+                .endpoints
+                .open(&self.links, loopback, OsSocket::new())
+                .unwrap();
+            let mut opened = false;
+            for _ in 0..100 {
+                self.agents.do_work(self.now).unwrap();
+                self.endpoints.poll(
+                    &self.links,
+                    self.now,
+                    |event| opened |= matches!(event, EndpointEvent::Opened(_)),
+                    |_| {},
+                );
+                if opened {
+                    break;
+                }
+            }
+            assert!(opened);
+            (control, self.endpoints.local_address(control).unwrap())
+        });
         self.links
             .receiver
             .post(|reply| AgentCommand::AddSubscription {
@@ -548,7 +571,7 @@ impl Rig {
                 max_term_length: setup.max_term_length,
                 reliable: setup.reliable,
                 multicast: false,
-                control_group: None,
+                control_group,
                 identity: setup.identity,
                 conflated: setup.conflated,
                 solicit_from: None,
@@ -2996,6 +3019,40 @@ fn a_lost_multicast_datagram_is_repaired() {
         rig.round(true);
     }
     assert_eq!(rig.agents.receiver.counters().naks, naks);
+}
+
+/// karyos#1064: on a two-path image whose paths each have a control group,
+/// every NAK is copied once to each path's group, and the receiver's own
+/// copies come back on both groups and are recognised as its own (an
+/// unbound group NAK would mean the later path's group was not bound).
+#[test]
+fn each_paths_control_group_gets_the_nak_copy() {
+    use karyos_sys::log_buffer::AppendOptions;
+
+    let setup = Setup {
+        reliable: true,
+        repairs: false,
+        control_group: true,
+        ..Setup::default()
+    };
+    let (mut rig, _b) = Rig::new(setup.again());
+    let slot = established(&mut rig);
+    let _b2 = rig.second_path(&setup, announce(setup.term_length), None);
+    rig.until(true, |rig| rig.agents.receiver.role.live_paths(slot) == 2);
+    rig.agents.receiver.role.drop_data(&[1]);
+    for i in 0..4u8 {
+        let log = rig.log.as_mut().unwrap();
+        let _ = log.publications[0]
+            .append(&[i; 900], AppendOptions::default())
+            .unwrap();
+    }
+    rig.until(true, |rig| rig.agents.receiver.counters().naks >= 1);
+    rig.until(true, |rig| {
+        rig.agents.receiver.counters().group_nak_own >= 2
+    });
+    let counters = rig.agents.receiver.counters();
+    assert!(counters.group_nak_copies >= 2, "{counters:?}");
+    assert_eq!(counters.group_nak_unbound, 0, "{counters:?}");
 }
 
 /// The setup of the control group tests: a reliable multicast image with
