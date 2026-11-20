@@ -59,7 +59,7 @@ pub mod source;
 pub mod trace_clock;
 
 pub use agent::{AgentCounter, AgentCounts, TraceAgent};
-pub use attribution::{AttributionConfig, Attributor, Observed, Verdict, combine};
+pub use attribution::{AttributionConfig, Attributor, HeldRange, Observed, Verdict, combine};
 pub use clocks::{
     Calibration, CalibrationError, ClockKey, Latency, Observation, Unavailable, latency,
 };

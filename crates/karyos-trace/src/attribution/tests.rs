@@ -409,3 +409,120 @@ fn unallocatable_tables_are_refused() {
         Err(TraceError::Attribution)
     ));
 }
+
+/// karyos#150: two records per trace `t` at `100 t` and `100 t + 5`
+/// (sequences `2 t` and `2 t + 1`), sequences 9 to 14 lost, over traces 0
+/// to 11.
+fn overflow_over_traces_four_to_seven(span: u64) -> HashMap<u64, Verdict> {
+    let mut feed = Feed::new(config(span));
+    for trace in 0..12u64 {
+        for (offset, sequence) in [(0, 2 * trace), (5, 2 * trace + 1)] {
+            if !(9..=14).contains(&sequence) {
+                feed.record(sequence, trace + 1, 0, 100 * trace + offset);
+            }
+        }
+    }
+    feed.close(24)
+}
+
+/// karyos#150: with `D` declared, an overflow over traces 4 to 7 marks
+/// only the traces whose window meets it: those with a record kept beside
+/// the loss. Traces 0 to 3 and 8 onwards stay complete.
+#[test]
+fn a_declared_span_narrows_an_overflow_to_its_traces() {
+    let verdicts = overflow_over_traces_four_to_seven(10);
+    for trace in [0u64, 1, 2, 3, 8, 9, 10, 11] {
+        assert_eq!(verdicts[&(trace + 1)], Complete, "trace {trace}");
+    }
+    // Trace 4 kept its first record (400), trace 7 its second (705); 5 and
+    // 6 were lost whole and have no entry.
+    assert_eq!(verdicts[&5], Incomplete);
+    assert_eq!(verdicts[&8], Incomplete);
+    assert!(!verdicts.contains_key(&6) && !verdicts.contains_key(&7));
+}
+
+/// The negative control: without a declared span every window is the whole
+/// axis, and the same overflow marks every trace of the journal.
+#[test]
+fn an_unbounded_span_keeps_the_coarse_attribution() {
+    let verdicts = overflow_over_traces_four_to_seven(u64::MAX);
+    assert!(verdicts.values().all(|verdict| *verdict == Incomplete));
+}
+
+fn range(first: u64, last: u64, first_time: u64, last_time: u64, epoch: u64) -> HeldRange {
+    HeldRange {
+        first,
+        last,
+        first_time,
+        last_time,
+        clock: 1,
+        epoch,
+    }
+}
+
+/// Traces 1 to 4 at 0, 100, 200 and 300, then a tail loss of sequences 4
+/// and 5 with the given accounting.
+fn tail_loss(
+    ranges: &[HeldRange],
+    lost_before: Option<u64>,
+    mirror: &[(u64, u64)],
+) -> HashMap<u64, Verdict> {
+    let mut feed = Feed::new(config(10));
+    for trace in 0..4u64 {
+        feed.record(trace, trace + 1, 0, 100 * trace);
+    }
+    feed.attributor.set_ranges(ranges, lost_before, mirror);
+    feed.attributor.observe_snapshot(6, 4);
+    feed.close(6)
+}
+
+/// A tail loss inside one held drop range is the interval from the last
+/// record (300) to the range's last drop (360): with `D = 10` it meets only
+/// trace 4's window.
+#[test]
+fn a_tail_loss_in_a_held_range_marks_only_the_traces_it_meets() {
+    let verdicts = tail_loss(&[range(4, 5, 350, 360, 0)], None, &[]);
+    assert_eq!(
+        (verdicts[&1], verdicts[&2], verdicts[&3], verdicts[&4]),
+        (Complete, Complete, Complete, Incomplete)
+    );
+}
+
+/// Nothing narrows below `lost_before` (an evicted range), across another
+/// epoch, where a range leaves a sequence uncovered, or over mirror loss:
+/// the tail marks the cohort.
+#[test]
+fn a_tail_loss_without_a_held_cover_marks_the_cohort() {
+    for (ranges, lost_before, mirror) in [
+        (vec![range(4, 5, 350, 360, 0)], Some(6), vec![]),
+        (vec![range(4, 5, 350, 360, 1)], None, vec![]),
+        (vec![range(4, 4, 350, 350, 0)], None, vec![]),
+        (vec![range(4, 5, 350, 360, 0)], None, vec![(5, 5)]),
+        (vec![], None, vec![]),
+    ] {
+        let verdicts = tail_loss(&ranges, lost_before, &mirror);
+        assert!(
+            verdicts.values().all(|verdict| *verdict == Incomplete),
+            "{ranges:?} {lost_before:?} {mirror:?}"
+        );
+    }
+}
+
+/// A loss before the first record covered by a held range in its epoch is
+/// the interval from the range's first drop to that record: a trace first
+/// retained well after it stays complete.
+#[test]
+fn a_loss_before_the_first_record_in_a_held_range_is_an_interval() {
+    let mut feed = Feed::new(config(10));
+    feed.attributor
+        .set_ranges(&[range(0, 1, 10, 20, 0)], None, &[]);
+    feed.record(2, 1, 0, 100);
+    feed.record(3, 2, 0, 200);
+    let verdicts = feed.close(4);
+    assert_eq!((verdicts[&1], verdicts[&2]), (Incomplete, Complete));
+    // Without the range it marks the cohort.
+    let mut feed = Feed::new(config(10));
+    feed.record(2, 1, 0, 100);
+    feed.record(3, 2, 0, 200);
+    assert!(feed.close(4).values().all(|verdict| *verdict == Incomplete));
+}

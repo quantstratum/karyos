@@ -86,13 +86,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use karyos_protocol::frame::Lane;
 
-use crate::attribution::{AttributionConfig, Attributor, Verdict, combine};
+use crate::attribution::{AttributionConfig, Attributor, HeldRange, Verdict, combine};
 use crate::clocks::{Calibration, ClockKey, Observation, latency};
 use crate::error::TraceError;
 use crate::histogram::{Histogram, HistogramError};
 use crate::journal::{Collected, ObserverId, TraceCollector};
 use crate::record::{NetworkPath, ObservedTime, Point, PublicationId};
-use crate::source::{JournalSource, SourceState};
+use crate::source::{JournalSource, SourceLosses, SourceState};
 use crate::trace_clock::ClockProvenance;
 use karyos_protocol::trace_hook::NetSide;
 
@@ -406,6 +406,40 @@ fn widened(low: u64, high: u64, by: u64) -> (u64, u64) {
 )]
 fn from_start(value: u64, start: u64) -> u64 {
     if value > start { value - start } else { 0 }
+}
+
+/// Hands the attributor `losses`' held drop ranges, `lost_before` and
+/// mirror loss, counted from `start` like its feed; a range below `start`
+/// is out of scope and one across it is clipped there.
+fn set_ranges(attributor: &mut Attributor, losses: &SourceLosses, start: u64) {
+    let mut held = Vec::with_capacity(losses.ranges.len());
+    held.extend(
+        losses
+            .ranges
+            .iter()
+            .filter(|range| range.last >= start)
+            .map(|range| HeldRange {
+                first: from_start(range.first, start),
+                last: from_start(range.last, start),
+                first_time: range.first_time,
+                last_time: range.last_time,
+                clock: range.clock,
+                epoch: range.epoch,
+            }),
+    );
+    let mut mirror = Vec::with_capacity(losses.mirror_ranges.len());
+    mirror.extend(
+        losses
+            .mirror_ranges
+            .iter()
+            .filter(|&&(_, last)| last >= start)
+            .map(|&(first, last)| (from_start(first, start), from_start(last, start))),
+    );
+    attributor.set_ranges(
+        &held,
+        losses.lost_before.map(|below| from_start(below, start)),
+        &mirror,
+    );
 }
 
 /// `item` with its sequences counted from `start`, so the attributor reads
@@ -889,6 +923,10 @@ impl TraceReport {
             }
         }
         let start = journal.start;
+        // The held drop ranges, before the records: a range that appears
+        // only later leaves a loss unnarrowed, which is conservative.
+        let losses = journal.source.losses();
+        set_ranges(&mut journal.attributor, &losses, start);
         // The publications whose fragments found the parking area full.
         let mut lost_parking: Vec<PublicationKey> = Vec::new();
         loop {
@@ -988,6 +1026,7 @@ impl TraceReport {
             }
         }
         let losses = journal.source.losses();
+        set_ranges(&mut journal.attributor, &losses, start);
         let (attempted, stored) = (from_start(losses.attempted, start), losses.stored);
         journal.attributor.observe_snapshot(attempted, stored);
         if journal.drained && journal.owner_closed {

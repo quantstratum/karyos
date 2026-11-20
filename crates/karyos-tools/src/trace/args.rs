@@ -16,12 +16,18 @@ use crate::args::ArgsError;
 pub const HELP: &str = "\
 karyos-trace: the trace report of a running Karyos driver (Linux).
 
-Usage: karyos-trace --dir <path> [--follow] [--interval <ms>]
+Usage: karyos-trace --dir <path> [--follow] [--interval <ms>] [--trace-span <ns>]
 
   --dir <path>        admission directory of the driver (required)
   --follow            rescan and print what changed until the driver exits
                       or the process is interrupted
   --interval <ms>     milliseconds between two rescans with --follow [1000]
+  --trace-span <ns>   the longest span, in collection-clock nanoseconds,
+                      between two observations of one trace in a journal;
+                      losses then mark only the traces they could touch,
+                      and a complete trace is complete under this
+                      declaration [unbounded: any loss marks every trace
+                      of its journal]
   -h, --help          print this text
 
 The report has one section per publication: its messages, the latency
@@ -58,6 +64,8 @@ pub struct Options {
     pub follow: bool,
     /// The interval between two rescans.
     pub interval: Duration,
+    /// The declared attribution span `D` in nanoseconds; `None`: unbounded.
+    pub span: Option<u64>,
 }
 
 /// Parses the arguments after the program name.
@@ -75,6 +83,7 @@ where
     let mut dir = None;
     let mut follow = false;
     let mut interval = DEFAULT_INTERVAL;
+    let mut span = None;
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let text = arg
@@ -95,6 +104,7 @@ where
         let option = match name {
             "--dir" => "--dir",
             "--interval" => "--interval",
+            "--trace-span" => "--trace-span",
             _ => return Err(ArgsError::UnknownOption(text.to_owned())),
         };
         let value = inline
@@ -108,17 +118,22 @@ where
             option,
             value: value.to_string_lossy().into_owned(),
         };
-        let millis = value
+        let number = value
             .to_str()
             .and_then(|value| value.parse::<u64>().ok())
-            .filter(|millis| *millis > 0)
+            .filter(|number| *number > 0)
             .ok_or_else(|| invalid(&value))?;
-        interval = Duration::from_millis(millis);
+        if option == "--trace-span" {
+            span = Some(number);
+        } else {
+            interval = Duration::from_millis(number);
+        }
     }
     Ok(Command::Run(Options {
         dir: dir.ok_or(ArgsError::Missing("--dir"))?,
         follow,
         interval,
+        span,
     }))
 }
 
@@ -138,6 +153,7 @@ mod tests {
                 dir: PathBuf::from("/run/karyos"),
                 follow: false,
                 interval: DEFAULT_INTERVAL,
+                span: None,
             }))
         );
     }
@@ -150,6 +166,7 @@ mod tests {
                 dir: PathBuf::from("/d"),
                 follow: true,
                 interval: Duration::from_millis(250),
+                span: None,
             }))
         );
         assert_eq!(
@@ -158,6 +175,7 @@ mod tests {
                 dir: PathBuf::from("/d"),
                 follow: false,
                 interval: Duration::from_millis(5),
+                span: None,
             }))
         );
     }
@@ -169,7 +187,7 @@ mod tests {
             run(&["--dir", "/d", "--help", "--bogus"]),
             Ok(Command::Help)
         );
-        for option in ["--dir", "--follow", "--interval"] {
+        for option in ["--dir", "--follow", "--interval", "--trace-span"] {
             assert!(HELP.contains(option), "{option} is not in the help");
         }
     }
@@ -198,5 +216,39 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    /// karyos#150: `--trace-span` declares `D`; a zero or unparsable value
+    /// is a usage error, and without it `D` is unbounded.
+    #[test]
+    fn the_trace_span_is_declared_or_unbounded() {
+        let Ok(Command::Run(options)) = run(&["--dir", "/d", "--trace-span", "5000000"]) else {
+            panic!("not a run");
+        };
+        assert_eq!(options.span, Some(5_000_000));
+        let Ok(Command::Run(options)) = run(&["--dir", "/d", "--trace-span=7"]) else {
+            panic!("not a run");
+        };
+        assert_eq!(options.span, Some(7));
+        let Ok(Command::Run(options)) = run(&["--dir", "/d"]) else {
+            panic!("not a run");
+        };
+        assert_eq!(options.span, None);
+        for bad in ["0", "-1", "ten"] {
+            assert!(
+                matches!(
+                    run(&["--dir", "/d", "--trace-span", bad]),
+                    Err(ArgsError::InvalidValue {
+                        option: "--trace-span",
+                        ..
+                    })
+                ),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            run(&["--dir", "/d", "--trace-span"]),
+            Err(ArgsError::MissingValue("--trace-span"))
+        );
     }
 }
