@@ -36,6 +36,8 @@ use karyos_archive::disk::{Disk as _, ReadOnly, StdDisk};
 use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Externality, StoredAnchors};
 use karyos_archive::integrity::journal::read_records;
 use karyos_archive::integrity::ledger::read_entries;
+use karyos_archive::integrity::time::{self, Requirement, Verdict};
+use karyos_archive::integrity::time_evidence;
 use karyos_archive::integrity::trust::{
     Custody, HEADS_FILE, KEYS_FILE, PUBLIC_KEY_LENGTH, REGISTRY_ENTRY_LENGTH, SIGNED_HEAD_LENGTH,
     TrustRoot,
@@ -70,6 +72,16 @@ Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]...
                  an operator export store of anchors (DIR/anchors.kya)
                  at the location HEX (64 hex digits), stated by the
                  operator; repeatable
+  --time-requirement NS:GRAN
+                 report the time verdict of the entries in
+                 <dir>/time-evidence against this requirement: a maximum
+                 divergence from UTC of NS nanoseconds and a granularity
+                 of GRAN nanoseconds or finer (SPEC.md 8.4); without it
+                 no time verdict is reported
+  --time-anchors HEX=DIR
+                 an operator export store of the anchors of
+                 <dir>/time-evidence's own journal, as --anchors;
+                 repeatable; without it --anchors serves both
   --json         one JSON object instead of text
   -h, --help     print this text
 
@@ -89,6 +101,12 @@ pub struct VerifyArgs {
     pub anchors: Vec<([u8; 32], PathBuf)>,
     /// JSON output.
     pub json: bool,
+    /// The operator's time requirement; `None` reports no time verdict
+    /// (karyos#1065).
+    pub time_requirement: Option<Requirement>,
+    /// The anchor stores of the entries' own journal; empty uses
+    /// `anchors`.
+    pub time_anchors: Vec<([u8; 32], PathBuf)>,
 }
 
 /// A command line `verify` refuses.
@@ -122,6 +140,9 @@ pub enum UsageError {
     /// No directory.
     #[error("verify needs a directory")]
     NoDirectory,
+    /// A `--time-requirement` that is not `NS:GRAN`.
+    #[error("--time-requirement needs NS:GRAN, two numbers of nanoseconds")]
+    TimeRequirement,
 }
 
 /// A value that is not 64 hex digits.
@@ -257,6 +278,14 @@ pub enum VerifyError {
     /// The report could not be written.
     #[error("writing the report: {0}")]
     ReportWrite(io::Error),
+    /// The time evidence entries could not be read.
+    #[error("{}: {source}", dir.display())]
+    TimeEvidence {
+        /// The entries' directory.
+        dir: PathBuf,
+        /// The error.
+        source: time_evidence::StoreError,
+    },
 }
 
 /// Parses the arguments after `verify`: `Ok(None)` for `--help`.
@@ -268,11 +297,39 @@ pub fn parse_verify(
     args: impl IntoIterator<Item = OsString>,
 ) -> Result<Option<VerifyArgs>, UsageError> {
     let (mut dir, mut trust, mut anchors, mut json) = (None, None, Vec::new(), false);
+    let mut time_requirement = None;
+    let mut time_anchors = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("-h" | "--help") => return Ok(None),
             Some("--json") => json = true,
+            Some("--time-anchors") => {
+                let value = args.next().ok_or(UsageError::AnchorsNeedsValue)?;
+                let value = value.to_str().ok_or(UsageError::AnchorsNotText)?;
+                let (location, store) = value
+                    .split_once('=')
+                    .ok_or(UsageError::AnchorsNoSeparator)?;
+                time_anchors.push((
+                    hex32(location).map_err(UsageError::AnchorsLocation)?,
+                    PathBuf::from(store),
+                ));
+            }
+            Some("--time-requirement") => {
+                let value = args.next().ok_or(UsageError::TimeRequirement)?;
+                let (divergence, granularity) = value
+                    .to_str()
+                    .and_then(|value| value.split_once(':'))
+                    .ok_or(UsageError::TimeRequirement)?;
+                time_requirement = Some(Requirement {
+                    max_divergence_ns: divergence
+                        .parse()
+                        .map_err(|_| UsageError::TimeRequirement)?,
+                    max_granularity_ns: granularity
+                        .parse()
+                        .map_err(|_| UsageError::TimeRequirement)?,
+                });
+            }
             Some("--trust") => {
                 let value = args.next().ok_or(UsageError::TrustNeedsFile)?;
                 if trust.replace(PathBuf::from(value)).is_some() {
@@ -306,7 +363,140 @@ pub fn parse_verify(
         trust,
         anchors,
         json,
+        time_requirement,
+        time_anchors,
     }))
+}
+
+/// The time verdict of a directory's entries (karyos#1065).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeReport {
+    /// Each entry, with its verdict: `met` only for an entry its own
+    /// integrity journal verifies, `no_evidence` otherwise.
+    pub entries: Vec<(time_evidence::Entry, Verdict)>,
+    /// The combined verdict: `not_met` over `no_evidence` over `met`.
+    pub verdict: Verdict,
+}
+
+/// The time verdict of `args.dir`'s entries against its requirement,
+/// `None` without one. The entries' own integrity is verified under the
+/// same trust and anchors; an entry not verified is `no_evidence`.
+///
+/// # Errors
+///
+/// As [`run_checks`], for the entries' directory, and a malformed entry.
+pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError> {
+    let Some(requirement) = args.time_requirement else {
+        return Ok(None);
+    };
+    let dir = time_evidence::entries_dir(&args.dir);
+    let entries = time_evidence::read_sealed(StdDisk, &args.dir).map_err(|source| {
+        VerifyError::TimeEvidence {
+            dir: dir.clone(),
+            source,
+        }
+    })?;
+    let verified: Vec<(u64, u64)> = if entries.is_empty() {
+        Vec::new()
+    } else {
+        let anchors = if args.time_anchors.is_empty() {
+            args.anchors.clone()
+        } else {
+            args.time_anchors.clone()
+        };
+        let checked = run_checks(&VerifyArgs {
+            dir: dir.clone(),
+            anchors,
+            time_requirement: None,
+            time_anchors: Vec::new(),
+            ..args.clone()
+        })?;
+        checked
+            .ranges
+            .iter()
+            .filter(|range| {
+                range.recording == time_evidence::ENTRIES && range.outcome == Outcome::Verified
+            })
+            .map(|range| (range.start, range.end))
+            .collect()
+    };
+    let length = time_evidence::ENTRY_LENGTH as u64;
+    let mut at = 0u64;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let end = at.saturating_add(length);
+        let covered = verified
+            .iter()
+            .any(|&(start, stop)| start <= at && end <= stop);
+        let verdict = if covered {
+            entry.verdict(&requirement)
+        } else {
+            Verdict::NoEvidence
+        };
+        out.push((entry, verdict));
+        at = end;
+    }
+    let verdicts: Vec<Verdict> = out.iter().map(|(_, verdict)| *verdict).collect();
+    let verdict = time::reduce(&verdicts, Some(&requirement))
+        .map(|combined| combined.verdict)
+        .unwrap_or(Verdict::NoEvidence);
+    Ok(Some(TimeReport {
+        entries: out,
+        verdict,
+    }))
+}
+
+const fn verdict_name(verdict: Verdict) -> &'static str {
+    match verdict {
+        Verdict::Met => "met",
+        Verdict::NoEvidence => "no_evidence",
+        Verdict::NotMet => "not_met",
+    }
+}
+
+/// The time report as text lines.
+#[must_use]
+pub fn time_text(report: &TimeReport) -> String {
+    let mut out = String::new();
+    for (entry, verdict) in &report.entries {
+        let [_, _, _, domain, epoch] = entry.clock;
+        let _ = writeln!(
+            out,
+            "time recording {} [{}, {}) clock {domain}:{epoch} {}",
+            entry.recording,
+            entry.start,
+            entry.end,
+            verdict_name(*verdict)
+        );
+    }
+    let _ = writeln!(out, "time verdict: {}", verdict_name(report.verdict));
+    out
+}
+
+/// The time report as a JSON value.
+#[must_use]
+pub fn time_json(report: &TimeReport) -> String {
+    let entries: Vec<String> = report
+        .entries
+        .iter()
+        .map(|(entry, verdict)| {
+            let [_, _, _, domain, epoch] = entry.clock;
+            format!(
+                "{{\"recording\":{},\"start\":{},\"end\":{},\"domain\":{},\"epoch\":{},\"verdict\":\"{}\"}}",
+                entry.recording,
+                entry.start,
+                entry.end,
+                domain,
+                epoch,
+                verdict_name(*verdict)
+            )
+        })
+        .collect();
+    format!(
+        "{{\"verdict\":\"{}\",\"entries\":[{}]}}",
+        verdict_name(report.verdict),
+        entries.join(",")
+    )
 }
 
 pub(crate) fn hex32(text: &str) -> Result<[u8; 32], HexError> {
@@ -721,12 +911,35 @@ pub fn run_verify(
         }
         Err(error) => return report_error(stderr, &VerifyError::Usage(error)),
     };
-    match run_checks(&parsed) {
-        Ok(verification) => {
-            let report = if parsed.json {
-                json(&verification)
-            } else {
-                text(&verification)
+    match run_checks(&parsed)
+        .and_then(|verification| time_report(&parsed).map(|time| (verification, time)))
+    {
+        Ok((verification, time)) => {
+            let report = match (&time, parsed.json) {
+                (None, true) => json(&verification),
+                (None, false) => text(&verification),
+                (Some(time), true) => {
+                    let integrity = json(&verification);
+                    let field = "\"time\":\"not_evaluated\"";
+                    match integrity.rfind(field) {
+                        Some(at) => format!(
+                            "{}\"time\":{}{}",
+                            integrity.get(..at).unwrap_or_default(),
+                            time_json(time),
+                            integrity
+                                .get(at.saturating_add(field.len())..)
+                                .unwrap_or_default()
+                        ),
+                        None => integrity,
+                    }
+                }
+                (Some(time), false) => {
+                    let integrity = text(&verification);
+                    let head = integrity
+                        .strip_suffix("time evidence: not evaluated by the integrity verifier\n")
+                        .unwrap_or(&integrity);
+                    format!("{head}{}", time_text(time))
+                }
             };
             // A report that could not be written is an error, never a
             // status automation would read as the evidence's.

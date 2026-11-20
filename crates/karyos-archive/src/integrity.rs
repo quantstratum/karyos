@@ -60,6 +60,7 @@ pub mod signing;
 pub mod test_key;
 pub mod tiering;
 pub mod time;
+pub mod time_evidence;
 pub mod trust;
 pub mod verify;
 

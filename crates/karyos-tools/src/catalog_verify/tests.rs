@@ -596,6 +596,8 @@ fn run_checks_errors_keep_their_path_and_source() {
         trust,
         anchors,
         json: false,
+        time_requirement: None,
+        time_anchors: Vec::new(),
     };
     let missing = archive.root.join("no-such-trust");
     match run_checks(&args(Some(missing.clone()), Vec::new())) {
@@ -796,4 +798,176 @@ fn verify_reports_a_sealed_group_journal_and_its_tampering() {
     let (status, out, _) = full(&archive, false);
     assert_eq!(status, EXIT_INCONSISTENT, "{out}");
     assert!(out.contains(" inconsistent "), "{out}");
+}
+
+/// An archive directory whose only content is two time evidence entries,
+/// sealed in `time-evidence/`, the head there signed and anchored by the
+/// operator (karyos#1065). The first entry meets a 1000 ns requirement,
+/// the second has no evidence.
+fn time_archive(name: &str) -> Archive {
+    use karyos_archive::integrity::time::{Source, SyncState};
+    use karyos_archive::integrity::time_evidence::{Entry, EntryStore, NO_BOUND, entries_dir};
+
+    let root = std::env::temp_dir().join(format!("karyos-verify-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let archive = Archive { root };
+    let dir = archive.dir();
+    let entries = entries_dir(&dir);
+    std::fs::create_dir_all(&entries).unwrap();
+    std::fs::create_dir_all(archive.anchors()).unwrap();
+    let met = Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [1, 0, 2, 3, 4],
+        recording: 7,
+        start: 0,
+        end: 4096,
+        min_time: 1000,
+        max_time: 2000,
+        granularity: 1,
+        bound_min_ns: 150,
+        bound_max_ns: 160,
+        calibration: [0xAA; 32],
+        utc_reference: [0xBB; 32],
+        tick_fs: 1_000_000,
+    };
+    let missing = Entry {
+        start: 4096,
+        end: 8192,
+        bound_min_ns: NO_BOUND,
+        bound_max_ns: NO_BOUND,
+        utc_reference: [0; 32],
+        ..met
+    };
+    let mut store = EntryStore::open(StdDisk, &dir).unwrap();
+    store.append(&met).unwrap();
+    store.append(&missing).unwrap();
+    drop(store);
+
+    let mut journal = IntegrityJournal::open(StdDisk, &entries).unwrap().journal;
+    let authority = TestKey::from_seed([1; 32]);
+    let mut signer = TestKey::from_seed([9; 32]);
+    let mut entry = RegistryEntry {
+        action: RegistryAction::Register,
+        algorithm: Algorithm::Ed25519,
+        custody: Custody::NoSeparation,
+        sequence: 0,
+        key_id: signer.key_id(),
+        public: signer.public(),
+        effective: u64::try_from(journal.records().unwrap().len()).unwrap(),
+        evidence: [0; 32],
+        endorsement: [0; 64],
+    };
+    entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&ARCHIVE));
+    let trust = TrustRoot {
+        archive_id: ARCHIVE,
+        authorities: vec![authority.public()],
+    };
+    let mut keys = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &entries, KEYS_FILE).unwrap();
+    KeyRegistry::new(trust)
+        .append(&entry, &mut journal, &mut keys)
+        .unwrap();
+    let records = journal.records().unwrap();
+    let last = records.last().unwrap();
+    let head = ChainHead {
+        archive_id: ARCHIVE,
+        journal_id: 0,
+        counter: last.counter,
+        digest: last.digest(),
+    };
+    let signed = SignedHead {
+        head,
+        key_id: signer.key_id(),
+        custody: Custody::NoSeparation,
+        signature: signer.sign(&head).unwrap(),
+    };
+    let mut heads = Ledger::<_, SIGNED_HEAD_LENGTH>::open(StdDisk, &entries, HEADS_FILE).unwrap();
+    heads.append(signed.encode()).unwrap();
+    let mut anchors = LedgerAnchorStore::open(StdDisk, &archive.anchors(), OPERATOR).unwrap();
+    publish_due(
+        &mut anchors,
+        None,
+        Some(&signed),
+        std::num::NonZeroU64::new(1).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    std::fs::write(
+        archive.trust(),
+        format!(
+            "archive {}\nauthority {}\njournal 0\n",
+            hex(&ARCHIVE),
+            hex(&authority.public())
+        ),
+    )
+    .unwrap();
+    archive
+}
+
+fn time_run(archive: &Archive, extra: &[&str]) -> (u8, String, String) {
+    let mut argv: Vec<OsString> = vec![
+        archive.dir().into(),
+        "--trust".into(),
+        archive.trust().into(),
+        // The entries' own journal is anchored in its own store.
+        "--time-anchors".into(),
+        format!("{}={}", hex(&OPERATOR), archive.anchors().display()).into(),
+    ];
+    argv.extend(extra.iter().map(OsString::from));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let status = run_verify(argv, &mut out, &mut err);
+    (
+        status,
+        String::from_utf8(out).unwrap(),
+        String::from_utf8(err).unwrap(),
+    )
+}
+
+/// karyos#1065: the time verdict of verified entries, per entry and
+/// combined, apart from integrity; none without a requirement.
+#[test]
+fn verify_reports_the_time_verdict_of_verified_entries() {
+    let archive = time_archive("time");
+    let (status, out, err) = time_run(&archive, &[]);
+    assert_eq!((status, err.as_str()), (0, ""), "{out}");
+    assert!(
+        out.contains("time evidence: not evaluated by the integrity verifier"),
+        "{out}"
+    );
+    let (status, out, err) = time_run(&archive, &["--time-requirement", "1000:1"]);
+    assert_eq!((status, err.as_str()), (0, ""), "{out}");
+    assert!(
+        out.contains("time recording 7 [0, 4096) clock 3:4 met"),
+        "{out}"
+    );
+    assert!(
+        out.contains("time recording 7 [4096, 8192) clock 3:4 no_evidence"),
+        "{out}"
+    );
+    assert!(out.ends_with("time verdict: no_evidence\n"), "{out}");
+    let (_, out, _) = time_run(&archive, &["--time-requirement", "155:1"]);
+    assert!(out.contains("[0, 4096) clock 3:4 not_met"), "{out}");
+    assert!(out.ends_with("time verdict: not_met\n"), "{out}");
+    let (_, out, _) = time_run(&archive, &["--time-requirement", "1000:1", "--json"]);
+    assert!(
+        out.contains("\"time\":{\"verdict\":\"no_evidence\",\"entries\":[{\"recording\":7,\"start\":0,\"end\":4096,\"domain\":3,\"epoch\":4,\"verdict\":\"met\"}"),
+        "{out}"
+    );
+    // Without the anchors the entries do not verify: no `met`.
+    let mut argv: Vec<OsString> = vec![
+        archive.dir().into(),
+        "--trust".into(),
+        archive.trust().into(),
+        "--time-requirement".into(),
+        "1000:1".into(),
+    ];
+    argv.truncate(5);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let _ = run_verify(argv, &mut out, &mut err);
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains(" met\n"), "{out}");
+    assert_eq!(
+        usage(&["d", "--time-requirement", "x"]),
+        UsageError::TimeRequirement
+    );
 }
