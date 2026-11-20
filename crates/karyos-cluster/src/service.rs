@@ -596,6 +596,10 @@ pub struct ContainerConfig {
     pub dedup: DedupConfig,
     /// Timers scheduled at once, at most.
     pub timers: u32,
+    /// The bytes its session table may reserve, for its own bounds and
+    /// for bounds a log entry carries ([`crate::dedup::DEFAULT_BUDGET`] by
+    /// default; karyos#1070).
+    pub session_budget: u64,
 }
 
 /// The timers of [`ContainerConfig::default`].
@@ -607,6 +611,7 @@ impl Default for ContainerConfig {
         Self {
             dedup: DedupConfig::default(),
             timers: DEFAULT_TIMERS,
+            session_budget: crate::dedup::DEFAULT_BUDGET,
         }
     }
 }
@@ -616,6 +621,13 @@ impl ContainerConfig {
     #[must_use]
     pub fn with_dedup(mut self, dedup: DedupConfig) -> Self {
         self.dedup = dedup;
+        self
+    }
+
+    /// With its session table limited to `budget` reserved bytes.
+    #[must_use]
+    pub fn with_session_budget(mut self, budget: u64) -> Self {
+        self.session_budget = budget;
         self
     }
 
@@ -701,6 +713,8 @@ pub struct ServiceContainer<S> {
     fresh: bool,
     /// A `SessionBounds` entry has applied.
     bounds_logged: bool,
+    /// [`ContainerConfig::session_budget`], for bounds a log entry carries.
+    session_budget: u64,
 }
 
 impl<S: ClusteredService> ServiceContainer<S> {
@@ -714,7 +728,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
         let timers = usize::try_from(config.timers).map_err(|_| ConfigError::TooLarge)?;
         Ok(Self {
             service,
-            sessions: SessionTable::new(config.dedup)?,
+            sessions: SessionTable::new_within(config.dedup, config.session_budget)?,
             timers: Timers {
                 scheduled: Vec::with_capacity(timers),
                 bound: timers,
@@ -722,6 +736,7 @@ impl<S: ClusteredService> ServiceContainer<S> {
             applied: None,
             fresh: true,
             bounds_logged: false,
+            session_budget: config.session_budget,
         })
     }
 
@@ -904,7 +919,8 @@ impl<S: ClusteredService> ServiceContainer<S> {
                     table,
                 });
             }
-            let mut rebuilt = SessionTable::new(bounds.config).map_err(ApplyError::BoundsUnheld)?;
+            let mut rebuilt = SessionTable::new_within(bounds.config, self.session_budget)
+                .map_err(ApplyError::BoundsUnheld)?;
             rebuilt.observe(self.sessions.log_time());
             self.sessions = rebuilt;
         }

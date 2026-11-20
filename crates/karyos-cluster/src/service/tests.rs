@@ -934,3 +934,19 @@ fn test_container_a_leader_proposes_no_registration_before_the_bounds_apply() {
         container.sessions().config()
     );
 }
+
+/// karyos#1070: a logged bounds entry over the container's budget stops
+/// it, typed, without reserving the table.
+#[test]
+fn test_container_bounds_over_its_budget_stop_it() {
+    let big = DedupConfig::default()
+        .with_sessions(1 << 16)
+        .with_window(1 << 10)
+        .with_response_bytes(1 << 10);
+    let mut container = container();
+    assert!(matches!(
+        container.apply(&bounds_entry(1, 0, big)),
+        Err(ApplyError::BoundsUnheld(ConfigError::OverBudget { .. }))
+    ));
+    assert_eq!(container.applied(), None);
+}

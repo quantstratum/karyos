@@ -236,7 +236,25 @@ pub enum ConfigError {
     /// allocation is refused (fallibly reserved, never an abort).
     #[error("sessions × window × response bytes overflows or cannot be allocated")]
     TooLarge,
+    /// The table would reserve more than the replica's byte budget
+    /// ([`SessionTable::new_within`], karyos#1070): refused before
+    /// anything is reserved.
+    #[error("the session table asks {asked} bytes, over its budget of {budget}")]
+    OverBudget {
+        /// The bytes the bounds reserve ([`DedupConfig::reserved_bytes`]).
+        asked: u64,
+        /// The budget.
+        budget: u64,
+    },
 }
+
+/// The bytes a session table may reserve by default: 2 GiB, room for the
+/// large profile ([`DedupConfig::large`], 512 MiB of replies plus
+/// metadata) and far below what would exhaust a replica's host
+/// (karyos#1070). Bounds past it are refused before any reservation, so
+/// no test or logged bounds entry can drive a host into overcommitted
+/// memory, whatever its operating system.
+pub const DEFAULT_BUDGET: u64 = 2 << 30;
 
 /// A registration refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -368,6 +386,17 @@ impl SessionTable {
     /// [`ConfigError`] for a zero bound or reply bytes past the address
     /// space.
     pub fn new(config: DedupConfig) -> Result<Self, ConfigError> {
+        Self::new_within(config, DEFAULT_BUDGET)
+    }
+
+    /// [`SessionTable::new`] under a byte budget of `budget`: bounds
+    /// whose [`DedupConfig::reserved_bytes`] pass it, or overflow, are
+    /// refused before anything is reserved (karyos#1070).
+    ///
+    /// # Errors
+    ///
+    /// As [`SessionTable::new`], and [`ConfigError::OverBudget`].
+    pub fn new_within(config: DedupConfig, budget: u64) -> Result<Self, ConfigError> {
         for (name, value) in [
             ("sessions", config.sessions),
             ("window", config.window),
@@ -379,6 +408,12 @@ impl SessionTable {
         }
         if config.ttl == 0 {
             return Err(ConfigError::Zero("ttl"));
+        }
+        // Checked first, from the bounds alone: nothing is reserved for
+        // bounds past the budget (karyos#1070).
+        let asked = config.reserved_bytes().ok_or(ConfigError::TooLarge)?;
+        if asked > budget {
+            return Err(ConfigError::OverBudget { asked, budget });
         }
         let sessions = usize::try_from(config.sessions).map_err(|_| ConfigError::TooLarge)?;
         let window = usize::try_from(config.window).map_err(|_| ConfigError::TooLarge)?;

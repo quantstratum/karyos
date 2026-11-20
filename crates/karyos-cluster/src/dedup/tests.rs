@@ -607,3 +607,30 @@ fn bounds_past_the_address_space_reserve_nothing() {
         .with_response_bytes(1);
     assert_eq!(SessionTable::new(huge).err(), Some(ConfigError::TooLarge));
 }
+
+/// karyos#1070: bounds within the address space but over the budget are
+/// refused before anything is reserved, naming both sizes; the large
+/// profile fits the default budget.
+#[test]
+fn bounds_over_the_byte_budget_reserve_nothing() {
+    let large = DedupConfig::large();
+    let asked = large.reserved_bytes().unwrap();
+    // Within the default budget (not built here: 512 MiB).
+    assert!(asked <= DEFAULT_BUDGET);
+    assert_eq!(
+        SessionTable::new_within(large, asked - 1).err(),
+        Some(ConfigError::OverBudget {
+            asked,
+            budget: asked - 1
+        })
+    );
+    // 64 GiB of replies: addressable, never reserved.
+    let big = DedupConfig::default()
+        .with_sessions(1 << 16)
+        .with_window(1 << 10)
+        .with_response_bytes(1 << 10);
+    assert!(matches!(
+        SessionTable::new(big),
+        Err(ConfigError::OverBudget { .. })
+    ));
+}
