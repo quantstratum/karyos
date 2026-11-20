@@ -614,6 +614,15 @@ pub struct ContainerConfig {
     /// The bytes its session table may reserve, for its own bounds and
     /// for bounds a log entry carries ([`crate::dedup::DEFAULT_BUDGET`] by
     /// default; karyos#1070).
+    ///
+    /// **Every replica of a cluster must use the same budget**
+    /// (karyos#1097). The bounds are a log entry every replica applies; a
+    /// replica whose budget is smaller than the logged bounds need refuses
+    /// the entry the others accept and stops at its index with
+    /// [`ApplyError::BoundsUnheld`]`(`[`ConfigError::OverBudget`]`)`, naming
+    /// the bytes asked and its budget. It does not apply the entry or any
+    /// later one, so it stays behind until it restarts with a budget that
+    /// holds the bounds.
     pub session_budget: u64,
 }
 
@@ -639,7 +648,8 @@ impl ContainerConfig {
         self
     }
 
-    /// With its session table limited to `budget` reserved bytes.
+    /// With its session table limited to `budget` reserved bytes: the same
+    /// on every replica ([`ContainerConfig::session_budget`]).
     #[must_use]
     pub fn with_session_budget(mut self, budget: u64) -> Self {
         self.session_budget = budget;
@@ -710,7 +720,9 @@ pub enum ApplyError {
         table: DedupConfig,
     },
     /// A `SessionBounds` entry names bounds this replica cannot hold: a
-    /// safety stop.
+    /// safety stop. [`ConfigError::OverBudget`] here means this replica's
+    /// [`ContainerConfig::session_budget`] is smaller than another
+    /// replica's, which proposed the bounds (karyos#1097).
     #[error("the logged session bounds cannot be held: {0}")]
     BoundsUnheld(ConfigError),
 }
