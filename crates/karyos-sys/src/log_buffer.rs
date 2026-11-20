@@ -4888,10 +4888,49 @@ impl<O: BufferOwner> Conductor<O> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
         if buffer.concurrent() {
             return Err(SysError::InvalidPublicationMode {
-                reason: "a concurrent buffer's claims are not aborted by a guard close here",
+                reason: "a concurrent buffer's claims are aborted by abort_marked_claims",
             });
         }
         self.exclusive_deadline(&mut || 0, true)
+    }
+
+    /// Aborts a concurrent buffer's outstanding claims now, whatever their
+    /// deadlines (a guard close, karyos#1102): one deadline service call in
+    /// which every observation is expired at once. Blocks the call's scan
+    /// observes for the first time are aborted by the next call, so a
+    /// caller repeats it while the report's `waiting` is set, as the
+    /// exclusive walker repeats [`Conductor::abort_admitted_claim`]. Each
+    /// abort is the deadline's compare-exchange against the writer's mark
+    /// or commit, so exactly one wins.
+    ///
+    /// # Errors
+    ///
+    /// [`DeadlineError`] as [`Conductor::service_deadlines`], and
+    /// `InvalidPublicationMode` (in the error, with an empty report) for an
+    /// exclusive buffer, whose claim [`Conductor::abort_admitted_claim`]
+    /// aborts.
+    pub fn abort_marked_claims(&mut self) -> Result<DeadlineReport, DeadlineError> {
+        let mut report = DeadlineReport::default();
+        if !self.buffer.concurrent() {
+            return Err(DeadlineError {
+                report,
+                error: SysError::InvalidPublicationMode {
+                    reason: "an exclusive buffer's claim is aborted by abort_admitted_claim",
+                },
+            });
+        }
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        let result =
+            self.deadlines
+                .service_with(buffer, &mut || u64::MAX, 0, &mut report, &mut || {});
+        if result.is_ok() {
+            self.release_ended_publishers();
+        }
+        report.waiting = self.deadlines.waiting();
+        match result {
+            Ok(()) => Ok(report),
+            Err(error) => Err(DeadlineError { report, error }),
+        }
     }
 
     /// The deadline service (`quantstratum-docs: karyos/design/concurrent-deadline.md`,

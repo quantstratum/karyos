@@ -1093,7 +1093,8 @@ fn cleaner_throughput(config: Config) -> Result<Measurement, BenchError> {
                                 SysConcurrentOfferOutcome::Aborted { .. }
                                 | SysConcurrentOfferOutcome::BackPressured
                                 | SysConcurrentOfferOutcome::AdminAction => thread::yield_now(),
-                                SysConcurrentOfferOutcome::Closed => {
+                                SysConcurrentOfferOutcome::Closed
+                                | SysConcurrentOfferOutcome::Gated => {
                                     return Err(BenchError("the publication closed".into()));
                                 }
                             }

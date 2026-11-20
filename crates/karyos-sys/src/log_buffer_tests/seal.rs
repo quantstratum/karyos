@@ -868,3 +868,88 @@ fn an_unknown_seal_reason_reads_as_unspecified() {
         );
     }
 }
+
+/// karyos#1102: a concurrent buffer sealed with a gate reason reports
+/// `Gated` to its handles, offers and claims alike, as an exclusive one
+/// does (GC-8); a seal with another reason still reports `Closed`.
+#[test]
+fn a_concurrent_gate_seal_reports_gated() {
+    for (reason, gated) in [
+        (SealReason::GuardClosed, true),
+        (SealReason::DeadlineMissed, true),
+        (SealReason::Unspecified, false),
+    ] {
+        let buffer = new_buffer(concurrent_config(2)).unwrap();
+        let mut conductor = buffer.conductor().unwrap();
+        let _subscription = conductor.subscribe(Role::Optional).unwrap();
+        let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+        conductor.seal_with_reason(reason).unwrap();
+        let (offer, claim) = if gated {
+            (ConcurrentOfferOutcome::Gated, "Gated")
+        } else {
+            (ConcurrentOfferOutcome::Closed, "Closed")
+        };
+        // The first attempt observes the seal; the next answers at once.
+        for _ in 0..2 {
+            assert_eq!(
+                handle.offer(&message(1), AppendOptions::default()).unwrap(),
+                offer,
+                "{reason:?}"
+            );
+            let outcome = handle.try_claim(8, AppendOptions::default()).unwrap();
+            let name = match outcome {
+                ConcurrentClaimOutcome::Gated => "Gated",
+                ConcurrentClaimOutcome::Closed => "Closed",
+                _ => "other",
+            };
+            assert_eq!(name, claim, "{reason:?}");
+        }
+    }
+}
+
+/// karyos#1102: a guard close aborts a concurrent buffer's outstanding
+/// claim at once, whatever its deadline: `abort_marked_claims` repeated
+/// while `waiting` aborts the marked block, and the reader skips it.
+#[test]
+fn a_guard_close_aborts_concurrent_claims_at_once() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let ConcurrentClaimOutcome::Claimed(claim) =
+        handle.try_claim(64, AppendOptions::default()).unwrap()
+    else {
+        panic!("not claimed");
+    };
+    core::mem::forget(claim);
+    let mut aborted = 0;
+    for _ in 0..4 {
+        let report = conductor.abort_marked_claims().unwrap();
+        aborted += report.aborted;
+        if !report.waiting && aborted > 0 {
+            break;
+        }
+    }
+    assert_eq!(aborted, 1, "the marked block, long before its deadline");
+    assert_eq!(
+        poll(&mut subscription),
+        PollOutcome::Aborted {
+            position: 0,
+            extent: 96,
+        }
+    );
+    // Each mode keeps its own call.
+    assert!(matches!(
+        conductor.abort_admitted_claim(),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+    let exclusive = new_buffer(config(6, 4)).unwrap();
+    let mut exclusive = exclusive.conductor().unwrap();
+    assert!(matches!(
+        exclusive.abort_marked_claims(),
+        Err(DeadlineError {
+            error: SysError::InvalidPublicationMode { .. },
+            ..
+        })
+    ));
+}

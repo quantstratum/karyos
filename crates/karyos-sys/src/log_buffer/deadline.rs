@@ -173,11 +173,27 @@ impl ConcurrentDeadlines {
         report: &mut DeadlineReport,
         after_marked: &mut dyn FnMut(),
     ) -> Result<(), SysError> {
+        let deadline = buffer.config.claim_deadline;
+        self.service_with(buffer, clock, deadline, report, after_marked)
+    }
+
+    /// [`Self::service`] with `deadline` in place of the buffer's claim
+    /// deadline: 0, with a clock that reads `u64::MAX`, makes every
+    /// observation expired at once (a guard close aborts outstanding
+    /// claims, karyos#1102).
+    pub(super) fn service_with<T: TermBytes>(
+        &mut self,
+        buffer: &LogBuffer<T>,
+        clock: &mut dyn FnMut() -> u64,
+        deadline: u64,
+        report: &mut DeadlineReport,
+        after_marked: &mut dyn FnMut(),
+    ) -> Result<(), SysError> {
         // The clock of points already observed below the admitted head.
         let mut now = Now { clock, value: None };
-        self.serve_marked(buffer, &mut now, report)?;
+        self.serve_marked(buffer, &mut now, deadline, report)?;
         after_marked();
-        self.walk(buffer, &mut now, report)?;
+        self.walk(buffer, &mut now, deadline, report)?;
         // New observations are dated by a clock read after the head
         // snapshot of the scan.
         let mut scan_now = Now {
@@ -203,9 +219,9 @@ impl ConcurrentDeadlines {
         &mut self,
         buffer: &LogBuffer<T>,
         now: &mut Now<'_>,
+        deadline: u64,
         report: &mut DeadlineReport,
     ) -> Result<(), SysError> {
-        let deadline = buffer.config.claim_deadline;
         let mut index = 0;
         while let Some(marked) = self.marked.get_mut(index) {
             if !holds(buffer, marked.slot, marked.count)? {
@@ -253,6 +269,7 @@ impl ConcurrentDeadlines {
         &mut self,
         buffer: &LogBuffer<T>,
         now: &mut Now<'_>,
+        deadline: u64,
         report: &mut DeadlineReport,
     ) -> Result<(), SysError> {
         let Some(mut span) = self.span else {
@@ -264,12 +281,7 @@ impl ConcurrentDeadlines {
         }
         let mut budget = self.walk_budget;
         if span.next.is_none() {
-            let expired = timer(
-                &mut span.first_seen,
-                now.get(),
-                buffer.config.claim_deadline,
-                report,
-            )?;
+            let expired = timer(&mut span.first_seen, now.get(), deadline, report)?;
             if !expired {
                 self.span = Some(span);
                 return Ok(());

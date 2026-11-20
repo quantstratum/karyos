@@ -2174,7 +2174,9 @@ fn offer_concurrent(
     for _ in 0..1000 {
         match handle.offer(data, AppendOptions::default()).unwrap() {
             ConcurrentOfferOutcome::Appended { position } => return position,
-            outcome @ (ConcurrentOfferOutcome::Aborted { .. } | ConcurrentOfferOutcome::Closed) => {
+            outcome @ (ConcurrentOfferOutcome::Aborted { .. }
+            | ConcurrentOfferOutcome::Closed
+            | ConcurrentOfferOutcome::Gated) => {
                 panic!("unexpected {outcome:?}")
             }
             ConcurrentOfferOutcome::BackPressured | ConcurrentOfferOutcome::AdminAction => {
@@ -2278,7 +2280,9 @@ fn the_crossing_owner_pads_its_remainder_and_the_others_catch_up() {
                 break;
             }
             ConcurrentOfferOutcome::BackPressured => {}
-            outcome @ (ConcurrentOfferOutcome::Aborted { .. } | ConcurrentOfferOutcome::Closed) => {
+            outcome @ (ConcurrentOfferOutcome::Aborted { .. }
+            | ConcurrentOfferOutcome::Closed
+            | ConcurrentOfferOutcome::Gated) => {
                 panic!("unexpected {outcome:?}")
             }
         }
