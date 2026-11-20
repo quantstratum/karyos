@@ -11,7 +11,7 @@ usage: karyos-agent --api-dir DIR --driver DIR [--driver DIR]... \
 --role UID=ROLE [--role UID=ROLE]... [--refresh-ms MS] [--lag-bytes N] \
 [--lag-refreshes N] [--loss-quiet N] [--archive DIR=REQ,RESP]... \
 [--journal DIR] [--agent-id NAME] [--relay UID=ID]... \
-[--principal NAME=OPERATOR:ROLE]... [--relay-group GID]
+[--principal NAME=OPERATOR:ROLE]... [--relay-group GID] [--stop-timeout-ms MS]
 
 Serves API v1 (JSON) on DIR/agent.sock to the uids given a role (viewer,
 operator, risk-officer, administrator, registrar), reading each driver's
@@ -35,7 +35,13 @@ the operator. A relayed request is KARYOS-AGENT 1 relay NAME REQUEST; its
 role is the principal's here, never the relay's. --relay-group lets the
 members of GID, which this agent's uid must belong to, reach DIR/agent.sock
 (DIR 0710, the socket 0660, both of GID): a relay under a uid of its own
-joins it; without it DIR is 0700 and the socket 0600. Linux only.
+joins it; without it DIR is 0700 and the socket 0600. SIGTERM or SIGINT
+stops the agent cleanly: it writes its durable `agent stopped` journal
+record and exits 0, within MS milliseconds (default 5000); past that
+deadline, on a second signal, or when the record cannot be made durable
+it exits nonzero and the next start records an unknown interval. A
+service manager sends SIGTERM and waits at least MS plus one refresh
+before SIGKILL. Linux only.
 
 A request is one line: KARYOS-AGENT 1 view, or
 KARYOS-AGENT 1 guard-close DIR GUARD [REASON] (operator, risk-officer),
@@ -48,6 +54,9 @@ NAME=VALUE... and join-retire DIR KIND KEY (registrar, administrator),
 join-get DIR KIND KEY [AT_NS] and join-list DIR [KIND KEY], KIND being
 stream, point or counter.
 ";
+
+/// The default bound of a signal stop (karyos#710).
+pub const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The default refresh period.
 pub const DEFAULT_REFRESH: Duration = Duration::from_secs(1);
@@ -79,6 +88,9 @@ pub struct Args {
     pub principals: Vec<(String, u32, String)>,
     /// The group whose members may reach the socket (karyos#708).
     pub relay_group: Option<u32>,
+    /// How long a signal stop may take before the agent exits anyway,
+    /// leaving an unclean stop (karyos#710); zero exits at once.
+    pub stop_timeout: Duration,
 }
 
 /// Parses `args` (without the program name); `None` for anything this
@@ -96,6 +108,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
     let mut relays: Vec<(u32, u64)> = Vec::new();
     let mut principals: Vec<(String, u32, String)> = Vec::new();
     let mut relay_group = None;
+    let mut stop_timeout = None;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
@@ -157,6 +170,9 @@ pub fn parse(args: &[String]) -> Option<Args> {
                 }
                 principals.push((name.to_owned(), operator, role.to_owned()));
             }
+            "--stop-timeout-ms" if stop_timeout.is_none() => {
+                stop_timeout = Some(Duration::from_millis(value.parse().ok()?));
+            }
             "--refresh-ms" => {
                 let millis: u64 = value.parse().ok()?;
                 if millis == 0 {
@@ -214,6 +230,7 @@ pub fn parse(args: &[String]) -> Option<Args> {
         relays,
         principals,
         relay_group,
+        stop_timeout: stop_timeout.unwrap_or(DEFAULT_STOP_TIMEOUT),
     })
 }
 

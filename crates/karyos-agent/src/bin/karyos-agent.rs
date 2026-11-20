@@ -3,8 +3,21 @@
 //! `karyos-agent`: the per-host management agent (SPEC.md §11, ADR-0055;
 //! quantstratum-docs: karyos/design/management-agent-gap-analysis.md, M7).
 //! It reads each driver's CnC as a tool at every refresh and serves API v1
-//! on a local Unix socket until it is killed. Exit status: 2 on a bad
-//! command line or when the socket cannot be bound, 1 when serving fails.
+//! on a local Unix socket until `SIGTERM` or `SIGINT`.
+//!
+//! **Stop** (owner item 55, karyos#710). Each signal only sets a flag
+//! (`signal_hook::flag`); the serving loop reads it between polls and runs
+//! the agent's one clean stop, [`karyos_agent::Agent::stop`], which writes
+//! the durable `agent stopped` journal record. The stop is bounded by
+//! `--stop-timeout-ms` (default 5 s): a watchdog thread exits the process
+//! when it passes, and a second signal exits at once. Either way, and when
+//! the record cannot be made durable, no `agent stopped` record is
+//! written and the next start records an unclean stop, an unknown
+//! interval. No library code handles a signal.
+//!
+//! Exit status: 0 after a clean stop; 2 on a bad command line or when the
+//! socket cannot be bound; 1 when serving fails or the stop could not be
+//! recorded; 3 when the stop passed its deadline; 1 on a second signal.
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -27,7 +40,11 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
 
 #[cfg(target_os = "linux")]
 fn serve(args: karyos_agent::cli::Args) -> ExitCode {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
+
+    use signal_hook::consts::signal::{SIGINT, SIGTERM};
 
     use karyos_agent::server::{ApiConfig, Principal, Role, Server};
     use karyos_agent::{Agent, AgentConfig};
@@ -48,6 +65,22 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
     let mut config = ApiConfig::new(args.api_dir, roles).with_relays(args.relays, principals);
     if let Some(gid) = args.relay_group {
         config = config.with_relay_group(gid);
+    }
+    // Registered before the socket is bound, so a signal during startup
+    // stops the agent at once. A first signal sets `stop`; a second one,
+    // with `stop` already set, exits at once with status 1, unclean.
+    let stop = Arc::new(AtomicBool::new(false));
+    for signal in [SIGTERM, SIGINT] {
+        let registered =
+            signal_hook::flag::register_conditional_shutdown(signal, 1, Arc::clone(&stop))
+                .and_then(|_| signal_hook::flag::register(signal, Arc::clone(&stop)));
+        if let Err(error) = registered {
+            let _ = writeln!(
+                std::io::stderr(),
+                "karyos-agent: signal registration failed: {error}"
+            );
+            return ExitCode::from(2);
+        }
     }
     let mut server = match Server::bind(config) {
         Ok(server) => server,
@@ -72,12 +105,13 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
         config = config.with_agent_id(id);
     }
     let mut agent = Agent::new(config);
-    // Between refreshes the socket is polled every 10 ms.
+    // Between refreshes the socket is polled every 10 ms, and the stop
+    // flag read as often.
     let tick = Duration::from_millis(10).min(args.refresh);
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         agent.refresh();
         let next = Instant::now().checked_add(args.refresh);
-        loop {
+        while !stop.load(Ordering::Relaxed) {
             if let Err(error) = server.poll(&mut agent) {
                 let _ = writeln!(std::io::stderr(), "karyos-agent: {error}");
                 return ExitCode::from(1);
@@ -86,6 +120,56 @@ fn serve(args: karyos_agent::cli::Args) -> ExitCode {
                 break;
             }
             std::thread::sleep(tick);
+        }
+    }
+    stop_cleanly(&mut agent, args.stop_timeout)
+}
+
+/// The exit status of a stop past its deadline.
+#[cfg(target_os = "linux")]
+const DEADLINE_EXIT: i32 = 3;
+
+/// Runs the agent's clean stop within `timeout`: a watchdog exits the
+/// process with [`DEADLINE_EXIT`] when it passes, before `agent stopped`
+/// is durable, so that run stays unclean. A zero timeout exits at once,
+/// without trying.
+#[cfg(target_os = "linux")]
+fn stop_cleanly(agent: &mut karyos_agent::Agent, timeout: std::time::Duration) -> ExitCode {
+    if timeout.is_zero() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "karyos-agent: stop deadline passed; the stop is unclean"
+        );
+        return ExitCode::from(3);
+    }
+    // The watchdog is never joined: the process ends before or with it.
+    let watchdog = std::thread::Builder::new()
+        .name("karyos-agent-stop".to_owned())
+        .spawn(move || {
+            std::thread::sleep(timeout);
+            let _ = writeln!(
+                std::io::stderr(),
+                "karyos-agent: stop deadline passed; the stop is unclean"
+            );
+            std::process::exit(DEADLINE_EXIT);
+        });
+    if let Err(error) = watchdog {
+        // Without a bound the stop is not attempted: unclean, as item 55
+        // requires a bounded one.
+        let _ = writeln!(
+            std::io::stderr(),
+            "karyos-agent: no stop watchdog ({error}); the stop is unclean"
+        );
+        return ExitCode::from(1);
+    }
+    match agent.stop() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "karyos-agent: the stop was not recorded ({error}); the stop is unclean"
+            );
+            ExitCode::from(1)
         }
     }
 }

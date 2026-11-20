@@ -16,6 +16,9 @@ karyos-client.workspace = true
 karyos-protocol.workspace = true
 karyos-sys.workspace = true
 karyos-trace.workspace = true
+# The binary's stop on SIGTERM and SIGINT, a flag only (owner item 55,
+# karyos#710; quantstratum-docs: karyos/reviews/dependency-admission-signal-hook-agent.md).
+signal-hook.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
