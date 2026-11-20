@@ -478,6 +478,10 @@ fn published_keys_keep_their_meaning() {
                 udp("karyos:udp?group=239.1.1.1:4000|nak-control=239.1.1.2:4001").nak_control,
                 vec![addr("239.1.1.2:4001")]
             ),
+            Key::Linger => assert_eq!(
+                udp("karyos:udp?endpoint=10.0.0.5:1|linger=250ms").linger,
+                Some(Duration::from_millis(250))
+            ),
         }
         assert_eq!(key.name(), name);
     }
