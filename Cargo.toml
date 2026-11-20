@@ -7,6 +7,7 @@ members = [
     "crates/karyos-io",
     "crates/karyos-protocol",
     "crates/karyos-codec",
+    "crates/karyos-codec-derive",
     "crates/karyos-client",
     "crates/karyos-driver",
     "crates/karyos-trace",
@@ -30,6 +31,8 @@ default-members = [
     "crates/karyos-io",
     "crates/karyos-protocol",
     "crates/karyos-codec",
+    "crates/karyos-codec-derive",
+    "crates/karyos-codec-derive",
     "crates/karyos-client",
     "crates/karyos-driver",
     "crates/karyos-trace",
@@ -57,6 +60,7 @@ karyos-sys = { path = "crates/karyos-sys", version = "0.1.0-alpha.3" }
 karyos-io = { path = "crates/karyos-io", version = "0.1.0-alpha.3" }
 karyos-protocol = { path = "crates/karyos-protocol", version = "0.1.0-alpha.3" }
 karyos-codec = { path = "crates/karyos-codec", version = "0.1.0-alpha.3" }
+karyos-codec-derive = { path = "crates/karyos-codec-derive", version = "0.1.0-alpha.3" }
 karyos-client = { path = "crates/karyos-client", version = "0.1.0-alpha.3" }
 karyos-driver = { path = "crates/karyos-driver", version = "0.1.0-alpha.3" }
 karyos-trace = { path = "crates/karyos-trace", version = "0.1.0-alpha.3" }
@@ -73,6 +77,11 @@ proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "mm", "net", "param", "process", "rand", "time"] }
 signal-hook = { version = "0.4.5", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
+# The codec derive's compile-time graph (karyos#661; owner decision
+# 2026-10-21 item 15): the resolutions `thiserror-impl` already brings.
+proc-macro2 = { version = "1.0.107", default-features = false, features = ["proc-macro"] }
+quote = { version = "1.0.47", default-features = false, features = ["proc-macro"] }
+syn = { version = "3.0.8", default-features = false, features = ["derive", "parsing", "printing", "proc-macro", "clone-impls"] }
 sha2 = { version = "=0.11.1", default-features = false }
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }

@@ -14,6 +14,7 @@
 //! these hand-written ones become its vectors.
 
 use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
+use karyos_codec_derive::Message;
 
 use crate::catalog::{SourceIncarnation, Stop, StopReason};
 use crate::recorder::{Mode, OnLap};
@@ -178,80 +179,39 @@ impl<'a> StartRecording<'a> {
 }
 
 /// Requests a recording's stop where it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = STOP_RECORDING)]
 pub struct StopRecording {
     /// Echoed in the response.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The recording, never 0.
+    #[field(offset = 8, check = id)]
     pub recording_id: u64,
-}
-
-impl StopRecording {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        Ok(Self {
-            correlation_id: block.u64(0)?,
-            recording_id: id("recording_id", block.u64(8)?)?,
-        })
-    }
-
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// a recording id of 0.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &STOP_RECORDING)?;
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, id("recording_id", self.recording_id)?)?;
-        encoder.finish()
-    }
 }
 
 /// Requests the catalog's recordings from an id on: one
 /// [`RecordingDescriptor`] each, then a [`ControlResponse`] with the count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = LIST_RECORDINGS)]
 pub struct ListRecordings {
     /// Echoed in the responses.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The first id listed: a cursor, so 0 lists from the first
     /// recording.
+    #[field(offset = 8)]
     pub from_id: u64,
     /// At most this many, 1 to [`MAX_LIST_COUNT`].
+    #[field(offset = 16, check = list_count)]
     pub max_count: u32,
 }
 
-fn list_count(count: u32) -> Result<u32, CodecError> {
+fn list_count(field: &'static str, count: u32) -> Result<u32, CodecError> {
     if (1..=MAX_LIST_COUNT).contains(&count) {
         Ok(count)
     } else {
-        Err(out_of_range("max_count"))
-    }
-}
-
-impl ListRecordings {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        Ok(Self {
-            correlation_id: block.u64(0)?,
-            from_id: block.u64(8)?,
-            max_count: list_count(block.u32(16)?)?,
-        })
-    }
-
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// a count outside its bounds.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &LIST_RECORDINGS)?;
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, self.from_id)?;
-        encoder.u32(16, list_count(self.max_count)?)?;
-        encoder.finish()
+        Err(out_of_range(field))
     }
 }
 
@@ -347,35 +307,15 @@ impl<'a> Replay<'a> {
 }
 
 /// Requests a replay's stop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = STOP_REPLAY)]
 pub struct StopReplay {
     /// Echoed in the response.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The replay, never 0.
+    #[field(offset = 8, check = id)]
     pub replay_id: u64,
-}
-
-impl StopReplay {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        Ok(Self {
-            correlation_id: block.u64(0)?,
-            replay_id: id("replay_id", block.u64(8)?)?,
-        })
-    }
-
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// a replay id of 0.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &STOP_REPLAY)?;
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, id("replay_id", self.replay_id)?)?;
-        encoder.finish()
-    }
 }
 
 /// The outcome of a request.

@@ -654,6 +654,7 @@ dependencies = [
  "ed25519-dalek",
  "karyos-client",
  "karyos-codec",
+ "karyos-codec-derive",
  "karyos-io",
  "karyos-sys",
  "karyos-trace",
@@ -703,6 +704,15 @@ dependencies = [
 [[package]]
 name = "karyos-codec"
 version = "0.1.0-alpha.3"
+
+[[package]]
+name = "karyos-codec-derive"
+version = "0.1.0-alpha.3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.8",
+]
 
 [[package]]
 name = "karyos-control"

@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check raft-eval lint-sync changelog-check lint-linux pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check codec-derive-check raft-eval lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -148,6 +148,11 @@ control-plane-graph-check:
 tiering-graph-check:
 	scripts/check-tiering-graph.sh
 
+# The codec derive's crates stay compiler-side and add no `syn` major
+# (karyos#661; owner decision 2026-10-21 item 15).
+codec-derive-check:
+	scripts/check-codec-derive-graph.sh
+
 # No Raft candidate and not the evaluation crate in any shipped graph, and
 # no Tokio outside karyos-control's (cargo tree, every target, default and every feature; with
 # negative controls): the evaluation-only admission's
@@ -173,4 +178,4 @@ changelog-check:
 netem:
 	scripts/netem-test.sh
 
-pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check tiering-graph-check header-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check
+pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check tiering-graph-check header-check codec-derive-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check
