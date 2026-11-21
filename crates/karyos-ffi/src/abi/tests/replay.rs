@@ -535,7 +535,7 @@ fn a_replay_through_a_real_archive_ends_at_its_targets_seal() {
     let reading = real::Reading(driver.subscribe(requests, Role::Required).unwrap());
     let writing = real::Writing(driver.publication(responses).unwrap());
     let mut publication = driver.publication(data).unwrap();
-    let conductor = driver.connect().unwrap();
+    let conductor = patient(driver.connect().unwrap());
     let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
     let mut server = ControlServer::new(
         agent,

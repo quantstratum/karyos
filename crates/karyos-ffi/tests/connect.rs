@@ -5,7 +5,9 @@
 //! one refuses its version or admits it at another, which the C ABI
 //! reports as `KARYOS_E_INCOMPATIBLE_DRIVER` (SPEC.md §10.2, §13).
 
-#![cfg(target_os = "linux")]
+// The cross-process client: shared mappings, descriptors and real files
+// are outside Miri (MIRI.md, "What Miri does not cover"; karyos#1117).
+#![cfg(all(target_os = "linux", not(miri)))]
 // Test helpers outside `#[test]` functions.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
