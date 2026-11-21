@@ -131,13 +131,6 @@ struct Shared {
 
 /// A handle slot of a concurrent guarded incarnation's shared ring, as
 /// its handle binds it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client handles bind slots in karyos#1102 (c) and (d)"
-    )
-)]
 #[derive(Debug, Clone)]
 pub(crate) struct SharedSlot {
     /// The slot index, 0 to `H - 1`.
@@ -679,7 +672,13 @@ impl<T: TermBytes> GuardedStream<T> {
                     ..record
                 };
                 let mut cells = [shared.unissued.cell(); SLOTS];
-                for (cell, issued) in cells.iter_mut().zip(&shared.cells) {
+                for (slot, (cell, issued)) in cells.iter_mut().zip(&shared.cells).enumerate() {
+                    // An in-process handle that was dropped held the only
+                    // other reference to its cell: it leaves the minimum
+                    // (ADR-0092 decision 8). Detaching twice is harmless.
+                    if Arc::strong_count(issued) == 1 {
+                        shared.writer.detach(slot);
+                    }
                     *cell = issued.cell();
                 }
                 match shared

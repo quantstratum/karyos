@@ -22,6 +22,7 @@ use crate::error::ClientError;
 use crate::generation::{
     End, GenerationLink, Next, Retired, RetiredHandle, Successor, representable,
 };
+use crate::guarded::{Admission, GuardBinding};
 use crate::link::{Export, Lease, Origin};
 use crate::publication::CommitOutcome;
 use crate::trace::{PublishTrace, TraceDecision};
@@ -61,6 +62,14 @@ pub enum ConcurrentOfferOutcome {
     /// The stream is sealed: the handle accepts nothing again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
     Closed,
+    /// A guarded handle's guard is not open at the epoch it was admitted
+    /// under, or a guard close sealed the stream: nothing reserved
+    /// (GC-8, ADR-0092). Pre-1.0 addition.
+    Gated,
+    /// A guarded handle's copy of its publication's rate limit holds no
+    /// message token: nothing reserved, retry later (as
+    /// [`crate::OfferOutcome::RateLimited`]). Pre-1.0 addition.
+    RateLimited,
 }
 
 /// Result of [`ClientConcurrentPublication::try_claim`]. Embedded API,
@@ -90,6 +99,10 @@ pub enum ConcurrentClaimOutcome<'a, T: TermBytes = HeapTerms> {
     /// The stream is sealed: the handle reserves nothing again
     /// (`quantstratum-docs: karyos/design/publication-seal.md`).
     Closed,
+    /// As [`ConcurrentOfferOutcome::Gated`]. Pre-1.0 addition.
+    Gated,
+    /// As [`ConcurrentOfferOutcome::RateLimited`]. Pre-1.0 addition.
+    RateLimited,
 }
 
 /// A claimed block of a [`ClientConcurrentPublication`]. It mutably
@@ -198,6 +211,9 @@ pub struct ClientConcurrentPublication<T: TermBytes = HeapTerms> {
     /// The table's shape, or why the one `with_conflation` was given has
     /// none: every keyed offer and claim then fails with it.
     conflation: Option<Result<ConflationShape, ConflationError>>,
+    /// The guard and shared outcome ring slot of a guarded handle
+    /// (ADR-0092).
+    guard: Option<GuardBinding>,
     /// The stream lease of a handle from the direct driver API, held only
     /// for its drop.
     _lease: Option<Lease>,
@@ -231,6 +247,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             base: 0,
             trace: None,
             conflation,
+            guard: None,
             _lease: None,
             _export: None,
         }
@@ -253,6 +270,80 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
     #[must_use]
     pub fn seal_reason(&self) -> Option<karyos_sys::log_buffer::SealReason> {
         self.inner.seal_reason()
+    }
+
+    /// Binds the handle to its guard and its slot of the incarnation's
+    /// shared outcome ring ([`GuardBinding::new_shared`]). The driver calls
+    /// this while issuing a guarded concurrent handle.
+    #[must_use]
+    pub fn with_guard(mut self, binding: GuardBinding) -> Self {
+        self.guard = Some(binding);
+        self
+    }
+
+    /// The guard binding of a guarded handle.
+    #[must_use]
+    pub fn guard(&self) -> Option<&GuardBinding> {
+        self.guard.as_ref()
+    }
+
+    /// Reads up to `limit` of a guarded handle's outcome records in
+    /// sequence order: the final records of the blocks it reserved, every
+    /// range-side record, and its own `OutcomesLost`, which ends its
+    /// stream; other handles' records are skipped. 0 for an unguarded one.
+    /// A handle whose admission is not open first releases if its buffer
+    /// is sealed, as an exclusive guarded handle does.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Outcomes`] for a corrupt record.
+    pub fn poll_outcomes(
+        &mut self,
+        limit: usize,
+        handler: impl FnMut(u64, karyos_sys::outcome_ring::Record),
+    ) -> Result<usize, ClientError> {
+        let Some(binding) = &mut self.guard else {
+            return Ok(0);
+        };
+        if binding.admission() != Admission::Open {
+            let _ = self.inner.close_if_sealed();
+        }
+        binding.poll_outcomes(limit, handler)
+    }
+
+    /// A guarded handle's admission: `None` when it may reserve, else what
+    /// to report. A sealed handle releases first and reports its seal
+    /// (GC-8), whatever the guard check says; the rate copy is asked last.
+    fn guard_refusal(&mut self) -> Result<Option<Refused>, ClientError> {
+        let Some(binding) = &mut self.guard else {
+            return Ok(None);
+        };
+        let refused = match binding.admission() {
+            Admission::Open if binding.rate_admits() => return Ok(None),
+            Admission::Open => Refused::RateLimited,
+            Admission::Lost => Refused::Lost,
+            Admission::BackPressured => Refused::BackPressured,
+            Admission::Gated => Refused::Gated,
+        };
+        match self.inner.close_if_sealed() {
+            Some(reason) if reason.is_gate() => Ok(Some(Refused::Gated)),
+            Some(_) => Ok(Some(Refused::Ended)),
+            None if refused == Refused::Lost => Err(ClientError::OutcomesLost),
+            None => Ok(Some(refused)),
+        }
+    }
+
+    /// Records a guarded handle's block at stream position `position`:
+    /// its final record is this handle's. `accepted` takes a token of the
+    /// rate copy.
+    fn reserved(&mut self, position: u64, accepted: bool) {
+        let lane = self.inner.buffer().lane().get();
+        if let Some(binding) = &mut self.guard {
+            binding.reserve_block(lane, position);
+            if accepted {
+                binding.charge_rate();
+            }
+        }
     }
 
     /// Attaches the generation link the driver keeps for this handle, and
@@ -359,10 +450,33 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         if let Some(shape) = self.conflation {
             shape?.validate_publication(options.reserved_value, payload.len())?;
         }
+        if let Some(refused) = self.guard_refusal()? {
+            return Ok(match refused {
+                Refused::Ended => self.after_end().concurrent_offer(),
+                refused => refused.offer(),
+            });
+        }
         let lane = self.inner.buffer().lane();
-        match offer_outcome(self.inner.offer(payload, options)?, lane, self.base) {
+        let guarded = self.guard.is_some();
+        match offer_outcome(
+            self.inner.offer(payload, options)?,
+            lane,
+            self.base,
+            guarded,
+        ) {
             ConcurrentOfferOutcome::Closed => Ok(self.after_end().concurrent_offer()),
-            outcome => Ok(outcome),
+            outcome => {
+                match outcome {
+                    ConcurrentOfferOutcome::Accepted { position, .. } => {
+                        self.reserved(position, true);
+                    }
+                    ConcurrentOfferOutcome::Aborted { position, .. } => {
+                        self.reserved(position, false);
+                    }
+                    _ => {}
+                }
+                Ok(outcome)
+            }
         }
     }
 
@@ -495,6 +609,12 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
                 usize::try_from(length).map_err(|_| ConflationError::InvalidConfig)?;
             shape.validate_publication(options.reserved_value, value_length)?;
         }
+        if let Some(refused) = self.guard_refusal()? {
+            return Ok(match refused {
+                Refused::Ended => self.after_end().concurrent_claim(),
+                refused => refused.claim(),
+            });
+        }
         let lane = self.inner.buffer().lane();
         let base = self.base;
         let end = End::peek(self.link.as_deref());
@@ -502,13 +622,23 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             (Some(extension), Some(trace)) => Some((trace, extension)),
             _ => None,
         };
-        Ok(claim_outcome(
-            self.inner.try_claim(length, options)?,
-            lane,
-            base,
-            end,
-            trace,
-        ))
+        let outcome = self.inner.try_claim(length, options)?;
+        // A guarded handle's claimed or aborted block gets its final
+        // record; a claim takes its rate token when it is claimed.
+        if let Some(binding) = &mut self.guard {
+            match &outcome {
+                SysClaimOutcome::Claimed(claim) => {
+                    binding.reserve_block(lane.get(), base + claim.position());
+                    binding.charge_rate();
+                }
+                SysClaimOutcome::Aborted { position } => {
+                    binding.reserve_block(lane.get(), base + position);
+                }
+                _ => {}
+            }
+        }
+        let guarded = self.guard.is_some();
+        Ok(claim_outcome(outcome, lane, base, end, trace, guarded))
     }
 
     /// The handle's mapping ended (its sys handle is closed). With a link,
@@ -590,8 +720,43 @@ impl End {
     }
 }
 
-/// The sys offer outcome on the buffer's lane.
-fn offer_outcome(outcome: SysOfferOutcome, lane: Lane, base: u64) -> ConcurrentOfferOutcome {
+/// Why a guarded handle reserved nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refused {
+    Gated,
+    BackPressured,
+    RateLimited,
+    Lost,
+    /// Sealed by something other than a gate: the handle's mapping ended.
+    Ended,
+}
+
+impl Refused {
+    fn offer(self) -> ConcurrentOfferOutcome {
+        match self {
+            Self::BackPressured => ConcurrentOfferOutcome::BackPressured,
+            Self::RateLimited => ConcurrentOfferOutcome::RateLimited,
+            Self::Gated | Self::Lost | Self::Ended => ConcurrentOfferOutcome::Gated,
+        }
+    }
+
+    fn claim<'a, T: TermBytes>(self) -> ConcurrentClaimOutcome<'a, T> {
+        match self {
+            Self::BackPressured => ConcurrentClaimOutcome::BackPressured,
+            Self::RateLimited => ConcurrentClaimOutcome::RateLimited,
+            Self::Gated | Self::Lost | Self::Ended => ConcurrentClaimOutcome::Gated,
+        }
+    }
+}
+
+/// The sys offer outcome on the buffer's lane. A gate seal is `Gated` for
+/// a guarded handle and ends an unguarded one as any seal does.
+fn offer_outcome(
+    outcome: SysOfferOutcome,
+    lane: Lane,
+    base: u64,
+    guarded: bool,
+) -> ConcurrentOfferOutcome {
     match outcome {
         SysOfferOutcome::Appended { position } => ConcurrentOfferOutcome::Accepted {
             lane,
@@ -603,8 +768,7 @@ fn offer_outcome(outcome: SysOfferOutcome, lane: Lane, base: u64) -> ConcurrentO
         },
         SysOfferOutcome::BackPressured => ConcurrentOfferOutcome::BackPressured,
         SysOfferOutcome::AdminAction => ConcurrentOfferOutcome::AdminAction,
-        // No concurrent guarded handle exists yet (karyos#1102 part c): a
-        // gate seal ends the handle as any seal does.
+        SysOfferOutcome::Gated if guarded => ConcurrentOfferOutcome::Gated,
         SysOfferOutcome::Closed | SysOfferOutcome::Gated => ConcurrentOfferOutcome::Closed,
     }
 }
@@ -617,6 +781,7 @@ fn claim_outcome<'a, T: TermBytes>(
     base: u64,
     end: End,
     trace: Option<(&'a mut PublishTrace, TraceExtension)>,
+    guarded: bool,
 ) -> ConcurrentClaimOutcome<'a, T> {
     match outcome {
         SysClaimOutcome::Claimed(inner) => ConcurrentClaimOutcome::Claimed(ClientConcurrentClaim {
@@ -631,6 +796,7 @@ fn claim_outcome<'a, T: TermBytes>(
             lane,
             position: base + position,
         },
+        SysClaimOutcome::Gated if guarded => ConcurrentClaimOutcome::Gated,
         SysClaimOutcome::Closed | SysClaimOutcome::Gated => end.concurrent_claim(),
     }
 }
@@ -652,29 +818,34 @@ mod tests {
     fn every_sys_outcome_gains_the_base_and_the_lane() {
         let lane = Lane::try_new(3).unwrap();
         assert_eq!(
-            offer_outcome(SysOfferOutcome::Appended { position: 64 }, lane, 1000),
+            offer_outcome(
+                SysOfferOutcome::Appended { position: 64 },
+                lane,
+                1000,
+                false
+            ),
             ConcurrentOfferOutcome::Accepted {
                 lane,
                 position: 1064
             }
         );
         assert_eq!(
-            offer_outcome(SysOfferOutcome::Aborted { position: 96 }, lane, 1000),
+            offer_outcome(SysOfferOutcome::Aborted { position: 96 }, lane, 1000, false),
             ConcurrentOfferOutcome::Aborted {
                 lane,
                 position: 1096
             }
         );
         assert_eq!(
-            offer_outcome(SysOfferOutcome::BackPressured, lane, 1000),
+            offer_outcome(SysOfferOutcome::BackPressured, lane, 1000, false),
             ConcurrentOfferOutcome::BackPressured
         );
         assert_eq!(
-            offer_outcome(SysOfferOutcome::AdminAction, lane, 1000),
+            offer_outcome(SysOfferOutcome::AdminAction, lane, 1000, false),
             ConcurrentOfferOutcome::AdminAction
         );
         assert!(matches!(
-            claim_outcome::<HeapTerms>(SysClaimOutcome::Aborted { position: 128 }, lane, 1000, End::Closed, None),
+            claim_outcome::<HeapTerms>(SysClaimOutcome::Aborted { position: 128 }, lane, 1000, End::Closed, None, false),
             ConcurrentClaimOutcome::Aborted { lane: l, position: 1128 } if l == lane
         ));
         assert!(matches!(
@@ -683,25 +854,60 @@ mod tests {
                 lane,
                 1000,
                 End::Closed,
-                None
+                None,
+                false
             ),
             ConcurrentClaimOutcome::BackPressured
         ));
         assert!(matches!(
-            claim_outcome::<HeapTerms>(SysClaimOutcome::AdminAction, lane, 1000, End::Closed, None),
+            claim_outcome::<HeapTerms>(
+                SysClaimOutcome::AdminAction,
+                lane,
+                1000,
+                End::Closed,
+                None,
+                false
+            ),
             ConcurrentClaimOutcome::AdminAction
         ));
         assert_eq!(
-            offer_outcome(SysOfferOutcome::Closed, lane, 1000),
+            offer_outcome(SysOfferOutcome::Closed, lane, 1000, false),
             ConcurrentOfferOutcome::Closed
         );
         assert!(matches!(
-            claim_outcome::<HeapTerms>(SysClaimOutcome::Closed, lane, 1000, End::Closed, None),
+            claim_outcome::<HeapTerms>(
+                SysClaimOutcome::Closed,
+                lane,
+                1000,
+                End::Closed,
+                None,
+                false
+            ),
             ConcurrentClaimOutcome::Closed
+        ));
+        // A gate seal is `Gated` for a guarded handle only (GC-8).
+        assert_eq!(
+            offer_outcome(SysOfferOutcome::Gated, lane, 1000, true),
+            ConcurrentOfferOutcome::Gated
+        );
+        assert_eq!(
+            offer_outcome(SysOfferOutcome::Gated, lane, 1000, false),
+            ConcurrentOfferOutcome::Closed
+        );
+        assert!(matches!(
+            claim_outcome::<HeapTerms>(SysClaimOutcome::Gated, lane, 1000, End::Closed, None, true),
+            ConcurrentClaimOutcome::Gated
         ));
         // A cutover is coming: the just-closed handle retries.
         assert!(matches!(
-            claim_outcome::<HeapTerms>(SysClaimOutcome::Closed, lane, 1000, End::Retry, None),
+            claim_outcome::<HeapTerms>(
+                SysClaimOutcome::Closed,
+                lane,
+                1000,
+                End::Retry,
+                None,
+                false
+            ),
             ConcurrentClaimOutcome::AdminAction
         ));
     }

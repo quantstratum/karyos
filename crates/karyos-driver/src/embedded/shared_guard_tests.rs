@@ -83,13 +83,6 @@ fn delivered(
 #[test]
 fn slots_come_from_the_publisher_count_and_one_client_holds_them() {
     let (mut driver, handle, _) = guarded();
-    // Not issued unguarded while the client handle cannot bind a slot.
-    assert!(matches!(
-        driver.concurrent_publication(handle),
-        Err(DriverError::Sys(
-            karyos_sys::error::SysError::InvalidPublicationMode { reason: "GC-7" }
-        ))
-    ));
     let first = driver
         .attach_concurrent_guard(handle, ShareClient::InProcess)
         .unwrap();
@@ -238,4 +231,54 @@ fn a_detached_handle_leaves_the_room_minimum() {
         read += seen.len();
     }
     assert_eq!(read, 12);
+}
+
+/// karyos#1102 (c): concurrent guarded handles from the driver. Each
+/// reserves through its slot's reader, answers `BackPressured` at its own
+/// quota, polls only its own records, and reads `Gated` and `Ended` after
+/// the close; a dropped handle leaves the room minimum.
+#[test]
+fn concurrent_guarded_handles_keep_their_own_outcomes() {
+    use karyos_client::ConcurrentOfferOutcome as Offer;
+
+    let (mut driver, handle, guard) = guarded();
+    let mut a = driver.concurrent_publication(handle).unwrap();
+    let mut b = driver.concurrent_publication(handle).unwrap();
+    assert_eq!(a.guard().unwrap().outstanding(), 0);
+    let position = |outcome| match outcome {
+        Offer::Accepted { position, .. } => position,
+        other => panic!("not accepted: {other:?}"),
+    };
+    let a1 = position(a.offer(b"a1").unwrap());
+    let b1 = position(b.offer(b"b1").unwrap());
+    let a2 = position(a.offer(b"a2").unwrap());
+    // C_m = 2: A's quota is full, B's is not.
+    assert_eq!(a.offer(b"a3").unwrap(), Offer::BackPressured);
+    assert_eq!(a.guard().unwrap().outstanding(), 2);
+    let _ = driver.do_work().unwrap();
+    let mut seen_a = Vec::new();
+    let _ = a
+        .poll_outcomes(16, |_, record| seen_a.push((record.kind, record.start)))
+        .unwrap();
+    assert_eq!(seen_a, [(Kind::Submitted, a1), (Kind::Submitted, a2)]);
+    let mut seen_b = Vec::new();
+    let _ = b
+        .poll_outcomes(16, |_, record| seen_b.push((record.kind, record.start)))
+        .unwrap();
+    assert_eq!(seen_b, [(Kind::Submitted, b1)]);
+    // Records read: A's quota is free again.
+    assert_eq!(a.guard().unwrap().outstanding(), 0);
+    let _ = position(a.offer(b"a3").unwrap());
+    // A dropped handle is detached; the other keeps reading.
+    drop(b);
+    driver.close_guard(guard, 2).unwrap();
+    assert_eq!(a.offer(b"late").unwrap(), Offer::Gated);
+    let mut ended = false;
+    for _ in 0..8 {
+        let _ = driver.do_work().unwrap();
+        let _ = a
+            .poll_outcomes(16, |_, record| ended |= record.kind == Kind::Ended)
+            .unwrap();
+    }
+    assert!(ended, "A reads the incarnation's Ended record");
 }
