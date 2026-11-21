@@ -1900,6 +1900,80 @@ fn many_small_commits_leave_one_seal_per_chunk() {
     assert_eq!(open(StdDisk, &dir.0, small()).last_index(), Some(commits));
 }
 
+/// The committed ClusterLog seal ranges of the journal in `dir`.
+fn cluster_seals(dir: &std::path::Path) -> Vec<(u64, u64)> {
+    use karyos_archive::integrity::SealKind;
+    use karyos_archive::integrity::journal::read_records;
+    let (records, _) = read_records(&mut StdDisk, dir).unwrap();
+    records
+        .iter()
+        .filter(|record| record.kind == SealKind::ClusterLog && record.start < record.end)
+        .map(|record| (record.start, record.end))
+        .collect()
+}
+
+fn commit_small(log: &mut RaftLog<StdDisk>, indexes: std::ops::RangeInclusive<u64>) {
+    for index in indexes {
+        log.append(&[entry(index, 1, &[3; 200])]).unwrap();
+        log.sync().unwrap();
+        log.save_hard_state(HardState {
+            current_term: 1,
+            voted_for: None,
+            commit: Some(index),
+        })
+        .unwrap();
+    }
+}
+
+/// karyos#1050 review: a few small commits, a clean shutdown, a reopen:
+/// the committed tail, shorter than a chunk, is sealed by the close.
+#[test]
+fn a_clean_shutdown_seals_the_committed_tail() {
+    let dir = TempDir::new("close-seals");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
+    commit_small(&mut log, 1..=5);
+    assert!(cluster_seals(&dir.0).is_empty(), "no chunk yet");
+    let written = log.written();
+    log.close().unwrap();
+    let reopened = open(StdDisk, &dir.0, small());
+    assert_eq!(reopened.last_index(), Some(5));
+    assert_eq!(
+        cluster_seals(&dir.0).last().map(|range| range.1),
+        Some(written)
+    );
+}
+
+/// karyos#1050 review: a committed tail waits at most the seal interval
+/// on the caller's clock; `tick` seals it then, and only then.
+#[test]
+fn a_slow_tail_is_sealed_within_the_seal_interval() {
+    let dir = TempDir::new("tick-seals");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 1).unwrap();
+    log.set_seal_interval(1_000);
+    commit_small(&mut log, 1..=2);
+    log.tick(5_000).unwrap();
+    log.tick(5_999).unwrap();
+    assert!(cluster_seals(&dir.0).is_empty(), "inside the interval");
+    log.tick(6_000).unwrap();
+    assert_eq!(
+        cluster_seals(&dir.0).last().map(|range| range.1),
+        Some(log.written())
+    );
+    // Sealed: a later tick writes nothing.
+    let seals = cluster_seals(&dir.0).len();
+    log.tick(9_000).unwrap();
+    assert_eq!(cluster_seals(&dir.0).len(), seals);
+    // A new commit starts a new wait.
+    commit_small(&mut log, 3..=3);
+    log.tick(9_500).unwrap();
+    assert_eq!(cluster_seals(&dir.0).len(), seals);
+    log.tick(10_500).unwrap();
+    assert_eq!(
+        cluster_seals(&dir.0).last().map(|range| range.1),
+        Some(log.written())
+    );
+}
+
 /// The commit path's cost (karyos#1050): `save_hard_state` per commit
 /// advance, one small entry each, on the real disk. Run by hand with
 /// `--ignored --nocapture`; the numbers go in the PR.
