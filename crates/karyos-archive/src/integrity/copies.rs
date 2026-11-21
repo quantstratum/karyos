@@ -325,6 +325,67 @@ fn backend_released(result: std::io::Result<()>) -> std::io::Result<()> {
     }
 }
 
+/// The copies the chain `records` commits, replayed in journal order
+/// from the copy catalog's ledger `entries`, and the latest state of each
+/// copy, for a reader that opens nothing for writing (`karyos-catalog
+/// verify`; karyos#1087).
+///
+/// # Errors
+///
+/// [`IntegrityError::Unrecorded`] for a copy change the chain commits
+/// whose record the ledger does not hold or that does not match it.
+pub fn replay_current(
+    records: &[SealRecord],
+    entries: &[[u8; COPY_RECORD_LENGTH]],
+) -> Result<Vec<CopyRecord>, IntegrityError> {
+    let replayed = replay(records, entries)?;
+    Ok(latest_of(&replayed))
+}
+
+/// The copy changes of `records`, each matched to its ledger record.
+fn replay(
+    records: &[SealRecord],
+    entries: &[[u8; COPY_RECORD_LENGTH]],
+) -> Result<Vec<CopyRecord>, IntegrityError> {
+    let stored: std::collections::BTreeMap<Digest, &[u8; COPY_RECORD_LENGTH]> = entries
+        .iter()
+        .rev()
+        .map(|bytes| (super::digest(bytes), bytes))
+        .collect();
+    let mut replayed = Vec::new();
+    for change in records
+        .iter()
+        .filter(|change| change.kind == SealKind::Copy)
+    {
+        let unrecorded = || IntegrityError::Unrecorded {
+            counter: change.counter,
+        };
+        let bytes = stored.get(&change.content).ok_or_else(unrecorded)?;
+        let record = CopyRecord::decode(bytes).map_err(|_| unrecorded())?;
+        let expected = u64::try_from(replayed.len()).unwrap_or(u64::MAX);
+        if record.recording != change.subject
+            || record.sequence != change.start
+            || record.sequence != expected
+        {
+            return Err(unrecorded());
+        }
+        replayed.push(record);
+    }
+    Ok(replayed)
+}
+
+/// The latest record of every copy, in the order each first appeared.
+fn latest_of(records: &[CopyRecord]) -> Vec<CopyRecord> {
+    let mut current: Vec<CopyRecord> = Vec::new();
+    for record in records {
+        match current.iter_mut().find(|copy| copy.same_copy(record)) {
+            Some(copy) => *copy = *record,
+            None => current.push(*record),
+        }
+    }
+    current
+}
+
 /// The copy catalog of an archive directory.
 #[derive(Debug)]
 pub struct CopyCatalog<D: Disk> {
@@ -375,35 +436,7 @@ impl<D: Disk> CopyCatalog<D> {
             return Err(IntegrityError::ForeignLedger);
         }
         let ledger = Ledger::open(disk, dir, COPIES_FILE)?;
-        let stored: std::collections::BTreeMap<Digest, &[u8; COPY_RECORD_LENGTH]> = ledger
-            .entries()
-            .iter()
-            .rev()
-            .map(|bytes| (super::digest(bytes), bytes))
-            .collect();
-        let mut records = Vec::new();
-        for change in journal.records()? {
-            if change.kind != SealKind::Copy {
-                continue;
-            }
-            let unrecorded = IntegrityError::Unrecorded {
-                counter: change.counter,
-            };
-            let bytes = stored.get(&change.content).ok_or(unrecorded)?;
-            let record = CopyRecord::decode(bytes).map_err(|_| IntegrityError::Unrecorded {
-                counter: change.counter,
-            })?;
-            let expected = u64::try_from(records.len()).unwrap_or(u64::MAX);
-            if record.recording != change.subject
-                || record.sequence != change.start
-                || record.sequence != expected
-            {
-                return Err(IntegrityError::Unrecorded {
-                    counter: change.counter,
-                });
-            }
-            records.push(record);
-        }
+        let records = replay(&journal.records()?, ledger.entries())?;
         Ok(Self {
             ledger,
             journal: journal.handle(),
@@ -525,14 +558,7 @@ impl<D: Disk> CopyCatalog<D> {
 
     /// The latest record of every copy, poisoned or not.
     fn latest(&self) -> Vec<CopyRecord> {
-        let mut current: Vec<CopyRecord> = Vec::new();
-        for record in &self.records {
-            match current.iter_mut().find(|copy| copy.same_copy(record)) {
-                Some(copy) => *copy = *record,
-                None => current.push(*record),
-            }
-        }
-        current
+        latest_of(&self.records)
     }
 
     /// The copies of `recording` whose latest state is verified and that

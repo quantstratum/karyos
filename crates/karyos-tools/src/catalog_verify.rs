@@ -34,6 +34,9 @@ use std::path::PathBuf;
 use karyos_archive::catalog::{CatalogError, list};
 use karyos_archive::disk::{Disk as _, ReadOnly, StdDisk};
 use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Externality, StoredAnchors};
+use karyos_archive::integrity::copies::{
+    COPIES_FILE, COPY_RECORD_LENGTH, CopyRecord, CopyState, Enforcement, replay_current,
+};
 use karyos_archive::integrity::journal::read_records;
 use karyos_archive::integrity::ledger::read_entries;
 use karyos_archive::integrity::time::{self, Requirement, Verdict};
@@ -278,6 +281,14 @@ pub enum VerifyError {
     /// The report could not be written.
     #[error("writing the report: {0}")]
     ReportWrite(io::Error),
+    /// The copy catalog does not hold a change the chain commits.
+    #[error("{}: copy catalog: {source}", dir.display())]
+    Copies {
+        /// The archive directory.
+        dir: PathBuf,
+        /// The error.
+        source: karyos_archive::integrity::journal::IntegrityError,
+    },
     /// The time evidence entries could not be read.
     #[error("{}: {source}", dir.display())]
     TimeEvidence {
@@ -895,6 +906,123 @@ pub fn json(verification: &Verification) -> String {
     out
 }
 
+/// The current copies of `args.dir`'s copy catalog, as its integrity
+/// journal commits them, each with its enforcement (karyos#1087).
+///
+/// # Errors
+///
+/// An I/O error on the journal or the catalog, and a copy change the
+/// catalog does not hold.
+pub fn copies_report(args: &VerifyArgs) -> Result<Vec<CopyRecord>, VerifyError> {
+    let dir = &args.dir;
+    let at = |source: io::Error| VerifyError::Io {
+        path: dir.clone(),
+        source,
+    };
+    let mut disk = ReadOnly(StdDisk);
+    let (records, _) = read_records(&mut disk, dir).map_err(at)?;
+    let entries: Vec<[u8; COPY_RECORD_LENGTH]> =
+        read_entries(&mut disk, dir, COPIES_FILE).map_err(at)?;
+    replay_current(&records, &entries).map_err(|source| VerifyError::Copies {
+        dir: dir.clone(),
+        source,
+    })
+}
+
+const fn state_name(state: CopyState) -> &'static str {
+    match state {
+        CopyState::Unverified => "unverified",
+        CopyState::Verified => "verified",
+        CopyState::Removed => "removed",
+        _ => "unknown",
+    }
+}
+
+const fn enforcement_name(enforcement: Enforcement) -> &'static str {
+    match enforcement {
+        Enforcement::Unsupported => "none",
+        Enforcement::ImmutableAttribute => "immutable_attribute",
+        Enforcement::ObjectLock => "object_lock",
+        _ => "unknown",
+    }
+}
+
+fn location_hex(location: &[u8; 32]) -> String {
+    location
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// The copies as text lines.
+#[must_use]
+pub fn copies_text(copies: &[CopyRecord]) -> String {
+    let mut out = String::new();
+    for copy in copies {
+        let _ = writeln!(
+            out,
+            "copy recording {} [{}, {}) location {} {} enforcement {}",
+            copy.recording,
+            copy.start,
+            copy.end,
+            location_hex(&copy.location),
+            state_name(copy.state),
+            enforcement_name(copy.enforcement)
+        );
+    }
+    out
+}
+
+/// The copies as a JSON array.
+#[must_use]
+pub fn copies_json(copies: &[CopyRecord]) -> String {
+    let items: Vec<String> = copies
+        .iter()
+        .map(|copy| {
+            format!(
+                "{{\"recording\":{},\"start\":{},\"end\":{},\"location\":\"{}\",\"state\":\"{}\",\"enforcement\":\"{}\"}}",
+                copy.recording,
+                copy.start,
+                copy.end,
+                location_hex(&copy.location),
+                state_name(copy.state),
+                enforcement_name(copy.enforcement)
+            )
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// `report` with the copies placed before its time part: a `copies`
+/// field before `time` in JSON, lines before the time lines in text.
+fn insert_copies(report: String, copies: &[CopyRecord], json: bool) -> String {
+    let (marker, inserted) = if json {
+        ("\"time\":", format!("\"copies\":{},", copies_json(copies)))
+    } else {
+        ("time ", copies_text(copies))
+    };
+    let at = if json {
+        report.rfind(marker)
+    } else {
+        // The first time line: the verdict lines or "time evidence:".
+        report
+            .match_indices(marker)
+            .find(|(at, _)| *at == 0 || report.get(at.saturating_sub(1)..*at) == Some("\n"))
+            .map(|(at, _)| at)
+    };
+    match at {
+        Some(at) => format!(
+            "{}{}{}",
+            report.get(..at).unwrap_or_default(),
+            inserted,
+            report.get(at..).unwrap_or_default()
+        ),
+        None => report,
+    }
+}
+
 /// Runs `verify` on `args` (the arguments after `verify`), printing the
 /// help, the report (to `stdout`) or the error (to `stderr`), and returns
 /// the exit status.
@@ -911,10 +1039,12 @@ pub fn run_verify(
         }
         Err(error) => return report_error(stderr, &VerifyError::Usage(error)),
     };
-    match run_checks(&parsed)
-        .and_then(|verification| time_report(&parsed).map(|time| (verification, time)))
-    {
-        Ok((verification, time)) => {
+    match run_checks(&parsed).and_then(|verification| {
+        let time = time_report(&parsed)?;
+        let copies = copies_report(&parsed)?;
+        Ok((verification, time, copies))
+    }) {
+        Ok((verification, time, copies)) => {
             let report = match (&time, parsed.json) {
                 (None, true) => json(&verification),
                 (None, false) => text(&verification),
@@ -941,6 +1071,8 @@ pub fn run_verify(
                     format!("{head}{}", time_text(time))
                 }
             };
+            // Each copy's enforcement, before the time (karyos#1087).
+            let report = insert_copies(report, &copies, parsed.json);
             // A report that could not be written is an error, never a
             // status automation would read as the evidence's.
             if let Err(error) = stdout

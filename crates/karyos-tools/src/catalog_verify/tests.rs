@@ -971,3 +971,62 @@ fn verify_reports_the_time_verdict_of_verified_entries() {
         UsageError::TimeRequirement
     );
 }
+
+/// karyos#1087: each copy the chain commits is reported with its state
+/// and enforcement, in text and JSON.
+#[test]
+fn verify_reports_each_copy_and_its_enforcement() {
+    use karyos_archive::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+    let archive = archive("copies");
+    let dir = archive.dir();
+    {
+        let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+        let mut copies = CopyCatalog::open(StdDisk, &dir, &mut journal).unwrap();
+        for (location, enforcement) in [
+            ([0x11u8; 32], Enforcement::ImmutableAttribute),
+            ([0x22u8; 32], Enforcement::Unsupported),
+        ] {
+            copies
+                .record(
+                    CopyRecord {
+                        sequence: 0,
+                        recording: RECORDING,
+                        start: 0,
+                        end: 48,
+                        location,
+                        digest: [0; 32],
+                        retain_until_ns: 0,
+                        state: CopyState::Verified,
+                        enforcement,
+                    },
+                    &mut journal,
+                )
+                .unwrap();
+        }
+    }
+    let (_, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    assert!(
+        out.contains(&format!(
+            "copy recording 3 [0, 48) location {} verified enforcement immutable_attribute\n",
+            hex(&[0x11; 32])
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "copy recording 3 [0, 48) location {} verified enforcement none\n",
+            hex(&[0x22; 32])
+        )),
+        "{out}"
+    );
+    let (_, out, _) = full(&archive, true);
+    assert!(
+        out.contains("\"copies\":[{\"recording\":3,\"start\":0,\"end\":48,"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\"enforcement\":\"immutable_attribute\""),
+        "{out}"
+    );
+}
