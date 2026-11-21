@@ -2337,6 +2337,7 @@ impl<D: Disk + Clone> Signing<D> {
             records,
             now,
         );
+        drop(signer);
         let status = self.signing.status(now, sealed, registry);
         self.trim();
         if let Ok(mut slot) = self.counts.signing.lock() {
