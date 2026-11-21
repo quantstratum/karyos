@@ -1377,6 +1377,61 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// karyos#1140: the Archive's own directory reached by a relative
+    /// path, a `..` detour or a link is still the Archive's directory, and
+    /// refused; a directory that does not resolve is refused, typed; and a
+    /// group's own directory reached through a detour still starts.
+    #[test]
+    fn the_archives_directory_by_any_path_is_refused_when_sealing() {
+        let dir = temp_dir("group-canonical");
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let groups = groups_dir(&dir);
+        // A relative path from the process's current directory.
+        let cwd = std::env::current_dir().unwrap();
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.push(dir.strip_prefix("/").unwrap());
+        // A detour through the group directory.
+        let detour = groups.join("..");
+        let link = dir.with_file_name(format!(
+            "{}-link",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        for spelled in [relative, detour, link.clone()] {
+            match agent.start_group(start_group(&spelled, Some(Capture::Strict))) {
+                Err(AgentError::GroupInArchiveDirectory { dir: named }) => {
+                    assert_eq!(named, spelled);
+                }
+                other => panic!("{spelled:?}: {other:?}"),
+            }
+        }
+        let missing = dir.join("no-such-directory");
+        match agent.start_group(start_group(&missing, Some(Capture::Strict))) {
+            Err(AgentError::GroupDirectoryUnresolved { dir: named, kind }) => {
+                assert_eq!(named, missing);
+                assert_eq!(kind, std::io::ErrorKind::NotFound);
+            }
+            other => panic!("{other:?}"),
+        }
+        // The group's own directory, through a detour, is not refused.
+        let own = groups.join("..").join("groups");
+        assert!(
+            agent
+                .start_group(start_group(&own, Some(Capture::Strict)))
+                .is_ok()
+        );
+        agent.shutdown().unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// karyos#1112: with sealing on, a group whose journal directory is the
     /// Archive's own is refused at its start, naming the directory, and
     /// leaves no journal behind; with sealing off it starts.
