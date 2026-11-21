@@ -953,19 +953,12 @@ fn verify_reports_the_time_verdict_of_verified_entries() {
         out.contains("\"time\":{\"verdict\":\"no_evidence\",\"entries\":[{\"recording\":7,\"start\":0,\"end\":4096,\"domain\":3,\"epoch\":4,\"verdict\":\"met\"}"),
         "{out}"
     );
-    // Without the anchors the entries do not verify: no `met`.
-    let mut argv: Vec<OsString> = vec![
-        archive.dir().into(),
-        "--trust".into(),
-        archive.trust().into(),
-        "--time-requirement".into(),
-        "1000:1".into(),
-    ];
-    argv.truncate(5);
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    let _ = run_verify(argv, &mut out, &mut err);
-    let out = String::from_utf8(out).unwrap();
-    assert!(!out.contains(" met\n"), "{out}");
+    // The entries' journal has its own anchor store: a requirement
+    // without it is a usage error, never an unverified `no_evidence`.
+    assert_eq!(
+        usage(&["d", "--time-requirement", "1000:1"]),
+        UsageError::TimeAnchorsRequired
+    );
     assert_eq!(
         usage(&["d", "--time-requirement", "x"]),
         UsageError::TimeRequirement
