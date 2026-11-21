@@ -22,6 +22,27 @@ fn test_context() -> Context {
     builder.build().unwrap()
 }
 
+/// `conductor` with a driver timeout of an hour under Miri (karyos#1117):
+/// the client gives a driver up as lost when its heartbeat has not moved
+/// for [`karyos_client::DEFAULT_DRIVER_TIMEOUT`] on the client's clock, and
+/// under the interpreter, with every test's threads interpreted, the
+/// driver's thread can miss that window. A request pending then fails as
+/// unknown (`KARYOS_E_UNKNOWN`), which is not what these tests check. The
+/// same hour other suites give their conductors (`karyos-sim`,
+/// `karyos-driver`'s embedded tests); natively the default stands.
+fn patient(conductor: karyos_client::ClientConductor) -> karyos_client::ClientConductor {
+    #[cfg(miri)]
+    let conductor = {
+        let mut conductor = conductor;
+        conductor.set_liveness(
+            std::time::Duration::ZERO,
+            std::time::Duration::from_secs(3600),
+        );
+        conductor
+    };
+    conductor
+}
+
 /// Waits a little in a test's loop: a millisecond's sleep under Miri, so
 /// the interpreter runs the thread that has work instead of the one that
 /// waits (the Miri profile, MIRI.md); a yield natively.
@@ -178,7 +199,7 @@ fn connect_is_unsupported_without_a_cross_process_client() {
 #[test]
 fn a_client_handle_is_served_and_closed_once() {
     let mut driver = EmbeddedDriver::new().unwrap();
-    let conductor = driver.connect().unwrap();
+    let conductor = patient(driver.connect().unwrap());
     let context = test_context();
     let handle = client::insert_embedded(Client::with_conductor(conductor, context)).unwrap();
     let raw = handle.raw();
@@ -357,8 +378,8 @@ fn driven() -> (
     shared_conflated.conflation = conflated.conflation;
     let _ = driver.add_stream(conflated).unwrap();
     let _ = driver.add_stream(shared_conflated).unwrap();
-    let ours = driver.connect().unwrap();
-    let theirs = driver.connect().unwrap();
+    let ours = patient(driver.connect().unwrap());
+    let theirs = patient(driver.connect().unwrap());
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&stop);
     let thread = std::thread::spawn(move || {
@@ -1345,7 +1366,7 @@ fn driven_network_with<const N: usize>(
         ..karyos_driver::DriverConfig::default()
     })
     .unwrap();
-    let conductors = core::array::from_fn(|_| driver.connect().unwrap());
+    let conductors = core::array::from_fn(|_| patient(driver.connect().unwrap()));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&stop);
     let thread = std::thread::spawn(move || {
@@ -1785,8 +1806,8 @@ fn a_timed_lane_takes_a_timed_offer() {
         allow_non_lse: true,
     };
     let _ = driver.add_stream(shared).unwrap();
-    let ours = driver.connect().unwrap();
-    let theirs = driver.connect().unwrap();
+    let ours = patient(driver.connect().unwrap());
+    let theirs = patient(driver.connect().unwrap());
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&stop);
     let thread = std::thread::spawn(move || {

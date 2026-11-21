@@ -35,7 +35,7 @@ fn guarded(messages: u64) -> Guarded {
     let handle = driver.publication(stream).unwrap();
     let publication = Publication::from_handles(vec![handle]).unwrap();
     let client = client::insert_embedded(Client::with_conductor(
-        driver.connect().unwrap(),
+        patient(driver.connect().unwrap()),
         test_context(),
     ))
     .unwrap();
@@ -281,7 +281,7 @@ fn an_unguarded_lane_has_no_records() {
     let stream = driver.add_stream(stream_config(STREAM)).unwrap();
     let handle = driver.publication(stream).unwrap();
     let client = client::insert_embedded(Client::with_conductor(
-        driver.connect().unwrap(),
+        patient(driver.connect().unwrap()),
         test_context(),
     ))
     .unwrap();
@@ -365,7 +365,7 @@ fn an_embedded_client_is_refused_a_guarded_stream() {
     let guard = driver.add_guard("orders").unwrap();
     driver.guard_stream(stream, guard, 4, None).unwrap();
     assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
-    let conductor = driver.connect().unwrap();
+    let conductor = patient(driver.connect().unwrap());
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = std::sync::Arc::clone(&stop);
     let _driven = super::Driven {

@@ -456,7 +456,7 @@ pub(super) fn served_archive_with(
     let _ = driver.add_stream(data).unwrap();
     let mut reader = driver.subscribe(requests, Role::Required).unwrap();
     let mut answers = driver.publication(responses).unwrap();
-    let conductor = driver.connect().unwrap();
+    let conductor = patient(driver.connect().unwrap());
 
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);

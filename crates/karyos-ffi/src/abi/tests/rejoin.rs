@@ -399,7 +399,7 @@ fn a_lapped_subscription_recovers_its_gap_through_a_real_archive() {
     let reading = real::Reading(driver.subscribe(requests, Role::Required).unwrap());
     let writing = real::Writing(driver.publication(responses).unwrap());
     let mut publication = driver.publication(data).unwrap();
-    let conductor = driver.connect().unwrap();
+    let conductor = patient(driver.connect().unwrap());
     let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
     let mut server = ControlServer::new(agent, DriverHost::new(driver), reading, writing);
     let cycle = |server: &mut ControlServer<
