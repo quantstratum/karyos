@@ -22,6 +22,9 @@ use crate::fault::{FaultDisk, Survives};
 
 const DIR: &str = "/archive";
 
+/// The close time the gate's runs record (ADR-0093).
+const CLOSED: u64 = 1_763_600_000_000_000_000;
+
 fn geometry() -> Geometry {
     Geometry::new(64, 128).unwrap()
 }
@@ -84,6 +87,8 @@ fn run(disk: FaultDisk, ops: &[Op]) -> Done {
         return done;
     };
     let mut catalog = opened.catalog;
+    // A fixed close time, so runs of the same workload compare equal.
+    catalog.set_utc(|| CLOSED);
     done.states.push(catalog.recordings().to_vec());
     for op in ops {
         let result = match *op {
@@ -331,6 +336,7 @@ fn a_checked_record_that_does_not_hold_is_refused() {
             time_ns: 1,
             reason: StopReason::Normal,
             incomplete: false,
+            closed_utc_ns: None,
         },
     }
     .encode()
@@ -453,6 +459,7 @@ fn settling_stops_what_a_crash_left_open() {
     drop(catalog);
     let restarted = disk.after_crash(Survives::Synced);
     let mut catalog = Catalog::open(restarted.clone(), dir).unwrap().catalog;
+    catalog.set_utc(|| CLOSED);
     let settled = catalog.settle(77).unwrap();
     assert_eq!(
         settled,
@@ -478,6 +485,7 @@ fn settling_stops_what_a_crash_left_open() {
             time_ns: 77,
             reason: StopReason::Recovered,
             incomplete: false,
+            closed_utc_ns: Some(CLOSED),
         })
     );
     assert_eq!(
@@ -638,6 +646,7 @@ fn an_unknown_stop_reason_is_corrupt() {
             time_ns: 1,
             reason: StopReason::Stopped,
             incomplete: false,
+            closed_utc_ns: None,
         },
     }
     .encode()
@@ -825,6 +834,7 @@ fn a_mixed_catalog_keeps_each_mode() {
                 time_ns: 9,
                 reason: StopReason::Stopped,
                 incomplete: false,
+                closed_utc_ns: None,
             },
         }
         .encode()
@@ -914,4 +924,103 @@ fn a_listing_leaves_a_compactions_leftover_file() {
             .iter()
             .any(|name| name == TEMPORARY)
     );
+}
+
+fn hex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+        .collect()
+}
+
+fn stopped(reason: StopReason, closed_utc_ns: Option<u64>) -> Record {
+    Record::Stopped {
+        id: 7,
+        stop: Stop {
+            position: 4096,
+            time_ns: 5,
+            reason,
+            incomplete: false,
+            closed_utc_ns,
+        },
+    }
+}
+
+/// The payload of `record`'s bytes, if its CRC holds and it decodes.
+fn decoded(bytes: &[u8]) -> Option<Record> {
+    let (head, crc) = bytes.split_at(bytes.len() - 4);
+    if crc32c(head).to_le_bytes() != crc {
+        return None;
+    }
+    let kind = u16::from_le_bytes([head[0], head[1]]);
+    Record::decode(kind, &head[4..])
+}
+
+/// ADR-0093 vectors C-1 to C-3, C-5 and C-6: the `Stopped` record with
+/// and without its close time, a zero close time refused though its CRC
+/// holds, and an `incomplete` byte outside 0 and 1 refused.
+#[test]
+fn test_adr_0093_stopped_record_vectors() {
+    const C1: &str =
+        "0200220007000000000000000010000000000000050000000000000005000000e125db90791866d8cd4e";
+    const C2: &str = "02001a000700000000000000001000000000000005000000000000000500a840e51c";
+    const C3: &str =
+        "02002200070000000000000000100000000000000500000000000000050000000000000000009ffa1021";
+    const C5: &str =
+        "02002200070000000000000000100000000000000500000000000000020000e8576ef2907918502ab1bf";
+    let c1 = stopped(StopReason::Stopped, Some(1_763_600_000_000_000_000));
+    assert_eq!(c1.encode().unwrap(), hex(C1));
+    assert_eq!(decoded(&hex(C1)), Some(c1));
+    let c2 = stopped(StopReason::Stopped, None);
+    assert_eq!(c2.encode().unwrap(), hex(C2));
+    assert_eq!(decoded(&hex(C2)), Some(c2));
+    assert_eq!(decoded(&hex(C3)), None, "a zero close time is corrupt");
+    let c5 = stopped(StopReason::Recovered, Some(1_763_600_100_000_000_000));
+    assert_eq!(c5.encode().unwrap(), hex(C5));
+    // `incomplete` 2: corrupt, whatever its CRC.
+    let mut bad = hex(C2);
+    bad[29] = 2;
+    let crc = crc32c(&bad[..bad.len() - 4]).to_le_bytes();
+    let at = bad.len() - 4;
+    bad[at..].copy_from_slice(&crc);
+    assert_eq!(decoded(&bad), None);
+}
+
+/// ADR-0093 decision 1 and vectors C-5, C-6: a stop's close time is the
+/// realtime clock, never below an earlier stop's in the catalog, a
+/// recovered stop's included; it survives a reopen and a compaction.
+#[test]
+fn test_adr_0093_close_times_never_go_backwards() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    let mut catalog = Catalog::open(disk.clone(), dir).unwrap().catalog;
+    let channel = channel_of(1);
+    let first = catalog.start(new_recording(1, &channel)).unwrap();
+    let second = catalog.start(new_recording(2, &channel)).unwrap();
+    let third = catalog.start(new_recording(3, &channel)).unwrap();
+    catalog.set_utc(|| 1_763_600_000_000_000_000);
+    catalog
+        .stop(first, 0, 1, StopReason::Stopped, false)
+        .unwrap();
+    // C-6: the clock stepped back; the high-water holds.
+    catalog.set_utc(|| 1_763_599_000_000_000_000);
+    catalog
+        .stop(second, 0, 2, StopReason::Stopped, false)
+        .unwrap();
+    let closed =
+        |catalog: &Catalog<FaultDisk>, id| catalog.get(id).unwrap().stop.unwrap().closed_utc_ns;
+    assert_eq!(closed(&catalog, first), Some(1_763_600_000_000_000_000));
+    assert_eq!(closed(&catalog, second), Some(1_763_600_000_000_000_000));
+    drop(catalog);
+    // A recovered stop below the high-water takes the high-water too.
+    let mut catalog = Catalog::open(disk.clone(), dir).unwrap().catalog;
+    catalog.set_utc(|| 1_763_598_000_000_000_000);
+    let settled = catalog.settle(3).unwrap();
+    assert_eq!(settled.len(), 1);
+    assert_eq!(closed(&catalog, third), Some(1_763_600_000_000_000_000));
+    catalog.compact().unwrap();
+    let catalog = Catalog::open(disk, dir).unwrap().catalog;
+    for id in [first, second, third] {
+        assert_eq!(closed(&catalog, id), Some(1_763_600_000_000_000_000));
+    }
 }

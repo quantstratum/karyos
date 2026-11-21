@@ -807,6 +807,8 @@ impl<'a> RecordingDescriptor<'a> {
                 time_ns: stop_time_ns,
                 reason: StopReason::of(code).ok_or_else(|| invalid_enum("stop_reason", code))?,
                 incomplete,
+                // Not on the wire.
+                closed_utc_ns: None,
             }),
         };
         // Written from the start on, and up to the stop once stopped.

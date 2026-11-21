@@ -27,7 +27,8 @@ use crate::integrity::journal::IntegrityError;
 use crate::integrity::ledger::{Ledger, read_entries};
 use crate::integrity::retention::{
     Authorisation, HoldReport, MARKER_LENGTH, OPERATION_LENGTH, OPERATIONS_FILE,
-    PENDING_HOLDS_FILE, PurgeError, PurgeRequest, PurgeSource, Retention,
+    PENDING_HOLDS_FILE, PurgeContext, PurgeError, PurgeRefusal, PurgeRequest, PurgeSource,
+    Retention, RetentionPolicy,
 };
 use crate::integrity::trust::{KEYS_FILE, REGISTRY_ENTRY_LENGTH};
 use crate::integrity::verify::{self, Evidence, Outcome, RangeBytes, Reason};
@@ -172,8 +173,94 @@ impl<D: Disk + Clone> State<D> {
                     closed_ns: 0,
                     source: PurgeSource::Operator,
                 };
-                purge_failed(&self.retention.refuse_unconfigured(&request))
+                match self.config.retention_policy {
+                    Some(policy) => self.purge(request, &policy),
+                    None => purge_failed(&self.retention.refuse_unconfigured(&request)),
+                }
             }
+        }
+    }
+
+    /// Runs `request` through [`Retention::purge`] under `policy`
+    /// (karyos#1093): against the stopped recording's store reopened, the
+    /// copy catalog counting the verified copies elsewhere. The range's
+    /// close time is the stop's recorded `closed_utc_ns` (ADR-0093), raised
+    /// by the newest modification time of the segments holding bytes below
+    /// the cutoff; without a recorded one the purge is refused
+    /// `no_close_time`, so a purge is never early.
+    fn purge(&mut self, mut request: PurgeRequest, policy: &RetentionPolicy) -> RetentionAnswer {
+        let error = |why: String| RetentionAnswer::Error(why);
+        // The verification worker reads the recording's files: they are
+        // never deleted under it (karyos#1124 review).
+        if self.verifying.load(std::sync::atomic::Ordering::Acquire) == request.recording {
+            return RetentionAnswer::Refused(VERIFICATION_RUNNING.to_owned());
+        }
+        if self.replays.reads(request.recording) {
+            return error("a replay reads the recording; purge it once the replay ends".to_owned());
+        }
+        let Some(recording) = self.catalog.get(request.recording).cloned() else {
+            return RetentionAnswer::UnknownRecording;
+        };
+        // ADR-0093: the close time is the one the stop recorded, chained in
+        // the integrity journal; a recording that still records, or one
+        // stopped before close times were recorded, has none.
+        let Some(recorded) = recording.stop.and_then(|stop| stop.closed_utc_ns) else {
+            return purge_failed(
+                &self
+                    .retention
+                    .refuse_after_holds(&request, PurgeRefusal::NoCloseTime),
+            );
+        };
+        let mut store = match SegmentStore::recover(
+            self.disk.clone(),
+            &self.dir,
+            recording.id,
+            recording.geometry,
+            recording.policy,
+        ) {
+            Ok(recovered) => recovered.store,
+            Err(why) => return error(why.to_string()),
+        };
+        // A segment's modification time may only raise it, never lower it;
+        // one that cannot be read adds nothing.
+        let mut disk = self.disk.clone();
+        let mut closed_ns = recorded;
+        match store.segment_files_holding_below(request.before) {
+            Ok(files) => {
+                for file in files {
+                    if let Ok(at) = disk.modified(&file) {
+                        closed_ns = closed_ns.max(at);
+                    }
+                }
+            }
+            Err(why) => return error(why.to_string()),
+        }
+        request.closed_ns = closed_ns;
+        let Some(integrity) = self.integrity.as_mut() else {
+            return error("no integrity journal: the Archive seals nothing".to_owned());
+        };
+        let Some((copies, local)) = integrity.copies.as_ref() else {
+            return error("the copy catalog is unavailable".to_owned());
+        };
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|since| u64::try_from(since.as_nanos()).ok());
+        let Some(now_ns) = now_ns else {
+            return error("the UTC time is unavailable".to_owned());
+        };
+        let context = PurgeContext {
+            policy: Some(policy),
+            copies,
+            local: *local,
+            now_ns,
+        };
+        match self
+            .retention
+            .purge(&request, &context, &mut store, &mut integrity.journal)
+        {
+            Ok(_) => RetentionAnswer::Done,
+            Err(failed) => purge_failed(&failed),
         }
     }
 
@@ -198,7 +285,13 @@ impl<D: Disk + Clone> State<D> {
         };
         if self
             .verifying
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
+            .compare_exchange(
+                0,
+                id,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
         {
             let _ = reply.send(Ok(Err(RetentionAnswer::Error(
                 "a verification runs; retry once it answers".to_owned(),
@@ -218,7 +311,7 @@ impl<D: Disk + Clone> State<D> {
             });
         if let Err(error) = spawned {
             self.verifying
-                .store(false, std::sync::atomic::Ordering::Release);
+                .store(0, std::sync::atomic::Ordering::Release);
             let _ = answer.send(Ok(Err(RetentionAnswer::Error(error.to_string()))));
         }
     }
@@ -268,13 +361,18 @@ impl<D: Disk + Clone> State<D> {
 }
 
 /// Clears the "verification runs" flag when dropped.
-struct Clear(std::sync::Arc<std::sync::atomic::AtomicBool>);
+struct Clear(std::sync::Arc<std::sync::atomic::AtomicU64>);
 
 impl Drop for Clear {
     fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
+        self.0.store(0, std::sync::atomic::Ordering::Release);
     }
 }
+
+/// The refusal of a purge of a recording a verification reads: retried
+/// once the verification answers. Not journalled: nothing was asked of the
+/// retention engine.
+pub const VERIFICATION_RUNNING: &str = "verification_running";
 
 /// The name of the verification worker's thread.
 pub(super) const VERIFY_THREAD: &str = "karyos-archive-verify";

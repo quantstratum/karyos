@@ -4482,3 +4482,206 @@ fn a_verification_never_holds_a_replay() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The answer to a posted retention command, waiting up to five seconds.
+fn answered<T>(posted: Result<Posted<T>, AgentError>) -> T {
+    let posted = posted.unwrap();
+    for _ in 0..5000 {
+        if let Some(answer) = posted.try_answer() {
+            return answer.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("no answer");
+}
+
+/// karyos#1093: with a retention policy, a purge runs through the
+/// retention engine against the recording's store: refused `legal_hold`
+/// under a hold, `not_expired` before its retention ran (a backdated
+/// segment time included: ADR-0093), `no_close_time` while it records, and
+/// `below_min_copies` without a verified copy elsewhere; with one, and the
+/// retention run, the recording is purged.
+#[test]
+fn a_configured_policy_purges_through_the_engine() {
+    use crate::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+    use crate::integrity::retention::{PurgeMode, RetentionPolicy};
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-policy");
+    let location = [5u8; 32];
+    let policy = |retain_for_ns| RetentionPolicy {
+        policy: 1,
+        version: 1,
+        retain_for_ns,
+        min_copies: std::num::NonZeroU32::MIN,
+        storage_tier: 0,
+        purge: PurgeMode::Manual,
+    };
+    let config = |retain_for_ns| {
+        sealing()
+            .with_copy_location(Some(location))
+            .with_retention_policy(Some(policy(retain_for_ns)))
+    };
+    let refused = |reason: &str| RetentionAnswer::Refused(reason.to_owned());
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config(3_600_000_000_000)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    assert_eq!(answered(agent.post_hold(id)), RetentionAnswer::Done);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        refused("legal_hold")
+    );
+    assert_eq!(answered(agent.post_release(id)), RetentionAnswer::Done);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 2, 9)),
+        refused("not_expired")
+    );
+    // ADR-0093: a backdated segment time never makes a purge early; the
+    // recorded close time stands.
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|extension| extension == "seg") {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        answered(agent.post_purge(id, end, 5, 9)),
+        refused("not_expired")
+    );
+    // A recording that still records has no close time.
+    let drained = Arc::new(AtomicBool::new(false));
+    let live = agent
+        .start(start(Chunks {
+            chunks: vec![frames(1, 9)].into(),
+            drained: Arc::clone(&drained),
+            ..Chunks::default()
+        }))
+        .unwrap();
+    wait(&drained);
+    assert_eq!(
+        answered(agent.post_purge(live, 96, 6, 9)),
+        refused("no_close_time")
+    );
+    agent.shutdown().unwrap();
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config(0)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 3, 9)),
+        refused("below_min_copies")
+    );
+    agent.shutdown().unwrap();
+
+    // A verified copy elsewhere, as a replica's verification records it.
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    let mut copies = CopyCatalog::open(StdDisk, &dir, &mut journal).unwrap();
+    let local = copies.current().unwrap();
+    if local
+        .iter()
+        .any(|copy| copy.enforcement == Enforcement::ImmutableAttribute)
+    {
+        // Not expected under test: a purge would need the attribute's
+        // release, which this host's process may not have.
+        return;
+    }
+    copies
+        .record(
+            CopyRecord {
+                sequence: 0,
+                recording: id,
+                start: 0,
+                end,
+                location: [6u8; 32],
+                digest: crate::integrity::retention::seals_digest(&records, id, 0, end),
+                retain_until_ns: 0,
+                state: CopyState::Verified,
+                enforcement: Enforcement::Unsupported,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    drop(copies);
+    drop(journal);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config(0)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 4, 9)),
+        RetentionAnswer::Done
+    );
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1093: a retention policy needs the copy catalog.
+#[test]
+fn a_policy_without_a_copy_location_is_refused() {
+    let dir = temp_dir("policy-no-copies");
+    let policy = crate::integrity::retention::RetentionPolicy {
+        policy: 1,
+        version: 1,
+        retain_for_ns: 0,
+        min_copies: std::num::NonZeroU32::MIN,
+        storage_tier: 0,
+        purge: crate::integrity::retention::PurgeMode::Manual,
+    };
+    let spawned =
+        ArchiveHandle::spawn(StdDisk, &dir, sealing().with_retention_policy(Some(policy)));
+    assert!(matches!(spawned, Err(AgentError::PolicyWithoutCopies)));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1124 review: a purge of a recording a verification reads is
+/// refused `verification_running`, so the worker never reads files being
+/// deleted; once the verification answers, the purge goes to the engine.
+#[test]
+fn a_purge_waits_for_the_verification_of_its_recording() {
+    use crate::integrity::retention::{PurgeMode, RetentionPolicy};
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-while-verifying");
+    let gate = Arc::new(AtomicBool::new(true));
+    let policy = RetentionPolicy {
+        policy: 1,
+        version: 1,
+        retain_for_ns: 3_600_000_000_000,
+        min_copies: std::num::NonZeroU32::MIN,
+        storage_tier: 0,
+        purge: PurgeMode::Manual,
+    };
+    let config = sealing()
+        .with_copy_location(Some([5u8; 32]))
+        .with_retention_policy(Some(policy));
+    let agent = ArchiveHandle::spawn(GatedVerify(Arc::clone(&gate)), &dir, config).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    let verify = agent.post_verify(id).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        RetentionAnswer::Refused(super::retention::VERIFICATION_RUNNING.to_owned())
+    );
+    gate.store(false, Ordering::Release);
+    for _ in 0..5000 {
+        if verify.try_answer().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The flag clears just after the answer is sent.
+    let mut answer = RetentionAnswer::Done;
+    for request in 2..5000 {
+        answer = answered(agent.post_purge(id, end, request, 9));
+        if answer != RetentionAnswer::Refused(super::retention::VERIFICATION_RUNNING.to_owned()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(answer, RetentionAnswer::Refused("not_expired".to_owned()));
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
