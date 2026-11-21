@@ -9,7 +9,9 @@
 //! the in-process tests of `src/abi/tests/outcomes.rs`, which run under
 //! Miri.
 
-#![cfg(target_os = "linux")]
+// The cross-process client: shared mappings, descriptors and real files
+// are outside Miri (MIRI.md, "What Miri does not cover"; karyos#1117).
+#![cfg(all(target_os = "linux", not(miri)))]
 // Test helpers outside `#[test]` functions.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
