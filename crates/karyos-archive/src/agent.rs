@@ -674,15 +674,28 @@ pub enum AgentError {
     #[error("this Archive keeps no time evidence")]
     NoTimeEvidence,
     /// A time evidence entry for a range its recording's seals do not
-    /// cover yet: an entry follows its range's seal (ADR-0095).
-    #[error("recording {recording} is sealed to {sealed}, below the entry's end {end}")]
+    /// cover whole: an entry follows its range's seal (ADR-0095).
+    #[error(
+        "recording {recording} is sealed over [{first}, {sealed}), which does not hold the entry's [{start}, {end})"
+    )]
     TimeEvidenceUnsealed {
         /// The recording.
         recording: u64,
+        /// The entry's start.
+        start: u64,
         /// The entry's end.
         end: u64,
+        /// Where its seals start.
+        first: u64,
         /// Where its seals end.
         sealed: u64,
+    },
+    /// A time evidence entry for a recording nothing of which is sealed,
+    /// or that this Archive does not know (karyos#1128).
+    #[error("recording {recording} has no sealed range")]
+    TimeEvidenceNoSeal {
+        /// The recording.
+        recording: u64,
     },
     /// The entries could not be written.
     #[error(transparent)]
@@ -1181,9 +1194,9 @@ impl ArchiveHandle {
     ///
     /// # Errors
     ///
-    /// [`AgentError::NoTimeEvidence`], [`AgentError::TimeEvidenceUnsealed`],
-    /// [`AgentError::TimeEvidence`] (a refused entry or a store failure),
-    /// and [`AgentError::Gone`].
+    /// [`AgentError::NoTimeEvidence`], [`AgentError::TimeEvidenceNoSeal`],
+    /// [`AgentError::TimeEvidenceUnsealed`], [`AgentError::TimeEvidence`]
+    /// (a refused entry or a store failure), and [`AgentError::Gone`].
     pub fn record_time_evidence(
         &self,
         entry: crate::integrity::time_evidence::Entry,
@@ -2414,6 +2427,32 @@ impl<D: Disk + Clone> Signing<D> {
     }
 }
 
+/// Whether `entry` names only bytes its recording's seals cover:
+/// `sealed`, the range `[first, end)` they cover whole, must exist and
+/// hold the entry's `[start, end)` (karyos#1128). An unknown recording,
+/// or one nothing of which is sealed, is refused, never read as sealed
+/// to zero.
+fn admit_time_evidence(
+    sealed: Option<(u64, u64)>,
+    entry: &crate::integrity::time_evidence::Entry,
+) -> Result<(), AgentError> {
+    let Some((first, end)) = sealed else {
+        return Err(AgentError::TimeEvidenceNoSeal {
+            recording: entry.recording,
+        });
+    };
+    if entry.start < first || entry.start > entry.end || entry.end > end {
+        return Err(AgentError::TimeEvidenceUnsealed {
+            recording: entry.recording,
+            start: entry.start,
+            end: entry.end,
+            first,
+            sealed: end,
+        });
+    }
+    Ok(())
+}
+
 /// The bytes `[start, end)` of active recording `id`.
 fn read_range<D: Disk>(
     active: &mut [Active<D>],
@@ -3246,17 +3285,11 @@ where
         let Some(integrity) = self.integrity.as_mut() else {
             return Err(AgentError::NoTimeEvidence);
         };
-        let sealed = integrity.journal.sealed_end(entry.recording).unwrap_or(0);
+        let sealed = integrity.journal.sealed_range(entry.recording);
         let Some(evidence) = integrity.evidence.as_mut() else {
             return Err(AgentError::NoTimeEvidence);
         };
-        if entry.end > sealed {
-            return Err(AgentError::TimeEvidenceUnsealed {
-                recording: entry.recording,
-                end: entry.end,
-                sealed,
-            });
-        }
+        admit_time_evidence(sealed, entry)?;
         Ok(evidence.store.append(entry)?)
     }
 

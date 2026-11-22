@@ -423,6 +423,9 @@ pub struct ChainCheck {
     next_counter: u64,
     head: Option<Digest>,
     sealed_ends: std::collections::BTreeMap<u64, u64>,
+    /// Where each recording's first sealed range starts: its ranges are
+    /// contiguous, so they cover `[start, end)` whole.
+    sealed_starts: std::collections::BTreeMap<u64, u64>,
 }
 
 impl ChainCheck {
@@ -450,6 +453,15 @@ impl ChainCheck {
     #[must_use]
     pub fn sealed_end(&self, recording: u64) -> Option<u64> {
         self.sealed_ends.get(&recording).copied()
+    }
+
+    /// The range `[start, end)` the sealed ranges of `recording` cover
+    /// whole, if any is sealed (karyos#1128).
+    #[must_use]
+    pub fn sealed_range(&self, recording: u64) -> Option<(u64, u64)> {
+        let start = self.sealed_starts.get(&recording).copied()?;
+        let end = self.sealed_ends.get(&recording).copied()?;
+        Some((start, end))
     }
 
     /// Accepts `record` as the next record of the chain.
@@ -496,6 +508,10 @@ impl ChainCheck {
             })?;
         if record.kind.is_range() {
             self.sealed_ends.insert(record.subject, record.end);
+            let _ = self
+                .sealed_starts
+                .entry(record.subject)
+                .or_insert(record.start);
         }
         self.next_counter = next;
         self.head = Some(record.digest());

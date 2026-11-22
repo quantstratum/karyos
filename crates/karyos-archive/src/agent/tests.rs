@@ -4565,6 +4565,18 @@ fn a_running_archive_records_and_signs_time_evidence() {
         agent.record_time_evidence(past),
         Err(AgentError::TimeEvidenceUnsealed { sealed, .. }) if sealed == end
     ));
+    // karyos#1138 review P2: a recording this Archive never sealed is
+    // refused, never read as sealed to zero, even for an empty range.
+    let unknown = Entry {
+        recording: id + 1000,
+        start: 0,
+        end: 0,
+        ..entry
+    };
+    assert!(matches!(
+        agent.record_time_evidence(unknown),
+        Err(AgentError::TimeEvidenceNoSeal { recording }) if recording == id + 1000
+    ));
     // Two signing polls, a second apart.
     std::thread::sleep(Duration::from_millis(2_500));
     agent.shutdown().unwrap();
@@ -4617,4 +4629,49 @@ fn an_archive_without_time_evidence_refuses_an_entry() {
     ));
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1138 review P2: an entry is admitted only when its whole
+/// `[start, end)` lies within the sealed `[first, end)` of its recording,
+/// a nonzero first included.
+#[test]
+fn time_evidence_needs_its_whole_range_sealed() {
+    use crate::integrity::time::{Source, SyncState};
+    use crate::integrity::time_evidence::Entry;
+    let entry = |start: u64, end: u64| Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [1, 0, 2, 3, 4],
+        recording: 3,
+        start,
+        end,
+        min_time: 0,
+        max_time: 0,
+        granularity: 1,
+        bound_min_ns: 150,
+        bound_max_ns: 160,
+        calibration: [0; 32],
+        utc_reference: [0xBB; 32],
+        tick_fs: 1,
+    };
+    let sealed = Some((100, 200));
+    assert!(super::admit_time_evidence(sealed, &entry(100, 200)).is_ok());
+    assert!(super::admit_time_evidence(sealed, &entry(150, 150)).is_ok());
+    for (start, end) in [(50, 150), (0, 0), (0, 200), (150, 201), (150, 100)] {
+        assert!(
+            matches!(
+                super::admit_time_evidence(sealed, &entry(start, end)),
+                Err(AgentError::TimeEvidenceUnsealed {
+                    first: 100,
+                    sealed: 200,
+                    ..
+                })
+            ),
+            "[{start}, {end})"
+        );
+    }
+    assert!(matches!(
+        super::admit_time_evidence(None, &entry(0, 0)),
+        Err(AgentError::TimeEvidenceNoSeal { recording: 3 })
+    ));
 }
