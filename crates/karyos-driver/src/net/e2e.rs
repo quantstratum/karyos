@@ -2780,6 +2780,26 @@ fn optional_receiver_closes(
     let (Some(on_b), Some(_on_c)) = images else {
         unreachable!("pumped until both exist");
     };
+    // An image exists before its path is bound to it: DATA that arrives
+    // in between is dropped as unbound, a hole at the stream's start that
+    // the sender, ignoring NAKs below, never repairs. Under host load the
+    // first offers could land there, so wait, bounded, until each
+    // receiver's path heartbeat refreshes a bound path. On a loaded
+    // swarmer one run in twenty never binds B's path (its heartbeats stay
+    // unbound with the image installed): that fails here, with every
+    // counter, and is open on karyos#1067.
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        drivers[1..].iter().all(|driver| {
+            driver
+                .net
+                .as_ref()
+                .unwrap()
+                .receiver_counters()
+                .unwrap()
+                .path_heartbeats
+                >= 1
+        })
+    });
     let mut reader = b.subscribe_aggregate(&on_b, Role::Required).unwrap();
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
@@ -2807,7 +2827,13 @@ fn optional_receiver_closes(
         }
         std::thread::sleep(Duration::from_micros(100));
     }
-    assert_eq!(seen, total, "B reads everything");
+    if seen != total {
+        let counters: Vec<String> = [&a, &b, &c]
+            .iter()
+            .map(|driver| driver.net.as_ref().unwrap().agent_counters())
+            .collect();
+        panic!("B reads everything: {seen} of {total} (sent {sent}): {counters:?}");
+    }
     if reset {
         // An endpoint reset while C lags below the hold: the lane reads
         // again from its restart position, at the hold, and B drops the
@@ -3481,6 +3507,23 @@ fn two_paths(
         image.is_some()
     });
     let image = image?;
+    // The image exists once the founding path's SETUP is answered; the
+    // second path binds later, at its own SETUP answer. Under host load
+    // the test's first messages could leave before it does, and their
+    // copies on that path are dropped as unbound, so wait, bounded, until
+    // the second path is bound or its join failed on this host (which the
+    // callers report as a skip) (karyos#1067).
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1]
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .unwrap()
+            .paths_bound
+            >= 1
+            || drivers[1].network_path_counters().1 > 0
+    });
     Some((a, b, publication, image))
 }
 

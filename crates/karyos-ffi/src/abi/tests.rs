@@ -1630,9 +1630,15 @@ fn a_retired_images_change_carries_its_end() {
             (reason, code),
             "{removed}"
         );
-        if removed {
-            // The clean end is positioned after what was delivered.
-            assert!(retired.end_position > 0);
+        // A clean end's position is what was delivered or more, once the
+        // seal is positioned. The change is taken when the image retires
+        // (`terminal_seal` at that instant), and the seal is marked sealed
+        // before it is positioned: a change taken between the two carries
+        // the header's documented 0, "a seal not positioned yet", which a
+        // loaded host showed once (karyos#1067). So 0 is allowed; any
+        // other position is not below the delivered message.
+        if removed && retired.end_position != 0 {
+            assert!(retired.end_position >= 3, "{}", retired.end_position);
         }
         assert_eq!(karyos_client_close(client), Status::Ok.code());
     }
