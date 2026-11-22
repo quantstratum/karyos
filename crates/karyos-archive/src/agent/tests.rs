@@ -5130,31 +5130,28 @@ fn a_resumed_purge_rechecks_the_segment_times() {
 
 /// karyos#1122: an intent a crash left before its deletion, still
 /// authorised, expired and copied elsewhere at the next start, is
-/// completed there before any request: the floor moves past the cutoff,
-/// the integrity journal gets its purge record, and the id is free again.
+/// completed by that start alone, before any request: the floor moves past
+/// the cutoff, the integrity journal gets its purge record of `[0, end)`
+/// and the operations journal its `PurgeDone`. The recording is made
+/// without a local copy, so no segment is immutable on any host.
 #[test]
 fn a_start_completes_an_unfinished_purge_that_passes_its_recheck() {
     use crate::integrity::SealKind;
-    use crate::server::RetentionAnswer;
+    use crate::integrity::retention::{OPERATION_LENGTH, OPERATIONS_FILE, Operation};
 
     let dir = temp_dir("purge-crash-unfinished");
-    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
     let (id, all) = sealed_recording(&agent);
     let end = u64::try_from(all.len()).unwrap();
     agent.shutdown().unwrap();
-    if !copy_elsewhere(&dir, id, end) {
-        return;
-    }
+    assert!(copy_elsewhere(&dir, id, end), "no local copy to release");
     journal_intent(&dir, 4, id, end);
     assert!(!dir.join(format!("{id:016x}.floor")).exists());
 
-    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
-    // Completed at start: the id is not outstanding any more.
-    assert_ne!(
-        answered(agent.post_purge(id, end, 4, 9)),
-        RetentionAnswer::Refused("duplicate_id".to_owned())
-    );
-    agent.shutdown().unwrap();
+    ArchiveHandle::spawn(StdDisk, &dir, purge_config(0))
+        .unwrap()
+        .shutdown()
+        .unwrap();
     assert!(
         dir.join(format!("{id:016x}.floor")).exists(),
         "the floor moved"
@@ -5164,14 +5161,22 @@ fn a_start_completes_an_unfinished_purge_that_passes_its_recheck() {
         .journal
         .records()
         .unwrap();
-    assert_eq!(
-        records
+    let purges: Vec<(u64, u64)> = records
+        .iter()
+        .filter(|record| record.kind == SealKind::Purge && record.subject == id)
+        .map(|record| (record.start, record.end))
+        .collect();
+    assert_eq!(purges, [(0, end)]);
+    let operations =
+        Ledger::<StdDisk, OPERATION_LENGTH>::open(StdDisk, &dir, OPERATIONS_FILE).unwrap();
+    assert!(
+        operations
+            .entries()
             .iter()
-            .filter(|record| record.kind == SealKind::Purge && record.subject == id)
-            .count(),
-        1,
-        "one purge record"
+            .any(|entry| Operation::decode(entry) == Some(Operation::PurgeDone { id: 4 })),
+        "the intent is done"
     );
+    drop(operations);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
