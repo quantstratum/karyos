@@ -253,11 +253,7 @@ impl<D: Disk + Clone> State<D> {
         let Some((copies, local)) = integrity.copies.as_ref() else {
             return error("the copy catalog is unavailable".to_owned());
         };
-        let now_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|since| u64::try_from(since.as_nanos()).ok());
-        let Some(now_ns) = now_ns else {
+        let Some(now_ns) = utc_now_ns() else {
             return error("the UTC time is unavailable".to_owned());
         };
         let context = PurgeContext {
@@ -272,6 +268,58 @@ impl<D: Disk + Clone> State<D> {
         {
             Ok(_) => RetentionAnswer::Done,
             Err(failed) => purge_failed(&failed),
+        }
+    }
+
+    /// Reconciles the purge intents a crash left outstanding, at start and
+    /// before any control request is served (karyos#1121 review), through
+    /// [`Retention::recover_purges`] against each recording's stopped
+    /// store, opened read only: an intent whose deletion already happened
+    /// gets its integrity purge record and completes; an unfinished one is
+    /// rechecked against the holds, the policy and the copies as they are
+    /// now, then completed or cancelled. An intent that cannot be
+    /// reconciled (no integrity journal or copy catalog, a store or
+    /// journal error) stays outstanding until a later start.
+    pub(super) fn reconcile_purges(&mut self) {
+        let recordings: std::collections::BTreeSet<u64> = self
+            .retention
+            .outstanding()
+            .iter()
+            .map(|request| request.recording)
+            .collect();
+        if recordings.is_empty() {
+            return;
+        }
+        let Some(now_ns) = utc_now_ns() else {
+            return;
+        };
+        for id in recordings {
+            let Some(recording) = self.catalog.get(id).cloned() else {
+                continue;
+            };
+            let Ok(Some(mut store)) = open_stopped(&self.disk, &self.dir, &recording) else {
+                continue;
+            };
+            let Some(integrity) = self.integrity.as_mut() else {
+                return;
+            };
+            let Some((copies, local)) = integrity.copies.as_ref() else {
+                return;
+            };
+            let context = PurgeContext {
+                policy: self.config.retention_policy.as_ref(),
+                copies,
+                local: *local,
+                now_ns,
+            };
+            // The control path authorised each intent (ADR-0088, decision
+            // 4). A failure leaves the intent outstanding.
+            let _ = self.retention.recover_purges(
+                &context,
+                |_| true,
+                &mut store,
+                &mut integrity.journal,
+            );
         }
     }
 
@@ -369,6 +417,14 @@ impl<D: Disk + Clone> State<D> {
             registry,
         })
     }
+}
+
+/// The current UTC time in ns, if the clock reads past the epoch.
+fn utc_now_ns() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_nanos()).ok())
 }
 
 /// Clears the "verification runs" flag when dropped.

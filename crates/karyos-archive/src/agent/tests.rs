@@ -4837,3 +4837,96 @@ fn a_cutoff_past_the_written_end_lists_no_file() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Journals a purge intent of `id` before `before`, as a purge does right
+/// before its deletion, from start 0.
+fn journal_intent(dir: &Path, request: u64, id: u64, before: u64) {
+    use crate::integrity::retention::{
+        OPERATION_LENGTH, OPERATIONS_FILE, Operation, OperationsJournal, PurgeSource,
+    };
+    let mut operations =
+        Ledger::<StdDisk, OPERATION_LENGTH>::open(StdDisk, dir, OPERATIONS_FILE).unwrap();
+    OperationsJournal::append(
+        &mut operations,
+        &Operation::PurgeIntent {
+            id: request,
+            recording: id,
+            before,
+            operator: 9,
+            closed_ns: 1,
+            source: PurgeSource::Operator,
+            from: 0,
+        },
+    )
+    .unwrap();
+}
+
+/// karyos#1121 review: a crash after a purge advanced the store's floor
+/// but before its integrity purge record leaves the intent outstanding.
+/// The next start reconciles it before serving any request: the purge
+/// record is written and the intent completes, so its id is free again.
+#[test]
+fn a_start_records_a_purge_a_crash_left_unrecorded() {
+    use crate::integrity::SealKind;
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-crash-recorded");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    journal_intent(&dir, 1, id, end);
+    let recording = Catalog::open(StdDisk, &dir)
+        .unwrap()
+        .catalog
+        .get(id)
+        .cloned()
+        .unwrap();
+    let mut store = SegmentStore::recover(StdDisk, &dir, id, recording.geometry, recording.policy)
+        .unwrap()
+        .store;
+    assert_eq!(store.purge_before(end).unwrap(), end);
+    drop(store);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let answer = answered(agent.post_purge(id, end, 1, 9));
+    assert_ne!(answer, RetentionAnswer::Refused("duplicate_id".to_owned()));
+    agent.shutdown().unwrap();
+    let records = IntegrityJournal::open(StdDisk, &dir)
+        .unwrap()
+        .journal
+        .records()
+        .unwrap();
+    assert!(records.iter().any(|record| record.kind == SealKind::Purge
+        && record.subject == id
+        && record.start == 0
+        && record.end == end));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1121 review: an intent a crash left before its deletion is
+/// rechecked at the next start against the holds now in force: under a
+/// hold it is cancelled and nothing is deleted, so a retry of its id is
+/// answered `legal_hold`, never `duplicate_id`.
+#[test]
+fn a_start_cancels_an_unfinished_purge_under_a_hold() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-crash-held");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    assert_eq!(answered(agent.post_hold(id)), RetentionAnswer::Done);
+    agent.shutdown().unwrap();
+    journal_intent(&dir, 7, id, end);
+    let before = segment_lengths(&dir);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 7, 9)),
+        RetentionAnswer::Refused("legal_hold".to_owned())
+    );
+    assert_eq!(segment_lengths(&dir), before);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

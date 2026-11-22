@@ -1860,6 +1860,9 @@ fn run<D>(
         retention,
         verifying: Arc::default(),
     };
+    // Before the first command: a purge a crash cut short is completed or
+    // cancelled before any retry reaches it (karyos#1121 review).
+    state.reconcile_purges();
     loop {
         let mut worked = false;
         loop {
