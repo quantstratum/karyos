@@ -267,3 +267,111 @@ fn the_zero_tuple_is_never_a_clock() {
     assert_eq!(entries[0].granularity, 0);
     assert_eq!(entries[0].bound_min_ns, NO_BOUND);
 }
+
+/// #1168 review P2: a known record that does not decode makes the
+/// snapshot incomplete, so the rest can never look unique.
+#[test]
+fn a_known_record_that_does_not_decode_makes_coverage_incomplete() {
+    let mut broken = calibration(0, 100, 11);
+    // Type 1, but word 0 not exactly 1: refused by the calibration codec.
+    broken[0] |= 1 << 8;
+    let mut records = records();
+    records.push(broken);
+    let entries = produce(
+        7,
+        &events(&[(40, true)]),
+        Some(&clock()),
+        &Snapshot::new(&records, true),
+    );
+    assert_eq!(entries[0].bound_min_ns, NO_BOUND);
+}
+
+/// #1168 review P1: completeness is checked for the target the entry
+/// cites. A calibration retargets A to C; the producer's later records
+/// cover only B, so the entry citing C is `no_evidence`, even with a
+/// valid reference of C.
+#[test]
+fn completeness_is_of_the_cited_target() {
+    let c = key([8, 0, 8, 8, 8]);
+    let into_c = Calibration {
+        from: key(A),
+        to: c,
+        reference: 0,
+        offset: 10,
+        offset_uncertainty: 2,
+        drift: 0,
+        drift_uncertainty: 0,
+        valid_from: 0,
+        valid_to: 100,
+    }
+    .encode()
+    .unwrap();
+    let mut reference_c = reference(0, 1999);
+    let utc_c = UtcReference::decode(&reference_c).unwrap();
+    reference_c = UtcReference { clock: c, ..utc_c }.encode().unwrap();
+    // Without B's calibration over [0, 100]: only C applies there.
+    let records = vec![
+        into_c,
+        reference_c,
+        reference(0, 1999),
+        calibration(1000, 2000, 20),
+        reference(2000, 3000),
+    ];
+    let entries = produce(
+        7,
+        &events(&[(40, true)]),
+        Some(&clock()),
+        &Snapshot::new(&records, true),
+    );
+    assert_eq!(entries[0].bound_min_ns, NO_BOUND);
+    assert_eq!(entries[0].calibration, [0; 32]);
+}
+
+/// #1168 review P1: runs split where the offset to UTC changes (a leap
+/// second), and a timestamp inside the inserted second, where the UTC
+/// conversion is undefined, gets a `no_evidence` entry of its own.
+#[test]
+fn a_leap_second_splits_and_an_inserted_second_is_no_evidence() {
+    let second = 1_000_000_000u64;
+    // TAI at the leap of 2017-01-01, 1958 based: 21550 days, then the 36 s
+    // TAI was ahead of UTC before it; start 5 s before.
+    let leap_tai = (21_550 * 86_400 + 36) * second;
+    let start_tai = leap_tai - 5 * second;
+    let utc = |valid_from: u64, valid_to: u64| {
+        let base = UtcReference::decode(&reference(valid_from, valid_to)).unwrap();
+        UtcReference {
+            origin: 0,
+            origin_scale_ns: start_tai,
+            ..base
+        }
+        .encode()
+        .unwrap()
+    };
+    let span = 20 * second;
+    let records = vec![
+        calibration(0, span, 0),
+        utc(0, 2 * span),
+        calibration(span + 1, 2 * span, 0),
+        utc(3 * span, 4 * span),
+    ];
+    let snapshot = Snapshot::new(&records, true);
+    let times: Vec<(u64, bool)> = (0..=20).map(|half| (half * second / 2, true)).collect();
+    let entries = produce(7, &events(&times), Some(&clock()), &snapshot);
+    let proven: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry.bound_min_ns != NO_BOUND)
+        .collect();
+    assert!(proven.len() >= 2, "{entries:#?}");
+    assert!(
+        entries.iter().any(|entry| entry.bound_min_ns == NO_BOUND),
+        "the inserted second: {entries:#?}"
+    );
+    // The proven runs never straddle the leap: each lies wholly before or
+    // after it (5 s into the range).
+    for entry in proven {
+        assert!(
+            entry.max_time < 5 * second || entry.min_time >= 6 * second,
+            "{entry:?}"
+        );
+    }
+}

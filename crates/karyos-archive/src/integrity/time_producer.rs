@@ -100,6 +100,10 @@ impl Snapshot {
                 Ok(ClockRecord::UtcReference(reference)) if !is_zero(&reference.clock) => {
                     snapshot.references.push((reference, digest));
                 }
+                // A known record that does not decode may be the one that
+                // replaces or competes with another: coverage cannot be
+                // established from this snapshot.
+                Err(_) => snapshot.lossless = false,
                 _ => {}
             }
         }
@@ -147,8 +151,10 @@ enum Provenance {
     /// The declared clock, without authoritative coverage.
     Declared,
     /// The declared clock, the calibration and UTC reference at these
-    /// indexes of the snapshot.
-    Proven(usize, usize),
+    /// indexes of the snapshot, and the offset from the clock's converted
+    /// time to UTC there: a change of it (a leap, a smear, a UTC offset)
+    /// starts a new entry.
+    Proven(usize, usize, i128),
 }
 
 /// The entries of `group`'s sealed events, in position order, tiling
@@ -164,16 +170,14 @@ pub fn produce(
     // A declaration of the reserved zero tuple declares nothing.
     let clock = clock.filter(|clock| clock.clock != [0; 5]);
     let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
-    let complete = clock.is_some_and(|clock| complete(snapshot, &clock.key(), largest));
     let mut entries: Vec<(Provenance, Entry)> = Vec::new();
     for event in events {
         let provenance = match clock {
             Some(_) if !event.in_session => Provenance::Unknown,
             None => Provenance::Unknown,
-            Some(clock) if complete => {
-                proven(snapshot, &clock.key(), event.time).unwrap_or(Provenance::Declared)
+            Some(clock) => {
+                proven(snapshot, &clock.key(), event.time, largest).unwrap_or(Provenance::Declared)
             }
-            Some(_) => Provenance::Declared,
         };
         match entries.last_mut() {
             Some((last, entry)) if *last == provenance && entry.end == event.start => {
@@ -208,27 +212,31 @@ pub fn produce(
         .collect()
 }
 
-/// Whether the snapshot is lossless and holds, for `clock`, a calibration
-/// and a UTC reference record of its target whose validity starts after
-/// `largest`: the producer published past the range.
-fn complete(snapshot: &Snapshot, clock: &ClockKey, largest: u64) -> bool {
+/// Whether the snapshot is lossless and holds, for `clock` into `target`
+/// (the target the entry cites), a calibration and a UTC reference record
+/// of that target whose validity starts after `largest`: the producer
+/// published past the range for that very target.
+fn complete(snapshot: &Snapshot, clock: &ClockKey, target: &ClockKey, largest: u64) -> bool {
     snapshot.lossless
         && snapshot.calibrations.iter().any(|(later, _)| {
             later.from == *clock
+                && later.to == *target
                 && later.valid_from > largest
                 && later
                     .convert(i128::from(largest), i128::from(largest))
                     .is_some_and(|(_, high)| {
                         snapshot.references.iter().any(|(reference, _)| {
-                            reference.clock == later.to && i128::from(reference.valid_from) > high
+                            reference.clock == *target && i128::from(reference.valid_from) > high
                         })
                     })
         })
 }
 
 /// The unique calibration of `clock` valid at `time` and the unique UTC
-/// reference valid over its converted interval, or `None`.
-fn proven(snapshot: &Snapshot, clock: &ClockKey, time: u64) -> Option<Provenance> {
+/// reference valid over its converted interval, with the completeness
+/// boundary of that calibration's target past `largest` and the UTC
+/// conversion defined at `time`, or `None`.
+fn proven(snapshot: &Snapshot, clock: &ClockKey, time: u64, largest: u64) -> Option<Provenance> {
     let t = i128::from(time);
     let mut calibrations = snapshot
         .calibrations
@@ -249,11 +257,25 @@ fn proven(snapshot: &Snapshot, clock: &ClockKey, time: u64) -> Option<Provenance
                 && i128::from(reference.valid_from) <= low
                 && high <= i128::from(reference.valid_to)
         });
-    let (reference_index, _) = references.next()?;
+    let (reference_index, (reference, _)) = references.next()?;
     if references.next().is_some() {
         return None;
     }
-    Some(Provenance::Proven(calibration_index, reference_index))
+    if !complete(snapshot, clock, &calibration.to, largest) {
+        return None;
+    }
+    // Defined at this timestamp (not inside an inserted second, nor past
+    // the leap table), and the offset to UTC there, which partitions.
+    bound(time, calibration, reference)?;
+    let middle = low.checked_add(high)?.div_euclid(2);
+    let offset = reference
+        .utc(u64::try_from(middle).ok()?)?
+        .checked_sub(middle)?;
+    Some(Provenance::Proven(
+        calibration_index,
+        reference_index,
+        offset,
+    ))
 }
 
 /// The bound at `time`: `time` converted through `calibration`, its
@@ -288,7 +310,7 @@ fn finish(
     entry.clock = clock.clock;
     entry.granularity = clock.granularity;
     entry.tick_fs = HOST_MONOTONIC_TICK_FS;
-    let Provenance::Proven(calibration_index, reference_index) = provenance else {
+    let Provenance::Proven(calibration_index, reference_index, _) = provenance else {
         return entry;
     };
     let (Some((calibration, calibration_digest)), Some((reference, reference_digest))) = (
