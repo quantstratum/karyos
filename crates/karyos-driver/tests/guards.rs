@@ -179,8 +179,8 @@ fn guarding_is_refused_where_it_cannot_hold() {
     let mut driver = EmbeddedDriver::new().unwrap();
     let guard = driver.add_guard("orders").unwrap();
     // A concurrent stream's handles share one ring (ADR-0092): two
-    // handles of four do not fit half a term, and its handle is not issued
-    // unguarded before the client binds a slot (karyos#1102 (c)).
+    // handles of four do not fit half a term, and a guarded handle is
+    // bound to an open epoch, so none is issued while the guard is closed.
     let concurrent = stream(
         &mut driver,
         3,
@@ -197,9 +197,7 @@ fn guarding_is_refused_where_it_cannot_hold() {
     driver.guard_stream(concurrent, guard, 2, None).unwrap();
     assert!(matches!(
         driver.concurrent_publication(concurrent),
-        Err(DriverError::Sys(
-            karyos_sys::error::SysError::InvalidPublicationMode { reason: "GC-7" }
-        ))
+        Err(DriverError::GuardNotOpen { .. })
     ));
     let handle = stream(&mut driver, 2, PublicationMode::Exclusive, true);
     assert_eq!(
