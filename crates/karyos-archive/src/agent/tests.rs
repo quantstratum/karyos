@@ -1480,8 +1480,19 @@ mod groups {
             let _sender = agent
                 .start_group(start_group(&groups, Some(Capture::Strict)))
                 .unwrap();
-            // A few duties: the group's integrity journal is open.
-            std::thread::sleep(Duration::from_millis(5));
+            // Wait, bounded, until the agent holds the group directory's
+            // integrity journal (its first open is lazy, at a duty): only
+            // then does the open after shutdown test the lock's release.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                match IntegrityJournal::open(StdDisk, &groups) {
+                    Err(crate::integrity::journal::IntegrityError::Locked) => break,
+                    _ if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                    other => panic!("round {round}: the agent never took the lock: {other:?}"),
+                }
+            }
             agent.shutdown().unwrap();
             if let Err(error) = IntegrityJournal::open(StdDisk, &groups) {
                 panic!("round {round}: {error:?}");
