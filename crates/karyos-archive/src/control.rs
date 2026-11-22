@@ -160,71 +160,54 @@ fn id(field: &'static str, value: u64) -> Result<u64, CodecError> {
 }
 
 /// Requests a recording of a stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = START_RECORDING)]
 pub struct StartRecording<'a> {
     /// Echoed in the responses.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The recorded stream.
+    #[field(offset = 24)]
     pub stream_id: i32,
     /// The recorded session.
+    #[field(offset = 28)]
     pub session_id: i32,
-    /// Required or async.
+    /// Required or async: the mode at 32 and its on-lap byte at 33.
+    #[field(with = mode_on_lap, spans = [(32, 1), (33, 1)])]
     pub mode: Mode,
-    /// The store's sync policy.
+    /// The store's sync policy: the policy at 34 and its interval at 8.
+    #[field(with = sync_policy, spans = [(8, 8), (34, 1)])]
     pub sync_policy: SyncPolicy,
     /// Segment length in bytes; 0 for the Archive's default.
+    #[field(offset = 16)]
     pub segment_length: u64,
     /// The channel, 1 to [`MAX_CHANNEL`] bytes.
+    #[field(var, min = 1, max = MAX_CHANNEL)]
     pub channel: &'a str,
 }
 
-impl<'a> StartRecording<'a> {
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
-        let interval = block.u64(8)?;
-        let mode = match (block.u8(32)?, block.u8(33)?) {
-            (1, 0) => Mode::Required,
-            (2, 1) => Mode::Async {
+/// [`Mode`] as a tied field of the derive: the mode at 32, the on-lap byte
+/// at 33 (karyos#1104).
+mod mode_on_lap {
+    use super::{Block, CodecError, Encoder, Mode, OnLap, invalid_enum, out_of_range};
+
+    pub(super) fn read(block: &Block<'_>) -> Result<Mode, CodecError> {
+        match (block.u8(32)?, block.u8(33)?) {
+            (1, 0) => Ok(Mode::Required),
+            (2, 1) => Ok(Mode::Async {
                 on_lap: OnLap::Stop,
-            },
-            (2, 2) => Mode::Async {
+            }),
+            (2, 2) => Ok(Mode::Async {
                 on_lap: OnLap::Resume,
-            },
-            (1 | 2, 0..=2) => return Err(out_of_range("on_lap")),
-            (1 | 2, value) => return Err(invalid_enum("on_lap", value)),
-            (value, _) => return Err(invalid_enum("mode", value)),
-        };
-        let sync_policy = match block.u8(34)? {
-            0 | 1 if interval != 0 => return Err(out_of_range("sync_interval_ns")),
-            0 => SyncPolicy::None,
-            1 => SyncPolicy::PerSegment,
-            2 if interval == 0 => return Err(out_of_range("sync_interval_ns")),
-            2 => SyncPolicy::Every {
-                interval_ns: interval,
-            },
-            value => return Err(invalid_enum("sync_policy", value)),
-        };
-        let channel = decoder.str("channel", 1, MAX_CHANNEL)?;
-        decoder.finish()?;
-        Ok(Self {
-            correlation_id: block.u64(0)?,
-            stream_id: block.i32(24)?,
-            session_id: block.i32(28)?,
-            mode,
-            sync_policy,
-            segment_length: block.u64(16)?,
-            channel,
-        })
+            }),
+            (1 | 2, 0..=2) => Err(out_of_range("on_lap")),
+            (1 | 2, value) => Err(invalid_enum("on_lap", value)),
+            (value, _) => Err(invalid_enum("mode", value)),
+        }
     }
 
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] when `out` is short, and
-    /// [`CodecError::LengthOutOfRange`] for the channel.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &START_RECORDING)?;
-        let (mode, on_lap) = match self.mode {
+    pub(super) fn write(encoder: &mut Encoder<'_>, mode: &Mode) -> Result<(), CodecError> {
+        let (mode, on_lap) = match mode {
             Mode::Required => (1, 0),
             Mode::Async {
                 on_lap: OnLap::Stop,
@@ -233,22 +216,39 @@ impl<'a> StartRecording<'a> {
                 on_lap: OnLap::Resume,
             } => (2, 2),
         };
-        let (policy, interval) = match self.sync_policy {
+        encoder.u8(32, mode)?;
+        encoder.u8(33, on_lap)
+    }
+}
+
+/// [`SyncPolicy`] as a tied field of the derive: the policy at 34, its
+/// interval at 8, nonzero exactly for `Every` (karyos#1104).
+mod sync_policy {
+    use super::{Block, CodecError, Encoder, SyncPolicy, invalid_enum, out_of_range};
+
+    pub(super) fn read(block: &Block<'_>) -> Result<SyncPolicy, CodecError> {
+        let interval = block.u64(8)?;
+        match block.u8(34)? {
+            0 | 1 if interval != 0 => Err(out_of_range("sync_interval_ns")),
+            0 => Ok(SyncPolicy::None),
+            1 => Ok(SyncPolicy::PerSegment),
+            2 if interval == 0 => Err(out_of_range("sync_interval_ns")),
+            2 => Ok(SyncPolicy::Every {
+                interval_ns: interval,
+            }),
+            value => Err(invalid_enum("sync_policy", value)),
+        }
+    }
+
+    pub(super) fn write(encoder: &mut Encoder<'_>, policy: &SyncPolicy) -> Result<(), CodecError> {
+        let (policy, interval) = match *policy {
             SyncPolicy::None => (0, 0),
             SyncPolicy::PerSegment => (1, 0),
             SyncPolicy::Every { interval_ns: 0 } => return Err(out_of_range("sync_interval_ns")),
             SyncPolicy::Every { interval_ns } => (2, interval_ns),
         };
-        encoder.u64(0, self.correlation_id)?;
         encoder.u64(8, interval)?;
-        encoder.u64(16, self.segment_length)?;
-        encoder.i32(24, self.stream_id)?;
-        encoder.i32(28, self.session_id)?;
-        encoder.u8(32, mode)?;
-        encoder.u8(33, on_lap)?;
-        encoder.u8(34, policy)?;
-        encoder.bytes("channel", 1, MAX_CHANNEL, self.channel.as_bytes())?;
-        encoder.finish()
+        encoder.u8(34, policy)
     }
 }
 
@@ -547,77 +547,60 @@ pub enum ReplayRate {
 }
 
 /// Requests a replay of a recording's range onto a new stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = REPLAY)]
 pub struct Replay<'a> {
     /// Echoed in the responses.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The recording, never 0.
+    #[field(offset = 8, check = id)]
     pub recording_id: u64,
     /// The first position replayed.
+    #[field(offset = 16)]
     pub position: u64,
     /// Bytes; `u64::MAX` to the recording's end.
+    #[field(offset = 24)]
     pub length: u64,
-    /// The pace.
+    /// The pace: the rate at 40 and its scale at 32.
+    #[field(with = replay_rate, spans = [(32, 4), (40, 1)])]
     pub rate: ReplayRate,
     /// The target stream.
+    #[field(offset = 36)]
     pub target_stream_id: i32,
     /// The target channel, 1 to [`MAX_CHANNEL`] bytes.
+    #[field(var, min = 1, max = MAX_CHANNEL)]
     pub target_channel: &'a str,
 }
 
-impl<'a> Replay<'a> {
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
+/// [`ReplayRate`] as a tied field of the derive: the rate at 40, its scale
+/// at 32, nonzero exactly for `Scaled` (karyos#1104).
+mod replay_rate {
+    use super::{
+        Block, CodecError, Encoder, MAX_SCALE_PPM, ReplayRate, invalid_enum, out_of_range,
+    };
+
+    pub(super) fn read(block: &Block<'_>) -> Result<ReplayRate, CodecError> {
         let scale = block.u32(32)?;
-        let rate = match block.u8(40)? {
-            1 | 2 if scale != 0 => return Err(out_of_range("scale_ppm")),
-            1 => ReplayRate::Full,
-            2 => ReplayRate::AsRecorded,
-            3 if (1..=MAX_SCALE_PPM).contains(&scale) => ReplayRate::Scaled { ppm: scale },
-            3 => return Err(out_of_range("scale_ppm")),
-            value => return Err(invalid_enum("rate", value)),
-        };
-        let target_channel = decoder.str("target_channel", 1, MAX_CHANNEL)?;
-        decoder.finish()?;
-        Ok(Self {
-            correlation_id: block.u64(0)?,
-            recording_id: id("recording_id", block.u64(8)?)?,
-            position: block.u64(16)?,
-            length: block.u64(24)?,
-            rate,
-            target_stream_id: block.i32(36)?,
-            target_channel,
-        })
+        match block.u8(40)? {
+            1 | 2 if scale != 0 => Err(out_of_range("scale_ppm")),
+            1 => Ok(ReplayRate::Full),
+            2 => Ok(ReplayRate::AsRecorded),
+            3 if (1..=MAX_SCALE_PPM).contains(&scale) => Ok(ReplayRate::Scaled { ppm: scale }),
+            3 => Err(out_of_range("scale_ppm")),
+            value => Err(invalid_enum("rate", value)),
+        }
     }
 
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], [`CodecError::ValueOutOfRange`] for a
-    /// recording id of 0 or a scale outside its bounds, and
-    /// [`CodecError::LengthOutOfRange`] for the channel.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &REPLAY)?;
-        let (rate, scale) = match self.rate {
+    pub(super) fn write(encoder: &mut Encoder<'_>, rate: &ReplayRate) -> Result<(), CodecError> {
+        let (rate, scale) = match *rate {
             ReplayRate::Full => (1, 0),
             ReplayRate::AsRecorded => (2, 0),
             ReplayRate::Scaled { ppm } if (1..=MAX_SCALE_PPM).contains(&ppm) => (3, ppm),
             ReplayRate::Scaled { .. } => return Err(out_of_range("scale_ppm")),
         };
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, id("recording_id", self.recording_id)?)?;
-        encoder.u64(16, self.position)?;
-        encoder.u64(24, self.length)?;
         encoder.u32(32, scale)?;
-        encoder.i32(36, self.target_stream_id)?;
-        encoder.u8(40, rate)?;
-        encoder.bytes(
-            "target_channel",
-            1,
-            MAX_CHANNEL,
-            self.target_channel.as_bytes(),
-        )?;
-        encoder.finish()
+        encoder.u8(40, rate)
     }
 }
 
@@ -762,33 +745,65 @@ pub enum RecordingState {
 }
 
 /// One recording of a list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = RECORDING_DESCRIPTOR, check = Self::check)]
 pub struct RecordingDescriptor<'a> {
     /// The list request's.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The recording, never 0.
+    #[field(offset = 8, check = id)]
     pub recording_id: u64,
     /// Its first position.
+    #[field(offset = 16)]
     pub start: u64,
     /// When it started.
+    #[field(offset = 40)]
     pub start_time_ns: u64,
-    /// Whether it still records, or where it stopped.
+    /// Whether it still records, or where it stopped: the stop position
+    /// at 24, the written position at 32, the stop time at 48, the reason
+    /// at 108 and the incomplete flag at 109.
+    #[field(with = recording_state, spans = [(24, 8), (32, 8), (48, 8), (108, 1), (109, 1)])]
     pub state: RecordingState,
-    /// Its segment geometry.
+    /// Its segment geometry: the segment length at 56, the term length at
+    /// 96.
+    #[field(with = geometry, spans = [(56, 8), (96, 4)])]
     pub geometry: Geometry,
     /// The publication recorded, which a live merge matches.
+    #[field(offset = 64, width = 32, with = source_incarnation)]
     pub source: SourceIncarnation,
     /// The recorded stream.
+    #[field(offset = 100)]
     pub stream_id: i32,
     /// The recorded session.
+    #[field(offset = 104)]
     pub session_id: i32,
     /// The channel, 1 to [`MAX_CHANNEL`] bytes.
+    #[field(var, min = 1, max = MAX_CHANNEL)]
     pub channel: &'a str,
 }
 
-impl<'a> RecordingDescriptor<'a> {
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
-        let start = block.u64(16)?;
+impl RecordingDescriptor<'_> {
+    /// Written from the start on: refused on decode and on encode.
+    fn check(&self) -> Result<(), CodecError> {
+        let written = match self.state {
+            RecordingState::Recording { written, .. } => written,
+            RecordingState::Stopped(stop) => stop.position,
+        };
+        if written < self.start {
+            return Err(out_of_range("written"));
+        }
+        Ok(())
+    }
+}
+
+/// [`RecordingState`] as a tied field of the derive (karyos#1104).
+mod recording_state {
+    use super::{
+        Block, CodecError, Encoder, RecordingState, Stop, StopReason, invalid_enum, out_of_range,
+    };
+
+    pub(super) fn read(block: &Block<'_>) -> Result<RecordingState, CodecError> {
         let stop_position = block.u64(24)?;
         let written = block.u64(32)?;
         let stop_time_ns = block.u64(48)?;
@@ -809,50 +824,18 @@ impl<'a> RecordingDescriptor<'a> {
                 incomplete,
             }),
         };
-        // Written from the start on, and up to the stop once stopped.
-        let stopped_elsewhere =
-            matches!(state, RecordingState::Stopped(stop) if stop.position != written);
-        if written < start || stopped_elsewhere {
+        // Written up to the stop once stopped.
+        if matches!(state, RecordingState::Stopped(stop) if stop.position != written) {
             return Err(out_of_range("written"));
         }
-        let term_length = block.u32(96)?;
-        let geometry = Geometry::new(term_length, block.u64(56)?).map_err(|_| {
-            out_of_range(if term_length == 0 {
-                "term_length"
-            } else {
-                "segment_length"
-            })
-        })?;
-        let channel = decoder.str("channel", 1, MAX_CHANNEL)?;
-        decoder.finish()?;
-        Ok(Self {
-            correlation_id: block.u64(0)?,
-            recording_id: id("recording_id", block.u64(8)?)?,
-            start,
-            start_time_ns: block.u64(40)?,
-            state,
-            geometry,
-            source: SourceIncarnation {
-                driver: [block.u64(64)?, block.u64(72)?],
-                registration: block.u64(80)?,
-                incarnation: block.u64(88)?,
-            },
-            stream_id: block.i32(100)?,
-            session_id: block.i32(104)?,
-            channel,
-        })
+        Ok(state)
     }
 
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], [`CodecError::ValueOutOfRange`] for a
-    /// recording id of 0 and for a position written below the start, and
-    /// [`CodecError::LengthOutOfRange`] for the channel.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &RECORDING_DESCRIPTOR)?;
-        let (stop, written, time, reason, incomplete) = match self.state {
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        state: &RecordingState,
+    ) -> Result<(), CodecError> {
+        let (stop, written, time, reason, incomplete) = match *state {
             RecordingState::Recording {
                 written,
                 incomplete,
@@ -865,29 +848,60 @@ impl<'a> RecordingDescriptor<'a> {
                 stop.incomplete,
             ),
         };
-        // As the decoder refuses it.
-        if written < self.start {
-            return Err(out_of_range("written"));
-        }
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, id("recording_id", self.recording_id)?)?;
-        encoder.u64(16, self.start)?;
         encoder.u64(24, stop)?;
         encoder.u64(32, written)?;
-        encoder.u64(40, self.start_time_ns)?;
         encoder.u64(48, time)?;
-        encoder.u64(56, self.geometry.segment_length())?;
-        encoder.u64(64, self.source.driver[0])?;
-        encoder.u64(72, self.source.driver[1])?;
-        encoder.u64(80, self.source.registration)?;
-        encoder.u64(88, self.source.incarnation)?;
-        encoder.u32(96, self.geometry.term_length())?;
-        encoder.i32(100, self.stream_id)?;
-        encoder.i32(104, self.session_id)?;
         encoder.u8(108, reason)?;
-        encoder.bool(109, incomplete)?;
-        encoder.bytes("channel", 1, MAX_CHANNEL, self.channel.as_bytes())?;
-        encoder.finish()
+        encoder.bool(109, incomplete)
+    }
+}
+
+/// [`Geometry`] as a tied field of the derive: the segment length at 56,
+/// the term length at 96 (karyos#1104).
+mod geometry {
+    use super::{Block, CodecError, Encoder, Geometry, out_of_range};
+
+    pub(super) fn read(block: &Block<'_>) -> Result<Geometry, CodecError> {
+        let term_length = block.u32(96)?;
+        Geometry::new(term_length, block.u64(56)?).map_err(|_| {
+            out_of_range(if term_length == 0 {
+                "term_length"
+            } else {
+                "segment_length"
+            })
+        })
+    }
+
+    pub(super) fn write(encoder: &mut Encoder<'_>, geometry: &Geometry) -> Result<(), CodecError> {
+        encoder.u64(56, geometry.segment_length())?;
+        encoder.u32(96, geometry.term_length())
+    }
+}
+
+/// [`SourceIncarnation`] as a block field of the derive: the driver at
+/// `at` and `at + 8`, the registration and the incarnation after it
+/// (karyos#1104).
+mod source_incarnation {
+    use super::{Block, CodecError, Encoder, SourceIncarnation};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<SourceIncarnation, CodecError> {
+        Ok(SourceIncarnation {
+            driver: [block.u64(at)?, block.u64(at + 8)?],
+            registration: block.u64(at + 16)?,
+            incarnation: block.u64(at + 24)?,
+        })
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        source: &SourceIncarnation,
+    ) -> Result<(), CodecError> {
+        let [first, second] = source.driver;
+        encoder.u64(at, first)?;
+        encoder.u64(at + 8, second)?;
+        encoder.u64(at + 16, source.registration)?;
+        encoder.u64(at + 24, source.incarnation)
     }
 }
 
@@ -909,69 +923,64 @@ pub enum Signal {
 }
 
 /// An unsolicited event of a recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = RECORDING_SIGNAL, check = Self::check)]
 pub struct RecordingSignal {
     /// The start request's for [`Signal::Started`], else 0.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The recording, never 0.
+    #[field(offset = 8, check = id)]
     pub recording_id: u64,
     /// Its start, or where it stopped.
+    #[field(offset = 16)]
     pub position: u64,
-    /// What happened.
+    /// What happened: the signal at 24, the stop reason at 25 and the
+    /// incomplete flag at 26.
+    #[field(with = signal, spans = [(24, 1), (25, 1), (26, 1)])]
     pub signal: Signal,
 }
 
 impl RecordingSignal {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
+    /// A correlation id on [`Signal::Started`] only.
+    fn check(&self) -> Result<(), CodecError> {
+        if self.signal != Signal::Started && self.correlation_id != 0 {
+            return Err(out_of_range("correlation_id"));
+        }
+        Ok(())
+    }
+}
+
+/// [`Signal`] as a tied field of the derive (karyos#1104).
+mod signal {
+    use super::{Block, CodecError, Encoder, Signal, StopReason, invalid_enum, out_of_range};
+
+    pub(super) fn read(block: &Block<'_>) -> Result<Signal, CodecError> {
         let reason = block.u8(25)?;
         let incomplete = block.bool("incomplete", 26)?;
-        let correlation_id = block.u64(0)?;
-        let signal = match block.u8(24)? {
-            1 | 3 if reason != 0 => return Err(out_of_range("stop_reason")),
-            1 | 3 if incomplete => return Err(out_of_range("incomplete")),
-            2 | 3 if correlation_id != 0 => return Err(out_of_range("correlation_id")),
-            1 => Signal::Started,
-            3 => Signal::Failed,
-            2 => Signal::Stopped {
+        match block.u8(24)? {
+            1 | 3 if reason != 0 => Err(out_of_range("stop_reason")),
+            1 | 3 if incomplete => Err(out_of_range("incomplete")),
+            1 => Ok(Signal::Started),
+            3 => Ok(Signal::Failed),
+            2 => Ok(Signal::Stopped {
                 reason: StopReason::of(reason)
                     .ok_or_else(|| invalid_enum("stop_reason", reason))?,
                 incomplete,
-            },
-            value => return Err(invalid_enum("signal", value)),
-        };
-        decoder.finish()?;
-        Ok(Self {
-            correlation_id,
-            recording_id: id("recording_id", block.u64(8)?)?,
-            position: block.u64(16)?,
-            signal,
-        })
+            }),
+            value => Err(invalid_enum("signal", value)),
+        }
     }
 
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// a recording id of 0 or a correlation id on a signal other than
-    /// [`Signal::Started`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &RECORDING_SIGNAL)?;
-        let (signal, reason, incomplete) = match self.signal {
+    pub(super) fn write(encoder: &mut Encoder<'_>, signal: &Signal) -> Result<(), CodecError> {
+        let (signal, reason, incomplete) = match *signal {
             Signal::Started => (1, 0, false),
             Signal::Stopped { reason, incomplete } => (2, reason.code(), incomplete),
             Signal::Failed => (3, 0, false),
         };
-        if signal != 1 && self.correlation_id != 0 {
-            return Err(out_of_range("correlation_id"));
-        }
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, id("recording_id", self.recording_id)?)?;
-        encoder.u64(16, self.position)?;
         encoder.u8(24, signal)?;
         encoder.u8(25, reason)?;
-        encoder.bool(26, incomplete)?;
-        encoder.finish()
+        encoder.bool(26, incomplete)
     }
 }
 
