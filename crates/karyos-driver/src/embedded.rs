@@ -4094,7 +4094,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// A remote client's concurrent guarded handle on stream id `stream`:
     /// after a guard close and reopen the fresh incarnation first, as for
     /// an exclusive grant, then its slot at `place`
-    /// ([`Self::attach_concurrent_guard_at`]).
+    /// ([`Self::attach_concurrent_guard_at`]). Remote clients exist only
+    /// on Linux.
+    #[cfg(target_os = "linux")]
     pub(crate) fn attach_remote_concurrent_guard(
         &mut self,
         stream: u64,

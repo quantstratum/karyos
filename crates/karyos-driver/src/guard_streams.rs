@@ -96,11 +96,8 @@ const _: () = assert!(MAX_HANDLES == 64);
 /// The client that holds a concurrent guarded incarnation's handles
 /// (ADR-0092 decision 2): every handle of the incarnation is its.
 #[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the client handles bind slots in karyos#1102 (c) and (d)"
-    )
+    not(any(test, target_os = "linux")),
+    expect(dead_code, reason = "remote clients exist only on Linux")
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShareClient {
