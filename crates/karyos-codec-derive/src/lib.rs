@@ -355,6 +355,24 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             quote! { template },
         ),
     };
+    // A shared block encodes only as one of its listed templates, whose
+    // layouts the checks above cover: any other is refused before a byte
+    // is written (karyos#1104, Codex review of #1167).
+    let template_guard = if shared {
+        quote! {
+            if ![#(#templates),*].contains(template) {
+                return ::core::result::Result::Err(
+                    ::karyos_codec::CodecError::UnsupportedSchema {
+                        schema: template.schema_id,
+                        template: template.template_id,
+                        version: template.version,
+                    },
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
     // Each reserved byte zero, refused otherwise (karyos#1104).
     let zero_checks = zero.iter().map(|(offset, width)| {
         let end = offset.saturating_add(*width);
@@ -416,6 +434,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
 
             #encode_head {
+                #template_guard
                 let mut encoder = ::karyos_codec::Encoder::new(out, #encode_template)?;
                 #encode_check
                 #(#writes)*
