@@ -1008,14 +1008,14 @@ fn verify_reports_each_copy_and_its_enforcement() {
     assert_eq!(err, "", "{out}");
     assert!(
         out.contains(&format!(
-            "copy recording 3 [0, 48) location {} verified enforcement immutable_attribute\n",
+            "copy recording 3 [0, 48) location {} verified enforcement immutable_attribute observed not_checked\n",
             hex(&[0x11; 32])
         )),
         "{out}"
     );
     assert!(
         out.contains(&format!(
-            "copy recording 3 [0, 48) location {} verified enforcement none\n",
+            "copy recording 3 [0, 48) location {} verified enforcement none observed not_checked\n",
             hex(&[0x22; 32])
         )),
         "{out}"
@@ -1136,4 +1136,110 @@ fn a_truncated_copy_catalog_is_reported_inconsistent_not_an_error() {
         out.contains("\"copies\":[],\"copies_first_inconsistent\":7"),
         "{out}"
     );
+}
+
+/// karyos#1087 review: the immutable attribute of a copy in this
+/// directory is read from its segment files, never assumed from the
+/// record. A copy recorded immutable whose files do not carry the
+/// attribute is reported with what they carry and, where they plainly do
+/// not, as an enforcement mismatch (exit 1).
+#[test]
+fn verify_reads_the_attribute_of_a_local_copy_from_its_files() {
+    use karyos_archive::integrity::copies::{CopyState, Enforcement};
+    let archive = archive("copies-observed");
+    let dir = archive.dir();
+    record_copies(
+        &dir,
+        &[(
+            ARCHIVE,
+            CopyState::Verified,
+            Enforcement::ImmutableAttribute,
+        )],
+    );
+    let (status, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    let prefix = format!(
+        "copy recording 3 [0, 48) location {} verified enforcement immutable_attribute observed ",
+        hex(&ARCHIVE)
+    );
+    let line = out
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(!line.contains("observed immutable_attribute"), "{out}");
+    if line.contains("observed none") {
+        assert!(line.ends_with(" enforcement_mismatch"), "{out}");
+        assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+        let (_, json_out, _) = full(&archive, true);
+        assert!(
+            json_out.contains("\"observed\":\"none\",\"mismatch\":true"),
+            "{json_out}"
+        );
+    } else {
+        // A file system with no attribute to read.
+        assert!(line.ends_with("observed unknown"), "{out}");
+    }
+    if cfg!(target_os = "macos") {
+        assert!(line.contains("observed none"), "{out}");
+    }
+}
+
+/// karyos#1087 review: on macOS the owner may set the user immutable flag
+/// (`chflags uchg`), and a copy whose every segment file carries it is
+/// reported as carrying the attribute, with no mismatch.
+#[cfg(target_os = "macos")]
+#[test]
+fn verify_reports_the_immutable_flag_its_files_carry() {
+    use karyos_archive::integrity::copies::{CopyState, Enforcement};
+    struct Flagged(Vec<PathBuf>);
+    impl Drop for Flagged {
+        fn drop(&mut self) {
+            for file in &self.0 {
+                let _ = std::process::Command::new("chflags")
+                    .arg("nouchg")
+                    .arg(file)
+                    .status();
+            }
+        }
+    }
+    let archive = archive("copies-flagged");
+    let dir = archive.dir();
+    record_copies(
+        &dir,
+        &[(
+            ARCHIVE,
+            CopyState::Verified,
+            Enforcement::ImmutableAttribute,
+        )],
+    );
+    let prefix = format!("{RECORDING:016x}-");
+    let files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".seg"))
+        })
+        .collect();
+    assert!(!files.is_empty());
+    let flagged = Flagged(files);
+    for file in &flagged.0 {
+        let status = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let (_, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    assert!(
+        out.contains(&format!(
+            "copy recording 3 [0, 48) location {} verified enforcement immutable_attribute observed immutable_attribute\n",
+            hex(&ARCHIVE)
+        )),
+        "{out}"
+    );
+    drop(flagged);
 }
