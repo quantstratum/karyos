@@ -49,7 +49,10 @@
 //! bool` and whose fields `#[field(offset = N, since = 2)]` read as their
 //! default from a version 1 block; and reserved bytes `#[message(zero =
 //! [(OFFSET, WIDTH), ...])]`, refused unless zero on decode and left zero
-//! on encode.
+//! on encode. A block several templates share takes `#[message(templates =
+//! [PATH, ...])]` in place of `template`: its fields are checked against
+//! every one, and its `encode(&self, out, template)` (crate visible) takes
+//! the template the caller encodes.
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -142,7 +145,10 @@ impl Field {
 
 /// The `#[message(...)]` of a struct.
 struct Message {
-    template: Path,
+    /// The template, or the templates a shared block serves.
+    templates: Vec<Path>,
+    /// Whether `encode` takes the template (`templates = [...]`).
+    shared: bool,
     check: Option<Path>,
     /// Its `decode` takes `v2: bool` (karyos#1104).
     versioned: bool,
@@ -152,7 +158,8 @@ struct Message {
 
 fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     let Message {
-        template,
+        templates,
+        shared,
         check,
         versioned,
         zero,
@@ -218,6 +225,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             _ => None,
         }
     });
+    let v2_read = Ident::new("__karyos_v2", Span::mixed_site());
     let reads = fields.iter().map(|field| {
         let name = &field.name;
         let label = name.to_string();
@@ -234,7 +242,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 };
                 if *since {
                     quote! {
-                        #name: if v2 { #read } else { ::core::default::Default::default() }
+                        #name: if #v2_read { #read } else { ::core::default::Default::default() }
                     }
                 } else {
                     quote! { #name: #read }
@@ -287,26 +295,66 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             "field `{}` runs past the template's block length",
             field.name
         );
-        let template = &template;
+        let templates = &templates;
         field
             .spans()
             .into_iter()
-            .map(move |(_, end)| {
-                quote! {
-                    ::core::assert!(#end <= #template.block_length as usize, #message);
-                }
+            .flat_map(move |(_, end)| {
+                let message = message.clone();
+                templates.iter().map(move |template| {
+                    quote! {
+                        ::core::assert!(#end <= #template.block_length as usize, #message);
+                    }
+                })
             })
             .collect::<Vec<_>>()
     });
-    let zero_ends = zero.iter().map(|(offset, width)| {
+    let zero_ends = zero.iter().flat_map(|(offset, width)| {
         let end = offset.saturating_add(*width);
-        quote! {
-            ::core::assert!(
-                #end <= #template.block_length as usize,
-                "a reserved range runs past the template's block length"
-            );
-        }
+        templates.iter().map(move |template| {
+            quote! {
+                ::core::assert!(
+                    #end <= #template.block_length as usize,
+                    "a reserved range runs past the template's block length"
+                );
+            }
+        })
     });
+    // One template, or the one the caller passes for a shared block.
+    let (encode_head, encode_template) = match (shared, templates.first()) {
+        (false, Some(template)) => (
+            quote! {
+                /// Encodes into `out`; returns the message's length.
+                ///
+                /// # Errors
+                ///
+                /// `CodecError::Truncated` when `out` is short, and a field's
+                /// or the message's check error.
+                pub fn encode(
+                    &self,
+                    out: &mut [u8],
+                ) -> ::core::result::Result<usize, ::karyos_codec::CodecError>
+            },
+            quote! { &#template },
+        ),
+        _ => (
+            quote! {
+                /// Encodes into `out` as `template`, one of the templates
+                /// the block serves; returns the message's length.
+                ///
+                /// # Errors
+                ///
+                /// `CodecError::Truncated` when `out` is short, and a field's
+                /// or the message's check error.
+                pub(crate) fn encode(
+                    &self,
+                    out: &mut [u8],
+                    template: &::karyos_codec::Template,
+                ) -> ::core::result::Result<usize, ::karyos_codec::CodecError>
+            },
+            quote! { template },
+        ),
+    };
     // Each reserved byte zero, refused otherwise (karyos#1104).
     let zero_checks = zero.iter().map(|(offset, width)| {
         let end = offset.saturating_add(*width);
@@ -320,8 +368,10 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
         }
     });
+    // Hygienic, so no field named `v2` shadows it (karyos#1104).
+    let v2 = Ident::new("__karyos_v2", Span::mixed_site());
     let version = if versioned {
-        quote! { v2: bool, }
+        quote! { #v2: bool, }
     } else {
         quote! {}
     };
@@ -331,7 +381,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             .iter()
             .any(|field| matches!(field.kind, Kind::Fixed { since: true, .. }))
     {
-        quote! { let _ = v2; }
+        quote! { let _ = #v2; }
     } else {
         quote! {}
     };
@@ -365,17 +415,8 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 ::core::result::Result::Ok(message)
             }
 
-            /// Encodes into `out`; returns the message's length.
-            ///
-            /// # Errors
-            ///
-            /// `CodecError::Truncated` when `out` is short, and a field's
-            /// or the message's check error.
-            pub fn encode(
-                &self,
-                out: &mut [u8],
-            ) -> ::core::result::Result<usize, ::karyos_codec::CodecError> {
-                let mut encoder = ::karyos_codec::Encoder::new(out, &#template)?;
+            #encode_head {
+                let mut encoder = ::karyos_codec::Encoder::new(out, #encode_template)?;
                 #encode_check
                 #(#writes)*
                 #(#var_writes)*
@@ -388,6 +429,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 /// The `#[message(template = PATH, check = PATH)]` of `input`.
 fn message(input: &DeriveInput) -> syn::Result<Message> {
     let mut template = None;
+    let mut shared: Option<Vec<Path>> = None;
     let mut check = None;
     let mut versioned = false;
     let mut zero = None;
@@ -397,30 +439,65 @@ fn message(input: &DeriveInput) -> syn::Result<Message> {
         .filter(|attr| attr.path().is_ident("message"))
     {
         attr.parse_nested_meta(|meta| {
+            // An option given twice is refused: the second would replace
+            // the first (karyos#1104).
+            let once = |taken: bool| {
+                if taken {
+                    Err(meta.error("a message option given twice"))
+                } else {
+                    Ok(())
+                }
+            };
             if meta.path.is_ident("template") {
+                once(template.is_some())?;
                 template = Some(meta.value()?.parse::<Path>()?);
                 Ok(())
             } else if meta.path.is_ident("check") {
+                once(check.is_some())?;
                 check = Some(meta.value()?.parse::<Path>()?);
                 Ok(())
+            } else if meta.path.is_ident("templates") {
+                once(shared.is_some())?;
+                let value = meta.value()?;
+                let list;
+                syn::bracketed!(list in value);
+                let paths = list.parse_terminated(Path::parse_mod_style, syn::Token![,])?;
+                shared = Some(paths.into_iter().collect());
+                Ok(())
             } else if meta.path.is_ident("versioned") {
+                once(versioned)?;
                 versioned = true;
                 Ok(())
             } else if meta.path.is_ident("zero") {
+                once(zero.is_some())?;
                 zero = Some(parse_spans(meta.value()?)?);
                 Ok(())
             } else {
                 Err(meta.error(
-                    "expected `template = PATH`, `check = PATH`, `versioned` or `zero = [(N, N), ...]`",
+                    "expected `template = PATH`, `templates = [PATH, ...]`, `check = PATH`, `versioned` or `zero = [(N, N), ...]`",
                 ))
             }
         })?;
     }
-    let template = template.ok_or_else(|| {
-        syn::Error::new_spanned(&input.ident, "missing #[message(template = PATH)]")
-    })?;
+    let (templates, shared) = match (template, shared) {
+        (Some(template), None) => (vec![template], false),
+        (None, Some(templates)) if !templates.is_empty() => (templates, true),
+        (None, None) => {
+            return Err(syn::Error::new_spanned(
+                &input.ident,
+                "missing #[message(template = PATH)]",
+            ));
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &input.ident,
+                "#[message] takes `template = PATH` or `templates = [PATH, ...]`, one of them",
+            ));
+        }
+    };
     Ok(Message {
-        template,
+        templates,
+        shared,
         check,
         versioned,
         zero: zero.unwrap_or_default(),
@@ -953,8 +1030,8 @@ mod tests {
         };
         let tokens = expand(&input).unwrap().to_string();
         for part in [
-            "v2 : bool ,",
-            "image : if v2 { block . u64 (8usize) ? } else { :: core :: default :: Default :: default () }",
+            "__karyos_v2 : bool ,",
+            "image : if __karyos_v2 { block . u64 (8usize) ? } else { :: core :: default :: Default :: default () }",
             "encoder . u64 (8usize , self . image) ?",
         ] {
             assert!(tokens.contains(part), "{part}: {tokens}");
@@ -963,7 +1040,26 @@ mod tests {
             #[message(template = T, versioned)]
             struct M { #[field(offset = 0)] a: u64 }
         };
-        assert!(expand(&plain).unwrap().to_string().contains("let _ = v2 ;"));
+        assert!(
+            expand(&plain)
+                .unwrap()
+                .to_string()
+                .contains("let _ = __karyos_v2 ;")
+        );
+        // A field named `v2` does not shadow the version: the generated
+        // parameter is hygienic, and the field reads as any other.
+        let named: DeriveInput = syn::parse_quote! {
+            #[message(template = T, versioned)]
+            struct M<'a> {
+                #[field(var, min = 0, max = 4)]
+                v2: &'a [u8],
+                #[field(offset = 0, since = 2)]
+                image: u64,
+            }
+        };
+        let tokens = expand(&named).unwrap().to_string();
+        assert!(tokens.contains("let v2 = decoder . bytes"), "{tokens}");
+        assert!(tokens.contains("image : if __karyos_v2 {"), "{tokens}");
         let unversioned: DeriveInput = syn::parse_quote! {
             #[message(template = T)]
             struct M { #[field(offset = 0, since = 2)] a: u64 }
@@ -1005,13 +1101,67 @@ mod tests {
             struct M { #[field(offset = 0)] a: u64 }
         };
         assert_eq!(error(covered), "field `a` overlaps a reserved range");
+        // A second `zero` would replace the first: refused, as is any
+        // message option given twice.
+        for twice in [
+            syn::parse_quote! {
+                #[message(template = T, zero = [(8, 4)], zero = [(0, 1)])]
+                struct M { #[field(offset = 0)] a: u8 }
+            },
+            syn::parse_quote! {
+                #[message(template = T)]
+                #[message(template = U)]
+                struct M { #[field(offset = 0)] a: u8 }
+            },
+            syn::parse_quote! {
+                #[message(template = T, versioned, versioned)]
+                struct M { #[field(offset = 0)] a: u8 }
+            },
+        ] {
+            assert_eq!(error(twice), "a message option given twice");
+        }
         let unknown: DeriveInput = syn::parse_quote! {
             #[message(template = T, zeros = [(4, 4)])]
             struct M { #[field(offset = 0)] a: u64 }
         };
         assert_eq!(
             error(unknown),
-            "expected `template = PATH`, `check = PATH`, `versioned` or `zero = [(N, N), ...]`"
+            "expected `template = PATH`, `templates = [PATH, ...]`, `check = PATH`, `versioned` or `zero = [(N, N), ...]`"
+        );
+    }
+
+    /// karyos#1104: a block several templates share is checked against
+    /// each, and encodes as the template its caller passes.
+    #[test]
+    fn a_shared_block_encodes_as_the_template_passed() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[message(templates = [A, B])]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        let tokens = expand(&input).unwrap().to_string();
+        for part in [
+            "8usize <= A . block_length",
+            "8usize <= B . block_length",
+            "pub (crate) fn encode (& self , out : & mut [u8] , template : & :: karyos_codec :: Template ,)",
+            "Encoder :: new (out , template) ?",
+        ] {
+            assert!(tokens.contains(part), "{part}: {tokens}");
+        }
+        let both: DeriveInput = syn::parse_quote! {
+            #[message(template = A, templates = [A, B])]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        assert_eq!(
+            error(both),
+            "#[message] takes `template = PATH` or `templates = [PATH, ...]`, one of them"
+        );
+        let none: DeriveInput = syn::parse_quote! {
+            #[message(templates = [])]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        assert_eq!(
+            error(none),
+            "#[message] takes `template = PATH` or `templates = [PATH, ...]`, one of them"
         );
     }
 

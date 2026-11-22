@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Archive's control messages, version 1, written by hand on the
-//! `karyos-codec` runtime (`quantstratum-docs:
+//! The Archive's control messages, version 1, derived with
+//! `karyos-codec-derive` on the `karyos-codec` runtime (`quantstratum-docs:
 //! karyos/design/archive-control-codec.md`, phase 3 batch A1; ADR-0036).
 //!
 //! Schema 1 holds nine requests ([`StartRecording`], [`StopRecording`],
@@ -14,8 +14,9 @@
 //! Each message is a plain value whose text fields borrow the decoded
 //! input; [`ControlMessage::decode`] validates a whole message before any
 //! value exists, and `encode` writes into the caller's buffer. Nothing
-//! allocates. A derive macro is to generate these from schema definitions;
-//! these hand-written ones become its vectors.
+//! allocates. Every message is derived (karyos#1029, karyos#1104);
+//! [`ControlMessage`], the dispatcher over the templates, is not a message
+//! and stays written by hand.
 //!
 //! The derive refuses, when the crate compiles, a field past its
 //! template's block and two fields that overlap (karyos#1066). A message
@@ -311,29 +312,15 @@ fn list_count(field: &'static str, count: u32) -> Result<u32, CodecError> {
 
 /// A request naming one recording: [`HoldRecording`], [`ReleaseHold`] and
 /// [`VerifyRecording`] share this block (ADR-0088).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(templates = [HOLD_RECORDING, RELEASE_HOLD, VERIFY_RECORDING])]
 pub struct RecordingRequest {
     /// Echoed in the response.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The recording, never 0.
+    #[field(offset = 8, check = id)]
     pub recording_id: u64,
-}
-
-impl RecordingRequest {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        Ok(Self {
-            correlation_id: block.u64(0)?,
-            recording_id: id("recording_id", block.u64(8)?)?,
-        })
-    }
-
-    fn encode(&self, out: &mut [u8], template: &Template) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, template)?;
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, id("recording_id", self.recording_id)?)?;
-        encoder.finish()
-    }
 }
 
 /// Requests a legal hold on a recording, template 6 (ADR-0088): answered
@@ -352,48 +339,25 @@ pub type VerifyRecording = RecordingRequest;
 
 /// Requests a purge of a recording below a position, template 8
 /// (ADR-0088): answered with code 0 or [`ResponseCode::Refused`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = PURGE_RECORDING)]
 pub struct PurgeRecording {
     /// Echoed in the response.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The recording, never 0.
+    #[field(offset = 8, check = id)]
     pub recording_id: u64,
     /// The first position kept.
+    #[field(offset = 16)]
     pub before: u64,
     /// The purge's id, unique among the Archive's outstanding purges,
     /// never 0.
+    #[field(offset = 24, check = id)]
     pub request_id: u64,
     /// The operator the requester authenticated, never 0.
+    #[field(offset = 32, check = id)]
     pub operator: u64,
-}
-
-impl PurgeRecording {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        Ok(Self {
-            correlation_id: block.u64(0)?,
-            recording_id: id("recording_id", block.u64(8)?)?,
-            before: block.u64(16)?,
-            request_id: id("request_id", block.u64(24)?)?,
-            operator: id("operator", block.u64(32)?)?,
-        })
-    }
-
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// a recording, request or operator id of 0.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &PURGE_RECORDING)?;
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, id("recording_id", self.recording_id)?)?;
-        encoder.u64(16, self.before)?;
-        encoder.u64(24, id("request_id", self.request_id)?)?;
-        encoder.u64(32, id("operator", self.operator)?)?;
-        encoder.finish()
-    }
 }
 
 /// A range's integrity outcome, the verifier's verbatim (SPEC.md §8.4,
@@ -468,23 +432,49 @@ pub const REASON_NAMES: [&str; 10] = [
 ];
 
 /// One range's verification outcome, template 104 (ADR-0088).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = RANGE_OUTCOME, check = Self::check)]
 pub struct RangeOutcome {
     /// The verify request's.
+    #[field(offset = 0)]
     pub correlation_id: u64,
     /// The recording, never 0.
+    #[field(offset = 8)]
     pub recording_id: u64,
     /// The range's start.
+    #[field(offset = 16)]
     pub start: u64,
     /// Its end, exclusive, at least `start`.
+    #[field(offset = 24)]
     pub end: u64,
     /// The counter of the first inconsistent record, [`NO_INCONSISTENT`]
     /// for none; always none unless the outcome is inconsistent.
+    #[field(offset = 32)]
     pub first_inconsistent: u64,
     /// The reasons, a bit set within [`RANGE_REASONS`].
+    #[field(offset = 40)]
     pub reasons: u32,
     /// The outcome.
+    #[field(with = integrity_outcome, offset = 44, width = 1)]
     pub outcome: IntegrityOutcome,
+}
+
+/// A range's [`IntegrityOutcome`], as a `with` field.
+mod integrity_outcome {
+    use super::{Block, CodecError, Encoder, IntegrityOutcome, invalid_enum};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<IntegrityOutcome, CodecError> {
+        let raw = block.u8(at)?;
+        IntegrityOutcome::of(raw).ok_or_else(|| invalid_enum("outcome", raw))
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &IntegrityOutcome,
+    ) -> Result<(), CodecError> {
+        encoder.u8(at, value.code())
+    }
 }
 
 impl RangeOutcome {
@@ -503,23 +493,6 @@ impl RangeOutcome {
         id("recording_id", self.recording_id).map(|_| ())
     }
 
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let raw = block.u8(44)?;
-        let outcome = IntegrityOutcome::of(raw).ok_or_else(|| invalid_enum("outcome", raw))?;
-        let range = Self {
-            correlation_id: block.u64(0)?,
-            recording_id: block.u64(8)?,
-            start: block.u64(16)?,
-            end: block.u64(24)?,
-            first_inconsistent: block.u64(32)?,
-            reasons: block.u32(40)?,
-            outcome,
-        };
-        range.check()?;
-        Ok(range)
-    }
-
     /// The names of its reasons, bit 0 first.
     pub fn reason_names(&self) -> impl Iterator<Item = &'static str> + '_ {
         REASON_NAMES
@@ -527,26 +500,6 @@ impl RangeOutcome {
             .enumerate()
             .filter(|&(bit, _)| self.reasons & (1 << bit) != 0)
             .map(|(_, name)| *name)
-    }
-
-    /// Encodes into `out`; returns the message's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// an end below the start, a reserved reason bit, a first inconsistent
-    /// record on another outcome, or a recording id of 0.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &RANGE_OUTCOME)?;
-        self.check()?;
-        encoder.u64(0, self.correlation_id)?;
-        encoder.u64(8, self.recording_id)?;
-        encoder.u64(16, self.start)?;
-        encoder.u64(24, self.end)?;
-        encoder.u64(32, self.first_inconsistent)?;
-        encoder.u32(40, self.reasons)?;
-        encoder.u8(44, self.outcome.code())?;
-        encoder.finish()
     }
 }
 
