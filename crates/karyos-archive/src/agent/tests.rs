@@ -5128,6 +5128,53 @@ fn a_resumed_purge_rechecks_the_segment_times() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// karyos#1122: an intent a crash left before its deletion, still
+/// authorised, expired and copied elsewhere at the next start, is
+/// completed there before any request: the floor moves past the cutoff,
+/// the integrity journal gets its purge record, and the id is free again.
+#[test]
+fn a_start_completes_an_unfinished_purge_that_passes_its_recheck() {
+    use crate::integrity::SealKind;
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-crash-unfinished");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    if !copy_elsewhere(&dir, id, end) {
+        return;
+    }
+    journal_intent(&dir, 4, id, end);
+    assert!(!dir.join(format!("{id:016x}.floor")).exists());
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    // Completed at start: the id is not outstanding any more.
+    assert_ne!(
+        answered(agent.post_purge(id, end, 4, 9)),
+        RetentionAnswer::Refused("duplicate_id".to_owned())
+    );
+    agent.shutdown().unwrap();
+    assert!(
+        dir.join(format!("{id:016x}.floor")).exists(),
+        "the floor moved"
+    );
+    let records = IntegrityJournal::open(StdDisk, &dir)
+        .unwrap()
+        .journal
+        .records()
+        .unwrap();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.kind == SealKind::Purge && record.subject == id)
+            .count(),
+        1,
+        "one purge record"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// karyos#1121 review: a crash inside a purge's removal, after its floor
 /// moved, leaves segments below the floor. The next start removes them
 /// before it records the purge done.
