@@ -1585,8 +1585,9 @@ impl<T: StreamTerms> Network<T> {
             .filter_map(|endpoint| self.endpoints.local_address(endpoint))
     }
 
-    /// Tests: makes every later control endpoint creation fail.
-    #[cfg(test)]
+    /// Tests: makes every later control endpoint creation fail (its e2e
+    /// case is Linux only).
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn fail_control_endpoint(&mut self) {
         self.fail_control_endpoint = true;
     }
