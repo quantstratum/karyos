@@ -822,6 +822,8 @@ mod recording_state {
                 time_ns: stop_time_ns,
                 reason: StopReason::of(code).ok_or_else(|| invalid_enum("stop_reason", code))?,
                 incomplete,
+                // Not on the wire.
+                closed_utc_ns: None,
             }),
         };
         // Written up to the stop once stopped.

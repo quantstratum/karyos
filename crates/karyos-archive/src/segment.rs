@@ -1430,6 +1430,82 @@ impl<D: Disk> SegmentStore<D> {
         Ok(files)
     }
 
+    /// The files of the segments still on disk below the floor's segment,
+    /// each with its base and whether it is the data file, lowest first:
+    /// what a purge's removal a crash cut short left after the floor moved
+    /// (karyos#1121 review). Read from the directory.
+    ///
+    /// # Errors
+    ///
+    /// The operating system's errors listing the directory.
+    pub fn files_left_below_floor(
+        &mut self,
+    ) -> Result<Vec<(u64, std::path::PathBuf, bool)>, SegmentError> {
+        let floor_base = self.geometry.base_of(self.start);
+        let prefix = format!("{:016x}-", self.recording);
+        let mut files: Vec<(u64, std::path::PathBuf, bool)> = self
+            .disk
+            .list(&self.dir)?
+            .iter()
+            .filter_map(|name| {
+                let rest = name.strip_prefix(&prefix)?;
+                let (hex, data) = match rest.strip_suffix(".seg") {
+                    Some(hex) => (hex, true),
+                    None => (rest.strip_suffix(".idx")?, false),
+                };
+                if hex.len() != 16 {
+                    return None;
+                }
+                let base = u64::from_str_radix(hex, 16).ok()?;
+                (base < floor_base).then(|| (base, self.dir.join(name), data))
+            })
+            .collect();
+        files.sort();
+        Ok(files)
+    }
+
+    /// Removes the segments at `bases`, each below the floor's segment,
+    /// and makes the removal durable: the rest of a purge a crash cut
+    /// short (karyos#1121 review). A base at or above the floor's segment
+    /// is left alone.
+    ///
+    /// # Errors
+    ///
+    /// The operating system's errors.
+    pub fn remove_left_below_floor(&mut self, bases: &[u64]) -> Result<(), SegmentError> {
+        let floor_base = self.geometry.base_of(self.start);
+        let mut removed = false;
+        for base in bases.iter().copied().filter(|base| *base < floor_base) {
+            remove_segment(&mut self.disk, &self.dir, self.recording, base)?;
+            removed = true;
+        }
+        if removed {
+            self.disk.sync_dir(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    /// The data files of every segment that holds a byte below `position`,
+    /// lowest first, the one `position` falls inside included: the files a
+    /// purge before `position` reads its range's close time from
+    /// (karyos#1093). Empty at or below the start.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::PositionOverflow`].
+    pub fn segment_files_holding_below(
+        &self,
+        position: u64,
+    ) -> Result<Vec<std::path::PathBuf>, SegmentError> {
+        if position <= self.start {
+            return Ok(Vec::new());
+        }
+        let last = self.geometry.base_of(position.saturating_sub(1));
+        let mut files = self.segment_files_below(last)?;
+        files.push(self.dir.join(data_name(self.recording, last)));
+        Ok(files)
+    }
+
     /// The data files of every segment that holds a byte of the
     /// recording, lowest first: what a closed recording's copy covers
     /// (karyos#1024).

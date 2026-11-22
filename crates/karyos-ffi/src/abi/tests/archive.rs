@@ -50,6 +50,7 @@ fn descriptor<'a>(correlation_id: u64, recording_id: u64) -> RecordingDescriptor
             time_ns: 2,
             reason: StopReason::Stopped,
             incomplete: false,
+            closed_utc_ns: None,
         })
     };
     RecordingDescriptor {
