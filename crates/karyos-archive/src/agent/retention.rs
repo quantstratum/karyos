@@ -214,10 +214,9 @@ impl<D: Disk + Clone> State<D> {
                 // failed verification never blocks the next one.
                 let clear = Clear(verifying);
                 let verified = work.run();
-                // Cleared before the answer, so a client retrying on it
-                // is never told a verification still runs (karyos#1135).
-                drop(clear);
-                let _ = worker_reply.send(Ok(verified));
+                clear_then_answer(clear, verified, |verified| {
+                    let _ = worker_reply.send(Ok(verified));
+                });
             });
         if let Err(error) = spawned {
             self.verifying
@@ -277,6 +276,14 @@ impl Drop for Clear {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::Release);
     }
+}
+
+/// Clears the "verification runs" flag, then sends the answer: a client
+/// retrying on the answer is never told a verification still runs
+/// (karyos#1135).
+fn clear_then_answer<T>(clear: Clear, value: T, send: impl FnOnce(T)) {
+    drop(clear);
+    send(value);
 }
 
 /// The name of the verification worker's thread.
@@ -361,6 +368,19 @@ fn open_stopped<D: Disk + Clone>(
 
 #[cfg(test)]
 mod tests {
+    /// karyos#1135: at the moment the answer is sent, the "verification
+    /// runs" flag is already clear.
+    #[test]
+    fn the_flag_is_clear_when_the_answer_is_sent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let flag = std::sync::Arc::new(AtomicBool::new(true));
+        let mut seen = None;
+        super::clear_then_answer(super::Clear(std::sync::Arc::clone(&flag)), 7, |value| {
+            seen = Some((value, flag.load(Ordering::Acquire)));
+        });
+        assert_eq!(seen, Some((7, false)));
+    }
+
     use super::*;
 
     #[test]
