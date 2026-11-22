@@ -2805,17 +2805,29 @@ where
         integrity.failed = !ok;
         // Signing never fails the integrity work: an unavailable signer
         // leaves heads pending, and anchoring falls behind. A poisoned
-        // signer is refused and counted, never skipped silently.
+        // signer is refused and counted, never skipped silently. The
+        // entries' journal is signed only with the Archive's signer, so
+        // its signing's counts are the handle's.
+        let counts = integrity
+            .signing
+            .as_ref()
+            .map(|signing| Arc::clone(&signing.counts));
+        let mut poisoned = 0u8;
         if let Some(signing) = integrity.signing.as_mut()
             && signing.duty(&mut integrity.journal, now).is_err()
         {
-            count(&self.counts.poisoned_signer);
+            poisoned = poisoned.saturating_add(1);
         }
         if let Some(evidence) = integrity.evidence.as_mut()
             && let Some(signing) = evidence.signing.as_mut()
             && signing.duty(evidence.store.journal_mut(), now).is_err()
         {
-            count(&self.counts.poisoned_signer);
+            poisoned = poisoned.saturating_add(1);
+        }
+        if let Some(counts) = counts {
+            for _ in 0..poisoned {
+                count(&counts.poisoned_signer);
+            }
         }
         !changes.is_empty() || integrity.journal.head() != before
     }
