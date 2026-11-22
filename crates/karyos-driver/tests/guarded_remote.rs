@@ -503,7 +503,7 @@ fn concurrent_outcomes(
 fn remote_concurrent_guarded_handles_read_only_their_own_outcomes() {
     let dir = dir("shared");
     let mut driver = driver(&dir);
-    let stream = driver.add_stream(concurrent_config(2)).unwrap();
+    let stream = driver.add_stream(concurrent_config(3)).unwrap();
     let guard = driver.add_guard("orders").unwrap();
     driver.guard_stream(stream, guard, 4, None).unwrap();
     assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
@@ -521,7 +521,7 @@ fn remote_concurrent_guarded_handles_read_only_their_own_outcomes() {
             assert_eq!(publication.guard().unwrap().epoch(), 2);
             handles.push(publication);
         }
-        // Another client on the same incarnation (GC-7-client).
+        // Another client, with a publisher slot free on the same incarnation (GC-7-client).
         let _ = other.add_concurrent_publication(KEY, true).unwrap();
         let refused = completion(&mut other);
         assert!(
@@ -554,19 +554,35 @@ fn remote_concurrent_guarded_handles_read_only_their_own_outcomes() {
             assert!(records.iter().all(|record| record.kind == Kind::Submitted));
             assert_eq!(publication.guard().unwrap().outstanding(), 0);
         }
-        // `H = 2` is the publisher slot count, so a third handle comes only
-        // once one is dropped: its publisher slot is free again, its ring
-        // slot is not within the incarnation, so it is refused with `H` as
-        // the detail.
-        drop(handles.pop());
+        // A third handle takes the last slot. `H = 3` is the publisher slot
+        // count, so a fourth comes only once one is dropped: its publisher
+        // slot is free again once the driver read its detach, its ring slot
+        // never within the incarnation, so it is refused with `H` as the
+        // detail.
         let _ = client.add_concurrent_publication(KEY, true).unwrap();
-        let refused = completion(&mut client);
+        let Outcome::Fetchable(grant) = completion(&mut client) else {
+            panic!("expected a third grant");
+        };
+        handles.push(client.take_concurrent_publication(&grant).unwrap());
+        drop(handles.pop());
+        let start = Instant::now();
+        let refused = loop {
+            assert!(start.elapsed() < Duration::from_secs(5), "slot never freed");
+            let _ = client.add_concurrent_publication(KEY, true).unwrap();
+            match completion(&mut client) {
+                Outcome::Refused {
+                    code: ErrorCode::PublicationTaken,
+                    ..
+                } => std::thread::yield_now(),
+                other => break other,
+            }
+        };
         assert!(
             matches!(
                 refused,
                 Outcome::Refused {
                     code: ErrorCode::GuardHandlesExhausted,
-                    detail: 2,
+                    detail: 3,
                 }
             ),
             "{refused:?}"
@@ -574,13 +590,13 @@ fn remote_concurrent_guarded_handles_read_only_their_own_outcomes() {
         (client, other, handles)
     });
 
-    // Dropping the handles detaches every export: per handle its log
-    // buffer slot, the shared ring, its cell and the guard words.
+    // Dropping the handles detaches every export: per handle (three) its
+    // log buffer slot, the shared ring, its cell and the guard words.
     drop(handles);
     drop(client);
     drop(other);
     serve_until(&mut driver, |driver| driver.clients() == 0);
-    assert_eq!(counter(&driver, "grants exported"), 8);
-    assert_eq!(counter(&driver, "grants detached"), 8);
+    assert_eq!(counter(&driver, "grants exported"), 12);
+    assert_eq!(counter(&driver, "grants detached"), 12);
     let _ = std::fs::remove_dir_all(&dir);
 }
