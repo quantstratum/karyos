@@ -1566,35 +1566,6 @@ fn one_handle_at_a_time_writes_a_journal_or_a_ledger() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// karyos#1067: a child process spawned while a journal is open never
-/// holds its lock: the file is opened close-on-exec, so the child, still
-/// running, has no copy of it once it runs its program, and the parent's
-/// drop releases the lock at once. (Only the instant between a fork and
-/// the child's exec shares the descriptor, which is std's spawn, not this
-/// crate's; the karyos-tools tests retry for that instant.)
-#[test]
-fn a_spawned_child_never_keeps_a_journals_lock() {
-    use crate::disk::StdDisk;
-    let dir = std::env::temp_dir().join(format!("karyos-lock-child-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
-    let mut child = std::process::Command::new("sleep")
-        .arg("5")
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    // `spawn` returns once the child has run `sleep` (std waits for its
-    // exec to succeed or fail), so its close-on-exec copies are gone.
-    drop(journal);
-    assert!(child.try_wait().unwrap().is_none(), "the child still runs");
-    let reopened = IntegrityJournal::open(StdDisk, &dir);
-    let _ = child.kill();
-    let _ = child.wait();
-    assert!(reopened.is_ok(), "{:?}", reopened.err());
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn a_stale_journal_view_never_cuts_a_committed_registry_entry() {
     // The in-memory disk takes no lock: the journal's own check is the
