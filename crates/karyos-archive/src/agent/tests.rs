@@ -1463,6 +1463,33 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// karyos#1148: a shutdown releases the integrity journal lock of a
+    /// sealed group's directory before it returns: opened at once, many
+    /// times over, it is never `Locked` (no child process runs here).
+    #[test]
+    fn a_shutdown_releases_the_group_integrity_journal_lock() {
+        use crate::integrity::journal::IntegrityJournal;
+        for round in 0..100 {
+            let dir = temp_dir(&format!("group-lock-{round}"));
+            let groups = groups_dir(&dir);
+            let config = AgentConfig {
+                seal_interval: Some(Duration::from_millis(1)),
+                ..AgentConfig::default()
+            };
+            let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+            let _sender = agent
+                .start_group(start_group(&groups, Some(Capture::Strict)))
+                .unwrap();
+            // A few duties: the group's integrity journal is open.
+            std::thread::sleep(Duration::from_millis(5));
+            agent.shutdown().unwrap();
+            if let Err(error) = IntegrityJournal::open(StdDisk, &groups) {
+                panic!("round {round}: {error:?}");
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
     /// A reference its recording stops short of: a strict group ends, a
     /// best-effort one marks it and goes on.
     #[test]

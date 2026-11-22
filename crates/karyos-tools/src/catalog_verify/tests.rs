@@ -698,8 +698,24 @@ fn sealed_groups(name: &str) -> (Archive, PathBuf) {
     std::thread::sleep(std::time::Duration::from_millis(100));
     agent.shutdown().unwrap();
 
-    // The operator's key, signed head and anchor, as for an archive.
-    let mut journal = IntegrityJournal::open(StdDisk, &groups).unwrap().journal;
+    // The operator's key, signed head and anchor, as for an archive. The
+    // shutdown released the journal's lock, but `flock` belongs to the
+    // open file description: a child another test of this binary forks
+    // while the agent's file was open shares it until the child execs, so
+    // `Locked` can be seen for that instant (karyos#1148). Retried, bounded.
+    let mut journal = {
+        let mut tries = 0u32;
+        loop {
+            match IntegrityJournal::open(StdDisk, &groups) {
+                Ok(opened) => break opened.journal,
+                Err(karyos_archive::integrity::journal::IntegrityError::Locked) if tries < 5000 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("{error:?}"),
+            }
+        }
+    };
     let authority = TestKey::from_seed([1; 32]);
     let mut signer = TestKey::from_seed([9; 32]);
     let mut entry = RegistryEntry {
