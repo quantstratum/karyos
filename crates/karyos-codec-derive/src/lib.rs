@@ -34,7 +34,12 @@
 //! through `PATH::read(&block, offset)` and `PATH::write(&mut encoder,
 //! offset, &value)`; and a message check `#[message(check = PATH)]`,
 //! `fn(&Self) -> Result<(), CodecError>`, after decoding and before
-//! encoding. Groups stay hand written.
+//! encoding. Also (karyos#1104): a field tied across several block
+//! ranges, `#[field(with = PATH, spans = [(OFFSET, WIDTH), ...])]`,
+//! through `PATH::read(&block)` and `PATH::write(&mut encoder, &value)`:
+//! one value whose bytes sit at offsets that are not adjacent (a mode and
+//! its on-lap byte, a sync policy and its interval). Groups stay hand
+//! written.
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -70,6 +75,13 @@ enum Kind {
         offset: usize,
         width: usize,
     },
+    /// Any type over several block ranges `spans` (offset, width), through
+    /// `with::read(&block)` and `with::write(&mut encoder, &value)`
+    /// (karyos#1104).
+    Tied {
+        with: Path,
+        spans: Vec<(usize, usize)>,
+    },
     /// A variable field, `min` to `max` bytes, text (`&str`) or bytes
     /// (`&[u8]`), in declaration order after the block (karyos#1029).
     Var {
@@ -86,14 +98,18 @@ struct Field {
 }
 
 impl Field {
-    /// The block range it takes: `None` for a variable field.
-    fn span(&self) -> Option<(usize, usize)> {
+    /// The block ranges it takes: none for a variable field.
+    fn spans(&self) -> Vec<(usize, usize)> {
         match &self.kind {
             Kind::Fixed { method, offset, .. } => {
-                Some((*offset, offset.saturating_add(size(method))))
+                vec![(*offset, offset.saturating_add(size(method)))]
             }
-            Kind::With { offset, width, .. } => Some((*offset, offset.saturating_add(*width))),
-            Kind::Var { .. } => None,
+            Kind::With { offset, width, .. } => vec![(*offset, offset.saturating_add(*width))],
+            Kind::Tied { spans, .. } => spans
+                .iter()
+                .map(|(offset, width)| (*offset, offset.saturating_add(*width)))
+                .collect(),
+            Kind::Var { .. } => Vec::new(),
         }
     }
 }
@@ -170,6 +186,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 }
             }
             Kind::With { with, offset, .. } => quote! { #name: #with::read(&block, #offset)? },
+            Kind::Tied { with, .. } => quote! { #name: #with::read(&block)? },
             Kind::Var { .. } => quote! { #name },
         }
     });
@@ -191,6 +208,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             Kind::With { with, offset, .. } => {
                 quote! { #with::write(&mut encoder, #offset, &self.#name)?; }
             }
+            Kind::Tied { with, .. } => quote! { #with::write(&mut encoder, &self.#name)?; },
             Kind::Var { .. } => quote! {},
         }
     });
@@ -207,15 +225,21 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         }
         _ => None,
     });
-    let ends = fields.iter().filter_map(|field| {
-        let (_, end) = field.span()?;
+    let ends = fields.iter().flat_map(|field| {
         let message = format!(
             "field `{}` runs past the template's block length",
             field.name
         );
-        Some(quote! {
-            ::core::assert!(#end <= #template.block_length as usize, #message);
-        })
+        let template = &template;
+        field
+            .spans()
+            .into_iter()
+            .map(move |(_, end)| {
+                quote! {
+                    ::core::assert!(#end <= #template.block_length as usize, #message);
+                }
+            })
+            .collect::<Vec<_>>()
     });
     // `mut` only when a variable field reads from the decoder.
     let decoder_binding = if fields
@@ -315,6 +339,7 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
         return Err(syn::Error::new_spanned(field, "a named field"));
     };
     let (mut offset, mut check, mut with, mut width) = (None, None, None, None);
+    let mut spans: Option<Vec<(usize, usize)>> = None;
     let (mut var, mut min, mut max) = (false, None, None);
     for attr in field
         .attrs
@@ -322,29 +347,61 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
         .filter(|attr| attr.path().is_ident("field"))
     {
         attr.parse_nested_meta(|meta| {
+            // An option given twice is refused: the second would replace
+            // the first, and skip its checks (karyos#1104).
+            let once = |taken: bool| {
+                if taken {
+                    Err(meta.error("an option given twice"))
+                } else {
+                    Ok(())
+                }
+            };
             if meta.path.is_ident("offset") {
+                once(offset.is_some())?;
                 offset = Some(meta.value()?.parse::<LitInt>()?.base10_parse::<usize>()?);
             } else if meta.path.is_ident("check") {
+                once(check.is_some())?;
                 check = Some(meta.value()?.parse::<Path>()?);
             } else if meta.path.is_ident("with") {
+                once(with.is_some())?;
                 with = Some(meta.value()?.parse::<Path>()?);
             } else if meta.path.is_ident("width") {
+                once(width.is_some())?;
                 width = Some(meta.value()?.parse::<LitInt>()?.base10_parse::<usize>()?);
+            } else if meta.path.is_ident("spans") {
+                once(spans.is_some())?;
+                spans = Some(parse_spans(meta.value()?)?);
             } else if meta.path.is_ident("var") {
+                once(var)?;
                 var = true;
             } else if meta.path.is_ident("min") {
+                once(min.is_some())?;
                 min = Some(meta.value()?.parse::<Expr>()?);
             } else if meta.path.is_ident("max") {
+                once(max.is_some())?;
                 max = Some(meta.value()?.parse::<Expr>()?);
             } else {
                 return Err(meta.error(
-                    "expected `offset = N`, `check = PATH`, `with = PATH`, `width = N`, `var`, `min = EXPR` or `max = EXPR`",
+                    "expected `offset = N`, `check = PATH`, `with = PATH`, `width = N`, `spans = [(N, N), ...]`, `var`, `min = EXPR` or `max = EXPR`",
                 ));
             }
             Ok(())
         })?;
     }
+    // Every option belongs to one kind: one that kind does not read is
+    // refused, never dropped (karyos#1104).
     if var {
+        if offset.is_some()
+            || check.is_some()
+            || with.is_some()
+            || width.is_some()
+            || spans.is_some()
+        {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "a variable field takes `var`, `min` and `max` only",
+            ));
+        }
         let Some(text) = borrowed(&field.ty) else {
             return Err(syn::Error::new_spanned(
                 &field.ty,
@@ -366,13 +423,49 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
             },
         });
     }
+    if let Some(spans) = spans {
+        let Some(with) = with else {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "a field with `spans` needs `with = PATH`",
+            ));
+        };
+        if offset.is_some()
+            || width.is_some()
+            || check.is_some()
+            || min.is_some()
+            || max.is_some()
+            || spans.is_empty()
+        {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "a tied field takes `with` and one or more `spans` only: its module checks its value",
+            ));
+        }
+        return Ok(Field {
+            name,
+            kind: Kind::Tied { with, spans },
+        });
+    }
     let Some(offset) = offset else {
         return Err(syn::Error::new_spanned(
             &name,
             "missing #[field(offset = N)]",
         ));
     };
+    if min.is_some() || max.is_some() {
+        return Err(syn::Error::new_spanned(
+            &name,
+            "`min` and `max` belong to a variable field",
+        ));
+    }
     if let Some(with) = with {
+        if check.is_some() {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "a `with` field takes no `check`: its module checks its value",
+            ));
+        }
         let Some(width) = width else {
             return Err(syn::Error::new_spanned(
                 &name,
@@ -398,6 +491,33 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
     })
 }
 
+/// The `[(OFFSET, WIDTH), ...]` of a tied field, parsed without syn's
+/// `full` feature.
+fn parse_spans(input: syn::parse::ParseStream<'_>) -> syn::Result<Vec<(usize, usize)>> {
+    let list;
+    syn::bracketed!(list in input);
+    let mut spans = Vec::new();
+    while !list.is_empty() {
+        let pair;
+        let parens = syn::parenthesized!(pair in list);
+        let offset = pair.parse::<LitInt>()?.base10_parse::<usize>()?;
+        pair.parse::<syn::Token![,]>()?;
+        let width = pair.parse::<LitInt>()?.base10_parse::<usize>()?;
+        if !pair.is_empty() || width == 0 {
+            return Err(syn::Error::new(
+                parens.span.join(),
+                "a span is `(OFFSET, WIDTH)`, WIDTH > 0",
+            ));
+        }
+        spans.push((offset, width));
+        if list.is_empty() {
+            break;
+        }
+        list.parse::<syn::Token![,]>()?;
+    }
+    Ok(spans)
+}
+
 /// The width in bytes of a field read by `method`.
 fn size(method: &Ident) -> usize {
     match method.to_string().as_str() {
@@ -410,20 +530,23 @@ fn size(method: &Ident) -> usize {
 
 /// Refuses two fields whose byte ranges overlap, naming both.
 fn overlaps(fields: &[Field]) -> syn::Result<()> {
-    for (index, first) in fields.iter().enumerate() {
-        let Some((first_start, first_end)) = first.span() else {
-            continue;
-        };
-        for second in fields.iter().skip(index.saturating_add(1)) {
-            let Some((second_start, second_end)) = second.span() else {
-                continue;
-            };
-            if first_start < second_end && second_start < first_end {
+    let mut taken: Vec<(usize, usize, &Ident)> = Vec::new();
+    for field in fields {
+        for (start, end) in field.spans() {
+            if let Some((_, _, first)) = taken
+                .iter()
+                .find(|(taken_start, taken_end, _)| start < *taken_end && *taken_start < end)
+            {
                 return Err(syn::Error::new_spanned(
-                    &second.name,
-                    format!("fields `{}` and `{}` overlap", first.name, second.name),
+                    &field.name,
+                    if **first == field.name {
+                        format!("field `{}`'s spans overlap", field.name)
+                    } else {
+                        format!("fields `{first}` and `{}` overlap", field.name)
+                    },
                 ));
             }
+            taken.push((start, end, &field.name));
         }
     }
     Ok(())
@@ -522,6 +645,103 @@ mod tests {
         assert_eq!(error(no_width), "a `with` field needs `width = N`");
     }
 
+    /// karyos#1104: a field tied across ranges that are not adjacent.
+    #[test]
+    fn a_tied_field_reads_and_writes_through_its_module() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M {
+                #[field(offset = 0)]
+                a: u64,
+                #[field(with = policy, spans = [(8, 8), (16, 1)])]
+                p: Policy,
+            }
+        };
+        let tokens = expand(&input).unwrap().to_string();
+        for part in [
+            "p : policy :: read (& block) ?",
+            "policy :: write (& mut encoder , & self . p) ?",
+            "16usize <= T . block_length",
+            "17usize <= T . block_length",
+        ] {
+            assert!(tokens.contains(part), "{part}: {tokens}");
+        }
+        let no_with: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(spans = [(0, 1)])] a: A }
+        };
+        assert_eq!(error(no_with), "a field with `spans` needs `with = PATH`");
+        let with_offset: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(offset = 0, with = t, spans = [(0, 1)])] a: A }
+        };
+        assert_eq!(
+            error(with_offset),
+            "a tied field takes `with` and one or more `spans` only: its module checks its value"
+        );
+        // An option the field's kind does not read is refused, not dropped.
+        let tied_check: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(with = t, spans = [(0, 1)], check = c)] a: A }
+        };
+        assert_eq!(
+            error(tied_check),
+            "a tied field takes `with` and one or more `spans` only: its module checks its value"
+        );
+        let var_spans: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(var, min = 0, max = 4, spans = [(0, 1)])] a: &'a [u8] }
+        };
+        assert_eq!(
+            error(var_spans),
+            "a variable field takes `var`, `min` and `max` only"
+        );
+        let var_check: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(var, min = 0, max = 4, check = c)] a: &'a [u8] }
+        };
+        assert_eq!(
+            error(var_check),
+            "a variable field takes `var`, `min` and `max` only"
+        );
+        let with_check: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(offset = 0, with = t, width = 4, check = c)] a: A }
+        };
+        assert_eq!(
+            error(with_check),
+            "a `with` field takes no `check`: its module checks its value"
+        );
+        let fixed_max: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(offset = 0, max = 4)] a: u32 }
+        };
+        assert_eq!(
+            error(fixed_max),
+            "`min` and `max` belong to a variable field"
+        );
+        // An option given twice, in one attribute or two, is refused.
+        let twice: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(with = t, spans = [(0, 1)], spans = [(0, 4), (2, 1)])] a: A }
+        };
+        assert_eq!(error(twice), "an option given twice");
+        let twice_apart: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M {
+                #[field(with = t, spans = [(0, 1)])]
+                #[field(spans = [(64, 1)])]
+                a: A,
+            }
+        };
+        assert_eq!(error(twice_apart), "an option given twice");
+        let self_overlap: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(with = t, spans = [(0, 4), (2, 1)])] a: A }
+        };
+        assert_eq!(error(self_overlap), "field `a`'s spans overlap");
+    }
+
     #[test]
     fn a_wrong_shape_is_a_compile_error() {
         let cases: [(DeriveInput, &str); 5] = [
@@ -547,7 +767,7 @@ mod tests {
                 syn::parse_quote! {
                     #[message(template = T)] struct M { #[field(offset = 0, size = 1)] a: u8 }
                 },
-                "expected `offset = N`, `check = PATH`, `with = PATH`, `width = N`, `var`, `min = EXPR` or `max = EXPR`",
+                "expected `offset = N`, `check = PATH`, `with = PATH`, `width = N`, `spans = [(N, N), ...]`, `var`, `min = EXPR` or `max = EXPR`",
             ),
         ];
         let overlap: DeriveInput = syn::parse_quote! {
@@ -555,6 +775,14 @@ mod tests {
             struct M { #[field(offset = 0)] a: u64, #[field(offset = 4)] b: u32 }
         };
         assert_eq!(error(overlap), "fields `a` and `b` overlap");
+        let tied_overlap: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M {
+                #[field(offset = 8)] a: u64,
+                #[field(with = t, spans = [(0, 1), (12, 1)])] b: B,
+            }
+        };
+        assert_eq!(error(tied_overlap), "fields `a` and `b` overlap");
         for (input, expected) in cases {
             assert_eq!(error(input), expected);
         }

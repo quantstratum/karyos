@@ -162,6 +162,12 @@ Archive:
   --archive-signer-key <hex>        the signer's 32-byte public key, in hex
   --archive-trust <file>            the trust file the key registry is replayed under (the
                                     format of karyos-catalog verify --trust)
+  --archive-copy-location <hex>     this Archive's 32-byte location id in its copy catalog:
+                                    each recording closed sealed is recorded as a local copy
+  --archive-retain-for <duration>   retention policy: how long a range is kept once it closed
+  --archive-purge <mode>            retention policy: manual or after-expiry
+  --archive-min-copies <n>          retention policy: verified copies elsewhere before a
+                                    purge (the three together, with --archive-copy-location)
 
 Shutdown:
   --shutdown-linger <duration>      time clients have to leave after SIGTERM or SIGINT [5s]
@@ -319,6 +325,14 @@ pub struct ArchiveOptions {
     pub anchor_interval: Duration,
     /// The head signer, when one is configured (karyos#966).
     pub signer: Option<SignerOption>,
+    /// This Archive's location id in its copy catalog
+    /// (`--archive-copy-location`, karyos#1024): each recording closed
+    /// sealed is recorded as a local copy.
+    pub copy_location: Option<[u8; 32]>,
+    /// The retention policy purges are checked against
+    /// (`--archive-retain-for`, `--archive-purge`, `--archive-min-copies`;
+    /// karyos#1093). Needs `copy_location`.
+    pub retention: Option<karyos_archive::integrity::retention::RetentionPolicy>,
 }
 
 /// The head signer of an Archive (`--archive-signer`,
@@ -559,7 +573,7 @@ where
             })?;
         if matches!(
             option,
-            "--archive-seal-interval" | "--archive-anchor-interval"
+            "--archive-seal-interval" | "--archive-anchor-interval" | "--archive-retain-for"
         ) {
             let parsed = karyos_protocol::channel::parse_duration(&value).map_err(|error| {
                 ArgsError::InvalidDuration {
@@ -573,6 +587,8 @@ where
             }
             if option == "--archive-seal-interval" {
                 archive.seal_interval = Some(parsed);
+            } else if option == "--archive-retain-for" {
+                archive.retain_for = Some(parsed);
             } else {
                 archive.anchor_interval = Some(parsed);
             }
@@ -612,6 +628,21 @@ where
                 archive.trust = Some(PathBuf::from(&value));
                 Some(())
             }
+            "--archive-copy-location" => crate::catalog_verify::hex32(&value)
+                .ok()
+                .map(|location| archive.copy_location = Some(location)),
+            "--archive-purge" => match value.as_str() {
+                "manual" => Some(karyos_archive::integrity::retention::PurgeMode::Manual),
+                "after-expiry" => {
+                    Some(karyos_archive::integrity::retention::PurgeMode::AfterExpiry)
+                }
+                _ => None,
+            }
+            .map(|purge| archive.purge = Some(purge)),
+            "--archive-min-copies" => value
+                .parse::<std::num::NonZeroU32>()
+                .ok()
+                .map(|copies| archive.min_copies = Some(copies)),
             _ => apply(&mut options, option, &value),
         };
         applied.ok_or_else(|| ArgsError::InvalidValue {
@@ -767,6 +798,10 @@ const OPTIONS: &[&str] = &[
     "--archive-signer",
     "--archive-signer-key",
     "--archive-trust",
+    "--archive-copy-location",
+    "--archive-retain-for",
+    "--archive-purge",
+    "--archive-min-copies",
 ];
 
 /// The static name of a known option.
@@ -1177,6 +1212,10 @@ struct Archive {
     signer: Option<PathBuf>,
     signer_key: Option<[u8; 32]>,
     trust: Option<PathBuf>,
+    copy_location: Option<[u8; 32]>,
+    retain_for: Option<Duration>,
+    purge: Option<karyos_archive::integrity::retention::PurgeMode>,
+    min_copies: Option<std::num::NonZeroU32>,
 }
 
 impl Archive {
@@ -1198,6 +1237,10 @@ impl Archive {
                 (self.signer.is_some(), "--archive-signer"),
                 (self.signer_key.is_some(), "--archive-signer-key"),
                 (self.trust.is_some(), "--archive-trust"),
+                (self.copy_location.is_some(), "--archive-copy-location"),
+                (self.retain_for.is_some(), "--archive-retain-for"),
+                (self.purge.is_some(), "--archive-purge"),
+                (self.min_copies.is_some(), "--archive-min-copies"),
             ] {
                 if given {
                     return Err(ArgsError::Needs {
@@ -1218,6 +1261,12 @@ impl Archive {
             option: "--archive",
             needs: "--archive-anchor-interval",
         })?;
+        let retention = retention(
+            self.retain_for,
+            self.purge,
+            self.min_copies,
+            self.copy_location.is_some(),
+        )?;
         // The signer, its key and the trust file come together or not at
         // all.
         let signer = match (self.signer, self.signer_key, self.trust) {
@@ -1255,7 +1304,58 @@ impl Archive {
             seal_interval: self.seal_interval.unwrap_or(DEFAULT_ARCHIVE_SEAL_INTERVAL),
             anchor_interval,
             signer,
+            copy_location: self.copy_location,
+            retention,
         }))
+    }
+}
+
+/// The retention policy: `--archive-retain-for`, `--archive-purge` and
+/// `--archive-min-copies` together or not at all, with
+/// `--archive-copy-location` (`located`; karyos#1093). Policy 1, version 1,
+/// tier 0: the one policy this Archive applies to every recording.
+fn retention(
+    retain_for: Option<Duration>,
+    purge: Option<karyos_archive::integrity::retention::PurgeMode>,
+    min_copies: Option<std::num::NonZeroU32>,
+    located: bool,
+) -> Result<Option<karyos_archive::integrity::retention::RetentionPolicy>, ArgsError> {
+    {
+        let (retain_for, purge, min_copies) = match (retain_for, purge, min_copies) {
+            (None, None, None) => return Ok(None),
+            (Some(retain_for), Some(purge), Some(min_copies)) => (retain_for, purge, min_copies),
+            (retain_for, purge, _) => {
+                let given = |is: bool, option| is.then_some(option);
+                let option = given(retain_for.is_some(), "--archive-retain-for")
+                    .or(given(purge.is_some(), "--archive-purge"))
+                    .unwrap_or("--archive-min-copies");
+                let needs = given(retain_for.is_none(), "--archive-retain-for")
+                    .or(given(purge.is_none(), "--archive-purge"))
+                    .unwrap_or("--archive-min-copies");
+                return Err(ArgsError::Needs { option, needs });
+            }
+        };
+        if !located {
+            return Err(ArgsError::Needs {
+                option: "--archive-retain-for",
+                needs: "--archive-copy-location",
+            });
+        }
+        let retain_for_ns =
+            u64::try_from(retain_for.as_nanos()).map_err(|_| ArgsError::InvalidValue {
+                option: "--archive-retain-for",
+                value: format!("{retain_for:?}"),
+            })?;
+        Ok(Some(
+            karyos_archive::integrity::retention::RetentionPolicy {
+                policy: 1,
+                version: 1,
+                retain_for_ns,
+                min_copies,
+                storage_tier: 0,
+                purge,
+            },
+        ))
     }
 }
 
@@ -1664,6 +1764,8 @@ mod tests {
                 seal_interval: DEFAULT_ARCHIVE_SEAL_INTERVAL,
                 anchor_interval: Duration::from_secs(3600),
                 signer: None,
+                copy_location: None,
+                retention: None,
             })
         );
         let guarded = options(&[
@@ -1744,6 +1846,81 @@ mod tests {
         ));
         assert!(matches!(
             with(&["--archive-signer-key", "zz"]),
+            Err(ArgsError::InvalidValue { .. })
+        ));
+    }
+
+    /// The retention policy's three options come together, with the copy
+    /// location (karyos#1093).
+    #[test]
+    fn the_archive_retention_options_come_together() {
+        use karyos_archive::integrity::retention::{PurgeMode, RetentionPolicy};
+        let base = [
+            "--dir",
+            "d",
+            "--archive",
+            "a",
+            "--archive-control",
+            "1,2",
+            "--archive-anchor-interval",
+            "3600s",
+        ];
+        let location = "05".repeat(32);
+        let with = |extra: &[&str]| {
+            let mut all: Vec<&str> = base.to_vec();
+            all.extend_from_slice(extra);
+            run(&all)
+        };
+        let policy = [
+            "--archive-retain-for",
+            "3600s",
+            "--archive-purge",
+            "after-expiry",
+            "--archive-min-copies",
+            "2",
+        ];
+        let parsed = options(
+            &[
+                &base[..],
+                &policy[..],
+                &["--archive-copy-location", &location],
+            ]
+            .concat(),
+        )
+        .archive
+        .unwrap();
+        assert_eq!(parsed.copy_location, Some([5; 32]));
+        assert_eq!(
+            parsed.retention,
+            Some(RetentionPolicy {
+                policy: 1,
+                version: 1,
+                retain_for_ns: 3_600_000_000_000,
+                min_copies: std::num::NonZeroU32::new(2).unwrap(),
+                storage_tier: 0,
+                purge: PurgeMode::AfterExpiry,
+            })
+        );
+        assert!(matches!(
+            with(&policy),
+            Err(ArgsError::Needs {
+                needs: "--archive-copy-location",
+                ..
+            })
+        ));
+        assert!(matches!(
+            with(&["--archive-retain-for", "3600s"]),
+            Err(ArgsError::Needs {
+                option: "--archive-retain-for",
+                needs: "--archive-purge"
+            })
+        ));
+        assert!(matches!(
+            with(&["--archive-purge", "sometimes"]),
+            Err(ArgsError::InvalidValue { .. })
+        ));
+        assert!(matches!(
+            with(&["--archive-min-copies", "0"]),
             Err(ArgsError::InvalidValue { .. })
         ));
     }

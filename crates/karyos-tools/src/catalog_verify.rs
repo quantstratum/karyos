@@ -21,9 +21,9 @@
 //! `untrusted_evidence`. Each `--anchors LOCATION=DIR` adds the operator
 //! export store in DIR, which the operator identifies by its location
 //! digest outside the export: an anchor counts only if it names that
-//! location. Exit status: 0 when nothing is inconsistent, 1 when a range
-//! or the journal is, 2 for an error, including a report that could not
-//! be written.
+//! location. Exit status: 0 when nothing is inconsistent, 1 when a range,
+//! the journal or the copy catalog is, 2 for an error, including a report
+//! that could not be written.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -33,8 +33,12 @@ use std::path::PathBuf;
 
 use karyos_archive::catalog::{CatalogError, list};
 use karyos_archive::disk::{Disk as _, ReadOnly, StdDisk};
+use karyos_archive::integrity::SealRecord;
 use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Externality, StoredAnchors};
-use karyos_archive::integrity::journal::read_records;
+use karyos_archive::integrity::copies::{
+    COPIES_FILE, COPY_RECORD_LENGTH, CopyRecord, CopyState, Enforcement, replay_current,
+};
+use karyos_archive::integrity::journal::{IntegrityError, read_records};
 use karyos_archive::integrity::ledger::read_entries;
 use karyos_archive::integrity::time::{self, Requirement, Verdict};
 use karyos_archive::integrity::time_evidence;
@@ -85,8 +89,8 @@ Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]...
   --json         one JSON object instead of text
   -h, --help     print this text
 
-Exit status: 0 nothing inconsistent; 1 a range or the journal inconsistent;
-2 an error, or a report that could not be written.
+Exit status: 0 nothing inconsistent; 1 a range, the journal or the copy
+catalog inconsistent; 2 an error, or a report that could not be written.
 ";
 
 /// A parsed `verify` command line.
@@ -278,6 +282,14 @@ pub enum VerifyError {
     /// The report could not be written.
     #[error("writing the report: {0}")]
     ReportWrite(io::Error),
+    /// The copy catalog does not hold a change the chain commits.
+    #[error("{}: copy catalog: {source}", dir.display())]
+    Copies {
+        /// The archive directory.
+        dir: PathBuf,
+        /// The error.
+        source: karyos_archive::integrity::journal::IntegrityError,
+    },
     /// The time evidence entries could not be read.
     #[error("{}: {source}", dir.display())]
     TimeEvidence {
@@ -672,6 +684,37 @@ impl Stores {
 /// An I/O error, a malformed trust file, or a store that cannot be
 /// opened or read.
 pub fn run_checks(args: &VerifyArgs) -> Result<Verification, VerifyError> {
+    checked(args).map(|checked| checked.verification)
+}
+
+/// A verification and the journal snapshot it checked, from which the
+/// copies are replayed: a second read of a live archive could hold
+/// records this verification never checked (karyos#1087 review).
+struct Checked {
+    verification: Verification,
+    records: Vec<SealRecord>,
+    /// The locations the trust file names as this directory's: its
+    /// Archive and its `local` stores; empty without a trust file.
+    local: BTreeSet<[u8; 32]>,
+}
+
+impl Checked {
+    /// The records of the accepted prefix: those before the journal's
+    /// first inconsistent record.
+    fn accepted(&self) -> &[SealRecord] {
+        let end = self
+            .verification
+            .journal_break
+            .and_then(|position| usize::try_from(position).ok())
+            .map_or(self.records.len(), |position| {
+                position.min(self.records.len())
+            });
+        self.records.get(..end).unwrap_or_default()
+    }
+}
+
+/// [`run_checks`], keeping the journal snapshot it verified.
+fn checked(args: &VerifyArgs) -> Result<Checked, VerifyError> {
     let dir = &args.dir;
     let at = |source: io::Error| VerifyError::Io {
         path: dir.clone(),
@@ -766,7 +809,20 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, VerifyError> {
     });
     match stores.error {
         Some(error) => Err(error),
-        None => Ok(verification),
+        None => {
+            let local = if trust.is_some() {
+                let mut local = externality.local_locations.clone();
+                let _ = local.insert(externality.local_archive);
+                local
+            } else {
+                BTreeSet::new()
+            };
+            Ok(Checked {
+                verification,
+                records,
+                local,
+            })
+        }
     }
 }
 
@@ -895,6 +951,275 @@ pub fn json(verification: &Verification) -> String {
     out
 }
 
+/// The copies `verify` reports: the current copies the chain commits,
+/// and the first copy change the catalog does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyReport {
+    /// The current copies, each with its recorded enforcement and what
+    /// its files carry; empty when a change could not be replayed.
+    pub copies: Vec<(CopyRecord, Observed)>,
+    /// The counter of the first copy change the chain commits that the
+    /// copy catalog does not hold or holds in a form that does not match:
+    /// an inconsistency of the evidence, never an error of the command.
+    pub first_inconsistent: Option<u64>,
+}
+
+/// What `verify` reads of a copy's immutable attribute on its segment
+/// files, beside the enforcement the catalog records (karyos#1087).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Observed {
+    /// Not read: the copy is removed, or its location is not one the
+    /// trust file names as this directory's (`archive` or `local`).
+    NotChecked,
+    /// Every segment file of the copy carries the immutable attribute.
+    Immutable,
+    /// A segment file of the copy does not carry it.
+    Absent,
+    /// It could not be read: no segment file, a platform or file system
+    /// without the attribute, or a read that failed.
+    Unknown,
+}
+
+impl Observed {
+    /// The name `verify` reports.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NotChecked => "not_checked",
+            Self::Immutable => "immutable_attribute",
+            Self::Absent => "none",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Whether `copy` records an immutable attribute its files do not carry:
+/// an inconsistency, a protection the catalog states that is not there.
+fn mismatched(copy: &CopyRecord, observed: Observed) -> bool {
+    copy.enforcement == Enforcement::ImmutableAttribute && observed == Observed::Absent
+}
+
+/// Whether the file at `path` carries the immutable attribute: `None`
+/// when that cannot be read.
+#[cfg(target_os = "linux")]
+fn immutable_attribute(path: &std::path::Path) -> Option<bool> {
+    karyos_sys::fs::is_immutable(path).ok().flatten()
+}
+
+/// Whether the file at `path` carries the immutable attribute, the user
+/// or the system flag of `chflags`: `None` when that cannot be read.
+#[cfg(target_os = "macos")]
+fn immutable_attribute(path: &std::path::Path) -> Option<bool> {
+    use std::os::macos::fs::MetadataExt as _;
+    const UF_IMMUTABLE: u32 = 0x0000_0002;
+    const SF_IMMUTABLE: u32 = 0x0002_0000;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|metadata| metadata.st_flags() & (UF_IMMUTABLE | SF_IMMUTABLE) != 0)
+}
+
+/// No immutable attribute is read on this platform.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn immutable_attribute(_path: &std::path::Path) -> Option<bool> {
+    None
+}
+
+/// What the segment files of `copy` carry, read from `stores`.
+fn observe(stores: &mut Stores, copy: &CopyRecord, local: &BTreeSet<[u8; 32]>) -> Observed {
+    if copy.state == CopyState::Removed || !local.contains(&copy.location) {
+        return Observed::NotChecked;
+    }
+    let files = match stores.store(copy.recording) {
+        Ok(Some(store)) => store.segment_files().unwrap_or_default(),
+        Ok(None) | Err(_) => Vec::new(),
+    };
+    if files.is_empty() {
+        return Observed::Unknown;
+    }
+    let mut observed = Observed::Immutable;
+    for file in &files {
+        match immutable_attribute(file) {
+            Some(true) => {}
+            Some(false) => return Observed::Absent,
+            None => observed = Observed::Unknown,
+        }
+    }
+    observed
+}
+
+/// The current copies of `args.dir`'s copy catalog, as the journal
+/// `records` commits them, each with its enforcement (karyos#1087).
+/// `records` is the accepted prefix of the journal snapshot the
+/// verification checked: never a second read, and nothing from the
+/// journal's first inconsistent record on. A copy change the catalog
+/// does not hold, a truncated catalog for one, is reported in
+/// [`CopyReport::first_inconsistent`]. The immutable attribute of each
+/// copy at a location in `local` is read from its segment files in
+/// `args.dir`, never assumed from the record.
+///
+/// # Errors
+///
+/// An I/O error on the catalog.
+pub fn copies_report(
+    args: &VerifyArgs,
+    records: &[SealRecord],
+    local: &BTreeSet<[u8; 32]>,
+) -> Result<CopyReport, VerifyError> {
+    let dir = &args.dir;
+    let at = |source: io::Error| VerifyError::Io {
+        path: dir.clone(),
+        source,
+    };
+    let mut disk = ReadOnly(StdDisk);
+    let entries: Vec<[u8; COPY_RECORD_LENGTH]> =
+        read_entries(&mut disk, dir, COPIES_FILE).map_err(at)?;
+    match replay_current(records, &entries) {
+        Ok(copies) => {
+            let mut stores = Stores {
+                dir: dir.clone(),
+                open: BTreeMap::new(),
+                error: None,
+            };
+            let copies = copies
+                .into_iter()
+                .map(|copy| {
+                    let observed = observe(&mut stores, &copy, local);
+                    (copy, observed)
+                })
+                .collect();
+            Ok(CopyReport {
+                copies,
+                first_inconsistent: None,
+            })
+        }
+        Err(IntegrityError::Unrecorded { counter }) => Ok(CopyReport {
+            copies: Vec::new(),
+            first_inconsistent: Some(counter),
+        }),
+        Err(source) => Err(VerifyError::Copies {
+            dir: dir.clone(),
+            source,
+        }),
+    }
+}
+
+const fn state_name(state: CopyState) -> &'static str {
+    match state {
+        CopyState::Unverified => "unverified",
+        CopyState::Verified => "verified",
+        CopyState::Removed => "removed",
+        _ => "unknown",
+    }
+}
+
+const fn enforcement_name(enforcement: Enforcement) -> &'static str {
+    match enforcement {
+        Enforcement::Unsupported => "none",
+        Enforcement::ImmutableAttribute => "immutable_attribute",
+        Enforcement::ObjectLock => "object_lock",
+        _ => "unknown",
+    }
+}
+
+fn location_hex(location: &[u8; 32]) -> String {
+    location
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+}
+
+/// The copies as text lines.
+#[must_use]
+pub fn copies_text(report: &CopyReport) -> String {
+    let mut out = String::new();
+    for (copy, observed) in &report.copies {
+        let _ = write!(
+            out,
+            "copy recording {} [{}, {}) location {} {} enforcement {} observed {}",
+            copy.recording,
+            copy.start,
+            copy.end,
+            location_hex(&copy.location),
+            state_name(copy.state),
+            enforcement_name(copy.enforcement),
+            observed.name()
+        );
+        if mismatched(copy, *observed) {
+            out.push_str(" enforcement_mismatch");
+        }
+        out.push('\n');
+    }
+    if let Some(first) = report.first_inconsistent {
+        let _ = writeln!(
+            out,
+            "copies inconsistent first_inconsistent={first}: the copy catalog does not hold this change"
+        );
+    }
+    out
+}
+
+/// The copies as JSON fields: `copies`, an array, and
+/// `copies_first_inconsistent`.
+#[must_use]
+pub fn copies_json(report: &CopyReport) -> String {
+    let items: Vec<String> = report
+        .copies
+        .iter()
+        .map(|(copy, observed)| {
+            format!(
+                "{{\"recording\":{},\"start\":{},\"end\":{},\"location\":\"{}\",\"state\":\"{}\",\"enforcement\":\"{}\",\"observed\":\"{}\",\"mismatch\":{}}}",
+                copy.recording,
+                copy.start,
+                copy.end,
+                location_hex(&copy.location),
+                state_name(copy.state),
+                enforcement_name(copy.enforcement),
+                observed.name(),
+                mismatched(copy, *observed)
+            )
+        })
+        .collect();
+    format!(
+        "\"copies\":[{}],\"copies_first_inconsistent\":{}",
+        items.join(","),
+        report
+            .first_inconsistent
+            .map_or_else(|| "null".to_owned(), |first| first.to_string())
+    )
+}
+
+/// `report` with the copies placed before its time part: a `copies`
+/// field before `time` in JSON, lines before the time lines in text.
+fn insert_copies(report: String, copies: &CopyReport, json: bool) -> String {
+    let (marker, inserted) = if json {
+        ("\"time\":", format!("{},", copies_json(copies)))
+    } else {
+        ("time ", copies_text(copies))
+    };
+    let at = if json {
+        report.rfind(marker)
+    } else {
+        // The first time line: the verdict lines or "time evidence:".
+        report
+            .match_indices(marker)
+            .find(|(at, _)| *at == 0 || report.get(at.saturating_sub(1)..*at) == Some("\n"))
+            .map(|(at, _)| at)
+    };
+    match at {
+        Some(at) => format!(
+            "{}{}{}",
+            report.get(..at).unwrap_or_default(),
+            inserted,
+            report.get(at..).unwrap_or_default()
+        ),
+        None => report,
+    }
+}
+
 /// Runs `verify` on `args` (the arguments after `verify`), printing the
 /// help, the report (to `stdout`) or the error (to `stderr`), and returns
 /// the exit status.
@@ -911,10 +1236,12 @@ pub fn run_verify(
         }
         Err(error) => return report_error(stderr, &VerifyError::Usage(error)),
     };
-    match run_checks(&parsed)
-        .and_then(|verification| time_report(&parsed).map(|time| (verification, time)))
-    {
-        Ok((verification, time)) => {
+    match checked(&parsed).and_then(|checked| {
+        let time = time_report(&parsed)?;
+        let copies = copies_report(&parsed, checked.accepted(), &checked.local)?;
+        Ok((checked.verification, time, copies))
+    }) {
+        Ok((verification, time, copies)) => {
             let report = match (&time, parsed.json) {
                 (None, true) => json(&verification),
                 (None, false) => text(&verification),
@@ -941,6 +1268,8 @@ pub fn run_verify(
                     format!("{head}{}", time_text(time))
                 }
             };
+            // Each copy's enforcement, before the time (karyos#1087).
+            let report = insert_copies(report, &copies, parsed.json);
             // A report that could not be written is an error, never a
             // status automation would read as the evidence's.
             if let Err(error) = stdout
@@ -950,6 +1279,11 @@ pub fn run_verify(
                 return report_error(stderr, &VerifyError::ReportWrite(error));
             }
             if verification.journal_break.is_some()
+                || copies.first_inconsistent.is_some()
+                || copies
+                    .copies
+                    .iter()
+                    .any(|(copy, observed)| mismatched(copy, *observed))
                 || !verification.evidence.is_empty()
                 || verification
                     .ranges
