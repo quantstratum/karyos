@@ -5070,6 +5070,58 @@ fn a_verification_retried_on_its_answer_is_not_refused() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// karyos#1113: the agent serves a replica's on demand request for a
+/// stopped, sealed recording: its bytes in order, each range's seal after
+/// its bytes, then a caught up status; an unknown recording is refused
+/// with code 2.
+#[test]
+fn a_stopped_recording_replicates_on_demand() {
+    use crate::replication::transport::{Outgoing, Refusal};
+    use crate::replication::{MAX_CHUNK, Mode, ReplicateRecording, State};
+    let dir = temp_dir("replicate");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let request = |recording_id| ReplicateRecording {
+        correlation_id: 7,
+        recording_id,
+        from: 0,
+        until: u64::MAX,
+        mode: Mode::OnDemand,
+    };
+    let unknown = answer(agent.post_replicate(request(id + 100), MAX_CHUNK));
+    assert!(matches!(
+        unknown,
+        Err(AgentError::ReplicationRefused(Refusal::UnknownRecording))
+    ));
+    let messages = answer(agent.post_replicate(request(id), 100)).unwrap();
+    let mut bytes = Vec::new();
+    let mut sealed_to = 0;
+    let mut last = None;
+    while let Ok(message) = messages.recv_timeout(Duration::from_secs(5)) {
+        match message {
+            Outgoing::Bytes {
+                start,
+                bytes: chunk,
+            } => {
+                assert!(chunk.len() <= 100, "{}", chunk.len());
+                assert_eq!(start, u64::try_from(bytes.len()).unwrap());
+                bytes.extend_from_slice(&chunk);
+            }
+            Outgoing::Seal(seal) => {
+                assert_eq!(seal.end, u64::try_from(bytes.len()).unwrap());
+                sealed_to = seal.end;
+            }
+            Outgoing::Status(status) => last = Some(status),
+        }
+    }
+    assert_eq!(bytes, all);
+    assert_eq!(sealed_to, u64::try_from(all.len()).unwrap());
+    let last = last.unwrap();
+    assert!(matches!(last.state, State::CaughtUp | State::Ended));
+    assert_eq!(last.sealed_end, sealed_to);
+    agent.shutdown().unwrap();
+}
+
 /// The answer to a posted retention command, waiting up to five seconds.
 fn answered<T>(posted: Result<Posted<T>, AgentError>) -> T {
     let posted = posted.unwrap();

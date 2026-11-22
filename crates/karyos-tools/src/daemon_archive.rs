@@ -248,6 +248,10 @@ impl ResponseSink for Responses {
         }
         sent
     }
+
+    fn max_message(&self) -> usize {
+        usize::try_from(self.0.max_message_length()).unwrap_or(usize::MAX)
+    }
 }
 
 /// Logs a request: its correlation id (requester half not authenticated)
