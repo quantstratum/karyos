@@ -505,7 +505,8 @@ fn remote_concurrent_guarded_handles_read_only_their_own_outcomes() {
     let mut driver = driver(&dir);
     let stream = driver.add_stream(concurrent_config(3)).unwrap();
     let guard = driver.add_guard("orders").unwrap();
-    driver.guard_stream(stream, guard, 4, None).unwrap();
+    // `C_m = 2`: every handle's quota reserved at once fits half a term.
+    driver.guard_stream(stream, guard, 2, None).unwrap();
     assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
     let mut client = attach_serving(&mut driver, &dir).unwrap();
     let mut other = attach_serving(&mut driver, &dir).unwrap();
