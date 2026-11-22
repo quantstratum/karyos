@@ -1773,6 +1773,7 @@ impl<C: Connection> Client<C> {
                     changes: std::collections::VecDeque::with_capacity(max_changes),
                     max_changes,
                     changes_lost: 0,
+                    ending: Vec::with_capacity(self.context.max_images),
                 }),
             }),
         }
@@ -2266,6 +2267,8 @@ impl<T: TermBytes> Drop for Images<T> {
     fn drop(&mut self) {
         let images = core::mem::take(&mut self.images);
         self.release(images);
+        let ending = core::mem::take(&mut self.ending);
+        self.release(ending.into_iter().map(|(image, _)| image).collect());
         let arrived = core::mem::take(
             &mut self
                 .inbox
@@ -2312,7 +2315,16 @@ struct Images<T: TermBytes> {
     max_changes: usize,
     /// The changes dropped from a full queue.
     changes_lost: u64,
+    /// Retired images whose clean end is sealed but not positioned yet,
+    /// each with the adoptions it has waited: their change waits for the
+    /// position, so it never reports a clean end at position 0 that is
+    /// not (karyos#1067). Reserved for `max_images`.
+    ending: Vec<(Image<T>, u32)>,
 }
+
+/// Adoptions a retired image's change waits for its seal's position
+/// before it goes without one.
+const ENDING_ADOPTIONS: u32 = 10_000;
 
 /// A stream subscription taken outside [`Client::add_subscription`], such
 /// as a replay target granted by [`Client::replay_targets`], as a
@@ -2631,6 +2643,7 @@ impl<T: TermBytes> Images<T> {
 
     /// Takes what the client handed over.
     fn adopt(&mut self) {
+        self.settle_ending();
         if !self.inbox.changed.swap(false, Ordering::Acquire) {
             return;
         }
@@ -2650,6 +2663,16 @@ impl<T: TermBytes> Images<T> {
         for id in state.retired.drain(..) {
             if let Some(index) = self.images.iter().position(|image| image.id == id) {
                 let image = self.images.remove(index);
+                // A clean end sealed but not positioned yet: its change
+                // waits for the position (karyos#1067).
+                let unpositioned = image
+                    .subscription
+                    .terminal_seal()
+                    .is_some_and(|end| end.position.is_none());
+                if unpositioned && self.ending.len() < self.ending.capacity() {
+                    self.ending.push((image, 0));
+                    continue;
+                }
                 Self::change(
                     &mut self.changes,
                     self.max_changes,
@@ -2675,6 +2698,16 @@ impl<T: TermBytes> Images<T> {
         }
         drop(state);
         if self.closed.is_some() {
+            for (image, _) in self.ending.drain(..) {
+                Self::change(
+                    &mut self.changes,
+                    self.max_changes,
+                    &mut self.changes_lost,
+                    &image,
+                    false,
+                );
+                released.push(image.subscription);
+            }
             for image in self.images.drain(..) {
                 Self::change(
                     &mut self.changes,
@@ -2689,6 +2722,40 @@ impl<T: TermBytes> Images<T> {
         drop(released);
         if self.next >= self.images.len() {
             self.next = 0;
+        }
+    }
+
+    /// Reports each retired image whose seal is positioned now, or that
+    /// waited [`ENDING_ADOPTIONS`] adoptions, and lets it go. In order of
+    /// retirement; allocates nothing.
+    fn settle_ending(&mut self) {
+        if self.ending.is_empty() {
+            return;
+        }
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut index = 0;
+        while let Some((image, waited)) = self.ending.get_mut(index) {
+            let positioned = image
+                .subscription
+                .terminal_seal()
+                .is_none_or(|end| end.position.is_some());
+            if positioned || *waited >= ENDING_ADOPTIONS {
+                let (image, _) = self.ending.remove(index);
+                Self::change(
+                    &mut self.changes,
+                    self.max_changes,
+                    &mut self.changes_lost,
+                    &image,
+                    false,
+                );
+                released.push(image.subscription);
+            } else {
+                *waited = waited.saturating_add(1);
+                index = index.saturating_add(1);
+            }
         }
     }
 
@@ -2972,6 +3039,7 @@ mod tests {
             changes: std::collections::VecDeque::with_capacity(3 * max_images),
             max_changes: 3 * max_images,
             changes_lost: 0,
+            ending: Vec::new(),
         };
         images.images.push(image(1, 1));
         images.images.push(image(2, 2));
@@ -3021,6 +3089,7 @@ mod tests {
             changes: std::collections::VecDeque::with_capacity(3 * max_images),
             max_changes: 3 * max_images,
             changes_lost: 0,
+            ending: Vec::new(),
         };
         images
             .images
@@ -3091,6 +3160,7 @@ mod tests {
                 changes: std::collections::VecDeque::with_capacity(6),
                 max_changes: 6,
                 changes_lost: 0,
+                ending: Vec::with_capacity(2),
             }),
         };
         (subscription, inbox)
@@ -3259,6 +3329,7 @@ mod tests {
                 changes: std::collections::VecDeque::new(),
                 max_changes: 3,
                 changes_lost: 0,
+                ending: Vec::new(),
             }),
         };
         let refused = network

@@ -1631,8 +1631,10 @@ fn a_retired_images_change_carries_its_end() {
             "{removed}"
         );
         if removed {
-            // The clean end is positioned after what was delivered.
-            assert!(retired.end_position > 0);
+            // The clean end is positioned after what was delivered: the
+            // client holds a retired image's change until its seal is
+            // positioned (karyos#1067).
+            assert!(retired.end_position > 0, "{}", retired.end_position);
         }
         assert_eq!(karyos_client_close(client), Status::Ok.code());
     }
