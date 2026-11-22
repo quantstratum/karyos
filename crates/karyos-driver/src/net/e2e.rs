@@ -932,6 +932,86 @@ fn a_multicast_publication_reaches_every_subscriber() {
     });
 }
 
+/// karyos#1067, Linux: two subscribing drivers on one host share the
+/// group port, so before the fix both sent their CHALLENGEs from one
+/// source endpoint and the publisher charged them to one
+/// `setup_answer_rate` bucket (20, burst 20; network-control-schemas.md
+/// §7.4). With 20 streams each, 40 CHALLENGEs of the first announcement
+/// rounds overran it: refused ones bound only later through SOLICIT. Each driver
+/// now sends a multicast key's CHALLENGE from its own unicast control
+/// endpoint, as its SOLICITs (plan 169), so neither is refused and every
+/// image binds through its CHALLENGE, with no SOLICIT. Skipped like
+/// `a_multicast_publication_reaches_every_subscriber`.
+#[cfg(target_os = "linux")]
+#[test]
+fn two_drivers_on_one_host_bind_through_their_own_challenges() {
+    use std::io::Write as _;
+
+    const STREAMS: usize = 20;
+    if let Err(why) = multicast_probe() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED two_drivers_on_one_host_bind_through_their_own_challenges: {why}"
+        );
+        return;
+    }
+    let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 13)), free_port());
+    let channel = UdpConfig {
+        retransmit_window: None,
+        nak_control: Vec::new(),
+        linger: None,
+        path_skew: None,
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        paths: Vec::new(),
+        reliable: true,
+        flow_control: None,
+        security: Security::Trusted,
+    };
+    let ids: Vec<i32> = (0..STREAMS)
+        .map(|index| 300 + i32::try_from(index).unwrap())
+        .collect();
+    let mut a = bind_time::sized_publisher(STREAMS);
+    let (mut b, mut c) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    for subscriber in [&mut b, &mut c] {
+        for &stream in &ids {
+            let _ = subscriber
+                .add_network_subscription(stream, &channel)
+                .unwrap();
+        }
+    }
+    let mut lanes = Vec::with_capacity(STREAMS);
+    for &stream in &ids {
+        let publication = a
+            .add_network_publication(aggregate(stream, 3, 1), &channel)
+            .unwrap();
+        lanes.push(
+            a.publication(publication.lane(Lane::ZERO).unwrap())
+                .unwrap(),
+        );
+    }
+    // DATA keeps flowing, so a refused CHALLENGE still binds through
+    // SOLICIT and the test ends on the counters, not on a timeout.
+    pump(&mut [&mut a, &mut b, &mut c], |drivers| {
+        for lane in &mut lanes {
+            let _ = lane.offer(&[0u8; 100]).unwrap();
+        }
+        drivers[1..].iter().all(|driver| {
+            ids.iter()
+                .all(|&stream| driver.network_image(stream, 3).is_some())
+        })
+    });
+    let answers = shared(&mut a).sender.session_counters();
+    assert_eq!(answers.rate_limited, 0, "{answers:?}");
+    for subscriber in [&mut b, &mut c] {
+        let sessions = shared(subscriber).receiver.session_counters();
+        assert_eq!(
+            sessions.solicits, 0,
+            "bound through CHALLENGE: {sessions:?}"
+        );
+    }
+}
+
 /// SPEC §13 phase 2, alias collision, on one multicast group: two
 /// publisher drivers use the same `session_id` and stream on one group.
 /// The subscribing driver's receiver keeps two images, keyed by source

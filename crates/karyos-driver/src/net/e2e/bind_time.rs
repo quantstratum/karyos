@@ -710,7 +710,7 @@ fn measure_drivers(label: &str, reliable: bool, count: usize, streams: usize, dr
 
 /// A publisher whose endpoint holds `streams` reliable single-lane
 /// publications (karyos#859).
-fn sized_publisher(streams: usize) -> crate::embedded::EmbeddedDriver {
+pub(super) fn sized_publisher(streams: usize) -> crate::embedded::EmbeddedDriver {
     let count = u16::try_from(streams).unwrap();
     let tables = crate::net::EndpointTables {
         tx_slots: std::num::NonZeroU16::new(32 + 9 * count).unwrap(),

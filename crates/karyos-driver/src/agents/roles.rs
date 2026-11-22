@@ -4847,8 +4847,9 @@ impl<T: StreamTerms> Intake<'_, T> {
         }
     }
 
-    /// Sends `challenge` toward `source` if §7.3 and §7.4 allow it.
-    /// Returns whether it was handed to the sender.
+    /// Sends `control` toward `source` from the intake's own endpoint if
+    /// §7.3 and §7.4 allow it: the rate tests' entry point.
+    #[cfg(test)]
     fn challenge(&mut self, source: SocketAddr, control: Control) -> bool {
         let endpoint = self.endpoint;
         self.challenge_from(endpoint, source, control)
@@ -4864,7 +4865,8 @@ impl<T: StreamTerms> Intake<'_, T> {
             .map_or(key.endpoint, |(.., from)| *from)
     }
 
-    /// [`Intake::challenge`], sent from `endpoint`.
+    /// Sends an RSP_SETUP `control` from `endpoint` toward `source` if
+    /// §7.3 and §7.4 allow it. Returns whether it was handed to the sender.
     fn challenge_from(
         &mut self,
         endpoint: EndpointId,
@@ -5126,7 +5128,13 @@ impl<T: StreamTerms> Intake<'_, T> {
                     role.sessions
                         .announce(key, &announce, now, &mut role.nonces)
                 {
-                    self.challenge(source, Control::Challenge(challenge));
+                    // A multicast key's CHALLENGE leaves from the driver's
+                    // unicast control endpoint, as its SOLICITs do: the
+                    // drivers of one host share the group port, and from it
+                    // they would be one source to the publisher's
+                    // `setup_answer_rate` (ADR-0096; karyos#1067).
+                    let from = self.solicit_endpoint(&key);
+                    self.challenge_from(from, source, Control::Challenge(challenge));
                 }
             }
             Control::SetupAnswer(answer) => {
