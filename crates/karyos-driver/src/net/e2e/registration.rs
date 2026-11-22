@@ -1098,7 +1098,16 @@ fn a_silent_receiver_is_removed_and_registers_again() {
         Box::new(clock.clone()),
     )
     .unwrap();
-    let mut b = driver(ThreadingMode::Shared);
+    // No REGISTER retry is due in the test's runtime (as for `again`
+    // below): on a slow host a retry would replace the binding and retire
+    // the slot before the silence, counted as a timeout (karyos#1067).
+    let mut b = driver_with(
+        ThreadingMode::Shared,
+        AgentConfig {
+            setup_interval: 600_000_000_000,
+            ..AgentConfig::default()
+        },
+    );
     let control = SocketAddr::new(LOOPBACK, free_port());
     let publication = a
         .add_dynamic_network_publication(
@@ -1146,7 +1155,13 @@ fn a_silent_receiver_is_removed_and_registers_again() {
         std::thread::sleep(std::time::Duration::from_micros(100));
     }
     assert!(quiet >= 2_000, "SMs kept arriving after `b` stopped");
-    assert_eq!(sender(&a).registrants_timed_out, 0);
+    assert_eq!(
+        sender(&a).registrants_timed_out,
+        0,
+        "retired while the clock was held: {:?} {:?}",
+        sender(&a),
+        receiver(&b)
+    );
     // Silence: only the sender runs from here. `b` stays alive, holding
     // its UDP port, so the new receiver cannot reuse it and meet the old
     // endpoint's quarantine. One nanosecond before the liveness timeout
