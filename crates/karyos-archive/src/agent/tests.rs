@@ -5782,7 +5782,9 @@ fn a_recovered_purge_is_chained_before_a_new_policy_version() {
 /// by default: run it with `KARYOS_LINUX_CAPS=LINUX_IMMUTABLE
 /// scripts/linux-test.sh -p karyos-archive --lib -- --ignored
 /// immutable_segments`. It fails, rather than skips, without the
-/// capability.
+/// capability, and also where the temporary directory's filesystem does
+/// not support the immutable flag (`FS_IOC_SETFLAGS`, as ext4, xfs and
+/// btrfs do; tmpfs does not): the runner must provide both.
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "needs CAP_LINUX_IMMUTABLE: scripts/linux-test.sh with KARYOS_LINUX_CAPS=LINUX_IMMUTABLE"]
@@ -5790,7 +5792,23 @@ fn immutable_segments_are_released_only_by_a_purge() {
     use crate::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
     use crate::server::RetentionAnswer;
 
+    // Releases whatever is still immutable and removes the directory,
+    // whether the test passes or fails, so a persistent runner keeps no
+    // immutable files.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(entries) = std::fs::read_dir(&self.0) {
+                for entry in entries.flatten() {
+                    let _ = crate::integrity::copies::ImmutableAttribute.release(&entry.path());
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     let dir = temp_dir("purge-immutable");
+    let _cleanup = Cleanup(dir.clone());
     let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
     // Four writes of 2880 bytes: two segments of the test geometry.
     let chunks: Vec<Vec<u8>> = (1..=4).map(|fill| frames(30, fill)).collect();
@@ -5824,7 +5842,8 @@ fn immutable_segments_are_released_only_by_a_purge() {
             .unwrap()
             .iter()
             .any(|copy| copy.recording == id && copy.enforcement == Enforcement::ImmutableAttribute),
-        "the local copy is immutable: does the process hold CAP_LINUX_IMMUTABLE?"
+        "the local copy is not immutable: the process needs CAP_LINUX_IMMUTABLE and {} on a filesystem with the immutable flag (ext4, xfs, btrfs; not tmpfs)",
+        dir.display()
     );
     for (path, _) in &segments {
         let written = std::fs::OpenOptions::new().write(true).open(path);
@@ -5884,10 +5903,4 @@ fn immutable_segments_are_released_only_by_a_purge() {
     let (last, _) = &segments[segments.len() - 1];
     assert!(last.exists());
     assert!(std::fs::OpenOptions::new().write(true).open(last).is_err());
-    for (path, _) in &segments[1..] {
-        crate::integrity::copies::ImmutableAttribute
-            .release(path)
-            .unwrap();
-    }
-    std::fs::remove_dir_all(&dir).unwrap();
 }
