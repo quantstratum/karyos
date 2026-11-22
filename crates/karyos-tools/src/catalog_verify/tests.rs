@@ -1030,3 +1030,80 @@ fn verify_reports_each_copy_and_its_enforcement() {
         "{out}"
     );
 }
+
+/// Records one copy of `[0, 48)` of the test recording per entry of
+/// `changes`, each a location, a state and an enforcement, in order.
+fn record_copies(
+    dir: &Path,
+    changes: &[(
+        [u8; 32],
+        karyos_archive::integrity::copies::CopyState,
+        karyos_archive::integrity::copies::Enforcement,
+    )],
+) {
+    use karyos_archive::integrity::copies::{CopyCatalog, CopyRecord};
+    let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+    let mut copies = CopyCatalog::open(StdDisk, dir, &mut journal).unwrap();
+    for &(location, state, enforcement) in changes {
+        copies
+            .record(
+                CopyRecord {
+                    sequence: 0,
+                    recording: RECORDING,
+                    start: 0,
+                    end: 48,
+                    location,
+                    digest: [0; 32],
+                    retain_until_ns: 0,
+                    state,
+                    enforcement,
+                },
+                &mut journal,
+            )
+            .unwrap();
+    }
+}
+
+/// karyos#1087 review: the copies are replayed from the journal snapshot
+/// the verification checked, limited to its accepted prefix. A matching
+/// copy update chained after the journal's first inconsistent record
+/// never changes the reported copy state.
+#[test]
+fn a_copy_update_after_a_chain_break_does_not_change_the_copy_state() {
+    use karyos_archive::integrity::copies::{CopyState, Enforcement};
+    let archive = archive("copies-break");
+    let dir = archive.dir();
+    record_copies(
+        &dir,
+        &[
+            ([0x11; 32], CopyState::Verified, Enforcement::Unsupported),
+            ([0x11; 32], CopyState::Removed, Enforcement::Unsupported),
+        ],
+    );
+    // The first copy change, still decodable, no longer chains to the
+    // second: the journal breaks at the second, position 8.
+    let path = IntegrityJournal::<StdDisk>::path(&dir);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let length = karyos_archive::integrity::SEAL_RECORD_LENGTH;
+    let at = 7 * length;
+    let mut record =
+        karyos_archive::integrity::SealRecord::decode(&bytes[at..at + length]).unwrap();
+    record.end ^= 1;
+    bytes[at..at + length].copy_from_slice(&record.encode());
+    std::fs::write(&path, bytes).unwrap();
+    let (status, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+    assert!(
+        out.contains("journal inconsistent first_inconsistent=8"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "copy recording 3 [0, 48) location {} verified enforcement none",
+            hex(&[0x11; 32])
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("removed"), "{out}");
+}

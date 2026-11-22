@@ -33,6 +33,7 @@ use std::path::PathBuf;
 
 use karyos_archive::catalog::{CatalogError, list};
 use karyos_archive::disk::{Disk as _, ReadOnly, StdDisk};
+use karyos_archive::integrity::SealRecord;
 use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Externality, StoredAnchors};
 use karyos_archive::integrity::copies::{
     COPIES_FILE, COPY_RECORD_LENGTH, CopyRecord, CopyState, Enforcement, replay_current,
@@ -683,6 +684,34 @@ impl Stores {
 /// An I/O error, a malformed trust file, or a store that cannot be
 /// opened or read.
 pub fn run_checks(args: &VerifyArgs) -> Result<Verification, VerifyError> {
+    checked(args).map(|checked| checked.verification)
+}
+
+/// A verification and the journal snapshot it checked, from which the
+/// copies are replayed: a second read of a live archive could hold
+/// records this verification never checked (karyos#1087 review).
+struct Checked {
+    verification: Verification,
+    records: Vec<SealRecord>,
+}
+
+impl Checked {
+    /// The records of the accepted prefix: those before the journal's
+    /// first inconsistent record.
+    fn accepted(&self) -> &[SealRecord] {
+        let end = self
+            .verification
+            .journal_break
+            .and_then(|position| usize::try_from(position).ok())
+            .map_or(self.records.len(), |position| {
+                position.min(self.records.len())
+            });
+        self.records.get(..end).unwrap_or_default()
+    }
+}
+
+/// [`run_checks`], keeping the journal snapshot it verified.
+fn checked(args: &VerifyArgs) -> Result<Checked, VerifyError> {
     let dir = &args.dir;
     let at = |source: io::Error| VerifyError::Io {
         path: dir.clone(),
@@ -777,7 +806,10 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, VerifyError> {
     });
     match stores.error {
         Some(error) => Err(error),
-        None => Ok(verification),
+        None => Ok(Checked {
+            verification,
+            records,
+        }),
     }
 }
 
@@ -906,24 +938,29 @@ pub fn json(verification: &Verification) -> String {
     out
 }
 
-/// The current copies of `args.dir`'s copy catalog, as its integrity
-/// journal commits them, each with its enforcement (karyos#1087).
+/// The current copies of `args.dir`'s copy catalog, as the journal
+/// `records` commits them, each with its enforcement (karyos#1087).
+/// `records` is the accepted prefix of the journal snapshot the
+/// verification checked: never a second read, and nothing from the
+/// journal's first inconsistent record on.
 ///
 /// # Errors
 ///
-/// An I/O error on the journal or the catalog, and a copy change the
-/// catalog does not hold.
-pub fn copies_report(args: &VerifyArgs) -> Result<Vec<CopyRecord>, VerifyError> {
+/// An I/O error on the catalog, and a copy change the catalog does not
+/// hold.
+pub fn copies_report(
+    args: &VerifyArgs,
+    records: &[SealRecord],
+) -> Result<Vec<CopyRecord>, VerifyError> {
     let dir = &args.dir;
     let at = |source: io::Error| VerifyError::Io {
         path: dir.clone(),
         source,
     };
     let mut disk = ReadOnly(StdDisk);
-    let (records, _) = read_records(&mut disk, dir).map_err(at)?;
     let entries: Vec<[u8; COPY_RECORD_LENGTH]> =
         read_entries(&mut disk, dir, COPIES_FILE).map_err(at)?;
-    replay_current(&records, &entries).map_err(|source| VerifyError::Copies {
+    replay_current(records, &entries).map_err(|source| VerifyError::Copies {
         dir: dir.clone(),
         source,
     })
@@ -1039,10 +1076,10 @@ pub fn run_verify(
         }
         Err(error) => return report_error(stderr, &VerifyError::Usage(error)),
     };
-    match run_checks(&parsed).and_then(|verification| {
+    match checked(&parsed).and_then(|checked| {
         let time = time_report(&parsed)?;
-        let copies = copies_report(&parsed)?;
-        Ok((verification, time, copies))
+        let copies = copies_report(&parsed, checked.accepted())?;
+        Ok((checked.verification, time, copies))
     }) {
         Ok((verification, time, copies)) => {
             let report = match (&time, parsed.json) {
