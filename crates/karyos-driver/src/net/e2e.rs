@@ -142,6 +142,7 @@ fn free_port() -> u16 {
 /// (both swarmer receivers here bound two path rows), and the second binds
 /// through its own SOLICIT, which a loaded host showed taking several
 /// retries; waiting on the first alone left that window open (karyos#1067).
+#[cfg(target_os = "linux")]
 fn wait_paths_bound(drivers: &mut [&mut EmbeddedDriver]) {
     let counters = |driver: &EmbeddedDriver| {
         let receiver = driver.net.as_ref().unwrap().receiver_counters().unwrap();

@@ -3039,6 +3039,7 @@ mod tests {
             changes: std::collections::VecDeque::with_capacity(3 * max_images),
             max_changes: 3 * max_images,
             changes_lost: 0,
+            ending: Vec::new(),
         };
         images.images.push(image(1, 1));
         images.images.push(image(2, 2));
@@ -3088,6 +3089,7 @@ mod tests {
             changes: std::collections::VecDeque::with_capacity(3 * max_images),
             max_changes: 3 * max_images,
             changes_lost: 0,
+            ending: Vec::new(),
         };
         images
             .images
