@@ -970,6 +970,278 @@ fn verify_reports_the_time_verdict_of_verified_entries() {
     );
 }
 
+/// karyos#1087: each copy the chain commits is reported with its state
+/// and enforcement, in text and JSON.
+#[test]
+fn verify_reports_each_copy_and_its_enforcement() {
+    use karyos_archive::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+    let archive = archive("copies");
+    let dir = archive.dir();
+    {
+        let mut journal = open_journal(&dir);
+        let mut copies = CopyCatalog::open(StdDisk, &dir, &mut journal).unwrap();
+        for (location, enforcement) in [
+            ([0x11u8; 32], Enforcement::ImmutableAttribute),
+            ([0x22u8; 32], Enforcement::Unsupported),
+        ] {
+            copies
+                .record(
+                    CopyRecord {
+                        sequence: 0,
+                        recording: RECORDING,
+                        start: 0,
+                        end: 48,
+                        location,
+                        digest: [0; 32],
+                        retain_until_ns: 0,
+                        state: CopyState::Verified,
+                        enforcement,
+                    },
+                    &mut journal,
+                )
+                .unwrap();
+        }
+    }
+    let (_, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    assert!(
+        out.contains(&format!(
+            "copy recording 3 [0, 48) location {} verified enforcement immutable_attribute observed not_checked\n",
+            hex(&[0x11; 32])
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "copy recording 3 [0, 48) location {} verified enforcement none observed not_checked\n",
+            hex(&[0x22; 32])
+        )),
+        "{out}"
+    );
+    let (_, out, _) = full(&archive, true);
+    assert!(
+        out.contains("\"copies\":[{\"recording\":3,\"start\":0,\"end\":48,"),
+        "{out}"
+    );
+    assert!(
+        out.contains("\"enforcement\":\"immutable_attribute\""),
+        "{out}"
+    );
+}
+
+/// Records one copy of `[0, 48)` of the test recording per entry of
+/// `changes`, each a location, a state and an enforcement, in order.
+fn record_copies(
+    dir: &Path,
+    changes: &[(
+        [u8; 32],
+        karyos_archive::integrity::copies::CopyState,
+        karyos_archive::integrity::copies::Enforcement,
+    )],
+) {
+    use karyos_archive::integrity::copies::{CopyCatalog, CopyRecord};
+    let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+    let mut copies = CopyCatalog::open(StdDisk, dir, &mut journal).unwrap();
+    for &(location, state, enforcement) in changes {
+        copies
+            .record(
+                CopyRecord {
+                    sequence: 0,
+                    recording: RECORDING,
+                    start: 0,
+                    end: 48,
+                    location,
+                    digest: [0; 32],
+                    retain_until_ns: 0,
+                    state,
+                    enforcement,
+                },
+                &mut journal,
+            )
+            .unwrap();
+    }
+}
+
+/// karyos#1087 review: the copies are replayed from the journal snapshot
+/// the verification checked, limited to its accepted prefix. A matching
+/// copy update chained after the journal's first inconsistent record
+/// never changes the reported copy state.
+#[test]
+fn a_copy_update_after_a_chain_break_does_not_change_the_copy_state() {
+    use karyos_archive::integrity::copies::{CopyState, Enforcement};
+    let archive = archive("copies-break");
+    let dir = archive.dir();
+    record_copies(
+        &dir,
+        &[
+            ([0x11; 32], CopyState::Verified, Enforcement::Unsupported),
+            ([0x11; 32], CopyState::Removed, Enforcement::Unsupported),
+        ],
+    );
+    // The first copy change, still decodable, no longer chains to the
+    // second: the journal breaks at the second, position 8.
+    let path = IntegrityJournal::<StdDisk>::path(&dir);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let length = karyos_archive::integrity::SEAL_RECORD_LENGTH;
+    let at = 7 * length;
+    let mut record =
+        karyos_archive::integrity::SealRecord::decode(&bytes[at..at + length]).unwrap();
+    record.end ^= 1;
+    bytes[at..at + length].copy_from_slice(&record.encode());
+    std::fs::write(&path, bytes).unwrap();
+    let (status, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+    assert!(
+        out.contains("journal inconsistent first_inconsistent=8"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "copy recording 3 [0, 48) location {} verified enforcement none",
+            hex(&[0x11; 32])
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("removed"), "{out}");
+}
+
+/// karyos#1087 review: a copy change the chain commits whose record the
+/// copy catalog no longer holds is an inconsistency of the report (exit
+/// 1, the report written, JSON included), never an error that discards
+/// it.
+#[test]
+fn a_truncated_copy_catalog_is_reported_inconsistent_not_an_error() {
+    use karyos_archive::integrity::copies::{COPIES_FILE, CopyState, Enforcement};
+    let archive = archive("copies-truncated");
+    let dir = archive.dir();
+    record_copies(
+        &dir,
+        &[([0x11; 32], CopyState::Verified, Enforcement::Unsupported)],
+    );
+    std::fs::write(dir.join(COPIES_FILE), b"").unwrap();
+    let (status, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+    assert!(
+        out.contains("copies inconsistent first_inconsistent=7"),
+        "{out}"
+    );
+    let (status, out, err) = full(&archive, true);
+    assert_eq!(err, "", "{out}");
+    assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+    assert!(
+        out.contains("\"copies\":[],\"copies_first_inconsistent\":7"),
+        "{out}"
+    );
+}
+
+/// karyos#1087 review: the immutable attribute of a copy in this
+/// directory is read from its segment files, never assumed from the
+/// record. A copy recorded immutable whose files do not carry the
+/// attribute is reported with what they carry and, where they plainly do
+/// not, as an enforcement mismatch (exit 1).
+#[test]
+fn verify_reads_the_attribute_of_a_local_copy_from_its_files() {
+    use karyos_archive::integrity::copies::{CopyState, Enforcement};
+    let archive = archive("copies-observed");
+    let dir = archive.dir();
+    record_copies(
+        &dir,
+        &[(
+            ARCHIVE,
+            CopyState::Verified,
+            Enforcement::ImmutableAttribute,
+        )],
+    );
+    let (status, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    let prefix = format!(
+        "copy recording 3 [0, 48) location {} verified enforcement immutable_attribute observed ",
+        hex(&ARCHIVE)
+    );
+    let line = out
+        .lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(!line.contains("observed immutable_attribute"), "{out}");
+    if line.contains("observed none") {
+        assert!(line.ends_with(" enforcement_mismatch"), "{out}");
+        assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+        let (_, json_out, _) = full(&archive, true);
+        assert!(
+            json_out.contains("\"observed\":\"none\",\"mismatch\":true"),
+            "{json_out}"
+        );
+    } else {
+        // A file system with no attribute to read.
+        assert!(line.ends_with("observed unknown"), "{out}");
+    }
+    if cfg!(target_os = "macos") {
+        assert!(line.contains("observed none"), "{out}");
+    }
+}
+
+/// karyos#1087 review: on macOS the owner may set the user immutable flag
+/// (`chflags uchg`), and a copy whose every segment file carries it is
+/// reported as carrying the attribute, with no mismatch.
+#[cfg(target_os = "macos")]
+#[test]
+fn verify_reports_the_immutable_flag_its_files_carry() {
+    use karyos_archive::integrity::copies::{CopyState, Enforcement};
+    struct Flagged(Vec<PathBuf>);
+    impl Drop for Flagged {
+        fn drop(&mut self) {
+            for file in &self.0 {
+                let _ = std::process::Command::new("chflags")
+                    .arg("nouchg")
+                    .arg(file)
+                    .status();
+            }
+        }
+    }
+    let archive = archive("copies-flagged");
+    let dir = archive.dir();
+    record_copies(
+        &dir,
+        &[(
+            ARCHIVE,
+            CopyState::Verified,
+            Enforcement::ImmutableAttribute,
+        )],
+    );
+    let prefix = format!("{RECORDING:016x}-");
+    let files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".seg"))
+        })
+        .collect();
+    assert!(!files.is_empty());
+    let flagged = Flagged(files);
+    for file in &flagged.0 {
+        let status = std::process::Command::new("chflags")
+            .arg("uchg")
+            .arg(file)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let (_, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    assert!(
+        out.contains(&format!(
+            "copy recording 3 [0, 48) location {} verified enforcement immutable_attribute observed immutable_attribute\n",
+            hex(&ARCHIVE)
+        )),
+        "{out}"
+    );
+    drop(flagged);
+}
+
 /// Opens the integrity journal of `dir`. An agent's shutdown releases the
 /// journal's lock, but `flock` belongs to the open file description: a
 /// child another test of this binary forks while the agent's file was open

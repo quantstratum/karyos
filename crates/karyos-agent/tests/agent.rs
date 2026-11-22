@@ -436,6 +436,7 @@ fn the_agent_lists_the_archive_catalog_of_a_driver() {
                 time_ns: 2,
                 reason: StopReason::Stopped,
                 incomplete: false,
+                closed_utc_ns: None,
             })
         },
         geometry: Geometry::new(MIN_TERM_LENGTH, 4 * u64::from(MIN_TERM_LENGTH)).unwrap(),

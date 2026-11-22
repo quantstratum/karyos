@@ -243,6 +243,7 @@ fn descriptor<'a>(correlation_id: u64, recording: &Listed) -> RecordingDescripto
                 time_ns: 2,
                 reason: StopReason::Stopped,
                 incomplete: false,
+                closed_utc_ns: None,
             })
         },
         geometry: Geometry::new(MIN_TERM_LENGTH, 4 * u64::from(MIN_TERM_LENGTH)).unwrap(),

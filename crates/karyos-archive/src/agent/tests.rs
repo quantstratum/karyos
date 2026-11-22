@@ -1432,6 +1432,46 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// karyos#1149: with sealing on, the Archive's own directory moved
+    /// while it runs refuses a group start, naming that directory, and
+    /// leaves no journal in the group's directory.
+    #[test]
+    fn a_group_is_refused_when_the_archives_directory_does_not_resolve() {
+        let dir = temp_dir("group-own-unresolved");
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let groups = temp_dir("group-own-unresolved-groups");
+        let moved = dir.with_file_name(format!(
+            "{}-moved",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::rename(&dir, &moved).unwrap();
+        match agent.start_group(start_group(&groups, Some(Capture::Strict))) {
+            Err(error @ AgentError::GroupDirectoryUnresolved { .. }) => {
+                // The text does not call the Archive's directory the
+                // group's.
+                assert!(
+                    error.to_string().contains("or the Archive's own"),
+                    "{error}"
+                );
+                let AgentError::GroupDirectoryUnresolved { dir: named, kind } = error else {
+                    unreachable!()
+                };
+                assert_eq!(named, dir);
+                assert_eq!(kind, std::io::ErrorKind::NotFound);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read_dir(&groups).unwrap().count(), 0);
+        std::fs::rename(&moved, &dir).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&groups).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// karyos#1112: with sealing on, a group whose journal directory is the
     /// Archive's own is refused at its start, naming the directory, and
     /// leaves no journal behind; with sealing off it starts.
@@ -4581,5 +4621,647 @@ fn a_verification_never_holds_a_replay() {
     assert_eq!(ranges.first().unwrap().start, 0);
     assert_eq!(ranges.last().unwrap().end, end);
     agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The answer to a posted retention command, waiting up to five seconds.
+fn answered<T>(posted: Result<Posted<T>, AgentError>) -> T {
+    let posted = posted.unwrap();
+    for _ in 0..5000 {
+        if let Some(answer) = posted.try_answer() {
+            return answer.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("no answer");
+}
+
+/// karyos#1093: with a retention policy, a purge runs through the
+/// retention engine against the recording's store: refused `legal_hold`
+/// under a hold, `not_expired` before its retention ran (a backdated
+/// segment time included: ADR-0093), `no_close_time` while it records, and
+/// `below_min_copies` without a verified copy elsewhere; with one, and the
+/// retention run, the recording is purged.
+#[test]
+fn a_configured_policy_purges_through_the_engine() {
+    use crate::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+    use crate::integrity::retention::{PurgeMode, RetentionPolicy};
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-policy");
+    let location = [5u8; 32];
+    let policy = |retain_for_ns| RetentionPolicy {
+        policy: 1,
+        version: 1,
+        retain_for_ns,
+        min_copies: std::num::NonZeroU32::MIN,
+        storage_tier: 0,
+        purge: PurgeMode::Manual,
+    };
+    let config = |retain_for_ns| {
+        sealing()
+            .with_copy_location(Some(location))
+            .with_retention_policy(Some(policy(retain_for_ns)))
+    };
+    let refused = |reason: &str| RetentionAnswer::Refused(reason.to_owned());
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config(3_600_000_000_000)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    assert_eq!(answered(agent.post_hold(id)), RetentionAnswer::Done);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        refused("legal_hold")
+    );
+    assert_eq!(answered(agent.post_release(id)), RetentionAnswer::Done);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 2, 9)),
+        refused("not_expired")
+    );
+    // ADR-0093: a backdated segment time never makes a purge early; the
+    // recorded close time stands.
+    let old = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|extension| extension == "seg") {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        answered(agent.post_purge(id, end, 5, 9)),
+        refused("not_expired")
+    );
+    // A recording that still records has no close time.
+    let drained = Arc::new(AtomicBool::new(false));
+    let live = agent
+        .start(start(Chunks {
+            chunks: vec![frames(1, 9)].into(),
+            drained: Arc::clone(&drained),
+            ..Chunks::default()
+        }))
+        .unwrap();
+    wait(&drained);
+    assert_eq!(
+        answered(agent.post_purge(live, 96, 6, 9)),
+        refused("no_close_time")
+    );
+    agent.shutdown().unwrap();
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config(0)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 3, 9)),
+        refused("below_min_copies")
+    );
+    agent.shutdown().unwrap();
+
+    // A verified copy elsewhere, as a replica's verification records it.
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    let mut copies = CopyCatalog::open(StdDisk, &dir, &mut journal).unwrap();
+    let local = copies.current().unwrap();
+    if local
+        .iter()
+        .any(|copy| copy.enforcement == Enforcement::ImmutableAttribute)
+    {
+        // Not expected under test: a purge would need the attribute's
+        // release, which this host's process may not have.
+        return;
+    }
+    copies
+        .record(
+            CopyRecord {
+                sequence: 0,
+                recording: id,
+                start: 0,
+                end,
+                location: [6u8; 32],
+                digest: crate::integrity::retention::seals_digest(&records, id, 0, end),
+                retain_until_ns: 0,
+                state: CopyState::Verified,
+                enforcement: Enforcement::Unsupported,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    drop(copies);
+    drop(journal);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, config(0)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 4, 9)),
+        RetentionAnswer::Done
+    );
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1093: a retention policy needs the copy catalog.
+#[test]
+fn a_policy_without_a_copy_location_is_refused() {
+    let dir = temp_dir("policy-no-copies");
+    let policy = crate::integrity::retention::RetentionPolicy {
+        policy: 1,
+        version: 1,
+        retain_for_ns: 0,
+        min_copies: std::num::NonZeroU32::MIN,
+        storage_tier: 0,
+        purge: crate::integrity::retention::PurgeMode::Manual,
+    };
+    let spawned =
+        ArchiveHandle::spawn(StdDisk, &dir, sealing().with_retention_policy(Some(policy)));
+    assert!(matches!(spawned, Err(AgentError::PolicyWithoutCopies)));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1124 review: a purge of a recording a verification reads is
+/// refused `verification_running`, so the worker never reads files being
+/// deleted; once the verification answers, the purge goes to the engine.
+#[test]
+fn a_purge_waits_for_the_verification_of_its_recording() {
+    use crate::integrity::retention::{PurgeMode, RetentionPolicy};
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-while-verifying");
+    let gate = Arc::new(AtomicBool::new(true));
+    let policy = RetentionPolicy {
+        policy: 1,
+        version: 1,
+        retain_for_ns: 3_600_000_000_000,
+        min_copies: std::num::NonZeroU32::MIN,
+        storage_tier: 0,
+        purge: PurgeMode::Manual,
+    };
+    let config = sealing()
+        .with_copy_location(Some([5u8; 32]))
+        .with_retention_policy(Some(policy));
+    let agent = ArchiveHandle::spawn(GatedVerify(Arc::clone(&gate)), &dir, config).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    let verify = agent.post_verify(id).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        RetentionAnswer::Refused(super::retention::VERIFICATION_RUNNING.to_owned())
+    );
+    gate.store(false, Ordering::Release);
+    for _ in 0..5000 {
+        if verify.try_answer().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The flag clears just after the answer is sent.
+    let mut answer = RetentionAnswer::Done;
+    for request in 2..5000 {
+        answer = answered(agent.post_purge(id, end, request, 9));
+        if answer != RetentionAnswer::Refused(super::retention::VERIFICATION_RUNNING.to_owned()) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(answer, RetentionAnswer::Refused("not_expired".to_owned()));
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A disk that counts modification time reads and, while `immutable` is
+/// set, refuses to open a segment data file for writing, as the immutable
+/// attribute a local copy sets does (karyos#1121 review).
+#[derive(Clone, Default)]
+struct Probe {
+    immutable: Arc<AtomicBool>,
+    /// While set, a segment data file cannot be opened at all.
+    unreadable: Arc<AtomicBool>,
+    modified: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Disk for Probe {
+    type File = std::fs::File;
+
+    fn modified(&mut self, path: &Path) -> std::io::Result<u64> {
+        self.modified.fetch_add(1, Ordering::AcqRel);
+        StdDisk.modified(path)
+    }
+
+    fn create(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        StdDisk.create(path)
+    }
+
+    fn create_new(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        StdDisk.create_new(path)
+    }
+
+    fn open(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        if self.immutable.load(Ordering::Acquire)
+            && path.extension().is_some_and(|extension| extension == "seg")
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        StdDisk.open(path)
+    }
+
+    fn open_read(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        if self.unreadable.load(Ordering::Acquire)
+            && path.extension().is_some_and(|extension| extension == "seg")
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        StdDisk.open_read(path)
+    }
+
+    fn write_at(&mut self, file: &Self::File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        StdDisk.write_at(file, offset, bytes)
+    }
+
+    fn read_at(&mut self, file: &Self::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        StdDisk.read_at(file, offset, buf)
+    }
+
+    fn len(&mut self, file: &Self::File) -> std::io::Result<u64> {
+        StdDisk.len(file)
+    }
+
+    fn set_len(&mut self, file: &Self::File, len: u64) -> std::io::Result<()> {
+        StdDisk.set_len(file, len)
+    }
+
+    fn sync(&mut self, file: &Self::File) -> std::io::Result<()> {
+        StdDisk.sync(file)
+    }
+
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        StdDisk.sync_dir(dir)
+    }
+
+    fn list(&mut self, dir: &Path) -> std::io::Result<Vec<String>> {
+        StdDisk.list(dir)
+    }
+
+    fn remove(&mut self, path: &Path) -> std::io::Result<()> {
+        StdDisk.remove(path)
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        StdDisk.rename(from, to)
+    }
+
+    fn lock(&mut self, file: &Self::File) -> std::io::Result<()> {
+        StdDisk.lock(file)
+    }
+}
+
+/// A purge policy of `retain_for_ns` with one copy required, and the
+/// sealing config that carries it with a copy location.
+fn purge_config(retain_for_ns: u64) -> AgentConfig {
+    use crate::integrity::retention::{PurgeMode, RetentionPolicy};
+    sealing()
+        .with_copy_location(Some([5u8; 32]))
+        .with_retention_policy(Some(RetentionPolicy {
+            policy: 1,
+            version: 1,
+            retain_for_ns,
+            min_copies: std::num::NonZeroU32::MIN,
+            storage_tier: 0,
+            purge: PurgeMode::Manual,
+        }))
+}
+
+/// Records a verified copy of `id`'s `[0, end)` at another location, as a
+/// replica's verification does; false when the local copy took the
+/// immutable attribute, which this host's process may not release.
+fn copy_elsewhere(dir: &Path, id: u64, end: u64) -> bool {
+    use crate::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+    let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    let mut copies = CopyCatalog::open(StdDisk, dir, &mut journal).unwrap();
+    if copies
+        .current()
+        .unwrap()
+        .iter()
+        .any(|copy| copy.enforcement == Enforcement::ImmutableAttribute)
+    {
+        return false;
+    }
+    copies
+        .record(
+            CopyRecord {
+                sequence: 0,
+                recording: id,
+                start: 0,
+                end,
+                location: [6u8; 32],
+                digest: crate::integrity::retention::seals_digest(&records, id, 0, end),
+                retain_until_ns: 0,
+                state: CopyState::Verified,
+                enforcement: Enforcement::Unsupported,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    true
+}
+
+/// The segment data files in `dir`, each with its length.
+fn segment_lengths(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files: Vec<(PathBuf, u64)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "seg"))
+        .map(|path| {
+            let length = std::fs::metadata(&path).unwrap().len();
+            (path, length)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// karyos#1121 review: segments a local copy made immutable cannot be
+/// opened for writing, so a purge validates against a read-only view of
+/// the stopped store and still reaches the engine, which purges.
+#[test]
+fn a_purge_opens_immutable_segments_read_only() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-immutable");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    if !copy_elsewhere(&dir, id, end) {
+        return;
+    }
+    let probe = Probe::default();
+    let agent = ArchiveHandle::spawn(probe.clone(), &dir, purge_config(0)).unwrap();
+    probe.immutable.store(true, Ordering::Release);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        RetentionAnswer::Done
+    );
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1121 review: a purge refused under a legal hold changes no
+/// file, even of a recording whose tail recovery would cut: the refusal
+/// path never runs a destructive recovery.
+#[test]
+fn a_refused_purge_never_cuts_a_damaged_tail() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-damaged-hold");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    // Bytes past the last indexed write: recovery would cut them.
+    let (last, _) = segment_lengths(&dir).pop().unwrap();
+    let length = std::fs::metadata(&last).unwrap().len();
+    std::fs::File::options()
+        .write(true)
+        .open(&last)
+        .unwrap()
+        .set_len(length + 64)
+        .unwrap();
+    let before = segment_lengths(&dir);
+    assert_eq!(answered(agent.post_hold(id)), RetentionAnswer::Done);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        RetentionAnswer::Refused("legal_hold".to_owned())
+    );
+    assert_eq!(segment_lengths(&dir), before);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1121 review: a cutoff past the recording's written end is
+/// refused `not_a_write_start` before any segment file is listed, however
+/// far past it lies.
+#[test]
+fn a_cutoff_past_the_written_end_lists_no_file() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-past-end");
+    let probe = Probe::default();
+    let agent = ArchiveHandle::spawn(probe.clone(), &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    // A thousand segments of the test geometry past the end.
+    let past = end + 1000 * 8192;
+    for (request, before) in [(1, end + 1), (2, past), (3, u64::MAX)] {
+        let read = probe.modified.load(Ordering::Acquire);
+        assert_eq!(
+            answered(agent.post_purge(id, before, request, 9)),
+            RetentionAnswer::Refused("not_a_write_start".to_owned())
+        );
+        assert_eq!(probe.modified.load(Ordering::Acquire), read, "{before}");
+    }
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Journals a purge intent of `id` before `before`, as a purge does right
+/// before its deletion, from start 0.
+fn journal_intent(dir: &Path, request: u64, id: u64, before: u64) {
+    use crate::integrity::retention::{
+        OPERATION_LENGTH, OPERATIONS_FILE, Operation, OperationsJournal, PurgeSource,
+    };
+    let mut operations =
+        Ledger::<StdDisk, OPERATION_LENGTH>::open(StdDisk, dir, OPERATIONS_FILE).unwrap();
+    OperationsJournal::append(
+        &mut operations,
+        &Operation::PurgeIntent {
+            id: request,
+            recording: id,
+            before,
+            operator: 9,
+            closed_ns: 1,
+            source: PurgeSource::Operator,
+            from: 0,
+        },
+    )
+    .unwrap();
+}
+
+/// karyos#1121 review: a crash after a purge advanced the store's floor
+/// but before its integrity purge record leaves the intent outstanding.
+/// The next start reconciles it before serving any request: the purge
+/// record is written and the intent completes, so its id is free again.
+#[test]
+fn a_start_records_a_purge_a_crash_left_unrecorded() {
+    use crate::integrity::SealKind;
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-crash-recorded");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    journal_intent(&dir, 1, id, end);
+    let recording = Catalog::open(StdDisk, &dir)
+        .unwrap()
+        .catalog
+        .get(id)
+        .cloned()
+        .unwrap();
+    let mut store = SegmentStore::recover(StdDisk, &dir, id, recording.geometry, recording.policy)
+        .unwrap()
+        .store;
+    assert_eq!(store.purge_before(end).unwrap(), end);
+    drop(store);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let answer = answered(agent.post_purge(id, end, 1, 9));
+    assert_ne!(answer, RetentionAnswer::Refused("duplicate_id".to_owned()));
+    agent.shutdown().unwrap();
+    let records = IntegrityJournal::open(StdDisk, &dir)
+        .unwrap()
+        .journal
+        .records()
+        .unwrap();
+    assert!(records.iter().any(|record| record.kind == SealKind::Purge
+        && record.subject == id
+        && record.start == 0
+        && record.end == end));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1121 review: an intent a crash left before its deletion is
+/// rechecked at the next start against the holds now in force: under a
+/// hold it is cancelled and nothing is deleted, so a retry of its id is
+/// answered `legal_hold`, never `duplicate_id`.
+#[test]
+fn a_start_cancels_an_unfinished_purge_under_a_hold() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-crash-held");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    assert_eq!(answered(agent.post_hold(id)), RetentionAnswer::Done);
+    agent.shutdown().unwrap();
+    journal_intent(&dir, 7, id, end);
+    let before = segment_lengths(&dir);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 7, 9)),
+        RetentionAnswer::Refused("legal_hold".to_owned())
+    );
+    assert_eq!(segment_lengths(&dir), before);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1121 review: a held recording whose segment files cannot be
+/// opened is answered `legal_hold`, never the store's error: holds are
+/// checked before the store is opened.
+#[test]
+fn a_held_purge_is_refused_before_the_store_opens() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-held-unreadable");
+    let probe = Probe::default();
+    let agent = ArchiveHandle::spawn(probe.clone(), &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    assert_eq!(answered(agent.post_hold(id)), RetentionAnswer::Done);
+    probe.unreadable.store(true, Ordering::Release);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        RetentionAnswer::Refused("legal_hold".to_owned())
+    );
+    probe.unreadable.store(false, Ordering::Release);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1121 review: a purge a crash left before its deletion is
+/// rechecked at the next start against the segments' modification times
+/// as they are now, not the close time its intent saved (ADR-0093,
+/// decision 3): segments written within the retention keep it unexpired,
+/// so the intent is cancelled and nothing is deleted.
+#[test]
+fn a_resumed_purge_rechecks_the_segment_times() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-crash-mtime");
+    let hour = 3_600_000_000_000;
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(hour)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    if !copy_elsewhere(&dir, id, end) {
+        return;
+    }
+    // The intent saved a close time long past.
+    journal_intent(&dir, 3, id, end);
+    let before = segment_lengths(&dir);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(hour)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 3, 9)),
+        RetentionAnswer::Refused("not_expired".to_owned())
+    );
+    assert_eq!(segment_lengths(&dir), before);
+    assert!(
+        !dir.join(format!("{id:016x}.floor")).exists(),
+        "the floor never moved"
+    );
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1121 review: a crash inside a purge's removal, after its floor
+/// moved, leaves segments below the floor. The next start removes them
+/// before it records the purge done.
+#[test]
+fn a_start_removes_the_segments_a_crash_left_below_the_floor() {
+    let dir = temp_dir("purge-crash-left");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    // Four writes of 2880 bytes: two segments of the test geometry.
+    let chunks: Vec<Vec<u8>> = (1..=4).map(|fill| frames(30, fill)).collect();
+    let id = agent
+        .start(start(Chunks {
+            chunks: chunks.into(),
+            seal: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    agent.shutdown().unwrap();
+    let cutoff = 3 * 2880;
+    let first = segment_lengths(&dir).first().unwrap().0.clone();
+    let index = first.with_extension("idx");
+    let (data_bytes, index_bytes) = (
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&index).unwrap(),
+    );
+    journal_intent(&dir, 1, id, cutoff);
+    let recording = Catalog::open(StdDisk, &dir)
+        .unwrap()
+        .catalog
+        .get(id)
+        .cloned()
+        .unwrap();
+    let mut store = SegmentStore::recover(StdDisk, &dir, id, recording.geometry, recording.policy)
+        .unwrap()
+        .store;
+    assert_eq!(store.purge_before(cutoff).unwrap(), cutoff);
+    drop(store);
+    // The crash cut the removal short: the first segment is still there.
+    assert!(!first.exists());
+    std::fs::write(&first, data_bytes).unwrap();
+    std::fs::write(&index, index_bytes).unwrap();
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    agent.shutdown().unwrap();
+    assert!(!first.exists(), "the data file left below the floor");
+    assert!(!index.exists(), "the index file left below the floor");
     std::fs::remove_dir_all(&dir).unwrap();
 }
