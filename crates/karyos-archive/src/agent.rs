@@ -773,7 +773,9 @@ pub enum AgentError {
     /// (`std::fs::canonicalize` failed): the two cannot be told apart, so
     /// the group is refused before its journal exists (karyos#1140,
     /// karyos#1149). `dir` names the one that did not resolve.
-    #[error("group journal directory {dir:?} does not resolve: {kind}")]
+    #[error(
+        "directory {dir:?} (the group journal's or the Archive's own) does not resolve: {kind}"
+    )]
     GroupDirectoryUnresolved {
         /// The directory as given.
         dir: PathBuf,

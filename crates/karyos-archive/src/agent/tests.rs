@@ -1450,7 +1450,16 @@ mod groups {
         ));
         std::fs::rename(&dir, &moved).unwrap();
         match agent.start_group(start_group(&groups, Some(Capture::Strict))) {
-            Err(AgentError::GroupDirectoryUnresolved { dir: named, kind }) => {
+            Err(error @ AgentError::GroupDirectoryUnresolved { .. }) => {
+                // The text does not call the Archive's directory the
+                // group's.
+                assert!(
+                    error.to_string().contains("or the Archive's own"),
+                    "{error}"
+                );
+                let AgentError::GroupDirectoryUnresolved { dir: named, kind } = error else {
+                    unreachable!()
+                };
                 assert_eq!(named, dir);
                 assert_eq!(kind, std::io::ErrorKind::NotFound);
             }
