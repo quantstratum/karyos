@@ -125,6 +125,69 @@ fn serve(
     thread
 }
 
+/// A driver serving `dir` on its own thread with one guarded concurrent
+/// stream (`H = 2`, `C_m = 4`) whose rate policy allows a burst of two
+/// messages per handle, open at epoch 2, until `stop`; it closes the guard
+/// when `close` receives (karyos#1102 (e), ADR-0092).
+fn serve_concurrent(
+    dir: &Path,
+    stop: Arc<AtomicBool>,
+    close: mpsc::Receiver<()>,
+) -> std::thread::JoinHandle<()> {
+    let (ready, started) = mpsc::channel();
+    let dir = dir.to_path_buf();
+    let thread = std::thread::spawn(move || {
+        let timeout = 5_000_000_000;
+        let mut driver: EmbeddedDriver<SharedTerms> = EmbeddedDriver::with_ipc(
+            DriverConfig::default(),
+            IpcConfig {
+                dir,
+                max_pending_hellos: 4,
+                hello_timeout: timeout,
+                max_outbound_per_client: 16,
+                fetch_deadline: timeout,
+                max_exports_per_client: 16,
+                max_fetches_per_client: 4,
+                max_regions_per_fetch: 4,
+                max_fetch_bytes: 1 << 30,
+                max_tools: karyos_driver::DEFAULT_MAX_TOOLS,
+            },
+            Box::new(SystemClock::new()),
+        )
+        .unwrap();
+        let mut config = stream_config();
+        config.buffer.max_reserved = MIN_TERM_LENGTH / 32;
+        config.buffer.publication = PublicationMode::Concurrent {
+            publishers: 2,
+            allow_non_lse: true,
+        };
+        let stream = driver.add_stream(config).unwrap();
+        let guard = driver.add_guard("orders").unwrap();
+        // One message a second, a burst of two: each handle's copy admits
+        // two at once, then refuses for now.
+        let rate = karyos_driver::GuardRate::publication(karyos_sys::rate_limit::RatePolicy {
+            messages: karyos_sys::rate_limit::Rate {
+                per_second: 1,
+                burst: 2,
+            },
+            bytes: None,
+        });
+        driver.guard_stream(stream, guard, 4, Some(rate)).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let _subscriber = driver.subscribe(stream, Role::Optional).unwrap();
+        ready.send(()).unwrap();
+        while !stop.load(Ordering::Relaxed) {
+            if close.try_recv().is_ok() {
+                let _ = driver.close_guard(guard, 2).unwrap();
+            }
+            let _ = driver.do_work().unwrap();
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    });
+    started.recv().unwrap();
+    thread
+}
+
 /// How long one wait may take: generous, as a loaded runner can starve the
 /// driver's thread (karyos #526); each wait ends when its condition holds.
 const WAIT: Duration = Duration::from_secs(30);
@@ -214,6 +277,94 @@ fn a_remote_guarded_publication_reads_its_outcomes_over_the_c_abi() {
     assert_eq!(records.last().map(|record| record.kind), Some(ENDED));
 
     assert_eq!(abi::publication_close(publication), 0);
+    assert_eq!(abi::client_close(client), 0);
+    stop.store(true, Ordering::Relaxed);
+    driver.join().unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `KARYOS_E_RATE_LIMITED`.
+const RATE_LIMITED: i32 = 6;
+
+/// The accepted position of an offer of `data` on lane 0 of `publication`.
+fn offered(publication: u64, data: &[u8]) -> u64 {
+    let (status, accepted) = abi::publication_offer_on(publication, 0, data, 16);
+    assert_eq!(status, 0);
+    abi::accepted_fields(&accepted).unwrap().1
+}
+
+/// A staged claim of `data` on lane 0, committed: the commit's status.
+fn claimed(publication: u64, data: &[u8]) -> i32 {
+    let length = u32::try_from(data.len()).unwrap();
+    // A concurrent handle stages the claim; its commit reserves, so the
+    // commit reports the refusal.
+    let (status, claim) = abi::publication_claim_filled(publication, 0, length, data);
+    assert_eq!(status, 0);
+    abi::claim_commit(claim, 16).0
+}
+
+/// karyos#1102 (e), review of #1161: two concurrent handles of a guarded
+/// stream acquired through `karyos_client_add_concurrent_publication` from
+/// a remote client each read exactly their own lane 0 `SUBMITTED` records.
+/// Past its rate copy, an offer and a staged claim's commit are
+/// `KARYOS_E_RATE_LIMITED`; once the guard closes, both are
+/// `KARYOS_E_GATED`.
+#[test]
+fn remote_concurrent_guarded_handles_over_the_c_abi() {
+    let dir = dir("concurrent");
+    let stop = Arc::new(AtomicBool::new(false));
+    let (close, closing) = mpsc::channel();
+    let driver = serve_concurrent(&dir, Arc::clone(&stop), closing);
+    let path = CString::new(dir.to_str().unwrap()).unwrap();
+    let (status, client, _) = abi::client_connect(&path);
+    assert_eq!(status, 0);
+    let (status, a) = abi::client_add_ipc_concurrent_publication(client, STREAM);
+    assert_eq!(status, 0);
+    let (status, b) = abi::client_add_ipc_concurrent_publication(client, STREAM);
+    assert_eq!(status, 0);
+
+    let a1 = offered(a, b"a1");
+    let b1 = offered(b, b"b1");
+    let a2 = offered(a, b"a2");
+    // A's copy of the burst is spent: an offer and a staged commit refuse
+    // for now, and reserve nothing.
+    assert_eq!(abi::publication_offer(a, b"a3"), RATE_LIMITED);
+    assert_eq!(claimed(a, b"a4"), RATE_LIMITED);
+
+    let starts = |records: &[abi::Outcome]| {
+        records
+            .iter()
+            .map(|record| (record.kind, record.start))
+            .collect::<Vec<_>>()
+    };
+    let seen_a = outcomes_until(a, "A's two SUBMITTED", |records| records.len() >= 2);
+    assert_eq!(starts(&seen_a), [(SUBMITTED, a1), (SUBMITTED, a2)]);
+    let seen_b = outcomes_until(b, "B's SUBMITTED", |records| !records.is_empty());
+    assert_eq!(starts(&seen_b), [(SUBMITTED, b1)]);
+    assert_eq!(abi::publication_poll_outcomes(b, 1, 64).0, INVALID_LANE);
+
+    // The guard closes: B is gated, offer and staged commit.
+    close.send(()).unwrap();
+    let start = Instant::now();
+    loop {
+        match abi::publication_offer(b, b"late") {
+            GATED => break,
+            // Accepted, or rate limited, before the driver applied the
+            // close.
+            status => assert!(
+                (status == 0 || status == RATE_LIMITED) && start.elapsed() < WAIT,
+                "never gated: {status}"
+            ),
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    assert_eq!(claimed(b, b"later"), GATED);
+    for publication in [a, b] {
+        let _ = outcomes_until(publication, "ENDED", |records| {
+            records.iter().any(|record| record.kind == ENDED)
+        });
+        assert_eq!(abi::publication_close(publication), 0);
+    }
     assert_eq!(abi::client_close(client), 0);
     stop.store(true, Ordering::Relaxed);
     driver.join().unwrap();

@@ -101,6 +101,9 @@ fn concurrent_offered(outcome: ConcurrentOfferOutcome) -> Result<Placed, OfferEr
             Err(OfferError::Aborted { lane, position })
         }
         ConcurrentOfferOutcome::Closed => Err(OfferError::Closed),
+        // A guarded concurrent handle (ADR-0092), as an exclusive one's.
+        ConcurrentOfferOutcome::Gated => Err(OfferError::Gated),
+        ConcurrentOfferOutcome::RateLimited => Err(OfferError::RateLimited),
         _ => Err(OfferError::Client(ClientError::Unknown)),
     }
 }
@@ -167,7 +170,8 @@ impl Lanes {
 
     /// Delivers up to `limit` outcome records of `lane` to `handler`
     /// (F7a-2): a lane that is not guarded has none. A concurrent handle
-    /// is never guarded (GC-7): lane 0 has none, any other is invalid.
+    /// has lane 0 only: a guarded one's records are its own blocks' in the
+    /// incarnation's shared ring (ADR-0092), any other lane is invalid.
     pub(super) fn poll_outcomes_on(
         &mut self,
         lane: Lane,
@@ -176,11 +180,11 @@ impl Lanes {
     ) -> Result<usize, OfferError> {
         lanes!(self,
         publication => publication.poll_outcomes_on(lane, limit, handler),
-        _handle => {
+        handle => {
             if lane != Lane::ZERO {
                 return Err(OfferError::InvalidLane { lane });
             }
-            Ok(0)
+            Ok(handle.poll_outcomes(limit, handler)?)
         })
     }
 
@@ -234,6 +238,8 @@ impl Lanes {
                     return Err(OfferError::Aborted { lane, position });
                 }
                 ConcurrentClaimOutcome::Closed => return Err(OfferError::Closed),
+                ConcurrentClaimOutcome::Gated => return Err(OfferError::Gated),
+                ConcurrentClaimOutcome::RateLimited => return Err(OfferError::RateLimited),
                 _ => return Err(OfferError::Client(ClientError::Unknown)),
             };
             for (byte, staged) in claim.payload().iter_mut().zip(staged) {
@@ -399,6 +405,26 @@ pub(crate) fn insert_local(
 ) -> Result<Handle, Failure> {
     with_client(client, |entry| {
         insert(client, entry, Lanes::Embedded(publication))
+    })?
+}
+
+/// As [`insert_local`], for a concurrent handle the driver issued in
+/// process, guarded or not (ADR-0092).
+///
+/// # Errors
+///
+/// As [`insert_local`].
+#[cfg(test)]
+pub(crate) fn insert_local_concurrent(
+    client: Handle,
+    publication: karyos_client::ClientConcurrentPublication<HeapTerms>,
+) -> Result<Handle, Failure> {
+    with_client(client, |entry| {
+        insert(
+            client,
+            entry,
+            Lanes::ConcurrentEmbedded(Box::new(publication)),
+        )
     })?
 }
 

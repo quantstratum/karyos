@@ -321,8 +321,8 @@ fn closing_a_local_publication_drops_its_handle() {
     assert_eq!(karyos_client_close(guarded.client), Status::Ok.code());
 }
 
-/// A concurrent handle is never guarded: lane 0 has no records, and every
-/// other lane is invalid (GC-7).
+/// An unguarded concurrent handle has no records on lane 0, and every
+/// other lane is invalid.
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
 fn a_concurrent_handle_has_no_records() {
@@ -349,6 +349,83 @@ fn a_concurrent_handle_has_no_records() {
         (Status::InvalidLane.code(), 0)
     );
     assert_eq!(karyos_client_close(client), Status::Ok.code());
+}
+
+/// karyos#1102 (e), ADR-0092: two guarded concurrent handles of one
+/// stream through the C ABI each poll exactly their own `SUBMITTED`
+/// records on lane 0; once the guard closes, an offer is `KARYOS_E_GATED`
+/// and each reads the incarnation's `ENDED` record. Lane 1 stays invalid.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn guarded_concurrent_handles_poll_their_own_records() {
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let mut config = stream_config(STREAM);
+    config.buffer.spare_slots = 6;
+    config.buffer.max_reserved = karyos_sys::sizing::MIN_TERM_LENGTH / 16;
+    config.buffer.publication = karyos_sys::log_buffer::PublicationMode::Concurrent {
+        publishers: 2,
+        allow_non_lse: true,
+    };
+    let stream = driver.add_stream(config).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    driver.guard_stream(stream, guard, 2, None).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let first = driver.concurrent_publication(stream).unwrap();
+    let second = driver.concurrent_publication(stream).unwrap();
+    let client = client::insert_embedded(Client::with_conductor(
+        patient(driver.connect().unwrap()),
+        test_context(),
+    ))
+    .unwrap();
+    let a = api::publication::insert_local_concurrent(client, first)
+        .unwrap()
+        .raw();
+    let b = api::publication::insert_local_concurrent(client, second)
+        .unwrap()
+        .raw();
+    let (status, a1) = offer(a, b"a1");
+    assert_eq!(status, Status::Ok.code());
+    let (status, b1) = offer(b, b"b1");
+    assert_eq!(status, Status::Ok.code());
+    let (status, a2) = offer(a, b"a2");
+    assert_eq!(status, Status::Ok.code());
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    let starts = |publication: u64| {
+        let mut records = Vec::new();
+        let (status, _) = poll(publication, 0, 64, &mut records);
+        assert_eq!(status, 0);
+        records
+            .iter()
+            .map(|record| (record.kind, record.start))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        starts(a),
+        [
+            (OUTCOME_SUBMITTED, a1.position),
+            (OUTCOME_SUBMITTED, a2.position)
+        ]
+    );
+    assert_eq!(starts(b), [(OUTCOME_SUBMITTED, b1.position)]);
+    assert_eq!(
+        poll(a, 1, 64, &mut Vec::new()),
+        (Status::InvalidLane.code(), 0)
+    );
+    let _ = driver.close_guard(guard, 2).unwrap();
+    assert_eq!(offer(a, b"late").0, Status::Gated.code());
+    for _ in 0..3 {
+        let _ = driver.do_work().unwrap();
+    }
+    for publication in [a, b] {
+        assert!(
+            starts(publication)
+                .iter()
+                .any(|(kind, _)| *kind == OUTCOME_ENDED)
+        );
+    }
+    assert_eq!(karyos_client_close(client.raw()), Status::Ok.code());
 }
 
 /// A client of the embedded driver's in-process command ring has no grant
