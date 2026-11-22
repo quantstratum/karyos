@@ -13,6 +13,9 @@
 //! archive <64 hex digits>     the Archive's identity
 //! authority <64 hex digits>   an authority public key (one or more)
 //! journal <id>                the journal's identity (default 0)
+//! time-journal <id>           the time evidence journal's identity, another
+//!                             than the journal's (default the journal's
+//!                             plus one)
 //! local <64 hex digits>       a store on this host, never external
 //! anchors <64 hex digits>     an Archive this one anchors (circular)
 //! ```
@@ -66,8 +69,9 @@ Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]...
                  tamper-evidence statement; every other outcome is
                  unverifiable (C-EXTRACT)
   --trust FILE   the trust supplied outside the export: lines
-                 `archive HEX`, `authority HEX`, `journal N`, `local HEX`,
-                 `anchors HEX`; without it nothing is trusted
+                 `archive HEX`, `authority HEX`, `journal N`,
+                 `time-journal N`, `local HEX`, `anchors HEX`; without
+                 it nothing is trusted
   --anchors HEX=DIR
                  an operator export store of anchors (DIR/anchors.kya)
                  at the location HEX (64 hex digits), stated by the
@@ -198,6 +202,10 @@ pub enum TrustError {
     /// No `authority` line.
     #[error("the trust file names no authority")]
     NoAuthority,
+    /// The time evidence journal's identity is the journal's, or none
+    /// follows a `journal` of `u64::MAX` by default (karyos#1128).
+    #[error("the time evidence journal needs a journal id of its own")]
+    TimeJournal,
 }
 
 /// A recording's store that cannot be opened or read.
@@ -388,7 +396,8 @@ pub struct TimeReport {
 
 /// The time verdict of `args.dir`'s entries against its requirement,
 /// `None` without one. The entries' own integrity is verified under the
-/// same trust and anchors; an entry not verified is `no_evidence`.
+/// same trust, as the trust file's `time-journal`, with `time_anchors`;
+/// an entry not verified is `no_evidence`.
 ///
 /// # Errors
 ///
@@ -408,13 +417,16 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
         Vec::new()
     } else {
         let anchors = args.time_anchors.clone();
-        let checked = run_checks(&VerifyArgs {
-            dir: dir.clone(),
-            anchors,
-            time_requirement: None,
-            time_anchors: Vec::new(),
-            ..args.clone()
-        })?;
+        let checked = run_checks_of(
+            &VerifyArgs {
+                dir: dir.clone(),
+                anchors,
+                time_requirement: None,
+                time_anchors: Vec::new(),
+                ..args.clone()
+            },
+            Chain::TimeEvidence,
+        )?;
         checked
             .ranges
             .iter()
@@ -520,11 +532,24 @@ pub(crate) fn hex32(text: &str) -> Result<[u8; 32], HexError> {
 ///
 /// # Errors
 ///
-/// The first malformed line, or a missing archive or authority.
+/// As [`parse_trust_journals`].
 pub fn parse_trust(text: &str) -> Result<(TrustRoot, Externality, u64), TrustError> {
+    parse_trust_journals(text).map(|(trust, externality, journal, _)| (trust, externality, journal))
+}
+
+/// [`parse_trust`], with the time evidence journal's identity last
+/// (karyos#1128): `time-journal N`, by default the journal's plus one.
+///
+/// # Errors
+///
+/// The first malformed line, a missing archive or authority, and
+/// [`TrustError::TimeJournal`] for a time evidence journal with the
+/// journal's identity.
+pub fn parse_trust_journals(text: &str) -> Result<(TrustRoot, Externality, u64, u64), TrustError> {
     let mut archive = None;
     let mut authorities: Vec<[u8; PUBLIC_KEY_LENGTH]> = Vec::new();
     let mut journal = 0u64;
+    let mut time_journal = None;
     let mut externality = Externality::default();
     for (number, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -548,6 +573,13 @@ pub fn parse_trust(text: &str) -> Result<(TrustRoot, Externality, u64), TrustErr
                     .parse()
                     .map_err(|_| at(LineError::JournalId(value.to_owned())))?;
             }
+            "time-journal" => {
+                time_journal = Some(
+                    value
+                        .parse()
+                        .map_err(|_| at(LineError::JournalId(value.to_owned())))?,
+                );
+            }
             "local" => {
                 externality.local_locations.insert(hex(value)?);
             }
@@ -561,6 +593,10 @@ pub fn parse_trust(text: &str) -> Result<(TrustRoot, Externality, u64), TrustErr
     if authorities.is_empty() {
         return Err(TrustError::NoAuthority);
     }
+    let time_journal = time_journal
+        .or_else(|| journal.checked_add(1))
+        .filter(|&time| time != journal)
+        .ok_or(TrustError::TimeJournal)?;
     externality.local_archive = archive_id;
     Ok((
         TrustRoot {
@@ -569,6 +605,7 @@ pub fn parse_trust(text: &str) -> Result<(TrustRoot, Externality, u64), TrustErr
         },
         externality,
         journal,
+        time_journal,
     ))
 }
 
@@ -676,6 +713,22 @@ impl Stores {
 /// An I/O error, a malformed trust file, or a store that cannot be
 /// opened or read.
 pub fn run_checks(args: &VerifyArgs) -> Result<Verification, VerifyError> {
+    run_checks_of(args, Chain::Integrity)
+}
+
+/// Which journal of the trust file a directory's chain is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chain {
+    /// The integrity journal, `journal`.
+    Integrity,
+    /// The time evidence entries' journal, `time-journal` (karyos#1128).
+    TimeEvidence,
+}
+
+/// [`run_checks`] of `args.dir` as the journal `chain`: its heads and
+/// anchors must name that journal's identity, so another chain's anchor
+/// is refused as `WrongJournal`.
+fn run_checks_of(args: &VerifyArgs, chain: Chain) -> Result<Verification, VerifyError> {
     let dir = &args.dir;
     let at = |source: io::Error| VerifyError::Io {
         path: dir.clone(),
@@ -693,11 +746,15 @@ pub fn run_checks(args: &VerifyArgs) -> Result<Verification, VerifyError> {
                 path: path.clone(),
                 source,
             })?;
-            let (trust, externality, journal) =
-                parse_trust(&text).map_err(|source| VerifyError::Trust {
+            let (trust, externality, journal, time_journal) =
+                parse_trust_journals(&text).map_err(|source| VerifyError::Trust {
                     path: path.clone(),
                     source,
                 })?;
+            let journal = match chain {
+                Chain::Integrity => journal,
+                Chain::TimeEvidence => time_journal,
+            };
             (Some(trust), externality, journal)
         }
         None => (None, Externality::default(), 0),

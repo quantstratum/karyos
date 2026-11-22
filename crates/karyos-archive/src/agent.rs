@@ -700,6 +700,10 @@ pub enum AgentError {
     /// The entries could not be written.
     #[error(transparent)]
     TimeEvidence(#[from] crate::integrity::time_evidence::StoreError),
+    /// The time evidence entries' journal was given the integrity
+    /// journal's identity: each chain needs its own (karyos#1128).
+    #[error("the time evidence journal needs a journal id of its own")]
+    SharedJournalId,
     /// Head signing was asked for without a `seal_interval`: there would
     /// be no seals to sign.
     #[error("head signing needs a seal_interval")]
@@ -1033,6 +1037,12 @@ impl ArchiveHandle {
     {
         if signing.is_some() && config.seal_interval.is_none() {
             return Err(AgentError::SigningWithoutSealing);
+        }
+        if signing
+            .as_ref()
+            .is_some_and(|signing| signing.time_evidence_journal_id == signing.journal_id)
+        {
+            return Err(AgentError::SharedJournalId);
         }
         let (commands, inbox) = mpsc::sync_channel(config.command_capacity);
         let (events_in, events) = mpsc::sync_channel(config.event_capacity);
@@ -1986,7 +1996,11 @@ impl<D: Disk> Integrity<D> {
         let mut journal = IntegrityJournal::open(disk.clone(), dir)?.journal;
         let (signing, shared) = match signing {
             Some(setup) => {
-                let parts = (setup.trust.clone(), setup.journal_id, setup.config);
+                let parts = (
+                    setup.trust.clone(),
+                    setup.time_evidence_journal_id,
+                    setup.config,
+                );
                 let signing =
                     Signing::open(disk.clone(), dir, setup, &mut journal, Arc::clone(counts))?;
                 let signer = Arc::clone(&signing.signer);
@@ -2108,6 +2122,10 @@ pub struct ArchiveSigning {
     pub trust: TrustRoot,
     /// The integrity journal's identity within the Archive.
     pub journal_id: u64,
+    /// The identity of the time evidence entries' journal (karyos#1128),
+    /// another than `journal_id`: a head of one chain never stands for the
+    /// other's, and an anchor of one is refused for the other.
+    pub time_evidence_journal_id: u64,
     /// The `anchor_interval` and backlog policy.
     pub config: SigningConfig,
     /// The signer. It is asked from the agent's control path and must not
@@ -2119,6 +2137,7 @@ impl std::fmt::Debug for ArchiveSigning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArchiveSigning")
             .field("journal_id", &self.journal_id)
+            .field("time_evidence_journal_id", &self.time_evidence_journal_id)
             .field("config", &self.config)
             .finish_non_exhaustive()
     }
