@@ -826,29 +826,29 @@ fn guarded_grant(records: &[Record]) -> bool {
     let Some(first) = buffers.first() else {
         return false;
     };
-    buffers
-        .iter()
-        .all(|record| record.kind == RegionKind::LogBuffer)
-        && binding.iter().map(|record| record.kind).eq([
-            RegionKind::OutcomeRing,
-            RegionKind::ConsumedCell,
-            RegionKind::GuardRegion,
-        ])
-        && binding.iter().zip(0..).all(|(record, index)| {
-            // The consumed cell of a concurrent handle names its slot of
-            // the shared ring (ADR-0092 decision 3); every other binding
-            // record grants nothing.
-            let capability = match (index, first.capability) {
-                (1, Capability::ConcurrentPublication { .. }) => {
-                    matches!(record.capability, Capability::GuardSlot { .. })
-                }
-                _ => record.capability == Capability::None,
-            };
-            capability
-                && record.lane == 0
-                && record.stream_id == first.stream_id
-                && record.session_id == first.session_id
-        })
+    // A guard slot is the consumed cell's alone, never a log buffer's.
+    buffers.iter().all(|record| {
+        record.kind == RegionKind::LogBuffer
+            && !matches!(record.capability, Capability::GuardSlot { .. })
+    }) && binding.iter().map(|record| record.kind).eq([
+        RegionKind::OutcomeRing,
+        RegionKind::ConsumedCell,
+        RegionKind::GuardRegion,
+    ]) && binding.iter().zip(0..).all(|(record, index)| {
+        // The consumed cell of a concurrent handle names its slot of
+        // the shared ring (ADR-0092 decision 3); every other binding
+        // record grants nothing.
+        let capability = match (index, first.capability) {
+            (1, Capability::ConcurrentPublication { .. }) => {
+                matches!(record.capability, Capability::GuardSlot { .. })
+            }
+            _ => record.capability == Capability::None,
+        };
+        capability
+            && record.lane == 0
+            && record.stream_id == first.stream_id
+            && record.session_id == first.session_id
+    })
 }
 
 impl Message {
@@ -1693,6 +1693,20 @@ mod tests {
         };
         round_trip(&manifest(vec![concurrent, ring, slotted, guards], 4096));
         for refused in [
+            // A slot on a log buffer record of the buffer prefix.
+            manifest(
+                vec![
+                    concurrent,
+                    Record {
+                        capability: Capability::GuardSlot { slot: 1 },
+                        ..concurrent
+                    },
+                    ring,
+                    slotted,
+                    guards,
+                ],
+                4096,
+            ),
             // A concurrent grant without its slot, an exclusive one with one.
             manifest(vec![concurrent, ring, cell, guards], 4096),
             manifest(vec![buffer, ring, slotted, guards], 4096),

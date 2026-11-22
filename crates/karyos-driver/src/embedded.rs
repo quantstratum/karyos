@@ -4091,6 +4091,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .attach_shared(id, client, state.epoch, index, reincarnated_at, place)
     }
 
+    /// After a guard close and reopen, stream id `stream`'s fresh
+    /// incarnation, before a remote handle registers on it.
+    pub(crate) fn reincarnate_stream_if_reopened(
+        &mut self,
+        stream: u64,
+    ) -> Result<(), DriverError> {
+        self.reincarnate_if_reopened(StreamHandle {
+            driver: self.id,
+            stream,
+        })
+    }
+
     /// A remote client's concurrent guarded handle on stream id `stream`:
     /// after a guard close and reopen the fresh incarnation first, as for
     /// an exclusive grant, then its slot at `place`

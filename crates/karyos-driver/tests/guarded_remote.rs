@@ -601,3 +601,37 @@ fn remote_concurrent_guarded_handles_read_only_their_own_outcomes() {
     assert_eq!(counter(&driver, "grants detached"), 12);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Review of #1157: after a guard close and reopen, a remote concurrent
+/// handle registers on the fresh incarnation, bound to the new epoch,
+/// rather than being refused on the sealed one.
+#[test]
+fn a_remote_concurrent_handle_after_a_reopen_binds_the_fresh_incarnation() {
+    let dir = dir("reopen");
+    let mut driver = driver(&dir);
+    let stream = driver.add_stream(concurrent_config(2)).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    driver.guard_stream(stream, guard, 2, None).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let _ = driver.close_guard(guard, 2).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let (client, publication) = serve_while(&mut driver, move || {
+        let _ = client.add_concurrent_publication(KEY, true).unwrap();
+        let granted = completion(&mut client);
+        let Outcome::Fetchable(grant) = granted else {
+            panic!("expected a fetchable grant, got {granted:?}");
+        };
+        let mut publication = client.take_concurrent_publication(&grant).unwrap();
+        assert_eq!(publication.guard().unwrap().epoch(), 4);
+        assert!(matches!(
+            publication.offer(b"fresh").unwrap(),
+            ConcurrentOfferOutcome::Accepted { .. }
+        ));
+        (client, publication)
+    });
+    drop(publication);
+    drop(client);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

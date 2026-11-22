@@ -2219,7 +2219,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 Ok(bound) => Some(bound),
                 Err(code) => return refuse(code, detail),
             },
-            Some((_, Some(_))) | None => None,
+            // A concurrent handle registers its publisher slot on the
+            // fresh incarnation after a guard reopen, before its ring slot,
+            // never on the sealed one.
+            Some((_, Some(_))) => match self.reincarnate_stream_if_reopened(stream_id) {
+                Ok(()) => None,
+                Err(error) => return refuse(crate::guards::error_code(&error), detail),
+            },
+            None => None,
         };
         let Some(target) = self.streams.iter_mut().find(|found| found.id == stream_id) else {
             return refuse(ErrorCode::UnknownStream, 0);
