@@ -333,6 +333,15 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         }
     }
 
+    /// A guarded handle's gate while it is not connected: `Gated` when the
+    /// guard is closed, so a closed guard is reported before connectivity.
+    fn unconnected_guard(&self) -> Option<Refused> {
+        self.guard
+            .as_ref()
+            .filter(|binding| binding.admission() == Admission::Gated)
+            .map(|_| Refused::Gated)
+    }
+
     /// Records a guarded handle's block at stream position `position`:
     /// its final record is this handle's. `accepted` takes a token of the
     /// rate copy.
@@ -441,9 +450,14 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         // A forgotten claim is resolved before any early return.
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
-            // A sealed handle still releases (publication-seal.md).
+            // A sealed handle still releases (publication-seal.md); a
+            // guarded one reports its guard first (GC-8), never
+            // `NotConnected` for a closed guard.
             if self.inner.close_if_sealed().is_some() {
                 return Ok(self.ended_offer());
+            }
+            if let Some(refused) = self.unconnected_guard() {
+                return Ok(refused.offer());
             }
             return Ok(ConcurrentOfferOutcome::NotConnected);
         }
@@ -593,6 +607,9 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         if !self.connected() {
             if self.inner.close_if_sealed().is_some() {
                 return Ok(self.ended_claim());
+            }
+            if let Some(refused) = self.unconnected_guard() {
+                return Ok(refused.claim());
             }
             return Ok(ConcurrentClaimOutcome::NotConnected);
         }

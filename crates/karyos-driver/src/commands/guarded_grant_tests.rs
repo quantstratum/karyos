@@ -236,13 +236,16 @@ fn a_guarded_grant_carries_its_binding() {
         [
             Participant::Exclusive,
             Participant::Binding {
-                region: BindingRegion::Outcomes
+                region: BindingRegion::Outcomes,
+                slot: None
             },
             Participant::Binding {
-                region: BindingRegion::Consumed
+                region: BindingRegion::Consumed,
+                slot: None
             },
             Participant::Binding {
-                region: BindingRegion::Guards
+                region: BindingRegion::Guards,
+                slot: None
             },
         ]
     );

@@ -46,8 +46,13 @@ pub(crate) enum Participant {
     /// binding (`quantstratum-docs: karyos/design/guards-and-abort.md`,
     /// "The binding across processes"), granted with the publication's log
     /// buffer under the same key. Its region outlives mapping generations,
-    /// so a cutover neither moves nor fences it.
-    Binding { region: BindingRegion },
+    /// so a cutover neither moves nor fences it. A concurrent handle's
+    /// consumed cell names its `slot` of the incarnation's shared outcome
+    /// ring (ADR-0092); every other binding region has none.
+    Binding {
+        region: BindingRegion,
+        slot: Option<usize>,
+    },
 }
 
 /// Which region of a guarded publication's binding a grant carries, in
@@ -254,7 +259,7 @@ impl Ledger {
             .copied()
             .collect::<Vec<_>>();
         held.sort_by_key(|grant| match grant.participant {
-            Participant::Binding { region } => Some(region),
+            Participant::Binding { region, .. } => Some(region),
             _ => None,
         });
         held

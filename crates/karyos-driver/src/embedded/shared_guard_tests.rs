@@ -27,6 +27,15 @@ use karyos_client::ConsumedCell;
 use crate::guard_streams::ShareClient;
 
 fn concurrent(driver: &mut EmbeddedDriver, publishers: u8) -> StreamHandle {
+    concurrent_allowing(driver, publishers, true)
+}
+
+/// As [`concurrent`], with the stream's `allow_unconnected`.
+fn concurrent_allowing(
+    driver: &mut EmbeddedDriver,
+    publishers: u8,
+    allow_unconnected: bool,
+) -> StreamHandle {
     driver
         .add_stream(StreamConfig {
             buffer: LogBufferConfig {
@@ -46,7 +55,7 @@ fn concurrent(driver: &mut EmbeddedDriver, publishers: u8) -> StreamHandle {
                 },
                 schedule_capacity: 0,
             },
-            allow_unconnected: true,
+            allow_unconnected,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
             conflation: None,
         })
@@ -320,4 +329,23 @@ fn a_failed_issuance_takes_its_slot_back() {
         driver.attach_concurrent_guard(handle, ShareClient::InProcess),
         Ok(slot) if slot.slot == 1
     ));
+}
+
+/// Review of #1157: an unconnected guarded handle reports a closed guard
+/// as `Gated`, offer and claim, never `NotConnected`.
+#[test]
+fn an_unconnected_guarded_handle_reports_its_closed_guard() {
+    use karyos_client::{ConcurrentClaimOutcome as Claim, ConcurrentOfferOutcome as Offer};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let handle = concurrent_allowing(&mut driver, 2, false);
+    driver.guard_stream(handle, guard, 2, None).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut a = driver.concurrent_publication(handle).unwrap();
+    // Open and unconnected: `NotConnected`.
+    assert_eq!(a.offer(b"x").unwrap(), Offer::NotConnected);
+    let _ = driver.close_guard(guard, 2).unwrap();
+    assert_eq!(a.offer(b"x").unwrap(), Offer::Gated);
+    assert!(matches!(a.try_claim(8).unwrap(), Claim::Gated));
 }

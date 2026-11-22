@@ -4054,6 +4054,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         stream: StreamHandle,
         client: crate::guard_streams::ShareClient,
     ) -> Result<crate::guard_streams::SharedSlot, DriverError> {
+        self.attach_concurrent_guard_at(stream, client, crate::guard_streams::Place::Heap)
+    }
+
+    /// [`Self::attach_concurrent_guard`], with the slot's consumed cell
+    /// and, at the first handle, the shared ring at `place`: in regions
+    /// for a remote client's grant.
+    pub(crate) fn attach_concurrent_guard_at(
+        &mut self,
+        stream: StreamHandle,
+        client: crate::guard_streams::ShareClient,
+        place: crate::guard_streams::Place,
+    ) -> Result<crate::guard_streams::SharedSlot, DriverError> {
         let found = self.stream_ref(stream)?;
         let guard = found
             .guarded
@@ -4076,18 +4088,70 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .guarded
             .as_mut()
             .ok_or(DriverError::InvalidPublicationMode)?
-            .attach_shared(id, client, state.epoch, index, reincarnated_at)
+            .attach_shared(id, client, state.epoch, index, reincarnated_at, place)
+    }
+
+    /// After a guard close and reopen, stream id `stream`'s fresh
+    /// incarnation, before a remote handle registers on it.
+    pub(crate) fn reincarnate_stream_if_reopened(
+        &mut self,
+        stream: u64,
+    ) -> Result<(), DriverError> {
+        self.reincarnate_if_reopened(StreamHandle {
+            driver: self.id,
+            stream,
+        })
+    }
+
+    /// A remote client's concurrent guarded handle on stream id `stream`:
+    /// after a guard close and reopen the fresh incarnation first, as for
+    /// an exclusive grant, then its slot at `place`
+    /// ([`Self::attach_concurrent_guard_at`]). Remote clients exist only
+    /// on Linux.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach_remote_concurrent_guard(
+        &mut self,
+        stream: u64,
+        client: u64,
+        place: crate::guard_streams::Place,
+    ) -> Result<crate::guard_streams::SharedSlot, DriverError> {
+        let handle = StreamHandle {
+            driver: self.id,
+            stream,
+        };
+        self.reincarnate_if_reopened(handle)?;
+        self.attach_concurrent_guard_at(
+            handle,
+            crate::guard_streams::ShareClient::Remote(client),
+            place,
+        )
+    }
+
+    /// Detaches slot `slot` of stream id `stream`'s shared ring, when its
+    /// current incarnation is `incarnation`: a remote handle's grant ended.
+    pub(crate) fn detach_remote_concurrent_guard(
+        &mut self,
+        stream: u64,
+        incarnation: u64,
+        slot: usize,
+    ) {
+        if self
+            .streams
+            .iter()
+            .any(|found| found.id == stream && found.incarnation == incarnation)
+        {
+            self.detach_concurrent_guard(
+                StreamHandle {
+                    driver: self.id,
+                    stream,
+                },
+                slot,
+            );
+        }
     }
 
     /// Detaches slot `slot` of stream `stream`'s shared ring: its handle is
     /// gone (ADR-0092 decision 8).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the client handles bind it in karyos#1102 (c) and (d)"
-        )
-    )]
     pub(crate) fn detach_concurrent_guard(&mut self, stream: StreamHandle, slot: usize) {
         if let Ok(found) = self.stream(stream)
             && let Some(guarded) = found.guarded.as_mut()
