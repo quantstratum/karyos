@@ -546,8 +546,9 @@ struct NetSubscription {
     /// The routes the channel asked for its later paths: a second handle
     /// of the key must ask for the same ones.
     later_routes: [Option<(SocketAddr, MulticastConfig)>; LATER_PATHS],
-    /// The control group entries its channel's `nak-control` holds in the
-    /// driver's table, released with the key (karyos#1086).
+    /// The control group entries of the driver's table its paths joined,
+    /// whether its own channel's `nak-control` added them or not, released
+    /// with the key (karyos#1086).
     control_held: control_group::Held,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
@@ -1213,6 +1214,10 @@ impl<T: StreamTerms> Network<T> {
             (true, Some(config)) => self.hold_control_group(bind, config),
             _ => None,
         };
+        // Every entry its paths join is counted for the key, so it stays
+        // while the key uses it, even when another channel's `nak-control`
+        // added it (karyos#1086 review).
+        let mut control_held = [false; MAX_CONTROL_GROUPS];
         // A multicast key sends its SOLICITs from the driver's unicast
         // control endpoint of its family (network-control-schemas.md §6.3,
         // plan 164): one per driver and family, held by every multicast key
@@ -1231,7 +1236,7 @@ impl<T: StreamTerms> Network<T> {
                 max_term_length,
                 reliable,
                 multicast: group,
-                control_group: control,
+                control_group: control.map(|(control, group, _)| (control, group)),
                 identity,
                 conflated: conflated.map(|(lane, _)| lane),
                 solicit_from: solicit,
@@ -1240,13 +1245,16 @@ impl<T: StreamTerms> Network<T> {
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
-            if let Some((control, _)) = control {
+            if let Some((control, _, _)) = control {
                 release(&mut self.send_endpoints, control);
             }
             if let Some(solicit) = solicit {
                 release(&mut self.send_endpoints, solicit);
             }
             return Err(DriverError::NetworkBusy);
+        }
+        if let Some((_, _, slot)) = control {
+            control_group::hold_slot(&mut self.control_group_uses, &mut control_held, slot);
         }
         // Each later path is a receiver entry of its own endpoint; the
         // receiver binds it to the image as a later path of the same
@@ -1297,7 +1305,7 @@ impl<T: StreamTerms> Network<T> {
                     max_term_length,
                     reliable,
                     multicast: true,
-                    control_group: path_control,
+                    control_group: path_control.map(|(control, group, _)| (control, group)),
                     identity,
                     conflated: conflated.map(|(lane, _)| lane),
                     solicit_from: solicit,
@@ -1306,20 +1314,23 @@ impl<T: StreamTerms> Network<T> {
                 });
             if posted.is_err() {
                 release(&mut self.send_endpoints, path);
-                if let Some((control, _)) = path_control {
+                if let Some((control, _, _)) = path_control {
                     release(&mut self.send_endpoints, control);
                 }
                 self.count_path_failure();
                 continue;
             }
             *slot = Some(path);
-            *control_slot = path_control.map(|(control, _)| control);
+            if let Some((_, _, at)) = path_control {
+                control_group::hold_slot(&mut self.control_group_uses, &mut control_held, at);
+            }
+            *control_slot = path_control.map(|(control, _, _)| control);
         }
         self.subscriptions.push(NetSubscription {
             endpoint,
             stream_id,
             reliable,
-            control: control.map(|(control, _)| control),
+            control: control.map(|(control, _, _)| control),
             solicit,
             identity,
             conflated,
@@ -1329,7 +1340,7 @@ impl<T: StreamTerms> Network<T> {
             later: held,
             later_controls,
             later_routes,
-            control_held: [false; MAX_CONTROL_GROUPS],
+            control_held,
             users: 1,
         });
         Ok(handle)
@@ -1368,8 +1379,9 @@ impl<T: StreamTerms> Network<T> {
     /// Enters `channel`'s `nak-control` groups, one per path, into the
     /// driver's one control group table (owner item 8, karyos#654), all
     /// or none, before the subscription joins its group; a channel
-    /// without the key changes nothing. Entries stay for the driver's
-    /// life: the table is the driver's topology, not a subscription's.
+    /// without the key changes nothing. What it counts only bridges the
+    /// add: the key then counts each entry its paths join, and an entry a
+    /// URI added leaves with the last key joined to it (karyos#1086).
     ///
     /// # Errors
     ///
@@ -1422,24 +1434,6 @@ impl<T: StreamTerms> Network<T> {
                     control_group: *control,
                 }),
         )
-    }
-
-    /// Keeps `held`, what [`Self::map_nak_control`] counted for the
-    /// channel of `subscription`, on its key; a key that already holds its
-    /// entries (a second handle) releases them at once (karyos#1086).
-    pub(crate) fn keep_control_groups(
-        &mut self,
-        subscription: NetworkSubscription,
-        held: control_group::Held,
-    ) {
-        let first = self.subscriptions.iter_mut().find(|entry| {
-            (entry.endpoint, entry.stream_id) == (subscription.endpoint, subscription.stream_id)
-                && entry.users == 1
-        });
-        match first {
-            Some(entry) => entry.control_held = held,
-            None => self.release_control_groups(&held),
-        }
     }
 
     /// Releases `held` (karyos#1086).
@@ -1521,15 +1515,8 @@ impl<T: StreamTerms> Network<T> {
         &mut self,
         bind: SocketAddr,
         config: MulticastConfig,
-    ) -> Option<(EndpointId, SocketAddr)> {
-        let data_group = SocketAddr::new(config.group, bind.port());
-        let interface = match config.interface {
-            InterfaceSel::Address(address) if !address.is_unspecified() => {
-                Some(IpAddr::V4(address))
-            }
-            _ => None,
-        };
-        let group = control_group::lookup(&self.control_groups, data_group, interface)?;
+    ) -> Option<(EndpointId, SocketAddr, usize)> {
+        let (slot, group) = self.control_group_of(bind, config)?;
         let control = MulticastConfig {
             group: group.ip(),
             loopback: true,
@@ -1537,7 +1524,7 @@ impl<T: StreamTerms> Network<T> {
         };
         let local = SocketAddr::new(bind.ip(), group.port());
         match self.hold_endpoint(local, Some(control)) {
-            Ok(endpoint) => Some((endpoint, group)),
+            Ok(endpoint) => Some((endpoint, group, slot)),
             Err(_) => {
                 if let Some(count) = self.control_join_failures.checked_add(1) {
                     self.control_join_failures = count;
@@ -1545,6 +1532,23 @@ impl<T: StreamTerms> Network<T> {
                 None
             }
         }
+    }
+
+    /// The table's entry for the data group `config` on `bind`'s port, on
+    /// its interface: its slot and its control group.
+    fn control_group_of(
+        &self,
+        bind: SocketAddr,
+        config: MulticastConfig,
+    ) -> Option<(usize, SocketAddr)> {
+        let data_group = SocketAddr::new(config.group, bind.port());
+        let interface = match config.interface {
+            InterfaceSel::Address(address) if !address.is_unspecified() => {
+                Some(IpAddr::V4(address))
+            }
+            _ => None,
+        };
+        control_group::lookup_slot(&self.control_groups, data_group, interface)
     }
 
     /// The driver's unicast control endpoint of `bind`'s address family,

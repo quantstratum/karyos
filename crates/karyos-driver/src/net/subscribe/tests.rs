@@ -2405,6 +2405,33 @@ fn a_failed_add_releases_its_nak_control_entry() {
     assert_eq!(b.network_control_groups_in_use(), 0);
 }
 
+/// karyos#1086 review: a key whose channel has no `nak-control` but joins
+/// the control group another key's channel mapped holds that entry, so
+/// the entry stays while it is joined, and leaves with the last of them.
+#[test]
+fn a_key_holds_the_control_group_it_joins_without_nak_control() {
+    if !multicast_joins() {
+        return;
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 40, 1], port));
+    let mapped = control_channel(group, vec![SocketAddr::from(([239, 8, 40, 2], port))]);
+    let a = b.add_network_subscription(41, &mapped).unwrap();
+    let plain = b
+        .add_network_subscription(42, &control_channel(group, Vec::new()))
+        .unwrap();
+    assert_eq!(b.network_control_groups_in_use(), 1);
+    assert!(b.remove_network_subscription(a).unwrap());
+    assert_eq!(
+        b.network_control_groups_in_use(),
+        1,
+        "the second key still joins it"
+    );
+    assert!(b.remove_network_subscription(plain).unwrap());
+    assert_eq!(b.network_control_groups_in_use(), 0);
+}
+
 /// karyos#1086 review: a two-path subscription's `nak-control` enters one
 /// table entry per path, and both leave the table when it closes; a failed
 /// add releases both.

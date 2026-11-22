@@ -160,19 +160,49 @@ pub(crate) type Uses = [Option<u32>; MAX_CONTROL_GROUPS];
 pub(crate) type Held = [bool; MAX_CONTROL_GROUPS];
 
 /// The control group of `data_group` on `interface`: an entry for that
-/// interface, or else one for any interface.
+/// interface, or else one for any interface (tests; the driver uses
+/// `lookup_slot`).
+#[cfg(test)]
 pub(crate) fn lookup(
     table: &ControlGroups,
     data_group: SocketAddr,
     interface: Option<IpAddr>,
 ) -> Option<SocketAddr> {
-    let entries = || table.iter().flatten();
+    lookup_slot(table, data_group, interface).map(|(_, group)| group)
+}
+
+/// The slot and control group of `data_group` on `interface`: an entry
+/// for that interface, or else one for any interface.
+pub(crate) fn lookup_slot(
+    table: &ControlGroups,
+    data_group: SocketAddr,
+    interface: Option<IpAddr>,
+) -> Option<(usize, SocketAddr)> {
+    let entries = || {
+        table
+            .iter()
+            .enumerate()
+            .filter_map(|(at, entry)| entry.map(|entry| (at, entry)))
+    };
     entries()
-        .find(|entry| entry.data_group == data_group && entry.interface == interface)
+        .find(|(_, entry)| entry.data_group == data_group && entry.interface == interface)
         .or_else(|| {
-            entries().find(|entry| entry.data_group == data_group && entry.interface.is_none())
+            entries().find(|(_, entry)| entry.data_group == data_group && entry.interface.is_none())
         })
-        .map(|entry| entry.control_group)
+        .map(|(at, entry)| (at, entry.control_group))
+}
+
+/// Counts one more user of the URI entry at `slot` for the holder of
+/// `held`, once per holder; a configured entry or a free slot is not
+/// counted (karyos#1086 review).
+pub(crate) fn hold_slot(uses: &mut Uses, held: &mut Held, slot: usize) {
+    if let (Some(Some(count)), Some(mine)) = (uses.get_mut(slot), held.get_mut(slot))
+        && !*mine
+        && let Some(next) = count.checked_add(1)
+    {
+        *count = next;
+        *mine = true;
+    }
 }
 
 #[cfg(test)]
