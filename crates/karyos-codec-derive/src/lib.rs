@@ -347,21 +347,38 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
         .filter(|attr| attr.path().is_ident("field"))
     {
         attr.parse_nested_meta(|meta| {
+            // An option given twice is refused: the second would replace
+            // the first, and skip its checks (karyos#1104).
+            let once = |taken: bool| {
+                if taken {
+                    Err(meta.error("an option given twice"))
+                } else {
+                    Ok(())
+                }
+            };
             if meta.path.is_ident("offset") {
+                once(offset.is_some())?;
                 offset = Some(meta.value()?.parse::<LitInt>()?.base10_parse::<usize>()?);
             } else if meta.path.is_ident("check") {
+                once(check.is_some())?;
                 check = Some(meta.value()?.parse::<Path>()?);
             } else if meta.path.is_ident("with") {
+                once(with.is_some())?;
                 with = Some(meta.value()?.parse::<Path>()?);
             } else if meta.path.is_ident("width") {
+                once(width.is_some())?;
                 width = Some(meta.value()?.parse::<LitInt>()?.base10_parse::<usize>()?);
             } else if meta.path.is_ident("spans") {
+                once(spans.is_some())?;
                 spans = Some(parse_spans(meta.value()?)?);
             } else if meta.path.is_ident("var") {
+                once(var)?;
                 var = true;
             } else if meta.path.is_ident("min") {
+                once(min.is_some())?;
                 min = Some(meta.value()?.parse::<Expr>()?);
             } else if meta.path.is_ident("max") {
+                once(max.is_some())?;
                 max = Some(meta.value()?.parse::<Expr>()?);
             } else {
                 return Err(meta.error(
@@ -703,6 +720,21 @@ mod tests {
             error(fixed_max),
             "`min` and `max` belong to a variable field"
         );
+        // An option given twice, in one attribute or two, is refused.
+        let twice: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(with = t, spans = [(0, 1)], spans = [(0, 4), (2, 1)])] a: A }
+        };
+        assert_eq!(error(twice), "an option given twice");
+        let twice_apart: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M {
+                #[field(with = t, spans = [(0, 1)])]
+                #[field(spans = [(64, 1)])]
+                a: A,
+            }
+        };
+        assert_eq!(error(twice_apart), "an option given twice");
         let self_overlap: DeriveInput = syn::parse_quote! {
             #[message(template = T)]
             struct M { #[field(with = t, spans = [(0, 4), (2, 1)])] a: A }
