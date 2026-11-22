@@ -4126,7 +4126,7 @@ fn a_shared_signer_completes_one_journal_before_the_other() {
     }
     for poll in 1..=8u64 {
         for (signing, journal) in signings.iter_mut().zip(journals.iter_mut()) {
-            signing.duty(journal, poll * SIGNING_POLL);
+            signing.duty(journal, poll * SIGNING_POLL).unwrap();
         }
     }
     assert!(!signed_counters(&main).is_empty(), "the integrity journal");
@@ -4134,6 +4134,40 @@ fn a_shared_signer_completes_one_journal_before_the_other() {
     assert_eq!(retired.load(std::sync::atomic::Ordering::Relaxed), 0);
     std::fs::remove_dir_all(&main).unwrap();
     std::fs::remove_dir_all(&other).unwrap();
+}
+
+/// karyos#1138 review: a poisoned signer lock is refused with
+/// [`AgentError::SignerPoisoned`], never skipped silently; nothing is
+/// signed.
+#[test]
+fn a_poisoned_signer_is_refused() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+
+    let dir = temp_dir("signing-poisoned");
+    let (trust, key) = registered_archival(&dir);
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let setup = ArchiveSigning {
+        trust,
+        journal_id: 1,
+        time_evidence_journal_id: 2,
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(key),
+    };
+    let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal, Arc::default()).unwrap();
+    let shared = Arc::clone(&signing.signer);
+    let poisoner = std::thread::spawn(move || {
+        let _held = shared.lock().unwrap();
+        panic!("poisons the signer's lock");
+    });
+    assert!(poisoner.join().is_err());
+    let _ = journal.record_policy_version(1, 1, b"pending").unwrap();
+    assert!(matches!(
+        signing.duty(&mut journal, SIGNING_POLL),
+        Err(AgentError::SignerPoisoned)
+    ));
+    assert!(signed_counters(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The counters of the heads `dir`'s `heads.kyh` records.
@@ -4177,7 +4211,7 @@ fn a_slow_signer_still_signs_while_heads_advance() {
         let _ = journal
             .record_policy_version(1, poll, &poll.to_le_bytes())
             .unwrap();
-        signing.duty(&mut journal, poll * SIGNING_POLL);
+        signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
     }
     let signed = signed_counters(&dir);
     assert!(signed.len() >= 2, "coverage progressed: {signed:?}");
@@ -4212,7 +4246,7 @@ fn the_signing_cache_holds_only_the_uncovered_tail() {
         let _ = journal
             .record_policy_version(1, poll, &poll.to_le_bytes())
             .unwrap();
-        signing.duty(&mut journal, poll * SIGNING_POLL);
+        signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
     }
     let (base, cached) = signing.cached();
     let chained = journal.records().unwrap().len();
@@ -4263,13 +4297,13 @@ fn a_refused_head_is_offered_again() {
     let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal, Arc::default()).unwrap();
     // The first head queues; the final one is refused, the backlog full.
     let _ = journal.record_policy_version(1, 1, b"first").unwrap();
-    signing.duty(&mut journal, SIGNING_POLL);
+    signing.duty(&mut journal, SIGNING_POLL).unwrap();
     let last = journal.record_policy_version(1, 2, b"final").unwrap();
-    signing.duty(&mut journal, 2 * SIGNING_POLL);
+    signing.duty(&mut journal, 2 * SIGNING_POLL).unwrap();
     // The signer recovers; no seal arrives after.
     open.store(true, std::sync::atomic::Ordering::Relaxed);
-    signing.duty(&mut journal, 3 * SIGNING_POLL);
-    signing.duty(&mut journal, 4 * SIGNING_POLL);
+    signing.duty(&mut journal, 3 * SIGNING_POLL).unwrap();
+    signing.duty(&mut journal, 4 * SIGNING_POLL).unwrap();
     let signed = signed_counters(&dir);
     assert_eq!(signed.last(), Some(&last.counter), "{signed:?}");
     std::fs::remove_dir_all(&dir).unwrap();
@@ -4373,7 +4407,7 @@ fn a_head_before_the_keys_validity_never_pins_the_backlog() {
             let _ = journal
                 .record_policy_version(1, poll, &poll.to_le_bytes())
                 .unwrap();
-            signing.duty(&mut journal, poll * SIGNING_POLL);
+            signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
             poll += 1;
         }
         assert!(signed_counters(&dir).is_empty(), "{name}");
@@ -4382,10 +4416,10 @@ fn a_head_before_the_keys_validity_never_pins_the_backlog() {
             let _ = journal
                 .record_policy_version(1, poll, &poll.to_le_bytes())
                 .unwrap();
-            signing.duty(&mut journal, poll * SIGNING_POLL);
+            signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
             poll += 1;
         }
-        signing.duty(&mut journal, poll * SIGNING_POLL);
+        signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
         let signed = signed_counters(&dir);
         assert!(
             signed.last().is_some_and(|&counter| counter >= effective),

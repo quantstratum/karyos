@@ -700,6 +700,11 @@ pub enum AgentError {
     /// The entries could not be written.
     #[error(transparent)]
     TimeEvidence(#[from] crate::integrity::time_evidence::StoreError),
+    /// The shared head signer's lock is poisoned: a thread panicked
+    /// holding it, so the signer's state is unknown and no head is asked
+    /// of it (karyos#1128).
+    #[error("the head signer's lock is poisoned: no head is signed")]
+    SignerPoisoned,
     /// The time evidence entries' journal was given the integrity
     /// journal's identity: each chain needs its own (karyos#1128).
     #[error("the time evidence journal needs a journal id of its own")]
@@ -898,6 +903,9 @@ struct Counts {
     fenced_recordings: AtomicU64,
     rejoined_recordings: AtomicU64,
     shortened_indexes: AtomicU64,
+    /// Signing polls refused because the shared signer's lock is
+    /// poisoned (karyos#1128).
+    poisoned_signer: AtomicU64,
     /// The shortened indexes found at start, kept whole for
     /// [`ArchiveHandle::shortened_index_reports`]: the event queue may
     /// drop some before a caller can read it (karyos#671 review).
@@ -1455,6 +1463,14 @@ impl ArchiveHandle {
     #[must_use]
     pub fn signing_lag(&self) -> Option<SigningLag> {
         self.counts.signing.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Signing polls refused with [`AgentError::SignerPoisoned`]: the
+    /// shared signer's lock is poisoned, so no head is signed and
+    /// coverage falls behind (karyos#1128).
+    #[must_use]
+    pub fn poisoned_signer(&self) -> u64 {
+        self.counts.poisoned_signer.load(Ordering::Relaxed)
     }
 
     /// Starts and replays refused at a cap ([`AgentError::Full`]).
@@ -2340,13 +2356,18 @@ impl<D: Disk + Clone> Signing<D> {
     /// the newer work waiting behind it coalesces into the latest head at
     /// that point (karyos#966 review). A head the backlog refuses is not
     /// marked offered, so it is offered again at the next duty.
-    fn duty(&mut self, journal: &mut IntegrityJournal<D>, now: u64) {
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::SignerPoisoned`]: the shared signer's lock is
+    /// poisoned, so nothing is offered or asked; the heads stay pending.
+    fn duty(&mut self, journal: &mut IntegrityJournal<D>, now: u64) -> Result<(), AgentError> {
         if now < self.next_ns {
-            return;
+            return Ok(());
         }
         self.next_ns = now.saturating_add(SIGNING_POLL);
         if !self.refresh(journal) {
-            return;
+            return Ok(());
         }
         let records = &self.records;
         let registry = &self.registry;
@@ -2356,7 +2377,7 @@ impl<D: Disk + Clone> Signing<D> {
             .unwrap_or(u64::MAX);
         let busy = self.coalesce && self.signing.status(now, sealed, registry).pending > 0;
         let Ok(mut slot) = self.signer.lock() else {
-            return;
+            return Err(AgentError::SignerPoisoned);
         };
         if let Some(last) = records.last() {
             let digest = last.digest();
@@ -2409,6 +2430,7 @@ impl<D: Disk + Clone> Signing<D> {
                 pending: status.pending,
             });
         }
+        Ok(())
     }
 
     /// Drops the records signed heads cover from the cache (karyos#1095),
@@ -2782,14 +2804,18 @@ where
         ok &= integrity.seal(&mut self.active, now);
         integrity.failed = !ok;
         // Signing never fails the integrity work: an unavailable signer
-        // leaves heads pending, and anchoring falls behind.
-        if let Some(signing) = integrity.signing.as_mut() {
-            signing.duty(&mut integrity.journal, now);
+        // leaves heads pending, and anchoring falls behind. A poisoned
+        // signer is refused and counted, never skipped silently.
+        if let Some(signing) = integrity.signing.as_mut()
+            && signing.duty(&mut integrity.journal, now).is_err()
+        {
+            count(&self.counts.poisoned_signer);
         }
         if let Some(evidence) = integrity.evidence.as_mut()
             && let Some(signing) = evidence.signing.as_mut()
+            && signing.duty(evidence.store.journal_mut(), now).is_err()
         {
-            signing.duty(evidence.store.journal_mut(), now);
+            count(&self.counts.poisoned_signer);
         }
         !changes.is_empty() || integrity.journal.head() != before
     }
