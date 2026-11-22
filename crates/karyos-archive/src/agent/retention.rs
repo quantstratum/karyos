@@ -221,6 +221,17 @@ impl<D: Disk + Clone> State<D> {
             Ok(None) => return error("the recording wrote no segment".to_owned()),
             Err(answer) => return answer,
         };
+        // The cutoff is bounded before any file is listed (karyos#1121
+        // review): one past the written end names segments that never
+        // existed, as many as the request asks.
+        if request.before > store.written() {
+            return purge_failed(&self.retention.refuse_after_holds(
+                &request,
+                PurgeRefusal::NotAWriteStart {
+                    before: request.before,
+                },
+            ));
+        }
         // A segment's modification time may only raise it, never lower it;
         // one that cannot be read adds nothing.
         let mut disk = self.disk.clone();

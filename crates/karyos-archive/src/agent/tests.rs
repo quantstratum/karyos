@@ -4811,3 +4811,29 @@ fn a_refused_purge_never_cuts_a_damaged_tail() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// karyos#1121 review: a cutoff past the recording's written end is
+/// refused `not_a_write_start` before any segment file is listed, however
+/// far past it lies.
+#[test]
+fn a_cutoff_past_the_written_end_lists_no_file() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-past-end");
+    let probe = Probe::default();
+    let agent = ArchiveHandle::spawn(probe.clone(), &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    // A thousand segments of the test geometry past the end.
+    let past = end + 1000 * 8192;
+    for (request, before) in [(1, end + 1), (2, past), (3, u64::MAX)] {
+        let read = probe.modified.load(Ordering::Acquire);
+        assert_eq!(
+            answered(agent.post_purge(id, before, request, 9)),
+            RetentionAnswer::Refused("not_a_write_start".to_owned())
+        );
+        assert_eq!(probe.modified.load(Ordering::Acquire), read, "{before}");
+    }
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
