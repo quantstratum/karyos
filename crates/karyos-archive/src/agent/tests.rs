@@ -1503,6 +1503,52 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// karyos#1148: a shutdown releases the integrity journal lock of a
+    /// sealed group's directory before it returns: opened at once, many
+    /// times over, it is never `Locked` (no child process runs here).
+    #[test]
+    fn a_shutdown_releases_the_group_integrity_journal_lock() {
+        use crate::integrity::journal::IntegrityJournal;
+        for round in 0..100 {
+            let dir = temp_dir(&format!("group-lock-{round}"));
+            let groups = groups_dir(&dir);
+            let config = AgentConfig {
+                seal_interval: Some(Duration::from_millis(1)),
+                ..AgentConfig::default()
+            };
+            let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+            let _sender = agent
+                .start_group(start_group(&groups, Some(Capture::Strict)))
+                .unwrap();
+            // Wait, bounded, until the agent holds the group directory's
+            // integrity journal (its first open is lazy, at a duty): only
+            // then does the open after shutdown test the lock's release.
+            // The test never opens it before: an open of its own would
+            // take the lock and make the agent's open fail. The agent
+            // creates the file and locks it at once, so once the file
+            // exists a single open must see `Locked`.
+            let journal_file = groups.join(crate::integrity::journal::JOURNAL_FILE);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !journal_file.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "round {round}: the agent never opened the journal"
+                );
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            match IntegrityJournal::open(StdDisk, &groups) {
+                Err(crate::integrity::journal::IntegrityError::Locked) => {}
+                other => panic!("round {round}: the agent does not hold the lock: {other:?}"),
+            }
+            agent.shutdown().unwrap();
+            if let Err(error) = IntegrityJournal::open(StdDisk, &groups) {
+                panic!("round {round}: {error:?}");
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
     /// A reference its recording stops short of: a strict group ends, a
     /// best-effort one marks it and goes on.
     #[test]
