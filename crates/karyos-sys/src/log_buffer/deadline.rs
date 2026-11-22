@@ -161,6 +161,7 @@ impl ConcurrentDeadlines {
 
     /// Forgets the last call's positions: a call that returns before it
     /// serves anything leaves none recorded.
+    #[cfg(feature = "test-hooks")]
     pub(super) fn clear_aborted(&mut self) {
         self.aborted_at.clear();
     }
