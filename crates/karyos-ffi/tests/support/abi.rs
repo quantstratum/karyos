@@ -1188,6 +1188,24 @@ pub fn client_add_ipc_publication(client: u64, stream_id: i32) -> (i32, u64) {
     (status, publication)
 }
 
+/// `karyos_client_add_concurrent_publication` on `karyos:ipc`: the status
+/// and the publication handle.
+pub fn client_add_ipc_concurrent_publication(client: u64, stream_id: i32) -> (i32, u64) {
+    let mut publication = 0;
+    // SAFETY: a static C string and a live, aligned `u64`; a null detail
+    // is allowed.
+    let status = unsafe {
+        karyos_client_add_concurrent_publication(
+            client,
+            c"karyos:ipc".as_ptr(),
+            stream_id,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    (status, publication)
+}
+
 /// `karyos_publication_offer` of `data` on lane 0, without the accepted
 /// position.
 pub fn publication_offer(publication: u64, data: &[u8]) -> i32 {
