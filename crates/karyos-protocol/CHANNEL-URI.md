@@ -229,7 +229,7 @@ The common URI rule binds every key added after the sixteen above.
   bounded at eight entries: a mapping the table already holds is
   accepted, a different control group for a held data group and path is
   refused (`ControlGroupConflict`), and a ninth entry is refused
-  (`ControlGroupsFull`). Entries stay for the driver's life. Cross-host
+  (`ControlGroupsFull`). An entry a channel added leaves the table with the last subscription holding it; configured entries stay. Cross-host
   agreement on the groups is a deployment matter: there is no discovery.
 - **`linger`** (owner item 16) is how long a removed publication keeps
   serving status messages and NAKs and repeating each lane's EOS at its

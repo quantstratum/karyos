@@ -7,6 +7,7 @@
     clippy::unwrap_used,
     clippy::panic,
     clippy::indexing_slicing,
+    clippy::print_stderr,
     reason = "tests, as ADR-0007 allows"
 )]
 
@@ -1173,6 +1174,8 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         later: paths,
         later_routes: [None; crate::net::LATER_PATHS],
         later_controls: [None; crate::net::LATER_PATHS],
+        control_held: [false; crate::net::MAX_CONTROL_GROUPS],
+        control_admitted: [None; crate::net::LATER_PATHS + 1],
         identity: None,
         conflated: None,
         register_at: None,
@@ -2331,4 +2334,260 @@ fn path_skew_is_validated_at_admission_and_shared_by_a_key() {
         ),
         Err(DriverError::InvalidConfig)
     ));
+}
+
+/// Whether this host can join an IPv4 multicast group on its default
+/// interface: a subscription test that needs the join says so, instead of
+/// passing when every add fails (karyos#1086 review).
+fn multicast_joins() -> bool {
+    let joined =
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).and_then(|socket| {
+            socket.join_multicast_v4(&Ipv4Addr::new(239, 8, 99, 1), &Ipv4Addr::UNSPECIFIED)
+        });
+    if let Err(error) = &joined {
+        eprintln!("SKIP: no multicast ({error})");
+    }
+    joined.is_ok()
+}
+
+/// A reliable multicast channel of `group` on the default interface, with
+/// `nak_control`.
+fn control_channel(group: SocketAddr, nak_control: Vec<SocketAddr>) -> UdpConfig {
+    UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        nak_control,
+        ..channel(group)
+    }
+}
+
+/// karyos#1086: the control group entries channels' `nak-control` adds
+/// leave the driver's table with their last subscription, so channels
+/// naming nine distinct groups in turn never exhaust its eight entries;
+/// the count is visible. Every add must succeed: a host that cannot join
+/// a group is detected, not passed through.
+#[test]
+fn nak_control_entries_leave_with_their_last_subscription() {
+    if !multicast_joins() {
+        return;
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    assert_eq!(b.network_control_groups_in_use(), 0);
+    for n in 0..9u8 {
+        // A port of its own: the last key's endpoint may still be retiring.
+        let (port, control) = (free_port(), free_port());
+        let at = |n: u8, last: u8| {
+            SocketAddr::from(([239, 8, n, last], if last == 1 { port } else { control }))
+        };
+        let subscription = b
+            .add_network_subscription(
+                i32::from(n) + 10,
+                &control_channel(at(n, 1), vec![at(n, 2)]),
+            )
+            .unwrap();
+        assert_eq!(b.network_control_groups_in_use(), 1, "{n}");
+        assert!(b.remove_network_subscription(subscription).unwrap());
+        assert_eq!(b.network_control_groups_in_use(), 0, "{n}");
+        // The key's endpoints retire through the agents: their table
+        // entries must leave before the next key opens its own.
+        for _ in 0..1000 {
+            if b.net.as_ref().unwrap().endpoints.is_empty() {
+                break;
+            }
+            let _ = b.do_work().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(b.net.as_ref().unwrap().endpoints.is_empty(), "{n}");
+    }
+}
+
+/// karyos#1086 review: an add that fails after its channel's
+/// `nak-control` entered the table, here on an interface the host does
+/// not have (TEST-NET-1), releases the entry.
+#[test]
+fn a_failed_add_releases_its_nak_control_entry() {
+    use crate::error::DriverError;
+
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 30, 1], port));
+    let channel = UdpConfig {
+        interface: Some(Interface::Address(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
+        ..control_channel(
+            group,
+            vec![SocketAddr::from(([239, 8, 30, 2], free_port()))],
+        )
+    };
+    assert_eq!(
+        b.add_network_subscription(30, &channel),
+        Err(DriverError::NetworkEndpoint)
+    );
+    assert_eq!(b.network_control_groups_in_use(), 0);
+}
+
+/// karyos#1086 review: a key whose channel has no `nak-control` but joins
+/// the control group another key's channel mapped holds that entry, so
+/// the entry stays while it is joined, and leaves with the last of them.
+#[test]
+fn a_key_holds_the_control_group_it_joins_without_nak_control() {
+    if !multicast_joins() {
+        return;
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 40, 1], port));
+    let mapped = control_channel(
+        group,
+        vec![SocketAddr::from(([239, 8, 40, 2], free_port()))],
+    );
+    let a = b.add_network_subscription(41, &mapped).unwrap();
+    let plain = b
+        .add_network_subscription(42, &control_channel(group, Vec::new()))
+        .unwrap();
+    assert_eq!(b.network_control_groups_in_use(), 1);
+    assert!(b.remove_network_subscription(a).unwrap());
+    assert_eq!(
+        b.network_control_groups_in_use(),
+        1,
+        "the second key still joins it"
+    );
+    assert!(b.remove_network_subscription(plain).unwrap());
+    assert_eq!(b.network_control_groups_in_use(), 0);
+}
+
+/// karyos#1086 review: a two-path subscription's `nak-control` enters one
+/// table entry per path, and both leave the table when it closes; a failed
+/// add releases both.
+#[test]
+fn a_two_path_subscriptions_control_groups_leave_together() {
+    let mut b = driver(ThreadingMode::Shared);
+    b.net.as_mut().unwrap().assume_isolated_paths();
+    let at = |last: u8, port: u16| SocketAddr::from(([239, 8, 20, last], port));
+    let channel = UdpConfig {
+        destination: Destination::Multicast {
+            group: at(1, 4000),
+            ttl: None,
+        },
+        interface: None,
+        paths: vec![
+            Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Interface::Address(LOOPBACK),
+        ],
+        nak_control: vec![at(2, 4001), at(3, 4001)],
+        ..channel(at(1, 4000))
+    };
+    assert_eq!(b.network_control_groups_in_use(), 0);
+    // A host without multicast cannot join: the add fails, and must still
+    // release both entries.
+    if let Ok(subscription) = b.add_network_subscription(40, &channel) {
+        assert_eq!(b.network_control_groups_in_use(), 2);
+        assert!(b.remove_network_subscription(subscription).unwrap());
+    }
+    assert_eq!(b.network_control_groups_in_use(), 0);
+}
+
+/// karyos#1086 review: a second handle of a key whose channel names
+/// `nak-control` groups the key did not join is refused, typed, and leaves
+/// no entry behind; one naming the groups the key joined, or none, shares
+/// the key.
+#[test]
+fn a_second_handle_must_match_the_keys_control_groups() {
+    use crate::error::DriverError;
+
+    if !multicast_joins() {
+        return;
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 50, 1], port));
+    let control = SocketAddr::from(([239, 8, 50, 2], free_port()));
+    let plain = b
+        .add_network_subscription(51, &control_channel(group, Vec::new()))
+        .unwrap();
+    assert_eq!(
+        b.add_network_subscription(51, &control_channel(group, vec![control])),
+        Err(DriverError::ControlGroupConflict { data_group: group })
+    );
+    assert_eq!(b.network_control_groups_in_use(), 0);
+    let again = b
+        .add_network_subscription(51, &control_channel(group, Vec::new()))
+        .unwrap();
+    assert!(b.remove_network_subscription(again).unwrap());
+    assert!(b.remove_network_subscription(plain).unwrap());
+    // A key that joined its group, on a port of its own (the first key's
+    // endpoint may still be retiring): the same `nak-control`, or none, is
+    // a second handle.
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 51, 1], port));
+    let control = SocketAddr::from(([239, 8, 51, 2], free_port()));
+    let mapped = b
+        .add_network_subscription(52, &control_channel(group, vec![control]))
+        .unwrap();
+    let same = b
+        .add_network_subscription(52, &control_channel(group, vec![control]))
+        .unwrap();
+    let bare = b
+        .add_network_subscription(52, &control_channel(group, Vec::new()))
+        .unwrap();
+    for handle in [bare, same, mapped] {
+        assert!(b.remove_network_subscription(handle).unwrap());
+    }
+    assert_eq!(b.network_control_groups_in_use(), 0);
+}
+
+/// karyos#1086 review: a second handle naming the mapping its key's table
+/// entry holds is refused when the key's control socket could not open,
+/// here because another socket holds the control port: the receiver's
+/// entry runs with no control group, so the declaration is not honored.
+#[test]
+fn a_second_handle_is_refused_when_the_keys_control_join_failed() {
+    use crate::error::DriverError;
+
+    if !multicast_joins() {
+        return;
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let taken = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).unwrap();
+    let group = SocketAddr::from(([239, 8, 60, 1], port));
+    let control = SocketAddr::from(([239, 8, 60, 2], taken.local_addr().unwrap().port()));
+    let first = b
+        .add_network_subscription(61, &control_channel(group, vec![control]))
+        .unwrap();
+    assert_eq!(b.network_control_join_failures(), 1);
+    assert_eq!(
+        b.add_network_subscription(61, &control_channel(group, vec![control])),
+        Err(DriverError::ControlGroupConflict { data_group: group })
+    );
+    assert!(b.remove_network_subscription(first).unwrap());
+    assert_eq!(b.network_control_groups_in_use(), 0);
+}
+
+/// karyos#1086 review: an unreliable key joins no control group, so a
+/// second handle whose channel names `nak-control` is refused, typed, and
+/// leaves no entry behind.
+#[test]
+fn a_second_handle_of_an_unreliable_key_cannot_add_nak_control() {
+    use crate::error::DriverError;
+
+    if !multicast_joins() {
+        return;
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 70, 1], port));
+    let control = SocketAddr::from(([239, 8, 70, 2], free_port()));
+    let unreliable = |nak_control| UdpConfig {
+        reliable: false,
+        ..control_channel(group, nak_control)
+    };
+    let first = b
+        .add_network_subscription(71, &unreliable(Vec::new()))
+        .unwrap();
+    assert_eq!(
+        b.add_network_subscription(71, &unreliable(vec![control])),
+        Err(DriverError::ControlGroupConflict { data_group: group })
+    );
+    assert_eq!(b.network_control_groups_in_use(), 0);
+    assert!(b.remove_network_subscription(first).unwrap());
 }
