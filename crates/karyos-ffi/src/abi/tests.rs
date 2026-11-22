@@ -3179,7 +3179,7 @@ fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
 
 /// ADR-0099: a network publication is exclusive, so a driver with its
 /// network refuses a concurrent handle on a `karyos:udp` channel with
-/// `KARYOS_E_UNSUPPORTED_CHANNEL`, and no handle is written. That is why no
+/// `KARYOS_E_UNSUPPORTED_CHANNEL`, and its output is left untouched. That is why no
 /// concurrent writer reaches a timed lane's schedule ring.
 #[test]
 #[cfg_attr(miri, ignore = "driver integration; covered natively")]
@@ -3194,7 +3194,10 @@ fn a_networked_driver_refuses_a_concurrent_udp_publication() {
     };
     let uri =
         std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{}", test_port())).unwrap();
-    let mut publication = 0;
+    // A sentinel, so the test shows that a refusal leaves the output as
+    // it was rather than writing any handle, zero included.
+    const UNTOUCHED: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+    let mut publication = UNTOUCHED;
     // SAFETY: a live C string, a live `u64`, no detail.
     let status = unsafe {
         karyos_client_add_concurrent_publication(
@@ -3206,7 +3209,7 @@ fn a_networked_driver_refuses_a_concurrent_udp_publication() {
         )
     };
     assert_eq!(status, Status::UnsupportedChannel.code());
-    assert_eq!(publication, 0);
+    assert_eq!(publication, UNTOUCHED);
 }
 
 /// An older caller's struct, ABI 0.1.1's 56 bytes or 0.1.3's 64, works
