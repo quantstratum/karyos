@@ -3045,6 +3045,16 @@ impl<T: StreamTerms> Network<T> {
         }
     }
 
+    /// The Shared receiver's session table, ignored controls and path
+    /// counters, for a test's failure message (karyos#1067).
+    #[cfg(test)]
+    pub(crate) fn receiver_sessions_debug(&self) -> String {
+        match &self.agents {
+            Agents::Shared(agents) => agents.receiver.sessions_debug(),
+            _ => String::new(),
+        }
+    }
+
     /// The Shared receiver agent's counters, for tests.
     #[cfg(test)]
     pub(crate) fn receiver_counters(&self) -> Option<crate::agents::roles::ReceiverCounters> {

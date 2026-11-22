@@ -1551,6 +1551,12 @@ pub struct ReceiverAgent<O: SocketOps, T: StreamTerms = HeapTerms> {
 }
 
 impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
+    /// Its session table, ignored controls and path counters (tests).
+    #[cfg(test)]
+    pub(crate) fn sessions_debug(&self) -> String {
+        self.role.sessions_debug()
+    }
+
     /// Retired images whose `StorageReclaimed` the receiver handled, still
     /// in quarantine (tests).
     #[cfg(test)]

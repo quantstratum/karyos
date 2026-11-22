@@ -1,3 +1,4 @@
 ### Changed
 
 - Tests: more load-sensitive tests from karyos#1067. The two-path driver tests wait, bounded, for the second path to bind before their first message; the retention-floor and min-gate tests wait for each receiver's path to bind, the min-gate repair loop is bounded by time, and the one-local-gap test asks for both paths' heartbeat sources, at least; the tool attach rollback test checks that no descriptor is left open instead of comparing counts, which a previous test's late close could lower; and the C ABI retired-image test accepts the documented 0 of a seal not positioned yet when the image retired.
+- `karyos-client`: a network subscription holds back a retired image's change until the image's clean end is positioned (the driver announces the retirement before it positions the seal), so `karyos_subscription_next_image_change` no longer reports a clean end at position 0 when it is not (karyos#1067). It goes without a position after 10 000 adoptions.

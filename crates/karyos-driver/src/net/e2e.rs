@@ -133,23 +133,51 @@ fn free_port() -> u16 {
     crate::test_ports::test_port()
 }
 
-/// Pumps until every receiver of `drivers` after the first has a bound
-/// path, seen as a path heartbeat that refreshed one: until then DATA it
-/// receives is dropped as unbound, a hole a test that holds NAKs back never
-/// sees repaired (karyos#1067).
+/// Pumps until every receiver of `drivers` after the first has bound
+/// every path the sender's heartbeats come from: a path heartbeat
+/// refreshed a bound path, and then no path heartbeat arrived unbound for
+/// 2000 duties (several heartbeat intervals). Until a source is bound,
+/// DATA from it is dropped as unbound, a hole a test that holds NAKs back
+/// never sees repaired. A receiver can see the sender from two sources
+/// (both swarmer receivers here bound two path rows), and the second binds
+/// through its own SOLICIT, which a loaded host showed taking several
+/// retries; waiting on the first alone left that window open (karyos#1067).
 fn wait_paths_bound(drivers: &mut [&mut EmbeddedDriver]) {
-    pump(drivers, |drivers| {
-        drivers[1..].iter().all(|driver| {
-            driver
-                .net
-                .as_ref()
-                .unwrap()
-                .receiver_counters()
-                .unwrap()
-                .path_heartbeats
-                >= 1
+    let counters = |driver: &EmbeddedDriver| {
+        let receiver = driver.net.as_ref().unwrap().receiver_counters().unwrap();
+        (receiver.path_heartbeats, receiver.path_heartbeats_unbound)
+    };
+    let mut last: Vec<u64> = drivers[1..]
+        .iter()
+        .map(|driver| counters(driver).1)
+        .collect();
+    let mut quiet = 0u32;
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        for driver in drivers.iter_mut() {
+            let _ = driver.do_work().unwrap();
+        }
+        let now: Vec<(u64, u64)> = drivers[1..].iter().map(|driver| counters(driver)).collect();
+        let unbound: Vec<u64> = now.iter().map(|(_, unbound)| *unbound).collect();
+        quiet = if unbound == last { quiet + 1 } else { 0 };
+        last = unbound;
+        if quiet >= 2_000 && now.iter().all(|(bound, _)| *bound >= 1) {
+            return;
+        }
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    let state: Vec<String> = drivers
+        .iter()
+        .map(|driver| {
+            let net = driver.net.as_ref().unwrap();
+            format!(
+                "{} sessions {}",
+                net.agent_counters(),
+                net.receiver_sessions_debug()
+            )
         })
-    });
+        .collect();
+    panic!("paths never all bound: {state:?}");
 }
 
 /// Runs every driver until `done`, at most about four seconds.
@@ -168,7 +196,14 @@ fn pump<T: StreamTerms>(
     }
     let counters: Vec<String> = drivers
         .iter()
-        .map(|driver| driver.net.as_ref().unwrap().agent_counters())
+        .map(|driver| {
+            let net = driver.net.as_ref().unwrap();
+            format!(
+                "{} sessions {}",
+                net.agent_counters(),
+                net.receiver_sessions_debug()
+            )
+        })
         .collect();
     panic!("not reached: {counters:?}");
 }
@@ -2838,7 +2873,14 @@ fn optional_receiver_closes(
     if seen != total {
         let counters: Vec<String> = [&a, &b, &c]
             .iter()
-            .map(|driver| driver.net.as_ref().unwrap().agent_counters())
+            .map(|driver| {
+                let net = driver.net.as_ref().unwrap();
+                format!(
+                    "{} sessions {}",
+                    net.agent_counters(),
+                    net.receiver_sessions_debug()
+                )
+            })
             .collect();
         panic!("B reads everything: {seen} of {total} (sent {sent}): {counters:?}");
     }

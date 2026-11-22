@@ -2549,6 +2549,18 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.sessions.ignored_counts()
     }
 
+    /// The session table's counters, ignored controls and path counters
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn sessions_debug(&self) -> String {
+        format!(
+            "{:?} {:?} {:?}",
+            self.sessions.counters(),
+            self.sessions.ignored_counts(),
+            self.sessions.paths().counters()
+        )
+    }
+
     /// The session table's counters.
     #[must_use]
     pub fn session_counters(&self) -> crate::sessions::receive::SessionCounters {
