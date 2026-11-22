@@ -192,6 +192,10 @@ pub struct ReceiverCounters {
     /// Challenges not sent: the source is not an answerable unicast
     /// endpoint (network-control-schemas.md §7.3).
     pub unanswerable_source: u64,
+    /// Challenges of a multicast key sent from its arrival endpoint: the
+    /// key has no unicast control endpoint, so they share the group
+    /// port's `setup_answer_rate` bucket (ADR-0096 decision 1).
+    pub challenges_from_arrival: u64,
     /// Challenges not sent: `rsp_setup_rate_per_destination` (§7.4).
     pub rsp_setup_rate_limited: u64,
     /// Challenges not sent: the destination rate table is full.
@@ -4847,8 +4851,9 @@ impl<T: StreamTerms> Intake<'_, T> {
         }
     }
 
-    /// Sends `challenge` toward `source` if §7.3 and §7.4 allow it.
-    /// Returns whether it was handed to the sender.
+    /// Sends `control` toward `source` from the intake's own endpoint if
+    /// §7.3 and §7.4 allow it: the rate tests' entry point.
+    #[cfg(test)]
     fn challenge(&mut self, source: SocketAddr, control: Control) -> bool {
         let endpoint = self.endpoint;
         self.challenge_from(endpoint, source, control)
@@ -4864,7 +4869,18 @@ impl<T: StreamTerms> Intake<'_, T> {
             .map_or(key.endpoint, |(.., from)| *from)
     }
 
-    /// [`Intake::challenge`], sent from `endpoint`.
+    /// Whether `key`'s subscription receives a multicast group.
+    fn multicast_key(&self, key: &BindingKey) -> bool {
+        self.role
+            .subscriptions
+            .iter()
+            .any(|(held, stream, .., multicast)| {
+                (*held, *stream) == (key.endpoint, key.alias.stream_id) && *multicast
+            })
+    }
+
+    /// Sends an RSP_SETUP `control` from `endpoint` toward `source` if
+    /// §7.3 and §7.4 allow it. Returns whether it was handed to the sender.
     fn challenge_from(
         &mut self,
         endpoint: EndpointId,
@@ -5126,7 +5142,20 @@ impl<T: StreamTerms> Intake<'_, T> {
                     role.sessions
                         .announce(key, &announce, now, &mut role.nonces)
                 {
-                    self.challenge(source, Control::Challenge(challenge));
+                    // A multicast key's CHALLENGE leaves from the driver's
+                    // unicast control endpoint, as its SOLICITs do: the
+                    // drivers of one host share the group port, and from it
+                    // they would be one source to the publisher's
+                    // `setup_answer_rate` (ADR-0096; karyos#1067).
+                    let from = self.solicit_endpoint(&key);
+                    // Counted only once handed to the sender: a refused
+                    // one (§7.3, §7.4, a full ring) sent nothing.
+                    if self.challenge_from(from, source, Control::Challenge(challenge))
+                        && from == endpoint
+                        && self.multicast_key(&key)
+                    {
+                        self.role.count(|c| &mut c.challenges_from_arrival);
+                    }
                 }
             }
             Control::SetupAnswer(answer) => {

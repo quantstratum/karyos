@@ -99,6 +99,9 @@ struct Setup {
     concurrent: Option<u8>,
     /// The channel's `path-skew` in ns, on both sides (karyos#1056).
     path_skew: Option<u64>,
+    /// Whether the subscription has a unicast control endpoint S, from
+    /// which its SOLICITs and multicast CHALLENGEs leave (ADR-0096).
+    solicit: bool,
 }
 
 impl Setup {
@@ -132,6 +135,7 @@ impl Default for Setup {
             conflated: None,
             concurrent: None,
             path_skew: None,
+            solicit: false,
         }
     }
 }
@@ -151,6 +155,8 @@ struct Rig {
     publisher: EndpointId,
     /// The control group endpoint C, with `Setup::control_group`.
     control: Option<EndpointId>,
+    /// The unicast control endpoint S, with `Setup::solicit`.
+    solicit: Option<EndpointId>,
     /// The publication's log on A (64 KiB terms, whatever is announced).
     log: Option<super::super::data::testing::TestLog>,
     /// A second publisher's log, with [`Rig::second_publisher`].
@@ -195,6 +201,7 @@ impl Rig {
         let mut rig = Self {
             publisher: EndpointId(u32::MAX),
             control: None,
+            solicit: None,
             log: None,
             second: None,
             agents,
@@ -220,7 +227,12 @@ impl Rig {
                 .open(&rig.links, loopback, OsSocket::new())
                 .unwrap()
         });
-        let endpoints = 2 + usize::from(control.is_some());
+        let solicit = setup.solicit.then(|| {
+            rig.endpoints
+                .open(&rig.links, loopback, OsSocket::new())
+                .unwrap()
+        });
+        let endpoints = 2 + usize::from(control.is_some()) + usize::from(solicit.is_some());
         let mut opened = 0;
         for _ in 0..100 {
             rig.agents.do_work(0).unwrap();
@@ -237,6 +249,7 @@ impl Rig {
         assert_eq!(opened, endpoints);
         rig.publisher = a;
         rig.control = control;
+        rig.solicit = solicit;
         let control_group =
             control.map(|control| (control, rig.endpoints.local_address(control).unwrap()));
         let destination = rig.endpoints.local_address(b).unwrap();
@@ -260,7 +273,7 @@ impl Rig {
                 control_group,
                 identity: setup.identity,
                 conflated: setup.conflated,
-                solicit_from: None,
+                solicit_from: solicit,
                 register_at: None,
                 path_skew: setup.path_skew,
             })
@@ -328,6 +341,7 @@ impl Rig {
         let mut rig = Self {
             publisher: EndpointId(u32::MAX),
             control: None,
+            solicit: None,
             log: None,
             second: None,
             agents,
@@ -1129,6 +1143,83 @@ fn established(rig: &mut Rig) -> SlotRef {
         panic!("{:?}", rig.events);
     };
     slot
+}
+
+/// The endpoint each CHALLENGE the receiver sent left from.
+fn challenge_endpoints(rig: &Rig) -> Vec<EndpointId> {
+    rig.agents
+        .receiver
+        .role
+        .posted_challenges()
+        .iter()
+        .filter_map(|(endpoint, control)| {
+            matches!(control, karyos_protocol::network::Control::Challenge(_)).then_some(*endpoint)
+        })
+        .collect()
+}
+
+/// ADR-0096 decision 1 (karyos#1067): a multicast key's CHALLENGE leaves
+/// from its unicast control endpoint S, not from its group endpoint B, and
+/// still binds: the answer comes to B, and the SM leaves from B.
+#[test]
+fn a_multicast_challenge_leaves_from_the_control_endpoint() {
+    let (mut rig, b) = Rig::new(Setup {
+        multicast: true,
+        solicit: true,
+        ..Setup::default()
+    });
+    let _slot = established(&mut rig);
+    let solicit = rig.solicit.unwrap();
+    assert_ne!(solicit, b);
+    let sent = challenge_endpoints(&rig);
+    assert!(!sent.is_empty());
+    assert!(sent.iter().all(|endpoint| *endpoint == solicit), "{sent:?}");
+    assert_eq!(
+        rig.agents.receiver.role.counters().challenges_from_arrival,
+        0
+    );
+}
+
+/// ADR-0096 decision 1, fallback: a multicast key with no control endpoint
+/// challenges from its arrival endpoint, counted; a unicast key always
+/// does, uncounted.
+#[test]
+fn a_challenge_without_a_control_endpoint_leaves_from_its_arrival_endpoint() {
+    for multicast in [true, false] {
+        let (mut rig, b) = Rig::new(Setup {
+            multicast,
+            ..Setup::default()
+        });
+        let _slot = established(&mut rig);
+        let sent = challenge_endpoints(&rig);
+        assert!(!sent.is_empty());
+        assert!(sent.iter().all(|endpoint| *endpoint == b), "{sent:?}");
+        let counted = rig.agents.receiver.role.counters().challenges_from_arrival;
+        let expected = if multicast {
+            u64::try_from(sent.len()).unwrap()
+        } else {
+            0
+        };
+        assert_eq!(counted, expected, "multicast {multicast}");
+        // An ANNOUNCE from an unanswerable source gets no CHALLENGE, so
+        // nothing is counted as sent from the arrival socket.
+        let unanswerable = rig.agents.receiver.counters().unanswerable_source;
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_control(
+            &receiver.sessions,
+            b,
+            "239.1.1.1:4000".parse().unwrap(),
+            karyos_protocol::network::Control::SetupAnnounce(announce(65_536)),
+            rig.now,
+        );
+        let counters = rig.agents.receiver.counters();
+        assert_eq!(
+            counters.unanswerable_source,
+            unanswerable + 1,
+            "{counters:?}"
+        );
+        assert_eq!(counters.challenges_from_arrival, expected);
+    }
 }
 
 /// Test 1 (driver-network-agents.md §9): after establishment, messages
