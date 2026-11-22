@@ -4033,6 +4033,109 @@ impl crate::integrity::signing::HeadSigner for SlowSigner {
     }
 }
 
+/// A signer with one request in flight, as the operator's signing
+/// program: asked for another head than the one in flight, it retires
+/// that request and starts anew; a request is answered on its `asks`-th
+/// ask in a row (karyos#1138 review P1).
+struct InFlightSigner {
+    key: crate::integrity::test_key::TestKey,
+    asks: u32,
+    in_flight: Option<(crate::integrity::trust::ChainHead, u32)>,
+    retired: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl crate::integrity::signing::HeadSigner for InFlightSigner {
+    fn key_id(&self) -> crate::integrity::Digest {
+        self.key.key_id()
+    }
+
+    fn custody(&self) -> crate::integrity::trust::Custody {
+        self.key.custody()
+    }
+
+    fn sign(
+        &mut self,
+        head: &crate::integrity::trust::ChainHead,
+    ) -> Result<[u8; crate::integrity::trust::SIGNATURE_LENGTH], SignerUnavailable> {
+        let asked = match self.in_flight.take() {
+            Some((flying, asked)) if flying == *head => asked + 1,
+            Some(_) => {
+                let _ = self
+                    .retired
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                1
+            }
+            None => 1,
+        };
+        if asked < self.asks {
+            self.in_flight = Some((*head, asked));
+            return Err(SignerUnavailable);
+        }
+        self.key.sign(head)
+    }
+}
+
+/// karyos#1138 review P1: with heads pending in both the integrity
+/// journal and the time evidence journal, a shared signer that retires
+/// its in-flight request on another head still signs both: the journal
+/// that asked keeps the signer until its head is signed.
+#[test]
+fn a_shared_signer_completes_one_journal_before_the_other() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+
+    let main = temp_dir("signing-shared-main");
+    let other = temp_dir("signing-shared-other");
+    let (trust, key) = registered_archival(&main);
+    let _ = registered_archival(&other);
+    let retired = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let signer = SignerSlot::shared(Box::new(InFlightSigner {
+        key,
+        asks: 2,
+        in_flight: None,
+        retired: std::sync::Arc::clone(&retired),
+    }));
+    let config = SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap();
+    let mut journals = [
+        IntegrityJournal::open(StdDisk, &main).unwrap().journal,
+        IntegrityJournal::open(StdDisk, &other).unwrap().journal,
+    ];
+    let [first, second] = &mut journals;
+    let mut signings = [
+        Signing::open_shared(
+            StdDisk,
+            &main,
+            (trust.clone(), 1, config),
+            Arc::clone(&signer),
+            first,
+            Arc::default(),
+        )
+        .unwrap(),
+        Signing::open_shared(
+            StdDisk,
+            &other,
+            (trust, 2, config),
+            Arc::clone(&signer),
+            second,
+            Arc::default(),
+        )
+        .unwrap(),
+    ];
+    for journal in &mut journals {
+        let _ = journal.record_policy_version(1, 1, b"pending").unwrap();
+    }
+    for poll in 1..=8u64 {
+        for (signing, journal) in signings.iter_mut().zip(journals.iter_mut()) {
+            signing.duty(journal, poll * SIGNING_POLL);
+        }
+    }
+    assert!(!signed_counters(&main).is_empty(), "the integrity journal");
+    assert!(!signed_counters(&other).is_empty(), "the time evidence one");
+    assert_eq!(retired.load(std::sync::atomic::Ordering::Relaxed), 0);
+    std::fs::remove_dir_all(&main).unwrap();
+    std::fs::remove_dir_all(&other).unwrap();
+}
+
 /// The counters of the heads `dir`'s `heads.kyh` records.
 fn signed_counters(dir: &Path) -> Vec<u64> {
     use crate::integrity::ledger::read_entries;

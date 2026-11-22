@@ -2195,7 +2195,30 @@ struct SigningSetup {
 }
 
 /// The Archive's signer, shared by the journals it signs.
-type SharedSigner = Arc<std::sync::Mutex<Box<dyn HeadSigner + Send>>>;
+type SharedSigner = Arc<std::sync::Mutex<SignerSlot>>;
+
+/// The shared signer and the journal whose head it is asked for.
+///
+/// A signer may hold one request in flight and retire it when asked for
+/// another head (the operator's signing program does): two journals
+/// asking in turn would cancel each other's requests forever. So the
+/// journal that asked keeps the signer until its pending heads are
+/// signed or dropped, and the other journal waits (karyos#1138 review).
+struct SignerSlot {
+    signer: Box<dyn HeadSigner + Send>,
+    /// The journal id holding the signer, while it has heads pending.
+    holder: Option<u64>,
+}
+
+impl SignerSlot {
+    /// A slot no journal holds yet.
+    fn shared(signer: Box<dyn HeadSigner + Send>) -> SharedSigner {
+        Arc::new(std::sync::Mutex::new(Self {
+            signer,
+            holder: None,
+        }))
+    }
+}
 
 /// A boxed signer, as the sized signer [`HeadSigning::poll`] takes.
 struct Boxed<'a>(&'a mut (dyn HeadSigner + Send));
@@ -2232,7 +2255,7 @@ impl<D: Disk + Clone> Signing<D> {
         journal: &mut IntegrityJournal<D>,
         counts: Arc<Counts>,
     ) -> Result<Self, IntegrityError> {
-        let signer = Arc::new(std::sync::Mutex::new(setup.signer));
+        let signer = SignerSlot::shared(setup.signer);
         Self::open_shared(
             disk,
             dir,
@@ -2332,7 +2355,7 @@ impl<D: Disk + Clone> Signing<D> {
             .and_then(|len| self.base.checked_add(len))
             .unwrap_or(u64::MAX);
         let busy = self.coalesce && self.signing.status(now, sealed, registry).pending > 0;
-        let Ok(mut signer) = self.signer.lock() else {
+        let Ok(mut slot) = self.signer.lock() else {
             return;
         };
         if let Some(last) = records.last() {
@@ -2344,7 +2367,7 @@ impl<D: Disk + Clone> Signing<D> {
             // (karyos#966 review). Not offered, it is not marked, so the
             // first eligible head is offered as soon as it exists.
             let eligible = registry
-                .key(&signer.key_id())
+                .key(&slot.signer.key_id())
                 .is_some_and(|key| last.counter >= key.valid_from);
             if eligible && !busy && self.offered != Some(digest) {
                 let offered = self.signing.offer(
@@ -2361,15 +2384,21 @@ impl<D: Disk + Clone> Signing<D> {
                 }
             }
         }
-        let _ = self.signing.poll_from(
-            &mut Boxed(signer.as_mut()),
-            &mut self.heads,
-            registry,
-            self.base,
-            records,
-            now,
-        );
-        drop(signer);
+        // Another journal's request is in flight: asking for this head
+        // would retire it. This journal asks once that one is done.
+        if slot.holder.is_none_or(|holder| holder == self.journal_id) {
+            let _ = self.signing.poll_from(
+                &mut Boxed(slot.signer.as_mut()),
+                &mut self.heads,
+                registry,
+                self.base,
+                records,
+                now,
+            );
+            slot.holder =
+                (self.signing.status(now, sealed, registry).pending > 0).then_some(self.journal_id);
+        }
+        drop(slot);
         let status = self.signing.status(now, sealed, registry);
         self.trim();
         if let Ok(mut slot) = self.counts.signing.lock() {
