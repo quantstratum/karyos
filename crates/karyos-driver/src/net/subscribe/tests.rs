@@ -1174,6 +1174,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         later_routes: [None; crate::net::LATER_PATHS],
         later_controls: [None; crate::net::LATER_PATHS],
         control_held: [false; crate::net::MAX_CONTROL_GROUPS],
+        control_asked: [None; crate::net::LATER_PATHS + 1],
         identity: None,
         conflated: None,
         register_at: None,
@@ -2459,6 +2460,55 @@ fn a_two_path_subscriptions_control_groups_leave_together() {
     if let Ok(subscription) = b.add_network_subscription(40, &channel) {
         assert_eq!(b.network_control_groups_in_use(), 2);
         assert!(b.remove_network_subscription(subscription).unwrap());
+    }
+    assert_eq!(b.network_control_groups_in_use(), 0);
+}
+
+/// karyos#1086 review: a second handle of a key whose channel names
+/// `nak-control` groups the key did not join is refused, typed, and leaves
+/// no entry behind; one naming the groups the key joined, or none, shares
+/// the key.
+#[test]
+fn a_second_handle_must_match_the_keys_control_groups() {
+    use crate::error::DriverError;
+
+    if !multicast_joins() {
+        return;
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 50, 1], port));
+    let control = SocketAddr::from(([239, 8, 50, 2], port));
+    let plain = b
+        .add_network_subscription(51, &control_channel(group, Vec::new()))
+        .unwrap();
+    assert_eq!(
+        b.add_network_subscription(51, &control_channel(group, vec![control])),
+        Err(DriverError::ControlGroupConflict { data_group: group })
+    );
+    assert_eq!(b.network_control_groups_in_use(), 0);
+    let again = b
+        .add_network_subscription(51, &control_channel(group, Vec::new()))
+        .unwrap();
+    assert!(b.remove_network_subscription(again).unwrap());
+    assert!(b.remove_network_subscription(plain).unwrap());
+    // A key that joined its group, on a port of its own (the first key's
+    // endpoint may still be retiring): the same `nak-control`, or none, is
+    // a second handle.
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 51, 1], port));
+    let control = SocketAddr::from(([239, 8, 51, 2], port));
+    let mapped = b
+        .add_network_subscription(52, &control_channel(group, vec![control]))
+        .unwrap();
+    let same = b
+        .add_network_subscription(52, &control_channel(group, vec![control]))
+        .unwrap();
+    let bare = b
+        .add_network_subscription(52, &control_channel(group, Vec::new()))
+        .unwrap();
+    for handle in [bare, same, mapped] {
+        assert!(b.remove_network_subscription(handle).unwrap());
     }
     assert_eq!(b.network_control_groups_in_use(), 0);
 }

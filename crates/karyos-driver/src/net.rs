@@ -550,6 +550,10 @@ struct NetSubscription {
     /// whether its own channel's `nak-control` added them or not, released
     /// with the key (karyos#1086).
     control_held: control_group::Held,
+    /// The control group the table named for each path when the key
+    /// opened, first path first: a second handle must find the same ones
+    /// (karyos#1086 review).
+    control_asked: ControlAsked,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
 }
@@ -651,6 +655,10 @@ impl NetworkViewCounters {
 /// The later paths a network subscription holds beside its first: the
 /// channel URI allows four paths (karyos-protocol `channel.rs`).
 pub(crate) const LATER_PATHS: usize = 3;
+
+/// The control group the table names for each path of a key, first path
+/// first (karyos#1086 review).
+pub(crate) type ControlAsked = [Option<SocketAddr>; LATER_PATHS + 1];
 
 /// A timed lane whose publisher breached its schedule ring's protocol, as
 /// its sender reported it (`AgentEvent::ScheduleViolated`) for the live
@@ -1110,14 +1118,17 @@ impl<T: StreamTerms> Network<T> {
     /// [`DriverError::NetworkEndpoint`], [`DriverError::NetworkBusy`],
     /// [`DriverError::ReliabilityMismatch`],
     /// [`DriverError::ReceiverIdentityMismatch`],
-    /// [`DriverError::ConflationMismatch`].
+    /// [`DriverError::ConflationMismatch`],
+    /// [`DriverError::ControlGroupConflict`] for a second handle whose
+    /// channel names `nak-control` groups (`names_control`) other than
+    /// those the key's paths joined.
     pub(crate) fn add_subscription(
         &mut self,
         stream_id: i32,
         (bind, multicast): (SocketAddr, Option<MulticastConfig>),
         later: &[(SocketAddr, MulticastConfig)],
         max_term_length: u32,
-        (reliable, own_port): (bool, bool),
+        (reliable, own_port, names_control): (bool, bool, bool),
         (identity, conflated, register_at, path_skew): KeyOptions,
     ) -> Result<NetworkSubscription, DriverError> {
         let group = multicast.is_some();
@@ -1131,6 +1142,7 @@ impl<T: StreamTerms> Network<T> {
             endpoint,
             stream_id,
         };
+        let asked_controls = self.control_asked(bind, multicast, later, reliable);
         if let Some(entry) = self
             .subscriptions
             .iter_mut()
@@ -1176,6 +1188,21 @@ impl<T: StreamTerms> Network<T> {
             if entry.path_skew != path_skew {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::UnsupportedChannel);
+            }
+            // Its paths joined the control groups the table named when it
+            // opened, and its receiver's entry does not follow a later
+            // change: a second handle whose own `nak-control`
+            // (`names_control`) would have its paths join others, or join
+            // some where the key joined none, is refused (karyos#1086
+            // review). A handle without the key shares what the key joined.
+            if names_control && entry.control_asked != asked_controls {
+                release(&mut self.send_endpoints, endpoint);
+                return Err(DriverError::ControlGroupConflict {
+                    data_group: SocketAddr::new(
+                        multicast.map_or(bind.ip(), |config| config.group),
+                        bind.port(),
+                    ),
+                });
             }
             let Some(users) = entry.users.checked_add(1) else {
                 release(&mut self.send_endpoints, endpoint);
@@ -1341,6 +1368,7 @@ impl<T: StreamTerms> Network<T> {
             later_controls,
             later_routes,
             control_held,
+            control_asked: asked_controls,
             users: 1,
         });
         Ok(handle)
@@ -1549,6 +1577,26 @@ impl<T: StreamTerms> Network<T> {
             _ => None,
         };
         control_group::lookup_slot(&self.control_groups, data_group, interface)
+    }
+
+    /// The control group the table names for each path of a key: none for
+    /// an unreliable or unicast one (karyos#1086 review).
+    fn control_asked(
+        &self,
+        bind: SocketAddr,
+        multicast: Option<MulticastConfig>,
+        later: &[(SocketAddr, MulticastConfig)],
+        reliable: bool,
+    ) -> ControlAsked {
+        let mut asked = [None; LATER_PATHS + 1];
+        let (Some(config), true) = (multicast, reliable) else {
+            return asked;
+        };
+        let routes = std::iter::once((bind, config)).chain(later.iter().copied());
+        for (slot, (bind, config)) in asked.iter_mut().zip(routes) {
+            *slot = self.control_group_of(bind, config).map(|(_, group)| group);
+        }
+        asked
     }
 
     /// The driver's unicast control endpoint of `bind`'s address family,

@@ -513,7 +513,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             route,
             &later,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
-            (channel.reliable, own_port),
+            (channel.reliable, own_port, !channel.nak_control.is_empty()),
             (options.0, options.1, register_at(channel), path_skew),
         );
         // The key counts the entries its paths joined itself, so what the
