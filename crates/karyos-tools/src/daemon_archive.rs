@@ -122,15 +122,17 @@ fn signing(
     let text = std::fs::read_to_string(&signer.trust).map_err(|error| {
         ArchiveStartError::Agent(format!("{}: {error}", signer.trust.display()))
     })?;
-    let (trust, _, journal_id) = crate::catalog_verify::parse_trust(&text).map_err(|error| {
-        ArchiveStartError::Agent(format!("{}: {error}", signer.trust.display()))
-    })?;
+    let (trust, _, journal_id, time_evidence_journal_id) =
+        crate::catalog_verify::parse_trust_journals(&text).map_err(|error| {
+            ArchiveStartError::Agent(format!("{}: {error}", signer.trust.display()))
+        })?;
     let interval = u64::try_from(options.anchor_interval.as_nanos()).ok();
     let config = SigningConfig::new(interval, BacklogPolicy::Coalesce)
         .map_err(|error| ArchiveStartError::Agent(error.to_string()))?;
     Ok(karyos_archive::agent::ArchiveSigning {
         trust,
         journal_id,
+        time_evidence_journal_id,
         config,
         signer: Box::new(crate::archive_signer::CommandSigner::new(
             signer.program.clone(),

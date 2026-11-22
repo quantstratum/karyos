@@ -1616,7 +1616,11 @@ fn binding_part<T: StreamTerms>(
     grant: &Grant,
     buffer: Record,
 ) -> Option<(Grant, Record, Option<OwnedFd>)> {
-    let Participant::Binding { region: which } = grant.participant else {
+    let Participant::Binding {
+        region: which,
+        slot,
+    } = grant.participant
+    else {
         return None;
     };
     let held = |export: u64| {
@@ -1640,10 +1644,19 @@ fn binding_part<T: StreamTerms>(
             (region, region.read_only_descriptor().ok())
         }
     };
+    // A concurrent handle's cell names its slot of the shared ring
+    // (ADR-0092 decision 3).
+    let capability = match slot {
+        Some(slot) => Capability::GuardSlot {
+            slot: u64::try_from(slot).ok()?,
+        },
+        None => Capability::None,
+    };
     let record = Record {
         stream_id: buffer.stream_id,
         session_id: buffer.session_id,
         lane: 0,
+        capability,
         ..record(region, grant.export)?
     };
     Some((*grant, record, fd))

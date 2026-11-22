@@ -299,6 +299,13 @@ impl<D: Disk> IntegrityJournal<D> {
         self.check.sealed_end(recording)
     }
 
+    /// The range `[start, end)` the sealed ranges of `recording` cover
+    /// whole, if any is sealed (karyos#1128).
+    #[must_use]
+    pub fn sealed_range(&self, recording: u64) -> Option<(u64, u64)> {
+        self.check.sealed_range(recording)
+    }
+
     /// Every record, read back from disk.
     ///
     /// # Errors

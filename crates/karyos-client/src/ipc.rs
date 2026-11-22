@@ -500,16 +500,9 @@ impl crate::guarded::ConsumedCell for MappedCell {
 }
 
 impl BindingFds {
-    /// Maps the binding's regions and binds a handle on `lanes` lanes to
-    /// them: the ring and the guard words read-only, the cell writable. The
-    /// ring's header names the guard's index and the admission epoch, which
-    /// must be open and fall within the guard words.
-    fn bind(
-        self,
-        instance: u128,
-        lanes: u8,
-        incarnation: u64,
-    ) -> Result<GuardBinding, AttachError> {
+    /// Maps the binding's regions: the ring and the guard words read-only,
+    /// the cell writable.
+    fn map(self, instance: u128) -> Result<(MappedWords, MappedWords, MappedCell), AttachError> {
         let read_only = |part: BindingFd| -> Result<MappedWords, AttachError> {
             let expected = fetched_region(instance, &part.record)?;
             let region = ReadOnlyRegion::attach(part.fd, expected, SealProfile::DriverOnly)?;
@@ -525,6 +518,20 @@ impl BindingFds {
             region: Region::attach(self.cell.fd, expected)?,
             _detach: self.cell.detach,
         };
+        Ok((ring, guards, cell))
+    }
+
+    /// Maps the binding's regions and binds a handle on `lanes` lanes to
+    /// them: the ring and the guard words read-only, the cell writable. The
+    /// ring's header names the guard's index and the admission epoch, which
+    /// must be open and fall within the guard words.
+    fn bind(
+        self,
+        instance: u128,
+        lanes: u8,
+        incarnation: u64,
+    ) -> Result<GuardBinding, AttachError> {
+        let (ring, guards, cell) = self.map(instance)?;
         let binding = karyos_sys::outcome_ring::binding(
             &ring.region.structure(),
             guards.region.structure().len(),
@@ -551,6 +558,56 @@ impl BindingFds {
             // Past the first incarnation, a reincarnation: its copy starts
             // empty at the time the driver wrote (0, unknown: now), as its
             // gate did (R-CORE-21).
+            let bound = if incarnation > FIRST_INCARNATION {
+                bound.reincarnated_at(reincarnated)
+            } else {
+                bound
+            };
+            bound.with_published_rate(karyos_sys::host_clock::host_monotonic_ns)
+        })
+        .map_err(|_| AttachError::Protocol)
+    }
+
+    /// Maps a concurrent handle's binding and binds it to its slot of the
+    /// incarnation's shared outcome ring (ADR-0092), as
+    /// [`BindingFds::bind`] for an exclusive one: the slot comes from the
+    /// grant's consumed cell record, never from the ring, and the handle
+    /// reads after the sequence its cell holds, which the driver wrote
+    /// before the grant.
+    fn bind_shared(
+        self,
+        instance: u128,
+        lanes: u8,
+        incarnation: u64,
+    ) -> Result<GuardBinding, AttachError> {
+        let Capability::GuardSlot { slot } = self.cell.record.capability else {
+            return Err(AttachError::Protocol);
+        };
+        let (ring, guards, cell) = self.map(instance)?;
+        let binding = karyos_sys::outcome_ring::shared::binding(
+            &ring.region.structure(),
+            guards.region.structure().len(),
+        )
+        .map_err(|_| AttachError::Protocol)?;
+        let index = usize::try_from(binding.guard_index).map_err(|_| AttachError::Protocol)?;
+        let after =
+            crate::guarded::ConsumedCell::cell(&cell).load(karyos_sys::sync::Ordering::Acquire);
+        let reincarnated = karyos_sys::load_words::LoadWords::load_acquire(
+            &ring,
+            karyos_sys::outcome_ring::REINCARNATED_AT,
+        )
+        .unwrap_or(0);
+        GuardBinding::new_shared(
+            Arc::new(guards),
+            index,
+            binding.epoch,
+            Arc::new(ring),
+            Arc::new(cell),
+            lanes,
+            slot,
+            after,
+        )
+        .map(|bound| {
             let bound = if incarnation > FIRST_INCARNATION {
                 bound.reincarnated_at(reincarnated)
             } else {
@@ -1597,14 +1654,30 @@ impl RemoteClient {
         else {
             return Err(AttachError::Protocol);
         };
+        let instance = self.session.as_ref().ok_or(AttachError::Protocol)?.instance;
         self.take(fetchable, |fetched, export| {
             // The request's policy or its stream's, from the grant
             // (ipc-admission.md, Unconnected offers).
             let allow_unconnected = allow_unconnected || fetched.record.allow_unconnected;
+            // A guarded stream's handle binds its slot of the shared ring
+            // first, so a refusal takes nothing (ADR-0092, G-x3).
+            let lanes = fetched
+                .record
+                .lane
+                .checked_add(1)
+                .ok_or(AttachError::Protocol)?;
+            let guard = match fetched.binding.take() {
+                Some(binding) => Some(binding.bind_shared(instance, lanes, fetched.incarnation)?),
+                None => None,
+            };
             let inner = prepare_concurrent(fetched, export)?
                 .activate()
                 .map_err(|refused| AttachError::Sys(refused.error))?;
-            Ok(ClientConcurrentPublication::new(inner, allow_unconnected))
+            let publication = ClientConcurrentPublication::new(inner, allow_unconnected);
+            Ok(match guard {
+                Some(guard) => publication.with_guard(guard),
+                None => publication,
+            })
         })
     }
 
@@ -1670,8 +1743,13 @@ impl RemoteClient {
         } else {
             fetchable.request
         };
-        // Only a publication is granted a binding; it takes it in `adopt`.
-        let bindable = fetched.binding.is_none() || matches!(request, Request::Publication { .. });
+        // Only a publication, exclusive or concurrent (ADR-0092), is
+        // granted a binding; it takes it in `adopt`.
+        let bindable = fetched.binding.is_none()
+            || matches!(
+                request,
+                Request::Publication { .. } | Request::ConcurrentPublication { .. }
+            );
         let built = check(&fetched, &request)
             .and_then(|()| bindable.then_some(()).ok_or(AttachError::Protocol))
             .and_then(|()| adopt(&mut fetched, export));

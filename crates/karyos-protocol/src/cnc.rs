@@ -1340,6 +1340,10 @@ pub enum ErrorCode {
     TracePointIdsExhausted,
     /// The label is empty, too long or holds a control character.
     InvalidLabel,
+    /// Every handle slot of a guarded concurrent stream's incarnation was
+    /// issued (ADR-0092 decision 3): a slot is freed only when the
+    /// incarnation ends. The detail is the stream's handle count `H`.
+    GuardHandlesExhausted,
     /// A refusal code this peer does not define, read from a newer driver
     /// (karyos#819): a refusal all the same, with its wire value and its
     /// detail kept. It encodes to its own wire value, so a decoded
@@ -1427,6 +1431,7 @@ error_code_table! {
     RatePolicyConflict = 25,
     TracePointIdsExhausted = 26,
     InvalidLabel = 27,
+    GuardHandlesExhausted = 28,
 }
 
 impl ErrorCode {
@@ -5273,6 +5278,7 @@ mod journal_tests {
             (ErrorCode::GuardNotClosedAt, 9),
             (ErrorCode::GuardExhausted, 10),
             (ErrorCode::NotAuthorized, 11),
+            (ErrorCode::GuardHandlesExhausted, 28),
         ] {
             let refused = Response::Error {
                 request,
@@ -6343,6 +6349,7 @@ mod properties {
                 ErrorCode::RateNotSet,
                 ErrorCode::RateInvalidPolicy,
                 ErrorCode::StreamTooLarge,
+                ErrorCode::GuardHandlesExhausted,
                 ErrorCode::RatePolicyConflict,
                 ErrorCode::TracePointIdsExhausted,
                 ErrorCode::InvalidLabel,

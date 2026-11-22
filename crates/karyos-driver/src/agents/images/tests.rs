@@ -4510,14 +4510,24 @@ fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
     let source = rig.endpoints.local_address(rig.publisher).unwrap();
     let challenges = rig.agents.receiver.role.session_counters().challenges;
     let dropped = rig.agents.receiver.role.session_counters().dropped;
+    // Each replay is counted as it is handled, read around it: the real
+    // sockets of the rig may deliver other dropped control frames at any
+    // round under host load, so a total over the run is not exact
+    // (karyos#1067).
     let replay = |rig: &mut Rig| {
         let receiver = &mut rig.agents.receiver;
+        let before = receiver.role.session_counters().dropped;
         receiver.role.inject_control(
             &receiver.sessions,
             b,
             source,
             karyos_protocol::network::Control::SetupAnnounce(announce(65_536)),
             rig.now,
+        );
+        assert_eq!(
+            receiver.role.session_counters().dropped,
+            before + 1,
+            "every replay counted"
         );
     };
     // One replay a second, through the liveness timeout and past it.
@@ -4536,7 +4546,10 @@ fn a_replayed_setup_neither_keeps_the_image_nor_blocks_a_rebind() {
     assert!(retired_after <= 11, "retired after {retired_after} s");
     assert_eq!(rig.agents.receiver.counters().images_retired, 1);
     let sessions = rig.agents.receiver.role.session_counters();
-    assert_eq!(sessions.dropped, dropped + replays, "every replay counted");
+    assert!(
+        sessions.dropped >= dropped + replays,
+        "every replay counted"
+    );
     assert_eq!(sessions.challenges, challenges, "no replay challenged");
     // A new incarnation binds a new image.
     let installed = rig

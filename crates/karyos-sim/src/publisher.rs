@@ -141,32 +141,74 @@ impl SimPublisher for ClientPublication {
 
 impl SimPublisher for ClientConcurrentPublication {
     fn offer(&mut self, payload: &[u8], key: i64) -> Result<Attempt, ClientError> {
-        Ok(
-            match ClientConcurrentPublication::offer_with(self, payload, keyed(key))? {
-                ConcurrentOfferOutcome::Accepted { position, .. } => Attempt::Accepted(position),
-                ConcurrentOfferOutcome::Aborted { position, .. } => Attempt::Aborted(position),
-                ConcurrentOfferOutcome::BackPressured
-                | ConcurrentOfferOutcome::AdminAction
-                | ConcurrentOfferOutcome::NotConnected => Attempt::Retry,
-                ConcurrentOfferOutcome::Closed => Attempt::Closed,
-                // A later outcome the simulator does not know: it stops.
-                _ => Attempt::Closed,
-            },
-        )
+        Ok(concurrent_offered(ClientConcurrentPublication::offer_with(
+            self,
+            payload,
+            keyed(key),
+        )?))
     }
 
     fn claim(&mut self, length: u32, key: i64) -> Result<Claimed<'_>, ClientError> {
         Ok(match self.try_claim_with(length, keyed(key))? {
             ConcurrentClaimOutcome::Claimed(claim) => Claimed::Claim(Box::new(claim)),
-            ConcurrentClaimOutcome::Aborted { position, .. } => {
-                Claimed::Outcome(Attempt::Aborted(position))
-            }
-            ConcurrentClaimOutcome::BackPressured
-            | ConcurrentClaimOutcome::AdminAction
-            | ConcurrentClaimOutcome::NotConnected => Claimed::Outcome(Attempt::Retry),
-            ConcurrentClaimOutcome::Closed => Claimed::Outcome(Attempt::Closed),
-            // A later outcome the simulator does not know: it stops.
-            _ => Claimed::Outcome(Attempt::Closed),
+            other => Claimed::Outcome(concurrent_refused(&other)),
         })
+    }
+}
+
+/// The attempt of a concurrent offer's outcome. A guarded handle's rate
+/// copy refuses for now only (`RateLimited`): it retries, as the exclusive
+/// adapter does; a gate seal ends the publication.
+fn concurrent_offered(outcome: ConcurrentOfferOutcome) -> Attempt {
+    match outcome {
+        ConcurrentOfferOutcome::Accepted { position, .. } => Attempt::Accepted(position),
+        ConcurrentOfferOutcome::Aborted { position, .. } => Attempt::Aborted(position),
+        ConcurrentOfferOutcome::BackPressured
+        | ConcurrentOfferOutcome::AdminAction
+        | ConcurrentOfferOutcome::NotConnected
+        | ConcurrentOfferOutcome::RateLimited => Attempt::Retry,
+        ConcurrentOfferOutcome::Closed | ConcurrentOfferOutcome::Gated => Attempt::Closed,
+        // A later outcome the simulator does not know: it stops.
+        _ => Attempt::Closed,
+    }
+}
+
+/// The attempt of a concurrent claim that claimed nothing, as
+/// [`concurrent_offered`].
+fn concurrent_refused<T: karyos_sys::term_bytes::TermBytes>(
+    outcome: &ConcurrentClaimOutcome<'_, T>,
+) -> Attempt {
+    match outcome {
+        ConcurrentClaimOutcome::Aborted { position, .. } => Attempt::Aborted(*position),
+        ConcurrentClaimOutcome::BackPressured
+        | ConcurrentClaimOutcome::AdminAction
+        | ConcurrentClaimOutcome::NotConnected
+        | ConcurrentClaimOutcome::RateLimited => Attempt::Retry,
+        // A gate seal, a claim handled by the caller, or a later outcome
+        // the simulator does not know: it stops.
+        _ => Attempt::Closed,
+    }
+}
+
+#[cfg(test)]
+mod concurrent_tests {
+    use super::*;
+
+    /// Review of #1153: a guarded concurrent handle's `RateLimited`
+    /// retries, offer and claim; `Gated` ends the publication.
+    #[test]
+    fn a_rate_limited_concurrent_attempt_retries() {
+        assert_eq!(
+            concurrent_offered(ConcurrentOfferOutcome::RateLimited),
+            Attempt::Retry
+        );
+        assert_eq!(
+            concurrent_offered(ConcurrentOfferOutcome::Gated),
+            Attempt::Closed
+        );
+        let limited: ConcurrentClaimOutcome<'_> = ConcurrentClaimOutcome::RateLimited;
+        assert_eq!(concurrent_refused(&limited), Attempt::Retry);
+        let gated: ConcurrentClaimOutcome<'_> = ConcurrentClaimOutcome::Gated;
+        assert_eq!(concurrent_refused(&gated), Attempt::Closed);
     }
 }

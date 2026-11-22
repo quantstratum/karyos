@@ -4049,17 +4049,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// Refused, with nothing changed, on a stream a guard close sealed,
     /// while the guard is not open, and as
     /// [`crate::guard_streams::GuardedStream::attach_shared`] refuses.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the client handles bind it in karyos#1102 (c) and (d)"
-        )
-    )]
     pub(crate) fn attach_concurrent_guard(
         &mut self,
         stream: StreamHandle,
         client: crate::guard_streams::ShareClient,
+    ) -> Result<crate::guard_streams::SharedSlot, DriverError> {
+        self.attach_concurrent_guard_at(stream, client, crate::guard_streams::Place::Heap)
+    }
+
+    /// [`Self::attach_concurrent_guard`], with the slot's consumed cell
+    /// and, at the first handle, the shared ring at `place`: in regions
+    /// for a remote client's grant.
+    pub(crate) fn attach_concurrent_guard_at(
+        &mut self,
+        stream: StreamHandle,
+        client: crate::guard_streams::ShareClient,
+        place: crate::guard_streams::Place,
     ) -> Result<crate::guard_streams::SharedSlot, DriverError> {
         let found = self.stream_ref(stream)?;
         let guard = found
@@ -4083,18 +4088,70 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .guarded
             .as_mut()
             .ok_or(DriverError::InvalidPublicationMode)?
-            .attach_shared(id, client, state.epoch, index, reincarnated_at)
+            .attach_shared(id, client, state.epoch, index, reincarnated_at, place)
+    }
+
+    /// After a guard close and reopen, stream id `stream`'s fresh
+    /// incarnation, before a remote handle registers on it.
+    pub(crate) fn reincarnate_stream_if_reopened(
+        &mut self,
+        stream: u64,
+    ) -> Result<(), DriverError> {
+        self.reincarnate_if_reopened(StreamHandle {
+            driver: self.id,
+            stream,
+        })
+    }
+
+    /// A remote client's concurrent guarded handle on stream id `stream`:
+    /// after a guard close and reopen the fresh incarnation first, as for
+    /// an exclusive grant, then its slot at `place`
+    /// ([`Self::attach_concurrent_guard_at`]). Remote clients exist only
+    /// on Linux.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach_remote_concurrent_guard(
+        &mut self,
+        stream: u64,
+        client: u64,
+        place: crate::guard_streams::Place,
+    ) -> Result<crate::guard_streams::SharedSlot, DriverError> {
+        let handle = StreamHandle {
+            driver: self.id,
+            stream,
+        };
+        self.reincarnate_if_reopened(handle)?;
+        self.attach_concurrent_guard_at(
+            handle,
+            crate::guard_streams::ShareClient::Remote(client),
+            place,
+        )
+    }
+
+    /// Detaches slot `slot` of stream id `stream`'s shared ring, when its
+    /// current incarnation is `incarnation`: a remote handle's grant ended.
+    pub(crate) fn detach_remote_concurrent_guard(
+        &mut self,
+        stream: u64,
+        incarnation: u64,
+        slot: usize,
+    ) {
+        if self
+            .streams
+            .iter()
+            .any(|found| found.id == stream && found.incarnation == incarnation)
+        {
+            self.detach_concurrent_guard(
+                StreamHandle {
+                    driver: self.id,
+                    stream,
+                },
+                slot,
+            );
+        }
     }
 
     /// Detaches slot `slot` of stream `stream`'s shared ring: its handle is
     /// gone (ADR-0092 decision 8).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the client handles bind it in karyos#1102 (c) and (d)"
-        )
-    )]
     pub(crate) fn detach_concurrent_guard(&mut self, stream: StreamHandle, slot: usize) {
         if let Ok(found) = self.stream(stream)
             && let Some(guarded) = found.guarded.as_mut()
@@ -4120,29 +4177,107 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         &mut self,
         stream: StreamHandle,
     ) -> Result<ClientConcurrentPublication<T>, DriverError> {
-        let stream = self.active_stream(stream)?;
-        // A guarded stream's handle binds a slot of its shared ring, which
-        // the client handle does not do yet (karyos#1102 (c)): never
-        // issued unguarded.
-        if stream.guarded.is_some() {
-            return Err(DriverError::Sys(
-                karyos_sys::error::SysError::InvalidPublicationMode { reason: "GC-7" },
-            ));
-        }
+        let handle = stream;
+        let _ = self.active_stream(handle)?;
+        // After a guard close and reopen, the fresh incarnation first.
+        self.reincarnate_if_reopened(handle)?;
+        let stream = self.active_stream(handle)?;
         stream.issuing()?;
+        let guarded = stream.guarded.is_some();
         let inner = stream
             .conductor
             .concurrent_publication()
             .map_err(mode_error)?
             .ok_or(DriverError::PublicationTaken)?;
+        // A guarded stream's handle takes the next slot of its shared ring
+        // (ADR-0092), after its publisher slot, so a refusal of either
+        // takes nothing else; a refused slot drops `inner`, freeing its
+        // publisher slot.
+        let binding = if guarded {
+            match self.concurrent_guard_binding(handle) {
+                Ok(binding) => Some(binding),
+                Err(error) => {
+                    let guard = self
+                        .stream_ref(handle)
+                        .ok()
+                        .and_then(|found| found.guarded.as_ref().map(|guarded| guarded.guard.id()));
+                    if let Some(guard) = guard {
+                        self.report_guard_error(guard, &error);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let stream = self.active_stream(handle)?;
         let lease = Lease::acquire(&stream.leases, &Arc::new(LeaseEnd::default()));
         let (link, base) = stream.join_host(MemberKind::Concurrent);
         // Its stream's conflation table comes with the buffer (F7b-2c-2).
         let publication =
             ClientConcurrentPublication::with_lease(inner, stream.allow_unconnected, lease);
-        let publication = publication.with_generation(link, base)?;
+        let mut publication = publication.with_generation(link, base)?;
+        if let Some(binding) = binding {
+            publication = publication.with_guard(binding);
+        }
         self.update_stream_gauges();
         Ok(publication)
+    }
+
+    /// The guard binding of a concurrent handle about to be issued on a
+    /// guarded stream: its slot of the shared ring
+    /// ([`Self::attach_concurrent_guard`]), its guard word, and the
+    /// handle's early copy of the rate limit, as an exclusive handle's.
+    fn concurrent_guard_binding(
+        &mut self,
+        handle: StreamHandle,
+    ) -> Result<karyos_client::GuardBinding, DriverError> {
+        let slot =
+            self.attach_concurrent_guard(handle, crate::guard_streams::ShareClient::InProcess)?;
+        // The slot is taken back if the handle's binding fails, so a failed
+        // issuance consumes no slot of the incarnation.
+        let bound = self.bind_concurrent_guard(handle, &slot);
+        if bound.is_err()
+            && let Ok(found) = self.stream(handle)
+            && let Some(guarded) = found.guarded.as_mut()
+        {
+            guarded.revoke_shared(slot.slot);
+        }
+        bound
+    }
+
+    /// The client binding of `slot`, a concurrent handle's slot of its
+    /// stream's shared ring ([`Self::concurrent_guard_binding`]).
+    fn bind_concurrent_guard(
+        &self,
+        handle: StreamHandle,
+        slot: &crate::guard_streams::SharedSlot,
+    ) -> Result<karyos_client::GuardBinding, DriverError> {
+        let found = self.stream_ref(handle)?;
+        let guarded = found
+            .guarded
+            .as_ref()
+            .ok_or(DriverError::InvalidPublicationMode)?;
+        let (words, index) = self.guards.view(guarded.guard)?;
+        let client = karyos_client::GuardBinding::new_shared(
+            words,
+            index,
+            slot.binding.epoch,
+            Arc::clone(&slot.ring) as Arc<dyn karyos_client::SharedWords>,
+            Arc::clone(&slot.cell) as Arc<dyn karyos_client::ConsumedCell>,
+            found.config.lane.get() + 1,
+            u64::try_from(slot.slot).map_err(|_| DriverError::InvalidConfig)?,
+            slot.consumed,
+        )?;
+        let client = if found.incarnation > FIRST_INCARNATION {
+            client.reincarnated_at(found.reincarnated_at)
+        } else {
+            client
+        };
+        Ok(match guarded.rate {
+            Some(policy) => client.with_rate(policy, karyos_sys::host_clock::host_monotonic_ns),
+            None => client.with_published_rate(karyos_sys::host_clock::host_monotonic_ns),
+        })
     }
 
     /// Admits a subscriber to the stream (control path: allocates its copy

@@ -254,6 +254,22 @@ impl SharedOutcomeWriter {
         Ok(written)
     }
 
+    /// Takes back slot `slot`, attached and never issued: its handle's
+    /// setup failed before it existed, so no handle has read or reserved
+    /// through it, and the slot is free for the next handle (ADR-0092
+    /// decision 3: a slot index still names at most one handle). Returns
+    /// whether it was taken back; a slot not attached, or faulted, stays
+    /// as it is.
+    pub fn revoke(&mut self, slot: usize) -> bool {
+        match self.handles.get_mut(slot) {
+            Some(state) if state.attached && !state.faulted => {
+                *state = HandleState::default();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Detaches handle `slot`: it leaves the minimum. Its slot stays used.
     pub fn detach(&mut self, slot: usize) {
         if let Some(state) = self.handles.get_mut(slot) {
