@@ -1131,12 +1131,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // the binding's regions (G-x2) and binds them (G-x3); a
                 // client of the in-process command ring has no such grant,
                 // so it is issued none.
+                // A concurrent handle's binding is its slot of the shared
+                // ring (ADR-0092), granted the same way.
                 let remote = self.ledger(client).is_some();
-                if matches!(command, Command::AddPublication { .. })
-                    && self
-                        .streams
-                        .get(index)
-                        .is_some_and(|found| found.guarded.is_some() && !remote)
+                if matches!(
+                    command,
+                    Command::AddPublication { .. } | Command::AddConcurrentPublication { .. }
+                ) && self
+                    .streams
+                    .get(index)
+                    .is_some_and(|found| found.guarded.is_some() && !remote)
                 {
                     return Ok(refuse(ErrorCode::InvalidPublicationMode, detail));
                 }
@@ -6846,6 +6850,69 @@ mod tests {
         );
         assert!(ledger(&driver, client).is_empty());
         assert!(driver.binding_exports.is_empty());
+    }
+
+    /// A guarded concurrent stream issues a client of the in-process
+    /// command ring no handle either: it has no grant to carry the handle's
+    /// slot of the shared ring (ADR-0092), so it is refused rather than
+    /// handed an unguarded handle.
+    #[test]
+    fn a_guarded_concurrent_stream_issues_the_command_ring_no_handle() {
+        let mut driver = EmbeddedDriver::new().unwrap();
+        let stream = driver
+            .add_stream(StreamConfig {
+                buffer: LogBufferConfig {
+                    term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                    spare_slots: 6,
+                    max_subscribers: 4,
+                    mtu: DEFAULT_MTU,
+                    max_reserved: MIN_TERM_LENGTH / 16,
+                    initial_term_id: TermId::new(7),
+                    lane: Lane::ZERO,
+                    session_id: 1,
+                    stream_id: 2,
+                    claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                    publication: karyos_sys::log_buffer::PublicationMode::Concurrent {
+                        publishers: 2,
+                        allow_non_lse: true,
+                    },
+                    schedule_capacity: 0,
+                },
+                allow_unconnected: true,
+                on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
+                conflation: None,
+            })
+            .unwrap();
+        let guard = driver.add_guard("orders").unwrap();
+        driver.guard_stream(stream, guard, 2, None).unwrap();
+        assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+        let mut observer = driver.broadcast.receiver();
+        let (ring_client, mut ring_producer, _link) = raw_client(&mut driver);
+        write(
+            &mut ring_producer,
+            Command::AddConcurrentPublication {
+                sequence: 1,
+                stream: KEY,
+                allow_unconnected: true,
+                lane: Lane::ZERO,
+            },
+        );
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        assert!(
+            answers.iter().any(|answer| matches!(
+                answer,
+                Response::Error {
+                    request: RequestId { client, sequence: 1 },
+                    code: ErrorCode::InvalidPublicationMode,
+                    ..
+                } if *client == ring_client
+            )),
+            "{answers:?}"
+        );
     }
 
     /// The guard counters count what the walker did.

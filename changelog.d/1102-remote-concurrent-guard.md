@@ -5,3 +5,4 @@
   - **`RemoteClient::take_concurrent_publication`.** It binds a guarded grant to its slot with `GuardBinding::new_shared`, so the handle answers `BackPressured` at its quota and reads only its own message records.
   - **Refusals.** A handle beyond the stream's `H` is refused with the new `ErrorCode::GuardHandlesExhausted` (code 28), whose detail is `H`; another client's handle on the same incarnation with `InvalidPublicationMode` (`GC-7-client`). A refused slot ends the handle's publisher registration.
   - **Detach.** When a remote handle's consumed cell grant ends, its slot leaves the ring's room minimum.
+  - **In-process command ring.** A client of the in-process command ring is refused a guarded stream's concurrent handle (`InvalidPublicationMode`), as it already was the exclusive one: it has no grant to carry the handle's slot.
