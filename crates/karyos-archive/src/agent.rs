@@ -1804,18 +1804,24 @@ fn run<D>(
         }
     };
     // The configured retention policy is chained in the integrity journal
-    // when its terms changed, as the next version, and purges are checked
-    // against the version recorded (SPEC.md 8.4; karyos#1123).
+    // when its terms changed (SPEC.md 8.4; karyos#1123), but only after
+    // the purges a crash cut short are reconciled: they are rechecked, and
+    // their evidence chained, under the version in force when they were
+    // asked, never under a newer one (karyos#1123 review).
     let mut config = config;
+    let mut book = None;
     if let (Some(policy), Some(integrity)) = (config.retention_policy, integrity.as_mut()) {
-        let recorded = crate::integrity::retention::PolicyBook::open(
+        match crate::integrity::retention::PolicyBook::open(
             disk.clone(),
             &dir,
             &mut integrity.journal,
-        )
-        .and_then(|mut book| book.record_configured(policy, &mut integrity.journal));
-        match recorded {
-            Ok(recorded) => config.retention_policy = Some(recorded),
+        ) {
+            Ok(opened) => {
+                if let Some(current) = opened.current(policy.policy) {
+                    config.retention_policy = Some(current);
+                }
+                book = Some((opened, policy));
+            }
             Err(error) => {
                 let _ = ready.send(Err(error.into()));
                 return;
@@ -1879,9 +1885,6 @@ fn run<D>(
             }
         }
     }
-    if ready.send(Ok(())).is_err() {
-        return;
-    }
     let mut state = State {
         disk,
         dir,
@@ -1905,6 +1908,20 @@ fn run<D>(
     // Before the first command: a purge a crash cut short is completed or
     // cancelled before any retry reaches it (karyos#1121 review).
     state.reconcile_purges();
+    if let Some((mut book, policy)) = book
+        && let Some(integrity) = state.integrity.as_mut()
+    {
+        match book.record_configured(policy, &mut integrity.journal) {
+            Ok(recorded) => state.config.retention_policy = Some(recorded),
+            Err(error) => {
+                let _ = ready.send(Err(error.into()));
+                return;
+            }
+        }
+    }
+    if ready.send(Ok(())).is_err() {
+        return;
+    }
     loop {
         let mut worked = false;
         loop {

@@ -5220,3 +5220,49 @@ fn a_start_chains_the_configured_policy_when_it_changes() {
     drop(journal);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// karyos#1123 review: a crash between a purge's floor advance and its
+/// seal, then a restart with changed terms. The start reconciles the purge
+/// first, under the version in force when it was asked, and chains the
+/// new version only after: the purge record precedes version 2 in the
+/// chain, so version 1 governs the deletion.
+#[test]
+fn a_recovered_purge_is_chained_before_a_new_policy_version() {
+    use crate::integrity::SealKind;
+
+    let dir = temp_dir("policy-after-recovery");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    journal_intent(&dir, 1, id, end);
+    let recording = Catalog::open(StdDisk, &dir)
+        .unwrap()
+        .catalog
+        .get(id)
+        .cloned()
+        .unwrap();
+    let mut store = SegmentStore::recover(StdDisk, &dir, id, recording.geometry, recording.policy)
+        .unwrap()
+        .store;
+    assert_eq!(store.purge_before(end).unwrap(), end);
+    drop(store);
+
+    ArchiveHandle::spawn(StdDisk, &dir, purge_config(60))
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    let records = IntegrityJournal::open(StdDisk, &dir)
+        .unwrap()
+        .journal
+        .records()
+        .unwrap();
+    let position = |found: &dyn Fn(&crate::integrity::SealRecord) -> bool| {
+        records.iter().position(found).unwrap()
+    };
+    let purge = position(&|record| record.kind == SealKind::Purge && record.subject == id);
+    let first = position(&|record| record.kind == SealKind::Policy && record.start == 1);
+    let second = position(&|record| record.kind == SealKind::Policy && record.start == 2);
+    assert!(first < purge && purge < second, "{first} {purge} {second}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
