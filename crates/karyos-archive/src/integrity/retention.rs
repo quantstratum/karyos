@@ -305,6 +305,51 @@ impl<D: Disk> PolicyBook<D> {
         Ok(book)
     }
 
+    /// The version of `policy` in force, if one was recorded.
+    #[must_use]
+    pub fn current(&self, policy: u64) -> Option<RetentionPolicy> {
+        self.current.get(&policy).copied()
+    }
+
+    /// Records the operator's configured `policy` when its terms differ
+    /// from the version in force, as the next version (or as configured,
+    /// when none was recorded); an unchanged one records nothing
+    /// (karyos#1123). Returns the version purges are checked against: the
+    /// one in force afterwards. The configured version number is only a
+    /// starting point: the book's own order wins.
+    ///
+    /// # Errors
+    ///
+    /// As [`PolicyBook::record`]; [`IntegrityError::Policy`] when the next
+    /// version would pass `u64::MAX`.
+    pub fn record_configured(
+        &mut self,
+        policy: RetentionPolicy,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<RetentionPolicy, IntegrityError> {
+        let next = match self.current(policy.policy) {
+            Some(current)
+                if RetentionPolicy {
+                    version: current.version,
+                    ..policy
+                } == current =>
+            {
+                return Ok(current);
+            }
+            Some(current) => RetentionPolicy {
+                version: current.version.checked_add(1).ok_or(PolicyError::Version {
+                    policy: policy.policy,
+                    version: current.version,
+                    current: current.version,
+                })?,
+                ..policy
+            },
+            None => policy,
+        };
+        self.record(next, journal)?;
+        Ok(next)
+    }
+
     /// Records a new policy version: stored, then chained in `journal`,
     /// and only then in force.
     ///

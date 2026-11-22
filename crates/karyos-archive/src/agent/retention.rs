@@ -384,9 +384,11 @@ impl<D: Disk + Clone> State<D> {
             .spawn(move || {
                 // Cleared on every exit, a panic's unwind included, so a
                 // failed verification never blocks the next one.
-                let _clear = Clear(verifying);
+                let clear = Clear(verifying);
                 let verified = work.run();
-                let _ = worker_reply.send(Ok(verified));
+                clear_then_answer(clear, verified, |verified| {
+                    let _ = worker_reply.send(Ok(verified));
+                });
             });
         if let Err(error) = spawned {
             self.verifying
@@ -476,6 +478,14 @@ impl Drop for Clear {
     }
 }
 
+/// Clears the "verification runs" flag, then sends the answer: a client
+/// retrying on the answer is never told a verification still runs
+/// (karyos#1135).
+fn clear_then_answer<T>(clear: Clear, value: T, send: impl FnOnce(T)) {
+    drop(clear);
+    send(value);
+}
+
 /// The refusal of a purge of a recording a verification reads: retried
 /// once the verification answers. Not journalled: nothing was asked of the
 /// retention engine.
@@ -563,6 +573,20 @@ fn open_stopped<D: Disk + Clone>(
 
 #[cfg(test)]
 mod tests {
+    /// karyos#1135: at the moment the answer is sent, the "verification
+    /// runs" flag is already clear.
+    #[test]
+    fn the_flag_is_clear_when_the_answer_is_sent() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // The recording a verification runs for; 0 once clear.
+        let flag = std::sync::Arc::new(AtomicU64::new(9));
+        let mut seen = None;
+        super::clear_then_answer(super::Clear(std::sync::Arc::clone(&flag)), 7, |value| {
+            seen = Some((value, flag.load(Ordering::Acquire)));
+        });
+        assert_eq!(seen, Some((7, 0)));
+    }
+
     use super::*;
 
     #[test]

@@ -362,6 +362,11 @@ impl<D: Disk + Clone> EntryStore<D> {
         Ok(Self { store, journal })
     }
 
+    /// The entries' integrity journal, which the Archive's signer signs.
+    pub(crate) fn journal_mut(&mut self) -> &mut IntegrityJournal<D> {
+        &mut self.journal
+    }
+
     /// Appends `entry`, durable, and seals it: its seal is the entry's
     /// evidence. Call it only after the entry's own range was sealed.
     ///

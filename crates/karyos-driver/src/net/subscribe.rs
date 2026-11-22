@@ -294,6 +294,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             .map_or(0, crate::net::Network::subscription_refusals)
     }
 
+    /// The entries of the driver's NAK control group table in use: the
+    /// configured ones, and those channels' `nak-control` keys added while
+    /// a channel holds them (karyos#1086). At most
+    /// [`MAX_CONTROL_GROUPS`](crate::net::MAX_CONTROL_GROUPS).
+    #[must_use]
+    pub fn network_control_groups_in_use(&self) -> usize {
+        self.net
+            .as_ref()
+            .map_or(0, crate::net::Network::control_groups_in_use)
+    }
+
     /// NAK control group joins that failed (RC-15): those subscriptions
     /// run without peer suppression input.
     #[must_use]
@@ -496,15 +507,28 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let later = later_routes(channel)?;
         // The channel's NAK control groups join the driver's one table
         // first, so the subscription's join finds them (karyos#654).
-        net.map_nak_control(channel)?;
-        net.add_subscription(
+        let held = net.map_nak_control(channel)?;
+        let added = net.add_subscription(
             stream_id,
             route,
             &later,
             DEFAULT_MAX_IMAGE_TERM_LENGTH,
-            (channel.reliable, own_port),
+            (channel.reliable, own_port, !channel.nak_control.is_empty()),
             (options.0, options.1, register_at(channel), path_skew),
-        )
+        );
+        // The channel's entries stay counted while its key lives, beside
+        // those its paths select, and are released when it ends or the add
+        // fails (karyos#1086).
+        match added {
+            Ok(subscription) => {
+                net.keep_control_groups(subscription, held);
+                Ok(subscription)
+            }
+            Err(error) => {
+                net.release_control_groups(&held);
+                Err(error)
+            }
+        }
     }
 
     /// Stops `subscription`, as [`EmbeddedDriver::remove_network_subscription`].

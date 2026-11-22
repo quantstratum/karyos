@@ -27,6 +27,15 @@ use karyos_client::ConsumedCell;
 use crate::guard_streams::ShareClient;
 
 fn concurrent(driver: &mut EmbeddedDriver, publishers: u8) -> StreamHandle {
+    concurrent_allowing(driver, publishers, true)
+}
+
+/// As [`concurrent`], with the stream's `allow_unconnected`.
+fn concurrent_allowing(
+    driver: &mut EmbeddedDriver,
+    publishers: u8,
+    allow_unconnected: bool,
+) -> StreamHandle {
     driver
         .add_stream(StreamConfig {
             buffer: LogBufferConfig {
@@ -46,7 +55,7 @@ fn concurrent(driver: &mut EmbeddedDriver, publishers: u8) -> StreamHandle {
                 },
                 schedule_capacity: 0,
             },
-            allow_unconnected: true,
+            allow_unconnected,
             on_required_loss: karyos_sys::log_buffer::LossPolicy::Hold,
             conflation: None,
         })
@@ -83,13 +92,6 @@ fn delivered(
 #[test]
 fn slots_come_from_the_publisher_count_and_one_client_holds_them() {
     let (mut driver, handle, _) = guarded();
-    // Not issued unguarded while the client handle cannot bind a slot.
-    assert!(matches!(
-        driver.concurrent_publication(handle),
-        Err(DriverError::Sys(
-            karyos_sys::error::SysError::InvalidPublicationMode { reason: "GC-7" }
-        ))
-    ));
     let first = driver
         .attach_concurrent_guard(handle, ShareClient::InProcess)
         .unwrap();
@@ -238,4 +240,112 @@ fn a_detached_handle_leaves_the_room_minimum() {
         read += seen.len();
     }
     assert_eq!(read, 12);
+}
+
+/// karyos#1102 (c): concurrent guarded handles from the driver. Each
+/// reserves through its slot's reader, answers `BackPressured` at its own
+/// quota, polls only its own records, and reads `Gated` and `Ended` after
+/// the close; a dropped handle leaves the room minimum.
+#[test]
+fn concurrent_guarded_handles_keep_their_own_outcomes() {
+    use karyos_client::ConcurrentOfferOutcome as Offer;
+
+    let (mut driver, handle, guard) = guarded();
+    let mut a = driver.concurrent_publication(handle).unwrap();
+    let mut b = driver.concurrent_publication(handle).unwrap();
+    assert_eq!(a.guard().unwrap().outstanding(), 0);
+    let position = |outcome| match outcome {
+        Offer::Accepted { position, .. } => position,
+        other => panic!("not accepted: {other:?}"),
+    };
+    let a1 = position(a.offer(b"a1").unwrap());
+    let b1 = position(b.offer(b"b1").unwrap());
+    let a2 = position(a.offer(b"a2").unwrap());
+    // C_m = 2: A's quota is full, B's is not.
+    assert_eq!(a.offer(b"a3").unwrap(), Offer::BackPressured);
+    assert_eq!(a.guard().unwrap().outstanding(), 2);
+    let _ = driver.do_work().unwrap();
+    let mut seen_a = Vec::new();
+    let _ = a
+        .poll_outcomes(16, |_, record| seen_a.push((record.kind, record.start)))
+        .unwrap();
+    assert_eq!(seen_a, [(Kind::Submitted, a1), (Kind::Submitted, a2)]);
+    let mut seen_b = Vec::new();
+    let _ = b
+        .poll_outcomes(16, |_, record| seen_b.push((record.kind, record.start)))
+        .unwrap();
+    assert_eq!(seen_b, [(Kind::Submitted, b1)]);
+    // Records read: A's quota is free again.
+    assert_eq!(a.guard().unwrap().outstanding(), 0);
+    let _ = position(a.offer(b"a3").unwrap());
+    // A dropped handle is detached; the other keeps reading.
+    drop(b);
+    driver.close_guard(guard, 2).unwrap();
+    assert_eq!(a.offer(b"late").unwrap(), Offer::Gated);
+    let mut ended = false;
+    for _ in 0..8 {
+        let _ = driver.do_work().unwrap();
+        let _ = a
+            .poll_outcomes(16, |_, record| ended |= record.kind == Kind::Ended)
+            .unwrap();
+    }
+    assert!(ended, "A reads the incarnation's Ended record");
+    // Review of #1153: once the handle observed the gate seal, every later
+    // offer and claim still reports `Gated`, never `Closed`.
+    use karyos_client::ConcurrentClaimOutcome as Claim;
+    assert!(matches!(a.try_claim(8).unwrap(), Claim::Gated));
+    assert!(matches!(a.try_claim(8).unwrap(), Claim::Gated));
+    assert_eq!(a.offer(b"later").unwrap(), Offer::Gated);
+}
+
+/// Review of #1153: a slot whose handle's binding failed is taken back,
+/// so the next handle gets the same slot.
+#[test]
+fn a_failed_issuance_takes_its_slot_back() {
+    let (mut driver, handle, _guard) = guarded();
+    let first = driver
+        .attach_concurrent_guard(handle, ShareClient::InProcess)
+        .unwrap();
+    assert_eq!(first.slot, 0);
+    driver
+        .stream(handle)
+        .unwrap()
+        .guarded
+        .as_mut()
+        .unwrap()
+        .revoke_shared(first.slot);
+    let again = driver
+        .attach_concurrent_guard(handle, ShareClient::InProcess)
+        .unwrap();
+    assert_eq!(again.slot, 0);
+    // Only the last slot attached is taken back.
+    let second = driver
+        .attach_concurrent_guard(handle, ShareClient::InProcess)
+        .unwrap();
+    let guarded = driver.stream(handle).unwrap().guarded.as_mut().unwrap();
+    guarded.revoke_shared(again.slot);
+    guarded.revoke_shared(second.slot);
+    assert!(matches!(
+        driver.attach_concurrent_guard(handle, ShareClient::InProcess),
+        Ok(slot) if slot.slot == 1
+    ));
+}
+
+/// Review of #1157: an unconnected guarded handle reports a closed guard
+/// as `Gated`, offer and claim, never `NotConnected`.
+#[test]
+fn an_unconnected_guarded_handle_reports_its_closed_guard() {
+    use karyos_client::{ConcurrentClaimOutcome as Claim, ConcurrentOfferOutcome as Offer};
+
+    let mut driver = EmbeddedDriver::new().unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    let handle = concurrent_allowing(&mut driver, 2, false);
+    driver.guard_stream(handle, guard, 2, None).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut a = driver.concurrent_publication(handle).unwrap();
+    // Open and unconnected: `NotConnected`.
+    assert_eq!(a.offer(b"x").unwrap(), Offer::NotConnected);
+    let _ = driver.close_guard(guard, 2).unwrap();
+    assert_eq!(a.offer(b"x").unwrap(), Offer::Gated);
+    assert!(matches!(a.try_claim(8).unwrap(), Claim::Gated));
 }

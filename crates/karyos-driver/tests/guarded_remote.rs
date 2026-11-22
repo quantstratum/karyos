@@ -17,9 +17,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use karyos_client::ipc::{AttachError, RemoteClient, attach};
-use karyos_client::{Client, ClientPublication, Context, OfferOutcome, Outcome};
+use karyos_client::{
+    Client, ClientConcurrentPublication, ClientPublication, ConcurrentOfferOutcome, Context,
+    OfferOutcome, Outcome,
+};
 use karyos_driver::{DriverConfig, EmbeddedDriver, IpcConfig, StreamConfig, SystemClock};
-use karyos_protocol::cnc::{StreamId, StreamKey};
+use karyos_protocol::cnc::{ErrorCode, StreamId, StreamKey};
 use karyos_sys::frame::Lane;
 use karyos_sys::log_buffer::{LogBufferConfig, LossPolicy, PublicationMode};
 use karyos_sys::outcome_ring::{Kind, Record};
@@ -443,6 +446,191 @@ fn a_remote_handle_of_a_reincarnation_earns_since_it_began() {
     let (client, third, tokens) = serve_while(&mut driver, move || take(client));
     assert_eq!(tokens, Some(2));
     drop(third);
+    drop(client);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn concurrent_config(publishers: u8) -> StreamConfig {
+    let mut config = stream_config();
+    // A concurrent stream's reservation room and spares, as the driver's
+    // own concurrent guarded tests use.
+    config.buffer.spare_slots = 6;
+    config.buffer.max_reserved = MIN_TERM_LENGTH / 16;
+    config.buffer.publication = PublicationMode::Concurrent {
+        publishers,
+        allow_non_lse: true,
+    };
+    config
+}
+
+/// The completion of the client's last request: its grant, or its
+/// refusal's code and detail.
+fn completion(client: &mut RemoteClient) -> Outcome {
+    let mut outcome = None;
+    let start = Instant::now();
+    while outcome.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5), "no completion");
+        let _ = client.poll(usize::MAX, |completion| outcome = Some(completion.outcome));
+    }
+    outcome.unwrap()
+}
+
+/// A concurrent handle's message records until `count` arrived, with the
+/// driver served on the other thread.
+fn concurrent_outcomes(
+    publication: &mut ClientConcurrentPublication<SharedTerms>,
+    count: usize,
+) -> Vec<Record> {
+    let mut records = Vec::new();
+    let start = Instant::now();
+    while records.len() < count {
+        assert!(start.elapsed() < Duration::from_secs(5), "saw {records:?}");
+        let _ = publication
+            .poll_outcomes(64, |_, record| records.push(record))
+            .unwrap();
+        std::thread::yield_now();
+    }
+    records
+}
+
+/// karyos#1102 (d), ADR-0092 decisions 2, 3 and 6: two concurrent guarded
+/// handles of one remote client, each granted its slot of the shared
+/// outcome ring, read one record per message each and none of the
+/// other's; a handle beyond `H` is refused naming `H`, and another
+/// client's handle on the same incarnation with `GC-7-client`.
+#[test]
+fn remote_concurrent_guarded_handles_read_only_their_own_outcomes() {
+    let dir = dir("shared");
+    let mut driver = driver(&dir);
+    let stream = driver.add_stream(concurrent_config(3)).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    // `C_m = 2`: every handle's quota reserved at once fits half a term.
+    driver.guard_stream(stream, guard, 2, None).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let mut other = attach_serving(&mut driver, &dir).unwrap();
+
+    let (client, other, handles) = serve_while(&mut driver, move || {
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let _ = client.add_concurrent_publication(KEY, true).unwrap();
+            let Outcome::Fetchable(grant) = completion(&mut client) else {
+                panic!("expected a fetchable grant");
+            };
+            let publication = client.take_concurrent_publication(&grant).unwrap();
+            assert_eq!(publication.guard().unwrap().epoch(), 2);
+            handles.push(publication);
+        }
+        // Another client, with a publisher slot free on the same incarnation (GC-7-client).
+        let _ = other.add_concurrent_publication(KEY, true).unwrap();
+        let refused = completion(&mut other);
+        assert!(
+            matches!(
+                refused,
+                Outcome::Refused {
+                    code: ErrorCode::InvalidPublicationMode,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        // Interleaved offers: each handle reads exactly its own.
+        let mut accepted = [Vec::new(), Vec::new()];
+        for round in 0..2 {
+            for (which, publication) in handles.iter_mut().enumerate() {
+                let payload = [u8::try_from(which * 2 + round).unwrap()];
+                match publication.offer(&payload).unwrap() {
+                    ConcurrentOfferOutcome::Accepted { position, .. } => {
+                        accepted[which].push(position);
+                    }
+                    other => panic!("not accepted: {other:?}"),
+                }
+            }
+        }
+        for (publication, positions) in handles.iter_mut().zip(&accepted) {
+            let records = concurrent_outcomes(publication, 2);
+            let starts: Vec<u64> = records.iter().map(|record| record.start).collect();
+            assert_eq!(&starts, positions, "{records:?}");
+            assert!(records.iter().all(|record| record.kind == Kind::Submitted));
+            assert_eq!(publication.guard().unwrap().outstanding(), 0);
+        }
+        // A third handle takes the last slot. `H = 3` is the publisher slot
+        // count, so a fourth comes only once one is dropped: its publisher
+        // slot is free again once the driver read its detach, its ring slot
+        // never within the incarnation, so it is refused with `H` as the
+        // detail.
+        let _ = client.add_concurrent_publication(KEY, true).unwrap();
+        let Outcome::Fetchable(grant) = completion(&mut client) else {
+            panic!("expected a third grant");
+        };
+        handles.push(client.take_concurrent_publication(&grant).unwrap());
+        drop(handles.pop());
+        let start = Instant::now();
+        let refused = loop {
+            assert!(start.elapsed() < Duration::from_secs(5), "slot never freed");
+            let _ = client.add_concurrent_publication(KEY, true).unwrap();
+            match completion(&mut client) {
+                Outcome::Refused {
+                    code: ErrorCode::PublicationTaken,
+                    ..
+                } => std::thread::yield_now(),
+                other => break other,
+            }
+        };
+        assert!(
+            matches!(
+                refused,
+                Outcome::Refused {
+                    code: ErrorCode::GuardHandlesExhausted,
+                    detail: 3,
+                }
+            ),
+            "{refused:?}"
+        );
+        (client, other, handles)
+    });
+
+    // Dropping the handles detaches every export: per handle (three) its
+    // log buffer slot, the shared ring, its cell and the guard words.
+    drop(handles);
+    drop(client);
+    drop(other);
+    serve_until(&mut driver, |driver| driver.clients() == 0);
+    assert_eq!(counter(&driver, "grants exported"), 12);
+    assert_eq!(counter(&driver, "grants detached"), 12);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Review of #1157: after a guard close and reopen, a remote concurrent
+/// handle registers on the fresh incarnation, bound to the new epoch,
+/// rather than being refused on the sealed one.
+#[test]
+fn a_remote_concurrent_handle_after_a_reopen_binds_the_fresh_incarnation() {
+    let dir = dir("reopen");
+    let mut driver = driver(&dir);
+    let stream = driver.add_stream(concurrent_config(2)).unwrap();
+    let guard = driver.add_guard("orders").unwrap();
+    driver.guard_stream(stream, guard, 2, None).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 1, 1), Ok(2));
+    let _ = driver.close_guard(guard, 2).unwrap();
+    assert_eq!(driver.reopen_guard(guard, 3, 3), Ok(4));
+    let mut client = attach_serving(&mut driver, &dir).unwrap();
+    let (client, publication) = serve_while(&mut driver, move || {
+        let _ = client.add_concurrent_publication(KEY, true).unwrap();
+        let granted = completion(&mut client);
+        let Outcome::Fetchable(grant) = granted else {
+            panic!("expected a fetchable grant, got {granted:?}");
+        };
+        let mut publication = client.take_concurrent_publication(&grant).unwrap();
+        assert_eq!(publication.guard().unwrap().epoch(), 4);
+        assert!(matches!(
+            publication.offer(b"fresh").unwrap(),
+            ConcurrentOfferOutcome::Accepted { .. }
+        ));
+        (client, publication)
+    });
+    drop(publication);
     drop(client);
     serve_until(&mut driver, |driver| driver.clients() == 0);
     let _ = std::fs::remove_dir_all(&dir);

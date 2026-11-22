@@ -362,3 +362,18 @@ fn a_faulted_handle_lapped_by_the_others_ends_cleanly() {
         Err(OutcomeError::Corrupt { sequence: 4 })
     );
 }
+
+/// karyos#1102 review of #1153: a slot attached for a handle whose setup
+/// then failed is taken back, and the next handle gets it; a detached or
+/// never attached slot is not.
+#[test]
+fn a_slot_never_issued_is_taken_back() {
+    let mut writer = SharedOutcomeWriter::new(&O1).unwrap();
+    assert_eq!(writer.attach(0), Ok(0));
+    assert!(writer.revoke(0));
+    assert_eq!(writer.attach(0), Ok(0));
+    writer.detach(0);
+    assert!(!writer.revoke(0));
+    assert_eq!(writer.attach(0), Err(OutcomeError::Layout));
+    assert!(!writer.revoke(1));
+}
