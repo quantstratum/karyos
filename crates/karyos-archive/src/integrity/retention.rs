@@ -1443,6 +1443,24 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             self.release(store, request.before)?;
             store.purge_before(request.before)?;
         }
+        // A crash inside the removal leaves segments below the floor: they
+        // are released and removed before the purge is done (karyos#1121
+        // review).
+        let left = store.files_left_below_floor()?;
+        if !left.is_empty() {
+            if let Some(Releaser(backend)) = self.immutability.as_mut() {
+                for (_, path, data) in &left {
+                    if *data {
+                        backend.release(path).map_err(|error| PurgeError::Release {
+                            path: path.clone(),
+                            error,
+                        })?;
+                    }
+                }
+            }
+            let bases: Vec<u64> = left.iter().map(|(base, _, _)| *base).collect();
+            store.remove_left_below_floor(&bases)?;
+        }
         self.operations
             .append(&Operation::PurgeDone { id: request.id })
             .map_err(PurgeError::Operations)?;

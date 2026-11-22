@@ -4996,3 +4996,55 @@ fn a_resumed_purge_rechecks_the_segment_times() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// karyos#1121 review: a crash inside a purge's removal, after its floor
+/// moved, leaves segments below the floor. The next start removes them
+/// before it records the purge done.
+#[test]
+fn a_start_removes_the_segments_a_crash_left_below_the_floor() {
+    let dir = temp_dir("purge-crash-left");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    // Four writes of 2880 bytes: two segments of the test geometry.
+    let chunks: Vec<Vec<u8>> = (1..=4).map(|fill| frames(30, fill)).collect();
+    let id = agent
+        .start(start(Chunks {
+            chunks: chunks.into(),
+            seal: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    agent.shutdown().unwrap();
+    let cutoff = 3 * 2880;
+    let first = segment_lengths(&dir).first().unwrap().0.clone();
+    let index = first.with_extension("idx");
+    let (data_bytes, index_bytes) = (
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&index).unwrap(),
+    );
+    journal_intent(&dir, 1, id, cutoff);
+    let recording = Catalog::open(StdDisk, &dir)
+        .unwrap()
+        .catalog
+        .get(id)
+        .cloned()
+        .unwrap();
+    let mut store = SegmentStore::recover(StdDisk, &dir, id, recording.geometry, recording.policy)
+        .unwrap()
+        .store;
+    assert_eq!(store.purge_before(cutoff).unwrap(), cutoff);
+    drop(store);
+    // The crash cut the removal short: the first segment is still there.
+    assert!(!first.exists());
+    std::fs::write(&first, data_bytes).unwrap();
+    std::fs::write(&index, index_bytes).unwrap();
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    agent.shutdown().unwrap();
+    assert!(!first.exists(), "the data file left below the floor");
+    assert!(!index.exists(), "the index file left below the floor");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
