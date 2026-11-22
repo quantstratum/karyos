@@ -482,6 +482,14 @@ pub enum Capability {
         /// The publisher slot.
         slot: u64,
     },
+    /// The consumed cell of a concurrent guarded handle, whose slot in the
+    /// incarnation's shared outcome ring is `slot`, from 0 to `H - 1`
+    /// (ADR-0092 decision 3). Only on the consumed cell record of a
+    /// guarded grant whose log buffer record is a concurrent publication's.
+    GuardSlot {
+        /// The handle's slot in the shared outcome ring.
+        slot: u64,
+    },
 }
 
 impl Capability {
@@ -493,6 +501,7 @@ impl Capability {
             Self::ExclusivePublication => (3, 0),
             Self::ConcurrentPublication { slot } => (4, slot),
             Self::ObserverSubscriber { cell } => (5, cell),
+            Self::GuardSlot { slot } => (6, slot),
         }
     }
 
@@ -513,6 +522,7 @@ impl Capability {
             (3, 0) => Some(Self::ExclusivePublication),
             (4, slot) => Some(Self::ConcurrentPublication { slot }),
             (5, cell) => Some(Self::ObserverSubscriber { cell }),
+            (6, slot) => Some(Self::GuardSlot { slot }),
             _ => None,
         }
     }
@@ -785,7 +795,17 @@ fn check_manifest_identity(
         )
     });
     let positioned = log_buffers(records) || guarded;
-    if valid && base >> 63 == 0 && (base == 0 || positioned) && (guarded || !binding_kinds) {
+    // A guard slot names a concurrent guarded handle's consumed cell,
+    // which only a guarded grant carries (ADR-0092 decision 3).
+    let slots = records
+        .iter()
+        .any(|record| matches!(record.capability, Capability::GuardSlot { .. }));
+    if valid
+        && base >> 63 == 0
+        && (base == 0 || positioned)
+        && (guarded || !binding_kinds)
+        && (guarded || !slots)
+    {
         Ok(())
     } else {
         Err(AdmissionError::Reserved)
@@ -814,8 +834,17 @@ fn guarded_grant(records: &[Record]) -> bool {
             RegionKind::ConsumedCell,
             RegionKind::GuardRegion,
         ])
-        && binding.iter().all(|record| {
-            record.capability == Capability::None
+        && binding.iter().zip(0..).all(|(record, index)| {
+            // The consumed cell of a concurrent handle names its slot of
+            // the shared ring (ADR-0092 decision 3); every other binding
+            // record grants nothing.
+            let capability = match (index, first.capability) {
+                (1, Capability::ConcurrentPublication { .. }) => {
+                    matches!(record.capability, Capability::GuardSlot { .. })
+                }
+                _ => record.capability == Capability::None,
+            };
+            capability
                 && record.lane == 0
                 && record.stream_id == first.stream_id
                 && record.session_id == first.session_id
@@ -939,7 +968,16 @@ impl Message {
                 check_manifest_identity(records, *stream_registration, *incarnation, *base)?;
                 records.as_slice()
             }
-            Self::Admitted { records, .. } => records.as_slice(),
+            Self::Admitted { records, .. } => {
+                // A guard slot comes only in a guarded grant's manifest.
+                if records
+                    .iter()
+                    .any(|record| matches!(record.capability, Capability::GuardSlot { .. }))
+                {
+                    return Err(AdmissionError::Reserved);
+                }
+                records.as_slice()
+            }
             Self::ToolAdmitted { records, .. } => {
                 if records
                     .iter()
@@ -1071,12 +1109,22 @@ impl Message {
                     uptime_ns: word(3),
                 })
             }
-            ADMITTED => Ok(Self::Admitted {
-                instance: u128::from(word(1)) | (u128::from(word(2)) << 64),
-                version: word(3),
-                client: word(4),
-                records: records_from(5, &words)?,
-            }),
+            ADMITTED => {
+                let records = records_from(5, &words)?;
+                // A guard slot comes only in a guarded grant's manifest.
+                if records
+                    .iter()
+                    .any(|record| matches!(record.capability, Capability::GuardSlot { .. }))
+                {
+                    return Err(AdmissionError::Reserved);
+                }
+                Ok(Self::Admitted {
+                    instance: u128::from(word(1)) | (u128::from(word(2)) << 64),
+                    version: word(3),
+                    client: word(4),
+                    records,
+                })
+            }
             MANIFEST => {
                 if word(1) == 0 {
                     return Err(AdmissionError::Reserved);
@@ -1629,6 +1677,45 @@ mod tests {
             manifest(vec![buffer, ring, other_stream, guards], 4096),
             manifest(vec![buffer, ring, cell, granted], 4096),
             manifest(vec![buffer, laned, cell, guards], 4096),
+        ] {
+            assert_eq!(
+                refused.encode(&mut out),
+                Err(AdmissionError::Reserved),
+                "{refused:?}"
+            );
+        }
+        // A concurrent handle's grant names its slot of the shared ring on
+        // its consumed cell, and only there (ADR-0092 decision 3).
+        let concurrent = record(1, Capability::ConcurrentPublication { slot: 2 });
+        let slotted = Record {
+            capability: Capability::GuardSlot { slot: 5 },
+            ..cell
+        };
+        round_trip(&manifest(vec![concurrent, ring, slotted, guards], 4096));
+        for refused in [
+            // A concurrent grant without its slot, an exclusive one with one.
+            manifest(vec![concurrent, ring, cell, guards], 4096),
+            manifest(vec![buffer, ring, slotted, guards], 4096),
+            // A slot on another binding record, or with no binding.
+            manifest(
+                vec![
+                    concurrent,
+                    Record {
+                        capability: Capability::GuardSlot { slot: 5 },
+                        ..ring
+                    },
+                    slotted,
+                    guards,
+                ],
+                4096,
+            ),
+            manifest(
+                vec![Record {
+                    capability: Capability::GuardSlot { slot: 0 },
+                    ..buffer
+                }],
+                4096,
+            ),
         ] {
             assert_eq!(
                 refused.encode(&mut out),

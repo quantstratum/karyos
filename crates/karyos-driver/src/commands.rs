@@ -2164,10 +2164,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // beside its log buffer (`quantstratum-docs:
         // karyos/design/guards-and-abort.md`, "The binding across
         // processes"), each its own export and ledger entry.
+        // A concurrent one's binding is its slot of the incarnation's shared
+        // outcome ring (ADR-0092): `H` is the guarded stream's handle count.
         let guarded = match command {
-            Command::AddPublication { .. } => {
-                target.guarded.as_ref().map(|guarded| guarded.messages)
-            }
+            Command::AddPublication { .. } => target
+                .guarded
+                .as_ref()
+                .map(|guarded| (guarded.messages, None)),
+            Command::AddConcurrentPublication { .. } => target
+                .guarded
+                .as_ref()
+                .map(|guarded| (guarded.messages, guarded.handles())),
             _ => None,
         };
         let stream_id = target.id;
@@ -2177,8 +2184,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // reserved (one log buffer region per grant: one lane).
         let buffer_bytes = fetch_bytes(&target.buffer);
         let bytes = match guarded {
-            Some(messages) => self
-                .binding_bytes(messages)
+            Some((messages, handles)) => self
+                .binding_bytes(messages, handles)
                 .and_then(|binding| buffer_bytes.checked_add(binding)),
             None => Some(buffer_bytes),
         };
@@ -2204,11 +2211,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // incarnation after a guard reopen, the ring and the cell in their
         // regions. A refusal registers nothing.
         let bound = match guarded {
-            Some(_) => match self.prepare_remote_bound(stream_id) {
+            Some((_, None)) => match self.prepare_remote_bound(stream_id) {
                 Ok(bound) => Some(bound),
                 Err(code) => return refuse(code, detail),
             },
-            None => None,
+            Some((_, Some(_))) | None => None,
         };
         let Some(target) = self.streams.iter_mut().find(|found| found.id == stream_id) else {
             return refuse(ErrorCode::UnknownStream, 0);
@@ -2269,6 +2276,29 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             },
             _ => None,
         };
+        // A concurrent guarded handle's slot of the shared ring, after its
+        // publisher slot, as `concurrent_publication` takes them: a refused
+        // slot ends the publisher registration, so a refusal registers
+        // nothing (ADR-0092 decisions 2 and 3).
+        let shared = match (guarded, participant) {
+            (Some((_, Some(_))), Participant::Concurrent { slot }) => {
+                match self.prepare_remote_shared(stream_id, client) {
+                    Ok(shared) => Some(shared),
+                    Err((code, limit)) => {
+                        if let Some(target) =
+                            self.streams.iter_mut().find(|found| found.id == stream_id)
+                        {
+                            let _ = target.conductor.end_concurrent_publication(slot, export);
+                        }
+                        return refuse(code, limit.unwrap_or(detail));
+                    }
+                }
+            }
+            _ => None,
+        };
+        let Some(target) = self.streams.iter_mut().find(|found| found.id == stream_id) else {
+            return refuse(ErrorCode::UnknownStream, 0);
+        };
         // Effect: everything below cannot fail.
         let stream = target.id;
         let generation = target.generation.get();
@@ -2301,13 +2331,39 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             ];
             for (next, (region, words)) in (export + 1..).zip(held) {
                 if let Some(ledger) = self.ledger_mut(client) {
-                    ledger.push(grant(next, Participant::Binding { region }));
+                    ledger.push(grant(next, Participant::Binding { region, slot: None }));
                 }
                 if let Some(words) = words {
                     self.binding_exports.push((next, words));
                 }
             }
             self.bind_remote_guard(stream, bound);
+        }
+        // A concurrent handle's binding: the shared ring, its slot's cell,
+        // which names the slot, and the guard words. The writer already
+        // reads the cell.
+        if let Some(shared) = shared {
+            let held = [
+                (
+                    BindingRegion::Outcomes,
+                    None,
+                    Some(Arc::clone(&shared.ring)),
+                ),
+                (
+                    BindingRegion::Consumed,
+                    Some(shared.slot),
+                    Some(Arc::clone(&shared.cell)),
+                ),
+                (BindingRegion::Guards, None, None),
+            ];
+            for (next, (region, slot, words)) in (export + 1..).zip(held) {
+                if let Some(ledger) = self.ledger_mut(client) {
+                    ledger.push(grant(next, Participant::Binding { region, slot }));
+                }
+                if let Some(words) = words {
+                    self.binding_exports.push((next, words));
+                }
+            }
         }
         let (kind, subscriber) = match participant {
             Participant::Subscriber { cell, role } => {
@@ -2352,10 +2408,22 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// The bytes of a guarded publication's binding regions, headers
     /// included: its outcome ring for `messages` message records and one
     /// local record, its consumed cell and the guard words.
+    /// A concurrent handle's (`handles`, its stream's `H`) is the shared
+    /// ring of `H * C_m + C_r + H` records (ADR-0092 decision 4).
     #[cfg(target_os = "linux")]
-    fn binding_bytes(&self, messages: u64) -> Option<u64> {
+    fn binding_bytes(&self, messages: u64, handles: Option<u64>) -> Option<u64> {
         use crate::shared_words::region_bytes;
-        let capacity = karyos_sys::outcome_ring::capacity(messages, 1)?;
+        let capacity = match handles {
+            None => karyos_sys::outcome_ring::capacity(messages, 1)?,
+            Some(handles) => karyos_sys::outcome_ring::shared::SharedBinding {
+                messages,
+                ranges: 1,
+                guard_index: 0,
+                epoch: 0,
+                handles,
+            }
+            .capacity()?,
+        };
         let ring = karyos_sys::outcome_ring::ring_words(usize::try_from(capacity).ok()?)?;
         let guards = self.guards.guard_words().words().len();
         region_bytes(ring)?
@@ -2369,7 +2437,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         clippy::unused_self,
         reason = "the Linux version sizes the driver's guard words"
     )]
-    const fn binding_bytes(&self, _messages: u64) -> Option<u64> {
+    const fn binding_bytes(&self, _messages: u64, _handles: Option<u64>) -> Option<u64> {
         None
     }
 
@@ -2396,6 +2464,61 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Ok(None) => Err(ErrorCode::InvalidPublicationMode),
             Err(error) => Err(crate::guards::error_code(&error)),
         }
+    }
+
+    /// The slot of a concurrent guarded handle granted to remote client
+    /// `client` in its stream's shared outcome ring, the ring (at the
+    /// incarnation's first handle) and the slot's cell in new regions; the
+    /// refusal's code otherwise ([`shared_refusal`]), with `H` as its
+    /// detail for a handle beyond `H`.
+    #[cfg(target_os = "linux")]
+    fn prepare_remote_shared(
+        &mut self,
+        stream: u64,
+        client: u64,
+    ) -> Result<crate::guard_streams::SharedSlot, (ErrorCode, Option<u64>)> {
+        let plain = |code| (code, None);
+        let admission = self
+            .admission
+            .as_mut()
+            .ok_or(plain(ErrorCode::ResourcesUnavailable))?;
+        let mut ids = admission.region_ids();
+        let (instance, ring) = ids
+            .next()
+            .map_err(|error| plain(crate::guards::error_code(&error)))?;
+        let (_, cell) = ids
+            .next()
+            .map_err(|error| plain(crate::guards::error_code(&error)))?;
+        self.attach_remote_concurrent_guard(
+            stream,
+            client,
+            crate::guard_streams::Place::Regions {
+                instance,
+                ring,
+                cell,
+            },
+        )
+        .map_err(|error| {
+            let limit = match error {
+                DriverError::GuardHandleSlotsExhausted { handles, .. } => Some(handles),
+                _ => None,
+            };
+            (shared_refusal(&error), limit)
+        })
+    }
+
+    /// Remote clients exist only on Linux.
+    #[cfg(not(target_os = "linux"))]
+    #[allow(
+        clippy::unused_self,
+        reason = "the Linux version creates the regions through the admission"
+    )]
+    fn prepare_remote_shared(
+        &mut self,
+        _stream: u64,
+        _client: u64,
+    ) -> Result<crate::guard_streams::SharedSlot, (ErrorCode, Option<u64>)> {
+        Err((ErrorCode::ResourcesUnavailable, None))
     }
 
     /// Remote clients exist only on Linux.
@@ -2480,9 +2603,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // its hold on a ring or cell; the walker's bound keeps the region
         // until its last outcome record is written. The guard region
         // outlives every grant.
-        if let Participant::Binding { .. } = grant.participant {
+        if let Participant::Binding { slot, .. } = grant.participant {
             self.binding_exports
                 .retain(|(export, _)| *export != grant.export);
+            // A concurrent handle's slot leaves the shared ring's room
+            // minimum once its cell's grant ends (ADR-0092 decision 8), in
+            // the incarnation it was granted on only: a later one's ring
+            // has its own slots.
+            if let Some(slot) = slot {
+                self.detach_remote_concurrent_guard(grant.stream, grant.incarnation, slot);
+            }
             self.counters.add(Event::GrantsEnded, 1);
             return;
         }
@@ -2578,6 +2708,23 @@ fn subscription_role(command: &Command) -> Role {
             Role::from(*role)
         }
         _ => Role::Required,
+    }
+}
+
+/// The refusal of a concurrent guarded handle's slot of its shared ring
+/// (ADR-0092 decisions 2 and 3): another client's (`GC-7-client`) is an
+/// invalid mode, one beyond `H` its own code; a guard refusal as for an
+/// exclusive grant.
+#[cfg_attr(
+    not(target_os = "linux"),
+    expect(dead_code, reason = "remote clients exist only on Linux")
+)]
+fn shared_refusal(error: &DriverError) -> ErrorCode {
+    match error {
+        DriverError::Sys(sys) => issue_refusal(sys),
+        DriverError::InvalidPublicationMode => ErrorCode::InvalidPublicationMode,
+        DriverError::GuardHandleSlotsExhausted { .. } => ErrorCode::GuardHandlesExhausted,
+        other => crate::guards::error_code(other),
     }
 }
 

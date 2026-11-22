@@ -285,7 +285,13 @@ impl<T: TermBytes> GuardedStream<T> {
     /// decision 2); [`DriverError::GuardHandleSlotsExhausted`] once `H`
     /// slots were issued; [`DriverError::GuardNotOpen`] for an epoch other
     /// than the ring's; [`DriverError::Outcomes`] for a ring too large to
-    /// size. Nothing changes on error.
+    /// size; [`DriverError::Sys`] for a region that could not be created.
+    /// Nothing changes on error.
+    ///
+    /// `place` says where the slot's consumed cell lives and, at the first
+    /// handle, the ring: on the heap for an in-process client, in regions
+    /// for a remote one (its grant). A later handle's ring region id goes
+    /// unused, since the ring exists.
     pub(crate) fn attach_shared(
         &mut self,
         stream: u64,
@@ -293,6 +299,7 @@ impl<T: TermBytes> GuardedStream<T> {
         epoch: u64,
         guard_index: usize,
         reincarnated_at: Option<u64>,
+        place: Place,
     ) -> Result<SharedSlot, DriverError> {
         let handles = self.handles.ok_or(DriverError::InvalidPublicationMode)?;
         if let Some(shared) = &self.shared {
@@ -313,8 +320,12 @@ impl<T: TermBytes> GuardedStream<T> {
         if u64::try_from(slot).ok().is_none_or(|slot| slot >= handles) {
             return Err(DriverError::GuardHandleSlotsExhausted { stream, handles });
         }
+        // The slot's cell before anything is kept, so a refusal keeps
+        // nothing.
+        let cell = Arc::new(consumed_cell(place)?);
         if self.shared.is_none() {
-            self.shared = Some(self.new_shared(client, epoch, guard_index, reincarnated_at)?);
+            self.shared =
+                Some(self.new_shared(client, epoch, guard_index, reincarnated_at, place)?);
         }
         let shared = self
             .shared
@@ -322,7 +333,6 @@ impl<T: TermBytes> GuardedStream<T> {
             .ok_or(DriverError::InvalidPublicationMode)?;
         // Within the `H` cells reserved with the ring: no allocation.
         let consumed = shared.writer.attach(slot).map_err(DriverError::Outcomes)?;
-        let cell = Arc::new(Words::heap(1));
         cell.cell()
             .store(consumed, karyos_sys::sync::Ordering::Release);
         shared.cells.push(Arc::clone(&cell));
@@ -342,6 +352,7 @@ impl<T: TermBytes> GuardedStream<T> {
         epoch: u64,
         guard_index: usize,
         reincarnated_at: Option<u64>,
+        place: Place,
     ) -> Result<Shared, DriverError> {
         let layout = || DriverError::Outcomes(OutcomeError::Layout);
         let binding = SharedBinding {
@@ -356,7 +367,18 @@ impl<T: TermBytes> GuardedStream<T> {
             .and_then(|capacity| usize::try_from(capacity).ok())
             .and_then(karyos_sys::outcome_ring::ring_words)
             .ok_or_else(layout)?;
-        let ring = Words::heap(words);
+        let ring = match place {
+            Place::Heap => Words::heap(words),
+            #[cfg(target_os = "linux")]
+            Place::Regions { instance, ring, .. } => Words::region(
+                instance,
+                ring,
+                karyos_sys::ipc::RegionKind::OutcomeRing,
+                karyos_sys::outcome_ring::shared::SHARED_OUTCOME_LAYOUT_VERSION,
+                words,
+                true,
+            )?,
+        };
         karyos_sys::outcome_ring::shared::init(ring.words(), &binding)
             .map_err(DriverError::Outcomes)?;
         if let Some(at) = reincarnated_at {
@@ -765,6 +787,22 @@ pub(crate) enum Place {
         /// The cell's region id.
         cell: u64,
     },
+}
+
+/// A handle's consumed cell, one word at `place`: writable by its client.
+fn consumed_cell(place: Place) -> Result<Words, DriverError> {
+    Ok(match place {
+        Place::Heap => Words::heap(1),
+        #[cfg(target_os = "linux")]
+        Place::Regions { instance, cell, .. } => Words::region(
+            instance,
+            cell,
+            karyos_sys::ipc::RegionKind::ConsumedCell,
+            karyos_sys::outcome_ring::CONSUMED_CELL_LAYOUT_VERSION,
+            1,
+            false,
+        )?,
+    })
 }
 
 /// The outcome ring, consumed cell and writer of a new handle bound to
