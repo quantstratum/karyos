@@ -1082,25 +1082,15 @@ fn a_silent_receiver_is_removed_and_registers_again() {
     };
     let liveness_ns = quick.image_liveness_timeout;
     let liveness = std::time::Duration::from_nanos(liveness_ns);
-    // The sender's clock follows the host's until the silence, then holds
-    // and steps only when the test moves it, so its removal is pinned to
-    // the driver clock's own times, whatever the host's load (karyos#1067).
-    let clock = HoldableClock::default();
-    let mut a = EmbeddedDriver::with_clock(
-        crate::embedded::DriverConfig {
-            network: Some(crate::net::NetworkConfig {
-                threading: ThreadingMode::Shared,
-                agents: quick,
-                ..crate::net::NetworkConfig::default()
-            }),
-            ..crate::embedded::DriverConfig::default()
-        },
-        Box::new(clock.clone()),
-    )
-    .unwrap();
+    // The sender's network clock (its agents' duty time, which times the
+    // liveness) follows the host's until the silence, then holds and steps
+    // only when the test moves it, so its removal is pinned to the
+    // sender's own times, whatever the host's load (karyos#1067). The
+    // driver's injected clock would not do: it times claim deadlines only.
+    let mut a = driver_with(ThreadingMode::Shared, quick);
+    a.net.as_mut().unwrap().set_clock(held_clock::now);
     // No REGISTER retry is due in the test's runtime (as for `again`
-    // below): on a slow host a retry would replace the binding and retire
-    // the slot before the silence, counted as a timeout (karyos#1067).
+    // below), so only the SMs this test pumps touch the binding.
     let mut b = driver_with(
         ThreadingMode::Shared,
         AgentConfig {
@@ -1137,7 +1127,7 @@ fn a_silent_receiver_is_removed_and_registers_again() {
     // still held, until no SM has been accepted for 2000 duties: every SM
     // `b` sent is handled at `held`, so the last SM the sender saw is at
     // `held` and nothing queued can move it after the clock steps.
-    let held = clock.hold();
+    let held = held_clock::hold();
     let accepted = sender(&a).sm_accepted;
     pump(&mut [&mut a, &mut b], |drivers| {
         sender(drivers[0]).sm_accepted > accepted
@@ -1166,7 +1156,7 @@ fn a_silent_receiver_is_removed_and_registers_again() {
     // its UDP port, so the new receiver cannot reuse it and meet the old
     // endpoint's quarantine. One nanosecond before the liveness timeout
     // from the last SM, the slot stays; at the timeout it goes.
-    clock.set(held + liveness_ns - 1);
+    held_clock::set(held + liveness_ns - 1);
     for _ in 0..200 {
         let _ = a.do_work().unwrap();
     }
@@ -1175,12 +1165,12 @@ fn a_silent_receiver_is_removed_and_registers_again() {
         0,
         "retired before the {liveness:?} liveness timeout from the last SM"
     );
-    clock.set(held + liveness_ns);
+    held_clock::set(held + liveness_ns);
     pump(&mut [&mut a], |drivers| {
         sender(drivers[0]).registrants_timed_out >= 1
     });
     // Host time runs again for the rejoin below.
-    clock.release();
+    held_clock::release();
     assert_eq!(sender(&a).registrants_timed_out, 1);
     let before = registrations(&a);
     // Its REGISTER retry interval (`setup_interval`) is far above the
@@ -1214,62 +1204,62 @@ fn a_silent_receiver_is_removed_and_registers_again() {
     drop(b);
 }
 
-/// A clock that follows the host's monotonic time until held, then reads
-/// only the value the test sets, until released (karyos#1067).
-#[derive(Debug, Clone, Default)]
-struct HoldableClock(std::sync::Arc<std::sync::Mutex<ClockState>>);
+/// The rejoin test's network clock (karyos#1067): the host's monotonic
+/// time until held, then only the value the test sets, until released,
+/// from where it runs on with the host. Never goes back. One test uses it.
+mod held_clock {
+    use std::sync::Mutex;
 
-#[derive(Debug, Default)]
-struct ClockState {
-    /// The held value, or `None` to follow the host.
-    held: Option<u64>,
-    /// The value it last returned: never goes back.
-    last: u64,
-    /// The host's time it counts from: its first read, then its release.
-    origin: Option<std::time::Instant>,
-    /// Its value at `origin`.
-    base: u64,
-}
+    struct State {
+        /// The held value, or `None` to run.
+        held: Option<u64>,
+        /// Added to the host's time while running.
+        offset: u64,
+        /// The last value read.
+        last: u64,
+    }
 
-impl HoldableClock {
-    /// Holds the clock at its current value and returns it.
-    fn hold(&self) -> u64 {
-        let mut state = self.0.lock().unwrap();
-        let now = state.read();
+    static STATE: Mutex<State> = Mutex::new(State {
+        held: None,
+        offset: 0,
+        last: 0,
+    });
+
+    fn host() -> u64 {
+        karyos_sys::host_clock::host_monotonic_ns()
+    }
+
+    fn read(state: &mut State) -> u64 {
+        let now = state.held.unwrap_or_else(|| host() + state.offset);
+        state.last = state.last.max(now);
+        state.last
+    }
+
+    /// The clock, as the network reads it.
+    pub(super) fn now() -> u64 {
+        read(&mut STATE.lock().unwrap())
+    }
+
+    /// Holds it at its current value and returns that.
+    pub(super) fn hold() -> u64 {
+        let mut state = STATE.lock().unwrap();
+        let now = read(&mut state);
         state.held = Some(now);
         now
     }
 
     /// Sets the held value; never back in time.
-    fn set(&self, value: u64) {
-        let mut state = self.0.lock().unwrap();
+    pub(super) fn set(value: u64) {
+        let mut state = STATE.lock().unwrap();
         assert!(value >= state.last, "a monotonic clock");
         state.held = Some(value);
     }
 
-    /// Follows the host's time again, from the held value on.
-    fn release(&self) {
-        let mut state = self.0.lock().unwrap();
-        let now = state.read();
-        state.base = now;
-        state.origin = Some(std::time::Instant::now());
+    /// Runs with the host again, from the held value on.
+    pub(super) fn release() {
+        let mut state = STATE.lock().unwrap();
+        let now = read(&mut state);
+        state.offset = now.saturating_sub(host());
         state.held = None;
-    }
-}
-
-impl ClockState {
-    fn read(&mut self) -> u64 {
-        let now = self.held.unwrap_or_else(|| {
-            let origin = *self.origin.get_or_insert_with(std::time::Instant::now);
-            self.base + u64::try_from(origin.elapsed().as_nanos()).unwrap()
-        });
-        self.last = self.last.max(now);
-        self.last
-    }
-}
-
-impl crate::clock::MonotonicClock for HoldableClock {
-    fn now(&mut self) -> u64 {
-        self.0.lock().unwrap().read()
     }
 }

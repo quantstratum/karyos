@@ -2397,6 +2397,13 @@ impl<T: StreamTerms> Network<T> {
         (self.clock)()
     }
 
+    /// Replaces the network clock, the agents' duty time (tests: a clock
+    /// the test holds and steps; karyos#1067).
+    #[cfg(test)]
+    pub(crate) fn set_clock(&mut self, clock: fn() -> u64) {
+        self.clock = clock;
+    }
+
     /// Starts the reincarnation of the network publication `registration`
     /// after a guard reopen (control path): one extra hold on each of its
     /// send endpoints, then its old session's removal, with no linger.
