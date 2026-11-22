@@ -1122,16 +1122,30 @@ fn a_silent_receiver_is_removed_and_registers_again() {
     // sender runs. `b` stays alive, holding its UDP port, so the new
     // receiver cannot reuse it and meet the old endpoint's quarantine.
     drop(reader);
-    // Hold the sender's clock at `held`, and keep both drivers running for
-    // well over an SM interval (10 ms) of host time: SMs keep arriving,
-    // each stamped `held`, so the last SM the sender saw is at `held`.
+    // Hold the sender's clock at `held`, and run both drivers until the
+    // sender accepts an SM: one stamped `held`. Then only the sender runs
+    // (`b` sends nothing unless pumped, in shared threading), the clock
+    // still held, until no SM has been accepted for 2000 duties: every SM
+    // `b` sent is handled at `held`, so the last SM the sender saw is at
+    // `held` and nothing queued can move it after the clock steps.
     let held = clock.hold();
-    let window = std::time::Instant::now();
-    while window.elapsed() < std::time::Duration::from_millis(100) {
+    let accepted = sender(&a).sm_accepted;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        sender(drivers[0]).sm_accepted > accepted
+    });
+    let mut quiet = 0;
+    let mut last = sender(&a).sm_accepted;
+    for _ in 0..40_000 {
         let _ = a.do_work().unwrap();
-        let _ = b.do_work().unwrap();
+        let now = sender(&a).sm_accepted;
+        quiet = if now == last { quiet + 1 } else { 0 };
+        last = now;
+        if quiet >= 2_000 {
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_micros(100));
     }
+    assert!(quiet >= 2_000, "SMs kept arriving after `b` stopped");
     assert_eq!(sender(&a).registrants_timed_out, 0);
     // Silence: only the sender runs from here. `b` stays alive, holding
     // its UDP port, so the new receiver cannot reuse it and meet the old
