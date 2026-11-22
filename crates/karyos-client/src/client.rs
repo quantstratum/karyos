@@ -1773,6 +1773,7 @@ impl<C: Connection> Client<C> {
                     changes: std::collections::VecDeque::with_capacity(max_changes),
                     max_changes,
                     changes_lost: 0,
+                    held: std::collections::VecDeque::with_capacity(max_changes),
                 }),
             }),
         }
@@ -2230,13 +2231,13 @@ impl<C: Connection> Client<C> {
     /// the network subscriptions whose handle was dropped.
     fn remove_dropped(&mut self) {
         for network in &self.networks {
-            let released = core::mem::take(
-                &mut *network
-                    .released
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-            for subscription in released {
+            // Drained in place: the bin keeps its reserved capacity, so a
+            // later poll that releases an image never allocates.
+            let mut released = network
+                .released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for subscription in released.drain(..) {
                 if !self.connection.release_subscription(subscription) {
                     bump(&mut self.subscription_releases_failed);
                 }
@@ -2266,6 +2267,15 @@ impl<T: TermBytes> Drop for Images<T> {
     fn drop(&mut self) {
         let images = core::mem::take(&mut self.images);
         self.release(images);
+        let held = core::mem::take(&mut self.held);
+        self.release(
+            held.into_iter()
+                .filter_map(|held| match held {
+                    Held::Retiring(image, _) => Some(image),
+                    Held::Change(_) => None,
+                })
+                .collect(),
+        );
         let arrived = core::mem::take(
             &mut self
                 .inbox
@@ -2312,7 +2322,31 @@ struct Images<T: TermBytes> {
     max_changes: usize,
     /// The changes dropped from a full queue.
     changes_lost: u64,
+    /// Changes waiting behind a retired image whose clean end is sealed
+    /// but not positioned yet, in order: the retirement waits for the
+    /// position, so it never reports a clean end at position 0 that is
+    /// not, and every later change waits behind it, so none overtakes it
+    /// (karyos#1067). Reserved for `max_changes`.
+    held: std::collections::VecDeque<Held<T>>,
 }
+
+/// A change held in order behind a retirement waiting for its seal's
+/// position.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "held in a queue reserved at creation: boxing the image would allocate on the poll path"
+)]
+enum Held<T: TermBytes> {
+    /// A change ready, queued behind an earlier retirement.
+    Change(ImageChange),
+    /// A retired image and the adoptions it has waited.
+    Retiring(Image<T>, u32),
+}
+
+/// Adoptions a retired image's change waits for its seal's position
+/// before it goes without one.
+const ENDING_ADOPTIONS: u32 = 10_000;
 
 /// A stream subscription taken outside [`Client::add_subscription`], such
 /// as a replay target granted by [`Client::replay_targets`], as a
@@ -2601,36 +2635,58 @@ impl<T: TermBytes> Images<T> {
         released.extend(images.into_iter().map(|image| image.subscription));
     }
 
-    /// Queues `image`'s change, dropping the oldest when full: never
-    /// allocates.
-    fn change(
+    /// `image`'s change.
+    fn change_of(image: &Image<T>, available: bool) -> ImageChange {
+        ImageChange {
+            image_id: image.id,
+            session_id: image.session_id,
+            lane: image.lane,
+            available,
+            registration: Some(image.registration),
+            end: if available {
+                None
+            } else {
+                image.subscription.terminal_seal()
+            },
+        }
+    }
+
+    /// Queues `change`, dropping the oldest when full: never allocates.
+    fn queue(
         changes: &mut std::collections::VecDeque<ImageChange>,
         max: usize,
         lost: &mut u64,
-        image: &Image<T>,
-        available: bool,
+        change: ImageChange,
     ) {
         if changes.len() >= max && changes.pop_front().is_some() {
             bump(lost);
         }
         if changes.len() < max {
-            changes.push_back(ImageChange {
-                image_id: image.id,
-                session_id: image.session_id,
-                lane: image.lane,
-                available,
-                registration: Some(image.registration),
-                end: if available {
-                    None
-                } else {
-                    image.subscription.terminal_seal()
-                },
-            });
+            changes.push_back(change);
+        }
+    }
+
+    /// Queues `image`'s change, behind any held one so that none
+    /// overtakes another: never allocates.
+    fn change(
+        changes: &mut std::collections::VecDeque<ImageChange>,
+        held: &mut std::collections::VecDeque<Held<T>>,
+        max: usize,
+        lost: &mut u64,
+        image: &Image<T>,
+        available: bool,
+    ) {
+        let change = Self::change_of(image, available);
+        if !held.is_empty() && held.len() < held.capacity() {
+            held.push_back(Held::Change(change));
+        } else {
+            Self::queue(changes, max, lost, change);
         }
     }
 
     /// Takes what the client handed over.
     fn adopt(&mut self) {
+        self.settle_held();
         if !self.inbox.changed.swap(false, Ordering::Acquire) {
             return;
         }
@@ -2650,8 +2706,19 @@ impl<T: TermBytes> Images<T> {
         for id in state.retired.drain(..) {
             if let Some(index) = self.images.iter().position(|image| image.id == id) {
                 let image = self.images.remove(index);
+                // A clean end sealed but not positioned yet: its change
+                // waits for the position (karyos#1067).
+                let unpositioned = image
+                    .subscription
+                    .terminal_seal()
+                    .is_some_and(|end| end.position.is_none());
+                if unpositioned && self.held.len() < self.held.capacity() {
+                    self.held.push_back(Held::Retiring(image, 0));
+                    continue;
+                }
                 Self::change(
                     &mut self.changes,
+                    &mut self.held,
                     self.max_changes,
                     &mut self.changes_lost,
                     &image,
@@ -2663,6 +2730,7 @@ impl<T: TermBytes> Images<T> {
         for image in &state.arrived {
             Self::change(
                 &mut self.changes,
+                &mut self.held,
                 self.max_changes,
                 &mut self.changes_lost,
                 image,
@@ -2675,9 +2743,30 @@ impl<T: TermBytes> Images<T> {
         }
         drop(state);
         if self.closed.is_some() {
+            // Closed: every held change goes now, in order.
+            while let Some(held) = self.held.pop_front() {
+                match held {
+                    Held::Change(change) => Self::queue(
+                        &mut self.changes,
+                        self.max_changes,
+                        &mut self.changes_lost,
+                        change,
+                    ),
+                    Held::Retiring(image, _) => {
+                        Self::queue(
+                            &mut self.changes,
+                            self.max_changes,
+                            &mut self.changes_lost,
+                            Self::change_of(&image, false),
+                        );
+                        released.push(image.subscription);
+                    }
+                }
+            }
             for image in self.images.drain(..) {
                 Self::change(
                     &mut self.changes,
+                    &mut self.held,
                     self.max_changes,
                     &mut self.changes_lost,
                     &image,
@@ -2689,6 +2778,52 @@ impl<T: TermBytes> Images<T> {
         drop(released);
         if self.next >= self.images.len() {
             self.next = 0;
+        }
+    }
+
+    /// Moves the held changes to the queue, in order, up to the first
+    /// retirement whose seal is still not positioned and that has waited
+    /// fewer than [`ENDING_ADOPTIONS`] adoptions. Allocates nothing.
+    fn settle_held(&mut self) {
+        if self.held.is_empty() {
+            return;
+        }
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some(front) = self.held.front_mut() {
+            match front {
+                Held::Change(_) => {}
+                Held::Retiring(image, waited) => {
+                    let positioned = image
+                        .subscription
+                        .terminal_seal()
+                        .is_none_or(|end| end.position.is_some());
+                    if !positioned && *waited < ENDING_ADOPTIONS {
+                        *waited = waited.saturating_add(1);
+                        return;
+                    }
+                }
+            }
+            match self.held.pop_front() {
+                Some(Held::Change(change)) => Self::queue(
+                    &mut self.changes,
+                    self.max_changes,
+                    &mut self.changes_lost,
+                    change,
+                ),
+                Some(Held::Retiring(image, _)) => {
+                    Self::queue(
+                        &mut self.changes,
+                        self.max_changes,
+                        &mut self.changes_lost,
+                        Self::change_of(&image, false),
+                    );
+                    released.push(image.subscription);
+                }
+                None => return,
+            }
         }
     }
 
@@ -2954,6 +3089,64 @@ mod tests {
         }
     }
 
+    /// karyos#1067 (Codex review of #1164): a retirement whose clean end is
+    /// sealed but not positioned yet is held, and a change after it, the
+    /// replacement's arrival, waits behind it; once the seal is positioned
+    /// both are queued in order, the retirement carrying its position.
+    #[test]
+    fn a_held_retirement_keeps_its_place_in_the_changes() {
+        use karyos_sys::log_buffer::SealReason;
+        let buffer = Arc::new(
+            LogBuffer::new(LogBufferConfig {
+                term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+                spare_slots: 2,
+                max_subscribers: 2,
+                mtu: DEFAULT_MTU,
+                max_reserved: MIN_TERM_LENGTH / 8,
+                initial_term_id: TermId::new(7),
+                lane: Lane::ZERO,
+                session_id: 1,
+                stream_id: 2,
+                claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+                publication: karyos_sys::log_buffer::PublicationMode::Exclusive,
+                schedule_capacity: 0,
+            })
+            .unwrap(),
+        );
+        let mut conductor = buffer.conductor_owned().unwrap();
+        let subscription = ClientSubscription::new(conductor.subscribe(Role::Required).unwrap());
+        // Sealed, not positioned: the position comes at the next duty.
+        conductor.seal_with_reason(SealReason::EndOfStream).unwrap();
+        let (mut network, inbox) = network();
+        let Kind::Images(images) = &mut network.kind else {
+            unreachable!("a network subscription")
+        };
+        images.images.push(Image {
+            id: 1,
+            registration: 1,
+            session_id: 1,
+            lane: Lane::ZERO,
+            subscription,
+        });
+        inbox.update(|state| {
+            state.retired.push(1);
+            state.arrived.push(image(2, 2));
+        });
+        images.adopt();
+        assert!(images.changes.is_empty(), "{:?}", images.changes);
+        assert_eq!(images.held.len(), 2);
+        let _ = conductor.duty_cycle().unwrap();
+        images.adopt();
+        let retired = images.changes.pop_front().unwrap();
+        assert_eq!((retired.image_id, retired.available), (1, false));
+        let end = retired.end.unwrap();
+        assert_eq!(end.reason, SealReason::EndOfStream);
+        assert!(end.position.is_some(), "{end:?}");
+        let arrived = images.changes.pop_front().unwrap();
+        assert_eq!((arrived.image_id, arrived.available), (2, true));
+        assert!(images.held.is_empty());
+    }
+
     /// #440 review F1: one adoption's worst case, every image retired, as
     /// many arriving and a close draining them, is `3 * max_images`
     /// changes: all are queued, none lost.
@@ -2972,6 +3165,7 @@ mod tests {
             changes: std::collections::VecDeque::with_capacity(3 * max_images),
             max_changes: 3 * max_images,
             changes_lost: 0,
+            held: std::collections::VecDeque::new(),
         };
         images.images.push(image(1, 1));
         images.images.push(image(2, 2));
@@ -3021,6 +3215,7 @@ mod tests {
             changes: std::collections::VecDeque::with_capacity(3 * max_images),
             max_changes: 3 * max_images,
             changes_lost: 0,
+            held: std::collections::VecDeque::new(),
         };
         images
             .images
@@ -3091,6 +3286,7 @@ mod tests {
                 changes: std::collections::VecDeque::with_capacity(6),
                 max_changes: 6,
                 changes_lost: 0,
+                held: std::collections::VecDeque::with_capacity(6),
             }),
         };
         (subscription, inbox)
@@ -3259,6 +3455,7 @@ mod tests {
                 changes: std::collections::VecDeque::new(),
                 max_changes: 3,
                 changes_lost: 0,
+                held: std::collections::VecDeque::new(),
             }),
         };
         let refused = network

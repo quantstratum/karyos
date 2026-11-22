@@ -1080,7 +1080,7 @@ fn record_copies(
     )],
 ) {
     use karyos_archive::integrity::copies::{CopyCatalog, CopyRecord};
-    let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+    let mut journal = open_journal(dir);
     let mut copies = CopyCatalog::open(StdDisk, dir, &mut journal).unwrap();
     for &(location, state, enforcement) in changes {
         copies
