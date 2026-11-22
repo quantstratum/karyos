@@ -1080,9 +1080,24 @@ fn a_silent_receiver_is_removed_and_registers_again() {
         sender_heartbeat_interval: 100_000_000,
         ..AgentConfig::default()
     };
-    let liveness = std::time::Duration::from_nanos(quick.image_liveness_timeout);
+    let liveness_ns = quick.image_liveness_timeout;
+    let liveness = std::time::Duration::from_nanos(liveness_ns);
+    // The sender's network clock (its agents' duty time, which times the
+    // liveness) follows the host's until the silence, then holds and steps
+    // only when the test moves it, so its removal is pinned to the
+    // sender's own times, whatever the host's load (karyos#1067). The
+    // driver's injected clock would not do: it times claim deadlines only.
     let mut a = driver_with(ThreadingMode::Shared, quick);
-    let mut b = driver(ThreadingMode::Shared);
+    a.net.as_mut().unwrap().set_clock(held_clock::now);
+    // No REGISTER retry is due in the test's runtime (as for `again`
+    // below), so only the SMs this test pumps touch the binding.
+    let mut b = driver_with(
+        ThreadingMode::Shared,
+        AgentConfig {
+            setup_interval: 600_000_000_000,
+            ..AgentConfig::default()
+        },
+    );
     let control = SocketAddr::new(LOOPBACK, free_port());
     let publication = a
         .add_dynamic_network_publication(
@@ -1106,20 +1121,56 @@ fn a_silent_receiver_is_removed_and_registers_again() {
     // sender runs. `b` stays alive, holding its UDP port, so the new
     // receiver cannot reuse it and meet the old endpoint's quarantine.
     drop(reader);
-    let silent = std::time::Instant::now();
+    // Hold the sender's clock at `held`, and run both drivers until the
+    // sender accepts an SM: one stamped `held`. Then only the sender runs
+    // (`b` sends nothing unless pumped, in shared threading), the clock
+    // still held, until no SM has been accepted for 2000 duties: every SM
+    // `b` sent is handled at `held`, so the last SM the sender saw is at
+    // `held` and nothing queued can move it after the clock steps.
+    let held = held_clock::hold();
+    let accepted = sender(&a).sm_accepted;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        sender(drivers[0]).sm_accepted > accepted
+    });
+    let mut quiet = 0;
+    let mut last = sender(&a).sm_accepted;
+    for _ in 0..40_000 {
+        let _ = a.do_work().unwrap();
+        let now = sender(&a).sm_accepted;
+        quiet = if now == last { quiet + 1 } else { 0 };
+        last = now;
+        if quiet >= 2_000 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+    assert!(quiet >= 2_000, "SMs kept arriving after `b` stopped");
+    assert_eq!(
+        sender(&a).registrants_timed_out,
+        0,
+        "retired while the clock was held: {:?} {:?}",
+        sender(&a),
+        receiver(&b)
+    );
+    // Silence: only the sender runs from here. `b` stays alive, holding
+    // its UDP port, so the new receiver cannot reuse it and meet the old
+    // endpoint's quarantine. One nanosecond before the liveness timeout
+    // from the last SM, the slot stays; at the timeout it goes.
+    held_clock::set(held + liveness_ns - 1);
+    for _ in 0..200 {
+        let _ = a.do_work().unwrap();
+    }
+    assert_eq!(
+        sender(&a).registrants_timed_out,
+        0,
+        "retired before the {liveness:?} liveness timeout from the last SM"
+    );
+    held_clock::set(held + liveness_ns);
     pump(&mut [&mut a], |drivers| {
         sender(drivers[0]).registrants_timed_out >= 1
     });
-    // Not before the configured liveness timeout (500 ms), counted from
-    // the last SM, which arrived at most one SM interval (10 ms) before
-    // the silence began: 100 ms of slack covers that and the pump's
-    // granularity, far below the timeout, so an earlier retirement fails.
-    let slack = std::time::Duration::from_millis(100);
-    assert!(
-        silent.elapsed() + slack >= liveness,
-        "retired after {:?}, before the {liveness:?} liveness timeout",
-        silent.elapsed()
-    );
+    // Host time runs again for the rejoin below.
+    held_clock::release();
     assert_eq!(sender(&a).registrants_timed_out, 1);
     let before = registrations(&a);
     // Its REGISTER retry interval (`setup_interval`) is far above the
@@ -1151,4 +1202,64 @@ fn a_silent_receiver_is_removed_and_registers_again() {
     assert_eq!(counters.registrants_timed_out, 1);
     assert_eq!(counters.registrants_restarted, 0);
     drop(b);
+}
+
+/// The rejoin test's network clock (karyos#1067): the host's monotonic
+/// time until held, then only the value the test sets, until released,
+/// from where it runs on with the host. Never goes back. One test uses it.
+mod held_clock {
+    use std::sync::Mutex;
+
+    struct State {
+        /// The held value, or `None` to run.
+        held: Option<u64>,
+        /// Added to the host's time while running.
+        offset: u64,
+        /// The last value read.
+        last: u64,
+    }
+
+    static STATE: Mutex<State> = Mutex::new(State {
+        held: None,
+        offset: 0,
+        last: 0,
+    });
+
+    fn host() -> u64 {
+        karyos_sys::host_clock::host_monotonic_ns()
+    }
+
+    fn read(state: &mut State) -> u64 {
+        let now = state.held.unwrap_or_else(|| host() + state.offset);
+        state.last = state.last.max(now);
+        state.last
+    }
+
+    /// The clock, as the network reads it.
+    pub(super) fn now() -> u64 {
+        read(&mut STATE.lock().unwrap())
+    }
+
+    /// Holds it at its current value and returns that.
+    pub(super) fn hold() -> u64 {
+        let mut state = STATE.lock().unwrap();
+        let now = read(&mut state);
+        state.held = Some(now);
+        now
+    }
+
+    /// Sets the held value; never back in time.
+    pub(super) fn set(value: u64) {
+        let mut state = STATE.lock().unwrap();
+        assert!(value >= state.last, "a monotonic clock");
+        state.held = Some(value);
+    }
+
+    /// Runs with the host again, from the held value on.
+    pub(super) fn release() {
+        let mut state = STATE.lock().unwrap();
+        let now = read(&mut state);
+        state.offset = now.saturating_sub(host());
+        state.held = None;
+    }
 }
