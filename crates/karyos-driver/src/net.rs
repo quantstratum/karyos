@@ -1241,10 +1241,14 @@ impl<T: StreamTerms> Network<T> {
             (true, Some(config)) => self.hold_control_group(bind, config),
             _ => None,
         };
-        // Every entry its paths join is counted for the key, so it stays
-        // while the key uses it, even when another channel's `nak-control`
-        // added it (karyos#1086 review).
+        // Every entry the table selects for its paths is counted for the
+        // key, joined or not, so it stays while the key uses it, even when
+        // another channel's `nak-control` added it (karyos#1086 review).
         let mut control_held = [false; MAX_CONTROL_GROUPS];
+        let first_slot = multicast
+            .filter(|_| reliable)
+            .and_then(|config| self.control_group_of(bind, config))
+            .map(|(at, _)| at);
         // A multicast key sends its SOLICITs from the driver's unicast
         // control endpoint of its family (network-control-schemas.md §6.3,
         // plan 164): one per driver and family, held by every multicast key
@@ -1263,7 +1267,7 @@ impl<T: StreamTerms> Network<T> {
                 max_term_length,
                 reliable,
                 multicast: group,
-                control_group: control.map(|(control, group, _)| (control, group)),
+                control_group: control,
                 identity,
                 conflated: conflated.map(|(lane, _)| lane),
                 solicit_from: solicit,
@@ -1272,7 +1276,7 @@ impl<T: StreamTerms> Network<T> {
             });
         if posted.is_err() {
             release(&mut self.send_endpoints, endpoint);
-            if let Some((control, _, _)) = control {
+            if let Some((control, _)) = control {
                 release(&mut self.send_endpoints, control);
             }
             if let Some(solicit) = solicit {
@@ -1280,7 +1284,7 @@ impl<T: StreamTerms> Network<T> {
             }
             return Err(DriverError::NetworkBusy);
         }
-        if let Some((_, _, slot)) = control {
+        if let Some(slot) = first_slot {
             control_group::hold_slot(&mut self.control_group_uses, &mut control_held, slot);
         }
         // Each later path is a receiver entry of its own endpoint; the
@@ -1322,6 +1326,11 @@ impl<T: StreamTerms> Network<T> {
             } else {
                 None
             };
+            let path_slot = if reliable {
+                self.control_group_of(*bind, *config).map(|(at, _)| at)
+            } else {
+                None
+            };
             let posted = self
                 .links
                 .receiver
@@ -1332,7 +1341,7 @@ impl<T: StreamTerms> Network<T> {
                     max_term_length,
                     reliable,
                     multicast: true,
-                    control_group: path_control.map(|(control, group, _)| (control, group)),
+                    control_group: path_control,
                     identity,
                     conflated: conflated.map(|(lane, _)| lane),
                     solicit_from: solicit,
@@ -1341,23 +1350,23 @@ impl<T: StreamTerms> Network<T> {
                 });
             if posted.is_err() {
                 release(&mut self.send_endpoints, path);
-                if let Some((control, _, _)) = path_control {
+                if let Some((control, _)) = path_control {
                     release(&mut self.send_endpoints, control);
                 }
                 self.count_path_failure();
                 continue;
             }
             *slot = Some(path);
-            if let Some((_, _, at)) = path_control {
+            if let Some(at) = path_slot {
                 control_group::hold_slot(&mut self.control_group_uses, &mut control_held, at);
             }
-            *control_slot = path_control.map(|(control, _, _)| control);
+            *control_slot = path_control.map(|(control, _)| control);
         }
         self.subscriptions.push(NetSubscription {
             endpoint,
             stream_id,
             reliable,
-            control: control.map(|(control, _, _)| control),
+            control: control.map(|(control, _)| control),
             solicit,
             identity,
             conflated,
@@ -1543,8 +1552,8 @@ impl<T: StreamTerms> Network<T> {
         &mut self,
         bind: SocketAddr,
         config: MulticastConfig,
-    ) -> Option<(EndpointId, SocketAddr, usize)> {
-        let (slot, group) = self.control_group_of(bind, config)?;
+    ) -> Option<(EndpointId, SocketAddr)> {
+        let (_, group) = self.control_group_of(bind, config)?;
         let control = MulticastConfig {
             group: group.ip(),
             loopback: true,
@@ -1552,7 +1561,7 @@ impl<T: StreamTerms> Network<T> {
         };
         let local = SocketAddr::new(bind.ip(), group.port());
         match self.hold_endpoint(local, Some(control)) {
-            Ok(endpoint) => Some((endpoint, group, slot)),
+            Ok(endpoint) => Some((endpoint, group)),
             Err(_) => {
                 if let Some(count) = self.control_join_failures.checked_add(1) {
                     self.control_join_failures = count;

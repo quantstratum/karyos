@@ -2371,8 +2371,10 @@ fn nak_control_entries_leave_with_their_last_subscription() {
     assert_eq!(b.network_control_groups_in_use(), 0);
     for n in 0..9u8 {
         // A port of its own: the last key's endpoint may still be retiring.
-        let port = free_port();
-        let at = |n: u8, last: u8| SocketAddr::from(([239, 8, n, last], port));
+        let (port, control) = (free_port(), free_port());
+        let at = |n: u8, last: u8| {
+            SocketAddr::from(([239, 8, n, last], if last == 1 { port } else { control }))
+        };
         let subscription = b
             .add_network_subscription(
                 i32::from(n) + 10,
@@ -2397,7 +2399,10 @@ fn a_failed_add_releases_its_nak_control_entry() {
     let group = SocketAddr::from(([239, 8, 30, 1], port));
     let channel = UdpConfig {
         interface: Some(Interface::Address(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
-        ..control_channel(group, vec![SocketAddr::from(([239, 8, 30, 2], port))])
+        ..control_channel(
+            group,
+            vec![SocketAddr::from(([239, 8, 30, 2], free_port()))],
+        )
     };
     assert_eq!(
         b.add_network_subscription(30, &channel),
@@ -2417,7 +2422,10 @@ fn a_key_holds_the_control_group_it_joins_without_nak_control() {
     let mut b = driver(ThreadingMode::Shared);
     let port = free_port();
     let group = SocketAddr::from(([239, 8, 40, 1], port));
-    let mapped = control_channel(group, vec![SocketAddr::from(([239, 8, 40, 2], port))]);
+    let mapped = control_channel(
+        group,
+        vec![SocketAddr::from(([239, 8, 40, 2], free_port()))],
+    );
     let a = b.add_network_subscription(41, &mapped).unwrap();
     let plain = b
         .add_network_subscription(42, &control_channel(group, Vec::new()))
@@ -2478,7 +2486,7 @@ fn a_second_handle_must_match_the_keys_control_groups() {
     let mut b = driver(ThreadingMode::Shared);
     let port = free_port();
     let group = SocketAddr::from(([239, 8, 50, 1], port));
-    let control = SocketAddr::from(([239, 8, 50, 2], port));
+    let control = SocketAddr::from(([239, 8, 50, 2], free_port()));
     let plain = b
         .add_network_subscription(51, &control_channel(group, Vec::new()))
         .unwrap();
@@ -2497,7 +2505,7 @@ fn a_second_handle_must_match_the_keys_control_groups() {
     // a second handle.
     let port = free_port();
     let group = SocketAddr::from(([239, 8, 51, 1], port));
-    let control = SocketAddr::from(([239, 8, 51, 2], port));
+    let control = SocketAddr::from(([239, 8, 51, 2], free_port()));
     let mapped = b
         .add_network_subscription(52, &control_channel(group, vec![control]))
         .unwrap();
