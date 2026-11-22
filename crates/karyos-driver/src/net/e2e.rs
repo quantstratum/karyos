@@ -932,18 +932,31 @@ fn a_multicast_publication_reaches_every_subscriber() {
     });
 }
 
-/// karyos#1067, Linux: two subscribing drivers on one host share the
-/// group port, so before the fix both sent their CHALLENGEs from one
-/// source endpoint and the publisher charged them to one
-/// `setup_answer_rate` bucket (20, burst 20; network-control-schemas.md
-/// §7.4). With 20 streams each, 40 CHALLENGEs of the first announcement
-/// rounds overran it: refused ones bound only later through SOLICIT. Each driver
-/// now sends a multicast key's CHALLENGE from its own unicast control
-/// endpoint, as its SOLICITs (plan 169), so neither is refused and every
-/// image binds through its CHALLENGE, with no SOLICIT. Skipped like
-/// `a_multicast_publication_reaches_every_subscriber`.
+/// How the subscribing drivers of [`two_drivers_on_one_host`] send their
+/// multicast CHALLENGEs and SOLICITs (ADR-0096, ADR-0097).
 #[cfg(target_os = "linux")]
-fn two_drivers_on_one_host(offer: bool, name: &str) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlSocket {
+    /// From each driver's own unicast control endpoint.
+    Own,
+    /// From the shared group port: `NetworkConfig::control_endpoint` off.
+    Disabled,
+    /// From the shared group port: every control endpoint creation fails.
+    Failing,
+}
+
+/// karyos#1067, Linux: two subscribing drivers on one host share the
+/// group port. From it, their CHALLENGEs are one source endpoint to the
+/// publisher, charged to one `setup_answer_rate` bucket (20, burst 20;
+/// network-control-schemas.md §7.4): with 20 streams each, the 40
+/// CHALLENGEs of the first announcement rounds overrun it, and the refused
+/// keys bind only later, through SOLICITs that DATA or, idle, heartbeats
+/// trigger after their challenges expire (§6.3 step 1). With their own
+/// control endpoints (ADR-0096) neither is refused and every image binds
+/// through its CHALLENGE. With `offer`, DATA flows; without, only
+/// heartbeats. Skipped like `a_multicast_publication_reaches_every_subscriber`.
+#[cfg(target_os = "linux")]
+fn two_drivers_on_one_host(offer: bool, socket: ControlSocket, name: &str) {
     use std::io::Write as _;
 
     const STREAMS: usize = 20;
@@ -968,13 +981,39 @@ fn two_drivers_on_one_host(offer: bool, name: &str) {
         .map(|index| 300 + i32::try_from(index).unwrap())
         .collect();
     let mut a = bind_time::sized_publisher(STREAMS);
-    let (mut b, mut c) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let subscriber = || {
+        let mut driver = EmbeddedDriver::with_config(DriverConfig {
+            network: Some(NetworkConfig {
+                threading: ThreadingMode::Shared,
+                control_endpoint: socket != ControlSocket::Disabled,
+                ..NetworkConfig::default()
+            }),
+            ..DriverConfig::default()
+        })
+        .unwrap();
+        if socket == ControlSocket::Failing {
+            driver.net.as_mut().unwrap().fail_control_endpoint();
+        }
+        driver
+    };
+    let (mut b, mut c) = (subscriber(), subscriber());
     for subscriber in [&mut b, &mut c] {
         for &stream in &ids {
+            // ADR-0097 decision 3: admitted even when the control
+            // endpoint cannot be created.
             let _ = subscriber
                 .add_network_subscription(stream, &channel)
                 .unwrap();
         }
+        let failures = subscriber.network_solicit_endpoint_failures();
+        match socket {
+            ControlSocket::Failing => assert_eq!(failures, u64::try_from(STREAMS).unwrap()),
+            _ => assert_eq!(failures, 0),
+        }
+        assert_eq!(
+            subscriber.network_solicit_endpoints().is_empty(),
+            socket != ControlSocket::Own
+        );
     }
     let mut lanes = Vec::with_capacity(STREAMS);
     for &stream in &ids {
@@ -986,9 +1025,6 @@ fn two_drivers_on_one_host(offer: bool, name: &str) {
                 .unwrap(),
         );
     }
-    // With `offer`, DATA flows; without, only heartbeats. Either way a
-    // refused CHALLENGE still binds through SOLICIT after it expires
-    // (§6.3 step 1), so the test ends on the counters, not on a timeout.
     pump(&mut [&mut a, &mut b, &mut c], |drivers| {
         for lane in lanes.iter_mut().filter(|_| offer) {
             let _ = lane.offer(&[0u8; 100]).unwrap();
@@ -999,13 +1035,35 @@ fn two_drivers_on_one_host(offer: bool, name: &str) {
         })
     });
     let answers = shared(&mut a).sender.session_counters();
-    assert_eq!(answers.rate_limited, 0, "{answers:?}");
+    let mut solicits = 0;
     for subscriber in [&mut b, &mut c] {
         let sessions = shared(subscriber).receiver.session_counters();
-        assert_eq!(
-            sessions.solicits, 0,
-            "bound through CHALLENGE: {sessions:?}"
-        );
+        let own = subscriber
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .unwrap();
+        solicits += sessions.solicits;
+        if socket == ControlSocket::Own {
+            assert_eq!(
+                sessions.solicits, 0,
+                "bound through CHALLENGE: {sessions:?}"
+            );
+            assert_eq!(own.challenges_from_arrival, 0);
+        } else {
+            // A key whose first trigger was DATA solicited instead: only
+            // some keys challenge, and every CHALLENGE is counted.
+            assert!(own.challenges_from_arrival > 0, "{own:?}");
+        }
+    }
+    if socket == ControlSocket::Own {
+        assert_eq!(answers.rate_limited, 0, "{answers:?}");
+    } else {
+        // The shared bucket refused some, and their keys still bound,
+        // through SOLICITs that DATA or heartbeats triggered.
+        assert!(answers.rate_limited > 0, "{answers:?}");
+        assert!(solicits > 0, "{answers:?}");
     }
 }
 
@@ -1014,6 +1072,7 @@ fn two_drivers_on_one_host(offer: bool, name: &str) {
 fn two_drivers_on_one_host_bind_through_their_own_challenges() {
     two_drivers_on_one_host(
         true,
+        ControlSocket::Own,
         "two_drivers_on_one_host_bind_through_their_own_challenges",
     );
 }
@@ -1025,7 +1084,34 @@ fn two_drivers_on_one_host_bind_through_their_own_challenges() {
 fn two_drivers_on_one_host_bind_an_idle_publication_through_their_own_challenges() {
     two_drivers_on_one_host(
         false,
+        ControlSocket::Own,
         "two_drivers_on_one_host_bind_an_idle_publication_through_their_own_challenges",
+    );
+}
+
+/// ADR-0097 validation: with the control endpoint disabled, the drivers
+/// share the group port again; an idle publication's refused keys bind
+/// through heartbeat triggered SOLICITs.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_idle_publication_binds_refused_keys_through_heartbeat_solicits() {
+    two_drivers_on_one_host(
+        false,
+        ControlSocket::Disabled,
+        "an_idle_publication_binds_refused_keys_through_heartbeat_solicits",
+    );
+}
+
+/// ADR-0097 validation: a control endpoint that cannot be created is
+/// counted, the subscriptions are admitted, and every CHALLENGE and
+/// SOLICIT leaves from the arrival socket.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_control_endpoint_falls_back_to_the_arrival_socket() {
+    two_drivers_on_one_host(
+        true,
+        ControlSocket::Failing,
+        "a_failed_control_endpoint_falls_back_to_the_arrival_socket",
     );
 }
 

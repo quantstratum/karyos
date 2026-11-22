@@ -106,6 +106,13 @@ pub struct NetworkConfig {
     /// (`[io] require`, R-CORE-43): an endpoint missing one fails to open
     /// (`DriverError::NetworkEndpoint`). Empty by default.
     pub require: CapabilitySet,
+    /// Whether an eligible multicast key sends its CHALLENGEs and
+    /// SOLICITs from the driver's unicast control endpoint (ADR-0096,
+    /// ADR-0097). `false` sends them from the key's arrival socket, for a
+    /// network whose multipath routing must keep the flow's own source
+    /// port; the drivers of one host then share the group port's
+    /// `setup_answer_rate` bucket at the publisher. Default `true`.
+    pub control_endpoint: bool,
 }
 
 /// The tables of a network endpoint (karyos#859): what its publications
@@ -147,6 +154,7 @@ impl Default for NetworkConfig {
             max_owned_per_client: 16,
             endpoint_tables: EndpointTables::default(),
             require: CapabilitySet::EMPTY,
+            control_endpoint: true,
         }
     }
 }
@@ -849,6 +857,12 @@ pub(crate) struct Network<T: StreamTerms = HeapTerms> {
     control_join_failures: u64,
     /// Unicast control endpoints that could not open (plan 164).
     solicit_endpoint_failures: u64,
+    /// [`NetworkConfig::control_endpoint`].
+    control_endpoint: bool,
+    /// Tests: every control endpoint creation fails (ADR-0097
+    /// validation).
+    #[cfg(test)]
+    fail_control_endpoint: bool,
     /// Whether the backend isolates redundant path sockets.
     paths_isolated: bool,
     /// Channels with `paths` refused because they cannot be isolated.
@@ -985,6 +999,9 @@ impl<T: StreamTerms> Network<T> {
             control_groups: config.nak_control_groups,
             control_join_failures: 0,
             solicit_endpoint_failures: 0,
+            control_endpoint: config.control_endpoint,
+            #[cfg(test)]
+            fail_control_endpoint: false,
             paths_isolated: <OsSocket as karyos_io::sockets::ops::SocketOps>::isolates_paths(),
             paths_refused: 0,
             path_failures: 0,
@@ -1214,8 +1231,11 @@ impl<T: StreamTerms> Network<T> {
         // with no device, so the route lookup, interface and source
         // address are the arrival socket's and only the port differs
         // (decision 2); any other key keeps its arrival socket.
+        // ADR-0097 decision 3: decided once, here; a key that holds none
+        // sends every CHALLENGE and SOLICIT from its arrival socket.
+        let eligible = self.control_endpoint && bind.ip().is_unspecified();
         let solicit = multicast
-            .filter(|_| bind.ip().is_unspecified())
+            .filter(|_| eligible)
             .and_then(|_| self.hold_solicit_endpoint(bind));
         // A dynamic key's registration state, shared with its receiver.
         let registration = register_at
@@ -1520,6 +1540,13 @@ impl<T: StreamTerms> Network<T> {
     /// first use, one more key holds it (plan 164). `None` when it cannot
     /// open (counted): the key's SOLICITs then leave from its own endpoint.
     fn hold_solicit_endpoint(&mut self, bind: SocketAddr) -> Option<EndpointId> {
+        #[cfg(test)]
+        if self.fail_control_endpoint {
+            if let Some(count) = self.solicit_endpoint_failures.checked_add(1) {
+                self.solicit_endpoint_failures = count;
+            }
+            return None;
+        }
         let any = match bind {
             SocketAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             SocketAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
@@ -1556,6 +1583,12 @@ impl<T: StreamTerms> Network<T> {
         held.into_iter()
             .flatten()
             .filter_map(|endpoint| self.endpoints.local_address(endpoint))
+    }
+
+    /// Tests: makes every later control endpoint creation fail.
+    #[cfg(test)]
+    pub(crate) fn fail_control_endpoint(&mut self) {
+        self.fail_control_endpoint = true;
     }
 
     /// Unicast control endpoints that could not open (plan 164).
