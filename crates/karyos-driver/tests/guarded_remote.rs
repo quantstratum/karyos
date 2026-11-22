@@ -453,6 +453,10 @@ fn a_remote_handle_of_a_reincarnation_earns_since_it_began() {
 
 fn concurrent_config(publishers: u8) -> StreamConfig {
     let mut config = stream_config();
+    // A concurrent stream's reservation room and spares, as the driver's
+    // own concurrent guarded tests use.
+    config.buffer.spare_slots = 6;
+    config.buffer.max_reserved = MIN_TERM_LENGTH / 16;
     config.buffer.publication = PublicationMode::Concurrent {
         publishers,
         allow_non_lse: true,
