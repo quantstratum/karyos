@@ -120,6 +120,11 @@ pub struct GuardBinding {
     /// How a copy made at bind starts: full, or empty for a reincarnation
     /// ([`Self::reincarnated_at`]).
     bind_bucket: Bucket,
+    /// A block of a shared ring's handle could not be kept in its
+    /// reservation set: its final record would go unread, so the outcome
+    /// stream is lost from here (a broken invariant: admission checked the
+    /// quota).
+    untracked: bool,
 }
 
 /// A handle's reader of its outcome records: its own ring, or its slot of
@@ -215,6 +220,7 @@ impl GuardBinding {
             rate: None,
             pending_rate: None,
             bind_bucket: Bucket::Full,
+            untracked: false,
         })
     }
 
@@ -264,6 +270,7 @@ impl GuardBinding {
             rate: None,
             pending_rate: None,
             bind_bucket: Bucket::Full,
+            untracked: false,
         })
     }
 
@@ -486,7 +493,7 @@ impl GuardBinding {
     pub(crate) fn admission(&self) -> Admission {
         // An exhausted reservation count is as terminal as a fault; it
         // takes 2^64 messages.
-        if self.reader.ended() || self.reserved == u64::MAX {
+        if self.reader.ended() || self.reserved == u64::MAX || self.untracked {
             return Admission::Lost;
         }
         if !guard::admits_in(&*self.guard, self.index, self.epoch) {
@@ -501,11 +508,13 @@ impl GuardBinding {
     /// Records the block a shared ring's handle reserved, on wire lane
     /// `lane` at stream position `start`: its final record is the handle's.
     /// The admission that preceded it checked the quota, so the set has
-    /// room.
+    /// room; a block it could not keep loses the handle's outcome stream,
+    /// and its next call reports `OutcomesLost`.
     pub(crate) fn reserve_block(&mut self, lane: u8, start: u64) {
-        if let Reader::Shared(reader) = &mut self.reader {
-            let kept = reader.reserve(lane, start);
-            debug_assert!(kept, "a reservation past the quota");
+        if let Reader::Shared(reader) = &mut self.reader
+            && !reader.reserve(lane, start)
+        {
+            self.untracked = true;
         }
     }
 
@@ -580,4 +589,50 @@ const fn is_message(kind: Kind) -> bool {
         kind,
         Kind::Submitted | Kind::ConfirmedCancelled | Kind::Unknown | Kind::Rejected | Kind::Aborted
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use karyos_sys::outcome_ring::shared::{SharedBinding, init};
+
+    /// Review of #1153: a shared ring's handle whose block cannot be kept
+    /// in its reservation set (past its quota, a broken invariant) loses
+    /// its outcome stream instead of asserting: its next admission is
+    /// `Lost`.
+    #[test]
+    fn an_untracked_block_loses_the_outcome_stream() {
+        let binding = SharedBinding {
+            messages: 1,
+            ranges: 1,
+            guard_index: 0,
+            epoch: 2,
+            handles: 1,
+        };
+        let capacity = usize::try_from(binding.capacity().unwrap()).unwrap();
+        let ring = Arc::new(HeapWords::zeroed(
+            karyos_sys::outcome_ring::ring_words(capacity).unwrap(),
+        ));
+        init(ring.words(), &binding).unwrap();
+        // The guard word open at epoch 2: `(2 << 1) | 1`.
+        let guard = HeapWords::zeroed(1);
+        guard.words()[0].store(5, karyos_sys::sync::Ordering::Relaxed);
+        let mut bound = GuardBinding::new_shared(
+            Arc::new(guard),
+            0,
+            2,
+            ring,
+            Arc::new(AtomicU64::new(0)),
+            1,
+            0,
+            0,
+        )
+        .unwrap();
+        assert_eq!(bound.admission(), Admission::Open);
+        bound.reserve_block(0, 0);
+        assert_eq!(bound.admission(), Admission::BackPressured);
+        // Past the quota: the set refuses the pair.
+        bound.reserve_block(0, 64);
+        assert_eq!(bound.admission(), Admission::Lost);
+    }
 }

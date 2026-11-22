@@ -443,7 +443,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         if !self.connected() {
             // A sealed handle still releases (publication-seal.md).
             if self.inner.close_if_sealed().is_some() {
-                return Ok(self.after_end().concurrent_offer());
+                return Ok(self.ended_offer());
             }
             return Ok(ConcurrentOfferOutcome::NotConnected);
         }
@@ -452,7 +452,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         }
         if let Some(refused) = self.guard_refusal()? {
             return Ok(match refused {
-                Refused::Ended => self.after_end().concurrent_offer(),
+                Refused::Ended => self.ended_offer(),
                 refused => refused.offer(),
             });
         }
@@ -464,7 +464,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
             self.base,
             guarded,
         ) {
-            ConcurrentOfferOutcome::Closed => Ok(self.after_end().concurrent_offer()),
+            ConcurrentOfferOutcome::Closed => Ok(self.ended_offer()),
             outcome => {
                 match outcome {
                     ConcurrentOfferOutcome::Accepted { position, .. } => {
@@ -592,14 +592,14 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         self.inner.resolve_forgotten_claim();
         if !self.connected() {
             if self.inner.close_if_sealed().is_some() {
-                return Ok(self.after_end().concurrent_claim());
+                return Ok(self.ended_claim());
             }
             return Ok(ConcurrentClaimOutcome::NotConnected);
         }
         // A handle closed by an earlier call moves (or reports the end)
         // here, before the attempt borrows it.
         if self.inner.is_closed() {
-            return Ok(self.after_end().concurrent_claim());
+            return Ok(self.ended_claim());
         }
         if let Some(shape) = self.conflation {
             let shape = shape?;
@@ -611,7 +611,7 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         }
         if let Some(refused) = self.guard_refusal()? {
             return Ok(match refused {
-                Refused::Ended => self.after_end().concurrent_claim(),
+                Refused::Ended => self.ended_claim(),
                 refused => refused.claim(),
             });
         }
@@ -639,6 +639,34 @@ impl<T: TermBytes> ClientConcurrentPublication<T> {
         }
         let guarded = self.guard.is_some();
         Ok(claim_outcome(outcome, lane, base, end, trace, guarded))
+    }
+
+    /// What an ended handle's offer reports: `Gated` for a guarded handle
+    /// whose buffer a gate sealed (GC-8), whichever call observed the seal
+    /// first, else as [`Self::after_end`] says.
+    fn ended_offer(&mut self) -> ConcurrentOfferOutcome {
+        if self.gate_sealed() {
+            return ConcurrentOfferOutcome::Gated;
+        }
+        self.after_end().concurrent_offer()
+    }
+
+    /// What an ended handle's claim reports, as [`Self::ended_offer`].
+    fn ended_claim<'a>(&mut self) -> ConcurrentClaimOutcome<'a, T> {
+        if self.gate_sealed() {
+            return ConcurrentClaimOutcome::Gated;
+        }
+        self.after_end().concurrent_claim()
+    }
+
+    /// Whether this is a guarded handle closed by a gate seal: a closed
+    /// handle's terminal seal reason, read from its buffer.
+    fn gate_sealed(&self) -> bool {
+        self.guard.is_some()
+            && self
+                .inner
+                .seal_reason()
+                .is_some_and(|reason| reason.is_gate())
     }
 
     /// The handle's mapping ended (its sys handle is closed). With a link,

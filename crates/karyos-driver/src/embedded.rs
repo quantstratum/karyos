@@ -4170,6 +4170,25 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     ) -> Result<karyos_client::GuardBinding, DriverError> {
         let slot =
             self.attach_concurrent_guard(handle, crate::guard_streams::ShareClient::InProcess)?;
+        // The slot is taken back if the handle's binding fails, so a failed
+        // issuance consumes no slot of the incarnation.
+        let bound = self.bind_concurrent_guard(handle, &slot);
+        if bound.is_err()
+            && let Ok(found) = self.stream(handle)
+            && let Some(guarded) = found.guarded.as_mut()
+        {
+            guarded.revoke_shared(slot.slot);
+        }
+        bound
+    }
+
+    /// The client binding of `slot`, a concurrent handle's slot of its
+    /// stream's shared ring ([`Self::concurrent_guard_binding`]).
+    fn bind_concurrent_guard(
+        &self,
+        handle: StreamHandle,
+        slot: &crate::guard_streams::SharedSlot,
+    ) -> Result<karyos_client::GuardBinding, DriverError> {
         let found = self.stream_ref(handle)?;
         let guarded = found
             .guarded

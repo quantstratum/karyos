@@ -385,6 +385,17 @@ impl<T: TermBytes> GuardedStream<T> {
         })
     }
 
+    /// Takes back slot `slot`, the last one attached, whose handle was
+    /// never issued (its client binding failed): the next handle gets it.
+    pub(crate) fn revoke_shared(&mut self, slot: usize) {
+        if let Some(shared) = &mut self.shared
+            && shared.cells.len().checked_sub(1) == Some(slot)
+            && shared.writer.revoke(slot)
+        {
+            let _ = shared.cells.pop();
+        }
+    }
+
     /// Detaches handle `slot` from the shared ring: it leaves the room
     /// minimum, its blocks' records are still written, and its slot is not
     /// issued again in this incarnation (ADR-0092 decisions 3 and 8).

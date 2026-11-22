@@ -281,4 +281,43 @@ fn concurrent_guarded_handles_keep_their_own_outcomes() {
             .unwrap();
     }
     assert!(ended, "A reads the incarnation's Ended record");
+    // Review of #1153: once the handle observed the gate seal, every later
+    // offer and claim still reports `Gated`, never `Closed`.
+    use karyos_client::ConcurrentClaimOutcome as Claim;
+    assert!(matches!(a.try_claim(8).unwrap(), Claim::Gated));
+    assert!(matches!(a.try_claim(8).unwrap(), Claim::Gated));
+    assert_eq!(a.offer(b"later").unwrap(), Offer::Gated);
+}
+
+/// Review of #1153: a slot whose handle's binding failed is taken back,
+/// so the next handle gets the same slot.
+#[test]
+fn a_failed_issuance_takes_its_slot_back() {
+    let (mut driver, handle, _guard) = guarded();
+    let first = driver
+        .attach_concurrent_guard(handle, ShareClient::InProcess)
+        .unwrap();
+    assert_eq!(first.slot, 0);
+    driver
+        .stream(handle)
+        .unwrap()
+        .guarded
+        .as_mut()
+        .unwrap()
+        .revoke_shared(first.slot);
+    let again = driver
+        .attach_concurrent_guard(handle, ShareClient::InProcess)
+        .unwrap();
+    assert_eq!(again.slot, 0);
+    // Only the last slot attached is taken back.
+    let second = driver
+        .attach_concurrent_guard(handle, ShareClient::InProcess)
+        .unwrap();
+    let guarded = driver.stream(handle).unwrap().guarded.as_mut().unwrap();
+    guarded.revoke_shared(again.slot);
+    guarded.revoke_shared(second.slot);
+    assert!(matches!(
+        driver.attach_concurrent_guard(handle, ShareClient::InProcess),
+        Ok(slot) if slot.slot == 1
+    ));
 }
