@@ -2334,33 +2334,75 @@ fn path_skew_is_validated_at_admission_and_shared_by_a_key() {
     ));
 }
 
+/// Whether this host can join an IPv4 multicast group on its default
+/// interface: a subscription test that needs the join says so, instead of
+/// passing when every add fails (karyos#1086 review).
+fn multicast_joins() -> bool {
+    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        .and_then(|socket| {
+            socket.join_multicast_v4(&Ipv4Addr::new(239, 8, 99, 1), &Ipv4Addr::UNSPECIFIED)
+        })
+        .is_ok()
+}
+
+/// A reliable multicast channel of `group` on the default interface, with
+/// `nak_control`.
+fn control_channel(group: SocketAddr, nak_control: Vec<SocketAddr>) -> UdpConfig {
+    UdpConfig {
+        destination: Destination::Multicast { group, ttl: None },
+        interface: None,
+        nak_control,
+        ..channel(group)
+    }
+}
+
 /// karyos#1086: the control group entries channels' `nak-control` adds
 /// leave the driver's table with their last subscription, so channels
-/// naming nine distinct groups in turn never exhaust its eight entries; a
-/// failed add releases what it counted, and the count is visible.
+/// naming nine distinct groups in turn never exhaust its eight entries;
+/// the count is visible. Every add must succeed: a host that cannot join
+/// a group is detected, not passed through.
 #[test]
 fn nak_control_entries_leave_with_their_last_subscription() {
+    if !multicast_joins() {
+        return;
+    }
     let mut b = driver(ThreadingMode::Shared);
-    let at = |n: u8, last: u8, port: u16| SocketAddr::from(([239, 8, n, last], port));
-    let multicast = |n: u8| UdpConfig {
-        destination: Destination::Multicast {
-            group: at(n, 1, 4000),
-            ttl: None,
-        },
-        interface: None,
-        nak_control: vec![at(n, 2, 4001)],
-        ..channel(at(n, 1, 4000))
-    };
     assert_eq!(b.network_control_groups_in_use(), 0);
     for n in 0..9u8 {
-        // A host without multicast cannot join: the add fails, and must
-        // still release what it counted.
-        if let Ok(subscription) = b.add_network_subscription(i32::from(n) + 10, &multicast(n)) {
-            assert_eq!(b.network_control_groups_in_use(), 1, "{n}");
-            assert!(b.remove_network_subscription(subscription).unwrap());
-        }
+        // A port of its own: the last key's endpoint may still be retiring.
+        let port = free_port();
+        let at = |n: u8, last: u8| SocketAddr::from(([239, 8, n, last], port));
+        let subscription = b
+            .add_network_subscription(
+                i32::from(n) + 10,
+                &control_channel(at(n, 1), vec![at(n, 2)]),
+            )
+            .unwrap();
+        assert_eq!(b.network_control_groups_in_use(), 1, "{n}");
+        assert!(b.remove_network_subscription(subscription).unwrap());
         assert_eq!(b.network_control_groups_in_use(), 0, "{n}");
     }
+}
+
+/// karyos#1086 review: an add that fails after its channel's
+/// `nak-control` entered the table, here on an interface the host does
+/// not have (TEST-NET-1), releases the entry.
+#[test]
+fn a_failed_add_releases_its_nak_control_entry() {
+    use crate::error::DriverError;
+
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 30, 1], port));
+    let channel = UdpConfig {
+        interface: Some(Interface::Address(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)))),
+        ..control_channel(group, vec![SocketAddr::from(([239, 8, 30, 2], port))])
+    };
+    assert_eq!(
+        b.add_network_subscription(30, &channel),
+        Err(DriverError::NetworkEndpoint)
+    );
+    assert_eq!(b.network_control_groups_in_use(), 0);
 }
 
 /// karyos#1086 review: a two-path subscription's `nak-control` enters one
