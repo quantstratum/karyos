@@ -1148,7 +1148,7 @@ impl<T: StreamTerms> Network<T> {
             endpoint,
             stream_id,
         };
-        let asked_controls = self.control_asked(bind, multicast, later, reliable);
+        let asked_controls = self.control_asked(bind, multicast, later);
         if let Some(entry) = self
             .subscriptions
             .iter_mut()
@@ -1198,9 +1198,9 @@ impl<T: StreamTerms> Network<T> {
             // Its admitted paths' receiver entries run with the control
             // groups they joined, and do not follow a later change: a second
             // handle whose own `nak-control` (`names_control`) asks for
-            // others, or for one where a path joined none (a failed join), is
-            // refused (karyos#1086 review). A handle without the key shares
-            // what the key joined.
+            // others, or for one where a path joined none (a failed join, an
+            // unreliable key), is refused (karyos#1086 review). A handle
+            // without the key shares what the key joined.
             let admitted = entry
                 .control_admitted
                 .iter()
@@ -1636,17 +1636,16 @@ impl<T: StreamTerms> Network<T> {
         control_group::lookup_slot(&self.control_groups, data_group, interface)
     }
 
-    /// The control group the table names for each path of a key: none for
-    /// an unreliable or unicast one (karyos#1086 review).
+    /// The control group the table names for each path of a key, reliable
+    /// or not: none for a unicast one (karyos#1086 review).
     fn control_asked(
         &self,
         bind: SocketAddr,
         multicast: Option<MulticastConfig>,
         later: &[(SocketAddr, MulticastConfig)],
-        reliable: bool,
     ) -> ControlAsked {
         let mut asked = [None; LATER_PATHS + 1];
-        let (Some(config), true) = (multicast, reliable) else {
+        let Some(config) = multicast else {
             return asked;
         };
         let routes = std::iter::once((bind, config)).chain(later.iter().copied());

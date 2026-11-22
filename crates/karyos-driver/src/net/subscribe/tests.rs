@@ -2558,3 +2558,32 @@ fn a_second_handle_is_refused_when_the_keys_control_join_failed() {
     assert!(b.remove_network_subscription(first).unwrap());
     assert_eq!(b.network_control_groups_in_use(), 0);
 }
+
+/// karyos#1086 review: an unreliable key joins no control group, so a
+/// second handle whose channel names `nak-control` is refused, typed, and
+/// leaves no entry behind.
+#[test]
+fn a_second_handle_of_an_unreliable_key_cannot_add_nak_control() {
+    use crate::error::DriverError;
+
+    if !multicast_joins() {
+        return;
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let group = SocketAddr::from(([239, 8, 70, 1], port));
+    let control = SocketAddr::from(([239, 8, 70, 2], free_port()));
+    let unreliable = |nak_control| UdpConfig {
+        reliable: false,
+        ..control_channel(group, nak_control)
+    };
+    let first = b
+        .add_network_subscription(71, &unreliable(Vec::new()))
+        .unwrap();
+    assert_eq!(
+        b.add_network_subscription(71, &unreliable(vec![control])),
+        Err(DriverError::ControlGroupConflict { data_group: group })
+    );
+    assert_eq!(b.network_control_groups_in_use(), 0);
+    assert!(b.remove_network_subscription(first).unwrap());
+}
