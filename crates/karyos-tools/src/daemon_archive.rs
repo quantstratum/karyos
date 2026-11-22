@@ -490,7 +490,10 @@ impl DaemonArchive {
             started: Vec::new(),
             next: 1,
         };
-        let config = AgentConfig::default().with_seal_interval(Some(options.seal_interval));
+        let config = AgentConfig::default()
+            .with_seal_interval(Some(options.seal_interval))
+            .with_copy_location(options.copy_location)
+            .with_retention_policy(options.retention);
         let agent = match &options.signer {
             None => ArchiveHandle::spawn(StdDisk, &options.dir, config),
             Some(signer) => ArchiveHandle::spawn_signing(

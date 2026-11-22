@@ -141,9 +141,28 @@ pub struct AgentConfig {
     /// the process allow it, and the enforcement that applies recorded.
     /// `None` records no copy. Needs `seal_interval`.
     pub copy_location: Option<crate::integrity::Digest>,
+    /// The retention policy purges are checked against (karyos#1093):
+    /// with it, a `PurgeRecording` runs [`Retention::purge`] against the
+    /// recording's store, the copy catalog of `copy_location` counting the
+    /// verified copies elsewhere. `None` refuses every purge `no_policy`.
+    /// Needs `copy_location`.
+    ///
+    /// [`Retention::purge`]: crate::integrity::retention::Retention::purge
+    pub retention_policy: Option<crate::integrity::retention::RetentionPolicy>,
 }
 
 impl AgentConfig {
+    /// This configuration with `retention_policy` set (karyos#1093).
+    #[must_use]
+    #[inline]
+    pub const fn with_retention_policy(
+        mut self,
+        policy: Option<crate::integrity::retention::RetentionPolicy>,
+    ) -> Self {
+        self.retention_policy = policy;
+        self
+    }
+
     /// This configuration with `copy_location` set (karyos#1024).
     #[must_use]
     #[inline]
@@ -182,6 +201,7 @@ impl Default for AgentConfig {
             checkpoint_budget: 256 * 1024,
             seal_interval: None,
             copy_location: None,
+            retention_policy: None,
         }
     }
 }
@@ -677,6 +697,11 @@ pub enum AgentError {
     /// be no seals to sign.
     #[error("head signing needs a seal_interval")]
     SigningWithoutSealing,
+    /// A retention policy was given without a `copy_location` and a
+    /// `seal_interval`: a purge needs the copy catalog and the seals
+    /// (karyos#1093).
+    #[error("a retention policy needs a copy_location and a seal_interval")]
+    PolicyWithoutCopies,
     /// No such recording records.
     #[error("recording {id} is not recording")]
     NotRecording {
@@ -772,11 +797,14 @@ pub enum AgentError {
         /// The directory.
         dir: PathBuf,
     },
-    /// With sealing on, a group journal directory that does not resolve
-    /// to a directory on the host (`std::fs::canonicalize` failed): it
-    /// cannot be told apart from the Archive's own, so it is refused
-    /// before the journal exists (karyos#1140).
-    #[error("group journal directory {dir:?} does not resolve: {kind}")]
+    /// With sealing on, a group journal directory, or the Archive's own
+    /// directory, that does not resolve to a directory on the host
+    /// (`std::fs::canonicalize` failed): the two cannot be told apart, so
+    /// the group is refused before its journal exists (karyos#1140,
+    /// karyos#1149). `dir` names the one that did not resolve.
+    #[error(
+        "directory {dir:?} (the group journal's or the Archive's own) does not resolve: {kind}"
+    )]
     GroupDirectoryUnresolved {
         /// The directory as given.
         dir: PathBuf,
@@ -1024,6 +1052,11 @@ impl ArchiveHandle {
     {
         if signing.is_some() && config.seal_interval.is_none() {
             return Err(AgentError::SigningWithoutSealing);
+        }
+        if config.retention_policy.is_some()
+            && (config.copy_location.is_none() || config.seal_interval.is_none())
+        {
+            return Err(AgentError::PolicyWithoutCopies);
         }
         let (commands, inbox) = mpsc::sync_channel(config.command_capacity);
         let (events_in, events) = mpsc::sync_channel(config.event_capacity);
@@ -1615,6 +1648,15 @@ struct Replays<D: Disk> {
 }
 
 impl<D: Disk> Replays<D> {
+    /// Whether a replay prepared or running reads `recording`.
+    fn reads(&self, recording: u64) -> bool {
+        self.active
+            .iter()
+            .map(|replay| &replay.source)
+            .chain(self.prepared.iter().map(|replay| &replay.source))
+            .any(|source| source.recording() == recording)
+    }
+
     /// Replays prepared or running.
     fn len(&self) -> usize {
         self.active.len() + self.prepared.len()
@@ -1771,13 +1813,21 @@ fn run<D>(
             return;
         }
     };
-    let retention = match retention::open(&disk, &dir) {
+    let mut retention = match retention::open(&disk, &dir) {
         Ok(retention) => retention,
         Err(error) => {
             let _ = ready.send(Err(error.into()));
             return;
         }
     };
+    // A purge releases the immutability the local copies' segments were
+    // given (karyos#1024) right before it deletes them.
+    #[cfg(target_os = "linux")]
+    if config.retention_policy.is_some() {
+        retention.set_immutability(Box::new(crate::integrity::copies::ImmutableAttribute));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = &mut retention;
     // Collected before the settle, so the stops recovery appends are
     // chained too, before the start is reported.
     let mut integrity = match config.seal_interval.map(|interval| {
@@ -1879,6 +1929,9 @@ fn run<D>(
         verifying: Arc::default(),
         replications: Vec::new(),
     };
+    // Before the first command: a purge a crash cut short is completed or
+    // cancelled before any retry reaches it (karyos#1121 review).
+    state.reconcile_purges();
     loop {
         let mut worked = false;
         loop {
@@ -1940,8 +1993,9 @@ struct State<D: Disk> {
     integrity: Option<Integrity<D>>,
     /// The retention engine (ADR-0088; karyos#967).
     retention: retention::Engine<D>,
-    /// A verification runs on its worker (karyos#1111).
-    verifying: Arc<std::sync::atomic::AtomicBool>,
+    /// The recording a verification reads on its worker (karyos#1111), 0
+    /// for none: recording ids are never 0.
+    verifying: Arc<AtomicU64>,
     /// The replications this Archive is the source of (karyos#1113).
     replications: Vec<Replication<D>>,
     /// The integrity journal of each group journal directory, which seals
@@ -3250,8 +3304,20 @@ where
                     kind: error.kind(),
                 })
             };
+            // `std::fs::canonicalize` goes around the `Disk` abstraction,
+            // which matters only if a disk other than the host's ever runs
+            // a sealing Archive.
             let group = resolve(&start.dir)?;
-            if std::fs::canonicalize(&self.dir).is_ok_and(|own| own == group) {
+            // The Archive's own directory not resolving (moved or removed
+            // while the Archive runs) refuses the group: without it the
+            // two cannot be told apart (karyos#1149).
+            let own = std::fs::canonicalize(&self.dir).map_err(|error| {
+                AgentError::GroupDirectoryUnresolved {
+                    dir: self.dir.clone(),
+                    kind: error.kind(),
+                }
+            })?;
+            if own == group {
                 return Err(AgentError::GroupInArchiveDirectory { dir: start.dir });
             }
             Some(group)

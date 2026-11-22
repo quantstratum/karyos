@@ -112,6 +112,18 @@ pub trait Disk {
     /// The operating system's error.
     fn remove(&mut self, path: &Path) -> io::Result<()>;
 
+    /// When `path` was last modified, in ns of UTC (karyos#1093): when a
+    /// segment stopped taking writes, which bounds when its range closed.
+    ///
+    /// # Errors
+    ///
+    /// The operating system's error; [`io::ErrorKind::Unsupported`] on a
+    /// disk that keeps no times, so whatever needs one fails closed.
+    fn modified(&mut self, path: &Path) -> io::Result<u64> {
+        let _ = path;
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
     /// Renames `from` to `to`, replacing `to` atomically. The new name is
     /// durable only after [`Disk::sync_dir`].
     ///
@@ -141,6 +153,14 @@ pub struct StdDisk;
 
 impl Disk for StdDisk {
     type File = std::fs::File;
+
+    fn modified(&mut self, path: &Path) -> io::Result<u64> {
+        let since = std::fs::metadata(path)?
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?;
+        u64::try_from(since.as_nanos()).map_err(io::Error::other)
+    }
 
     fn create(&mut self, path: &Path) -> io::Result<Self::File> {
         std::fs::OpenOptions::new()

@@ -308,6 +308,12 @@ impl<D: Disk> ReplaySource<D> {
         Ok(source)
     }
 
+    /// The recording it reads.
+    #[must_use]
+    pub const fn recording(&self) -> u64 {
+        self.recording
+    }
+
     /// The next position to deliver.
     #[must_use]
     pub const fn position(&self) -> u64 {
