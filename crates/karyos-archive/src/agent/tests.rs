@@ -1483,15 +1483,23 @@ mod groups {
             // Wait, bounded, until the agent holds the group directory's
             // integrity journal (its first open is lazy, at a duty): only
             // then does the open after shutdown test the lock's release.
+            // The test never opens it before: an open of its own would
+            // take the lock and make the agent's open fail. The agent
+            // creates the file and locks it at once, so once the file
+            // exists a single open must see `Locked`.
+            let journal_file = groups.join(crate::integrity::journal::JOURNAL_FILE);
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            loop {
-                match IntegrityJournal::open(StdDisk, &groups) {
-                    Err(crate::integrity::journal::IntegrityError::Locked) => break,
-                    _ if std::time::Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_micros(200));
-                    }
-                    other => panic!("round {round}: the agent never took the lock: {other:?}"),
-                }
+            while !journal_file.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "round {round}: the agent never opened the journal"
+                );
+                std::thread::sleep(Duration::from_micros(200));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            match IntegrityJournal::open(StdDisk, &groups) {
+                Err(crate::integrity::journal::IntegrityError::Locked) => {}
+                other => panic!("round {round}: the agent does not hold the lock: {other:?}"),
             }
             agent.shutdown().unwrap();
             if let Err(error) = IntegrityJournal::open(StdDisk, &groups) {
