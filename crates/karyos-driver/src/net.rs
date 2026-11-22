@@ -550,10 +550,12 @@ struct NetSubscription {
     /// whether its own channel's `nak-control` added them or not, released
     /// with the key (karyos#1086).
     control_held: control_group::Held,
-    /// The control group the table named for each path when the key
-    /// opened, first path first: a second handle must find the same ones
-    /// (karyos#1086 review).
-    control_asked: ControlAsked,
+    /// The control group each admitted path's receiver entry runs with,
+    /// first path first: `Some(None)` for an admitted path with none (no
+    /// entry, a failed join, an unreliable key), `None` for a path not
+    /// admitted. A second handle naming `nak-control` must ask for the same
+    /// ones (karyos#1086 review).
+    control_admitted: ControlAdmitted,
     /// Handles of this key; the receiver's entry goes with the last.
     users: usize,
 }
@@ -659,6 +661,10 @@ pub(crate) const LATER_PATHS: usize = 3;
 /// The control group the table names for each path of a key, first path
 /// first (karyos#1086 review).
 pub(crate) type ControlAsked = [Option<SocketAddr>; LATER_PATHS + 1];
+
+/// The control group each admitted path of a key runs with
+/// (`NetSubscription::control_admitted`).
+pub(crate) type ControlAdmitted = [Option<Option<SocketAddr>>; LATER_PATHS + 1];
 
 /// A timed lane whose publisher breached its schedule ring's protocol, as
 /// its sender reported it (`AgentEvent::ScheduleViolated`) for the live
@@ -1189,13 +1195,18 @@ impl<T: StreamTerms> Network<T> {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::UnsupportedChannel);
             }
-            // Its paths joined the control groups the table named when it
-            // opened, and its receiver's entry does not follow a later
-            // change: a second handle whose own `nak-control`
-            // (`names_control`) would have its paths join others, or join
-            // some where the key joined none, is refused (karyos#1086
-            // review). A handle without the key shares what the key joined.
-            if names_control && entry.control_asked != asked_controls {
+            // Its admitted paths' receiver entries run with the control
+            // groups they joined, and do not follow a later change: a second
+            // handle whose own `nak-control` (`names_control`) asks for
+            // others, or for one where a path joined none (a failed join), is
+            // refused (karyos#1086 review). A handle without the key shares
+            // what the key joined.
+            let admitted = entry
+                .control_admitted
+                .iter()
+                .zip(asked_controls)
+                .all(|(admitted, asked)| admitted.is_none_or(|admitted| admitted == asked));
+            if names_control && !admitted {
                 release(&mut self.send_endpoints, endpoint);
                 return Err(DriverError::ControlGroupConflict {
                     data_group: SocketAddr::new(
@@ -1295,10 +1306,15 @@ impl<T: StreamTerms> Network<T> {
         let mut held = [None; LATER_PATHS];
         let mut later_routes = [None; LATER_PATHS];
         let mut later_controls = [None; LATER_PATHS];
-        for (((slot, route), control_slot), (bind, config)) in held
+        let mut control_admitted: ControlAdmitted = [None; LATER_PATHS + 1];
+        if let Some(first) = control_admitted.first_mut() {
+            *first = Some(control.map(|(_, group)| group));
+        }
+        for ((((slot, route), control_slot), admitted), (bind, config)) in held
             .iter_mut()
             .zip(later_routes.iter_mut())
             .zip(later_controls.iter_mut())
+            .zip(control_admitted.iter_mut().skip(1))
             .zip(later)
         {
             *route = Some((*bind, *config));
@@ -1362,6 +1378,7 @@ impl<T: StreamTerms> Network<T> {
                 control_group::hold_slot(&mut self.control_group_uses, &mut control_held, at);
             }
             *control_slot = path_control.map(|(control, _)| control);
+            *admitted = Some(path_control.map(|(_, group)| group));
         }
         self.subscriptions.push(NetSubscription {
             endpoint,
@@ -1378,7 +1395,7 @@ impl<T: StreamTerms> Network<T> {
             later_controls,
             later_routes,
             control_held,
-            control_asked: asked_controls,
+            control_admitted,
             users: 1,
         });
         Ok(handle)

@@ -1174,7 +1174,7 @@ fn entry(first: u32, stream_id: i32, later: &[u32]) -> crate::net::NetSubscripti
         later_routes: [None; crate::net::LATER_PATHS],
         later_controls: [None; crate::net::LATER_PATHS],
         control_held: [false; crate::net::MAX_CONTROL_GROUPS],
-        control_asked: [None; crate::net::LATER_PATHS + 1],
+        control_admitted: [None; crate::net::LATER_PATHS + 1],
         identity: None,
         conflated: None,
         register_at: None,
@@ -2528,5 +2528,33 @@ fn a_second_handle_must_match_the_keys_control_groups() {
     for handle in [bare, same, mapped] {
         assert!(b.remove_network_subscription(handle).unwrap());
     }
+    assert_eq!(b.network_control_groups_in_use(), 0);
+}
+
+/// karyos#1086 review: a second handle naming the mapping its key's table
+/// entry holds is refused when the key's control socket could not open,
+/// here because another socket holds the control port: the receiver's
+/// entry runs with no control group, so the declaration is not honored.
+#[test]
+fn a_second_handle_is_refused_when_the_keys_control_join_failed() {
+    use crate::error::DriverError;
+
+    if !multicast_joins() {
+        return;
+    }
+    let mut b = driver(ThreadingMode::Shared);
+    let port = free_port();
+    let taken = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).unwrap();
+    let group = SocketAddr::from(([239, 8, 60, 1], port));
+    let control = SocketAddr::from(([239, 8, 60, 2], taken.local_addr().unwrap().port()));
+    let first = b
+        .add_network_subscription(61, &control_channel(group, vec![control]))
+        .unwrap();
+    assert_eq!(b.network_control_join_failures(), 1);
+    assert_eq!(
+        b.add_network_subscription(61, &control_channel(group, vec![control])),
+        Err(DriverError::ControlGroupConflict { data_group: group })
+    );
+    assert!(b.remove_network_subscription(first).unwrap());
     assert_eq!(b.network_control_groups_in_use(), 0);
 }
