@@ -768,6 +768,17 @@ pub enum AgentError {
         /// The directory.
         dir: PathBuf,
     },
+    /// With sealing on, a group journal directory that does not resolve
+    /// to a directory on the host (`std::fs::canonicalize` failed): it
+    /// cannot be told apart from the Archive's own, so it is refused
+    /// before the journal exists (karyos#1140).
+    #[error("group journal directory {dir:?} does not resolve: {kind}")]
+    GroupDirectoryUnresolved {
+        /// The directory as given.
+        dir: PathBuf,
+        /// Why it did not resolve.
+        kind: std::io::ErrorKind,
+    },
     /// A journal whose recovery would cut it to nothing, dropping more
     /// than the header's own write: a damaged header that events
     /// followed, not one torn while it was written. Neither a restart nor
@@ -2899,10 +2910,25 @@ where
             return Err(AgentError::GroupCaptured { id });
         }
         // Sealing on: the Archive's directory holds its own integrity
-        // journal, which a group's cannot share (karyos#1112).
-        if self.integrity.is_some() && start.dir == self.dir {
-            return Err(AgentError::GroupInArchiveDirectory { dir: start.dir });
-        }
+        // journal, which a group's cannot share (karyos#1112). Compared as
+        // canonical paths, so a relative path, a `..` detour or a link to
+        // the Archive's directory is the Archive's directory (karyos#1140);
+        // the canonical path also keys the group's integrity journal.
+        let sealed_dir = if self.integrity.is_some() {
+            let resolve = |dir: &Path| {
+                std::fs::canonicalize(dir).map_err(|error| AgentError::GroupDirectoryUnresolved {
+                    dir: start.dir.clone(),
+                    kind: error.kind(),
+                })
+            };
+            let group = resolve(&start.dir)?;
+            if std::fs::canonicalize(&self.dir).is_ok_and(|own| own == group) {
+                return Err(AgentError::GroupInArchiveDirectory { dir: start.dir });
+            }
+            Some(group)
+        } else {
+            None
+        };
         // Checked before the journal exists, so a refused start leaves
         // none behind.
         capture::validate(start.capture, start.journal.policy).map_err(AgentError::Capture)?;
@@ -3087,7 +3113,7 @@ where
         // A new ring holds no reference to a recording that failed.
         self.groups.push(ActiveGroup {
             id,
-            dir: start.dir.clone(),
+            dir: sealed_dir.unwrap_or_else(|| start.dir.clone()),
             job,
             checkpoints,
             cleared: self.failures,
