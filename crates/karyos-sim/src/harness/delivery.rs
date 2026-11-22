@@ -57,7 +57,7 @@ use karyos_cluster::service::{
 use karyos_cluster::{Entry, LogError, RaftLog};
 
 use super::core::{Change, ConsensusCore, LogView, Refused, drive};
-use super::node::LOG_DIR;
+use super::node::{LOG_DIR, SEAL_TICKS};
 use crate::cluster::{Node, Outbox};
 use crate::disk::{SimDisk, Survives};
 use crate::net::NodeId;
@@ -393,6 +393,19 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> DeliveryServer<C, S> {
     #[must_use]
     pub fn proposed_firings(&self) -> usize {
         self.fired.len()
+    }
+
+    /// A clean shutdown (karyos#1050 review): the server stops and its log
+    /// closes, sealing its committed tail; its restart reopens it.
+    ///
+    /// # Errors
+    ///
+    /// The log's close error.
+    pub fn shutdown(&mut self) -> Result<(), LogError> {
+        match self.running.take() {
+            Some((_, log)) => log.close(),
+            None => Ok(()),
+        }
     }
 
     /// Whether it is up.
@@ -740,6 +753,12 @@ impl<C: ConsensusCore, S: ClusteredService + Clone> Node<Delivery<C::Message>>
     fn tick(&mut self, now: u64, out: &mut Outbox<Delivery<C::Message>>) {
         if let Some((core, log)) = self.running.as_mut() {
             core.tick(now, &mut LogView::new(log));
+            // The log's seal duty on the harness clock (karyos#1050
+            // review): a committed tail waits at most `SEAL_TICKS` ticks
+            // unsealed. A failed seal poisons the log; the next drive
+            // stops the server.
+            log.set_seal_interval(SEAL_TICKS);
+            let _ = log.tick(now);
         }
         self.propose_due(now);
         // The registrations held for the bounds go once they apply.
