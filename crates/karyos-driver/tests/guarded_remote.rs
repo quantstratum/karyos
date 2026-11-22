@@ -521,24 +521,19 @@ fn remote_concurrent_guarded_handles_read_only_their_own_outcomes() {
             assert_eq!(publication.guard().unwrap().epoch(), 2);
             handles.push(publication);
         }
-        // A third handle: past `H = 2`, refused with `H` as the detail.
-        let _ = client.add_concurrent_publication(KEY, true).unwrap();
-        assert!(matches!(
-            completion(&mut client),
-            Outcome::Refused {
-                code: ErrorCode::GuardHandlesExhausted,
-                detail: 2,
-            }
-        ));
         // Another client on the same incarnation (GC-7-client).
         let _ = other.add_concurrent_publication(KEY, true).unwrap();
-        assert!(matches!(
-            completion(&mut other),
-            Outcome::Refused {
-                code: ErrorCode::InvalidPublicationMode,
-                ..
-            }
-        ));
+        let refused = completion(&mut other);
+        assert!(
+            matches!(
+                refused,
+                Outcome::Refused {
+                    code: ErrorCode::InvalidPublicationMode,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
         // Interleaved offers: each handle reads exactly its own.
         let mut accepted = [Vec::new(), Vec::new()];
         for round in 0..2 {
@@ -559,6 +554,23 @@ fn remote_concurrent_guarded_handles_read_only_their_own_outcomes() {
             assert!(records.iter().all(|record| record.kind == Kind::Submitted));
             assert_eq!(publication.guard().unwrap().outstanding(), 0);
         }
+        // `H = 2` is the publisher slot count, so a third handle comes only
+        // once one is dropped: its publisher slot is free again, its ring
+        // slot is not within the incarnation, so it is refused with `H` as
+        // the detail.
+        drop(handles.pop());
+        let _ = client.add_concurrent_publication(KEY, true).unwrap();
+        let refused = completion(&mut client);
+        assert!(
+            matches!(
+                refused,
+                Outcome::Refused {
+                    code: ErrorCode::GuardHandlesExhausted,
+                    detail: 2,
+                }
+            ),
+            "{refused:?}"
+        );
         (client, other, handles)
     });
 
