@@ -7,6 +7,7 @@
     clippy::unwrap_used,
     clippy::panic,
     clippy::indexing_slicing,
+    clippy::print_stderr,
     reason = "tests, as ADR-0007 allows"
 )]
 
@@ -2339,11 +2340,14 @@ fn path_skew_is_validated_at_admission_and_shared_by_a_key() {
 /// interface: a subscription test that needs the join says so, instead of
 /// passing when every add fails (karyos#1086 review).
 fn multicast_joins() -> bool {
-    UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
-        .and_then(|socket| {
+    let joined =
+        UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).and_then(|socket| {
             socket.join_multicast_v4(&Ipv4Addr::new(239, 8, 99, 1), &Ipv4Addr::UNSPECIFIED)
-        })
-        .is_ok()
+        });
+    if let Err(error) = &joined {
+        eprintln!("SKIP: no multicast ({error})");
+    }
+    joined.is_ok()
 }
 
 /// A reliable multicast channel of `group` on the default interface, with
