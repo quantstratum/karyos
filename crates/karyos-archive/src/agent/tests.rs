@@ -1432,6 +1432,46 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// karyos#1149: with sealing on, the Archive's own directory moved
+    /// while it runs refuses a group start, naming that directory, and
+    /// leaves no journal in the group's directory.
+    #[test]
+    fn a_group_is_refused_when_the_archives_directory_does_not_resolve() {
+        let dir = temp_dir("group-own-unresolved");
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let groups = temp_dir("group-own-unresolved-groups");
+        let moved = dir.with_file_name(format!(
+            "{}-moved",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::rename(&dir, &moved).unwrap();
+        match agent.start_group(start_group(&groups, Some(Capture::Strict))) {
+            Err(error @ AgentError::GroupDirectoryUnresolved { .. }) => {
+                // The text does not call the Archive's directory the
+                // group's.
+                assert!(
+                    error.to_string().contains("or the Archive's own"),
+                    "{error}"
+                );
+                let AgentError::GroupDirectoryUnresolved { dir: named, kind } = error else {
+                    unreachable!()
+                };
+                assert_eq!(named, dir);
+                assert_eq!(kind, std::io::ErrorKind::NotFound);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(std::fs::read_dir(&groups).unwrap().count(), 0);
+        std::fs::rename(&moved, &dir).unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&groups).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// karyos#1112: with sealing on, a group whose journal directory is the
     /// Archive's own is refused at its start, naming the directory, and
     /// leaves no journal behind; with sealing off it starts.
