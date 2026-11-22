@@ -112,8 +112,17 @@ use crate::snapshot::SnapshotStore;
 
 /// The A2 recording id of the log.
 pub const LOG_RECORDING: u64 = 1;
-/// The most bytes one seal of the committed log reads at a time.
-const SEAL_CHUNK: u64 = 1 << 20;
+/// The most bytes one seal of the committed log reads at a time, and the
+/// committed bytes a commit advance waits for before it seals: the
+/// journal holds one record per chunk of committed log, not one per
+/// commit advance (karyos#1050). Up to one chunk of committed tail stays
+/// unsealed between seals; [`RaftLog::seal`] seals it, and a purge does
+/// before it removes anything.
+pub const SEAL_CHUNK: u64 = 1 << 20;
+/// How long a committed tail shorter than [`SEAL_CHUNK`] may stay
+/// unsealed by default before [`RaftLog::tick`] seals it: 1 s of the
+/// caller's clock (karyos#1050 review).
+pub const DEFAULT_SEAL_INTERVAL_NS: u64 = 1_000_000_000;
 /// The file keeping the log's first index.
 pub const FIRST_INDEX_FILE: &str = "first-index";
 /// A frame's header length.
@@ -445,6 +454,10 @@ pub struct RaftLog<D: Disk + Clone> {
     epoch: u64,
     /// The bytes of one seal, reused.
     seal_buf: Vec<u8>,
+    /// The longest a committed tail waits unsealed ([`RaftLog::tick`]).
+    seal_interval_ns: u64,
+    /// When [`RaftLog::tick`] first saw the current unsealed tail.
+    tail_since: Option<u64>,
 }
 
 /// The seal subject the log's latest cluster log record names: 0 before
@@ -603,6 +616,8 @@ impl<D: Disk + Clone> RaftLog<D> {
             integrity,
             epoch,
             seal_buf: Vec::new(),
+            seal_interval_ns: DEFAULT_SEAL_INTERVAL_NS,
+            tail_since: None,
         })
     }
 
@@ -830,6 +845,8 @@ impl<D: Disk + Clone> RaftLog<D> {
             integrity,
             epoch,
             seal_buf: Vec::new(),
+            seal_interval_ns: DEFAULT_SEAL_INTERVAL_NS,
+            tail_since: None,
         };
         if first_index != stored_first {
             file::replace(
@@ -1283,6 +1300,12 @@ impl<D: Disk + Clone> RaftLog<D> {
             .ok()
             .and_then(|kept| self.first_index.checked_add(kept))
             .ok_or(LogError::TooLarge { index: below })?;
+        // The committed tail a commit advance left unsealed is sealed
+        // before any of it is removed (karyos#1050).
+        if let Err(error) = self.seal_committed(true) {
+            self.poisoned = true;
+            return Err(error);
+        }
         let purged = self.store.purge_before(position);
         let _ = self.poison_on(purged)?;
         if let Err(error) = file::replace(
@@ -1447,7 +1470,24 @@ impl<D: Disk + Clone> RaftLog<D> {
                 return Err(LogError::Io(error));
             }
         }
-        let sealed = self.seal_committed();
+        let sealed = self.seal_committed(false);
+        if sealed.is_err() {
+            self.poisoned = true;
+        }
+        sealed
+    }
+
+    /// Seals the committed log's tail, however short, as a clean close
+    /// does (karyos#1050): a commit advance seals only whole
+    /// [`SEAL_CHUNK`]s.
+    ///
+    /// # Errors
+    ///
+    /// [`LogError::Poisoned`]; the store's and the journal's errors, which
+    /// poison the log.
+    pub fn seal(&mut self) -> Result<(), LogError> {
+        self.check_writable()?;
+        let sealed = self.seal_committed(true);
         if sealed.is_err() {
             self.poisoned = true;
         }
@@ -1457,17 +1497,11 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// Seals the log's bytes up to the end of the stored commit's entry,
     /// from where the current subject's seals end (karyos#990): never a
     /// byte Raft may still truncate. Committed bytes are durable, so they
-    /// read back as written.
-    fn seal_committed(&mut self) -> Result<(), LogError> {
-        let Some(commit) = self.hard_state.and_then(|state| state.commit) else {
+    /// read back as written. Unless `all`, only whole [`SEAL_CHUNK`]s are
+    /// sealed, and a shorter tail waits (karyos#1050).
+    fn seal_committed(&mut self, all: bool) -> Result<(), LogError> {
+        let Some((commit, end)) = self.committed_end() else {
             return Ok(());
-        };
-        let Some(slot) = self.slot(commit).filter(|&slot| slot < self.entries.len()) else {
-            return Ok(());
-        };
-        let end = match slot.checked_add(1).and_then(|next| self.entries.get(next)) {
-            Some(&(next, _)) => next,
-            None => self.store.written(),
         };
         let mut start = match self.integrity.sealed_end(self.epoch) {
             Some(start) => start,
@@ -1481,6 +1515,9 @@ impl<D: Disk + Clone> RaftLog<D> {
         }
         while start < end {
             let chunk_end = end.min(start.saturating_add(SEAL_CHUNK));
+            if !all && chunk_end.saturating_sub(start) < SEAL_CHUNK {
+                break;
+            }
             let length = usize::try_from(chunk_end.saturating_sub(start))
                 .map_err(|_| LogError::TooLarge { index: commit })?;
             self.seal_buf.resize(length, 0);
@@ -1490,6 +1527,76 @@ impl<D: Disk + Clone> RaftLog<D> {
             start = chunk_end;
         }
         Ok(())
+    }
+
+    /// The stored commit and where its entry ends in the log, if the log
+    /// holds it.
+    fn committed_end(&self) -> Option<(u64, u64)> {
+        let commit = self.hard_state.and_then(|state| state.commit)?;
+        let slot = self
+            .slot(commit)
+            .filter(|&slot| slot < self.entries.len())?;
+        let end = match slot.checked_add(1).and_then(|next| self.entries.get(next)) {
+            Some(&(next, _)) => next,
+            None => self.store.written(),
+        };
+        Some((commit, end))
+    }
+
+    /// Whether committed bytes wait unsealed.
+    fn unsealed_tail(&self) -> bool {
+        self.committed_end().is_some_and(|(_, end)| {
+            self.integrity
+                .sealed_end(self.epoch)
+                .unwrap_or(self.store.start())
+                < end
+        })
+    }
+
+    /// Bounds how long a committed tail waits unsealed: `interval_ns` of
+    /// the clock [`RaftLog::tick`] is given ([`DEFAULT_SEAL_INTERVAL_NS`]
+    /// by default).
+    pub fn set_seal_interval(&mut self, interval_ns: u64) {
+        self.seal_interval_ns = interval_ns;
+    }
+
+    /// The host's periodic duty, at `now_ns` of its monotonic clock
+    /// (karyos#1050 review): a committed tail shorter than [`SEAL_CHUNK`]
+    /// that has waited unsealed for the seal interval is sealed, so a
+    /// cluster committing slowly still has its log sealed within about
+    /// one interval. Nothing is written otherwise.
+    ///
+    /// # Errors
+    ///
+    /// As [`RaftLog::seal`].
+    pub fn tick(&mut self, now_ns: u64) -> Result<(), LogError> {
+        if self.poisoned || !self.unsealed_tail() {
+            self.tail_since = None;
+            return Ok(());
+        }
+        match self.tail_since {
+            None => {
+                self.tail_since = Some(now_ns);
+                Ok(())
+            }
+            Some(since) if now_ns.saturating_sub(since) >= self.seal_interval_ns => {
+                self.tail_since = None;
+                self.seal()
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// A clean shutdown (karyos#1050 review): seals the committed tail and
+    /// syncs the log, so a reopened log's seals cover everything it
+    /// committed.
+    ///
+    /// # Errors
+    ///
+    /// As [`RaftLog::seal`] and [`RaftLog::sync`].
+    pub fn close(mut self) -> Result<(), LogError> {
+        let _ = self.sync()?;
+        self.seal()
     }
 
     /// Starts the next seal subject at `at`, with an empty range there, so

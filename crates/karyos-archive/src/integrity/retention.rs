@@ -800,6 +800,10 @@ pub enum PurgeRefusal {
         /// The seal record's counter.
         counter: u64,
     },
+    /// The recording has no recorded close time (ADR-0093): it still
+    /// records, or it stopped before close times were recorded.
+    #[error("the recording has no recorded close time")]
+    NoCloseTime,
 }
 
 impl PurgeRefusal {
@@ -821,6 +825,7 @@ impl PurgeRefusal {
             Self::DuplicateId { .. } => "duplicate_id",
             Self::ManualOnly => "manual_only",
             Self::SplitsSeal { .. } => "splits_seal",
+            Self::NoCloseTime => "no_close_time",
         }
     }
 
@@ -841,6 +846,7 @@ impl PurgeRefusal {
             Self::DuplicateId { .. } => 11,
             Self::ManualOnly => 12,
             Self::NotSealed { .. } => 13,
+            Self::NoCloseTime => 14,
         }
     }
 }
@@ -1085,6 +1091,16 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         self.intents.values().copied().collect()
     }
 
+    /// Raises outstanding intent `id`'s close time to `closed_ns`, in
+    /// memory, never lowering it: a resumed purge is rechecked against the
+    /// segments' modification times as they are now (ADR-0093, decision 3;
+    /// karyos#1121 review). Unknown ids change nothing.
+    pub fn raise_close_time(&mut self, id: u64, closed_ns: u64) {
+        if let Some(intent) = self.intents.get_mut(&id) {
+            intent.closed_ns = intent.closed_ns.max(closed_ns);
+        }
+    }
+
     /// Applies a hold on `recording`. It inhibits at once, never waiting
     /// on the operations journal; it is reported applied only with the
     /// journal's evidence. The pending marker is written first, so a
@@ -1227,18 +1243,41 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
     /// [`Retention::purge`] would: holds first, as in
     /// [`Retention::check`], then `no_policy`. Never deletes.
     pub fn refuse_unconfigured(&mut self, request: &PurgeRequest) -> PurgeError {
-        let refusal = if self.intents.contains_key(&request.id) {
-            PurgeRefusal::DuplicateId { id: request.id }
-        } else if self.holds_unknown {
-            PurgeRefusal::HoldsUnknown
-        } else if self.holds.contains_key(&request.recording) {
-            PurgeRefusal::LegalHold
-        } else if !request.authorisation.authorised {
-            PurgeRefusal::NotAuthorised
-        } else {
-            PurgeRefusal::NoPolicy
-        };
+        self.refuse_after_holds(request, PurgeRefusal::NoPolicy)
+    }
+
+    /// Refuses `request` with `last`, journalled, unless a refusal that
+    /// comes first in [`Retention::check`] applies: a duplicate id, unknown
+    /// holds, a hold, no authorisation. Never deletes. Used for what the
+    /// check cannot see: no policy, no close time (ADR-0093).
+    pub fn refuse_after_holds(&mut self, request: &PurgeRequest, last: PurgeRefusal) -> PurgeError {
+        let refusal = self.first_refusal(request).unwrap_or(last);
         self.refuse(request, refusal)
+    }
+
+    /// Refuses `request`, journalled, when a refusal that comes first in
+    /// [`Retention::check`] applies (a duplicate id, unknown holds, a hold,
+    /// no authorisation); `None`, journalling nothing, otherwise. Run
+    /// before anything that may fail on the recording's files, so a held
+    /// recording is answered `legal_hold`, never a store error (karyos#1121
+    /// review).
+    pub fn refuse_early(&mut self, request: &PurgeRequest) -> Option<PurgeError> {
+        let refusal = self.first_refusal(request)?;
+        Some(self.refuse(request, refusal))
+    }
+
+    fn first_refusal(&self, request: &PurgeRequest) -> Option<PurgeRefusal> {
+        if self.intents.contains_key(&request.id) {
+            Some(PurgeRefusal::DuplicateId { id: request.id })
+        } else if self.holds_unknown {
+            Some(PurgeRefusal::HoldsUnknown)
+        } else if self.holds.contains_key(&request.recording) {
+            Some(PurgeRefusal::LegalHold)
+        } else if !request.authorisation.authorised {
+            Some(PurgeRefusal::NotAuthorised)
+        } else {
+            None
+        }
     }
 
     fn refuse(&mut self, request: &PurgeRequest, refusal: PurgeRefusal) -> PurgeError {
@@ -1403,6 +1442,24 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         if store.start() < request.before {
             self.release(store, request.before)?;
             store.purge_before(request.before)?;
+        }
+        // A crash inside the removal leaves segments below the floor: they
+        // are released and removed before the purge is done (karyos#1121
+        // review).
+        let left = store.files_left_below_floor()?;
+        if !left.is_empty() {
+            if let Some(Releaser(backend)) = self.immutability.as_mut() {
+                for (_, path, data) in &left {
+                    if *data {
+                        backend.release(path).map_err(|error| PurgeError::Release {
+                            path: path.clone(),
+                            error,
+                        })?;
+                    }
+                }
+            }
+            let bases: Vec<u64> = left.iter().map(|(base, _, _)| *base).collect();
+            store.remove_left_below_floor(&bases)?;
         }
         self.operations
             .append(&Operation::PurgeDone { id: request.id })

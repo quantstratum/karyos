@@ -851,7 +851,11 @@ mod tests {
                 conflation: None,
             })
             .unwrap();
-        let conductor = driver.connect().unwrap();
+        #[cfg_attr(not(miri), allow(unused_mut))]
+        let mut conductor = driver.connect().unwrap();
+        // An hour's driver timeout under Miri, as abi's tests (karyos#1117).
+        #[cfg(miri)]
+        conductor.set_liveness(Duration::ZERO, Duration::from_secs(3600));
         let builder = Context::builder().timeout(Duration::from_secs(3600));
         #[cfg(miri)]
         let builder = builder.idle_strategy(IdleStrategy::Sleep(Duration::from_millis(1)));

@@ -68,6 +68,9 @@ pub const COMMAND_MAGIC: [u8; 4] = *b"KC5\x01";
 
 /// The directory of a server's log on its disk.
 pub const LOG_DIR: &str = "/raft";
+/// Harness ticks a committed log tail may wait unsealed before the log's
+/// seal duty seals it ([`karyos_cluster::RaftLog::tick`]; karyos#1050).
+pub const SEAL_TICKS: u64 = 10;
 /// The directory of a server's snapshot store, beside its log (W5).
 pub const SNAPSHOT_DIR: &str = "/snap";
 /// The version of the service section a snapshot holds.
@@ -1716,6 +1719,19 @@ impl<C: ConsensusCore> ServerNode<C> {
                 .is_none_or(|lease| lease.borrow().held_at(self.now))
     }
 
+    /// A clean shutdown (karyos#1050 review): the server stops and its log
+    /// closes, sealing its committed tail; a restart reopens it.
+    ///
+    /// # Errors
+    ///
+    /// The log's close error.
+    pub fn shutdown(&mut self) -> Result<(), LogError> {
+        match self.running.take() {
+            Some((_, log)) => log.close(),
+            None => Ok(()),
+        }
+    }
+
     /// Whether it is up: its log open and its core running.
     #[must_use]
     pub fn is_up(&self) -> bool {
@@ -2040,6 +2056,12 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
                 now,
                 &mut LogView::metered(log, budget.as_ref()).with_base(self.base),
             );
+            // The log's seal duty on the harness clock (karyos#1050
+            // review): a committed tail waits at most `SEAL_TICKS` ticks
+            // unsealed. A failed seal poisons the log; the next drive
+            // stops the server.
+            log.set_seal_interval(SEAL_TICKS);
+            let _ = log.tick(now);
             if core.leads() {
                 if let Some(lease) = &self.lease {
                     let mut lease = lease.borrow_mut();

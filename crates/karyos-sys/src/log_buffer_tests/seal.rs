@@ -953,3 +953,25 @@ fn a_guard_close_aborts_concurrent_claims_at_once() {
         })
     ));
 }
+
+/// Review of #1120: a guard close's pass aborts the claims it observes in
+/// the same call, so it leaves no observation dated by its `u64::MAX`
+/// clock, and a later deadline service with a real clock sees no clock
+/// going back.
+#[test]
+fn a_guard_close_pass_leaves_no_observation_for_the_deadline_service() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let _subscription = conductor.subscribe(Role::Optional).unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let ConcurrentClaimOutcome::Claimed(claim) =
+        handle.try_claim(64, AppendOptions::default()).unwrap()
+    else {
+        panic!("not claimed");
+    };
+    core::mem::forget(claim);
+    let report = conductor.abort_marked_claims().unwrap();
+    assert_eq!((report.aborted, report.waiting), (1, false), "in one call");
+    let report = conductor.service_deadlines(&mut || 1_000).unwrap();
+    assert_eq!(report.clock_went_back, 0);
+}
