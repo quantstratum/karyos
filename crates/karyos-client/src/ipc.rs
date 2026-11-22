@@ -1743,8 +1743,13 @@ impl RemoteClient {
         } else {
             fetchable.request
         };
-        // Only a publication is granted a binding; it takes it in `adopt`.
-        let bindable = fetched.binding.is_none() || matches!(request, Request::Publication { .. });
+        // Only a publication, exclusive or concurrent (ADR-0092), is
+        // granted a binding; it takes it in `adopt`.
+        let bindable = fetched.binding.is_none()
+            || matches!(
+                request,
+                Request::Publication { .. } | Request::ConcurrentPublication { .. }
+            );
         let built = check(&fetched, &request)
             .and_then(|()| bindable.then_some(()).ok_or(AttachError::Protocol))
             .and_then(|()| adopt(&mut fetched, export));
