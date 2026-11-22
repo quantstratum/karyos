@@ -5774,3 +5774,120 @@ fn a_recovered_purge_is_chained_before_a_new_policy_version() {
     assert!(first < purge && purge < second, "{first} {purge} {second}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// karyos#1143: on a host whose process holds `CAP_LINUX_IMMUTABLE`, a
+/// running Archive's sealed segments take the immutable attribute: they
+/// cannot be opened for writing or removed, the store still opens them
+/// for reading, and a purge releases each before it deletes it. Ignored
+/// by default: run it with `KARYOS_LINUX_CAPS=LINUX_IMMUTABLE
+/// scripts/linux-test.sh -p karyos-archive --lib -- --ignored
+/// immutable_segments`. It fails, rather than skips, without the
+/// capability.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs CAP_LINUX_IMMUTABLE: scripts/linux-test.sh with KARYOS_LINUX_CAPS=LINUX_IMMUTABLE"]
+fn immutable_segments_are_released_only_by_a_purge() {
+    use crate::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-immutable");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    // Four writes of 2880 bytes: two segments of the test geometry.
+    let chunks: Vec<Vec<u8>> = (1..=4).map(|fill| frames(30, fill)).collect();
+    let all = chunks.concat();
+    let id = agent
+        .start(start(Chunks {
+            chunks: chunks.into(),
+            seal: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    let segments = segment_lengths(&dir);
+    assert!(segments.len() >= 2, "{segments:?}");
+
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    // The cutoff: the recording's end, its one closing seal's end. The
+    // store keeps its last segment, which holds the end; the purge removes
+    // every segment wholly below it.
+    let cutoff = end;
+    let mut copies = CopyCatalog::open(StdDisk, &dir, &mut journal).unwrap();
+    assert!(
+        copies
+            .current()
+            .unwrap()
+            .iter()
+            .any(|copy| copy.recording == id && copy.enforcement == Enforcement::ImmutableAttribute),
+        "the local copy is immutable: does the process hold CAP_LINUX_IMMUTABLE?"
+    );
+    for (path, _) in &segments {
+        let written = std::fs::OpenOptions::new().write(true).open(path);
+        assert!(written.is_err(), "{} opened for writing", path.display());
+        assert!(
+            std::fs::remove_file(path).is_err(),
+            "{} removed",
+            path.display()
+        );
+    }
+    let recording = Catalog::open(StdDisk, &dir)
+        .unwrap()
+        .catalog
+        .get(id)
+        .cloned()
+        .unwrap();
+    let mut store = SegmentStore::open_verified(
+        crate::disk::ReadOnly(StdDisk),
+        &dir,
+        id,
+        recording.geometry,
+        SyncPolicy::None,
+    )
+    .unwrap();
+    let mut read = vec![0u8; all.len()];
+    store.read(0, &mut read).unwrap();
+    assert_eq!(read, all);
+    drop(store);
+    copies
+        .record(
+            CopyRecord {
+                sequence: 0,
+                recording: id,
+                start: 0,
+                end,
+                location: [6u8; 32],
+                digest: crate::integrity::retention::seals_digest(&records, id, 0, end),
+                retain_until_ns: 0,
+                state: CopyState::Verified,
+                enforcement: Enforcement::Unsupported,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    drop(copies);
+    drop(journal);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, cutoff, 1, 9)),
+        RetentionAnswer::Done
+    );
+    agent.shutdown().unwrap();
+    let (first, _) = &segments[0];
+    assert!(!first.exists(), "{} left after the purge", first.display());
+    // The segment holding the cutoff stays, still immutable.
+    let (last, _) = &segments[segments.len() - 1];
+    assert!(last.exists());
+    assert!(std::fs::OpenOptions::new().write(true).open(last).is_err());
+    for (path, _) in &segments[1..] {
+        crate::integrity::copies::ImmutableAttribute
+            .release(path)
+            .unwrap();
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}

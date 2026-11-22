@@ -44,6 +44,15 @@ for name in KARYOS_SIM_SEED KARYOS_SIM_SEEDS; do
         env_args+=(-e "$name=${!name}")
     fi
 done
+# KARYOS_LINUX_CAPS adds Linux capabilities to the container, comma
+# separated, for the tests that need one (karyos#1143: LINUX_IMMUTABLE).
+cap_args=()
+if [ -n "${KARYOS_LINUX_CAPS:-}" ]; then
+    IFS=',' read -r -a caps <<<"$KARYOS_LINUX_CAPS"
+    for cap in "${caps[@]}"; do
+        cap_args+=(--cap-add "$cap")
+    done
+fi
 args=("$@")
 if [ ${#args[@]} -eq 0 ]; then
     args=(--workspace --locked)
@@ -52,6 +61,7 @@ fi
 exec docker run --rm \
     ${platform_args[@]+"${platform_args[@]}"} \
     ${name_args[@]+"${name_args[@]}"} \
+    ${cap_args[@]+"${cap_args[@]}"} \
     -v "$root":/work \
     -v "$target":/target \
     -v karyos-linux-cargo:/usr/local/cargo/registry \
