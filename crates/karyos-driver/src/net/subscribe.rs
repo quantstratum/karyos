@@ -516,11 +516,19 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             (channel.reliable, own_port, !channel.nak_control.is_empty()),
             (options.0, options.1, register_at(channel), path_skew),
         );
-        // The key counts the entries its paths joined itself, so what the
-        // channel's mapping counted only bridged the add: released either
-        // way (karyos#1086 review).
-        net.release_control_groups(&held);
-        added
+        // The channel's entries stay counted while its key lives, beside
+        // those its paths select, and are released when it ends or the add
+        // fails (karyos#1086).
+        match added {
+            Ok(subscription) => {
+                net.keep_control_groups(subscription, held);
+                Ok(subscription)
+            }
+            Err(error) => {
+                net.release_control_groups(&held);
+                Err(error)
+            }
+        }
     }
 
     /// Stops `subscription`, as [`EmbeddedDriver::remove_network_subscription`].

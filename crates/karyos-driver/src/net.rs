@@ -1241,9 +1241,10 @@ impl<T: StreamTerms> Network<T> {
             (true, Some(config)) => self.hold_control_group(bind, config),
             _ => None,
         };
-        // Every entry the table selects for its paths is counted for the
-        // key, joined or not, so it stays while the key uses it, even when
-        // another channel's `nak-control` added it (karyos#1086 review).
+        // Every entry the table selects for its held paths is counted for
+        // the key, joined or not, so it stays while the key uses it, even
+        // when another channel's `nak-control` added it (karyos#1086
+        // review).
         let mut control_held = [false; MAX_CONTROL_GROUPS];
         let first_slot = multicast
             .filter(|_| reliable)
@@ -1416,9 +1417,10 @@ impl<T: StreamTerms> Network<T> {
     /// Enters `channel`'s `nak-control` groups, one per path, into the
     /// driver's one control group table (owner item 8, karyos#654), all
     /// or none, before the subscription joins its group; a channel
-    /// without the key changes nothing. What it counts only bridges the
-    /// add: the key then counts each entry its paths join, and an entry a
-    /// URI added leaves with the last key joined to it (karyos#1086).
+    /// without the key changes nothing. What it counts goes to the key
+    /// (`keep_control_groups`), which also counts each entry its paths
+    /// select; an entry a URI added leaves with the last key that counts
+    /// it (karyos#1086).
     ///
     /// # Errors
     ///
@@ -1471,6 +1473,35 @@ impl<T: StreamTerms> Network<T> {
                     control_group: *control,
                 }),
         )
+    }
+
+    /// Hands `held`, what [`Self::map_nak_control`] counted for the
+    /// channel of `subscription`, to its key when the add opened the key:
+    /// the entries its own `nak-control` named stay with it even where no
+    /// path joined them, and one the key already counted for a path it
+    /// joined is released once. A second handle of a key releases `held`
+    /// at once (karyos#1086).
+    pub(crate) fn keep_control_groups(
+        &mut self,
+        subscription: NetworkSubscription,
+        held: control_group::Held,
+    ) {
+        let first = self.subscriptions.iter_mut().find(|entry| {
+            (entry.endpoint, entry.stream_id) == (subscription.endpoint, subscription.stream_id)
+                && entry.users == 1
+        });
+        let Some(entry) = first else {
+            self.release_control_groups(&held);
+            return;
+        };
+        let mut twice = [false; MAX_CONTROL_GROUPS];
+        for ((mine, bridged), again) in entry.control_held.iter_mut().zip(held).zip(&mut twice) {
+            if bridged {
+                *again = *mine;
+                *mine = true;
+            }
+        }
+        self.release_control_groups(&twice);
     }
 
     /// Releases `held` (karyos#1086).

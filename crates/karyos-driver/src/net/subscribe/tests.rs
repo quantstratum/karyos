@@ -2384,6 +2384,16 @@ fn nak_control_entries_leave_with_their_last_subscription() {
         assert_eq!(b.network_control_groups_in_use(), 1, "{n}");
         assert!(b.remove_network_subscription(subscription).unwrap());
         assert_eq!(b.network_control_groups_in_use(), 0, "{n}");
+        // The key's endpoints retire through the agents: their table
+        // entries must leave before the next key opens its own.
+        for _ in 0..1000 {
+            if b.net.as_ref().unwrap().endpoints.is_empty() {
+                break;
+            }
+            let _ = b.do_work().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(b.net.as_ref().unwrap().endpoints.is_empty(), "{n}");
     }
 }
 
