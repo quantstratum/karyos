@@ -1091,6 +1091,16 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         self.intents.values().copied().collect()
     }
 
+    /// Raises outstanding intent `id`'s close time to `closed_ns`, in
+    /// memory, never lowering it: a resumed purge is rechecked against the
+    /// segments' modification times as they are now (ADR-0093, decision 3;
+    /// karyos#1121 review). Unknown ids change nothing.
+    pub fn raise_close_time(&mut self, id: u64, closed_ns: u64) {
+        if let Some(intent) = self.intents.get_mut(&id) {
+            intent.closed_ns = intent.closed_ns.max(closed_ns);
+        }
+    }
+
     /// Applies a hold on `recording`. It inhibits at once, never waiting
     /// on the operations journal; it is reported applied only with the
     /// journal's evidence. The pending marker is written first, so a

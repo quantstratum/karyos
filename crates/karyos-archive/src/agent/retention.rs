@@ -237,21 +237,10 @@ impl<D: Disk + Clone> State<D> {
                 },
             ));
         }
-        // A segment's modification time may only raise it, never lower it;
-        // one that cannot be read adds nothing.
-        let mut disk = self.disk.clone();
-        let mut closed_ns = recorded;
-        match store.segment_files_holding_below(request.before) {
-            Ok(files) => {
-                for file in files {
-                    if let Ok(at) = disk.modified(&file) {
-                        closed_ns = closed_ns.max(at);
-                    }
-                }
-            }
+        request.closed_ns = match close_time(&self.disk, &store, request.before, recorded) {
+            Ok(closed_ns) => closed_ns,
             Err(why) => return error(why.to_string()),
-        }
-        request.closed_ns = closed_ns;
+        };
         let Some(integrity) = self.integrity.as_mut() else {
             return error("no integrity journal: the Archive seals nothing".to_owned());
         };
@@ -305,6 +294,25 @@ impl<D: Disk + Clone> State<D> {
             let Ok(Some(mut store)) = open_stopped(&self.disk, &self.dir, &recording) else {
                 continue;
             };
+            // An unfinished intent is rechecked against the segments'
+            // modification times as they are now, never only the close
+            // time it saved (ADR-0093, decision 3).
+            let recorded = recording
+                .stop
+                .and_then(|stop| stop.closed_utc_ns)
+                .unwrap_or(0);
+            for intent in self.retention.outstanding() {
+                if intent.recording != id || store.start() >= intent.before {
+                    continue;
+                }
+                if intent.before > store.written() {
+                    continue;
+                }
+                let Ok(closed_ns) = close_time(&self.disk, &store, intent.before, recorded) else {
+                    continue;
+                };
+                self.retention.raise_close_time(intent.id, closed_ns);
+            }
             let Some(integrity) = self.integrity.as_mut() else {
                 return;
             };
@@ -422,6 +430,26 @@ impl<D: Disk + Clone> State<D> {
             registry,
         })
     }
+}
+
+/// A purge's close time before `before` (ADR-0093): `recorded`, raised by
+/// the newest modification time of the segments holding bytes below the
+/// cutoff, never lowered; a time that cannot be read adds nothing. The
+/// caller bounds `before` by the written end first.
+fn close_time<D: Disk + Clone>(
+    disk: &D,
+    store: &SegmentStore<D>,
+    before: u64,
+    recorded: u64,
+) -> Result<u64, crate::segment::SegmentError> {
+    let mut disk = disk.clone();
+    let mut closed_ns = recorded;
+    for file in store.segment_files_holding_below(before)? {
+        if let Ok(at) = disk.modified(&file) {
+            closed_ns = closed_ns.max(at);
+        }
+    }
+    Ok(closed_ns)
 }
 
 /// The current UTC time in ns, if the clock reads past the epoch.

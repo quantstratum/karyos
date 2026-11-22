@@ -4960,3 +4960,39 @@ fn a_held_purge_is_refused_before_the_store_opens() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// karyos#1121 review: a purge a crash left before its deletion is
+/// rechecked at the next start against the segments' modification times
+/// as they are now, not the close time its intent saved (ADR-0093,
+/// decision 3): segments written within the retention keep it unexpired,
+/// so the intent is cancelled and nothing is deleted.
+#[test]
+fn a_resumed_purge_rechecks_the_segment_times() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-crash-mtime");
+    let hour = 3_600_000_000_000;
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(hour)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    if !copy_elsewhere(&dir, id, end) {
+        return;
+    }
+    // The intent saved a close time long past.
+    journal_intent(&dir, 3, id, end);
+    let before = segment_lengths(&dir);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(hour)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, end, 3, 9)),
+        RetentionAnswer::Refused("not_expired".to_owned())
+    );
+    assert_eq!(segment_lengths(&dir), before);
+    assert!(
+        !dir.join(format!("{id:016x}.floor")).exists(),
+        "the floor never moved"
+    );
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
