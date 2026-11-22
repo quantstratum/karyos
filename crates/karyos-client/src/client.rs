@@ -2333,6 +2333,10 @@ struct Images<T: TermBytes> {
 /// A change held in order behind a retirement waiting for its seal's
 /// position.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "held in a queue reserved at creation: boxing the image would allocate on the poll path"
+)]
 enum Held<T: TermBytes> {
     /// A change ready, queued behind an earlier retirement.
     Change(ImageChange),
