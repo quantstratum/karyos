@@ -1107,3 +1107,33 @@ fn a_copy_update_after_a_chain_break_does_not_change_the_copy_state() {
     );
     assert!(!out.contains("removed"), "{out}");
 }
+
+/// karyos#1087 review: a copy change the chain commits whose record the
+/// copy catalog no longer holds is an inconsistency of the report (exit
+/// 1, the report written, JSON included), never an error that discards
+/// it.
+#[test]
+fn a_truncated_copy_catalog_is_reported_inconsistent_not_an_error() {
+    use karyos_archive::integrity::copies::{COPIES_FILE, CopyState, Enforcement};
+    let archive = archive("copies-truncated");
+    let dir = archive.dir();
+    record_copies(
+        &dir,
+        &[([0x11; 32], CopyState::Verified, Enforcement::Unsupported)],
+    );
+    std::fs::write(dir.join(COPIES_FILE), b"").unwrap();
+    let (status, out, err) = full(&archive, false);
+    assert_eq!(err, "", "{out}");
+    assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+    assert!(
+        out.contains("copies inconsistent first_inconsistent=7"),
+        "{out}"
+    );
+    let (status, out, err) = full(&archive, true);
+    assert_eq!(err, "", "{out}");
+    assert_eq!(status, EXIT_INCONSISTENT, "{out}");
+    assert!(
+        out.contains("\"copies\":[],\"copies_first_inconsistent\":7"),
+        "{out}"
+    );
+}

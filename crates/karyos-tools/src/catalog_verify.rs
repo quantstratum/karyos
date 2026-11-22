@@ -21,9 +21,9 @@
 //! `untrusted_evidence`. Each `--anchors LOCATION=DIR` adds the operator
 //! export store in DIR, which the operator identifies by its location
 //! digest outside the export: an anchor counts only if it names that
-//! location. Exit status: 0 when nothing is inconsistent, 1 when a range
-//! or the journal is, 2 for an error, including a report that could not
-//! be written.
+//! location. Exit status: 0 when nothing is inconsistent, 1 when a range,
+//! the journal or the copy catalog is, 2 for an error, including a report
+//! that could not be written.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -38,7 +38,7 @@ use karyos_archive::integrity::anchor::{ANCHOR_FILE, ANCHOR_LENGTH, Externality,
 use karyos_archive::integrity::copies::{
     COPIES_FILE, COPY_RECORD_LENGTH, CopyRecord, CopyState, Enforcement, replay_current,
 };
-use karyos_archive::integrity::journal::read_records;
+use karyos_archive::integrity::journal::{IntegrityError, read_records};
 use karyos_archive::integrity::ledger::read_entries;
 use karyos_archive::integrity::time::{self, Requirement, Verdict};
 use karyos_archive::integrity::time_evidence;
@@ -89,8 +89,8 @@ Usage: karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]...
   --json         one JSON object instead of text
   -h, --help     print this text
 
-Exit status: 0 nothing inconsistent; 1 a range or the journal inconsistent;
-2 an error, or a report that could not be written.
+Exit status: 0 nothing inconsistent; 1 a range, the journal or the copy
+catalog inconsistent; 2 an error, or a report that could not be written.
 ";
 
 /// A parsed `verify` command line.
@@ -938,20 +938,31 @@ pub fn json(verification: &Verification) -> String {
     out
 }
 
+/// The copies `verify` reports: the current copies the chain commits,
+/// and the first copy change the catalog does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyReport {
+    /// The current copies, each with its recorded enforcement; empty
+    /// when a change could not be replayed.
+    pub copies: Vec<CopyRecord>,
+    /// The counter of the first copy change the chain commits that the
+    /// copy catalog does not hold or holds in a form that does not match:
+    /// an inconsistency of the evidence, never an error of the command.
+    pub first_inconsistent: Option<u64>,
+}
+
 /// The current copies of `args.dir`'s copy catalog, as the journal
 /// `records` commits them, each with its enforcement (karyos#1087).
 /// `records` is the accepted prefix of the journal snapshot the
 /// verification checked: never a second read, and nothing from the
-/// journal's first inconsistent record on.
+/// journal's first inconsistent record on. A copy change the catalog
+/// does not hold, a truncated catalog for one, is reported in
+/// [`CopyReport::first_inconsistent`].
 ///
 /// # Errors
 ///
-/// An I/O error on the catalog, and a copy change the catalog does not
-/// hold.
-pub fn copies_report(
-    args: &VerifyArgs,
-    records: &[SealRecord],
-) -> Result<Vec<CopyRecord>, VerifyError> {
+/// An I/O error on the catalog.
+pub fn copies_report(args: &VerifyArgs, records: &[SealRecord]) -> Result<CopyReport, VerifyError> {
     let dir = &args.dir;
     let at = |source: io::Error| VerifyError::Io {
         path: dir.clone(),
@@ -960,10 +971,20 @@ pub fn copies_report(
     let mut disk = ReadOnly(StdDisk);
     let entries: Vec<[u8; COPY_RECORD_LENGTH]> =
         read_entries(&mut disk, dir, COPIES_FILE).map_err(at)?;
-    replay_current(records, &entries).map_err(|source| VerifyError::Copies {
-        dir: dir.clone(),
-        source,
-    })
+    match replay_current(records, &entries) {
+        Ok(copies) => Ok(CopyReport {
+            copies,
+            first_inconsistent: None,
+        }),
+        Err(IntegrityError::Unrecorded { counter }) => Ok(CopyReport {
+            copies: Vec::new(),
+            first_inconsistent: Some(counter),
+        }),
+        Err(source) => Err(VerifyError::Copies {
+            dir: dir.clone(),
+            source,
+        }),
+    }
 }
 
 const fn state_name(state: CopyState) -> &'static str {
@@ -995,9 +1016,9 @@ fn location_hex(location: &[u8; 32]) -> String {
 
 /// The copies as text lines.
 #[must_use]
-pub fn copies_text(copies: &[CopyRecord]) -> String {
+pub fn copies_text(report: &CopyReport) -> String {
     let mut out = String::new();
-    for copy in copies {
+    for copy in &report.copies {
         let _ = writeln!(
             out,
             "copy recording {} [{}, {}) location {} {} enforcement {}",
@@ -1009,13 +1030,21 @@ pub fn copies_text(copies: &[CopyRecord]) -> String {
             enforcement_name(copy.enforcement)
         );
     }
+    if let Some(first) = report.first_inconsistent {
+        let _ = writeln!(
+            out,
+            "copies inconsistent first_inconsistent={first}: the copy catalog does not hold this change"
+        );
+    }
     out
 }
 
-/// The copies as a JSON array.
+/// The copies as JSON fields: `copies`, an array, and
+/// `copies_first_inconsistent`.
 #[must_use]
-pub fn copies_json(copies: &[CopyRecord]) -> String {
-    let items: Vec<String> = copies
+pub fn copies_json(report: &CopyReport) -> String {
+    let items: Vec<String> = report
+        .copies
         .iter()
         .map(|copy| {
             format!(
@@ -1029,14 +1058,20 @@ pub fn copies_json(copies: &[CopyRecord]) -> String {
             )
         })
         .collect();
-    format!("[{}]", items.join(","))
+    format!(
+        "\"copies\":[{}],\"copies_first_inconsistent\":{}",
+        items.join(","),
+        report
+            .first_inconsistent
+            .map_or_else(|| "null".to_owned(), |first| first.to_string())
+    )
 }
 
 /// `report` with the copies placed before its time part: a `copies`
 /// field before `time` in JSON, lines before the time lines in text.
-fn insert_copies(report: String, copies: &[CopyRecord], json: bool) -> String {
+fn insert_copies(report: String, copies: &CopyReport, json: bool) -> String {
     let (marker, inserted) = if json {
-        ("\"time\":", format!("\"copies\":{},", copies_json(copies)))
+        ("\"time\":", format!("{},", copies_json(copies)))
     } else {
         ("time ", copies_text(copies))
     };
@@ -1119,6 +1154,7 @@ pub fn run_verify(
                 return report_error(stderr, &VerifyError::ReportWrite(error));
             }
             if verification.journal_break.is_some()
+                || copies.first_inconsistent.is_some()
                 || !verification.evidence.is_empty()
                 || verification
                     .ranges
