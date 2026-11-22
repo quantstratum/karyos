@@ -182,8 +182,9 @@ impl<D: Disk + Clone> State<D> {
     }
 
     /// Runs `request` through [`Retention::purge`] under `policy`
-    /// (karyos#1093): against the stopped recording's store reopened, the
-    /// copy catalog counting the verified copies elsewhere. The range's
+    /// (karyos#1093): against the stopped recording's store reopened read
+    /// only, the copy catalog counting the verified copies elsewhere. The
+    /// range's
     /// close time is the stop's recorded `closed_utc_ns` (ADR-0093), raised
     /// by the newest modification time of the segments holding bytes below
     /// the cutoff; without a recorded one the purge is refused
@@ -211,15 +212,14 @@ impl<D: Disk + Clone> State<D> {
                     .refuse_after_holds(&request, PurgeRefusal::NoCloseTime),
             );
         };
-        let mut store = match SegmentStore::recover(
-            self.disk.clone(),
-            &self.dir,
-            recording.id,
-            recording.geometry,
-            recording.policy,
-        ) {
-            Ok(recovered) => recovered.store,
-            Err(why) => return error(why.to_string()),
+        // Read only (karyos#1121 review): validation changes nothing, so a
+        // refused purge never cuts a damaged tail, and segments a local
+        // copy made immutable open. Only an approved purge releases and
+        // deletes, and only the segments below its cutoff.
+        let mut store = match open_stopped(&self.disk, &self.dir, &recording) {
+            Ok(Some(store)) => store,
+            Ok(None) => return error("the recording wrote no segment".to_owned()),
+            Err(answer) => return answer,
         };
         // A segment's modification time may only raise it, never lower it;
         // one that cannot be read adds nothing.

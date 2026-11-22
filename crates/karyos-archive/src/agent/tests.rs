@@ -4609,3 +4609,205 @@ fn a_purge_waits_for_the_verification_of_its_recording() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A disk that counts modification time reads and, while `immutable` is
+/// set, refuses to open a segment data file for writing, as the immutable
+/// attribute a local copy sets does (karyos#1121 review).
+#[derive(Clone, Default)]
+struct Probe {
+    immutable: Arc<AtomicBool>,
+    modified: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Disk for Probe {
+    type File = std::fs::File;
+
+    fn modified(&mut self, path: &Path) -> std::io::Result<u64> {
+        self.modified.fetch_add(1, Ordering::AcqRel);
+        StdDisk.modified(path)
+    }
+
+    fn create(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        StdDisk.create(path)
+    }
+
+    fn create_new(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        StdDisk.create_new(path)
+    }
+
+    fn open(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        if self.immutable.load(Ordering::Acquire)
+            && path.extension().is_some_and(|extension| extension == "seg")
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        StdDisk.open(path)
+    }
+
+    fn open_read(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        StdDisk.open_read(path)
+    }
+
+    fn write_at(&mut self, file: &Self::File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+        StdDisk.write_at(file, offset, bytes)
+    }
+
+    fn read_at(&mut self, file: &Self::File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        StdDisk.read_at(file, offset, buf)
+    }
+
+    fn len(&mut self, file: &Self::File) -> std::io::Result<u64> {
+        StdDisk.len(file)
+    }
+
+    fn set_len(&mut self, file: &Self::File, len: u64) -> std::io::Result<()> {
+        StdDisk.set_len(file, len)
+    }
+
+    fn sync(&mut self, file: &Self::File) -> std::io::Result<()> {
+        StdDisk.sync(file)
+    }
+
+    fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        StdDisk.sync_dir(dir)
+    }
+
+    fn list(&mut self, dir: &Path) -> std::io::Result<Vec<String>> {
+        StdDisk.list(dir)
+    }
+
+    fn remove(&mut self, path: &Path) -> std::io::Result<()> {
+        StdDisk.remove(path)
+    }
+
+    fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+        StdDisk.rename(from, to)
+    }
+
+    fn lock(&mut self, file: &Self::File) -> std::io::Result<()> {
+        StdDisk.lock(file)
+    }
+}
+
+/// A purge policy of `retain_for_ns` with one copy required, and the
+/// sealing config that carries it with a copy location.
+fn purge_config(retain_for_ns: u64) -> AgentConfig {
+    use crate::integrity::retention::{PurgeMode, RetentionPolicy};
+    sealing()
+        .with_copy_location(Some([5u8; 32]))
+        .with_retention_policy(Some(RetentionPolicy {
+            policy: 1,
+            version: 1,
+            retain_for_ns,
+            min_copies: std::num::NonZeroU32::MIN,
+            storage_tier: 0,
+            purge: PurgeMode::Manual,
+        }))
+}
+
+/// Records a verified copy of `id`'s `[0, end)` at another location, as a
+/// replica's verification does; false when the local copy took the
+/// immutable attribute, which this host's process may not release.
+fn copy_elsewhere(dir: &Path, id: u64, end: u64) -> bool {
+    use crate::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+    let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    let mut copies = CopyCatalog::open(StdDisk, dir, &mut journal).unwrap();
+    if copies
+        .current()
+        .unwrap()
+        .iter()
+        .any(|copy| copy.enforcement == Enforcement::ImmutableAttribute)
+    {
+        return false;
+    }
+    copies
+        .record(
+            CopyRecord {
+                sequence: 0,
+                recording: id,
+                start: 0,
+                end,
+                location: [6u8; 32],
+                digest: crate::integrity::retention::seals_digest(&records, id, 0, end),
+                retain_until_ns: 0,
+                state: CopyState::Verified,
+                enforcement: Enforcement::Unsupported,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    true
+}
+
+/// The segment data files in `dir`, each with its length.
+fn segment_lengths(dir: &Path) -> Vec<(PathBuf, u64)> {
+    let mut files: Vec<(PathBuf, u64)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "seg"))
+        .map(|path| {
+            let length = std::fs::metadata(&path).unwrap().len();
+            (path, length)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// karyos#1121 review: segments a local copy made immutable cannot be
+/// opened for writing, so a purge validates against a read-only view of
+/// the stopped store and still reaches the engine, which purges.
+#[test]
+fn a_purge_opens_immutable_segments_read_only() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-immutable");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    if !copy_elsewhere(&dir, id, end) {
+        return;
+    }
+    let probe = Probe::default();
+    let agent = ArchiveHandle::spawn(probe.clone(), &dir, purge_config(0)).unwrap();
+    probe.immutable.store(true, Ordering::Release);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        RetentionAnswer::Done
+    );
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1121 review: a purge refused under a legal hold changes no
+/// file, even of a recording whose tail recovery would cut: the refusal
+/// path never runs a destructive recovery.
+#[test]
+fn a_refused_purge_never_cuts_a_damaged_tail() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-damaged-hold");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    // Bytes past the last indexed write: recovery would cut them.
+    let (last, _) = segment_lengths(&dir).pop().unwrap();
+    let length = std::fs::metadata(&last).unwrap().len();
+    std::fs::File::options()
+        .write(true)
+        .open(&last)
+        .unwrap()
+        .set_len(length + 64)
+        .unwrap();
+    let before = segment_lengths(&dir);
+    assert_eq!(answered(agent.post_hold(id)), RetentionAnswer::Done);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        RetentionAnswer::Refused("legal_hold".to_owned())
+    );
+    assert_eq!(segment_lengths(&dir), before);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
