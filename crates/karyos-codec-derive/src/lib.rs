@@ -371,7 +371,20 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
             Ok(())
         })?;
     }
+    // Every option belongs to one kind: one that kind does not read is
+    // refused, never dropped (karyos#1104).
     if var {
+        if offset.is_some()
+            || check.is_some()
+            || with.is_some()
+            || width.is_some()
+            || spans.is_some()
+        {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "a variable field takes `var`, `min` and `max` only",
+            ));
+        }
         let Some(text) = borrowed(&field.ty) else {
             return Err(syn::Error::new_spanned(
                 &field.ty,
@@ -400,10 +413,16 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
                 "a field with `spans` needs `with = PATH`",
             ));
         };
-        if offset.is_some() || width.is_some() || spans.is_empty() {
+        if offset.is_some()
+            || width.is_some()
+            || check.is_some()
+            || min.is_some()
+            || max.is_some()
+            || spans.is_empty()
+        {
             return Err(syn::Error::new_spanned(
                 &name,
-                "a tied field takes `with` and one or more `spans`, no `offset` or `width`",
+                "a tied field takes `with` and one or more `spans` only: its module checks its value",
             ));
         }
         return Ok(Field {
@@ -417,7 +436,19 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
             "missing #[field(offset = N)]",
         ));
     };
+    if min.is_some() || max.is_some() {
+        return Err(syn::Error::new_spanned(
+            &name,
+            "`min` and `max` belong to a variable field",
+        ));
+    }
     if let Some(with) = with {
+        if check.is_some() {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "a `with` field takes no `check`: its module checks its value",
+            ));
+        }
         let Some(width) = width else {
             return Err(syn::Error::new_spanned(
                 &name,
@@ -629,7 +660,48 @@ mod tests {
         };
         assert_eq!(
             error(with_offset),
-            "a tied field takes `with` and one or more `spans`, no `offset` or `width`"
+            "a tied field takes `with` and one or more `spans` only: its module checks its value"
+        );
+        // An option the field's kind does not read is refused, not dropped.
+        let tied_check: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(with = t, spans = [(0, 1)], check = c)] a: A }
+        };
+        assert_eq!(
+            error(tied_check),
+            "a tied field takes `with` and one or more `spans` only: its module checks its value"
+        );
+        let var_spans: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(var, min = 0, max = 4, spans = [(0, 1)])] a: &'a [u8] }
+        };
+        assert_eq!(
+            error(var_spans),
+            "a variable field takes `var`, `min` and `max` only"
+        );
+        let var_check: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(var, min = 0, max = 4, check = c)] a: &'a [u8] }
+        };
+        assert_eq!(
+            error(var_check),
+            "a variable field takes `var`, `min` and `max` only"
+        );
+        let with_check: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(offset = 0, with = t, width = 4, check = c)] a: A }
+        };
+        assert_eq!(
+            error(with_check),
+            "a `with` field takes no `check`: its module checks its value"
+        );
+        let fixed_max: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(offset = 0, max = 4)] a: u32 }
+        };
+        assert_eq!(
+            error(fixed_max),
+            "`min` and `max` belong to a variable field"
         );
         let self_overlap: DeriveInput = syn::parse_quote! {
             #[message(template = T)]
