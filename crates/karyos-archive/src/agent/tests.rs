@@ -5179,3 +5179,44 @@ fn a_start_removes_the_segments_a_crash_left_below_the_floor() {
     assert!(!index.exists(), "the index file left below the floor");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// karyos#1123: the configured retention policy is chained at start when
+/// its terms changed. The first start records version 1; a restart with
+/// the same options records nothing; a changed option records version 2,
+/// whatever version the configuration names.
+#[test]
+fn a_start_chains_the_configured_policy_when_it_changes() {
+    use crate::integrity::SealKind;
+    use crate::integrity::retention::PolicyBook;
+
+    let dir = temp_dir("policy-chain");
+    let versions = |dir: &Path| -> Vec<u64> {
+        let mut journal = IntegrityJournal::open(StdDisk, dir).unwrap().journal;
+        let records = journal.records().unwrap();
+        let book = PolicyBook::open(StdDisk, dir, &mut journal).unwrap();
+        assert!(book.current(1).is_some());
+        records
+            .iter()
+            .filter(|record| record.kind == SealKind::Policy && record.subject == 1)
+            .map(|record| record.start)
+            .collect()
+    };
+    for _ in 0..2 {
+        ArchiveHandle::spawn(StdDisk, &dir, purge_config(0))
+            .unwrap()
+            .shutdown()
+            .unwrap();
+        assert_eq!(versions(&dir), [1]);
+    }
+    ArchiveHandle::spawn(StdDisk, &dir, purge_config(60))
+        .unwrap()
+        .shutdown()
+        .unwrap();
+    assert_eq!(versions(&dir), [1, 2]);
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let book = PolicyBook::open(StdDisk, &dir, &mut journal).unwrap();
+    assert_eq!(book.current(1).unwrap().retain_for_ns, 60);
+    drop(book);
+    drop(journal);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

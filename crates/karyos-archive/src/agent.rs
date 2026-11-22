@@ -1803,6 +1803,25 @@ fn run<D>(
             return;
         }
     };
+    // The configured retention policy is chained in the integrity journal
+    // when its terms changed, as the next version, and purges are checked
+    // against the version recorded (SPEC.md 8.4; karyos#1123).
+    let mut config = config;
+    if let (Some(policy), Some(integrity)) = (config.retention_policy, integrity.as_mut()) {
+        let recorded = crate::integrity::retention::PolicyBook::open(
+            disk.clone(),
+            &dir,
+            &mut integrity.journal,
+        )
+        .and_then(|mut book| book.record_configured(policy, &mut integrity.journal));
+        match recorded {
+            Ok(recorded) => config.retention_policy = Some(recorded),
+            Err(error) => {
+                let _ = ready.send(Err(error.into()));
+                return;
+            }
+        }
+    }
     // A recording a crash left open recovered at A2's rule; one whose
     // recovered end falls below its seals lost sealed bytes to media
     // damage, which the seal chain shows (karyos#671). The check runs
