@@ -183,11 +183,6 @@ pub(crate) struct GuardedStream<T: TermBytes> {
     /// A concurrent stream's shared ring, once its first guarded handle
     /// was issued.
     shared: Option<Shared>,
-    /// Blocks a guard close aborted on a concurrent stream, not labelled
-    /// yet: its abort reports a count, not positions, so the walker labels
-    /// that many aborted blocks `GUARD_CLOSED`, the first it reads after
-    /// the close.
-    close_aborts: u64,
 }
 
 /// One block the walker read.
@@ -245,7 +240,6 @@ impl<T: TermBytes> GuardedStream<T> {
             pending: None,
             handles: None,
             shared: None,
-            close_aborts: 0,
         }
     }
 
@@ -422,12 +416,6 @@ impl<T: TermBytes> GuardedStream<T> {
         if let Some(shared) = &mut self.shared {
             shared.writer.detach(slot);
         }
-    }
-
-    /// Counts `aborted` blocks a guard close aborted on a concurrent
-    /// stream (`Conductor::abort_marked_claims`).
-    pub(crate) fn note_close_aborts(&mut self, aborted: u32) {
-        self.close_aborts = self.close_aborts.saturating_add(u64::from(aborted));
     }
 
     /// From now on its messages are decided by `frontier`'s `lane`: the
@@ -642,10 +630,6 @@ impl<T: TermBytes> GuardedStream<T> {
                         let reason = match by_close {
                             Some(index) => {
                                 let _ = self.guard_aborted.swap_remove(index);
-                                REASON_GUARD_CLOSED
-                            }
-                            None if self.close_aborts > 0 => {
-                                self.close_aborts = self.close_aborts.saturating_sub(1);
                                 REASON_GUARD_CLOSED
                             }
                             None => REASON_WRITER_ABORTED,

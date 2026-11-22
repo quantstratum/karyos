@@ -5947,16 +5947,16 @@ fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), Dri
         stream.config.publication,
         karyos_sys::log_buffer::PublicationMode::Concurrent { .. }
     ) {
+        // Each block a pass aborted is labelled by its position (karyos#1141),
+        // also the ones of a pass that then failed.
         for _ in 0..CLOSE_ABORT_PASSES {
-            let report = stream.conductor.abort_marked_claims().map_err(|failed| {
-                if let Some(guarded) = &mut stream.guarded {
-                    guarded.note_close_aborts(failed.report.aborted);
-                }
-                DriverError::Sys(failed.error)
-            })?;
+            let result = stream.conductor.abort_marked_claims();
             if let Some(guarded) = &mut stream.guarded {
-                guarded.note_close_aborts(report.aborted);
+                for &position in stream.conductor.aborted_positions() {
+                    guarded.note_guard_abort(position);
+                }
             }
+            let report = result.map_err(|failed| DriverError::Sys(failed.error))?;
             if !report.waiting {
                 break;
             }

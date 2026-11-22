@@ -4894,6 +4894,19 @@ impl<O: BufferOwner> Conductor<O> {
         self.exclusive_deadline(&mut || 0, true)
     }
 
+    /// The stream positions of the blocks the last
+    /// [`Conductor::abort_marked_claims`] or concurrent
+    /// [`Conductor::service_deadlines`] call aborted, in abort order
+    /// (karyos#1141); empty for an exclusive buffer.
+    #[must_use]
+    pub fn aborted_positions(&self) -> &[u64] {
+        if self.buffer.concurrent() {
+            self.deadlines.aborted_positions()
+        } else {
+            &[]
+        }
+    }
+
     /// Aborts a concurrent buffer's outstanding claims now, whatever their
     /// deadlines (a guard close, karyos#1102): one deadline service call in
     /// which every observation is expired at once. Blocks the call's scan

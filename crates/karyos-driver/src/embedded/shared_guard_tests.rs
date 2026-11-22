@@ -349,3 +349,56 @@ fn an_unconnected_guarded_handle_reports_its_closed_guard() {
     assert_eq!(a.offer(b"x").unwrap(), Offer::Gated);
     assert!(matches!(a.try_claim(8).unwrap(), Claim::Gated));
 }
+
+/// karyos#1141: a guard close labels by position. A block its writer
+/// aborted just before the close stays `WRITER_ABORTED`, and only the
+/// claim the close aborted is `GUARD_CLOSED`, whichever the walker reads
+/// first.
+#[test]
+fn a_guard_close_labels_its_aborts_by_position() {
+    use karyos_client::ConcurrentClaimOutcome as Claim;
+
+    let (mut driver, handle, guard) = guarded();
+    let mut a = driver.concurrent_publication(handle).unwrap();
+    let mut b = driver.concurrent_publication(handle).unwrap();
+    // A's own abort first, at the lower position.
+    let Claim::Claimed(own) = a.try_claim(8).unwrap() else {
+        panic!("A's claim");
+    };
+    let own_at = own.position();
+    own.abort();
+    // B's claim is outstanding when the guard closes.
+    let Claim::Claimed(held) = b.try_claim(8).unwrap() else {
+        panic!("B's claim");
+    };
+    let held_at = held.position();
+    assert!(own_at < held_at);
+    let _ = driver.close_guard(guard, 2).unwrap();
+    drop(held);
+    let reasons = |publication: &mut ClientConcurrentPublication| {
+        let mut seen = Vec::new();
+        let _ = publication
+            .poll_outcomes(16, |_, record| {
+                if record.kind == Kind::Aborted {
+                    seen.push((record.start, record.reason));
+                }
+            })
+            .unwrap();
+        seen
+    };
+    let mut seen_a = Vec::new();
+    let mut seen_b = Vec::new();
+    for _ in 0..8 {
+        let _ = driver.do_work().unwrap();
+        seen_a.extend(reasons(&mut a));
+        seen_b.extend(reasons(&mut b));
+    }
+    assert_eq!(
+        seen_a,
+        [(own_at, crate::guard_streams::REASON_WRITER_ABORTED)]
+    );
+    assert_eq!(
+        seen_b,
+        [(held_at, crate::guard_streams::REASON_GUARD_CLOSED)]
+    );
+}
