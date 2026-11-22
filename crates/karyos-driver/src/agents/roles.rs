@@ -192,6 +192,10 @@ pub struct ReceiverCounters {
     /// Challenges not sent: the source is not an answerable unicast
     /// endpoint (network-control-schemas.md §7.3).
     pub unanswerable_source: u64,
+    /// Challenges of a multicast key sent from its arrival endpoint: the
+    /// key has no unicast control endpoint, so they share the group
+    /// port's `setup_answer_rate` bucket (ADR-0096 decision 1).
+    pub challenges_from_arrival: u64,
     /// Challenges not sent: `rsp_setup_rate_per_destination` (§7.4).
     pub rsp_setup_rate_limited: u64,
     /// Challenges not sent: the destination rate table is full.
@@ -4865,6 +4869,16 @@ impl<T: StreamTerms> Intake<'_, T> {
             .map_or(key.endpoint, |(.., from)| *from)
     }
 
+    /// Whether `key`'s subscription receives a multicast group.
+    fn multicast_key(&self, key: &BindingKey) -> bool {
+        self.role
+            .subscriptions
+            .iter()
+            .any(|(held, stream, .., multicast)| {
+                (*held, *stream) == (key.endpoint, key.alias.stream_id) && *multicast
+            })
+    }
+
     /// Sends an RSP_SETUP `control` from `endpoint` toward `source` if
     /// §7.3 and §7.4 allow it. Returns whether it was handed to the sender.
     fn challenge_from(
@@ -5134,6 +5148,9 @@ impl<T: StreamTerms> Intake<'_, T> {
                     // they would be one source to the publisher's
                     // `setup_answer_rate` (ADR-0096; karyos#1067).
                     let from = self.solicit_endpoint(&key);
+                    if from == endpoint && self.multicast_key(&key) {
+                        self.role.count(|c| &mut c.challenges_from_arrival);
+                    }
                     self.challenge_from(from, source, Control::Challenge(challenge));
                 }
             }

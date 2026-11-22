@@ -837,6 +837,17 @@ fn control_group_attempt() -> Result<bool, crate::error::DriverError> {
     // endpoint (plan 164).
     let solicit = driver.network_solicit_endpoints().len();
     assert_eq!(solicit, 1, "one SOLICIT endpoint for IPv4");
+    // ADR-0096 decision 2: it is bound to the unspecified address of the
+    // key's family, as the key's group endpoint is, so a CHALLENGE from it
+    // takes the same route as one from the group endpoint.
+    assert!(
+        driver
+            .network_solicit_endpoints()
+            .iter()
+            .all(|bound| bound.ip() == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+        "{:?}",
+        driver.network_solicit_endpoints()
+    );
     assert_eq!(
         held,
         before + 2 + solicit - usize::try_from(failed).unwrap()

@@ -1209,8 +1209,14 @@ impl<T: StreamTerms> Network<T> {
         // A multicast key sends its SOLICITs from the driver's unicast
         // control endpoint of its family (network-control-schemas.md §6.3,
         // plan 164): one per driver and family, held by every multicast key
-        // and closed with the last.
-        let solicit = multicast.and_then(|_| self.hold_solicit_endpoint(bind));
+        // and closed with the last. Its multicast CHALLENGEs leave from it
+        // too (ADR-0096): only for a key bound to the unspecified address,
+        // with no device, so the route lookup, interface and source
+        // address are the arrival socket's and only the port differs
+        // (decision 2); any other key keeps its arrival socket.
+        let solicit = multicast
+            .filter(|_| bind.ip().is_unspecified())
+            .and_then(|_| self.hold_solicit_endpoint(bind));
         // A dynamic key's registration state, shared with its receiver.
         let registration = register_at
             .map(|_| std::sync::Arc::new(crate::sessions::register::RegistrationStatus::default()));

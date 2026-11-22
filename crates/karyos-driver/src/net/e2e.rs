@@ -943,16 +943,12 @@ fn a_multicast_publication_reaches_every_subscriber() {
 /// image binds through its CHALLENGE, with no SOLICIT. Skipped like
 /// `a_multicast_publication_reaches_every_subscriber`.
 #[cfg(target_os = "linux")]
-#[test]
-fn two_drivers_on_one_host_bind_through_their_own_challenges() {
+fn two_drivers_on_one_host(offer: bool, name: &str) {
     use std::io::Write as _;
 
     const STREAMS: usize = 20;
     if let Err(why) = multicast_probe() {
-        let _ = writeln!(
-            std::io::stderr(),
-            "SKIPPED two_drivers_on_one_host_bind_through_their_own_challenges: {why}"
-        );
+        let _ = writeln!(std::io::stderr(), "SKIPPED {name}: {why}");
         return;
     }
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 255, 0, 13)), free_port());
@@ -990,10 +986,11 @@ fn two_drivers_on_one_host_bind_through_their_own_challenges() {
                 .unwrap(),
         );
     }
-    // DATA keeps flowing, so a refused CHALLENGE still binds through
-    // SOLICIT and the test ends on the counters, not on a timeout.
+    // With `offer`, DATA flows; without, only heartbeats. Either way a
+    // refused CHALLENGE still binds through SOLICIT after it expires
+    // (§6.3 step 1), so the test ends on the counters, not on a timeout.
     pump(&mut [&mut a, &mut b, &mut c], |drivers| {
-        for lane in &mut lanes {
+        for lane in lanes.iter_mut().filter(|_| offer) {
             let _ = lane.offer(&[0u8; 100]).unwrap();
         }
         drivers[1..].iter().all(|driver| {
@@ -1010,6 +1007,26 @@ fn two_drivers_on_one_host_bind_through_their_own_challenges() {
             "bound through CHALLENGE: {sessions:?}"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn two_drivers_on_one_host_bind_through_their_own_challenges() {
+    two_drivers_on_one_host(
+        true,
+        "two_drivers_on_one_host_bind_through_their_own_challenges",
+    );
+}
+
+/// The same with an idle publisher (ADR-0096 validation): only
+/// heartbeats flow.
+#[cfg(target_os = "linux")]
+#[test]
+fn two_drivers_on_one_host_bind_an_idle_publication_through_their_own_challenges() {
+    two_drivers_on_one_host(
+        false,
+        "two_drivers_on_one_host_bind_an_idle_publication_through_their_own_challenges",
+    );
 }
 
 /// SPEC §13 phase 2, alias collision, on one multicast group: two
