@@ -768,10 +768,11 @@ pub enum AgentError {
         /// The directory.
         dir: PathBuf,
     },
-    /// With sealing on, a group journal directory that does not resolve
-    /// to a directory on the host (`std::fs::canonicalize` failed): it
-    /// cannot be told apart from the Archive's own, so it is refused
-    /// before the journal exists (karyos#1140).
+    /// With sealing on, a group journal directory, or the Archive's own
+    /// directory, that does not resolve to a directory on the host
+    /// (`std::fs::canonicalize` failed): the two cannot be told apart, so
+    /// the group is refused before its journal exists (karyos#1140,
+    /// karyos#1149). `dir` names the one that did not resolve.
     #[error("group journal directory {dir:?} does not resolve: {kind}")]
     GroupDirectoryUnresolved {
         /// The directory as given.
@@ -2921,8 +2922,20 @@ where
                     kind: error.kind(),
                 })
             };
+            // `std::fs::canonicalize` goes around the `Disk` abstraction,
+            // which matters only if a disk other than the host's ever runs
+            // a sealing Archive.
             let group = resolve(&start.dir)?;
-            if std::fs::canonicalize(&self.dir).is_ok_and(|own| own == group) {
+            // The Archive's own directory not resolving (moved or removed
+            // while the Archive runs) refuses the group: without it the
+            // two cannot be told apart (karyos#1149).
+            let own = std::fs::canonicalize(&self.dir).map_err(|error| {
+                AgentError::GroupDirectoryUnresolved {
+                    dir: self.dir.clone(),
+                    kind: error.kind(),
+                }
+            })?;
+            if own == group {
                 return Err(AgentError::GroupInArchiveDirectory { dir: start.dir });
             }
             Some(group)
