@@ -975,3 +975,34 @@ fn a_guard_close_pass_leaves_no_observation_for_the_deadline_service() {
     let report = conductor.service_deadlines(&mut || 1_000).unwrap();
     assert_eq!(report.clock_went_back, 0);
 }
+
+/// karyos#1141: `aborted_positions` names the positions the last call
+/// aborted, within `max_aborted_positions`, and a call that an injected
+/// fault ends before it serves anything reports none (review of #1163).
+#[test]
+#[cfg(feature = "test-hooks")]
+fn aborted_positions_name_the_last_call_only() {
+    let buffer = new_buffer(concurrent_config(2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut handle = conductor.concurrent_publication().unwrap().unwrap();
+    let ConcurrentClaimOutcome::Claimed(claim) =
+        handle.try_claim(64, AppendOptions::default()).unwrap()
+    else {
+        panic!("not claimed");
+    };
+    core::mem::forget(claim);
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let report = conductor.abort_marked_claims().unwrap();
+        assert!(conductor.aborted_positions().len() <= conductor.max_aborted_positions());
+        seen.extend_from_slice(conductor.aborted_positions());
+        if !report.waiting && !seen.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(seen, [0]);
+    assert_eq!(conductor.aborted_positions(), [0]);
+    buffer.inject_deadline_fault();
+    assert!(conductor.service_deadlines(&mut || 0).is_err());
+    assert!(conductor.aborted_positions().is_empty());
+}

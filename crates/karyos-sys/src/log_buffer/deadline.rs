@@ -154,6 +154,17 @@ impl ConcurrentDeadlines {
         }
     }
 
+    /// The most positions one call records: the reserved bound.
+    pub(super) fn max_aborted_positions(&self) -> usize {
+        self.aborted_at.capacity()
+    }
+
+    /// Forgets the last call's positions: a call that returns before it
+    /// serves anything leaves none recorded.
+    pub(super) fn clear_aborted(&mut self) {
+        self.aborted_at.clear();
+    }
+
     /// The stream positions of the blocks the last service call or guard
     /// close pass aborted, in abort order.
     pub(super) fn aborted_positions(&self) -> &[u64] {

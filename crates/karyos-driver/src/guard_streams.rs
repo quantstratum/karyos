@@ -223,6 +223,7 @@ impl<T: TermBytes> GuardedStream<T> {
         ),
         walker: Subscription<Arc<LogBuffer<T>>>,
         max_message: usize,
+        close_aborts: usize,
     ) -> Self {
         Self {
             guard,
@@ -235,7 +236,10 @@ impl<T: TermBytes> GuardedStream<T> {
             scratch: vec![0; max_message],
             bounds: VecDeque::new(),
             ended: false,
-            guard_aborted: Vec::new(),
+            // Reserved here, on the control path, for every block one
+            // guard close can abort, so labelling never allocates on the
+            // abort path (karyos#1141 review).
+            guard_aborted: Vec::with_capacity(close_aborts),
             network: None,
             pending: None,
             handles: None,
@@ -493,8 +497,12 @@ impl<T: TermBytes> GuardedStream<T> {
     }
 
     /// Records a block the guard close aborted (`ClaimDeadline::Aborted`).
+    /// Within the bound reserved at creation: a close aborts at most that
+    /// many blocks, and the walker removes each as it labels it.
     pub(crate) fn note_guard_abort(&mut self, position: u64) {
-        self.guard_aborted.push(position);
+        if self.guard_aborted.len() < self.guard_aborted.capacity() {
+            self.guard_aborted.push(position);
+        }
     }
 
     /// Abandons every bound ring with an unknown lost count: the walker
@@ -879,7 +887,7 @@ mod tests {
             driver: 1,
             guard: 1,
         };
-        let mut guarded = GuardedStream::new(guard, 2, (None, None), walker, 64);
+        let mut guarded = GuardedStream::new(guard, 2, (None, None), walker, 64, 1);
         let (ring, consumed, writer) = new_ring(2, 2, 0, Place::Heap).unwrap();
         guarded.bind(Bound {
             from: 0,
@@ -945,7 +953,7 @@ mod tests {
             driver: 1,
             guard: 1,
         };
-        GuardedStream::new(guard, 2, (None, None), walker, 64)
+        GuardedStream::new(guard, 2, (None, None), walker, 64, 1)
     }
 
     fn message(position: u64, end: u64) -> Block {
@@ -1058,5 +1066,19 @@ mod tests {
         assert_eq!(end_reason(SealReason::EndOfStream), 5);
         assert_eq!(end_reason(SealReason::Unspecified), 4);
         assert_eq!(end_reason(SealReason::ScheduleViolation), 4);
+    }
+
+    /// Review of #1163: the close's abort labels are kept within the
+    /// bound reserved at creation, so noting one never allocates.
+    #[test]
+    fn guard_abort_labels_stay_within_their_reserved_bound() {
+        let mut guarded = guarded();
+        let bound = guarded.guard_aborted.capacity();
+        assert!(bound >= 1);
+        for position in 0..u64::try_from(bound).unwrap() + 4 {
+            guarded.note_guard_abort(position * 64);
+        }
+        assert_eq!(guarded.guard_aborted.len(), bound);
+        assert_eq!(guarded.guard_aborted.capacity(), bound);
     }
 }

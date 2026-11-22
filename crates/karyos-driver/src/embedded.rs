@@ -2527,6 +2527,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             ),
             walker,
             scratch,
+            close_abort_bound(found.conductor.max_aborted_positions()),
         );
         let mut guarded = match handles {
             Some(handles) => guarded.with_handles(handles)?,
@@ -3748,6 +3749,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             (plan.rate, plan.reserve),
             fresh.walker,
             fresh.scratch,
+            close_abort_bound(fresh.conductor.max_aborted_positions()),
         );
         let mut guarded = match plan.handles {
             Some(handles) => guarded.with_handles(handles)?,
@@ -5972,6 +5974,14 @@ fn abort_guarded_claim<T: StreamTerms>(stream: &mut Stream<T>) -> Result<(), Dri
         guarded.note_guard_abort(position);
     }
     Ok(())
+}
+
+/// The blocks one guard close can abort: every pass's bound
+/// ([`CLOSE_ABORT_PASSES`] of them; one for an exclusive stream's claim).
+fn close_abort_bound(per_pass: usize) -> usize {
+    usize::try_from(CLOSE_ABORT_PASSES)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(per_pass)
 }
 
 /// The passes of one guard close's concurrent claim abort: the first

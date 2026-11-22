@@ -4894,6 +4894,20 @@ impl<O: BufferOwner> Conductor<O> {
         self.exclusive_deadline(&mut || 0, true)
     }
 
+    /// The most positions one [`Conductor::aborted_positions`] call can
+    /// report: the deadline service's reserved bound for a concurrent
+    /// buffer, 1 for an exclusive one (its one claim). A caller that keeps
+    /// positions reserves for this many per call, so it never allocates on
+    /// the abort path (karyos#1141).
+    #[must_use]
+    pub fn max_aborted_positions(&self) -> usize {
+        if self.buffer.concurrent() {
+            self.deadlines.max_aborted_positions()
+        } else {
+            1
+        }
+    }
+
     /// The stream positions of the blocks the last
     /// [`Conductor::abort_marked_claims`] or concurrent
     /// [`Conductor::service_deadlines`] call aborted, in abort order
@@ -4977,6 +4991,9 @@ impl<O: BufferOwner> Conductor<O> {
         let mut report = DeadlineReport::default();
         #[cfg(feature = "test-hooks")]
         if self.buffer.deadline_fault.load(Ordering::Relaxed) {
+            // An injected fault serves nothing: no position of an earlier
+            // call stays reported (karyos#1141 review).
+            self.deadlines.clear_aborted();
             return Err(DeadlineError {
                 report,
                 error: SysError::ResourcesUnavailable,
