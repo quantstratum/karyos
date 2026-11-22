@@ -653,6 +653,10 @@ pub enum Failure {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AgentError {
+    /// A replication the source refuses (ADR-0091; karyos#1113): answered
+    /// with its `ControlResponse` code.
+    #[error("replication refused: {0:?}")]
+    ReplicationRefused(crate::replication::transport::Refusal),
     /// The agent's count of failed recordings, or of recordings it holds,
     /// would pass its range: the start is refused.
     #[error("the agent's recording counts are exhausted")]
@@ -838,6 +842,13 @@ enum Command {
     Retain(retention::Request, Reply<RetentionAnswer>),
     /// A seal verification (ADR-0088).
     Verify(u64, Reply<retention::Verified>),
+    /// A replica's request (ADR-0091; karyos#1113).
+    Replicate(
+        crate::replication::ReplicateRecording,
+        Reply<Receiver<crate::replication::transport::Outgoing>>,
+    ),
+    /// A replica's stop.
+    StopReplication(crate::replication::StopReplication, Reply<()>),
     Shutdown(Reply<()>),
 }
 
@@ -937,6 +948,8 @@ impl core::fmt::Debug for Command {
             Self::StopGroup(id, _) => f.debug_tuple("StopGroup").field(id).finish(),
             Self::Retain(request, _) => f.debug_tuple("Retain").field(request).finish(),
             Self::Verify(id, _) => f.debug_tuple("Verify").field(id).finish(),
+            Self::Replicate(request, _) => f.debug_tuple("Replicate").field(request).finish(),
+            Self::StopReplication(stop, _) => f.debug_tuple("StopReplication").field(stop).finish(),
             Self::Shutdown(_) => f.write_str("Shutdown"),
         }
     }
@@ -1151,10 +1164,35 @@ impl ArchiveHandle {
         })
     }
 
-    /// Verifies `recording`'s seals (ADR-0088), posted: each range's
-    /// outcome, its correlation id 0, or why the verification could not
-    /// run (no integrity journal, an unknown recording, a store or journal
-    /// that cannot be read).
+    /// A replica's request to replicate a recording from this Archive
+    /// (ADR-0091; karyos#1113), posted. The answer is the stream of
+    /// messages the agent sends for it (its bytes, its seals, its status),
+    /// or [`AgentError::ReplicationRefused`] with the code to answer.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_replicate(
+        &self,
+        request: crate::replication::ReplicateRecording,
+    ) -> Result<Posted<Receiver<crate::replication::transport::Outgoing>>, AgentError> {
+        self.post(|reply| Command::Replicate(request, reply))
+    }
+
+    /// A replica's stop of its replication (ADR-0091), posted: the
+    /// replication's last status is `stopped`.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_stop_replication(
+        &self,
+        stop: crate::replication::StopReplication,
+    ) -> Result<Posted<()>, AgentError> {
+        self.post(|reply| Command::StopReplication(stop, reply))
+    }
+
+    /// Verifies `recording`'s seals (ADR-0088), posted.
     ///
     /// # Errors
     ///
@@ -1835,6 +1873,7 @@ fn run<D>(
         integrity,
         retention,
         verifying: Arc::default(),
+        replications: Vec::new(),
     };
     loop {
         let mut worked = false;
@@ -1858,6 +1897,8 @@ fn run<D>(
         // Control path work, after the recorders: sealing reads what they
         // made durable.
         worked |= state.integrity_duty(now());
+        // Sealed ranges to the replicas that asked (ADR-0091; karyos#1113).
+        worked |= state.replication_duty(config.replay_budget, now());
         // After the recorders: they keep priority.
         worked |= state.replays.duty(
             now(),
@@ -1897,6 +1938,8 @@ struct State<D: Disk> {
     retention: retention::Engine<D>,
     /// A verification runs on its worker (karyos#1111).
     verifying: Arc<std::sync::atomic::AtomicBool>,
+    /// The replications this Archive is the source of (karyos#1113).
+    replications: Vec<Replication<D>>,
     /// The integrity journal of each group journal directory, which seals
     /// its groups' journals (karyos#1088); a directory whose journal
     /// failed holds `None` and is not sealed again until restart.
@@ -2039,6 +2082,40 @@ impl std::fmt::Debug for ArchiveSigning {
 
 /// How often the agent offers a new head and asks the signer, at most.
 const SIGNING_POLL: u64 = 1_000_000_000;
+
+/// Messages a replication holds for the server at most.
+const REPLICATION_QUEUE: usize = 64;
+
+/// How often a replication sends a status at least, in nanoseconds.
+const REPLICATION_STATUS: u64 = 1_000_000_000;
+
+/// One replication this Archive is the source of (karyos#1113).
+struct Replication<D: Disk> {
+    sender: crate::replication::transport::Sender,
+    out: SyncSender<crate::replication::transport::Outgoing>,
+    /// Messages not handed to the server yet.
+    queued: std::collections::VecDeque<crate::replication::transport::Outgoing>,
+    /// A stopped recording's store, read only; `None` while it records.
+    store: Option<SegmentStore<crate::disk::ReadOnly<D>>>,
+    /// The recording's range seals read so far.
+    seals: Vec<crate::integrity::SealRecord>,
+    /// The integrity journal records read so far.
+    read: u64,
+    /// When its last status was produced, in agent nanoseconds.
+    status_at: u64,
+}
+
+/// `records`' range seals of `recording`.
+fn range_seals(
+    records: &[crate::integrity::SealRecord],
+    recording: u64,
+) -> Vec<crate::integrity::SealRecord> {
+    records
+        .iter()
+        .filter(|record| record.subject == recording && record.kind.is_range())
+        .copied()
+        .collect()
+}
 
 /// The running signing state.
 struct Signing<D: Disk> {
@@ -2533,6 +2610,227 @@ where
 {
     /// Each recording's duty; those that end or fail leave the set.
     /// Returns whether any moved.
+    /// Accepts a replica's request: the recording known, its seals read,
+    /// [`Sender::accept`](crate::replication::transport::Sender::accept)'s
+    /// boundaries checked (karyos#1113).
+    fn replicate(
+        &mut self,
+        request: crate::replication::ReplicateRecording,
+    ) -> Result<Receiver<crate::replication::transport::Outgoing>, AgentError> {
+        use crate::replication::transport::Sender;
+        let id = request.recording_id;
+        let recording = self.catalog.get(id);
+        let known = recording.is_some() && self.integrity.is_some();
+        let start = recording.map_or(0, |recording| recording.start);
+        let (seals, read) = match self.integrity.as_mut() {
+            Some(integrity) => {
+                let records = integrity.journal.records()?;
+                let read = u64::try_from(records.len()).unwrap_or(u64::MAX);
+                (range_seals(&records, id), read)
+            }
+            None => (Vec::new(), 0),
+        };
+        let sender = Sender::accept(request, known, start, &seals)
+            .map_err(AgentError::ReplicationRefused)?;
+        let store = if self.active.iter().any(|active| active.id == id) {
+            None
+        } else {
+            self.stopped_store(id)?
+        };
+        let (out, answer) = mpsc::sync_channel(REPLICATION_QUEUE);
+        self.replications.push(Replication {
+            sender,
+            out,
+            queued: std::collections::VecDeque::new(),
+            store,
+            seals,
+            read,
+            status_at: 0,
+        });
+        Ok(answer)
+    }
+
+    /// A stopped recording's store, opened read only; `None` for an
+    /// unknown recording.
+    fn stopped_store(
+        &self,
+        id: u64,
+    ) -> Result<Option<SegmentStore<crate::disk::ReadOnly<D>>>, AgentError> {
+        let Some(recording) = self.catalog.get(id) else {
+            return Ok(None);
+        };
+        Ok(Some(SegmentStore::open_verified(
+            crate::disk::ReadOnly(self.disk.clone()),
+            &self.dir,
+            id,
+            recording.geometry,
+            SyncPolicy::None,
+        )?))
+    }
+
+    /// Ends the replication `stop` names with a `stopped` status.
+    fn stop_replication(&mut self, stop: crate::replication::StopReplication) {
+        let ids: Vec<u64> = self
+            .replications
+            .iter()
+            .filter(|replication| replication.store.is_none())
+            .map(|replication| replication.sender.request().recording_id)
+            .filter(|id| !self.active.iter().any(|active| active.id == *id))
+            .collect();
+        self.reopen(&ids);
+        for replication in &mut self.replications {
+            let request = replication.sender.request();
+            if request.recording_id != stop.recording_id
+                || request.correlation_id != stop.correlation_id
+                || replication.sender.done().is_some()
+            {
+                continue;
+            }
+            let sealed = replication
+                .seals
+                .iter()
+                .map(|seal| seal.end)
+                .max()
+                .unwrap_or(request.from);
+            let status = match (
+                replication.store.as_ref(),
+                self.active
+                    .iter()
+                    .find(|active| active.id == stop.recording_id),
+            ) {
+                (Some(store), _) => replication.sender.stop(store, sealed),
+                (None, Some(active)) => replication.sender.stop(active.recorder.store(), sealed),
+                (None, None) => continue,
+            };
+            replication.queued.push_back(status);
+        }
+    }
+
+    /// Opens the store of each replication of `ids` whose recording
+    /// stopped since it was accepted; one that cannot be opened is dropped,
+    /// which ends its stream.
+    fn reopen(&mut self, ids: &[u64]) {
+        for id in ids {
+            let mut index = 0;
+            while let Some(replication) = self.replications.get(index) {
+                if replication.store.is_some() || replication.sender.request().recording_id != *id {
+                    index += 1;
+                    continue;
+                }
+                match self.stopped_store(*id) {
+                    Ok(Some(store)) => {
+                        if let Some(replication) = self.replications.get_mut(index) {
+                            replication.store = Some(store);
+                        }
+                        index += 1;
+                    }
+                    _ => {
+                        self.replications.swap_remove(index);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each replication: what is queued is handed over, then, once the
+    /// queue is empty, the next sealed ranges, at most `budget` bytes.
+    fn replication_duty(&mut self, budget: u64, now: u64) -> bool {
+        let ids: Vec<u64> = self
+            .replications
+            .iter()
+            .filter(|replication| replication.store.is_none())
+            .map(|replication| replication.sender.request().recording_id)
+            .filter(|id| !self.active.iter().any(|active| active.id == *id))
+            .collect();
+        self.reopen(&ids);
+        let budget = usize::try_from(budget).unwrap_or(usize::MAX);
+        let mut worked = false;
+        let mut index = 0;
+        while let Some(replication) = self.replications.get_mut(index) {
+            let mut gone = false;
+            while let Some(message) = replication.queued.pop_front() {
+                match replication.out.try_send(message) {
+                    Ok(()) => worked = true,
+                    Err(TrySendError::Full(message)) => {
+                        replication.queued.push_front(message);
+                        break;
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        gone = true;
+                        break;
+                    }
+                }
+            }
+            let done = replication.sender.done().is_some() && replication.queued.is_empty();
+            if gone || done {
+                self.replications.swap_remove(index);
+                continue;
+            }
+            if replication.queued.is_empty() && replication.sender.done().is_none() {
+                let id = replication.sender.request().recording_id;
+                if let Some(integrity) = self.integrity.as_mut()
+                    && let Ok(new) = integrity.journal.records_from(replication.read)
+                {
+                    replication.read = replication
+                        .read
+                        .saturating_add(u64::try_from(new.len()).unwrap_or(u64::MAX));
+                    replication.seals.extend(range_seals(&new, id));
+                }
+                let mut out = Vec::new();
+                let active = self.active.iter_mut().find(|active| active.id == id);
+                let polled = match (replication.store.as_mut(), active) {
+                    (Some(store), _) => {
+                        replication
+                            .sender
+                            .poll(store, &replication.seals, true, budget, &mut out)
+                    }
+                    (None, Some(active)) => replication.sender.poll(
+                        active.recorder.store_mut(),
+                        &replication.seals,
+                        false,
+                        budget,
+                        &mut out,
+                    ),
+                    // Reopened at the top of the next duty.
+                    (None, None) => Ok(()),
+                };
+                if polled.is_err() {
+                    self.replications.swap_remove(index);
+                    continue;
+                }
+                // A status at least once a second (ADR-0091).
+                if out.is_empty()
+                    && replication.sender.done().is_none()
+                    && now.saturating_sub(replication.status_at) >= REPLICATION_STATUS
+                {
+                    let active = self.active.iter().find(|active| active.id == id);
+                    if let Some(status) = match (replication.store.as_ref(), active) {
+                        (Some(store), _) => {
+                            Some(replication.sender.status(store, &replication.seals))
+                        }
+                        (None, Some(active)) => Some(
+                            replication
+                                .sender
+                                .status(active.recorder.store(), &replication.seals),
+                        ),
+                        (None, None) => None,
+                    } {
+                        out.push(status);
+                    }
+                }
+                if out.iter().any(|message| {
+                    matches!(message, crate::replication::transport::Outgoing::Status(_))
+                }) {
+                    replication.status_at = now;
+                }
+                worked |= !out.is_empty();
+                replication.queued.extend(out);
+            }
+            index += 1;
+        }
+        worked
+    }
+
     /// Chains the catalog's changes and seals what is due (A10). A
     /// failure stops the integrity work, never a recording.
     fn integrity_duty(&mut self, now: u64) -> bool {
@@ -2802,6 +3100,13 @@ where
                 let _ = reply.send(Ok(self.retain(request)));
             }
             Command::Verify(id, reply) => self.verify(id, reply),
+            Command::Replicate(request, reply) => {
+                let _ = reply.send(self.replicate(request));
+            }
+            Command::StopReplication(stop, reply) => {
+                self.stop_replication(stop);
+                let _ = reply.send(Ok(()));
+            }
             Command::Shutdown(reply) => {
                 let groups = std::mem::take(&mut self.groups);
                 for group in groups {
