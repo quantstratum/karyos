@@ -1201,6 +1201,24 @@ fn a_challenge_without_a_control_endpoint_leaves_from_its_arrival_endpoint() {
             0
         };
         assert_eq!(counted, expected, "multicast {multicast}");
+        // An ANNOUNCE from an unanswerable source gets no CHALLENGE, so
+        // nothing is counted as sent from the arrival socket.
+        let unanswerable = rig.agents.receiver.counters().unanswerable_source;
+        let receiver = &mut rig.agents.receiver;
+        receiver.role.inject_control(
+            &receiver.sessions,
+            b,
+            "239.1.1.1:4000".parse().unwrap(),
+            karyos_protocol::network::Control::SetupAnnounce(announce(65_536)),
+            rig.now,
+        );
+        let counters = rig.agents.receiver.counters();
+        assert_eq!(
+            counters.unanswerable_source,
+            unanswerable + 1,
+            "{counters:?}"
+        );
+        assert_eq!(counters.challenges_from_arrival, expected);
     }
 }
 

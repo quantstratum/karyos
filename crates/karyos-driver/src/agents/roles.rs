@@ -5148,10 +5148,14 @@ impl<T: StreamTerms> Intake<'_, T> {
                     // they would be one source to the publisher's
                     // `setup_answer_rate` (ADR-0096; karyos#1067).
                     let from = self.solicit_endpoint(&key);
-                    if from == endpoint && self.multicast_key(&key) {
+                    // Counted only once handed to the sender: a refused
+                    // one (§7.3, §7.4, a full ring) sent nothing.
+                    if self.challenge_from(from, source, Control::Challenge(challenge))
+                        && from == endpoint
+                        && self.multicast_key(&key)
+                    {
                         self.role.count(|c| &mut c.challenges_from_arrival);
                     }
-                    self.challenge_from(from, source, Control::Challenge(challenge));
                 }
             }
             Control::SetupAnswer(answer) => {
