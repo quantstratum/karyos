@@ -982,24 +982,32 @@ fn time_evidence_anchored_as_another_journal_has_no_evidence() {
 }
 
 /// karyos#1128: the time evidence journal's identity is the trust
-/// file's `time-journal`, by default the journal's plus one, and never
-/// the journal's own.
+/// file's `time-journal`, never guessed and never the journal's own;
+/// without that line, time evidence is refused with a clear error.
 #[test]
 fn the_time_journal_is_another_than_the_journal() {
     use super::parse_trust_journals;
     let base = format!("archive {}\nauthority {}\n", hex(&ARCHIVE), hex(&[3; 32]));
-    assert_eq!(parse_trust_journals(&base).unwrap().3, 1);
+    assert_eq!(parse_trust_journals(&base).unwrap().3, None);
     let explicit = format!("{base}journal 4\ntime-journal 9\n");
     let parsed = parse_trust_journals(&explicit).unwrap();
-    assert_eq!((parsed.2, parsed.3), (4, 9));
-    for refused in [
-        format!("{base}journal 4\ntime-journal 4\n"),
-        format!("{base}journal {}\n", u64::MAX),
-    ] {
-        assert_eq!(
-            parse_trust_journals(&refused).unwrap_err(),
-            TrustError::TimeJournal,
-            "{refused:?}"
-        );
-    }
+    assert_eq!((parsed.2, parsed.3), (4, Some(9)));
+    assert_eq!(
+        parse_trust_journals(&format!("{base}journal 4\ntime-journal 4\n")).unwrap_err(),
+        TrustError::TimeJournal
+    );
+    // A time verdict asked of a trust file with no `time-journal` line.
+    let archive = time_archive("time-no-journal-line", 1);
+    std::fs::write(
+        archive.trust(),
+        format!(
+            "archive {}\nauthority {}\njournal 0\n",
+            hex(&ARCHIVE),
+            hex(&[3; 32])
+        ),
+    )
+    .unwrap();
+    let (status, _, err) = time_run(&archive, &["--time-requirement", "1000:1"]);
+    assert_eq!(status, 2, "{err}");
+    assert!(err.contains("no time-journal line"), "{err}");
 }

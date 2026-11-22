@@ -3923,7 +3923,7 @@ fn a_signing_agent_records_trusted_heads_covering_the_chain() {
     let signing = ArchiveSigning {
         trust: trust.clone(),
         journal_id: 1,
-        time_evidence_journal_id: 2,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(archival),
     };
@@ -3973,7 +3973,7 @@ fn signing_without_a_seal_interval_is_refused() {
             authorities: Vec::new(),
         },
         journal_id: 1,
-        time_evidence_journal_id: 2,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(1), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(TestKey::from_seed([9; 32])),
     };
@@ -4000,7 +4000,7 @@ fn signing_refuses_a_time_evidence_journal_sharing_the_journal_id() {
             authorities: Vec::new(),
         },
         journal_id: 1,
-        time_evidence_journal_id: 1,
+        time_evidence_journal_id: Some(1),
         config: SigningConfig::new(Some(1), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(TestKey::from_seed([9; 32])),
     };
@@ -4009,6 +4009,55 @@ fn signing_refuses_a_time_evidence_journal_sharing_the_journal_id() {
         Err(AgentError::SharedJournalId)
     ));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// karyos#1138: head signing with no time evidence journal id refuses
+/// an entry with a clear error, never guessing an id.
+#[test]
+fn signing_without_a_time_evidence_journal_id_refuses_an_entry() {
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+    use crate::integrity::time::{Source, SyncState};
+    use crate::integrity::time_evidence::{Entry, entries_dir};
+
+    let dir = temp_dir("signing-no-time-journal");
+    std::fs::create_dir_all(entries_dir(&dir)).unwrap();
+    let (trust, key) = registered_archival(&dir);
+    let signing = ArchiveSigning {
+        trust,
+        journal_id: 1,
+        time_evidence_journal_id: None,
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(key),
+    };
+    let agent = ArchiveHandle::spawn_signing(StdDisk, &dir, sealing(), signing).unwrap();
+    let entry = Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [1, 0, 2, 3, 4],
+        recording: 1,
+        start: 0,
+        end: 0,
+        min_time: 0,
+        max_time: 0,
+        granularity: 1,
+        bound_min_ns: u64::MAX,
+        bound_max_ns: u64::MAX,
+        calibration: [0; 32],
+        utc_reference: [0; 32],
+        tick_fs: 1,
+    };
+    let refused = agent.record_time_evidence(entry);
+    assert!(
+        matches!(refused, Err(AgentError::NoTimeEvidenceJournal)),
+        "{refused:?}"
+    );
+    assert!(
+        AgentError::NoTimeEvidenceJournal
+            .to_string()
+            .contains("time-journal")
+    );
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 /// The operator's registered archival key in `dir`'s registry, for the
@@ -4205,7 +4254,7 @@ fn a_poisoned_signer_is_refused() {
     let setup = ArchiveSigning {
         trust,
         journal_id: 1,
-        time_evidence_journal_id: 2,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(key),
     };
@@ -4252,7 +4301,7 @@ fn a_slow_signer_still_signs_while_heads_advance() {
     let setup = ArchiveSigning {
         trust,
         journal_id: 1,
-        time_evidence_journal_id: 2,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(SlowSigner {
             key,
@@ -4286,7 +4335,7 @@ fn the_signing_cache_holds_only_the_uncovered_tail() {
     let setup = ArchiveSigning {
         trust,
         journal_id: 1,
-        time_evidence_journal_id: 2,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(SlowSigner {
             key,
@@ -4334,7 +4383,7 @@ fn a_refused_head_is_offered_again() {
     let setup = ArchiveSigning {
         trust,
         journal_id: 1,
-        time_evidence_journal_id: 2,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(
             Some(60_000_000_000),
             BacklogPolicy::Refuse {
@@ -4447,7 +4496,7 @@ fn a_head_before_the_keys_validity_never_pins_the_backlog() {
         let setup = ArchiveSigning {
             trust,
             journal_id: 1,
-            time_evidence_journal_id: 2,
+            time_evidence_journal_id: Some(2),
             config: SigningConfig::new(Some(60_000_000_000), policy).unwrap(),
             signer: Box::new(EffectiveSigner {
                 key: archival,
@@ -4758,7 +4807,7 @@ fn a_running_archive_records_and_signs_time_evidence() {
     let signing = ArchiveSigning {
         trust: trust.clone(),
         journal_id: 1,
-        time_evidence_journal_id: 2,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(archival),
     };

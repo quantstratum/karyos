@@ -725,6 +725,10 @@ pub enum AgentError {
     /// of it (karyos#1128).
     #[error("the head signer's lock is poisoned: no head is signed")]
     SignerPoisoned,
+    /// Head signing configures no time evidence journal identity: an
+    /// entry would have no journal to be signed as (karyos#1128).
+    #[error("time evidence needs its own journal id: the trust file has no time-journal line")]
+    NoTimeEvidenceJournal,
     /// The time evidence entries' journal was given the integrity
     /// journal's identity: each chain needs its own (karyos#1128).
     #[error("the time evidence journal needs a journal id of its own")]
@@ -1084,7 +1088,7 @@ impl ArchiveHandle {
         }
         if signing
             .as_ref()
-            .is_some_and(|signing| signing.time_evidence_journal_id == signing.journal_id)
+            .is_some_and(|signing| signing.time_evidence_journal_id == Some(signing.journal_id))
         {
             return Err(AgentError::SharedJournalId);
         }
@@ -1253,7 +1257,8 @@ impl ArchiveHandle {
     ///
     /// # Errors
     ///
-    /// [`AgentError::NoTimeEvidence`], [`AgentError::TimeEvidenceNoSeal`],
+    /// [`AgentError::NoTimeEvidence`], [`AgentError::NoTimeEvidenceJournal`],
+    /// [`AgentError::TimeEvidenceNoSeal`],
     /// [`AgentError::TimeEvidenceUnsealed`], [`AgentError::TimeEvidence`]
     /// (a refused entry or a store failure), and [`AgentError::Gone`].
     pub fn record_time_evidence(
@@ -2039,6 +2044,9 @@ struct Integrity<D: Disk> {
     /// The time evidence entries and their journal's signing, when the
     /// host made `time-evidence/` (karyos#1128).
     evidence: Option<Evidence<D>>,
+    /// Whether head signing configures no time evidence journal id, so
+    /// entries are refused ([`AgentError::NoTimeEvidenceJournal`]).
+    no_time_journal: bool,
     /// The copy catalog and this Archive's location in it, when
     /// `copy_location` is set; dropped at its first failure.
     copies: Option<(
@@ -2072,21 +2080,29 @@ impl<D: Disk> Integrity<D> {
             .and_then(std::num::NonZeroU64::new)
             .ok_or(IntegrityError::Overflow)?;
         let mut journal = IntegrityJournal::open(disk.clone(), dir)?.journal;
-        let (signing, shared) = match signing {
+        let (signing, shared, no_time_journal) = match signing {
             Some(setup) => {
-                let parts = (
-                    setup.trust.clone(),
-                    setup.time_evidence_journal_id,
-                    setup.config,
-                );
+                let parts = setup
+                    .time_evidence_journal_id
+                    .map(|id| (setup.trust.clone(), id, setup.config));
                 let signing =
                     Signing::open(disk.clone(), dir, setup, &mut journal, Arc::clone(counts))?;
                 let signer = Arc::clone(&signing.signer);
-                (Some(signing), Some((parts, signer)))
+                let no_time_journal = parts.is_none();
+                (
+                    Some(signing),
+                    parts.map(|parts| (parts, signer)),
+                    no_time_journal,
+                )
             }
-            None => (None, None),
+            None => (None, None, false),
         };
-        let evidence = Self::open_evidence(disk.clone(), dir, shared)?;
+        // Signed, but with no journal id for the entries: none are kept.
+        let evidence = if no_time_journal {
+            None
+        } else {
+            Self::open_evidence(disk.clone(), dir, shared)?
+        };
         let copies = location
             .map(|location| {
                 crate::integrity::copies::CopyCatalog::open(disk, dir, &mut journal)
@@ -2097,6 +2113,7 @@ impl<D: Disk> Integrity<D> {
         Ok(Self {
             signing,
             evidence,
+            no_time_journal,
             copies,
             journal,
             sealer: Sealer::new(interval),
@@ -2202,8 +2219,10 @@ pub struct ArchiveSigning {
     pub journal_id: u64,
     /// The identity of the time evidence entries' journal (karyos#1128),
     /// another than `journal_id`: a head of one chain never stands for the
-    /// other's, and an anchor of one is refused for the other.
-    pub time_evidence_journal_id: u64,
+    /// other's, and an anchor of one is refused for the other. `None`
+    /// configures none, and time evidence is then refused
+    /// ([`AgentError::NoTimeEvidenceJournal`]); no identity is guessed.
+    pub time_evidence_journal_id: Option<u64>,
     /// The `anchor_interval` and backlog policy.
     pub config: SigningConfig,
     /// The signer. It is asked from the agent's control path and must not
@@ -3448,6 +3467,9 @@ where
         let Some(integrity) = self.integrity.as_mut() else {
             return Err(AgentError::NoTimeEvidence);
         };
+        if integrity.no_time_journal {
+            return Err(AgentError::NoTimeEvidenceJournal);
+        }
         let sealed = integrity.journal.sealed_range(entry.recording);
         let Some(evidence) = integrity.evidence.as_mut() else {
             return Err(AgentError::NoTimeEvidence);

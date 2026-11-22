@@ -14,8 +14,8 @@
 //! authority <64 hex digits>   an authority public key (one or more)
 //! journal <id>                the journal's identity (default 0)
 //! time-journal <id>           the time evidence journal's identity, another
-//!                             than the journal's (default the journal's
-//!                             plus one)
+//!                             than the journal's; required to verify or
+//!                             sign time evidence, never guessed
 //! local <64 hex digits>       a store on this host, never external
 //! anchors <64 hex digits>     an Archive this one anchors (circular)
 //! ```
@@ -202,10 +202,14 @@ pub enum TrustError {
     /// No `authority` line.
     #[error("the trust file names no authority")]
     NoAuthority,
-    /// The time evidence journal's identity is the journal's, or none
-    /// follows a `journal` of `u64::MAX` by default (karyos#1128).
+    /// The time evidence journal's identity is the journal's
+    /// (karyos#1128).
     #[error("the time evidence journal needs a journal id of its own")]
     TimeJournal,
+    /// No `time-journal` line, where time evidence is verified: its
+    /// journal's identity is never guessed (karyos#1128).
+    #[error("the trust file has no time-journal line: time evidence needs its journal's id")]
+    NoTimeJournal,
 }
 
 /// A recording's store that cannot be opened or read.
@@ -538,14 +542,16 @@ pub fn parse_trust(text: &str) -> Result<(TrustRoot, Externality, u64), TrustErr
 }
 
 /// [`parse_trust`], with the time evidence journal's identity last
-/// (karyos#1128): `time-journal N`, by default the journal's plus one.
+/// (karyos#1128): `time-journal N`, `None` without that line.
 ///
 /// # Errors
 ///
 /// The first malformed line, a missing archive or authority, and
 /// [`TrustError::TimeJournal`] for a time evidence journal with the
 /// journal's identity.
-pub fn parse_trust_journals(text: &str) -> Result<(TrustRoot, Externality, u64, u64), TrustError> {
+pub fn parse_trust_journals(
+    text: &str,
+) -> Result<(TrustRoot, Externality, u64, Option<u64>), TrustError> {
     let mut archive = None;
     let mut authorities: Vec<[u8; PUBLIC_KEY_LENGTH]> = Vec::new();
     let mut journal = 0u64;
@@ -593,10 +599,9 @@ pub fn parse_trust_journals(text: &str) -> Result<(TrustRoot, Externality, u64, 
     if authorities.is_empty() {
         return Err(TrustError::NoAuthority);
     }
-    let time_journal = time_journal
-        .or_else(|| journal.checked_add(1))
-        .filter(|&time| time != journal)
-        .ok_or(TrustError::TimeJournal)?;
+    if time_journal == Some(journal) {
+        return Err(TrustError::TimeJournal);
+    }
     externality.local_archive = archive_id;
     Ok((
         TrustRoot {
@@ -753,7 +758,10 @@ fn run_checks_of(args: &VerifyArgs, chain: Chain) -> Result<Verification, Verify
                 })?;
             let journal = match chain {
                 Chain::Integrity => journal,
-                Chain::TimeEvidence => time_journal,
+                Chain::TimeEvidence => time_journal.ok_or_else(|| VerifyError::Trust {
+                    path: path.clone(),
+                    source: TrustError::NoTimeJournal,
+                })?,
             };
             (Some(trust), externality, journal)
         }
