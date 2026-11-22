@@ -577,13 +577,14 @@ mod tests {
     /// runs" flag is already clear.
     #[test]
     fn the_flag_is_clear_when_the_answer_is_sent() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let flag = std::sync::Arc::new(AtomicBool::new(true));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // The recording a verification runs for; 0 once clear.
+        let flag = std::sync::Arc::new(AtomicU64::new(9));
         let mut seen = None;
         super::clear_then_answer(super::Clear(std::sync::Arc::clone(&flag)), 7, |value| {
             seen = Some((value, flag.load(Ordering::Acquire)));
         });
-        assert_eq!(seen, Some((7, false)));
+        assert_eq!(seen, Some((7, 0)));
     }
 
     use super::*;
