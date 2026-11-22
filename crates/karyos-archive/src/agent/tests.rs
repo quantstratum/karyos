@@ -3963,6 +3963,7 @@ fn a_signing_agent_records_trusted_heads_covering_the_chain() {
     let signing = ArchiveSigning {
         trust: trust.clone(),
         journal_id: 1,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(archival),
     };
@@ -4012,6 +4013,7 @@ fn signing_without_a_seal_interval_is_refused() {
             authorities: Vec::new(),
         },
         journal_id: 1,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(1), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(TestKey::from_seed([9; 32])),
     };
@@ -4019,6 +4021,82 @@ fn signing_without_a_seal_interval_is_refused() {
         ArchiveHandle::spawn_signing(StdDisk, &dir, AgentConfig::default(), signing),
         Err(AgentError::SigningWithoutSealing)
     ));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1138 review P2: a time evidence journal given the integrity
+/// journal's identity is refused, so one chain's head never stands for
+/// the other's.
+#[test]
+fn signing_refuses_a_time_evidence_journal_sharing_the_journal_id() {
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+    use crate::integrity::test_key::TestKey;
+    use crate::integrity::trust::TrustRoot;
+
+    let dir = temp_dir("signing-shared-journal");
+    let signing = ArchiveSigning {
+        trust: TrustRoot {
+            archive_id: [7; 32],
+            authorities: Vec::new(),
+        },
+        journal_id: 1,
+        time_evidence_journal_id: Some(1),
+        config: SigningConfig::new(Some(1), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(TestKey::from_seed([9; 32])),
+    };
+    assert!(matches!(
+        ArchiveHandle::spawn_signing(StdDisk, &dir, sealing(), signing),
+        Err(AgentError::SharedJournalId)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// karyos#1138: head signing with no time evidence journal id refuses
+/// an entry with a clear error, never guessing an id.
+#[test]
+fn signing_without_a_time_evidence_journal_id_refuses_an_entry() {
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+    use crate::integrity::time::{Source, SyncState};
+    use crate::integrity::time_evidence::{Entry, entries_dir};
+
+    let dir = temp_dir("signing-no-time-journal");
+    std::fs::create_dir_all(entries_dir(&dir)).unwrap();
+    let (trust, key) = registered_archival(&dir);
+    let signing = ArchiveSigning {
+        trust,
+        journal_id: 1,
+        time_evidence_journal_id: None,
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(key),
+    };
+    let agent = ArchiveHandle::spawn_signing(StdDisk, &dir, sealing(), signing).unwrap();
+    let entry = Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [1, 0, 2, 3, 4],
+        recording: 1,
+        start: 0,
+        end: 0,
+        min_time: 0,
+        max_time: 0,
+        granularity: 1,
+        bound_min_ns: u64::MAX,
+        bound_max_ns: u64::MAX,
+        calibration: [0; 32],
+        utc_reference: [0; 32],
+        tick_fs: 1,
+    };
+    let refused = agent.record_time_evidence(entry);
+    assert!(
+        matches!(refused, Err(AgentError::NoTimeEvidenceJournal)),
+        "{refused:?}"
+    );
+    assert!(
+        AgentError::NoTimeEvidenceJournal
+            .to_string()
+            .contains("time-journal")
+    );
+    agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -4099,6 +4177,143 @@ impl crate::integrity::signing::HeadSigner for SlowSigner {
     }
 }
 
+/// A signer with one request in flight, as the operator's signing
+/// program: asked for another head than the one in flight, it retires
+/// that request and starts anew; a request is answered on its `asks`-th
+/// ask in a row (karyos#1138 review P1).
+struct InFlightSigner {
+    key: crate::integrity::test_key::TestKey,
+    asks: u32,
+    in_flight: Option<(crate::integrity::trust::ChainHead, u32)>,
+    retired: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl crate::integrity::signing::HeadSigner for InFlightSigner {
+    fn key_id(&self) -> crate::integrity::Digest {
+        self.key.key_id()
+    }
+
+    fn custody(&self) -> crate::integrity::trust::Custody {
+        self.key.custody()
+    }
+
+    fn sign(
+        &mut self,
+        head: &crate::integrity::trust::ChainHead,
+    ) -> Result<[u8; crate::integrity::trust::SIGNATURE_LENGTH], SignerUnavailable> {
+        let asked = match self.in_flight.take() {
+            Some((flying, asked)) if flying == *head => asked + 1,
+            Some(_) => {
+                let _ = self
+                    .retired
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                1
+            }
+            None => 1,
+        };
+        if asked < self.asks {
+            self.in_flight = Some((*head, asked));
+            return Err(SignerUnavailable);
+        }
+        self.key.sign(head)
+    }
+}
+
+/// karyos#1138 review P1: with heads pending in both the integrity
+/// journal and the time evidence journal, a shared signer that retires
+/// its in-flight request on another head still signs both: the journal
+/// that asked keeps the signer until its head is signed.
+#[test]
+fn a_shared_signer_completes_one_journal_before_the_other() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+
+    let main = temp_dir("signing-shared-main");
+    let other = temp_dir("signing-shared-other");
+    let (trust, key) = registered_archival(&main);
+    let _ = registered_archival(&other);
+    let retired = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let signer = SignerSlot::shared(Box::new(InFlightSigner {
+        key,
+        asks: 2,
+        in_flight: None,
+        retired: std::sync::Arc::clone(&retired),
+    }));
+    let config = SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap();
+    let mut journals = [
+        IntegrityJournal::open(StdDisk, &main).unwrap().journal,
+        IntegrityJournal::open(StdDisk, &other).unwrap().journal,
+    ];
+    let [first, second] = &mut journals;
+    let mut signings = [
+        Signing::open_shared(
+            StdDisk,
+            &main,
+            (trust.clone(), 1, config),
+            Arc::clone(&signer),
+            first,
+            Arc::default(),
+        )
+        .unwrap(),
+        Signing::open_shared(
+            StdDisk,
+            &other,
+            (trust, 2, config),
+            Arc::clone(&signer),
+            second,
+            Arc::default(),
+        )
+        .unwrap(),
+    ];
+    for journal in &mut journals {
+        let _ = journal.record_policy_version(1, 1, b"pending").unwrap();
+    }
+    for poll in 1..=8u64 {
+        for (signing, journal) in signings.iter_mut().zip(journals.iter_mut()) {
+            signing.duty(journal, poll * SIGNING_POLL).unwrap();
+        }
+    }
+    assert!(!signed_counters(&main).is_empty(), "the integrity journal");
+    assert!(!signed_counters(&other).is_empty(), "the time evidence one");
+    assert_eq!(retired.load(std::sync::atomic::Ordering::Relaxed), 0);
+    std::fs::remove_dir_all(&main).unwrap();
+    std::fs::remove_dir_all(&other).unwrap();
+}
+
+/// karyos#1138 review: a poisoned signer lock is refused with
+/// [`AgentError::SignerPoisoned`], never skipped silently; nothing is
+/// signed.
+#[test]
+fn a_poisoned_signer_is_refused() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+
+    let dir = temp_dir("signing-poisoned");
+    let (trust, key) = registered_archival(&dir);
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let setup = ArchiveSigning {
+        trust,
+        journal_id: 1,
+        time_evidence_journal_id: Some(2),
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(key),
+    };
+    let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal, Arc::default()).unwrap();
+    let shared = Arc::clone(&signing.signer);
+    let poisoner = std::thread::spawn(move || {
+        let _held = shared.lock().unwrap();
+        panic!("poisons the signer's lock");
+    });
+    assert!(poisoner.join().is_err());
+    let _ = journal.record_policy_version(1, 1, b"pending").unwrap();
+    assert!(matches!(
+        signing.duty(&mut journal, SIGNING_POLL),
+        Err(AgentError::SignerPoisoned)
+    ));
+    assert!(signed_counters(&dir).is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// The counters of the heads `dir`'s `heads.kyh` records.
 fn signed_counters(dir: &Path) -> Vec<u64> {
     use crate::integrity::ledger::read_entries;
@@ -4126,6 +4341,7 @@ fn a_slow_signer_still_signs_while_heads_advance() {
     let setup = ArchiveSigning {
         trust,
         journal_id: 1,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(SlowSigner {
             key,
@@ -4139,7 +4355,7 @@ fn a_slow_signer_still_signs_while_heads_advance() {
         let _ = journal
             .record_policy_version(1, poll, &poll.to_le_bytes())
             .unwrap();
-        signing.duty(&mut journal, poll * SIGNING_POLL);
+        signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
     }
     let signed = signed_counters(&dir);
     assert!(signed.len() >= 2, "coverage progressed: {signed:?}");
@@ -4159,6 +4375,7 @@ fn the_signing_cache_holds_only_the_uncovered_tail() {
     let setup = ArchiveSigning {
         trust,
         journal_id: 1,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
         signer: Box::new(SlowSigner {
             key,
@@ -4173,7 +4390,7 @@ fn the_signing_cache_holds_only_the_uncovered_tail() {
         let _ = journal
             .record_policy_version(1, poll, &poll.to_le_bytes())
             .unwrap();
-        signing.duty(&mut journal, poll * SIGNING_POLL);
+        signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
     }
     let (base, cached) = signing.cached();
     let chained = journal.records().unwrap().len();
@@ -4206,6 +4423,7 @@ fn a_refused_head_is_offered_again() {
     let setup = ArchiveSigning {
         trust,
         journal_id: 1,
+        time_evidence_journal_id: Some(2),
         config: SigningConfig::new(
             Some(60_000_000_000),
             BacklogPolicy::Refuse {
@@ -4223,13 +4441,13 @@ fn a_refused_head_is_offered_again() {
     let mut signing = Signing::open(StdDisk, &dir, setup, &mut journal, Arc::default()).unwrap();
     // The first head queues; the final one is refused, the backlog full.
     let _ = journal.record_policy_version(1, 1, b"first").unwrap();
-    signing.duty(&mut journal, SIGNING_POLL);
+    signing.duty(&mut journal, SIGNING_POLL).unwrap();
     let last = journal.record_policy_version(1, 2, b"final").unwrap();
-    signing.duty(&mut journal, 2 * SIGNING_POLL);
+    signing.duty(&mut journal, 2 * SIGNING_POLL).unwrap();
     // The signer recovers; no seal arrives after.
     open.store(true, std::sync::atomic::Ordering::Relaxed);
-    signing.duty(&mut journal, 3 * SIGNING_POLL);
-    signing.duty(&mut journal, 4 * SIGNING_POLL);
+    signing.duty(&mut journal, 3 * SIGNING_POLL).unwrap();
+    signing.duty(&mut journal, 4 * SIGNING_POLL).unwrap();
     let signed = signed_counters(&dir);
     assert_eq!(signed.last(), Some(&last.counter), "{signed:?}");
     std::fs::remove_dir_all(&dir).unwrap();
@@ -4318,6 +4536,7 @@ fn a_head_before_the_keys_validity_never_pins_the_backlog() {
         let setup = ArchiveSigning {
             trust,
             journal_id: 1,
+            time_evidence_journal_id: Some(2),
             config: SigningConfig::new(Some(60_000_000_000), policy).unwrap(),
             signer: Box::new(EffectiveSigner {
                 key: archival,
@@ -4332,7 +4551,7 @@ fn a_head_before_the_keys_validity_never_pins_the_backlog() {
             let _ = journal
                 .record_policy_version(1, poll, &poll.to_le_bytes())
                 .unwrap();
-            signing.duty(&mut journal, poll * SIGNING_POLL);
+            signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
             poll += 1;
         }
         assert!(signed_counters(&dir).is_empty(), "{name}");
@@ -4341,10 +4560,10 @@ fn a_head_before_the_keys_validity_never_pins_the_backlog() {
             let _ = journal
                 .record_policy_version(1, poll, &poll.to_le_bytes())
                 .unwrap();
-            signing.duty(&mut journal, poll * SIGNING_POLL);
+            signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
             poll += 1;
         }
-        signing.duty(&mut journal, poll * SIGNING_POLL);
+        signing.duty(&mut journal, poll * SIGNING_POLL).unwrap();
         let signed = signed_counters(&dir);
         assert!(
             signed.last().is_some_and(|&counter| counter >= effective),
@@ -4574,8 +4793,205 @@ fn a_verification_never_holds_a_replay() {
     assert!(!ranges.is_empty());
     assert_eq!(ranges.first().unwrap().start, 0);
     assert_eq!(ranges.last().unwrap().end, end);
+}
+
+/// karyos#1128: a running Archive with `time-evidence/` takes an entry
+/// once its range is sealed, refuses one past the seals, and signs the
+/// entries' journal with its own signer.
+#[test]
+fn a_running_archive_records_and_signs_time_evidence() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::ledger::{Ledger, read_entries};
+    use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+    use crate::integrity::test_key::TestKey;
+    use crate::integrity::time::{Source, SyncState};
+    use crate::integrity::time_evidence::{Entry, entries_dir, read_sealed};
+    use crate::integrity::trust::{
+        Algorithm, Custody, HEADS_FILE, HeadVerdict, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH,
+        RegistryAction, RegistryEntry, SIGNED_HEAD_LENGTH, SignedHead, TrustRoot, key_id,
+    };
+
+    let dir = temp_dir("time-evidence");
+    let entries = entries_dir(&dir);
+    std::fs::create_dir_all(&entries).unwrap();
+    let archive = [7u8; 32];
+    let authority = TestKey::from_seed([1; 32]);
+    let archival = TestKey::from_seed([9; 32]);
+    let trust = TrustRoot {
+        archive_id: archive,
+        authorities: vec![authority.public()],
+    };
+    // The operator registers the archival key in both journals.
+    for journal_dir in [&dir, &entries] {
+        let mut journal = IntegrityJournal::open(StdDisk, journal_dir)
+            .unwrap()
+            .journal;
+        let mut keys =
+            Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, journal_dir, KEYS_FILE).unwrap();
+        let mut entry = RegistryEntry {
+            action: RegistryAction::Register,
+            algorithm: Algorithm::Ed25519,
+            custody: Custody::Declared,
+            sequence: 0,
+            key_id: key_id(&archival.public()),
+            public: archival.public(),
+            effective: 0,
+            evidence: [0; 32],
+            endorsement: [0; 64],
+        };
+        entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&archive));
+        KeyRegistry::new(trust.clone())
+            .append(&entry, &mut journal, &mut keys)
+            .unwrap();
+    }
+    let signing = ArchiveSigning {
+        trust: trust.clone(),
+        journal_id: 1,
+        time_evidence_journal_id: Some(2),
+        config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+        signer: Box::new(archival),
+    };
+    let agent = ArchiveHandle::spawn_signing(StdDisk, &dir, sealing(), signing).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    let entry = Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [1, 0, 2, 3, 4],
+        recording: id,
+        start: 0,
+        end,
+        min_time: 1000,
+        max_time: 2000,
+        granularity: 1,
+        bound_min_ns: 150,
+        bound_max_ns: 160,
+        calibration: [0xAA; 32],
+        utc_reference: [0xBB; 32],
+        tick_fs: 1_000_000,
+    };
+    assert_eq!(agent.record_time_evidence(entry).unwrap(), 0);
+    let past = Entry {
+        start: end,
+        end: end + 64,
+        ..entry
+    };
+    assert!(matches!(
+        agent.record_time_evidence(past),
+        Err(AgentError::TimeEvidenceUnsealed { sealed, .. }) if sealed == end
+    ));
+    // karyos#1138 review P2: a recording this Archive never sealed is
+    // refused, never read as sealed to zero, even for an empty range.
+    let unknown = Entry {
+        recording: id + 1000,
+        start: 0,
+        end: 0,
+        ..entry
+    };
+    assert!(matches!(
+        agent.record_time_evidence(unknown),
+        Err(AgentError::TimeEvidenceNoSeal { recording }) if recording == id + 1000
+    ));
+    // Two signing polls, a second apart.
+    std::thread::sleep(Duration::from_millis(2_500));
+    agent.shutdown().unwrap();
+
+    assert_eq!(read_sealed(StdDisk, &dir).unwrap(), [entry]);
+    let mut journal = IntegrityJournal::open(StdDisk, &entries).unwrap().journal;
+    let records = journal.records().unwrap();
+    let mut disk = StdDisk;
+    let keys: Vec<[u8; REGISTRY_ENTRY_LENGTH]> =
+        read_entries(&mut disk, &entries, KEYS_FILE).unwrap();
+    let registry = KeyRegistry::replay(trust, &records, &keys).unwrap().0;
+    let heads: Vec<[u8; SIGNED_HEAD_LENGTH]> =
+        read_entries(&mut disk, &entries, HEADS_FILE).unwrap();
+    assert!(!heads.is_empty(), "the entries' journal is signed");
+    let last = SignedHead::decode(heads.last().unwrap()).unwrap();
+    assert!(matches!(
+        registry.verify(&last, None),
+        HeadVerdict::Trusted { .. }
+    ));
+    assert_eq!(last.head.counter, records.last().unwrap().counter);
+    // karyos#1138 review P2: the entries' journal is signed as its own
+    // journal, never as the integrity journal.
+    assert_eq!(last.head.journal_id, 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Without `time-evidence/`, an entry is refused.
+#[test]
+fn an_archive_without_time_evidence_refuses_an_entry() {
+    use crate::integrity::time::{Source, SyncState};
+    use crate::integrity::time_evidence::Entry;
+    let dir = temp_dir("no-time-evidence");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let entry = Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [1, 0, 2, 3, 4],
+        recording: 1,
+        start: 0,
+        end: 0,
+        min_time: 0,
+        max_time: 0,
+        granularity: 1,
+        bound_min_ns: u64::MAX,
+        bound_max_ns: u64::MAX,
+        calibration: [0; 32],
+        utc_reference: [0; 32],
+        tick_fs: 1,
+    };
+    assert!(matches!(
+        agent.record_time_evidence(entry),
+        Err(AgentError::NoTimeEvidence)
+    ));
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1138 review P2: an entry is admitted only when its whole
+/// `[start, end)` lies within the sealed `[first, end)` of its recording,
+/// a nonzero first included.
+#[test]
+fn time_evidence_needs_its_whole_range_sealed() {
+    use crate::integrity::time::{Source, SyncState};
+    use crate::integrity::time_evidence::Entry;
+    let entry = |start: u64, end: u64| Entry {
+        source: Source::Gnss,
+        sync_state: SyncState::Synchronised,
+        clock: [1, 0, 2, 3, 4],
+        recording: 3,
+        start,
+        end,
+        min_time: 0,
+        max_time: 0,
+        granularity: 1,
+        bound_min_ns: 150,
+        bound_max_ns: 160,
+        calibration: [0; 32],
+        utc_reference: [0xBB; 32],
+        tick_fs: 1,
+    };
+    let sealed = Some((100, 200));
+    assert!(super::admit_time_evidence(sealed, &entry(100, 200)).is_ok());
+    assert!(super::admit_time_evidence(sealed, &entry(150, 150)).is_ok());
+    for (start, end) in [(50, 150), (0, 0), (0, 200), (150, 201), (150, 100)] {
+        assert!(
+            matches!(
+                super::admit_time_evidence(sealed, &entry(start, end)),
+                Err(AgentError::TimeEvidenceUnsealed {
+                    first: 100,
+                    sealed: 200,
+                    ..
+                })
+            ),
+            "[{start}, {end})"
+        );
+    }
+    assert!(matches!(
+        super::admit_time_evidence(None, &entry(0, 0)),
+        Err(AgentError::TimeEvidenceNoSeal { recording: 3 })
+    ));
 }
 
 /// The answer to a posted retention command, waiting up to five seconds.

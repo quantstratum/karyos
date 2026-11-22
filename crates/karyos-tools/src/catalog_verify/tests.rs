@@ -802,9 +802,10 @@ fn verify_reports_a_sealed_group_journal_and_its_tampering() {
 
 /// An archive directory whose only content is two time evidence entries,
 /// sealed in `time-evidence/`, the head there signed and anchored by the
-/// operator (karyos#1065). The first entry meets a 1000 ns requirement,
-/// the second has no evidence.
-fn time_archive(name: &str) -> Archive {
+/// operator (karyos#1065) as journal `journal_id`, the trust file's
+/// `time-journal 1`. The first entry meets a 1000 ns requirement, the
+/// second has no evidence.
+fn time_archive(name: &str, journal_id: u64) -> Archive {
     use karyos_archive::integrity::time::{Source, SyncState};
     use karyos_archive::integrity::time_evidence::{Entry, EntryStore, NO_BOUND, entries_dir};
 
@@ -871,7 +872,7 @@ fn time_archive(name: &str) -> Archive {
     let last = records.last().unwrap();
     let head = ChainHead {
         archive_id: ARCHIVE,
-        journal_id: 0,
+        journal_id,
         counter: last.counter,
         digest: last.digest(),
     };
@@ -895,7 +896,7 @@ fn time_archive(name: &str) -> Archive {
     std::fs::write(
         archive.trust(),
         format!(
-            "archive {}\nauthority {}\njournal 0\n",
+            "archive {}\nauthority {}\njournal 0\ntime-journal 1\n",
             hex(&ARCHIVE),
             hex(&authority.public())
         ),
@@ -927,7 +928,7 @@ fn time_run(archive: &Archive, extra: &[&str]) -> (u8, String, String) {
 /// combined, apart from integrity; none without a requirement.
 #[test]
 fn verify_reports_the_time_verdict_of_verified_entries() {
-    let archive = time_archive("time");
+    let archive = time_archive("time", 1);
     let (status, out, err) = time_run(&archive, &[]);
     assert_eq!((status, err.as_str()), (0, ""), "{out}");
     assert!(
@@ -953,23 +954,62 @@ fn verify_reports_the_time_verdict_of_verified_entries() {
         out.contains("\"time\":{\"verdict\":\"no_evidence\",\"entries\":[{\"recording\":7,\"start\":0,\"end\":4096,\"domain\":3,\"epoch\":4,\"verdict\":\"met\"}"),
         "{out}"
     );
-    // Without the anchors the entries do not verify: no `met`.
-    let mut argv: Vec<OsString> = vec![
-        archive.dir().into(),
-        "--trust".into(),
-        archive.trust().into(),
-        "--time-requirement".into(),
-        "1000:1".into(),
-    ];
-    argv.truncate(5);
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    let _ = run_verify(argv, &mut out, &mut err);
-    let out = String::from_utf8(out).unwrap();
-    assert!(!out.contains(" met\n"), "{out}");
+    // The entries' journal has its own anchor store: a requirement
+    // without it is a usage error, never an unverified `no_evidence`.
+    assert_eq!(
+        usage(&["d", "--time-requirement", "1000:1"]),
+        UsageError::TimeAnchorsRequired
+    );
     assert_eq!(
         usage(&["d", "--time-requirement", "x"]),
         UsageError::TimeRequirement
     );
+}
+
+/// karyos#1138 review P2: the entries' journal is verified as the trust
+/// file's `time-journal`, never as the integrity journal: a head and
+/// anchor naming the integrity journal's identity is `WrongJournal`, so
+/// its entries have no evidence.
+#[test]
+fn time_evidence_anchored_as_another_journal_has_no_evidence() {
+    let archive = time_archive("time-wrong-journal", 0);
+    let (_, out, _) = time_run(&archive, &["--time-requirement", "1000:1"]);
+    assert!(
+        out.contains("time recording 7 [0, 4096) clock 3:4 no_evidence"),
+        "{out}"
+    );
+    assert!(out.ends_with("time verdict: no_evidence\n"), "{out}");
+}
+
+/// karyos#1128: the time evidence journal's identity is the trust
+/// file's `time-journal`, never guessed and never the journal's own;
+/// without that line, time evidence is refused with a clear error.
+#[test]
+fn the_time_journal_is_another_than_the_journal() {
+    use super::parse_trust_journals;
+    let base = format!("archive {}\nauthority {}\n", hex(&ARCHIVE), hex(&[3; 32]));
+    assert_eq!(parse_trust_journals(&base).unwrap().3, None);
+    let explicit = format!("{base}journal 4\ntime-journal 9\n");
+    let parsed = parse_trust_journals(&explicit).unwrap();
+    assert_eq!((parsed.2, parsed.3), (4, Some(9)));
+    assert_eq!(
+        parse_trust_journals(&format!("{base}journal 4\ntime-journal 4\n")).unwrap_err(),
+        TrustError::TimeJournal
+    );
+    // A time verdict asked of a trust file with no `time-journal` line.
+    let archive = time_archive("time-no-journal-line", 1);
+    std::fs::write(
+        archive.trust(),
+        format!(
+            "archive {}\nauthority {}\njournal 0\n",
+            hex(&ARCHIVE),
+            hex(&[3; 32])
+        ),
+    )
+    .unwrap();
+    let (status, _, err) = time_run(&archive, &["--time-requirement", "1000:1"]);
+    assert_eq!(status, 2, "{err}");
+    assert!(err.contains("no time-journal line"), "{err}");
 }
 
 /// karyos#1087: each copy the chain commits is reported with its state
