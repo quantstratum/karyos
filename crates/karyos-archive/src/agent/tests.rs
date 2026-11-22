@@ -4537,3 +4537,33 @@ fn a_verification_never_holds_a_replay() {
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// karyos#1135: the "verification runs" guard is cleared before the
+/// answer is sent, so a second verification posted the moment the first
+/// answers is never refused as busy. Repeated, since the refusal it pins
+/// was a race.
+#[test]
+fn a_verification_retried_on_its_answer_is_not_refused() {
+    let dir = temp_dir("verify-retry");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let (id, _) = sealed_recording(&agent);
+    let answered = |verify: &Posted<retention::Verified>| {
+        for _ in 0..10_000 {
+            if let Some(answer) = verify.try_answer() {
+                return answer;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        panic!("no answer");
+    };
+    let mut verify = agent.post_verify(id).unwrap();
+    for round in 0..50 {
+        let answer = answered(&verify);
+        assert!(matches!(answer, Ok(Ok(_))), "round {round}: {answer:?}");
+        // At once, on the answer: never "a verification runs".
+        verify = agent.post_verify(id).unwrap();
+    }
+    assert!(matches!(answered(&verify), Ok(Ok(_))));
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

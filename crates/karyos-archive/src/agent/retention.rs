@@ -212,8 +212,11 @@ impl<D: Disk + Clone> State<D> {
             .spawn(move || {
                 // Cleared on every exit, a panic's unwind included, so a
                 // failed verification never blocks the next one.
-                let _clear = Clear(verifying);
+                let clear = Clear(verifying);
                 let verified = work.run();
+                // Cleared before the answer, so a client retrying on it
+                // is never told a verification still runs (karyos#1135).
+                drop(clear);
                 let _ = worker_reply.send(Ok(verified));
             });
         if let Err(error) = spawned {
