@@ -508,10 +508,17 @@ fn a_long_trace_on_run_takes_bounded_time() {
 
 /// The child part of the wire workloads: the run starts this binary
 /// again with `--exact wire_child`, and the environment names the role.
+/// A failed role exits with a failing status and one line on standard
+/// error, as the `karyos-bench` binary's child does, never a panic: the
+/// fault tests make a child fail on purpose ("receiver stopped before the
+/// sender finished"), and a panic there read as a failure in a passing
+/// run's log (karyos#993). The parent judges the child by its status.
 #[test]
 fn wire_child() {
-    if let Some(result) = karyos_bench::wire::process::child() {
-        result.unwrap_or_else(|cause| panic!("{cause}"));
+    if let Some(Err(cause)) = karyos_bench::wire::process::child() {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "karyos-bench wire child: {cause}");
+        std::process::exit(1);
     }
 }
 
