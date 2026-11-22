@@ -189,7 +189,9 @@ pub struct StartRecording<'a> {
 /// [`Mode`] as a tied field of the derive: the mode at 32, the on-lap byte
 /// at 33 (karyos#1104).
 mod mode_on_lap {
-    use super::{Block, CodecError, Encoder, Mode, OnLap, invalid_enum, out_of_range};
+    use super::{
+        Block, CodecError, Encoder, Mode, OnLap, StartRecording, invalid_enum, out_of_range,
+    };
 
     pub(super) fn read(block: &Block<'_>) -> Result<Mode, CodecError> {
         match (block.u8(32)?, block.u8(33)?) {
@@ -206,7 +208,7 @@ mod mode_on_lap {
         }
     }
 
-    pub(super) fn write(encoder: &mut Encoder<'_>, mode: &Mode) -> Result<(), CodecError> {
+    fn write_value(encoder: &mut Encoder<'_>, mode: &Mode) -> Result<(), CodecError> {
         let (mode, on_lap) = match mode {
             Mode::Required => (1, 0),
             Mode::Async {
@@ -219,12 +221,22 @@ mod mode_on_lap {
         encoder.u8(32, mode)?;
         encoder.u8(33, on_lap)
     }
+
+    /// The message's `mode`, as the derive writes a tied field.
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &StartRecording<'_>,
+    ) -> Result<(), CodecError> {
+        write_value(encoder, &message.mode)
+    }
 }
 
 /// [`SyncPolicy`] as a tied field of the derive: the policy at 34, its
 /// interval at 8, nonzero exactly for `Every` (karyos#1104).
 mod sync_policy {
-    use super::{Block, CodecError, Encoder, SyncPolicy, invalid_enum, out_of_range};
+    use super::{
+        Block, CodecError, Encoder, StartRecording, SyncPolicy, invalid_enum, out_of_range,
+    };
 
     pub(super) fn read(block: &Block<'_>) -> Result<SyncPolicy, CodecError> {
         let interval = block.u64(8)?;
@@ -240,7 +252,7 @@ mod sync_policy {
         }
     }
 
-    pub(super) fn write(encoder: &mut Encoder<'_>, policy: &SyncPolicy) -> Result<(), CodecError> {
+    fn write_value(encoder: &mut Encoder<'_>, policy: &SyncPolicy) -> Result<(), CodecError> {
         let (policy, interval) = match *policy {
             SyncPolicy::None => (0, 0),
             SyncPolicy::PerSegment => (1, 0),
@@ -249,6 +261,14 @@ mod sync_policy {
         };
         encoder.u64(8, interval)?;
         encoder.u8(34, policy)
+    }
+
+    /// The message's `sync_policy`, as the derive writes a tied field.
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &StartRecording<'_>,
+    ) -> Result<(), CodecError> {
+        write_value(encoder, &message.sync_policy)
     }
 }
 
@@ -577,7 +597,7 @@ pub struct Replay<'a> {
 /// at 32, nonzero exactly for `Scaled` (karyos#1104).
 mod replay_rate {
     use super::{
-        Block, CodecError, Encoder, MAX_SCALE_PPM, ReplayRate, invalid_enum, out_of_range,
+        Block, CodecError, Encoder, MAX_SCALE_PPM, Replay, ReplayRate, invalid_enum, out_of_range,
     };
 
     pub(super) fn read(block: &Block<'_>) -> Result<ReplayRate, CodecError> {
@@ -592,7 +612,7 @@ mod replay_rate {
         }
     }
 
-    pub(super) fn write(encoder: &mut Encoder<'_>, rate: &ReplayRate) -> Result<(), CodecError> {
+    fn write_value(encoder: &mut Encoder<'_>, rate: &ReplayRate) -> Result<(), CodecError> {
         let (rate, scale) = match *rate {
             ReplayRate::Full => (1, 0),
             ReplayRate::AsRecorded => (2, 0),
@@ -601,6 +621,11 @@ mod replay_rate {
         };
         encoder.u32(32, scale)?;
         encoder.u8(40, rate)
+    }
+
+    /// The message's `rate`, as the derive writes a tied field.
+    pub(super) fn write(encoder: &mut Encoder<'_>, message: &Replay<'_>) -> Result<(), CodecError> {
+        write_value(encoder, &message.rate)
     }
 }
 
@@ -800,7 +825,8 @@ impl RecordingDescriptor<'_> {
 /// [`RecordingState`] as a tied field of the derive (karyos#1104).
 mod recording_state {
     use super::{
-        Block, CodecError, Encoder, RecordingState, Stop, StopReason, invalid_enum, out_of_range,
+        Block, CodecError, Encoder, RecordingDescriptor, RecordingState, Stop, StopReason,
+        invalid_enum, out_of_range,
     };
 
     pub(super) fn read(block: &Block<'_>) -> Result<RecordingState, CodecError> {
@@ -833,10 +859,7 @@ mod recording_state {
         Ok(state)
     }
 
-    pub(super) fn write(
-        encoder: &mut Encoder<'_>,
-        state: &RecordingState,
-    ) -> Result<(), CodecError> {
+    fn write_value(encoder: &mut Encoder<'_>, state: &RecordingState) -> Result<(), CodecError> {
         let (stop, written, time, reason, incomplete) = match *state {
             RecordingState::Recording {
                 written,
@@ -856,12 +879,20 @@ mod recording_state {
         encoder.u8(108, reason)?;
         encoder.bool(109, incomplete)
     }
+
+    /// The message's `state`, as the derive writes a tied field.
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &RecordingDescriptor<'_>,
+    ) -> Result<(), CodecError> {
+        write_value(encoder, &message.state)
+    }
 }
 
 /// [`Geometry`] as a tied field of the derive: the segment length at 56,
 /// the term length at 96 (karyos#1104).
 mod geometry {
-    use super::{Block, CodecError, Encoder, Geometry, out_of_range};
+    use super::{Block, CodecError, Encoder, Geometry, RecordingDescriptor, out_of_range};
 
     pub(super) fn read(block: &Block<'_>) -> Result<Geometry, CodecError> {
         let term_length = block.u32(96)?;
@@ -874,9 +905,17 @@ mod geometry {
         })
     }
 
-    pub(super) fn write(encoder: &mut Encoder<'_>, geometry: &Geometry) -> Result<(), CodecError> {
+    fn write_value(encoder: &mut Encoder<'_>, geometry: &Geometry) -> Result<(), CodecError> {
         encoder.u64(56, geometry.segment_length())?;
         encoder.u32(96, geometry.term_length())
+    }
+
+    /// The message's `geometry`, as the derive writes a tied field.
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &RecordingDescriptor<'_>,
+    ) -> Result<(), CodecError> {
+        write_value(encoder, &message.geometry)
     }
 }
 
@@ -955,7 +994,9 @@ impl RecordingSignal {
 
 /// [`Signal`] as a tied field of the derive (karyos#1104).
 mod signal {
-    use super::{Block, CodecError, Encoder, Signal, StopReason, invalid_enum, out_of_range};
+    use super::{
+        Block, CodecError, Encoder, RecordingSignal, Signal, StopReason, invalid_enum, out_of_range,
+    };
 
     pub(super) fn read(block: &Block<'_>) -> Result<Signal, CodecError> {
         let reason = block.u8(25)?;
@@ -974,7 +1015,7 @@ mod signal {
         }
     }
 
-    pub(super) fn write(encoder: &mut Encoder<'_>, signal: &Signal) -> Result<(), CodecError> {
+    fn write_value(encoder: &mut Encoder<'_>, signal: &Signal) -> Result<(), CodecError> {
         let (signal, reason, incomplete) = match *signal {
             Signal::Started => (1, 0, false),
             Signal::Stopped { reason, incomplete } => (2, reason.code(), incomplete),
@@ -983,6 +1024,14 @@ mod signal {
         encoder.u8(24, signal)?;
         encoder.u8(25, reason)?;
         encoder.bool(26, incomplete)
+    }
+
+    /// The message's `signal`, as the derive writes a tied field.
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &RecordingSignal,
+    ) -> Result<(), CodecError> {
+        write_value(encoder, &message.signal)
     }
 }
 
