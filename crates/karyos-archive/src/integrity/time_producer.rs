@@ -90,10 +90,14 @@ impl Snapshot {
         for words in records {
             let digest = record_digest(words);
             match ClockRecord::decode(words) {
-                Ok(ClockRecord::Calibration(calibration)) => {
+                // The zero tuple is "provenance unknown": a record naming
+                // it is never matched (docs#975).
+                Ok(ClockRecord::Calibration(calibration))
+                    if !is_zero(&calibration.from) && !is_zero(&calibration.to) =>
+                {
                     snapshot.calibrations.push((calibration, digest));
                 }
-                Ok(ClockRecord::UtcReference(reference)) => {
+                Ok(ClockRecord::UtcReference(reference)) if !is_zero(&reference.clock) => {
                     snapshot.references.push((reference, digest));
                 }
                 _ => {}
@@ -101,6 +105,14 @@ impl Snapshot {
         }
         snapshot
     }
+}
+
+/// Whether `clock` is the reserved five word zero tuple.
+const fn is_zero(clock: &ClockKey) -> bool {
+    matches!(clock.observer.driver, [0, 0])
+        && clock.observer.journal == 0
+        && clock.domain == 0
+        && clock.epoch == 0
 }
 
 /// The SHA-256 of a record's 144 little-endian bytes.
@@ -149,6 +161,8 @@ pub fn produce(
     clock: Option<&EventClock>,
     snapshot: &Snapshot,
 ) -> Vec<Entry> {
+    // A declaration of the reserved zero tuple declares nothing.
+    let clock = clock.filter(|clock| clock.clock != [0; 5]);
     let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
     let complete = clock.is_some_and(|clock| complete(snapshot, &clock.key(), largest));
     let mut entries: Vec<(Provenance, Entry)> = Vec::new();

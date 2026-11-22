@@ -224,3 +224,46 @@ fn a_timer_from_an_earlier_session_is_not_proven() {
 fn no_events_no_entries() {
     assert!(produce(7, &[], Some(&clock()), &Snapshot::new(&records(), true)).is_empty());
 }
+
+/// docs#975: records naming the zero tuple are never matched, and a
+/// declaration of it declares nothing.
+#[test]
+fn the_zero_tuple_is_never_a_clock() {
+    let zero_target = Calibration {
+        from: key(A),
+        to: key([0; 5]),
+        reference: 0,
+        offset: 0,
+        offset_uncertainty: 0,
+        drift: 0,
+        drift_uncertainty: 0,
+        valid_from: 0,
+        valid_to: 100,
+    }
+    .encode()
+    .unwrap();
+    // The ordinary calibration over [0, 100] competes with one into the
+    // zero tuple: skipped, so coverage stays unique.
+    let mut with_zero = records();
+    with_zero.push(zero_target);
+    let entries = produce(
+        7,
+        &events(&[(40, true)]),
+        Some(&clock()),
+        &Snapshot::new(&with_zero, true),
+    );
+    assert_ne!(entries[0].bound_min_ns, NO_BOUND);
+    let zero = EventClock {
+        clock: [0; 5],
+        granularity: 1,
+    };
+    let entries = produce(
+        7,
+        &events(&[(40, true)]),
+        Some(&zero),
+        &Snapshot::new(&records(), true),
+    );
+    assert_eq!(entries[0].clock, [0; 5]);
+    assert_eq!(entries[0].granularity, 0);
+    assert_eq!(entries[0].bound_min_ns, NO_BOUND);
+}
