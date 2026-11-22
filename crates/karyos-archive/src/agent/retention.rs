@@ -61,7 +61,14 @@ pub(super) fn open<D: Disk + Clone>(disk: &D, dir: &Path) -> Result<Engine<D>, I
     let operations = Ledger::<D, OPERATION_LENGTH>::open(disk.clone(), dir, OPERATIONS_FILE)?;
     let pending = Ledger::<D, MARKER_LENGTH>::open(disk.clone(), dir, PENDING_HOLDS_FILE)?;
     let records = operations.entries().to_vec();
-    Ok(Retention::recover(operations, Some(&records), pending))
+    let mut engine = Retention::recover(operations, Some(&records), pending);
+    // A purge releases each removed segment's immutable attribute first,
+    // once its checks passed (karyos#995, karyos#1087).
+    #[cfg(target_os = "linux")]
+    engine.set_immutability(Box::new(crate::integrity::copies::ImmutableAttribute));
+    #[cfg(not(target_os = "linux"))]
+    engine.set_immutability(Box::new(crate::integrity::copies::NoImmutability));
+    Ok(engine)
 }
 
 /// The store anchors would be confirmed by: the agent keeps none.

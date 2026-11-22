@@ -103,6 +103,44 @@ pub fn set_immutable(path: &Path, immutable: bool) -> Result<Immutability, SysEr
     }
 }
 
+/// Whether the regular file at `path` carries the immutable attribute
+/// (`FS_IOC_GETFLAGS`, `FS_IMMUTABLE_FL`), read through `rustix`'s safe
+/// wrapper as [`set_immutable`] reads it: `None` where the file system
+/// has no such attribute. `karyos-catalog verify` reports it per copy
+/// (karyos#1087).
+///
+/// # Errors
+///
+/// [`SysError::Os`] when the file cannot be opened or its flags read for
+/// another reason than missing support, and (`EINVAL`) for a path that is
+/// not a regular file.
+pub fn is_immutable(path: &Path) -> Result<Option<bool>, SysError> {
+    use rustix::fs::{FileType, IFlags, Mode, OFlags, fstat, ioctl_getflags, open};
+    use rustix::io::Errno;
+
+    let os = |operation: &'static str| {
+        move |errno: Errno| SysError::Os {
+            operation,
+            errno: errno.raw_os_error(),
+        }
+    };
+    let file = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(os("open"))?;
+    let stat = fstat(&file).map_err(os("fstat"))?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(os("not a regular file")(Errno::INVAL));
+    }
+    match ioctl_getflags(&file) {
+        Ok(flags) => Ok(Some(flags.contains(IFlags::IMMUTABLE))),
+        Err(Errno::NOTTY | Errno::OPNOTSUPP | Errno::INVAL) => Ok(None),
+        Err(errno) => Err(os("ioctl(FS_IOC_GETFLAGS)")(errno)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, reason = "tests, as ADR-0007 allows")]
@@ -207,5 +245,22 @@ mod tests {
             })
         ));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A plain file reads as not immutable, or as no attribute where the
+    /// file system has none; a directory is refused (karyos#1087).
+    #[cfg(not(miri))]
+    #[test]
+    #[cfg_attr(miri, ignore = "host syscalls")]
+    fn the_immutable_attribute_of_a_file_is_read() {
+        let dir = std::env::temp_dir().join(format!("karyos-fs-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plain");
+        std::fs::write(&path, b"x").unwrap();
+        assert!(matches!(is_immutable(&path).unwrap(), Some(false) | None));
+        assert!(is_immutable(&dir).is_err());
+        assert!(is_immutable(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
