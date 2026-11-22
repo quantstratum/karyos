@@ -845,6 +845,7 @@ enum Command {
     /// A replica's request (ADR-0091; karyos#1113).
     Replicate(
         crate::replication::ReplicateRecording,
+        usize,
         Reply<Receiver<crate::replication::transport::Outgoing>>,
     ),
     /// A replica's stop.
@@ -948,7 +949,7 @@ impl core::fmt::Debug for Command {
             Self::StopGroup(id, _) => f.debug_tuple("StopGroup").field(id).finish(),
             Self::Retain(request, _) => f.debug_tuple("Retain").field(request).finish(),
             Self::Verify(id, _) => f.debug_tuple("Verify").field(id).finish(),
-            Self::Replicate(request, _) => f.debug_tuple("Replicate").field(request).finish(),
+            Self::Replicate(request, _, _) => f.debug_tuple("Replicate").field(request).finish(),
             Self::StopReplication(stop, _) => f.debug_tuple("StopReplication").field(stop).finish(),
             Self::Shutdown(_) => f.write_str("Shutdown"),
         }
@@ -1168,6 +1169,8 @@ impl ArchiveHandle {
     /// (ADR-0091; karyos#1113), posted. The answer is the stream of
     /// messages the agent sends for it (its bytes, its seals, its status),
     /// or [`AgentError::ReplicationRefused`] with the code to answer.
+    /// Each bytes message carries at most `chunk` bytes, so it fits the
+    /// stream that carries it.
     ///
     /// # Errors
     ///
@@ -1175,8 +1178,9 @@ impl ArchiveHandle {
     pub fn post_replicate(
         &self,
         request: crate::replication::ReplicateRecording,
+        chunk: usize,
     ) -> Result<Posted<Receiver<crate::replication::transport::Outgoing>>, AgentError> {
-        self.post(|reply| Command::Replicate(request, reply))
+        self.post(|reply| Command::Replicate(request, chunk, reply))
     }
 
     /// A replica's stop of its replication (ADR-0091), posted: the
@@ -2616,12 +2620,19 @@ where
     fn replicate(
         &mut self,
         request: crate::replication::ReplicateRecording,
+        chunk: usize,
     ) -> Result<Receiver<crate::replication::transport::Outgoing>, AgentError> {
-        use crate::replication::transport::Sender;
+        use crate::replication::transport::{Refusal, Sender};
         let id = request.recording_id;
-        let recording = self.catalog.get(id);
-        let known = recording.is_some() && self.integrity.is_some();
-        let start = recording.map_or(0, |recording| recording.start);
+        // Refused before the journal is read.
+        let Some(start) = self
+            .catalog
+            .get(id)
+            .filter(|_| self.integrity.is_some())
+            .map(|recording| recording.start)
+        else {
+            return Err(AgentError::ReplicationRefused(Refusal::UnknownRecording));
+        };
         let (seals, read) = match self.integrity.as_mut() {
             Some(integrity) => {
                 let records = integrity.journal.records()?;
@@ -2630,8 +2641,9 @@ where
             }
             None => (Vec::new(), 0),
         };
-        let sender = Sender::accept(request, known, start, &seals)
-            .map_err(AgentError::ReplicationRefused)?;
+        let sender = Sender::accept(request, true, start, &seals)
+            .map_err(AgentError::ReplicationRefused)?
+            .with_chunk(chunk);
         let store = if self.active.iter().any(|active| active.id == id) {
             None
         } else {
@@ -2733,7 +2745,8 @@ where
     }
 
     /// Each replication: what is queued is handed over, then, once the
-    /// queue is empty, the next sealed ranges, at most `budget` bytes.
+    /// queue is empty, the next sealed ranges, at most `budget` bytes for
+    /// all of them in one duty, and a status when one is due.
     fn replication_duty(&mut self, budget: u64, now: u64) -> bool {
         let ids: Vec<u64> = self
             .replications
@@ -2743,7 +2756,7 @@ where
             .filter(|id| !self.active.iter().any(|active| active.id == *id))
             .collect();
         self.reopen(&ids);
-        let budget = usize::try_from(budget).unwrap_or(usize::MAX);
+        let mut budget = usize::try_from(budget).unwrap_or(usize::MAX).max(1);
         let mut worked = false;
         let mut index = 0;
         while let Some(replication) = self.replications.get_mut(index) {
@@ -2794,12 +2807,23 @@ where
                     // Reopened at the top of the next duty.
                     (None, None) => Ok(()),
                 };
+                let sent: usize = out
+                    .iter()
+                    .map(|message| match message {
+                        crate::replication::transport::Outgoing::Bytes { bytes, .. } => bytes.len(),
+                        _ => 0,
+                    })
+                    .sum();
+                budget = budget.saturating_sub(sent);
                 if polled.is_err() {
                     self.replications.swap_remove(index);
                     continue;
                 }
                 // A status at least once a second (ADR-0091).
-                if out.is_empty()
+                let has_status = out.iter().any(|message| {
+                    matches!(message, crate::replication::transport::Outgoing::Status(_))
+                });
+                if !has_status
                     && replication.sender.done().is_none()
                     && now.saturating_sub(replication.status_at) >= REPLICATION_STATUS
                 {
@@ -3100,8 +3124,8 @@ where
                 let _ = reply.send(Ok(self.retain(request)));
             }
             Command::Verify(id, reply) => self.verify(id, reply),
-            Command::Replicate(request, reply) => {
-                let _ = reply.send(self.replicate(request));
+            Command::Replicate(request, chunk, reply) => {
+                let _ = reply.send(self.replicate(request, chunk));
             }
             Command::StopReplication(stop, reply) => {
                 self.stop_replication(stop);

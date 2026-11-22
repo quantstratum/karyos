@@ -69,6 +69,8 @@ pub struct Sender {
     sent_end: u64,
     /// Set once a final status was produced: nothing more is sent.
     done: Option<State>,
+    /// The most bytes one [`Outgoing::Bytes`] carries, 1 to [`MAX_CHUNK`].
+    chunk: usize,
 }
 
 impl Sender {
@@ -96,7 +98,16 @@ impl Sender {
             next: request.from,
             sent_end: request.from,
             done: None,
+            chunk: MAX_CHUNK,
         })
+    }
+
+    /// Caps each [`Outgoing::Bytes`] at `chunk` bytes, clamped to 1 to
+    /// [`MAX_CHUNK`], so each fits the stream that carries it.
+    #[must_use]
+    pub fn with_chunk(mut self, chunk: usize) -> Self {
+        self.chunk = chunk.clamp(1, MAX_CHUNK);
+        self
     }
 
     /// The request.
@@ -117,7 +128,7 @@ impl Sender {
     }
 
     /// Sends what is due, at most `budget` bytes of recording per call
-    /// (at least one chunk), so nothing is buffered without bound: for
+    /// (none when it is 0), each chunk at most the sender's chunk, so nothing is buffered without bound: for
     /// each range seal that follows what was sent, its bytes in chunks
     /// then the seal, up to `until`. A range cut by the budget goes on at
     /// the next call. On demand, then a [`State::CaughtUp`] status; when
@@ -155,7 +166,7 @@ impl Sender {
             })
             .collect();
         ranges.sort_by_key(|seal| seal.start);
-        let mut left = budget.max(MAX_CHUNK);
+        let mut left = budget;
         for seal in ranges {
             if seal.start != self.sent_end {
                 // A range that does not follow what was sent: a gap.
@@ -166,7 +177,7 @@ impl Sender {
                 if left == 0 {
                     return Ok(());
                 }
-                let chunk = MAX_CHUNK.min(left) as u64;
+                let chunk = self.chunk.min(left) as u64;
                 let to = seal.end.min(self.next.saturating_add(chunk));
                 let length = usize::try_from(to.saturating_sub(self.next))
                     .map_err(|_| SegmentError::PositionOverflow)?;

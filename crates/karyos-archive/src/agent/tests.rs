@@ -4545,7 +4545,7 @@ fn a_verification_never_holds_a_replay() {
 #[test]
 fn a_stopped_recording_replicates_on_demand() {
     use crate::replication::transport::{Outgoing, Refusal};
-    use crate::replication::{Mode, ReplicateRecording, State};
+    use crate::replication::{MAX_CHUNK, Mode, ReplicateRecording, State};
     let dir = temp_dir("replicate");
     let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
     let (id, all) = sealed_recording(&agent);
@@ -4556,12 +4556,12 @@ fn a_stopped_recording_replicates_on_demand() {
         until: u64::MAX,
         mode: Mode::OnDemand,
     };
-    let unknown = answer(agent.post_replicate(request(id + 100)));
+    let unknown = answer(agent.post_replicate(request(id + 100), MAX_CHUNK));
     assert!(matches!(
         unknown,
         Err(AgentError::ReplicationRefused(Refusal::UnknownRecording))
     ));
-    let messages = answer(agent.post_replicate(request(id))).unwrap();
+    let messages = answer(agent.post_replicate(request(id), 100)).unwrap();
     let mut bytes = Vec::new();
     let mut sealed_to = 0;
     let mut last = None;
@@ -4571,6 +4571,7 @@ fn a_stopped_recording_replicates_on_demand() {
                 start,
                 bytes: chunk,
             } => {
+                assert!(chunk.len() <= 100, "{}", chunk.len());
                 assert_eq!(start, u64::try_from(bytes.len()).unwrap());
                 bytes.extend_from_slice(&chunk);
             }

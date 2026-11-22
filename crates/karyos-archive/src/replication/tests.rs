@@ -472,6 +472,48 @@ mod transport {
         assert_eq!(counted, 1);
     }
 
+    /// karyos#1113: a budget below one chunk is kept, a budget of 0 sends
+    /// no bytes, and each chunk fits the sender's chunk; the whole still
+    /// arrives and counts.
+    #[test]
+    fn a_poll_keeps_a_small_budget_and_the_chunk_size() {
+        let (_dirs, source_dir, replica_dir) = dirs("small-budget");
+        let (mut store, seals) = source(&source_dir);
+        let mut sender = Sender::accept(request(0, u64::MAX, Mode::OnDemand), true, 0, &seals)
+            .unwrap()
+            .with_chunk(1000);
+        let mut out = Vec::new();
+        sender.poll(&mut store, &seals, false, 0, &mut out).unwrap();
+        assert!(
+            !out.iter()
+                .any(|message| matches!(message, Outgoing::Bytes { .. })),
+            "a budget of 0 sends no bytes"
+        );
+        let mut all = out;
+        let mut polls = 0;
+        while sender.done().is_none() {
+            let mut out = Vec::new();
+            sender
+                .poll(&mut store, &seals, false, 2500, &mut out)
+                .unwrap();
+            let mut bytes = 0;
+            for message in &out {
+                if let Outgoing::Bytes { bytes: chunk, .. } = message {
+                    assert!(chunk.len() <= 1000, "{}", chunk.len());
+                    bytes += chunk.len();
+                }
+            }
+            assert!(bytes <= 2500, "{bytes}");
+            all.extend(out);
+            polls += 1;
+            assert!(polls < 1000);
+        }
+        let (verdicts, status, counted) = deliver(&all, &replica_dir, false, (100, 40_100));
+        assert_eq!(verdicts.len(), 3);
+        assert_eq!(status.unwrap().state, State::CaughtUp);
+        assert_eq!(counted, 1);
+    }
+
     /// ADR-0094: a purge past the next position interrupts the request,
     /// whose status names the store's start above the last range sent;
     /// it decodes, and the same order in another state does not (P-7).

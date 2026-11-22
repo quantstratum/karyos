@@ -223,7 +223,22 @@ pub trait ResponseSink {
     /// Sends one message; `false` when there is no room yet, and the same
     /// message is offered again later.
     fn send(&mut self, message: &[u8]) -> bool;
+
+    /// The longest message [`ResponseSink::send`] ever accepts; a
+    /// replication's chunks are cut to fit it (karyos#1113).
+    fn max_message(&self) -> usize {
+        usize::MAX
+    }
 }
+
+/// A [`RecordingBytes`] message's length beyond its bytes.
+const RECORDING_BYTES_OVERHEAD: usize =
+    replication::RECORDING_BYTES.max_length as usize - replication::MAX_CHUNK;
+
+/// Replication messages taken from the agent per duty at most, and only
+/// while fewer than this many answers wait: the rest stay in the agent's
+/// bounded channel, so a slow reader holds the agent back (karyos#1113).
+const REPLICATION_FORWARD: usize = 8;
 
 /// The server's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -756,7 +771,20 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             Ok(ReplicationMessage::ReplicateRecording(request)) => {
                 let correlation_id = request.correlation_id;
                 let recording_id = request.recording_id;
-                let posted = self.agent.post_replicate(request);
+                let chunk = self
+                    .responses
+                    .max_message()
+                    .saturating_sub(RECORDING_BYTES_OVERHEAD);
+                if chunk == 0 {
+                    self.respond(
+                        correlation_id,
+                        0,
+                        ResponseCode::InvalidRequest,
+                        "response stream too short for replication",
+                    );
+                    return None;
+                }
+                let posted = self.agent.post_replicate(request, chunk);
                 self.posted(correlation_id, posted, |answer| Waiting::Replicate {
                     correlation_id,
                     recording_id,
@@ -794,14 +822,20 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
     /// schema 6 messages; a replication whose agent side ended is dropped.
     fn forward_replications(&mut self) -> bool {
         let mut worked = false;
+        let mut taken = 0;
         let mut index = 0;
         while let Some((correlation_id, recording_id, messages)) = self.replications.get(index) {
             let (correlation_id, recording_id) = (*correlation_id, *recording_id);
             let mut ended = false;
             let mut batch = Vec::new();
-            loop {
+            while taken < REPLICATION_FORWARD
+                && self.pending.len().saturating_add(batch.len()) < REPLICATION_FORWARD
+            {
                 match messages.try_recv() {
-                    Ok(message) => batch.push(message),
+                    Ok(message) => {
+                        batch.push(message);
+                        taken += 1;
+                    }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         ended = true;
