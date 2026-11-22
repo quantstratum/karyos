@@ -802,10 +802,10 @@ fn verify_reports_a_sealed_group_journal_and_its_tampering() {
 
 /// An archive directory whose only content is two time evidence entries,
 /// sealed in `time-evidence/`, the head there signed and anchored by the
-/// operator (karyos#1065) as journal `journal`, the trust file's
+/// operator (karyos#1065) as journal `journal_id`, the trust file's
 /// `time-journal 1`. The first entry meets a 1000 ns requirement, the
 /// second has no evidence.
-fn time_archive(name: &str, journal: u64) -> Archive {
+fn time_archive(name: &str, journal_id: u64) -> Archive {
     use karyos_archive::integrity::time::{Source, SyncState};
     use karyos_archive::integrity::time_evidence::{Entry, EntryStore, NO_BOUND, entries_dir};
 
@@ -872,7 +872,7 @@ fn time_archive(name: &str, journal: u64) -> Archive {
     let last = records.last().unwrap();
     let head = ChainHead {
         archive_id: ARCHIVE,
-        journal_id: journal,
+        journal_id,
         counter: last.counter,
         digest: last.digest(),
     };
