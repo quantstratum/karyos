@@ -1241,18 +1241,33 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
     /// holds, a hold, no authorisation. Never deletes. Used for what the
     /// check cannot see: no policy, no close time (ADR-0093).
     pub fn refuse_after_holds(&mut self, request: &PurgeRequest, last: PurgeRefusal) -> PurgeError {
-        let refusal = if self.intents.contains_key(&request.id) {
-            PurgeRefusal::DuplicateId { id: request.id }
-        } else if self.holds_unknown {
-            PurgeRefusal::HoldsUnknown
-        } else if self.holds.contains_key(&request.recording) {
-            PurgeRefusal::LegalHold
-        } else if !request.authorisation.authorised {
-            PurgeRefusal::NotAuthorised
-        } else {
-            last
-        };
+        let refusal = self.first_refusal(request).unwrap_or(last);
         self.refuse(request, refusal)
+    }
+
+    /// Refuses `request`, journalled, when a refusal that comes first in
+    /// [`Retention::check`] applies (a duplicate id, unknown holds, a hold,
+    /// no authorisation); `None`, journalling nothing, otherwise. Run
+    /// before anything that may fail on the recording's files, so a held
+    /// recording is answered `legal_hold`, never a store error (karyos#1121
+    /// review).
+    pub fn refuse_early(&mut self, request: &PurgeRequest) -> Option<PurgeError> {
+        let refusal = self.first_refusal(request)?;
+        Some(self.refuse(request, refusal))
+    }
+
+    fn first_refusal(&self, request: &PurgeRequest) -> Option<PurgeRefusal> {
+        if self.intents.contains_key(&request.id) {
+            Some(PurgeRefusal::DuplicateId { id: request.id })
+        } else if self.holds_unknown {
+            Some(PurgeRefusal::HoldsUnknown)
+        } else if self.holds.contains_key(&request.recording) {
+            Some(PurgeRefusal::LegalHold)
+        } else if !request.authorisation.authorised {
+            Some(PurgeRefusal::NotAuthorised)
+        } else {
+            None
+        }
     }
 
     fn refuse(&mut self, request: &PurgeRequest, refusal: PurgeRefusal) -> PurgeError {

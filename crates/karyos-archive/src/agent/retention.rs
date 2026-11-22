@@ -212,6 +212,11 @@ impl<D: Disk + Clone> State<D> {
                     .refuse_after_holds(&request, PurgeRefusal::NoCloseTime),
             );
         };
+        // Holds first: a held recording is answered `legal_hold` even when
+        // its files cannot be opened (karyos#1121 review).
+        if let Some(refused) = self.retention.refuse_early(&request) {
+            return purge_failed(&refused);
+        }
         // Read only (karyos#1121 review): validation changes nothing, so a
         // refused purge never cuts a damaged tail, and segments a local
         // copy made immutable open. Only an approved purge releases and

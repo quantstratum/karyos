@@ -4616,6 +4616,8 @@ fn a_purge_waits_for_the_verification_of_its_recording() {
 #[derive(Clone, Default)]
 struct Probe {
     immutable: Arc<AtomicBool>,
+    /// While set, a segment data file cannot be opened at all.
+    unreadable: Arc<AtomicBool>,
     modified: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -4645,6 +4647,11 @@ impl Disk for Probe {
     }
 
     fn open_read(&mut self, path: &Path) -> std::io::Result<Self::File> {
+        if self.unreadable.load(Ordering::Acquire)
+            && path.extension().is_some_and(|extension| extension == "seg")
+        {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
         StdDisk.open_read(path)
     }
 
@@ -4927,6 +4934,29 @@ fn a_start_cancels_an_unfinished_purge_under_a_hold() {
         RetentionAnswer::Refused("legal_hold".to_owned())
     );
     assert_eq!(segment_lengths(&dir), before);
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1121 review: a held recording whose segment files cannot be
+/// opened is answered `legal_hold`, never the store's error: holds are
+/// checked before the store is opened.
+#[test]
+fn a_held_purge_is_refused_before_the_store_opens() {
+    use crate::server::RetentionAnswer;
+
+    let dir = temp_dir("purge-held-unreadable");
+    let probe = Probe::default();
+    let agent = ArchiveHandle::spawn(probe.clone(), &dir, purge_config(0)).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let end = u64::try_from(all.len()).unwrap();
+    assert_eq!(answered(agent.post_hold(id)), RetentionAnswer::Done);
+    probe.unreadable.store(true, Ordering::Release);
+    assert_eq!(
+        answered(agent.post_purge(id, end, 1, 9)),
+        RetentionAnswer::Refused("legal_hold".to_owned())
+    );
+    probe.unreadable.store(false, Ordering::Release);
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
