@@ -1223,6 +1223,7 @@ fn the_hold_state_reports_none_held_pending_and_unknown() {
 fn a_release_whose_resolving_marker_fails_reports_pending_until_retried() {
     use crate::control::HoldState;
     let mut found = false;
+    let mut retried = false;
     for budget in 0..400 {
         // The setup, the restart's opening and the evidenced hold, then a
         // release on a disk that crashes after `budget` more units.
@@ -1253,15 +1254,23 @@ fn a_release_whose_resolving_marker_fails_reports_pending_until_retried() {
         // The journal holds the release; the marker is not written.
         assert_eq!(archive.retention.hold_state(RECORDING), HoldState::Pending);
         drop(archive);
-        let mut restarted = open(disk.after_crash(Survives::Everything));
-        assert_eq!(
-            restarted.retention.hold_state(RECORDING),
-            HoldState::Pending
-        );
-        restarted.retention.release_hold(RECORDING).unwrap();
-        assert_eq!(restarted.retention.hold_state(RECORDING), HoldState::None);
+        // After the crash the marker is either lost, and the hold stays
+        // pending until a retry writes it, or it reached the disk before
+        // the crash, and the release is done.
+        for survives in [Survives::Synced, Survives::Everything] {
+            let mut restarted = open(disk.after_crash(survives));
+            match restarted.retention.hold_state(RECORDING) {
+                HoldState::Pending => {
+                    retried = true;
+                    restarted.retention.release_hold(RECORDING).unwrap();
+                    assert_eq!(restarted.retention.hold_state(RECORDING), HoldState::None);
+                }
+                state => assert_eq!(state, HoldState::None, "{survives:?}"),
+            }
+        }
     }
     assert!(found, "no budget failed only the resolving marker");
+    assert!(retried, "no restart kept the release pending");
 }
 
 /// ADR-0101, read only: with an outstanding purge intent and a pending
