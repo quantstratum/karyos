@@ -1093,7 +1093,7 @@ fn test_log_buffer_required_set_transitions_limit_follows_and_never_decreases() 
 /// does not move; a required cell and an adopted one are refused.
 #[test]
 fn an_unadopted_optional_cell_is_raised_to_the_floor() {
-    let buffer = new_buffer(config(3, 3)).unwrap();
+    let buffer = Arc::new(new_buffer(config(3, 3)).unwrap());
     let mut conductor = buffer.conductor().unwrap();
     let optional = conductor
         .register_subscriber_with(Role::Optional, false, 9)
