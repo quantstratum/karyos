@@ -1203,7 +1203,7 @@ fn the_retention_state_refusals() {
     let mutated = |at: usize, value: u8| {
         let mut bytes = s1.clone();
         bytes[at] = value;
-        ControlMessage::decode(&bytes)
+        ControlMessage::decode(&bytes).map(|_| ())
     };
     // max_count 0 (block offset 16, byte 28) and above 1000.
     assert_eq!(
