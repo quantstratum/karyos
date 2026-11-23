@@ -446,7 +446,8 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
 mod exporter_tests {
     use super::*;
 
-    /// karyos#887: off loopback only with TLS, and TLS takes both files.
+    /// karyos#887: off loopback only with TLS and a token, and TLS takes
+    /// both files.
     #[test]
     fn a_non_loopback_address_needs_both_tls_files() {
         let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
@@ -454,8 +455,15 @@ mod exporter_tests {
             parse_exporter(&args("--listen 0.0.0.0:9464 --driver /d")),
             None
         );
+        assert_eq!(
+            parse_exporter(&args(
+                "--listen 0.0.0.0:9464 --driver /d --tls-cert /c --tls-key /k"
+            )),
+            None,
+            "off loopback without a token"
+        );
         let parsed = parse_exporter(&args(
-            "--listen 0.0.0.0:9464 --driver /d --tls-cert /c --tls-key /k",
+            "--listen 0.0.0.0:9464 --driver /d --tls-cert /c --tls-key /k --token-file /t",
         ))
         .unwrap();
         assert_eq!(parsed.tls, Some((PathBuf::from("/c"), PathBuf::from("/k"))));

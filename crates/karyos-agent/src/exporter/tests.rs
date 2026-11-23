@@ -1068,8 +1068,14 @@ mod over_tls {
             .filter(|suite| suite.version() == &rustls::version::TLS13)
             .map(|suite| format!("{:?}", suite.suite()))
             .collect();
-        assert!(!suites.is_empty());
-        println!("TLS 1.3 suites: {suites:?}");
+        assert_eq!(
+            suites,
+            [
+                "TLS13_AES_128_GCM_SHA256",
+                "TLS13_AES_256_GCM_SHA384",
+                "TLS13_CHACHA20_POLY1305_SHA256"
+            ]
+        );
     }
 
     /// The development and CI hosts have the provider's features.
