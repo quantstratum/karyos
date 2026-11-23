@@ -60,6 +60,7 @@ pub mod signing;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_key;
 pub mod tiering;
+pub mod tiering_offline;
 pub mod time;
 pub mod time_evidence;
 pub mod time_producer;
@@ -78,6 +79,8 @@ mod retention_tests;
 mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tiering_offline_tests;
 #[cfg(test)]
 mod tiering_tests;
 #[cfg(test)]

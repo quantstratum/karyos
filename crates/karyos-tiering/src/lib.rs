@@ -32,13 +32,14 @@ use hyper::body::{Body, Bytes, Frame, Incoming, SizeHint};
 use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use karyos_archive::integrity::copies::Enforcement;
-use karyos_archive::integrity::tiering::{ObjectKey, ObjectStore};
+use karyos_archive::integrity::tiering::{LockMode, ObjectKey, ObjectRetention, ObjectStore};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, RootCertStore};
 use rusty_s3::{Bucket, Credentials, S3Action, UrlStyle};
 use tokio_rustls::TlsConnector;
 
 pub mod cpu;
+pub mod tool;
 
 /// How long a signed request stays valid.
 const SIGNED_FOR: Duration = Duration::from_secs(300);
@@ -121,7 +122,13 @@ pub struct S3Store {
     object_lock: bool,
     timeout: Duration,
     max_object: usize,
+    /// The version id each object's last PUT wrote, by name: the version
+    /// whose retention [`ObjectStore::retention`] reads back.
+    versions: std::collections::HashMap<String, String>,
 }
+
+/// A response's status, headers (names in lower case) and body.
+type Response = (StatusCode, Vec<(String, String)>, Vec<u8>);
 
 impl std::fmt::Debug for S3Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -175,6 +182,7 @@ impl S3Store {
             object_lock: config.object_lock,
             timeout: config.timeout,
             max_object: config.max_object,
+            versions: std::collections::HashMap::new(),
         })
     }
 
@@ -190,7 +198,7 @@ impl S3Store {
         url: &url::Url,
         headers: &[(String, String)],
         body: Option<Bytes>,
-    ) -> io::Result<(StatusCode, Vec<u8>)> {
+    ) -> io::Result<Response> {
         if tokio::runtime::Handle::try_current().is_ok() {
             return Err(io::Error::other(
                 "the object store is synchronous: call it outside a Tokio runtime",
@@ -237,6 +245,16 @@ impl S3Store {
                 .await
                 .map_err(io::Error::other)?;
             let status = response.status();
+            let headers: Vec<(String, String)> = response
+                .headers()
+                .iter()
+                .filter_map(|(name, value)| {
+                    Some((
+                        name.as_str().to_ascii_lowercase(),
+                        value.to_str().ok()?.to_owned(),
+                    ))
+                })
+                .collect();
             let bytes = if status.is_success() {
                 body_within(response.into_body(), self.max_object)
                     .await
@@ -244,7 +262,7 @@ impl S3Store {
             } else {
                 body_prefix(response.into_body(), ERROR_BODY).await
             };
-            Ok::<_, io::Error>((status, bytes))
+            Ok::<_, io::Error>((status, headers, bytes))
         };
         self.runtime.block_on(async {
             tokio::time::timeout(self.timeout, call)
@@ -282,7 +300,7 @@ impl ObjectStore for S3Store {
             action.headers_mut().insert(header.clone(), value.clone());
         }
         let url = action.sign(SIGNED_FOR);
-        let (status, body) = self.send(
+        let (status, answered, body) = self.send(
             hyper::Method::PUT,
             &url,
             &headers,
@@ -293,6 +311,21 @@ impl ObjectStore for S3Store {
                 "PutObject {name}: status {status}: {}",
                 String::from_utf8_lossy(&body)
             )));
+        }
+        match header(&answered, "x-amz-version-id") {
+            Some(version) => {
+                self.versions.insert(name, version.to_owned());
+            }
+            // Object lock needs a versioned bucket: an answer without a
+            // version cannot be read back by version.
+            None if self.object_lock => {
+                return Err(io::Error::other(format!(
+                    "PutObject {name}: no x-amz-version-id under object lock"
+                )));
+            }
+            None => {
+                self.versions.remove(&name);
+            }
         }
         Ok(if self.object_lock {
             Enforcement::ObjectLock
@@ -307,7 +340,7 @@ impl ObjectStore for S3Store {
             .bucket
             .get_object(Some(&self.credentials), &name)
             .sign(SIGNED_FOR);
-        let (status, body) = self.send(hyper::Method::GET, &url, &[], None)?;
+        let (status, _, body) = self.send(hyper::Method::GET, &url, &[], None)?;
         match status {
             StatusCode::OK => Ok(body),
             StatusCode::NOT_FOUND => Err(io::Error::from(io::ErrorKind::NotFound)),
@@ -316,6 +349,114 @@ impl ObjectStore for S3Store {
             ))),
         }
     }
+
+    fn retention(&mut self, key: &ObjectKey) -> io::Result<Option<ObjectRetention>> {
+        let name = key.name();
+        let Some(version) = self.versions.get(&name).cloned() else {
+            return Ok(None);
+        };
+        // HEAD of the exact version the last PUT wrote (ADR-0104,
+        // decision 2): a later version of the same key never stands in.
+        let mut action = self.bucket.head_object(Some(&self.credentials), &name);
+        action.query_mut().insert("versionId", version.clone());
+        let url = action.sign(SIGNED_FOR);
+        let (status, headers, _) = self.send(hyper::Method::HEAD, &url, &[], None)?;
+        if status != StatusCode::OK {
+            return Err(io::Error::other(format!(
+                "HeadObject {name} version {version}: status {status}"
+            )));
+        }
+        if header(&headers, "x-amz-version-id").is_some_and(|answered| answered != version) {
+            return Err(io::Error::other(format!(
+                "HeadObject {name}: answered another version than {version}"
+            )));
+        }
+        let mode = match header(&headers, "x-amz-object-lock-mode") {
+            None => return Ok(None),
+            Some(mode) if mode.eq_ignore_ascii_case("COMPLIANCE") => LockMode::Compliance,
+            Some(mode) if mode.eq_ignore_ascii_case("GOVERNANCE") => LockMode::Governance,
+            Some(mode) => {
+                return Err(io::Error::other(format!(
+                    "HeadObject {name}: unknown object lock mode {mode}"
+                )));
+            }
+        };
+        let until = header(&headers, "x-amz-object-lock-retain-until-date")
+            .and_then(parse_rfc3339)
+            .ok_or_else(|| {
+                io::Error::other(format!("HeadObject {name}: no readable retain-until date"))
+            })?;
+        Ok(Some(ObjectRetention {
+            mode,
+            retain_until_ns: until,
+        }))
+    }
+}
+
+/// The value of header `name` (lower case) among `headers`.
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header, _)| header == name)
+        .map(|(_, value)| value.as_str())
+}
+
+/// The ns since the Unix epoch of an RFC 3339 UTC date-time,
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, as S3 writes a retain-until date;
+/// `None` for anything else or a date before the epoch.
+#[must_use]
+pub fn parse_rfc3339(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (date, time) = text.split_once(['T', 't'])?;
+    let time = time.strip_suffix(['Z', 'z'])?;
+    let mut date = date.split('-');
+    let (year, month, day) = (
+        date.next()?.parse::<u64>().ok()?,
+        date.next()?.parse::<u64>().ok()?,
+        date.next()?.parse::<u64>().ok()?,
+    );
+    if date.next().is_some()
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || year < 1970
+    {
+        return None;
+    }
+    let (clock, fraction) = match time.split_once('.') {
+        Some((clock, fraction)) => (clock, fraction),
+        None => (time, ""),
+    };
+    let mut clock = clock.split(':');
+    let (hour, minute, second) = (
+        clock.next()?.parse::<u64>().ok()?,
+        clock.next()?.parse::<u64>().ok()?,
+        clock.next()?.parse::<u64>().ok()?,
+    );
+    if clock.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut nanos = 0u64;
+    let mut scale = 100_000_000u64;
+    for digit in fraction.chars() {
+        let digit = u64::from(digit.to_digit(10)?);
+        nanos = nanos.checked_add(digit.checked_mul(scale)?)?;
+        scale /= 10;
+    }
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146_097 + doe).checked_sub(719_468)?;
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?;
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
 }
 
 /// A spawned task cancelled when this guard drops.

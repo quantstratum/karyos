@@ -155,6 +155,48 @@ pub trait ObjectStore {
     ///
     /// The storage's error, including a missing object.
     fn get(&mut self, key: &ObjectKey) -> std::io::Result<Vec<u8>>;
+
+    /// Reads back the object-lock retention of the exact object version
+    /// the last [`ObjectStore::put`] of `key` wrote (ADR-0104, decision 2):
+    /// `None` when that version holds none. A store without object lock
+    /// keeps the default, which reports none.
+    ///
+    /// # Errors
+    ///
+    /// The storage's error.
+    fn retention(&mut self, key: &ObjectKey) -> std::io::Result<Option<ObjectRetention>> {
+        let _ = key;
+        Ok(None)
+    }
+}
+
+/// An object version's object-lock retention, as object storage reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectRetention {
+    /// The lock mode.
+    pub mode: LockMode,
+    /// The retain-until date, in ns since the Unix epoch.
+    pub retain_until_ns: u64,
+}
+
+/// An object-lock mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LockMode {
+    /// `GOVERNANCE`.
+    Governance,
+    /// `COMPLIANCE`.
+    Compliance,
+}
+
+impl ObjectRetention {
+    /// Whether it enforces retention up to `deadline_ns`: governance or
+    /// compliance mode, retained until at or past the deadline.
+    #[must_use]
+    pub const fn enforces(&self, deadline_ns: u64) -> bool {
+        matches!(self.mode, LockMode::Governance | LockMode::Compliance)
+            && self.retain_until_ns >= deadline_ns
+    }
 }
 
 /// Why an offload or a restore did not complete.
