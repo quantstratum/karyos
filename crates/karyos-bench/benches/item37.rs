@@ -259,7 +259,8 @@ fn snapshot() -> Result<(), Failed> {
 fn catch_up() -> Result<(), Failed> {
     say("## Catch-up allowance: 1 GiB of log read back as a leader reads it")?;
     let geometry = ok(Geometry::new(64 * 1024, 1024 * 1024), "a geometry")?;
-    for payload in PAYLOADS {
+    // W1's 32 B commands too: the most frames per GiB (karyos#1001).
+    for payload in [32, 256, 8192] {
         let scratch = Scratch::new(&format!("log-{payload}"))?;
         let mut log = ok(
             RaftLog::create(StdDisk, scratch.path(), geometry, 1),
@@ -285,6 +286,26 @@ fn catch_up() -> Result<(), Failed> {
         }
         let _ = ok(log.sync(), "a sync")?;
         let wrote = started.elapsed();
+        // A cold read when asked (karyos#1001): `KARYOS_ITEM37_COLD` is a
+        // shell command run after the sync, before the read, that empties
+        // the page cache (for example `sync; sudo -n sh -c 'echo 3 >
+        // /proc/sys/vm/drop_caches'` on Linux).
+        let cache = match std::env::var("KARYOS_ITEM37_COLD") {
+            Ok(command) => {
+                let status = ok(
+                    std::process::Command::new("sh")
+                        .arg("-c")
+                        .arg(&command)
+                        .status(),
+                    "the cold-cache command",
+                )?;
+                if !status.success() {
+                    return Err(format!("the cold-cache command failed: {status}"));
+                }
+                "cold"
+            }
+            Err(_) => "warm",
+        };
         // A leader reads a lagging follower's entries in appends of at
         // most 1 MiB.
         let started = Instant::now();
@@ -308,7 +329,7 @@ fn catch_up() -> Result<(), Failed> {
         #[allow(clippy::cast_precision_loss, reason = "a printed rate")]
         let per_entry = took.as_secs_f64() * 1e6 / (entries.max(1) as f64);
         say(&format!(
-            "catch-up payload {payload} B: {entries} entries in 1 GiB, written and synced in {wrote:?}; read back in {took:?} ({rate:.2} GiB/s, {per_entry:.2} µs per entry, {} MiB of payload)",
+            "catch-up payload {payload} B: {entries} entries in 1 GiB, written and synced in {wrote:?}; read back {cache} in {took:?} ({rate:.2} GiB/s, {per_entry:.2} µs per entry, {} MiB of payload)",
             read >> 20
         ))?;
     }
