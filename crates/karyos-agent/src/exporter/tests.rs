@@ -1075,12 +1075,9 @@ mod over_tls {
         assert_eq!(exporter.deadline(), TLS_CONNECTION_DEADLINE);
         assert!(took < TLS_CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
         // A shorter deadline is honoured.
-        let mut exporter =
-            exporter("0.0.0.0:0", "trickle-short").with_deadline(CONNECTION_DEADLINE);
-        let (answered, took) = trickle(
-            &mut exporter,
-            b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03",
-        );
+        let mut short =
+            self::exporter("0.0.0.0:0", "trickle-short").with_deadline(CONNECTION_DEADLINE);
+        let (answered, took) = trickle(&mut short, b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03");
         assert_eq!(answered, vec![Answered::Dropped]);
         assert!(took < CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
     }
