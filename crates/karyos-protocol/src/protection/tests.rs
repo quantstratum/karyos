@@ -12,7 +12,10 @@ fn trusted_adds_no_envelope_and_accepts_every_byte() {
     assert_eq!(datagram, [7_u8; 64], "sealing writes nothing");
     assert_eq!(
         Trusted.open(datagram.get(..40).unwrap_or_default()),
-        Verdict::Accept { frames: 40 }
+        Verdict::Accept {
+            start: 0,
+            frames: 40
+        }
     );
 }
 
@@ -71,7 +74,10 @@ fn synthetic_round_trips_its_envelope() {
     );
     assert_eq!(
         synthetic.open(datagram.get(..48).unwrap_or_default()),
-        Verdict::Accept { frames: 32 }
+        Verdict::Accept {
+            start: 0,
+            frames: 32
+        }
     );
     assert_eq!(
         synthetic.open(datagram.get(..15).unwrap_or_default()),
@@ -90,7 +96,13 @@ fn synthetic_spins_at_least_its_time_on_each_side() {
     assert_eq!(synthetic.seal(&mut datagram, 8), Ok(8));
     assert!(start.elapsed() >= Duration::from_nanos(200_000));
     let start = Instant::now();
-    assert_eq!(synthetic.open(&datagram), Verdict::Accept { frames: 8 });
+    assert_eq!(
+        synthetic.open(&datagram),
+        Verdict::Accept {
+            start: 0,
+            frames: 8
+        }
+    );
     assert!(start.elapsed() >= Duration::from_nanos(200_000));
 }
 

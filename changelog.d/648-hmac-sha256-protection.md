@@ -1,0 +1,4 @@
+### Added
+
+- `karyos_protocol::protection::HmacSha256`, the wire authentication profile that owner decision D51 selected: HMAC-SHA-256 with a 16-byte tag over the 32-byte envelope header of ADR-0086 section 2 and the inner frames. It checks every field against the channel binding before the tag, and compares the tag in constant time. It reproduces the independent envelope vectors byte for byte. `protection::replay::ReplayWindow` adds the 1024-sequence replay window of manifest 4.3, which advances only after a tag verifies. No channel uses either yet: `authenticated` stays refused at parse (part of karyos#648).
+- Alongside it, `protection::Verdict::Accept` now carries the offset of the frames (`start`) as well as their length, so that an envelope can lead the frames. `protection::Rejection` gains one reason per envelope check.

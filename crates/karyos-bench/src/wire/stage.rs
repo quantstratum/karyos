@@ -347,7 +347,7 @@ impl<'p, P: Protection> Receiver<'p, P> {
         callback: Instant,
     ) -> Result<(), BenchError> {
         let frames = match self.protection.open(bytes) {
-            Verdict::Accept { frames } => bytes.get(..frames),
+            Verdict::Accept { start, frames } => bytes.get(start..start.saturating_add(frames)),
             Verdict::Reject(rejection) => {
                 return Err(BenchError(format!(
                     "datagram rejected by the protection: {rejection:?}"
