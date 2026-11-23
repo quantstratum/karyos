@@ -11,7 +11,13 @@
 //! gapped append), `OldTermCommit`, `Contract` with
 //! `TruncateBelowCommit` (applied entries truncated: C4's log refuses
 //! it), and `PositionsOutOfOrder` (a core that reports no last index over
-//! a written log; karyos#976). The other checks of
+//! a written log; karyos#976). **Fault-injected** around the unmutated
+//! adapter (karyos#1038), the core real and its surroundings faulty:
+//! `AppliedNotDurable` (a driver that applies a Ready's fresh entries),
+//! `ReleasedBeforePersisted` (a driver that releases before the sync),
+//! `DivergentResponse` (a service that alters one server's answers) and
+//! `NotLinearizable` (a client that records a value no one wrote). The
+//! other checks of
 //! `karyos_sim::harness::check::Violation` keep their fixture negative
 //! cases (`crates/karyos-sim/tests/harness.rs`); why each has no mutant
 //! here is recorded in `eval/raft-candidates/README.md` (karyos#976).
@@ -278,24 +284,6 @@ fn a_driver_that_releases_before_persistence_is_caught() {
     let violation = faulty(drive(1, DriveFault::ReleaseEarly), Vec::new());
     assert!(
         matches!(violation, Violation::ReleasedBeforePersisted { .. }),
-        "{violation:?}"
-    );
-}
-
-#[test]
-fn a_disk_that_acknowledges_unsynced_writes_loses_them_on_a_crash() {
-    let violation = faulty(
-        drive(1, DriveFault::SkipSync),
-        vec![
-            (300, workloads::Action::Crash(1)),
-            (340, workloads::Action::Restart(1)),
-        ],
-    );
-    assert!(
-        matches!(
-            violation,
-            Violation::DurableLost { node: 1, .. } | Violation::CommittedTruncated { node: 1, .. }
-        ),
         "{violation:?}"
     );
 }

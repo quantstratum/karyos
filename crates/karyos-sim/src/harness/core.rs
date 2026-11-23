@@ -729,9 +729,6 @@ pub enum DriveFault {
     /// A Ready's fresh entries are applied before they are written, as a
     /// driver that took them for committed would.
     ApplyFresh,
-    /// The log is not synced, yet the Ready's last entry is reported
-    /// durable, as a disk that acknowledges an unsynced write would.
-    SkipSync,
 }
 
 /// [`drive`], the core's reads spending `budget` when one is given, and
@@ -809,7 +806,7 @@ pub fn drive_faulty<C: ConsensusCore, D: Disk + Clone>(
                     apply(entry, applying);
                 }
             }
-            DriveFault::None | DriveFault::SkipSync => {}
+            DriveFault::None => {}
         }
         // 2. Persistence.
         if let Some(from) = ready.truncate_from {
@@ -821,11 +818,7 @@ pub fn drive_faulty<C: ConsensusCore, D: Disk + Clone>(
             if !ready.entries.is_empty() {
                 let _ = log.append(&ready.entries)?;
             }
-            match fault {
-                // Reported durable, never synced (tests).
-                DriveFault::SkipSync => needs.or_else(|| log.durable_index()),
-                _ => log.sync()?,
-            }
+            log.sync()?
         };
         if let Some(state) = ready.hard_state {
             log.save_hard_state(state)?;
