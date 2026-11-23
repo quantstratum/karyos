@@ -177,3 +177,75 @@ fn a_read_across_segments_allocates_per_crossing_not_per_entry() {
     );
     assert!(8 * segments < 400 / 2);
 }
+
+/// A byte budget that admits exactly `out`'s capacity in entries, with
+/// another entry after them, takes no slot for the one it stops at: the
+/// read allocates nothing (karyos#1209 review).
+#[test]
+fn a_budget_that_stops_at_the_pool_capacity_allocates_nothing() {
+    let _serial = serial();
+    let dir = TempDir::new("capacity");
+    let (mut log, written) = log(&dir);
+    let budget: u64 = written
+        .iter()
+        .skip(36)
+        .take(3)
+        .map(|entry| entry.encoded_len().unwrap())
+        .sum();
+    let (mut out, mut buffer) = (Vec::new(), Vec::new());
+    // Stops at entry 40, the log's last, read alone: its header is
+    // checked, then the budget refuses it.
+    log.entries_into(37..41, budget, &mut out, &mut buffer)
+        .unwrap();
+    assert_eq!(out.len(), 3);
+    out.shrink_to_fit();
+    assert_eq!(out.capacity(), 3);
+    let (read, counts) = window(|| {
+        let _enrolled = enroll();
+        log.entries_into(37..41, budget, &mut out, &mut buffer)
+    })
+    .unwrap();
+    read.unwrap();
+    assert_eq!(counts, NOTHING);
+    assert_eq!(out, written.get(36..39).unwrap());
+}
+
+/// A frame that fails its check after valid ones leaves nothing in
+/// `out`, through the log and through a metered view, whose budget stays
+/// charged (karyos#1209 review).
+#[test]
+fn a_failure_after_valid_frames_leaves_nothing() {
+    let _serial = serial();
+    let dir = TempDir::new("failure");
+    let (mut log, written) = log(&dir);
+    // Entry 40's payload is 1480 bytes of 40: flip one of them on disk.
+    let run = vec![40u8; 1480];
+    let segment = std::fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .unwrap();
+    let mut bytes = std::fs::read(&segment).unwrap();
+    let at = bytes
+        .windows(run.len())
+        .position(|window| window == run.as_slice())
+        .unwrap();
+    *bytes.get_mut(at + 100).unwrap() ^= 0xff;
+    std::fs::write(&segment, &bytes).unwrap();
+    let (mut out, mut buffer) = (written.clone(), Vec::new());
+    assert!(
+        log.entries_into(1..41, u64::MAX, &mut out, &mut buffer)
+            .is_err()
+    );
+    assert!(out.is_empty());
+    let budget = ReadBudget::new();
+    budget.refill(u64::MAX);
+    out.clone_from(&written);
+    assert!(
+        LogView::metered(&mut log, Some(&budget))
+            .entries_into(1..41, u64::MAX, &mut out, &mut buffer)
+            .is_err()
+    );
+    assert!(out.is_empty());
+    assert!(budget.left() < u64::MAX);
+}

@@ -1353,8 +1353,8 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// same entries, checks and errors, but `out`'s entries and their
     /// payload buffers are reused in place, and `window` keeps its
     /// capacity, so a read that fits what an earlier one left allocates
-    /// nothing (karyos#681). `out` ends holding exactly the entries read;
-    /// on an error it holds those read before it.
+    /// nothing (karyos#681). `out` ends holding exactly the entries read,
+    /// and nothing on an error, even one past valid frames.
     ///
     /// # Errors
     ///
@@ -1368,6 +1368,9 @@ impl<D: Disk + Clone> RaftLog<D> {
     ) -> Result<(), LogError> {
         let mut filled = 0usize;
         let read = self.fill_entries(range, max_bytes, out, window, &mut filled);
+        if read.is_err() {
+            filled = 0;
+        }
         out.truncate(filled);
         read
     }
@@ -1417,9 +1420,8 @@ impl<D: Disk + Clone> RaftLog<D> {
                 // One frame alone: the log's last, one past the budget (its
                 // header checked before the read stops), or one larger than
                 // a window (read once, never copied again).
-                let entry = pooled(out, *filled)?;
                 let Some(claimed) =
-                    self.entry_alone(index, first, bytes, max_bytes, *filled == 0, entry)?
+                    self.entry_alone(index, first, bytes, max_bytes, out, *filled)?
                 else {
                     break;
                 };
@@ -1456,16 +1458,18 @@ impl<D: Disk + Clone> RaftLog<D> {
 
     /// The entry at `slot`, read alone: the log's last frame (its span
     /// runs to the written end) or one larger than a read window, with its
-    /// encoded size, read into `entry`. `None` (with `entry` unspecified)
-    /// when it would take `bytes` past `max_bytes` and is not the first.
+    /// encoded size, read into slot `at` of `out`. `None` when it would
+    /// take `bytes` past `max_bytes` and is not the first (`at` > 0): its
+    /// header is checked, but no slot is taken, so a budget that stops at
+    /// `out`'s capacity allocates nothing.
     fn entry_alone(
         &mut self,
         index: u64,
         slot: usize,
         bytes: u64,
         max_bytes: u64,
-        first: bool,
-        entry: &mut Entry,
+        out: &mut Vec<Entry>,
+        at: usize,
     ) -> Result<Option<u64>, LogError> {
         let Some(&(position, term)) = self.entries.get(slot) else {
             return Ok(None);
@@ -1482,13 +1486,14 @@ impl<D: Disk + Clone> RaftLog<D> {
         self.store.read(position, &mut header)?;
         let frame = check_header(&header, index, term, position, span, last)?;
         let claimed = u64::from(frame.length).saturating_add(FRAME_HEADER_LEN);
-        if !first
+        if at != 0
             && bytes
                 .checked_add(claimed)
                 .is_none_or(|total| total > max_bytes)
         {
             return Ok(None);
         }
+        let entry = pooled(out, at)?;
         // Within the span the index gives: the allocation is bounded.
         let length = usize::try_from(frame.length).map_err(|_| chain(ChainProblem::PastEnd))?;
         entry.payload.clear();

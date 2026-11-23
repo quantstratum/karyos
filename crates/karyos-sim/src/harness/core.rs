@@ -260,8 +260,9 @@ impl<'a> LogView<'a> {
 
     /// [`Self::entries`] into `out`, reusing its entries and `window` as
     /// [`RaftLog::entries_into`] does: same budget walk and charge, no
-    /// allocation once the buffers fit (karyos#681). `out` is cleared on
-    /// every path, a refused read included.
+    /// allocation once the buffers fit (karyos#681). `out` holds only the
+    /// entries read: nothing after a refused read or any error, even one
+    /// past valid frames, whose bytes stay charged.
     ///
     /// # Errors
     ///
