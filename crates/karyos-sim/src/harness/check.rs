@@ -78,6 +78,13 @@ pub enum Violation {
         /// The servers.
         servers: usize,
     },
+    /// A server's core panicked (karyos#976). Reported only when no other
+    /// check names what led to it: a panic that follows a lost durable
+    /// entry is reported as [`Violation::DurableLost`].
+    CorePanicked {
+        /// The server.
+        node: NodeId,
+    },
     /// A server's positions out of their order.
     PositionsOutOfOrder {
         /// The server.
@@ -541,9 +548,11 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
                     });
                 }
             }
-            // A drive error stops a server that is up: what it held waits
-            // for its restart, as after a crash.
-            Observation::OpenFailed { node, .. } | Observation::Contract { node, .. } => {
+            // A drive error, or a core's panic, stops a server that is up:
+            // what it held waits for its restart, as after a crash.
+            Observation::OpenFailed { node, .. }
+            | Observation::Contract { node, .. }
+            | Observation::CorePanicked { node } => {
                 let _ = down.insert(*node);
             }
             Observation::Applied { entry, .. } => {
@@ -640,6 +649,23 @@ pub fn responses_agree(observations: &[Observation]) -> Result<(), Violation> {
         }
     }
     Ok(())
+}
+
+/// No server's core panicked (karyos#976).
+///
+/// # Errors
+///
+/// [`Violation::CorePanicked`] with the first server that did.
+pub fn no_core_panic(observations: &[Observation]) -> Result<(), Violation> {
+    match observations
+        .iter()
+        .find_map(|observation| match observation {
+            Observation::CorePanicked { node } => Some(*node),
+            _ => None,
+        }) {
+        Some(node) => Err(Violation::CorePanicked { node }),
+        None => Ok(()),
+    }
 }
 
 /// No server's core broke C4's contract.
@@ -1139,7 +1165,9 @@ pub fn group(observations: &[Observation], servers: usize) -> Result<(), Violati
     committed_prefixes_agree(observations)?;
     responses_agree(observations)?;
     no_old_term_direct_commit(observations)?;
-    positions_ordered(observations)
+    positions_ordered(observations)?;
+    // Last: a panic is reported only when nothing above names its cause.
+    no_core_panic(observations)
 }
 
 /// Every check of a run with `servers` servers.

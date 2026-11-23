@@ -203,6 +203,11 @@ struct State {
     /// A failed flush keeps its operations pending, to be made durable by
     /// a later one; by default it drops them, as Linux does ("fsyncgate").
     optimistic: bool,
+    /// File syncs succeed but make nothing durable: a disk that lies about
+    /// `fsync` (karyos#976, the `test-hooks` feature). The disk a crash
+    /// leaves is honest again.
+    #[cfg(feature = "test-hooks")]
+    lies: bool,
     trace: Vec<Decision>,
 }
 
@@ -219,6 +224,8 @@ impl Default for State {
             failing: BTreeSet::new(),
             sector: SECTOR,
             optimistic: false,
+            #[cfg(feature = "test-hooks")]
+            lies: false,
             trace: Vec::new(),
         }
     }
@@ -376,6 +383,16 @@ impl SimDisk {
     #[must_use]
     pub fn with_failed_syncs(self, syncs: impl IntoIterator<Item = u64>) -> Self {
         self.0.borrow_mut().failing.extend(syncs);
+        self
+    }
+
+    /// A disk whose file syncs succeed without making anything durable,
+    /// so a crash loses what they acknowledged (karyos#976, tests only).
+    /// Directory syncs stay honest, so the files themselves survive.
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn lying_about_syncs(self) -> Self {
+        self.0.borrow_mut().lies = true;
         self
     }
 
@@ -671,6 +688,10 @@ impl Disk for SimDisk {
                 Self::file(&mut state, file)?.pending.clear();
             }
             return Err(failure);
+        }
+        #[cfg(feature = "test-hooks")]
+        if state.lies {
+            return Ok(());
         }
         let entry = Self::file(&mut state, file)?;
         entry.durable = entry.live()?;

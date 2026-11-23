@@ -47,6 +47,9 @@ const TRUNCATE: u8 = 4;
 /// Each server reports no last index while its log holds entries
 /// (karyos#976).
 const UNREPORTED: u8 = 5;
+/// Server 2's core panics at its tenth Ready (karyos#976): any core's
+/// panic, not a particular library's.
+const PANICS: u8 = 6;
 
 #[derive(Debug)]
 struct Mutant<const KIND: u8> {
@@ -58,6 +61,8 @@ struct Mutant<const KIND: u8> {
     applied: u64,
     /// Whether it truncated already (`TRUNCATE`).
     truncated: bool,
+    /// Readys taken (`PANICS`).
+    readies: u32,
 }
 
 impl<const KIND: u8> Mutant<KIND> {
@@ -126,6 +131,7 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
             handed: 0,
             applied: 0,
             truncated: false,
+            readies: 0,
         }
     }
 
@@ -142,6 +148,10 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     }
 
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
+        if KIND == PANICS && self.id == 2 {
+            self.readies += 1;
+            assert!(self.readies < 10, "a core that panics (karyos#976)");
+        }
         let ready = self.core.ready(log)?;
         Some(self.mutate(ready))
     }
@@ -326,6 +336,43 @@ fn an_altered_answer_reaches_the_client() {
     let violation = faulty(faults, Vec::new());
     assert!(
         matches!(violation, Violation::NotLinearizable(_)),
+        "{violation:?}"
+    );
+}
+
+/// A core that panics is caught at the harness's core boundary, whatever
+/// the core: the run completes, and the panic is its verdict when nothing
+/// else names a cause (karyos#976).
+#[test]
+fn a_core_that_panics_is_caught_and_reported() {
+    let case = case();
+    let outcome = workloads::run::<Mutant<PANICS>>(&case, 1).unwrap();
+    assert!(
+        matches!(outcome.safety, Err(Violation::CorePanicked { node: 2 })),
+        "{:?}",
+        outcome.safety
+    );
+}
+
+/// A disk that acknowledges file syncs without making them durable loses
+/// them at a crash: the restarted server's log no longer holds what it
+/// reported durable, and `DurableLost` names it even though the real core
+/// may panic over the loss afterwards (karyos#976).
+#[test]
+fn a_disk_that_lies_about_syncs_loses_durable_entries_at_a_crash() {
+    let faults = workloads::Faults {
+        lying_disks: vec![1],
+        ..workloads::Faults::default()
+    };
+    let violation = faulty(
+        faults,
+        vec![
+            (300, workloads::Action::Crash(1)),
+            (340, workloads::Action::Restart(1)),
+        ],
+    );
+    assert!(
+        matches!(violation, Violation::DurableLost { node: 1, .. }),
         "{violation:?}"
     );
 }

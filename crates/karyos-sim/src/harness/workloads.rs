@@ -565,6 +565,9 @@ pub struct Faults {
     pub altered_responses: Vec<NodeId>,
     /// Clients, by index, that record each read with a value no one wrote.
     pub corrupt_reads: Vec<usize>,
+    /// Servers whose disk acknowledges file syncs without making anything
+    /// durable, until their first crash (karyos#976).
+    pub lying_disks: Vec<NodeId>,
 }
 
 impl Case {
@@ -873,6 +876,10 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         {
             let last = first.checked_add(FAILING).ok_or(RunError::Count)?;
             disk = disk.with_failed_syncs(first..last);
+        }
+        #[cfg(feature = "test-hooks")]
+        if case.faults.lying_disks.contains(&id) {
+            disk = disk.lying_about_syncs();
         }
         let in_standby = standby.contains(&id);
         let group = if in_standby { &standby } else { &peers };
