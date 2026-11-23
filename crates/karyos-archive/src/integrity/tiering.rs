@@ -33,6 +33,17 @@
 //! the offload record again for every offload a crash cut short, and
 //! [`reconcile_floors`] raises, before any scan, a start an offload record
 //! left unraised.
+//!
+//! [`Tiering::restore_segment`] works one segment at a time, from the one
+//! just below the start downward, and stops at the offload floor: it gets
+//! the segment's range objects and index object, verifies them, and hands
+//! them to [`SegmentStore::restore_below`], which writes them under
+//! temporary names, scans them whole, renames them into place and lowers
+//! the start durably. Only then is the restore record (kind 10) chained
+//! and the local copies counted verified again. A lowered start whose
+//! restore record a crash cut short gets it in [`Tiering::reconcile`]; the
+//! floor record's restored mark tells it apart from an offload whose start
+//! was never raised.
 
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -375,7 +386,12 @@ pub fn reconcile_floors<S: Disk>(
     records: &[SealRecord],
 ) -> Result<Vec<u64>, SegmentError> {
     let mut raised = Vec::new();
-    for (recording, offloads) in offloaded(records) {
+    for (recording, mut offloads) in offloaded(records) {
+        // A restore whose record a crash cut short lowered the start onto
+        // its offload's: that one is local again, never raised over.
+        if let Some((start, _, true)) = crate::segment::floor_of(disk, dir, recording)? {
+            offloads.retain(|offload| offload.start < start);
+        }
         let (Some(lowest), Some(end)) = (
             offloads.iter().map(|offload| offload.start).min(),
             offloads.iter().map(|offload| offload.end).max(),
@@ -655,6 +671,9 @@ impl Tiering {
                     journal,
                 )?;
             }
+            // An offload record at a start a restore moved would read as
+            // a restore cut short: the mark goes first.
+            segments.clear_restored()?;
             journal.record_offload(
                 uploaded.recording,
                 uploaded.start,
@@ -753,21 +772,136 @@ impl Tiering {
     ) -> Result<(), TieringError> {
         let records = journal.records()?;
         let recording = segments.recording();
-        let offloads = offloaded(&records).remove(&recording).unwrap_or_default();
-        for offload in offloads {
-            let seals: Vec<SealRecord> = records
+        let mut offloads = offloaded(&records).remove(&recording).unwrap_or_default();
+        // A lowered start with no restore record: the restore a crash cut
+        // short after the start moved (ADR-0104, decision 6).
+        if segments.restored()
+            && let Some(position) = offloads
                 .iter()
-                .filter(|record| {
-                    record.kind.is_range()
-                        && record.subject == recording
-                        && record.start >= offload.start
-                        && record.end <= offload.end
-                })
-                .copied()
-                .collect();
+                .position(|offload| offload.start == segments.start())
+        {
+            let offload = offloads.remove(position);
+            let seals = Self::seals_of(&records, &offload);
+            self.record_restored(&offload, &seals, copies, journal)?;
+        }
+        for offload in offloads {
+            let seals = Self::seals_of(&records, &offload);
             self.finish(&offload, &seals, copies, journal, segments, release)?;
         }
         Self::remove_below(segments, release)
+    }
+
+    /// The range seals an offload record's segment holds.
+    fn seals_of(records: &[SealRecord], offload: &SealRecord) -> Vec<SealRecord> {
+        records
+            .iter()
+            .filter(|record| {
+                record.kind.is_range()
+                    && record.subject == offload.subject
+                    && record.start >= offload.start
+                    && record.end <= offload.end
+            })
+            .copied()
+            .collect()
+    }
+
+    /// Restores the offloaded segment just below `segments`' start from
+    /// `store` (ADR-0104, decision 6), returning the restore record. The
+    /// index object must match the offload record's digest and each range
+    /// object its seal; the store then rebuilds the segment and lowers the
+    /// start, and only after that is the restore record chained and the
+    /// local copies recorded verified again.
+    ///
+    /// # Errors
+    ///
+    /// [`TieringError::NotEligible`] when no offload record ends at the
+    /// start, the store's error, [`TieringError::IndexMismatch`] or
+    /// [`TieringError::RemoteMismatch`] with nothing changed; the segment
+    /// store's [`SegmentError::InvalidRestore`] when the files do not scan
+    /// whole; the catalog's after the start moved, which
+    /// [`Tiering::reconcile`] completes.
+    pub fn restore_segment<D: Disk, S: Disk, O: ObjectStore>(
+        &self,
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+        segments: &mut SegmentStore<S>,
+        store: &mut O,
+    ) -> Result<SealRecord, TieringError> {
+        let records = journal.records()?;
+        let recording = segments.recording();
+        let start = segments.start();
+        let base = start.saturating_sub(segments.geometry().segment_length());
+        let refuse = |why| TieringError::NotEligible { base, why };
+        let offload = offloaded(&records)
+            .remove(&recording)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|offload| offload.end == start)
+            .ok_or_else(|| refuse("no offloaded segment ends at the start"))?;
+        if segments.geometry().base_of(offload.start) != base
+            || offload.start < segments.lowest_retained()
+        {
+            return Err(refuse(
+                "the offload record is not the segment below the start",
+            ));
+        }
+        let index = store
+            .get(&ObjectKey::index(self.local, recording, base))
+            .map_err(TieringError::Store)?;
+        if index_digest(&index) != offload.content {
+            return Err(TieringError::IndexMismatch);
+        }
+        let seals = Self::seals_of(&records, &offload);
+        Self::check_covered(base, offload.start, offload.end, &seals)?;
+        let length = usize::try_from(offload.end.saturating_sub(base))
+            .map_err(|_| refuse("the segment does not fit in memory"))?;
+        let mut data = vec![0u8; length];
+        for seal in &seals {
+            let bytes = store
+                .get(&ObjectKey::of(self.local, seal))
+                .map_err(TieringError::Store)?;
+            verify_range(seal, &bytes).map_err(TieringError::RemoteMismatch)?;
+            let from = usize::try_from(seal.start.saturating_sub(base))
+                .map_err(|_| refuse("a seal crosses the segment's boundary"))?;
+            let to = from
+                .checked_add(bytes.len())
+                .ok_or_else(|| refuse("a seal crosses the segment's boundary"))?;
+            data.get_mut(from..to)
+                .ok_or_else(|| refuse("a seal crosses the segment's boundary"))?
+                .copy_from_slice(&bytes);
+        }
+        let restored = segments.restore_below(&data, &index)?;
+        if restored != offload.start {
+            return Err(refuse("the restored start is not the offload record's"));
+        }
+        self.record_restored(&offload, &seals, copies, journal)
+    }
+
+    /// Chains the restore record of `offload` and records the local copy
+    /// of each of its ranges verified again: the restored segment counts
+    /// as a local copy only from here.
+    fn record_restored<D: Disk>(
+        &self,
+        offload: &SealRecord,
+        seals: &[SealRecord],
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<SealRecord, TieringError> {
+        let record =
+            journal.record_restore(offload.subject, offload.start, offload.end, offload.content)?;
+        for seal in seals {
+            copies.record(
+                Self::copy(
+                    seal,
+                    self.local,
+                    0,
+                    CopyState::Verified,
+                    Enforcement::Unsupported,
+                ),
+                journal,
+            )?;
+        }
+        Ok(record)
     }
 
     /// Stops every verified local copy overlapping `seal`'s range from

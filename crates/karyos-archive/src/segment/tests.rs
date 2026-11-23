@@ -2240,6 +2240,7 @@ fn a_leftover_floor_temporary_is_removed_at_recovery() {
                 Floor {
                     start: 300,
                     offloaded: None,
+                    restored: false,
                 },
             ),
         )
@@ -2261,10 +2262,12 @@ fn a_floor_record_with_an_offload_floor_round_trips_and_an_inverted_one_is_damag
     let plain = Floor {
         start: 300,
         offloaded: None,
+        restored: false,
     };
     let tiered = Floor {
         start: 256,
         offloaded: Some(0),
+        restored: false,
     };
     assert_eq!(encode_floor(RECORDING, plain).len(), FLOOR_LEN);
     assert_eq!(encode_floor(RECORDING, tiered).len(), OFFLOAD_FLOOR_LEN);
@@ -2282,6 +2285,7 @@ fn a_floor_record_with_an_offload_floor_round_trips_and_an_inverted_one_is_damag
     let inverted = Floor {
         start: 0,
         offloaded: Some(128),
+        restored: false,
     };
     assert_eq!(
         decode_floor(RECORDING, &encode_floor(RECORDING, inverted)),
@@ -2341,7 +2345,8 @@ fn raising_a_floor_before_a_scan_never_lowers_it() {
         read_floor(&mut probe, Path::new(DIR), RECORDING).unwrap(),
         Some(Floor {
             start: 128,
-            offloaded: Some(0)
+            offloaded: Some(0),
+            restored: false
         })
     );
 }
