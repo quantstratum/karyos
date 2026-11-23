@@ -1760,7 +1760,30 @@ mod groups {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        // #1172 review P1: stopping the group with its store's signing in
+        // flight never stalls the shared signer: the directory's signing
+        // lives on, so the Archive's own heads keep being signed.
+        let own = |dir: &Path| {
+            read_entries::<_, SIGNED_HEAD_LENGTH>(&mut StdDisk, dir, HEADS_FILE)
+                .unwrap_or_default()
+                .len()
+        };
+        agent.stop_group(GROUP).unwrap();
+        let before = own(&dir);
+        let drained = Arc::new(AtomicBool::new(false));
+        let later = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        agent.stop(later).unwrap();
+        let mut after = before;
+        for _ in 0..10_000 {
+            after = own(&dir);
+            if after > before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         agent.shutdown().unwrap();
+        assert!(after > before, "the Archive's heads are still signed");
         assert!(!signed.is_empty(), "the group store's head is signed");
         std::fs::remove_dir_all(&dir).unwrap();
     }

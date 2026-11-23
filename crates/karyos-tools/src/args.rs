@@ -1253,6 +1253,7 @@ impl Archive {
                 (self.retain_for.is_some(), "--archive-retain-for"),
                 (self.purge.is_some(), "--archive-purge"),
                 (self.min_copies.is_some(), "--archive-min-copies"),
+                (self.time_evidence, "--archive-time-evidence"),
             ] {
                 if given {
                     return Err(ArgsError::Needs {
@@ -1905,6 +1906,14 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.copy_location, Some([5; 32]));
         assert!(!parsed.time_evidence);
+        // karyos#1137 review: never accepted without --archive.
+        assert_eq!(
+            run(&["--dir", "d", "--archive-time-evidence"]),
+            Err(ArgsError::Needs {
+                option: "--archive-time-evidence",
+                needs: "--archive",
+            })
+        );
         // karyos#1137: a flag, no value.
         let kept = options(&[&base[..], &["--archive-time-evidence"]].concat())
             .archive
