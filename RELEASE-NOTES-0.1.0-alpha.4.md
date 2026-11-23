@@ -90,10 +90,10 @@ See the `0.1.0-alpha.4` section of `CHANGELOG.md`.
 
 | Check | Command | Platform | Head | Result |
 | --- | --- | --- | --- | --- |
-| The local gate | `CHANGELOG_RELEASE=1 make pre-push` | Linux 7.0.0-43-generic, x86_64 host flumix (not macOS: the team's gate pool) | `8fcea31a` | 255 test suites, 6069 passed, 0 failed, 37 ignored; exit 0 |
-| The Linux tests | `scripts/linux-test.sh --workspace --all-features --locked --no-fail-fast` (volume `karyos-linux-target-issue1033-head`) | Docker on studiom4, Linux kernel 6.8.0-117-generic, aarch64 | `8fcea31a` | 206 test suites, 5796 passed, 0 failed, 36 ignored; exit 0 |
+| The local gate | `CHANGELOG_RELEASE=1 make pre-push` | Linux (the team's gate pool) | the release head | recorded in the gate comment of karyos#1206 and in the GitHub release of `v0.1.0-alpha.4` |
+| The Linux tests | `scripts/linux-test.sh --workspace --all-features --locked --no-fail-fast` | Docker, Linux | the release head | recorded in the gate comment of karyos#1206 and in the GitHub release of `v0.1.0-alpha.4` |
 
-The release tree differs from `8fcea31a` only in this file (its Evidence rows). The joint `cargo publish --dry-run`, the scratch project build and the libkaryos artifacts' conformance runs are recorded after the tag, as dated rows.
+The gates run on the exact head that is merged and tagged, so their results, with that head, live outside the tree: in the pull request's gate comment and in the GitHub release. The joint `cargo publish --dry-run`, the scratch project build and the libkaryos artifacts' conformance runs are recorded there too, after the tag.
 
 ### Written exception
 
