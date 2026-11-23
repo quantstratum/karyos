@@ -1061,6 +1061,8 @@ fn a_subscription_delivers_each_message_from_its_private_copy() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     let (mut has, mut lost) = (u32::MAX, u64::MAX);
     // SAFETY: live, aligned out-parameters.
@@ -1248,6 +1250,8 @@ fn image_changes_and_bad_arguments() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     let (mut has, mut lost) = (u32::MAX, u64::MAX);
     // SAFETY: live, aligned out-parameters.
@@ -1471,6 +1475,8 @@ fn a_network_subscription_grows_its_copy_with_a_larger_image() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     // SAFETY: live, aligned out-parameters.
     let status =
@@ -1577,6 +1583,8 @@ fn a_retired_images_change_carries_its_end() {
                 reserved: 7,
                 end_position: 7,
                 seal_code: 7,
+                join_loss_from: 7,
+                join_loss_to: 7,
             };
             let mut publisher = publisher;
             let start = std::time::Instant::now();
@@ -1702,6 +1710,8 @@ fn next_image_change_checks_its_struct_before_its_handle() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     // SAFETY: live, aligned out-parameters.
     let status = unsafe { karyos_subscription_next_image_change(stale, &mut change, &mut has) };
@@ -1919,6 +1929,8 @@ fn an_image_change_is_written_by_the_callers_size() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     // The first header's struct: the end fields are past its size.
     let mut first = filled(IMAGE_CHANGE_SIZE_0_1);
@@ -1963,7 +1975,21 @@ fn an_image_change_is_written_by_the_callers_size() {
             SealReason::ImageRetired.code()
         )
     );
-    assert_eq!(size_of_u32::<ImageChange>(), IMAGE_CHANGE_SIZE_ENDS);
+    // The 48-byte struct keeps the join loss fields past its size.
+    assert_eq!((current.join_loss_from, current.join_loss_to), (7, 7));
+    assert_eq!(size_of_u32::<ImageChange>(), IMAGE_CHANGE_SIZE_JOIN_LOSS);
+    // ADR-0100: a 64-byte struct takes an attach's join loss, and zeros
+    // for a change that carries none.
+    let lost = karyos_client::ImageChange::new(1, 1, lane, true)
+        .with_join_loss(Some(karyos_client::JoinLoss::new(64, 4096)));
+    let mut joined = filled(IMAGE_CHANGE_SIZE_JOIN_LOSS);
+    // SAFETY: `joined` is live, aligned and of its size.
+    unsafe { write_image_change(&raw mut joined, &lost) };
+    assert_eq!((joined.join_loss_from, joined.join_loss_to), (64, 4096));
+    let mut plain = filled(IMAGE_CHANGE_SIZE_JOIN_LOSS);
+    // SAFETY: as above.
+    unsafe { write_image_change(&raw mut plain, &retired) };
+    assert_eq!((plain.join_loss_from, plain.join_loss_to), (0, 0));
     // A clean end, an end whose seal is not positioned, and an arrival.
     for (change, fields) in [
         (
@@ -1991,21 +2017,22 @@ fn an_image_change_is_written_by_the_callers_size() {
             fields
         );
     }
-    // A struct of a newer header, 8 bytes longer: its tail stays.
+    // A struct of a newer header, 8 bytes longer than this one: its tail
+    // stays.
     #[repr(C)]
     struct Newer {
         change: ImageChange,
         tail: u64,
     }
     let mut newer = Newer {
-        change: filled(56),
+        change: filled(IMAGE_CHANGE_SIZE_JOIN_LOSS + 8),
         tail: 0xA5A5,
     };
-    // SAFETY: `newer` is live, aligned and 56 bytes, its size.
+    // SAFETY: `newer` is live, aligned and 72 bytes, its size.
     unsafe { write_image_change(&raw mut newer.change, &retired) };
     assert_eq!(
         (newer.change.size, newer.change.end_position, newer.tail),
-        (56, 4096, 0xA5A5)
+        (72, 4096, 0xA5A5)
     );
 }
 

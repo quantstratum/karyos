@@ -444,6 +444,15 @@ pub struct JoinLoss {
     pub to: u64,
 }
 
+impl JoinLoss {
+    /// The loss of `[from, to)`: for sources other than a client's, and
+    /// tests.
+    #[must_use]
+    pub const fn new(from: u64, to: u64) -> Self {
+        Self { from, to }
+    }
+}
+
 /// How a retired image's stream ended: its terminal seal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -489,6 +498,13 @@ impl ImageChange {
             end: None,
             join_loss: None,
         }
+    }
+
+    /// The change with an attach's join loss (ADR-0100).
+    #[must_use]
+    pub const fn with_join_loss(mut self, join_loss: Option<JoinLoss>) -> Self {
+        self.join_loss = join_loss;
+        self
     }
 
     /// The change with the image's `registration` (ADR-0089).
