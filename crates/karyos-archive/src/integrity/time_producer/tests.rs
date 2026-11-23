@@ -375,3 +375,18 @@ fn a_leap_second_splits_and_an_inserted_second_is_no_evidence() {
         );
     }
 }
+
+/// #1171 review: the agent waits on the target-specific completeness
+/// boundary: a later calibration published before its target's UTC
+/// reference does not end the wait.
+#[test]
+fn reaching_needs_the_cited_targets_reference_too() {
+    let mut records = records();
+    // Without the later UTC reference of B.
+    records.pop();
+    let events = events(&[(40, true)]);
+    assert!(!Snapshot::new(&records, true).reaches(&clock(), &events));
+    assert!(Snapshot::new(&self::records(), true).reaches(&clock(), &events));
+    // Events of no session prove nothing and wait for nothing.
+    assert!(Snapshot::default().reaches(&clock(), &self::events(&[(40, false)])));
+}

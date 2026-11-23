@@ -328,6 +328,24 @@ pub enum StoreError {
     /// The directory could not be made.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// An entry of the reserved all zero clock identity ("provenance
+    /// unknown") with a finite bound or a record cited: only the sentinel,
+    /// both bounds [`NO_BOUND`] and both digests zero, is kept
+    /// (quantstratum-docs: karyos/design/trace-clocks.md).
+    #[error("an entry of the zero clock identity must carry no bound and cite no record")]
+    Sentinel,
+}
+
+/// Whether `entry` keeps the zero identity's sentinel rule: an entry of
+/// the all zero clock identity has both bounds [`NO_BOUND`] and both
+/// digests zero. Any other identity passes.
+#[must_use]
+pub fn keeps_sentinel(entry: &Entry) -> bool {
+    entry.clock != [0; 5]
+        || (entry.bound_min_ns == NO_BOUND
+            && entry.bound_max_ns == NO_BOUND
+            && entry.calibration == [0; 32]
+            && entry.utc_reference == [0; 32])
 }
 
 impl<D: Disk + Clone> EntryStore<D> {
@@ -367,6 +385,25 @@ impl<D: Disk + Clone> EntryStore<D> {
         &mut self.journal
     }
 
+    /// The entries this store holds, in order (karyos#1137: a group's
+    /// production resumes after its last).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] for a read or a malformed entry.
+    pub fn entries(&mut self) -> Result<Vec<Entry>, StoreError> {
+        let length = ENTRY_LENGTH as u64;
+        let mut out = Vec::new();
+        let mut at = self.store.start();
+        let mut bytes = [0u8; ENTRY_LENGTH];
+        while at.saturating_add(length) <= self.store.written() {
+            self.store.read(at, &mut bytes)?;
+            out.push(Entry::decode(&bytes)?);
+            at = at.saturating_add(length);
+        }
+        Ok(out)
+    }
+
     /// Appends `entry`, durable, and seals it: its seal is the entry's
     /// evidence. Call it only after the entry's own range was sealed.
     ///
@@ -374,6 +411,9 @@ impl<D: Disk + Clone> EntryStore<D> {
     ///
     /// [`StoreError`]; an entry written but not sealed is not evidence.
     pub fn append(&mut self, entry: &Entry) -> Result<u64, StoreError> {
+        if !keeps_sentinel(entry) {
+            return Err(StoreError::Sentinel);
+        }
         let bytes = entry.encode()?;
         let at = self.store.written();
         let _ = self.store.append(at, &bytes)?;

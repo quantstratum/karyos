@@ -119,6 +119,43 @@ const fn is_zero(clock: &ClockKey) -> bool {
         && clock.epoch == 0
 }
 
+impl Snapshot {
+    /// Whether the producer published past every in-session event of
+    /// `events` for the target it would cite: each such event has a
+    /// calibration of `clock` valid at its time whose target passes
+    /// [`produce`]'s completeness boundary over the largest timestamp.
+    /// The agent waits for this before producing a range (ADR-0098 item
+    /// 3), on the same target-specific boundary `produce` checks.
+    #[must_use]
+    pub fn reaches(&self, clock: &EventClock, events: &[Event]) -> bool {
+        let key = clock.key();
+        let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
+        events.iter().filter(|event| event.in_session).all(|event| {
+            let t = i128::from(event.time);
+            self.calibrations.iter().any(|(calibration, _)| {
+                calibration.from == key
+                    && calibration.covers(t, t)
+                    && complete(self, &key, &calibration.to, largest)
+            })
+        })
+    }
+}
+
+/// Where the Archive agent takes its calibration snapshots: the host's
+/// view of its calibration journal (ADR-0098 item 3). Each call is one
+/// snapshot, read once at one durable position.
+pub trait CalibrationSource: Send + core::fmt::Debug {
+    /// The journal's records now, and whether it reported no loss.
+    fn snapshot(&mut self) -> Snapshot;
+}
+
+/// A fixed snapshot, for a host whose calibrations do not change.
+impl CalibrationSource for Snapshot {
+    fn snapshot(&mut self) -> Snapshot {
+        self.clone()
+    }
+}
+
 /// The SHA-256 of a record's 144 little-endian bytes.
 fn record_digest(words: &[u64; CALIBRATION_WORDS]) -> Digest {
     let mut hasher = Sha256::new();
