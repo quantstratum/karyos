@@ -634,6 +634,18 @@ impl Tiering {
         if chained != seals || segments.recording() != uploaded.recording {
             return Err(refuse("the upload's seals are not the segment's"));
         }
+        // A segment a purge cut keeps index entries below the start whose
+        // bytes no seal holds: it could never be restored whole, so it is
+        // never offloaded (ADR-0104, decisions 1 and 5).
+        if uploaded.start > uploaded.base
+            && records.iter().any(|record| {
+                record.kind == SealKind::Purge
+                    && record.subject == uploaded.recording
+                    && record.end > uploaded.base
+            })
+        {
+            return Err(refuse("a purge cut the segment"));
+        }
         let committed = offloaded(&records)
             .get(&uploaded.recording)
             .and_then(|list| {
@@ -788,6 +800,25 @@ impl Tiering {
             let seals = Self::seals_of(&records, &offload);
             self.finish(&offload, &seals, copies, journal, segments, release)?;
         }
+        // A restore record whose copy records a crash cut short: the
+        // segment is local again, so its copies are counted again.
+        let mut last: std::collections::BTreeMap<(u64, u64), &SealRecord> =
+            std::collections::BTreeMap::new();
+        for record in records.iter().filter(|record| {
+            record.subject == recording
+                && matches!(record.kind, SealKind::Offload | SealKind::Restore)
+        }) {
+            last.insert((record.start, record.end), record);
+        }
+        for restore in last
+            .values()
+            .filter(|record| record.kind == SealKind::Restore)
+        {
+            if segments.start() <= restore.start {
+                let seals = Self::seals_of(&records, restore);
+                self.count_restored(&seals, copies, journal)?;
+            }
+        }
         Self::remove_below(segments, release)
     }
 
@@ -889,7 +920,27 @@ impl Tiering {
     ) -> Result<SealRecord, TieringError> {
         let record =
             journal.record_restore(offload.subject, offload.start, offload.end, offload.content)?;
+        self.count_restored(seals, copies, journal)?;
+        Ok(record)
+    }
+
+    /// Records the local copy of each of `seals` verified, unless it
+    /// already counts: idempotent, so a crash between the restore record
+    /// and its copy records is finished by [`Tiering::reconcile`].
+    fn count_restored<D: Disk>(
+        &self,
+        seals: &[SealRecord],
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+    ) -> Result<(), TieringError> {
         for seal in seals {
+            let counted = copies
+                .current()?
+                .into_iter()
+                .any(|copy| self.is_local_verified(&copy, seal));
+            if counted {
+                continue;
+            }
             copies.record(
                 Self::copy(
                     seal,
@@ -901,7 +952,7 @@ impl Tiering {
                 journal,
             )?;
         }
-        Ok(record)
+        Ok(())
     }
 
     /// Stops every verified local copy overlapping `seal`'s range from

@@ -1209,7 +1209,21 @@ impl<D: Disk> SegmentStore<D> {
             self.disk.sync(&file)?;
         }
         let scanned = self.scan_restored(base, restored_start, (&data_temporary, &index_temporary));
-        let gaps = match scanned {
+        // The restored segment's lost ranges joined to the recording's, the
+        // touching ones merged, within the bound recovery holds the
+        // recording to: checked before anything moves.
+        let merged = scanned.map(|found| {
+            found.and_then(|restored| {
+                let mut merged: Vec<(u64, u64)> = Vec::with_capacity(restored.len());
+                for (from, to) in restored.into_iter().chain(self.gaps.iter().copied()) {
+                    if !push_gap(&mut merged, from, to) {
+                        return None;
+                    }
+                }
+                Some(merged)
+            })
+        });
+        let gaps = match merged {
             Ok(Some(gaps)) => gaps,
             other => {
                 for path in [&data_temporary, &index_temporary] {
@@ -1218,7 +1232,9 @@ impl<D: Disk> SegmentStore<D> {
                 self.disk.sync_dir(&self.dir)?;
                 self.failed = false;
                 other?;
-                return Err(refuse("the restored files do not scan whole"));
+                return Err(refuse(
+                    "the restored files do not scan whole, or their lost ranges exceed the bound",
+                ));
             }
         };
         self.disk.rename(&data_temporary, &data_path)?;
@@ -1238,9 +1254,7 @@ impl<D: Disk> SegmentStore<D> {
         self.start = restored_start;
         self.offloaded = Some(offloaded.unwrap_or(restored_start));
         self.restored = true;
-        let mut merged = gaps;
-        merged.extend(self.gaps.iter().copied());
-        self.gaps = merged;
+        self.gaps = gaps;
         self.failed = false;
         Ok(restored_start)
     }
