@@ -368,6 +368,9 @@ enum Waiting {
     },
 }
 
+/// A retention state answer's own stream and what waits to be sent on it.
+type Answering = (Box<dyn ResponseSink + Send>, VecDeque<Vec<u8>>);
+
 /// The control server: requests in, the agent's work, answers out.
 pub struct ControlServer<H, Q, R> {
     agent: ArchiveHandle,
@@ -391,7 +394,7 @@ pub struct ControlServer<H, Q, R> {
     /// A retention state answer being sent on the stream its query named
     /// (ADR-0101): that stream and the messages not sent yet. It never
     /// holds the shared stream back.
-    answering: Option<(Box<dyn ResponseSink + Send>, VecDeque<Vec<u8>>)>,
+    answering: Option<Answering>,
 }
 
 impl<H, Q, R> core::fmt::Debug for ControlServer<H, Q, R> {
