@@ -1,0 +1,3 @@
+### Added
+
+- `karyos-sbe`: the SBE feed adapter (karyos#647). `adapter::SbeFeed` takes one SBE feed on its two lines, frames each message by its SBE message header against the feed's `SbeSchema` (a frame of another schema, or of a version this build does not read, is refused and counted, never delivered), reads its epoch and sequence through the feed's own `SbeSequence` extractor, and arbitrates the lines with `karyos-feed`: each sequenced message once, in order, with its header and frame borrowed for the client to decode in place. A steady cycle allocates nothing. Registering schemas in Archive manifests is not part of it: it follows with the Archive in M03.

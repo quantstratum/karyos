@@ -19,7 +19,15 @@
 //! frames a received message: it reads the SBE message header first and
 //! refuses a schema, a schema version or a template this build does not
 //! know with a typed [`FrameError`], never reading such a message as a
-//! known one. The feed adapters arrive with karyos#647.
+//! known one.
+//!
+//! The feed adapter (karyos#647): [`adapter::SbeFeed`] takes one SBE feed on
+//! its two lines, frames each message by its SBE header against the feed's
+//! [`adapter::SbeSchema`], reads its epoch and sequence through the feed's
+//! [`adapter::SbeSequence`], and arbitrates the lines with
+//! [`karyos_feed`]: each sequenced message once, in order, its header and
+//! frame borrowed for the client to decode in place. Registering schemas
+//! in Archive manifests is not here: it follows with the Archive in M03.
 //!
 //! Internal to the Karyos workspace and unstable in alpha, with no
 //! compatibility promise. The supported API is the `karyos` facade,
@@ -30,6 +38,8 @@
 
 /// The feed arbitration the SBE adapters plug into (SPEC §7.2).
 pub use karyos_feed as feed;
+
+pub mod adapter;
 
 use ironsbe_core::decoder::{DecodeError, SbeDecoder};
 use ironsbe_core::header::MessageHeader;
