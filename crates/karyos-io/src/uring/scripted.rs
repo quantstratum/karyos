@@ -60,6 +60,10 @@ pub struct ScriptedRing {
     enters: u32,
     overflowed: bool,
     taskrun: bool,
+    /// `bytes_mut` calls on a kernel owned slot: a frame touched while the
+    /// kernel owns it, which the double refuses and counts (SPEC.md §13,
+    /// "Backend ring and frame ownership").
+    touches_while_owned: u64,
 }
 
 impl ScriptedRing {
@@ -81,7 +85,14 @@ impl ScriptedRing {
             enters: 0,
             overflowed: false,
             taskrun: false,
+            touches_while_owned: 0,
         }
+    }
+
+    /// Writes attempted on a kernel owned slot so far.
+    #[must_use]
+    pub fn touches_while_owned(&self) -> u64 {
+        self.touches_while_owned
     }
 
     /// Every operation published so far, in order.
@@ -170,6 +181,7 @@ impl RingOps for ScriptedRing {
 
     fn bytes_mut(&mut self, slot: u16) -> Option<&mut [u8]> {
         if self.owner(slot).is_some() {
+            self.touches_while_owned = self.touches_while_owned.saturating_add(1);
             return None;
         }
         self.bytes

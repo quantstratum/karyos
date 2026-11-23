@@ -56,13 +56,18 @@ if [ -n "${KARYOS_LINUX_CAPS:-}" ]; then
         cap_args+=(--cap-add "$cap")
     done
 fi
-# KARYOS_LINUX_SECCOMP sets the container's seccomp profile, for example
-# "unconfined" for the io_uring tests: Docker's default profile denies the
-# io_uring system calls (quantstratum-docs karyos/design/io-uring-backend.md
-# section 9).
+# KARYOS_LINUX_SECCOMP sets the container's seccomp profile: Docker's
+# default profile denies the io_uring system calls (quantstratum-docs
+# karyos/design/io-uring-backend.md section 9). ci/seccomp/io-uring.json is
+# that default profile plus the three io_uring calls only (IU-10); a path
+# inside the tree is taken from the tree's root.
 seccomp_args=()
 if [ -n "${KARYOS_LINUX_SECCOMP:-}" ]; then
-    seccomp_args=(--security-opt "seccomp=$KARYOS_LINUX_SECCOMP")
+    profile="$KARYOS_LINUX_SECCOMP"
+    if [ -f "$root/$profile" ]; then
+        profile="$root/$profile"
+    fi
+    seccomp_args=(--security-opt "seccomp=$profile")
 fi
 args=("$@")
 if [ ${#args[@]} -eq 0 ]; then

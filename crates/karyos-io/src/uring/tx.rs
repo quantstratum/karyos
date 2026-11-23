@@ -311,6 +311,11 @@ pub struct UringTx<R: RingOps> {
     /// `-ECANCELED` completions seen since it was published.
     ring_cancel: Option<RingCancel>,
     sqpoll: CapabilityState,
+    /// A deliberate mutant for the simulator's negative control: release
+    /// each slot at its submission, as copied sockets do, instead of at its
+    /// completion.
+    #[cfg(any(test, feature = "test-hooks"))]
+    release_at_submission: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -439,6 +444,8 @@ impl<R: RingOps> UringTx<R> {
             failed: None,
             ring_cancel: None,
             sqpoll,
+            #[cfg(any(test, feature = "test-hooks"))]
+            release_at_submission: false,
         })
     }
 
@@ -452,6 +459,14 @@ impl<R: RingOps> UringTx<R> {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn ring_mut(&mut self) -> &mut R {
         &mut self.ring
+    }
+
+    /// Turns on the mutant that releases each slot at its submission
+    /// instead of at its completion (the "release on enter return"
+    /// negative control of design section 12). Never correct.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn inject_release_at_submission(&mut self) {
+        self.release_at_submission = true;
     }
 
     /// Whether SQPOLL runs: `NotRequested` unless the configuration asked
@@ -1395,6 +1410,16 @@ impl<R: RingOps> TxBackend for UringTx<R> {
             if let Some(slot_meta) = self.slots.get_mut(slot as usize) {
                 slot_meta.phase = Phase::Submitted;
                 slot_meta.next = NO_SLOT;
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            if self.release_at_submission
+                && let Some(slot_meta) = self.slots.get_mut(slot as usize)
+            {
+                *slot_meta = SlotMeta {
+                    generation: meta.generation,
+                    ..FREE_META
+                };
+                let _ = self.ledger.release_pending(request.queue, slot);
             }
             if let Some(entry) = self.entry(
                 slot,
