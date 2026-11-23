@@ -840,4 +840,168 @@ mod assembly {
         check("X-11", &x6(&[], Vec::new(), &[], &[]));
         check("X-12", &x6(&[e1(), e2()], vec![e1(), e2()], &[1, 2], &[1]));
     }
+
+    /// ADR-0104: an export of a tiered Archive carries the offload record
+    /// in a version 2 `Seals` section, and the offline verifier reports the
+    /// offloaded range with its seal's outcome and residency `offloaded`,
+    /// never `purged` nor a shortened index; the local range stays local.
+    #[test]
+    fn an_export_of_a_tiered_archive_reports_residency_not_purge() {
+        use super::super::offline::{OfflineTrust, Role, verify_export};
+        use crate::integrity::anchor::{AnchorEvidence, Externality};
+        use crate::integrity::trust::TrustRoot;
+        use crate::integrity::verify::{Outcome, Residency};
+
+        #[derive(Debug)]
+        struct Store;
+        impl AnchorEvidence for Store {
+            fn confirms(&self, anchor: &Anchor) -> bool {
+                anchor.location == [0x0A; 32]
+            }
+        }
+        let seals = vec![
+            Seal::Registry(r0()),
+            Seal::Range(SealKind::OpenSegment, 7, 0, sevens()),
+            Seal::Range(SealKind::OpenSegment, 7, 64, vec![0x17; 64]),
+            Seal::Range(SealKind::Copy, 7, 0, Vec::new()),
+            Seal::Range(SealKind::Offload, 7, 0, vec![0x0E; 64]),
+        ];
+        let contents = ExportContents {
+            archive_id: ARCHIVE,
+            journals: vec![archive_journal(&seals, &[4], &[4], vec![r0()])],
+            // Only the local bytes travel: [0, 64) is remote.
+            recordings: vec![recording(7, 3, 64, vec![0x17; 64])],
+            ..ExportContents::default()
+        };
+        let bytes = assemble(&contents).unwrap();
+        let decoded = super::super::decode(&bytes).unwrap();
+        let seals_section = decoded
+            .sections
+            .iter()
+            .find(|section| section.kind == super::super::SectionKind::Seals)
+            .unwrap();
+        assert_eq!(
+            super::super::section_version(seals_section.kind, &seals_section.body),
+            super::super::SEALS_TIERED_VERSION
+        );
+        let trust = TrustRoot {
+            archive_id: ARCHIVE,
+            authorities: vec![authority().public()],
+        };
+        let externality = Externality {
+            local_archive: ARCHIVE,
+            local_locations: std::collections::BTreeSet::new(),
+            anchored_by_this: std::collections::BTreeSet::new(),
+        };
+        let report = verify_export(
+            &bytes,
+            &OfflineTrust {
+                trust: &trust,
+                journals: &[(1, Role::Archive)],
+                stores: &Store,
+                externality: &externality,
+                requirement: None,
+            },
+        )
+        .unwrap();
+        let ranges: Vec<_> = report.journals[0]
+            .2
+            .ranges
+            .iter()
+            .map(|range| (range.start, range.outcome, range.residency.name()))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![
+                (0, Outcome::Verified, "offloaded"),
+                (64, Outcome::Verified, "local"),
+            ]
+        );
+        assert!(matches!(
+            report.journals[0].2.ranges[0].residency,
+            Residency::Offloaded { record: 4 }
+        ));
+    }
+}
+
+/// The first decoded vector with a `Seals` section, and that section's
+/// index.
+fn with_seals() -> (Export, usize) {
+    for name in ["X-5", "X-6", "X-7", "X-8", "X-9", "X-10", "X-11", "X-12"] {
+        let Ok(export) = decode(&vector(name)) else {
+            continue;
+        };
+        if let Some(index) = export
+            .sections
+            .iter()
+            .position(|section| section.kind == SectionKind::Seals && section.count > 0)
+        {
+            return (export, index);
+        }
+    }
+    panic!("no vector with a seals section");
+}
+
+/// `bytes` with section `index`'s version set to `version` and the
+/// trailer recomputed.
+fn with_section_version(mut bytes: Vec<u8>, index: usize, version: u16) -> Vec<u8> {
+    let mut at = HEADER_LENGTH;
+    for _ in 0..index {
+        let length = u64_at(&bytes, at + 24).unwrap() as usize;
+        at += SECTION_HEADER_LENGTH + length;
+    }
+    bytes[at + 2..at + 4].copy_from_slice(&version.to_le_bytes());
+    let end = bytes.len() - TRAILER_LENGTH;
+    let trailer: [u8; TRAILER_LENGTH] = Sha256::digest(&bytes[..end]).into();
+    bytes[end..].copy_from_slice(&trailer);
+    bytes
+}
+
+/// ADR-0104: a `Seals` section holding an offload or restore record is
+/// version 2, one holding neither stays version 1, and a mismatch either
+/// way is refused.
+#[test]
+fn a_seals_section_with_offload_or_restore_records_is_version_2() {
+    let (export, index) = with_seals();
+    let plain = encode(&export.archive_id, export.created_utc_ns, &export.sections);
+    assert_eq!(
+        section_version(SectionKind::Seals, &export.sections[index].body),
+        VERSION
+    );
+    for kind in [
+        super::super::SealKind::Offload,
+        super::super::SealKind::Restore,
+    ] {
+        let mut sections = export.sections.clone();
+        sections[index].body[2..4].copy_from_slice(&(kind as u16).to_le_bytes());
+        assert_eq!(
+            section_version(SectionKind::Seals, &sections[index].body),
+            SEALS_TIERED_VERSION
+        );
+        let tiered = encode(&export.archive_id, export.created_utc_ns, &sections);
+        let decoded = decode(&tiered).unwrap();
+        assert_eq!(decoded.sections, sections);
+        let downgraded = with_section_version(tiered, index, VERSION);
+        assert!(matches!(
+            decode(&downgraded),
+            Err(ExportError::SealsVersion { version: 1, .. })
+        ));
+    }
+    let upgraded = with_section_version(plain, index, SEALS_TIERED_VERSION);
+    assert!(matches!(
+        decode(&upgraded),
+        Err(ExportError::SealsVersion { version: 2, .. })
+    ));
+}
+
+/// Version 2 is a `Seals` section's only: any other section's is refused.
+#[test]
+fn version_2_of_another_section_is_refused() {
+    let (export, index) = with_seals();
+    let bytes = encode(&export.archive_id, export.created_utc_ns, &export.sections);
+    let other = if index == 0 { 1 } else { 0 };
+    assert!(matches!(
+        decode(&with_section_version(bytes, other, SEALS_TIERED_VERSION)),
+        Err(ExportError::SectionVersion { version: 2, .. })
+    ));
 }
