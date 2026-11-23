@@ -263,6 +263,12 @@ release may break APIs, wire formats and shared-memory layouts.
 
 - `RaftLog::entries_into` and `LogView::entries_into` read a log range into caller buffers: the entries and their payload buffers are reused in place and the read window keeps its capacity, so a second read of the same range within one segment allocates nothing (a read that crosses segments still allocates when the segment store reopens its reader file) (karyos#681, ADR-0105). The checks, errors, read window and metered budget are those of `entries`, which is now a wrapper.
 
+- The Archive export container writes a `Seals` section holding seal kinds 9 (offload) or 10 (restore) as section version 2 and keeps version 1 for one holding neither (ADR-0104, amending design/archive-export.md §3.2); a version 1 reader refuses version 2 explicitly, and a `Seals` section whose version does not match its kinds is refused `SealsVersion` (karyos#1113).
+
+- The AF_XDP copy-mode backend of `karyos-io` (feature `xdp`, Linux, karyos#642): `xdp::endpoint::XdpEndpoint` over the `XskOps` seam with claim, commit, a flush that writes Ethernet, IP and UDP headers with software checksums and publishes one producer store, `Released`-only completions (any other completion is an invariant that releases nothing), and RX that validates each frame and lends its payload before reposting it to the fill ring. Wakeups are nonblocking `sendto`/`recvfrom` with `MSG_DONTWAIT`. `xdp::ring::OsXsk` binds in `XDP_COPY | XDP_USE_NEED_WAKEUP` with one owned UMEM per socket and queue and tears down rings, then socket, then UMEM. `xdp::attach` attaches the committed program in an explicit generic or native mode as a `bpf_link`, never replacing another program. `xdp::netlink` is a bounded read-only neighbour lookup whose parsers have `proptest` harnesses. `karyos-sys::xsk_map` adds the UMEM and ring mappings and `live_umem_bytes`. Busy polling, NUMA placement, zero copy and multi-buffer frames are deferred.
+
+- `karyos-exporter` can serve `/metrics` over TLS 1.3 on any address, with `--tls-cert` and `--tls-key`, in a build with `karyos-agent`'s `exporter-tls` feature (off by default; `rustls` with the `rustls-graviola` provider). Without TLS it still binds loopback only, and the bearer token is kept (karyos#887).
+
 ### Changed
 
 - `karyos-codec-derive` is publishable (`publish = true`, a README) and joins the crates.io set at 0.1.0-alpha.4, after `karyos-codec`, because `karyos-archive` depends on it (owner decision 2026-11-23). It is internal and unstable in alpha.
