@@ -110,6 +110,10 @@ use crate::hard_state::{HARD_STATE_FILE, HARD_STATE_LEN, HardState, HardStatePro
 use crate::mark::{self, MARK_FILE, MARK_LEN, Slot};
 use crate::snapshot::SnapshotStore;
 
+mod mapping;
+
+pub use mapping::{EntryAnswer, EntrySlot, SlotAnswer};
+
 /// The A2 recording id of the log.
 pub const LOG_RECORDING: u64 = 1;
 /// The most bytes one seal of the committed log reads at a time, and the

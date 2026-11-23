@@ -1,0 +1,3 @@
+### Added
+
+- The public mapping between the Cluster log's entries and the positions of the recording that holds them (R-CORE-8; karyos#745). `RaftLog::slot_of(index)` answers where an entry's frame is: an `EntrySlot`, which names the log epoch, position, length, index and term. `RaftLog::entry_at(epoch, position)` answers which entry starts there. `RaftLog::read_slot` reads an entry by its slot. Each case with no answer is a value, never an error: `NotYet` past the durable prefix, `Purged` under retention, `BelowSnapshot` after an install, `NotAnEntry` inside a frame, `OtherEpoch` for a slot an install cut. Slots survive a restart, and walking them from a first position replays the entries in the live order.
