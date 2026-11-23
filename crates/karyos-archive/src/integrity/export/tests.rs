@@ -805,14 +805,28 @@ mod assembly {
     fn check(name: &str, contents: &ExportContents) {
         let built = assemble(contents).unwrap();
         let expected = vector(name);
-        if built != expected {
-            let at = built.iter().zip(&expected).position(|(a, b)| a != b);
-            panic!(
-                "{name}: lengths {} vs {}, first difference at {at:?}",
-                built.len(),
-                expected.len()
-            );
-        }
+        let first = built.iter().zip(&expected).position(|(a, b)| a != b);
+        assert!(
+            built == expected,
+            "{name}: lengths {} vs {}, first difference at {first:?}",
+            built.len(),
+            expected.len()
+        );
+    }
+
+    /// #1189 review P2: a range ending past `u64::MAX` is refused, typed.
+    #[test]
+    fn an_overflowing_range_is_refused() {
+        use super::super::assemble::AssembleError;
+        let contents = ExportContents {
+            archive_id: ARCHIVE,
+            recordings: vec![recording(7, 3, u64::MAX, vec![1])],
+            ..ExportContents::default()
+        };
+        assert_eq!(
+            assemble(&contents),
+            Err(AssembleError::RangeOverflow { recording: 7 })
+        );
     }
 
     #[test]

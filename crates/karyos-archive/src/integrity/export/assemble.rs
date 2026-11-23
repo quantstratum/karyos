@@ -75,6 +75,21 @@ pub struct ExportContents {
     pub bindings: Vec<[u8; 64]>,
 }
 
+/// Why an export cannot be assembled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum AssembleError {
+    /// A time evidence entry does not encode.
+    #[error(transparent)]
+    Entry(#[from] super::super::time_evidence::EntryError),
+    /// A recording's exported range ends past `u64::MAX`.
+    #[error("recording {recording}'s exported range overflows")]
+    RangeOverflow {
+        /// The recording.
+        recording: u64,
+    },
+}
+
 fn count(rows: usize) -> u64 {
     u64::try_from(rows).unwrap_or(u64::MAX)
 }
@@ -92,11 +107,8 @@ fn rows<const N: usize>(kind: SectionKind, journal: u64, rows: &[[u8; N]]) -> Op
 ///
 /// # Errors
 ///
-/// [`super::super::time_evidence::EntryError`] for a time evidence entry
-/// that does not encode.
-pub fn assemble(
-    contents: &ExportContents,
-) -> Result<Vec<u8>, super::super::time_evidence::EntryError> {
+/// [`AssembleError`].
+pub fn assemble(contents: &ExportContents) -> Result<Vec<u8>, AssembleError> {
     let mut sections = Vec::new();
     for journal in &contents.journals {
         let mut row = [0u8; 24];
@@ -132,7 +144,12 @@ pub fn assemble(
         .recordings
         .iter()
         .map(|recording| {
-            let end = recording.start.saturating_add(count(recording.bytes.len()));
+            let end = recording
+                .start
+                .checked_add(count(recording.bytes.len()))
+                .ok_or(AssembleError::RangeOverflow {
+                    recording: recording.recording,
+                })?;
             let mut row = [0u8; 64];
             for (slot, byte) in row.iter_mut().zip(
                 recording
@@ -149,9 +166,9 @@ pub fn assemble(
             ) {
                 *slot = byte;
             }
-            row
+            Ok(row)
         })
-        .collect();
+        .collect::<Result<_, AssembleError>>()?;
     sections.extend(rows(SectionKind::Manifest, 0, &manifest));
     if !contents.recordings.is_empty() {
         let body: Vec<u8> = contents
