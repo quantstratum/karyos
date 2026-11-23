@@ -269,7 +269,9 @@ pub fn decode(bytes: &[u8]) -> Result<Export, ExportError> {
         .checked_sub(TRAILER_LENGTH)
         .filter(|end| *end >= HEADER_LENGTH)
         .ok_or(ExportError::Trailer)?;
-    let (content, trailer) = bytes.split_at(body_end);
+    let (content, trailer) = bytes
+        .split_at_checked(body_end)
+        .ok_or(ExportError::Trailer)?;
     let digest: [u8; TRAILER_LENGTH] = Sha256::digest(content).into();
     if digest.as_slice() != trailer {
         return Err(ExportError::Trailer);
@@ -384,6 +386,14 @@ fn fits(kind: SectionKind, count: u64, body: &[u8]) -> bool {
         if next > body.len() || (kind == SectionKind::Frames && length == 0) {
             return false;
         }
+        // The padding after the payload is zero (design section 2.2).
+        let payload_end = at.saturating_add(fixed).saturating_add(length);
+        if body
+            .get(payload_end..next)
+            .is_none_or(|padding| padding.iter().any(|byte| *byte != 0))
+        {
+            return false;
+        }
         at = next;
         chunks = chunks.saturating_add(1);
     }
@@ -401,6 +411,8 @@ struct Order {
     any_group: bool,
     /// The last non-journal kind read.
     last: Option<SectionKind>,
+    /// The journals whose group was read: each at most once.
+    seen: std::collections::BTreeSet<u64>,
 }
 
 impl Order {
@@ -416,6 +428,9 @@ impl Order {
                     return false;
                 }
                 if self.any_group && role == Some(1) {
+                    return false;
+                }
+                if !self.seen.insert(journal) {
                     return false;
                 }
                 self.group = Some((journal, kind));

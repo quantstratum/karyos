@@ -150,6 +150,25 @@ fn every_refusal_is_typed() {
         decode(&with(&[policies.clone(), policies])),
         Err(ExportError::Order { section: 1 })
     );
+    // #1180 review: a journal's group appears once.
+    assert_eq!(
+        decode(&with(&[journal(1, 1), journal(3, 1)])),
+        Err(ExportError::Order { section: 1 })
+    );
+    // #1180 review: a chunk's padding is zero.
+    let mut chunk = frames_chunk(7, 0, &[1, 2, 3]);
+    assert_eq!(chunk.len(), 32);
+    chunk[31] = 9;
+    let frames = Section {
+        kind: SectionKind::Frames,
+        journal: 0,
+        count: 1,
+        body: chunk,
+    };
+    assert_eq!(
+        decode(&with(&[frames])),
+        Err(ExportError::Length { section: 0 })
+    );
     // A count that does not match.
     let mut bytes = vector("X-1");
     bytes[12] = 1;
