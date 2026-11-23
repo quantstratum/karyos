@@ -734,6 +734,11 @@ enum CloseReset {
     Asked,
 }
 
+/// Test only: positions and lengths a receiver lost on purpose, shared
+/// with a sender that holds back only the NAKs for them (karyos#1067).
+#[cfg(test)]
+pub(crate) type HeldRanges = std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>;
+
 /// Test only: the frame length, term offset and term id of the DATA frame
 /// `bytes` starts with, from its header (word 0, the term offset at bytes 8
 /// to 12, the term id at 20 to 24); `None` for another frame type or a
@@ -777,6 +782,16 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// count since the hook was set (a lossy path).
     #[cfg(test)]
     drop_data: Vec<u64>,
+    /// Test only: the positions and lengths of the DATA `drop_data` lost,
+    /// shared with a sender that holds back only the NAKs for them
+    /// (karyos#1067). First term positions: the term offset.
+    #[cfg(test)]
+    dropped: Option<HeldRanges>,
+    /// Test only: term offsets of the first term whose DATA datagram is
+    /// lost on its first arrival only (karyos#1067): a hole planted by
+    /// position, which natural loss before it does not move.
+    #[cfg(test)]
+    drop_once_at: Vec<u32>,
     /// Test only: DATA datagrams seen since the hook was set.
     #[cfg(test)]
     data_seen: u64,
@@ -798,6 +813,11 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// Test only: every RSP_SETUP handed to the sender, with its endpoint.
     #[cfg(test)]
     posted_challenges: Vec<(EndpointId, Control)>,
+    /// Tests: what the receiver saw, for a failure message (karyos#1067).
+    #[cfg(test)]
+    debug_trace: Vec<String>,
+    #[cfg(test)]
+    dropped_notes: u64,
     /// Test only: NAKs handed over on an image's founding path.
     #[cfg(test)]
     founding_naks: u64,
@@ -1855,6 +1875,15 @@ pub struct SenderRole<T: StreamTerms = HeapTerms> {
     /// repairs (receiver rigs that answer NAKs themselves).
     #[cfg(test)]
     ignore_naks: bool,
+    /// Test only: NAKs of this receiver boot id that ask for a range in
+    /// the shared list are dropped unread, every other answered
+    /// (karyos#1067).
+    #[cfg(test)]
+    ignore_naks_of: Option<([u64; 2], HeldRanges)>,
+    /// Test only: the first 64 NAKs answered while `ignore_naks_of` was
+    /// set, for a failure message.
+    #[cfg(test)]
+    nak_log: Vec<String>,
 }
 
 /// The driver settings a publication's membership follows: the receivers'
@@ -2019,12 +2048,20 @@ pub(super) fn roles<T: StreamTerms>(
             trace: super::net_trace::SenderTrace::default(),
             #[cfg(test)]
             ignore_naks: false,
+            #[cfg(test)]
+            ignore_naks_of: None,
+            #[cfg(test)]
+            nak_log: Vec::new(),
         },
         ReceiverRole {
             #[cfg(test)]
             drop_data: Vec::new(),
             #[cfg(test)]
             data_seen: 0,
+            #[cfg(test)]
+            dropped: None,
+            #[cfg(test)]
+            drop_once_at: Vec::new(),
             #[cfg(test)]
             repeat_data_from: None,
             #[cfg(test)]
@@ -2033,6 +2070,10 @@ pub(super) fn roles<T: StreamTerms>(
             posted_naks: Vec::new(),
             #[cfg(test)]
             posted_challenges: Vec::new(),
+            #[cfg(test)]
+            debug_trace: Vec::new(),
+            #[cfg(test)]
+            dropped_notes: 0,
             #[cfg(test)]
             founding_naks: 0,
             #[cfg(test)]
@@ -2553,6 +2594,40 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.sessions.ignored_counts()
     }
 
+    /// The session table's counters, ignored controls and path counters
+    /// (tests).
+    #[cfg(test)]
+    pub(crate) fn sessions_debug(&self) -> String {
+        format!(
+            "{:?} {:?} {:?} trace {:?}",
+            self.sessions.counters(),
+            self.sessions.ignored_counts(),
+            self.sessions.paths().counters(),
+            self.debug_trace
+        )
+    }
+
+    /// Tests: records `line`, the first 48 and then one in 64 of the rest.
+    #[cfg(test)]
+    fn note(&mut self, line: String) {
+        self.dropped_notes = self.dropped_notes.wrapping_add(1);
+        if self.debug_trace.len() < 48
+            || self.dropped_notes % 64 == 0 && self.debug_trace.len() < 160
+        {
+            self.debug_trace.push(line);
+        }
+    }
+
+    /// This receiver's boot id (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast tests (T9)")
+    )]
+    pub(crate) fn boot_id(&self) -> [u64; 2] {
+        self.sessions.boot_id()
+    }
+
     /// The session table's counters.
     #[must_use]
     pub fn session_counters(&self) -> crate::sessions::receive::SessionCounters {
@@ -2708,6 +2783,20 @@ impl<T: StreamTerms> ReceiverRole<T> {
     pub(super) fn drop_data(&mut self, nth: &[u64]) {
         self.drop_data = nth.to_vec();
         self.data_seen = 0;
+    }
+
+    /// Loses the first arrival of the DATA datagram at each term offset of
+    /// `at`, in the first term (tests).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn drop_data_at(&mut self, at: &[u32]) {
+        self.drop_once_at = at.to_vec();
+    }
+
+    /// Records into `held` the position and length of each DATA datagram
+    /// `drop_data` loses from now on (tests).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn share_dropped(&mut self, held: HeldRanges) {
+        self.dropped = Some(held);
     }
 
     /// Loses every DATA datagram with a payload at or past `term_offset`
@@ -4522,7 +4611,25 @@ impl<T: StreamTerms> Intake<'_, T> {
             if let Some(next) = seen.checked_add(1) {
                 self.role.data_seen = next;
             }
+            if let Some((_, at, _)) = drop_tail_frame(bytes)
+                && let Some(index) = self.role.drop_once_at.iter().position(|held| *held == at)
+            {
+                let _ = self.role.drop_once_at.swap_remove(index);
+                if let (Some(dropped), Ok(length)) =
+                    (self.role.dropped.as_ref(), u64::try_from(bytes.len()))
+                    && let Ok(mut held) = dropped.lock()
+                {
+                    held.push((u64::from(at), length));
+                }
+                return;
+            }
             if self.role.drop_data.contains(&seen) {
+                if let (Some(dropped), Some((_, at, _))) =
+                    (self.role.dropped.as_ref(), drop_tail_frame(bytes))
+                    && let (Ok(length), Ok(mut held)) = (u64::try_from(bytes.len()), dropped.lock())
+                {
+                    held.push((u64::from(at), length));
+                }
                 return;
             }
             // A DATA frame at or past the offset, decoded from its header:
@@ -4662,6 +4769,11 @@ impl<T: StreamTerms> Intake<'_, T> {
         });
         let Some(image) = found.and_then(|index| role.images.get_mut(index)) else {
             role.count(|c| &mut c.data_unbound);
+            #[cfg(test)]
+            role.note(format!(
+                "{} data unbound ep{} from {source}",
+                self.now, key.endpoint.0
+            ));
             self.solicit(key);
             return;
         };
@@ -4911,6 +5023,17 @@ impl<T: StreamTerms> Intake<'_, T> {
         }
         #[cfg(test)]
         self.role.posted_challenges.push((endpoint, control));
+        #[cfg(test)]
+        self.role.note(format!(
+            "{} sent ep{} to {source} {}",
+            self.now,
+            endpoint.0,
+            match control {
+                Control::Challenge(_) => "challenge",
+                Control::Solicit(_) => "solicit",
+                _ => "other",
+            }
+        ));
         self.forward(ControlItem::Outgoing {
             endpoint,
             destination: source,
@@ -5195,6 +5318,11 @@ impl<T: StreamTerms> Intake<'_, T> {
                     reserved = reserve_chain(sessions);
                     reserved.is_some()
                 });
+                #[cfg(test)]
+                self.role.note(format!(
+                    "{now} answer ep{} from {source} {outcome:?}",
+                    endpoint.0
+                ));
                 if let (
                     AnswerOutcome::CreateImage {
                         slot,
@@ -5282,7 +5410,14 @@ impl<T: StreamTerms> Intake<'_, T> {
                 // It refreshes only its own bound path; it creates nothing.
                 match self.role.sessions.paths_mut().path_hb(key, now) {
                     Some(_) => self.role.count(|c| &mut c.path_heartbeats),
-                    None => self.role.count(|c| &mut c.path_heartbeats_unbound),
+                    None => {
+                        #[cfg(test)]
+                        self.role.note(format!(
+                            "{now} path_hb unbound ep{} from {source}",
+                            endpoint.0
+                        ));
+                        self.role.count(|c| &mut c.path_heartbeats_unbound);
+                    }
                 }
             }
             Control::Challenge(_) | Control::Solicit(_) | Control::Status(_) | Control::Nak(_) => {
@@ -6869,6 +7004,46 @@ impl<T: StreamTerms> SenderRole<T> {
         self.ignore_naks = true;
     }
 
+    /// Drops the NAKs of receiver boot id `boot_id` unread, or none
+    /// (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast tests (T9)")
+    )]
+    pub(super) fn ignore_naks_of(&mut self, held: Option<([u64; 2], HeldRanges)>) {
+        self.ignore_naks_of = held;
+    }
+
+    /// The held ranges and the NAKs answered while they were held (tests).
+    #[cfg(test)]
+    pub(crate) fn nak_debug(&self) -> String {
+        let held = self.ignore_naks_of.as_ref().and_then(|(boot, held)| {
+            held.lock()
+                .ok()
+                .map(|held| format!("{:x} {:?}", boot[0], *held))
+        });
+        format!("held {held:?} answered {:?}", self.nak_log)
+    }
+
+    /// Whether `nak` is one [`SenderRole::ignore_naks_of`] holds back: its
+    /// receiver's, overlapping a held range (tests).
+    #[cfg(test)]
+    fn holds_nak(&self, nak: &Nak) -> bool {
+        let Some((boot_id, held)) = self.ignore_naks_of.as_ref() else {
+            return false;
+        };
+        if *boot_id != nak.receiver.receiver_boot_id {
+            return false;
+        }
+        let start = nak.range.start;
+        let end = start.saturating_add(u64::from(nak.range.length));
+        held.lock().is_ok_and(|held| {
+            held.iter()
+                .any(|&(at, length)| at < end && start < at.saturating_add(length))
+        })
+    }
+
     /// Reads NAKs again after [`SenderRole::ignore_naks`] (tests).
     #[cfg(test)]
     #[cfg_attr(
@@ -7350,8 +7525,15 @@ impl<T: StreamTerms> SenderRole<T> {
         now: u64,
     ) {
         #[cfg(test)]
-        if self.ignore_naks {
+        if self.ignore_naks || self.holds_nak(nak) {
             return;
+        }
+        #[cfg(test)]
+        if self.ignore_naks_of.is_some() && self.nak_log.len() < 64 {
+            self.nak_log.push(format!(
+                "boot {:x} start {} len {}",
+                nak.receiver.receiver_boot_id[0], nak.range.start, nak.range.length
+            ));
         }
         // RP-11's order: the binding, then the absorption of copies, then
         // the cycle's NAK budget, so an absorbed copy spends none.
