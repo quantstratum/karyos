@@ -142,6 +142,9 @@ pub struct Sender {
     /// taken from again.
     give: SyncSender<Vec<u8>>,
     pool: Returned<Vec<u8>>,
+    /// Chunk buffers made so far, at most [`CHUNK_POOL`]: past it a poll
+    /// waits for one to come back rather than allocate another.
+    made: usize,
 }
 
 impl Sender {
@@ -173,6 +176,7 @@ impl Sender {
             chunk: MAX_CHUNK,
             give,
             pool,
+            made: 0,
         })
     }
 
@@ -238,19 +242,40 @@ impl Sender {
             return Ok(());
         }
         let mut left = budget;
-        // The range that follows what was sent, found without collecting:
-        // the range seal past it that starts first.
-        while let Some(seal) = seals
-            .iter()
-            .filter(|seal| {
-                seal.subject == recording
-                    && matches!(seal.kind, SealKind::OpenSegment | SealKind::ClosedSegment)
-                    && seal.end > self.sent_end
-                    && seal.end <= self.request.until
-            })
-            .min_by_key(|seal| seal.start)
-            .copied()
-        {
+        let wanted = |seal: &SealRecord, sent_end: u64, until: u64| {
+            seal.subject == recording
+                && matches!(seal.kind, SealKind::OpenSegment | SealKind::ClosedSegment)
+                && seal.end > sent_end
+                && seal.end <= until
+        };
+        // The journal holds a recording's range seals in position order,
+        // so one pass in that order sends them all: no rescan per range.
+        // A seal met out of that order ends the pass, and the range that
+        // starts first past what was sent decides, as before, whether it
+        // follows or is a gap.
+        let mut at = 0;
+        loop {
+            let next = seals
+                .get(at..)
+                .unwrap_or_default()
+                .iter()
+                .position(|seal| wanted(seal, self.sent_end, self.request.until));
+            let seal = match next.and_then(|offset| at.checked_add(offset)) {
+                Some(index)
+                    if seals
+                        .get(index)
+                        .is_some_and(|seal| seal.start == self.sent_end) =>
+                {
+                    at = index;
+                    seals.get(index).copied()
+                }
+                _ => seals
+                    .iter()
+                    .filter(|seal| wanted(seal, self.sent_end, self.request.until))
+                    .min_by_key(|seal| seal.start)
+                    .copied(),
+            };
+            let Some(seal) = seal else { break };
             if seal.start != self.sent_end {
                 // A range that does not follow what was sent: a gap.
                 out.push(self.finish(State::Interrupted, store, sealed_end));
@@ -264,7 +289,10 @@ impl Sender {
                 let to = seal.end.min(self.next.saturating_add(chunk));
                 let length = usize::try_from(to.saturating_sub(self.next))
                     .map_err(|_| SegmentError::PositionOverflow)?;
-                let mut bytes = self.buffer();
+                // Every buffer is out: wait for one to come back.
+                let Some(mut bytes) = self.buffer() else {
+                    return Ok(());
+                };
                 bytes.resize(length, 0);
                 // Back to the pool on a failed read too.
                 let mut bytes = Chunk {
@@ -293,14 +321,19 @@ impl Sender {
     }
 
     /// A buffer a dropped chunk gave back, or a new one that holds a
-    /// whole chunk, so filling it never grows it.
-    fn buffer(&self) -> Vec<u8> {
+    /// whole chunk while fewer than [`CHUNK_POOL`] were made, so filling it
+    /// never grows it; `None` while every buffer is out.
+    fn buffer(&mut self) -> Option<Vec<u8>> {
         match self.pool.try_recv() {
             Ok(mut bytes) => {
                 bytes.clear();
-                bytes
+                Some(bytes)
             }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Vec::with_capacity(self.chunk),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) if self.made < CHUNK_POOL => {
+                self.made = self.made.saturating_add(1);
+                Some(Vec::with_capacity(self.chunk))
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
         }
     }
 

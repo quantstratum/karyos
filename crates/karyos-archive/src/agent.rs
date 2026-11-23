@@ -3385,6 +3385,9 @@ where
                     .sum();
                 budget = budget.saturating_sub(sent);
                 if polled.is_err() {
+                    // Its chunks go with it: the shared buffer keeps its
+                    // capacity for the next replication (Codex review).
+                    out.clear();
                     self.replications.swap_remove(index);
                     continue;
                 }
