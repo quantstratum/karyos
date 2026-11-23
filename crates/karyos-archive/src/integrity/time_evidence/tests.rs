@@ -163,3 +163,39 @@ fn the_verdict_follows_the_precedence() {
     };
     assert_eq!(coarse.verdict(&loose), Verdict::NotMet);
 }
+
+/// karyos#1137 (docs#975): an entry of the reserved zero clock identity
+/// is kept only as the sentinel, both bounds `NO_BOUND` and both digests
+/// zero; any other is refused before it is appended or sealed. A single
+/// zero field in another identity is ordinary.
+#[test]
+fn the_zero_identity_is_kept_only_as_the_sentinel() {
+    let archive = std::env::temp_dir().join(format!("karyos-te-sentinel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&archive);
+    std::fs::create_dir_all(entries_dir(&archive)).unwrap();
+    let mut store = EntryStore::open(StdDisk, &archive).unwrap();
+    let zero = Entry {
+        clock: [0; 5],
+        ..t1()
+    };
+    assert!(matches!(store.append(&zero), Err(StoreError::Sentinel)));
+    let sentinel = Entry {
+        bound_min_ns: NO_BOUND,
+        bound_max_ns: NO_BOUND,
+        calibration: [0; 32],
+        utc_reference: [0; 32],
+        ..zero
+    };
+    assert_eq!(store.append(&sentinel).unwrap(), 0);
+    let one_zero_field = Entry {
+        clock: [0, 0, 2, 3, 4],
+        ..t1()
+    };
+    assert_eq!(store.append(&one_zero_field).unwrap(), 200);
+    drop(store);
+    assert_eq!(
+        read_sealed(StdDisk, &archive).unwrap(),
+        [sentinel, one_zero_field]
+    );
+    std::fs::remove_dir_all(&archive).unwrap();
+}

@@ -229,6 +229,43 @@ pub struct StartGroup {
     /// The group's checkpoints (A9-3), or `None` for a group that keeps
     /// none.
     pub checkpoints: Option<GroupCheckpoints>,
+    /// The capture session's declared event clock, for time evidence
+    /// (ADR-0098; karyos#1137); `None` declares none, and the group gets
+    /// no entries.
+    pub time_evidence: Option<GroupTimeEvidence>,
+}
+
+/// A capture session's time evidence (ADR-0098 item 1): the declared
+/// clock of the `logical_time`s the event loop passes, and how long a
+/// sealed range waits for the calibration journal to reach it.
+///
+/// Entries are kept only when the Archive seals (an integrity journal) and
+/// the host made `time-evidence/` in the group journal directory, as for
+/// the Archive's own entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GroupTimeEvidence {
+    /// The declared clock; the zero tuple is refused
+    /// ([`AgentError::ZeroEventClock`]).
+    pub clock: crate::integrity::time_producer::EventClock,
+    /// The longest a sealed range waits for the calibration journal to
+    /// publish past its largest timestamp; past it, its entries are
+    /// `no_evidence`.
+    pub calibration_wait: Duration,
+}
+
+impl GroupTimeEvidence {
+    /// The declaration of `clock`, waiting at most `calibration_wait`.
+    #[must_use]
+    pub const fn new(
+        clock: crate::integrity::time_producer::EventClock,
+        calibration_wait: Duration,
+    ) -> Self {
+        Self {
+            clock,
+            calibration_wait,
+        }
+    }
 }
 
 impl StartGroup {
@@ -249,6 +286,7 @@ impl StartGroup {
             journal,
             capture,
             checkpoints: None,
+            time_evidence: None,
         }
     }
 
@@ -263,6 +301,13 @@ impl StartGroup {
     #[must_use]
     pub const fn with_checkpoints(mut self, checkpoints: GroupCheckpoints) -> Self {
         self.checkpoints = Some(checkpoints);
+        self
+    }
+
+    /// Declares the capture session's event clock, for time evidence.
+    #[must_use]
+    pub const fn with_time_evidence(mut self, evidence: GroupTimeEvidence) -> Self {
+        self.time_evidence = Some(evidence);
         self
     }
 }
@@ -673,6 +718,10 @@ pub enum Failure {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AgentError {
+    /// A group's declared event clock is the reserved all zero identity,
+    /// which means "provenance unknown" (karyos#1137): declare none.
+    #[error("the all zero clock identity is reserved: declare no clock instead")]
+    ZeroEventClock,
     /// A replication the source refuses (ADR-0091; karyos#1113): answered
     /// with its `ControlResponse` code.
     #[error("replication refused: {0:?}")]
@@ -924,6 +973,11 @@ enum Command {
     StopReplication(crate::replication::StopReplication, Reply<()>),
     /// A time evidence entry to record (karyos#1128).
     TimeEvidence(Box<crate::integrity::time_evidence::Entry>, Reply<u64>),
+    /// The calibration source for groups' time evidence (karyos#1137).
+    CalibrationSource(
+        Box<dyn crate::integrity::time_producer::CalibrationSource>,
+        Reply<()>,
+    ),
     Shutdown(Reply<()>),
 }
 
@@ -1029,6 +1083,9 @@ impl core::fmt::Debug for Command {
             Self::Replicate(request, _, _) => f.debug_tuple("Replicate").field(request).finish(),
             Self::StopReplication(stop, _) => f.debug_tuple("StopReplication").field(stop).finish(),
             Self::TimeEvidence(entry, _) => f.debug_tuple("TimeEvidence").field(entry).finish(),
+            Self::CalibrationSource(source, _) => {
+                f.debug_tuple("CalibrationSource").field(source).finish()
+            }
             Self::Shutdown(_) => f.write_str("Shutdown"),
         }
     }
@@ -1311,6 +1368,21 @@ impl ArchiveHandle {
         entry: crate::integrity::time_evidence::Entry,
     ) -> Result<u64, AgentError> {
         self.call(|reply| Command::TimeEvidence(Box::new(entry), reply))
+    }
+
+    /// Sets where the agent takes its calibration snapshots for groups'
+    /// time evidence (ADR-0098; karyos#1137), replacing any earlier one.
+    /// Without one, every snapshot is empty, so a group's ranges wait
+    /// their `calibration_wait` and then get `no_evidence` entries.
+    ///
+    /// # Errors
+    ///
+    /// [`AgentError::Gone`].
+    pub fn set_calibration_source(
+        &self,
+        source: Box<dyn crate::integrity::time_producer::CalibrationSource>,
+    ) -> Result<(), AgentError> {
+        self.call(|reply| Command::CalibrationSource(source, reply))
     }
 
     /// [`ArchiveHandle::stop`], posted.
@@ -2033,6 +2105,7 @@ fn run<D>(
         retention,
         verifying: Arc::default(),
         replications: Vec::new(),
+        calibrations: None,
     };
     // Before the first command: a purge a crash cut short is completed or
     // cancelled before any retry reaches it (karyos#1121 review).
@@ -2097,6 +2170,9 @@ fn run<D>(
 
 /// What the agent's thread owns.
 struct State<D: Disk> {
+    /// Where groups' time evidence takes its calibration snapshots
+    /// (karyos#1137).
+    calibrations: Option<Box<dyn crate::integrity::time_producer::CalibrationSource>>,
     disk: D,
     dir: PathBuf,
     config: AgentConfig,
@@ -2830,6 +2906,25 @@ struct ActiveGroup<D: Disk> {
     /// The failures whose references this group has all read: its last
     /// duty that read the ring empty began after them.
     cleared: u64,
+    /// Its time evidence, when declared and kept (karyos#1137).
+    evidence: Option<GroupEvidence<D>>,
+}
+
+/// A group's time evidence production (ADR-0098).
+#[derive(Debug)]
+struct GroupEvidence<D: Disk> {
+    declared: GroupTimeEvidence,
+    /// The group's `time-evidence/` store.
+    store: crate::integrity::time_evidence::EntryStore<D>,
+    /// The journal position this capture session began at: earlier
+    /// records are of another session, whose clock is not known.
+    session_start: u64,
+    /// The record boundary entries are produced from.
+    next: u64,
+    /// The timers created in this session and not cancelled.
+    timers: std::collections::BTreeSet<u64>,
+    /// When the range from `next` began waiting for the calibrations.
+    waiting_since: Option<u64>,
 }
 
 /// A group's checkpoint writer on the agent's thread (A9-3): the store,
@@ -3508,6 +3603,10 @@ where
             Command::TimeEvidence(entry, reply) => {
                 let _ = reply.send(self.record_time_evidence(&entry));
             }
+            Command::CalibrationSource(source, reply) => {
+                self.calibrations = Some(source);
+                let _ = reply.send(Ok(()));
+            }
             Command::Shutdown(reply) => {
                 let groups = std::mem::take(&mut self.groups);
                 for group in groups {
@@ -3829,12 +3928,20 @@ where
             _ => None,
         };
         // A new ring holds no reference to a recording that failed.
+        let dir = sealed_dir.unwrap_or_else(|| start.dir.clone());
+        let evidence = match start.time_evidence {
+            Some(declared) if self.integrity.is_some() => {
+                group_evidence(&self.disk, &dir, declared, job.journal().durable())?
+            }
+            _ => None,
+        };
         self.groups.push(ActiveGroup {
             id,
-            dir: sealed_dir.unwrap_or_else(|| start.dir.clone()),
+            dir,
             job,
             checkpoints,
             cleared: self.failures,
+            evidence,
         });
         Ok(sender)
     }
@@ -3894,6 +4001,8 @@ where
             }
             if self.integrity.is_some() {
                 seal_group(&mut self.group_seals, group, &self.disk);
+                worked |=
+                    produce_evidence(&self.group_seals, group, self.calibrations.as_mut(), now);
             }
             // A group that read its ring empty, or that reads nothing
             // more, holds no reference to an earlier failure.
@@ -4297,6 +4406,158 @@ fn seal_group<D: Disk + Clone>(
     if failed {
         *entry = None;
     }
+}
+
+/// A group's time evidence, when the host made `time-evidence/` in its
+/// journal directory: its store opened, the session starting at
+/// `session_start`.
+///
+/// # Errors
+///
+/// [`AgentError::ZeroEventClock`] for the reserved zero tuple, and the
+/// store's errors.
+fn group_evidence<D: Disk + Clone>(
+    disk: &D,
+    dir: &Path,
+    declared: GroupTimeEvidence,
+    session_start: u64,
+) -> Result<Option<GroupEvidence<D>>, AgentError> {
+    use crate::integrity::time_evidence::{DIR, EntryStore};
+    if declared.clock.clock == [0; 5] {
+        return Err(AgentError::ZeroEventClock);
+    }
+    if !disk.clone().list(dir)?.iter().any(|name| name == DIR) {
+        return Ok(None);
+    }
+    let store = EntryStore::open(disk.clone(), dir)?;
+    Ok(Some(GroupEvidence {
+        declared,
+        store,
+        session_start,
+        next: session_start,
+        timers: std::collections::BTreeSet::new(),
+        waiting_since: None,
+    }))
+}
+
+/// Produces `group`'s time evidence entries for what its integrity
+/// journal sealed since the last (ADR-0098 item 3): the sealed records'
+/// events, partitioned and bounded by [`produce`], appended to the
+/// group's store, sealed there. A range waits for the calibrations to
+/// reach its largest timestamp at most the declared `calibration_wait`.
+/// A walk or store failure stops the group's production, never the
+/// capture or the seal: the rest stays without entries (`no_evidence`).
+/// Returns whether any entry was appended.
+///
+/// [`produce`]: crate::integrity::time_producer::produce
+fn produce_evidence<D: Disk + Clone>(
+    seals: &std::collections::BTreeMap<PathBuf, Option<IntegrityJournal<D>>>,
+    group: &mut ActiveGroup<D>,
+    calibrations: Option<&mut Box<dyn crate::integrity::time_producer::CalibrationSource>>,
+    now: u64,
+) -> bool {
+    use crate::group::record::{GroupRecord, TimerAction};
+    use crate::integrity::time_producer::{Event, Snapshot, produce};
+    let ActiveGroup {
+        id,
+        dir,
+        job,
+        evidence: slot,
+        ..
+    } = group;
+    let Some(evidence) = slot.as_mut() else {
+        return false;
+    };
+    let Some(sealed) = seals
+        .get(dir)
+        .and_then(Option::as_ref)
+        .and_then(|integrity| integrity.sealed_end(*id))
+    else {
+        return false;
+    };
+    if sealed <= evidence.next {
+        return false;
+    }
+    let session_start = evidence.session_start;
+    let mut timers = evidence.timers.clone();
+    let mut events: Vec<Event> = Vec::new();
+    let mut stop = evidence.next;
+    let walked = job.journal_mut().walk(evidence.next, |start, end, record| {
+        if end > sealed {
+            return false;
+        }
+        stop = end;
+        let in_session = start >= session_start;
+        let time = match record {
+            GroupRecord::Message(event) => Some(event.logical_time),
+            GroupRecord::Conflated(event) => Some(event.logical_time),
+            GroupRecord::Timer(event) => Some(event.logical_time),
+            GroupRecord::Lifecycle(event) => Some(event.logical_time),
+            GroupRecord::External(event) => Some(event.logical_time),
+            GroupRecord::Loss(event) => Some(event.logical_time),
+            GroupRecord::TimerOperation(operation) => {
+                if in_session {
+                    match operation.action {
+                        TimerAction::Create => {
+                            timers.insert(operation.timer_id);
+                        }
+                        TimerAction::Cancel => {
+                            timers.remove(&operation.timer_id);
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        // A fired timer's deadline is proven only if this session
+        // scheduled it.
+        let proven = match record {
+            GroupRecord::Timer(event) => timers.contains(&event.timer_id),
+            _ => true,
+        };
+        match (time, events.last_mut()) {
+            (Some(time), _) => events.push(Event {
+                start,
+                end,
+                time,
+                in_session: in_session && proven,
+            }),
+            (None, Some(last)) => last.end = end,
+            (None, None) => {}
+        }
+        true
+    });
+    if walked.is_err() {
+        *slot = None;
+        return false;
+    }
+    // The records before the first timed one belong to its entry, so the
+    // entries tile from `next`.
+    if let Some(first) = events.first_mut() {
+        first.start = evidence.next;
+    }
+    let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
+    let snapshot = calibrations.map_or_else(Snapshot::default, |source| source.snapshot());
+    let wait = u64::try_from(evidence.declared.calibration_wait.as_nanos()).unwrap_or(u64::MAX);
+    if !events.is_empty() && !snapshot.reaches(&evidence.declared.clock, largest) {
+        let since = *evidence.waiting_since.get_or_insert(now);
+        if now.saturating_sub(since) < wait {
+            return false;
+        }
+    }
+    let mut appended = false;
+    for entry in produce(*id, &events, Some(&evidence.declared.clock), &snapshot) {
+        if evidence.store.append(&entry).is_err() {
+            *slot = None;
+            return appended;
+        }
+        appended = true;
+    }
+    evidence.next = stop;
+    evidence.timers = timers;
+    evidence.waiting_since = None;
+    appended
 }
 
 /// Seals the last range of `id` before its store closes: everything

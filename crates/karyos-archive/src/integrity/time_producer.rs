@@ -119,6 +119,35 @@ const fn is_zero(clock: &ClockKey) -> bool {
         && clock.epoch == 0
 }
 
+impl Snapshot {
+    /// Whether the producer published past `largest` for `clock`: a
+    /// calibration of it whose validity starts after `largest`. The agent
+    /// waits for this before producing a range (ADR-0098 item 3); the
+    /// complete check per cited target is [`produce`]'s.
+    #[must_use]
+    pub fn reaches(&self, clock: &EventClock, largest: u64) -> bool {
+        let key = clock.key();
+        self.calibrations
+            .iter()
+            .any(|(later, _)| later.from == key && later.valid_from > largest)
+    }
+}
+
+/// Where the Archive agent takes its calibration snapshots: the host's
+/// view of its calibration journal (ADR-0098 item 3). Each call is one
+/// snapshot, read once at one durable position.
+pub trait CalibrationSource: Send + core::fmt::Debug {
+    /// The journal's records now, and whether it reported no loss.
+    fn snapshot(&mut self) -> Snapshot;
+}
+
+/// A fixed snapshot, for a host whose calibrations do not change.
+impl CalibrationSource for Snapshot {
+    fn snapshot(&mut self) -> Snapshot {
+        self.clone()
+    }
+}
+
 /// The SHA-256 of a record's 144 little-endian bytes.
 fn record_digest(words: &[u64; CALIBRATION_WORDS]) -> Digest {
     let mut hasher = Sha256::new();

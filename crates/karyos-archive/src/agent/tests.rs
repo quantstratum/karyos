@@ -1240,6 +1240,7 @@ mod groups {
                 in_flight: 64,
             },
             checkpoints: None,
+            time_evidence: None,
         }
     }
 
@@ -1374,6 +1375,154 @@ mod groups {
             journal.read_bytes(range.start, &mut bytes).unwrap();
             verify_range(range, &bytes).unwrap();
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The calibrations of clock `[1, 0, 2, 3, 4]` into a UTC-traceable
+    /// clock over `[0, 100]`, its UTC reference, and the producer's later
+    /// records: a snapshot proving coverage of times up to 100.
+    fn calibrations() -> crate::integrity::time_producer::Snapshot {
+        use karyos_trace::clocks::utc::{Scale, Source, SyncState, UtcReference};
+        use karyos_trace::clocks::{Calibration, ClockKey};
+        use karyos_trace::journal::ObserverId;
+        let key = |[low, high, journal, domain, epoch]: [u64; 5]| ClockKey {
+            observer: ObserverId {
+                driver: [low, high],
+                journal,
+            },
+            domain,
+            epoch,
+        };
+        let calibration = |valid_from, valid_to| {
+            Calibration {
+                from: key([1, 0, 2, 3, 4]),
+                to: key([9, 0, 9, 9, 9]),
+                reference: valid_from,
+                offset: 10,
+                offset_uncertainty: 2,
+                drift: 0,
+                drift_uncertainty: 0,
+                valid_from,
+                valid_to,
+            }
+            .encode()
+            .unwrap()
+        };
+        let reference = |valid_from, valid_to| {
+            UtcReference {
+                clock: key([9, 0, 9, 9, 9]),
+                source: Source::Gnss,
+                sync_state: SyncState::Synchronised,
+                bound: 100,
+                valid_from,
+                valid_to,
+                tick_fs: 1_000_000,
+                scale: Scale::Tai,
+                origin: 0,
+                origin_scale_ns: 2_000_000_000_000_000_000,
+                leap_table: 69,
+                transform_uncertainty_ns: 0,
+            }
+            .encode()
+            .unwrap()
+        };
+        crate::integrity::time_producer::Snapshot::new(
+            &[
+                calibration(0, 100),
+                reference(0, 1999),
+                calibration(1000, 2000),
+                reference(2000, 3000),
+            ],
+            true,
+        )
+    }
+
+    /// karyos#1137: a group started with a declared event clock, in a
+    /// directory whose host made `time-evidence/`, gets its time evidence
+    /// entries as its journal is sealed: in the group's own store, naming
+    /// the group, covering its journal from the session's start, bounded
+    /// through the calibration source's records.
+    #[test]
+    fn a_sealed_group_range_gets_its_time_evidence() {
+        use crate::agent::GroupTimeEvidence;
+        use crate::integrity::time_evidence::{DIR, NO_BOUND, read_sealed};
+        use crate::integrity::time_producer::EventClock;
+        let dir = temp_dir("group-time-evidence");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        agent
+            .set_calibration_source(Box::new(calibrations()))
+            .unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        let clock = EventClock {
+            clock: [1, 0, 2, 3, 4],
+            granularity: 1,
+        };
+        let mut sender = agent
+            .start_group(
+                start_group(&groups, Some(Capture::Strict))
+                    .with_time_evidence(GroupTimeEvidence::new(clock, Duration::from_secs(5))),
+            )
+            .unwrap();
+        sender.admit().unwrap();
+        // Its `logical_time` is its sequence, 1.
+        sender.send(&referencing(1, recording), 1).unwrap();
+        let waiter = sender.waiter();
+        assert_eq!(agent.stop(recording).unwrap().position, 3000);
+        assert_eq!(waiter.wait_durable(1, Duration::from_secs(5)), Ok(1));
+        let mut entries = Vec::new();
+        for _ in 0..5000 {
+            entries = read_sealed(StdDisk, &groups).unwrap();
+            if !entries.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        agent.shutdown().unwrap();
+        assert!(!entries.is_empty(), "no entry produced");
+        for entry in &entries {
+            assert_eq!(entry.recording, GROUP);
+            assert_eq!(entry.clock, [1, 0, 2, 3, 4]);
+            assert_eq!((entry.min_time, entry.max_time), (1, 1));
+            assert_ne!(entry.bound_min_ns, NO_BOUND);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// karyos#1137: the all zero clock identity is reserved; declaring it
+    /// is refused.
+    #[test]
+    fn a_zero_event_clock_is_refused() {
+        use crate::agent::GroupTimeEvidence;
+        use crate::integrity::time_evidence::DIR;
+        use crate::integrity::time_producer::EventClock;
+        let dir = temp_dir("group-zero-clock");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let zero = EventClock {
+            clock: [0; 5],
+            granularity: 1,
+        };
+        assert!(matches!(
+            agent.start_group(
+                start_group(&groups, Some(Capture::Strict))
+                    .with_time_evidence(GroupTimeEvidence::new(zero, Duration::ZERO)),
+            ),
+            Err(AgentError::ZeroEventClock)
+        ));
+        agent.shutdown().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2523,6 +2672,7 @@ mod checkpoints {
                 max_checkpoint: 300_000,
                 reopen_hold: None,
             }),
+            time_evidence: None,
         }
     }
 
