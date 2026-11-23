@@ -8,6 +8,8 @@
 //! counts a range only once its seal verifies on the replica's own bytes.
 //! Either end is driven by its host's control streams.
 
+use std::sync::mpsc::{Receiver as Returned, SyncSender, TryRecvError, sync_channel};
+
 use crate::control::ResponseCode;
 use crate::disk::Disk;
 use crate::integrity::copies::CopyCatalog;
@@ -30,12 +32,77 @@ pub enum Outgoing {
         /// Their position.
         start: u64,
         /// At most [`MAX_CHUNK`] of them.
-        bytes: Vec<u8>,
+        bytes: Chunk,
     },
     /// A range's seal, sent once its bytes were.
     Seal(SealRecord),
     /// The source's status.
     Status(ReplicationStatus),
+}
+
+/// How many chunk buffers a [`Sender`] keeps for reuse: the stream's
+/// queue and one poll's chunks in flight fit, so a steady replication
+/// takes every buffer back and allocates none (karyos#1113).
+pub const CHUNK_POOL: usize = 256;
+
+/// The bytes of one [`Outgoing::Bytes`]. A chunk a [`Sender`] made goes
+/// back to it once dropped, for its next poll to fill again: a steady
+/// replication allocates no buffer per chunk (karyos#1113).
+pub struct Chunk {
+    bytes: Vec<u8>,
+    /// Where the buffer goes back to; `None` for a chunk no sender owns.
+    home: Option<SyncSender<Vec<u8>>>,
+}
+
+impl Chunk {
+    /// The bytes.
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl From<Vec<u8>> for Chunk {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self { bytes, home: None }
+    }
+}
+
+impl core::ops::Deref for Chunk {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take() {
+            // A full pool or a gone sender: the buffer is freed.
+            let _ = home.try_send(core::mem::take(&mut self.bytes));
+        }
+    }
+}
+
+impl Clone for Chunk {
+    fn clone(&self) -> Self {
+        Self::from(self.bytes.clone())
+    }
+}
+
+impl PartialEq for Chunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for Chunk {}
+
+impl core::fmt::Debug for Chunk {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("Chunk").field(&self.bytes).finish()
+    }
 }
 
 /// Why a source refuses a request: the `ControlResponse` code to answer.
@@ -71,6 +138,10 @@ pub struct Sender {
     done: Option<State>,
     /// The most bytes one [`Outgoing::Bytes`] carries, 1 to [`MAX_CHUNK`].
     chunk: usize,
+    /// Where dropped chunks return their buffers, and where they are
+    /// taken from again.
+    give: SyncSender<Vec<u8>>,
+    pool: Returned<Vec<u8>>,
 }
 
 impl Sender {
@@ -93,12 +164,15 @@ impl Sender {
             return Err(Refusal::UnknownRecording);
         }
         check_request(&request, start, seals).map_err(Refusal::Invalid)?;
+        let (give, pool) = sync_channel(CHUNK_POOL);
         Ok(Self {
             request,
             next: request.from,
             sent_end: request.from,
             done: None,
             chunk: MAX_CHUNK,
+            give,
+            pool,
         })
     }
 
@@ -114,6 +188,13 @@ impl Sender {
     #[must_use]
     pub const fn request(&self) -> &ReplicateRecording {
         &self.request
+    }
+
+    /// The end of the last range sent whole with its seal: the seals at
+    /// or below it are not needed again.
+    #[must_use]
+    pub const fn sent_end(&self) -> u64 {
+        self.sent_end
     }
 
     /// The final state, once reached; nothing more is sent after it.
@@ -156,7 +237,10 @@ impl Sender {
             out.push(self.finish(State::Interrupted, store, sealed_end));
             return Ok(());
         }
-        let mut ranges: Vec<&SealRecord> = seals
+        let mut left = budget;
+        // The range that follows what was sent, found without collecting:
+        // the range seal past it that starts first.
+        while let Some(seal) = seals
             .iter()
             .filter(|seal| {
                 seal.subject == recording
@@ -164,10 +248,9 @@ impl Sender {
                     && seal.end > self.sent_end
                     && seal.end <= self.request.until
             })
-            .collect();
-        ranges.sort_by_key(|seal| seal.start);
-        let mut left = budget;
-        for seal in ranges {
+            .min_by_key(|seal| seal.start)
+            .copied()
+        {
             if seal.start != self.sent_end {
                 // A range that does not follow what was sent: a gap.
                 out.push(self.finish(State::Interrupted, store, sealed_end));
@@ -181,8 +264,14 @@ impl Sender {
                 let to = seal.end.min(self.next.saturating_add(chunk));
                 let length = usize::try_from(to.saturating_sub(self.next))
                     .map_err(|_| SegmentError::PositionOverflow)?;
-                let mut bytes = vec![0u8; length];
-                store.read(self.next, &mut bytes)?;
+                let mut bytes = self.buffer();
+                bytes.resize(length, 0);
+                // Back to the pool on a failed read too.
+                let mut bytes = Chunk {
+                    bytes,
+                    home: Some(self.give.clone()),
+                };
+                store.read(self.next, &mut bytes.bytes)?;
                 out.push(Outgoing::Bytes {
                     start: self.next,
                     bytes,
@@ -190,7 +279,7 @@ impl Sender {
                 left = left.saturating_sub(length);
                 self.next = to;
             }
-            out.push(Outgoing::Seal(*seal));
+            out.push(Outgoing::Seal(seal));
             self.sent_end = seal.end;
         }
         if self.sent_end == self.request.until {
@@ -201,6 +290,18 @@ impl Sender {
             out.push(self.finish(State::CaughtUp, store, sealed_end));
         }
         Ok(())
+    }
+
+    /// A buffer a dropped chunk gave back, or a new one that holds a
+    /// whole chunk, so filling it never grows it.
+    fn buffer(&self) -> Vec<u8> {
+        match self.pool.try_recv() {
+            Ok(mut bytes) => {
+                bytes.clear();
+                bytes
+            }
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Vec::with_capacity(self.chunk),
+        }
     }
 
     /// A status of the recording as the store holds it now.

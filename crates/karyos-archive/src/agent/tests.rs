@@ -5680,6 +5680,140 @@ fn a_stopped_recording_replicates_on_demand() {
     agent.shutdown().unwrap();
 }
 
+/// A source of one frame per release: it reads the next frame only once
+/// the test released it.
+struct Paced {
+    position: u64,
+    next: usize,
+    released: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FrameSource for Paced {
+    fn position(&self) -> u64 {
+        self.position
+    }
+
+    fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {
+        if self.next >= self.released.load(Ordering::Acquire) {
+            return Ok(Frames::Pending);
+        }
+        let frame = frames(1, u8::try_from(self.next % 200 + 1).unwrap());
+        let position = self.position;
+        out[..frame.len()].copy_from_slice(&frame);
+        self.position += frame.len() as u64;
+        self.next += 1;
+        Ok(Frames::Copied {
+            position,
+            len: frame.len(),
+            next: self.position,
+        })
+    }
+
+    fn consumed(&mut self, _position: u64) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+        self.position = to;
+        Ok(to)
+    }
+}
+
+/// karyos#1113 (#996: a steady recording cycle allocates nothing more
+/// with replication enabled): once a continuous replication of an active
+/// recording runs, its duties, the sender's polls included, allocate and
+/// free nothing while frames are recorded, sealed and sent; the chunk
+/// buffers the consumer drops go back to the sender. Only the
+/// replication duty is counted, on the agent's thread: recording itself
+/// is outside it.
+#[test]
+fn a_steady_continuous_replication_allocates_nothing() {
+    use crate::replication::ReplicateRecording;
+    use crate::replication::transport::Outgoing;
+    const FRAME: u64 = 96;
+    let dir = temp_dir("replicate-steady");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let id = agent
+        .start(StartRecording {
+            stream_id: 10,
+            session_id: 3,
+            channel: b"karyos:ipc".to_vec(),
+            geometry: Geometry::new(4096, 8192).unwrap(),
+            policy: SyncPolicy::Every {
+                interval_ns: 1_000_000,
+            },
+            mode: Mode::Required,
+            format: format(),
+            source: Box::new(Paced {
+                position: 0,
+                next: 0,
+                released: Arc::clone(&released),
+            }),
+            origin: RecordedFrom::Local,
+        })
+        .unwrap();
+    let messages = answer(agent.post_replicate(
+        ReplicateRecording {
+            correlation_id: 7,
+            recording_id: id,
+            from: 0,
+            until: u64::MAX,
+            mode: crate::replication::Mode::Continuous,
+        },
+        32,
+    ))
+    .unwrap();
+    let mut received = 0u64;
+    let mut sealed = 0u64;
+    // Releases one frame and takes the messages until its range's seal;
+    // each chunk is dropped right away, back to the sender.
+    let mut cycle = |frame: usize| {
+        released.store(frame, Ordering::Release);
+        let end = u64::try_from(frame).unwrap() * FRAME;
+        while sealed < end {
+            match messages.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Outgoing::Bytes { start, bytes } => {
+                    assert_eq!(start, received);
+                    assert!(bytes.len() <= 32);
+                    received += bytes.len() as u64;
+                }
+                Outgoing::Seal(seal) => {
+                    assert_eq!(seal.start, sealed);
+                    assert_eq!(seal.end, received);
+                    sealed = seal.end;
+                }
+                Outgoing::Status(status) => {
+                    assert_eq!(status.state, crate::replication::State::Streaming);
+                }
+            }
+        }
+    };
+    // Warm up past a status (one a second), so every buffer has grown.
+    let warm = std::time::Instant::now();
+    let mut frame = 0;
+    while frame < 10 || warm.elapsed() < Duration::from_millis(1500) {
+        frame += 1;
+        cycle(frame);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let before = agent.replication_allocations();
+    // The counter counts: the first chunks' buffers were allocated.
+    assert!(before > 0);
+    let steady = std::time::Instant::now();
+    for _ in 0..30 {
+        frame += 1;
+        cycle(frame);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Idle duties past the last seal, and past a status.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(steady.elapsed() > Duration::from_secs(1));
+    assert_eq!(sealed, u64::try_from(frame).unwrap() * FRAME);
+    assert_eq!(agent.replication_allocations() - before, 0);
+    agent.shutdown().unwrap();
+}
+
 /// The answer to a posted retention command, waiting up to five seconds.
 fn answered<T>(posted: Result<Posted<T>, AgentError>) -> T {
     let posted = posted.unwrap();

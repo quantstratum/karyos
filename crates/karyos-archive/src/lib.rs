@@ -13,6 +13,14 @@
 
 #![forbid(unsafe_code)]
 
+/// Counts this test binary's allocations, for the replication duty that
+/// must not allocate in a steady state (`karyos_sys::alloc_count`;
+/// karyos#1113).
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
+    karyos_sys::alloc_count::CountingAllocator;
+
 pub mod agent;
 pub mod catalog;
 pub mod client;
