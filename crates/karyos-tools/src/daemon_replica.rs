@@ -680,7 +680,6 @@ impl<D: Disk + Clone> ReplicaState<D> {
                             "replica range already counted"
                         );
                     }
-                    Ok(_) => {}
                     Err(ReceiveError::SealOutOfRange { start, end, .. }) => {
                         counters.mismatches = counters.mismatches.saturating_add(1);
                         tracing::warn!(
