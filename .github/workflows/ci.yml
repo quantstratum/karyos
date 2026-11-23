@@ -41,11 +41,11 @@ jobs:
       - run: cargo install cbindgen --version 0.29.4 --locked
       - run: make header-check
 
-  # Linux runs on GitHub-hosted runners. macOS arm64 runs on the org's
-  # self-hosted Apple silicon runner (owner decision of 2026-11-08 on
-  # karyos#623): the hosted macos-14 configuration is not available to the
-  # org, so that job never started. Until that runner is registered the
-  # macOS job waits in the queue; the Linux jobs are not held by it.
+  # Every job runs on GitHub-hosted runners. karyos is public, so the macOS
+  # arm64 job no longer uses the org's self-hosted Mac (which replaced the
+  # hosted macos-14 job by the owner decision of 2026-11-08 on karyos#623):
+  # the self-hosted group stopped allowing public repositories on
+  # 2026-11-23 (karyos-market-data#104).
   test:
     name: Clippy and test (${{ matrix.name }})
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -58,14 +58,16 @@ jobs:
           - name: ubuntu-24.04-arm
             runner: ubuntu-24.04-arm
           - name: macos-arm64
-            runner: [self-hosted, macOS, ARM64, quant-macos]
+            runner: macos-15
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      # The self-hosted Mac builds with Homebrew llvm@23, as the local
-      # macOS setup does, and keeps the user rustup first on PATH.
+      # karyos is public, so the Mac job runs on a GitHub-hosted runner, not
+      # on a self-hosted machine. It builds with Homebrew llvm@23, as the
+      # local macOS setup does, and keeps the user rustup first on PATH.
       - if: runner.os == 'macOS'
         run: |
+          brew list llvm@23 >/dev/null 2>&1 || brew install llvm@23
           echo "/opt/homebrew/opt/llvm@23/bin" >> "$GITHUB_PATH"
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # The runner provides rustup; install the channel pinned in rust-toolchain.toml.
