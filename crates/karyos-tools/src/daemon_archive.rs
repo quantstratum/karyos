@@ -484,6 +484,8 @@ impl Requester {
 pub struct DaemonArchive {
     server: ControlServer<DaemonHost, Requests, Responses>,
     requester: Requester,
+    /// The replications this source pushes (ADR-0102).
+    replications: crate::daemon_replication::Replications,
     /// The driver's dropped grant audits last seen: a growth is logged, so
     /// a hole in the audit trail is never silent.
     audits_dropped: u64,
@@ -538,6 +540,13 @@ impl DaemonArchive {
                 .audit_grants(stream)
                 .map_err(ArchiveStartError::Stream)?;
         }
+        let replications = crate::daemon_replication::Replications::start(
+            &mut driver,
+            terms,
+            &options.replications,
+            options.trusted_network,
+        )
+        .map_err(|error| ArchiveStartError::Agent(error.to_string()))?;
         let handle = ArchiveStartError::Handle;
         let reading = Requests(driver.subscribe(requests, Role::Required).map_err(handle)?);
         let writing = Responses(driver.publication(responses).map_err(handle)?);
@@ -591,6 +600,7 @@ impl DaemonArchive {
         let mut archive = Self {
             server: ControlServer::new(agent, host, reading, writing),
             requester,
+            replications,
             audits_dropped: 0,
             signing_alarm: false,
         };
@@ -624,6 +634,8 @@ impl DaemonArchive {
         self.server.host_mut().inner.finish_ended();
         let _ = self.requester.serve();
         self.release_idle_requester();
+        let (agent, host) = self.server.agent_and_host_mut();
+        let replicated = self.replications.duty(agent, host.driver_mut());
         self.driver_mut().drain_grant_audits(audit_grant);
         // Drained every cycle, the queue should never overflow; if it does,
         // the audit has a hole, which is logged with the new total.
@@ -640,7 +652,13 @@ impl DaemonArchive {
         self.report_signing();
         // A request served counts as work, so the idle strategy does not
         // back off while requests arrive.
-        work.map(|work| if served { work.max(1) } else { work })
+        work.map(|work| {
+            if served || replicated {
+                work.max(1)
+            } else {
+                work
+            }
+        })
     }
 
     /// Logs the head signing's alarm when it changes: records uncovered
@@ -690,7 +708,13 @@ impl DaemonArchive {
     /// driver back.
     #[must_use]
     pub fn shutdown(self) -> EmbeddedDriver<SharedTerms> {
+        let replications = self.replications;
         let (mut host, stopped) = self.server.shutdown_into_host();
+        let streams = replications.streams().to_vec();
+        replications.shutdown(host.driver_mut());
+        for stream in streams {
+            let _ = host.driver_mut().remove_stream(stream);
+        }
         if let Err(error) = stopped {
             tracing::warn!(?error, "archive agent shutdown error");
         }

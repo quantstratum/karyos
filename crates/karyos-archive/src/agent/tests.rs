@@ -5680,6 +5680,47 @@ fn a_stopped_recording_replicates_on_demand() {
     agent.shutdown().unwrap();
 }
 
+/// ADR-0102 decision 3: a stop drops the replication's pending output,
+/// its last status is `stopped`, and the agent's own answer says when
+/// the request is gone, whatever the channel holds.
+#[test]
+fn a_stopped_replication_drops_its_output_and_reports_itself_gone() {
+    use crate::replication::transport::Outgoing;
+    use crate::replication::{Mode, ReplicateRecording, State, StopReplication};
+    let dir = temp_dir("replicate-stop");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let (id, _) = sealed_recording(&agent);
+    let request = ReplicateRecording {
+        correlation_id: 9,
+        recording_id: id,
+        from: 0,
+        until: u64::MAX,
+        mode: Mode::Continuous,
+    };
+    assert!(!answer(agent.post_replication_active(9)).unwrap());
+    let messages = answer(agent.post_replicate(request, 1)).unwrap();
+    assert!(answer(agent.post_replication_active(9)).unwrap());
+    assert!(!answer(agent.post_replication_active(10)).unwrap());
+    answer(agent.post_stop_replication(StopReplication {
+        correlation_id: 9,
+        recording_id: id,
+    }))
+    .unwrap();
+    let mut last = None;
+    while let Ok(message) = messages.recv_timeout(Duration::from_secs(5)) {
+        if let Outgoing::Status(status) = message {
+            last = Some(status.state);
+        }
+    }
+    assert_eq!(last, Some(State::Stopped));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while answer(agent.post_replication_active(9)).unwrap() {
+        assert!(std::time::Instant::now() < deadline, "still active");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    agent.shutdown().unwrap();
+}
+
 /// A source of one frame per release: it reads the next frame only once
 /// the test released it.
 struct Paced {
