@@ -30,6 +30,7 @@ pub mod archive_signer;
 pub mod args;
 pub mod capability_log;
 pub mod catalog;
+pub mod catalog_export;
 pub mod catalog_verify;
 pub mod compat;
 pub mod config;
