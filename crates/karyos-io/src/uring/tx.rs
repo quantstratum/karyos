@@ -461,14 +461,6 @@ impl<R: RingOps> UringTx<R> {
         &mut self.ring
     }
 
-    /// Turns on the mutant that releases each slot at its submission
-    /// instead of at its completion (the "release on enter return"
-    /// negative control of design section 12). Never correct.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn inject_release_at_submission(&mut self) {
-        self.release_at_submission = true;
-    }
-
     /// Whether SQPOLL runs: `NotRequested` unless the configuration asked
     /// for it (IU-2).
     #[must_use]
@@ -1120,6 +1112,18 @@ impl<R: RingOps> UringTx<R> {
                 0
             }
         }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl UringTx<super::scripted::ScriptedRing> {
+    /// Turns on the mutant that releases each slot at its submission
+    /// instead of at its completion (the "release on enter return"
+    /// negative control of design section 12). Never correct, and only on
+    /// the scripted ring, whose kernel is the test: a real ring never gets
+    /// it.
+    pub fn inject_release_at_submission(&mut self) {
+        self.release_at_submission = true;
     }
 }
 

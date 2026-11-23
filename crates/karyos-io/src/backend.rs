@@ -1552,6 +1552,9 @@ pub enum Capability {
     RecvBuffer,
     /// A verified path MTU per route.
     PathMtu,
+    /// The `io_uring` ring with every probe `open` requires
+    /// (io-uring-backend.md 4.1, `uring_ring`).
+    UringRing,
 }
 
 /// The probed state of one capability.

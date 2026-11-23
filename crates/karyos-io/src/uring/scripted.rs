@@ -291,6 +291,9 @@ pub struct ScriptedRxRing {
     /// Posted buffers in the order the kernel takes them.
     ring: VecDeque<u16>,
     arm: Option<UserData>,
+    /// The current arm's terminal completion is queued: like the kernel,
+    /// the double posts nothing more for it.
+    ended: bool,
     cq: VecDeque<Cqe>,
     pushed: Vec<Pushed>,
     arms: u32,
@@ -314,6 +317,7 @@ impl ScriptedRxRing {
             state: vec![Buffer::Posted; usize::from(buffers)],
             ring: (0..buffers).collect(),
             arm: None,
+            ended: false,
             cq: VecDeque::with_capacity(LOG),
             pushed: Vec::with_capacity(LOG),
             arms: 0,
@@ -360,6 +364,9 @@ impl ScriptedRxRing {
     /// Returns the buffer used.
     pub fn deliver(&mut self, payload: &[u8], source: SocketAddr, flags: u32) -> Option<u16> {
         let arm = self.arm?;
+        if self.ended {
+            return None;
+        }
         let Some(id) = self.ring.pop_front() else {
             self.end_arm(-ENOBUFS);
             return None;
@@ -404,7 +411,10 @@ impl ScriptedRxRing {
 
     /// Ends the arm with a terminal completion of `result`.
     pub fn end_arm(&mut self, result: i32) {
-        if let Some(arm) = self.arm {
+        if let Some(arm) = self.arm
+            && !self.ended
+        {
+            self.ended = true;
             self.cq.push_back(Cqe {
                 user_data: arm,
                 result,
@@ -475,6 +485,7 @@ impl RxRingOps for ScriptedRxRing {
         }
         self.unconsumed = self.unconsumed.saturating_add(1);
         self.arm = Some(user_data);
+        self.ended = false;
         self.arms = self.arms.saturating_add(1);
         Ok(())
     }

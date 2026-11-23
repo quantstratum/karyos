@@ -74,6 +74,7 @@ struct TxRun {
     retained_after_reset: u16,
     submitted_after_reset: usize,
     kernel_mismatches: u32,
+    reset_finished: bool,
 }
 
 fn tx_run(seed: u64, mutant: bool) -> TxRun {
@@ -187,7 +188,11 @@ fn tx_run(seed: u64, mutant: bool) -> TxRun {
     loop {
         let reset = tx.reset(&mut report, budget, &mut releases);
         while report.pop_front().is_some() {}
-        if !reset.more || rounds > 64 {
+        if !reset.more {
+            run.reset_finished = true;
+            break;
+        }
+        if rounds > 64 {
             break;
         }
         rounds += 1;
@@ -224,6 +229,10 @@ fn no_frame_is_touched_while_the_kernel_owns_it_and_none_leaks() {
         assert_eq!(run.double_releases, 0, "seed {seed}: {run:?}");
         assert_eq!(run.retained_after_reset, 0, "seed {seed}: {run:?}");
         assert_eq!(run.submitted_after_reset, 0, "seed {seed}: {run:?}");
+        assert!(
+            run.reset_finished,
+            "seed {seed}: the reset finished within its retries: {run:?}"
+        );
     }
 }
 
@@ -231,7 +240,10 @@ fn no_frame_is_touched_while_the_kernel_owns_it_and_none_leaks() {
 fn the_model_catches_a_backend_that_releases_at_submission() {
     let caught = seeds().into_iter().any(|seed| {
         let run = tx_run(seed, true);
-        run.touches_while_owned > 0 || run.stale_completions > 0 || run.double_releases > 0
+        // The same ownership checks as the correct runs: a frame touched
+        // while the kernel owns it, bytes the kernel reads changed, or a
+        // second release.
+        run.touches_while_owned > 0 || run.kernel_mismatches > 0 || run.double_releases > 0
     });
     assert!(
         caught,
@@ -283,6 +295,20 @@ fn rx_buffers_return_only_after_completion_and_survive_resets() {
                             assert_eq!(
                                 reset.posted, BUFFERS,
                                 "seed {seed}: a reset leaks no buffer"
+                            );
+                            // The recovered ring delivers a datagram, and
+                            // exactly once.
+                            let before = handler.0;
+                            rx.poll_rx(Budget::new(64, u64::MAX, 4), &mut handler);
+                            assert!(rx.ring_mut().deliver(b"after reset", source, 0).is_some());
+                            delivered += 1;
+                            for _ in 0..4 {
+                                rx.poll_rx(Budget::new(64, u64::MAX, 4), &mut handler);
+                            }
+                            assert_eq!(
+                                handler.0,
+                                before + 1,
+                                "seed {seed}: delivered exactly once after the reset"
                             );
                             break;
                         }

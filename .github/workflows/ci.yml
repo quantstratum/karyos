@@ -141,3 +141,25 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         with:
           command: check advisories
+
+  # The two Docker jobs of io-uring-backend.md IU-10 (karyos#641): the
+  # functional io_uring suite under the narrow profile, which fails instead
+  # of skipping, and Docker's default profile, under which the setup must be
+  # denied with EPERM.
+  uring:
+    name: io_uring (${{ matrix.name }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: narrow seccomp profile
+            env: KARYOS_URING_REQUIRED=1 KARYOS_LINUX_SECCOMP=ci/seccomp/io-uring.json
+            filter: uring
+          - name: default seccomp profile
+            env: KARYOS_URING_EXPECT_DENIED=1
+            filter: a_denying_seccomp_profile_is_reported_as_denied
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: env ${{ matrix.env }} scripts/linux-test.sh -p karyos-io --features uring --locked ${{ matrix.filter }}

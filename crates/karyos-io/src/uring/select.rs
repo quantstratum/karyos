@@ -18,7 +18,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::backend::{CapabilityState, OpenError, Reason};
+use crate::backend::{Capability, CapabilityState, OpenError, Reason};
 
 /// Fallbacks from `io_uring` to sockets over the process
 /// (`capability_fallback`, design 4.3).
@@ -96,12 +96,27 @@ pub fn reason_of(error: OpenError) -> Reason {
     }
 }
 
-/// Opens `io_uring` through `uring`; on failure, falls back to `sockets`
-/// only when `choice` allows it.
+/// Whether `error` is a failed `io_uring` probe (design 4.1): a setup,
+/// feature, opcode, registration or cancel probe the kernel or a seccomp
+/// profile refused. Configuration errors, socket errors and the rest are
+/// not, and never fall back.
+#[must_use]
+pub fn is_probe_failure(error: OpenError) -> bool {
+    matches!(error, OpenError::Os { operation, .. } if operation.starts_with("io_uring_"))
+}
+
+/// Opens `io_uring` through `uring` on the initial open; on a failed
+/// required probe, falls back to `sockets` only when `choice` allows it
+/// (design 4.3). Optional facilities (SQPOLL, fixed files) fall back
+/// inside the backend and never reach here; a `reopen` that loses a
+/// required capability fails instead, as the design asks.
 ///
 /// # Errors
 ///
-/// With [`UringChoice::IoUring`], the error of `uring`. With
+/// With [`UringChoice::IoUring`], a failed required probe is
+/// [`OpenError::RequiredCapability`] naming [`Capability::UringRing`] and
+/// its reason. Any other error of `uring` is returned as it is under
+/// either choice: it is not a capability the fallback can replace. With
 /// [`UringChoice::IoUringOrSockets`], the error of `sockets` when that
 /// fails too.
 pub fn select<U, S>(
@@ -109,20 +124,28 @@ pub fn select<U, S>(
     uring: impl FnOnce() -> Result<U, OpenError>,
     sockets: impl FnOnce() -> Result<S, OpenError>,
 ) -> Result<Selected<U, S>, OpenError> {
-    match uring() {
-        Ok(opened) => Ok(Selected::Uring(opened)),
-        Err(error) => match choice {
-            UringChoice::IoUring => Err(error),
-            UringChoice::IoUringOrSockets => {
-                let sockets = sockets()?;
-                CAPABILITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-                Ok(Selected::Sockets {
-                    sockets,
-                    uring_ring: CapabilityState::Fallback(reason_of(error)),
-                    cause: error,
-                })
-            }
-        },
+    let error = match uring() {
+        Ok(opened) => return Ok(Selected::Uring(opened)),
+        Err(error) => error,
+    };
+    if !is_probe_failure(error) {
+        return Err(error);
+    }
+    let state = CapabilityState::Unavailable(reason_of(error));
+    match choice {
+        UringChoice::IoUring => Err(OpenError::RequiredCapability {
+            capability: Capability::UringRing,
+            state,
+        }),
+        UringChoice::IoUringOrSockets => {
+            let sockets = sockets()?;
+            CAPABILITY_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            Ok(Selected::Sockets {
+                sockets,
+                uring_ring: CapabilityState::Fallback(reason_of(error)),
+                cause: error,
+            })
+        }
     }
 }
 
@@ -146,7 +169,13 @@ mod tests {
                 Ok(())
             },
         );
-        assert_eq!(selected.err(), Some(DENIED));
+        assert_eq!(
+            selected.err(),
+            Some(OpenError::RequiredCapability {
+                capability: Capability::UringRing,
+                state: CapabilityState::Unavailable(Reason::Denied { errno: 1 })
+            })
+        );
         assert!(!sockets_opened, "nothing falls back silently");
     }
 
@@ -196,6 +225,25 @@ mod tests {
             || Err::<(), _>(failed),
         );
         assert_eq!(selected.err(), Some(failed));
+    }
+
+    #[test]
+    fn only_a_failed_probe_falls_back() {
+        for not_a_probe in [
+            OpenError::InvalidConfig {
+                field: "tx_slots",
+                value: 0,
+            },
+            OpenError::Os {
+                operation: "bind",
+                errno: 98,
+            },
+        ] {
+            for choice in [UringChoice::IoUring, UringChoice::IoUringOrSockets] {
+                let selected = select(choice, || Err::<(), _>(not_a_probe), || Ok("sockets"));
+                assert_eq!(selected.err(), Some(not_a_probe), "{choice:?}");
+            }
+        }
     }
 
     #[test]
