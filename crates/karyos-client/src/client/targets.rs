@@ -157,9 +157,7 @@ impl<C: Connection> Client<C> {
                 (asked, std::mem::take(&mut target.discarded), gone)
             };
             for withdrawn in discarded {
-                if !self.connection.release_subscription(withdrawn) {
-                    super::bump(&mut self.subscription_releases_failed);
-                }
+                self.release(withdrawn);
             }
             if gone {
                 let _ = self.targets.swap_remove(index);

@@ -558,6 +558,39 @@ mod sealed {
     pub trait Sealed {}
 }
 
+/// The held-back releases a client tries again per service at most
+/// (karyos#1067).
+const RELEASE_RETRIES: usize = 64;
+
+/// What became of a released handle (karyos#1067).
+#[doc(hidden)]
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ReleaseOutcome<S> {
+    /// Its removal is submitted.
+    Submitted,
+    /// Not submitted now: the command ring is full or the pending requests
+    /// are at their limit; it is tried again.
+    Retry(S),
+    /// It can never be submitted, so it was dropped.
+    Dropped,
+}
+
+impl<S> ReleaseOutcome<S> {
+    fn of(result: Result<u64, (S, ConductorError)>) -> Self {
+        match result {
+            Ok(_) => Self::Submitted,
+            Err((handle, ConductorError::Full | ConductorError::TooManyPending)) => {
+                Self::Retry(handle)
+            }
+            Err((handle, _)) => {
+                drop(handle);
+                Self::Dropped
+            }
+        }
+    }
+}
+
 /// A client's connection to its driver: a remote client or an in-process
 /// conductor.
 pub trait Connection: sealed::Sealed {
@@ -662,12 +695,17 @@ pub trait Connection: sealed::Sealed {
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError>;
 
     /// Releases an image's subscription handle the facade no longer reads:
-    /// it is removed, so the driver forgets its registration; whether the
-    /// removal was submitted. One that cannot be removed now is dropped:
-    /// in process that ends its lease; for a remote client it detaches its
-    /// export, and the registration stays until the client ends.
+    /// it is removed, so the driver forgets its registration. A removal
+    /// that cannot be submitted now (the command ring full, the pending
+    /// requests at their limit) hands the handle back to be tried again
+    /// (karyos#1067: a dropped one kept the registration until the client
+    /// ended); one that can never be submitted is dropped: in process that
+    /// ends its lease, for a remote client it detaches its export.
     #[doc(hidden)]
-    fn release_subscription(&mut self, subscription: ClientSubscription<Self::Terms>) -> bool;
+    fn release_subscription(
+        &mut self,
+        subscription: ClientSubscription<Self::Terms>,
+    ) -> ReleaseOutcome<ClientSubscription<Self::Terms>>;
 
     #[doc(hidden)]
     fn poll_into(&mut self, limit: usize, completions: &mut Vec<Completion>) -> ConductorPoll;
@@ -832,9 +870,11 @@ impl Connection for ClientConductor {
         self.remove_concurrent_publication(publication).is_ok()
     }
 
-    fn release_subscription(&mut self, subscription: ClientSubscription<Self::Terms>) -> bool {
-        // A handle that cannot be removed now is dropped, ending its lease.
-        self.remove_subscription(subscription).is_ok()
+    fn release_subscription(
+        &mut self,
+        subscription: ClientSubscription<Self::Terms>,
+    ) -> ReleaseOutcome<ClientSubscription<Self::Terms>> {
+        ReleaseOutcome::of(self.remove_subscription(subscription))
     }
 
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError> {
@@ -1032,10 +1072,14 @@ impl Connection for crate::ipc::RemoteClient {
         crate::ipc::RemoteClient::remove_concurrent_publication(self, publication).is_ok()
     }
 
-    fn release_subscription(&mut self, subscription: ClientSubscription<Self::Terms>) -> bool {
-        // A handle that cannot be removed now is dropped: it detaches its
-        // export, and its registration ends with the client.
-        crate::ipc::RemoteClient::remove_subscription(self, subscription).is_ok()
+    fn release_subscription(
+        &mut self,
+        subscription: ClientSubscription<Self::Terms>,
+    ) -> ReleaseOutcome<ClientSubscription<Self::Terms>> {
+        ReleaseOutcome::of(crate::ipc::RemoteClient::remove_subscription(
+            self,
+            subscription,
+        ))
     }
 
     fn remove_network_subscription(&mut self, registration: u64) -> Result<u64, ConductorError> {
@@ -1370,6 +1414,9 @@ pub struct Client<C: Connection> {
     releases_failed: u64,
     /// Subscription handles released whose removal could not be sent.
     subscription_releases_failed: u64,
+    /// The releases not submitted yet, tried again at each service
+    /// (karyos#1067).
+    pending_releases: Vec<ClientSubscription<C::Terms>>,
     completions: Vec<Completion>,
     events: Vec<Event>,
     /// The role and rejoin policy of the network subscription being added,
@@ -1436,6 +1483,7 @@ impl<C: Connection> Client<C> {
             late_released: 0,
             releases_failed: 0,
             subscription_releases_failed: 0,
+            pending_releases: Vec::with_capacity(RELEASE_RETRIES),
             completions: Vec::new(),
             events: Vec::new(),
             adding: None,
@@ -1712,9 +1760,7 @@ impl<C: Connection> Client<C> {
     pub fn remove_subscription(&mut self, subscription: Subscription<C::Terms>) {
         match subscription.kind {
             Kind::Stream(subscription) => {
-                if !self.connection.release_subscription(*subscription) {
-                    bump(&mut self.subscription_releases_failed);
-                }
+                self.release(*subscription);
             }
             // Its images go to the client's release bin as it drops.
             Kind::Images(images) => drop(images),
@@ -2181,7 +2227,11 @@ impl<C: Connection> Client<C> {
                 // lane; one that does not is refused as a failed attach,
                 // never given a lane it does not read.
                 let Some(lane) = subscription.lane() else {
-                    let _ = self.connection.release_subscription(subscription);
+                    if let ReleaseOutcome::Retry(subscription) =
+                        self.connection.release_subscription(subscription)
+                    {
+                        self.pending_releases.push(subscription);
+                    }
                     network.slots.retain(|slot| slot.id != attach.sequence);
                     inbox.update(|state| bump(&mut state.refused));
                     return;
@@ -2332,9 +2382,12 @@ impl<C: Connection> Client<C> {
                 .inbox
                 .upgrade()
                 .and_then(|inbox| inbox.retire(slot.id))
-                && !self.connection.release_subscription(subscription)
             {
-                bump(&mut self.subscription_releases_failed);
+                match self.connection.release_subscription(subscription) {
+                    ReleaseOutcome::Submitted => {}
+                    ReleaseOutcome::Retry(subscription) => self.pending_releases.push(subscription),
+                    ReleaseOutcome::Dropped => bump(&mut self.subscription_releases_failed),
+                }
             }
         } else if let Some(attach) = self
             .attaches
@@ -2345,9 +2398,47 @@ impl<C: Connection> Client<C> {
         }
     }
 
+    /// Releases `subscription`, keeping it to try again when its removal
+    /// cannot be submitted now.
+    fn release(&mut self, subscription: ClientSubscription<C::Terms>) {
+        match self.connection.release_subscription(subscription) {
+            ReleaseOutcome::Submitted => {}
+            ReleaseOutcome::Retry(subscription) => self.pending_releases.push(subscription),
+            ReleaseOutcome::Dropped => bump(&mut self.subscription_releases_failed),
+        }
+    }
+
+    /// The releases a full ring or the pending limit held back, tried
+    /// again, at most [`RELEASE_RETRIES`] per service. The first one still
+    /// refused stops the round: the ring or the limit is still full, so
+    /// the rest wait for the next service. Popped and pushed back in place,
+    /// so a backlog under sustained backpressure never allocates.
+    fn retry_releases(&mut self) {
+        for _ in 0..RELEASE_RETRIES {
+            let Some(subscription) = self.pending_releases.pop() else {
+                return;
+            };
+            match self.connection.release_subscription(subscription) {
+                ReleaseOutcome::Submitted => {}
+                ReleaseOutcome::Retry(subscription) => {
+                    self.pending_releases.push(subscription);
+                    return;
+                }
+                ReleaseOutcome::Dropped => bump(&mut self.subscription_releases_failed),
+            }
+        }
+    }
+
+    /// The releases not submitted yet (karyos#1067).
+    #[must_use]
+    pub fn pending_releases(&self) -> usize {
+        self.pending_releases.len()
+    }
+
     /// Releases the image handles the subscriptions let go of, then removes
     /// the network subscriptions whose handle was dropped.
     fn remove_dropped(&mut self) {
+        self.retry_releases();
         for network in &self.networks {
             // Drained in place: the bin keeps its reserved capacity, so a
             // later poll that releases an image never allocates.
@@ -2356,8 +2447,10 @@ impl<C: Connection> Client<C> {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             for subscription in released.drain(..) {
-                if !self.connection.release_subscription(subscription) {
-                    bump(&mut self.subscription_releases_failed);
+                match self.connection.release_subscription(subscription) {
+                    ReleaseOutcome::Submitted => {}
+                    ReleaseOutcome::Retry(subscription) => self.pending_releases.push(subscription),
+                    ReleaseOutcome::Dropped => bump(&mut self.subscription_releases_failed),
                 }
             }
         }

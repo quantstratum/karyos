@@ -222,6 +222,47 @@ release may break APIs, wire formats and shared-memory layouts.
 
 - `karyos_archive::replication`: schema 6 version 1 of ADR-0091, recording replication between Archives: `ReplicateRecording`, `StopReplication`, `RecordingBytes`, `SourceSeal` (the seal record verbatim, open and closed segment kinds only) and `ReplicationStatus`, with their rules, and the source's `check_request` (requests start and end on seal boundaries) and the replica's `check_seal`. Vectors P-1 to P-6 pass byte for byte (karyos#996).
 
+- `karyosd --replica <rec>,<source-ip>,<bind host:port>,<stream>` accepts a recording pushed by a source Archive (ADR-0102; karyos#1113). The replica follows only the newest incarnation of its authorized source on the stream, and drops messages naming another recording. It ignores payload until the request's `streaming` status. It stores what arrives in `<archive>/replicas/<rec>` through `Receiver`, and counts a range only once its seal verifies, recorded with the profile it arrived under. A source start above the replica's last verified range is committed as a durable gap before the first range. Lag reads unknown before any status and after 3 s without one. An interrupted replication raises a warning and a counter. It needs `--replication-trusted-network`, `--archive-copy-location` and `--network on`.
+- `EmbeddedDriver::network_image_from(stream_id, source)`: the newest exposed network image of a stream from a source address.
+
+- `karyos-archive` restores an offloaded segment (ADR-0104, decision 6): `Tiering::restore_segment` gets the segment just below the start from object storage, checks the index object against the offload record's digest and each range against its seal, and `SegmentStore::restore_below` writes the data file and the original index verbatim under temporary names, refuses them unless the recovery scanner keeps them whole, renames them into place and lowers the start durably, never below the offload floor. The restore record (kind 10) is chained and the local copies count again only after that; a lowered start whose record a crash cut short gets it on the next reconcile, and recovery removes a restore's temporary files (karyos#1113).
+
+- `karyos-tiering offload|restore|verify`, the offline tiering binary (ADR-0104): it takes the Archive's own locks without waiting and refuses a directory a running `karyosd` holds; it refuses while any purge intent is unresolved and for a recording with a legal hold in any state; under a retention deadline it reads back each object version's lock (a HEAD of the exact version) and skips the segment unless it is governance or compliance retained at or past the deadline; it checks `--location` against the location the Archive recorded for its own copies and refuses the first tiering commit of a directory without `--accept-downgrade-break`. Configuration comes from flags only and credentials from the file `--credentials` names, never from the environment. `verify` reports each object `verified`, `missing` or `corrupt` and downgrades a missing or corrupt copy (karyos#1113).
+
+- The AF_XDP copy-mode groundwork of ADR-0038 (karyos#629): the XDP program source `bpf/karyos-xdp` (outside the workspace) with its pinned chain (`aya-ebpf` =0.3.0 from its committed lock, `nightly-2026-11-10`, the `bpf-linker` 0.13.0 release binary checked by digest, image `rust:1.99` by digest), the recipe `scripts/xdp-object.sh`, the committed object `karyos-io/src/xdp/karyos_xdp.bpf.o` with its provenance manifest and notices, reproduced bit for bit on x86_64 and aarch64 hosts, and a `workflow_dispatch` job that rebuilds and compares it. `karyos-io` gains the `xdp` feature (Linux, `aya` =0.16.0) with `xdp::load`, which takes the object through the kernel verifier; `deny.toml` takes the record's scoped `foldhash` 0.2.0 Zlib exception.
+
+- `karyos-io` feature `uring` (Linux): the `io_uring` TX half `uring::tx::UringTx` with one copied `IORING_OP_SENDMSG` per permitted item, `Release::Deferred` and a `SendResult` plus `Released` pair per completion, SQPOLL off unless configured, `cancel_submitted` and a bounded reset that keeps every slot the kernel still owns and reports it (`retained`), over the `RingOps` seam with its scripted double, and the send parking probe (karyos#639). The `io-uring` 0.7.16 dependency follows its R8 admission record. `SendError` gains `WouldBlock`, `NoBuffers`, `PeerRefused` and `Cancelled` for completed sends the kernel did not transmit. `scripts/linux-test.sh` takes `KARYOS_LINUX_SECCOMP` and passes `KARYOS_URING_REQUIRED` through.
+
+- `karyos-io` feature `uring` (Linux): the `io_uring` RX half `uring::rx::UringRx`, one multishot `IORING_OP_RECVMSG` over a provided buffer ring (`IORING_REGISTER_PBUF_RING`) whose buffers go back to the kernel only after the completion that named them was reaped and lent, reposted when the lend returns or unwinds (karyos#640). Truncated and oversize datagrams are dropped, buffer exhaustion (`-ENOBUFS`) is counted and re-armed, and `reset` cancels the arm and re-registers the pool with every buffer posted once more.
+
+- The `io_uring` completion model of `karyos-sim` (`tests/uring_model.rs`, karyos#641): seeded runs complete the TX and RX operations of the `io_uring` backend in random order with random results, cancels and resets, and fail on a frame touched while the kernel owns it, a leaked slot or buffer, or a wrong recovery after a reset; a mutant that releases at submission is caught. `karyos_io::uring::select` opens `io_uring` with an explicit `io_uring_or_sockets` fallback (`Fallback(reason)`, a counter, the cause kept) and fails a required `io_uring` instead of falling back. `ci/seccomp/io-uring.json` is Docker's default seccomp profile plus the three `io_uring` calls, for `KARYOS_LINUX_SECCOMP`.
+
+- `karyos-sbe`: SBE 1.0 framing over IronSBE 0.9.1 (karyos#646). Codecs generated at build time from Real Logic's public example schemas (`Car`, versions 0 and 1: repeating groups, a nested group, variable data, enums, a set, composites, constants) encode the reference SBE tool's bytes exactly; `decode_car` reads a message in place, allocating nothing, and refuses a schema, a schema version or a template this build does not know with a typed `FrameError`, never reading it as a known one. A frame cut anywhere inside the message, its repeating groups, nested groups and variable data included, is refused (`FrameError::Incomplete` or `FrameError::Decode`), never read in part. The golden vectors come from sbe-all 1.42.0 and an independent derivation from the SBE 1.0 specification, which agree byte for byte; `crates/karyos-sbe/tests/vectors/README.md` says how to reproduce them.
+
+- `karyos-sbe`: the SBE feed adapter (karyos#647). `adapter::SbeFeed` takes one SBE feed on its two lines, frames each message by its SBE message header against the feed's `SbeSchema` (a frame of another schema, of a version this build does not read, cut inside its root block, or incomplete by the feed's `SbeSequence::complete`, is refused and counted before arbitration, so a truncated copy never wins over the whole one), reads its epoch and sequence through the feed's own `SbeSequence` extractor, and arbitrates the lines with `karyos-feed`: each sequenced message once, in order, with its header and frame borrowed for the client to decode in place. A steady cycle allocates nothing. Registering schemas in Archive manifests is not part of it: it follows with the Archive in M03. `karyos-feed`'s `Arbiter` gains a `sequencer()` accessor for that check.
+
+- `karyos_protocol::network::authenticated` decodes and encodes the bodies of GUARD (STATE, STATUS_CHALLENGE, STATUS), SESSION_ABORT and SESSION_ABORT_ACK, following quantstratum-docs `karyos/design/authenticated-control-schemas.md` and ADR-0107. It reproduces that design's 5 blind positive vectors byte for byte and the first error of each of its 11 negative vectors. `decode_bare_status_challenge` accepts only a bare STATUS_CHALLENGE, for a guard authority's endpoint. The trusted decoder still returns `GatedType` for every one of these types, so nothing is enabled (part of karyos#648).
+
+- `karyos_protocol::protection::signed` seals and opens the signed envelope of the guard and abort authority (Ed25519, `profile_id` 4, ADR-0086 sections 2 and 8). It checks every header field against the binding before the signature. `karyos_driver::authority` provides the Ed25519 signer and verifier. The verifier uses `verify_strict`, and the key loader refuses non-canonical and small-order public keys. Both reproduce the independent Ed25519 envelope vectors byte for byte. No path uses them yet: GUARD and SESSION_ABORT stay gated (part of karyos#648).
+
+- `karyos_driver::wire_keys` parses and validates the wire authentication key files of quantstratum-docs `karyos/design/wire-key-files.md`:
+  - the canonical field order, numbers and timestamps;
+  - the per-purpose fields, and a profile that matches the purpose;
+  - the 90-day and 180-day validity bounds;
+  - canonical and not small-order authority public keys.
+
+  It also derives the per-purpose MAC keys with HKDF-SHA-256 (RFC 5869, written over `hmac` so the PRK and every intermediate output are erased) over the `info` contexts of ADR-0086 section 4, reproducing the design's blind K-1 to K-5 vectors and its canonical parser files. Secrets and derived keys are erased on drop. The key directory, durable key state and reload are later parts of karyos#648; nothing uses these keys yet.
+
+- `karyos-catalog export` and `karyos-catalog verify-export` (ADR-0103; karyos#668).
+  - `export` writes an export of the named recordings from an Archive's own files. It carries the Archive journal from genesis to the later of the last record sealing exported bytes and its latest anchored head, with the registry rows its key registry seals commit and the heads and anchors over it, the recordings' bytes, and the policy versions and bindings it seals. `--time` adds the time evidence entries' journal and store, `--clock-records` the calibration and UTC reference records, and `--schema` codec schemas.
+  - `verify-export` verifies an export offline with the trust file and anchor stores only. It exits 0 when every range verifies, 1 when any does not, and 2 when the export is refused.
+  
+  An exported recording verifies offline, with the Archive's directory removed, to the same outcomes as online.
+
+- The Retention integrity contract's last case, "an export is verified offline" (karyos#670): `test_retention_integrity_export_verified_offline` exports the contract scenario's own evidence and verifies it with the external trust only, no Archive present. Every range's offline outcome equals the online verifier's.
+
+- `RaftLog::entries_into` and `LogView::entries_into` read a log range into caller buffers: the entries and their payload buffers are reused in place and the read window keeps its capacity, so a second read of the same range within one segment allocates nothing (a read that crosses segments still allocates when the segment store reopens its reader file) (karyos#681, ADR-0105). The checks, errors, read window and metered budget are those of `entries`, which is now a wrapper.
+
 ### Changed
 
 - The agent's reply deadline tests fill the socket's buffer before writing a bounded 4 MiB reply, instead of relying on a fixed 16 or 64 MiB reply to outsize it: a host with `net.core.wmem_default` at 128 MiB held that reply whole, so the write never blocked and both tests failed there.
@@ -314,6 +355,10 @@ release may break APIs, wire formats and shared-memory layouts.
 
 - `karyos-trace` is publishable (`publish = true`, a README) and joins the crates.io set from the next alpha, after `karyos-protocol`, for karyos-insights (ADR-0068, INS-Q4). Its analysis surface, the trace report, journal sources, histograms and clock calibration and the types their signatures name, is supported in alpha; the rest of the crate, its writers, collectors, agents, sampling and trace clocks, stays internal and unstable (karyos#997).
 
+- `RaftLog::entries` reads frames the index places back to back in windows of up to 1 MiB instead of two reads per entry, still checking every frame: reading 1 GiB of 256 B entries back for catch-up drops from 0.68 to 0.14 µs per entry on an unloaded host (karyos#1001).
+
+- Copy records keep the arrival profile (`ArrivalProfile`) in a byte version 1 kept reserved, and gain the state `Gap`. A record written before reads as `Local`.
+
 ### Removed
 
 - The unused `karyos-sim` dependency of `karyos-tools`, so nothing added to `karyos-sim` enters the shipped `karyosd` graph (karyos#926).
@@ -378,9 +423,20 @@ release may break APIs, wire formats and shared-memory layouts.
 
 - A network publication or subscription added while an endpoint at its fixed bind address is still retiring after its last user went is refused with the retryable `DriverError::NetworkBusy`, and taken once the endpoint has retired, instead of failing with `NetworkEndpoint` on the bind (karyos#994). Endpoints bound to port 0 are not affected.
 
+- Four tests that failed only on a loaded host now wait by deadline, not by a count of cycles, with their assertions kept:
+  - `the_facade_removes_a_retired_images_subscription`: its rig waits for the driver to forget the registration, its waits are bounded at 120 s, and its client's liveness timeout matches them. The assertion now reports the stage, registrations and image count.
+  - `colliding_aliases_on_one_multicast_group_keep_two_images_apart` and `a_client_sees_the_admission_change_by_event`: the e2e `pump` deadline is 120 s.
+  - `a_shutdown_releases_the_group_integrity_journal_lock`: it waits for the agent's first record, written only under the lock, rather than for the file and a 1 ms sleep.
+
+- A subscription release the client cannot submit now is tried again instead of dropped (karyos#1067). When the command ring is full or the pending requests are at their limit, the client keeps the returned handle and retries it at each service: `Client::pending_releases` counts the ones waiting. Before, the client dropped the handle and counted it in `subscription_releases_failed`, and the driver kept the registration until the client ended. Under load that left a retired image's registration in place: the cause of `the_facade_removes_a_retired_images_subscription`'s rare failure. A removal that can never be submitted is still dropped and counted.
+
+- A steady seal no longer allocates: `IntegrityJournal::append` checked each record against a clone of the chain's state (two maps) before writing it, four allocations per seal; it now checks in place (`ChainCheck::check`) and accepts after the write. A new test counts a steady recorder, sealing and replication cycle over the real disk and asserts it allocates nothing (karyos#1113).
+
 ### Security
 
 - CI pins every GitHub Action by full commit SHA, with the release tag as a comment, instead of a mutable major tag (karyos#920).
+
+- `url` moves from 2.5.8 to 2.5.9 (with `form_urlencoded` 1.2.3) in the lockfile, for RUSTSEC-2026-0592: `Url::origin()` recursed once per nested `blob:` prefix and could overflow the stack. It reaches `karyos-tiering` through `rusty-s3`; `make deny` failed on it (found by the runtime admission check of karyos#688).
 
 ## [0.1.0-alpha.3]: 2026-11-17
 

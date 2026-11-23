@@ -188,7 +188,9 @@ fn pump<T: StreamTerms>(
     drivers: &mut [&mut EmbeddedDriver<T>],
     mut done: impl FnMut(&mut [&mut EmbeddedDriver<T>]) -> bool,
 ) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    // A deadline far above any load seen: a loaded host only slows the
+    // drivers' duty cycles, so a shorter one fails tests that are right.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while std::time::Instant::now() < deadline {
         for driver in drivers.iter_mut() {
             let _ = driver.do_work().unwrap();

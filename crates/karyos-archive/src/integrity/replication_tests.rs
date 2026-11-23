@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use super::copies::{CopyCatalog, Enforcement};
+use super::copies::{ArrivalProfile, CopyCatalog, CopyRecord, CopyState, Enforcement};
 use super::journal::IntegrityJournal;
 use super::replication::{Replica, ReplicationError, Verdict};
 use super::test_support::DIR;
@@ -122,6 +122,53 @@ fn a_seal_of_no_range_or_an_inverted_invalidation_is_refused() {
         replica().invalidate(&mut f.copies, &mut f.journal, RECORDING, 9, 8),
         Err(ReplicationError::InvertedRange { .. })
     ));
+}
+
+/// ADR-0102 decisions 6 and 10: a gap is durable, recorded once, counts
+/// towards nothing; a counted copy keeps the profile it arrived under.
+#[test]
+fn a_gap_is_durable_and_a_counted_copy_keeps_its_profile() {
+    let mut f = fixture();
+    let trusted = replica().with_profile(ArrivalProfile::Trusted);
+    assert!(
+        trusted
+            .gap(&mut f.copies, &mut f.journal, RECORDING, 0, 16)
+            .unwrap()
+    );
+    // Recorded once; an empty one records nothing.
+    assert!(
+        !trusted
+            .gap(&mut f.copies, &mut f.journal, RECORDING, 0, 16)
+            .unwrap()
+    );
+    assert!(
+        !trusted
+            .gap(&mut f.copies, &mut f.journal, RECORDING, 16, 16)
+            .unwrap()
+    );
+    assert!(matches!(
+        trusted.gap(&mut f.copies, &mut f.journal, RECORDING, 9, 8),
+        Err(ReplicationError::InvertedRange { .. })
+    ));
+    assert_eq!(f.copies.verified_copies(RECORDING, 0, 16).unwrap(), 0);
+    let (seal, bytes) = f.ranges[1].clone();
+    let _ = trusted
+        .verify(&mut f.copies, &mut f.journal, &seal, &bytes)
+        .unwrap();
+    let reopened = CopyCatalog::open(f.disk.clone(), Path::new(DIR), &mut f.journal).unwrap();
+    assert_eq!(trusted.gaps(&reopened, RECORDING).unwrap(), vec![(0, 16)]);
+    let counted = reopened
+        .current()
+        .unwrap()
+        .into_iter()
+        .find(|copy| copy.state == CopyState::Verified)
+        .unwrap();
+    assert_eq!(counted.profile, ArrivalProfile::Trusted);
+    assert_eq!(
+        CopyRecord::decode(&counted.encode()).unwrap(),
+        counted,
+        "the profile and the state round trip"
+    );
 }
 
 #[test]

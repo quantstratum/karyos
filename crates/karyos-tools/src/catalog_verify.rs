@@ -1524,4 +1524,4 @@ fn report_error(stderr: &mut dyn io::Write, error: &VerifyError) -> u8 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -486,6 +486,8 @@ pub struct DaemonArchive {
     requester: Requester,
     /// The replications this source pushes (ADR-0102).
     replications: crate::daemon_replication::Replications,
+    /// The replications this Archive accepts as a replica (ADR-0102).
+    replicas: crate::daemon_replica::Replicas,
     /// The driver's dropped grant audits last seen: a growth is logged, so
     /// a hole in the audit trail is never silent.
     audits_dropped: u64,
@@ -547,6 +549,14 @@ impl DaemonArchive {
             options.trusted_network,
         )
         .map_err(|error| ArchiveStartError::Agent(error.to_string()))?;
+        let replicas = crate::daemon_replica::Replicas::start(
+            &mut driver,
+            &options.dir,
+            options.copy_location.unwrap_or([0; 32]),
+            &options.replicas,
+            options.trusted_network,
+        )
+        .map_err(|error| ArchiveStartError::Agent(error.to_string()))?;
         let handle = ArchiveStartError::Handle;
         let reading = Requests(driver.subscribe(requests, Role::Required).map_err(handle)?);
         let writing = Responses(driver.publication(responses).map_err(handle)?);
@@ -601,6 +611,7 @@ impl DaemonArchive {
             server: ControlServer::new(agent, host, reading, writing),
             requester,
             replications,
+            replicas,
             audits_dropped: 0,
             signing_alarm: false,
         };
@@ -635,7 +646,8 @@ impl DaemonArchive {
         let _ = self.requester.serve();
         self.release_idle_requester();
         let (agent, host) = self.server.agent_and_host_mut();
-        let replicated = self.replications.duty(agent, host.driver_mut());
+        let replicated = self.replications.duty(agent, host.driver_mut())
+            | self.replicas.duty(host.driver_mut());
         self.driver_mut().drain_grant_audits(audit_grant);
         // Drained every cycle, the queue should never overflow; if it does,
         // the audit has a hole, which is logged with the new total.
@@ -709,9 +721,11 @@ impl DaemonArchive {
     #[must_use]
     pub fn shutdown(self) -> EmbeddedDriver<SharedTerms> {
         let replications = self.replications;
+        let replicas = self.replicas;
         let (mut host, stopped) = self.server.shutdown_into_host();
         let streams = replications.streams().to_vec();
         replications.shutdown(host.driver_mut());
+        replicas.shutdown(host.driver_mut());
         for stream in streams {
             let _ = host.driver_mut().remove_stream(stream);
         }

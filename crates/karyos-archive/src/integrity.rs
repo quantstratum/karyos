@@ -60,6 +60,7 @@ pub mod signing;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod test_key;
 pub mod tiering;
+pub mod tiering_offline;
 pub mod time;
 pub mod time_evidence;
 pub mod time_producer;
@@ -78,6 +79,8 @@ mod retention_tests;
 mod test_support;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tiering_offline_tests;
 #[cfg(test)]
 mod tiering_tests;
 #[cfg(test)]
@@ -488,6 +491,28 @@ impl ChainCheck {
     /// link, an inverted range or a range that does not follow the
     /// recording's previous one. Nothing is accepted on an error.
     pub fn accept(&mut self, record: &SealRecord) -> Result<(), Inconsistency> {
+        let next = self.check(record)?;
+        if record.kind.is_range() {
+            self.sealed_ends.insert(record.subject, record.end);
+            let _ = self
+                .sealed_starts
+                .entry(record.subject)
+                .or_insert(record.start);
+        }
+        self.next_counter = next;
+        self.head = Some(record.digest());
+        Ok(())
+    }
+
+    /// Checks `record` as the next record of the chain, changing nothing:
+    /// what [`ChainCheck::accept`] would refuse, without cloning the
+    /// chain's state (a steady seal allocates nothing; karyos#1113).
+    /// Returns the counter after it.
+    ///
+    /// # Errors
+    ///
+    /// As [`ChainCheck::accept`].
+    pub fn check(&self, record: &SealRecord) -> Result<u64, Inconsistency> {
         if record.counter != self.next_counter {
             return Err(Inconsistency::CounterGap {
                 expected: self.next_counter,
@@ -515,23 +540,13 @@ impl ChainCheck {
                 found: record.start,
             });
         }
-        let next = record
+        record
             .counter
             .checked_add(1)
             .ok_or(Inconsistency::CounterGap {
                 expected: self.next_counter,
                 found: record.counter,
-            })?;
-        if record.kind.is_range() {
-            self.sealed_ends.insert(record.subject, record.end);
-            let _ = self
-                .sealed_starts
-                .entry(record.subject)
-                .or_insert(record.start);
-        }
-        self.next_counter = next;
-        self.head = Some(record.digest());
-        Ok(())
+            })
     }
 }
 

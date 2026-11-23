@@ -21,6 +21,7 @@
 
 pub mod hmac_sha256;
 pub mod replay;
+pub mod signed;
 
 pub use hmac_sha256::HmacSha256;
 

@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# The nightly the aya R8 record pins for the shipped BPF bytecode.
+[toolchain]
+channel = "nightly-2026-11-10"
+components = ["rust-src"]
+profile = "minimal"

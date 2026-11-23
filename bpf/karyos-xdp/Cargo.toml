@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The XDP program of the AF_XDP copy-mode backend (quantstratum-docs:
+# karyos/design/af-xdp-backend.md 5.1; ADR-0038). Outside the Karyos
+# workspace: user builds never compile BPF. Only the maintainer recipe,
+# scripts/xdp-object.sh, builds it, in the pinned container, with this
+# crate's committed Cargo.lock (`--locked`) and the toolchain of its
+# rust-toolchain.toml; the R8 record is quantstratum-docs
+# karyos/reviews/dependency-admission-aya-af-xdp.md.
+
+[package]
+name = "karyos-xdp"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+aya-ebpf = { version = "=0.3.0", default-features = false }
+
+[[bin]]
+name = "karyos-xdp"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+panic = "abort"
+codegen-units = 1
+
+[profile.dev]
+panic = "abort"
+
+# Its own workspace root, so the Karyos workspace never builds it.
+[workspace]

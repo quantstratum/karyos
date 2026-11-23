@@ -397,6 +397,10 @@ fn sealed_end(seals: &[SealRecord], recording: u64, start: u64) -> u64 {
         .max(start)
 }
 
+/// The longest range a replica checks against one seal: a seal covers at
+/// most a segment, and no segment is longer (`Geometry::new`).
+pub const MAX_SEALED_RANGE: u64 = 0xFFFF_FFFF;
+
 /// What a replica refuses.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -420,6 +424,20 @@ pub enum ReceiveError {
         tail: u64,
         /// The bytes' start.
         start: u64,
+    },
+    /// A seal whose range the replica's store does not hold whole, or
+    /// longer than [`MAX_SEALED_RANGE`]: refused before anything is read
+    /// or allocated.
+    #[error("seal of [{start}, {end}) outside the stored [{floor}, {tail}) or too long")]
+    SealOutOfRange {
+        /// The seal's start.
+        start: u64,
+        /// Its end.
+        end: u64,
+        /// The store's start.
+        floor: u64,
+        /// The store's written end.
+        tail: u64,
     },
     /// Bytes below the replica's start, which it cannot compare.
     #[error("bytes at {start} below the replica's start {floor}")]
@@ -541,8 +559,8 @@ impl Receiver {
     ///
     /// # Errors
     ///
-    /// [`ReceiveError::ForeignSeal`], the store's read error, and the
-    /// replica's.
+    /// [`ReceiveError::ForeignSeal`], [`ReceiveError::SealOutOfRange`],
+    /// the store's read error, and the replica's.
     pub fn seal<D: Disk>(
         &self,
         seal: &SealRecord,
@@ -551,8 +569,25 @@ impl Receiver {
         journal: &mut IntegrityJournal<D>,
     ) -> Result<Verdict, ReceiveError> {
         check_seal(seal, self.recording_id).map_err(|_| ReceiveError::ForeignSeal)?;
-        let length = usize::try_from(seal.end.saturating_sub(seal.start))
-            .map_err(|_| SegmentError::PositionOverflow)?;
+        // Checked before anything is read or allocated: the range must be
+        // whole in the store, and bounded.
+        let (floor, tail) = (store.start(), store.written());
+        let out_of_range = ReceiveError::SealOutOfRange {
+            start: seal.start,
+            end: seal.end,
+            floor,
+            tail,
+        };
+        let span = seal.end.checked_sub(seal.start).ok_or(out_of_range)?;
+        if seal.start < floor || seal.end > tail || span > MAX_SEALED_RANGE {
+            return Err(ReceiveError::SealOutOfRange {
+                start: seal.start,
+                end: seal.end,
+                floor,
+                tail,
+            });
+        }
+        let length = usize::try_from(span).map_err(|_| SegmentError::PositionOverflow)?;
         let mut bytes = vec![0u8; length];
         store.read(seal.start, &mut bytes)?;
         Ok(self.replica.verify(copies, journal, seal, &bytes)?)

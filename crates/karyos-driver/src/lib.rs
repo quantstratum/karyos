@@ -17,6 +17,7 @@
 #[cfg(target_os = "linux")]
 pub mod admission;
 pub mod agents;
+pub mod authority;
 mod capabilities;
 mod client_counters;
 pub mod clock;
@@ -51,6 +52,7 @@ pub mod sm_schedule;
 pub mod spin;
 pub mod timed_gate;
 mod trace_journals;
+pub mod wire_keys;
 
 #[cfg(test)]
 pub(crate) mod test_ports;
