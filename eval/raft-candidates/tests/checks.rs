@@ -313,3 +313,19 @@ fn a_client_that_reads_a_value_never_written_is_caught() {
         "{violation:?}"
     );
 }
+
+/// The faulty service's answer is the one sent, not only the one
+/// recorded: when every server answers the same altered way, no two
+/// responses diverge, and the clients' history is what refuses it.
+#[test]
+fn an_altered_answer_reaches_the_client() {
+    let faults = workloads::Faults {
+        altered_responses: vec![0, 1, 2],
+        ..workloads::Faults::default()
+    };
+    let violation = faulty(faults, Vec::new());
+    assert!(
+        matches!(violation, Violation::NotLinearizable(_)),
+        "{violation:?}"
+    );
+}

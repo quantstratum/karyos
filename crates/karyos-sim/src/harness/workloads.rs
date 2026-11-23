@@ -943,6 +943,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             .ok()
             .and_then(|index| standby_end.checked_add(index))
             .ok_or(RunError::Count)?;
+        #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
         let mut client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
             .with_retry_after(case.retry_after);
         #[cfg(feature = "test-hooks")]
