@@ -4852,7 +4852,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(ADD_IMAGE_SUBSCRIPTION_OF + 1, &out[..length]),
+            Command::decode(GUARD_CLOSE_AT + 1, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         // A lane word of 4 or more, or with any bit above the lane, is
