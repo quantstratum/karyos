@@ -1647,6 +1647,124 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// karyos#1137 (ADR-0098 item 2): a signing Archive signs and anchors
+    /// a group store's journal with its own signer, under the group
+    /// declaration's journal identity; a group declaring none, or one of
+    /// the Archive's own, is refused.
+    #[test]
+    fn a_signing_archive_signs_a_group_store() {
+        use crate::agent::{ArchiveSigning, GroupTimeEvidence};
+        use crate::integrity::journal::IntegrityJournal;
+        use crate::integrity::ledger::{Ledger, read_entries};
+        use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+        use crate::integrity::test_key::TestKey;
+        use crate::integrity::time_evidence::{DIR, entries_dir, read_sealed};
+        use crate::integrity::time_producer::EventClock;
+        use crate::integrity::trust::{
+            Algorithm, Custody, HEADS_FILE, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH,
+            RegistryAction, RegistryEntry, SIGNED_HEAD_LENGTH, TrustRoot, key_id,
+        };
+        let dir = temp_dir("group-signed-evidence");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let archive = [7u8; 32];
+        let authority = TestKey::from_seed([1; 32]);
+        let archival = TestKey::from_seed([9; 32]);
+        let trust = TrustRoot {
+            archive_id: archive,
+            authorities: vec![authority.public()],
+        };
+        // The operator registers the archival key in each journal it signs.
+        for journal_dir in [dir.clone(), entries_dir(&groups)] {
+            let mut journal = IntegrityJournal::open(StdDisk, &journal_dir)
+                .unwrap()
+                .journal;
+            let mut keys =
+                Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &journal_dir, KEYS_FILE).unwrap();
+            let mut entry = RegistryEntry {
+                action: RegistryAction::Register,
+                algorithm: Algorithm::Ed25519,
+                custody: Custody::Declared,
+                sequence: 0,
+                key_id: key_id(&archival.public()),
+                public: archival.public(),
+                effective: 0,
+                evidence: [0; 32],
+                endorsement: [0; 64],
+            };
+            entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&archive));
+            KeyRegistry::new(trust.clone())
+                .append(&entry, &mut journal, &mut keys)
+                .unwrap();
+        }
+        let signing = ArchiveSigning {
+            trust,
+            journal_id: 1,
+            time_evidence_journal_id: None,
+            config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+            signer: Box::new(archival),
+        };
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn_signing(StdDisk, &dir, config, signing).unwrap();
+        agent
+            .set_calibration_source(Box::new(calibrations()))
+            .unwrap();
+        let clock = EventClock {
+            clock: [1, 0, 2, 3, 4],
+            granularity: 1,
+        };
+        let declared = GroupTimeEvidence::new(clock, Duration::from_secs(5));
+        let started = |evidence: GroupTimeEvidence| {
+            agent.start_group(
+                start_group(&groups, Some(Capture::Strict)).with_time_evidence(evidence),
+            )
+        };
+        assert!(matches!(
+            started(declared),
+            Err(AgentError::NoTimeEvidenceJournal)
+        ));
+        assert!(matches!(
+            started(declared.with_journal_id(1)),
+            Err(AgentError::SharedJournalId)
+        ));
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        let mut sender = started(declared.with_journal_id(3)).unwrap();
+        sender.admit().unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        let waiter = sender.waiter();
+        assert_eq!(agent.stop(recording).unwrap().position, 3000);
+        assert_eq!(waiter.wait_durable(1, Duration::from_secs(5)), Ok(1));
+        // Another group of the directory under another identity: refused.
+        let mut other = start_group(&groups, Some(Capture::Strict))
+            .with_time_evidence(declared.with_journal_id(4));
+        other.group_id = GROUP + 1;
+        assert!(matches!(
+            agent.start_group(other),
+            Err(AgentError::GroupStoreJournalId {
+                signed: 3,
+                declared: 4
+            })
+        ));
+        let store = entries_dir(&groups);
+        let mut signed = Vec::new();
+        for _ in 0..5000 {
+            signed = read_entries::<_, SIGNED_HEAD_LENGTH>(&mut StdDisk, &store, HEADS_FILE)
+                .unwrap_or_default();
+            if !signed.is_empty() && !read_sealed(StdDisk, &groups).unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        agent.shutdown().unwrap();
+        assert!(!signed.is_empty(), "the group store's head is signed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// karyos#1137: the all zero clock identity is reserved; declaring it
     /// is refused.
     #[test]

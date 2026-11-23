@@ -838,6 +838,25 @@ fn time_archive(name: &str, journal_id: u64) -> Archive {
         utc_reference: [0; 32],
         ..met
     };
+    // The Archive seals recording 7's [0, 8192), which the entries cite
+    // (karyos#1137: an entry naming unsealed positions is invalid).
+    let mut recording = SegmentStore::create(
+        StdDisk,
+        &dir,
+        7,
+        Geometry::new(4096, 8192).unwrap(),
+        SyncPolicy::None,
+        0,
+    )
+    .unwrap();
+    let bytes = vec![7u8; 8192];
+    recording.append(0, &bytes).unwrap();
+    recording.sync().unwrap();
+    drop(recording);
+    let mut sealed = open_journal(&dir);
+    sealed.seal_segment(7, 0, &bytes[..4096], false).unwrap();
+    sealed.seal_segment(7, 4096, &bytes[4096..], false).unwrap();
+    drop(sealed);
     let mut store = EntryStore::open(StdDisk, &dir).unwrap();
     store.append(&met).unwrap();
     store.append(&missing).unwrap();
@@ -927,14 +946,16 @@ fn time_run(archive: &Archive, extra: &[&str]) -> (u8, String, String) {
 #[test]
 fn verify_reports_the_time_verdict_of_verified_entries() {
     let archive = time_archive("time", 1);
+    // The Archive's own chain seals recording 7 unsigned in this fixture,
+    // so integrity is unverifiable (1); the time verdict stays apart.
     let (status, out, err) = time_run(&archive, &[]);
-    assert_eq!((status, err.as_str()), (0, ""), "{out}");
+    assert_eq!((status, err.as_str()), (1, ""), "{out}");
     assert!(
         out.contains("time evidence: not evaluated by the integrity verifier"),
         "{out}"
     );
     let (status, out, err) = time_run(&archive, &["--time-requirement", "1000:1"]);
-    assert_eq!((status, err.as_str()), (0, ""), "{out}");
+    assert_eq!((status, err.as_str()), (1, ""), "{out}");
     assert!(
         out.contains("time recording 7 [0, 4096) clock 3:4 met"),
         "{out}"
@@ -952,6 +973,8 @@ fn verify_reports_the_time_verdict_of_verified_entries() {
         out.contains("\"time\":{\"verdict\":\"no_evidence\",\"entries\":[{\"recording\":7,\"start\":0,\"end\":4096,\"domain\":3,\"epoch\":4,\"verdict\":\"met\"}"),
         "{out}"
     );
+    // Both sealed ranges are covered: no gap.
+    assert!(out.contains("\"gaps\":[]"), "{out}");
     // The entries' journal has its own anchor store: a requirement
     // without it is a usage error, never an unverified `no_evidence`.
     assert_eq!(
@@ -1299,4 +1322,76 @@ fn open_journal(dir: &std::path::Path) -> IntegrityJournal<StdDisk> {
             Err(error) => panic!("{error:?}"),
         }
     }
+}
+
+/// karyos#1137 (ADR-0098 item 2; docs#975): entries are checked against
+/// what their directory's chain seals. A sealed range no entry covers is
+/// reported `no_evidence`; an entry naming positions the chain does not
+/// seal, or a zero identity entry other than the sentinel, is an
+/// integrity failure (exit 2), never a verdict.
+#[test]
+fn time_evidence_is_checked_against_its_directorys_seals() {
+    use karyos_archive::integrity::time_evidence::{Entry, EntryStore, NO_BOUND, entries_dir};
+    let archive = time_archive("time-coverage", 1);
+    let dir = archive.dir();
+    // A third range, sealed, with no entry.
+    let mut recording = SegmentStore::recover(
+        StdDisk,
+        &dir,
+        7,
+        Geometry::new(4096, 8192).unwrap(),
+        SyncPolicy::None,
+    )
+    .unwrap()
+    .store;
+    let bytes = vec![7u8; 4096];
+    recording.append(8192, &bytes).unwrap();
+    recording.sync().unwrap();
+    drop(recording);
+    let mut sealed = open_journal(&dir);
+    sealed.seal_segment(7, 8192, &bytes, false).unwrap();
+    drop(sealed);
+    let (_, out, _) = time_run(&archive, &["--time-requirement", "1000:1"]);
+    assert!(
+        out.contains("time recording 7 [8192, 12288) uncovered no_evidence"),
+        "{out}"
+    );
+    assert!(out.ends_with("time verdict: no_evidence\n"), "{out}");
+    let base = time_evidence_first(&dir);
+    // An entry naming positions the chain does not seal, appended to a
+    // fresh copy's store: exit 2.
+    let copy = time_archive("time-invalid-unsealed", 1);
+    let mut store = EntryStore::open(StdDisk, &copy.dir()).unwrap();
+    store
+        .append(&Entry {
+            start: 12_288,
+            end: 16_384,
+            ..base
+        })
+        .unwrap();
+    drop(store);
+    let (status, _, err) = time_run(&copy, &["--time-requirement", "1000:1"]);
+    assert_eq!(status, 2, "{err}");
+    assert!(err.contains("invalid time evidence entry"), "{err}");
+    // A zero identity entry with a bound, as a store written by another
+    // build could hold (this build's store refuses it): invalid.
+    let bad = Entry {
+        clock: [0; 5],
+        ..base
+    };
+    assert!(matches!(
+        super::coverage(&dir, &entries_dir(&dir), &[bad]),
+        Err(super::VerifyError::InvalidTimeEvidence { .. })
+    ));
+    // Two entries over the same positions: invalid.
+    assert!(matches!(
+        super::coverage(&dir, &entries_dir(&dir), &[base, base]),
+        Err(super::VerifyError::InvalidTimeEvidence { .. })
+    ));
+    let _ = NO_BOUND;
+}
+
+/// The first entry of `dir`'s store.
+fn time_evidence_first(dir: &std::path::Path) -> karyos_archive::integrity::time_evidence::Entry {
+    karyos_archive::integrity::time_evidence::read_sealed(StdDisk, dir).unwrap()[0]
 }

@@ -808,6 +808,7 @@ mod tests {
             signer: None,
             copy_location: None,
             retention: None,
+            time_evidence: false,
         });
         let daemon = Daemon::start(&options).unwrap();
         // The configured stream and the two control streams.
@@ -848,6 +849,7 @@ mod tests {
             signer: None,
             copy_location: None,
             retention: None,
+            time_evidence: false,
         });
         assert!(matches!(
             Daemon::start(&options),

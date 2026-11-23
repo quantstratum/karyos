@@ -315,6 +315,23 @@ pub enum VerifyError {
         /// The error.
         source: time_evidence::StoreError,
     },
+    /// A signed entry is invalid evidence (karyos#1137): the zero clock
+    /// identity other than as the sentinel, or positions its directory's
+    /// chain does not seal, or overlapping another entry of its subject.
+    /// An integrity failure, never a verdict.
+    #[error("{}: invalid time evidence entry of {recording} [{start}, {end}): {why}", dir.display())]
+    InvalidTimeEvidence {
+        /// The entries' directory.
+        dir: PathBuf,
+        /// The entry's recording or group.
+        recording: u64,
+        /// Its start.
+        start: u64,
+        /// Its end.
+        end: u64,
+        /// Why.
+        why: &'static str,
+    },
 }
 
 /// Parses the arguments after `verify`: `Ok(None)` for `--help`.
@@ -406,6 +423,9 @@ pub struct TimeReport {
     /// Each entry, with its verdict: `met` only for an entry its own
     /// integrity journal verifies, `no_evidence` otherwise.
     pub entries: Vec<(time_evidence::Entry, Verdict)>,
+    /// The sealed positions of each subject with entries that no entry
+    /// covers, `(subject, start, end)`: `no_evidence` (ADR-0098 item 2).
+    pub gaps: Vec<(u64, u64, u64)>,
     /// The combined verdict: `not_met` over `no_evidence` over `met`.
     pub verdict: Verdict,
 }
@@ -453,6 +473,7 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
             .map(|range| (range.start, range.end))
             .collect()
     };
+    let gaps = coverage(&args.dir, &dir, &entries)?;
     let length = time_evidence::ENTRY_LENGTH as u64;
     let mut at = 0u64;
     let mut out = Vec::with_capacity(entries.len());
@@ -461,7 +482,9 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
         let covered = verified
             .iter()
             .any(|&(start, stop)| start <= at && end <= stop);
-        let verdict = if covered {
+        // The zero identity is "provenance unknown", never a clock to look
+        // up (quantstratum-docs: karyos/design/trace-clocks.md).
+        let verdict = if covered && entry.clock != [0; 5] {
             entry.verdict(&requirement)
         } else {
             Verdict::NoEvidence
@@ -469,14 +492,115 @@ pub fn time_report(args: &VerifyArgs) -> Result<Option<TimeReport>, VerifyError>
         out.push((entry, verdict));
         at = end;
     }
-    let verdicts: Vec<Verdict> = out.iter().map(|(_, verdict)| *verdict).collect();
+    let mut verdicts: Vec<Verdict> = out.iter().map(|(_, verdict)| *verdict).collect();
+    verdicts.extend(gaps.iter().map(|_| Verdict::NoEvidence));
     let verdict = time::reduce(&verdicts, Some(&requirement))
         .map(|combined| combined.verdict)
         .unwrap_or(Verdict::NoEvidence);
     Ok(Some(TimeReport {
         entries: out,
+        gaps,
         verdict,
     }))
+}
+
+/// Checks `entries` against what `archive`'s own integrity journal seals
+/// for their subjects (ADR-0098 item 2; docs#975), and returns the sealed
+/// positions of each subject with entries that none covers.
+///
+/// # Errors
+///
+/// [`VerifyError::InvalidTimeEvidence`] for an entry of the zero identity
+/// other than the sentinel, one naming positions the chain does not seal,
+/// or one overlapping another of its subject; and the journal's read
+/// error.
+fn coverage(
+    archive: &std::path::Path,
+    dir: &std::path::Path,
+    entries: &[time_evidence::Entry],
+) -> Result<Vec<(u64, u64, u64)>, VerifyError> {
+    use std::collections::BTreeMap;
+    let invalid = |entry: &time_evidence::Entry, why| VerifyError::InvalidTimeEvidence {
+        dir: dir.to_path_buf(),
+        recording: entry.recording,
+        start: entry.start,
+        end: entry.end,
+        why,
+    };
+    let (records, _) = karyos_archive::integrity::journal::read_records(&mut StdDisk, archive)
+        .map_err(|source| VerifyError::TimeEvidence {
+            dir: dir.to_path_buf(),
+            source: time_evidence::StoreError::Io(source),
+        })?;
+    // Each subject's sealed ranges, merged.
+    let mut sealed: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+    for record in records.iter().filter(|record| record.kind.is_range()) {
+        sealed
+            .entry(record.subject)
+            .or_default()
+            .push((record.start, record.end));
+    }
+    for ranges in sealed.values_mut() {
+        ranges.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for &(start, end) in ranges.iter() {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
+            }
+        }
+        *ranges = merged;
+    }
+    let mut covered: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
+    for entry in entries {
+        if !time_evidence::keeps_sentinel(entry) {
+            return Err(invalid(
+                entry,
+                "the zero clock identity with a bound or a record",
+            ));
+        }
+        let inside = sealed.get(&entry.recording).is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|&(start, end)| start <= entry.start && entry.end <= end)
+        });
+        if !inside {
+            return Err(invalid(entry, "positions the chain does not seal"));
+        }
+        covered
+            .entry(entry.recording)
+            .or_default()
+            .push((entry.start, entry.end));
+    }
+    let mut gaps = Vec::new();
+    for (subject, mut spans) in covered {
+        spans.sort_unstable();
+        if let Some([_, (start, end)]) = spans
+            .windows(2)
+            .find(|pair| matches!(pair, [a, b] if b.0 < a.1))
+        {
+            return Err(VerifyError::InvalidTimeEvidence {
+                dir: dir.to_path_buf(),
+                recording: subject,
+                start: *start,
+                end: *end,
+                why: "overlapping another entry",
+            });
+        }
+        for &(start, end) in sealed.get(&subject).into_iter().flatten() {
+            let mut at = start;
+            for &(from, to) in spans.iter().filter(|&&(from, to)| to > start && from < end) {
+                if from > at {
+                    gaps.push((subject, at, from));
+                }
+                at = at.max(to);
+            }
+            if at < end {
+                gaps.push((subject, at, end));
+            }
+        }
+    }
+    Ok(gaps)
 }
 
 const fn verdict_name(verdict: Verdict) -> &'static str {
@@ -502,6 +626,12 @@ pub fn time_text(report: &TimeReport) -> String {
             verdict_name(*verdict)
         );
     }
+    for (subject, start, end) in &report.gaps {
+        let _ = writeln!(
+            out,
+            "time recording {subject} [{start}, {end}) uncovered no_evidence"
+        );
+    }
     let _ = writeln!(out, "time verdict: {}", verdict_name(report.verdict));
     out
 }
@@ -525,10 +655,18 @@ pub fn time_json(report: &TimeReport) -> String {
             )
         })
         .collect();
+    let gaps: Vec<String> = report
+        .gaps
+        .iter()
+        .map(|(subject, start, end)| {
+            format!("{{\"recording\":{subject},\"start\":{start},\"end\":{end}}}")
+        })
+        .collect();
     format!(
-        "{{\"verdict\":\"{}\",\"entries\":[{}]}}",
+        "{{\"verdict\":\"{}\",\"entries\":[{}],\"gaps\":[{}]}}",
         verdict_name(report.verdict),
-        entries.join(",")
+        entries.join(","),
+        gaps.join(",")
     )
 }
 
