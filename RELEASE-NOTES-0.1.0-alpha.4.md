@@ -90,8 +90,10 @@ See the `0.1.0-alpha.4` section of `CHANGELOG.md`.
 
 | Check | Command | Platform | Head | Result |
 | --- | --- | --- | --- | --- |
-| The local gate | `CHANGELOG_RELEASE=1 make pre-push` | macOS arm64 (studiom4) | PENDING | PENDING |
-| The Linux tests | `scripts/linux-test.sh --workspace --all-features --locked --no-fail-fast` | Docker, Linux | PENDING | PENDING |
+| The local gate | `CHANGELOG_RELEASE=1 make pre-push` | Linux 7.0.0-43-generic, x86_64 host flumix (not macOS: the team's gate pool) | `7d43d878` | 255 test suites, 6069 passed, 0 failed, 37 ignored; exit 0 |
+| The Linux tests | `scripts/linux-test.sh --workspace --all-features --locked --no-fail-fast` (volume `karyos-linux-target-issue1033-7d43d878`) | Docker on studiom4, Linux kernel 6.8.0-117-generic, aarch64 | `7d43d878` | 206 test suites, 5796 passed, 0 failed, 36 ignored; exit 0 |
+
+The release tree differs from `7d43d878` only in this file (its Evidence rows). The joint `cargo publish --dry-run`, the scratch project build and the libkaryos artifacts' conformance runs are recorded after the tag, as dated rows.
 
 ### Written exception
 
