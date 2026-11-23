@@ -1,3 +1,0 @@
-### Added
-
-- Replica verification and tiered storage logic of the Archive (SPEC.md §8.4, "Replication" and "Tiered storage"; part of karyos#669): `karyos_archive::integrity::replication` records what arrives before its seal as unverified, counts a range as a copy only after it verified against the source seal, and reports the replication lag; `karyos_archive::integrity::tiering` offloads a sealed range behind an `ObjectStore` trait on the control path, checking `min_copies` before it acts, refusing a corrupt local range, recording the remote copy only after it read back verified and removing the local range only then, and restores an offloaded range for replay only once it verifies.

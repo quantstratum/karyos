@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-archive"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "ed25519-dalek",
  "karyos-client",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-client"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "karyos-protocol",
  "karyos-sys",
@@ -546,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-cluster"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "karyos-archive",
  "karyos-codec",
@@ -555,11 +555,11 @@ dependencies = [
 
 [[package]]
 name = "karyos-codec"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 
 [[package]]
 name = "karyos-codec-derive"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-driver"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "karyos-client",
  "karyos-io",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-io"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "karyos-protocol",
  "karyos-sys",
@@ -589,7 +589,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-protocol"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "hmac",
  "karyos-sys",
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-sim"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "karyos-archive",
  "karyos-client",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-sys"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "loom",
  "rustix",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "karyos-trace"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "karyos-protocol",
  "thiserror 2.0.21",

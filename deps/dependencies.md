@@ -160,7 +160,10 @@ anything.
 
 `sha2` is a dependency of `karyos-archive`, as its admission record
 scopes it, and of `karyos-protocol` for the wire authentication profile
-(owner decision D51; `hmac` 0.13.0, which adds no other runtime crate). Its transitive runtime crates, admitted with it, are `digest`
+(owner decision D51; `hmac` 0.13.0, which adds no other runtime crate
+of its own; its lock brought `digest` 0.11.3, whose constant time
+comparison `ctutils::CtEq` the D51 record names, with `ctutils` 0.4.8
+and `cmov` 0.5.4, both Apache-2.0 OR MIT with no build script). Its transitive runtime crates, admitted with it, are `digest`
 0.11.3, `block-buffer` 0.12.1, `crypto-common` 0.2.2, `hybrid-array`
 0.4.15, `typenum` 1.20.1 and `cpufeatures` 0.3.1 (all MIT OR
 Apache-2.0); `cfg-if` 1.0.5 and `libc` 0.2.190 (under `cpufeatures`, for
