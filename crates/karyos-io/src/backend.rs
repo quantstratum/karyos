@@ -1565,6 +1565,9 @@ pub enum Capability {
     /// The `io_uring` ring with every probe `open` requires
     /// (io-uring-backend.md 4.1, `uring_ring`).
     UringRing,
+    /// The AF_XDP socket, UMEM and attachment with every step `open`
+    /// requires (af-xdp-backend.md 4.1, `xdp_socket`).
+    XdpSocket,
 }
 
 /// The probed state of one capability.

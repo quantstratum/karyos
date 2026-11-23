@@ -23,6 +23,7 @@ members = [
     "crates/karyos-agent",
     "crates/karyos-control",
     "crates/karyos-tiering",
+    "crates/karyos-otlp",
 ]
 # The XDP program builds only through scripts/xdp-object.sh (ADR-0038).
 exclude = ["bpf/karyos-xdp"]
