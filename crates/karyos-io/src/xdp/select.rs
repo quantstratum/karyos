@@ -5,9 +5,10 @@
 //! `af_xdp_or_sockets` mode would follow IU-7"; karyos#643), the same
 //! policy as `io_uring_or_sockets`.
 //!
-//! With [`XdpChoice::AfXdp`] a failed required AF_XDP step (the socket,
-//! the UMEM registration, the rings, the bind, the program load or the
-//! attach) is [`OpenError::RequiredCapability`] naming
+//! With [`XdpChoice::AfXdp`] a failed baseline AF_XDP probe (the socket,
+//! the UMEM registration, the rings or the program load; never the
+//! explicit bind or the configured attach, which fail the configuration
+//! under either choice) is [`OpenError::RequiredCapability`] naming
 //! [`Capability::XdpSocket`]; nothing falls back. With
 //! [`XdpChoice::AfXdpOrSockets`] the same failure, on the initial open
 //! only, opens sockets instead and says so. Any other error, a
@@ -64,12 +65,17 @@ pub enum Selected<X, S> {
     },
 }
 
-/// Whether `error` is a failed required AF_XDP step: an `OpenError::Os`
-/// whose operation is one of the backend's (`xsk_*`, `xdp_*`).
+/// Whether `error` is a failed baseline AF_XDP probe of the initial open:
+/// the socket, the UMEM registration, the ring setup, or loading the
+/// program. The explicit copy-mode bind (`xsk_bind`) and the attach in the
+/// configured mode (`xdp_attach`) are not: SPEC §16.3 makes their failure
+/// fail the configuration under either choice, never a fallback.
 #[must_use]
 pub fn is_required_step_failure(error: OpenError) -> bool {
     matches!(error, OpenError::Os { operation, .. }
-        if operation.starts_with("xsk_") || operation.starts_with("xdp_"))
+        if (operation.starts_with("xsk_") || operation.starts_with("xdp_"))
+            && operation != "xsk_bind"
+            && operation != "xdp_attach")
 }
 
 fn reason_of(error: OpenError) -> Reason {
@@ -183,6 +189,17 @@ mod tests {
             assert_eq!(
                 select(choice, || Err::<(), _>(config), || Ok(())).err(),
                 Some(config)
+            );
+        }
+        let bind = OpenError::Os {
+            operation: "xsk_bind",
+            errno: 19,
+        };
+        for choice in [XdpChoice::AfXdp, XdpChoice::AfXdpOrSockets] {
+            assert_eq!(
+                select(choice, || Err::<(), _>(bind), || Ok(())).err(),
+                Some(bind),
+                "an explicit bind never falls back"
             );
         }
         assert_eq!(

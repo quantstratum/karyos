@@ -743,62 +743,33 @@ mod kernel {
         assert_eq!(from, source);
     }
 
-    /// A real failed required step: binding to an interface that does not
-    /// exist. `af_xdp` fails with `RequiredCapability`, `af_xdp_or_sockets`
-    /// opens sockets.
+    /// A real failed bind (an interface that does not exist) fails the
+    /// configuration under either choice: the explicit copy-mode bind is
+    /// never a fallback trigger (SPEC §16.3).
     #[test]
-    fn a_real_failed_bind_falls_back_only_under_af_xdp_or_sockets() {
+    fn a_real_failed_bind_fails_under_both_choices() {
+        use crate::xdp::select::{XdpChoice, select};
         let _umem = umem_lock();
-        use crate::backend::{Capability, CapabilityState};
-        use crate::xdp::select::{Selected, XdpChoice, select};
         let sizes = XskSizes {
             frame_len: FRAME,
             tx_frames: TX,
             rx_frames: RX,
         };
         let missing = 0x7fff_fff0;
-        let required_fails = select(
-            XdpChoice::AfXdp,
-            || OsXsk::open(missing, 0, sizes),
-            || {
-                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|_| {
-                    crate::backend::OpenError::Os {
-                        operation: "socket",
-                        errno: 0,
-                    }
-                })
-            },
-        );
-        assert!(
-            matches!(
-                required_fails,
-                Err(crate::backend::OpenError::RequiredCapability {
-                    capability: Capability::XdpSocket,
-                    state: CapabilityState::Unavailable(_)
-                })
-            ),
-            "{:?}",
-            required_fails.map(|_| ())
-        );
-        let fallback = select(
-            XdpChoice::AfXdpOrSockets,
-            || OsXsk::open(missing, 0, sizes),
-            || {
-                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|_| {
-                    crate::backend::OpenError::Os {
-                        operation: "socket",
-                        errno: 0,
-                    }
-                })
-            },
-        );
-        assert!(matches!(
-            fallback,
-            Ok(Selected::Sockets {
-                xdp_socket: CapabilityState::Fallback(_),
-                ..
-            })
-        ));
+        for choice in [XdpChoice::AfXdp, XdpChoice::AfXdpOrSockets] {
+            let selected = select(choice, || OsXsk::open(missing, 0, sizes), || Ok(()));
+            assert!(
+                matches!(
+                    selected,
+                    Err(crate::backend::OpenError::Os {
+                        operation: "xsk_bind",
+                        ..
+                    })
+                ),
+                "{choice:?}: {:?}",
+                selected.map(|_| ())
+            );
+        }
     }
 
     /// Under Docker's default capabilities (no `CAP_BPF`, no
