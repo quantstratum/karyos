@@ -89,6 +89,8 @@ ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zer
 # The wire authentication profile (owner decision D51; quantstratum-docs:
 # karyos/reviews/dependency-admission-wire-auth-hmac.md).
 hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
+hkdf = { version = "=0.13.0", default-features = false }
+zeroize = { version = "=1.9.2", default-features = false }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
 tracing = { version = "0.1.44", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
