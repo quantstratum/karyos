@@ -178,6 +178,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e8bd762f7479489c70ed6c768ddca99d7296857de437a68dcb2a94365b3fae"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
+
+[[package]]
 name = "crunchy"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -597,6 +612,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironsbe-codegen"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e30ecd1aa9dc806510096712ca289b1e40963bd9cf499f4ce3f53c89d60eab85"
+dependencies = [
+ "ironsbe-core",
+ "ironsbe-schema",
+ "proc-macro2",
+ "quote",
+ "thiserror",
+]
+
+[[package]]
+name = "ironsbe-core"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80a64069810655fb034a50b1826c75c7a479d7ba4e49c43387b2f261cd3198bb"
+dependencies = [
+ "crossbeam-queue",
+ "thiserror",
+]
+
+[[package]]
+name = "ironsbe-schema"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d22b30c4d3704aa4803a7b186fd0562bd5375c24197c9e18e1d9f9ecc351523"
+dependencies = [
+ "ironsbe-core",
+ "quick-xml",
+ "thiserror",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -815,7 +864,11 @@ dependencies = [
 name = "karyos-sbe"
 version = "0.1.0-alpha.3"
 dependencies = [
+ "ironsbe-codegen",
+ "ironsbe-core",
  "karyos-feed",
+ "karyos-sys",
+ "thiserror",
 ]
 
 [[package]]
@@ -1057,6 +1110,15 @@ dependencies = [
  "rand_xorshift",
  "regex-syntax",
  "unarray",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
