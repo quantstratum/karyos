@@ -39,6 +39,11 @@ karyos-catalog: an Archive's recordings (SPEC.md section 11).
 Usage: karyos-catalog list <dir> [--json]
        karyos-catalog list --live DIR=REQ,RESP [--timeout-ms N] [--json]
        karyos-catalog verify <dir> [--trust FILE] [--anchors HEX=DIR]... [--json]
+       karyos-catalog export <dir> --trust FILE --recording ID... --out FILE
+                      [--anchors HEX=DIR]... [--time] [--clock-records FILE]
+                      [--schema ID:VERSION=FILE]...
+       karyos-catalog verify-export <file> --trust FILE [--anchors HEX=DIR]...
+                      [--time-requirement MAX:GRAN] [--json]
 
   list <dir>     the recordings of the catalog in <dir>, read only: no
                  running Archive is needed, and none is disturbed. A
@@ -53,6 +58,15 @@ Usage: karyos-catalog list <dir> [--json]
   -h, --help     print this text
   verify <dir>   the integrity outcome of every range (SPEC.md section
                  8.4); karyos-catalog verify --help for its options
+  export <dir>   write an export of the recordings (ADR-0103) to --out:
+                 each journal from genesis to its latest anchored head,
+                 the registry, heads and anchors over it, the recordings'
+                 bytes, policies and bindings; --time adds the time
+                 evidence entries, --clock-records the calibration and
+                 UTC reference records they cite, --schema a codec schema
+  verify-export <file>
+                 verify an export offline, with the trust file and anchor
+                 stores only: 0 every range verified, 1 not, 2 refused
 
 Exit status: 0 listed (a directory with no catalog lists nothing); 2 an
 error (arguments, I/O, a damaged catalog or another format version, an
