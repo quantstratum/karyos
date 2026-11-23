@@ -96,12 +96,12 @@ mod rtnl {
         let _ = request(17, 0, &link);
     }
 
-    /// Removes the pair on every exit of the test.
-    pub struct Pair(pub &'static str);
+    /// Removes the pair on every exit of the test, once created.
+    pub struct Pair(pub String);
 
     impl Drop for Pair {
         fn drop(&mut self) {
-            delete(self.0);
+            delete(&self.0);
         }
     }
 
@@ -162,24 +162,34 @@ fn tai_now_ns() -> u64 {
 
 #[test]
 fn a_datagram_past_its_txtime_is_dropped_and_reported_with_its_time() {
-    rtnl::delete("kt0");
-    let _pair = rtnl::Pair("kt0");
-    let setup = rtnl::veth("kt0", "kt1")
-        .and_then(|()| rtnl::address("kt0", [10, 78, 0, 1]))
-        .and_then(|()| rtnl::neighbour("kt0", [10, 78, 0, 9], [2, 0, 0, 0, 0, 9]))
-        .and_then(|()| rtnl::etf("kt0", 500_000));
+    // Names of this process only: the test never touches an interface it
+    // did not create, and registers the cleanup only once it exists.
+    let a = format!("ke{:x}", std::process::id());
+    let b = format!("kf{:x}", std::process::id());
+    if let Err(errno) = rtnl::veth(&a, &b) {
+        if required() {
+            panic!("veth setup failed with errno {errno}");
+        }
+        eprintln!("veth unavailable here (errno {errno}); skipped");
+        return;
+    }
+    let _pair = rtnl::Pair(a.clone());
+    let setup = rtnl::address(&a, [10, 78, 0, 1])
+        .and_then(|()| rtnl::neighbour(&a, [10, 78, 0, 9], [2, 0, 0, 0, 0, 9]))
+        .and_then(|()| rtnl::etf(&a, 500_000));
     if let Err(errno) = setup {
         if required() {
-            panic!("veth or etf qdisc setup failed with errno {errno}");
+            panic!("address, neighbour or etf qdisc setup failed with errno {errno}");
         }
-        eprintln!("veth or etf qdisc unavailable here (errno {errno}); skipped");
+        eprintln!("etf qdisc unavailable here (errno {errno}); skipped");
         return;
     }
     let socket = EtfSocket::open(SocketAddr::from((Ipv4Addr::new(10, 78, 0, 1), 0))).unwrap();
     let to = SocketAddr::from((Ipv4Addr::new(10, 78, 0, 9), 47_100));
     let past = tai_now_ns() - 1_000_000_000;
     socket.send(to, b"too late", past).unwrap();
-    let future = tai_now_ns() + 2_000_000;
+    // A generous lead, so a loaded runner cannot make it late too.
+    let future = tai_now_ns() + 200_000_000;
     socket.send(to, b"on time", future).unwrap();
     let mut entries = [ErrEntry::Truncated; 4];
     let mut found = 0;
@@ -190,7 +200,8 @@ fn a_datagram_past_its_txtime_is_dropped_and_reported_with_its_time() {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    std::thread::sleep(Duration::from_millis(20));
+    // Past the future datagram's time: it was sent, not dropped.
+    std::thread::sleep(Duration::from_millis(300));
     let later = socket.drain_errors(&mut entries[found..]).unwrap();
     let entries = &entries[..found + later];
     assert!(

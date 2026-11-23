@@ -170,7 +170,7 @@ mod tests {
         out.extend_from_slice(&level.to_ne_bytes());
         out.extend_from_slice(&kind.to_ne_bytes());
         out.extend_from_slice(data);
-        while out.len() % ALIGN != 0 {
+        while !out.len().is_multiple_of(ALIGN) {
             out.push(0);
         }
         out
