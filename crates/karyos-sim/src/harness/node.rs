@@ -50,8 +50,8 @@ use karyos_cluster::{Entry, LogError, RaftLog};
 
 use super::core::{
     Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, DriveFault, Limit,
-    Limits, LogView, NotLeader, ReadBudget, Refused, Release, SnapshotBase, Step, TransferRefused,
-    Unsupported, drive_inner,
+    Limits, LogView, NotLeader, ReadBudget, ReadyBuf, Refused, Release, SnapshotBase, Step,
+    TransferRefused, Unsupported, drive_inner,
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
@@ -1303,6 +1303,8 @@ pub struct ServerNode<C: ConsensusCore> {
     /// Its service answers differently (karyos#1038, tests).
     #[cfg(feature = "test-hooks")]
     alters_responses: bool,
+    /// The Ready its core fills in place ([`ConsensusCore::ready_into`]).
+    ready: ReadyBuf<C::Message>,
 }
 
 /// Why a server could not be created.
@@ -1433,6 +1435,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             drive_fault: DriveFault::None,
             #[cfg(feature = "test-hooks")]
             alters_responses: false,
+            ready: ReadyBuf::default(),
         };
         if let Some(configuration) = configuration {
             server.record_configuration(configuration, None);
@@ -1477,6 +1480,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             drive_fault: DriveFault::None,
             #[cfg(feature = "test-hooks")]
             alters_responses: false,
+            ready: ReadyBuf::default(),
         };
         server.start();
         server
@@ -1805,6 +1809,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         let driven = drive_inner(
             &mut core,
             &mut log,
+            &mut self.ready,
             (budget, self.base, self.drive_fault),
             &mut |to, message, release| {
                 if let Some(release) = release {
@@ -2158,7 +2163,7 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
             )),
             Wire::Request(command) => {
                 let key = (command.client, command.sequence);
-                match core.propose(command.encode(), &mut view) {
+                match core.propose_slice(&command.encode(), &mut view) {
                     Ok(()) => {
                         let _ = self.pending.insert(key);
                     }
