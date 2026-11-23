@@ -3743,11 +3743,13 @@ fn a_recording_is_sealed_and_its_catalog_changes_chained() {
 /// any recording, with no step of its own. Its producer, the Sequencer,
 /// lives in the commercial karyos-sequencer repository (SPEC §20.5,
 /// ADR-0064); here an admission-journal-shaped recording, one entry per
-/// frame, is recorded into a sealing Archive. Its ranges verify clean,
-/// and a byte of an entry changed on disk is reported inconsistent.
+/// frame, is recorded into a sealing Archive. Its ranges are sealed in the
+/// chain and verify clean, and a byte of an entry changed on disk no
+/// longer matches its seal.
 #[test]
 fn an_admission_journal_recorded_into_the_archive_is_sealed_and_verified() {
-    use crate::control::IntegrityOutcome;
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::{SealKind, verify_chain, verify_range};
 
     const MARKER: &[u8] = b"admission entry ";
     // One admission entry per 96-byte frame: a marker and its sequence.
@@ -3775,46 +3777,55 @@ fn an_admission_journal_recorded_into_the_archive_is_sealed_and_verified() {
         agent.event(Duration::from_secs(5)).unwrap(),
         Event::Ended { .. }
     ));
-    // The running Archive's verification answers every range clean.
-    let verified = |agent: &ArchiveHandle| {
-        let verify = agent.post_verify(id).unwrap();
-        for _ in 0..5000 {
-            if let Some(answer) = verify.try_answer() {
-                return answer.unwrap().unwrap();
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("no verification answer");
-    };
-    let clean = verified(&agent);
-    assert!(!clean.is_empty());
-    assert_eq!(clean.first().unwrap().start, 0);
-    assert_eq!(clean.last().unwrap().end, all.len() as u64);
-    assert!(
-        clean
-            .iter()
-            .all(|range| range.outcome != IntegrityOutcome::Inconsistent),
-        "{clean:?}"
+    agent.shutdown().unwrap();
+    // Its ranges are sealed in the Archive's chain, the last closing, and
+    // each matches the entries recorded.
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    drop(journal);
+    assert!(verify_chain(records.iter()).is_ok());
+    let ranges: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind.is_range() && record.subject == id)
+        .collect();
+    assert_eq!(ranges.first().unwrap().start, 0);
+    let last = ranges.last().unwrap();
+    assert_eq!(
+        (last.end, last.kind),
+        (all.len() as u64, SealKind::ClosedSegment)
     );
-    // One byte of one entry changed in the segment file.
+    for range in &ranges {
+        let bytes = &all[range.start as usize..range.end as usize];
+        assert!(verify_range(range, bytes).is_ok());
+    }
+    // One byte of one entry changed in the segment file: what the Archive
+    // now holds no longer matches its seals.
     let segment = std::fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
         .unwrap();
-    let mut bytes = std::fs::read(&segment).unwrap();
-    let at = bytes
+    let mut file = std::fs::read(&segment).unwrap();
+    let at = file
         .windows(MARKER.len())
         .position(|window| window == MARKER)
         .unwrap();
-    bytes[at] ^= 0xFF;
-    std::fs::write(&segment, &bytes).unwrap();
-    let tampered = verified(&agent);
+    file[at] ^= 0xFF;
+    std::fs::write(&segment, &file).unwrap();
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Seen::default()));
+    let _ = agent
+        .replay(replay_of(id, all.len() as u64, Sink::new(&seen)))
+        .unwrap();
+    let _ = replay_ended(&agent);
+    let held = seen.lock().unwrap().bytes.clone();
+    assert_ne!(held, all, "the change reaches what the Archive holds");
     assert!(
-        tampered
-            .iter()
-            .any(|range| range.outcome == IntegrityOutcome::Inconsistent),
-        "{tampered:?}"
+        ranges.iter().any(|range| {
+            held.get(range.start as usize..range.end as usize)
+                .is_none_or(|bytes| verify_range(range, bytes).is_err())
+        }),
+        "a sealed range detects the change"
     );
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
