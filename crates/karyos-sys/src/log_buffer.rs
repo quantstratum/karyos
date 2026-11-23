@@ -789,7 +789,8 @@ impl<T: TermBytes> LogBuffer<T> {
     }
 
     /// The join point of an image; 0 for any other buffer.
-    fn join(&self) -> u64 {
+    #[must_use]
+    pub fn join(&self) -> u64 {
         match self.config.publication {
             PublicationMode::Image { join, .. } => join,
             _ => 0,

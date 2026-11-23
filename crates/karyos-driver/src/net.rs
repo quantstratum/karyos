@@ -1851,6 +1851,15 @@ impl<T: StreamTerms> Network<T> {
         self.image_events = events;
     }
 
+    /// Takes the awaiting cells (ADR-0100) the image table registered on
+    /// the installed image `slot`.
+    pub(crate) fn take_awaiting(
+        &mut self,
+        slot: SlotRef,
+    ) -> Vec<crate::agents::images::AwaitingLane> {
+        self.images.take_awaiting(slot)
+    }
+
     /// The lane buffers of the installed image `slot`.
     pub(crate) fn image_lanes(&self, slot: SlotRef) -> Option<Vec<Arc<LogBuffer<T>>>> {
         self.images.installed(slot).map(<[_]>::to_vec)
@@ -1878,8 +1887,9 @@ impl<T: StreamTerms> Network<T> {
         traced: karyos_protocol::trace_hook::PublicationIdentity,
         exposed: Option<crate::embedded::AggregateHandle>,
         lanes: &[Arc<LogBuffer<T>>],
+        awaiting: Vec<crate::agents::images::AwaitingLane>,
     ) {
-        let mut conductors = Vec::new();
+        let mut conductors: Vec<Conductor<Arc<LogBuffer<T>>>> = Vec::new();
         if exposed.is_none() {
             if let Some(count) = self.images_unexposed.checked_add(1) {
                 self.images_unexposed = count;
@@ -1888,6 +1898,13 @@ impl<T: StreamTerms> Network<T> {
                 .iter()
                 .filter_map(LogBuffer::<T>::conductor_owned)
                 .collect();
+            // No client can attach an unexposed image: its awaiting cells
+            // (ADR-0100) end at once.
+            for waiting in awaiting {
+                if let Some(conductor) = conductors.get_mut(waiting.lane) {
+                    let _ = conductor.end_subscriber(waiting.cell.cell(), waiting.cell.export());
+                }
+            }
         }
         self.net_images.push(NetImage {
             slot,

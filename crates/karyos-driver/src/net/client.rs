@@ -70,6 +70,8 @@ pub(crate) enum Owned {
     Subscription {
         handle: NetworkSubscription,
         announced: bool,
+        /// Its role: its awaiting cells' (ADR-0100) and its attaches'.
+        role: SubscriberRole,
     },
 }
 
@@ -543,9 +545,11 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             owned: Owned::Subscription {
                 handle,
                 announced: false,
+                role,
             },
             admission_sent: 0,
         });
+        self.refresh_awaiting();
         Ok(Response::NetworkSubscriptionReady {
             request,
             registration,
@@ -631,6 +635,45 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
     }
 
+    /// Rebuilds the awaiting entries the image table registers cells for
+    /// (ADR-0100) from the network subscriptions clients own. Run after
+    /// each change of `net_owned`'s subscriptions; it never allocates past
+    /// the capacity `net_owned` was given.
+    pub(crate) fn refresh_awaiting(&mut self) {
+        self.awaiting_entries.clear();
+        for owned in &self.net_owned {
+            if let Owned::Subscription { handle, role, .. } = owned.owned {
+                self.awaiting_entries
+                    .push(crate::agents::images::AwaitingEntry {
+                        endpoint: handle.endpoint(),
+                        stream_id: handle.stream_id(),
+                        parent: owned.registration,
+                        client: owned.client,
+                        role: karyos_sys::log_buffer::Role::from(role),
+                    });
+            }
+        }
+    }
+
+    /// Withdraws every awaiting cell (ADR-0100) that `matches` selects,
+    /// on every stream: its cell ends as a lost reader's would, at once.
+    pub(crate) fn withdraw_awaiting(
+        &mut self,
+        mut matches: impl FnMut(&crate::embedded::StreamAwaiting) -> bool,
+    ) {
+        for stream in &mut self.streams {
+            let conductor = &mut stream.conductor;
+            stream.awaiting.retain(|awaiting| {
+                if matches(awaiting) {
+                    let _ = conductor.end_subscriber(awaiting.cell.cell(), awaiting.cell.export());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
     /// Removes the network subscription `registration` of `client`;
     /// `false` when it is not one.
     pub(crate) fn remove_owned_subscription(&mut self, client: u64, registration: u64) -> bool {
@@ -676,6 +719,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let _ = self.remove_aggregate(&handle);
             }
             Owned::Subscription { handle, .. } => {
+                // Its awaiting cells go with it (ADR-0100), so none waits
+                // for an attach that cannot come.
+                self.withdraw_awaiting(|awaiting| awaiting.parent == owned.registration);
+                self.refresh_awaiting();
                 if let Some(net) = &mut self.net {
                     net.remove_subscription_later(handle);
                 }
@@ -713,6 +760,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     Owned::Subscription {
                         handle: subscription,
                         announced: true,
+                        ..
                     },
                 ..
             }) = self.net_owned.get(index).copied()
@@ -757,6 +805,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     Owned::Subscription {
                         handle: subscription,
                         announced: false,
+                        ..
                     },
                 ..
             }) = self.net_owned.get(index).copied()

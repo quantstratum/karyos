@@ -728,6 +728,21 @@ fn charge_of(mtu: u32) -> Option<u64> {
 /// Source of driver identities within the process.
 static NEXT_DRIVER: AtomicU64 = AtomicU64::new(1);
 
+/// One awaiting cell of a network image lane (ADR-0100).
+#[derive(Debug)]
+pub(crate) struct StreamAwaiting {
+    /// The subscription it awaits (the attach's `parent`) and its client.
+    pub(crate) parent: u64,
+    pub(crate) client: u64,
+    /// The subscription's role, the cell's.
+    pub(crate) role: Role,
+    /// The registered cell.
+    pub(crate) cell: karyos_sys::log_buffer::AwaitingCell,
+    /// When it was placed, in the driver clock's ns: a required cell ends
+    /// at this plus `image_join_deadline`.
+    pub(crate) since: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct Stream<T: StreamTerms> {
     pub(crate) id: u64,
@@ -805,6 +820,10 @@ pub(crate) struct Stream<T: StreamTerms> {
     /// retiring: served until their walker ended and their readers passed
     /// the seal.
     pub(crate) replaced: Vec<Replaced<T>>,
+    /// A network image lane's awaiting cells (ADR-0100), one per
+    /// subscription that awaited the image when it was built, until the
+    /// subscription attaches, is removed, or (required) its deadline ends.
+    pub(crate) awaiting: Vec<StreamAwaiting>,
     /// Whether it is a lane of a network publication, and whether its
     /// sender serves the current incarnation: such a lane reincarnates
     /// only through the network, never locally.
@@ -1317,6 +1336,16 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// (W5b): at most `NetworkConfig::max_owned_per_client` per client,
     /// preallocated for every client.
     pub(crate) net_owned: Vec<crate::net::client::OwnedNetwork>,
+    /// The network subscriptions in `net_owned`, as the image table needs
+    /// them to register awaiting cells (ADR-0100); kept in step with it.
+    pub(crate) awaiting_entries: Vec<crate::agents::images::AwaitingEntry>,
+    /// The parent an `AddImageSubscriptionOf` named (ADR-0100), handed
+    /// from its validation to the issuing paths of the same command, which
+    /// adopt that parent's awaiting cell; cleared at each command.
+    pub(crate) attach_of: Option<u64>,
+    /// The `ImageJoinLoss` an attach owes its client (ADR-0100), sent once
+    /// the attach succeeded; cleared at each command.
+    pub(crate) pending_join_loss: Option<karyos_protocol::cnc::Event>,
     /// Network resources refused because their client owned its most.
     pub(crate) owned_refusals: u64,
     /// `owned_refusals` reached its end and kept its value (SPEC §14).
@@ -1434,6 +1463,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 reincarnated_at: 0,
                 reincarnation_backdate: 0,
                 replaced: Vec::new(),
+                awaiting: Vec::new(),
                 network: NetworkLane::Local,
                 schedule: None,
                 schedule_issued: false,
@@ -1755,6 +1785,9 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             net_owned: Vec::with_capacity(config.network.map_or(0, |network| {
                 crate::net::client::owned_capacity(&network, config.max_clients).unwrap_or(0)
             })),
+            awaiting_entries: Vec::new(),
+            attach_of: None,
+            pending_join_loss: None,
             owned_refusals: 0,
             owned_refusals_overflowed: false,
             capabilities: crate::capabilities::CapabilityCells::default(),
@@ -3327,6 +3360,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             reincarnated_at: 0,
             reincarnation_backdate: 0,
             replaced: Vec::new(),
+            awaiting: Vec::new(),
             network: NetworkLane::Local,
             schedule: None,
             schedule_issued: false,
@@ -5132,9 +5166,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // The image table builds lanes from the admission's region ids, a
         // sibling field lent for this duty (network-shared-terms N-2).
         #[cfg(target_os = "linux")]
-        let mut lanes = lane_source(self.admission.as_mut());
+        let lanes = lane_source(self.admission.as_mut());
         #[cfg(not(target_os = "linux"))]
-        let mut lanes = crate::agents::images::LaneSource::heap();
+        let lanes = crate::agents::images::LaneSource::heap();
+        // The awaiting subscriptions and the export counter their cells
+        // take ids from (ADR-0100), lent with the lanes.
+        let mut lanes = lanes.with_awaiting(&self.awaiting_entries, &mut self.next_export);
         let served = match net.duty(&mut lanes) {
             Ok(work) => (work, None),
             Err(error) => (0, Some(error)),
@@ -5545,6 +5582,42 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
     /// the lane streams of one aggregate, or is driven unexposed; a
     /// retiring one has its streams sealed and retired, so they free once
     /// no lease holds them and the image table can reclaim the image.
+    /// Places the awaiting cells (ADR-0100) the image table registered on
+    /// an exposed image on its lanes' streams, reconciled with the network
+    /// subscriptions now owned: a cell whose subscription went away
+    /// between the build and `Installed` ends at once.
+    fn place_awaiting(
+        &mut self,
+        handle: &AggregateHandle,
+        awaiting: Vec<crate::agents::images::AwaitingLane>,
+    ) {
+        let now = self.clock.now();
+        for waiting in awaiting {
+            let live = self.awaiting_entries.contains(&waiting.entry);
+            let Some(stream) = u8::try_from(waiting.lane)
+                .ok()
+                .and_then(|lane| Lane::try_new(lane).ok())
+                .and_then(|lane| handle.lane(lane))
+                .and_then(|lane| self.stream(lane).ok())
+            else {
+                continue;
+            };
+            if live {
+                stream.awaiting.push(StreamAwaiting {
+                    parent: waiting.entry.parent,
+                    client: waiting.entry.client,
+                    role: waiting.entry.role,
+                    cell: waiting.cell,
+                    since: now,
+                });
+            } else {
+                let _ = stream
+                    .conductor
+                    .end_subscriber(waiting.cell.cell(), waiting.cell.export());
+            }
+        }
+    }
+
     fn serve_images(&mut self) {
         let Some(events) = self
             .net
@@ -5572,9 +5645,23 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         identity,
                     };
                     let exposed = self.add_image_aggregate(&lanes, Some(source));
+                    let awaiting = self
+                        .net
+                        .as_mut()
+                        .map(|net| net.take_awaiting(slot))
+                        .unwrap_or_default();
+                    // An exposed image's awaiting cells go to its lanes'
+                    // streams; an unexposed one's end in `record_image`.
+                    let awaiting = match &exposed {
+                        Some(handle) => {
+                            self.place_awaiting(handle, awaiting);
+                            Vec::new()
+                        }
+                        None => awaiting,
+                    };
                     if let Some(net) = &mut self.net {
                         let traced = crate::net::trace::identity(&identity, alias);
-                        net.record_image(slot, source, traced, exposed, &lanes);
+                        net.record_image(slot, source, traced, exposed, &lanes, awaiting);
                     }
                     self.build_network_view(slot, endpoint, exposed.as_ref());
                     // Its receiver journals, while the receiver has a hook.
