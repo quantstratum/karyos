@@ -534,10 +534,18 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
     let mut logs = DurableLogs::default();
     let mut applied: BTreeMap<u64, u64> = BTreeMap::new();
     let mut down: BTreeSet<NodeId> = BTreeSet::new();
+    // Servers down since their core panicked: their verdict is the panic
+    // (`no_core_panic`), not an unverified log (karyos#976).
+    let mut panicked: BTreeSet<NodeId> = BTreeSet::new();
     for observation in observations {
         match observation {
             Observation::Crashed { node } => {
                 let _ = down.insert(*node);
+                let _ = panicked.remove(node);
+            }
+            Observation::CorePanicked { node } => {
+                let _ = down.insert(*node);
+                let _ = panicked.insert(*node);
             }
             Observation::OpenFailed { node, .. } if down.contains(node) => {
                 if let Some((index, term)) = logs.logs.get(node).and_then(|log| log.iter().next()) {
@@ -550,9 +558,7 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
             }
             // A drive error, or a core's panic, stops a server that is up:
             // what it held waits for its restart, as after a crash.
-            Observation::OpenFailed { node, .. }
-            | Observation::Contract { node, .. }
-            | Observation::CorePanicked { node } => {
+            Observation::OpenFailed { node, .. } | Observation::Contract { node, .. } => {
                 let _ = down.insert(*node);
             }
             Observation::Applied { entry, .. } => {
@@ -560,6 +566,7 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
             }
             Observation::Recovered { node, entries, .. } => {
                 let _ = down.remove(node);
+                let _ = panicked.remove(node);
                 if let Some(before) = logs.logs.get(node) {
                     let reopened: BTreeMap<u64, u64> = entries.iter().copied().collect();
                     if let Some((index, term)) = before
@@ -582,7 +589,7 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
             }
         }
     }
-    for node in down {
+    for node in down.difference(&panicked).copied() {
         if logs.logs.get(&node).is_some_and(|log| !log.is_empty()) {
             return Err(Violation::Unverified { node });
         }
