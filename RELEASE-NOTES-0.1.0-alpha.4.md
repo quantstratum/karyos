@@ -9,11 +9,16 @@ karyos#1033).
 ## Published crates
 
 In dependency order: `karyos-sys`, `karyos-protocol`, `karyos-trace`,
-`karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`,
+`karyos-codec`, `karyos-codec-derive`, `karyos-client`, `karyos-io`, `karyos-archive`,
 `karyos-cluster`, `karyos`. Depend on them by the exact pre-release, for
 example `karyos = "=0.1.0-alpha.4"` or `karyos-trace = "=0.1.0-alpha.4"`; a
 Cargo pre-release does not match a plain `0.1` requirement. Every other
 crate keeps `publish = false`.
+
+`karyos-codec-derive`, the codec's derive macro, is published for the first
+time because `karyos-archive` depends on it since karyos#661 (owner decision
+2026-11-23). It is internal and unstable, like the other published crates
+outside the supported API.
 
 ## Supported API
 
