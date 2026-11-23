@@ -1,3 +1,0 @@
-### Added
-
-- The management agent changes a guarded stream's rate policy (R-CORE-21, karyos#740): the API v1 request `rate-change DIR STREAM_ID SESSION_ID EXPECTED AUTHORITY MSG_RATE MSG_BURST BYTE_RATE BYTE_BURST [REASON]`, served for an operator, a risk officer or an administrator on the safety path and for an administrator only on the administrator's path, and relayed by `karyos-control`'s `POST /v1/request` as every v1 request. Each change is journalled as a request (kind 17) and an outcome (kind 18) with the stream, the version it replaces and the version after it; an administrator's change needs its request durable first. The view's `rates` lists the version each changed stream was last answered with, and the capability `rate-change` is listed.

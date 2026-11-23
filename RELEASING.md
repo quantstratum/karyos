@@ -40,6 +40,20 @@ Clippy with every feature on Linux, the network impairment suite, the C
 library package, the binding conformance suite and the wire compatibility
 matrix. This exception covers 0.1.0-alpha.3 only.
 
+### 0.1.0-alpha.4 (prerelease)
+
+0.1.0-alpha.4, which adds `karyos-trace` to crates.io (karyos#997,
+karyos#1033), was gated by `CHANGELOG_RELEASE=1 make pre-push`, the full
+Linux run and the joint `cargo publish --dry-run` of the ten published
+crates, by owner authorisation of 2026-11-23 while hosted CI is off
+(karyos#623). Its release notes record the gates not run as a written
+exception. This exception covers 0.1.0-alpha.4 only.
+
+0.1.0-alpha.4 is also the first release of the `libkaryos` and `karyosd`
+artifacts (karyos#700): unsigned, because the owner deferred signing on
+2026-11-23; both MANIFESTs say `signed=no`, and the release notes record
+the deferral. The deferral covers this release only.
+
 ## Changelog
 
 The author of the release pull request assembles the changelog, in that
@@ -165,6 +179,12 @@ open to anyone until they are published.
 | 2026-10-28 | Go module proxy | `github.com/quantstratum/karyos-go` | free (no public module) |
 | 2026-10-28 | GitHub | `quantstratum/karyos-go` | unknown: an anonymous request cannot tell a missing repository from a private one |
 | 2026-10-28 | crates.io | `karyos`, `libkaryos` | free |
+| 2026-11-23 | PyPI | `karyos`, `quantstratum-karyos` | free (404) |
+| 2026-11-23 | NuGet | `Karyos`, `QuantStratum.Karyos` | free (404) |
+| 2026-11-23 | Maven Central | `com.quantstratum`, `io.github.quantstratum` | free (no artifact); namespace control still unknown |
+| 2026-11-23 | Go module proxy | `github.com/quantstratum/karyos-go` | free (404) |
+| 2026-11-23 | GitHub | `quantstratum/karyos-go` | unknown (404 anonymously) |
+| 2026-11-23 | crates.io | `libkaryos`, `karyos-trace`, `karyos-codec-derive` | free (404); `karyos` published, owners list names only `joaquinbejar` |
 
 The C++ names (CMake `karyos`; Conan and vcpkg deferred) are not
 registry names and are not checked. Each binding's own release repeats
@@ -180,7 +200,7 @@ answered by the owner on 2026-11-17, when 0.1.0-alpha.3 was published
 
 | Point | Answer (2026-11-17) |
 | --- | --- |
-| Which crates, in which order | The facade and everything it depends on, in dependency order: `karyos-sys`, `karyos-protocol`, `karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`, `karyos-cluster`, `karyos`; and, from the alpha after 0.1.0-alpha.3, `karyos-trace` after `karyos-protocol` (its one Karyos dependency) for karyos-insights (ADR-0068, INS-Q4; karyos#997). Every other crate keeps `publish = false` |
+| Which crates, in which order | The facade and everything it depends on, in dependency order: `karyos-sys`, `karyos-protocol`, `karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`, `karyos-cluster`, `karyos`; and, from the alpha after 0.1.0-alpha.3, `karyos-trace` after `karyos-protocol` (its one Karyos dependency) for karyos-insights (ADR-0068, INS-Q4; karyos#997); and, from 0.1.0-alpha.4, `karyos-codec-derive` after `karyos-codec` and before `karyos-archive`, which depends on it since karyos#661 (owner decision 2026-11-23, karyos#1206; ADR-0108), required, with `karyos-codec`, at the exact workspace version (`=0.1.0-alpha.N` in the workspace `Cargo.toml`) so a registry build never mixes a derive of one alpha with the codec runtime of another. Every other crate keeps `publish = false` |
 | Version scheme | `0.1.0-alpha.N`, the workspace version, the same for every published crate |
 | Ownership | The owner's crates.io account |
 | Gate that authorised 0.1.0-alpha.3 | For alpha.3 only, a written exception: `CHANGELOG_RELEASE=1 make pre-push` run locally at the release head, plus `cargo publish --dry-run`, while hosted CI was off (karyos#623). Later releases run the full release gates of this file or record their own written exception |
@@ -200,11 +220,16 @@ answered by the owner on 2026-11-17, when 0.1.0-alpha.3 was published
    must be free on crates.io; a published name must be owned by the
    owner account. Record the result below.
 4. Run one dry run over all the published crates together:
-   `cargo publish --dry-run --locked -p karyos-sys -p karyos-protocol -p karyos-trace -p karyos-codec -p karyos-client -p karyos-io -p karyos-archive -p karyos-cluster -p karyos`.
+   `cargo publish --dry-run --locked -p karyos-sys -p karyos-protocol -p karyos-trace -p karyos-codec -p karyos-codec-derive -p karyos-client -p karyos-io -p karyos-archive -p karyos-cluster -p karyos`.
    Cargo packages them as one set and verifies each against the others'
    packaged sources, so it checks the new versions before any is on the
    index; a separate dry run per crate cannot, because a dependant's new
    dependency version is not published yet.
+   Then check the packaged requirements of the codec pair: in every
+   packaged manifest that names them,
+   `tar -xzOf target/package/<crate>-<version>.crate <crate>-<version>/Cargo.toml`
+   requires `karyos-codec` and `karyos-codec-derive` as `=<version>`
+   (ADR-0108). Any other requirement blocks the upload.
 5. Tag the release, then `cargo publish --locked -p <crate>` in the order
    above. Before publishing the next crate, wait until the previous one
    is in the index: `cargo info <crate>@<version>` (or
@@ -225,10 +250,11 @@ defect fix is a new `alpha.N`.
 | --- | --- | --- | --- |
 | 2026-11-19 | `v0.1.0-alpha.3` (b7b37d41) | `thiserror` 2.0.21, `thiserror-impl` 2.0.21 (proc macro), `syn` 3.0.8, `quote` 1.0.47, `proc-macro2` 1.0.107, `unicode-ident` 1.0.26; all from crates.io | Admitted: `thiserror` is an ADR-0033 family for every crate; `syn`, `quote`, `proc-macro2` and `unicode-ident` enter only as the build time graph of the `thiserror-impl` proc macro and ship no runtime code. Licences: MIT OR Apache-2.0, and `unicode-ident` adds Unicode-3.0. Build scripts (`thiserror`, `proc-macro2`, `quote`) compile no C or C++ |
 | 2026-11-20 | main `f468d88a`, `karyos-trace` added (karyos#997) | `karyos-trace` reaches `karyos-protocol` and `karyos-sys` (both published), `thiserror` 2.0.21 and its proc macro graph (`thiserror-impl`, `syn` 3.0.8, `quote` 1.0.47, `proc-macro2` 1.0.107, `unicode-ident` 1.0.26): `cargo tree --locked -e normal,build -p karyos-trace` | Admitted: no package outside the 2026-11-19 row; the published graph gains no family |
+| 2026-11-23 | release branch for `v0.1.0-alpha.4` (main `536650a5`) | the 2026-11-19 row's packages, plus: through `karyos-protocol`, `sha2` 0.11.1, `hmac` 0.13.0 and `zeroize` 1.9.2 with their graph (`digest` 0.11.3, `block-buffer` 0.12.1, `crypto-common` 0.2.2, `hybrid-array` 0.4.15, `typenum` 1.20.1, `cpufeatures` 0.3.1, `cfg-if` 1.0.5, `libc` 0.2.190, `ctutils` 0.4.8, `cmov` 0.5.4, `subtle` 2.6.1); through `karyos-archive`, `ed25519-dalek` 3.0.0, `curve25519-dalek` 5.0.0, `ed25519` 3.0.0, `signature` 3.0.0 and the build dependencies `rustc_version` 0.4.1 and `semver` 1.0.28; all from crates.io: `cargo tree --locked -e normal,build -p karyos-sys -p karyos-protocol -p karyos-trace -p karyos-codec -p karyos-codec-derive -p karyos-client -p karyos-io -p karyos-archive -p karyos-cluster -p karyos` (aarch64; on x86_64 `curve25519-dalek` adds the proc macro `curve25519-dalek-derive` 0.1.1) | Admitted: `sha2`, `hmac` and `zeroize` enter `karyos-protocol` under their R8 record, owner decision D51 (2026-11-23, quantstratum-docs#990, `karyos/reviews/dependency-admission-wire-auth-hmac.md`); `ed25519-dalek` and `sha2` enter `karyos-archive` under owner decision ACS 71206 (2026-11-12, `karyos/reviews/dependency-admission-ed25519-archival.md`, `dependency-admission-sha2.md`); each transitive crate is listed with its record in `deps/dependencies.md`, where this pull request adds `ctutils` and `cmov`, which `digest` 0.11.3 brought with the `hmac` lock and which the D51 record names as `hmac`'s constant time comparison. Licences: MIT OR Apache-2.0, Apache-2.0 OR MIT, BSD-3-Clause (`curve25519-dalek`, `subtle`) and Unicode-3.0 (`unicode-ident`). Build scripts (`libc`, `curve25519-dalek`, and those of the 2026-11-19 row) emit `cfg` flags and compile no C or C++ |
 
 Main after `v0.1.0-alpha.3` adds the ADR-0086 wire authentication
 families (`ed25519-dalek`, `sha2` and their graph) to the published
-crates; the next publication reviews them in its own row.
+crates; the 2026-11-23 row reviews them for `v0.1.0-alpha.4`.
 
 ### Crate name check
 

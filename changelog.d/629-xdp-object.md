@@ -1,3 +1,0 @@
-### Added
-
-- The AF_XDP copy-mode groundwork of ADR-0038 (karyos#629): the XDP program source `bpf/karyos-xdp` (outside the workspace) with its pinned chain (`aya-ebpf` =0.3.0 from its committed lock, `nightly-2026-11-10`, the `bpf-linker` 0.13.0 release binary checked by digest, image `rust:1.99` by digest), the recipe `scripts/xdp-object.sh`, the committed object `karyos-io/src/xdp/karyos_xdp.bpf.o` with its provenance manifest and notices, reproduced bit for bit on x86_64 and aarch64 hosts, and a `workflow_dispatch` job that rebuilds and compares it. `karyos-io` gains the `xdp` feature (Linux, `aya` =0.16.0) with `xdp::load`, which takes the object through the kernel verifier; `deny.toml` takes the record's scoped `foldhash` 0.2.0 Zlib exception.

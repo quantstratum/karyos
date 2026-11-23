@@ -1,3 +1,0 @@
-### Added
-
-- `karyos-archive` restores an offloaded segment (ADR-0104, decision 6): `Tiering::restore_segment` gets the segment just below the start from object storage, checks the index object against the offload record's digest and each range against its seal, and `SegmentStore::restore_below` writes the data file and the original index verbatim under temporary names, refuses them unless the recovery scanner keeps them whole, renames them into place and lowers the start durably, never below the offload floor. The restore record (kind 10) is chained and the local copies count again only after that; a lowered start whose record a crash cut short gets it on the next reconcile, and recovery removes a restore's temporary files (karyos#1113).

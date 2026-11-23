@@ -1,3 +1,0 @@
-### Added
-
-- `karyos-trace --trace-span <ns>` declares the attribution span `D` (karyos#150). A journal loss then marks only the traces whose window it can meet, instead of every trace of the journal, and the report labels its count "complete under the declared span". Without the option `D` stays unbounded and the report is as before. The attributor also narrows a tail loss, or a loss before the first record, to the times of the journal's held drop ranges when they cover every lost sequence in one clock and epoch. Below `lost_before`, or over the tool's own mirror loss, it still marks every trace (quantstratum-docs: karyos/design/trace-attribution.md, "Narrowing with a declared span and drop ranges").
