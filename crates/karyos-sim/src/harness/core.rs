@@ -84,7 +84,13 @@ pub struct LogView<'a> {
 /// over the simulator's disk and over real files (an adapter's real
 /// processes; karyos#956 review).
 trait LogSource {
-    fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, LogError>;
+    fn entries_into(
+        &mut self,
+        range: Range<u64>,
+        max_bytes: u64,
+        out: &mut Vec<Entry>,
+        window: &mut Vec<u8>,
+    ) -> Result<(), LogError>;
     fn frame_span(&self, index: u64) -> Option<u64>;
     fn term(&self, index: u64) -> Option<u64>;
     fn first_index(&self) -> u64;
@@ -94,8 +100,14 @@ trait LogSource {
 }
 
 impl<D: Disk + Clone> LogSource for RaftLog<D> {
-    fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, LogError> {
-        RaftLog::entries(self, range, max_bytes)
+    fn entries_into(
+        &mut self,
+        range: Range<u64>,
+        max_bytes: u64,
+        out: &mut Vec<Entry>,
+        window: &mut Vec<u8>,
+    ) -> Result<(), LogError> {
+        RaftLog::entries_into(self, range, max_bytes, out, window)
     }
 
     fn frame_span(&self, index: u64) -> Option<u64> {
@@ -240,12 +252,35 @@ impl<'a> LogView<'a> {
     /// [`ReadError::Budget`] when not one frame fits in the budget left,
     /// and the log's read error.
     pub fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, ReadError> {
+        let mut found = Vec::new();
+        let mut window = Vec::new();
+        self.entries_into(range, max_bytes, &mut found, &mut window)?;
+        Ok(found)
+    }
+
+    /// [`Self::entries`] into `out`, reusing its entries and `window` as
+    /// [`RaftLog::entries_into`] does: same budget walk and charge, no
+    /// allocation once the buffers fit (karyos#681). `out` holds only the
+    /// entries read: nothing after a refused read or any error, even one
+    /// past valid frames, whose bytes stay charged.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::entries`].
+    pub fn entries_into(
+        &mut self,
+        range: Range<u64>,
+        max_bytes: u64,
+        out: &mut Vec<Entry>,
+        window: &mut Vec<u8>,
+    ) -> Result<(), ReadError> {
         let Some(budget) = self.budget else {
-            return Ok(self.log.entries(range, max_bytes)?);
+            return Ok(self.log.entries_into(range, max_bytes, out, window)?);
         };
         // An empty range asks for nothing: no read, no charge.
         if range.is_empty() {
-            return Ok(Vec::new());
+            out.clear();
+            return Ok(());
         }
         let left = budget.left();
         let (mut end, mut spent) = (range.start, 0u64);
@@ -264,10 +299,11 @@ impl<'a> LogView<'a> {
         if end == range.start {
             // Nothing fits, or the log holds nothing there: a log that
             // holds the entry refuses it for the budget, unread.
+            out.clear();
             if self.log.frame_span(range.start).is_some() {
                 return Err(ReadError::Budget);
             }
-            return Ok(Vec::new());
+            return Ok(());
         }
         // Charged before the read: a read that fails part-way still
         // examined those bytes, and its retries stay within the budget
@@ -275,7 +311,9 @@ impl<'a> LogView<'a> {
         budget
             .left
             .set(left.checked_sub(spent).ok_or(ReadError::Budget)?);
-        Ok(self.log.entries(range.start..end, u64::MAX)?)
+        Ok(self
+            .log
+            .entries_into(range.start..end, u64::MAX, out, window)?)
     }
 
     /// It, with `base` as the node's latest snapshot.

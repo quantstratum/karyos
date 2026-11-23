@@ -1,0 +1,53 @@
+# The provenance of karyos_xdp.bpf.o (ADR-0038), written by scripts/xdp-object.sh.
+[source]
+revision = "9541863609e8df70204689c2f6a1d28bbb2832e7"
+crate = "bpf/karyos-xdp"
+lock_sha256 = "5c7d405258292a2ac22e928e622278dab10557bde7d534322ad99985e8f186c9"
+source_sha256 = "86f1957704b94adc5a1c3135a55ab0b82142fbb771a71c94d5ad4f7ea6f75c8c"
+
+[toolchain]
+channel = "nightly-2026-11-10"
+rustc_vv = """
+rustc 1.102.0-nightly (ac8310ba6 2026-11-09)
+binary: rustc
+commit-hash: ac8310ba643a3796cbe77d2e06944d7c8513999f
+commit-date: 2026-11-09
+host: aarch64-unknown-linux-gnu
+release: 1.102.0-nightly
+LLVM version: 23.1.5
+"""
+aya_ebpf = "0.3.0"
+aya_ebpf_checksum = "7998c4bcc24fb07447fe3018679f7ee1402ac9f27771753bb8890fc17ed967f4"
+bpf_linker = "0.13.0"
+bpf_linker_obtained = "release binary bpf-linker-aarch64-unknown-linux-musl.tar.zst, sha256 248e25f5c6a7242b054bd8f705470abb7a5a79b2b7c07df347c5d7049b783452"
+bpf_linker_version = "bpf-linker 0.13.0"
+# The release binary bundles its libLLVM; `bpf-linker --version` does not
+# print it. Its default feature is `llvm-23`, the major of the nightly's LLVM
+# 23.1.5; the exact bundled version is not reported (record, open point).
+bpf_linker_llvm = "23 (major, from the llvm-23 feature)"
+
+[build]
+image = "rust:1.99@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07"
+host = "aarch64"
+command = "cargo +nightly-2026-11-10 build --locked --release --target bpfel-unknown-none -Z build-std=core"
+rustflags = ""
+target = "bpfel-unknown-none"
+
+[object]
+file = "karyos_xdp.bpf.o"
+sha256 = "d77e87919e59752407f189ab1f246a3dface5acbc24d0a5b6b2ad61a60276a80"
+size = "3064"
+license = "Apache-2.0"
+program = "karyos_xdp"
+maps = "xsks: XSKMAP, 64 entries, key u32 queue index, value u32 socket; karyos_endpoints: HASH, 64 entries, key 20 bytes (family u8, pad u8, port [u8; 2] network order, addr [u8; 16]), value u8"
+
+# Two independent builds of the same revision, bit for bit equal.
+[[reproduced]]
+machine = "studiom4 (Docker, Linux 6.8.0-117-generic aarch64)"
+date = "2026-11-23"
+sha256 = "d77e87919e59752407f189ab1f246a3dface5acbc24d0a5b6b2ad61a60276a80"
+
+[[reproduced]]
+machine = "flumix (Docker, Linux 7.0.0-43-generic x86_64)"
+date = "2026-11-23"
+sha256 = "d77e87919e59752407f189ab1f246a3dface5acbc24d0a5b6b2ad61a60276a80"

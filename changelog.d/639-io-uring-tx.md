@@ -1,0 +1,3 @@
+### Added
+
+- `karyos-io` feature `uring` (Linux): the `io_uring` TX half `uring::tx::UringTx` with one copied `IORING_OP_SENDMSG` per permitted item, `Release::Deferred` and a `SendResult` plus `Released` pair per completion, SQPOLL off unless configured, `cancel_submitted` and a bounded reset that keeps every slot the kernel still owns and reports it (`retained`), over the `RingOps` seam with its scripted double, and the send parking probe (karyos#639). The `io-uring` 0.7.16 dependency follows its R8 admission record. `SendError` gains `WouldBlock`, `NoBuffers`, `PeerRefused` and `Cancelled` for completed sends the kernel did not transmit. `scripts/linux-test.sh` takes `KARYOS_LINUX_SECCOMP` and passes `KARYOS_URING_REQUIRED` through.

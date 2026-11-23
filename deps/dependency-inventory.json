@@ -7,6 +7,8 @@
       "cfg-if v1.0.5",
       "cmov v0.5.4",
       "cpufeatures v0.3.1",
+      "crossbeam-queue v0.3.14",
+      "crossbeam-utils v0.8.23",
       "crypto-common v0.2.2",
       "ctutils v0.4.8",
       "curve25519-dalek v5.0.0",
@@ -15,7 +17,7 @@
       "ed25519 v3.0.0",
       "ed25519-dalek v3.0.0",
       "errno v0.3.14",
-      "form_urlencoded v1.2.2",
+      "form_urlencoded v1.2.3",
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
@@ -36,6 +38,9 @@
       "icu_provider v2.4.0",
       "idna v1.1.0",
       "idna_adapter v1.2.2",
+      "ironsbe-codegen v0.9.1",
+      "ironsbe-core v0.9.1",
+      "ironsbe-schema v0.9.1",
       "itoa v1.0.18",
       "jiff v0.2.43",
       "jiff-core v0.1.5",
@@ -49,6 +54,7 @@
       "pin-project-lite v0.2.17",
       "potential_utf v0.1.6",
       "proc-macro2 v1.0.107",
+      "quick-xml v0.42.0",
       "quote v1.0.47",
       "rustc_version v0.4.1",
       "rustls v0.23.46",
@@ -89,7 +95,7 @@
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
       "untrusted v0.9.0",
-      "url v2.5.8",
+      "url v2.5.9",
       "utf8_iter v1.1.0",
       "utf_types v1.0.0",
       "want v0.3.2",
@@ -113,6 +119,8 @@
       "cfg-if v1.0.5",
       "cmov v0.5.4",
       "cpufeatures v0.3.1",
+      "crossbeam-queue v0.3.14",
+      "crossbeam-utils v0.8.23",
       "crypto-common v0.2.2",
       "ctutils v0.4.8",
       "curve25519-dalek v5.0.0",
@@ -121,7 +129,7 @@
       "ed25519 v3.0.0",
       "ed25519-dalek v3.0.0",
       "errno v0.3.14",
-      "form_urlencoded v1.2.2",
+      "form_urlencoded v1.2.3",
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
@@ -142,6 +150,9 @@
       "icu_provider v2.4.0",
       "idna v1.1.0",
       "idna_adapter v1.2.2",
+      "ironsbe-codegen v0.9.1",
+      "ironsbe-core v0.9.1",
+      "ironsbe-schema v0.9.1",
       "itoa v1.0.18",
       "jiff v0.2.43",
       "jiff-core v0.1.5",
@@ -156,6 +167,7 @@
       "pin-project-lite v0.2.17",
       "potential_utf v0.1.6",
       "proc-macro2 v1.0.107",
+      "quick-xml v0.42.0",
       "quote v1.0.47",
       "rustc_version v0.4.1",
       "rustix v1.1.6",
@@ -197,7 +209,7 @@
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
       "untrusted v0.9.0",
-      "url v2.5.8",
+      "url v2.5.9",
       "utf8_iter v1.1.0",
       "utf_types v1.0.0",
       "want v0.3.2",
@@ -221,6 +233,8 @@
       "cfg-if v1.0.5",
       "cmov v0.5.4",
       "cpufeatures v0.3.1",
+      "crossbeam-queue v0.3.14",
+      "crossbeam-utils v0.8.23",
       "crypto-common v0.2.2",
       "ctutils v0.4.8",
       "curve25519-dalek v5.0.0",
@@ -230,7 +244,7 @@
       "ed25519 v3.0.0",
       "ed25519-dalek v3.0.0",
       "errno v0.3.14",
-      "form_urlencoded v1.2.2",
+      "form_urlencoded v1.2.3",
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
@@ -251,6 +265,9 @@
       "icu_provider v2.4.0",
       "idna v1.1.0",
       "idna_adapter v1.2.2",
+      "ironsbe-codegen v0.9.1",
+      "ironsbe-core v0.9.1",
+      "ironsbe-schema v0.9.1",
       "itoa v1.0.18",
       "jiff v0.2.43",
       "jiff-core v0.1.5",
@@ -265,6 +282,7 @@
       "pin-project-lite v0.2.17",
       "potential_utf v0.1.6",
       "proc-macro2 v1.0.107",
+      "quick-xml v0.42.0",
       "quote v1.0.47",
       "rustc_version v0.4.1",
       "rustix v1.1.6",
@@ -307,7 +325,7 @@
       "typenum v1.20.1",
       "unicode-ident v1.0.26",
       "untrusted v0.9.0",
-      "url v2.5.8",
+      "url v2.5.9",
       "utf8_iter v1.1.0",
       "utf_types v1.0.0",
       "want v0.3.2",
@@ -1033,6 +1051,66 @@
       "version": "0.6.0"
     },
     {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-core@0.9.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#crossbeam-queue@0.3.14",
+      "license": "MIT OR Apache-2.0",
+      "name": "crossbeam-queue",
+      "paths": {
+        "build": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.14"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#crossbeam-queue@0.3.14",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#crossbeam-utils@0.8.23",
+      "license": "MIT OR Apache-2.0",
+      "name": "crossbeam-utils",
+      "paths": {
+        "build": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.8.23"
+    },
+    {
       "build_script": true,
       "edges": [
         {
@@ -1493,7 +1571,7 @@
           "features": [
             "alloc"
           ],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.9",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -1503,7 +1581,7 @@
         "alloc",
         "std"
       ],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#form_urlencoded@1.2.2",
+      "id": "registry+https://github.com/rust-lang/crates.io-index#form_urlencoded@1.2.3",
       "license": "MIT OR Apache-2.0",
       "name": "form_urlencoded",
       "paths": {
@@ -1513,7 +1591,7 @@
       },
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "1.2.2"
+      "version": "1.2.3"
     },
     {
       "build_script": false,
@@ -1758,6 +1836,15 @@
     {
       "build_script": false,
       "edges": [
+        {
+          "features": [
+            "zeroize"
+          ],
+          "from": "workspace:karyos-driver@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
         {
           "features": [
             "zeroize"
@@ -2276,7 +2363,7 @@
             "alloc",
             "compiled_data"
           ],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.9",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -2350,6 +2437,95 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "2.14.2"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "workspace:karyos-sbe@0.1.0-alpha.3",
+          "kind": "build",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
+      "license": "MIT",
+      "name": "ironsbe-codegen",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.9.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-sbe@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-core@0.9.1",
+      "license": "MIT",
+      "name": "ironsbe-core",
+      "paths": {
+        "build": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.9.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.1",
+      "license": "MIT",
+      "name": "ironsbe-schema",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.9.1"
     },
     {
       "build_script": false,
@@ -3081,6 +3257,13 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#quick-xml@0.42.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#regex-automata@0.4.18",
           "kind": "normal",
           "target": null,
@@ -3103,12 +3286,16 @@
       ],
       "features": [
         "alloc",
+        "default",
         "std"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#memchr@2.8.3",
       "license": "Unlicense OR MIT",
       "name": "memchr",
       "paths": {
+        "build": [
+          []
+        ],
         "dev": [
           []
         ],
@@ -3319,14 +3506,14 @@
           "features": [
             "alloc"
           ],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.9",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#form_urlencoded@1.2.2",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#form_urlencoded@1.2.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -3566,6 +3753,13 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
           "kind": "normal",
           "target": null,
@@ -3700,6 +3894,15 @@
           "features": [
             "std"
           ],
+          "from": "workspace:karyos-sbe@0.1.0-alpha.3",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "std"
+          ],
           "from": "workspace:karyos-sys@0.1.0-alpha.3",
           "kind": "dev",
           "target": null,
@@ -3732,6 +3935,32 @@
       "version": "1.11.0"
     },
     {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#quick-xml@0.42.0",
+      "license": "MIT",
+      "name": "quick-xml",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.42.0"
+    },
+    {
       "build_script": true,
       "edges": [
         {
@@ -3762,6 +3991,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#displaydoc@0.2.7",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -4661,7 +4897,7 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.9",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4902,6 +5138,13 @@
         {
           "features": [],
           "from": "workspace:karyos-archive@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-driver@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -5437,6 +5680,27 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-core@0.9.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "workspace:karyos-agent@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
@@ -5493,6 +5757,13 @@
         },
         {
           "features": [],
+          "from": "workspace:karyos-sbe@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
           "from": "workspace:karyos-sys@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
@@ -5527,11 +5798,17 @@
           "uses_default_features": false
         }
       ],
-      "features": [],
+      "features": [
+        "default",
+        "std"
+      ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#thiserror@2.0.21",
       "license": "MIT OR Apache-2.0",
       "name": "thiserror",
       "paths": {
+        "build": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -6247,7 +6524,7 @@
         "default",
         "std"
       ],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.8",
+      "id": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.9",
       "license": "MIT OR Apache-2.0",
       "name": "url",
       "paths": {
@@ -6257,7 +6534,7 @@
       },
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "2.5.8"
+      "version": "2.5.9"
     },
     {
       "build_script": false,
@@ -7418,6 +7695,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-driver@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [

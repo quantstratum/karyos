@@ -1141,6 +1141,22 @@ pub enum SendError {
         /// Raw OS error number.
         errno: i32,
     },
+    /// `EAGAIN` as the final result of a submitted send: the kernel did
+    /// not park it and did not transmit it (`io_uring`, design 3.5).
+    #[error("send completed with no room in the socket buffer")]
+    WouldBlock,
+    /// `ENOBUFS` or `ENOMEM` as the final result of a submitted send; not
+    /// transmitted.
+    #[error("send completed with no kernel buffers")]
+    NoBuffers,
+    /// `ECONNREFUSED` as the final result of a submitted send: a stale
+    /// ICMP error consumed it; not transmitted.
+    #[error("send completed with a refused peer")]
+    PeerRefused,
+    /// `ECANCELED`: a cancel ended the submitted send before the kernel
+    /// ran it; not transmitted.
+    #[error("send cancelled before it ran")]
+    Cancelled,
     /// Any other send error.
     #[error("send failed (os error {errno})")]
     Other {
@@ -1536,6 +1552,9 @@ pub enum Capability {
     RecvBuffer,
     /// A verified path MTU per route.
     PathMtu,
+    /// The `io_uring` ring with every probe `open` requires
+    /// (io-uring-backend.md 4.1, `uring_ring`).
+    UringRing,
 }
 
 /// The probed state of one capability.

@@ -653,8 +653,12 @@ impl AggregateHandle {
         })
     }
 
-    /// The aggregate's registration: lane 0's stream id.
-    pub(crate) fn registration(&self) -> u64 {
+    /// The aggregate's registration: lane 0's stream id. The driver
+    /// numbers its streams in creation order, so a later aggregate has a
+    /// higher registration (karyos#1113: a replica's incarnation
+    /// watermark).
+    #[must_use]
+    pub const fn registration(&self) -> u64 {
         self.registration
     }
 

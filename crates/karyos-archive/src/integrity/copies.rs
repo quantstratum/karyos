@@ -66,6 +66,26 @@ pub enum CopyState {
     Verified = 2,
     /// Removed.
     Removed = 3,
+    /// A replica's gap: a range of the recording it never received, which
+    /// the source no longer holds (ADR-0102 decision 6). Never filled, and
+    /// counts towards nothing.
+    Gap = 4,
+}
+
+/// How a replica's copy arrived (ADR-0102 decision 10), so a verifier or
+/// a later receipt can tell the profiles apart. The values are stable on
+/// disk, in the byte a version 1 record kept reserved, zero before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum ArrivalProfile {
+    /// Not received from another Archive: this Archive's own copy, a
+    /// bucket's, or a record written before profiles were kept.
+    Local = 0,
+    /// Over a network both operators declared trusted.
+    Trusted = 1,
+    /// Under an authenticated profile that identifies a single sender.
+    Authenticated = 2,
 }
 
 /// One record of the copy catalog.
@@ -89,6 +109,8 @@ pub struct CopyRecord {
     pub state: CopyState,
     /// Its immutability enforcement.
     pub enforcement: Enforcement,
+    /// How it arrived.
+    pub profile: ArrivalProfile,
 }
 
 /// Why a copy record could not be read.
@@ -110,15 +132,22 @@ pub enum CopyDecodeError {
 
 impl CopyRecord {
     /// The encoded record, version 1, little-endian at fixed offsets:
-    /// version `u16`, state `u8`, enforcement `u8`, four reserved zero
-    /// bytes, sequence, recording, start, end and retention `u64`s, the
+    /// version `u16`, state `u8`, enforcement `u8`, the arrival profile
+    /// `u8`, three reserved zero bytes, sequence, recording, start, end and retention `u64`s, the
     /// location and the digest.
     #[must_use]
     pub fn encode(&self) -> [u8; COPY_RECORD_LENGTH] {
         let mut out = [0u8; COPY_RECORD_LENGTH];
         let fields = [
             &COPY_VERSION.to_le_bytes()[..],
-            &[self.state as u8, self.enforcement as u8, 0, 0, 0, 0],
+            &[
+                self.state as u8,
+                self.enforcement as u8,
+                self.profile as u8,
+                0,
+                0,
+                0,
+            ],
             &self.sequence.to_le_bytes(),
             &self.recording.to_le_bytes(),
             &self.start.to_le_bytes(),
@@ -152,7 +181,7 @@ impl CopyRecord {
                 .copied()
                 .unwrap_or([0; 32])
         };
-        let [version_low, version_high, state, enforcement, ..] = *bytes;
+        let [version_low, version_high, state, enforcement, profile, ..] = *bytes;
         let version = u16::from_le_bytes([version_low, version_high]);
         if version != COPY_VERSION {
             return Err(CopyDecodeError::Version(version));
@@ -161,6 +190,7 @@ impl CopyRecord {
             1 => CopyState::Unverified,
             2 => CopyState::Verified,
             3 => CopyState::Removed,
+            4 => CopyState::Gap,
             value => {
                 return Err(CopyDecodeError::Unknown {
                     field: "state",
@@ -179,6 +209,17 @@ impl CopyRecord {
                 });
             }
         };
+        let profile = match profile {
+            0 => ArrivalProfile::Local,
+            1 => ArrivalProfile::Trusted,
+            2 => ArrivalProfile::Authenticated,
+            value => {
+                return Err(CopyDecodeError::Unknown {
+                    field: "profile",
+                    value,
+                });
+            }
+        };
         Ok(Self {
             sequence: u64_at(8),
             recording: u64_at(16),
@@ -189,6 +230,7 @@ impl CopyRecord {
             digest: digest_at(80),
             state,
             enforcement,
+            profile,
         })
     }
 

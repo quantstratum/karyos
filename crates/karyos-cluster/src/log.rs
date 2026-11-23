@@ -1344,9 +1344,47 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// longer reads as the one the index holds.
     pub fn entries(&mut self, range: Range<u64>, max_bytes: u64) -> Result<Vec<Entry>, LogError> {
         let mut found = Vec::new();
+        let mut window = Vec::new();
+        self.entries_into(range, max_bytes, &mut found, &mut window)?;
+        Ok(found)
+    }
+
+    /// [`Self::entries`] into `out`, with `window` as the read buffer: the
+    /// same entries, checks and errors, but `out`'s entries and their
+    /// payload buffers are reused in place, and `window` keeps its
+    /// capacity, so a read that fits what an earlier one left allocates
+    /// nothing (karyos#681). `out` ends holding exactly the entries read,
+    /// and nothing on an error, even one past valid frames.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::entries`].
+    pub fn entries_into(
+        &mut self,
+        range: Range<u64>,
+        max_bytes: u64,
+        out: &mut Vec<Entry>,
+        window: &mut Vec<u8>,
+    ) -> Result<(), LogError> {
+        let mut filled = 0usize;
+        let read = self.fill_entries(range, max_bytes, out, window, &mut filled);
+        if read.is_err() {
+            filled = 0;
+        }
+        out.truncate(filled);
+        read
+    }
+
+    fn fill_entries(
+        &mut self,
+        range: Range<u64>,
+        max_bytes: u64,
+        out: &mut Vec<Entry>,
+        window: &mut Vec<u8>,
+        filled: &mut usize,
+    ) -> Result<(), LogError> {
         let mut bytes = 0u64;
         let mut index = range.start;
-        let mut window = Vec::new();
         while index < range.end {
             // The frames the index places back to back from `index`, within
             // the budget and one read window: their spans are exact (each
@@ -1370,7 +1408,7 @@ impl<D: Disk + Clone> RaftLog<D> {
                 }
                 let span = next.saturating_sub(end);
                 let total = planned.saturating_add(span);
-                let fits = (found.is_empty() && slot == first) || total <= max_bytes;
+                let fits = (*filled == 0 && slot == first) || total <= max_bytes;
                 if !fits || next.saturating_sub(start) > READ_WINDOW {
                     break;
                 }
@@ -1382,13 +1420,13 @@ impl<D: Disk + Clone> RaftLog<D> {
                 // One frame alone: the log's last, one past the budget (its
                 // header checked before the read stops), or one larger than
                 // a window (read once, never copied again).
-                let Some((entry, claimed)) =
-                    self.entry_alone(index, first, bytes, max_bytes, found.is_empty())?
+                let Some(claimed) =
+                    self.entry_alone(index, first, bytes, max_bytes, out, *filled)?
                 else {
                     break;
                 };
                 bytes = bytes.saturating_add(claimed);
-                found.push(entry);
+                *filled += 1;
                 index = index.saturating_add(1);
                 continue;
             }
@@ -1396,7 +1434,7 @@ impl<D: Disk + Clone> RaftLog<D> {
                 .map_err(|_| LogError::Store(SegmentError::PositionOverflow))?;
             window.clear();
             window.resize(length, 0);
-            self.store.read(start, &mut window)?;
+            self.store.read(start, window)?;
             for at in first..slot {
                 let Some(&(position, term)) = self.entries.get(at) else {
                     break;
@@ -1407,28 +1445,32 @@ impl<D: Disk + Clone> RaftLog<D> {
                 let to = usize::try_from(span_end - start)
                     .map_err(|_| LogError::Store(SegmentError::PositionOverflow))?;
                 let frame = window.get(from..to).unwrap_or(&[]);
-                found.push(check_frame(frame, index, term, position, false)?);
+                check_frame_into(frame, index, term, position, false, pooled(out, *filled)?)?;
+                *filled += 1;
                 index = index.saturating_add(1);
             }
             // Past the budget, the next frame's header is still read and
             // checked, alone, before the read stops.
             bytes = planned;
         }
-        Ok(found)
+        Ok(())
     }
 
     /// The entry at `slot`, read alone: the log's last frame (its span
     /// runs to the written end) or one larger than a read window, with its
-    /// encoded size. `None`
-    /// when it would take `bytes` past `max_bytes` and is not the first.
+    /// encoded size, read into slot `at` of `out`. `None` when it would
+    /// take `bytes` past `max_bytes` and is not the first (`at` > 0): its
+    /// header is checked, but no slot is taken, so a budget that stops at
+    /// `out`'s capacity allocates nothing.
     fn entry_alone(
         &mut self,
         index: u64,
         slot: usize,
         bytes: u64,
         max_bytes: u64,
-        first: bool,
-    ) -> Result<Option<(Entry, u64)>, LogError> {
+        out: &mut Vec<Entry>,
+        at: usize,
+    ) -> Result<Option<u64>, LogError> {
         let Some(&(position, term)) = self.entries.get(slot) else {
             return Ok(None);
         };
@@ -1444,30 +1486,27 @@ impl<D: Disk + Clone> RaftLog<D> {
         self.store.read(position, &mut header)?;
         let frame = check_header(&header, index, term, position, span, last)?;
         let claimed = u64::from(frame.length).saturating_add(FRAME_HEADER_LEN);
-        if !first
+        if at != 0
             && bytes
                 .checked_add(claimed)
                 .is_none_or(|total| total > max_bytes)
         {
             return Ok(None);
         }
+        let entry = pooled(out, at)?;
         // Within the span the index gives: the allocation is bounded.
         let length = usize::try_from(frame.length).map_err(|_| chain(ChainProblem::PastEnd))?;
-        let mut payload = vec![0u8; length];
+        entry.payload.clear();
+        entry.payload.resize(length, 0);
         let at = position
             .checked_add(FRAME_HEADER_LEN)
             .ok_or(LogError::Store(SegmentError::PositionOverflow))?;
-        self.store.read(at, &mut payload)?;
-        check_crc(&header, &payload, frame.crc, position)?;
-        Ok(Some((
-            Entry {
-                index: frame.index,
-                term: frame.term,
-                event_time: frame.event_time,
-                payload,
-            },
-            claimed,
-        )))
+        self.store.read(at, &mut entry.payload)?;
+        check_crc(&header, &entry.payload, frame.crc, position)?;
+        entry.index = frame.index;
+        entry.term = frame.term;
+        entry.event_time = frame.event_time;
+        Ok(Some(claimed))
     }
 
     /// The stored hard state, if any was saved.
@@ -1828,13 +1867,32 @@ fn check_crc(
 
 /// The entry a whole frame's bytes hold, checked as [`check_header`] and
 /// [`check_crc`] do.
-fn check_frame(
+/// The entry slot `at` of `out`, pushed empty when `out` ends there: the
+/// pool [`RaftLog::entries_into`] reuses.
+fn pooled(out: &mut Vec<Entry>, at: usize) -> Result<&mut Entry, LogError> {
+    if at >= out.len() {
+        out.push(Entry {
+            index: 0,
+            term: 0,
+            event_time: 0,
+            payload: Vec::new(),
+        });
+    }
+    out.get_mut(at)
+        .ok_or(LogError::Store(SegmentError::PositionOverflow))
+}
+
+/// Checks `frame` as the entry `index` of `term` and writes it into
+/// `entry`, reusing its payload buffer; `entry` is left unchanged when
+/// the frame does not check.
+fn check_frame_into(
     frame: &[u8],
     index: u64,
     term: u64,
     position: u64,
     last: bool,
-) -> Result<Entry, LogError> {
+    entry: &mut Entry,
+) -> Result<(), LogError> {
     let span =
         u64::try_from(frame.len()).map_err(|_| LogError::Store(SegmentError::PositionOverflow))?;
     let Some((header, payload)) = frame.split_first_chunk::<FRAME_HEADER>() else {
@@ -1851,12 +1909,12 @@ fn check_frame(
         .map_err(|_| LogError::Store(SegmentError::PositionOverflow))?;
     let payload = payload.get(..length).unwrap_or(payload);
     check_crc(header, payload, decoded.crc, position)?;
-    Ok(Entry {
-        index: decoded.index,
-        term: decoded.term,
-        event_time: decoded.event_time,
-        payload: payload.to_vec(),
-    })
+    entry.index = decoded.index;
+    entry.term = decoded.term;
+    entry.event_time = decoded.event_time;
+    entry.payload.clear();
+    entry.payload.extend_from_slice(payload);
+    Ok(())
 }
 
 /// What the frame walk found: the entries, and a torn tail to cut.
