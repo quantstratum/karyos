@@ -1544,20 +1544,20 @@ mod tests {
     /// measured by filling a fresh pair without blocking: a host may tune
     /// its default send buffer far above a fixed padding (one with
     /// `net.core.wmem_default` at 128 MiB wrote a 64 MiB reply whole, so a
-    /// deadline test passed nothing to cut). Twice the measured bytes, at
-    /// least 16 MiB, and the fill stops at 1 GiB.
+    /// deadline test passed nothing to cut). The measured bytes plus 16
+    /// MiB; the fill stops at 512 MiB.
     fn past_socket_buffer() -> usize {
         let (writer, _reader) = UnixStream::pair().unwrap();
         writer.set_nonblocking(true).unwrap();
         let chunk = vec![0u8; 64 << 10];
         let mut held = 0usize;
-        while held < (1 << 30) {
+        while held < (512 << 20) {
             match (&writer).write(&chunk) {
                 Ok(written) if written > 0 => held = held.saturating_add(written),
                 Ok(_) | Err(_) => break,
             }
         }
-        held.saturating_mul(2).max(16 << 20)
+        held.saturating_add(16 << 20)
     }
 
     /// Review B1 of #826: a client that reads a few KiB at a time, often
@@ -1569,8 +1569,12 @@ mod tests {
         let trickle = std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
             let mut total = 0;
+            let started = std::time::Instant::now();
+            // It trickles until the writer's deadline has long passed, then
+            // stops: draining a large host buffer at this pace would take
+            // minutes.
             while let Ok(read) = reader.read(&mut buffer) {
-                if read == 0 {
+                if read == 0 || started.elapsed() > WRITE_DEADLINE * 4 {
                     break;
                 }
                 total += read;
