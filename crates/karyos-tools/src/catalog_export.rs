@@ -274,9 +274,14 @@ fn gather(args: &ExportArgs) -> Result<ExportContents, ExportCommandError> {
     let stores = stores(&args.anchors)?;
     let exported: BTreeSet<u64> = args.recordings.iter().copied().collect();
     let archive = journal(&args.dir, journal_id, 1, &stores, |records, anchors| {
+        // The seals of the exported recordings' ranges, and their purges:
+        // a purge record classifies the ranges it covers (#1196 review).
         let sealing = records
             .iter()
-            .filter(|record| record.kind.is_range() && exported.contains(&record.subject))
+            .filter(|record| {
+                (record.kind.is_range() || record.kind == SealKind::Purge)
+                    && exported.contains(&record.subject)
+            })
             .map(|record| record.counter)
             .max();
         sealing.max(anchored(anchors))
@@ -299,17 +304,6 @@ fn gather(args: &ExportArgs) -> Result<ExportContents, ExportCommandError> {
             .iter()
             .filter(|record| record.kind.is_range() && record.subject == *id)
             .collect();
-        let start = ranges
-            .iter()
-            .map(|record| record.start)
-            .min()
-            .or_else(|| recording.map(|recording| recording.start))
-            .unwrap_or(0);
-        let end = ranges
-            .iter()
-            .map(|record| record.end)
-            .max()
-            .unwrap_or(start);
         let mut store = SegmentStore::open_verified(
             ReadOnly(StdDisk),
             &args.dir,
@@ -318,6 +312,18 @@ fn gather(args: &ExportArgs) -> Result<ExportContents, ExportCommandError> {
             SyncPolicy::None,
         )
         .map_err(|error| ExportCommandError::Archive(format!("recording {id}: {error}")))?;
+        // The retained span only: bytes below a purge's floor are gone,
+        // and their ranges classify as purged from the chain's purge
+        // records (#1196 review). The unsealed tail is kept, so the
+        // verifier reports it unsealed as online (#1196 review).
+        let sealed_start = ranges
+            .iter()
+            .map(|record| record.start)
+            .min()
+            .or_else(|| recording.map(|recording| recording.start))
+            .unwrap_or(0);
+        let start = sealed_start.max(store.start());
+        let end = store.written().max(start);
         let length = usize::try_from(end.saturating_sub(start))
             .map_err(|_| ExportCommandError::Archive(format!("recording {id} is too long")))?;
         let mut bytes = vec![0u8; length];
@@ -344,7 +350,14 @@ fn gather(args: &ExportArgs) -> Result<ExportContents, ExportCommandError> {
         })?;
     let mut policies = Vec::new();
     let mut bindings = Vec::new();
-    for record in &archive.records {
+    // The verifier replays policies and bindings over the anchored run
+    // only, reciprocally: carry exactly those (#1196 review).
+    let run = anchored(&archive.anchors);
+    for record in archive
+        .records
+        .iter()
+        .filter(|record| run.is_some_and(|run| record.counter <= run))
+    {
         match record.kind {
             SealKind::Policy => {
                 if let Some(canonical) = book.iter().find_map(|entry| {
@@ -440,7 +453,19 @@ pub fn run_export(
         let bytes =
             assemble(&contents).map_err(|error| ExportCommandError::Archive(error.to_string()))?;
         let out = args.out.clone().unwrap_or_default();
-        std::fs::write(&out, &bytes).map_err(|source| ExportCommandError::Io {
+        // Never over an existing file: an --out naming one of the inputs
+        // (a journal, a segment, the trust file, an anchor ledger) would
+        // destroy it (#1196 review).
+        let write = || -> io::Result<()> {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out)?;
+            file.write_all(&bytes)?;
+            file.sync_all()
+        };
+        write().map_err(|source| ExportCommandError::Io {
             path: out.clone(),
             source,
         })?;
@@ -548,6 +573,22 @@ pub fn run_verify_export(
         if let Some(time_journal) = time_journal {
             journals.push((time_journal, Role::TimeEvidence));
         }
+        // The recordings the export carries: the Archive journal's other
+        // recordings are chain evidence only, never reported (#1196
+        // review).
+        let carried: BTreeSet<u64> = karyos_archive::integrity::export::decode(&bytes)
+            .map(|export| {
+                export
+                    .sections
+                    .iter()
+                    .filter(|section| {
+                        section.kind == karyos_archive::integrity::export::SectionKind::Manifest
+                    })
+                    .flat_map(|section| section.body.as_chunks::<64>().0.to_vec())
+                    .filter_map(|row| row.first_chunk::<8>().map(|id| u64::from_le_bytes(*id)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let report = verify_export(
             &bytes,
             &OfflineTrust {
@@ -558,14 +599,18 @@ pub fn run_verify_export(
                 requirement: args.requirement,
             },
         )?;
-        Ok((report, args.json))
+        Ok((report, args.json, carried))
     });
     match result {
-        Ok((report, json)) => {
+        Ok((report, json, carried)) => {
             let mut all = true;
             let mut lines = Vec::new();
-            for (id, _, verification) in &report.journals {
-                for range in &verification.ranges {
+            for (id, role, verification) in &report.journals {
+                for range in verification
+                    .ranges
+                    .iter()
+                    .filter(|range| *role != Role::Archive || carried.contains(&range.recording))
+                {
                     all &= range.outcome == Outcome::Verified;
                     lines.push((
                         *id,
