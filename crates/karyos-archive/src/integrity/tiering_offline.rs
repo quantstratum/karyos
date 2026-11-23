@@ -555,7 +555,7 @@ impl<D: Disk + Clone> Offline<D> {
                 report.stopped = Stopped::LockNotEnforced { base, object };
                 break;
             }
-            let record = tiering.commit_segment(
+            let record = match tiering.commit_segment(
                 &uploaded,
                 min_copies,
                 deadline,
@@ -563,7 +563,24 @@ impl<D: Disk + Clone> Offline<D> {
                 &mut self.journal,
                 &mut segments,
                 &mut Backend(self.immutability.as_mut()),
-            )?;
+            ) {
+                Ok(record) => record,
+                // A commit refused before it records anything: the segment
+                // stays local, reported.
+                Err(TieringError::NotEligible { base, why }) => {
+                    report.stopped = Stopped::NotEligible { base, why };
+                    break;
+                }
+                Err(TieringError::BelowMinCopies { verified, required }) => {
+                    report.stopped = Stopped::BelowMinCopies {
+                        base,
+                        verified,
+                        required,
+                    };
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            };
             report.offloaded.push(record);
         }
         Ok(report)
