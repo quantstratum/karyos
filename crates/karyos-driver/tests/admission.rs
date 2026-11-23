@@ -513,7 +513,7 @@ fn hellos_that_break_the_profile_are_refused() {
     );
     // Version 2, an alpha.2 client's (karyos#637: version 3 since the
     // roles commands).
-    assert_eq!(VERSION, 5);
+    assert_eq!(VERSION, 6);
     assert_eq!(
         raw_hello(
             &mut driver,
