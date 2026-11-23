@@ -492,6 +492,12 @@ impl DaemonArchive {
             started: Vec::new(),
             next: 1,
         };
+        if options.time_evidence {
+            let entries = karyos_archive::integrity::time_evidence::entries_dir(&options.dir);
+            std::fs::create_dir_all(&entries).map_err(|error| {
+                ArchiveStartError::Agent(format!("{}: {error}", entries.display()))
+            })?;
+        }
         let config = AgentConfig::default()
             .with_seal_interval(Some(options.seal_interval))
             .with_copy_location(options.copy_location)

@@ -252,6 +252,15 @@ pub struct GroupTimeEvidence {
     /// publish past its largest timestamp; past it, its entries are
     /// `no_evidence`.
     pub calibration_wait: Duration,
+    /// The identity of the group directory's store journal in the trust
+    /// root, when the Archive signs heads: its entries' journal is signed
+    /// and anchored by the Archive's signer under it, as the trust file's
+    /// `time-journal` of the groups directory. Required when the Archive
+    /// signs ([`AgentError::NoTimeEvidenceJournal`]), distinct from the
+    /// Archive's own journals ([`AgentError::SharedJournalId`]), and the
+    /// same for every group of one directory
+    /// ([`AgentError::GroupStoreJournalId`]).
+    pub journal_id: Option<u64>,
 }
 
 impl GroupTimeEvidence {
@@ -264,7 +273,15 @@ impl GroupTimeEvidence {
         Self {
             clock,
             calibration_wait,
+            journal_id: None,
         }
+    }
+
+    /// Names the group directory's store journal identity, for signing.
+    #[must_use]
+    pub const fn with_journal_id(mut self, journal_id: u64) -> Self {
+        self.journal_id = Some(journal_id);
+        self
     }
 }
 
@@ -722,6 +739,16 @@ pub enum AgentError {
     /// which means "provenance unknown" (karyos#1137): declare none.
     #[error("the all zero clock identity is reserved: declare no clock instead")]
     ZeroEventClock,
+    /// A group declares a store journal identity other than the one its
+    /// directory's store is already signed under (karyos#1137): one store
+    /// per directory has one identity.
+    #[error("the group directory's store is signed as journal {signed}, not {declared}")]
+    GroupStoreJournalId {
+        /// The identity the directory's store is signed under.
+        signed: u64,
+        /// The group's.
+        declared: u64,
+    },
     /// A replication the source refuses (ADR-0091; karyos#1113): answered
     /// with its `ControlResponse` code.
     #[error("replication refused: {0:?}")]
@@ -2102,6 +2129,7 @@ fn run<D>(
         groups: Vec::new(),
         group_seals: std::collections::BTreeMap::new(),
         group_stores: std::collections::BTreeMap::new(),
+        group_signings: std::collections::BTreeMap::new(),
         integrity,
         retention,
         verifying: Arc::default(),
@@ -2202,6 +2230,9 @@ struct State<D: Disk> {
     /// writer per directory shared by its groups (karyos#1137); a store
     /// that failed holds `None` until restart.
     group_stores: GroupStores<D>,
+    /// The signing of each group directory's store journal, under its
+    /// identity, when the Archive signs (karyos#1137).
+    group_signings: std::collections::BTreeMap<PathBuf, (u64, Signing<D>)>,
 }
 
 /// One `time-evidence/` store per group journal directory.
@@ -2218,6 +2249,8 @@ struct Integrity<D: Disk> {
     /// Whether head signing configures no time evidence journal id, so
     /// entries are refused ([`AgentError::NoTimeEvidenceJournal`]).
     no_time_journal: bool,
+    /// What a group store's signing shares with the Archive's (karyos#1137).
+    group_signing: Option<GroupSigning>,
     /// The copy catalog and this Archive's location in it, when
     /// `copy_location` is set; dropped at its first failure.
     copies: Option<(
@@ -2251,22 +2284,31 @@ impl<D: Disk> Integrity<D> {
             .and_then(std::num::NonZeroU64::new)
             .ok_or(IntegrityError::Overflow)?;
         let mut journal = IntegrityJournal::open(disk.clone(), dir)?.journal;
-        let (signing, shared, no_time_journal) = match signing {
+        let (signing, shared, no_time_journal, group_signing) = match signing {
             Some(setup) => {
                 let parts = setup
                     .time_evidence_journal_id
                     .map(|id| (setup.trust.clone(), id, setup.config));
+                let taken = [Some(setup.journal_id), setup.time_evidence_journal_id];
+                let (trust, config) = (setup.trust.clone(), setup.config);
                 let signing =
                     Signing::open(disk.clone(), dir, setup, &mut journal, Arc::clone(counts))?;
                 let signer = Arc::clone(&signing.signer);
                 let no_time_journal = parts.is_none();
+                let group_signing = GroupSigning {
+                    trust,
+                    config,
+                    signer: Arc::clone(&signer),
+                    taken,
+                };
                 (
                     Some(signing),
                     parts.map(|parts| (parts, signer)),
                     no_time_journal,
+                    Some(group_signing),
                 )
             }
-            None => (None, None, false),
+            None => (None, None, false, None),
         };
         // Signed, but with no journal id for the entries: none are kept.
         let evidence = if no_time_journal {
@@ -2285,6 +2327,7 @@ impl<D: Disk> Integrity<D> {
             signing,
             evidence,
             no_time_journal,
+            group_signing,
             copies,
             journal,
             sealer: Sealer::new(interval),
@@ -2479,6 +2522,15 @@ struct Signing<D: Disk> {
     registry: KeyRegistry,
     /// Where each poll publishes the status.
     counts: Arc<Counts>,
+}
+
+/// What a group store's signing shares with the Archive's (karyos#1137).
+struct GroupSigning {
+    trust: TrustRoot,
+    config: crate::integrity::signing::SigningConfig,
+    signer: SharedSigner,
+    /// The Archive's journal identity and its entries' journal identity.
+    taken: [Option<u64>; 2],
 }
 
 /// The time evidence entries of a running Archive (ADR-0095).
@@ -3370,6 +3422,15 @@ where
         {
             poisoned = poisoned.saturating_add(1);
         }
+        // Each group directory's store journal, on the same schedule
+        // (karyos#1137).
+        for (dir, (_, signing)) in &mut self.group_signings {
+            if let Some(Some(store)) = self.group_stores.get_mut(dir)
+                && signing.duty(store.journal_mut(), now).is_err()
+            {
+                poisoned = poisoned.saturating_add(1);
+            }
+        }
         if let Some(counts) = counts {
             for _ in 0..poisoned {
                 count(&counts.poisoned_signer);
@@ -3741,11 +3802,13 @@ where
         }
         // The declaration is checked before any file is made, sealing or
         // not (karyos#1137).
-        if start
-            .time_evidence
-            .is_some_and(|declared| declared.clock.clock == [0; 5])
-        {
-            return Err(AgentError::ZeroEventClock);
+        if let Some(declared) = start.time_evidence.as_ref() {
+            check_declared(
+                declared,
+                self.integrity
+                    .as_ref()
+                    .and_then(|integrity| integrity.group_signing.as_ref()),
+            )?;
         }
         // Sealing on: the Archive's directory holds its own integrity
         // journal, which a group's cannot share (karyos#1112). Compared as
@@ -3779,6 +3842,17 @@ where
         } else {
             None
         };
+        // One store per directory has one signed identity (karyos#1137).
+        if let (Some(declared), Some(dir)) = (start.time_evidence.as_ref(), sealed_dir.as_ref())
+            && let (Some(declared_id), Some((signed, _))) =
+                (declared.journal_id, self.group_signings.get(dir))
+            && declared_id != *signed
+        {
+            return Err(AgentError::GroupStoreJournalId {
+                signed: *signed,
+                declared: declared_id,
+            });
+        }
         // Checked before the journal exists, so a refused start leaves
         // none behind.
         capture::validate(start.capture, start.journal.policy).map_err(AgentError::Capture)?;
@@ -3974,6 +4048,23 @@ where
             )?,
             _ => None,
         };
+        if let (Some(declared), Some(integrity)) = (start.time_evidence, self.integrity.as_ref())
+            && let (Some(shared), Some(journal_id)) =
+                (integrity.group_signing.as_ref(), declared.journal_id)
+            && !self.group_signings.contains_key(&dir)
+            && let Some(Some(store)) = self.group_stores.get_mut(&dir)
+        {
+            let signing = Signing::open_shared(
+                self.disk.clone(),
+                &crate::integrity::time_evidence::entries_dir(&dir),
+                (shared.trust.clone(), journal_id, shared.config),
+                Arc::clone(&shared.signer),
+                store.journal_mut(),
+                Arc::default(),
+            )?;
+            self.group_signings
+                .insert(dir.clone(), (journal_id, signing));
+        }
         self.groups.push(ActiveGroup {
             id,
             dir,
@@ -4451,6 +4542,33 @@ fn seal_group<D: Disk + Clone>(
     if failed {
         *entry = None;
     }
+}
+
+/// Checks a group's declaration before any file is made: not the reserved
+/// zero tuple, and, for a signing Archive, a journal identity of its own,
+/// never one of the Archive's journals'.
+///
+/// # Errors
+///
+/// [`AgentError::ZeroEventClock`], [`AgentError::NoTimeEvidenceJournal`]
+/// and [`AgentError::SharedJournalId`].
+fn check_declared(
+    declared: &GroupTimeEvidence,
+    shared: Option<&GroupSigning>,
+) -> Result<(), AgentError> {
+    if declared.clock.clock == [0; 5] {
+        return Err(AgentError::ZeroEventClock);
+    }
+    let Some(shared) = shared else {
+        return Ok(());
+    };
+    let id = declared
+        .journal_id
+        .ok_or(AgentError::NoTimeEvidenceJournal)?;
+    if shared.taken.contains(&Some(id)) {
+        return Err(AgentError::SharedJournalId);
+    }
+    Ok(())
 }
 
 /// A group's time evidence, when the host made `time-evidence/` in its
