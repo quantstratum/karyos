@@ -89,7 +89,8 @@
 //! `GuardClose`, `GuardCloseAt` and `GuardReopen` (`quantstratum-docs:
 //! karyos/design/guards-and-abort.md`, local guards): a local operator
 //! closes a guard, closes one only if it is still open at the epoch it
-//! names (`GuardCloseAt`, karyos#738: the close an operator previewed),
+//! names (`GuardCloseAt`, karyos#738, admission version 6: the close an
+//! operator previewed),
 //! or reopens one closed at the epoch it names, on the
 //! driver's control path, authorized by the calling process's credentials
 //! (G1). The operation id is the requester's own id for the audit record

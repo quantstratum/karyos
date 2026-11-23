@@ -544,6 +544,17 @@ fn hellos_that_break_the_profile_are_refused() {
         ),
         refused(refusal::INCOMPATIBLE_VERSION)
     );
+    // Version 5, an alpha.4 client's (karyos#738: version 6 since the
+    // close at an epoch).
+    assert_eq!(
+        raw_hello(
+            &mut driver,
+            &dir,
+            &encode(&Message::Hello { version: 5 }),
+            Some(&own)
+        ),
+        refused(refusal::INCOMPATIBLE_VERSION)
+    );
     // Not a Hello: closed without an answer.
     assert_eq!(
         raw_hello(&mut driver, &dir, &encode(&Message::Leave), None),
@@ -551,7 +562,7 @@ fn hellos_that_break_the_profile_are_refused() {
     );
     assert_eq!(driver.clients(), 0);
     // Each refusal reached the error log, keyed by its code: three
-    // profile refusals and five version refusals (P7 o3).
+    // profile refusals and six version refusals (P7 o3).
     let mut occurrences = std::collections::HashMap::new();
     let _ = driver.error_log().scan(&mut 0, |record| {
         assert_eq!(
@@ -563,7 +574,7 @@ fn hellos_that_break_the_profile_are_refused() {
     assert_eq!(occurrences.get(&[0, refusal::PROFILE]), Some(&3));
     assert_eq!(
         occurrences.get(&[0, refusal::INCOMPATIBLE_VERSION]),
-        Some(&5)
+        Some(&6)
     );
     assert_eq!(occurrences.len(), 2);
 }
