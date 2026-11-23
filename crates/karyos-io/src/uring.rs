@@ -12,9 +12,8 @@
 //! kernel still owns and reports it, over the [`ops::RingOps`] seam; the
 //! real ring over the admitted `io-uring` crate (`ring`, Linux and feature
 //! `uring` only) with its send parking probe; and the scripted double
-//! (`scripted`). The capability snapshot, the
-//! `io_uring_or_sockets` fallback and the release record follow in their
-//! own issues.
+//! (`scripted`); and the explicit `io_uring_or_sockets` selection
+//! ([`select`]).
 //!
 //! `unsafe` is denied here and allowed in `ring` alone (SPEC.md §14,
 //! choice IU-9).
@@ -31,4 +30,5 @@ pub mod ring;
 pub mod rx;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod scripted;
+pub mod select;
 pub mod tx;

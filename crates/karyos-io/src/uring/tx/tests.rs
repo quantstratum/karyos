@@ -749,6 +749,29 @@ mod kernel {
         );
     }
 
+    /// The default Docker profile job of IU-10: with
+    /// `KARYOS_URING_EXPECT_DENIED` set, the setup must be denied with
+    /// `EPERM`, distinct from `ENOSYS` (design section 9).
+    #[test]
+    fn a_denying_seccomp_profile_is_reported_as_denied() {
+        if std::env::var_os("KARYOS_URING_EXPECT_DENIED").is_none() {
+            return;
+        }
+        let local = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let opened = OsRing::open(local, &config());
+        assert!(
+            matches!(
+                opened,
+                Err(OpenError::Os {
+                    operation: "io_uring_setup",
+                    errno: 1
+                })
+            ),
+            "{:?}",
+            opened.map(|_| ())
+        );
+    }
+
     #[test]
     fn a_configured_sqpoll_is_set_up_without_the_taskrun_flags() {
         let mut polled = config();

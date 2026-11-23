@@ -60,6 +60,10 @@ pub struct ScriptedRing {
     enters: u32,
     overflowed: bool,
     taskrun: bool,
+    /// `bytes_mut` calls on a kernel owned slot: a frame touched while the
+    /// kernel owns it, which the double refuses and counts (SPEC.md §13,
+    /// "Backend ring and frame ownership").
+    touches_while_owned: u64,
 }
 
 impl ScriptedRing {
@@ -81,7 +85,14 @@ impl ScriptedRing {
             enters: 0,
             overflowed: false,
             taskrun: false,
+            touches_while_owned: 0,
         }
+    }
+
+    /// Writes attempted on a kernel owned slot so far.
+    #[must_use]
+    pub fn touches_while_owned(&self) -> u64 {
+        self.touches_while_owned
     }
 
     /// Every operation published so far, in order.
@@ -170,6 +181,7 @@ impl RingOps for ScriptedRing {
 
     fn bytes_mut(&mut self, slot: u16) -> Option<&mut [u8]> {
         if self.owner(slot).is_some() {
+            self.touches_while_owned = self.touches_while_owned.saturating_add(1);
             return None;
         }
         self.bytes
@@ -279,6 +291,9 @@ pub struct ScriptedRxRing {
     /// Posted buffers in the order the kernel takes them.
     ring: VecDeque<u16>,
     arm: Option<UserData>,
+    /// The current arm's terminal completion is queued: like the kernel,
+    /// the double posts nothing more for it.
+    ended: bool,
     cq: VecDeque<Cqe>,
     pushed: Vec<Pushed>,
     arms: u32,
@@ -302,6 +317,7 @@ impl ScriptedRxRing {
             state: vec![Buffer::Posted; usize::from(buffers)],
             ring: (0..buffers).collect(),
             arm: None,
+            ended: false,
             cq: VecDeque::with_capacity(LOG),
             pushed: Vec::with_capacity(LOG),
             arms: 0,
@@ -348,6 +364,9 @@ impl ScriptedRxRing {
     /// Returns the buffer used.
     pub fn deliver(&mut self, payload: &[u8], source: SocketAddr, flags: u32) -> Option<u16> {
         let arm = self.arm?;
+        if self.ended {
+            return None;
+        }
         let Some(id) = self.ring.pop_front() else {
             self.end_arm(-ENOBUFS);
             return None;
@@ -392,7 +411,10 @@ impl ScriptedRxRing {
 
     /// Ends the arm with a terminal completion of `result`.
     pub fn end_arm(&mut self, result: i32) {
-        if let Some(arm) = self.arm {
+        if let Some(arm) = self.arm
+            && !self.ended
+        {
+            self.ended = true;
             self.cq.push_back(Cqe {
                 user_data: arm,
                 result,
@@ -463,6 +485,7 @@ impl RxRingOps for ScriptedRxRing {
         }
         self.unconsumed = self.unconsumed.saturating_add(1);
         self.arm = Some(user_data);
+        self.ended = false;
         self.arms = self.arms.saturating_add(1);
         Ok(())
     }
