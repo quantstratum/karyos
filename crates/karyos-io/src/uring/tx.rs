@@ -148,10 +148,13 @@ impl UringTxConfig {
     }
 
     /// The CQ entries the ring needs: `T + K` rounded up to a power of two
-    /// (design 5.1, copied sends).
+    /// (design 5.1, copied sends), and never fewer than the SQ entries,
+    /// which `IORING_SETUP_CQSIZE` refuses.
     #[must_use]
     pub fn cq_entries(&self) -> u32 {
-        (u32::from(self.tx_slots.get()) + u32::from(CONTROL_SLOTS)).next_power_of_two()
+        (u32::from(self.tx_slots.get()) + u32::from(CONTROL_SLOTS))
+            .next_power_of_two()
+            .max(self.sq_entries())
     }
 }
 
@@ -206,6 +209,9 @@ struct Run {
     len: u16,
     /// An invariant fault; only a reset clears it.
     faulted: bool,
+    /// `close_queue` started: no claim, commit or flush; it closes once
+    /// its Submitted items completed.
+    closing: bool,
 }
 
 const IDLE_RUN: Run = Run {
@@ -214,6 +220,7 @@ const IDLE_RUN: Run = Run {
     tail: NO_SLOT,
     len: 0,
     faulted: false,
+    closing: false,
 };
 
 /// One control slot for cancel operations (design 3.4).
@@ -561,9 +568,10 @@ impl<R: RingOps> UringTx<R> {
     }
 
     /// Returns the pending items of `queue` with `QueueClosed` up to the
-    /// report capacity; once none is pending, closes it. Its Submitted
-    /// items stay with the kernel until their completions, and their
-    /// slots are quarantined until reset.
+    /// report capacity and stops its claims, commits and flushes; once
+    /// none is pending and every Submitted item has its terminal
+    /// completion ([`TxBackend::poll_completions`]), closes it. Call while
+    /// `more` is true.
     ///
     /// # Errors
     ///
@@ -580,20 +588,25 @@ impl<R: RingOps> UringTx<R> {
             return Err(QueueError::NotActive);
         }
         let index = self.run_index(queue).ok_or(QueueError::UnknownQueue)?;
+        if let Some(run) = self.runs.get_mut(index) {
+            run.closing = true;
+        }
         let (returned, more) = self.return_pending(index, ReturnReason::QueueClosed, &mut writer);
         if more {
             return Ok(CancelOutcome { returned, more });
         }
-        for slot in 0..self.slots.len() {
-            let Some(meta) = self.slots.get_mut(slot) else {
-                break;
-            };
-            if meta.queue == Some(queue) && meta.phase == Phase::Submitted {
-                meta.phase = Phase::Quarantined;
-                let quarantined =
-                    u32::try_from(slot).is_ok_and(|slot| self.ledger.quarantine(queue, slot));
-                debug_assert!(quarantined, "a submitted slot is charged to its queue");
-            }
+        // Submitted items stay charged to the queue until their terminal
+        // completions release them; the queue closes only after that, so
+        // no slot is stranded by queue turnover.
+        let in_flight = self
+            .slots
+            .iter()
+            .any(|meta| meta.queue == Some(queue) && meta.phase == Phase::Submitted);
+        if in_flight {
+            return Ok(CancelOutcome {
+                returned,
+                more: true,
+            });
         }
         self.ledger.close_queue(queue)?;
         if let Some(run) = self.runs.get_mut(index) {
@@ -736,6 +749,13 @@ impl<R: RingOps> UringTx<R> {
         self.state = State::Closed;
     }
 
+    /// The run of an open queue that is not closing: the one claims,
+    /// commits and flushes use.
+    fn open_run(&self, queue: TxQueueId) -> Option<usize> {
+        let index = self.run_index(queue)?;
+        (!self.runs.get(index)?.closing).then_some(index)
+    }
+
     fn run_index(&self, queue: TxQueueId) -> Option<usize> {
         let index = usize::from(queue.index());
         let run = self.runs.get(index)?;
@@ -830,10 +850,23 @@ impl<R: RingOps> UringTx<R> {
             return;
         }
         meta.phase = Phase::Quarantined;
-        if let (Some(queue), Ok(slot)) = (meta.queue, u32::try_from(slot)) {
-            let quarantined = self.ledger.quarantine(queue, slot);
-            debug_assert!(quarantined, "a submitted slot is charged to its queue");
+        let charged = match (meta.queue, u32::try_from(slot)) {
+            (Some(queue), Ok(slot)) => self.ledger.quarantine(queue, slot),
+            _ => false,
+        };
+        if !charged {
+            bump(&mut self.counters.invariants);
         }
+    }
+
+    /// A report entry or a ledger charge the endpoint's own state promised
+    /// could not be written: the half stops until reset rather than go on
+    /// with evidence missing.
+    fn broken(&mut self, queue: Option<TxQueueId>) {
+        self.fault(queue);
+        self.failed.get_or_insert(BackendFailure::Invariant {
+            operation: "uring_tx_state",
+        });
     }
 
     fn fault(&mut self, queue: Option<TxQueueId>) {
@@ -874,7 +907,7 @@ impl<R: RingOps> UringTx<R> {
                 return (returned, false);
             };
             if writer.push(entry).is_err() {
-                debug_assert!(false, "the report had room");
+                self.broken(Some(queue));
             }
             if let Some(slot_meta) = self.slots.get_mut(slot as usize) {
                 *slot_meta = SlotMeta {
@@ -882,8 +915,9 @@ impl<R: RingOps> UringTx<R> {
                     ..FREE_META
                 };
             }
-            let released = self.ledger.release_pending(queue, slot);
-            debug_assert!(released, "a pending slot is charged to its queue");
+            if !self.ledger.release_pending(queue, slot) {
+                self.broken(Some(queue));
+            }
             returned = returned.saturating_add(1);
         }
     }
@@ -1060,8 +1094,9 @@ impl<R: RingOps> UringTx<R> {
                         ..FREE_META
                     };
                 }
-                let released = self.ledger.release_pending(queue, slot32);
-                debug_assert!(released, "a submitted slot is charged to its queue");
+                if !self.ledger.release_pending(queue, slot32) {
+                    self.broken(Some(queue));
+                }
                 2
             }
             Resolution::Invariant => {
@@ -1106,7 +1141,7 @@ impl<R: RingOps> TxFrame for UringFrame<'_, R> {
         {
             return Err(CommitRejected { frame: self, error });
         }
-        let Some(index) = self.tx.run_index(self.queue) else {
+        let Some(index) = self.tx.open_run(self.queue) else {
             return Err(CommitRejected {
                 frame: self,
                 error: CommitError::UnknownQueue,
@@ -1137,8 +1172,9 @@ impl<R: RingOps> TxFrame for UringFrame<'_, R> {
                 error: CommitError::UnknownQueue,
             });
         }
-        let committed = self.tx.ledger.pool_mut().commit(self.slot);
-        debug_assert!(committed, "a claimed slot commits");
+        if !self.tx.ledger.pool_mut().commit(self.slot) {
+            self.tx.broken(Some(self.queue));
+        }
         if let Some(meta) = self.tx.slots.get_mut(self.slot as usize) {
             meta.phase = Phase::Pending;
             meta.token = commit.token;
@@ -1174,7 +1210,7 @@ impl<R: RingOps> TxBackend for UringTx<R> {
 
     fn claim_tx(&mut self, queue: TxQueueId, len: usize) -> Result<UringFrame<'_, R>, ClaimError> {
         let active = self.state == State::Active;
-        if active && self.run_index(queue).is_none() {
+        if active && self.open_run(queue).is_none() {
             return Err(ClaimError::UnknownQueue);
         }
         let claimed = self.ledger.claim(active, queue, len)?;
@@ -1222,7 +1258,7 @@ impl<R: RingOps> TxBackend for UringTx<R> {
             outcome.stop = FlushStop::Queue(QueueError::NotActive);
             return outcome;
         }
-        let Some(index) = self.run_index(request.queue) else {
+        let Some(index) = self.open_run(request.queue) else {
             outcome.stop = FlushStop::Queue(QueueError::UnknownQueue);
             return outcome;
         };
@@ -1351,8 +1387,11 @@ impl<R: RingOps> TxBackend for UringTx<R> {
             {
                 break;
             }
-            let popped = self.pop_head(index);
-            debug_assert_eq!(popped.map(|(head, _)| head), Some(slot), "the head is sent");
+            if self.pop_head(index).map(|(head, _)| head) != Some(slot) {
+                // Published, but the FIFO disagrees: report it Submitted and
+                // stop the half, never re-send it.
+                self.broken(Some(request.queue));
+            }
             if let Some(slot_meta) = self.slots.get_mut(slot as usize) {
                 slot_meta.phase = Phase::Submitted;
                 slot_meta.next = NO_SLOT;
@@ -1365,7 +1404,7 @@ impl<R: RingOps> TxBackend for UringTx<R> {
                 },
             ) && writer.push(entry).is_err()
             {
-                debug_assert!(false, "the report had room");
+                self.broken(Some(request.queue));
             }
             outcome.submitted = outcome.submitted.saturating_add(1);
             outcome.bytes = outcome.bytes.saturating_add(u32::from(meta.len));
@@ -1426,7 +1465,7 @@ impl<R: RingOps> TxBackend for UringTx<R> {
 impl<R: RingOps> UringTx<R> {
     /// Reports candidates `from..to` of `slots` Pending with `cause`.
     fn report_pending(
-        &self,
+        &mut self,
         writer: &mut ReportWriter<'_>,
         slots: &[u32; BATCH],
         from: usize,
@@ -1440,7 +1479,7 @@ impl<R: RingOps> UringTx<R> {
             if let Some(entry) = self.entry(slot, meta, TxItemOutcome::Pending { cause })
                 && writer.push(entry).is_err()
             {
-                debug_assert!(false, "the report had room");
+                self.broken(meta.queue);
             }
         }
     }

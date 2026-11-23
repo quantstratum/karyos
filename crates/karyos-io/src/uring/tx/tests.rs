@@ -8,6 +8,7 @@ use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
 use super::*;
 use crate::backend::{Authority, Budget, InstanceId, TxEntry};
+use crate::uring::ops::{CancelTarget, Cqe, PushError, RingOps, UserData};
 use crate::uring::scripted::{Pushed, ScriptedRing};
 
 const SLOTS: u16 = 4;
@@ -39,6 +40,7 @@ fn instance() -> InstanceId {
 struct Fixture {
     tx: UringTx<ScriptedRing>,
     queue: TxQueueId,
+    route: crate::backend::RouteId,
 }
 
 fn fixture_with(sq: usize) -> Fixture {
@@ -59,7 +61,7 @@ fn fixture_with(sq: usize) -> Fixture {
     let Ok(queue) = queue else {
         panic!("queue: {queue:?}");
     };
-    Fixture { tx, queue }
+    Fixture { tx, queue, route }
 }
 
 fn fixture() -> Fixture {
@@ -553,6 +555,71 @@ fn the_configuration_bounds_user_data_and_the_batch() {
     assert_eq!(UringTxConfig::default().cq_entries(), 512);
 }
 
+#[test]
+fn send_and_control_identities_are_disjoint() {
+    let mut ring = ScriptedRing::new(SLOTS, LEN, 16);
+    let dest = destination();
+    // A send must carry its own slot's identity.
+    assert_eq!(
+        ring.push_send(1, 8, dest, UserData::new(2, 1)),
+        Err(PushError::OutOfRange)
+    );
+    // A cancel may not carry a send slot's identity.
+    assert_eq!(
+        ring.push_cancel(CancelTarget::All, UserData::new(1, 1)),
+        Err(PushError::OutOfRange)
+    );
+    assert_eq!(ring.push_send(1, 8, dest, UserData::new(1, 1)), Ok(()));
+    assert_eq!(
+        ring.push_cancel(CancelTarget::All, UserData::new(SLOTS, 1)),
+        Ok(())
+    );
+    // The cancel's completion never ends the send's kernel ownership.
+    ring.complete(UserData::new(SLOTS, 1), 1, 0);
+    let mut cqes = [Cqe::EMPTY; 4];
+    ring.reap(&mut cqes);
+    assert!(ring.owner(1).is_some());
+}
+
+#[test]
+fn closing_a_queue_waits_for_its_submitted_items_and_strands_no_slot() {
+    let mut f = fixture();
+    let mut report = TxReport::new();
+    for round in 0..(u32::from(SLOTS) * 4) {
+        let ticket = commit(&mut f, 1, 8);
+        f.tx.flush(request(f.queue), &mut Permit, &mut report);
+        drain(&mut report);
+        let first = f.tx.close_queue(f.queue, &mut report).unwrap();
+        assert!(
+            first.more,
+            "round {round}: a submitted item keeps the queue open"
+        );
+        assert!(matches!(
+            f.tx.claim_tx(f.queue, 4),
+            Err(ClaimError::UnknownQueue)
+        ));
+        f.tx.ring_mut().complete_slot(slot_of(ticket), 8);
+        f.tx.poll_completions(budget(), &mut Events::default());
+        let last = f.tx.close_queue(f.queue, &mut report).unwrap();
+        assert!(!last.more);
+        f.queue =
+            f.tx.open_queue(TxQueueConfig {
+                authority: Authority::new(NonZeroU64::MIN),
+                route: f.route,
+                max_pending: nz(SLOTS),
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_cq_is_never_smaller_than_the_sq() {
+    let mut small = config();
+    small.tx_slots = nz(8);
+    small.max_batch = nz(32);
+    assert!(small.cq_entries() >= small.sq_entries());
+}
+
 /// The real ring on this kernel. Where the environment denies
 /// `io_uring` (a default Docker seccomp profile, `io_uring_disabled`),
 /// each test says so and returns, unless `KARYOS_URING_REQUIRED` is set,
@@ -679,6 +746,39 @@ mod kernel {
             state,
             CapabilityState::Active,
             "the kernel parks a send on a full buffer, and a cancel ends it with -ECANCELED"
+        );
+    }
+
+    #[test]
+    fn a_configured_sqpoll_is_set_up_without_the_taskrun_flags() {
+        let mut polled = config();
+        polled.sqpoll = Some(SqPoll {
+            cpu: 0,
+            idle_ms: 10,
+        });
+        let Some((_ring, probes)) = open_ring(&polled) else {
+            return;
+        };
+        // EINVAL would mean the SQPOLL setup still carried COOP_TASKRUN or
+        // TASKRUN_FLAG; a denial or another kernel refusal stays possible.
+        assert_ne!(
+            probes.sqpoll,
+            CapabilityState::Fallback(Reason::ProbeFailed { errno: 22 })
+        );
+    }
+
+    #[test]
+    fn the_real_ring_refuses_a_cancel_with_a_send_identity() {
+        let Some((mut ring, _)) = open_ring(&config()) else {
+            return;
+        };
+        assert_eq!(
+            ring.push_cancel(CancelTarget::All, UserData::new(0, 1)),
+            Err(PushError::OutOfRange)
+        );
+        assert_eq!(
+            ring.push_send(0, 4, destination(), UserData::new(1, 1)),
+            Err(PushError::OutOfRange)
         );
     }
 

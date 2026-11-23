@@ -185,7 +185,8 @@ impl RingOps for ScriptedRing {
         destination: SocketAddr,
         user_data: UserData,
     ) -> Result<(), PushError> {
-        if len > self.slot_len || usize::from(slot) >= self.owned.len() {
+        if len > self.slot_len || usize::from(slot) >= self.owned.len() || user_data.index() != slot
+        {
             return Err(PushError::OutOfRange);
         }
         if self.owner(slot).is_some() {
@@ -205,13 +206,11 @@ impl RingOps for ScriptedRing {
     }
 
     fn push_cancel(&mut self, target: CancelTarget, user_data: UserData) -> Result<(), PushError> {
-        debug_assert!(
-            user_data
-                .index()
-                .checked_sub(self.slots())
-                .is_some_and(|control| control < CONTROL_SLOTS),
-            "a cancel runs in a control slot"
-        );
+        // As the real ring: a control identity never names a send slot.
+        let control = user_data.index().checked_sub(self.slots());
+        if !control.is_some_and(|control| control < CONTROL_SLOTS) {
+            return Err(PushError::OutOfRange);
+        }
         self.take_sq()?;
         self.pushed.push(Pushed::Cancel { target, user_data });
         Ok(())

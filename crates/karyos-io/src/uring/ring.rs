@@ -197,21 +197,31 @@ fn io_errno(error: &std::io::Error) -> i32 {
 /// missing.
 const EOPNOTSUPP: i32 = 95;
 
-fn build_ring(config: &UringTxConfig) -> Result<(IoUring, CapabilityState), OpenError> {
+/// The enter based builder of IU-6: `SUBMIT_ALL`, `COOP_TASKRUN`,
+/// `TASKRUN_FLAG` and the CQ size.
+fn enter_builder(config: &UringTxConfig) -> io_uring::Builder {
     let mut builder = IoUring::builder();
     builder
         .setup_submit_all()
         .setup_coop_taskrun()
         .setup_taskrun_flag()
         .setup_cqsize(config.cq_entries());
+    builder
+}
+
+fn build_ring(config: &UringTxConfig) -> Result<(IoUring, CapabilityState), OpenError> {
     let Some(sqpoll) = config.sqpoll else {
-        let ring = builder
+        let ring = enter_builder(config)
             .build(config.sq_entries())
             .map_err(|error| os("io_uring_setup", io_errno(&error)))?;
         return Ok((ring, CapabilityState::NotRequested));
     };
-    let mut polled = builder.clone();
+    // Linux rejects COOP_TASKRUN and TASKRUN_FLAG with SQPOLL (EINVAL):
+    // the SQPOLL builder sets only SUBMIT_ALL and the CQ size.
+    let mut polled = IoUring::builder();
     polled
+        .setup_submit_all()
+        .setup_cqsize(config.cq_entries())
         .setup_sqpoll(sqpoll.idle_ms)
         .setup_sqpoll_cpu(sqpoll.cpu);
     match polled.build(config.sq_entries()) {
@@ -219,7 +229,7 @@ fn build_ring(config: &UringTxConfig) -> Result<(IoUring, CapabilityState), Open
         Err(error) => {
             // A declared fallback to enter based submission (design 8).
             let state = CapabilityState::Fallback(reason(io_errno(&error)));
-            let ring = builder
+            let ring = enter_builder(config)
                 .build(config.sq_entries())
                 .map_err(|error| os("io_uring_setup", io_errno(&error)))?;
             Ok((ring, state))
@@ -246,8 +256,9 @@ impl OsRing {
             SocketAddr::V4(_) => AddressFamily::INET,
             SocketAddr::V6(_) => AddressFamily::INET6,
         };
-        let socket = rustix::net::socket(family, SocketType::DGRAM, None)
-            .map_err(|errno| os("socket", errno.raw_os_error()))?;
+        let socket =
+            rustix::net::socket_with(family, SocketType::DGRAM, SocketFlags::CLOEXEC, None)
+                .map_err(|errno| os("socket", errno.raw_os_error()))?;
         rustix::net::bind(&socket, &local).map_err(|errno| os("bind", errno.raw_os_error()))?;
         let (ring, sqpoll) = build_ring(config)?;
         let params = ring.params();
@@ -271,13 +282,14 @@ impl OsRing {
             Ok(()) => CapabilityState::Active,
             Err(error) => CapabilityState::Fallback(reason(io_errno(&error))),
         };
-        let ring = Self::with_ring(
+        let mut ring = Self::with_ring(
             ring,
             socket,
             fixed_files == CapabilityState::Active,
             config.tx_slots.get(),
             config.max_datagram.get(),
         );
+        ring.probe_cancel_any()?;
         let probes = OsRingProbes {
             sqpoll,
             fixed_files,
@@ -286,6 +298,28 @@ impl OsRing {
             cq_entries,
         };
         Ok((ring, probes))
+    }
+
+    /// The "cancel any" probe of design 4.1: `ASYNC_CANCEL` with
+    /// `CANCEL_ANY | CANCEL_ALL` on the idle ring must complete with 0, or
+    /// a reset could wait on a cancel the kernel does not run.
+    fn probe_cancel_any(&mut self) -> Result<(), OpenError> {
+        const PROBE: &str = "io_uring_cancel_any";
+        let control = UserData::new(self.slots(), 0);
+        self.push_cancel(CancelTarget::All, control)
+            .map_err(|_| os(PROBE, EOPNOTSUPP))?;
+        self.ring
+            .submit_and_wait(1)
+            .map_err(|error| os(PROBE, io_errno(&error)))?;
+        let mut cqes = [Cqe::EMPTY; 1];
+        let reaped = self.reap(&mut cqes);
+        match cqes {
+            [cqe] if reaped == 1 && cqe.user_data == control && cqe.result == 0 => Ok(()),
+            [cqe] if reaped == 1 && cqe.result < 0 => {
+                Err(os(PROBE, cqe.result.checked_neg().unwrap_or(EOPNOTSUPP)))
+            }
+            _ => Err(os(PROBE, EOPNOTSUPP)),
+        }
     }
 
     fn with_ring(ring: IoUring, socket: OwnedFd, fixed: bool, slots: u16, slot_len: u16) -> Self {
@@ -352,7 +386,10 @@ impl OsRing {
         user_data: UserData,
     ) -> Result<(), PushError> {
         let index = usize::from(slot);
-        if len > self.slot_len {
+        // A send's identity names its own slot, so no other operation's
+        // completion can carry it (control operations use indices from
+        // `slots` up, `push_cancel`).
+        if len > self.slot_len || user_data.index() != slot {
             return Err(PushError::OutOfRange);
         }
         match self.owned.get(index) {
@@ -442,6 +479,11 @@ impl RingOps for OsRing {
     }
 
     fn push_cancel(&mut self, target: CancelTarget, user_data: UserData) -> Result<(), PushError> {
+        // A control identity never names a send slot: a cancel's completion
+        // must not end a slot's kernel ownership.
+        if user_data.index() < self.slots() {
+            return Err(PushError::OutOfRange);
+        }
         let entry = match target {
             CancelTarget::One(target) => opcode::AsyncCancel::new(target.get()).build(),
             CancelTarget::All => {
@@ -459,8 +501,10 @@ impl RingOps for OsRing {
     }
 
     fn needs_enter(&mut self) -> bool {
+        // CQ_OVERFLOW: NODROP keeps overflowed CQEs on a kernel list that
+        // only an enter flushes (design 5.2).
         let sq = self.ring.submission();
-        !sq.is_empty() || sq.taskrun()
+        !sq.is_empty() || sq.taskrun() || sq.cq_overflow()
     }
 
     fn reap(&mut self, out: &mut [Cqe]) -> usize {
@@ -543,7 +587,7 @@ fn send_parks() -> Result<(), i32> {
     let (sender, _receiver) = rustix::net::socketpair(
         AddressFamily::UNIX,
         SocketType::DGRAM,
-        SocketFlags::empty(),
+        SocketFlags::CLOEXEC,
         None,
     )
     .map_err(|errno| errno.raw_os_error())?;
