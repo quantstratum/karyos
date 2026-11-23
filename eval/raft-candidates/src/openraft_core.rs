@@ -788,6 +788,27 @@ pub type OpenRaftNoPreVote = OpenRaftCore<false>;
 /// karyos/evaluations/c5-raft-comparison-v1.md, W1; karyos#691).
 pub type OpenRaftBatch16 = OpenRaftCore<true, 16>;
 
+/// The entries an outgoing message appends and their payload bytes, for a
+/// test that observes appends (karyos#691); `None` for any other message.
+#[must_use]
+pub fn append_shape(message: &Message) -> Option<(usize, u64)> {
+    let Message::Request {
+        request: Request::Append(rpc),
+        ..
+    } = message
+    else {
+        return None;
+    };
+    let bytes = rpc
+        .entries
+        .iter()
+        .filter_map(to_harness)
+        .fold(0u64, |sum, entry| {
+            sum.saturating_add(u64::try_from(entry.payload.len()).unwrap_or(u64::MAX))
+        });
+    Some((rpc.entries.len(), bytes))
+}
+
 impl<const PRE_VOTE: bool, const BATCH: u64> fmt::Debug for OpenRaftCore<PRE_VOTE, BATCH> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenRaftCore")
@@ -965,16 +986,15 @@ impl<const PRE_VOTE: bool, const BATCH: u64> OpenRaftCore<PRE_VOTE, BATCH> {
             // RPC_TIMEOUT ticks, and OpenRaft then sends the next append
             // while the first may still be in flight or unacknowledged
             // (karyos#975).
-            // Without limits, `BATCH` entries per append when it is set
-            // (W1's batch limit, karyos#691).
-            max_payload_entries: limits.map_or(
-                if BATCH > 0 {
-                    BATCH
-                } else {
-                    DEFAULT_PAYLOAD_ENTRIES
-                },
-                |limits| limits.in_flight_entries,
-            ),
+            // A capped variant (`BATCH` > 0, W1's batch limit, karyos#691)
+            // never sends more than `BATCH` entries an append, under
+            // declared limits too: the smaller of the two.
+            max_payload_entries: match (limits, BATCH) {
+                (Some(limits), 0) => limits.in_flight_entries,
+                (Some(limits), batch) => limits.in_flight_entries.min(batch),
+                (None, 0) => DEFAULT_PAYLOAD_ENTRIES,
+                (None, batch) => batch,
+            },
             // The durable vote is C4's `HardState`, which has no place for
             // OpenRaft's `committed` bit, so a restarted leader comes back
             // with an uncommitted vote. Leader restoration is off to match:

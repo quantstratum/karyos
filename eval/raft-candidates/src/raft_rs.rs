@@ -99,13 +99,27 @@ pub type RaftRsNoPreVote = RaftCore<false>;
 
 /// [`RaftRs`] with a batch entry cap of 16, W1's primary batch limit
 /// (quantstratum-docs: karyos/evaluations/c5-raft-comparison-v1.md, W1;
-/// karyos#691). raft-rs caps an append by bytes (`max_size_per_msg`), not
-/// by entries, so the adapter sets the cap to 16 entries of the first
-/// proposed command's size at the smallest index and term: an append
-/// then holds at most 16 such entries, fewer once larger indices make each
-/// entry a byte or two longer. Set on the proposing leader; a leader that
-/// has proposed nothing yet keeps the default cap.
+/// karyos#691), for W1's allocation case of [`BATCH_PAYLOAD`]-byte
+/// payloads. raft-rs caps an append by bytes (`max_size_per_msg`), not by
+/// entries, so the configuration sets the cap, from startup, to `BATCH`
+/// encoded entries of that case's command at index 1 and term 1, the
+/// smallest such an entry is: an append then holds at most 16 of them,
+/// fewer at larger indices. It is not an entry count: entries smaller than
+/// the case's (a new leader's empty entry) could let more through, which
+/// the append observation test (`tests/batch.rs`) would catch.
 pub type RaftRsBatch16 = RaftCore<true, 16>;
+
+/// The entries an outgoing message appends and their payload bytes, for a
+/// test that observes appends (karyos#691); `None` for any other message.
+#[must_use]
+pub fn append_shape(message: &eraftpb::Message) -> Option<(usize, u64)> {
+    (message.get_msg_type() == eraftpb::MessageType::MsgAppend).then(|| {
+        let bytes = message.entries.iter().fold(0u64, |sum, entry| {
+            sum.saturating_add(u64::try_from(entry.data.len()).unwrap_or(u64::MAX))
+        });
+        (message.entries.len(), bytes)
+    })
+}
 
 /// Node `id`'s election timeout among `voters`, `[min, max)` in ticks:
 /// one value, so raft-rs's `thread_rng` draw is deterministic, staggered
@@ -244,6 +258,22 @@ pub(crate) fn read_back(sent: &[Entry], log: &mut LogView<'_>) -> bool {
     matches && !held
 }
 
+/// The W1 payload [`RaftRsBatch16`]'s byte cap is sized for (W1's
+/// allocation case, `W1 n=3 payload=32 clients=32`).
+pub const BATCH_PAYLOAD: usize = 32;
+
+/// The command a client of W1's allocation case proposes: an append of a
+/// [`BATCH_PAYLOAD`]-byte value; its encoded length does not depend on the
+/// client or the sequence number.
+fn batch_command() -> Vec<u8> {
+    karyos_sim::harness::node::Command {
+        client: 0,
+        sequence: 1,
+        op: karyos_sim::harness::node::Op::Append(vec![0u8; BATCH_PAYLOAD]),
+    }
+    .encode()
+}
+
 /// The append byte cap that holds `entries` entries carrying `command`,
 /// each sized at index 1 and term 1 with the adapter's 8-byte event time
 /// context: the smallest such an entry can be.
@@ -315,10 +345,6 @@ pub struct RaftCore<const PRE_VOTE: bool, const BATCH: u64 = 0> {
     now: u64,
     /// The declared limits (W2), when started with them.
     limits: Option<Limits>,
-    /// With a batch entry cap (`BATCH` > 0, no declared limits): the
-    /// append size cap that holds `BATCH` entries of the first command's
-    /// size, once a command has been proposed.
-    batch_bytes: Option<u64>,
 }
 
 impl<const PRE_VOTE: bool, const BATCH: u64> std::fmt::Debug for RaftCore<PRE_VOTE, BATCH> {
@@ -432,6 +458,8 @@ impl<const PRE_VOTE: bool, const BATCH: u64> RaftCore<PRE_VOTE, BATCH> {
             // karyos#975).
             max_size_per_msg: if limits.is_some() {
                 0
+            } else if BATCH > 0 {
+                batch_cap(BATCH, &batch_command())
             } else {
                 MAX_SIZE_PER_MSG
             },
@@ -456,7 +484,6 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE
             node: Self::build(id, peers, None, log),
             pending: None,
             light: None,
-            batch_bytes: None,
             last_tick: None,
             now: 0,
             limits: None,
@@ -479,7 +506,6 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE
             node: Self::build(id, peers, Some(limits), log),
             pending: None,
             light: None,
-            batch_bytes: None,
             last_tick: None,
             now: 0,
             limits: Some(*limits),
@@ -501,12 +527,6 @@ impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE
                 node.raft.raft_log.last_index(),
                 node.raft.raft_log.committed,
             )?;
-        }
-        if BATCH > 0 && self.limits.is_none() {
-            let bytes = *self
-                .batch_bytes
-                .get_or_insert_with(|| batch_cap(BATCH, &command));
-            node.raft.max_msg_size = bytes;
         }
         // Dropped while it hands its leadership over, or past raft-rs's
         // own uncommitted limit: either way, not taken.
@@ -681,7 +701,7 @@ mod tests {
     /// fewer of the command it was sized for, at any index (karyos#691).
     #[test]
     fn the_batch_cap_holds_at_most_sixteen_entries() {
-        let command = vec![7u8; 45];
+        let command = batch_command();
         let cap = batch_cap(16, &command);
         for first in [1u64, 200, 70_000] {
             let mut entries: Vec<eraftpb::Entry> = (first..first + 40)
