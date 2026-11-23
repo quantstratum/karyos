@@ -27,8 +27,9 @@ for crate in karyos-sys karyos-io karyos-ffi; do
     done <<<"$workspace_lints"
 done
 
-# karyos-io (SPEC.md §14; the io-uring R8 record): unsafe_code denied for
-# the crate, expected only on `mod ring` of src/uring.rs, never allowed.
+# karyos-io (SPEC.md §14; the io-uring and libc R8 records): unsafe_code
+# denied for the crate, expected only on `mod ring` of src/uring.rs and on
+# `mod linux_sys` of src/lib.rs, never allowed.
 io="$root/crates/karyos-io"
 if ! awk '/^\[lints.rust\]/{f=1;next} /^\[/{f=0} f' "$io/Cargo.toml" | grep -qx 'unsafe_code = "deny"'; then
     echo 'karyos-io must set unsafe_code = "deny" in [lints.rust]' >&2
@@ -36,12 +37,16 @@ if ! awk '/^\[lints.rust\]/{f=1;next} /^\[/{f=0} f' "$io/Cargo.toml" | grep -qx 
 fi
 # shellcheck disable=SC2016
 io_expects="$(cd "$io" && find src -name '*.rs' -print0 | sort -z | xargs -0 perl -0ne 'while (/expect\(\s*unsafe_code\b/g) { print "$ARGV\n" }')"
-if [ "$io_expects" != "src/uring.rs" ]; then
-    printf 'karyos-io expects unsafe_code outside src/uring.rs (mod ring), or not once there:\n%s\n' "$io_expects" >&2
+if [ "$io_expects" != "$(printf 'src/lib.rs\nsrc/uring.rs')" ]; then
+    printf 'karyos-io expects unsafe_code outside src/uring.rs (mod ring) and src/lib.rs (mod linux_sys), or not once in each:\n%s\n' "$io_expects" >&2
     status=1
 fi
 if ! perl -0ne 'exit(/#\[expect\(\s*unsafe_code,\s*reason\s*=\s*"[^"]+",?\s*\)\]\s*pub mod ring;/ ? 0 : 1)' "$io/src/uring.rs"; then
     echo 'karyos-io src/uring.rs: the expect(unsafe_code, reason = "...") must sit on mod ring' >&2
+    status=1
+fi
+if ! perl -0ne 'exit(/#\[cfg\(target_os = "linux"\)\]\s*#\[expect\(\s*unsafe_code,\s*reason\s*=\s*"[^"]+",?\s*\)\]\s*mod linux_sys;/ ? 0 : 1)' "$io/src/lib.rs"; then
+    echo 'karyos-io src/lib.rs: the expect(unsafe_code, reason = "...") must sit on the Linux-only mod linux_sys' >&2
     status=1
 fi
 if grep -rqE 'allow\(\s*unsafe_code' "$io/src"; then

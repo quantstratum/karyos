@@ -2617,3 +2617,25 @@ fn a_second_handle_of_an_unreliable_key_cannot_add_nak_control() {
     assert_eq!(b.network_control_groups_in_use(), 0);
     assert!(b.remove_network_subscription(first).unwrap());
 }
+
+/// Owner item 12 (karyos#624): the sockets backend isolates redundant
+/// paths on Linux, so the driver admits a channel with `paths` there with
+/// no switch assumed; elsewhere (macOS, until an equivalent isolation test
+/// passes) the channel is refused, typed, and counted.
+#[test]
+fn paths_are_isolated_on_linux_and_refused_elsewhere() {
+    let mut driver = driver(ThreadingMode::Shared);
+    let isolated = driver.net.as_ref().unwrap().paths_isolated();
+    assert_eq!(isolated, cfg!(target_os = "linux"));
+    if isolated {
+        return;
+    }
+    let group = SocketAddr::from(([239, 7, 9, 4], free_port()));
+    let any = Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let refused = driver.network_path_counters().0;
+    assert_eq!(
+        driver.add_network_subscription(6, &path_channel(group, vec![any])),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    assert_eq!(driver.network_path_counters().0, refused + 1);
+}

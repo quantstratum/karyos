@@ -2982,6 +2982,13 @@
           "kind": "normal",
           "target": "cfg(unix)",
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-io@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": "cfg(target_os = \"linux\")",
+          "uses_default_features": false
         }
       ],
       "features": [

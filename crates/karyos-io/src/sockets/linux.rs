@@ -26,7 +26,10 @@
 //!   fragment read backs. The capabilities `rustix` 1.1.5 has no API for
 //!   (`recvmmsg`, GSO, GRO, `SO_TIMESTAMPING`, `SO_BUSY_POLL`) are reported
 //!   `Unavailable(LibraryApi)` by the snapshot (decision O-3);
-//!   `IP_MULTICAST_ALL` and `IP_PKTINFO` are not set.
+//!   `IP_PKTINFO` is not set. `IP_MULTICAST_ALL` (or `IPV6_MULTICAST_ALL`)
+//!   is set off on every socket that joins a group, through the one safe
+//!   `libc` wrapper of `crate::linux_sys` (owner item 12), so the sockets
+//!   of redundant paths are isolated ([`SocketOps::isolates_paths`]).
 //!
 //! The data calls neither allocate nor block: the socket is nonblocking
 //! from creation and every send and receive also passes `MSG_DONTWAIT`.
@@ -291,6 +294,23 @@ fn join(fd: &OwnedFd, multicast: MulticastConfig) -> Result<Membership, OpenErro
             });
         }
     }
+    // Only the group joined here, on the interface joined here: a socket
+    // bound to the wildcard address would otherwise also receive every
+    // group another socket of the host joined on this port, so one
+    // redundant path's socket would count another path's datagrams
+    // (owner item 12, sockets-backend.md 4.1).
+    crate::linux_sys::set_multicast_all_off(
+        std::os::fd::AsFd::as_fd(fd),
+        multicast.group.is_ipv6(),
+    )
+    .map_err(|error| OpenError::Os {
+        operation: if multicast.group.is_ipv6() {
+            "setsockopt IPV6_MULTICAST_ALL"
+        } else {
+            "setsockopt IP_MULTICAST_ALL"
+        },
+        errno: error.raw_os_error().unwrap_or(0),
+    })?;
     Ok(Membership {
         group: multicast.group,
         interface: multicast.interface,
@@ -465,6 +485,14 @@ impl LinuxSocket {
 }
 
 impl SocketOps for LinuxSocket {
+    /// `true`: every socket that joins a group sets `IP_MULTICAST_ALL`
+    /// (`IPV6_MULTICAST_ALL`) off, so it receives only its own group on its
+    /// own interface (owner item 12), proven by the two-interface test and
+    /// its negative control in `tests/path_isolation.rs`.
+    fn isolates_paths() -> bool {
+        true
+    }
+
     fn send(&mut self, route: &RouteAddr, datagrams: &[&[u8]]) -> SendResult {
         self.send_counted(route, datagrams).result
     }

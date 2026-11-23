@@ -915,6 +915,7 @@ dependencies = [
  "io-uring",
  "karyos-protocol",
  "karyos-sys",
+ "libc",
  "proptest",
  "rustix",
  "thiserror",
