@@ -1213,8 +1213,25 @@ struct InboxState<T: TermBytes> {
     /// Images refused: beyond the bound, or their attach failed.
     refused: u64,
     /// `ImageJoinLoss` events for this subscription not yet reported
-    /// (ADR-0100), at most `max_images`: each is one attach's.
-    join_losses: Vec<(u64, karyos_sys::frame::Lane, JoinLoss)>,
+    /// (ADR-0100), at most `max_images`, each tied to its attach: the
+    /// attach id and session of the slot it was requested for.
+    join_losses: Vec<PendingLoss>,
+    /// Join losses that found the queue full, counted into the
+    /// subscription's lost changes at its next adoption.
+    join_losses_dropped: u64,
+}
+
+/// An attach's join loss waiting to be reported (ADR-0100): the attach it
+/// belongs to, so the change names that image, after its arrival.
+#[derive(Debug, Clone, Copy)]
+struct PendingLoss {
+    /// The attach id (the request sequence) of the image's slot.
+    id: u64,
+    session_id: i32,
+    /// The image's registration.
+    registration: u64,
+    lane: karyos_sys::frame::Lane,
+    loss: JoinLoss,
 }
 
 /// An attached image: its attach id (the request sequence), its session
@@ -1240,6 +1257,7 @@ impl<T: TermBytes> Inbox<T> {
                 closed: None,
                 refused: 0,
                 join_losses: Vec::with_capacity(max_images),
+                join_losses_dropped: 0,
             }),
         }
     }
@@ -1251,6 +1269,12 @@ impl<T: TermBytes> Inbox<T> {
         self.update(|state| {
             if let Some(index) = state.arrived.iter().position(|image| image.id == id) {
                 removed = Some(state.arrived.swap_remove(index));
+                // Never taken, so never reported attached: its loss goes
+                // with it, counted as a lost change.
+                let before = state.join_losses.len();
+                state.join_losses.retain(|pending| pending.id != id);
+                let dropped = u64::try_from(before - state.join_losses.len()).unwrap_or(u64::MAX);
+                state.join_losses_dropped = state.join_losses_dropped.saturating_add(dropped);
             } else {
                 state.retired.push(id);
             }
@@ -2254,17 +2278,35 @@ impl<C: Connection> Client<C> {
         lane: karyos_sys::frame::Lane,
         loss: JoinLoss,
     ) {
-        let Some(inbox) = self
+        let Some(network) = self
             .networks
             .iter()
             .find(|network| network.registration == parent && !network.closed)
-            .and_then(|network| network.inbox.upgrade())
         else {
             return;
         };
+        let Some(inbox) = network.inbox.upgrade() else {
+            return;
+        };
+        // The attach it belongs to: the slot requested for that image.
+        let Some(slot) = network.slots.iter().find(|slot| slot.image == image) else {
+            inbox.update(|state| {
+                state.join_losses_dropped = state.join_losses_dropped.saturating_add(1);
+            });
+            return;
+        };
+        let pending = PendingLoss {
+            id: slot.id,
+            session_id: slot.session_id,
+            registration: image,
+            lane,
+            loss,
+        };
         inbox.update(|state| {
             if state.join_losses.len() < state.join_losses.capacity() {
-                state.join_losses.push((image, lane, loss));
+                state.join_losses.push(pending);
+            } else {
+                state.join_losses_dropped = state.join_losses_dropped.saturating_add(1);
             }
         });
     }
@@ -2761,14 +2803,50 @@ impl<T: TermBytes> Images<T> {
         }
     }
 
+    /// Reports the pending join losses whose image is attached (taken),
+    /// each as a change of that image, available, carrying the range; the
+    /// others stay pending until their image arrives.
+    fn report_losses(&mut self, pending: &mut Vec<PendingLoss>) {
+        let mut index = 0;
+        while let Some(loss) = pending.get(index).copied() {
+            if !self.images.iter().any(|image| image.id == loss.id) {
+                index += 1;
+                continue;
+            }
+            let _ = pending.swap_remove(index);
+            let change = ImageChange {
+                image_id: loss.id,
+                session_id: loss.session_id,
+                lane: loss.lane,
+                available: true,
+                registration: Some(loss.registration),
+                end: None,
+                join_loss: Some(loss.loss),
+            };
+            if !self.held.is_empty() && self.held.len() < self.held.capacity() {
+                self.held.push_back(Held::Change(change));
+            } else {
+                Self::queue(
+                    &mut self.changes,
+                    self.max_changes,
+                    &mut self.changes_lost,
+                    change,
+                );
+            }
+        }
+    }
+
     /// Takes what the client handed over.
     fn adopt(&mut self) {
         self.settle_held();
         if !self.inbox.changed.swap(false, Ordering::Acquire) {
             return;
         }
-        let mut state = self
-            .inbox
+        // The inbox's lock is held through the adoption, while this
+        // subscription's own fields change: a second handle on the inbox
+        // (a reference count, no allocation) keeps the two borrows apart.
+        let inbox = Arc::clone(&self.inbox);
+        let mut state = inbox
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2776,6 +2854,9 @@ impl<T: TermBytes> Images<T> {
         // new image, whatever the order of the two. What it lets go of goes
         // straight to the client's bin, reserved for `max_images`, so the
         // poll path allocates nothing.
+        // An attach's join loss (ADR-0100) goes after its image's attach
+        // and before its retirement: those of images taken earlier first.
+        self.report_losses(&mut state.join_losses);
         let mut released = self
             .released
             .lock()
@@ -2815,32 +2896,11 @@ impl<T: TermBytes> Images<T> {
             );
         }
         self.images.append(&mut state.arrived);
-        // An attach's join loss (ADR-0100), after its image's attach: a
-        // change of that image, available, carrying the range.
-        for (registration, lane, loss) in state.join_losses.drain(..) {
-            let image = self
-                .images
-                .iter()
-                .find(|image| image.registration == registration);
-            let change = ImageChange {
-                image_id: image.map_or(0, |image| image.id),
-                session_id: image.map_or(0, |image| image.session_id),
-                lane,
-                available: true,
-                registration: Some(registration),
-                end: None,
-                join_loss: Some(loss),
-            };
-            if !self.held.is_empty() && self.held.len() < self.held.capacity() {
-                self.held.push_back(Held::Change(change));
-            } else {
-                Self::queue(
-                    &mut self.changes,
-                    self.max_changes,
-                    &mut self.changes_lost,
-                    change,
-                );
-            }
+        // Join losses of images attached by now, the new ones included.
+        self.report_losses(&mut state.join_losses);
+        if state.join_losses_dropped > 0 {
+            self.changes_lost = self.changes_lost.saturating_add(state.join_losses_dropped);
+            state.join_losses_dropped = 0;
         }
         if self.closed.is_none() {
             self.closed = state.closed;
