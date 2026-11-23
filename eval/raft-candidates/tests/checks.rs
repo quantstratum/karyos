@@ -50,6 +50,10 @@ const UNREPORTED: u8 = 5;
 /// Server 2's core panics at its tenth Ready (karyos#976): any core's
 /// panic, not a particular library's.
 const PANICS: u8 = 6;
+/// Server 2 never stores a commit, then truncates its whole log once the
+/// cluster has applied some (karyos#976): C4's log has no stored commit
+/// to refuse the truncation below.
+const FORGETS: u8 = 7;
 
 #[derive(Debug)]
 struct Mutant<const KIND: u8> {
@@ -104,6 +108,17 @@ impl<const KIND: u8> Mutant<KIND> {
                 for entry in &mut ready.entries {
                     entry.index += 1;
                 }
+            }
+            FORGETS if self.id == 2 => {
+                if let Some(state) = ready.hard_state.as_mut() {
+                    state.commit = None;
+                }
+                if !self.truncated && self.applied >= 4 {
+                    ready.truncate_from = Some(1);
+                    ready.entries.clear();
+                    self.truncated = true;
+                }
+                self.applied += u64::try_from(ready.committed.len()).unwrap();
             }
             TRUNCATE if self.id == 2 => {
                 if !self.truncated && self.applied >= 4 {
@@ -373,6 +388,18 @@ fn a_disk_that_lies_about_syncs_loses_durable_entries_at_a_crash() {
     );
     assert!(
         matches!(violation, Violation::DurableLost { node: 1, .. }),
+        "{violation:?}"
+    );
+}
+
+/// A server that stores no commit lets C4's log truncate entries the
+/// cluster applied: `CommittedTruncated` names it, although the real core
+/// panics over its lost log afterwards (karyos#976).
+#[test]
+fn a_server_that_forgets_its_commit_and_truncates_applied_entries_is_caught() {
+    let violation = violation::<Mutant<FORGETS>>();
+    assert!(
+        matches!(violation, Violation::CommittedTruncated { node: 2, .. }),
         "{violation:?}"
     );
 }
