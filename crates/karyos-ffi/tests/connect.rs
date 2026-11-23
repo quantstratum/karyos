@@ -138,13 +138,13 @@ fn a_driver_that_admits_at_another_version_is_incompatible() {
 }
 
 /// SPEC.md §13, C ABI boundary row (karyos#637): an alpha.2 driver speaks
-/// admission version 2 and this client version 4 (3 until karyos#740), so the pair is
+/// admission version 2 and this client version 5 (3 until karyos#740, 4 until karyos#844), so the pair is
 /// incompatible whichever way the driver answers: `Admitted` at version 2
 /// here, and a `Refused` with `INCOMPATIBLE_VERSION` above.
 #[test]
 fn an_alpha2_driver_is_incompatible() {
     let _serial = serial();
-    assert_eq!(VERSION, 4);
+    assert_eq!(VERSION, 5);
     let dir = dir("alpha2");
     let admitted = Message::Admitted {
         instance: 1,

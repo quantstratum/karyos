@@ -93,6 +93,10 @@ pub struct ImageTemplate {
     pub local_gaps: bool,
     /// Term bytes of every image together (`image_storage_budget`).
     pub storage_budget: u64,
+    /// How long a required awaiting cell holds an image at its join for
+    /// its subscription's attach (ADR-0100, `image_join_deadline`), in ns;
+    /// default 10 s, the image liveness timeout.
+    pub image_join_deadline: u64,
 }
 
 impl Default for ImageTemplate {
@@ -102,6 +106,7 @@ impl Default for ImageTemplate {
             max_subscribers: 8,
             local_gaps: true,
             storage_budget: DEFAULT_IMAGE_STORAGE_BUDGET,
+            image_join_deadline: 10_000_000_000,
         }
     }
 }
@@ -173,6 +178,9 @@ pub struct ImageCounters {
     pub refused_storage: u64,
     /// Replies for no image, or for an image in another state; ignored.
     pub stale_replies: u64,
+    /// Awaiting cells not registered when an image was built (ADR-0100):
+    /// no free cell or spare credit, or export ids exhausted.
+    pub start_cells_refused: u64,
     /// An increment did not apply.
     pub overflowed: bool,
 }
@@ -201,6 +209,36 @@ enum State {
     Refused,
 }
 
+/// A local network subscription that awaits the images of its key
+/// (ADR-0100): the driver lends these to the table for a duty cycle, and
+/// the table registers one awaiting cell per entry and lane when it builds
+/// an image of the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AwaitingEntry {
+    /// The subscription's receive endpoint.
+    pub(crate) endpoint: EndpointId,
+    /// Its stream id.
+    pub(crate) stream_id: i32,
+    /// The subscription's registration (the attach's `parent`).
+    pub(crate) parent: u64,
+    /// Its client.
+    pub(crate) client: u64,
+    /// Its role.
+    pub(crate) role: karyos_sys::log_buffer::Role,
+}
+
+/// An awaiting cell the table registered on one lane of an image, for the
+/// driver to place on that lane's stream at `Installed`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AwaitingLane {
+    /// The lane index.
+    pub(crate) lane: usize,
+    /// The subscription it awaits.
+    pub(crate) entry: AwaitingEntry,
+    /// The registered cell.
+    pub(crate) cell: karyos_sys::log_buffer::AwaitingCell,
+}
+
 struct Image<T: StreamTerms> {
     /// The pending slot, at its challenge generation.
     slot: SlotRef,
@@ -219,6 +257,9 @@ struct Image<T: StreamTerms> {
     /// The conflated lane and the link its view shares with the receiver's
     /// seal gate (conflated-network-images.md (b)), once installed.
     freshness: Option<(Lane, karyos_sys::freshness::FreshnessLink)>,
+    /// The awaiting cells registered at the build (ADR-0100), until the
+    /// driver takes them at `Installed`.
+    awaiting: Vec<AwaitingLane>,
 }
 
 /// The conductor's image table.
@@ -255,6 +296,9 @@ pub struct LaneSource<'a> {
     /// The network is closing: no lane is built, so an image still asked
     /// for is refused with no region or memory spent on it.
     closing: bool,
+    /// The awaiting subscriptions and the driver's export counter, lent
+    /// with the lanes (ADR-0100); `None` registers no awaiting cell.
+    awaiting: Option<(&'a [AwaitingEntry], &'a mut u64)>,
     _lent: core::marker::PhantomData<&'a mut ()>,
 }
 
@@ -266,8 +310,21 @@ impl<'a> LaneSource<'a> {
             #[cfg(target_os = "linux")]
             regions: None,
             closing: false,
+            awaiting: None,
             _lent: core::marker::PhantomData,
         }
+    }
+
+    /// The same source, also lending the awaiting subscriptions and the
+    /// export counter their cells take ids from (ADR-0100).
+    #[must_use]
+    pub(crate) fn with_awaiting(
+        mut self,
+        entries: &'a [AwaitingEntry],
+        exports: &'a mut u64,
+    ) -> Self {
+        self.awaiting = Some((entries, exports));
+        self
     }
 
     /// No lanes at all: the network is closing, and every image still asked
@@ -287,6 +344,7 @@ impl<'a> LaneSource<'a> {
         Self {
             regions: Some(regions),
             closing: false,
+            awaiting: None,
             _lent: core::marker::PhantomData,
         }
     }
@@ -575,7 +633,7 @@ impl<T: StreamTerms> ImageTable<T> {
     fn create(
         &mut self,
         link: &SessionLink<T>,
-        lanes: &mut LaneSource<'_>,
+        lanes_source: &mut LaneSource<'_>,
         (endpoint, source): (EndpointId, std::net::SocketAddr),
         alias: Alias,
         slot: SlotRef,
@@ -616,6 +674,7 @@ impl<T: StreamTerms> ImageTable<T> {
             reclaimed,
             state,
             freshness: None,
+            awaiting: Vec::new(),
         };
         // Then the budget, before any allocation.
         let Some((charge, total)) = self.charge(term, joins).and_then(|charge| {
@@ -635,7 +694,7 @@ impl<T: StreamTerms> ImageTable<T> {
         }
         // A refusal drops every lane already built, its regions included,
         // before the answer.
-        let (lanes, owner) = match self.allocate(lanes, alias, term, joins) {
+        let (lanes, owner) = match self.allocate(lanes_source, alias, term, joins) {
             Ok(built) => built,
             Err(refusal) => {
                 refuse(self, refusal, command, reply);
@@ -646,8 +705,14 @@ impl<T: StreamTerms> ImageTable<T> {
         };
         self.charged = total;
         self.counters.bump(|c| &mut c.offered);
-        self.images
-            .push(image(State::Offered, lanes, charge, reclaimed));
+        // The awaiting cells, before the lanes reach the receiver, so its
+        // first consumption sample and every frame already see them
+        // (ADR-0100). A cell that cannot be registered is counted, and its
+        // subscription's attach joins at the head with a loss record.
+        let awaiting = self.register_awaiting(lanes_source, endpoint, alias, &lanes);
+        let mut built = image(State::Offered, lanes, charge, reclaimed);
+        built.awaiting = awaiting;
+        self.images.push(built);
         let _ = link.post(
             command,
             SessionCommand::InstallImage {
@@ -657,6 +722,58 @@ impl<T: StreamTerms> ImageTable<T> {
             },
         );
         None
+    }
+
+    /// Registers one awaiting cell per lane of a new image for each lent
+    /// subscription of its key (ADR-0100), with export ids from the lent
+    /// counter; a refused registration is counted and skipped.
+    fn register_awaiting(
+        &mut self,
+        source: &mut LaneSource<'_>,
+        endpoint: EndpointId,
+        alias: Alias,
+        lanes: &[Arc<LogBuffer<T>>],
+    ) -> Vec<AwaitingLane> {
+        let mut awaiting = Vec::new();
+        let Some((entries, exports)) = source.awaiting.as_mut() else {
+            return awaiting;
+        };
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.endpoint == endpoint && entry.stream_id == alias.stream_id)
+        {
+            for (lane, buffer) in lanes.iter().enumerate() {
+                let export = **exports;
+                let registered = export
+                    .checked_add(1)
+                    .filter(|_| karyos_sys::registration::valid_export(export))
+                    .ok_or(karyos_sys::error::SysError::ResourcesUnavailable)
+                    .and_then(|next| {
+                        let cell = buffer.register_awaiting(entry.role, false, export)?;
+                        **exports = next;
+                        Ok(cell)
+                    });
+                match registered {
+                    Ok(cell) => awaiting.push(AwaitingLane {
+                        lane,
+                        entry: *entry,
+                        cell,
+                    }),
+                    Err(_) => self.counters.bump(|c| &mut c.start_cells_refused),
+                }
+            }
+        }
+        awaiting
+    }
+
+    /// Takes the awaiting cells of the image installed at `slot`, for the
+    /// driver to place on its lanes' streams (ADR-0100).
+    pub(crate) fn take_awaiting(&mut self, slot: SlotRef) -> Vec<AwaitingLane> {
+        self.images
+            .iter_mut()
+            .find(|image| image.state == State::Installed(slot))
+            .map(|image| std::mem::take(&mut image.awaiting))
+            .unwrap_or_default()
     }
 
     /// The image's term bytes, `term_length * (3 + spare_slots) * lanes`;

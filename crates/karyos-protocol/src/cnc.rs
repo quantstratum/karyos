@@ -36,6 +36,7 @@
 //! | `0x12` | `AddNetworkPublicationWithRoles` | sequence | stream id as `AddNetworkPublication` | flags as `AddNetworkPublication` | channel URI length |
 //! | `0x13` | `AddNetworkSubscriptionAs` | sequence | stream id as `AddNetworkSubscription` | role as `AddSubscription` | channel URI length |
 //! | `0x14` | `RateChange` | sequence | stream and session as above | expected version | authority, operation id, operator uid, parameters digest, then the policy (see below) |
+//! | `0x15` | `AddImageSubscriptionOf` | sequence | image registration (nonzero) | parent network subscription registration (nonzero) | lane as `AddPublication` |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
 //! | `0x83` | `OperationSucceeded` | client | sequence | | |
@@ -285,6 +286,7 @@
 //! | `0xC6` | `ImageAvailable` | stream and session | network subscription registration | image registration (nonzero) | source family, port and scope (see below) | source address, high word |
 //! | `0xC7` | `ImageUnavailable` | stream and session | network subscription registration | image registration (nonzero) | | |
 //! | `0xC8` | `PublicationAdmission` | stream and session | network publication registration | admission: 1 open, 2 not joined, 3 lost required | | |
+//! | `0xC9` | `ImageJoinLoss` | parent network subscription registration (nonzero) | image registration (nonzero) | lane: below 4 | from: the lane's join | to: where the reader started, above `from` |
 //!
 //! `ImageAvailable` continues after its five words with word 5, the
 //! source address's low word. Its source in words 3 to 5 has exactly
@@ -386,6 +388,7 @@ const ADD_IMAGE_SUBSCRIPTION: u32 = 0x11;
 const ADD_NETWORK_PUBLICATION_WITH_ROLES: u32 = 0x12;
 const ADD_NETWORK_SUBSCRIPTION_AS: u32 = 0x13;
 const RATE_CHANGE: u32 = 0x14;
+const ADD_IMAGE_SUBSCRIPTION_OF: u32 = 0x15;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -412,6 +415,7 @@ const FENCED: u32 = 0xC5;
 const IMAGE_AVAILABLE: u32 = 0xC6;
 const IMAGE_UNAVAILABLE: u32 = 0xC7;
 const PUBLICATION_ADMISSION: u32 = 0xC8;
+const IMAGE_JOIN_LOSS: u32 = 0xC9;
 
 const ALLOW_UNCONNECTED: u64 = 1;
 /// `AddNetworkPublication`'s flag for a concurrent handle (M11).
@@ -868,6 +872,22 @@ pub enum Command {
         lane: Lane,
         /// The subscriber's role.
         role: SubscriberRole,
+    },
+    /// Attach lane `lane` of image `image` for the network subscription
+    /// `parent` it was announced to (`quantstratum-docs:
+    /// karyos/adr/0100-image-start-join.md`, admission version 5): the
+    /// driver takes the role from `parent`, and the reader adopts that
+    /// subscription's awaiting cell, joining at the image's join, when one
+    /// waits; otherwise it joins at the head with an `ImageJoinLoss`.
+    AddImageSubscriptionOf {
+        /// Request sequence.
+        sequence: u64,
+        /// The image's aggregate registration (nonzero).
+        image: u64,
+        /// The network subscription's registration (nonzero).
+        parent: u64,
+        /// The lane of the image's aggregate.
+        lane: Lane,
     },
     /// Subscribe `stream_id` on the channel `uri` (W5): its images are
     /// announced with `ImageAvailable`.
@@ -1678,6 +1698,7 @@ impl Command {
             Self::AddNetworkPublication { .. } => ADD_NETWORK_PUBLICATION,
             Self::AddNetworkSubscription { .. } => ADD_NETWORK_SUBSCRIPTION,
             Self::AddImageSubscription { .. } => ADD_IMAGE_SUBSCRIPTION,
+            Self::AddImageSubscriptionOf { .. } => ADD_IMAGE_SUBSCRIPTION_OF,
             Self::AddNetworkPublicationWithRoles { .. } => ADD_NETWORK_PUBLICATION_WITH_ROLES,
             Self::AddNetworkSubscriptionAs { .. } => ADD_NETWORK_SUBSCRIPTION_AS,
             Self::RateChange { .. } => RATE_CHANGE,
@@ -1705,6 +1726,7 @@ impl Command {
             | Self::AddNetworkPublication { sequence, .. }
             | Self::AddNetworkSubscription { sequence, .. }
             | Self::AddImageSubscription { sequence, .. }
+            | Self::AddImageSubscriptionOf { sequence, .. }
             | Self::AddNetworkPublicationWithRoles { sequence, .. }
             | Self::AddNetworkSubscriptionAs { sequence, .. }
             | Self::RateChange { sequence, .. } => sequence,
@@ -1939,6 +1961,12 @@ impl Command {
                 &[sequence, image, role_code(role), u64::from(lane.get())],
                 out,
             ),
+            Self::AddImageSubscriptionOf {
+                sequence,
+                image,
+                parent,
+                lane,
+            } => write_words(&[sequence, image, parent, u64::from(lane.get())], out),
             Self::AddNetworkPublicationWithRoles {
                 sequence,
                 stream_id,
@@ -2035,6 +2063,18 @@ impl Command {
                     image,
                     lane: lane_from(type_id, lane)?,
                     role: role_from(role).ok_or(CncError::Reserved { type_id })?,
+                })
+            }
+            ADD_IMAGE_SUBSCRIPTION_OF => {
+                let [sequence, image, parent, lane] = read_words::<4>(type_id, bytes)?;
+                if image == 0 || parent == 0 {
+                    return Err(CncError::Reserved { type_id });
+                }
+                Ok(Self::AddImageSubscriptionOf {
+                    sequence,
+                    image,
+                    parent,
+                    lane: lane_from(type_id, lane)?,
                 })
             }
             REMOVE_PUBLICATION => {
@@ -3097,6 +3137,22 @@ pub enum Event {
         /// The image's aggregate registration (nonzero).
         image: u64,
     },
+    /// The attach of `parent`'s reader to lane `lane` of image `image`
+    /// started at `to`, not at the lane's join `from` (ADR-0100): the
+    /// range `[from, to)` was not delivered to it. Emitted once, at the
+    /// attach.
+    ImageJoinLoss {
+        /// The network subscription's registration (nonzero).
+        parent: u64,
+        /// The image's aggregate registration (nonzero).
+        image: u64,
+        /// The lane.
+        lane: Lane,
+        /// The lane's join.
+        from: u64,
+        /// Where the reader started, above `from`.
+        to: u64,
+    },
 }
 
 impl Event {
@@ -3112,6 +3168,7 @@ impl Event {
             Self::PublicationAdmission { .. } => PUBLICATION_ADMISSION,
             Self::ImageAvailable { .. } => IMAGE_AVAILABLE,
             Self::ImageUnavailable { .. } => IMAGE_UNAVAILABLE,
+            Self::ImageJoinLoss { .. } => IMAGE_JOIN_LOSS,
         }
     }
 
@@ -3207,6 +3264,13 @@ impl Event {
                 registration,
                 image,
             } => write_words(&[stream_word(stream), registration, image], out),
+            Self::ImageJoinLoss {
+                parent,
+                image,
+                lane,
+                from,
+                to,
+            } => write_words(&[parent, image, u64::from(lane.get()), from, to], out),
         }
     }
 
@@ -3301,6 +3365,19 @@ impl Event {
                     image,
                 })
             }
+            IMAGE_JOIN_LOSS => {
+                let [parent, image, lane, from, to] = read_words::<5>(type_id, bytes)?;
+                if parent == 0 || image == 0 || to <= from {
+                    return Err(CncError::Reserved { type_id });
+                }
+                Ok(Self::ImageJoinLoss {
+                    parent,
+                    image,
+                    lane: lane_from(type_id, lane)?,
+                    from,
+                    to,
+                })
+            }
             _ => Err(CncError::UnknownType { type_id }),
         }
     }
@@ -3372,7 +3449,7 @@ mod tests {
                 Err(CncError::UnknownType { type_id })
             );
         }
-        for type_id in [PUBLICATION_ADMISSION + 1, NETWORK_SUBSCRIPTION_READY] {
+        for type_id in [IMAGE_JOIN_LOSS + 1, NETWORK_SUBSCRIPTION_READY] {
             assert_eq!(
                 Event::decode(type_id, &bytes),
                 Err(CncError::UnknownType { type_id })
@@ -4707,7 +4784,7 @@ mod tests {
             Err(CncError::Reserved { .. })
         ));
         assert!(matches!(
-            Command::decode(RATE_CHANGE + 1, &out[..length]),
+            Command::decode(ADD_IMAGE_SUBSCRIPTION_OF + 1, &out[..length]),
             Err(CncError::UnknownType { .. })
         ));
         // A lane word of 4 or more, or with any bit above the lane, is
@@ -5829,6 +5906,7 @@ mod properties {
             ADD_NETWORK_SUBSCRIPTION,
             ADD_IMAGE_SUBSCRIPTION,
             RATE_CHANGE,
+            ADD_IMAGE_SUBSCRIPTION_OF,
         ],
     };
 
@@ -5865,6 +5943,7 @@ mod properties {
             FENCED,
             IMAGE_AVAILABLE,
             IMAGE_UNAVAILABLE,
+            IMAGE_JOIN_LOSS,
         ],
     };
 
@@ -6193,6 +6272,14 @@ mod properties {
                     role,
                 }
             ),
+            (any::<u64>(), 1..=u64::MAX, 1..=u64::MAX, lane()).prop_map(
+                |(sequence, image, parent, lane)| Command::AddImageSubscriptionOf {
+                    sequence,
+                    image,
+                    parent,
+                    lane,
+                }
+            ),
             (any::<u64>(), any::<i32>(), role, "\\PC{1,100}").prop_map(
                 |(sequence, stream_id, role, uri)| Command::AddNetworkSubscription {
                     sequence,
@@ -6519,6 +6606,20 @@ mod properties {
                     image,
                 }
             }),
+            (
+                1..=u64::MAX,
+                1..=u64::MAX,
+                lane(),
+                0..u64::MAX - 1,
+                1..=u64::MAX
+            )
+                .prop_map(|(parent, image, lane, from, span)| Event::ImageJoinLoss {
+                    parent,
+                    image,
+                    lane,
+                    from,
+                    to: from.saturating_add(span).max(from + 1),
+                }),
         ]
     }
 
@@ -6544,6 +6645,7 @@ mod properties {
                     (GUARD_CLOSE, 5),
                     (GUARD_REOPEN, 6),
                     (ADD_IMAGE_SUBSCRIPTION, 4),
+                    (ADD_IMAGE_SUBSCRIPTION_OF, 4),
                 ],
             ),
         ) {
@@ -6584,6 +6686,7 @@ mod properties {
                     (FENCED, 2),
                     (IMAGE_AVAILABLE, IMAGE_AVAILABLE_WORDS),
                     (IMAGE_UNAVAILABLE, 3),
+                    (IMAGE_JOIN_LOSS, 5),
                 ],
             ),
         ) {
@@ -6622,5 +6725,85 @@ mod properties {
         ) {
             EVENTS.check_value(&event, flip, mask, cut, other)?;
         }
+    }
+}
+
+#[cfg(test)]
+mod image_start_join_vectors {
+    //! ADR-0100's wire vectors, byte for byte.
+    use super::*;
+
+    fn bytes(hex: &str) -> Vec<u8> {
+        hex.split_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+            .collect()
+    }
+
+    /// V-1, V-2, V-4 and V-5: `AddImageSubscriptionOf`.
+    #[test]
+    fn add_image_subscription_of_matches_its_vectors() {
+        let v1 = bytes(
+            "07 00 00 00 00 00 00 00 2a 00 00 00 00 00 00 00 \
+             15 00 00 00 00 00 00 00 01 00 00 00 00 00 00 00",
+        );
+        let command = Command::AddImageSubscriptionOf {
+            sequence: 7,
+            image: 0x2A,
+            parent: 0x15,
+            lane: Lane::try_new(1).unwrap(),
+        };
+        let mut out = [0u8; MAX_COMMAND_LENGTH];
+        let length = command.encode(&mut out).unwrap();
+        assert_eq!(&out[..length], v1.as_slice());
+        assert_eq!(command.type_id(), 0x15);
+        assert_eq!(Command::decode(0x15, &v1), Ok(command));
+        // V-2: a zero parent.
+        let mut v2 = v1.clone();
+        v2[16] = 0;
+        assert_eq!(
+            Command::decode(0x15, &v2),
+            Err(CncError::Reserved { type_id: 0x15 })
+        );
+        // V-4: three words.
+        assert!(matches!(
+            Command::decode(0x15, &v1[..24]),
+            Err(CncError::WrongLength { .. })
+        ));
+        // V-5: lane 4.
+        let mut v5 = v1.clone();
+        v5[24] = 4;
+        assert_eq!(
+            Command::decode(0x15, &v5),
+            Err(CncError::Reserved { type_id: 0x15 })
+        );
+    }
+
+    /// V-3 and V-3a: `ImageJoinLoss`.
+    #[test]
+    fn image_join_loss_matches_its_vectors() {
+        let v3 = bytes(
+            "09 00 00 00 00 00 00 00 2a 00 00 00 00 00 00 00 \
+             00 00 00 00 00 00 00 00 30 00 00 00 00 00 00 00 \
+             00 10 00 00 00 00 00 00",
+        );
+        let event = Event::ImageJoinLoss {
+            parent: 9,
+            image: 0x2A,
+            lane: Lane::ZERO,
+            from: 0x30,
+            to: 0x1000,
+        };
+        let mut out = [0u8; MAX_EVENT_LENGTH];
+        let length = event.encode(&mut out).unwrap();
+        assert_eq!(&out[..length], v3.as_slice());
+        assert_eq!(event.type_id(), 0xC9);
+        assert_eq!(Event::decode(0xC9, &v3), Ok(event));
+        // V-3a: `to` equal to `from`.
+        let mut v3a = v3.clone();
+        v3a[32..40].copy_from_slice(&0x30u64.to_le_bytes());
+        assert_eq!(
+            Event::decode(0xC9, &v3a),
+            Err(CncError::Reserved { type_id: 0xC9 })
+        );
     }
 }

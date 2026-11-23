@@ -789,7 +789,8 @@ impl<T: TermBytes> LogBuffer<T> {
     }
 
     /// The join point of an image; 0 for any other buffer.
-    fn join(&self) -> u64 {
+    #[must_use]
+    pub fn join(&self) -> u64 {
         match self.config.publication {
             PublicationMode::Image { join, .. } => join,
             _ => 0,
@@ -995,6 +996,34 @@ impl<T: TermBytes> LogBuffer<T> {
     #[must_use]
     pub fn conductor(&self) -> Option<Conductor<&Self>> {
         issue_conductor(self)
+    }
+
+    /// Registers a subscriber cell that awaits its adopter, as
+    /// [`Conductor::register_awaiting`] does, on a buffer whose conductor
+    /// is not taken yet: a network image's lane while it is built, before
+    /// the stream that will own its conductor exists (ADR-0100). The cell
+    /// is admitted at the head, which for a lane being built is its join.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::InvalidPublicationMode`] once the conductor is taken;
+    /// otherwise as [`Conductor::register_awaiting`].
+    pub fn register_awaiting(
+        &self,
+        role: Role,
+        reserve: bool,
+        export: u64,
+    ) -> Result<AwaitingCell, SysError> {
+        let mut conductor = issue_conductor(self).ok_or(SysError::InvalidPublicationMode {
+            reason: "awaiting cells are registered before the conductor is taken",
+        })?;
+        let registered = conductor.register_awaiting(role, reserve, export);
+        // The conductor goes back untaken: it kept no state (no quarantine,
+        // no deadline observation) that a later conductor would miss, and
+        // it has no drop glue.
+        drop(conductor);
+        self.conductor_taken.store(false, Ordering::Release);
+        registered
     }
 
     /// Takes the only conductor, owning a share of the buffer.
