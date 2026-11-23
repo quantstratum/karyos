@@ -1386,12 +1386,12 @@ impl<D: Disk + Clone> RaftLog<D> {
             }
             if slot == first {
                 // One frame: the log's last, or one past the budget.
-                let Some(entry) =
+                let Some((entry, claimed)) =
                     self.entry_alone(index, first, bytes, max_bytes, found.is_empty())?
                 else {
                     break;
                 };
-                bytes = bytes.saturating_add(entry.encoded_len());
+                bytes = bytes.saturating_add(claimed);
                 found.push(entry);
                 index = index.saturating_add(1);
                 continue;
@@ -1448,7 +1448,7 @@ impl<D: Disk + Clone> RaftLog<D> {
         let mut header = [0u8; FRAME_HEADER];
         self.store.read(position, &mut header)?;
         let frame = check_header(&header, index, term, position, span, last)?;
-        let claimed = u64::from(frame.length) + FRAME_HEADER_LEN;
+        let claimed = u64::from(frame.length).saturating_add(FRAME_HEADER_LEN);
         if !first
             && bytes
                 .checked_add(claimed)
