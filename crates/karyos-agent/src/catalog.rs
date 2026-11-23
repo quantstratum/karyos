@@ -125,8 +125,8 @@ mod watch {
     use std::time::{Duration, Instant};
 
     use karyos_archive::catalog::{FailKind, StopReason};
-    use karyos_archive::client::connection::Responses;
     use karyos_archive::client::connection::{ArchiveConnection, ControlStreams};
+    use karyos_archive::client::connection::{Requests, Responses};
     use karyos_archive::client::list::{
         ListPoll, ListedRecording, ListerConfig, Listing, RecordingLister,
     };
@@ -137,13 +137,16 @@ mod watch {
     use karyos_client::ipc::RemoteClient;
     use karyos_client::{Client, Context};
     use karyos_sys::host_clock::host_monotonic_ns;
+    use karyos_sys::term_bytes::SharedTerms;
 
     use super::CatalogConfig;
     use crate::api::{Catalog, CatalogRecording, RecordingRetention, RetentionView};
 
-    /// The correlation ids' client id of the retention state queries:
-    /// apart from the lister's and the retention operations'.
-    const RETENTION_STATE_CLIENT_ID: u32 = 0x4b52_5354;
+    /// The high 16 bits of the retention state queries' client id; the
+    /// low 16 are this process's, so two agents of one host do not share
+    /// correlation ids on the shared response stream (Codex review of
+    /// #1177).
+    const RETENTION_STATE_CLIENT_BASE: u32 = 0x4b53_0000;
     /// The recordings the view keeps the retention of at most: the pages
     /// of one query, each [`MAX_LIST_COUNT`] long.
     const MAX_RETENTION_RECORDINGS: usize = 16 * 1000;
@@ -290,55 +293,31 @@ mod watch {
         }
     }
 
-    /// Reads the Archive's retention state on a connection of its own
-    /// (ADR-0101): subscribes to its own answer stream `stream_id` first,
-    /// then pages `RetentionState` queries from the first recording until
-    /// a page comes back short, within `config.list_deadline` each. Read
-    /// only. The connection is closed before it returns.
-    fn retention_state(
-        client: &mut Client<RemoteClient>,
-        config: CatalogConfig,
-        stream_id: i32,
-        signals: &Signals,
-    ) -> Result<RetentionView, String> {
-        let own = Responses::open(client, stream_id)
-            .map_err(|error| format!("retention state stream {stream_id}: {error}"))?;
-        let (requests, shared) = match ArchiveConnection::open(
-            client,
-            ControlStreams::new(config.streams.requests, config.streams.responses),
-        ) {
-            Ok(connection) => connection.into_transports(),
-            Err(error) => {
-                own.close(client);
-                return Err(error.to_string());
-            }
-        };
-        let mut requester = RetentionStateRequester::new(
-            RETENTION_STATE_CLIENT_ID,
-            requests,
-            shared,
-            own,
-            stream_id,
-            "karyos:ipc",
-        );
-        let read = pages(client, &mut requester, config, signals);
-        let (requests, shared, own) = requester.into_transports();
-        requests.close(client);
-        shared.close(client);
-        own.close(client);
-        read
+    /// This process's retention state client id.
+    fn retention_state_client_id() -> u32 {
+        RETENTION_STATE_CLIENT_BASE | (std::process::id() & 0xFFFF)
     }
 
-    fn pages(
+    /// Reads the Archive's retention state (ADR-0101) over the lister's
+    /// own request and response handles (`requests`, `shared`), its
+    /// answers on `own`, the agent's subscription to the Archive's
+    /// retention state stream: `None` when that stream could not be
+    /// subscribed to, as on a version 1 host, which has none. The query
+    /// is sent all the same: a version 1 Archive answers it code 5
+    /// ("retention state unsupported by this Archive"), a version 2 one
+    /// with no such stream code 1. Pages from the first recording until a
+    /// page comes back short, within `config.list_deadline` each. Read
+    /// only.
+    fn retention_state(
         client: &mut Client<RemoteClient>,
-        requester: &mut RetentionStateRequester<
-            karyos_archive::client::connection::Requests<karyos_sys::term_bytes::SharedTerms>,
-            Responses<karyos_sys::term_bytes::SharedTerms>,
-            Responses<karyos_sys::term_bytes::SharedTerms>,
-        >,
+        requester: &mut RetentionStateRequester,
+        transports: (&mut Requests<SharedTerms>, &mut Responses<SharedTerms>),
+        own: Option<&mut Responses<SharedTerms>>,
         config: CatalogConfig,
         signals: &Signals,
     ) -> Result<RetentionView, String> {
+        let (requests, shared) = transports;
+        let mut own = own;
         let mut view = RetentionView::default();
         let mut from_id = 0u64;
         let page = usize::try_from(MAX_LIST_COUNT).unwrap_or(usize::MAX);
@@ -350,12 +329,17 @@ mod watch {
                     return Err("the driver closed".to_owned());
                 }
                 let _ = client.poll();
-                match requester.poll() {
+                match requester.poll(requests, shared, own.as_deref_mut()) {
                     RetentionStatePoll::Answered {
                         descriptors,
                         summary,
                     } => break (descriptors, summary),
                     RetentionStatePoll::Unsupported => return Err(UNSUPPORTED.to_owned()),
+                    RetentionStatePoll::Incomplete { received, count } => {
+                        return Err(format!(
+                            "an incomplete answer: {received} of {count} recordings arrived"
+                        ));
+                    }
                     RetentionStatePoll::Refused { code, message } => {
                         return Err(format!("refused ({code:?}): {message}"));
                     }
@@ -467,8 +451,15 @@ mod watch {
     }
 
     fn run(dir: &Path, config: CatalogConfig, shared: &Mutex<Catalog>, signals: &Signals) {
+        // One retention state requester for the thread's life: its
+        // correlation ids go on across refreshes and sessions, so a late
+        // answer to an expired query never matches a later one (Codex
+        // review of #1177).
+        let mut requester = config.streams.retention.map(|stream_id| {
+            RetentionStateRequester::new(retention_state_client_id(), stream_id, "karyos:ipc")
+        });
         while !signals.stop.load(Ordering::Acquire) {
-            if let Err(error) = session(dir, config, shared, signals) {
+            if let Err(error) = session(dir, config, shared, signals, &mut requester) {
                 fail(shared, &error);
             }
             // Between sessions only a stop matters: the signal that ended
@@ -491,6 +482,7 @@ mod watch {
         config: CatalogConfig,
         shared: &Mutex<Catalog>,
         signals: &Signals,
+        requester: &mut Option<RetentionStateRequester>,
     ) -> Result<(), String> {
         // A close seen before this connection is not this one's.
         signals.gone.store(false, Ordering::Release);
@@ -508,6 +500,13 @@ mod watch {
         .into_transports();
         let mut lister =
             RecordingLister::new(ListerConfig::new(config.client_id), requests, responses);
+        // The retention state answer stream, subscribed to once per
+        // session; a host without it (a version 1 Archive's) leaves `None`
+        // and the query still asks, to tell which it is (ADR-0101).
+        let mut own = match config.streams.retention {
+            Some(stream_id) => Responses::open(&mut client, stream_id).ok(),
+            None => None,
+        };
         loop {
             lister.start();
             let start = Instant::now();
@@ -521,8 +520,15 @@ mod watch {
                 match lister.poll() {
                     ListPoll::Done(listing) => {
                         listed(shared, listing);
-                        if let Some(stream_id) = config.streams.retention {
-                            let read = retention_state(&mut client, config, stream_id, signals);
+                        if let Some(requester) = requester.as_mut() {
+                            let read = retention_state(
+                                &mut client,
+                                requester,
+                                lister.transports_mut(),
+                                own.as_mut(),
+                                config,
+                                signals,
+                            );
                             retained(shared, read);
                         }
                         break;

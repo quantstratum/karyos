@@ -4,13 +4,22 @@
 //! section 11): one schema 1 version 2 `RetentionState` query at a time,
 //! for a tool such as the management agent.
 //!
-//! The query names a stream of the requester's own for its answer, which
-//! the requester subscribed to first: the descriptors and the summary are
-//! read there, never on the shared response stream, which a version 1
-//! reader decodes in full. The shared stream is read only for the one
-//! refusal frame a `ControlResponse` carries, by correlation id. A
-//! version 1 Archive answers code 5 there: [`RetentionStatePoll::Unsupported`].
-//! A lost answer leaves the query pending: its owner bounds the wait.
+//! The requester owns no transport: each [`RetentionStateRequester::poll`]
+//! borrows the request stream, the shared response stream and the
+//! requester's own answer stream, so it can use those of a connection
+//! another requester holds (the agent's catalog lister) and keep its
+//! correlation ids' sequence across queries. The query names the own
+//! stream for its answer: the descriptors and the summary are read there,
+//! never on the shared response stream, which a version 1 reader decodes
+//! in full. The shared stream is read only for the one refusal frame a
+//! `ControlResponse` carries, by correlation id. A version 1 Archive
+//! answers code 5 there: [`RetentionStatePoll::Unsupported`]; so a
+//! requester that could not subscribe to its own stream (a version 1 host
+//! has none) still asks, and learns which it is. An answer whose summary
+//! counts more descriptors than arrived is
+//! [`RetentionStatePoll::Incomplete`], never a short page passed as
+//! whole. A lost answer leaves the query pending: its owner bounds the
+//! wait.
 
 use super::{ControlRequests, ControlResponses};
 use crate::control::{
@@ -30,12 +39,21 @@ pub enum RetentionStatePoll {
     Idle,
     /// Sent or waiting for room; not answered yet.
     Pending,
-    /// The descriptors in the order sent, and the summary.
+    /// The descriptors in the order sent, and the summary, whose count
+    /// they match.
     Answered {
-        /// The descriptors kept, at most the query's `max_count`.
+        /// The descriptors, at most the query's `max_count`.
         descriptors: Vec<RetentionDescriptor>,
         /// The summary.
         summary: RetentionSummary,
+    },
+    /// The summary counts descriptors that did not arrive (lost on the way,
+    /// or the own stream lapped): the page is not whole.
+    Incomplete {
+        /// The descriptors that arrived.
+        received: u64,
+        /// The descriptors the summary counts.
+        count: u64,
     },
     /// The Archive has no version 2: "retention state unsupported by this
     /// Archive".
@@ -65,13 +83,10 @@ enum Step {
     },
 }
 
-/// The requester.
+/// The requester: its correlation ids and the query under way.
 #[derive(Debug)]
-pub struct RetentionStateRequester<Q, R, A> {
+pub struct RetentionStateRequester {
     client_id: u32,
-    requests: Q,
-    shared: R,
-    own: A,
     own_stream_id: i32,
     own_channel: String,
     next: u32,
@@ -81,26 +96,14 @@ pub struct RetentionStateRequester<Q, R, A> {
     answer: Vec<u8>,
 }
 
-impl<Q: ControlRequests, R: ControlResponses, A: ControlResponses>
-    RetentionStateRequester<Q, R, A>
-{
-    /// A requester for `client_id` over `requests`, the `shared` response
-    /// stream and `own`, its own answer stream: stream `own_stream_id` of
-    /// `own_channel`.
+impl RetentionStateRequester {
+    /// A requester for `client_id`, unique among the Archive's requesters
+    /// (archive-control-codec.md section 7a), whose answers go to its own
+    /// stream `own_stream_id` of `own_channel`.
     #[must_use]
-    pub fn new(
-        client_id: u32,
-        requests: Q,
-        shared: R,
-        own: A,
-        own_stream_id: i32,
-        own_channel: &str,
-    ) -> Self {
+    pub fn new(client_id: u32, own_stream_id: i32, own_channel: &str) -> Self {
         Self {
             client_id,
-            requests,
-            shared,
-            own,
             own_stream_id,
             own_channel: own_channel.to_owned(),
             next: 1,
@@ -111,14 +114,9 @@ impl<Q: ControlRequests, R: ControlResponses, A: ControlResponses>
         }
     }
 
-    /// Its transports back.
-    #[must_use]
-    pub fn into_transports(self) -> (Q, R, A) {
-        (self.requests, self.shared, self.own)
-    }
-
     /// Begins a query of at most `max_count` recordings from `from_id`
-    /// (inclusive; 0 from the first).
+    /// (inclusive; 0 from the first), dropping one under way. Its
+    /// correlation id continues the requester's sequence.
     pub fn start(&mut self, from_id: u64, max_count: u32) {
         self.descriptors.clear();
         let low = self.next;
@@ -131,7 +129,7 @@ impl<Q: ControlRequests, R: ControlResponses, A: ControlResponses>
         };
     }
 
-    fn send(&mut self) -> Option<RetentionStatePoll> {
+    fn send<Q: ControlRequests>(&mut self, requests: &mut Q) -> Option<RetentionStatePoll> {
         let Step::Sending {
             correlation_id,
             from_id,
@@ -155,25 +153,33 @@ impl<Q: ControlRequests, R: ControlResponses, A: ControlResponses>
             self.step = Step::Idle;
             return Some(RetentionStatePoll::Invalid);
         };
-        if !self.requests.send(bytes) {
+        if !requests.send(bytes) {
             return Some(RetentionStatePoll::Pending);
         }
         self.step = Step::Waiting { correlation_id };
         None
     }
 
-    /// Sends the query when there is room and reads the answers there are.
-    pub fn poll(&mut self) -> RetentionStatePoll {
-        if let Some(answer) = self.send() {
+    /// Sends the query when there is room and reads the answers there are:
+    /// on `own`, the requester's answer stream when it could subscribe to
+    /// it, and the refusal on `shared`.
+    pub fn poll<Q: ControlRequests, R: ControlResponses, A: ControlResponses>(
+        &mut self,
+        requests: &mut Q,
+        shared: &mut R,
+        own: Option<&mut A>,
+    ) -> RetentionStatePoll {
+        if let Some(answer) = self.send(requests) {
             return answer;
         }
         let Step::Waiting { correlation_id } = self.step else {
             return RetentionStatePoll::Idle;
         };
         let mut answer = std::mem::take(&mut self.answer);
-        let ended = self
-            .read_own(&mut answer, correlation_id)
-            .or_else(|| self.read_shared(&mut answer, correlation_id));
+        let mut ended = own.and_then(|own| self.read_own(own, &mut answer, correlation_id));
+        if ended.is_none() {
+            ended = Self::read_shared(shared, &mut answer, correlation_id);
+        }
         self.answer = answer;
         match ended {
             Some(ended) => {
@@ -185,11 +191,16 @@ impl<Q: ControlRequests, R: ControlResponses, A: ControlResponses>
     }
 
     /// The answer on the requester's own stream: descriptors kept up to
-    /// the query's bound, until the summary.
-    fn read_own(&mut self, answer: &mut [u8], correlation_id: u64) -> Option<RetentionStatePoll> {
+    /// the query's bound, until the summary, whose count they must match.
+    fn read_own<A: ControlResponses>(
+        &mut self,
+        own: &mut A,
+        answer: &mut [u8],
+        correlation_id: u64,
+    ) -> Option<RetentionStatePoll> {
         let max = usize::try_from(MAX_LIST_COUNT).unwrap_or(usize::MAX);
         for _ in 0..ANSWERS_PER_POLL {
-            let length = self.own.next(answer)?;
+            let length = own.next(answer)?;
             let Some(bytes) = answer.get(..length) else {
                 continue;
             };
@@ -204,6 +215,14 @@ impl<Q: ControlRequests, R: ControlResponses, A: ControlResponses>
                 Ok(ControlMessage::RetentionSummary(summary))
                     if summary.correlation_id == correlation_id =>
                 {
+                    let received = u64::try_from(self.descriptors.len()).unwrap_or(u64::MAX);
+                    if received != summary.count {
+                        self.descriptors.clear();
+                        return Some(RetentionStatePoll::Incomplete {
+                            received,
+                            count: summary.count,
+                        });
+                    }
                     return Some(RetentionStatePoll::Answered {
                         descriptors: std::mem::take(&mut self.descriptors),
                         summary,
@@ -216,13 +235,13 @@ impl<Q: ControlRequests, R: ControlResponses, A: ControlResponses>
     }
 
     /// A refusal on the shared stream: the query's `ControlResponse`.
-    fn read_shared(
-        &mut self,
+    fn read_shared<R: ControlResponses>(
+        shared: &mut R,
         answer: &mut [u8],
         correlation_id: u64,
     ) -> Option<RetentionStatePoll> {
         for _ in 0..ANSWERS_PER_POLL {
-            let length = self.shared.next(answer)?;
+            let length = shared.next(answer)?;
             let Some(bytes) = answer.get(..length) else {
                 continue;
             };
@@ -284,31 +303,25 @@ mod tests {
         }
     }
 
-    fn rig() -> (
-        RetentionStateRequester<Stream, Stream, Stream>,
-        Stream,
-        Stream,
-        Stream,
-    ) {
-        let (requests, shared, own) = (Stream::default(), Stream::default(), Stream::default());
-        let requester = RetentionStateRequester::new(
-            7,
-            requests.clone(),
-            shared.clone(),
-            own.clone(),
-            77,
-            "karyos:ipc",
-        );
-        (requester, requests, shared, own)
+    fn rig() -> (RetentionStateRequester, Stream, Stream, Stream) {
+        (
+            RetentionStateRequester::new(7, 77, "karyos:ipc"),
+            Stream::default(),
+            Stream::default(),
+            Stream::default(),
+        )
     }
 
     /// The query names its own stream; its descriptors and summary are
     /// read there, another requester's are skipped.
     #[test]
     fn a_query_is_answered_on_its_own_stream() {
-        let (mut requester, requests, _shared, own) = rig();
+        let (mut requester, requests, mut shared, own) = rig();
+        let mut poll = |requester: &mut RetentionStateRequester| {
+            requester.poll(&mut requests.clone(), &mut shared, Some(&mut own.clone()))
+        };
         requester.start(0, 100);
-        assert_eq!(requester.poll(), RetentionStatePoll::Pending);
+        assert_eq!(poll(&mut requester), RetentionStatePoll::Pending);
         let sent = requests.0.lock().unwrap().pop_front().unwrap();
         let ControlMessage::RetentionState(query) = ControlMessage::decode(&sent).unwrap() else {
             panic!("a query");
@@ -342,13 +355,34 @@ mod tests {
         };
         own.push(&ControlMessage::RetentionSummary(summary));
         assert_eq!(
-            requester.poll(),
+            poll(&mut requester),
             RetentionStatePoll::Answered {
                 descriptors: vec![descriptor(id, 1)],
                 summary,
             }
         );
-        assert_eq!(requester.poll(), RetentionStatePoll::Idle);
+        assert_eq!(poll(&mut requester), RetentionStatePoll::Idle);
+        // Codex review of #1177: a summary counting a descriptor that was
+        // lost is an incomplete page, never a short one passed as whole;
+        // the sequence goes on across queries.
+        requester.start(0, 100);
+        assert_eq!(poll(&mut requester), RetentionStatePoll::Pending);
+        let sent = requests.0.lock().unwrap().pop_front().unwrap();
+        let next = u64::from_le_bytes(sent[12..20].try_into().unwrap());
+        assert_eq!(next, id + 1);
+        own.push(&ControlMessage::RetentionDescriptor(descriptor(next, 1)));
+        own.push(&ControlMessage::RetentionSummary(RetentionSummary {
+            correlation_id: next,
+            count: 2,
+            ..summary
+        }));
+        assert_eq!(
+            poll(&mut requester),
+            RetentionStatePoll::Incomplete {
+                received: 1,
+                count: 2,
+            }
+        );
     }
 
     /// A version 1 Archive's code 5 is "unsupported"; another refusal is
@@ -356,6 +390,13 @@ mod tests {
     #[test]
     fn refusals_and_an_archive_without_version_2() {
         let (mut requester, requests, shared, _own) = rig();
+        let poll = |requester: &mut RetentionStateRequester| {
+            requester.poll::<Stream, Stream, Stream>(
+                &mut requests.clone(),
+                &mut shared.clone(),
+                None,
+            )
+        };
         for (code, expected) in [
             (
                 ResponseCode::UnsupportedSchema,
@@ -370,7 +411,7 @@ mod tests {
             ),
         ] {
             requester.start(0, 10);
-            assert_eq!(requester.poll(), RetentionStatePoll::Pending);
+            assert_eq!(poll(&mut requester), RetentionStatePoll::Pending);
             let sent = requests.0.lock().unwrap().pop_front().unwrap();
             let correlation_id = u64::from_le_bytes(sent[12..20].try_into().unwrap());
             shared.push(&ControlMessage::ControlResponse(ControlResponse {
@@ -383,10 +424,10 @@ mod tests {
                     ""
                 },
             }));
-            assert_eq!(requester.poll(), expected);
+            assert_eq!(poll(&mut requester), expected);
         }
         requester.start(0, 0);
-        assert_eq!(requester.poll(), RetentionStatePoll::Invalid);
+        assert_eq!(poll(&mut requester), RetentionStatePoll::Invalid);
         assert!(requests.0.lock().unwrap().is_empty());
     }
 }

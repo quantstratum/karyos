@@ -179,6 +179,13 @@ impl<Q: ControlRequests, R: ControlResponses> RecordingLister<Q, R> {
         (self.requests, self.responses)
     }
 
+    /// Its transports, borrowed: another requester of the same Archive (a
+    /// retention state query, ADR-0101) uses them between listings, so a
+    /// connection holds one request and one response handle only.
+    pub fn transports_mut(&mut self) -> (&mut Q, &mut R) {
+        (&mut self.requests, &mut self.responses)
+    }
+
     /// Begins a listing from the first recording, dropping one under way.
     pub fn start(&mut self) {
         self.begin(0, None);

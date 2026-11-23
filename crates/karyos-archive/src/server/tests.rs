@@ -1681,20 +1681,19 @@ fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
         Asking(rig.requests.clone()),
         shared(before),
     );
-    let mut agent = RetentionStateRequester::new(
-        0x4b52_5354,
-        Asking(rig.requests.clone()),
-        shared(before),
-        Reader {
-            sent: Arc::clone(&answers.sent),
-            next: 0,
-        },
-        77,
-        "karyos:ipc",
-    );
+    let mut agent = RetentionStateRequester::new(0x4b52_5354, 77, "karyos:ipc");
+    let mut agent_requests = Asking(rig.requests.clone());
+    let mut agent_shared = shared(before);
+    let mut agent_own = Reader {
+        sent: Arc::clone(&answers.sent),
+        next: 0,
+    };
+    let mut ask = |agent: &mut RetentionStateRequester| {
+        agent.poll(&mut agent_requests, &mut agent_shared, Some(&mut agent_own))
+    };
     // The agent's query first, then the replay behind it.
     agent.start(0, 1000);
-    assert_eq!(agent.poll(), RetentionStatePoll::Pending);
+    assert_eq!(ask(&mut agent), RetentionStatePoll::Pending);
     let asked = std::time::Instant::now();
     replayer.start(&ReplaySpec::new(1, 0, 20), asked).unwrap();
     let mut page = None;
@@ -1703,7 +1702,7 @@ fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
     while (page.is_none() || started.is_none()) && begun.elapsed() < Duration::from_secs(30) {
         rig.server.duty();
         if page.is_none() {
-            match agent.poll() {
+            match ask(&mut agent) {
                 RetentionStatePoll::Pending => {}
                 RetentionStatePoll::Answered {
                     descriptors,

@@ -1249,3 +1249,128 @@ fn the_view_shows_the_retention_state_of_a_running_archive() {
     server.shutdown().unwrap();
     let _ = std::fs::remove_dir_all(&archive_dir);
 }
+
+/// ADR-0101 and the Codex review of #1177: a version 1 Archive's host has
+/// no retention state stream, so the agent cannot subscribe to it; it asks
+/// all the same over its lister's handles, the Archive answers the
+/// version 2 query with code 5, and the view says the retention state is
+/// unsupported by this Archive, not a stream error.
+#[test]
+fn a_version_1_archive_shows_its_retention_state_unsupported() {
+    use karyos_agent::catalog::{ArchiveStreams, CatalogConfig};
+    use karyos_archive::control::{ControlMessage, ControlResponse, ResponseCode};
+    use karyos_archive::server::MAX_ANSWER;
+    use karyos_client::{MessageLimit, OfferOutcome};
+    use karyos_driver::{LossPolicy, StreamConfig};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    const REQUESTS: i32 = 100;
+    const RESPONSES: i32 = 101;
+    let stream = |stream_id, publication| StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 6,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    };
+    let _serial = serial();
+    let dir = dir("retention-v1");
+    let mut driver = driver(&dir, DriverConfig::default(), 4);
+    // Only the two control streams: a version 1 host has no state stream.
+    let requests = driver
+        .add_stream(stream(
+            REQUESTS,
+            PublicationMode::Concurrent {
+                publishers: 2,
+                allow_non_lse: true,
+            },
+        ))
+        .unwrap();
+    let responses = driver
+        .add_stream(stream(RESPONSES, PublicationMode::Exclusive))
+        .unwrap();
+    let mut reading = driver.subscribe(requests, Role::Optional).unwrap();
+    let mut answering = driver.publication(responses).unwrap();
+    let agent = Agent::new(
+        AgentConfig::new(vec![dir.clone()]).with_archive(
+            dir.clone(),
+            CatalogConfig::new(ArchiveStreams::new(REQUESTS, RESPONSES).with_retention(77))
+                .with_timing(
+                    Duration::from_secs(2),
+                    Duration::from_secs(5),
+                    Duration::from_millis(50),
+                ),
+        ),
+    );
+    let mut out = vec![0u8; MAX_ANSWER];
+    let start = Instant::now();
+    let retention = loop {
+        assert!(start.elapsed() < Duration::from_secs(30), "no answer");
+        let _ = driver.do_work().unwrap();
+        // The version 1 Archive: an empty catalog, and code 5, with the
+        // request's correlation id (bytes 12 to 19), for anything else.
+        let mut asked = Vec::new();
+        let _ = reading.poll(
+            |bytes, _| {
+                let correlation_id = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+                let listing = matches!(
+                    ControlMessage::decode(bytes),
+                    Ok(ControlMessage::ListRecordings(_))
+                ) && bytes[4] == 1;
+                asked.push((correlation_id, listing));
+            },
+            MessageLimit::new(8),
+        );
+        for (correlation_id, listing) in asked {
+            let (code, message) = if listing {
+                (ResponseCode::Ok, "")
+            } else {
+                (ResponseCode::UnsupportedSchema, "unsupported")
+            };
+            let length = ControlMessage::ControlResponse(ControlResponse {
+                correlation_id,
+                id: 0,
+                code,
+                message,
+            })
+            .encode(&mut out)
+            .unwrap();
+            while !matches!(
+                answering.offer(&out[..length]),
+                Ok(OfferOutcome::Accepted { .. })
+            ) {
+                let _ = driver.do_work().unwrap();
+            }
+        }
+        if let Some(retention) = agent.view().drivers[0]
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.retention.clone())
+        {
+            break retention;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(
+        retention.last_error.as_deref(),
+        Some("retention state unsupported by this Archive"),
+        "{retention:?}"
+    );
+    assert!(retention.recordings.is_empty());
+    drop(agent);
+}
