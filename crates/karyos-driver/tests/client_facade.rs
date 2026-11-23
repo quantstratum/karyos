@@ -2395,6 +2395,86 @@ fn a_network_subscription_attaches_its_images_with_its_options() {
     }
 }
 
+/// ADR-0100 (karyos#844): a network subscription that exists before its
+/// publication's image reads the first message, offered once the
+/// publication was connected and before the subscribing client even
+/// polled for the image: the client attaches with `AddImageSubscriptionOf`
+/// and adopts its awaiting cell at the image's join, so nothing offered
+/// in between is missed, and no join loss is reported.
+#[test]
+fn a_network_subscription_reads_the_first_message_offered_before_its_attach() {
+    use karyos_client::{RejoinPolicy, SubscriberRole, SubscriptionOptions};
+
+    let (_a, mut a) = driven(1, None);
+    let (_b, mut b) = driven(1, None);
+    let mut publisher = Client::with_conductor(a.remove(0), context());
+    let mut subscriber = Client::with_conductor(b.remove(0), context());
+    let port = port();
+    let mut reading = subscriber
+        .add_subscription_with(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}"),
+            StreamId::new(7),
+            SubscriptionOptions::new(SubscriberRole::Optional, RejoinPolicy::Close),
+        )
+        .unwrap();
+    // The subscription reaches the driver before any image exists.
+    for _ in 0..200 {
+        let _ = subscriber.poll();
+        let _ = reading.poll(|_, _| {}, MessageLimit::new(0));
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut publication = publisher
+        .add_exclusive_publication(
+            &format!("karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1"),
+            StreamId::new(7),
+        )
+        .unwrap();
+    // The first message goes as soon as the publication is connected,
+    // while the subscribing client has not polled for the image yet.
+    let start = Instant::now();
+    loop {
+        assert!(start.elapsed() < Duration::from_secs(20), "never connected");
+        let _ = publisher.poll();
+        match publication.offer(&0u32.to_le_bytes()) {
+            Ok(_) => break,
+            Err(OfferError::BackPressured | OfferError::AdminAction | OfferError::NotConnected) => {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+    let mut first = None;
+    let start = Instant::now();
+    while first.is_none() {
+        assert!(start.elapsed() < Duration::from_secs(20), "nothing read");
+        let _ = publisher.poll();
+        let _ = subscriber.poll();
+        let _ = reading
+            .poll(
+                |data, _| {
+                    if first.is_none() {
+                        first = data.get(..4).map(<[u8]>::to_vec);
+                    }
+                },
+                MessageLimit::new(16),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    assert_eq!(
+        first,
+        Some(0u32.to_le_bytes().to_vec()),
+        "the first message"
+    );
+    let mut losses = 0;
+    reading.image_changes(&mut |change| {
+        if change.join_loss.is_some() {
+            losses += 1;
+        }
+    });
+    assert_eq!(losses, 0);
+}
+
 /// An image takes a copy of its network subscription's policy: an
 /// optional reader under `Close` that never polls is lapped as its image
 /// fills past its window, and the poll then reports the overrun that

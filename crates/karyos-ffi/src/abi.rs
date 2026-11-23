@@ -1125,7 +1125,11 @@ pub struct MessageInfo {
 /// KARYOS_END_NONE for an attached image, and for one released unsealed
 /// when its client closed. Set size to sizeof(karyos_image_change): a
 /// caller built against the first version sets 24 and gets no end fields,
-/// one built with them sets at least KARYOS_IMAGE_CHANGE_SIZE_ENDS.
+/// one built with them sets at least KARYOS_IMAGE_CHANGE_SIZE_ENDS, and one
+/// built with the join loss fields (ADR-0100) at least
+/// KARYOS_IMAGE_CHANGE_SIZE_JOIN_LOSS. A change with join_loss_to above
+/// join_loss_from reports an attach that started above its lane's join:
+/// the range [join_loss_from, join_loss_to) was not delivered to it.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ImageChange {
@@ -1149,6 +1153,11 @@ pub struct ImageChange {
     pub end_position: u64,
     /// The seal's raw reason code; 0 with no end.
     pub seal_code: u64,
+    /// An attach's join loss (ADR-0100): the lane's join; 0 with none.
+    pub join_loss_from: u64,
+    /// Where that attach started; 0 with none, so `join_loss_to` above
+    /// `join_loss_from` marks a loss.
+    pub join_loss_to: u64,
 }
 
 /// The size of `karyos_image_change` in ABI 0.1.0.
@@ -1159,6 +1168,12 @@ const IMAGE_CHANGE_SIZE_0_1: u32 = 24;
 /// the library writes by the caller's size and needs no constant.
 #[cfg(test)]
 pub(crate) const IMAGE_CHANGE_SIZE_ENDS: u32 = 48;
+
+/// The size of `karyos_image_change` with its join loss fields
+/// (`KARYOS_IMAGE_CHANGE_SIZE_JOIN_LOSS`, ADR-0100), checked as
+/// [`IMAGE_CHANGE_SIZE_ENDS`] is.
+#[cfg(test)]
+pub(crate) const IMAGE_CHANGE_SIZE_JOIN_LOSS: u32 = 64;
 
 /// Called once per message with the caller's context, the message's length
 /// bytes at data (a private copy, never a term or a shared mapping, valid
@@ -1974,6 +1989,8 @@ unsafe fn write_image_change(change: *mut ImageChange, next: &karyos_client::Ima
         reserved: 0,
         end_position,
         seal_code,
+        join_loss_from: next.join_loss.map_or(0, |loss| loss.from),
+        join_loss_to: next.join_loss.map_or(0, |loss| loss.to),
     };
     // SAFETY: the caller's contract on `change`.
     unsafe { write_sized(change, IMAGE_CHANGE_SIZE_0_1, filled) };

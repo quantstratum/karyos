@@ -719,6 +719,10 @@ fn the_header_states_the_replay_rates_and_end_codes() {
             "KARYOS_IMAGE_CHANGE_SIZE_ENDS",
             crate::abi::IMAGE_CHANGE_SIZE_ENDS,
         ),
+        (
+            "KARYOS_IMAGE_CHANGE_SIZE_JOIN_LOSS",
+            crate::abi::IMAGE_CHANGE_SIZE_JOIN_LOSS,
+        ),
     ] {
         assert_eq!(defines[name], i64::from(value), "{name}");
     }

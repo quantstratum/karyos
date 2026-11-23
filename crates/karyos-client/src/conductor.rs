@@ -1116,8 +1116,11 @@ impl<T: TermBytes> ClientConductor<T> {
     /// Requests a subscription to lane `lane` of the network image whose
     /// aggregate registration is `image`, of the alias `stream`
     /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-5):
-    /// `AddImageSubscription`, recorded as a [`Request::Subscription`] of
-    /// the alias, so the grant is checked against it as any other.
+    /// `AddImageSubscriptionOf` naming `parent`, the network subscription
+    /// the image was announced to, so the reader adopts its awaiting cell
+    /// at the image's join (ADR-0100); the driver takes the role from
+    /// `parent`. Recorded as a [`Request::Subscription`] of the alias with
+    /// `role`, so the grant is checked against it as any other.
     ///
     /// # Errors
     ///
@@ -1126,16 +1129,17 @@ impl<T: TermBytes> ClientConductor<T> {
         &mut self,
         stream: StreamKey,
         image: u64,
+        parent: u64,
         lane: Lane,
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         let request = Request::Subscription { stream, lane, role };
         let sequence = self.submit(Kind::AddSubscription, Some(request), |sequence| {
-            Command::AddImageSubscription {
+            Command::AddImageSubscriptionOf {
                 sequence,
                 image,
+                parent,
                 lane,
-                role,
             }
         })?;
         // Its grant is an image's: a local close of the alias spares it.

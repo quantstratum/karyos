@@ -376,6 +376,9 @@ pub const KARYOS_E_INTERNAL: i32 = 500;
 /// The size of karyos_image_change with its end fields.
 pub const KARYOS_IMAGE_CHANGE_SIZE_ENDS: u32 = 48;
 
+/// The size of karyos_image_change with its join loss fields (ADR-0100).
+pub const KARYOS_IMAGE_CHANGE_SIZE_JOIN_LOSS: u32 = 64;
+
 /// Replay rates: as fast as the target takes it; at the recorded pace; the
 /// recorded pace scaled by scale_ppm (parts per million, 1 to 100000000).
 pub const KARYOS_REPLAY_FULL: u32 = 1;

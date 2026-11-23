@@ -1061,6 +1061,8 @@ fn a_subscription_delivers_each_message_from_its_private_copy() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     let (mut has, mut lost) = (u32::MAX, u64::MAX);
     // SAFETY: live, aligned out-parameters.
@@ -1248,6 +1250,8 @@ fn image_changes_and_bad_arguments() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     let (mut has, mut lost) = (u32::MAX, u64::MAX);
     // SAFETY: live, aligned out-parameters.
@@ -1471,6 +1475,8 @@ fn a_network_subscription_grows_its_copy_with_a_larger_image() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     // SAFETY: live, aligned out-parameters.
     let status =
@@ -1577,6 +1583,8 @@ fn a_retired_images_change_carries_its_end() {
                 reserved: 7,
                 end_position: 7,
                 seal_code: 7,
+                join_loss_from: 7,
+                join_loss_to: 7,
             };
             let mut publisher = publisher;
             let start = std::time::Instant::now();
@@ -1702,6 +1710,8 @@ fn next_image_change_checks_its_struct_before_its_handle() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     // SAFETY: live, aligned out-parameters.
     let status = unsafe { karyos_subscription_next_image_change(stale, &mut change, &mut has) };
@@ -1919,6 +1929,8 @@ fn an_image_change_is_written_by_the_callers_size() {
         reserved: 7,
         end_position: 7,
         seal_code: 7,
+        join_loss_from: 7,
+        join_loss_to: 7,
     };
     // The first header's struct: the end fields are past its size.
     let mut first = filled(IMAGE_CHANGE_SIZE_0_1);
@@ -1963,7 +1975,21 @@ fn an_image_change_is_written_by_the_callers_size() {
             SealReason::ImageRetired.code()
         )
     );
-    assert_eq!(size_of_u32::<ImageChange>(), IMAGE_CHANGE_SIZE_ENDS);
+    // The 48-byte struct keeps the join loss fields past its size.
+    assert_eq!((current.join_loss_from, current.join_loss_to), (7, 7));
+    assert_eq!(size_of_u32::<ImageChange>(), IMAGE_CHANGE_SIZE_JOIN_LOSS);
+    // ADR-0100: a 64-byte struct takes an attach's join loss, and zeros
+    // for a change that carries none.
+    let lost = karyos_client::ImageChange::new(1, 1, lane, true)
+        .with_join_loss(Some(karyos_client::JoinLoss::new(64, 4096)));
+    let mut joined = filled(IMAGE_CHANGE_SIZE_JOIN_LOSS);
+    // SAFETY: `joined` is live, aligned and of its size.
+    unsafe { write_image_change(&raw mut joined, &lost) };
+    assert_eq!((joined.join_loss_from, joined.join_loss_to), (64, 4096));
+    let mut plain = filled(IMAGE_CHANGE_SIZE_JOIN_LOSS);
+    // SAFETY: as above.
+    unsafe { write_image_change(&raw mut plain, &retired) };
+    assert_eq!((plain.join_loss_from, plain.join_loss_to), (0, 0));
     // A clean end, an end whose seal is not positioned, and an arrival.
     for (change, fields) in [
         (
@@ -1991,21 +2017,22 @@ fn an_image_change_is_written_by_the_callers_size() {
             fields
         );
     }
-    // A struct of a newer header, 8 bytes longer: its tail stays.
+    // A struct of a newer header, 8 bytes longer than this one: its tail
+    // stays.
     #[repr(C)]
     struct Newer {
         change: ImageChange,
         tail: u64,
     }
     let mut newer = Newer {
-        change: filled(56),
+        change: filled(IMAGE_CHANGE_SIZE_JOIN_LOSS + 8),
         tail: 0xA5A5,
     };
-    // SAFETY: `newer` is live, aligned and 56 bytes, its size.
+    // SAFETY: `newer` is live, aligned and 72 bytes, its size.
     unsafe { write_image_change(&raw mut newer.change, &retired) };
     assert_eq!(
         (newer.change.size, newer.change.end_position, newer.tail),
-        (56, 4096, 0xA5A5)
+        (72, 4096, 0xA5A5)
     );
 }
 
@@ -3177,6 +3204,138 @@ fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
         ..Opened::default()
     };
     refuses_udp(client);
+}
+
+/// ADR-0100 (karyos#844), through the C ABI: an optional network
+/// subscription whose client does not poll while the publisher sends past
+/// the image's window attaches late; its awaiting cell is raised to the
+/// floor, and `karyos_subscription_next_image_change` reports the range
+/// it did not read, `[join_loss_from, join_loss_to)`, after the image's
+/// attach.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_late_attach_reports_its_join_loss_through_the_c_abi() {
+    let _drivers = crate::test_drivers::drivers(1);
+    const STREAM: i32 = 736;
+    let (status, driver, publisher) = network_driver(api::driver::NETWORK_ON);
+    assert_eq!(status, Status::Ok.code());
+    let mut subscriber = 0;
+    // SAFETY: a live, aligned `u64`; no detail.
+    let status = unsafe { karyos_driver_connect(driver, &mut subscriber, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    let mut opened = Opened {
+        driver,
+        client: publisher,
+        ..Opened::default()
+    };
+    let port = test_port();
+    let receive = std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{port}")).unwrap();
+    let send = std::ffi::CString::new(format!(
+        "karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1|term-length=65536"
+    ))
+    .unwrap();
+    let mut options = subscription_defaults();
+    options.role = crate::abi::ROLE_OPTIONAL;
+    let mut subscription = 0;
+    // SAFETY: live C string, options and `u64`; no detail.
+    let status = unsafe {
+        karyos_client_add_subscription_with(
+            subscriber,
+            receive.as_ptr(),
+            STREAM,
+            &options,
+            &mut subscription,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::Ok.code());
+    // The subscription reaches the driver before the image exists.
+    for _ in 0..50 {
+        let _ = poll(subscriber);
+        idle();
+    }
+    let mut publication = 0;
+    // SAFETY: a live C string and `u64`; no detail.
+    let status = unsafe {
+        karyos_client_add_publication(
+            publisher,
+            send.as_ptr(),
+            STREAM,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::Ok.code());
+    opened.publication = publication;
+    // Past the image's window (half a 64 KiB term) while the subscriber
+    // does not poll, so the floor passes its awaiting cell.
+    let payload = [7u8; 1000];
+    let (mut sent, start) = (0usize, std::time::Instant::now());
+    while sent < 256 * 1000 {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "sent {sent}"
+        );
+        let mut done = accepted();
+        // SAFETY: `payload` and `done` are live for the call.
+        let offered = unsafe {
+            karyos_publication_offer(publication, 0, payload.as_ptr(), payload.len(), &mut done)
+        };
+        if offered == Status::Ok.code() {
+            sent += payload.len();
+        }
+        let _ = poll(publisher);
+    }
+    // Now the subscriber attaches, and is told what it did not read.
+    let mut loss = None;
+    let start = std::time::Instant::now();
+    while loss.is_none() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "no join loss"
+        );
+        let _ = poll(subscriber);
+        let mut delivered = 0;
+        let mut seen = 0u32;
+        // SAFETY: a live context and count.
+        let _ = unsafe {
+            karyos_subscription_poll(
+                subscription,
+                Some(count_message),
+                (&raw mut seen).cast(),
+                16,
+                &mut delivered,
+            )
+        };
+        let mut change = ImageChange {
+            size: IMAGE_CHANGE_SIZE_JOIN_LOSS,
+            session_id: 0,
+            image_id: 0,
+            lane: 0,
+            available: 0,
+            end_reason: 0,
+            reserved: 0,
+            end_position: 0,
+            seal_code: 0,
+            join_loss_from: 0,
+            join_loss_to: 0,
+        };
+        let mut has = 0;
+        // SAFETY: live, aligned out-parameters of their sizes.
+        let status =
+            unsafe { karyos_subscription_next_image_change(subscription, &mut change, &mut has) };
+        assert_eq!(status, Status::Ok.code());
+        if has == 1 && change.join_loss_to > change.join_loss_from {
+            loss = Some(change);
+        }
+        idle();
+    }
+    let loss = loss.unwrap();
+    assert_eq!(loss.available, 1);
+    assert_ne!(loss.image_id, 0, "the attach it belongs to");
+    assert!(loss.join_loss_to - loss.join_loss_from >= 32 * 1024);
+    opened.subscription = subscription;
+    assert_eq!(karyos_client_close(subscriber), Status::Ok.code());
 }
 
 /// ADR-0099: a network publication is exclusive, so a driver with its

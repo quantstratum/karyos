@@ -770,6 +770,11 @@ extern "C" {
 #define KARYOS_IMAGE_CHANGE_SIZE_ENDS 48
 
 /**
+ * The size of karyos_image_change with its join loss fields (ADR-0100).
+ */
+#define KARYOS_IMAGE_CHANGE_SIZE_JOIN_LOSS 64
+
+/**
  * Replay rates: as fast as the target takes it; at the recorded pace; the
  * recorded pace scaled by scale_ppm (parts per million, 1 to 100000000).
  */
@@ -1135,7 +1140,11 @@ typedef void (*karyos_message_handler)(void *context,
  * KARYOS_END_NONE for an attached image, and for one released unsealed
  * when its client closed. Set size to sizeof(karyos_image_change): a
  * caller built against the first version sets 24 and gets no end fields,
- * one built with them sets at least KARYOS_IMAGE_CHANGE_SIZE_ENDS.
+ * one built with them sets at least KARYOS_IMAGE_CHANGE_SIZE_ENDS, and one
+ * built with the join loss fields (ADR-0100) at least
+ * KARYOS_IMAGE_CHANGE_SIZE_JOIN_LOSS. A change with join_loss_to above
+ * join_loss_from reports an attach that started above its lane's join:
+ * the range [join_loss_from, join_loss_to) was not delivered to it.
  */
 typedef struct karyos_image_change {
     /**
@@ -1176,6 +1185,15 @@ typedef struct karyos_image_change {
      * The seal's raw reason code; 0 with no end.
      */
     uint64_t seal_code;
+    /**
+     * An attach's join loss (ADR-0100): the lane's join; 0 with none.
+     */
+    uint64_t join_loss_from;
+    /**
+     * Where that attach started; 0 with none, so `join_loss_to` above
+     * `join_loss_from` marks a loss.
+     */
+    uint64_t join_loss_to;
 } karyos_image_change;
 
 /**
