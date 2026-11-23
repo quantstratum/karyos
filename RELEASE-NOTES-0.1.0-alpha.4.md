@@ -103,7 +103,7 @@ while hosted CI is off (karyos#623). These gates were **not run** for it:
 in Docker Linux (pre-push's `lint-linux` runs it on macOS for
 `aarch64-unknown-linux-gnu`), the network impairment suite, the C library
 package, the binding conformance suite and the wire compatibility matrix.
-No `libkaryos` or `karyosd` artifact is released (no release key, see
-"libkaryos and karyosd artifacts"), so the C ABI manifest is not copied
-to `crates/karyos-ffi/abi/released/`. This exception covers
+`libkaryos` and `karyosd` are released unsigned (see "libkaryos and
+karyosd"); the C ABI manifest is committed as the released ABI 0.1.7's,
+`crates/karyos-ffi/abi/released/0.1.7.txt`. This exception covers
 0.1.0-alpha.4 only.
