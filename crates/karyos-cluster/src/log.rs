@@ -1362,15 +1362,9 @@ impl<D: Disk + Clone> RaftLog<D> {
             let mut slot = first;
             let mut end = start;
             let mut planned = bytes;
-            loop {
-                let Some(at) = index.checked_add(u64::try_from(slot - first).unwrap_or(u64::MAX))
-                else {
-                    break;
-                };
-                let Some(&(next, _)) = slot.checked_add(1).and_then(|next| self.entries.get(next))
-                else {
-                    break;
-                };
+            while let Some(&(next, _)) = slot.checked_add(1).and_then(|next| self.entries.get(next))
+            {
+                let at = index.saturating_add(u64::try_from(slot - first).unwrap_or(u64::MAX));
                 if at >= range.end {
                     break;
                 }
