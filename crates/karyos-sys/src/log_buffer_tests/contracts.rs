@@ -1086,3 +1086,38 @@ fn test_log_buffer_required_set_transitions_limit_follows_and_never_decreases() 
     ));
     assert!(limits.windows(2).all(|pair| pair[0] <= pair[1]), "{limits:?}");
 }
+
+/// ADR-0100 (karyos#844): an awaiting optional cell that the floor passed
+/// before its hand-over is raised to the floor once, reporting the range
+/// it skipped, and its adopter starts there. A cell at or above the floor
+/// does not move. A required cell is refused as a mode error, and a stale
+/// token (its cell adopted) as a protocol error, whatever the cell's role.
+#[test]
+fn an_unadopted_optional_cell_is_raised_to_the_floor() {
+    let buffer = Arc::new(new_buffer(config(3, 3)).unwrap());
+    let mut conductor = buffer.conductor().unwrap();
+    let optional = conductor
+        .register_awaiting(Role::Optional, false, 9)
+        .unwrap();
+    let required = conductor
+        .register_awaiting(Role::Required, false, 10)
+        .unwrap();
+    assert_eq!(conductor.raise_to_floor(&optional), Ok(None));
+    // The floor passes the cell, as a window of traffic would.
+    buffer.floor().store(4096, Ordering::Release);
+    assert_eq!(conductor.raise_to_floor(&optional), Ok(Some((0, 4096))));
+    assert_eq!(conductor.cell_position(optional.cell()), Some(4096));
+    assert_eq!(conductor.raise_to_floor(&optional), Ok(None));
+    assert!(matches!(
+        conductor.raise_to_floor(&required),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+    // Adopted, each token is stale: a protocol error for either role.
+    let adopted =
+        Subscription::adopt(Arc::clone(&buffer), optional.cell(), Role::Optional, 9).unwrap();
+    assert_eq!(adopted.position(), 4096);
+    let _required =
+        Subscription::adopt(Arc::clone(&buffer), required.cell(), Role::Required, 10).unwrap();
+    assert_eq!(conductor.raise_to_floor(&optional), Err(NOT_GRANTED));
+    assert_eq!(conductor.raise_to_floor(&required), Err(NOT_GRANTED));
+}
