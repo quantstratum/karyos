@@ -59,7 +59,9 @@ fn profile() -> HmacSha256 {
 
 fn sealed(frames: &[u8], seq: u64) -> Vec<u8> {
     let mut datagram = vec![0_u8; frames.len() + HEADER_LEN + TAG_LEN];
-    datagram[..frames.len()].copy_from_slice(frames);
+    if let Some(slot) = datagram.get_mut(..frames.len()) {
+        slot.copy_from_slice(frames);
+    }
     let total = profile().seal_with(&mut datagram, frames.len(), seq);
     assert_eq!(total, Ok(datagram.len()));
     datagram

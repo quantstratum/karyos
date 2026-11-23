@@ -193,7 +193,10 @@ impl HmacSha256 {
         if let Some(slot) = sealed.get_mut(..HEADER_LEN) {
             slot.copy_from_slice(&header);
         }
-        let (authed, tag) = sealed.split_at_mut(authed_len);
+        let (authed, tag) = sealed.split_at_mut_checked(authed_len).ok_or(SealError {
+            needed: authed_len,
+            available: total,
+        })?;
         let full = self.mac_over(authed).finalize().into_bytes();
         if let (Some(slot), Some(value)) = (tag.get_mut(..TAG_LEN), full.get(..TAG_LEN)) {
             slot.copy_from_slice(value);
@@ -266,7 +269,9 @@ impl HmacSha256 {
             .len()
             .checked_sub(TAG_LEN)
             .ok_or(Rejection::Short)?;
-        let (authed, tag) = datagram.split_at(authed_len);
+        let (authed, tag) = datagram
+            .split_at_checked(authed_len)
+            .ok_or(Rejection::Short)?;
         self.mac_over(authed)
             .verify_truncated_left(tag)
             .map_err(|_| Rejection::Tag)?;
