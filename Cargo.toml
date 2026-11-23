@@ -24,6 +24,8 @@ members = [
     "crates/karyos-control",
     "crates/karyos-tiering",
 ]
+# The XDP program builds only through scripts/xdp-object.sh (ADR-0038).
+exclude = ["bpf/karyos-xdp"]
 # Every member but the control-plane component (karyos#708): the default
 # build and its graph are unchanged by it (the agent HTTP stack's admission
 # record, condition 2).
@@ -86,6 +88,9 @@ quote = { version = "1.0.47", default-features = false, features = ["proc-macro"
 syn = { version = "3.0.8", default-features = false, features = ["derive", "parsing", "printing", "proc-macro", "clone-impls"] }
 sha2 = { version = "=0.11.1", default-features = false }
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
+# The wire authentication profile (owner decision D51; quantstratum-docs:
+# karyos/reviews/dependency-admission-wire-auth-hmac.md).
+hmac = { version = "=0.13.0", default-features = false, features = ["zeroize"] }
 serde = { version = "1.0.229", default-features = false, features = ["std", "derive"] }
 tracing = { version = "0.1.44", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }

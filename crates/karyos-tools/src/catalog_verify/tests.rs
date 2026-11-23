@@ -27,14 +27,14 @@ use karyos_archive::segment::{Geometry, SegmentStore, SyncPolicy};
 use super::*;
 
 const ARCHIVE: [u8; 32] = [7; 32];
-const OPERATOR: [u8; 32] = [21; 32];
-const RECORDING: u64 = 3;
+pub(crate) const OPERATOR: [u8; 32] = [21; 32];
+pub(crate) const RECORDING: u64 = 3;
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-struct Archive {
+pub(crate) struct Archive {
     root: PathBuf,
 }
 
@@ -45,13 +45,13 @@ impl Drop for Archive {
 }
 
 impl Archive {
-    fn dir(&self) -> PathBuf {
+    pub(crate) fn dir(&self) -> PathBuf {
         self.root.join("archive")
     }
-    fn anchors(&self) -> PathBuf {
+    pub(crate) fn anchors(&self) -> PathBuf {
         self.root.join("operator")
     }
-    fn trust(&self) -> PathBuf {
+    pub(crate) fn trust(&self) -> PathBuf {
         self.root.join("trust")
     }
 }
@@ -62,7 +62,7 @@ fn range(index: u64) -> Vec<u8> {
 
 /// An archive of six sealed eight-byte ranges and four unsealed bytes,
 /// the head signed at the last seal and anchored at the fourth range.
-fn archive(name: &str) -> Archive {
+pub(crate) fn archive(name: &str) -> Archive {
     let root = std::env::temp_dir().join(format!("karyos-verify-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let archive = Archive { root };

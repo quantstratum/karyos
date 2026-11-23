@@ -18,6 +18,10 @@
 //!   [`WARMUP`] entries, every call of it counts, for the rest of the run.
 //! - **Per replicated entry**: the counts over the entries the leaders
 //!   committed past the warm-up ([`AllocationReport::entries`]).
+//! - **Per stage** (karyos#691): each count is also attributed to the
+//!   [`Stage`] of the call that made it, the call and whether the core led
+//!   when it was made, so a report shows which part of the replication
+//!   path allocates ([`AllocationReport::stages`]).
 //! - Counting needs `karyos_sys::alloc_count::CountingAllocator` as the
 //!   global allocator, which a test binary installs. One measurement at a
 //!   time in a process: a second one while a window is open is refused
@@ -27,11 +31,11 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use karyos_sys::alloc_count::{SetCounts, enroll, window};
+use karyos_sys::alloc_count::{SetCounts, count, count_allocations, enroll, window};
 
 use super::core::{
-    ConsensusCore, InstallRefused, Limits, LogView, Persisted, Ready, Refused, SnapshotBase,
-    TransferRefused, Unsupported,
+    ConsensusCore, InstallRefused, Limits, LogView, Persisted, Ready, ReadyBuf, Refused,
+    SnapshotBase, TransferRefused, Unsupported,
 };
 use super::workloads::{Case, Outcome, RunError, run};
 use crate::net::NodeId;
@@ -41,6 +45,93 @@ pub const WARMUP: u64 = 16;
 
 /// The highest commit index any leader reached in the measurement.
 static LEADER_COMMITTED: AtomicU64 = AtomicU64::new(0);
+
+/// The part of the declared replication path a counted call belongs to:
+/// the call, and whether the core led when it was made (karyos#691).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stage {
+    /// `propose` or `propose_slice` on a leader: leader append.
+    Propose,
+    /// `step` on a leader: acknowledgements and commit advance.
+    StepLeader,
+    /// `step` on a follower: replication receive.
+    StepFollower,
+    /// `tick`.
+    Tick,
+    /// `ready` or `ready_into` on a leader: replication send and the
+    /// committed entries to apply.
+    ReadyLeader,
+    /// `ready` or `ready_into` on a follower: its writes, acknowledgements
+    /// and the committed entries to apply.
+    ReadyFollower,
+    /// `advance` on a leader: its own persistence reported.
+    AdvanceLeader,
+    /// `advance` on a follower: persistence acknowledgement.
+    AdvanceFollower,
+    /// The read-only queries and every other call.
+    Other,
+    /// Counted in the window but not inside a call of the core: a thread
+    /// the adapter declares (`enroll`), working between calls. Derived:
+    /// the totals less every other stage.
+    Unattributed,
+}
+
+impl Stage {
+    /// Every stage, in order.
+    pub const ALL: [Self; 10] = [
+        Self::Propose,
+        Self::StepLeader,
+        Self::StepFollower,
+        Self::Tick,
+        Self::ReadyLeader,
+        Self::ReadyFollower,
+        Self::AdvanceLeader,
+        Self::AdvanceFollower,
+        Self::Other,
+        Self::Unattributed,
+    ];
+
+    /// The stage of a call, by whether the core led: `(leader, follower)`.
+    fn of(leads: bool, (leader, follower): (Self, Self)) -> Self {
+        if leads { leader } else { follower }
+    }
+
+    /// Its position in [`Stage::ALL`].
+    fn slot(self) -> usize {
+        self as usize
+    }
+
+    /// Its name in a report.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Propose => "propose",
+            Self::StepLeader => "step_leader",
+            Self::StepFollower => "step_follower",
+            Self::Tick => "tick",
+            Self::ReadyLeader => "ready_leader",
+            Self::ReadyFollower => "ready_follower",
+            Self::AdvanceLeader => "advance_leader",
+            Self::AdvanceFollower => "advance_follower",
+            Self::Other => "other",
+            Self::Unattributed => "unattributed",
+        }
+    }
+}
+
+/// Allocations per stage in the measurement, by [`Stage::slot`].
+static STAGE_ALLOCATIONS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Frees per stage in the measurement, by [`Stage::slot`].
+static STAGE_FREES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// Adds one counted call's operations to its stage.
+fn note_stage(stage: Stage, operations: u64, allocations: u64) {
+    let slot = stage.slot();
+    if let (Some(allocated), Some(freed)) = (STAGE_ALLOCATIONS.get(slot), STAGE_FREES.get(slot)) {
+        let _ = allocated.fetch_add(allocations, Ordering::Relaxed);
+        let _ = freed.fetch_add(operations.saturating_sub(allocations), Ordering::Relaxed);
+    }
+}
 
 /// A core whose every call, once it has committed [`WARMUP`] entries,
 /// counts toward the allocation gate.
@@ -54,20 +145,32 @@ pub struct Probed<C> {
 impl<C: ConsensusCore> Probed<C> {
     /// Runs `read` on the inner core, counted once it is past the warm-up.
     fn read<R>(&self, read: impl FnOnce(&C) -> R) -> R {
-        let _enrolled = self.past.get().then(enroll);
-        read(&self.core)
+        if !self.past.get() {
+            return read(&self.core);
+        }
+        let _enrolled = enroll();
+        let ((result, allocations), operations) = count(|| count_allocations(|| read(&self.core)));
+        note_stage(Stage::Other, operations, allocations);
+        result
     }
 
     /// Runs `call` on the inner core, counted once it is past the warm-up,
     /// and notes a leader's commit index; that query is counted as well
     /// once past, and is the warm-up's own test before.
-    fn counted<R>(&mut self, call: impl FnOnce(&mut C) -> R) -> R {
-        let _enrolled = self.past.get().then(enroll);
-        let result = call(&mut self.core);
-        let committed = self.core.committed();
-        if self.core.leads()
-            && let Some(committed) = committed
-        {
+    fn counted<R>(&mut self, stages: (Stage, Stage), call: impl FnOnce(&mut C) -> R) -> R {
+        let result = if self.past.get() {
+            // The stage is read before the window counts anything.
+            let stage = Stage::of(self.core.leads(), stages);
+            let _enrolled = enroll();
+            let ((result, allocations), operations) =
+                count(|| count_allocations(|| call(&mut self.core)));
+            note_stage(stage, operations, allocations);
+            result
+        } else {
+            call(&mut self.core)
+        };
+        let (leads, committed) = self.read(|core| (core.leads(), core.committed()));
+        if leads && let Some(committed) = committed {
             LEADER_COMMITTED.fetch_max(committed, Ordering::Relaxed);
         }
         if committed.is_some_and(|committed| committed >= WARMUP) {
@@ -100,23 +203,43 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
     }
 
     fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused> {
-        self.counted(|core| core.propose(command, log))
+        self.counted((Stage::Propose, Stage::Other), |core| {
+            core.propose(command, log)
+        })
+    }
+
+    fn propose_slice(&mut self, command: &[u8], log: &mut LogView<'_>) -> Result<(), Refused> {
+        self.counted((Stage::Propose, Stage::Other), |core| {
+            core.propose_slice(command, log)
+        })
+    }
+
+    fn ready_into(&mut self, out: &mut ReadyBuf<Self::Message>, log: &mut LogView<'_>) -> bool {
+        self.counted((Stage::ReadyLeader, Stage::ReadyFollower), |core| {
+            core.ready_into(out, log)
+        })
     }
 
     fn step(&mut self, from: NodeId, message: Self::Message, log: &mut LogView<'_>) {
-        self.counted(|core| core.step(from, message, log));
+        self.counted((Stage::StepLeader, Stage::StepFollower), |core| {
+            core.step(from, message, log)
+        });
     }
 
     fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
-        self.counted(|core| core.tick(now, log));
+        self.counted((Stage::Tick, Stage::Tick), |core| core.tick(now, log));
     }
 
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
-        self.counted(|core| core.ready(log))
+        self.counted((Stage::ReadyLeader, Stage::ReadyFollower), |core| {
+            core.ready(log)
+        })
     }
 
     fn advance(&mut self, persisted: Persisted, log: &mut LogView<'_>) {
-        self.counted(|core| core.advance(persisted, log));
+        self.counted((Stage::AdvanceLeader, Stage::AdvanceFollower), |core| {
+            core.advance(persisted, log)
+        });
     }
 
     fn term(&self) -> u64 {
@@ -140,11 +263,13 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
     }
 
     fn compacted(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), Unsupported> {
-        self.counted(|core| core.compacted(base, log))
+        self.counted((Stage::Other, Stage::Other), |core| {
+            core.compacted(base, log)
+        })
     }
 
     fn install(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), InstallRefused> {
-        self.counted(|core| core.install(base, log))
+        self.counted((Stage::Other, Stage::Other), |core| core.install(base, log))
     }
 
     fn transfer_leadership(
@@ -152,7 +277,9 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
         to: NodeId,
         log: &mut LogView<'_>,
     ) -> Result<(), TransferRefused> {
-        self.counted(|core| core.transfer_leadership(to, log))
+        self.counted((Stage::Other, Stage::Other), |core| {
+            core.transfer_leadership(to, log)
+        })
     }
 
     fn propose_change(
@@ -160,7 +287,9 @@ impl<C: ConsensusCore> ConsensusCore for Probed<C> {
         change: super::core::Change,
         log: &mut LogView<'_>,
     ) -> Result<(), super::core::ChangeRefused> {
-        self.counted(|core| core.propose_change(change, log))
+        self.counted((Stage::Other, Stage::Other), |core| {
+            core.propose_change(change, log)
+        })
     }
 }
 
@@ -171,6 +300,9 @@ pub struct AllocationReport {
     pub counts: SetCounts,
     /// Entries the leaders committed past the warm-up.
     pub entries: u64,
+    /// The counts by stage, every stage listed, [`Stage::Unattributed`]
+    /// what no call of the core made, so they sum to `counts`.
+    pub stages: Vec<(Stage, SetCounts)>,
     /// The run itself.
     pub outcome: Outcome,
 }
@@ -205,19 +337,61 @@ pub enum MeasureError {
 ///
 /// [`MeasureError`].
 pub fn measure<C: ConsensusCore>(case: &Case, seed: u64) -> Result<AllocationReport, MeasureError> {
-    // The leaders' commit index is the window's, as its counts are: reset
-    // and read while this measurement holds it.
-    let ((outcome, committed), counts) = window(|| {
+    // The leaders' commit index and the stage counters are the window's,
+    // as its counts are: reset and read while this measurement holds it.
+    let ((outcome, committed, staged), counts) = window(|| {
         LEADER_COMMITTED.store(0, Ordering::SeqCst);
+        for counter in STAGE_ALLOCATIONS.iter().chain(STAGE_FREES.iter()) {
+            counter.store(0, Ordering::SeqCst);
+        }
         let outcome = run::<Probed<C>>(case, seed);
-        (outcome, LEADER_COMMITTED.load(Ordering::SeqCst))
+        let staged: Vec<(Stage, SetCounts)> = Stage::ALL
+            .iter()
+            .zip(STAGE_ALLOCATIONS.iter().zip(STAGE_FREES.iter()))
+            .map(|(&stage, (allocations, frees))| {
+                (
+                    stage,
+                    SetCounts {
+                        allocations: allocations.load(Ordering::SeqCst),
+                        frees: frees.load(Ordering::SeqCst),
+                    },
+                )
+            })
+            .collect();
+        (outcome, LEADER_COMMITTED.load(Ordering::SeqCst), staged)
     })
     .map_err(|_| MeasureError::WindowOpen)?;
     let outcome = outcome.map_err(MeasureError::Run)?;
     let entries = committed.saturating_sub(WARMUP);
+    let (in_calls, freed_in_calls) =
+        staged
+            .iter()
+            .fold((0u64, 0u64), |(allocations, frees), (_, stage)| {
+                (
+                    allocations.saturating_add(stage.allocations),
+                    frees.saturating_add(stage.frees),
+                )
+            });
+    let stages = staged
+        .into_iter()
+        .map(|(stage, counted)| {
+            if stage == Stage::Unattributed {
+                (
+                    stage,
+                    SetCounts {
+                        allocations: counts.allocations.saturating_sub(in_calls),
+                        frees: counts.frees.saturating_sub(freed_in_calls),
+                    },
+                )
+            } else {
+                (stage, counted)
+            }
+        })
+        .collect();
     Ok(AllocationReport {
         counts,
         entries,
+        stages,
         outcome,
     })
 }

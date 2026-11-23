@@ -11,6 +11,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Guard and abort authority (owner decision D51; quantstratum-docs:
+# karyos/reviews/dependency-admission-wire-auth-hmac.md, driver scope).
+ed25519-dalek.workspace = true
 karyos-client.workspace = true
 karyos-io.workspace = true
 karyos-protocol.workspace = true

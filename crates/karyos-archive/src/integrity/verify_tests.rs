@@ -851,3 +851,120 @@ fn a_chain_wide_fault_qualifies_a_purged_range_too() {
     assert!(first.reasons.contains(&Reason::MalformedEvidence));
     assert!(!first.reasons.contains(&Reason::UnauthenticatedPurge));
 }
+
+/// Vector V-1 (ADR-0104): segments `[0, 16)` and `[16, 32)` of recording
+/// 3 offloaded, each with a copy record and its offload record on a valid,
+/// signed chain, and `[32, 48)` local. `offload_second` drops the second
+/// segment's offload record.
+fn tiered(offload_second: bool) -> Scenario {
+    let mut scenario = Scenario::new();
+    let segments: &[(u64, u64)] = if offload_second {
+        &[(0, 16), (16, 32)]
+    } else {
+        &[(0, 16)]
+    };
+    for (sequence, &(start, end)) in (0u64..).zip(segments) {
+        scenario
+            .journal
+            .append(super::SealKind::Copy, 3, sequence, sequence, [5; 32])
+            .unwrap();
+        scenario
+            .journal
+            .record_offload(3, start, end, [6; 32])
+            .unwrap();
+    }
+    scenario.sign_head();
+    scenario
+}
+
+/// Below 32 the local store holds nothing: the start was raised.
+fn remote_below_32(_: u64, start: u64, _: u64) -> RangeBytes {
+    if start < 32 {
+        RangeBytes::Missing
+    } else {
+        RangeBytes::Bytes(range(start / 8))
+    }
+}
+
+#[test]
+fn vector_v1_offloaded_ranges_keep_their_seal_outcome_and_report_residency() {
+    let mut scenario = tiered(true);
+    let verification = scenario.verify_with(remote_below_32);
+    let sealed: Vec<_> = verification
+        .ranges
+        .iter()
+        .filter(|range| range.counter.is_some())
+        .collect();
+    assert_eq!(sealed.len(), 6, "{verification:?}");
+    for range in &sealed {
+        assert!(
+            matches!(range.outcome, Outcome::Verified | Outcome::BeyondAnchor),
+            "{range:?}"
+        );
+        assert!(
+            !range.reasons.contains(&Reason::ShortenedIndex),
+            "{range:?}"
+        );
+        let offloaded = matches!(range.residency, Residency::Offloaded { .. });
+        assert_eq!(offloaded, range.end <= 32, "{range:?}");
+    }
+    // The anchor at record 4 covers ranges 0 to 3: their outcome is the
+    // one their seal gives, offloaded or not.
+    assert_eq!(sealed[0].outcome, Outcome::Verified);
+    assert_eq!(sealed[3].outcome, Outcome::Verified);
+    assert_eq!(sealed[4].residency, Residency::Local);
+    assert_eq!(Residency::Local.name(), "local");
+    assert_eq!(sealed[0].residency.name(), "offloaded");
+}
+
+#[test]
+fn vector_v1_without_the_second_offload_record_reports_it_inconsistent() {
+    let mut scenario = tiered(false);
+    let verification = scenario.verify_with(remote_below_32);
+    for range in verification
+        .ranges
+        .iter()
+        .filter(|range| range.counter.is_some())
+    {
+        if range.end <= 16 {
+            assert!(matches!(range.residency, Residency::Offloaded { .. }));
+            assert_ne!(range.outcome, Outcome::Inconsistent, "{range:?}");
+        } else if range.end <= 32 {
+            assert_eq!(range.outcome, Outcome::Inconsistent, "{range:?}");
+            assert_eq!(range.reasons, vec![Reason::ShortenedIndex]);
+            assert_eq!(range.residency, Residency::Local);
+        } else {
+            assert_eq!(range.residency, Residency::Local);
+        }
+    }
+}
+
+#[test]
+fn an_offload_record_no_signed_head_covers_is_missing_evidence() {
+    let mut scenario = Scenario::new();
+    scenario
+        .journal
+        .append(super::SealKind::Copy, 3, 0, 0, [5; 32])
+        .unwrap();
+    let offload = scenario.journal.record_offload(3, 0, 16, [6; 32]).unwrap();
+    let verification = scenario.verify_with(remote_below_32);
+    let first = &verification.ranges[0];
+    assert_eq!(first.outcome, Outcome::Inconsistent);
+    assert!(first.reasons.contains(&Reason::MissingEvidence));
+    assert_eq!(first.first_inconsistent, Some(offload.counter));
+}
+
+#[test]
+fn a_restore_record_makes_the_range_local_again() {
+    let mut scenario = tiered(true);
+    scenario.journal.record_restore(3, 16, 32, [6; 32]).unwrap();
+    scenario.sign_head();
+    let verification = scenario.verify_with(remote_below_32);
+    let second = verification
+        .ranges
+        .iter()
+        .find(|range| range.start == 16)
+        .unwrap();
+    assert_eq!(second.residency, Residency::Local);
+    assert_eq!(second.outcome, Outcome::Inconsistent, "read back missing");
+}

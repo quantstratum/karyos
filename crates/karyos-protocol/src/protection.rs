@@ -12,9 +12,18 @@
 //!
 //! - [`Trusted`] is the baseline of every comparison: an envelope of zero
 //!   bytes, sealing and opening nothing.
+//! - [`HmacSha256`] is the selected wire authentication profile,
+//!   HMAC-SHA-256 with a 16-byte tag (owner decision D51). No channel uses
+//!   it yet: the channel gate keeps `authenticated` refused.
 //! - `Synthetic` (feature `test-hooks`, or tests) spins for a calibrated
 //!   time on each side. It checks the measurement harness end to end and
 //!   is never a profile: its results never reach a decision report.
+
+pub mod hmac_sha256;
+pub mod replay;
+pub mod signed;
+
+pub use hmac_sha256::HmacSha256;
 
 /// A datagram buffer too small for its frames and the envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -29,8 +38,11 @@ pub struct SealError {
 /// The decision on a received datagram, taken before any frame is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// The datagram is accepted; its frames are the first `frames` bytes.
+    /// The datagram is accepted; its frames are the `frames` bytes from
+    /// offset `start`.
     Accept {
+        /// Offset of the frames: 0 for an envelope that only trails them.
+        start: usize,
         /// Length of the frames, the datagram without its envelope.
         frames: usize,
     },
@@ -43,6 +55,28 @@ pub enum Verdict {
 pub enum Rejection {
     /// Shorter than the envelope.
     Short,
+    /// The declared datagram length differs from the received length.
+    Length,
+    /// An unknown envelope version.
+    Version,
+    /// Nonzero flags.
+    Flags,
+    /// Not the envelope frame type.
+    FrameType,
+    /// Not the profile the channel bound.
+    Profile,
+    /// A tag length other than the profile's.
+    TagLength,
+    /// Not the key purpose the channel and key allow.
+    Domain,
+    /// Not the current key epoch.
+    Epoch,
+    /// A session or stream id other than the bound one.
+    Binding,
+    /// An unknown key id.
+    Key,
+    /// The tag does not verify.
+    Tag,
 }
 
 /// Seals and opens datagrams of one channel.
@@ -59,7 +93,8 @@ pub trait Protection {
     /// envelope.
     fn seal(&self, datagram: &mut [u8], frames: usize) -> Result<usize, SealError>;
 
-    /// Opens a received datagram. Allocates nothing.
+    /// Opens a received datagram. Allocates nothing. A rejection changes
+    /// no state of the profile.
     fn open(&self, datagram: &[u8]) -> Verdict;
 }
 
@@ -94,6 +129,7 @@ impl Protection for Trusted {
 
     fn open(&self, datagram: &[u8]) -> Verdict {
         Verdict::Accept {
+            start: 0,
             frames: datagram.len(),
         }
     }
@@ -141,7 +177,7 @@ impl Protection for Synthetic {
     fn open(&self, datagram: &[u8]) -> Verdict {
         self.spin();
         match datagram.len().checked_sub(self.envelope) {
-            Some(frames) => Verdict::Accept { frames },
+            Some(frames) => Verdict::Accept { start: 0, frames },
             None => Verdict::Reject(Rejection::Short),
         }
     }

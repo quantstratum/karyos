@@ -17,6 +17,9 @@ categories = ["network-programming", "concurrency"]
 # The scripted `SocketOps` test double for tests of dependent crates; never
 # enabled outside dev-dependencies.
 test-hooks = []
+# The AF_XDP copy-mode backend (SPEC.md §16.3, owner item 3), Linux only:
+# quantstratum-docs karyos/reviews/dependency-admission-aya-af-xdp.md.
+xdp = ["dep:aya"]
 
 [dependencies]
 # The DRR of priority lanes (P2.4 l2); an internal edge the coordinator
@@ -32,6 +35,10 @@ thiserror.workspace = true
 # for `net` only; no `event` (decision O-6).
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", default-features = false, features = ["std", "net"] }
+# The loader of the prebuilt XDP object of the `xdp` feature (ADR-0038):
+# the ADR-0033 family `aya`, admitted under R8 at exactly 0.16.0 with no
+# feature (quantstratum-docs: karyos/reviews/dependency-admission-aya-af-xdp.md).
+aya = { version = "=0.16.0", default-features = false, optional = true }
 
 [dev-dependencies]
 # The counting allocator of the no allocation tests (`alloc_count`).

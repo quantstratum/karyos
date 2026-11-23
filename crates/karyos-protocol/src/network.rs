@@ -1706,6 +1706,8 @@ impl Writer {
     }
 }
 
+pub mod authenticated;
+
 #[cfg(test)]
 mod tests;
 

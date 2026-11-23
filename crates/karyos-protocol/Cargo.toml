@@ -20,7 +20,10 @@ categories = ["network-programming", "concurrency"]
 test-hooks = []
 
 [dependencies]
+hmac.workspace = true
 karyos-sys.workspace = true
+# `zeroize` erases the keyed SHA-256 states of the HMAC profile on drop.
+sha2 = { workspace = true, features = ["zeroize"] }
 thiserror.workspace = true
 
 [dev-dependencies]

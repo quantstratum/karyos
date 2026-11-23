@@ -1967,17 +1967,19 @@ mod groups {
             // The test never opens it before: an open of its own would
             // take the lock and make the agent's open fail. The agent
             // creates the file and locks it at once, so once the file
-            // exists a single open must see `Locked`.
+            // exists a single open must see `Locked`. Under load the
+            // file can exist a moment before its lock: wait, by deadline,
+            // for the agent's first record, which it writes only holding
+            // the lock.
             let journal_file = groups.join(crate::integrity::journal::JOURNAL_FILE);
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !journal_file.exists() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            while std::fs::metadata(&journal_file).map_or(0, |metadata| metadata.len()) == 0 {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "round {round}: the agent never opened the journal"
+                    "round {round}: the agent never sealed into the journal"
                 );
                 std::thread::sleep(Duration::from_micros(200));
             }
-            std::thread::sleep(Duration::from_millis(1));
             match IntegrityJournal::open(StdDisk, &groups) {
                 Err(crate::integrity::journal::IntegrityError::Locked) => {}
                 other => panic!("round {round}: the agent does not hold the lock: {other:?}"),

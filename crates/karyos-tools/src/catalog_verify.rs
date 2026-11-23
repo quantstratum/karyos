@@ -49,7 +49,9 @@ use karyos_archive::integrity::trust::{
     Custody, HEADS_FILE, KEYS_FILE, PUBLIC_KEY_LENGTH, REGISTRY_ENTRY_LENGTH, SIGNED_HEAD_LENGTH,
     TrustRoot,
 };
-use karyos_archive::integrity::verify::{Evidence, Outcome, RangeBytes, Verification, verify};
+use karyos_archive::integrity::verify::{
+    Evidence, OFFLOADED_COVERAGE, Outcome, RangeBytes, Residency, Verification, verify,
+};
 use karyos_archive::segment::{SegmentError, SegmentStore, SyncPolicy, recorded_geometry};
 
 use crate::catalog::EXIT_ERROR;
@@ -1068,6 +1070,12 @@ pub fn text(verification: &Verification) -> String {
         if range.outcome.is_unverifiable() {
             out.push_str(" unverifiable");
         }
+        if let Residency::Offloaded { record } = range.residency {
+            let _ = write!(
+                out,
+                " residency=offloaded offload_record={record} ({OFFLOADED_COVERAGE})"
+            );
+        }
         if let Some(statement) = range.outcome.statement() {
             let _ = write!(out, ": {statement}");
         }
@@ -1123,7 +1131,7 @@ pub fn json(verification: &Verification) -> String {
             .map_or_else(|| "null".to_owned(), |text| format!("\"{text}\""));
         let _ = write!(
             out,
-            "{{\"recording\":{},\"start\":{},\"end\":{},\"seal\":{},\"outcome\":\"{}\",\"reasons\":[{}],\"first_inconsistent\":{},\"unverifiable\":{},\"statement\":{}}}",
+            "{{\"recording\":{},\"start\":{},\"end\":{},\"seal\":{},\"outcome\":\"{}\",\"reasons\":[{}],\"first_inconsistent\":{},\"unverifiable\":{},\"statement\":{},\"residency\":\"{}\",\"offload_record\":{}}}",
             range.recording,
             range.start,
             range.end,
@@ -1132,7 +1140,12 @@ pub fn json(verification: &Verification) -> String {
             reasons.join(","),
             option(range.first_inconsistent),
             range.outcome.is_unverifiable(),
-            statement
+            statement,
+            range.residency.name(),
+            option(match range.residency {
+                Residency::Offloaded { record } => Some(record),
+                _ => None,
+            })
         );
     }
     let evidence: Vec<String> = verification
@@ -1511,4 +1524,4 @@ fn report_error(stderr: &mut dyn io::Write, error: &VerifyError) -> u8 {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
