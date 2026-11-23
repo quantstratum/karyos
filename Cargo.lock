@@ -782,6 +782,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "karyos-sbe"
+version = "0.1.0-alpha.3"
+dependencies = [
+ "karyos-feed",
+]
+
+[[package]]
 name = "karyos-sim"
 version = "0.1.0-alpha.3"
 dependencies = [

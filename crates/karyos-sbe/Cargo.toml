@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "karyos-sbe"
+description = "SBE 1.0 framing and feed adapters over Karyos, through IronSBE."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The SBE adapters plug into the feed's A/B arbitration (SPEC §7.2, §10.1):
+# `karyos-sbe` depends on `karyos-feed`, never the reverse, which
+# `make sbe-graph-check` enforces (karyos#631). The IronSBE crates admitted
+# by quantstratum-docs karyos/reviews/dependency-admission-ironsbe.md enter
+# with their first use (karyos#646), pinned `=0.8.0`, `ironsbe-codegen` as a
+# build dependency only.
+[dependencies]
+karyos-feed = { path = "../karyos-feed" }
+
+[lints]
+workspace = true

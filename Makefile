@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri miri-sys-log-buffer miri-sys-rest miri-ffi build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit libkaryos-release-check abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check codec-derive-check raft-eval lint-sync changelog-check lint-linux pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri miri-sys-log-buffer miri-sys-rest miri-ffi build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit libkaryos-release-check abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check codec-derive-check sbe-graph-check raft-eval lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -177,6 +177,13 @@ tiering-graph-check:
 codec-derive-check:
 	scripts/check-codec-derive-graph.sh
 
+# The SBE boundary (karyos#631; the IronSBE admission record's condition
+# 2): IronSBE only in karyos-sbe, none of its excluded crates anywhere, and
+# karyos-feed never depending on karyos-sbe; with its negative controls.
+sbe-graph-check:
+	CARGO="$(CARGO)" python3 scripts/check-sbe-graph.py
+	CARGO="$(CARGO)" scripts/check-sbe-graph-selftest.sh
+
 # No Raft candidate and not the evaluation crate in any shipped graph, and
 # no Tokio outside karyos-control's (cargo tree, every target, default and every feature; with
 # negative controls): the evaluation-only admission's
@@ -202,4 +209,4 @@ changelog-check:
 netem:
 	scripts/netem-test.sh
 
-pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check tiering-graph-check header-check codec-derive-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check
+pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check tiering-graph-check header-check codec-derive-check sbe-graph-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check

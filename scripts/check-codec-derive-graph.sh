@@ -13,7 +13,7 @@ runtime() {
     -e normal,no-proc-macro --prefix none
 }
 for p in karyos-sys karyos-io karyos-protocol karyos-codec karyos-client \
-         karyos-driver karyos-trace karyos-archive karyos-cluster karyos-feed \
+         karyos-driver karyos-trace karyos-archive karyos-cluster karyos-feed karyos-sbe \
          karyos karyos-tools karyos-ffi karyos-agent; do
   tree=$(runtime "$p") || exit 1
   if printf '%s\n' "$tree" | grep -E '^(syn|quote|proc-macro2) '; then
