@@ -105,11 +105,12 @@ karyos#975 (the first two).
 | --- | --- | --- |
 | `DivergentPrefix`, `ReplyBeforeDurableMajority`, `Contract` (gap), `OldTermCommit`, `Contract` (`TruncateBelowCommit`) | yes (karyos#678) | |
 | `PositionsOutOfOrder` | yes: a core that reports no last index over a written log | |
-| `AppliedNotDurable` | no | `drive` writes and syncs a Ready's entries before it applies that Ready's committed entries, so a core that hands its fresh entries to apply has them durable already (tried: the mutant passes every check). Reaching it needs a faulty `drive` or a disk that acknowledges an unsynced write |
-| `ReleasedBeforePersisted`, `DurableLost` | no | out of a core's reach through `ConsensusCore` (`drive` releases after the sync; C4's log and the disk keep durable entries), as #976 records |
+| `AppliedNotDurable` | yes, fault-injected (karyos#1038): a driver that applies a Ready's fresh entries before it writes them | |
+| `ReleasedBeforePersisted` | yes, fault-injected (karyos#1038): a driver that releases `after_persist` before the sync | |
+| `DivergentResponse` | yes, fault-injected (karyos#1038): one server's service alters its answers | |
+| `NotLinearizable` | yes, fault-injected (karyos#1038): a client that records a read with a value no one wrote | |
+| `DurableLost` | no | out of a core's reach through `ConsensusCore` (C4's log and the disk keep durable entries). A driver that reports an unsynced Ready durable and is then crashed was tried (karyos#1038): the reopened log breaks its contract first (`Contract`), or raft-rs panics (`to_commit … out of range`) once the others hold entries it lost, before the check runs |
 | `CommittedTruncated` | no | a core can truncate only through C4's log, which refuses below its stored commit (`TruncateBelowCommit`); above it, a server that stored no commit but holds entries the others applied makes raft-rs itself panic (`to_commit … out of range`) before the check runs (tried) |
-| `DivergentResponse` | no | responses are computed by the harness's service from the applied entry, so two servers answer one index differently only if they applied different entries, which `DivergentPrefix` names first |
-| `NotLinearizable` | no | the servers' service, not the core, produces each answer; a mutant that applies consistently altered commands on every server (tried) stays linearizable, since the register is a function of the applied log. Reaching it needs a faulty service or client |
 | `Undecided`, `MalformedHistory` | no | properties of C3 and of the client history the harness records, not of a core |
 | `Unverified` | no | a run property (a crashed server never restarted), set by the case, not the core |
 | `QuorumOfVoters`, `ConfigurationNotFromLog`, `ConfigurationConflict`, `LearnerBehind` | no | membership changes: neither adapter takes a configuration change yet; they become reachable with the membership work held behind the core selection (#681 and the M04/M05 membership items) |

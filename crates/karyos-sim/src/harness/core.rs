@@ -714,6 +714,25 @@ pub fn drive<C: ConsensusCore, D: Disk + Clone>(
     drive_metered(core, log, (None, None), send, apply, observe)
 }
 
+/// A fault injected into the driver (the `test-hooks` feature), so the harness checks can be
+/// shown to catch what a faulty driver or disk would do with a real core
+/// behind it (karyos#1038). Tests only: every production path drives with
+/// [`DriveFault::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DriveFault {
+    /// None: the five steps in order.
+    #[default]
+    None,
+    /// Messages that wait for persistence leave before it (step 4 before
+    /// step 2).
+    #[cfg(feature = "test-hooks")]
+    ReleaseEarly,
+    /// A Ready's fresh entries are applied before they are written, as a
+    /// driver that took them for committed would.
+    #[cfg(feature = "test-hooks")]
+    ApplyFresh,
+}
+
 /// [`drive`], the core's reads spending `budget` when one is given, and
 /// its views naming `base` as the node's latest snapshot.
 ///
@@ -724,6 +743,27 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
     core: &mut C,
     log: &mut RaftLog<D>,
     (budget, base): (Option<&ReadBudget>, Option<SnapshotBase>),
+    send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
+    apply: &mut dyn FnMut(&Entry, Applying),
+    observe: &mut dyn FnMut(Step),
+) -> Result<(), DriveError> {
+    drive_inner(
+        core,
+        log,
+        (budget, base, DriveFault::None),
+        send,
+        apply,
+        observe,
+    )
+}
+
+/// [`drive_metered`]'s steps, with `fault` injected; only
+/// [`DriveFault::None`] exists without the `test-hooks` feature
+/// (karyos#1038).
+pub(crate) fn drive_inner<C: ConsensusCore, D: Disk + Clone>(
+    core: &mut C,
+    log: &mut RaftLog<D>,
+    (budget, base, fault): (Option<&ReadBudget>, Option<SnapshotBase>, DriveFault),
     send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
     apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
@@ -741,6 +781,36 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
         }
         for (to, message) in ready.messages {
             send(to, message, None);
+        }
+        let needs = ready.entries.last().map(|entry| entry.index);
+        #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
+        let mut after_persist = ready.after_persist;
+        // Faults that act before persistence (tests).
+        #[cfg(not(feature = "test-hooks"))]
+        let DriveFault::None = fault;
+        #[cfg(feature = "test-hooks")]
+        match fault {
+            DriveFault::ReleaseEarly => {
+                for (to, message) in after_persist.drain(..) {
+                    let release = Release {
+                        needs,
+                        needs_state: ready.hard_state,
+                        durable: log.durable_index(),
+                        stored_state: log.hard_state(),
+                    };
+                    send(to, message, Some(release));
+                }
+            }
+            DriveFault::ApplyFresh => {
+                for entry in &ready.entries {
+                    let applying = Applying {
+                        durable: log.durable_index(),
+                        logged_term: log.term(entry.index),
+                    };
+                    apply(entry, applying);
+                }
+            }
+            DriveFault::None => {}
         }
         // 2. Persistence.
         if let Some(from) = ready.truncate_from {
@@ -776,8 +846,7 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
                 .collect(),
         });
         // 4. What depends on it.
-        let needs = ready.entries.last().map(|entry| entry.index);
-        for (to, message) in ready.after_persist {
+        for (to, message) in after_persist {
             let release = Release {
                 needs,
                 needs_state: ready.hard_state,
