@@ -182,7 +182,7 @@ mod transport {
 
     use std::path::PathBuf;
 
-    use super::super::transport::{Outgoing, Receiver, Refusal, Sender};
+    use super::super::transport::{Arrival, Outgoing, ReceiveError, Receiver, Refusal, Sender};
     use super::super::*;
     use crate::control::ResponseCode;
     use crate::disk::StdDisk;
@@ -298,15 +298,8 @@ mod transport {
                         owned[0] ^= 1;
                         tampered = true;
                     }
-                    receiver
-                        .bytes(
-                            bytes.recording_id,
-                            bytes.start,
-                            &owned,
-                            &mut store,
-                            &mut copies,
-                            &mut journal,
-                        )
+                    let _ = receiver
+                        .bytes(bytes.recording_id, bytes.start, &owned, &mut store)
                         .unwrap();
                 }
                 ReplicationMessage::SourceSeal(seal) => verdicts.push(
@@ -368,6 +361,95 @@ mod transport {
         let (verdicts, _, counted) = deliver(&out, &replica_dir, true, (0, 100));
         assert!(matches!(verdicts[0], Verdict::Corrupt(_)));
         assert_eq!(counted, 0);
+    }
+
+    #[test]
+    fn a_replayed_recording_changes_nothing_and_differing_bytes_never_overwrite() {
+        let (_dirs, source_dir, replica_dir) = dirs("replayed");
+        let (mut source_store, seals) = source(&source_dir);
+        let mut sender =
+            Sender::accept(request(0, u64::MAX, Mode::OnDemand), true, 0, &seals).unwrap();
+        let mut out = Vec::new();
+        sender
+            .poll(&mut source_store, &seals, false, usize::MAX, &mut out)
+            .unwrap();
+        let mut store = store(&replica_dir);
+        let mut journal = IntegrityJournal::open(StdDisk, &replica_dir)
+            .unwrap()
+            .journal;
+        let mut copies = CopyCatalog::open(StdDisk, &replica_dir, &mut journal).unwrap();
+        let receiver = Receiver::new(
+            RECORDING,
+            Replica::new([9; 32], 0, Enforcement::Unsupported),
+        );
+        let apply = |store: &mut SegmentStore<StdDisk>,
+                     copies: &mut CopyCatalog<StdDisk>,
+                     journal: &mut IntegrityJournal<StdDisk>| {
+            let mut arrivals = Vec::new();
+            let mut verdicts = Vec::new();
+            for message in &out {
+                match message {
+                    Outgoing::Bytes { start, bytes } => {
+                        arrivals.push(receiver.bytes(RECORDING, *start, bytes, store).unwrap())
+                    }
+                    Outgoing::Seal(seal) => {
+                        verdicts.push(receiver.seal(seal, store, copies, journal).unwrap());
+                    }
+                    Outgoing::Status(_) => {}
+                }
+            }
+            (arrivals, verdicts)
+        };
+        let (arrivals, verdicts) = apply(&mut store, &mut copies, &mut journal);
+        assert!(arrivals.iter().all(|arrival| *arrival == Arrival::Stored));
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| matches!(verdict, Verdict::Counted(_)))
+        );
+        let records = copies.records().len();
+        // The source resends from its start: identical bytes and verified
+        // seals change nothing.
+        let (arrivals, verdicts) = apply(&mut store, &mut copies, &mut journal);
+        assert!(
+            arrivals
+                .iter()
+                .all(|arrival| *arrival == Arrival::AlreadyStored)
+        );
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| *verdict == Verdict::AlreadyCounted)
+        );
+        assert_eq!(copies.records().len(), records);
+        // Differing bytes at a stored position are refused, and the stored
+        // bytes stay.
+        assert!(matches!(
+            receiver.bytes(RECORDING, 50, &[0xee; 10], &mut store),
+            Err(ReceiveError::Mismatch { start: 50 })
+        ));
+        let mut stored = [0u8; 10];
+        store.read(50, &mut stored).unwrap();
+        assert_eq!(stored, [1u8; 10]);
+        // Bytes past the tail would leave a hole: refused as a gap.
+        let tail = store.written();
+        assert!(matches!(
+            receiver.bytes(RECORDING, tail + 1, &[1], &mut store),
+            Err(ReceiveError::PastTail { .. })
+        ));
+        assert_eq!(store.written(), tail);
+        // Bytes straddling the tail: the held part is compared, the rest
+        // appended.
+        let mut straddle = vec![3u8; 7];
+        straddle.extend_from_slice(&[4u8; 5]);
+        assert_eq!(
+            receiver
+                .bytes(RECORDING, tail - 7, &straddle, &mut store)
+                .unwrap(),
+            Arrival::Stored
+        );
+        assert_eq!(store.written(), tail + 5);
+        assert_eq!(copies.verified_copies(RECORDING, 100, 40_100).unwrap(), 1);
     }
 
     #[test]

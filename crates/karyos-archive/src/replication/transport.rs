@@ -4,8 +4,9 @@
 //! karyos/design/archive-replication.md section 4; quantstratum/karyos#1072):
 //! [`Sender`], the source's state for one request, which turns the stored
 //! bytes and the range seals into the messages it sends, in order; and
-//! [`Receiver`], the replica's, which stores what arrives as unverified and
-//! counts a range only once its seal verifies on the replica's own bytes.
+//! [`Receiver`], the replica's, which stores what arrives without counting
+//! it, and counts a range only once its seal verifies on the replica's own
+//! bytes (ADR-0102 decision 5).
 //! Either end is driven by its host's control streams.
 
 use std::sync::mpsc::{Receiver as Returned, SyncSender, TryRecvError, sync_channel};
@@ -411,12 +412,47 @@ pub enum ReceiveError {
     /// A seal of another kind or subject.
     #[error("a seal that does not cover this recording")]
     ForeignSeal,
-    /// The replica's store refused the bytes (out of order, or failed).
+    /// Bytes past the replica's tail: they would leave a hole the source
+    /// has not sent (ADR-0102 decision 6). Dropped and counted as a gap.
+    #[error("bytes at {start} past the replica's tail {tail}")]
+    PastTail {
+        /// The replica's written end.
+        tail: u64,
+        /// The bytes' start.
+        start: u64,
+    },
+    /// Bytes below the replica's start, which it cannot compare.
+    #[error("bytes at {start} below the replica's start {floor}")]
+    BelowStart {
+        /// The replica store's start.
+        floor: u64,
+        /// The bytes' start.
+        start: u64,
+    },
+    /// Bytes that differ from the bytes the replica already stores at
+    /// their positions: refused, and never written over them (ADR-0102
+    /// decision 5).
+    #[error("bytes at {start} differ from the stored bytes")]
+    Mismatch {
+        /// The bytes' start.
+        start: u64,
+    },
+    /// The replica's store refused the bytes, or failed.
     #[error(transparent)]
     Store(#[from] SegmentError),
     /// The copy catalog or the integrity journal failed.
     #[error(transparent)]
     Replication(#[from] ReplicationError),
+}
+
+/// What the replica did with bytes it accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Arrival {
+    /// Stored at the tail (some of them may have been held already).
+    Stored,
+    /// Every byte was already stored, identical: nothing written.
+    AlreadyStored,
 }
 
 /// The replica's state for one recording it replicates.
@@ -436,36 +472,72 @@ impl Receiver {
         }
     }
 
-    /// Stores bytes that arrived at `start` in `store`, the replica's copy
-    /// of the recording, and records them as unverified.
+    /// Takes bytes that arrived at `start` into `store`, the replica's
+    /// copy of the recording. Nothing is recorded in the copy catalog:
+    /// only a seal that verifies changes it (ADR-0102 decision 5). Bytes
+    /// at positions already stored are compared, not written; the rest
+    /// is appended at the tail.
     ///
     /// # Errors
     ///
-    /// [`ReceiveError`]; a store that is not at `start` refuses them.
+    /// [`ReceiveError::OtherRecording`], [`ReceiveError::PastTail`],
+    /// [`ReceiveError::BelowStart`] and [`ReceiveError::Mismatch`], which
+    /// change nothing; the store's errors.
     pub fn bytes<D: Disk>(
         &self,
         recording_id: u64,
         start: u64,
         bytes: &[u8],
         store: &mut SegmentStore<D>,
-        copies: &mut CopyCatalog<D>,
-        journal: &mut IntegrityJournal<D>,
-    ) -> Result<(), ReceiveError> {
+    ) -> Result<Arrival, ReceiveError> {
         if recording_id != self.recording_id {
             return Err(ReceiveError::OtherRecording {
                 expected: self.recording_id,
                 got: recording_id,
             });
         }
-        let end = store.append(start, bytes)?;
-        let _ = self
-            .replica
-            .arrived(copies, journal, recording_id, start, end)?;
-        Ok(())
+        let tail = store.written();
+        if start > tail {
+            return Err(ReceiveError::PastTail { tail, start });
+        }
+        if start < store.start() {
+            return Err(ReceiveError::BelowStart {
+                floor: store.start(),
+                start,
+            });
+        }
+        let held = usize::try_from(tail.saturating_sub(start))
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let (stored, fresh) = bytes.split_at_checked(held).unwrap_or((bytes, &[]));
+        if !stored.is_empty() {
+            let mut buf = [0u8; MAX_CHUNK];
+            let mut position = start;
+            for chunk in stored.chunks(MAX_CHUNK) {
+                let read = buf
+                    .get_mut(..chunk.len())
+                    .ok_or(ReceiveError::Mismatch { start })?;
+                store.read(position, read)?;
+                if read != chunk {
+                    return Err(ReceiveError::Mismatch { start });
+                }
+                position = position
+                    .checked_add(
+                        u64::try_from(chunk.len()).map_err(|_| SegmentError::PositionOverflow)?,
+                    )
+                    .ok_or(SegmentError::PositionOverflow)?;
+            }
+        }
+        if fresh.is_empty() {
+            return Ok(Arrival::AlreadyStored);
+        }
+        let _ = store.append(tail, fresh)?;
+        Ok(Arrival::Stored)
     }
 
-    /// Checks `seal` on the replica's own bytes in `store`: only a match
-    /// counts the range.
+    /// Checks `seal` on the replica's own bytes in `store` before
+    /// anything is recorded: only a match counts the range, once; a
+    /// mismatch records nothing and never downgrades a verified copy.
     ///
     /// # Errors
     ///
@@ -483,11 +555,12 @@ impl Receiver {
             .map_err(|_| SegmentError::PositionOverflow)?;
         let mut bytes = vec![0u8; length];
         store.read(seal.start, &mut bytes)?;
-        // The range arrived whole, in however many chunks: recorded as one
-        // arrival, which the seal's check then counts or not.
-        let _ = self
-            .replica
-            .arrived(copies, journal, self.recording_id, seal.start, seal.end)?;
         Ok(self.replica.verify(copies, journal, seal, &bytes)?)
+    }
+
+    /// The replica this receiver records as.
+    #[must_use]
+    pub const fn replica(&self) -> &Replica {
+        &self.replica
     }
 }
