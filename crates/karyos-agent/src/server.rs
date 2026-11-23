@@ -1503,12 +1503,17 @@ mod tests {
         let first = window
             .buckets(cursor, 6, None, crate::api::MAX_BUCKET_REPLY)
             .unwrap();
-        // The reply, padded past this host's socket buffer so a peer that
-        // does not read blocks the write.
+        // A bounded reply, and a pair whose buffer is filled first and then
+        // drained by less than the reply: a peer that reads no more blocks
+        // the write part way, whatever the host's buffer size.
         let mut reply = json::trace_buckets(&first).into_bytes();
-        reply.resize(past_socket_buffer(), b' ');
+        reply.resize(REPLY_BYTES, b' ');
         reply.push(b'\n');
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let Some(held) = fill_socket(&writer) else {
+            return;
+        };
+        let drained = drain(&mut reader, (held / 2).min(REPLY_BYTES / 2));
         let start = std::time::Instant::now();
         assert!(!write_within(&mut writer, &reply, WRITE_DEADLINE));
         assert!(
@@ -1518,10 +1523,28 @@ mod tests {
         );
         // As `serve` does after a cut.
         writer.shutdown(std::net::Shutdown::Both).unwrap();
-        let mut cut = Vec::new();
-        reader.read_to_end(&mut cut).unwrap();
-        assert!(!cut.is_empty() && cut.len() < reply.len(), "{}", cut.len());
-        assert_ne!(cut.last(), Some(&b'\n'), "a cut reply has no final newline");
+        // The rest of the fill, then the cut reply, counted as they stream.
+        let mut fill_left = held - drained;
+        let mut cut = 0usize;
+        let mut last = None;
+        let mut buffer = vec![0u8; 64 << 10];
+        loop {
+            let read = reader.read(&mut buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+            let skip = fill_left.min(read);
+            fill_left -= skip;
+            let bytes = &buffer[skip..read];
+            if let Some(&byte) = bytes.last() {
+                assert!(cut > 0 || bytes[0] == reply[0], "the cut starts the reply");
+                last = Some(byte);
+            }
+            cut += bytes.len();
+        }
+        assert_eq!(fill_left, 0);
+        assert!(cut > 0 && cut < reply.len(), "{cut}");
+        assert_ne!(last, Some(b'\n'), "a cut reply has no final newline");
         // The retry, with the same cursor, read whole.
         let again = window
             .buckets(cursor, 6, None, crate::api::MAX_BUCKET_REPLY)
@@ -1540,24 +1563,49 @@ mod tests {
         assert_eq!(read.join().unwrap(), reply);
     }
 
-    /// A reply size past what this host's Unix stream socket buffers hold,
-    /// measured by filling a fresh pair without blocking: a host may tune
-    /// its default send buffer far above a fixed padding (one with
-    /// `net.core.wmem_default` at 128 MiB wrote a 64 MiB reply whole, so a
-    /// deadline test passed nothing to cut). The measured bytes plus 16
-    /// MiB; the fill stops at 512 MiB.
-    fn past_socket_buffer() -> usize {
-        let (writer, _reader) = UnixStream::pair().unwrap();
+    /// The bounded reply of the deadline tests.
+    const REPLY_BYTES: usize = 4 << 20;
+
+    /// The most a deadline test fills a socket buffer with.
+    const FILL_CAP: usize = 256 << 20;
+
+    /// Fills a pair's buffer without blocking, writing one 64 KiB chunk
+    /// over and over, and answers the bytes it holds; the socket is left
+    /// blocking. A host may tune its default send buffer far above a fixed
+    /// reply (one with `net.core.wmem_default` at 128 MiB held 64 MiB
+    /// whole), so the tests fill it instead of outsizing it. The fill only
+    /// uses kernel buffer memory and stops at 256 MiB: a buffer that holds
+    /// that much answers `None`, and the test skips its blocking assertions
+    /// with a logged reason rather than fill further.
+    fn fill_socket(writer: &UnixStream) -> Option<usize> {
         writer.set_nonblocking(true).unwrap();
-        let chunk = vec![0u8; 64 << 10];
+        let chunk = [0u8; 64 << 10];
         let mut held = 0usize;
-        while held < (512 << 20) {
-            match (&writer).write(&chunk) {
-                Ok(written) if written > 0 => held = held.saturating_add(written),
-                Ok(_) | Err(_) => break,
+        loop {
+            match (&*writer).write(&chunk) {
+                Ok(written) if written > 0 => held += written,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                other => panic!("filling the socket: {other:?}"),
+            }
+            if held >= FILL_CAP {
+                eprintln!("skipped: this host's socket buffer holds {FILL_CAP} bytes or more");
+                return None;
             }
         }
-        held.saturating_add(16 << 20)
+        writer.set_nonblocking(false).unwrap();
+        Some(held)
+    }
+
+    /// Reads exactly `bytes` of the fill and discards them.
+    fn drain(reader: &mut UnixStream, bytes: usize) -> usize {
+        let mut buffer = vec![0u8; 64 << 10];
+        let mut left = bytes;
+        while left > 0 {
+            let want = left.min(buffer.len());
+            reader.read_exact(&mut buffer[..want]).unwrap();
+            left -= want;
+        }
+        bytes
     }
 
     /// Review B1 of #826: a client that reads a few KiB at a time, often
@@ -1566,6 +1614,9 @@ mod tests {
     #[test]
     fn a_trickling_reader_cannot_stretch_the_deadline() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        let Some(held) = fill_socket(&writer) else {
+            return;
+        };
         let trickle = std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
             let mut total = 0;
@@ -1582,7 +1633,7 @@ mod tests {
             }
             total
         });
-        let reply = vec![b'z'; past_socket_buffer()];
+        let reply = vec![b'z'; REPLY_BYTES];
         let start = std::time::Instant::now();
         assert!(!write_within(&mut writer, &reply, WRITE_DEADLINE));
         let took = start.elapsed();
@@ -1591,7 +1642,7 @@ mod tests {
         // reader once held it for seconds.
         assert!(took < WRITE_DEADLINE + IO_TIMEOUT * 2, "{took:?}");
         writer.shutdown(std::net::Shutdown::Both).unwrap();
-        assert!(trickle.join().unwrap() < reply.len());
+        assert!(trickle.join().unwrap() < held + reply.len());
     }
 
     /// Re-review F2 of #826: a client sending a request a byte at a time,

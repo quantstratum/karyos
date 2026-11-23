@@ -42,8 +42,8 @@ change.
 
 ## Compatibility with 0.1.0-alpha.3
 
-The admission protocol version is 4 (`KARYOS_PROTOCOL_VERSION` 4, C ABI
-0.1.7): a client or driver of 0.1.0-alpha.3 (version 3) is refused at
+The admission protocol version is 5 (`karyos::PROTOCOL_VERSION`,
+`KARYOS_PROTOCOL_VERSION` 5, C ABI 0.1.7): a client or driver of 0.1.0-alpha.3 (version 3) is refused at
 admission with the typed `IncompatibleVersion`. Upgrade clients and the
 driver together.
 
