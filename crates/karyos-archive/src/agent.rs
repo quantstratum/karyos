@@ -1048,6 +1048,10 @@ struct Counts {
     /// Signing polls refused because the shared signer's lock is
     /// poisoned (karyos#1128).
     poisoned_signer: AtomicU64,
+    /// Allocations and frees the replication duties made, counted on
+    /// the agent's thread for the steady state test (karyos#1113).
+    #[cfg(test)]
+    replication_allocations: AtomicU64,
     /// The shortened indexes found at start, kept whole for
     /// [`ArchiveHandle::shortened_index_reports`]: the event queue may
     /// drop some before a caller can read it (karyos#671 review).
@@ -1656,6 +1660,12 @@ impl ArchiveHandle {
         self.counts.shortened_indexes.load(Ordering::Relaxed)
     }
 
+    /// Allocations and frees the replication duties made so far.
+    #[cfg(test)]
+    pub(crate) fn replication_allocations(&self) -> u64 {
+        self.counts.replication_allocations.load(Ordering::Acquire)
+    }
+
     /// Every shortened index found at start, with its recording and lost
     /// range, whatever the event queue dropped (karyos#671 review).
     #[must_use]
@@ -2165,6 +2175,8 @@ fn run<D>(
         retention,
         verifying: Arc::default(),
         replications: Vec::new(),
+        replication_records: Vec::with_capacity(REPLICATION_QUEUE),
+        replication_out: Vec::with_capacity(REPLICATION_QUEUE),
         calibrations: None,
     };
     // Before the first command: a purge a crash cut short is completed or
@@ -2207,7 +2219,21 @@ fn run<D>(
         // made durable.
         worked |= state.integrity_duty(now());
         // Sealed ranges to the replicas that asked (ADR-0091; karyos#1113).
-        worked |= state.replication_duty(config.replay_budget, now());
+        #[cfg(not(test))]
+        {
+            worked |= state.replication_duty(config.replay_budget, now());
+        }
+        #[cfg(test)]
+        {
+            let (replicated, allocations) = karyos_sys::alloc_count::count(|| {
+                state.replication_duty(config.replay_budget, now())
+            });
+            outbox
+                .counts
+                .replication_allocations
+                .fetch_add(allocations, Ordering::AcqRel);
+            worked |= replicated;
+        }
         // After the recorders: they keep priority.
         worked |= state.replays.duty(
             now(),
@@ -2253,6 +2279,11 @@ struct State<D: Disk> {
     verifying: Arc<AtomicU64>,
     /// The replications this Archive is the source of (karyos#1113).
     replications: Vec<Replication<D>>,
+    /// The journal records a replication duty reads, reused so a steady
+    /// duty allocates nothing (karyos#1113).
+    replication_records: Vec<crate::integrity::SealRecord>,
+    /// One replication's messages of a duty, reused likewise.
+    replication_out: Vec<crate::replication::transport::Outgoing>,
     /// The integrity journal of each group journal directory, which seals
     /// its groups' journals (karyos#1088); a directory whose journal
     /// failed holds `None` and is not sealed again until restart.
@@ -2508,6 +2539,20 @@ struct Replication<D: Disk> {
     read: u64,
     /// When its last status was produced, in agent nanoseconds.
     status_at: u64,
+}
+
+/// Drops the range seals sent whole, those ending at or below
+/// `sent_end`, but the last: it keeps where the seals end. They are in
+/// the journal's order, each range after the one before it, so a steady
+/// replication holds a few seals in the storage it already has
+/// (karyos#1113).
+fn forget_sent(seals: &mut Vec<crate::integrity::SealRecord>, sent_end: u64) {
+    let sent = seals
+        .iter()
+        .take_while(|seal| seal.end <= sent_end)
+        .count()
+        .min(seals.len().saturating_sub(1));
+    seals.drain(..sent);
 }
 
 /// `records`' range seals of `recording`.
@@ -3190,10 +3235,13 @@ where
             self.stopped_store(id)?
         };
         let (out, answer) = mpsc::sync_channel(REPLICATION_QUEUE);
+        // Room for a steady duty's messages and new seals up front.
+        let mut seals = seals;
+        seals.reserve(REPLICATION_QUEUE);
         self.replications.push(Replication {
             sender,
             out,
-            queued: std::collections::VecDeque::new(),
+            queued: std::collections::VecDeque::with_capacity(REPLICATION_QUEUE),
             store,
             seals,
             read,
@@ -3222,14 +3270,7 @@ where
 
     /// Ends the replication `stop` names with a `stopped` status.
     fn stop_replication(&mut self, stop: crate::replication::StopReplication) {
-        let ids: Vec<u64> = self
-            .replications
-            .iter()
-            .filter(|replication| replication.store.is_none())
-            .map(|replication| replication.sender.request().recording_id)
-            .filter(|id| !self.active.iter().any(|active| active.id == *id))
-            .collect();
-        self.reopen(&ids);
+        self.reopen();
         for replication in &mut self.replications {
             let request = replication.sender.request();
             if request.recording_id != stop.recording_id
@@ -3258,27 +3299,27 @@ where
         }
     }
 
-    /// Opens the store of each replication of `ids` whose recording
-    /// stopped since it was accepted; one that cannot be opened is dropped,
-    /// which ends its stream.
-    fn reopen(&mut self, ids: &[u64]) {
-        for id in ids {
-            let mut index = 0;
-            while let Some(replication) = self.replications.get(index) {
-                if replication.store.is_some() || replication.sender.request().recording_id != *id {
+    /// Opens the store of each replication whose recording stopped since
+    /// it was accepted; one that cannot be opened is dropped, which ends
+    /// its stream. Nothing is collected, so a duty with every recording
+    /// still active allocates nothing.
+    fn reopen(&mut self) {
+        let mut index = 0;
+        while let Some(replication) = self.replications.get(index) {
+            let id = replication.sender.request().recording_id;
+            if replication.store.is_some() || self.active.iter().any(|active| active.id == id) {
+                index += 1;
+                continue;
+            }
+            match self.stopped_store(id) {
+                Ok(Some(store)) => {
+                    if let Some(replication) = self.replications.get_mut(index) {
+                        replication.store = Some(store);
+                    }
                     index += 1;
-                    continue;
                 }
-                match self.stopped_store(*id) {
-                    Ok(Some(store)) => {
-                        if let Some(replication) = self.replications.get_mut(index) {
-                            replication.store = Some(store);
-                        }
-                        index += 1;
-                    }
-                    _ => {
-                        self.replications.swap_remove(index);
-                    }
+                _ => {
+                    self.replications.swap_remove(index);
                 }
             }
         }
@@ -3288,14 +3329,24 @@ where
     /// queue is empty, the next sealed ranges, at most `budget` bytes for
     /// all of them in one duty, and a status when one is due.
     fn replication_duty(&mut self, budget: u64, now: u64) -> bool {
-        let ids: Vec<u64> = self
-            .replications
-            .iter()
-            .filter(|replication| replication.store.is_none())
-            .map(|replication| replication.sender.request().recording_id)
-            .filter(|id| !self.active.iter().any(|active| active.id == *id))
-            .collect();
-        self.reopen(&ids);
+        self.reopen();
+        let mut out = core::mem::take(&mut self.replication_out);
+        let mut records = core::mem::take(&mut self.replication_records);
+        let worked = self.replicate_each(budget, now, &mut out, &mut records);
+        self.replication_out = out;
+        self.replication_records = records;
+        worked
+    }
+
+    /// [`State::replication_duty`]'s pass over the replications, with
+    /// its reused buffers.
+    fn replicate_each(
+        &mut self,
+        budget: u64,
+        now: u64,
+        out: &mut Vec<crate::replication::transport::Outgoing>,
+        records: &mut Vec<crate::integrity::SealRecord>,
+    ) -> bool {
         let mut budget = usize::try_from(budget).unwrap_or(usize::MAX).max(1);
         let mut worked = false;
         let mut index = 0;
@@ -3321,28 +3372,37 @@ where
             }
             if replication.queued.is_empty() && replication.sender.done().is_none() {
                 let id = replication.sender.request().recording_id;
+                records.clear();
                 if let Some(integrity) = self.integrity.as_mut()
-                    && let Ok(new) = integrity.journal.records_from(replication.read)
+                    && integrity
+                        .journal
+                        .records_from_into(replication.read, records)
+                        .is_ok()
                 {
                     replication.read = replication
                         .read
-                        .saturating_add(u64::try_from(new.len()).unwrap_or(u64::MAX));
-                    replication.seals.extend(range_seals(&new, id));
+                        .saturating_add(u64::try_from(records.len()).unwrap_or(u64::MAX));
+                    replication.seals.extend(
+                        records
+                            .iter()
+                            .filter(|record| record.subject == id && record.kind.is_range())
+                            .copied(),
+                    );
                 }
-                let mut out = Vec::new();
+                out.clear();
                 let active = self.active.iter_mut().find(|active| active.id == id);
                 let polled = match (replication.store.as_mut(), active) {
                     (Some(store), _) => {
                         replication
                             .sender
-                            .poll(store, &replication.seals, true, budget, &mut out)
+                            .poll(store, &replication.seals, true, budget, out)
                     }
                     (None, Some(active)) => replication.sender.poll(
                         active.recorder.store_mut(),
                         &replication.seals,
                         false,
                         budget,
-                        &mut out,
+                        out,
                     ),
                     // Reopened at the top of the next duty.
                     (None, None) => Ok(()),
@@ -3356,6 +3416,9 @@ where
                     .sum();
                 budget = budget.saturating_sub(sent);
                 if polled.is_err() {
+                    // Its chunks go with it: the shared buffer keeps its
+                    // capacity for the next replication (Codex review).
+                    out.clear();
                     self.replications.swap_remove(index);
                     continue;
                 }
@@ -3388,7 +3451,8 @@ where
                     replication.status_at = now;
                 }
                 worked |= !out.is_empty();
-                replication.queued.extend(out);
+                replication.queued.extend(out.drain(..));
+                forget_sent(&mut replication.seals, replication.sender.sent_end());
             }
             index += 1;
         }

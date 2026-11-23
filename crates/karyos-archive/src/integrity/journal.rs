@@ -323,8 +323,37 @@ impl<D: Disk> IntegrityJournal<D> {
     ///
     /// As [`IntegrityJournal::records`].
     pub fn records_from(&mut self, from: u64) -> Result<Vec<SealRecord>, IntegrityError> {
-        let count = self.next_counter();
         let mut records = Vec::new();
+        self.records_from_into(from, &mut records)?;
+        Ok(records)
+    }
+
+    /// The records from index `from` on, appended to `records`: a caller
+    /// that reuses `records` reads them without allocating once it holds
+    /// enough (karyos#1113). On an error `records` is left as it was.
+    ///
+    /// # Errors
+    ///
+    /// As [`IntegrityJournal::records`].
+    pub fn records_from_into(
+        &mut self,
+        from: u64,
+        records: &mut Vec<SealRecord>,
+    ) -> Result<(), IntegrityError> {
+        let held = records.len();
+        let read = self.append_records(from, records);
+        if read.is_err() {
+            records.truncate(held);
+        }
+        read
+    }
+
+    fn append_records(
+        &mut self,
+        from: u64,
+        records: &mut Vec<SealRecord>,
+    ) -> Result<(), IntegrityError> {
+        let count = self.next_counter();
         let mut buf = [0u8; SEAL_RECORD_LENGTH];
         for index in from..count {
             let offset = index
@@ -335,7 +364,7 @@ impl<D: Disk> IntegrityJournal<D> {
                 .map_err(|error| Inconsistency::Malformed { index, error })?;
             records.push(record);
         }
-        Ok(records)
+        Ok(())
     }
 
     /// Appends the next record and syncs it.

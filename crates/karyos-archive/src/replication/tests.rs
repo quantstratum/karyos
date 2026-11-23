@@ -475,6 +475,63 @@ mod transport {
     /// karyos#1113: a budget below one chunk is kept, a budget of 0 sends
     /// no bytes, and each chunk fits the sender's chunk; the whole still
     /// arrives and counts.
+    /// Codex review of #1178: a poll never has more than `CHUNK_POOL`
+    /// chunk buffers out. With a large budget and small chunks, a poll
+    /// stops at the pool's size while none come back, and goes on from
+    /// there once they do, every byte once and in order.
+    #[test]
+    fn a_poll_waits_for_chunks_to_come_back() {
+        use crate::replication::transport::CHUNK_POOL;
+        let (_dirs, source_dir, _replica_dir) = dirs("pool");
+        let (mut store, seals) = source(&source_dir);
+        let mut sender = Sender::accept(request(0, u64::MAX, Mode::OnDemand), true, 0, &seals)
+            .unwrap()
+            .with_chunk(16);
+        let mut out = Vec::new();
+        sender
+            .poll(&mut store, &seals, false, usize::MAX, &mut out)
+            .unwrap();
+        let held = |out: &Vec<Outgoing>| {
+            out.iter()
+                .filter(|message| matches!(message, Outgoing::Bytes { .. }))
+                .count()
+        };
+        assert_eq!(held(&out), CHUNK_POOL, "stopped at the pool's size");
+        assert!(
+            !out.iter()
+                .any(|message| matches!(message, Outgoing::Status(_)))
+        );
+        // Still held: nothing more.
+        let mut more = Vec::new();
+        sender
+            .poll(&mut store, &seals, false, usize::MAX, &mut more)
+            .unwrap();
+        assert!(more.is_empty(), "no chunk while every buffer is out");
+        let mut next = 0u64;
+        let mut done = false;
+        for _ in 0..10_000 {
+            for message in &out {
+                if let Outgoing::Bytes { start, bytes } = message {
+                    assert_eq!(*start, next, "in order, once");
+                    next += u64::try_from(bytes.len()).unwrap();
+                }
+                done |=
+                    matches!(message, Outgoing::Status(status) if status.state == State::CaughtUp);
+            }
+            // The chunks are dropped: their buffers come back.
+            out.clear();
+            if done {
+                break;
+            }
+            sender
+                .poll(&mut store, &seals, false, usize::MAX, &mut out)
+                .unwrap();
+            assert!(held(&out) <= CHUNK_POOL);
+        }
+        assert!(done, "caught up");
+        assert_eq!(next, 40_107);
+    }
+
     #[test]
     fn a_poll_keeps_a_small_budget_and_the_chunk_size() {
         let (_dirs, source_dir, replica_dir) = dirs("small-budget");
