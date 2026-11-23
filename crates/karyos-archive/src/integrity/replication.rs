@@ -135,6 +135,10 @@ impl Replica {
                 && copy.state == CopyState::Verified
         });
         if counted {
+            // The snapshot answers only if it is the journal's state: a
+            // copy another handle invalidated or removed since is not
+            // counted from a stale view.
+            copies.check(journal)?;
             return Ok(Verdict::AlreadyCounted);
         }
         let record = self.record(

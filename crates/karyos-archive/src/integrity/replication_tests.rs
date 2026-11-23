@@ -395,6 +395,29 @@ fn a_failed_or_replayed_seal_never_downgrades_a_verified_copy() {
 }
 
 #[test]
+fn a_replayed_seal_is_never_counted_from_a_stale_catalog() {
+    use super::journal::IntegrityError;
+    let mut f = fixture();
+    let (seal, bytes) = f.ranges[0].clone();
+    let _ = replica()
+        .verify(&mut f.copies, &mut f.journal, &seal, &bytes)
+        .unwrap();
+    // Another handle invalidates the copy: this one's snapshot still says
+    // verified.
+    let mut other = CopyCatalog::open(f.disk.clone(), Path::new(DIR), &mut f.journal).unwrap();
+    assert_eq!(
+        replica()
+            .invalidate(&mut other, &mut f.journal, RECORDING, seal.start, seal.end)
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        replica().verify(&mut f.copies, &mut f.journal, &seal, &bytes),
+        Err(ReplicationError::Integrity(IntegrityError::StaleCatalog))
+    ));
+}
+
+#[test]
 fn only_the_replicas_own_check_invalidates_a_verified_copy() {
     let mut f = fixture();
     for (seal, bytes) in f.ranges.clone() {
