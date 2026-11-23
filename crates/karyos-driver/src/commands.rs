@@ -1108,6 +1108,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // on that lane, so none waits for an adopter that will not come.
         self.attach_of = None;
         self.pending_join_loss = None;
+        let start_clock = (self.clock.now(), self.awaiting_deadline());
         let command = match command {
             Command::AddImageSubscriptionOf {
                 sequence,
@@ -1202,7 +1203,12 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 match remote {
                     // The export bound refuses before anything is reserved.
                     Some(true) => return Ok(refuse(ErrorCode::ResourcesUnavailable, detail)),
-                    Some(false) => return Ok(self.add_remote(client, index, command, request)),
+                    // The same completion as a local attach (ADR-0100):
+                    // its join loss and its counter.
+                    Some(false) => {
+                        let response = self.add_remote(client, index, command, request);
+                        return Ok(self.finish_attach(response));
+                    }
                     None => {}
                 }
                 if link.held() >= self.config.max_pending_per_client
@@ -1228,6 +1234,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 let mut subscriber = None;
                 let mut occupant_used = None;
                 let attach_of = self.attach_of.take();
+                let clock = start_clock;
                 // What an `AddImageSubscriptionOf` owes as an
                 // `ImageJoinLoss` (ADR-0100): an optional cell raised to
                 // the floor, or a head join for want of an awaiting cell.
@@ -1281,7 +1288,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                         // parent's awaiting cell in place, at the image's
                         // join (an optional one raised to the floor first).
                         let adopted =
-                            attach_of.and_then(|parent| take_awaiting(target, parent, role));
+                            attach_of.and_then(|parent| take_awaiting(target, parent, role, clock));
                         match adopted {
                             Some(cell) => {
                                 let raised = match role {
@@ -1622,7 +1629,13 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             }
             _ => return Err("a command this driver does not serve"),
         };
-        // The join loss the attach owes, once it succeeded (ADR-0100).
+        Ok(self.finish_attach(response))
+    }
+
+    /// The completion of an attach, local or remote (ADR-0100): once it
+    /// succeeded, the join loss it owes is sent and counted, or its start
+    /// join is counted.
+    fn finish_attach(&mut self, response: Response) -> Response {
         let attached = matches!(response, Response::SubscriptionReady { .. });
         if attached && let Some(event) = self.pending_join_loss.take() {
             self.counters.add(Event::ImageStartJoinsLate, 1);
@@ -1630,8 +1643,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         } else if attached && self.adopted_start {
             self.counters.add(Event::ImageStartJoins, 1);
         }
+        self.pending_join_loss = None;
         self.adopted_start = false;
-        Ok(response)
+        response
+    }
+
+    /// The image join deadline a required awaiting cell holds for, when
+    /// the driver has a network (ADR-0100).
+    pub(crate) fn awaiting_deadline(&self) -> Option<u64> {
+        self.config
+            .network
+            .as_ref()
+            .map(|network| network.images.image_join_deadline)
     }
 
     /// Withdraws `client`'s awaiting cells of `role` on stream `index`
@@ -2304,15 +2327,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // carries that export, and the export counter is not consumed.
         let attach_of = self.attach_of.take();
         let role = subscription_role(&command);
-        let adopted = attach_of.and_then(|parent| {
-            self.streams
-                .get_mut(index)
-                .and_then(|target| take_awaiting(target, parent, role))
+        let clock = (self.clock.now(), self.awaiting_deadline());
+        // The cell stays tracked on its stream until the grant commits, so
+        // a refused grant leaves it awaiting, for its expiry or removal.
+        let adopted: Option<(usize, u64)> = attach_of.and_then(|parent| {
+            let target = self.streams.get(index)?;
+            let at = awaiting_index(target, parent, role, clock)?;
+            let cell = &target.awaiting.get(at)?.cell;
+            Some((cell.cell(), cell.export()))
         });
-        let export = adopted.as_ref().map_or(
-            self.next_export,
-            karyos_sys::log_buffer::AwaitingCell::export,
-        );
+        let export = adopted.map_or(self.next_export, |(_, export)| export);
         // Export ids stop below the adoption and fence marks; they never
         // wrap.
         if !registration::valid_export(export) {
@@ -2392,7 +2416,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(target) = self.streams.iter_mut().find(|found| found.id == stream_id) else {
             return refuse(ErrorCode::UnknownStream, 0);
         };
-        let mut adopted_loss: Option<(u64, u64)> = None;
         let participant = match command {
             Command::AddPublication { .. } => {
                 // A spare publication is the driver's own issuance.
@@ -2420,16 +2443,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     Err(error) => return refuse(issue_refusal(&error), detail),
                 }
             }
-            _ => match &adopted {
-                Some(cell) => {
-                    if matches!(role, Role::Optional | Role::Observer) {
-                        adopted_loss = target.conductor.raise_to_floor(cell).ok().flatten();
-                    }
-                    Participant::Subscriber {
-                        cell: cell.cell(),
-                        role,
-                    }
-                }
+            _ => match adopted {
+                Some((cell, _)) => Participant::Subscriber { cell, role },
                 None => {
                     let reserve = role == Role::Required && target.policy == LossPolicy::Continue;
                     match target
@@ -2442,18 +2457,6 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 }
             },
         };
-        if let Some(parent) = attach_of {
-            let join = match participant {
-                Participant::Subscriber { cell, .. } => target
-                    .conductor
-                    .cell_position(cell)
-                    .and_then(|position| target.base.checked_add(position)),
-                _ => None,
-            };
-            self.pending_join_loss =
-                join_loss(target, parent, join, adopted_loss, adopted.is_none());
-        }
-        self.adopted_start = adopted.is_some();
         // Recorded by the driver, never taken from the client. Checked
         // (SPEC.md §14), as for a local subscription: if the sum did not
         // fit, the add is refused and the cell ended, which the grant never
@@ -2494,7 +2497,24 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let Some(target) = self.streams.iter_mut().find(|found| found.id == stream_id) else {
             return refuse(ErrorCode::UnknownStream, 0);
         };
-        // Effect: everything below cannot fail.
+        // Effect: everything below cannot fail. ADR-0100: the adopted cell
+        // leaves its stream's awaiting list here, an optional one raised to
+        // the floor first, and the join loss the attach owes is set.
+        let mut join = join;
+        if let Some(parent) = attach_of {
+            let mut raised = None;
+            if adopted.is_some()
+                && let Some(cell) = take_awaiting(target, parent, role, clock)
+                && matches!(role, Role::Optional | Role::Observer)
+            {
+                raised = target.conductor.raise_to_floor(&cell).ok().flatten();
+                if let Some((_, to)) = raised {
+                    join = target.base.checked_add(to).or(join);
+                }
+            }
+            self.pending_join_loss = join_loss(target, parent, join, raised, adopted.is_none());
+        }
+        self.adopted_start = adopted.is_some();
         let stream = target.id;
         let generation = target.generation.get();
         let incarnation = target.incarnation;
@@ -2907,12 +2927,31 @@ fn take_awaiting<T: StreamTerms>(
     stream: &mut crate::embedded::Stream<T>,
     parent: u64,
     role: Role,
+    clock: (u64, Option<u64>),
 ) -> Option<karyos_sys::log_buffer::AwaitingCell> {
-    let index = stream
-        .awaiting
-        .iter()
-        .position(|awaiting| awaiting.parent == parent && awaiting.role == role)?;
+    let index = awaiting_index(stream, parent, role, clock)?;
     Some(stream.awaiting.swap_remove(index).cell)
+}
+
+/// Where `parent`'s awaiting cell of `role` is on `stream` (ADR-0100), if
+/// one is waiting and, for a required one, its `image_join_deadline` has
+/// not passed: an expired cell is never adopted, and the next
+/// `expire_awaiting` ends it.
+fn awaiting_index<T: StreamTerms>(
+    stream: &crate::embedded::Stream<T>,
+    parent: u64,
+    role: Role,
+    (now, deadline): (u64, Option<u64>),
+) -> Option<usize> {
+    stream.awaiting.iter().position(|awaiting| {
+        awaiting.parent == parent
+            && awaiting.role == role
+            && (role != Role::Required
+                || deadline.is_none_or(|deadline| {
+                    now.checked_sub(awaiting.since)
+                        .is_none_or(|held| held < deadline)
+                }))
+    })
 }
 
 /// The `ImageJoinLoss` an `AddImageSubscriptionOf` attach of `parent` on

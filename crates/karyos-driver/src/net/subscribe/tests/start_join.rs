@@ -63,6 +63,19 @@ impl Rig {
     /// As [`Rig::new`]; with `remote`, the client is admitted with an
     /// export ledger, so its attaches are grants (`add_remote`).
     fn with_client(role: SubscriberRole, deadline: u64, remote: bool) -> Self {
+        Self::with_ledger(
+            role,
+            deadline,
+            remote.then(|| crate::ledger::Ledger::new(4, 4, 1 << 30)),
+        )
+    }
+
+    /// As [`Rig::with_client`], the remote client admitted with `ledger`.
+    fn with_ledger(
+        role: SubscriberRole,
+        deadline: u64,
+        ledger: Option<crate::ledger::Ledger>,
+    ) -> Self {
         let a = driver(ThreadingMode::Shared);
         let mut network = NetworkConfig {
             threading: ThreadingMode::Shared,
@@ -76,11 +89,14 @@ impl Rig {
         .unwrap();
         let address = SocketAddr::new(LOOPBACK, free_port());
         let mut observer = b.broadcast.receiver();
-        let (_client, mut producer, link) = if remote {
-            let (client, producer) = super::remote_client(&mut b);
-            (client, producer, Arc::new(ClientLink::new()))
-        } else {
-            local_client(&mut b)
+        let (_client, mut producer, link) = match ledger {
+            Some(ledger) => {
+                let (producer, consumer) = karyos_sys::command_ring::command_ring(1024).unwrap();
+                let link = Arc::new(ClientLink::new());
+                let client = b.admit(consumer, Arc::clone(&link), Some(ledger)).unwrap();
+                (client, producer, link)
+            }
+            None => local_client(&mut b),
         };
         write_command(
             &mut producer,
@@ -333,4 +349,56 @@ fn a_remote_attach_is_granted_the_awaiting_cell() {
     let grant = *rig.b.ledger(client).unwrap().grants().last().unwrap();
     assert!(grant.export < before, "the cell's export, from the build");
     assert!(rig.b.next_export >= before);
+}
+
+/// Review of #1175: a remote attach completes as a local one does. An
+/// expired required cell's remote attach is granted at the head, and its
+/// `ImageJoinLoss` is sent and counted.
+#[test]
+fn a_late_remote_attach_reports_its_loss() {
+    let mut rig = Rig::with_client(SubscriberRole::Required, 1, true);
+    let early = rig.offer(b"early");
+    let (responses, events) = rig.send(rig.attach_of(2));
+    assert!(
+        responses
+            .iter()
+            .any(|response| matches!(response, Response::SubscriptionReady { .. })),
+        "{responses:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            Event::ImageJoinLoss { parent, from, .. } if *parent == rig.parent && *from == early
+        )),
+        "{events:?}"
+    );
+}
+
+/// Review of #1175: a remote grant refused after the awaiting cell was
+/// found (a fetch the ledger's byte bound cannot carry) leaves the cell on
+/// its stream, still awaiting, for its expiry or its parent's removal.
+#[test]
+fn a_refused_remote_grant_leaves_the_cell_awaiting() {
+    let mut rig = Rig::with_ledger(
+        SubscriberRole::Required,
+        10_000_000_000,
+        Some(crate::ledger::Ledger::new(4, 4, 1)),
+    );
+    let _early = rig.offer(b"early");
+    let awaiting = |rig: &Rig| {
+        rig.b
+            .streams
+            .iter()
+            .map(|stream| stream.awaiting.len())
+            .sum::<usize>()
+    };
+    assert_eq!(awaiting(&rig), 1);
+    let (responses, _) = rig.send(rig.attach_of(2));
+    assert!(
+        responses
+            .iter()
+            .any(|response| matches!(response, Response::Error { .. })),
+        "{responses:?}"
+    );
+    assert_eq!(awaiting(&rig), 1, "the refused grant left the cell tracked");
 }
