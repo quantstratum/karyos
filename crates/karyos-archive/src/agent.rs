@@ -4621,6 +4621,7 @@ impl<D: Disk> Integrity<D> {
                     retain_until_ns: 0,
                     state: CopyState::Verified,
                     enforcement,
+                    profile: crate::integrity::copies::ArrivalProfile::Local,
                 },
                 &mut self.journal,
             )

@@ -152,6 +152,12 @@ Archive:
                                     control pair <req>,<resp>, forwarded on a reliable UDP
                                     stream; continuous unless on-demand; repeatable; needs
                                     --replication-trusted-network and --network on
+  --replica <rec>,<source-ip>,<bind host:port>,<stream>
+                                    accept a recording from a source Archive (ADR-0102):
+                                    only that source's images of the stream are read, into
+                                    <archive>/replicas/<rec>; repeatable; needs
+                                    --replication-trusted-network, --archive-copy-location
+                                    and --network on
   --replication-trusted-network     declare the replication network trusted: required for
                                     --replicate while no authenticated profile is selected
   --archive-min-free <size>         refuse a recording while the archive's file system has
@@ -331,6 +337,21 @@ pub struct ReplicateOption {
     pub mode: karyos_archive::replication::Mode,
 }
 
+/// A replication this Archive accepts as a replica (`--replica`,
+/// ADR-0102 decision 4): the triple (source address, recording id,
+/// destination stream) and the endpoint it listens at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaOption {
+    /// The recording replicated, the source's id, kept as the replica's.
+    pub recording_id: u64,
+    /// The source's address: only its images are read.
+    pub source: std::net::IpAddr,
+    /// The endpoint the replica's network subscription binds.
+    pub bind: std::net::SocketAddr,
+    /// The stream it arrives on.
+    pub stream_id: i32,
+}
+
 /// The Archive agent's settings (`--archive`, `--archive-control`,
 /// `--record`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,6 +393,9 @@ pub struct ArchiveOptions {
     pub time_evidence: bool,
     /// The replications this source pushes (`--replicate`; ADR-0102).
     pub replications: Vec<ReplicateOption>,
+    /// The replications this Archive accepts as a replica (`--replica`;
+    /// ADR-0102). Needs `copy_location`.
+    pub replicas: Vec<ReplicaOption>,
     /// The operator declares the replication network trusted
     /// (`--replication-trusted-network`, ADR-0102 decision 10): without it
     /// no replication starts.
@@ -667,6 +691,7 @@ where
             }
             "--archive-control" => control(&value).map(|control| archive.control = Some(control)),
             "--record" => record(&value).map(|record| archive.records.push(record)),
+            "--replica" => replica(&value).map(|replica| archive.replicas.push(replica)),
             "--replicate" => {
                 replicate(&value).map(|replicate| archive.replications.push(replicate))
             }
@@ -716,16 +741,20 @@ where
     options.archive = archive.finish()?;
     // A replication forwards over UDP: refused with the network off,
     // rather than started to fail forever.
-    if options
-        .archive
-        .as_ref()
-        .is_some_and(|archive| !archive.replications.is_empty())
+    if let Some(archive) = options.archive.as_ref()
         && options.driver.network.is_none()
     {
-        return Err(ArgsError::Needs {
-            option: "--replicate",
-            needs: "--network on",
-        });
+        for (given, option) in [
+            (!archive.replications.is_empty(), "--replicate"),
+            (!archive.replicas.is_empty(), "--replica"),
+        ] {
+            if given {
+                return Err(ArgsError::Needs {
+                    option,
+                    needs: "--network on",
+                });
+            }
+        }
     }
     if sizing {
         return Ok(Command::SizingReport(Box::new(options)));
@@ -860,6 +889,7 @@ const OPTIONS: &[&str] = &[
     "--archive-control",
     "--record",
     "--replicate",
+    "--replica",
     "--archive-min-free",
     "--archive-seal-interval",
     "--archive-anchor-interval",
@@ -1286,6 +1316,7 @@ struct Archive {
     min_copies: Option<std::num::NonZeroU32>,
     time_evidence: bool,
     replications: Vec<ReplicateOption>,
+    replicas: Vec<ReplicaOption>,
     trusted_network: bool,
 }
 
@@ -1314,6 +1345,7 @@ impl Archive {
                 (self.min_copies.is_some(), "--archive-min-copies"),
                 (self.time_evidence, "--archive-time-evidence"),
                 (!self.replications.is_empty(), "--replicate"),
+                (!self.replicas.is_empty(), "--replica"),
                 (self.trusted_network, "--replication-trusted-network"),
             ] {
                 if given {
@@ -1331,6 +1363,19 @@ impl Archive {
             return Err(ArgsError::Needs {
                 option: "--replicate",
                 needs: "--replication-trusted-network",
+            });
+        }
+        if !self.replicas.is_empty() && !self.trusted_network {
+            return Err(ArgsError::Needs {
+                option: "--replica",
+                needs: "--replication-trusted-network",
+            });
+        }
+        // A replica's copies are catalogued at this Archive's location.
+        if !self.replicas.is_empty() && self.copy_location.is_none() {
+            return Err(ArgsError::Needs {
+                option: "--replica",
+                needs: "--archive-copy-location",
             });
         }
         let (requests, responses, retention_responses) = self.control.ok_or(ArgsError::Needs {
@@ -1391,6 +1436,7 @@ impl Archive {
             retention,
             time_evidence: self.time_evidence,
             replications: self.replications,
+            replicas: self.replicas,
             trusted_network: self.trusted_network,
         }))
     }
@@ -1462,6 +1508,25 @@ fn control(value: &str) -> Option<(i32, i32, Option<i32>)> {
         return None;
     }
     Some((requests, responses, state))
+}
+
+/// `<recording>,<source-ip>,<bind host:port>,<stream>`: a replication
+/// this Archive accepts.
+fn replica(value: &str) -> Option<ReplicaOption> {
+    let mut parts = value.split(',');
+    let recording_id: u64 = parts.next()?.parse().ok().filter(|id| *id != 0)?;
+    let source = parts.next()?.parse().ok()?;
+    let bind = parts.next()?.parse().ok()?;
+    let stream_id = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(ReplicaOption {
+        recording_id,
+        source,
+        bind,
+        stream_id,
+    })
 }
 
 /// `<recording>,<host:port>,<stream>,<req>,<resp>[,on-demand]`: a
@@ -1891,6 +1956,76 @@ mod tests {
         }
     }
 
+    /// ADR-0102 decision 4: a replica is the triple and a bind endpoint,
+    /// refused without a trusted network, a copy location or the network.
+    #[test]
+    fn a_replica_parses_and_fails_closed() {
+        let base = [
+            "--dir",
+            "/run/k",
+            "--archive",
+            "/var/archive",
+            "--archive-control",
+            "100,101",
+            "--archive-anchor-interval",
+            "3600s",
+            "--replica",
+            "5,10.0.0.1,0.0.0.0:4000,40",
+        ];
+        let location = "ab".repeat(32);
+        let mut full = base.to_vec();
+        full.extend([
+            "--replication-trusted-network",
+            "--archive-copy-location",
+            &location,
+            "--network",
+            "on",
+        ]);
+        let archive = options(&full).archive.unwrap();
+        assert_eq!(
+            archive.replicas,
+            vec![ReplicaOption {
+                recording_id: 5,
+                source: "10.0.0.1".parse().unwrap(),
+                bind: "0.0.0.0:4000".parse().unwrap(),
+                stream_id: 40,
+            }]
+        );
+        assert_eq!(
+            run(&base).unwrap_err(),
+            ArgsError::Needs {
+                option: "--replica",
+                needs: "--replication-trusted-network",
+            }
+        );
+        let mut no_location = base.to_vec();
+        no_location.push("--replication-trusted-network");
+        assert_eq!(
+            run(&no_location).unwrap_err(),
+            ArgsError::Needs {
+                option: "--replica",
+                needs: "--archive-copy-location",
+            }
+        );
+        let off = &full[..full.len() - 2];
+        assert_eq!(
+            run(off).unwrap_err(),
+            ArgsError::Needs {
+                option: "--replica",
+                needs: "--network on",
+            }
+        );
+        for bad in [
+            "0,10.0.0.1,0.0.0.0:4000,40",
+            "5,host,0.0.0.0:4000,40",
+            "5,10.0.0.1,0.0.0.0:4000,40,x",
+        ] {
+            let mut args = full.clone();
+            args[9] = bad;
+            assert!(run(&args).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn errors_display_as_one_line() {
         for error in [
@@ -1960,6 +2095,7 @@ mod tests {
                 retention: None,
                 time_evidence: false,
                 replications: Vec::new(),
+                replicas: Vec::new(),
                 trusted_network: false,
             })
         );

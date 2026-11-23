@@ -5995,6 +5995,7 @@ fn a_configured_policy_purges_through_the_engine() {
                 retain_until_ns: 0,
                 state: CopyState::Verified,
                 enforcement: Enforcement::Unsupported,
+                profile: crate::integrity::copies::ArrivalProfile::Local,
             },
             &mut journal,
         )
@@ -6209,6 +6210,7 @@ fn copy_elsewhere(dir: &Path, id: u64, end: u64) -> bool {
                 retain_until_ns: 0,
                 state: CopyState::Verified,
                 enforcement: Enforcement::Unsupported,
+                profile: crate::integrity::copies::ArrivalProfile::Local,
             },
             &mut journal,
         )
@@ -6766,6 +6768,7 @@ fn immutable_segments_are_released_only_by_a_purge() {
                 retain_until_ns: 0,
                 state: CopyState::Verified,
                 enforcement: Enforcement::Unsupported,
+                profile: crate::integrity::copies::ArrivalProfile::Local,
             },
             &mut journal,
         )

@@ -1059,6 +1059,7 @@ fn verify_reports_each_copy_and_its_enforcement() {
                         retain_until_ns: 0,
                         state: CopyState::Verified,
                         enforcement,
+                        profile: karyos_archive::integrity::copies::ArrivalProfile::Local,
                     },
                     &mut journal,
                 )
@@ -1118,6 +1119,7 @@ fn record_copies(
                     retain_until_ns: 0,
                     state,
                     enforcement,
+                    profile: karyos_archive::integrity::copies::ArrivalProfile::Local,
                 },
                 &mut journal,
             )

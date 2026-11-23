@@ -155,6 +155,7 @@ fn setup(disk: &FaultDisk) {
                     retain_until_ns: 0,
                     state: CopyState::Verified,
                     enforcement: Enforcement::ObjectLock,
+                    profile: crate::integrity::copies::ArrivalProfile::Local,
                 },
                 &mut journal,
             )
@@ -729,6 +730,7 @@ fn copies_are_counted_from_the_stores_start() {
                     retain_until_ns: 0,
                     state: CopyState::Removed,
                     enforcement: Enforcement::ObjectLock,
+                    profile: crate::integrity::copies::ArrivalProfile::Local,
                 },
                 &mut archive.journal,
             )
@@ -746,6 +748,7 @@ fn copies_are_counted_from_the_stores_start() {
                     retain_until_ns: 0,
                     state: CopyState::Verified,
                     enforcement: Enforcement::ObjectLock,
+                    profile: crate::integrity::copies::ArrivalProfile::Local,
                 },
                 &mut archive.journal,
             )
@@ -1055,6 +1058,7 @@ fn a_cutoff_past_the_seals_or_the_purgeable_floor_is_refused() {
                     retain_until_ns: 0,
                     state: CopyState::Verified,
                     enforcement: Enforcement::ObjectLock,
+                    profile: crate::integrity::copies::ArrivalProfile::Local,
                 },
                 &mut archive.journal,
             )
@@ -1161,6 +1165,7 @@ fn a_sealed_segment_is_recorded_with_the_enforcement_that_applies() {
         retain_until_ns: 0,
         state: CopyState::Verified,
         enforcement: Enforcement::Unsupported,
+        profile: crate::integrity::copies::ArrivalProfile::Local,
     };
     let before = archive.copies.records().len();
     archive

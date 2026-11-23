@@ -365,6 +365,7 @@ impl Tiering {
             retain_until_ns,
             state,
             enforcement,
+            profile: crate::integrity::copies::ArrivalProfile::Local,
         }
     }
 }
