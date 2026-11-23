@@ -1923,3 +1923,33 @@ fn a_posted_interval_takes_no_frame_until_it_is_sealed() {
     assert_eq!(owner.posted(Lane::ZERO), None);
     assert_eq!(owner.rebuild_position(Lane::ZERO), Some(320));
 }
+
+/// ADR-0100 (karyos#844): a required cell registered when the image is
+/// built, before any frame, holds the consumption at the image's join
+/// while it waits; its adopter takes the same cell in place, so no sample
+/// between the registration and the adoption, or after it, reports past
+/// the join; the adopter reads from the join.
+#[test]
+fn an_awaiting_required_cell_is_handed_over_in_place() {
+    let buffer = image(0);
+    let mut conductor = buffer.conductor().unwrap();
+    let cell = conductor
+        .register_subscriber_with(Role::Required, false, 7)
+        .unwrap();
+    let mut owner = owner(&buffer);
+    assert_eq!(recv(&mut owner, &data(0, 0, 128, 7)), committed(0, 128));
+    assert_eq!(recv(&mut owner, &data(0, 128, 128, 8)), committed(128, 128));
+    // Every sample while the cell awaits its adopter stays at the join.
+    assert_eq!(owner.consumption(Lane::ZERO), Some(0));
+    let mut adopted =
+        crate::log_buffer::Subscription::adopt(Arc::clone(&buffer), cell, Role::Required, 7)
+            .unwrap();
+    assert_eq!(owner.consumption(Lane::ZERO), Some(0));
+    let mut out = [0u8; 256];
+    match adopted.poll(&mut out).unwrap() {
+        PollOutcome::Message { position, .. } => assert_eq!(position, 0),
+        other => panic!("expected the join's message, got {other:?}"),
+    }
+    adopted.acknowledge();
+    assert_eq!(owner.consumption(Lane::ZERO), Some(128));
+}

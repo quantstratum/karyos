@@ -4710,6 +4710,55 @@ impl<O: BufferOwner> Conductor<O> {
         is_reader(cell.state.load(Ordering::Acquire)).then(|| cell.position.load(Ordering::Acquire))
     }
 
+    /// Moves `cell`, a registered optional or observer subscriber cell
+    /// that no participant has adopted yet, up to the retention floor when
+    /// the floor passed it (ADR-0100, an awaiting cell handed over late).
+    /// Returns the range `(from, to)` it skipped, or `None` when the cell
+    /// is at or above the floor and nothing moved.
+    ///
+    /// The caller runs it on the control path before the cell's grant or
+    /// hand-over is issued, so no reader can adopt the cell meanwhile; the
+    /// registration word is checked to still hold the bare `export`.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::Protocol`] for a cell that is not a subscriber cell
+    /// registered for exactly `export` and not adopted;
+    /// [`SysError::InvalidPublicationMode`] for a required or walker cell,
+    /// whose position bounds the floor and so is never below it.
+    pub fn raise_to_floor(
+        &mut self,
+        cell: usize,
+        export: u64,
+    ) -> Result<Option<(u64, u64)>, SysError> {
+        let buffer: &LogBuffer<O::Terms> = &self.buffer;
+        if cell < buffer.first_subscriber_cell() || !valid_export(export) {
+            return Err(NOT_GRANTED);
+        }
+        let found = buffer.cells().get(cell).ok_or(NOT_GRANTED)?;
+        match found.state.load(Ordering::Acquire) {
+            CELL_OPTIONAL | CELL_OBSERVER => {}
+            CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_WALKER => {
+                return Err(SysError::InvalidPublicationMode {
+                    reason: "only an optional or observer cell is raised to the floor",
+                });
+            }
+            _ => return Err(NOT_GRANTED),
+        }
+        if found.registration.load(Ordering::Acquire) != export {
+            return Err(NOT_GRANTED);
+        }
+        let floor = buffer.floor().load(Ordering::Acquire);
+        let position = found.position.load(Ordering::Acquire);
+        if position >= floor {
+            return Ok(None);
+        }
+        // No reader holds the cell (not adopted), so the conductor is its
+        // only writer; the adopter reads it after the grant (Release).
+        found.position.store(floor, Ordering::Release);
+        Ok(Some((position, floor)))
+    }
+
     /// The retention floor (Acquire): the position below which terms may be
     /// reclaimed, as the last duty cycle published it (before the limit).
     /// Diagnostics sample it (`quantstratum-docs:

@@ -1086,3 +1086,34 @@ fn test_log_buffer_required_set_transitions_limit_follows_and_never_decreases() 
     ));
     assert!(limits.windows(2).all(|pair| pair[0] <= pair[1]), "{limits:?}");
 }
+
+/// ADR-0100 (karyos#844): an awaiting optional cell that the floor passed
+/// before its hand-over is raised to the floor once, reporting the range
+/// it skipped, and its adopter starts there. A cell at or above the floor
+/// does not move; a required cell and an adopted one are refused.
+#[test]
+fn an_unadopted_optional_cell_is_raised_to_the_floor() {
+    let buffer = new_buffer(config(3, 3)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let optional = conductor
+        .register_subscriber_with(Role::Optional, false, 9)
+        .unwrap();
+    let required = conductor
+        .register_subscriber_with(Role::Required, false, 10)
+        .unwrap();
+    assert_eq!(conductor.raise_to_floor(optional, 9), Ok(None));
+    // The floor passes the cell, as a window of traffic would.
+    buffer.floor().store(4096, Ordering::Release);
+    assert_eq!(conductor.raise_to_floor(optional, 9), Ok(Some((0, 4096))));
+    assert_eq!(conductor.cell_position(optional), Some(4096));
+    assert_eq!(conductor.raise_to_floor(optional, 9), Ok(None));
+    assert!(matches!(
+        conductor.raise_to_floor(required, 10),
+        Err(SysError::InvalidPublicationMode { .. })
+    ));
+    // Another export, then the adopted cell, are refused.
+    assert!(conductor.raise_to_floor(optional, 11).is_err());
+    let adopted = Subscription::adopt(Arc::clone(&buffer), optional, Role::Optional, 9).unwrap();
+    assert_eq!(adopted.position(), 4096);
+    assert!(conductor.raise_to_floor(optional, 9).is_err());
+}
