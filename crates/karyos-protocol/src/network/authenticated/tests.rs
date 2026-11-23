@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
+// The vector helpers are not `#[test]` functions, so clippy's test
+// exemption does not reach them (global_rules.md, as in properties.rs).
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
 use super::*;
 use crate::network::{Alias, Control, Identity, Lanes, Receiver};
 use proptest::prelude::*;
