@@ -1371,7 +1371,7 @@ impl<D: Disk + Clone> RaftLog<D> {
                 let span = next.saturating_sub(end);
                 let total = planned.saturating_add(span);
                 let fits = (found.is_empty() && slot == first) || total <= max_bytes;
-                if !fits || (slot > first && next.saturating_sub(start) > READ_WINDOW) {
+                if !fits || next.saturating_sub(start) > READ_WINDOW {
                     break;
                 }
                 planned = total;
@@ -1379,7 +1379,9 @@ impl<D: Disk + Clone> RaftLog<D> {
                 slot += 1;
             }
             if slot == first {
-                // One frame: the log's last, or one past the budget.
+                // One frame alone: the log's last, one past the budget (its
+                // header checked before the read stops), or one larger than
+                // a window (read once, never copied again).
                 let Some((entry, claimed)) =
                     self.entry_alone(index, first, bytes, max_bytes, found.is_empty())?
                 else {
@@ -1408,10 +1410,9 @@ impl<D: Disk + Clone> RaftLog<D> {
                 found.push(check_frame(frame, index, term, position, false)?);
                 index = index.saturating_add(1);
             }
+            // Past the budget, the next frame's header is still read and
+            // checked, alone, before the read stops.
             bytes = planned;
-            if bytes >= max_bytes {
-                break;
-            }
         }
         Ok(found)
     }
