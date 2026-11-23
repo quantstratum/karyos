@@ -1934,8 +1934,9 @@ fn an_awaiting_required_cell_is_handed_over_in_place() {
     let buffer = image(0);
     let mut conductor = buffer.conductor().unwrap();
     let cell = conductor
-        .register_subscriber_with(Role::Required, false, 7)
-        .unwrap();
+        .register_awaiting(Role::Required, false, 7)
+        .unwrap()
+        .cell();
     let mut owner = owner(&buffer);
     assert_eq!(recv(&mut owner, &data(0, 0, 128, 7)), committed(0, 128));
     assert_eq!(recv(&mut owner, &data(0, 128, 128, 8)), committed(128, 128));

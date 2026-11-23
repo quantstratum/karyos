@@ -140,6 +140,30 @@ impl<T: TermBytes> BufferOwner for Arc<LogBuffer<T>> {
     type Terms = T;
 }
 
+/// A subscriber cell registered to await its adopter
+/// ([`Conductor::register_awaiting`], ADR-0100): the only handle
+/// [`Conductor::raise_to_floor`] accepts. Not `Clone`, so one token names
+/// one registration.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AwaitingCell {
+    cell: usize,
+    export: u64,
+}
+
+impl AwaitingCell {
+    /// The registry cell, which the adopter adopts.
+    #[must_use]
+    pub const fn cell(&self) -> usize {
+        self.cell
+    }
+
+    /// The export it is registered for.
+    #[must_use]
+    pub const fn export(&self) -> u64 {
+        self.export
+    }
+}
+
 /// A reliable network publication's retention hold, admitted by
 /// [`Conductor::admit_hold`] and owned by the lane's sender reader
 /// ([`SenderRead::with_hold`]), which frees its cell when dropped. One
@@ -4710,32 +4734,57 @@ impl<O: BufferOwner> Conductor<O> {
         is_reader(cell.state.load(Ordering::Acquire)).then(|| cell.position.load(Ordering::Acquire))
     }
 
-    /// Moves `cell`, a registered optional or observer subscriber cell
-    /// that no participant has adopted yet, up to the retention floor when
-    /// the floor passed it (ADR-0100, an awaiting cell handed over late).
-    /// Returns the range `(from, to)` it skipped, or `None` when the cell
-    /// is at or above the floor and nothing moved.
-    ///
-    /// The caller runs it on the control path before the cell's grant or
-    /// hand-over is issued, so no reader can adopt the cell meanwhile; the
-    /// registration word is checked to still hold the bare `export`.
+    /// Registers a subscriber cell that awaits its adopter (ADR-0100), as
+    /// [`Conductor::register_subscriber_with`] registers one, for export
+    /// `export`: the cell is admitted at the head now and adopted later
+    /// with [`Subscription::adopt`]. Only a cell registered through this
+    /// call can be raised with [`Conductor::raise_to_floor`]; a reader
+    /// admitted in process ([`Conductor::subscribe_as`]) has no token, so
+    /// its live cursor's cell is never moved under it.
     ///
     /// # Errors
     ///
-    /// [`SysError::Protocol`] for a cell that is not a subscriber cell
-    /// registered for exactly `export` and not adopted;
+    /// As [`Conductor::register_subscriber_with`].
+    pub fn register_awaiting(
+        &mut self,
+        role: Role,
+        reserve: bool,
+        export: u64,
+    ) -> Result<AwaitingCell, SysError> {
+        let cell = self.register_subscriber_with(role, reserve, export)?;
+        Ok(AwaitingCell { cell, export })
+    }
+
+    /// Moves `awaiting`'s cell, an optional or observer cell that its
+    /// adopter has not taken yet, up to the retention floor when the floor
+    /// passed it (ADR-0100, an awaiting cell handed over late). Returns the
+    /// range `(from, to)` it skipped, or `None` when the cell is at or
+    /// above the floor and nothing moved.
+    ///
+    /// The caller runs it on the control path before the cell's grant or
+    /// hand-over is issued, so no adopter takes the cell meanwhile; the
+    /// registration word is checked first to still hold the bare export.
+    ///
+    /// # Errors
+    ///
+    /// [`SysError::Protocol`] for a cell no longer registered for exactly
+    /// the token's export (adopted, ended or reused), whatever its role;
     /// [`SysError::InvalidPublicationMode`] for a required or walker cell,
     /// whose position bounds the floor and so is never below it.
     pub fn raise_to_floor(
         &mut self,
-        cell: usize,
-        export: u64,
+        awaiting: &AwaitingCell,
     ) -> Result<Option<(u64, u64)>, SysError> {
         let buffer: &LogBuffer<O::Terms> = &self.buffer;
-        if cell < buffer.first_subscriber_cell() || !valid_export(export) {
+        if awaiting.cell < buffer.first_subscriber_cell() {
             return Err(NOT_GRANTED);
         }
-        let found = buffer.cells().get(cell).ok_or(NOT_GRANTED)?;
+        let found = buffer.cells().get(awaiting.cell).ok_or(NOT_GRANTED)?;
+        // The registration first: a stale token is a protocol error for
+        // every role.
+        if found.registration.load(Ordering::Acquire) != awaiting.export {
+            return Err(NOT_GRANTED);
+        }
         match found.state.load(Ordering::Acquire) {
             CELL_OPTIONAL | CELL_OBSERVER => {}
             CELL_REQUIRED | CELL_REQUIRED_RESERVED | CELL_WALKER => {
@@ -4744,9 +4793,6 @@ impl<O: BufferOwner> Conductor<O> {
                 });
             }
             _ => return Err(NOT_GRANTED),
-        }
-        if found.registration.load(Ordering::Acquire) != export {
-            return Err(NOT_GRANTED);
         }
         let floor = buffer.floor().load(Ordering::Acquire);
         let position = found.position.load(Ordering::Acquire);
