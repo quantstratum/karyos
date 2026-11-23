@@ -176,7 +176,9 @@ fn a_datagram_past_its_txtime_is_dropped_and_reported_with_its_time() {
     let _pair = rtnl::Pair(a.clone());
     let setup = rtnl::address(&a, [10, 78, 0, 1])
         .and_then(|()| rtnl::neighbour(&a, [10, 78, 0, 9], [2, 0, 0, 0, 0, 9]))
-        .and_then(|()| rtnl::etf(&a, 500_000));
+        // A 50 ms delta: the qdisc dequeues that early, so a loaded VM's
+        // late timer cannot turn the future datagram into a miss.
+        .and_then(|()| rtnl::etf(&a, 50_000_000));
     if let Err(errno) = setup {
         if required() {
             panic!("address, neighbour or etf qdisc setup failed with errno {errno}");
