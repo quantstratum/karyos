@@ -65,11 +65,12 @@ fn serve(args: karyos_agent::cli::ExporterArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let bound = bound.and_then(|listener| match args.deadline {
+        Some(deadline) => listener.with_deadline(deadline),
+        None => Ok(listener),
+    });
     let mut listener = match bound {
-        Ok(listener) => match args.deadline {
-            Some(deadline) => listener.with_deadline(deadline),
-            None => listener,
-        },
+        Ok(listener) => listener,
         Err(error) => {
             let _ = writeln!(std::io::stderr(), "karyos-exporter: {error}");
             return ExitCode::from(2);

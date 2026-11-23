@@ -712,6 +712,10 @@ pub enum ExportError {
     #[cfg(feature = "exporter-tls")]
     #[error(transparent)]
     Tls(#[from] tls::TlsError),
+    /// A connection deadline outside 1 ms to [`MAX_CONNECTION_DEADLINE`]
+    /// (karyos#887 review).
+    #[error("a connection deadline of {0:?} is outside 1 ms to 30 s")]
+    InvalidDeadline(Duration),
     /// The operating system's error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -893,18 +897,40 @@ impl Exporter {
         self
     }
 
-    /// Allows each connection `deadline` in all (`--deadline-ms`): over
-    /// TLS one read or write may then wait as long; on plain loopback each
-    /// still waits at most [`IO_TIMEOUT`].
-    #[must_use]
-    pub fn with_deadline(mut self, deadline: Duration) -> Self {
+    /// Allows each connection `deadline` in all (`--deadline-ms`), 1 ms to
+    /// [`MAX_CONNECTION_DEADLINE`]: over TLS one read or write may then
+    /// wait as long; on plain loopback each still waits at most
+    /// [`IO_TIMEOUT`]. The step follows the exporter's transport, however
+    /// many times this is called.
+    ///
+    /// # Errors
+    ///
+    /// [`ExportError::InvalidDeadline`] for a deadline outside that range;
+    /// the exporter is returned unchanged inside the error's caller only
+    /// by rebuilding it.
+    pub fn with_deadline(mut self, deadline: Duration) -> Result<Self, ExportError> {
+        if deadline < Duration::from_millis(1) || deadline > MAX_CONNECTION_DEADLINE {
+            return Err(ExportError::InvalidDeadline(deadline));
+        }
         self.deadline = deadline;
-        self.step = if self.step == IO_TIMEOUT {
-            IO_TIMEOUT.min(deadline)
-        } else {
+        self.step = if self.over_tls() {
             deadline
+        } else {
+            IO_TIMEOUT.min(deadline)
         };
-        self
+        Ok(self)
+    }
+
+    /// Whether every connection is served over TLS.
+    fn over_tls(&self) -> bool {
+        #[cfg(feature = "exporter-tls")]
+        {
+            self.tls.is_some()
+        }
+        #[cfg(not(feature = "exporter-tls"))]
+        {
+            false
+        }
     }
 
     /// The whole of one connection at most.
@@ -951,7 +977,11 @@ impl Exporter {
         }
         let stream = Deadlined {
             stream,
-            deadline: std::time::Instant::now() + self.deadline,
+            // Bounded by `with_deadline`, so this does not overflow; a
+            // failure is a connection with no time left.
+            deadline: std::time::Instant::now()
+                .checked_add(self.deadline)
+                .unwrap_or_else(std::time::Instant::now),
             step: self.step,
         };
         #[cfg(feature = "exporter-tls")]

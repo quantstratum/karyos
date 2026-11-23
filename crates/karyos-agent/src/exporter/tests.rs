@@ -1075,11 +1075,47 @@ mod over_tls {
         assert_eq!(exporter.deadline(), TLS_CONNECTION_DEADLINE);
         assert!(took < TLS_CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
         // A shorter deadline is honoured.
-        let mut short =
-            self::exporter("0.0.0.0:0", "trickle-short").with_deadline(CONNECTION_DEADLINE);
+        let mut short = self::exporter("0.0.0.0:0", "trickle-short")
+            .with_deadline(CONNECTION_DEADLINE)
+            .unwrap();
         let (answered, took) = trickle(&mut short, b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03");
         assert_eq!(answered, vec![Answered::Dropped]);
         assert!(took < CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
+    }
+
+    /// karyos#887 review: a deadline outside 1 ms to 30 s is a typed
+    /// error, and the step follows the transport however often it is set.
+    #[test]
+    fn a_deadline_is_bounded_and_its_step_follows_the_transport() {
+        for bad in [
+            Duration::ZERO,
+            MAX_CONNECTION_DEADLINE + Duration::from_millis(1),
+            Duration::MAX,
+        ] {
+            assert!(matches!(
+                exporter("127.0.0.1:0", "bad-deadline").with_deadline(bad),
+                Err(ExportError::InvalidDeadline(_))
+            ));
+        }
+        let tls = exporter("127.0.0.1:0", "tls-step")
+            .with_deadline(Duration::from_millis(50))
+            .unwrap()
+            .with_deadline(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(
+            (tls.deadline(), tls.step),
+            (Duration::from_secs(3), Duration::from_secs(3))
+        );
+        let plain = bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_deadline(Duration::from_millis(50))
+            .unwrap()
+            .with_deadline(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(
+            (plain.deadline(), plain.step),
+            (Duration::from_secs(3), IO_TIMEOUT)
+        );
     }
 
     /// A remote scraper whose request comes a long round trip after the
