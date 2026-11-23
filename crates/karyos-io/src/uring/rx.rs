@@ -551,6 +551,11 @@ impl<R: RxRingOps> UringRx<R> {
                     self.counters.unsupported_source.saturating_add(1);
                 outcome.dropped = outcome.dropped.saturating_add(1);
             }
+            // Frame parsing drops of backends that parse frames themselves;
+            // this parser never produces them, counted as drops if it did.
+            Some(RxDropReason::Malformed | RxDropReason::NotLocal | RxDropReason::Checksum) => {
+                outcome.dropped = outcome.dropped.saturating_add(1);
+            }
             None => {}
         }
         if let Some((len, flow)) = delivered {
