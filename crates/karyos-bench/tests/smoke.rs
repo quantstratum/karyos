@@ -801,46 +801,38 @@ fn an_already_joined_group_is_refused() {
 }
 
 /// A synthetic configuration runs its profile in both child processes
-/// (B3e): against a trusted run, the send stage carries the spin of
-/// `seal` and the receive stage the spin of `open`. A spin lasts at least
-/// its length, so every synthetic sample is at or above it, however
-/// loaded the host; the trusted run's fastest sample is below it, so
-/// neither a zero spin nor a child that ignores its profile passes. Load
-/// only lengthens samples, so neither bound can be broken by it, unlike
-/// a difference of medians (karyos#1067).
+/// (B3e). Each child writes the profile it ran into its sample header, and
+/// `run_processes` refuses a header that is not the run's, so both
+/// children are seen to select it. A spin lasts at least its length, so
+/// every send sample carries the spin of `seal` and every receive sample
+/// the spin of `open`: a zero spin or a child that ignores its profile
+/// fails. Both checks are lower bounds, which load can only help; no
+/// comparison with a trusted run's timing remains (karyos#1067).
 #[test]
 fn a_synthetic_configuration_runs_in_its_processes() {
     use karyos_bench::manifest::Shape;
     use karyos_bench::wire::process::{ProcessOptions, run_processes};
     use karyos_bench::wire::stage::StageLoad;
     const SPIN_NS: u32 = 20_000;
-    let medians = |profile: &str| {
-        let dir = TempDir::new("wire-synthetic");
-        let samples = run_processes(
-            &wire_run(Shape::W1, StageLoad::Closed, 200),
-            &dir.0,
-            &ProcessOptions {
-                profile: profile.to_string(),
-                ..ProcessOptions::default()
-            },
-        )
-        .unwrap_or_else(|cause| panic!("{profile}: {cause}"));
-        let min = |values: &[u32]| values.iter().copied().min().unwrap();
-        (min(&samples.send), min(&samples.receivers[0].receive))
-    };
-    let (trusted_send, trusted_receive) = medians("trusted");
-    let (send, receive) = medians(&format!("synthetic-{SPIN_NS}"));
-    for (stage, trusted, synthetic) in [
-        ("send", trusted_send, send),
-        ("receive", trusted_receive, receive),
+    let dir = TempDir::new("wire-synthetic");
+    let profile = format!("synthetic-{SPIN_NS}");
+    let samples = run_processes(
+        &wire_run(Shape::W1, StageLoad::Closed, 200),
+        &dir.0,
+        &ProcessOptions {
+            profile: profile.clone(),
+            ..ProcessOptions::default()
+        },
+    )
+    .unwrap_or_else(|cause| panic!("{profile}: {cause}"));
+    for (stage, values) in [
+        ("send", &samples.send),
+        ("receive", &samples.receivers[0].receive),
     ] {
+        let fastest = values.iter().copied().min().unwrap();
         assert!(
-            synthetic >= SPIN_NS,
-            "{stage}: fastest synthetic sample {synthetic} ns, below its spin"
-        );
-        assert!(
-            trusted < SPIN_NS,
-            "{stage}: fastest trusted sample {trusted} ns, not below the spin"
+            fastest >= SPIN_NS,
+            "{stage}: fastest sample {fastest} ns, below the {SPIN_NS} ns spin"
         );
     }
 }
