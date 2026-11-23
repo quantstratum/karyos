@@ -155,7 +155,10 @@ fn a_read_across_segments_allocates_per_crossing_not_per_entry() {
         .collect();
     assert_eq!(log.append(&written).unwrap(), Some(400));
     log.sync().unwrap();
-    let bytes: u64 = written.iter().map(|entry| entry.encoded_len().unwrap()).sum();
+    let bytes: u64 = written
+        .iter()
+        .map(|entry| entry.encoded_len().unwrap())
+        .sum();
     let segments = bytes / 4096 + 1;
     let (mut out, mut buffer) = (Vec::new(), Vec::new());
     log.entries_into(1..401, u64::MAX, &mut out, &mut buffer)
