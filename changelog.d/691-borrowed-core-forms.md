@@ -1,0 +1,3 @@
+### Added
+
+- The C5 harness's `ConsensusCore` gains borrowed forms, `propose_slice` and `ready_into` over a node-kept `ReadyBuf` whose vectors and entry buffers are reused, and `drive_into` drives a core through them; the defaults keep every existing core as it was. The allocation probe attributes its counts to the stage of each call (leader append, send, receive, persistence acknowledgement, commit advance, application), and both evaluation adapters fill the Ready in place, so the C5 allocation gate no longer charges a candidate for the harness interface's owned vectors (plan issue 073, karyos#691).

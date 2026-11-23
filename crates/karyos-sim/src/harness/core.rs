@@ -432,6 +432,82 @@ impl<M> Default for Ready<M> {
     }
 }
 
+/// A [`Ready`] the node keeps across calls, for the borrowed form
+/// [`ConsensusCore::ready_into`] (plan issue 073, karyos#691): its vectors
+/// keep their capacity, and the entries [`drive`] is done with go back to a
+/// pool, so a core that fills it in place hands its work over without
+/// allocating once the buffers have grown.
+#[derive(Debug)]
+pub struct ReadyBuf<M> {
+    /// The Ready being filled; empty after [`ReadyBuf::recycle`].
+    pub ready: Ready<M>,
+    /// Entries [`drive`] is done with, their payload buffers kept.
+    spare: Vec<Entry>,
+}
+
+impl<M> Default for ReadyBuf<M> {
+    fn default() -> Self {
+        Self {
+            ready: Ready::default(),
+            spare: Vec::new(),
+        }
+    }
+}
+
+impl<M> ReadyBuf<M> {
+    /// An entry with these fields, its payload copied into a buffer from
+    /// the pool when one is free: no allocation once the pool holds an
+    /// entry whose buffer is large enough.
+    #[must_use]
+    pub fn entry(&mut self, index: u64, term: u64, event_time: u64, payload: &[u8]) -> Entry {
+        let mut entry = self.spare.pop().unwrap_or(Entry {
+            index,
+            term,
+            event_time,
+            payload: Vec::new(),
+        });
+        entry.index = index;
+        entry.term = term;
+        entry.event_time = event_time;
+        entry.payload.clear();
+        entry.payload.extend_from_slice(payload);
+        entry
+    }
+
+    /// Moves the pool's entries to `into`, for a core that converts its
+    /// entries before [`ConsensusCore::ready_into`] runs and keeps a pool of
+    /// its own.
+    pub fn take_spare(&mut self, into: &mut Vec<Entry>) {
+        into.append(&mut self.spare);
+    }
+
+    /// Empties the Ready, keeping every vector's capacity and returning its
+    /// entries to the pool.
+    pub fn recycle(&mut self) {
+        let ready = &mut self.ready;
+        ready.messages.clear();
+        ready.truncate_from = None;
+        ready.hard_state = None;
+        ready.after_persist.clear();
+        ready.snapshot_to.clear();
+        self.spare.append(&mut ready.entries);
+        self.spare.append(&mut ready.committed);
+    }
+
+    /// Whether the Ready asks for nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        let ready = &self.ready;
+        ready.messages.is_empty()
+            && ready.truncate_from.is_none()
+            && ready.entries.is_empty()
+            && ready.hard_state.is_none()
+            && ready.after_persist.is_empty()
+            && ready.committed.is_empty()
+            && ready.snapshot_to.is_empty()
+    }
+}
+
 /// What a [`Ready`]'s persistence made durable, reported to the core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Persisted {
@@ -479,6 +555,18 @@ pub trait ConsensusCore: Sized {
     /// declared limit.
     fn propose(&mut self, command: Vec<u8>, log: &mut LogView<'_>) -> Result<(), Refused>;
 
+    /// [`ConsensusCore::propose`], borrowing `command` (plan issue 073,
+    /// karyos#691): the node keeps its buffer, so a core that copies only
+    /// what it keeps is not charged for the node's. The default copies it
+    /// into an owned command.
+    ///
+    /// # Errors
+    ///
+    /// As [`ConsensusCore::propose`].
+    fn propose_slice(&mut self, command: &[u8], log: &mut LogView<'_>) -> Result<(), Refused> {
+        self.propose(command.to_vec(), log)
+    }
+
     /// `message` from `from` arrives.
     fn step(&mut self, from: NodeId, message: Self::Message, log: &mut LogView<'_>);
 
@@ -487,6 +575,22 @@ pub trait ConsensusCore: Sized {
 
     /// What the node should do now, if anything.
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>>;
+
+    /// [`ConsensusCore::ready`], filled into the node's `out`, which
+    /// [`drive`] hands over empty ([`ReadyBuf::recycle`]) (plan issue 073,
+    /// karyos#691): whether the core had anything ready. A core that fills
+    /// `out` in place, its entries through [`ReadyBuf::entry`], allocates
+    /// nothing for the Ready itself once the buffers have grown. The
+    /// default moves [`ConsensusCore::ready`]'s Ready into it.
+    fn ready_into(&mut self, out: &mut ReadyBuf<Self::Message>, log: &mut LogView<'_>) -> bool {
+        match self.ready(log) {
+            Some(ready) => {
+                out.ready = ready;
+                true
+            }
+            None => false,
+        }
+    }
 
     /// The last [`Ready`]'s persistence is done.
     fn advance(&mut self, persisted: Persisted, log: &mut LogView<'_>);
@@ -728,18 +832,69 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
     apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
 ) -> Result<(), DriveError> {
+    drive_into(
+        core,
+        log,
+        &mut ReadyBuf::default(),
+        (budget, base),
+        send,
+        apply,
+        observe,
+    )
+}
+
+/// [`drive_metered`] through the borrowed form [`ConsensusCore::ready_into`]
+/// and the node's `buf`, which it leaves empty (plan issue 073,
+/// karyos#691).
+///
+/// # Errors
+///
+/// As [`drive`].
+pub fn drive_into<C: ConsensusCore, D: Disk + Clone>(
+    core: &mut C,
+    log: &mut RaftLog<D>,
+    buf: &mut ReadyBuf<C::Message>,
+    (budget, base): (Option<&ReadBudget>, Option<SnapshotBase>),
+    send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
+    apply: &mut dyn FnMut(&Entry, Applying),
+    observe: &mut dyn FnMut(Step),
+) -> Result<(), DriveError> {
     let mut readies = 0usize;
-    while let Some(ready) = core.ready(&mut LogView::metered(log, budget).with_base(base)) {
+    buf.recycle();
+    while core.ready_into(buf, &mut LogView::metered(log, budget).with_base(base)) {
         if readies == MAX_READIES {
+            buf.recycle();
             return Err(DriveError::WorkBudget { readies });
         }
         // Below MAX_READIES, so it does not overflow.
         readies += 1;
+        let result = take(core, log, buf, (budget, base), (send, apply, observe));
+        buf.recycle();
+        result?;
+    }
+    Ok(())
+}
+
+/// What [`drive`] does with one Ready, in its order.
+#[allow(clippy::type_complexity)]
+fn take<C: ConsensusCore, D: Disk + Clone>(
+    core: &mut C,
+    log: &mut RaftLog<D>,
+    buf: &mut ReadyBuf<C::Message>,
+    (budget, base): (Option<&ReadBudget>, Option<SnapshotBase>),
+    (send, apply, observe): (
+        &mut dyn FnMut(NodeId, C::Message, Option<Release>),
+        &mut dyn FnMut(&Entry, Applying),
+        &mut dyn FnMut(Step),
+    ),
+) -> Result<(), DriveError> {
+    let ready = &mut buf.ready;
+    {
         // 1. What depends on nothing.
-        for to in ready.snapshot_to {
+        for to in ready.snapshot_to.drain(..) {
             observe(Step::SnapshotTo(to));
         }
-        for (to, message) in ready.messages {
+        for (to, message) in ready.messages.drain(..) {
             send(to, message, None);
         }
         // 2. Persistence.
@@ -777,7 +932,7 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
         });
         // 4. What depends on it.
         let needs = ready.entries.last().map(|entry| entry.index);
-        for (to, message) in ready.after_persist {
+        for (to, message) in ready.after_persist.drain(..) {
             let release = Release {
                 needs,
                 needs_state: ready.hard_state,

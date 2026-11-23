@@ -50,8 +50,8 @@ use karyos_cluster::{Entry, LogError, RaftLog};
 
 use super::core::{
     Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, Limit, Limits,
-    LogView, NotLeader, ReadBudget, Refused, Release, SnapshotBase, Step, TransferRefused,
-    Unsupported, drive_metered,
+    LogView, NotLeader, ReadBudget, ReadyBuf, Refused, Release, SnapshotBase, Step,
+    TransferRefused, Unsupported, drive_into,
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
@@ -1283,6 +1283,8 @@ pub struct ServerNode<C: ConsensusCore> {
     snapshots: Option<SnapshotStore<SimDisk>>,
     /// Its latest snapshot's base.
     base: Option<SnapshotBase>,
+    /// The Ready its core fills in place ([`ConsensusCore::ready_into`]).
+    ready: ReadyBuf<C::Message>,
 }
 
 /// Why a server could not be created.
@@ -1410,6 +1412,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             compaction: None,
             snapshots: None,
             base: None,
+            ready: ReadyBuf::default(),
         };
         if let Some(configuration) = configuration {
             server.record_configuration(configuration, None);
@@ -1451,6 +1454,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             compaction: None,
             snapshots: None,
             base: None,
+            ready: ReadyBuf::default(),
         };
         server.start();
         server
@@ -1764,9 +1768,10 @@ impl<C: ConsensusCore> ServerNode<C> {
         let mut applied = Vec::new();
         let mut snapshot_to = Vec::new();
         let budget = self.limits.is_some().then_some(&self.budget);
-        let driven = drive_metered(
+        let driven = drive_into(
             &mut core,
             &mut log,
+            &mut self.ready,
             (budget, self.base),
             &mut |to, message, release| {
                 if let Some(release) = release {
@@ -2113,7 +2118,7 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
             )),
             Wire::Request(command) => {
                 let key = (command.client, command.sequence);
-                match core.propose(command.encode(), &mut view) {
+                match core.propose_slice(&command.encode(), &mut view) {
                     Ok(()) => {
                         let _ = self.pending.insert(key);
                     }

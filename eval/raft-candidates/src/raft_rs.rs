@@ -61,8 +61,8 @@
 
 use karyos_cluster::{Entry, HardState};
 use karyos_sim::harness::core::{
-    ConsensusCore, Limit, Limits, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
-    Unsupported,
+    ConsensusCore, Limit, Limits, LogView, NotLeader, Persisted, Ready, ReadyBuf, Refused,
+    TransferRefused, Unsupported,
 };
 use karyos_sim::net::NodeId;
 use raft::eraftpb::{self, ConfState, Snapshot};
@@ -202,6 +202,14 @@ pub fn from_raft(entry: &eraftpb::Entry) -> Entry {
     }
 }
 
+/// [`from_raft`] into a buffer of `out`'s pool (plan issue 073,
+/// karyos#691): the payload is copied into a kept buffer, not a new one.
+fn from_raft_into<M>(out: &mut ReadyBuf<M>, entry: &eraftpb::Entry) -> Entry {
+    let context: &[u8] = entry.context.as_ref();
+    let event_time = <[u8; 8]>::try_from(context).map_or(0, u64::from_le_bytes);
+    out.entry(entry.index, entry.term, event_time, entry.data.as_ref())
+}
+
 /// Whether the entries of an outgoing append, `sent`, that C4's log holds
 /// were read back through the metered `log` within the duty's budget and
 /// equal the log's (karyos#975, karyos#1040): both adapters send an append
@@ -251,11 +259,12 @@ fn raft_hard_state(state: &HardState) -> eraftpb::HardState {
     }
 }
 
-fn messages_of(messages: Vec<eraftpb::Message>) -> Vec<(NodeId, eraftpb::Message)> {
-    messages
-        .into_iter()
-        .filter_map(|message| Some((node_id(message.to)?, message)))
-        .collect()
+fn push_messages(out: &mut Vec<(NodeId, eraftpb::Message)>, messages: Vec<eraftpb::Message>) {
+    out.extend(
+        messages
+            .into_iter()
+            .filter_map(|message| Some((node_id(message.to)?, message))),
+    );
 }
 
 /// `raft` 0.7.0's `RawNode` behind [`ConsensusCore`], pre-vote on when
@@ -267,8 +276,9 @@ pub struct RaftCore<const PRE_VOTE: bool> {
     node: Option<RawNode<MemStorage>>,
     /// The raft-rs Ready handed out and not yet advanced.
     pending: Option<raft::Ready>,
-    /// What raft-rs released after the last persistence, not handed out.
-    light: Option<Ready<eraftpb::Message>>,
+    /// What raft-rs released after the last persistence, not handed out,
+    /// with the hard state its commit advance asks to save.
+    light: Option<(raft::LightReady, Option<HardState>)>,
     /// The clock at the last tick.
     last_tick: Option<u64>,
     /// The clock at the last tick, as the event time of what it proposes.
@@ -317,18 +327,10 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
     /// it is held back this duty, as a lost message, and raft-rs resends
     /// it. Entries the log does not hold yet (a leader's own, sent before
     /// its persistence) are not a log read. Unmetered, `messages` as is.
-    fn meter(
-        &self,
-        messages: Vec<(NodeId, eraftpb::Message)>,
-        log: &mut LogView<'_>,
-    ) -> Vec<(NodeId, eraftpb::Message)> {
-        if self.limits.is_none() {
-            return messages;
+    fn meter(&self, messages: &mut Vec<(NodeId, eraftpb::Message)>, log: &mut LogView<'_>) {
+        if self.limits.is_some() {
+            messages.retain(|(_, message)| Self::read_back(message, log));
         }
-        messages
-            .into_iter()
-            .filter(|(_, message)| Self::read_back(message, log))
-            .collect()
     }
 
     /// Whether `message`'s logged entries were read back through `log`.
@@ -492,33 +494,51 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
     }
 
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
-        if let Some(mut light) = self.light.take() {
-            light.messages = self.meter(std::mem::take(&mut light.messages), log);
-            return Some(light);
+        let mut out = ReadyBuf::default();
+        self.ready_into(&mut out, log).then_some(out.ready)
+    }
+
+    /// raft-rs's Ready copied into `out` in place: its messages moved over,
+    /// its entries' payloads copied into `out`'s kept buffers.
+    fn ready_into(&mut self, out: &mut ReadyBuf<Self::Message>, log: &mut LogView<'_>) -> bool {
+        if let Some((mut light, hard_state)) = self.light.take() {
+            push_messages(&mut out.ready.messages, light.take_messages());
+            self.meter(&mut out.ready.messages, log);
+            out.ready.hard_state = hard_state;
+            for entry in &light.take_committed_entries() {
+                let entry = from_raft_into(out, entry);
+                out.ready.committed.push(entry);
+            }
+            return true;
         }
         if self.pending.is_some() {
-            return None;
+            return false;
         }
         let mirrored = self.mirrored_last();
-        let node = self.node.as_mut()?;
+        let Some(node) = self.node.as_mut() else {
+            return false;
+        };
         if !node.has_ready() {
-            return None;
+            return false;
         }
         let mut raw = node.ready();
         let first = raw.entries().first().map(|entry| entry.index);
-        let messages = messages_of(raw.take_messages());
-        let after_persist = messages_of(raw.take_persisted_messages());
-        let ready = Ready {
-            messages: self.meter(messages, log),
-            truncate_from: first.filter(|first| mirrored.is_some_and(|last| *first <= last)),
-            entries: raw.entries().iter().map(from_raft).collect(),
-            hard_state: raw.hs().map(hard_state_of),
-            after_persist: self.meter(after_persist, log),
-            committed: raw.take_committed_entries().iter().map(from_raft).collect(),
-            snapshot_to: Vec::new(),
-        };
+        push_messages(&mut out.ready.messages, raw.take_messages());
+        self.meter(&mut out.ready.messages, log);
+        push_messages(&mut out.ready.after_persist, raw.take_persisted_messages());
+        self.meter(&mut out.ready.after_persist, log);
+        out.ready.truncate_from = first.filter(|first| mirrored.is_some_and(|last| *first <= last));
+        for entry in raw.entries() {
+            let entry = from_raft_into(out, entry);
+            out.ready.entries.push(entry);
+        }
+        out.ready.hard_state = raw.hs().map(hard_state_of);
+        for entry in &raw.take_committed_entries() {
+            let entry = from_raft_into(out, entry);
+            out.ready.committed.push(entry);
+        }
         self.pending = Some(raw);
-        Some(ready)
+        true
     }
 
     fn advance(&mut self, _persisted: Persisted, _log: &mut LogView<'_>) {
@@ -542,27 +562,19 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
             self.fault();
             return;
         }
-        let mut light = node.advance(raw);
+        let light = node.advance(raw);
         let hard_state = light.commit_index().map(|commit| {
             let mut state = node.raft.hard_state();
             state.commit = commit;
             hard_state_of(&state)
         });
-        let ready = Ready {
-            messages: messages_of(light.take_messages()),
-            hard_state,
-            committed: light
-                .take_committed_entries()
-                .iter()
-                .map(from_raft)
-                .collect(),
-            ..Ready::default()
-        };
-        if !ready.committed.is_empty() {
+        let committed = !light.committed_entries().is_empty();
+        if committed {
             node.advance_apply();
         }
-        if ready != Ready::default() {
-            self.light = Some(ready);
+        // Handed out by the next `ready_into`, converted there.
+        if committed || hard_state.is_some() || !light.messages().is_empty() {
+            self.light = Some((light, hard_state));
         }
     }
 
