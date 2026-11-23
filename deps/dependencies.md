@@ -18,6 +18,8 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `syn` | 3.0.8 | crates.io | default features off; `derive`, `parsing`, `printing`, `proc-macro`, `clone-impls` (its default set, as `thiserror-impl` resolves it) | compile time only, `karyos-codec-derive` (the codec derive, karyos#661); `make codec-derive-check` shows it in no runtime graph and that it is the `syn` major `thiserror-impl` already builds | all | MIT OR Apache-2.0 | ADR-0033 (`syn`, `quote`, `proc-macro2` for the codec derive); resolution review under owner decision 2026-10-21 item 15, which needs no second family vote (karyos#661) |
 | `quote` | 1.0.47 | crates.io | default features off; `proc-macro` | compile time only, `karyos-codec-derive` | all | MIT OR Apache-2.0 | as `syn` |
 | `proc-macro2` | 1.0.107 | crates.io | default features off; `proc-macro` | compile time only, `karyos-codec-derive` | all | MIT OR Apache-2.0 | as `syn` |
+| `ironsbe-core` | 0.9.0 (pinned `=0.9.0`) | crates.io | default features (it declares no other) | runtime, `karyos-sbe` only (the SBE 1.0 framing: the message header, the decode error and the runtime of the generated codecs, karyos#646); `make sbe-graph-check` keeps it out of every other crate | all | MIT | the IronSBE admission record (quantstratum-docs: karyos/reviews/dependency-admission-ironsbe.md), owner decision ACS 71206, 2026-11-12, under ADR-0083; bumped to 0.9.0 by quantstratum-docs#1000 |
+| `ironsbe-codegen` | 0.9.0 (pinned `=0.9.0`) | crates.io | default features (it declares no other) | build time only, a build dependency of `karyos-sbe` (generates its codecs from `crates/karyos-sbe/schemas/`, karyos#646); brings `ironsbe-schema` 0.9.0 and `quick-xml`, also build time only | all | MIT | as `ironsbe-core` |
 | `loom` | 0.7.2 | crates.io | default features off | model checking, only under `--cfg loom` | all | MIT | ADR-0033 (`loom`, dev only) |
 | `proptest` | 1.11.0 | crates.io | default features off; `std` | dev-dependency of `karyos-sys`, `karyos-protocol`, `karyos-io`, `karyos-archive`, `karyos-tools` and `karyos-agent` (tests only; `karyos-agent` for the properties of the join request parser, the join registry and the exporter's HTTP head parser, untrusted-input parsers under ADR-0062, karyos#893, coordinator approved 2026-10-30, ACS 37404; `karyos-tools` for the properties of the compat JSON reader, an untrusted-input parser under ADR-0062, karyos#732, coordinator approved 2026-10-29, ACS 37060; `karyos-archive` for the segment store's crash-point properties of A2, quantstratum-docs: karyos/design/archive-gap-analysis.md, coordinator approved 2026-10-17, ACS 16727; `karyos-protocol` added for the layout properties of issue #10, coordinator approved 2026-10-15; `karyos-io` for the backend slot, queue and report properties of P2.3, quantstratum-docs: karyos/design/sockets-backend.md section 12, coordinator approved 2026-10-16, ACS 14546) | all | MIT OR Apache-2.0 | ADR-0033 (`proptest`, dev only); owner confirmed phase 1 on 2026-10-15 (Q25, issue #40) |
 | `criterion` | 0.7.0 (pinned `=0.7.0`) | crates.io | default features off; `cargo_bench_support` | microbenchmarks only, dev-dependency of `karyos-bench` | all | Apache-2.0 OR MIT | owner approved 2026-10-15 (Q25, issue #12); exact resolution 0.7.0 under ADR-0033, coordinator decision 2026-10-15 (ACS 13315) |
@@ -303,12 +305,15 @@ or build-script change cannot reuse old admission evidence. Reach classes:
   binaries add `signal-hook`, `signal-hook-registry`, `libc`, `errno`,
   `tracing`, `tracing-core`, `pin-project-lite`, `once_cell`,
   `tracing-subscriber`, `sharded-slab`, `lazy_static`, `thread_local` and
-  `cfg-if` on every supported target. The raw edges also list `libc` and
+  `cfg-if` on every supported target. `karyos-sbe` adds `ironsbe-core`,
+  `crossbeam-queue` and `crossbeam-utils` (karyos#646). The raw edges also list `libc` and
   `errno` under `rustix`, either as optional dependencies of the
   `linux_raw` backend that only the unused `use-libc` feature enables, or
   behind `rustix_use_libc` or `miri`; neither applies to normal builds.
 - `build`: runs only at compile time, as a proc macro or its dependency
-  (`thiserror-impl`, `syn`, `quote`, `proc-macro2`, `unicode-ident`).
+  (`thiserror-impl`, `syn`, `quote`, `proc-macro2`, `unicode-ident`), and
+  `karyos-sbe`'s build script's `ironsbe-codegen`, `ironsbe-schema`,
+  `quick-xml` and `memchr` (karyos#646).
   ADR-0033 approves `syn`, `quote` and `proc-macro2` for the codec; they
   enter through `thiserror`'s derive and, as direct dependencies, through
   the codec derive `karyos-codec-derive` (karyos#661), at the same
@@ -364,6 +369,7 @@ supported target (x86_64 and aarch64 Linux, aarch64 macOS):
 | `rustls` 0.23.46 | runtime, `karyos-control` only | Empty `main` unless the `read_buf` feature is on (off here), which emits one cfg on nightly; compiles nothing |
 | `httparse` 1.10.1 | runtime, `karyos-control` only | Runs `rustc --version` to set SIMD cfgs; compiles nothing |
 | `getrandom` 0.4.3 | runtime, `karyos-control` only | Emits a cfg under the memory sanitizer; compiles nothing |
+| `crossbeam-utils` 0.8.23 | runtime, `karyos-sbe` only, under `ironsbe-core` | Reads the compiler's target configuration to set cfgs; compiles nothing |
 | `serde_json` 1.0.154 | runtime, `karyos-control` only; dev, under `criterion` | Emits arithmetic-width cfgs from the target; compiles nothing |
 | `zmij` 1.0.23 | runtime, `karyos-control` only, under `serde_json`; dev | Runs `rustc --version` to set cfgs; compiles nothing |
 

@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Verbatim from real-logic/simple-binary-encoding tag 1.42.0, sbe-samples/src/main/resources/, apart from these two comment lines. -->
 <types>
     <composite name="messageHeader" description="Message identifiers and length of message root.">
         <type name="blockLength" primitiveType="uint16"/>

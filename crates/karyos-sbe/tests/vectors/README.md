@@ -11,13 +11,14 @@ specification. Both agree byte for byte.
 | `car-v0.hex` | `Car`, version 0 | `../../schemas/example-schema.xml` | 207 |
 | `car-v1.hex` | `Car`, version 1 | `../../schemas/example-extension-schema.xml` | 224 |
 
-Each file holds the message with its 8-byte message header, as lowercase
-hex on one line. The values are those of `Vectors.java`.
+Each file holds an SPDX line (`#`), then the message with its 8-byte
+message header, as lowercase hex on one line. The values are those of `Vectors.java`.
 
 ## Schemas
 
 `../../schemas/` holds `example-schema.xml`, `example-extension-schema.xml`
-and `common-types.xml` verbatim from `real-logic/simple-binary-encoding`
+and `common-types.xml` verbatim, apart from an SPDX comment and a
+provenance comment after the XML declaration, from `real-logic/simple-binary-encoding`
 tag `1.42.0` (`sbe-samples/src/main/resources/`), Apache-2.0. Version 1
 adds the optional `uuid` and `cupHolderCount` fields (`sinceVersion="1"`):
 the schema version change. The messages exercise repeating groups, a
