@@ -1527,17 +1527,18 @@ mod tests {
         assert_eq!(RegionKind::from_code(15), None);
     }
 
-    /// The protocol version is 4 (karyos#740: the rate change command); 3
-    /// was the roles and identity commands' (karyos#637), published by
-    /// alpha.3, and 2 the trace journal kinds' (ACS 13677), published by
+    /// The protocol version is 5 (karyos#844, ADR-0100: the parent-aware
+    /// image attach); 4 was the rate change command's (karyos#740), never
+    /// released; 3 the roles and identity commands' (karyos#637), published
+    /// by alpha.3, and 2 the trace journal kinds' (ACS 13677), published by
     /// alpha.2.
     #[test]
-    fn the_version_is_four() {
+    fn the_version_is_five() {
         let mut out = [0u8; MAX_MESSAGE_LENGTH];
         let length = Message::Hello { version: VERSION }
             .encode(&mut out)
             .unwrap();
-        assert_eq!(words_of(&out[..length]), [HELLO, 4, PROFILE_FLAGS]);
+        assert_eq!(words_of(&out[..length]), [HELLO, 5, PROFILE_FLAGS]);
     }
 
     /// The manifest's words, literally: the stream registration, the

@@ -1129,20 +1129,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Command::AddImageSubscription {
                 image, lane, role, ..
             } => {
-                if let Some(index) = self.find_image(image, lane)
-                    && let Some(stream) = self.streams.get_mut(index)
-                {
-                    let role = Role::from(role);
-                    let conductor = &mut stream.conductor;
-                    stream.awaiting.retain(|awaiting| {
-                        if awaiting.client == client && awaiting.role == role {
-                            let _ = conductor
-                                .end_subscriber(awaiting.cell.cell(), awaiting.cell.export());
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                if let Some(index) = self.find_image(image, lane) {
+                    self.withdraw_client_awaiting(index, client, Role::from(role));
+                }
+                command
+            }
+            // An attach by alias that reaches an image is a legacy attach
+            // too.
+            Command::AddSubscription {
+                stream, lane, role, ..
+            } => {
+                if let Some(index) = self.find_stream(stream, Some(lane)) {
+                    self.withdraw_client_awaiting(index, client, Role::from(role));
                 }
                 command
             }
@@ -1634,6 +1632,24 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         }
         self.adopted_start = false;
         Ok(response)
+    }
+
+    /// Withdraws `client`'s awaiting cells of `role` on stream `index`
+    /// (ADR-0100): a legacy attach never adopts one, so none may wait for
+    /// it.
+    fn withdraw_client_awaiting(&mut self, index: usize, client: u64, role: Role) {
+        let Some(stream) = self.streams.get_mut(index) else {
+            return;
+        };
+        let conductor = &mut stream.conductor;
+        stream.awaiting.retain(|awaiting| {
+            if awaiting.client == client && awaiting.role == role {
+                let _ = conductor.end_subscriber(awaiting.cell.cell(), awaiting.cell.export());
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// The role of network subscription `parent` of `client` when it is
