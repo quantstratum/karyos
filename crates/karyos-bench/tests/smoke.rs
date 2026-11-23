@@ -802,9 +802,12 @@ fn an_already_joined_group_is_refused() {
 
 /// A synthetic configuration runs its profile in both child processes
 /// (B3e): against a trusted run, the send stage carries the spin of
-/// `seal` and the receive stage the spin of `open`. The spin is far above
-/// the trusted stages, so neither a zero spin nor a child that ignores
-/// its profile passes.
+/// `seal` and the receive stage the spin of `open`. A spin lasts at least
+/// its length, so every synthetic sample is at or above it, however
+/// loaded the host; the trusted run's fastest sample is below it, so
+/// neither a zero spin nor a child that ignores its profile passes. Load
+/// only lengthens samples, so neither bound can be broken by it, unlike
+/// a difference of medians (karyos#1067).
 #[test]
 fn a_synthetic_configuration_runs_in_its_processes() {
     use karyos_bench::manifest::Shape;
@@ -822,12 +825,8 @@ fn a_synthetic_configuration_runs_in_its_processes() {
             },
         )
         .unwrap_or_else(|cause| panic!("{profile}: {cause}"));
-        let median = |values: &[u32]| {
-            let mut values = values.to_vec();
-            values.sort_unstable();
-            values[values.len() / 2]
-        };
-        (median(&samples.send), median(&samples.receivers[0].receive))
+        let min = |values: &[u32]| values.iter().copied().min().unwrap();
+        (min(&samples.send), min(&samples.receivers[0].receive))
     };
     let (trusted_send, trusted_receive) = medians("trusted");
     let (send, receive) = medians(&format!("synthetic-{SPIN_NS}"));
@@ -836,8 +835,12 @@ fn a_synthetic_configuration_runs_in_its_processes() {
         ("receive", trusted_receive, receive),
     ] {
         assert!(
-            synthetic.saturating_sub(trusted) >= SPIN_NS / 2,
-            "{stage}: median {synthetic} ns against trusted {trusted} ns"
+            synthetic >= SPIN_NS,
+            "{stage}: fastest synthetic sample {synthetic} ns, below its spin"
+        );
+        assert!(
+            trusted < SPIN_NS,
+            "{stage}: fastest trusted sample {trusted} ns, not below the spin"
         );
     }
 }
