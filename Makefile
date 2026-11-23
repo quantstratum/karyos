@@ -41,7 +41,7 @@ loom-full:
 
 sim:
 	@start=$$(date +%s); \
-	KARYOS_SIM_SEED= KARYOS_SIM_SEEDS=2000 $(CARGO) test -p karyos-sim --release --locked --test scenarios --test uring_model; status=$$?; \
+	KARYOS_SIM_SEED= KARYOS_SIM_SEEDS=2000 $(CARGO) test -p karyos-sim --release --locked --test scenarios --test uring_model --test xdp_model; status=$$?; \
 	end=$$(date +%s); \
 	printf 'simulator sweep elapsed: %s seconds (fixed seeds 1..=2000)\n' "$$((end - start))"; \
 	exit $$status

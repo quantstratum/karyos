@@ -1,0 +1,3 @@
+### Added
+
+- The AF_XDP UMEM ring model of `karyos-sim` (`tests/xdp_model.rs`, karyos#643): seeded runs where the kernel sends only inside kicks while `need_wakeup` is set, completions and received frames interleave, and teardown ends every item released, returned or `Unknown`, failing on a frame touched while the kernel owns it, a leaked frame or a descriptor left unsent; an endpoint that frees frames at submission is caught. `karyos_io::xdp::select` opens AF_XDP with an explicit `af_xdp_or_sockets` fallback and fails a required `af_xdp` with `RequiredCapability(XdpSocket)`. A veth test shows the kernel stack accepts the frames the backend writes, and CI runs the backend's tests with its narrow capabilities and checks the denial under Docker's defaults.

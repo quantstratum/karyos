@@ -471,12 +471,22 @@ mod kernel {
     use crate::xdp::attach::{AttachMode, XdpAttachment};
     use crate::xdp::ring::{OsXsk, XskSizes};
 
+    /// The kernel tests that map a UMEM run one at a time: the UMEM byte
+    /// count they check is process wide.
+    static UMEM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn umem_lock() -> std::sync::MutexGuard<'static, ()> {
+        UMEM.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn required() -> bool {
         std::env::var_os("KARYOS_XDP_REQUIRED").is_some()
     }
 
     #[test]
     fn a_datagram_loops_through_the_copy_mode_backend_and_teardown_releases_the_umem() {
+        let _umem = umem_lock();
         let ifindex = rustix::net::netdevice::name_to_index(
             rustix::net::socket(
                 rustix::net::AddressFamily::INET,
@@ -574,5 +584,246 @@ mod kernel {
         );
         drop(attachment);
         drop(reservation);
+    }
+
+    /// Minimal rtnetlink writes for the test environment only: a veth pair,
+    /// links up, IPv4 addresses. Never part of the backend, whose adapter
+    /// is read-only (ADR-0038).
+    mod veth {
+        use rustix::net::netlink::SocketAddrNetlink;
+        use rustix::net::{AddressFamily, RecvFlags, SendFlags, SocketFlags, SocketType};
+
+        fn attr(kind: u16, payload: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(&u16::try_from(4 + payload.len()).unwrap().to_ne_bytes());
+            out.extend_from_slice(&kind.to_ne_bytes());
+            out.extend_from_slice(payload);
+            while out.len() % 4 != 0 {
+                out.push(0);
+            }
+            out
+        }
+
+        fn ifinfo(index: i32, flags: u32, change: u32) -> Vec<u8> {
+            let mut out = vec![0_u8; 16];
+            out[4..8].copy_from_slice(&index.to_ne_bytes());
+            out[8..12].copy_from_slice(&flags.to_ne_bytes());
+            out[12..16].copy_from_slice(&change.to_ne_bytes());
+            out
+        }
+
+        fn request(kind: u16, flags: u16, payload: &[u8]) -> Result<(), i32> {
+            let socket = rustix::net::socket_with(
+                AddressFamily::NETLINK,
+                SocketType::RAW,
+                SocketFlags::CLOEXEC,
+                None,
+            )
+            .map_err(|errno| errno.raw_os_error())?;
+            let mut message = Vec::new();
+            message.extend_from_slice(&u32::try_from(16 + payload.len()).unwrap().to_ne_bytes());
+            message.extend_from_slice(&kind.to_ne_bytes());
+            message.extend_from_slice(&(flags | 0x1 | 0x4).to_ne_bytes());
+            message.extend_from_slice(&1_u32.to_ne_bytes());
+            message.extend_from_slice(&0_u32.to_ne_bytes());
+            message.extend_from_slice(payload);
+            rustix::net::sendto(
+                &socket,
+                &message,
+                SendFlags::empty(),
+                &SocketAddrNetlink::new(0, 0),
+            )
+            .map_err(|errno| errno.raw_os_error())?;
+            let mut buffer = [0_u8; 4096];
+            let (len, _) = rustix::net::recv(&socket, &mut buffer[..], RecvFlags::empty())
+                .map_err(|errno| errno.raw_os_error())?;
+            if len >= 20 && u16::from_ne_bytes([buffer[4], buffer[5]]) == 2 {
+                let error = i32::from_ne_bytes(buffer[16..20].try_into().unwrap());
+                if error != 0 {
+                    return Err(-error);
+                }
+            }
+            Ok(())
+        }
+
+        /// Creates `a` and `b`, brings both up and gives each an address
+        /// of `10.77.0.0/24`.
+        pub fn create(a: &str, b: &str, a_host: u8, b_host: u8) -> Result<(), i32> {
+            let mut peer = ifinfo(0, 0, 0);
+            peer.extend(attr(3, format!("{b}\0").as_bytes()));
+            let info = [attr(1, b"veth"), attr(2 | 0x8000, &attr(1 | 0x8000, &peer))].concat();
+            let mut link = ifinfo(0, 0, 0);
+            link.extend(attr(3, format!("{a}\0").as_bytes()));
+            link.extend(attr(18 | 0x8000, &info));
+            request(16, 0x400 | 0x200, &link)?;
+            for (name, host) in [(a, a_host), (b, b_host)] {
+                let index = rustix::net::netdevice::name_to_index(
+                    rustix::net::socket(AddressFamily::INET, SocketType::DGRAM, None)
+                        .map_err(|e| e.raw_os_error())?,
+                    name,
+                )
+                .map_err(|errno| errno.raw_os_error())?;
+                request(16, 0, &ifinfo(i32::try_from(index).unwrap(), 1, 1))?;
+                let mut address = vec![2_u8, 24, 0, 0];
+                address.extend_from_slice(&index.to_ne_bytes());
+                address.extend(attr(2, &[10, 77, 0, host]));
+                address.extend(attr(1, &[10, 77, 0, host]));
+                request(20, 0x400 | 0x200, &address)?;
+            }
+            Ok(())
+        }
+    }
+
+    /// The kernel stack accepts the frames the backend writes: on a veth
+    /// pair, a datagram leaves `kx0`'s TX ring and an ordinary UDP socket
+    /// bound on `kx1` receives it (the check `lo` cannot make, karyos#642).
+    #[test]
+    fn the_kernel_stack_accepts_the_headers_the_backend_writes() {
+        let _umem = umem_lock();
+        if let Err(errno) = veth::create("kx0", "kx1", 1, 2) {
+            if required() {
+                panic!("veth setup failed with errno {errno}");
+            }
+            eprintln!("veth setup unavailable here (errno {errno}); skipped");
+            return;
+        }
+        let kx0 = rustix::net::netdevice::name_to_index(
+            rustix::net::socket(
+                rustix::net::AddressFamily::INET,
+                rustix::net::SocketType::DGRAM,
+                None,
+            )
+            .unwrap(),
+            "kx0",
+        )
+        .unwrap();
+        let (Some(mac0), Some(mac1)) = (
+            crate::xdp::netlink::link_mac("kx0"),
+            crate::xdp::netlink::link_mac("kx1"),
+        ) else {
+            panic!("sysfs MACs");
+        };
+        let receiver = UdpSocket::bind((Ipv4Addr::new(10, 77, 0, 2), 47_002)).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let sizes = XskSizes {
+            frame_len: FRAME,
+            tx_frames: TX,
+            rx_frames: RX,
+        };
+        let xsk = OsXsk::open(kx0, 0, sizes).unwrap();
+        // A source outside the host's addresses: a frame arriving with a
+        // local source address would be dropped as martian.
+        let source = SocketAddr::from((Ipv4Addr::new(10, 77, 0, 9), 47_003));
+        let to = receiver.local_addr().unwrap();
+        let mut f = fixture_over(xsk, source, mac0, to, mac1, TX);
+        let ticket = send(&mut f, b"kernel accepts", 1);
+        let mut report = TxReport::new();
+        f.endpoint.flush(request(f.queue), &mut Permit, &mut report);
+        drain(&mut report);
+        let mut events = Events::default();
+        for _ in 0..200 {
+            f.endpoint.poll_completions(budget(), &mut events);
+            if !events.0.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            events.0,
+            vec![TxEvent::Released {
+                id: ticket.id(),
+                token: SenderToken::new(1)
+            }]
+        );
+        let mut buffer = [0_u8; 64];
+        let (len, from) = receiver.recv_from(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"kernel accepts");
+        assert_eq!(from, source);
+    }
+
+    /// A real failed required step: binding to an interface that does not
+    /// exist. `af_xdp` fails with `RequiredCapability`, `af_xdp_or_sockets`
+    /// opens sockets.
+    #[test]
+    fn a_real_failed_bind_falls_back_only_under_af_xdp_or_sockets() {
+        let _umem = umem_lock();
+        use crate::backend::{Capability, CapabilityState};
+        use crate::xdp::select::{Selected, XdpChoice, select};
+        let sizes = XskSizes {
+            frame_len: FRAME,
+            tx_frames: TX,
+            rx_frames: RX,
+        };
+        let missing = 0x7fff_fff0;
+        let required_fails = select(
+            XdpChoice::AfXdp,
+            || OsXsk::open(missing, 0, sizes),
+            || {
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|_| {
+                    crate::backend::OpenError::Os {
+                        operation: "socket",
+                        errno: 0,
+                    }
+                })
+            },
+        );
+        assert!(
+            matches!(
+                required_fails,
+                Err(crate::backend::OpenError::RequiredCapability {
+                    capability: Capability::XdpSocket,
+                    state: CapabilityState::Unavailable(_)
+                })
+            ),
+            "{:?}",
+            required_fails.map(|_| ())
+        );
+        let fallback = select(
+            XdpChoice::AfXdpOrSockets,
+            || OsXsk::open(missing, 0, sizes),
+            || {
+                UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|_| {
+                    crate::backend::OpenError::Os {
+                        operation: "socket",
+                        errno: 0,
+                    }
+                })
+            },
+        );
+        assert!(matches!(
+            fallback,
+            Ok(Selected::Sockets {
+                xdp_socket: CapabilityState::Fallback(_),
+                ..
+            })
+        ));
+    }
+
+    /// Under Docker's default capabilities (no `CAP_BPF`, no
+    /// `CAP_NET_ADMIN`; the default job of CI) loading the program is
+    /// denied with `EPERM`, reported as a denial, never as absence.
+    #[test]
+    fn a_missing_privilege_is_reported_as_denied() {
+        if std::env::var_os("KARYOS_XDP_EXPECT_DENIED").is_none() {
+            return;
+        }
+        let attached = XdpAttachment::attach(1, AttachMode::Generic, &[]);
+        let Err(error) = attached else {
+            panic!("the program loaded without the BPF capabilities");
+        };
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        let mut denied = false;
+        while let Some(current) = source {
+            if let Some(io) = current.downcast_ref::<std::io::Error>() {
+                denied |= io.raw_os_error() == Some(1);
+            }
+            source = current.source();
+        }
+        assert!(
+            denied || error.to_string().contains("Operation not permitted"),
+            "{error}"
+        );
     }
 }
