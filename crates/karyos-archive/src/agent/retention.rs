@@ -146,7 +146,61 @@ fn purge_failed(error: &PurgeError) -> RetentionAnswer {
     }
 }
 
+/// A recording's retention state as a [`control::RetentionDescriptor`]
+/// reports it (ADR-0101), its correlation id left for the server: its
+/// hold (unknown while the hold state is), its recorded close time, and
+/// the earliest policy expiry from that close time.
+fn descriptor(
+    recording: &Recording,
+    hold: control::HoldState,
+    policy: Option<&RetentionPolicy>,
+) -> control::RetentionDescriptor {
+    let close_time_ns = recording
+        .stop
+        .as_ref()
+        .and_then(|stop| stop.closed_utc_ns)
+        .unwrap_or(0);
+    // A policy of identity 0 is none on the wire (section 11's rule).
+    let policy = policy.filter(|policy| policy.policy != 0 && policy.version != 0);
+    let earliest_expiry_ns = match policy {
+        Some(policy) if close_time_ns != 0 => close_time_ns.saturating_add(policy.retain_for_ns),
+        _ => control::NO_EXPIRY,
+    };
+    control::RetentionDescriptor {
+        correlation_id: 0,
+        recording_id: recording.id,
+        // The Archive records no hold time yet: 0 for every hold.
+        hold_since_ns: 0,
+        close_time_ns,
+        earliest_expiry_ns,
+        policy: policy.map_or(0, |policy| policy.policy),
+        policy_version: policy.map_or(0, |policy| policy.version),
+        hold,
+    }
+}
+
 impl<D: Disk + Clone> State<D> {
+    /// The retention state of at most `max` recordings from id `from_id`
+    /// on (inclusive), in id order (ADR-0101). Read only: it changes and
+    /// journals nothing, so an outstanding purge intent stays as it is.
+    pub(super) fn retention_state(
+        &self,
+        from_id: u64,
+        max: usize,
+    ) -> Vec<control::RetentionDescriptor> {
+        let policy = self.config.retention_policy.as_ref();
+        self.catalog
+            .recordings()
+            .iter()
+            .filter(|recording| recording.id >= from_id)
+            .take(max)
+            .map(|recording| {
+                let hold = self.retention.hold_state(recording.id);
+                descriptor(recording, hold, policy)
+            })
+            .collect()
+    }
+
     /// Serves a hold, a release or a purge.
     pub(super) fn retain(&mut self, request: Request) -> RetentionAnswer {
         let recording = match request {

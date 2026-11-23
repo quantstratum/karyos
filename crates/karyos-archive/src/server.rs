@@ -35,6 +35,15 @@
 //!   served by it instead, on the server's thread, its refusal names
 //!   verbatim.
 //!
+//! - **Retention state (ADR-0101).** A version 2 `RetentionState` is
+//!   answered only on the stream it names, which the host opens
+//!   ([`ArchiveHost::open_response`]): a descriptor per recording, then
+//!   the summary with the host's free space ([`ArchiveHost::free_space`]).
+//!   The shared response stream carries at most a refusal, so no version 1
+//!   reader of it decodes a version 2 page. That answer is sent beside the
+//!   shared stream and never holds it back; a second query while one is
+//!   still being sent is refused with code 1.
+//!
 //! This is the control path: it allocates (the queued answers, the boxed
 //! host objects); the replayed frames do not pass through it.
 
@@ -154,7 +163,41 @@ pub trait ArchiveHost {
         from: u64,
         to: u64,
     ) -> Result<Box<dyn ReplaySink + Send>, HostRefusal>;
+
+    /// Opens the stream a [`control::RetentionState`] names for its
+    /// answer (ADR-0101): stream `stream_id` of `channel`, which the
+    /// requester subscribed to before it asked. The answer goes only
+    /// there, never to the shared response stream, so no version 1 reader
+    /// of that stream decodes it. A host with no such stream refuses, and
+    /// the requester is told with code 1 on the shared stream.
+    ///
+    /// # Errors
+    ///
+    /// A [`HostRefusal`] the requester is told.
+    fn open_response(
+        &mut self,
+        stream_id: i32,
+        channel: &str,
+    ) -> Result<Box<dyn ResponseSink + Send>, HostRefusal> {
+        let _ = (stream_id, channel);
+        Err(HostRefusal(NO_RESPONSE_STREAM.to_owned()))
+    }
+
+    /// The archive's free-space floor (`--archive-min-free`, 0 for none)
+    /// and its file system's free bytes now ([`control::FREE_UNKNOWN`]
+    /// when not known), for a [`control::RetentionSummary`] (ADR-0101).
+    fn free_space(&self) -> (u64, u64) {
+        (0, control::FREE_UNKNOWN)
+    }
 }
+
+/// The refusal of a retention state query by a host with no stream of the
+/// requester's.
+pub const NO_RESPONSE_STREAM: &str = "no response stream of the requester's";
+
+/// The refusal of a retention state query while the last one's answer is
+/// still being sent on its own stream.
+pub const RETENTION_ANSWER_BUSY: &str = "a retention state answer is still being sent";
 
 /// A recorded lane the host opened.
 #[non_exhaustive]
@@ -316,7 +359,17 @@ enum Waiting {
     },
     /// A replica's stop.
     StopReplication { answer: Posted<()> },
+    /// A retention state query (ADR-0101): answered on `sink`, the
+    /// stream it named.
+    RetentionState {
+        correlation_id: u64,
+        sink: Box<dyn ResponseSink + Send>,
+        answer: Posted<Vec<control::RetentionDescriptor>>,
+    },
 }
+
+/// A retention state answer's own stream and what waits to be sent on it.
+type Answering = (Box<dyn ResponseSink + Send>, VecDeque<Vec<u8>>);
 
 /// The control server: requests in, the agent's work, answers out.
 pub struct ControlServer<H, Q, R> {
@@ -338,6 +391,10 @@ pub struct ControlServer<H, Q, R> {
     /// Each replication this Archive serves: its request's correlation id
     /// and recording, and the agent's messages for it (karyos#1113).
     replications: Vec<(u64, u64, Receiver<Outgoing>)>,
+    /// A retention state answer being sent on the stream its query named
+    /// (ADR-0101): that stream and the messages not sent yet. It never
+    /// holds the shared stream back.
+    answering: Option<Answering>,
 }
 
 impl<H, Q, R> core::fmt::Debug for ControlServer<H, Q, R> {
@@ -366,6 +423,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             unattended: 0,
             retention: None,
             replications: Vec::new(),
+            answering: None,
         }
     }
 
@@ -495,7 +553,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
     }
 
     fn flush(&mut self) -> bool {
-        let mut sent = false;
+        let mut sent = self.flush_answering();
         while let Some(message) = self.pending.front() {
             if !self.responses.send(message) {
                 break;
@@ -504,6 +562,38 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             self.pending.pop_front();
         }
         sent
+    }
+
+    /// Sends what waits on a retention state answer's own stream; the
+    /// stream is let go once all is sent.
+    fn flush_answering(&mut self) -> bool {
+        let Some((sink, queued)) = self.answering.as_mut() else {
+            return false;
+        };
+        let mut sent = false;
+        while let Some(message) = queued.front() {
+            if !sink.send(message) {
+                break;
+            }
+            sent = true;
+            queued.pop_front();
+        }
+        if queued.is_empty() {
+            self.answering = None;
+        }
+        sent
+    }
+
+    /// Encodes `message` for a retention state answer's own stream;
+    /// `None` (counted) when it did not encode.
+    fn encode_answer(&mut self, message: &ControlMessage<'_>) -> Option<Vec<u8>> {
+        let mut out = vec![0u8; MAX_ANSWER];
+        let Ok(length) = message.encode(&mut out) else {
+            count(&mut self.unencoded);
+            return None;
+        };
+        out.truncate(length);
+        Some(out)
     }
 
     /// Queues `message`; `false` when it did not encode.
@@ -664,7 +754,15 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             ControlMessage::VerifyRecording(request) => {
                 self.verify(request.correlation_id, request.recording_id)
             }
+            ControlMessage::RetentionState(request) => self.retention_state(&request),
             ControlMessage::ControlResponse(ControlResponse { correlation_id, .. })
+            | ControlMessage::RetentionDescriptor(control::RetentionDescriptor {
+                correlation_id,
+                ..
+            })
+            | ControlMessage::RetentionSummary(control::RetentionSummary {
+                correlation_id, ..
+            })
             | ControlMessage::RecordingDescriptor(RecordingDescriptor { correlation_id, .. })
             | ControlMessage::RangeOutcome(control::RangeOutcome { correlation_id, .. })
             | ControlMessage::RecordingSignal(RecordingSignal { correlation_id, .. }) => {
@@ -677,6 +775,79 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 None
             }
         }
+    }
+
+    /// Serves a retention state query (ADR-0101): opens the stream it
+    /// names and posts the snapshot to the agent. A refusal (code 1: no
+    /// such stream, or the last answer still being sent) goes to the
+    /// shared stream, one frame.
+    fn retention_state(&mut self, request: &control::RetentionState<'_>) -> Option<Waiting> {
+        let correlation_id = request.correlation_id;
+        if self.answering.is_some() {
+            self.respond(
+                correlation_id,
+                0,
+                ResponseCode::Error,
+                RETENTION_ANSWER_BUSY,
+            );
+            return None;
+        }
+        let sink = match self
+            .host
+            .open_response(request.response_stream_id, request.response_channel)
+        {
+            Ok(sink) => sink,
+            Err(HostRefusal(why)) => {
+                self.respond(correlation_id, 0, ResponseCode::Error, &why);
+                return None;
+            }
+        };
+        // The codec caps `max_count` at `MAX_LIST_COUNT`.
+        let max = usize::try_from(request.max_count).unwrap_or(usize::MAX);
+        let posted = self.agent.post_retention_state(request.from_id, max);
+        self.posted(correlation_id, posted, |answer| Waiting::RetentionState {
+            correlation_id,
+            sink,
+            answer,
+        })
+    }
+
+    /// Queues a retention state answer on its own stream: a descriptor
+    /// per recording, then the summary with their count and the free
+    /// space.
+    fn answer_retention_state(
+        &mut self,
+        correlation_id: u64,
+        sink: Box<dyn ResponseSink + Send>,
+        descriptors: Vec<control::RetentionDescriptor>,
+    ) {
+        let mut queued = VecDeque::with_capacity(descriptors.len().saturating_add(1));
+        let mut sent = 0u64;
+        for descriptor in descriptors {
+            let descriptor = control::RetentionDescriptor {
+                correlation_id,
+                ..descriptor
+            };
+            if let Some(bytes) =
+                self.encode_answer(&ControlMessage::RetentionDescriptor(descriptor))
+            {
+                queued.push_back(bytes);
+                count(&mut sent);
+            }
+        }
+        let (min_free_bytes, free_bytes) = self.host.free_space();
+        if let Some(bytes) = self.encode_answer(&ControlMessage::RetentionSummary(
+            control::RetentionSummary {
+                correlation_id,
+                count: sent,
+                min_free_bytes,
+                free_bytes,
+            },
+        )) {
+            queued.push_back(bytes);
+        }
+        self.answering = Some((sink, queued));
+        self.flush_answering();
     }
 
     /// Answers a hold, a release or a purge with what the attached
@@ -1168,6 +1339,25 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 }),
                 Some(Ok(answer)) => {
                     self.answer_retention(correlation_id, recording_id, &answer);
+                    true
+                }
+                Some(Err(error)) => {
+                    self.refuse(correlation_id, &error);
+                    true
+                }
+            },
+            Waiting::RetentionState {
+                correlation_id,
+                sink,
+                answer,
+            } => match answer.try_answer() {
+                None => self.wait(Waiting::RetentionState {
+                    correlation_id,
+                    sink,
+                    answer,
+                }),
+                Some(Ok(descriptors)) => {
+                    self.answer_retention_state(correlation_id, sink, descriptors);
                     true
                 }
                 Some(Err(error)) => {

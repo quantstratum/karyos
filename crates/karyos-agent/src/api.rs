@@ -373,6 +373,53 @@ pub struct Catalog {
     pub failures: u64,
     /// The last failure, until a listing completes.
     pub last_error: Option<String>,
+    /// The Archive's retention state (ADR-0101; karyos#967), read after
+    /// each listing; `None` unless the driver's Archive names a retention
+    /// state stream (`--archive DIR=REQ,RESP,STATE`).
+    pub retention: Option<RetentionView>,
+}
+
+/// An Archive's retention state as it last answered a retention state
+/// query (ADR-0101): read only, from the Archive itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RetentionView {
+    /// Each recording's retention, in id order, at most the agent's bound.
+    pub recordings: Vec<RecordingRetention>,
+    /// The Archive's `--archive-min-free` floor in bytes; 0 for none.
+    pub min_free_bytes: u64,
+    /// Its file system's free bytes when it answered; `None` when it
+    /// could not tell.
+    pub free_bytes: Option<u64>,
+    /// Host `CLOCK_MONOTONIC` nanoseconds when the answer ended; `None`
+    /// before the first.
+    pub read_at: Option<u64>,
+    /// The last failure, until a query is answered: "retention state
+    /// unsupported by this Archive" for an Archive without version 2.
+    pub last_error: Option<String>,
+}
+
+/// One recording's retention, as its Archive answers it (ADR-0101).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecordingRetention {
+    /// The recording id, never 0.
+    pub recording_id: u64,
+    /// Its hold: `none`, `held` (applied with evidence), `pending` (in
+    /// force without evidence) or `unknown` (the Archive could not read
+    /// its hold state).
+    pub hold: &'static str,
+    /// When the hold was applied or received, UTC nanoseconds; `None`
+    /// when not recorded.
+    pub hold_since_ns: Option<u64>,
+    /// Its recorded UTC close time; `None` while it records or without
+    /// one.
+    pub close_time_ns: Option<u64>,
+    /// The earliest expiry its policy gives from that close time, a lower
+    /// bound and never purge eligibility; `None` for none.
+    pub earliest_expiry_ns: Option<u64>,
+    /// The configured policy's identity and version; `None` for none.
+    pub policy: Option<(u64, u64)>,
 }
 
 /// One recording of a catalog.
