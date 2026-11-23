@@ -587,6 +587,7 @@ version = "0.1.0-alpha.3"
 dependencies = [
  "karyos-protocol",
  "karyos-sys",
+ "libc",
  "rustix",
  "thiserror 2.0.21",
 ]
