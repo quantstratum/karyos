@@ -1577,6 +1577,7 @@ mod tests {
     /// uses kernel buffer memory and stops at 256 MiB: a buffer that holds
     /// that much answers `None`, and the test skips its blocking assertions
     /// with a logged reason rather than fill further.
+    #[allow(clippy::print_stderr, reason = "a skipped test logs why")]
     fn fill_socket(writer: &UnixStream) -> Option<usize> {
         writer.set_nonblocking(true).unwrap();
         let chunk = [0u8; 64 << 10];
