@@ -3179,6 +3179,41 @@ fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
     refuses_udp(client);
 }
 
+/// ADR-0099: a network publication is exclusive, so a driver with its
+/// network refuses a concurrent handle on a `karyos:udp` channel with
+/// `KARYOS_E_UNSUPPORTED_CHANNEL`, and its output is left untouched. That is why no
+/// concurrent writer reaches a timed lane's schedule ring.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_networked_driver_refuses_a_concurrent_udp_publication() {
+    let _drivers = crate::test_drivers::drivers(1);
+    let (status, driver, client) = network_driver(api::driver::NETWORK_ON);
+    assert_eq!(status, Status::Ok.code());
+    let _opened = Opened {
+        driver,
+        client,
+        ..Opened::default()
+    };
+    let uri =
+        std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{}", test_port())).unwrap();
+    // A sentinel, so the test shows that a refusal leaves the output as
+    // it was rather than writing any handle, zero included.
+    const UNTOUCHED: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+    let mut publication = UNTOUCHED;
+    // SAFETY: a live C string, a live `u64`, no detail.
+    let status = unsafe {
+        karyos_client_add_concurrent_publication(
+            client,
+            uri.as_ptr(),
+            9,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::UnsupportedChannel.code());
+    assert_eq!(publication, UNTOUCHED);
+}
+
 /// An older caller's struct, ABI 0.1.1's 56 bytes or 0.1.3's 64, works
 /// through `karyos_driver_create` and its driver is IPC-only, even with
 /// `network = KARYOS_NETWORK_ON` in the bytes past its size.
