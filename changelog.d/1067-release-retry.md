@@ -1,0 +1,3 @@
+### Fixed
+
+- A subscription release the client cannot submit now is tried again instead of dropped (karyos#1067). When the command ring is full or the pending requests are at their limit, the client keeps the returned handle and retries it at each service: `Client::pending_releases` counts the ones waiting. Before, the client dropped the handle and counted it in `subscription_releases_failed`, and the driver kept the registration until the client ended. Under load that left a retired image's registration in place: the cause of `the_facade_removes_a_retired_images_subscription`'s rare failure. A removal that can never be submitted is still dropped and counted.
