@@ -2003,3 +2003,38 @@ fn measure_the_commit_path() {
         saving / u32::try_from(commits).unwrap()
     );
 }
+
+/// karyos#1001: frames the index places back to back are read in windows
+/// of up to 1 MiB, across segments; a read past several windows returns
+/// exactly what was written, stops at the budget as before, and still
+/// refuses a damaged frame in the middle of a window at its own position.
+#[test]
+fn catch_up_reads_cross_windows_and_still_check_every_frame() {
+    let dir = TempDir::new("windows");
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry(), 1).unwrap();
+    let written: Vec<Entry> = (1..=600)
+        .map(|index| entry(index, 1, &[u8::try_from(index % 251).unwrap(); 4000]))
+        .collect();
+    log.append(&written).unwrap();
+    log.sync().unwrap();
+    assert_eq!(log.entries(1..601, u64::MAX).unwrap(), written);
+    assert_eq!(log.entries(37..412, u64::MAX).unwrap(), written[36..411]);
+    let span = 4000 + FRAME_HEADER as u64;
+    assert_eq!(log.entries(1..601, span * 300).unwrap(), written[..300]);
+    assert_eq!(log.entries(1..601, span * 300 - 1).unwrap(), written[..299]);
+    // Entry 400's payload, in the middle of a window, damaged on disk.
+    let at = 399 * span + FRAME_HEADER as u64 + 7;
+    let segment_length = 65_536;
+    let base = at - at % segment_length;
+    let segment = dir.0.join(format!("{LOG_RECORDING:016x}-{base:016x}.seg"));
+    let mut disk = StdDisk;
+    let file = disk.open(&segment).unwrap();
+    disk.write_at(&file, at % segment_length, &[0xEE]).unwrap();
+    match log.entries(1..601, u64::MAX) {
+        Err(LogError::Chain { position, problem }) => {
+            assert_eq!((position, problem), (399 * span, ChainProblem::Checksum));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(log.entries(1..400, u64::MAX).unwrap(), written[..399]);
+}
