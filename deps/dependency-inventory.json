@@ -1305,6 +1305,15 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [
+            "zeroize"
+          ],
+          "from": "workspace:karyos-driver@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [

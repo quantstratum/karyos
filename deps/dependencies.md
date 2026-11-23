@@ -38,7 +38,7 @@ reviewed by hand, because `cargo deny` does not establish their absence.
 | `serde_json` | 1.0.154 | crates.io | default features off; `std` | runtime and dev, `karyos-control` only (karyos#708) | all | MIT OR Apache-2.0 | the JWT verification and JWKS retrieval records (quantstratum-docs: karyos/reviews/dependency-admission-jwt-verification.md, dependency-admission-jwks-retrieval.md), owner decision on quantstratum-docs#899 with the Codex half ACS 77226, 2026-11-18 |
 | `sha2` | 0.11.1 (pinned `=0.11.1`) | crates.io | default features off (no `alloc` or `oid`); `zeroize`, enabled by `karyos-protocol` to erase the keyed HMAC states (feature unification also enables it in `karyos-archive`); SHA-256 only | runtime: `karyos-archive` (the seal digests and hash chain of the integrity journal, SPEC.md §8.4, ADR-0051 item 2, karyos#662) and `karyos-protocol` (HMAC-SHA-256 of the wire authentication profile, ADR-0086, karyos#648) | all | MIT OR Apache-2.0 | archive: owner decision ACS 71206 (2026-11-12) on quantstratum-docs `karyos/reviews/dependency-admission-sha2.md`, ADR-0079 row `sha2` (archive), karyos#660; protocol: owner decision D51 (2026-11-23) on quantstratum-docs `karyos/reviews/dependency-admission-wire-auth-hmac.md`, ADR-0079 row `hmac`, `sha2`, `hkdf` |
 | `hmac` | 0.13.0 (pinned `=0.13.0`) | crates.io | default features off; `zeroize` (erases the keyed state on drop) | runtime, `karyos-protocol` only for now (`protection::HmacSha256`, the wire authentication profile v1 of ADR-0086, karyos#648); the record also scopes `karyos-driver` | all | MIT OR Apache-2.0 | owner decision D51 (2026-11-23) on quantstratum-docs `karyos/reviews/dependency-admission-wire-auth-hmac.md`, ADR-0079 row `hmac`, `sha2`, `hkdf` |
-| `ed25519-dalek` | 3.0.0 (pinned `=3.0.0`) | crates.io | default features off; `zeroize` (no `fast`, `batch`, `rand_core`, `pkcs8`, `pem`, `serde`, `digest`, `hazmat` or `legacy_compatibility`); `VerifyingKey::verify_strict` only, `SigningKey` only in tests | runtime, `karyos-archive` only (archival signed heads and the key registry, SPEC.md §8.4, ADR-0051 items 4 and 6, karyos#663); never a wire key | all | BSD-3-Clause | owner decision ACS 71206 (2026-11-12) on quantstratum-docs `karyos/reviews/dependency-admission-ed25519-archival.md`, ADR-0079 (archive scope), karyos#660 |
+| `ed25519-dalek` | 3.0.0 (pinned `=3.0.0`) | crates.io | default features off; `zeroize` (no `fast`, `batch`, `rand_core`, `pkcs8`, `pem`, `serde`, `digest`, `hazmat` or `legacy_compatibility`); `VerifyingKey::verify_strict` only, `SigningKey` only in tests | runtime: `karyos-archive` (archival signed heads and the key registry, SPEC.md §8.4, ADR-0051 items 4 and 6, karyos#663) and `karyos-driver` (guard and abort authority, `authority::Ed25519Verifier` and `Ed25519Signer`, ADR-0086 section 8, karyos#648); an archival key is never a wire key and a wire key never signs a head | all | BSD-3-Clause | archive: owner decision ACS 71206 (2026-11-12) on quantstratum-docs `karyos/reviews/dependency-admission-ed25519-archival.md`, ADR-0079 (archive scope), karyos#660; driver: owner decision D51 (2026-11-23) on quantstratum-docs `karyos/reviews/dependency-admission-wire-auth-hmac.md`, ADR-0079 (driver scope with the ADR-0044 profile) |
 
 The control-plane component `karyos-control` (karyos#708) holds the agent
 HTTP stack admitted by its record (quantstratum-docs:
@@ -169,9 +169,10 @@ lockfile. Of these only `libc` has a build script, already admitted with
 `libc` itself: it emits `cfg` flags from `rustc --version` and the target,
 and compiles no C. None of the crates added with `sha2` has one.
 
-`ed25519-dalek` is a dependency of `karyos-archive` only, for the archival
-purpose its admission record scopes; the driver's guard and abort
-authority is not admitted by it. Its transitive crates, admitted with it,
+`ed25519-dalek` is a dependency of `karyos-archive`, for the archival
+purpose its admission record scopes, and of `karyos-driver` for the guard
+and abort authority that owner decision D51 admits (the wire
+authentication record); the two purposes share no key. Its transitive crates, admitted with it,
 are `curve25519-dalek` 5.0.0 and `subtle` 2.6.1 (BSD-3-Clause), `ed25519`
 3.0.0, `signature` 3.0.0 and `zeroize` 1.9.2 (Apache-2.0 OR MIT), and the
 build dependencies `rustc_version` 0.4.1 and `semver` 1.0.28 (MIT OR
