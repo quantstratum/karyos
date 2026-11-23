@@ -38,9 +38,9 @@
       "icu_provider v2.4.0",
       "idna v1.1.0",
       "idna_adapter v1.2.2",
-      "ironsbe-codegen v0.9.0",
-      "ironsbe-core v0.9.0",
-      "ironsbe-schema v0.9.0",
+      "ironsbe-codegen v0.9.1",
+      "ironsbe-core v0.9.1",
+      "ironsbe-schema v0.9.1",
       "itoa v1.0.18",
       "jiff v0.2.43",
       "jiff-core v0.1.5",
@@ -150,9 +150,9 @@
       "icu_provider v2.4.0",
       "idna v1.1.0",
       "idna_adapter v1.2.2",
-      "ironsbe-codegen v0.9.0",
-      "ironsbe-core v0.9.0",
-      "ironsbe-schema v0.9.0",
+      "ironsbe-codegen v0.9.1",
+      "ironsbe-core v0.9.1",
+      "ironsbe-schema v0.9.1",
       "itoa v1.0.18",
       "jiff v0.2.43",
       "jiff-core v0.1.5",
@@ -265,9 +265,9 @@
       "icu_provider v2.4.0",
       "idna v1.1.0",
       "idna_adapter v1.2.2",
-      "ironsbe-codegen v0.9.0",
-      "ironsbe-core v0.9.0",
-      "ironsbe-schema v0.9.0",
+      "ironsbe-codegen v0.9.1",
+      "ironsbe-core v0.9.1",
+      "ironsbe-schema v0.9.1",
       "itoa v1.0.18",
       "jiff v0.2.43",
       "jiff-core v0.1.5",
@@ -1055,7 +1055,7 @@
       "edges": [
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-core@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-core@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -2441,7 +2441,7 @@
         }
       ],
       "features": [],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.0",
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
       "license": "MIT",
       "name": "ironsbe-codegen",
       "paths": {
@@ -2451,21 +2451,21 @@
       },
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.9.0"
+      "version": "0.9.1"
     },
     {
       "build_script": false,
       "edges": [
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -2479,7 +2479,7 @@
         }
       ],
       "features": [],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-core@0.9.0",
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-core@0.9.1",
       "license": "MIT",
       "name": "ironsbe-core",
       "paths": {
@@ -2492,21 +2492,21 @@
       },
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.9.0"
+      "version": "0.9.1"
     },
     {
       "build_script": false,
       "edges": [
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
         }
       ],
       "features": [],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.0",
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.1",
       "license": "MIT",
       "name": "ironsbe-schema",
       "paths": {
@@ -2516,7 +2516,7 @@
       },
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.9.0"
+      "version": "0.9.1"
     },
     {
       "build_script": false,
@@ -3744,7 +3744,7 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -3921,7 +3921,7 @@
       "edges": [
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -3979,7 +3979,7 @@
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -5655,21 +5655,21 @@
       "edges": [
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-core@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-core@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
         },
         {
           "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.0",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-schema@0.9.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true

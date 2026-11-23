@@ -613,9 +613,9 @@ dependencies = [
 
 [[package]]
 name = "ironsbe-codegen"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e30ecd1aa9dc806510096712ca289b1e40963bd9cf499f4ce3f53c89d60eab85"
+checksum = "ca7baf74aae4b40cc3c0ea0a483dfe70d4eedcfb2710e75ab46fd5550a7bd67b"
 dependencies = [
  "ironsbe-core",
  "ironsbe-schema",
@@ -626,9 +626,9 @@ dependencies = [
 
 [[package]]
 name = "ironsbe-core"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "80a64069810655fb034a50b1826c75c7a479d7ba4e49c43387b2f261cd3198bb"
+checksum = "3ef259b4936324bb91c8b11c3556d31d3a9b7f6ddf619575208612ba7b3265f0"
 dependencies = [
  "crossbeam-queue",
  "thiserror",
@@ -636,9 +636,9 @@ dependencies = [
 
 [[package]]
 name = "ironsbe-schema"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d22b30c4d3704aa4803a7b186fd0562bd5375c24197c9e18e1d9f9ecc351523"
+checksum = "c328831be9712ed3e05c8faad7c38915c611168f03af5424769a5a26c80abe4f"
 dependencies = [
  "ironsbe-core",
  "quick-xml",
