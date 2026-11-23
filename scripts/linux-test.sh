@@ -42,7 +42,7 @@ fi
 # KARYOS_URING_EXPECT_DENIED and KARYOS_XDP_REQUIRED (the XDP load test
 # fails instead of skipping) pass through to the container.
 env_args=()
-for name in KARYOS_SIM_SEED KARYOS_SIM_SEEDS KARYOS_URING_REQUIRED KARYOS_URING_EXPECT_DENIED KARYOS_XDP_REQUIRED; do
+for name in KARYOS_SIM_SEED KARYOS_SIM_SEEDS KARYOS_URING_REQUIRED KARYOS_URING_EXPECT_DENIED KARYOS_XDP_REQUIRED KARYOS_XDP_EXPECT_DENIED; do
     if [ -n "${!name+set}" ]; then
         env_args+=(-e "$name=${!name}")
     fi

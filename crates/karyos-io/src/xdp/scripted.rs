@@ -97,6 +97,50 @@ impl ScriptedXsk {
         self.completions.push_back(addr);
     }
 
+    /// Sets `XDP_RING_NEED_WAKEUP` on the TX ring: when clear, copy mode
+    /// is driven by the kernel and no kick is due.
+    pub fn set_need_wakeup(&mut self, need_wakeup: bool) {
+        self.need_wakeup = need_wakeup;
+    }
+
+    /// The "kernel" consumes up to `max` published TX descriptors, as a
+    /// kick that stops on its budget does.
+    pub fn transmit_some(&mut self, max: usize) {
+        for _ in 0..max {
+            let Some((frame, len)) = self.tx_published.pop_front() else {
+                break;
+            };
+            let bytes = self
+                .tx
+                .get(usize::from(frame))
+                .and_then(|bytes| bytes.get(..usize::try_from(len).unwrap_or(0)))
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default();
+            self.sent.push((frame, bytes));
+            self.completions
+                .push_back(u64::from(frame).saturating_mul(u64::from(self.frame_len)));
+        }
+    }
+
+    /// Published TX descriptors the kernel has not consumed.
+    #[must_use]
+    pub fn tx_outstanding(&self) -> usize {
+        self.tx_published.len()
+    }
+
+    /// RX frames in the fill ring now (not their states): the frames the
+    /// kernel can still write.
+    #[must_use]
+    pub fn fill_len(&self) -> usize {
+        self.fill.len()
+    }
+
+    /// RX descriptors the endpoint has not reaped.
+    #[must_use]
+    pub fn rx_pending(&self) -> usize {
+        self.rx_ring.len()
+    }
+
     /// Kicks so far.
     #[must_use]
     pub fn kicks(&self) -> u32 {

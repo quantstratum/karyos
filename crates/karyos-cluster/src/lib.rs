@@ -27,4 +27,6 @@ pub mod snapshot;
 
 pub use dedup::{DecodeError, DedupConfig, Outcome, Registered, Request, SessionTable};
 pub use hard_state::HardState;
-pub use log::{ChainProblem, Corruption, Entry, LogError, Opened, RaftLog};
+pub use log::{
+    ChainProblem, Corruption, Entry, EntryAnswer, EntrySlot, LogError, Opened, RaftLog, SlotAnswer,
+};

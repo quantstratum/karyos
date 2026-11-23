@@ -165,3 +165,27 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - run: env ${{ matrix.env }} scripts/linux-test.sh -p karyos-io --features uring --locked ${{ matrix.filter }}
+
+  # The AF_XDP jobs of karyos#643 (af-xdp-backend.md section 10): the
+  # backend's tests with the narrow privileges it needs (CAP_BPF,
+  # CAP_NET_ADMIN, CAP_NET_RAW, CAP_PERFMON, CAP_IPC_LOCK; Docker's default
+  # seccomp profile, which allows bpf with CAP_BPF; never --privileged),
+  # failing instead of skipping, and Docker's default capabilities, under
+  # which loading the program must be denied.
+  xdp:
+    name: AF_XDP (${{ matrix.name }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: narrow capabilities
+            env: KARYOS_XDP_REQUIRED=1 KARYOS_LINUX_CAPS=BPF,NET_ADMIN,NET_RAW,PERFMON,IPC_LOCK
+            filter: xdp
+          - name: default capabilities
+            env: KARYOS_XDP_EXPECT_DENIED=1
+            filter: a_missing_privilege_is_reported_as_denied
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - run: env ${{ matrix.env }} scripts/linux-test.sh -p karyos-io --features xdp --locked ${{ matrix.filter }}

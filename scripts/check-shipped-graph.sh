@@ -11,7 +11,7 @@
 #   own, must name no candidate and not the evaluation crate;
 # - Tokio is refused from the same roots except the crates it is admitted
 #   for: karyos-control, under the owner-admitted HTTP stack (karyos#704,
-#   ACS 71206). It is checked over the whole workspace with its features
+#   ACS 71206), and karyos-otlp, under the opentelemetry record (karyos#706). It is checked over the whole workspace with its features
 #   unified: every member from which Tokio is reachable must be admitted,
 #   so a crate that reaches it through an admitted one, through a member
 #   an admitted one uses, or through a feature an admitted one turns on,
@@ -33,7 +33,7 @@ candidates='^(raft|raft-proto|protobuf-build|openraft|openraft-rt|openraft-rt-to
 tokio='^tokio$'
 manifest="$root/Cargo.toml"
 package="karyos-tools"
-admitted=(karyos-control karyos-tiering)
+admitted=(karyos-control karyos-tiering karyos-otlp)
 admitted_set=0
 while [ $# -gt 0 ]; do
     case "$1" in

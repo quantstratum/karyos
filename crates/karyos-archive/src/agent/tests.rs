@@ -3012,7 +3012,10 @@ mod checkpoints {
 
     /// Polls `handle` until its last checkpoint ended.
     fn ended(handle: &mut crate::group::checkpoint::CheckpointHandle) -> LastCheckpoint {
-        for _ in 0..10_000 {
+        // Bounded by a deadline, not a count of polls: a loaded host
+        // stretches each 1 ms sleep (karyos#1067).
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
             handle.poll();
             if let Some(last) = handle.last_checkpoint() {
                 return last;

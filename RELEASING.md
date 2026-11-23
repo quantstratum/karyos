@@ -263,6 +263,8 @@ crates; the 2026-11-23 row reviews them for `v0.1.0-alpha.4`.
 | 2026-11-17 | the eight published crates | free before publication; published the same day (crates.io `created_at` 2026-11-17) |
 | 2026-11-19 | the eight published crates | owned by the owner account: the crates.io owners list of each crate (`cargo owner --list <crate>`) names only `joaquinbejar` |
 | 2026-11-20 | `karyos-trace` | free: `https://crates.io/api/v1/crates/karyos-trace` answers 404 (karyos#997) |
+| 2026-11-23 | `karyos-trace`, `karyos-codec-derive` | free before publication (404); the other eight owned only by `joaquinbejar` |
+| 2026-11-23 | the ten published crates | after the publication of `v0.1.0-alpha.4`: each crate's owners list names only `joaquinbejar`, and each answers version 0.1.0-alpha.4 (karyos#1033, ADR-0108) |
 
 ## After the tag
 
