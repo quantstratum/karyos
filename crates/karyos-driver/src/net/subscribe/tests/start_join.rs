@@ -375,14 +375,14 @@ fn a_late_remote_attach_reports_its_loss() {
 }
 
 /// Review of #1175: a remote grant refused after the awaiting cell was
-/// found (a fetch the ledger's byte bound cannot carry) leaves the cell on
+/// found (a fetch the ledger's region bound cannot carry) leaves the cell on
 /// its stream, still awaiting, for its expiry or its parent's removal.
 #[test]
 fn a_refused_remote_grant_leaves_the_cell_awaiting() {
     let mut rig = Rig::with_ledger(
         SubscriberRole::Required,
         10_000_000_000,
-        Some(crate::ledger::Ledger::new(4, 4, 1)),
+        Some(crate::ledger::Ledger::new(4, 0, 1 << 30)),
     );
     let _early = rig.offer(b"early");
     let awaiting = |rig: &Rig| {
