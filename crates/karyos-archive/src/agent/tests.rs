@@ -3738,6 +3738,88 @@ fn a_recording_is_sealed_and_its_catalog_changes_chained() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// karyos#1088 (SPEC.md:629): a journal recorded as an Archive recording,
+/// such as a sequencer's admission journal, is sealed and verified like
+/// any recording, with no step of its own. Its producer, the Sequencer,
+/// lives in the commercial karyos-sequencer repository (SPEC §20.5,
+/// ADR-0064); here an admission-journal-shaped recording, one entry per
+/// frame, is recorded into a sealing Archive. Its ranges verify clean,
+/// and a byte of an entry changed on disk is reported inconsistent.
+#[test]
+fn an_admission_journal_recorded_into_the_archive_is_sealed_and_verified() {
+    use crate::control::IntegrityOutcome;
+
+    const MARKER: &[u8] = b"admission entry ";
+    // One admission entry per 96-byte frame: a marker and its sequence.
+    let entry = |sequence: u8| {
+        let mut frame = vec![0u8; 96];
+        frame[..4].copy_from_slice(&96i32.to_le_bytes());
+        frame[32..32 + MARKER.len()].copy_from_slice(MARKER);
+        frame[32 + MARKER.len()] = sequence;
+        frame
+    };
+    let chunks: Vec<Vec<u8>> = (0..3u8)
+        .map(|chunk| [entry(2 * chunk), entry(2 * chunk + 1)].concat())
+        .collect();
+    let all = chunks.concat();
+    let dir = temp_dir("admission-journal");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let id = agent
+        .start(start(Chunks {
+            chunks: chunks.into(),
+            seal: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    // The running Archive's verification answers every range clean.
+    let verified = |agent: &ArchiveHandle| {
+        let verify = agent.post_verify(id).unwrap();
+        for _ in 0..5000 {
+            if let Some(answer) = verify.try_answer() {
+                return answer.unwrap().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("no verification answer");
+    };
+    let clean = verified(&agent);
+    assert!(!clean.is_empty());
+    assert_eq!(clean.first().unwrap().start, 0);
+    assert_eq!(clean.last().unwrap().end, all.len() as u64);
+    assert!(
+        clean
+            .iter()
+            .all(|range| range.outcome != IntegrityOutcome::Inconsistent),
+        "{clean:?}"
+    );
+    // One byte of one entry changed in the segment file.
+    let segment = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .unwrap();
+    let mut bytes = std::fs::read(&segment).unwrap();
+    let at = bytes
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .unwrap();
+    bytes[at] ^= 0xFF;
+    std::fs::write(&segment, &bytes).unwrap();
+    let tampered = verified(&agent);
+    assert!(
+        tampered
+            .iter()
+            .any(|range| range.outcome == IntegrityOutcome::Inconsistent),
+        "{tampered:?}"
+    );
+    agent.shutdown().unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Without a `seal_interval` the agent keeps no integrity journal.
 #[test]
 fn without_a_seal_interval_nothing_is_sealed() {
