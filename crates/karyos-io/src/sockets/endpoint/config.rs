@@ -139,7 +139,7 @@ impl MulticastConfig {
 pub struct CapabilitySet(u16);
 
 /// Every capability, in declaration order; its position is its bit.
-const ALL_CAPABILITIES: [Capability; 13] = [
+const ALL_CAPABILITIES: [Capability; 14] = [
     Capability::DontFragment,
     Capability::TxBatch,
     Capability::RxBatch,
@@ -153,6 +153,7 @@ const ALL_CAPABILITIES: [Capability; 13] = [
     Capability::RecvBuffer,
     Capability::PathMtu,
     Capability::UringRing,
+    Capability::XdpSocket,
 ];
 
 const fn bit(capability: Capability) -> u16 {
@@ -170,6 +171,7 @@ const fn bit(capability: Capability) -> u16 {
         Capability::RecvBuffer => 10,
         Capability::PathMtu => 11,
         Capability::UringRing => 12,
+        Capability::XdpSocket => 13,
     };
     1 << shift
 }
@@ -562,6 +564,7 @@ impl CapabilitySnapshot {
             Capability::PathMtu => CapabilityState::NotRequested,
             // The sockets backend has no ring.
             Capability::UringRing => CapabilityState::NotRequested,
+            Capability::XdpSocket => CapabilityState::NotRequested,
         }
     }
 

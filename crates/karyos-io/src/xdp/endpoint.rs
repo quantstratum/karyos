@@ -194,6 +194,20 @@ pub struct XdpEndpoint<O: XskOps> {
     failed: Option<BackendFailure>,
     /// `retire` has started: no claim, commit, flush, route or queue.
     retiring: bool,
+    /// The simulator's negative control: release each frame at its
+    /// submission instead of at its completion.
+    #[cfg(any(test, feature = "test-hooks"))]
+    release_at_submission: bool,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl XdpEndpoint<super::scripted::ScriptedXsk> {
+    /// Turns on the mutant that releases each frame at its submission
+    /// instead of at its completion. Never correct; only on the scripted
+    /// socket, never a real one.
+    pub fn inject_release_at_submission(&mut self) {
+        self.release_at_submission = true;
+    }
 }
 
 impl<O: XskOps> XdpEndpoint<O> {
@@ -245,6 +259,8 @@ impl<O: XskOps> XdpEndpoint<O> {
             counters: XdpCounters::default(),
             failed: None,
             retiring: false,
+            #[cfg(any(test, feature = "test-hooks"))]
+            release_at_submission: false,
         })
     }
 
@@ -812,6 +828,16 @@ impl<O: XskOps> TxBackend for XdpEndpoint<O> {
             if let Some(slot_meta) = self.slots.get_mut(slot as usize) {
                 slot_meta.phase = Phase::Submitted;
                 slot_meta.next = NO_SLOT;
+            }
+            #[cfg(any(test, feature = "test-hooks"))]
+            if self.release_at_submission
+                && let Some(slot_meta) = self.slots.get_mut(slot as usize)
+            {
+                *slot_meta = SlotMeta {
+                    generation: meta.generation,
+                    ..FREE_META
+                };
+                let _ = self.ledger.release_pending(request.queue, slot);
             }
             outcome.submitted = outcome.submitted.saturating_add(1);
             outcome.bytes = outcome.bytes.saturating_add(u32::from(meta.len));
