@@ -299,22 +299,39 @@ fn join(fd: &OwnedFd, multicast: MulticastConfig) -> Result<Membership, OpenErro
     // group another socket of the host joined on this port, so one
     // redundant path's socket would count another path's datagrams
     // (owner item 12, sockets-backend.md 4.1).
-    crate::linux_sys::set_multicast_all_off(
-        std::os::fd::AsFd::as_fd(fd),
+    multicast_all_off(
+        crate::linux_sys::set_multicast_all_off(
+            std::os::fd::AsFd::as_fd(fd),
+            multicast.group.is_ipv6(),
+        ),
         multicast.group.is_ipv6(),
-    )
-    .map_err(|error| OpenError::Os {
-        operation: if multicast.group.is_ipv6() {
-            "setsockopt IPV6_MULTICAST_ALL"
-        } else {
-            "setsockopt IP_MULTICAST_ALL"
-        },
-        errno: error.raw_os_error().unwrap_or(0),
-    })?;
+    )?;
     Ok(Membership {
         group: multicast.group,
         interface: multicast.interface,
     })
+}
+
+/// The outcome of setting the multicast-all option off. An IPv6 socket on a
+/// kernel without `IPV6_MULTICAST_ALL` (before Linux 4.20, `ENOPROTOOPT`)
+/// keeps its join: only redundant paths need the isolation, and the driver
+/// serves IPv4 paths only, so an IPv6 path is refused there whatever this
+/// answers (karyos#624). Any other failure fails the open.
+fn multicast_all_off(result: std::io::Result<()>, ipv6: bool) -> Result<(), OpenError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if ipv6 && error.raw_os_error() == Some(OsErrno::NOPROTOOPT.raw_os_error()) => {
+            Ok(())
+        }
+        Err(error) => Err(OpenError::Os {
+            operation: if ipv6 {
+                "setsockopt IPV6_MULTICAST_ALL"
+            } else {
+                "setsockopt IP_MULTICAST_ALL"
+            },
+            errno: error.raw_os_error().unwrap_or(0),
+        }),
+    }
 }
 
 /// The batching probe (8.2): `sendmmsg` with zero messages.

@@ -714,3 +714,29 @@ fn a_path_socket_receives_only_its_own_interface() {
         "the LAN path's socket received a datagram of the loopback path"
     );
 }
+
+/// Codex review of #1218 (karyos#624): a kernel without `IPV6_MULTICAST_ALL`
+/// (`ENOPROTOOPT`, before Linux 4.20) keeps an IPv6 join, without the
+/// isolation; an IPv4 socket, or any other error, still fails the open,
+/// naming the option.
+#[test]
+fn an_ipv6_join_survives_a_kernel_without_ipv6_multicast_all() {
+    let missing = || std::io::Error::from_raw_os_error(OsErrno::NOPROTOOPT.raw_os_error());
+    assert_eq!(multicast_all_off(Err(missing()), true), Ok(()));
+    assert!(matches!(
+        multicast_all_off(Err(missing()), false),
+        Err(OpenError::Os {
+            operation: "setsockopt IP_MULTICAST_ALL",
+            ..
+        })
+    ));
+    let other = std::io::Error::from_raw_os_error(OsErrno::BADF.raw_os_error());
+    assert!(matches!(
+        multicast_all_off(Err(other), true),
+        Err(OpenError::Os {
+            operation: "setsockopt IPV6_MULTICAST_ALL",
+            ..
+        })
+    ));
+    assert_eq!(multicast_all_off(Ok(()), true), Ok(()));
+}

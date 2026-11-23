@@ -606,6 +606,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             net.count_paths_refused();
             return Err(DriverError::UnsupportedChannel);
         }
+        if let Err(error) = super::subscribe::paths_on_distinct_interfaces(channel) {
+            net.count_paths_refused();
+            return Err(error);
+        }
         let (destination, binds) = route(channel, allowlist.is_some())?;
         let max_destinations = net.max_destinations();
         // An allowlist belongs to a dynamic channel only. Its required

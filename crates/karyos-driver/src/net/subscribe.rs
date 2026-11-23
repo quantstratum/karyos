@@ -57,6 +57,51 @@ use crate::membership::ReceiverIdentity;
 /// path joining the channel's group on its interface address, the first
 /// path being the route of [`receive_route`]. Unicast `paths` need a
 /// destination per path, which the URI cannot name yet (owner item 11).
+/// Redundant paths on distinct interfaces (karyos#624, Codex review of
+/// #1218): two path addresses that resolve to one interface, such as the
+/// unspecified address and the explicit address of the interface the group
+/// routes through, would hold two memberships on that interface, so each
+/// socket receives every datagram even with `IP_MULTICAST_ALL` off and one
+/// physical path looks like two. Such a channel is refused, as is one whose
+/// path cannot be resolved where the isolation is real (Linux). The same
+/// address given twice shares one endpoint and is skipped as before.
+/// Runs on the control path, so it may allocate.
+pub(super) fn paths_on_distinct_interfaces(channel: &UdpConfig) -> Result<(), DriverError> {
+    paths_on_distinct_interfaces_with(channel, karyos_io::sockets::path_interface::path_interface)
+}
+
+/// [`paths_on_distinct_interfaces`] with the resolver given (tests).
+pub(super) fn paths_on_distinct_interfaces_with(
+    channel: &UdpConfig,
+    resolve: impl Fn(Ipv4Addr, Ipv4Addr) -> Option<String>,
+) -> Result<(), DriverError> {
+    if channel.paths.len() < 2 || !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    // Another destination, or an IPv6 group, is refused by the routes.
+    let Destination::Multicast { group, .. } = &channel.destination else {
+        return Ok(());
+    };
+    let IpAddr::V4(group) = group.ip() else {
+        return Ok(());
+    };
+    let mut seen: Vec<(Ipv4Addr, String)> = Vec::with_capacity(channel.paths.len());
+    for path in &channel.paths {
+        let Interface::Address(IpAddr::V4(address)) = path else {
+            return Ok(());
+        };
+        if seen.iter().any(|(held, _)| held == address) {
+            continue;
+        }
+        let name = resolve(*address, group).ok_or(DriverError::UnsupportedChannel)?;
+        if seen.iter().any(|(_, held)| *held == name) {
+            return Err(DriverError::UnsupportedChannel);
+        }
+        seen.push((*address, name));
+    }
+    Ok(())
+}
+
 /// Runs on the control path, so it may allocate.
 fn later_routes(channel: &UdpConfig) -> Result<Vec<(SocketAddr, MulticastConfig)>, DriverError> {
     let Some((_, later)) = channel.paths.split_first() else {
@@ -524,6 +569,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !channel.paths.is_empty() && !net.paths_isolated() {
             net.count_paths_refused();
             return Err(DriverError::UnsupportedChannel);
+        }
+        if let Err(error) = paths_on_distinct_interfaces(channel) {
+            net.count_paths_refused();
+            return Err(error);
         }
         // A conflated view of an unreliable channel needs its fail-safe to
         // close the view before the far-window close ends the image
