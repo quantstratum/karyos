@@ -30,6 +30,10 @@ impl SbeSequence for BySerial {
             sequence: car.serial_number(),
         })
     }
+
+    fn complete(&self, _: &ironsbe_core::header::MessageHeader, frame: &[u8]) -> bool {
+        decode_car(frame).is_ok()
+    }
 }
 
 #[test]

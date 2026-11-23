@@ -59,15 +59,23 @@ pub struct SbeSchema {
 
 impl SbeSchema {
     /// The message header of `frame` when it names this schema and a
-    /// version this build reads; `None` for a frame shorter than the
-    /// header, another schema or an unknown version.
+    /// version this build reads and the frame holds the root block the
+    /// header declares; `None` for a frame shorter than the header or than
+    /// its root block, another schema or an unknown version. A frame cut
+    /// inside its root block is never sequenced, so a truncated copy on one
+    /// line cannot win the arbitration over the whole copy on the other
+    /// (Codex review of #1212).
     #[must_use]
     pub fn frame(&self, frame: &[u8]) -> Option<MessageHeader> {
         if frame.len() < MessageHeader::ENCODED_LENGTH {
             return None;
         }
         let header = MessageHeader::wrap(frame, 0);
-        (header.schema_id == self.schema_id && header.version <= self.max_version).then_some(header)
+        let block = MessageHeader::ENCODED_LENGTH.checked_add(usize::from(header.block_length))?;
+        (header.schema_id == self.schema_id
+            && header.version <= self.max_version
+            && frame.len() >= block)
+            .then_some(header)
     }
 }
 
@@ -78,6 +86,16 @@ pub trait SbeSequence {
     /// sequence (a heartbeat, an administrative message), which is counted
     /// as `unsequenced` and not delivered.
     fn identity(&self, header: &MessageHeader, frame: &[u8]) -> Option<Identity>;
+
+    /// Whether `frame` holds its whole message: its repeating groups and
+    /// variable data within the frame, as the schema's decoder walks them.
+    /// The adapter already checks the header and the root block; a schema
+    /// with a variable section checks it here, and a frame cut inside it is
+    /// refused before arbitration, never sequenced. Default `true`.
+    fn complete(&self, header: &MessageHeader, frame: &[u8]) -> bool {
+        let _ = (header, frame);
+        true
+    }
 
     /// The sequence space when the sequence wraps, at least 5; `None` when
     /// it never does.
@@ -108,9 +126,19 @@ impl<S> SbeSequencer<S> {
     }
 }
 
+impl<S: SbeSequence> SbeSequencer<S> {
+    /// The header of `frame` when the schema frames it and the feed finds
+    /// it complete; `None` for a frame the adapter refuses.
+    #[must_use]
+    pub fn accepted(&self, frame: &[u8]) -> Option<MessageHeader> {
+        let header = self.schema.frame(frame)?;
+        self.sequence.complete(&header, frame).then_some(header)
+    }
+}
+
 impl<S: SbeSequence> FeedSequencer for SbeSequencer<S> {
     fn identity(&self, message: &[u8]) -> Option<Identity> {
-        let header = self.schema.frame(message)?;
+        let header = self.accepted(message)?;
         self.sequence.identity(&header, message)
     }
 
@@ -171,8 +199,10 @@ pub enum SbeEvent<'a> {
 pub struct SbeCounters {
     /// The arbiter's counters.
     pub feed: Counters,
-    /// Frames shorter than the SBE message header, of another schema, or
-    /// of a schema version this build does not read: never delivered.
+    /// Frames shorter than the SBE message header or than their root
+    /// block, of another schema or of a schema version this build does not
+    /// read, or incomplete by the feed's [`SbeSequence::complete`]: never
+    /// arbitrated, never delivered.
     pub refused: u64,
 }
 
@@ -201,8 +231,9 @@ impl<S: SbeSequence> SbeFeed<S> {
     }
 
     /// Takes `frame` from `line` at the caller's time `now` and reports
-    /// what it releases to `emit`. A frame the schema refuses is counted
-    /// and goes no further.
+    /// what it releases to `emit`. A frame the schema refuses, or one the
+    /// feed finds incomplete ([`SbeSequence::complete`]), is counted as
+    /// refused and goes no further: it never competes in the arbitration.
     pub fn push<F: FnMut(SbeEvent<'_>)>(
         &mut self,
         line: Line,
@@ -210,7 +241,7 @@ impl<S: SbeSequence> SbeFeed<S> {
         now: u64,
         mut emit: F,
     ) {
-        if self.schema.frame(frame).is_none() {
+        if self.arbiter.sequencer().accepted(frame).is_none() {
             self.refused = self.refused.saturating_add(1);
             return;
         }

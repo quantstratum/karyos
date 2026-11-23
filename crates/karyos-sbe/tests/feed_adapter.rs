@@ -41,6 +41,10 @@ impl SbeSequence for BySerial {
             sequence: car.serial_number(),
         })
     }
+
+    fn complete(&self, _: &ironsbe_core::header::MessageHeader, frame: &[u8]) -> bool {
+        decode_car(frame).is_ok()
+    }
 }
 
 /// The skew window, in the test's nanoseconds.
@@ -241,4 +245,26 @@ fn a_client_sees_each_sbe_message_of_two_lines_once_in_order() {
     assert_eq!(counters.feed.gaps, 1);
     assert_eq!(counters.refused, 2, "another schema and an unknown version");
     assert!(counters.feed.duplicates_a + counters.feed.duplicates_b + counters.feed.late_b >= 5);
+}
+
+/// Codex review of #1212: a copy truncated on line A, inside its root block
+/// or inside its variable section, is refused before arbitration, so the
+/// whole copy line B brings later is the one delivered, once.
+#[test]
+fn a_truncated_copy_never_wins_over_the_whole_one() {
+    let mut feed = feed();
+    let mut seen = Vec::new();
+    let whole = car(1);
+    // Cut inside the root block (the header declares 62 bytes after it),
+    // then inside the variable section.
+    feed.push(Line::A, &whole[..20], 1, record(&mut seen));
+    feed.push(Line::A, &whole[..whole.len() - 3], 2, record(&mut seen));
+    assert!(seen.is_empty(), "{seen:?}");
+    feed.push(Line::B, &whole, 3, record(&mut seen));
+    feed.push(Line::A, &whole, 4, record(&mut seen));
+    assert_eq!(seen, [Seen::Message(Line::B, 1)]);
+    let counters = feed.counters();
+    assert_eq!(counters.refused, 2);
+    assert_eq!(counters.feed.delivered, 1);
+    assert_eq!(counters.feed.unsequenced, 0);
 }
