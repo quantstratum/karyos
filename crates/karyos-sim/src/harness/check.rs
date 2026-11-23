@@ -78,6 +78,14 @@ pub enum Violation {
         /// The servers.
         servers: usize,
     },
+    /// A server's core panicked (karyos#976). Reported after every other
+    /// check, linearizability included, so only when none names what led
+    /// to it: a panic that follows a lost durable entry is reported as
+    /// [`Violation::DurableLost`].
+    CorePanicked {
+        /// The server.
+        node: NodeId,
+    },
     /// A server's positions out of their order.
     PositionsOutOfOrder {
         /// The server.
@@ -527,10 +535,18 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
     let mut logs = DurableLogs::default();
     let mut applied: BTreeMap<u64, u64> = BTreeMap::new();
     let mut down: BTreeSet<NodeId> = BTreeSet::new();
+    // Servers down since their core panicked: their verdict is the panic
+    // (`no_core_panic`), not an unverified log (karyos#976).
+    let mut panicked: BTreeSet<NodeId> = BTreeSet::new();
     for observation in observations {
         match observation {
             Observation::Crashed { node } => {
                 let _ = down.insert(*node);
+                let _ = panicked.remove(node);
+            }
+            Observation::CorePanicked { node } => {
+                let _ = down.insert(*node);
+                let _ = panicked.insert(*node);
             }
             Observation::OpenFailed { node, .. } if down.contains(node) => {
                 if let Some((index, term)) = logs.logs.get(node).and_then(|log| log.iter().next()) {
@@ -541,8 +557,8 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
                     });
                 }
             }
-            // A drive error stops a server that is up: what it held waits
-            // for its restart, as after a crash.
+            // A drive error, or a core's panic, stops a server that is up:
+            // what it held waits for its restart, as after a crash.
             Observation::OpenFailed { node, .. } | Observation::Contract { node, .. } => {
                 let _ = down.insert(*node);
             }
@@ -551,6 +567,7 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
             }
             Observation::Recovered { node, entries, .. } => {
                 let _ = down.remove(node);
+                let _ = panicked.remove(node);
                 if let Some(before) = logs.logs.get(node) {
                     let reopened: BTreeMap<u64, u64> = entries.iter().copied().collect();
                     if let Some((index, term)) = before
@@ -573,7 +590,7 @@ pub fn durable_kept(observations: &[Observation]) -> Result<(), Violation> {
             }
         }
     }
-    for node in down {
+    for node in down.difference(&panicked).copied() {
         if logs.logs.get(&node).is_some_and(|log| !log.is_empty()) {
             return Err(Violation::Unverified { node });
         }
@@ -640,6 +657,23 @@ pub fn responses_agree(observations: &[Observation]) -> Result<(), Violation> {
         }
     }
     Ok(())
+}
+
+/// No server's core panicked (karyos#976).
+///
+/// # Errors
+///
+/// [`Violation::CorePanicked`] with the first server that did.
+pub fn no_core_panic(observations: &[Observation]) -> Result<(), Violation> {
+    match observations
+        .iter()
+        .find_map(|observation| match observation {
+            Observation::CorePanicked { node } => Some(*node),
+            _ => None,
+        }) {
+        Some(node) => Err(Violation::CorePanicked { node }),
+        None => Ok(()),
+    }
 }
 
 /// No server's core broke C4's contract.
@@ -880,6 +914,7 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::Released { node, .. }
         | Observation::Reply { node, .. }
         | Observation::Crashed { node }
+        | Observation::CorePanicked { node }
         | Observation::Recovered { node, .. }
         | Observation::Contract { node, .. }
         | Observation::Commit { node, .. }
@@ -1153,5 +1188,8 @@ pub fn all(
     servers: usize,
 ) -> Result<(), Violation> {
     group(observations, servers)?;
-    linearizable(history)
+    linearizable(history)?;
+    // Last: a core's panic is reported only when no other check, client
+    // history included, names its cause (karyos#976).
+    no_core_panic(observations)
 }

@@ -1,0 +1,3 @@
+### Fixed
+
+- Replication between two `karyosd` now works end to end (ADR-0102; karyos#1113), and a test covers it. The source sends a request's `streaming` status before any bytes, as decision 6 requires; before, the replica dropped the first ranges as payload without a start marker. A fresh forwarding incarnation that has not reached the replica yet no longer counts as a lost connection; before, the source asked again every 2 s. A replica whose store failed reopens it before the next request starts, and logs its counters and last status at shutdown. The source logs `replica connection lost` when the replica goes away.

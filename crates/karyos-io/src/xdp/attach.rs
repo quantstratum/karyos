@@ -64,7 +64,16 @@ impl std::fmt::Display for AttachError {
     }
 }
 
-impl std::error::Error for AttachError {}
+impl std::error::Error for AttachError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Load(error) => Some(error),
+            Self::Program(error) => Some(error),
+            Self::Map(error) => Some(error),
+            Self::NotALink | Self::Missing(_) => None,
+        }
+    }
+}
 
 /// The 20-byte `karyos_endpoints` key of `address` (the program's
 /// `EndpointKey`): family, a zero pad byte, the port in network order, the

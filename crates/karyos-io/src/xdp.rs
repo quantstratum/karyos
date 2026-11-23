@@ -35,6 +35,7 @@ pub mod ops;
 pub mod ring;
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod scripted;
+pub mod select;
 
 /// The XDP program, built by `scripts/xdp-object.sh` in the pinned
 /// container; its SHA-256 is in the manifest beside it. User builds never

@@ -156,6 +156,9 @@ tar -tzf "$work/out/$daemon_name.tar.gz" | grep -q 'libkaryos' &&
     fail "the karyosd artifact holds libkaryos"
 
 rm -rf "$dest"
+# DEST's parent may not exist yet, as with a CARGO_TARGET_DIR outside
+# the tree, where `target/` is never created.
+mkdir -p "$(dirname "$dest")"
 mv "$work/out" "$dest"
 echo "release artifacts of core $commit in $dest:"
 cat "$dest/SHA256SUMS"
