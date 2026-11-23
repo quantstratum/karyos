@@ -3738,7 +3738,7 @@ fn a_recording_is_sealed_and_its_catalog_changes_chained() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-/// karyos#1088 (SPEC.md:629): a journal recorded as an Archive recording,
+/// karyos#1088 (SPEC §8.4, "Sealing and tamper evidence"): a journal recorded as an Archive recording,
 /// such as a sequencer's admission journal, is sealed and verified like
 /// any recording, with no step of its own. Its producer, the Sequencer,
 /// lives in the commercial karyos-sequencer repository (SPEC §20.5,
@@ -3819,13 +3819,35 @@ fn an_admission_journal_recorded_into_the_archive_is_sealed_and_verified() {
         .unwrap();
     let _ = replay_ended(&agent);
     let held = seen.lock().unwrap().bytes.clone();
-    assert_ne!(held, all, "the change reaches what the Archive holds");
+    // The replay is complete and differs from what was recorded in exactly
+    // the one byte changed, so the check below sees the change, not a
+    // short or empty replay (Codex review of #1170).
+    let changed = all
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .unwrap();
+    let mut expected = all.clone();
+    expected[changed] ^= 0xFF;
+    assert_eq!(held.len(), all.len(), "the whole recording is replayed");
+    assert_eq!(held, expected, "only the changed byte differs");
+    // The sealed range holding it rejects the replayed bytes; every other
+    // range still matches.
+    for range in &ranges {
+        let bytes = &held[range.start as usize..range.end as usize];
+        let holds_change = (range.start as usize..range.end as usize).contains(&changed);
+        assert_eq!(
+            verify_range(range, bytes).is_err(),
+            holds_change,
+            "range [{}, {})",
+            range.start,
+            range.end
+        );
+    }
     assert!(
-        ranges.iter().any(|range| {
-            held.get(range.start as usize..range.end as usize)
-                .is_none_or(|bytes| verify_range(range, bytes).is_err())
-        }),
-        "a sealed range detects the change"
+        ranges
+            .iter()
+            .any(|range| (range.start as usize..range.end as usize).contains(&changed)),
+        "a sealed range covers the changed byte"
     );
     agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
