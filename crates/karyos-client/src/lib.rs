@@ -48,7 +48,8 @@ pub use client::{
     Accepted, Claim, Client, Connection, Context, ContextBuilder, DEFAULT_MAX_IMAGES,
     DEFAULT_MAX_PENDING, DEFAULT_TIMEOUT, IdleStrategy, ImageChange, ImageEnd, ImageStop, JoinLoss,
     MessageLength, NotRejoinable, OfferError, OfferOptions, Publication, RejoiningSubscription,
-    ReplayTargetSubscriber, Subscription, SubscriptionError, SubscriptionOptions, SubscriptionPoll,
+    ReleaseOutcome, ReplayTargetSubscriber, Subscription, SubscriptionError, SubscriptionOptions,
+    SubscriptionPoll,
 };
 pub use concurrent::{
     ClientConcurrentClaim, ClientConcurrentPublication, ConcurrentClaimOutcome,
