@@ -45,6 +45,16 @@ struct Seen {
     bad_checksums: usize,
     /// The body of a 404, as S3's error document.
     not_found_body: Vec<u8>,
+    /// Each object's version and the lock headers its PUT carried.
+    versions: HashMap<String, (String, Vec<(String, String)>)>,
+    /// PUTs answered, numbering the versions.
+    puts: u64,
+    /// The lock mode answered instead of the one put, if set.
+    answer_mode: Option<String>,
+    /// HEADs answered, with their version.
+    heads: Vec<String>,
+    /// The query of each GET.
+    gets: Vec<String>,
 }
 
 /// An S3 stand-in: PUT stores (only with the right SHA-256 checksum, as
@@ -82,6 +92,7 @@ fn stand_in(seen: Arc<Mutex<Seen>>) -> u16 {
             let first = lines.next().unwrap_or_default().to_owned();
             let mut length = 0usize;
             let mut checksum = None;
+            let mut locks: Vec<(String, String)> = Vec::new();
             let mut seen = seen.lock().unwrap();
             for line in lines {
                 let lower = line.to_ascii_lowercase();
@@ -94,37 +105,76 @@ fn stand_in(seen: Arc<Mutex<Seen>>) -> u16 {
                         .map(|(_, value)| value.trim().to_owned());
                 }
                 if lower.starts_with("x-amz-object-lock") {
-                    seen.lock_headers.push(lower);
+                    seen.lock_headers.push(lower.clone());
+                    if let Some((name, value)) = line.split_once(':') {
+                        locks.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+                    }
                 }
             }
             let mut body = vec![0u8; length];
             stream.read_exact(&mut body).unwrap();
             let mut parts = first.split(' ');
             let method = parts.next().unwrap_or_default();
-            let path = parts.next().unwrap_or_default();
-            let path = path.split('?').next().unwrap_or_default().to_owned();
+            let full = parts.next().unwrap_or_default();
+            let path = full.split('?').next().unwrap_or_default().to_owned();
+            let query = full
+                .split_once('?')
+                .map_or("", |(_, query)| query)
+                .to_owned();
+            let mut extra = String::new();
             let (status, answer) = match method {
                 "PUT" if checksum.as_deref() != Some(checksum_sha256(&body).as_str()) => {
                     seen.bad_checksums += 1;
                     ("400 Bad Request", Vec::new())
                 }
                 "PUT" => {
+                    seen.puts += 1;
+                    let version = format!("v{}", seen.puts);
+                    extra = format!("x-amz-version-id: {version}\r\n");
+                    seen.versions.insert(path.clone(), (version, locks));
                     seen.objects.insert(path, body);
                     ("200 OK", Vec::new())
                 }
-                "GET" => match seen.objects.get(&path) {
-                    Some(object) => ("200 OK", object.clone()),
-                    None => ("404 Not Found", seen.not_found_body.clone()),
-                },
+                "HEAD" => {
+                    let asked = query
+                        .split('&')
+                        .find_map(|pair| pair.strip_prefix("versionId="))
+                        .unwrap_or_default()
+                        .to_owned();
+                    match seen.versions.get(&path).cloned() {
+                        Some((version, locks)) if version == asked => {
+                            seen.heads.push(version.clone());
+                            extra = format!("x-amz-version-id: {version}\r\n");
+                            for (name, value) in locks {
+                                let value = match (&seen.answer_mode, name.as_str()) {
+                                    (Some(mode), "x-amz-object-lock-mode") => mode.clone(),
+                                    _ => value,
+                                };
+                                extra.push_str(&format!("{name}: {value}\r\n"));
+                            }
+                            ("200 OK", Vec::new())
+                        }
+                        _ => ("404 Not Found", Vec::new()),
+                    }
+                }
+                "GET" => {
+                    seen.gets.push(query.clone());
+                    match seen.objects.get(&path) {
+                        Some(object) => ("200 OK", object.clone()),
+                        None => ("404 Not Found", seen.not_found_body.clone()),
+                    }
+                }
                 _ => ("400 Bad Request", Vec::new()),
             };
             drop(seen);
             let reply = format!(
-                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
                 answer.len()
             );
             let _ = stream.write_all(reply.as_bytes());
-            let _ = stream.write_all(&answer);
+            if method != "HEAD" {
+                let _ = stream.write_all(&answer);
+            }
             let _ = stream.flush();
             tls.send_close_notify();
             let _ = tls.complete_io(&mut tcp);
@@ -285,5 +335,80 @@ fn a_large_not_found_document_is_still_not_found() {
     assert_eq!(
         store.get(&key(9)).unwrap_err().kind(),
         io::ErrorKind::NotFound
+    );
+}
+
+#[test]
+fn the_retention_of_the_exact_version_put_is_read_back() {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let port = stand_in(Arc::clone(&seen));
+    let mut store = S3Store::new(config(port, true)).unwrap();
+    let until = 1_900_000_000_000_000_000;
+    let _ = store.put(&key(1), b"first", until).unwrap();
+    let _ = store.put(&key(1), b"second", until).unwrap();
+    let retention = store.retention(&key(1)).unwrap().unwrap();
+    assert_eq!(retention.mode, LockMode::Compliance);
+    assert!(retention.retain_until_ns >= until);
+    assert!(retention.enforces(until));
+    assert!(!retention.enforces(until + 2_000_000_000));
+    // The HEAD named the second PUT's version, never the first.
+    assert_eq!(seen.lock().unwrap().heads, vec!["v2".to_owned()]);
+    // A mode the store does not know is refused.
+    seen.lock().unwrap().answer_mode = Some("LEGAL".to_owned());
+    assert!(store.retention(&key(1)).is_err());
+    // Without object lock, nothing is read back.
+    let mut plain = S3Store::new(config(port, false)).unwrap();
+    let _ = plain.put(&key(2), b"plain", 0).unwrap();
+    assert_eq!(plain.retention(&key(3)).unwrap(), None);
+    assert_eq!(plain.retention(&key(2)).unwrap(), None);
+}
+
+#[test]
+fn rfc3339_dates_parse_back_to_their_nanoseconds() {
+    for ns in [
+        0,
+        1_000_000_000,
+        1_700_000_000_000_000_000,
+        4_102_444_800_000_000_000,
+    ] {
+        assert_eq!(parse_rfc3339(&rfc3339(ns)), Some(ns));
+    }
+    assert_eq!(
+        parse_rfc3339("2030-01-01T00:00:00.5Z"),
+        Some(1_893_456_000_500_000_000)
+    );
+    for bad in [
+        "",
+        "2030-01-01",
+        "2030-13-01T00:00:00Z",
+        "2030-01-01T00:00:00+01:00",
+        "1969-12-31T23:59:59Z",
+    ] {
+        assert_eq!(parse_rfc3339(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn an_absurd_year_is_refused_not_wrapped() {
+    assert_eq!(parse_rfc3339("18446744073709551615-01-01T00:00:00Z"), None);
+    assert_eq!(parse_rfc3339("10000-01-01T00:00:00Z"), None);
+    // Within the year bound but past u64 nanoseconds (about 2554): none,
+    // never a wrapped value.
+    assert_eq!(parse_rfc3339("9999-12-31T23:59:59Z"), None);
+    assert!(parse_rfc3339("2500-12-31T23:59:59Z").is_some());
+}
+
+#[test]
+fn a_read_back_names_the_version_the_put_wrote() {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let port = stand_in(Arc::clone(&seen));
+    let mut store = S3Store::new(config(port, true)).unwrap();
+    let _ = store.put(&key(1), b"first", 1).unwrap();
+    let _ = store.get(&key(1)).unwrap();
+    let gets = seen.lock().unwrap().gets.clone();
+    assert_eq!(gets.len(), 1);
+    assert!(
+        gets[0].split('&').any(|pair| pair == "versionId=v1"),
+        "{gets:?}"
     );
 }
