@@ -170,7 +170,6 @@ fn a_read_across_segments_allocates_per_crossing_not_per_entry() {
     .unwrap();
     read.unwrap();
     assert_eq!(out, written);
-    println!("crossing read: {segments} segments, {counts:?}");
     // At most a few allocations per segment the read enters.
     assert!(
         counts.allocations <= 8 * segments,
