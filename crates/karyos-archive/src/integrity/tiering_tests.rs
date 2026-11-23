@@ -306,7 +306,7 @@ fn a_crash_after_the_offload_record_is_finished_on_the_next_open() {
     // The crash: the offload record is chained, the start not raised.
     let _ = archive
         .journal
-        .record_offload(RECORDING, 0, 128, uploaded.index_digest)
+        .record_offload(RECORDING, 0, 128, uploaded.index_digest())
         .unwrap();
     let disk = archive.disk.clone();
     drop(archive);
@@ -389,4 +389,146 @@ fn a_segment_whose_seals_cross_its_boundary_is_not_eligible() {
         ),
         Err(TieringError::NotEligible { base: 0, .. })
     ));
+}
+
+#[test]
+fn an_upload_is_committed_only_through_the_tiering_that_made_it() {
+    let mut archive = fresh();
+    let uploaded = upload(&mut archive, &mut Bucket::default(), 3).unwrap();
+    let counter = archive.journal.next_counter();
+    for other in [
+        Tiering {
+            local: ARCHIVE,
+            remote: [41; 32],
+        },
+        Tiering {
+            local: [8; 32],
+            remote: BUCKET,
+        },
+    ] {
+        assert!(matches!(
+            other.commit_segment(
+                &uploaded,
+                copies(3),
+                0,
+                &mut archive.copies,
+                &mut archive.journal,
+                &mut archive.store,
+                &mut NoRelease,
+            ),
+            Err(TieringError::NotEligible { .. })
+        ));
+    }
+    assert_eq!(archive.journal.next_counter(), counter);
+    assert_eq!(archive.store.start(), 0);
+    assert_eq!(segment_names(&archive.disk, 0), 2);
+}
+
+#[test]
+fn a_range_the_destination_already_holds_still_gets_its_copy_record() {
+    let mut archive = fresh();
+    let seal = archive
+        .journal
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.kind.is_range() && record.start == 0)
+        .unwrap();
+    archive
+        .copies
+        .record(
+            super::copies::CopyRecord {
+                sequence: 0,
+                recording: RECORDING,
+                start: 0,
+                end: 128,
+                location: BUCKET,
+                digest: seal.content,
+                retain_until_ns: 0,
+                state: CopyState::Verified,
+                enforcement: Enforcement::ObjectLock,
+            },
+            &mut archive.journal,
+        )
+        .unwrap();
+    let before = archive.copies.records().len();
+    let counter = archive.journal.next_counter();
+    let record = offload(&mut archive, &mut Bucket::default(), 3);
+    let after = archive.copies.records()[before..]
+        .iter()
+        .filter(|copy| copy.location == BUCKET)
+        .count();
+    assert_eq!(after, 1);
+    // That copy record lies between the seal and the offload record.
+    let records = archive.journal.records().unwrap();
+    assert!(records.iter().any(|chained| chained.kind == SealKind::Copy
+        && chained.counter >= counter
+        && chained.counter < record.counter));
+}
+
+/// Records the files released.
+#[derive(Default)]
+struct Released(Vec<std::path::PathBuf>);
+
+impl super::tiering::Release for Released {
+    fn release(&mut self, path: &Path) -> io::Result<()> {
+        self.0.push(path.to_path_buf());
+        Ok(())
+    }
+}
+
+#[test]
+fn a_crashed_offload_is_released_and_uncounted_before_its_files_go() {
+    let mut archive = fresh();
+    // A local verified copy of the segment, as karyosd records one.
+    let seal = archive
+        .journal
+        .records()
+        .unwrap()
+        .into_iter()
+        .find(|record| record.kind.is_range() && record.start == 0)
+        .unwrap();
+    archive
+        .copies
+        .record(
+            super::copies::CopyRecord {
+                sequence: 0,
+                recording: RECORDING,
+                start: 0,
+                end: 128,
+                location: ARCHIVE,
+                digest: seal.content,
+                retain_until_ns: 0,
+                state: CopyState::Verified,
+                enforcement: Enforcement::Unsupported,
+            },
+            &mut archive.journal,
+        )
+        .unwrap();
+    let uploaded = upload(&mut archive, &mut Bucket::default(), 3).unwrap();
+    let _ = archive
+        .journal
+        .record_offload(RECORDING, 0, 128, uploaded.index_digest())
+        .unwrap();
+    let mut released = Released::default();
+    tiering()
+        .reconcile(
+            &mut archive.copies,
+            &mut archive.journal,
+            &mut archive.store,
+            &mut released,
+        )
+        .unwrap();
+    assert_eq!(released.0, vec![archive.store.segment_paths(0).0]);
+    assert_eq!(segment_names(&archive.disk, 0), 0);
+    assert!(
+        !archive
+            .copies
+            .current()
+            .unwrap()
+            .iter()
+            .any(|copy| copy.location == ARCHIVE
+                && copy.state == CopyState::Verified
+                && copy.start < 128)
+    );
 }

@@ -239,23 +239,75 @@ pub struct LocalSegment<'a> {
 
 /// What [`Tiering::upload_segment`] put and read back: every object
 /// verified, nothing recorded yet.
+///
+/// Opaque: only [`Tiering::upload_segment`] makes one, and
+/// [`Tiering::commit_segment`] commits it only through the same archive and
+/// destination, for the segment and seals it was made from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use]
 pub struct Uploaded {
+    local: Digest,
+    remote: Digest,
+    recording: u64,
+    base: u64,
+    start: u64,
+    end: u64,
+    ranges: Vec<(SealRecord, Enforcement)>,
+    index_digest: Digest,
+    index: Enforcement,
+}
+
+impl Uploaded {
     /// The recording.
-    pub recording: u64,
+    #[must_use]
+    pub const fn recording(&self) -> u64 {
+        self.recording
+    }
+
     /// The segment's base.
-    pub base: u64,
-    /// The range it holds.
-    pub start: u64,
-    /// Its end, exclusive.
-    pub end: u64,
+    #[must_use]
+    pub const fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// The range it holds, `[start, end)`.
+    #[must_use]
+    pub const fn range(&self) -> (u64, u64) {
+        (self.start, self.end)
+    }
+
     /// Each range seal with the immutability of its remote copy.
-    pub ranges: Vec<(SealRecord, Enforcement)>,
+    #[must_use]
+    pub fn ranges(&self) -> &[(SealRecord, Enforcement)] {
+        &self.ranges
+    }
+
     /// The SHA-256 of the original index file, computed before the upload.
-    pub index_digest: Digest,
+    #[must_use]
+    pub const fn index_digest(&self) -> Digest {
+        self.index_digest
+    }
+
     /// The immutability of the index object.
-    pub index: Enforcement,
+    #[must_use]
+    pub const fn index(&self) -> Enforcement {
+        self.index
+    }
+}
+
+/// Releases through an [`super::copies::ImmutabilityBackend`].
+pub struct Releasing<'a>(pub &'a mut dyn super::copies::ImmutabilityBackend);
+
+impl std::fmt::Debug for Releasing<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Releasing")
+    }
+}
+
+impl Release for Releasing<'_> {
+    fn release(&mut self, path: &Path) -> std::io::Result<()> {
+        self.0.release(path)
+    }
 }
 
 /// The release of a segment file's immutability before its removal
@@ -483,6 +535,8 @@ impl Tiering {
             return Err(TieringError::IndexMismatch);
         }
         Ok(Uploaded {
+            local: self.local,
+            remote: self.remote,
             recording: segment.recording,
             base: segment.base,
             start: segment.start,
@@ -541,6 +595,29 @@ impl Tiering {
     ) -> Result<SealRecord, TieringError> {
         let seals: Vec<SealRecord> = uploaded.ranges.iter().map(|(seal, _)| *seal).collect();
         let records = journal.records()?;
+        let refuse = |why| TieringError::NotEligible {
+            base: uploaded.base,
+            why,
+        };
+        // The receipt binds the archive, the destination and the segment:
+        // a commit never records a copy at a location that did not get
+        // the objects (ADR-0104, decisions 3 and 4).
+        if (uploaded.local, uploaded.remote) != (self.local, self.remote) {
+            return Err(refuse("uploaded through another archive or destination"));
+        }
+        let chained: Vec<SealRecord> = records
+            .iter()
+            .filter(|record| {
+                record.kind.is_range()
+                    && record.subject == uploaded.recording
+                    && record.start < uploaded.end
+                    && record.end > uploaded.start
+            })
+            .copied()
+            .collect();
+        if chained != seals || segments.recording() != uploaded.recording {
+            return Err(refuse("the upload's seals are not the segment's"));
+        }
         let committed = offloaded(&records)
             .get(&uploaded.recording)
             .and_then(|list| {
@@ -549,6 +626,9 @@ impl Tiering {
                     .copied()
             });
         let record = if let Some(record) = committed {
+            if record.content != uploaded.index_digest {
+                return Err(TieringError::IndexMismatch);
+            }
             record
         } else {
             if segments.recording() != uploaded.recording
@@ -560,19 +640,20 @@ impl Tiering {
                 });
             }
             self.check_copies(copies, &seals, min_copies)?;
+            // A copy record for every range, even one the destination
+            // already held: the verifier finds the offload's custody
+            // change between each seal and its offload record (decision 4).
             for (seal, enforcement) in &uploaded.ranges {
-                if self.adds(copies, seal)? {
-                    copies.record(
-                        Self::copy(
-                            seal,
-                            self.remote,
-                            retain_until_ns,
-                            CopyState::Verified,
-                            *enforcement,
-                        ),
-                        journal,
-                    )?;
-                }
+                copies.record(
+                    Self::copy(
+                        seal,
+                        self.remote,
+                        retain_until_ns,
+                        CopyState::Verified,
+                        *enforcement,
+                    ),
+                    journal,
+                )?;
             }
             journal.record_offload(
                 uploaded.recording,
