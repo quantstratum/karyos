@@ -550,7 +550,7 @@ impl<D: Disk + Clone> Offline<D> {
                 };
             if deadline > 0
                 && let Some(object) =
-                    Self::unenforced(tiering, &uploaded.ranges, id, base, deadline, store)?
+                    Self::unenforced(tiering, uploaded.ranges(), id, base, deadline, store)?
             {
                 report.stopped = Stopped::LockNotEnforced { base, object };
                 break;
