@@ -2857,8 +2857,8 @@ impl<T: TermBytes> Images<T> {
         // An attach's join loss (ADR-0100) goes after its image's attach
         // and before its retirement: those of images taken earlier first.
         self.report_losses(&mut state.join_losses);
-        let mut released = self
-            .released
+        let bin = Arc::clone(&self.released);
+        let mut released = bin
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for id in state.retired.drain(..) {
