@@ -2123,8 +2123,12 @@ impl FacadeRig {
         // Until the driver forgot the registration, bounded by a deadline,
         // not by a count of services: under load the release reaches the
         // driver thread later. A sweep would also forget it, so the
-        // counter below still tells the command from a sweep.
-        self.until(false, &|rig| rig.registrations() == 0);
+        // counter below still tells the command from a sweep. The
+        // subscription is still read (karyos#1067): a retired image whose
+        // clean end is not positioned yet is held by it and released only
+        // at a later poll (`Images::settle_held`), so a subscription no
+        // longer read keeps that registration.
+        self.until(true, &|rig| rig.registrations() == 0);
         self.stage(STOP);
         let b = self.thread.join().unwrap();
         assert!(b.registrations.is_empty(), "the registration was removed");
@@ -2149,6 +2153,7 @@ fn the_facade_removes_a_retired_images_subscription() {
     rig.until(true, &|rig| {
         rig.reading.as_ref().is_some_and(|r| r.image_count() == 1)
     });
+    rig.until(true, &|rig| rig.registrations() == 1);
     rig.stage(REMOVE);
     rig.until(true, &|rig| {
         rig.reading.as_ref().is_some_and(|r| r.image_count() == 0)
@@ -2183,6 +2188,12 @@ fn a_dropped_network_subscription_removes_its_images() {
     rig.until(true, &|rig| {
         rig.reading.as_ref().is_some_and(|r| r.image_count() == 1)
     });
+    // The driver thread publishes its count after its duty cycle, so the
+    // client can hold the image while the count still reads 0: wait for
+    // the image's registration before dropping, or the wait below passes
+    // on that stale 0 without serving the client, whose release is then
+    // never sent (karyos#1067).
+    rig.until(true, &|rig| rig.registrations() == 1);
     drop(rig.reading.take());
     rig.until(false, &|rig| rig.registrations() == 0);
     rig.ends_with_none_swept();

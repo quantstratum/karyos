@@ -301,3 +301,31 @@ fn a_write_within_one_sector_is_never_torn_in_part() {
     }
     assert!(whole > 0 && dropped > 0, "{whole} whole, {dropped} dropped");
 }
+
+/// karyos#976: a disk that lies about syncs acknowledges them, and a crash
+/// loses what they acknowledged; a sync of a file it does not have fails as
+/// an honest disk's does; the disk the crash leaves is honest.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_disk_that_lies_about_syncs_loses_them_at_a_crash() {
+    let mut disk = SimDisk::new().lying_about_syncs();
+    let file = disk.create(&path("a")).unwrap();
+    disk.sync_dir(Path::new(DIR)).unwrap();
+    disk.write_at(&file, 0, b"acknowledged").unwrap();
+    disk.sync(&file).unwrap();
+    let missing = SimFile {
+        inode: u64::MAX,
+        writable: true,
+    };
+    assert_eq!(
+        disk.sync(&missing).unwrap_err().kind(),
+        io::ErrorKind::NotFound
+    );
+    let mut after = disk.after_crash(Survives::Synced).unwrap();
+    assert_eq!(contents(&mut after, "a").unwrap(), b"");
+    let file = after.open(&path("a")).unwrap();
+    after.write_at(&file, 0, b"kept").unwrap();
+    after.sync(&file).unwrap();
+    let mut again = after.after_crash(Survives::Synced).unwrap();
+    assert_eq!(contents(&mut again, "a").unwrap(), b"kept");
+}

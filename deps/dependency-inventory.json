@@ -1,6 +1,8 @@
 {
   "evaluated": {
     "aarch64-apple-darwin": [
+      "anyhow v1.0.105",
+      "async-trait v0.1.92",
       "atomic-waker v1.1.2",
       "block-buffer v0.12.1",
       "bytes v1.12.2",
@@ -16,14 +18,23 @@
       "displaydoc v0.2.7",
       "ed25519 v3.0.0",
       "ed25519-dalek v3.0.0",
+      "either v1.19.0",
       "errno v0.3.14",
       "form_urlencoded v1.2.3",
+      "futures-channel v0.3.34",
       "futures-core v0.3.34",
+      "futures-executor v0.3.34",
+      "futures-macro v0.3.34",
+      "futures-sink v0.3.34",
+      "futures-task v0.3.34",
+      "futures-util v0.3.34",
+      "getrandom v0.3.4",
       "getrandom v0.4.3",
       "graviola v0.4.2",
       "hmac v0.13.0",
       "http v1.5.0",
       "http-body v1.1.0",
+      "http-body-util v0.1.3",
       "httparse v1.10.1",
       "httpdate v1.0.3",
       "hybrid-array v0.4.15",
@@ -41,6 +52,7 @@
       "ironsbe-codegen v0.9.1",
       "ironsbe-core v0.9.1",
       "ironsbe-schema v0.9.1",
+      "itertools v0.13.0",
       "itoa v1.0.18",
       "jiff v0.2.43",
       "jiff-core v0.1.5",
@@ -50,12 +62,23 @@
       "memchr v2.8.3",
       "mio v1.2.5",
       "once_cell v1.21.4",
+      "opentelemetry v0.33.1",
+      "opentelemetry-http v0.33.1",
+      "opentelemetry-otlp v0.33.1",
+      "opentelemetry-proto v0.33.1",
+      "opentelemetry_sdk v0.33.1",
       "percent-encoding v2.3.2",
       "pin-project-lite v0.2.17",
       "potential_utf v0.1.6",
+      "ppv-lite86 v0.2.21",
       "proc-macro2 v1.0.107",
+      "prost v0.14.4",
+      "prost-derive v0.14.6",
       "quick-xml v0.42.0",
       "quote v1.0.47",
+      "rand v0.9.5",
+      "rand_chacha v0.9.0",
+      "rand_core v0.9.5",
       "rustc_version v0.4.1",
       "rustls v0.23.46",
       "rustls-graviola v0.4.0",
@@ -73,235 +96,7 @@
       "signal-hook v0.4.5",
       "signal-hook-registry v1.4.8",
       "signature v3.0.0",
-      "smallvec v1.16.3",
-      "socket2 v0.6.5",
-      "stable_deref_trait v1.2.1",
-      "subtle v2.6.1",
-      "syn v3.0.8",
-      "synstructure v0.14.0",
-      "thiserror v2.0.21",
-      "thiserror-impl v2.0.21",
-      "thread_local v1.1.10",
-      "tinystr v0.8.5",
-      "tokio v1.54.1",
-      "tokio-rustls v0.26.6",
-      "toml v1.1.8+spec-1.1.0",
-      "toml_datetime v1.1.2+spec-1.1.0",
-      "toml_parser v1.1.5+spec-1.1.0",
-      "tracing v0.1.44",
-      "tracing-core v0.1.36",
-      "tracing-subscriber v0.3.23",
-      "try-lock v0.2.5",
-      "typenum v1.20.1",
-      "unicode-ident v1.0.26",
-      "untrusted v0.9.0",
-      "url v2.5.9",
-      "utf8_iter v1.1.0",
-      "utf_types v1.0.0",
-      "want v0.3.2",
-      "winnow v1.0.4",
-      "writeable v0.6.4",
-      "yoke v0.8.4",
-      "yoke-derive v0.8.4",
-      "zerofrom v0.1.8",
-      "zerofrom-derive v0.1.8",
-      "zeroize v1.9.2",
-      "zerotrie v0.2.5",
-      "zerovec v0.11.9",
-      "zerovec-derive v0.11.7",
-      "zmij v1.0.23"
-    ],
-    "aarch64-unknown-linux-gnu": [
-      "atomic-waker v1.1.2",
-      "bitflags v2.13.2",
-      "block-buffer v0.12.1",
-      "bytes v1.12.2",
-      "cfg-if v1.0.5",
-      "cmov v0.5.4",
-      "cpufeatures v0.3.1",
-      "crossbeam-queue v0.3.14",
-      "crossbeam-utils v0.8.23",
-      "crypto-common v0.2.2",
-      "ctutils v0.4.8",
-      "curve25519-dalek v5.0.0",
-      "digest v0.11.3",
-      "displaydoc v0.2.7",
-      "ed25519 v3.0.0",
-      "ed25519-dalek v3.0.0",
-      "errno v0.3.14",
-      "form_urlencoded v1.2.3",
-      "futures-core v0.3.34",
-      "getrandom v0.4.3",
-      "graviola v0.4.2",
-      "hmac v0.13.0",
-      "http v1.5.0",
-      "http-body v1.1.0",
-      "httparse v1.10.1",
-      "httpdate v1.0.3",
-      "hybrid-array v0.4.15",
-      "hyper v1.12.0",
-      "hyper-util v0.1.21",
-      "icu_collections v2.4.0",
-      "icu_locale_core v2.4.0",
-      "icu_normalizer v2.4.0",
-      "icu_normalizer_data v2.4.0",
-      "icu_properties v2.4.0",
-      "icu_properties_data v2.4.0",
-      "icu_provider v2.4.0",
-      "idna v1.1.0",
-      "idna_adapter v1.2.2",
-      "ironsbe-codegen v0.9.1",
-      "ironsbe-core v0.9.1",
-      "ironsbe-schema v0.9.1",
-      "itoa v1.0.18",
-      "jiff v0.2.43",
-      "jiff-core v0.1.5",
-      "lazy_static v1.5.1",
-      "libc v0.2.190",
-      "linux-raw-sys v0.12.1",
-      "litemap v0.8.3",
-      "memchr v2.8.3",
-      "mio v1.2.5",
-      "once_cell v1.21.4",
-      "percent-encoding v2.3.2",
-      "pin-project-lite v0.2.17",
-      "potential_utf v0.1.6",
-      "proc-macro2 v1.0.107",
-      "quick-xml v0.42.0",
-      "quote v1.0.47",
-      "rustc_version v0.4.1",
-      "rustix v1.1.6",
-      "rustls v0.23.46",
-      "rustls-graviola v0.4.0",
-      "rustls-pki-types v1.16.0",
-      "rustls-webpki v0.103.17",
-      "rusty-s3 v0.11.0",
-      "semver v1.0.28",
-      "serde v1.0.229",
-      "serde_core v1.0.229",
-      "serde_derive v1.0.229",
-      "serde_json v1.0.154",
-      "serde_spanned v1.1.2",
-      "sha2 v0.11.1",
-      "sharded-slab v0.1.7",
-      "signal-hook v0.4.5",
-      "signal-hook-registry v1.4.8",
-      "signature v3.0.0",
-      "smallvec v1.16.3",
-      "socket2 v0.6.5",
-      "stable_deref_trait v1.2.1",
-      "subtle v2.6.1",
-      "syn v3.0.8",
-      "synstructure v0.14.0",
-      "thiserror v2.0.21",
-      "thiserror-impl v2.0.21",
-      "thread_local v1.1.10",
-      "tinystr v0.8.5",
-      "tokio v1.54.1",
-      "tokio-rustls v0.26.6",
-      "toml v1.1.8+spec-1.1.0",
-      "toml_datetime v1.1.2+spec-1.1.0",
-      "toml_parser v1.1.5+spec-1.1.0",
-      "tracing v0.1.44",
-      "tracing-core v0.1.36",
-      "tracing-subscriber v0.3.23",
-      "try-lock v0.2.5",
-      "typenum v1.20.1",
-      "unicode-ident v1.0.26",
-      "untrusted v0.9.0",
-      "url v2.5.9",
-      "utf8_iter v1.1.0",
-      "utf_types v1.0.0",
-      "want v0.3.2",
-      "winnow v1.0.4",
-      "writeable v0.6.4",
-      "yoke v0.8.4",
-      "yoke-derive v0.8.4",
-      "zerofrom v0.1.8",
-      "zerofrom-derive v0.1.8",
-      "zeroize v1.9.2",
-      "zerotrie v0.2.5",
-      "zerovec v0.11.9",
-      "zerovec-derive v0.11.7",
-      "zmij v1.0.23"
-    ],
-    "x86_64-unknown-linux-gnu": [
-      "atomic-waker v1.1.2",
-      "bitflags v2.13.2",
-      "block-buffer v0.12.1",
-      "bytes v1.12.2",
-      "cfg-if v1.0.5",
-      "cmov v0.5.4",
-      "cpufeatures v0.3.1",
-      "crossbeam-queue v0.3.14",
-      "crossbeam-utils v0.8.23",
-      "crypto-common v0.2.2",
-      "ctutils v0.4.8",
-      "curve25519-dalek v5.0.0",
-      "curve25519-dalek-derive v0.1.1",
-      "digest v0.11.3",
-      "displaydoc v0.2.7",
-      "ed25519 v3.0.0",
-      "ed25519-dalek v3.0.0",
-      "errno v0.3.14",
-      "form_urlencoded v1.2.3",
-      "futures-core v0.3.34",
-      "getrandom v0.4.3",
-      "graviola v0.4.2",
-      "hmac v0.13.0",
-      "http v1.5.0",
-      "http-body v1.1.0",
-      "httparse v1.10.1",
-      "httpdate v1.0.3",
-      "hybrid-array v0.4.15",
-      "hyper v1.12.0",
-      "hyper-util v0.1.21",
-      "icu_collections v2.4.0",
-      "icu_locale_core v2.4.0",
-      "icu_normalizer v2.4.0",
-      "icu_normalizer_data v2.4.0",
-      "icu_properties v2.4.0",
-      "icu_properties_data v2.4.0",
-      "icu_provider v2.4.0",
-      "idna v1.1.0",
-      "idna_adapter v1.2.2",
-      "ironsbe-codegen v0.9.1",
-      "ironsbe-core v0.9.1",
-      "ironsbe-schema v0.9.1",
-      "itoa v1.0.18",
-      "jiff v0.2.43",
-      "jiff-core v0.1.5",
-      "lazy_static v1.5.1",
-      "libc v0.2.190",
-      "linux-raw-sys v0.12.1",
-      "litemap v0.8.3",
-      "memchr v2.8.3",
-      "mio v1.2.5",
-      "once_cell v1.21.4",
-      "percent-encoding v2.3.2",
-      "pin-project-lite v0.2.17",
-      "potential_utf v0.1.6",
-      "proc-macro2 v1.0.107",
-      "quick-xml v0.42.0",
-      "quote v1.0.47",
-      "rustc_version v0.4.1",
-      "rustix v1.1.6",
-      "rustls v0.23.46",
-      "rustls-graviola v0.4.0",
-      "rustls-pki-types v1.16.0",
-      "rustls-webpki v0.103.17",
-      "rusty-s3 v0.11.0",
-      "semver v1.0.28",
-      "serde v1.0.229",
-      "serde_core v1.0.229",
-      "serde_derive v1.0.229",
-      "serde_json v1.0.154",
-      "serde_spanned v1.1.2",
-      "sha2 v0.11.1",
-      "sharded-slab v0.1.7",
-      "signal-hook v0.4.5",
-      "signal-hook-registry v1.4.8",
-      "signature v3.0.0",
+      "slab v0.4.12",
       "smallvec v1.16.3",
       "socket2 v0.6.5",
       "stable_deref_trait v1.2.1",
@@ -333,6 +128,288 @@
       "writeable v0.6.4",
       "yoke v0.8.4",
       "yoke-derive v0.8.4",
+      "zerocopy v0.8.63",
+      "zerofrom v0.1.8",
+      "zerofrom-derive v0.1.8",
+      "zeroize v1.9.2",
+      "zerotrie v0.2.5",
+      "zerovec v0.11.9",
+      "zerovec-derive v0.11.7",
+      "zmij v1.0.23"
+    ],
+    "aarch64-unknown-linux-gnu": [
+      "anyhow v1.0.105",
+      "async-trait v0.1.92",
+      "atomic-waker v1.1.2",
+      "bitflags v2.13.2",
+      "block-buffer v0.12.1",
+      "bytes v1.12.2",
+      "cfg-if v1.0.5",
+      "cmov v0.5.4",
+      "cpufeatures v0.3.1",
+      "crossbeam-queue v0.3.14",
+      "crossbeam-utils v0.8.23",
+      "crypto-common v0.2.2",
+      "ctutils v0.4.8",
+      "curve25519-dalek v5.0.0",
+      "digest v0.11.3",
+      "displaydoc v0.2.7",
+      "ed25519 v3.0.0",
+      "ed25519-dalek v3.0.0",
+      "either v1.19.0",
+      "errno v0.3.14",
+      "form_urlencoded v1.2.3",
+      "futures-channel v0.3.34",
+      "futures-core v0.3.34",
+      "futures-executor v0.3.34",
+      "futures-macro v0.3.34",
+      "futures-sink v0.3.34",
+      "futures-task v0.3.34",
+      "futures-util v0.3.34",
+      "getrandom v0.3.4",
+      "getrandom v0.4.3",
+      "graviola v0.4.2",
+      "hmac v0.13.0",
+      "http v1.5.0",
+      "http-body v1.1.0",
+      "http-body-util v0.1.3",
+      "httparse v1.10.1",
+      "httpdate v1.0.3",
+      "hybrid-array v0.4.15",
+      "hyper v1.12.0",
+      "hyper-util v0.1.21",
+      "icu_collections v2.4.0",
+      "icu_locale_core v2.4.0",
+      "icu_normalizer v2.4.0",
+      "icu_normalizer_data v2.4.0",
+      "icu_properties v2.4.0",
+      "icu_properties_data v2.4.0",
+      "icu_provider v2.4.0",
+      "idna v1.1.0",
+      "idna_adapter v1.2.2",
+      "ironsbe-codegen v0.9.1",
+      "ironsbe-core v0.9.1",
+      "ironsbe-schema v0.9.1",
+      "itertools v0.13.0",
+      "itoa v1.0.18",
+      "jiff v0.2.43",
+      "jiff-core v0.1.5",
+      "lazy_static v1.5.1",
+      "libc v0.2.190",
+      "linux-raw-sys v0.12.1",
+      "litemap v0.8.3",
+      "memchr v2.8.3",
+      "mio v1.2.5",
+      "once_cell v1.21.4",
+      "opentelemetry v0.33.1",
+      "opentelemetry-http v0.33.1",
+      "opentelemetry-otlp v0.33.1",
+      "opentelemetry-proto v0.33.1",
+      "opentelemetry_sdk v0.33.1",
+      "percent-encoding v2.3.2",
+      "pin-project-lite v0.2.17",
+      "potential_utf v0.1.6",
+      "ppv-lite86 v0.2.21",
+      "proc-macro2 v1.0.107",
+      "prost v0.14.4",
+      "prost-derive v0.14.6",
+      "quick-xml v0.42.0",
+      "quote v1.0.47",
+      "rand v0.9.5",
+      "rand_chacha v0.9.0",
+      "rand_core v0.9.5",
+      "rustc_version v0.4.1",
+      "rustix v1.1.6",
+      "rustls v0.23.46",
+      "rustls-graviola v0.4.0",
+      "rustls-pki-types v1.16.0",
+      "rustls-webpki v0.103.17",
+      "rusty-s3 v0.11.0",
+      "semver v1.0.28",
+      "serde v1.0.229",
+      "serde_core v1.0.229",
+      "serde_derive v1.0.229",
+      "serde_json v1.0.154",
+      "serde_spanned v1.1.2",
+      "sha2 v0.11.1",
+      "sharded-slab v0.1.7",
+      "signal-hook v0.4.5",
+      "signal-hook-registry v1.4.8",
+      "signature v3.0.0",
+      "slab v0.4.12",
+      "smallvec v1.16.3",
+      "socket2 v0.6.5",
+      "stable_deref_trait v1.2.1",
+      "subtle v2.6.1",
+      "syn v2.0.119",
+      "syn v3.0.8",
+      "synstructure v0.14.0",
+      "thiserror v2.0.21",
+      "thiserror-impl v2.0.21",
+      "thread_local v1.1.10",
+      "tinystr v0.8.5",
+      "tokio v1.54.1",
+      "tokio-rustls v0.26.6",
+      "toml v1.1.8+spec-1.1.0",
+      "toml_datetime v1.1.2+spec-1.1.0",
+      "toml_parser v1.1.5+spec-1.1.0",
+      "tracing v0.1.44",
+      "tracing-core v0.1.36",
+      "tracing-subscriber v0.3.23",
+      "try-lock v0.2.5",
+      "typenum v1.20.1",
+      "unicode-ident v1.0.26",
+      "untrusted v0.9.0",
+      "url v2.5.9",
+      "utf8_iter v1.1.0",
+      "utf_types v1.0.0",
+      "want v0.3.2",
+      "winnow v1.0.4",
+      "writeable v0.6.4",
+      "yoke v0.8.4",
+      "yoke-derive v0.8.4",
+      "zerocopy v0.8.63",
+      "zerofrom v0.1.8",
+      "zerofrom-derive v0.1.8",
+      "zeroize v1.9.2",
+      "zerotrie v0.2.5",
+      "zerovec v0.11.9",
+      "zerovec-derive v0.11.7",
+      "zmij v1.0.23"
+    ],
+    "x86_64-unknown-linux-gnu": [
+      "anyhow v1.0.105",
+      "async-trait v0.1.92",
+      "atomic-waker v1.1.2",
+      "bitflags v2.13.2",
+      "block-buffer v0.12.1",
+      "bytes v1.12.2",
+      "cfg-if v1.0.5",
+      "cmov v0.5.4",
+      "cpufeatures v0.3.1",
+      "crossbeam-queue v0.3.14",
+      "crossbeam-utils v0.8.23",
+      "crypto-common v0.2.2",
+      "ctutils v0.4.8",
+      "curve25519-dalek v5.0.0",
+      "curve25519-dalek-derive v0.1.1",
+      "digest v0.11.3",
+      "displaydoc v0.2.7",
+      "ed25519 v3.0.0",
+      "ed25519-dalek v3.0.0",
+      "either v1.19.0",
+      "errno v0.3.14",
+      "form_urlencoded v1.2.3",
+      "futures-channel v0.3.34",
+      "futures-core v0.3.34",
+      "futures-executor v0.3.34",
+      "futures-macro v0.3.34",
+      "futures-sink v0.3.34",
+      "futures-task v0.3.34",
+      "futures-util v0.3.34",
+      "getrandom v0.3.4",
+      "getrandom v0.4.3",
+      "graviola v0.4.2",
+      "hmac v0.13.0",
+      "http v1.5.0",
+      "http-body v1.1.0",
+      "http-body-util v0.1.3",
+      "httparse v1.10.1",
+      "httpdate v1.0.3",
+      "hybrid-array v0.4.15",
+      "hyper v1.12.0",
+      "hyper-util v0.1.21",
+      "icu_collections v2.4.0",
+      "icu_locale_core v2.4.0",
+      "icu_normalizer v2.4.0",
+      "icu_normalizer_data v2.4.0",
+      "icu_properties v2.4.0",
+      "icu_properties_data v2.4.0",
+      "icu_provider v2.4.0",
+      "idna v1.1.0",
+      "idna_adapter v1.2.2",
+      "ironsbe-codegen v0.9.1",
+      "ironsbe-core v0.9.1",
+      "ironsbe-schema v0.9.1",
+      "itertools v0.13.0",
+      "itoa v1.0.18",
+      "jiff v0.2.43",
+      "jiff-core v0.1.5",
+      "lazy_static v1.5.1",
+      "libc v0.2.190",
+      "linux-raw-sys v0.12.1",
+      "litemap v0.8.3",
+      "memchr v2.8.3",
+      "mio v1.2.5",
+      "once_cell v1.21.4",
+      "opentelemetry v0.33.1",
+      "opentelemetry-http v0.33.1",
+      "opentelemetry-otlp v0.33.1",
+      "opentelemetry-proto v0.33.1",
+      "opentelemetry_sdk v0.33.1",
+      "percent-encoding v2.3.2",
+      "pin-project-lite v0.2.17",
+      "potential_utf v0.1.6",
+      "ppv-lite86 v0.2.21",
+      "proc-macro2 v1.0.107",
+      "prost v0.14.4",
+      "prost-derive v0.14.6",
+      "quick-xml v0.42.0",
+      "quote v1.0.47",
+      "rand v0.9.5",
+      "rand_chacha v0.9.0",
+      "rand_core v0.9.5",
+      "rustc_version v0.4.1",
+      "rustix v1.1.6",
+      "rustls v0.23.46",
+      "rustls-graviola v0.4.0",
+      "rustls-pki-types v1.16.0",
+      "rustls-webpki v0.103.17",
+      "rusty-s3 v0.11.0",
+      "semver v1.0.28",
+      "serde v1.0.229",
+      "serde_core v1.0.229",
+      "serde_derive v1.0.229",
+      "serde_json v1.0.154",
+      "serde_spanned v1.1.2",
+      "sha2 v0.11.1",
+      "sharded-slab v0.1.7",
+      "signal-hook v0.4.5",
+      "signal-hook-registry v1.4.8",
+      "signature v3.0.0",
+      "slab v0.4.12",
+      "smallvec v1.16.3",
+      "socket2 v0.6.5",
+      "stable_deref_trait v1.2.1",
+      "subtle v2.6.1",
+      "syn v2.0.119",
+      "syn v3.0.8",
+      "synstructure v0.14.0",
+      "thiserror v2.0.21",
+      "thiserror-impl v2.0.21",
+      "thread_local v1.1.10",
+      "tinystr v0.8.5",
+      "tokio v1.54.1",
+      "tokio-rustls v0.26.6",
+      "toml v1.1.8+spec-1.1.0",
+      "toml_datetime v1.1.2+spec-1.1.0",
+      "toml_parser v1.1.5+spec-1.1.0",
+      "tracing v0.1.44",
+      "tracing-core v0.1.36",
+      "tracing-subscriber v0.3.23",
+      "try-lock v0.2.5",
+      "typenum v1.20.1",
+      "unicode-ident v1.0.26",
+      "untrusted v0.9.0",
+      "url v2.5.9",
+      "utf8_iter v1.1.0",
+      "utf_types v1.0.0",
+      "want v0.3.2",
+      "winnow v1.0.4",
+      "writeable v0.6.4",
+      "yoke v0.8.4",
+      "yoke-derive v0.8.4",
+      "zerocopy v0.8.63",
       "zerofrom v0.1.8",
       "zerofrom-derive v0.1.8",
       "zeroize v1.9.2",
@@ -435,6 +512,67 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.0.14"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#prost-derive@0.14.6",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#anyhow@1.0.105",
+      "license": "MIT OR Apache-2.0",
+      "name": "anyhow",
+      "paths": {
+        "build": [
+          []
+        ],
+        "dev": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "1.0.105"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-http@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#async-trait@0.1.92",
+      "license": "MIT OR Apache-2.0",
+      "name": "async-trait",
+      "paths": {
+        "build": [
+          []
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.92"
     },
     {
       "build_script": false,
@@ -556,6 +694,46 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro-support@0.2.130",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#bumpalo@3.20.4",
+      "license": "MIT OR Apache-2.0",
+      "name": "bumpalo",
+      "paths": {
+        "build": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ],
+        "dev": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "3.20.4"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#http-body-util@0.1.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#http-body@1.1.0",
           "kind": "normal",
           "target": null,
@@ -581,6 +759,27 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-http@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#prost@0.14.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [
@@ -724,6 +923,13 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#js-sys@0.3.107",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#loom@0.7.2",
           "kind": "normal",
           "target": null,
@@ -746,6 +952,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#thread_local@1.1.10",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen@0.2.130",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -1005,7 +1218,7 @@
           "features": [
             "cargo_bench_support"
           ],
-          "from": "workspace:karyos-bench@0.1.0-alpha.3",
+          "from": "workspace:karyos-bench@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -1379,7 +1592,7 @@
           "features": [
             "zeroize"
           ],
-          "from": "workspace:karyos-archive@0.1.0-alpha.3",
+          "from": "workspace:karyos-archive@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -1388,7 +1601,7 @@
           "features": [
             "zeroize"
           ],
-          "from": "workspace:karyos-driver@0.1.0-alpha.3",
+          "from": "workspace:karyos-driver@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -1428,6 +1641,9 @@
       "license": "MIT OR Apache-2.0",
       "name": "either",
       "paths": {
+        "build": [
+          []
+        ],
         "dev": [
           []
         ]
@@ -1598,7 +1814,73 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry_sdk@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#futures-channel@0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "name": "futures-channel",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.34"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-channel@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-executor@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-util@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#http-body-util@0.1.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#hyper@1.12.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry@0.33.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -1612,6 +1894,192 @@
       "id": "registry+https://github.com/rust-lang/crates.io-index#futures-core@0.3.34",
       "license": "MIT OR Apache-2.0",
       "name": "futures-core",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.34"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry_sdk@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#futures-executor@0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "name": "futures-executor",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.34"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-util@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#futures-macro@0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "name": "futures-macro",
+      "paths": {
+        "build": [
+          []
+        ],
+        "dev": [
+          []
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.34"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-util@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "alloc",
+        "default",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#futures-sink@0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "name": "futures-sink",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.34"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-executor@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-util@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#futures-task@0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "name": "futures-task",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.34"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "async-await-macro",
+            "sink",
+            "std"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry_sdk@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-executor@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#js-sys@0.3.107",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "alloc",
+        "async-await",
+        "async-await-macro",
+        "futures-macro",
+        "futures-sink",
+        "sink",
+        "slab",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#futures-util@0.3.34",
+      "license": "MIT OR Apache-2.0",
+      "name": "futures-util",
       "paths": {
         "dev": [
           []
@@ -1695,6 +2163,9 @@
       "paths": {
         "dev": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -1747,21 +2218,21 @@
         },
         {
           "features": [],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -1840,7 +2311,7 @@
           "features": [
             "zeroize"
           ],
-          "from": "workspace:karyos-driver@0.1.0-alpha.3",
+          "from": "workspace:karyos-driver@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -1849,7 +2320,7 @@
           "features": [
             "zeroize"
           ],
-          "from": "workspace:karyos-protocol@0.1.0-alpha.3",
+          "from": "workspace:karyos-protocol@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -1873,6 +2344,31 @@
     {
       "build_script": false,
       "edges": [
+        {
+          "features": [
+            "std"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-http@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "std"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-otlp@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#http-body-util@0.1.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#http-body@1.1.0",
@@ -1919,6 +2415,13 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#http-body-util@0.1.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#hyper-util@0.1.21",
           "kind": "normal",
           "target": null,
@@ -1947,6 +2450,30 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.1.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#http-body-util@0.1.3",
+      "license": "MIT",
+      "name": "http-body-util",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.1.3"
     },
     {
       "build_script": true,
@@ -1984,6 +2511,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#hyper@1.12.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-otlp@0.33.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -2045,7 +2579,7 @@
             "http1",
             "server"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -2056,7 +2590,7 @@
             "http1",
             "server"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -2066,7 +2600,17 @@
             "client",
             "http1"
           ],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "client",
+            "http1"
+          ],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -2107,7 +2651,7 @@
           "features": [
             "tokio"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -2116,7 +2660,7 @@
           "features": [
             "tokio"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -2125,7 +2669,16 @@
           "features": [
             "tokio"
           ],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "tokio"
+          ],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -2443,7 +2996,7 @@
       "edges": [
         {
           "features": [],
-          "from": "workspace:karyos-sbe@0.1.0-alpha.3",
+          "from": "workspace:karyos-sbe@0.1.0-alpha.4",
           "kind": "build",
           "target": null,
           "uses_default_features": true
@@ -2481,7 +3034,7 @@
         },
         {
           "features": [],
-          "from": "workspace:karyos-sbe@0.1.0-alpha.3",
+          "from": "workspace:karyos-sbe@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -2543,6 +3096,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#prost-derive@0.14.6",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         }
       ],
       "features": [
@@ -2554,6 +3114,9 @@
       "license": "MIT OR Apache-2.0",
       "name": "itertools",
       "paths": {
+        "build": [
+          []
+        ],
         "dev": [
           []
         ]
@@ -2700,6 +3263,41 @@
       "proc_macro": true,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.2.43"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry@0.33.1",
+          "kind": "normal",
+          "target": "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))",
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "std",
+        "unsafe-eval"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#js-sys@0.3.107",
+      "license": "MIT OR Apache-2.0",
+      "name": "js-sys",
+      "paths": {
+        "dev": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ],
+        "runtime": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.3.107"
     },
     {
       "build_script": false,
@@ -3199,7 +3797,7 @@
       "edges": [
         {
           "features": [],
-          "from": "workspace:karyos-sys@0.1.0-alpha.3",
+          "from": "workspace:karyos-sys@0.1.0-alpha.4",
           "kind": "normal",
           "target": "cfg(loom)",
           "uses_default_features": false
@@ -3504,6 +4102,229 @@
       "edges": [
         {
           "features": [
+            "metrics"
+          ],
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "trace"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-http@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-otlp@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-proto@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry_sdk@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "futures",
+        "futures-core",
+        "futures-sink",
+        "metrics",
+        "pin-project-lite",
+        "thiserror",
+        "trace"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry@0.33.1",
+      "license": "Apache-2.0",
+      "name": "opentelemetry",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.33.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-otlp@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-http@0.33.1",
+      "license": "Apache-2.0",
+      "name": "opentelemetry-http",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.33.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "http-proto",
+            "metrics"
+          ],
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "http",
+        "http-proto",
+        "httpdate",
+        "metrics",
+        "opentelemetry-http",
+        "prost",
+        "trace"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-otlp@0.33.1",
+      "license": "Apache-2.0",
+      "name": "opentelemetry-otlp",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.33.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "gen-tonic-messages",
+            "metrics"
+          ],
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-otlp@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "gen-tonic-messages",
+        "metrics",
+        "prost",
+        "trace"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-proto@0.33.1",
+      "license": "Apache-2.0",
+      "name": "opentelemetry-proto",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.33.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "metrics"
+          ],
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-otlp@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-proto@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "metrics",
+        "percent-encoding",
+        "rand",
+        "trace"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry_sdk@0.33.1",
+      "license": "Apache-2.0",
+      "name": "opentelemetry_sdk",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.33.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
             "alloc"
           ],
           "from": "registry+https://github.com/rust-lang/crates.io-index#url@2.5.9",
@@ -3517,6 +4338,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry_sdk@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         },
         {
           "features": [],
@@ -3535,6 +4363,9 @@
       "license": "MIT OR Apache-2.0",
       "name": "percent-encoding",
       "paths": {
+        "dev": [
+          []
+        ],
         "runtime": [
           []
         ]
@@ -3548,6 +4379,20 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-util@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#http-body-util@0.1.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#hyper-util@0.1.21",
           "kind": "normal",
           "target": null,
@@ -3556,6 +4401,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#hyper@1.12.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry@0.33.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -3599,6 +4451,15 @@
       "edges": [
         {
           "features": [
+            "fallback"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry_sdk@0.33.1",
+          "kind": "normal",
+          "target": "cfg(not(target_has_atomic = \"64\"))",
+          "uses_default_features": false
+        },
+        {
+          "features": [
             "require-cas"
           ],
           "from": "registry+https://github.com/rust-lang/crates.io-index#portable-atomic-util@0.2.8",
@@ -3615,13 +4476,22 @@
         }
       ],
       "features": [
+        "fallback",
         "require-cas"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#portable-atomic@1.15.0",
       "license": "Apache-2.0 OR MIT",
       "name": "portable-atomic",
       "paths": {
+        "dev": [
+          [
+            "cfg(not(target_has_atomic = \"64\"))"
+          ]
+        ],
         "runtime": [
+          [
+            "cfg(not(target_has_atomic = \"64\"))"
+          ],
           [
             "cfg(not(target_has_atomic = \"ptr\"))"
           ]
@@ -3710,6 +4580,9 @@
       "paths": {
         "dev": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -3732,10 +4605,17 @@
           "features": [
             "proc-macro"
           ],
-          "from": "workspace:karyos-codec-derive@0.1.0-alpha.3",
+          "from": "workspace:karyos-codec-derive@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#async-trait@0.1.92",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         },
         {
           "features": [],
@@ -3753,6 +4633,13 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-macro@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
           "kind": "normal",
           "target": null,
@@ -3761,6 +4648,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#prost-derive@0.14.6",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -3796,6 +4690,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@2.0.21",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro-support@0.2.130",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -3858,7 +4759,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-agent@0.1.0-alpha.3",
+          "from": "workspace:karyos-agent@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -3867,7 +4768,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-archive@0.1.0-alpha.3",
+          "from": "workspace:karyos-archive@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -3876,7 +4777,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-io@0.1.0-alpha.3",
+          "from": "workspace:karyos-io@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -3885,7 +4786,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-protocol@0.1.0-alpha.3",
+          "from": "workspace:karyos-protocol@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -3894,7 +4795,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-sbe@0.1.0-alpha.3",
+          "from": "workspace:karyos-sbe@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -3903,7 +4804,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-sys@0.1.0-alpha.3",
+          "from": "workspace:karyos-sys@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -3912,7 +4813,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-tools@0.1.0-alpha.3",
+          "from": "workspace:karyos-tools@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -3933,6 +4834,80 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.11.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "std"
+          ],
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-otlp@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-proto@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [
+        "default",
+        "derive",
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#prost@0.14.4",
+      "license": "Apache-2.0",
+      "name": "prost",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.14.4"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#prost@0.14.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#prost-derive@0.14.6",
+      "license": "Apache-2.0",
+      "name": "prost-derive",
+      "paths": {
+        "build": [
+          []
+        ],
+        "dev": [
+          []
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.14.6"
     },
     {
       "build_script": false,
@@ -3976,10 +4951,17 @@
           "features": [
             "proc-macro"
           ],
-          "from": "workspace:karyos-codec-derive@0.1.0-alpha.3",
+          "from": "workspace:karyos-codec-derive@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#async-trait@0.1.92",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         },
         {
           "features": [],
@@ -3997,6 +4979,13 @@
         },
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-macro@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#ironsbe-codegen@0.9.1",
           "kind": "normal",
           "target": null,
@@ -4005,6 +4994,13 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#jiff-static@0.2.43",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#prost-derive@0.14.6",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -4033,6 +5029,20 @@
         {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@2.0.21",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro-support@0.2.130",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro@0.2.130",
           "kind": "normal",
           "target": null,
           "uses_default_features": true
@@ -4108,6 +5118,11 @@
           [
             "cfg(all(target_os = \"uefi\", getrandom_backend = \"efi_rng\"))"
           ]
+        ],
+        "runtime": [
+          [
+            "cfg(all(target_os = \"uefi\", getrandom_backend = \"efi_rng\"))"
+          ]
         ]
       },
       "proc_macro": false,
@@ -4156,18 +5171,37 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [
+            "os_rng",
+            "small_rng",
+            "std",
+            "std_rng",
+            "thread_rng"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry_sdk@0.33.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
         }
       ],
       "features": [
         "alloc",
         "os_rng",
-        "std"
+        "small_rng",
+        "std",
+        "std_rng",
+        "thread_rng"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#rand@0.9.5",
       "license": "MIT OR Apache-2.0",
       "name": "rand",
       "paths": {
         "dev": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -4201,6 +5235,9 @@
       "name": "rand_chacha",
       "paths": {
         "dev": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -4242,6 +5279,9 @@
       "name": "rand_core",
       "paths": {
         "dev": [
+          []
+        ],
+        "runtime": [
           []
         ]
       },
@@ -4488,7 +5528,7 @@
             "std",
             "time"
           ],
-          "from": "workspace:karyos-sys@0.1.0-alpha.3",
+          "from": "workspace:karyos-sys@0.1.0-alpha.4",
           "kind": "normal",
           "target": "cfg(target_os = \"linux\")",
           "uses_default_features": false
@@ -4498,7 +5538,7 @@
             "net",
             "std"
           ],
-          "from": "workspace:karyos-io@0.1.0-alpha.3",
+          "from": "workspace:karyos-io@0.1.0-alpha.4",
           "kind": "normal",
           "target": "cfg(target_os = \"linux\")",
           "uses_default_features": false
@@ -4556,7 +5596,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -4565,7 +5605,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4574,7 +5614,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4604,21 +5644,21 @@
       "edges": [
         {
           "features": [],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4721,6 +5761,13 @@
           "kind": "build",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen@0.2.130",
+          "kind": "build",
+          "target": null,
+          "uses_default_features": true
         }
       ],
       "features": [],
@@ -4728,6 +5775,16 @@
       "license": "MIT OR Apache-2.0",
       "name": "rustversion",
       "paths": {
+        "build": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ],
+        "dev": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ],
         "loom-build": [
           []
         ]
@@ -4743,7 +5800,7 @@
           "features": [
             "graviola"
           ],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4857,7 +5914,7 @@
             "derive",
             "std"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -4867,7 +5924,7 @@
             "derive",
             "std"
           ],
-          "from": "workspace:karyos-tools@0.1.0-alpha.3",
+          "from": "workspace:karyos-tools@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -5038,7 +6095,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -5047,7 +6104,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -5123,7 +6180,7 @@
           "features": [
             "zeroize"
           ],
-          "from": "workspace:karyos-protocol@0.1.0-alpha.3",
+          "from": "workspace:karyos-protocol@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -5137,14 +6194,14 @@
         },
         {
           "features": [],
-          "from": "workspace:karyos-archive@0.1.0-alpha.3",
+          "from": "workspace:karyos-archive@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-driver@0.1.0-alpha.3",
+          "from": "workspace:karyos-driver@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -5230,14 +6287,14 @@
       "edges": [
         {
           "features": [],
-          "from": "workspace:karyos-agent@0.1.0-alpha.3",
+          "from": "workspace:karyos-agent@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-tools@0.1.0-alpha.3",
+          "from": "workspace:karyos-tools@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -5303,6 +6360,35 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "3.0.0"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-util@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#slab@0.4.12",
+      "license": "MIT",
+      "name": "slab",
+      "paths": {
+        "dev": [
+          []
+        ],
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.12"
     },
     {
       "build_script": false,
@@ -5472,6 +6558,15 @@
       "edges": [
         {
           "features": [
+            "extra-traits"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#prost-derive@0.14.6",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [
             "full"
           ],
           "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek-derive@0.1.1",
@@ -5500,6 +6595,7 @@
         "clone-impls",
         "default",
         "derive",
+        "extra-traits",
         "full",
         "parsing",
         "printing",
@@ -5510,12 +6606,7 @@
       "name": "syn",
       "paths": {
         "build": [
-          [
-            "cfg(all(not(curve25519_dalek_backend = \"fiat\"), not(curve25519_dalek_backend = \"serial\"), target_arch = \"x86_64\"))"
-          ],
-          [
-            "cfg(any())"
-          ]
+          []
         ],
         "dev": [
           []
@@ -5563,10 +6654,36 @@
             "printing",
             "proc-macro"
           ],
-          "from": "workspace:karyos-codec-derive@0.1.0-alpha.3",
+          "from": "workspace:karyos-codec-derive@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
+        },
+        {
+          "features": [
+            "clone-impls",
+            "full",
+            "parsing",
+            "printing",
+            "proc-macro",
+            "visit-mut"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#async-trait@0.1.92",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "extra-traits",
+            "full",
+            "visit",
+            "visit-mut"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro-support@0.2.130",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         },
         {
           "features": [
@@ -5598,6 +6715,15 @@
           "uses_default_features": true
         },
         {
+          "features": [
+            "full"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#futures-macro@0.3.34",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#displaydoc@0.2.7",
           "kind": "normal",
@@ -5618,10 +6744,12 @@
         "derive",
         "extra-traits",
         "fold",
+        "full",
         "parsing",
         "printing",
         "proc-macro",
-        "visit"
+        "visit",
+        "visit-mut"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#syn@3.0.8",
       "license": "MIT OR Apache-2.0",
@@ -5701,98 +6829,126 @@
         },
         {
           "features": [],
-          "from": "workspace:karyos-agent@0.1.0-alpha.3",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry-otlp@0.33.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-archive@0.1.0-alpha.3",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry@0.33.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-client@0.1.0-alpha.3",
+          "from": "registry+https://github.com/rust-lang/crates.io-index#opentelemetry_sdk@0.33.1",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-cluster@0.1.0-alpha.3",
+          "from": "workspace:karyos-agent@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-archive@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-driver@0.1.0-alpha.3",
+          "from": "workspace:karyos-client@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-io@0.1.0-alpha.3",
+          "from": "workspace:karyos-cluster@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-protocol@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-sbe@0.1.0-alpha.3",
+          "from": "workspace:karyos-driver@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-sys@0.1.0-alpha.3",
+          "from": "workspace:karyos-io@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-tools@0.1.0-alpha.3",
+          "from": "workspace:karyos-protocol@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-trace@0.1.0-alpha.3",
+          "from": "workspace:karyos-sbe@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos@0.1.0-alpha.3",
+          "from": "workspace:karyos-sys@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-tools@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos-trace@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "workspace:karyos@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -5807,6 +6963,9 @@
       "name": "thiserror",
       "paths": {
         "build": [
+          []
+        ],
+        "dev": [
           []
         ],
         "runtime": [
@@ -5834,6 +6993,9 @@
       "name": "thiserror-impl",
       "paths": {
         "build": [
+          []
+        ],
+        "dev": [
           []
         ]
       },
@@ -5927,7 +7089,7 @@
             "rt",
             "time"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
@@ -5938,7 +7100,7 @@
             "rt",
             "time"
           ],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -5949,7 +7111,18 @@
             "rt",
             "time"
           ],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-otlp@0.1.0-alpha.4",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "net",
+            "rt",
+            "time"
+          ],
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -6009,21 +7182,21 @@
       "edges": [
         {
           "features": [],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "dev",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-control@0.1.0-alpha.3",
+          "from": "workspace:karyos-control@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
         },
         {
           "features": [],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -6054,7 +7227,7 @@
             "serde",
             "std"
           ],
-          "from": "workspace:karyos-tools@0.1.0-alpha.3",
+          "from": "workspace:karyos-tools@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -6186,7 +7359,7 @@
         },
         {
           "features": [],
-          "from": "workspace:karyos-tools@0.1.0-alpha.3",
+          "from": "workspace:karyos-tools@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -6305,7 +7478,7 @@
             "fmt",
             "std"
           ],
-          "from": "workspace:karyos-tools@0.1.0-alpha.3",
+          "from": "workspace:karyos-tools@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -6445,6 +7618,13 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-shared@0.2.130",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
         }
       ],
       "features": [],
@@ -6507,7 +7687,7 @@
           "features": [
             "std"
           ],
-          "from": "workspace:karyos-tiering@0.1.0-alpha.3",
+          "from": "workspace:karyos-tiering@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
@@ -6737,11 +7917,154 @@
           [
             "cfg(all(target_arch = \"wasm32\", target_os = \"wasi\", target_env = \"p2\"))"
           ]
+        ],
+        "runtime": [
+          [
+            "cfg(all(target_arch = \"wasm32\", target_os = \"wasi\", target_env = \"p2\"))"
+          ]
         ]
       },
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "1.0.4+wasi-0.2.12"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#js-sys@0.3.107",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "std"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen@0.2.130",
+      "license": "MIT OR Apache-2.0",
+      "name": "wasm-bindgen",
+      "paths": {
+        "dev": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ],
+        "runtime": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.130"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen@0.2.130",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro@0.2.130",
+      "license": "MIT OR Apache-2.0",
+      "name": "wasm-bindgen-macro",
+      "paths": {
+        "build": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ],
+        "dev": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ]
+      },
+      "proc_macro": true,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.130"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro@0.2.130",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro-support@0.2.130",
+      "license": "MIT OR Apache-2.0",
+      "name": "wasm-bindgen-macro-support",
+      "paths": {
+        "build": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ],
+        "dev": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.130"
+    },
+    {
+      "build_script": true,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-macro-support@0.2.130",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen@0.2.130",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#wasm-bindgen-shared@0.2.130",
+      "license": "MIT OR Apache-2.0",
+      "name": "wasm-bindgen-shared",
+      "paths": {
+        "build": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ],
+        "dev": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ],
+        "runtime": [
+          [
+            "cfg(all(target_arch = \"wasm32\", not(target_os = \"wasi\")))"
+          ]
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.2.130"
     },
     {
       "build_script": false,
@@ -7376,6 +8699,11 @@
           [
             "cfg(all(target_arch = \"wasm32\", target_os = \"wasi\", target_env = \"p2\"))"
           ]
+        ],
+        "runtime": [
+          [
+            "cfg(all(target_arch = \"wasm32\", target_os = \"wasi\", target_env = \"p2\"))"
+          ]
         ]
       },
       "proc_macro": false,
@@ -7525,6 +8853,9 @@
       "paths": {
         "dev": [
           []
+        ],
+        "runtime": [
+          []
         ]
       },
       "proc_macro": false,
@@ -7554,6 +8885,9 @@
       "license": "BSD-2-Clause OR Apache-2.0 OR MIT",
       "name": "zerocopy-derive",
       "paths": {
+        "build": [
+          []
+        ],
         "dev": [
           []
         ]
@@ -7698,7 +9032,7 @@
         },
         {
           "features": [],
-          "from": "workspace:karyos-driver@0.1.0-alpha.3",
+          "from": "workspace:karyos-driver@0.1.0-alpha.4",
           "kind": "normal",
           "target": null,
           "uses_default_features": false

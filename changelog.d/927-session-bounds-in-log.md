@@ -1,3 +1,0 @@
-### Added
-
-- The session table's bounds are a log entry (karyos#927): schema 5 version 1, the core's own entries, with one template `SessionBounds` (sessions, window, response bytes and TTL, each nonzero) and golden vectors B-1 to B-12; schema 2 and its vectors are unchanged. `ServiceContainer::propose_bounds` lets a leader write its bounds while the log carries none, and the harness's `DeliveryServer` does so once per leadership. Equal logged bounds deliver nothing; different ones rebuild a table that has applied no registration, so a restored replica reads its bounds from the log, and stop the container with `ApplyError::BoundsDiffer` once one has.
