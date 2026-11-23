@@ -21,8 +21,12 @@ mod tests;
 
 /// The file's magic: ASCII `KARYOSX` then a zero byte.
 pub const MAGIC: [u8; 8] = *b"KARYOSX\0";
-/// The format's version, and every section's.
+/// The format's version, and every section's but a tiered `Seals`.
 pub const VERSION: u16 = 1;
+/// The version of a `Seals` section that holds seal kinds 9 (offload) or
+/// 10 (restore) (ADR-0104, amending design section 3.2): a version 1
+/// reader refuses it explicitly, as any section version it does not know.
+pub const SEALS_TIERED_VERSION: u16 = 2;
 /// The header's length.
 pub const HEADER_LENGTH: usize = 64;
 /// A section header's length.
@@ -155,7 +159,18 @@ pub enum ExportError {
         /// Its kind code.
         kind: u16,
     },
-    /// A section version other than 1.
+    /// A `Seals` section whose version does not match its rows: version 2
+    /// with no offload or restore record, or version 1 with one (ADR-0104).
+    #[error(
+        "section {section}: a seals section of version {version} does not match its seal kinds"
+    )]
+    SealsVersion {
+        /// The section's index.
+        section: u32,
+        /// Its version.
+        version: u16,
+    },
+    /// A section version other than 1, or 2 for `Seals`.
     #[error("section {section} has version {version}")]
     SectionVersion {
         /// The section, from 0.
@@ -247,7 +262,7 @@ pub fn encode(archive_id: &Digest, created_utc_ns: u64, sections: &[Section]) ->
     out.extend_from_slice(&0u64.to_le_bytes());
     for section in sections {
         out.extend_from_slice(&(section.kind as u16).to_le_bytes());
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&section_version(section.kind, &section.body).to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&section.journal.to_le_bytes());
         out.extend_from_slice(&section.count.to_le_bytes());
@@ -315,7 +330,9 @@ pub fn decode(bytes: &[u8]) -> Result<Export, ExportError> {
             kind: code,
         })?;
         let section_version = u16_at(header, 2).ok_or(length_error)?;
-        if section_version != VERSION {
+        if section_version != VERSION
+            && !(kind == SectionKind::Seals && section_version == SEALS_TIERED_VERSION)
+        {
             return Err(ExportError::SectionVersion {
                 section: index,
                 version: section_version,
@@ -334,6 +351,12 @@ pub fn decode(bytes: &[u8]) -> Result<Export, ExportError> {
             .ok_or(length_error)?;
         if !fits(kind, count, body) {
             return Err(length_error);
+        }
+        if kind == SectionKind::Seals && section_version != self::section_version(kind, body) {
+            return Err(ExportError::SealsVersion {
+                section: index,
+                version: section_version,
+            });
         }
         if !order.accepts(kind, journal, body) {
             return Err(ExportError::Order { section: index });
@@ -358,6 +381,27 @@ pub fn decode(bytes: &[u8]) -> Result<Export, ExportError> {
         created_utc_ns,
         sections,
     })
+}
+
+/// The version a section of `kind` with `body` is written with: 2 for a
+/// `Seals` section holding an offload or restore record, 1 otherwise.
+#[must_use]
+pub fn section_version(kind: SectionKind, body: &[u8]) -> u16 {
+    let tiered = kind == SectionKind::Seals
+        && body
+            .chunks(super::SEAL_RECORD_LENGTH)
+            .filter_map(|row| u16_at(row, 2))
+            .any(|code| {
+                matches!(
+                    super::SealKind::from_u16(code),
+                    Some(super::SealKind::Offload | super::SealKind::Restore)
+                )
+            });
+    if tiered {
+        SEALS_TIERED_VERSION
+    } else {
+        VERSION
+    }
 }
 
 /// Whether `body` is `count` rows of `kind`, or `count` well formed chunks.
