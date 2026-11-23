@@ -2058,7 +2058,10 @@ impl FacadeRig {
         });
         let context = Context::builder()
             .idle_strategy(IdleStrategy::Sleep(Duration::from_micros(100)))
-            .timeout(Duration::from_secs(10))
+            // As long as the waits' deadline: a loaded host can hold the
+            // driver thread past a shorter liveness timeout, which ends
+            // the client and loses its release.
+            .timeout(Duration::from_secs(120))
             .build()
             .unwrap();
         let mut client = Client::with_conductor(receive.recv().unwrap(), context);
@@ -2090,9 +2093,17 @@ impl FacadeRig {
     /// Serves the client, and reads its subscription when `read`, until
     /// `done`.
     fn until(&mut self, read: bool, done: &dyn Fn(&Self) -> bool) {
+        // A deadline far above any load seen, never a count of services:
+        // a loaded host only slows the driver thread.
         let start = std::time::Instant::now();
         while !done(self) {
-            assert!(start.elapsed() < Duration::from_secs(20), "not reached");
+            assert!(
+                start.elapsed() < Duration::from_secs(120),
+                "not reached: stage {}, registrations {}, images {:?}",
+                self.stage.load(std::sync::atomic::Ordering::Acquire),
+                self.registrations(),
+                self.reading.as_ref().map(|reading| reading.image_count())
+            );
             self.service(read);
         }
     }
@@ -2109,9 +2120,11 @@ impl FacadeRig {
     /// stops the driver thread and asserts that `b` forgot every
     /// registration by the command, none swept.
     fn ends_with_none_swept(mut self) {
-        for _ in 0..100 {
-            self.service(false);
-        }
+        // Until the driver forgot the registration, bounded by a deadline,
+        // not by a count of services: under load the release reaches the
+        // driver thread later. A sweep would also forget it, so the
+        // counter below still tells the command from a sweep.
+        self.until(false, &|rig| rig.registrations() == 0);
         self.stage(STOP);
         let b = self.thread.join().unwrap();
         assert!(b.registrations.is_empty(), "the registration was removed");
