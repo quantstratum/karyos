@@ -11,12 +11,9 @@
     reason = "tests, as ADR-0007 allows"
 )]
 
-use std::collections::HashMap;
-use std::io;
-use std::num::NonZeroU32;
 use std::path::Path;
 
-use super::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+use super::copies::{CopyCatalog, Enforcement};
 use super::journal::IntegrityJournal;
 use super::replication::{Replica, ReplicationError, Verdict};
 use super::test_support::DIR;
@@ -27,7 +24,6 @@ use crate::fault::FaultDisk;
 const RECORDING: u64 = 3;
 const LOCAL: Digest = [10; 32];
 const REPLICA: Digest = [20; 32];
-const BUCKET: Digest = [40; 32];
 
 /// A journal with two sealed ranges of [`RECORDING`], their bytes and seals.
 struct Fixture {
