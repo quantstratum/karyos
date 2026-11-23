@@ -61,6 +61,7 @@ pub mod test_key;
 pub mod tiering;
 pub mod time;
 pub mod time_evidence;
+pub mod time_producer;
 pub mod trust;
 pub mod verify;
 
