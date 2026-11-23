@@ -38,12 +38,17 @@ pub fn path_interface(address: Ipv4Addr, group: Ipv4Addr) -> Option<String> {
 }
 
 /// The interface of `target` in a `/proc/net/route` `table`, by longest
-/// prefix match; a loopback `target` with no route there is `lo`.
+/// prefix match; a loopback `target` is `lo`.
 #[cfg_attr(
     not(any(target_os = "linux", test)),
     expect(dead_code, reason = "Linux only")
 )]
 fn resolve(table: &str, target: Ipv4Addr) -> Option<String> {
+    // Loopback addresses are routed in the local table, which this file
+    // does not list; the main table's default route would match them too.
+    if target.is_loopback() {
+        return Some("lo".to_owned());
+    }
     let target = u32::from_ne_bytes(target.octets());
     let mut best: Option<(u32, &str)> = None;
     for line in table.lines().skip(1) {
@@ -69,11 +74,7 @@ fn resolve(table: &str, target: Ipv4Addr) -> Option<String> {
             best = Some((length, name));
         }
     }
-    match best {
-        Some((_, name)) => Some(name.to_owned()),
-        None if Ipv4Addr::from(target.to_ne_bytes()).is_loopback() => Some("lo".to_owned()),
-        None => None,
-    }
+    best.map(|(_, name)| name.to_owned())
 }
 
 #[cfg(test)]
