@@ -432,6 +432,8 @@ release may break APIs, wire formats and shared-memory layouts.
 
 - A steady seal no longer allocates: `IntegrityJournal::append` checked each record against a clone of the chain's state (two maps) before writing it, four allocations per seal; it now checks in place (`ChainCheck::check`) and accepts after the write. A new test counts a steady recorder, sealing and replication cycle over the real disk and asserts it allocates nothing (karyos#1113).
 
+- The offline tiering tests build again on main: their copy record names its arrival profile, the field #1202 added (karyos#1113).
+
 ### Security
 
 - CI pins every GitHub Action by full commit SHA, with the release tag as a comment, instead of a mutable major tag (karyos#920).
