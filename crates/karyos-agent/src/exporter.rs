@@ -17,7 +17,7 @@
 //!   writes. It is off unless the `karyos-exporter` binary is started with
 //!   an address. Without TLS it serves loopback only, and exposing it
 //!   beyond the pod takes a TLS-terminating sidecar or mesh (R-CORE-39,
-//!   karyos#734). Built with the `exporter-tls` feature, [`bind_tls`]
+//!   karyos#734). Built with the `exporter-tls` feature, `bind_tls`
 //!   serves `/metrics` over TLS 1.3 on any address, with a certificate and
 //!   key from files and a bearer token required off loopback
 //!   (karyos#887); loopback plain HTTP stays the default.
