@@ -671,6 +671,97 @@ fn test_retention_integrity_each_outcome_reachable() {
     assert_eq!(reached, all, "{verification:?}");
 }
 
+/// SPEC.md §13, Retention integrity: "an export is verified offline" (ADR-0103;
+/// karyos#668, #670). The contract scenario's own evidence (its chain, a
+/// head signed at record 6 and anchored at record 4, the registry, the
+/// recording's bytes, an unsealed tail) is exported, then verified with
+/// the external trust only, no Archive present: every range's outcome is
+/// the online verifier's, the anchored ranges `verified`, the later ones
+/// `beyond_anchor`, the tail `unsealed`.
+#[test]
+fn test_retention_integrity_export_verified_offline() {
+    use super::export::assemble::{ExportContents, JournalExport, RecordingExport, assemble};
+    use super::export::offline::{OfflineTrust, Role, verify_export};
+
+    let mut scenario = Scenario::new();
+    scenario.written = vec![(3, 52)];
+    let online = scenario.verify_with(|_, start, end| {
+        if start >= 48 {
+            RangeBytes::Bytes(vec![0xEE; usize::try_from(end - start).unwrap()])
+        } else {
+            RangeBytes::Bytes(range(start / 8))
+        }
+    });
+    let mut bytes: Vec<u8> = (0..6).flat_map(range).collect();
+    bytes.extend_from_slice(&[0xEE; 4]);
+    let contents = ExportContents {
+        archive_id: ARCHIVE,
+        journals: vec![JournalExport {
+            id: JOURNAL,
+            role: 1,
+            records: scenario.records(),
+            heads: scenario
+                .heads
+                .iter()
+                .map(|head| SignedHead::decode(head).unwrap())
+                .collect(),
+            anchors: scenario.anchors.clone(),
+            registry: scenario
+                .keys
+                .iter()
+                .map(|entry| RegistryEntry::decode(entry).unwrap())
+                .collect(),
+        }],
+        recordings: vec![RecordingExport {
+            recording: 3,
+            start: 0,
+            segment_length: 64,
+            bytes,
+            ..RecordingExport::default()
+        }],
+        ..ExportContents::default()
+    };
+    let export = assemble(&contents).unwrap();
+    // No Archive: only the bytes, the trust and the anchor stores.
+    drop(scenario.journal);
+    let externality = Externality {
+        local_archive: ARCHIVE,
+        ..Externality::default()
+    };
+    let report = verify_export(
+        &export,
+        &OfflineTrust {
+            trust: &trust(),
+            journals: &[(JOURNAL, Role::Archive)],
+            stores: &Held(&scenario.anchors),
+            externality: &externality,
+            requirement: None,
+        },
+    )
+    .unwrap();
+    let outcomes = |verification: &Verification| -> Vec<(u64, u64, u64, Outcome)> {
+        verification
+            .ranges
+            .iter()
+            .map(|range| (range.recording, range.start, range.end, range.outcome))
+            .collect()
+    };
+    let offline = outcomes(&report.journals[0].2);
+    assert_eq!(offline, outcomes(&online));
+    assert!(
+        offline.contains(&(3, 0, 8, Outcome::Verified)),
+        "{offline:?}"
+    );
+    assert!(
+        offline.contains(&(3, 40, 48, Outcome::BeyondAnchor)),
+        "{offline:?}"
+    );
+    assert!(
+        offline.contains(&(3, 48, 52, Outcome::Unsealed)),
+        "{offline:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Time evidence cases: the verdict vocabulary only.
 // ---------------------------------------------------------------------
