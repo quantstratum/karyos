@@ -411,8 +411,9 @@ impl<D: Disk> IntegrityJournal<D> {
             content,
             previous: self.check.head(),
         };
-        let mut next = self.check.clone();
-        next.accept(&record)?;
+        // Checked in place: a clone of the chain's state would allocate on
+        // every seal.
+        let _ = self.check.check(&record)?;
         let copy_changes = if kind == SealKind::Copy {
             self.copy_changes
                 .checked_add(1)
@@ -437,7 +438,7 @@ impl<D: Disk> IntegrityJournal<D> {
             self.poisoned = true;
             return Err(error.into());
         }
-        self.check = next;
+        self.check.accept(&record)?;
         self.copy_changes = copy_changes;
         self.tiered |= matches!(kind, SealKind::Offload | SealKind::Restore);
         if kind == SealKind::KeyRegistry {
