@@ -816,6 +816,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     /// Tests: what the receiver saw, for a failure message (karyos#1067).
     #[cfg(test)]
     debug_trace: Vec<String>,
+    /// Tests: the term offset of the first DATA datagrams, as they arrive.
+    #[cfg(test)]
+    rx_offsets: Vec<u32>,
     #[cfg(test)]
     dropped_notes: u64,
     /// Test only: NAKs handed over on an image's founding path.
@@ -2073,6 +2076,8 @@ pub(super) fn roles<T: StreamTerms>(
             #[cfg(test)]
             debug_trace: Vec::new(),
             #[cfg(test)]
+            rx_offsets: Vec::new(),
+            #[cfg(test)]
             dropped_notes: 0,
             #[cfg(test)]
             founding_naks: 0,
@@ -2599,11 +2604,12 @@ impl<T: StreamTerms> ReceiverRole<T> {
     #[cfg(test)]
     pub(crate) fn sessions_debug(&self) -> String {
         format!(
-            "{:?} {:?} {:?} trace {:?}",
+            "{:?} {:?} {:?} trace {:?} rx {:?}",
             self.sessions.counters(),
             self.sessions.ignored_counts(),
             self.sessions.paths().counters(),
-            self.debug_trace
+            self.debug_trace,
+            self.rx_offsets
         )
     }
 
@@ -4607,6 +4613,11 @@ impl<T: StreamTerms> Intake<'_, T> {
     fn data(&mut self, source: SocketAddr, alias: Alias, bytes: &[u8]) {
         #[cfg(test)]
         {
+            if self.role.rx_offsets.len() < 96
+                && let Some((_, at, _)) = drop_tail_frame(bytes)
+            {
+                self.role.rx_offsets.push(at);
+            }
             let seen = self.role.data_seen;
             if let Some(next) = seen.checked_add(1) {
                 self.role.data_seen = next;

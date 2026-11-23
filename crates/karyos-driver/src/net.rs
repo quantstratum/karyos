@@ -3218,8 +3218,9 @@ impl<T: StreamTerms> Network<T> {
     pub(crate) fn agent_counters(&self) -> String {
         match &self.agents {
             Agents::Shared(agents) => format!(
-                "sender {:?} receiver {:?} images {:?}",
+                "sender {:?} outbound0 {:?} receiver {:?} images {:?}",
                 agents.sender.counters(),
+                agents.sender.outbound_counters(0),
                 agents.receiver.counters(),
                 self.images.counters()
             ),
