@@ -393,13 +393,24 @@ fn a_disk_that_lies_about_syncs_loses_durable_entries_at_a_crash() {
 }
 
 /// A server that stores no commit lets C4's log truncate entries the
-/// cluster applied: `CommittedTruncated` names it, although the real core
-/// panics over its lost log afterwards (karyos#976).
+/// cluster applied (karyos#976). The run's first verdict is the contract
+/// breach that follows (its next append is no longer the next index), so
+/// the check is asked directly over the same run's observations:
+/// `CommittedTruncated` names the truncation itself.
 #[test]
 fn a_server_that_forgets_its_commit_and_truncates_applied_entries_is_caught() {
-    let violation = violation::<Mutant<FORGETS>>();
+    let outcome = workloads::run::<Mutant<FORGETS>>(&case(), 1).unwrap();
     assert!(
-        matches!(violation, Violation::CommittedTruncated { node: 2, .. }),
-        "{violation:?}"
+        matches!(outcome.safety, Err(Violation::Contract { node: 2, .. })),
+        "{:?}",
+        outcome.safety
+    );
+    let truncated = karyos_sim::harness::check::durable_kept(&outcome.observations);
+    assert!(
+        matches!(
+            truncated,
+            Err(Violation::CommittedTruncated { node: 2, .. })
+        ),
+        "{truncated:?}"
     );
 }
