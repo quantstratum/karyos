@@ -306,4 +306,159 @@ mod offline {
             assert_eq!(report.time, [(7, Verdict::NoEvidence)], "{name}");
         }
     }
+
+    /// #1183 review P1: an entries journal is read from the
+    /// `TimeEvidence` section, so its ranges verify.
+    #[test]
+    fn an_entries_journal_verifies_against_its_store() {
+        let report = run("X-12", true).unwrap();
+        let (_, role, entries) = &report.journals[1];
+        assert_eq!(*role, Role::TimeEvidence);
+        let first = entries
+            .ranges
+            .iter()
+            .find(|range| range.start == 0)
+            .unwrap();
+        assert_eq!(first.outcome, Outcome::Verified, "{:?}", entries.ranges);
+    }
+
+    /// #1183 review P1: a record after the chain breaks never counts,
+    /// whatever counter it declares. A binding seal appended to X-7 with a
+    /// counter inside the anchored run breaks the chain; read by declared
+    /// counter it would demand a row (or, with one, bind recording 8), but
+    /// only the verified prefix counts, so recording 8 stays unproven and
+    /// no row is asked for.
+    #[test]
+    fn a_broken_suffix_never_proves_a_policy() {
+        use super::super::{SectionKind, decode, encode};
+        use crate::integrity::{SealKind, SealRecord, digest};
+        let mut export = decode(&vector("X-7")).unwrap();
+        let mut binding = [0u8; 64];
+        binding[0] = 2;
+        binding[1] = 1;
+        binding[8..16].copy_from_slice(&1u64.to_le_bytes());
+        binding[16..24].copy_from_slice(&8u64.to_le_bytes());
+        let forged = SealRecord {
+            kind: SealKind::Catalog,
+            counter: 3,
+            subject: u64::MAX,
+            start: 9,
+            end: 9,
+            content: digest(&binding),
+            previous: [0; 32],
+        };
+        for section in &mut export.sections {
+            match section.kind {
+                SectionKind::Seals if section.journal == 1 => {
+                    section.body.extend_from_slice(&forged.encode());
+                    section.count += 1;
+                }
+                _ => {}
+            }
+        }
+        let bytes = encode(&export.archive_id, 0, &export.sections);
+        let trust = TrustRoot {
+            archive_id: [7; 32],
+            authorities: vec![TestKey::from_seed([1; 32]).public()],
+        };
+        let externality = Externality {
+            local_archive: [7; 32],
+            local_locations: std::collections::BTreeSet::new(),
+            anchored_by_this: std::collections::BTreeSet::new(),
+        };
+        let report = verify_export(
+            &bytes,
+            &OfflineTrust {
+                trust: &trust,
+                journals: &[(1, Role::Archive)],
+                stores: &Store { before: true },
+                externality: &externality,
+                requirement: None,
+            },
+        )
+        .unwrap();
+        assert!(report.journals[0].2.journal_break.is_some());
+        assert_eq!(report.policies[1], (8, PolicyFinding::Unproven));
+    }
+
+    /// #1183 review P2: entries with no journal to prove them are
+    /// `Incomplete`.
+    #[test]
+    fn entries_without_their_journal_are_incomplete() {
+        use super::super::{SectionKind, decode, encode};
+        let mut export = decode(&vector("X-12")).unwrap();
+        export
+            .sections
+            .retain(|section| !(section.kind.per_journal() && section.journal == 2));
+        let bytes = encode(&export.archive_id, 0, &export.sections);
+        let trust = TrustRoot {
+            archive_id: [7; 32],
+            authorities: vec![TestKey::from_seed([1; 32]).public()],
+        };
+        let externality = Externality {
+            local_archive: [7; 32],
+            local_locations: std::collections::BTreeSet::new(),
+            anchored_by_this: std::collections::BTreeSet::new(),
+        };
+        let _ = SectionKind::TimeEvidence;
+        assert!(matches!(
+            verify_export(
+                &bytes,
+                &OfflineTrust {
+                    trust: &trust,
+                    journals: &[(1, Role::Archive)],
+                    stores: &Store { before: true },
+                    externality: &externality,
+                    requirement: None,
+                },
+            ),
+            Err(OfflineError::Incomplete { .. })
+        ));
+    }
+
+    /// #1183 review P2: entries wholly outside the exported interval never
+    /// change its verdict.
+    #[test]
+    fn entries_outside_the_interval_are_ignored() {
+        use super::super::offline::{ManifestRow, time_verdict};
+        use crate::integrity::time::{Source, SyncState};
+        use crate::integrity::time_evidence::Entry;
+        let inside = Entry {
+            source: Source::Gnss,
+            sync_state: SyncState::Synchronised,
+            clock: [1, 0, 2, 3, 4],
+            recording: 7,
+            start: 0,
+            end: 64,
+            min_time: 1000,
+            max_time: 2000,
+            granularity: 1,
+            bound_min_ns: 150,
+            bound_max_ns: 160,
+            calibration: [0xAA; 32],
+            utc_reference: [0xBB; 32],
+            tick_fs: 1_000_000,
+        };
+        let outside = Entry {
+            start: 64,
+            end: 128,
+            bound_min_ns: 10_000_000_000,
+            bound_max_ns: 10_000_000_000,
+            ..inside
+        };
+        let row = ManifestRow {
+            recording: 7,
+            start: 0,
+            end: 64,
+        };
+        let requirement = Requirement {
+            max_divergence_ns: 1000,
+            max_granularity_ns: 1000,
+        };
+        let clocks = [[0xAA; 32], [0xBB; 32]];
+        assert_eq!(
+            time_verdict(&row, &[inside, outside], &clocks, &requirement),
+            Verdict::Met
+        );
+    }
 }

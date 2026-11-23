@@ -163,8 +163,8 @@ pub fn verify_export(
         .map(|row| (row.recording, row.end))
         .collect();
     let mut journals = Vec::new();
-    let mut archive_run: Option<(Vec<SealRecord>, Option<u64>)> = None;
-    let mut entries_runs: Vec<(Vec<SealRecord>, Option<u64>)> = Vec::new();
+    let mut archive_run: Option<(Vec<SealRecord>, Option<usize>)> = None;
+    let mut entries_runs: Vec<(Vec<SealRecord>, Option<usize>)> = Vec::new();
     for (id, group) in &groups {
         let role = group.role.unwrap_or(Role::Group);
         let records = seal_records(*id, group.seals)?;
@@ -192,10 +192,36 @@ pub fn verify_export(
             externality: trust.externality,
             written: if role == Role::Archive { &written } else { &[] },
         };
+        // A time evidence journal seals the entries' store, whose bytes
+        // are the `TimeEvidence` section's; every other journal seals
+        // recordings, read from `Frames` (#1183 review).
+        let store: Vec<(u64, u64, Vec<u8>)> = rest
+            .get(&SectionKind::TimeEvidence)
+            .map(|section| vec![(ENTRIES, 0, section.body.clone())])
+            .unwrap_or_default();
+        let source = if role == Role::TimeEvidence {
+            &store
+        } else {
+            &frames
+        };
         let verification = verify(&evidence, |recording, start, end| {
-            read(&frames, recording, start, end)
+            read(source, recording, start, end)
         });
-        let run = verification.coverage.anchored_through;
+        // Only the verified positional prefix counts: a record from a
+        // broken suffix never does, whatever counter it declares (#1183
+        // review). The run is a position in that prefix.
+        let prefix = verification
+            .journal_break
+            .and_then(|at| usize::try_from(at).ok())
+            .unwrap_or(records.len())
+            .min(records.len());
+        let mut records = records;
+        records.truncate(prefix);
+        let run = verification
+            .coverage
+            .anchored_through
+            .and_then(|at| usize::try_from(at).ok())
+            .filter(|at| *at < prefix);
         match role {
             Role::Archive => archive_run = Some((records, run)),
             Role::TimeEvidence => entries_runs.push((records, run)),
@@ -325,10 +351,10 @@ fn reciprocal_registry(
 
 /// A manifest row (design section 3.6).
 #[derive(Debug, Clone, Copy)]
-struct ManifestRow {
-    recording: u64,
-    start: u64,
-    end: u64,
+pub(super) struct ManifestRow {
+    pub(super) recording: u64,
+    pub(super) start: u64,
+    pub(super) end: u64,
 }
 
 fn u64_at(bytes: &[u8], at: usize) -> u64 {
@@ -414,23 +440,26 @@ const POLICY_BOOK: u64 = u64::MAX;
 /// anchored run (design section 5, step 7).
 fn policies(
     records: &[SealRecord],
-    run: Option<u64>,
+    run: Option<usize>,
     versions: Option<&Section>,
     bindings: Option<&Section>,
     manifest: &[ManifestRow],
 ) -> Result<Vec<(u64, PolicyFinding)>, OfflineError> {
-    let in_run = |record: &&SealRecord| run.is_some_and(|run| record.counter <= run);
+    // By position in the verified prefix, never by declared counter.
+    let in_run_records: Vec<&SealRecord> = run
+        .map(|run| records.iter().take(run.saturating_add(1)).collect())
+        .unwrap_or_default();
     let version_rows = rows::<32>(versions);
     let binding_rows = rows::<64>(bindings);
-    let version_seals: Vec<&SealRecord> = records
+    let version_seals: Vec<&SealRecord> = in_run_records
         .iter()
+        .copied()
         .filter(|record| record.kind == SealKind::Policy)
-        .filter(in_run)
         .collect();
-    let binding_seals: Vec<&SealRecord> = records
+    let binding_seals: Vec<&SealRecord> = in_run_records
         .iter()
+        .copied()
         .filter(|record| record.kind == SealKind::Catalog && record.subject == POLICY_BOOK)
-        .filter(in_run)
         .collect();
     let incomplete = |what| OfflineError::Incomplete { journal: 0, what };
     // Each seal in the run has its row, and the rows are those seals'.
@@ -490,52 +519,68 @@ fn policies(
 /// seal lies in the journal's anchored run (design section 5, step 6).
 fn time_entries(
     groups: &Groups<'_>,
-    runs: &[(Vec<SealRecord>, Option<u64>)],
+    runs: &[(Vec<SealRecord>, Option<usize>)],
     section: Option<&Section>,
 ) -> Result<Vec<Entry>, OfflineError> {
-    let Some((records, run)) = runs.first() else {
-        return Ok(Vec::new());
-    };
     let journal = groups
         .iter()
         .find(|(_, group)| group.role == Some(Role::TimeEvidence))
         .map_or(0, |(id, _)| *id);
-    let store: Vec<u8> = section
-        .map(|section| section.body.clone())
-        .unwrap_or_default();
-    let incomplete = OfflineError::Incomplete {
+    let store: &[u8] = section.map_or(&[], |section| section.body.as_slice());
+    let incomplete = || OfflineError::Incomplete {
         journal,
         what: "the time evidence entries",
     };
-    let seals: Vec<&SealRecord> = records
-        .iter()
-        .filter(|record| record.kind.is_range() && record.subject == ENTRIES)
-        .collect();
-    let mut sealed_end = 0u64;
-    for seal in &seals {
-        let (Ok(start), Ok(end)) = (usize::try_from(seal.start), usize::try_from(seal.end)) else {
-            return Err(incomplete);
+    let Some((records, run)) = runs.first() else {
+        // Entries with no journal to prove them (#1183 review).
+        return if store.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(incomplete())
         };
-        let bytes = store.get(start..end).ok_or_else(|| incomplete.clone())?;
-        if digest(bytes) != seal.content {
-            return Err(incomplete);
+    };
+    // The entries' seals by position, each with whether it is in the run.
+    let mut seals: Vec<(&SealRecord, bool)> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| record.kind.is_range() && record.subject == ENTRIES)
+        .map(|(position, record)| (record, run.is_some_and(|run| position <= run)))
+        .collect();
+    seals.sort_by_key(|(seal, _)| seal.start);
+    // The seals tile the store from zero, contiguous, each digest its
+    // bytes': no row unsealed before, between or after them (#1183 review).
+    let mut at = 0u64;
+    for (seal, _) in &seals {
+        if seal.start != at {
+            return Err(incomplete());
         }
-        sealed_end = sealed_end.max(seal.end);
+        let (Ok(start), Ok(end)) = (usize::try_from(seal.start), usize::try_from(seal.end)) else {
+            return Err(incomplete());
+        };
+        let bytes = store.get(start..end).ok_or_else(incomplete)?;
+        if digest(bytes) != seal.content {
+            return Err(incomplete());
+        }
+        at = seal.end;
     }
-    if u64::try_from(store.len()).unwrap_or(u64::MAX) != sealed_end {
-        return Err(incomplete);
+    if u64::try_from(store.len()).unwrap_or(u64::MAX) != at {
+        return Err(incomplete());
     }
+    // Entries and seals walked together, both in store order.
     let length = u64::try_from(ENTRY_LENGTH).unwrap_or(u64::MAX);
     let mut out = Vec::new();
+    let mut next = seals.iter().peekable();
     for (index, row) in store.as_chunks::<ENTRY_LENGTH>().0.iter().enumerate() {
-        let at = u64::try_from(index)
+        let from = u64::try_from(index)
             .unwrap_or(u64::MAX)
             .saturating_mul(length);
-        let counts = seals.iter().any(|seal| {
-            seal.start <= at
-                && at.saturating_add(length) <= seal.end
-                && run.is_some_and(|run| seal.counter <= run)
-        });
+        let to = from.saturating_add(length);
+        while next.peek().is_some_and(|(seal, _)| seal.end <= from) {
+            let _ = next.next();
+        }
+        let counts = next
+            .peek()
+            .is_some_and(|(seal, in_run)| *in_run && seal.start <= from && to <= seal.end);
         if counts {
             out.push(Entry::decode(row).map_err(|_| OfflineError::Malformed {
                 journal,
@@ -554,15 +599,18 @@ fn clock_digests(section: Option<&Section>) -> Vec<super::super::Digest> {
 /// A recording's time verdict: `met` only with at least one clock whose
 /// counting entries cover its whole exported range, each `met` with its
 /// cited records carried; `no_evidence` for no clock or a gap.
-fn time_verdict(
+pub(super) fn time_verdict(
     row: &ManifestRow,
     entries: &[Entry],
     clocks: &[super::super::Digest],
     requirement: &Requirement,
 ) -> Verdict {
+    // Only entries over the exported interval (#1183 review).
     let mine: Vec<&Entry> = entries
         .iter()
-        .filter(|entry| entry.recording == row.recording)
+        .filter(|entry| {
+            entry.recording == row.recording && entry.start < row.end && row.start < entry.end
+        })
         .collect();
     if mine.is_empty() {
         return Verdict::NoEvidence;
