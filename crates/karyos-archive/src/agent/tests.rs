@@ -3738,6 +3738,122 @@ fn a_recording_is_sealed_and_its_catalog_changes_chained() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// karyos#1088 (SPEC §8.4, "Sealing and tamper evidence"): a journal recorded as an Archive recording,
+/// such as a sequencer's admission journal, is sealed and verified like
+/// any recording, with no step of its own. Its producer, the Sequencer,
+/// lives in the commercial karyos-sequencer repository (SPEC §20.5,
+/// ADR-0064); here an admission-journal-shaped recording, one entry per
+/// frame, is recorded into a sealing Archive. Its ranges are sealed in the
+/// chain and verify clean, and a byte of an entry changed on disk no
+/// longer matches its seal.
+#[test]
+fn an_admission_journal_recorded_into_the_archive_is_sealed_and_verified() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::{SealKind, verify_chain, verify_range};
+
+    const MARKER: &[u8] = b"admission entry ";
+    // One admission entry per 96-byte frame: a marker and its sequence.
+    let entry = |sequence: u8| {
+        let mut frame = vec![0u8; 96];
+        frame[..4].copy_from_slice(&96i32.to_le_bytes());
+        frame[32..32 + MARKER.len()].copy_from_slice(MARKER);
+        frame[32 + MARKER.len()] = sequence;
+        frame
+    };
+    let chunks: Vec<Vec<u8>> = (0..3u8)
+        .map(|chunk| [entry(2 * chunk), entry(2 * chunk + 1)].concat())
+        .collect();
+    let all = chunks.concat();
+    let dir = temp_dir("admission-journal");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let id = agent
+        .start(start(Chunks {
+            chunks: chunks.into(),
+            seal: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    agent.shutdown().unwrap();
+    // Its ranges are sealed in the Archive's chain, the last closing, and
+    // each matches the entries recorded.
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    drop(journal);
+    assert!(verify_chain(records.iter()).is_ok());
+    let ranges: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind.is_range() && record.subject == id)
+        .collect();
+    assert_eq!(ranges.first().unwrap().start, 0);
+    let last = ranges.last().unwrap();
+    assert_eq!(
+        (last.end, last.kind),
+        (all.len() as u64, SealKind::ClosedSegment)
+    );
+    for range in &ranges {
+        let bytes = &all[range.start as usize..range.end as usize];
+        assert!(verify_range(range, bytes).is_ok());
+    }
+    // One byte of one entry changed in the segment file: what the Archive
+    // now holds no longer matches its seals.
+    let segment = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .unwrap();
+    let mut file = std::fs::read(&segment).unwrap();
+    let at = file
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .unwrap();
+    file[at] ^= 0xFF;
+    std::fs::write(&segment, &file).unwrap();
+    // What the Archive now holds of the recording, read from its segment
+    // file as stored: replay and recovery refuse the changed frame, so the
+    // seal is checked against the stored bytes themselves. The recording
+    // starts in the file where its first recorded bytes do.
+    let base = file
+        .windows(32)
+        .position(|window| window == &all[..32])
+        .unwrap();
+    let held = file[base..base + all.len()].to_vec();
+    // The stored bytes are the whole recording and differ from what was
+    // recorded in exactly the one byte changed, so the check below sees the
+    // change, not a short or empty read (Codex review of #1170).
+    let changed = all
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .unwrap();
+    let mut expected = all.clone();
+    expected[changed] ^= 0xFF;
+    assert_eq!(held.len(), all.len(), "the whole recording is read");
+    assert_eq!(held, expected, "only the changed byte differs");
+    // The sealed range holding it rejects the stored bytes; every other
+    // range still matches.
+    for range in &ranges {
+        let bytes = &held[range.start as usize..range.end as usize];
+        let holds_change = (range.start as usize..range.end as usize).contains(&changed);
+        assert_eq!(
+            verify_range(range, bytes).is_err(),
+            holds_change,
+            "range [{}, {})",
+            range.start,
+            range.end
+        );
+    }
+    assert!(
+        ranges
+            .iter()
+            .any(|range| (range.start as usize..range.end as usize).contains(&changed)),
+        "a sealed range covers the changed byte"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Without a `seal_interval` the agent keeps no integrity journal.
 #[test]
 fn without_a_seal_interval_nothing_is_sealed() {
