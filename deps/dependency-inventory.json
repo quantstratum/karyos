@@ -3885,6 +3885,15 @@
           "features": [
             "std"
           ],
+          "from": "workspace:karyos-sbe@0.1.0-alpha.3",
+          "kind": "dev",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [
+            "std"
+          ],
           "from": "workspace:karyos-sys@0.1.0-alpha.3",
           "kind": "dev",
           "target": null,

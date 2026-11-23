@@ -868,6 +868,7 @@ dependencies = [
  "ironsbe-core",
  "karyos-feed",
  "karyos-sys",
+ "proptest",
  "thiserror",
 ]
 

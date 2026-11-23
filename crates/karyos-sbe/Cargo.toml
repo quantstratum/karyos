@@ -28,6 +28,7 @@ ironsbe-codegen = "=0.9.1"
 
 [dev-dependencies]
 karyos-sys = { workspace = true, features = ["alloc-count"] }
+proptest.workspace = true
 
 [lints]
 workspace = true

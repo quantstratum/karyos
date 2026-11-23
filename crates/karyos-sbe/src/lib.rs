@@ -92,6 +92,15 @@ pub enum FrameError {
         /// The template the header names.
         template_id: u16,
     },
+    /// The frame ends inside the message: its repeating groups, nested
+    /// groups and variable data reach past the frame.
+    #[error("the Car message needs {needed} bytes, the frame has {length}")]
+    Incomplete {
+        /// The bytes the message's variable section reaches.
+        needed: usize,
+        /// The frame's length.
+        length: usize,
+    },
     /// The message does not decode.
     #[error("the Car message does not decode: {0:?}")]
     Decode(DecodeError),
@@ -106,8 +115,10 @@ pub enum FrameError {
 /// [`FrameError::Truncated`] for a frame shorter than the message header,
 /// [`FrameError::UnknownSchema`], [`FrameError::UnknownVersion`] and
 /// [`FrameError::UnknownTemplate`] for a header this build does not know,
-/// checked before the message is read, and [`FrameError::Decode`] for a
-/// message that does not decode.
+/// checked before the message is read, [`FrameError::Incomplete`] for a
+/// frame that ends inside the message's variable section, and
+/// [`FrameError::Decode`] for a message that does not decode, a bound of
+/// its groups or variable data included.
 pub fn decode_car(frame: &[u8]) -> Result<car::v1::CarDecoder<'_>, FrameError> {
     if frame.len() < MessageHeader::ENCODED_LENGTH {
         return Err(FrameError::Truncated {
@@ -130,5 +141,18 @@ pub fn decode_car(frame: &[u8]) -> Result<car::v1::CarDecoder<'_>, FrameError> {
             template_id: header.template_id,
         });
     }
-    car::v1::CarDecoder::decode(frame).map_err(FrameError::Decode)
+    let car = car::v1::CarDecoder::decode(frame).map_err(FrameError::Decode)?;
+    // The whole variable section, every group, nested group and var data
+    // field, is walked with checked bounds before the message is handed
+    // out, so a frame cut anywhere inside it is refused, not read in part
+    // (Codex review of #1197). The walk reads lengths in place and
+    // allocates nothing.
+    let needed = car.encoded_length().map_err(FrameError::Decode)?;
+    if needed > frame.len() {
+        return Err(FrameError::Incomplete {
+            needed,
+            length: frame.len(),
+        });
+    }
+    Ok(car)
 }
