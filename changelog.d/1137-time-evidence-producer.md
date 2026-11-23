@@ -1,3 +1,0 @@
-### Added
-
-- `integrity::time_producer` (ADR-0098; karyos#1137): the producer of a recording group's time evidence entries. `produce` partitions a sealed range's events, in position order, into runs of uniform provenance before it computes each run's extrema and bounds, so each entry cites one calibration and one UTC reference record. Coverage comes from one `Snapshot` of the calibration journal and needs the producer's completeness boundary (later records of both kinds past the range), no reported loss, a unique calibration and a unique UTC reference; otherwise the bounds are `no_evidence`. Positions with no declared `EventClock`, or timers scheduled in an earlier capture session, get an all zero identity.

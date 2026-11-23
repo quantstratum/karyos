@@ -1,3 +1,0 @@
-### Added
-
-- The Retention integrity contract tests (SPEC.md:946; part of karyos#670): `karyos_archive::integrity::contract_tests` has one `test_retention_integrity_<scenario>_<expected>` test for each of the row's cases except the offline export (karyos#668). The cases are sealing alteration, removal and crash, the signer outage, revocation and pre-revocation anchoring, anchor truncation, rollback, trust, conflict and equivocation, the shortened index, each integrity outcome, the time evidence cases with the verdict precedence, and purge and hold under crash and at restart. Integrity outcomes and time verdicts are asserted apart.

@@ -1773,7 +1773,7 @@ fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
 /// only counts while measured, so the count is the server's own.
 #[test]
 fn forwarding_a_steady_replication_allocates_nothing() {
-    use crate::replication::{Mode, ReplicateRecording, ReplicationMessage};
+    use crate::replication::{self, Mode, ReplicateRecording, ReplicationMessage};
     let agent = AgentConfig {
         seal_interval: Some(Duration::from_millis(1)),
         ..AgentConfig::default()
@@ -1806,8 +1806,56 @@ fn forwarding_a_steady_replication_allocates_nothing() {
         correlation_id: 2,
         recording_id: 1,
     }));
-    for _ in 0..500 {
-        rig.server.duty();
+    // Until the whole recording is sealed: an on-demand replication sends
+    // only sealed ranges and ends caught up at the sealed end, so one
+    // requested before the tail's seal sends too little to fill a batch.
+    // A probe replication is repeated until its final status names the
+    // full length, bounded by a deadline (karyos#1067): before, 500 duties
+    // stood in for the seal, too few on a loaded host.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut probe = 100;
+    'sealed: loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recording was never sealed to its end"
+        );
+        probe += 1;
+        let mut out = vec![0u8; 256];
+        let written = ReplicationMessage::ReplicateRecording(ReplicateRecording {
+            correlation_id: probe,
+            recording_id: 1,
+            from: 0,
+            until: u64::MAX,
+            mode: Mode::OnDemand,
+        })
+        .encode(&mut out)
+        .unwrap();
+        out.truncate(written);
+        let seen = rig.responses.sent.lock().unwrap().len();
+        rig.raw(out);
+        while std::time::Instant::now() < deadline {
+            rig.server.duty();
+            let sent = rig.responses.sent.lock().unwrap().clone();
+            let status =
+                sent[seen..]
+                    .iter()
+                    .find_map(|message| match ReplicationMessage::decode(message) {
+                        Ok(ReplicationMessage::ReplicationStatus(status))
+                            if status.correlation_id == probe
+                                && status.state != replication::State::Streaming =>
+                        {
+                            Some(status.sealed_end)
+                        }
+                        _ => None,
+                    });
+            if let Some(sealed_end) = status {
+                if sealed_end == length {
+                    break 'sealed;
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
     let mut out = vec![0u8; 256];
@@ -1829,7 +1877,12 @@ fn forwarding_a_steady_replication_allocates_nothing() {
     rig.responses.room.store(0, Ordering::Release);
     let warm = std::time::Instant::now();
     while rig.server.pending() < super::REPLICATION_FORWARD {
-        assert!(warm.elapsed() < Duration::from_secs(30), "no full batch");
+        // 120 s: a loaded host fills the batch slowly (karyos#1067).
+        assert!(
+            warm.elapsed() < Duration::from_secs(120),
+            "no full batch: {} pending",
+            rig.server.pending()
+        );
         rig.server.duty();
         std::thread::sleep(Duration::from_micros(200));
     }
