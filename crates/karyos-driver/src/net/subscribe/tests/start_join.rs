@@ -328,7 +328,7 @@ fn a_remote_attach_is_granted_the_awaiting_cell() {
         .clients
         .iter()
         .find(|slot| slot.ledger.is_some())
-        .map(|slot| slot.id)
+        .map(|slot| slot.id())
         .unwrap();
     let grant = *rig.b.ledger(client).unwrap().grants().last().unwrap();
     assert!(grant.export < before, "the cell's export, from the build");
