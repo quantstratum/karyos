@@ -22,18 +22,29 @@
 //! sizes asserted at compile time, so no direct `libc` edge is needed
 //! (the admission record's alternative); the opcode takes the pointer as
 //! the `libc` type by inference.
+//!
+//! [`OsRxRing`] is the RX ring: one provided buffer ring
+//! (`IORING_REGISTER_PBUF_RING`) whose entries are atomics in page aligned
+//! memory, and one multishot `RECVMSG` arm. A buffer is Posted until a
+//! reaped completion names it, then Completed until
+//! [`RxRingOps::lend`] reposts it; the kernel never writes a buffer that
+//! is lent.
 
 use std::mem;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use io_uring::{IoUring, Probe, opcode, squeue, types};
 use rustix::net::{AddressFamily, SendFlags, SocketFlags, SocketType};
 
-use super::ops::{CONTROL_SLOTS, CancelTarget, Cqe, Errno, PushError, RingOps, UserData};
+use super::ops::{
+    CONTROL_SLOTS, CQE_F_MORE, CancelTarget, Cqe, Errno, PushError, RX_NAME_LEN, RingOps,
+    RxRingOps, UserData, buffer_id,
+};
+use super::rx::UringRxConfig;
 use super::tx::UringTxConfig;
 use crate::backend::{CapabilityState, OpenError, Reason};
 
@@ -633,4 +644,455 @@ fn send_parks() -> Result<(), i32> {
         std::thread::sleep(Duration::from_millis(1));
     }
     Err(0)
+}
+
+/// The buffer group of every RX ring: one group per ring (design 6.2).
+const BGID: u16 = 0;
+/// Buffer ring entries per page.
+const ENTRIES_PER_PAGE: usize = 256;
+
+/// `struct io_uring_buf`; the `resv` field of entry 0 is the ring tail.
+#[repr(C)]
+#[derive(Debug)]
+struct BufEntry {
+    addr: AtomicU64,
+    len: AtomicU32,
+    bid: AtomicU16,
+    resv: AtomicU16,
+}
+
+/// One page of buffer ring entries: the ring is page aligned, as
+/// `IORING_REGISTER_PBUF_RING` requires.
+#[repr(C, align(4096))]
+#[derive(Debug)]
+struct BufPage([BufEntry; ENTRIES_PER_PAGE]);
+
+const _: () = {
+    assert!(mem::size_of::<BufEntry>() == 16);
+    assert!(mem::size_of::<BufPage>() == 4096);
+};
+
+impl BufPage {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| BufEntry {
+            addr: AtomicU64::new(0),
+            len: AtomicU32::new(0),
+            bid: AtomicU16::new(0),
+            resv: AtomicU16::new(0),
+        }))
+    }
+}
+
+/// Where one RX buffer is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufState {
+    Posted,
+    Completed,
+}
+
+/// Writes the entry at `tail` for buffer `id` and publishes the new tail
+/// with a Release store (design 6.2).
+fn post_entry(pages: &[BufPage], tail: &mut u16, mask: u16, addr: u64, len: u32, id: u16) {
+    let at = usize::from(*tail & mask);
+    if let Some(entry) = pages
+        .get(at / ENTRIES_PER_PAGE)
+        .and_then(|page| page.0.get(at % ENTRIES_PER_PAGE))
+    {
+        entry.addr.store(addr, Ordering::Relaxed);
+        entry.len.store(len, Ordering::Relaxed);
+        entry.bid.store(id, Ordering::Relaxed);
+    }
+    *tail = tail.wrapping_add(1);
+    if let Some(first) = pages.first().and_then(|page| page.0.first()) {
+        first.resv.store(*tail, Ordering::Release);
+    }
+}
+
+/// The RX ring of one RX half and its UDP socket.
+pub struct OsRxRing {
+    ring: IoUring,
+    socket: Option<OwnedFd>,
+    fixed: bool,
+    pages: Box<[BufPage]>,
+    buffers: Box<[Box<[u8]>]>,
+    state: Box<[BufState]>,
+    tail: u16,
+    mask: u16,
+    /// The `msghdr` the arm names: only its name and control lengths
+    /// count.
+    msg: Box<MsgHdr>,
+    arm: Option<UserData>,
+    /// Whether the buffer group is registered now.
+    registered: bool,
+}
+
+impl std::fmt::Debug for OsRxRing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OsRxRing")
+            .field("fixed", &self.fixed)
+            .field("buffers", &self.buffers.len())
+            .field("posted", &self.posted())
+            .field("arm", &self.arm)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OsRxRing {
+    /// Creates the UDP socket bound to `local` and opens the ring on it
+    /// ([`OsRxRing::with_socket`]).
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::Os`] naming the failed step.
+    pub fn open(local: SocketAddr, config: &UringRxConfig) -> Result<Self, OpenError> {
+        let family = match local {
+            SocketAddr::V4(_) => AddressFamily::INET,
+            SocketAddr::V6(_) => AddressFamily::INET6,
+        };
+        let socket = rustix::net::socket(family, SocketType::DGRAM, None)
+            .map_err(|errno| os("socket", errno.raw_os_error()))?;
+        rustix::net::bind(&socket, &local).map_err(|errno| os("bind", errno.raw_os_error()))?;
+        Self::with_socket(socket, config)
+    }
+
+    /// Sets up the RX ring on `socket` with the flags of IU-6, checks
+    /// `NODROP`, the CQ size and the `RECVMSG` opcode, registers the
+    /// socket as a fixed file when allowed, then registers the provided
+    /// buffer ring and posts every buffer.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::Os`] naming the failed step; a missing facility names
+    /// `EOPNOTSUPP`.
+    pub fn with_socket(socket: OwnedFd, config: &UringRxConfig) -> Result<Self, OpenError> {
+        config.validate()?;
+        let ring = IoUring::builder()
+            .setup_submit_all()
+            .setup_coop_taskrun()
+            .setup_taskrun_flag()
+            .setup_cqsize(config.cq_entries())
+            .build(config.sq_entries())
+            .map_err(|error| os("io_uring_setup", io_errno(&error)))?;
+        let params = ring.params();
+        if !params.is_feature_nodrop() {
+            return Err(os("io_uring_feature_nodrop", EOPNOTSUPP));
+        }
+        if params.cq_entries() < config.cq_entries() {
+            return Err(os("io_uring_cq_size", EOPNOTSUPP));
+        }
+        let mut probe = Probe::new();
+        ring.submitter()
+            .register_probe(&mut probe)
+            .map_err(|error| os("io_uring_register_probe", io_errno(&error)))?;
+        for code in [opcode::RecvMsgMulti::CODE, opcode::AsyncCancel::CODE] {
+            if !probe.is_supported(code) {
+                return Err(os("io_uring_opcode", EOPNOTSUPP));
+            }
+        }
+        let fixed = ring
+            .submitter()
+            .register_files(&[socket.as_raw_fd()])
+            .is_ok();
+        let buffers = config.rx_buffers.get();
+        let len = config.buffer_len();
+        let pages = (0..usize::from(buffers).div_ceil(ENTRIES_PER_PAGE))
+            .map(|_| BufPage::new())
+            .collect();
+        let mut rx = Self {
+            ring,
+            socket: Some(socket),
+            fixed,
+            pages,
+            buffers: (0..buffers)
+                .map(|_| vec![0; usize::try_from(len).unwrap_or(0)].into_boxed_slice())
+                .collect(),
+            state: vec![BufState::Posted; usize::from(buffers)].into_boxed_slice(),
+            tail: 0,
+            mask: buffers.saturating_sub(1),
+            msg: Box::new(MsgHdr {
+                name: 0,
+                namelen: RX_NAME_LEN,
+                iov: 0,
+                iovlen: 0,
+                control: 0,
+                controllen: 0,
+                flags: 0,
+            }),
+            arm: None,
+            registered: false,
+        };
+        rx.register()
+            .map_err(|errno| os("io_uring_register_pbuf_ring", errno.0))?;
+        Ok(rx)
+    }
+
+    /// The socket's local address.
+    ///
+    /// # Errors
+    ///
+    /// The errno of `getsockname`.
+    pub fn local_addr(&self) -> Result<SocketAddr, i32> {
+        let socket = self.socket.as_ref().ok_or(9)?;
+        rustix::net::getsockname(socket)
+            .and_then(SocketAddr::try_from)
+            .map_err(|errno| errno.raw_os_error())
+    }
+
+    /// Registers the buffer ring and posts every buffer.
+    fn register(&mut self) -> Result<(), Errno> {
+        // One contiguous, page aligned allocation of every entry: the
+        // kernel walks `entries * 16` bytes from this address.
+        let addr = self.pages.as_ptr().expose_provenance();
+        let entries = self.buffers();
+        // SAFETY: the ring memory is `self.pages`, page aligned and
+        // `entries` entries long; it stays allocated until the group is
+        // unregistered (`reregister`, `Drop`) or is leaked by `Drop` while
+        // the arm may still select from it.
+        let registered = unsafe {
+            self.ring.submitter().register_buf_ring_with_flags(
+                u64::try_from(addr).unwrap_or(0),
+                entries,
+                BGID,
+                0,
+            )
+        };
+        registered.map_err(|error| Errno(io_errno(&error)))?;
+        self.registered = true;
+        self.tail = 0;
+        for id in 0..entries {
+            self.post(id);
+        }
+        Ok(())
+    }
+
+    fn post(&mut self, id: u16) {
+        let Some(buffer) = self.buffers.get(usize::from(id)) else {
+            return;
+        };
+        let addr = u64::try_from(buffer.as_ptr().expose_provenance()).unwrap_or(0);
+        let len = u32::try_from(buffer.len()).unwrap_or(0);
+        post_entry(&self.pages, &mut self.tail, self.mask, addr, len, id);
+        if let Some(state) = self.state.get_mut(usize::from(id)) {
+            *state = BufState::Posted;
+        }
+    }
+
+    fn push(&mut self, entry: &squeue::Entry) -> Result<(), PushError> {
+        let mut sq = self.ring.submission();
+        // SAFETY: `entry` is the multishot RECVMSG, which names
+        // `self.msg` (alive as long as the ring) and buffers of the
+        // registered group (alive until unregistered, or leaked by
+        // `Drop`), or a cancel, which names no memory.
+        let pushed = unsafe { sq.push(entry) };
+        pushed.map_err(|_| PushError::Full)
+    }
+}
+
+impl RxRingOps for OsRxRing {
+    fn buffers(&self) -> u16 {
+        u16::try_from(self.buffers.len()).unwrap_or(u16::MAX)
+    }
+
+    fn buffer_len(&self) -> u32 {
+        self.buffers
+            .first()
+            .and_then(|buffer| u32::try_from(buffer.len()).ok())
+            .unwrap_or(0)
+    }
+
+    fn arm(&mut self, user_data: UserData) -> Result<(), PushError> {
+        // One outstanding arm, always at index 0: a second one would
+        // replace the tracked identity while the first may still write.
+        if self.arm.is_some() || user_data.index() != 0 || !self.registered {
+            return Err(PushError::KernelOwned);
+        }
+        let msg = ptr::from_ref::<MsgHdr>(&self.msg);
+        let entry = if self.fixed {
+            opcode::RecvMsgMulti::new(types::Fixed(0), msg.cast(), BGID).build()
+        } else {
+            let fd = self.socket.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+            opcode::RecvMsgMulti::new(types::Fd(fd), msg.cast(), BGID).build()
+        };
+        self.push(&entry.user_data(user_data.get()))?;
+        self.arm = Some(user_data);
+        Ok(())
+    }
+
+    fn push_cancel(&mut self, target: CancelTarget, user_data: UserData) -> Result<(), PushError> {
+        // Index 0 is the arm's: a cancel never carries it.
+        if user_data.index() == 0 {
+            return Err(PushError::OutOfRange);
+        }
+        let entry = match target {
+            CancelTarget::One(target) => opcode::AsyncCancel::new(target.get()).build(),
+            CancelTarget::All => {
+                opcode::AsyncCancel2::new(types::CancelBuilder::any().all()).build()
+            }
+        };
+        self.push(&entry.user_data(user_data.get()))
+    }
+
+    fn enter(&mut self) -> Result<u32, Errno> {
+        match self.ring.submit() {
+            Ok(consumed) => Ok(u32::try_from(consumed).unwrap_or(u32::MAX)),
+            Err(error) => Err(Errno(io_errno(&error))),
+        }
+    }
+
+    fn needs_enter(&mut self) -> bool {
+        let sq = self.ring.submission();
+        !sq.is_empty() || sq.taskrun()
+    }
+
+    fn reap(&mut self, out: &mut [Cqe]) -> usize {
+        let mut reaped: usize = 0;
+        let mut cq = self.ring.completion();
+        for (slot, cqe) in out.iter_mut().zip(cq.by_ref()) {
+            *slot = Cqe {
+                user_data: UserData::from_raw(cqe.user_data()),
+                result: cqe.result(),
+                flags: cqe.flags(),
+            };
+            reaped = reaped.saturating_add(1);
+        }
+        drop(cq);
+        for cqe in out.iter().take(reaped) {
+            if Some(cqe.user_data) == self.arm && cqe.flags & CQE_F_MORE == 0 {
+                self.arm = None;
+            }
+            if let Some(id) = buffer_id(cqe.flags)
+                && let Some(state) = self.state.get_mut(usize::from(id))
+            {
+                *state = BufState::Completed;
+            }
+        }
+        reaped
+    }
+
+    fn lend<T>(&mut self, id: u16, lend: impl FnOnce(&[u8]) -> T) -> Option<T> {
+        struct Repost<'a> {
+            pages: &'a [BufPage],
+            tail: &'a mut u16,
+            mask: u16,
+            state: &'a mut BufState,
+            addr: u64,
+            len: u32,
+            id: u16,
+        }
+        impl Drop for Repost<'_> {
+            fn drop(&mut self) {
+                post_entry(
+                    self.pages, self.tail, self.mask, self.addr, self.len, self.id,
+                );
+                *self.state = BufState::Posted;
+            }
+        }
+        let index = usize::from(id);
+        let state = self.state.get_mut(index)?;
+        if *state != BufState::Completed {
+            return None;
+        }
+        let buffer = self.buffers.get(index)?;
+        let _repost = Repost {
+            pages: &self.pages,
+            tail: &mut self.tail,
+            mask: self.mask,
+            state,
+            addr: u64::try_from(buffer.as_ptr().expose_provenance()).unwrap_or(0),
+            len: u32::try_from(buffer.len()).unwrap_or(0),
+            id,
+        };
+        Some(lend(buffer))
+    }
+
+    fn posted(&self) -> u16 {
+        let posted = self
+            .state
+            .iter()
+            .filter(|state| **state == BufState::Posted)
+            .count();
+        u16::try_from(posted).unwrap_or(u16::MAX)
+    }
+
+    fn arm_live(&self) -> bool {
+        self.arm.is_some()
+    }
+
+    fn cq_overflowed(&mut self) -> bool {
+        self.ring.completion().overflow() > 0 || self.ring.submission().cq_overflow()
+    }
+
+    fn reregister(&mut self) -> Result<(), Errno> {
+        if self.arm.is_some() {
+            return Err(Errno(16));
+        }
+        if self.registered {
+            self.ring
+                .submitter()
+                .unregister_buf_ring(BGID)
+                .map_err(|error| Errno(io_errno(&error)))?;
+            self.registered = false;
+        }
+        for page in &*self.pages {
+            for entry in &page.0 {
+                entry.resv.store(0, Ordering::Relaxed);
+            }
+        }
+        self.register()
+    }
+}
+
+impl Drop for OsRxRing {
+    fn drop(&mut self) {
+        if let Some(arm) = self.arm {
+            let control = UserData::new(1, u64::MAX);
+            if self.push_cancel(CancelTarget::One(arm), control).is_ok() {
+                let _ = self.enter();
+            }
+            let mut cqes = [Cqe::EMPTY; 64];
+            for _ in 0..DROP_ROUNDS {
+                let _ = self.enter();
+                let reaped = self.reap(&mut cqes);
+                for cqe in cqes.iter().take(reaped) {
+                    if let Some(id) = buffer_id(cqe.flags) {
+                        let _ = self.lend(id, |_| ());
+                    }
+                }
+                if self.arm.is_none() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
+        if self.arm.is_some() {
+            // The arm may still write: leak every buffer, the ring memory,
+            // the msghdr and the socket.
+            let buffers = mem::take(&mut self.buffers);
+            let bytes = buffers.iter().fold(0_u64, |sum, buffer| {
+                sum.saturating_add(u64::try_from(buffer.len()).unwrap_or(u64::MAX))
+            });
+            LEAKED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+            mem::forget(buffers);
+            mem::forget(mem::take(&mut self.pages));
+            mem::forget(mem::replace(
+                &mut self.msg,
+                Box::new(MsgHdr {
+                    name: 0,
+                    namelen: 0,
+                    iov: 0,
+                    iovlen: 0,
+                    control: 0,
+                    controllen: 0,
+                    flags: 0,
+                }),
+            ));
+            if let Some(socket) = self.socket.take() {
+                mem::forget(socket);
+            }
+            return;
+        }
+        if self.registered {
+            let _ = self.ring.submitter().unregister_buf_ring(BGID);
+        }
+    }
 }

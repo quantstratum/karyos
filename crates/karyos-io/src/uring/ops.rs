@@ -198,3 +198,97 @@ pub trait RingOps {
     /// Slots the kernel owns now.
     fn kernel_owned(&self) -> u16;
 }
+
+/// `IORING_CQE_F_BUFFER`: the upper 16 bits of the flags name a buffer.
+pub const CQE_F_BUFFER: u32 = 1;
+/// `IORING_CQE_F_MORE`: a multishot operation stays armed.
+pub const CQE_F_MORE: u32 = 2;
+/// The shift of the buffer id in the CQE flags.
+pub const CQE_BUFFER_SHIFT: u32 = 16;
+/// `ENOBUFS`: the provided buffer ring ran dry.
+pub const ENOBUFS: i32 = 105;
+/// Bytes of `struct io_uring_recvmsg_out` at the start of each buffer.
+pub const RECVMSG_OUT: usize = 16;
+/// The name area of each RX buffer: a `sockaddr_in6`.
+pub const RX_NAME_LEN: u32 = 28;
+
+/// The buffer a completion names, if its flags carry one.
+#[must_use]
+pub const fn buffer_id(flags: u32) -> Option<u16> {
+    if flags & CQE_F_BUFFER == 0 {
+        None
+    } else {
+        // The shift leaves the 16 high bits.
+        Some((flags >> CQE_BUFFER_SHIFT) as u16)
+    }
+}
+
+/// The RX ring operations of one RX half (design 3.6 and 6.2): one
+/// multishot `RECVMSG` arm over one provided buffer ring.
+///
+/// Each buffer is **Posted** (the kernel may write it; no reference
+/// exists), **Completed** (a reaped completion named it; the kernel will
+/// not write it again until it is reposted) or lent inside
+/// [`RxRingOps::lend`]. The implementation enforces it: only a Completed
+/// buffer is lent, and the lend reposts it when the closure returns or
+/// unwinds, never before.
+pub trait RxRingOps {
+    /// Buffers of the provided buffer ring (`R`).
+    fn buffers(&self) -> u16;
+
+    /// Bytes of each buffer.
+    fn buffer_len(&self) -> u32;
+
+    /// Publishes the multishot `RECVMSG` arm under `user_data`.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::Full`]; nothing was published.
+    fn arm(&mut self, user_data: UserData) -> Result<(), PushError>;
+
+    /// Publishes one cancel of `target` under `user_data`.
+    ///
+    /// # Errors
+    ///
+    /// [`PushError::Full`]; nothing was published.
+    fn push_cancel(&mut self, target: CancelTarget, user_data: UserData) -> Result<(), PushError>;
+
+    /// One non-waiting `io_uring_enter`, as [`RingOps::enter`].
+    ///
+    /// # Errors
+    ///
+    /// The raw errno.
+    fn enter(&mut self) -> Result<u32, Errno>;
+
+    /// Whether an enter is due without a new SQE.
+    fn needs_enter(&mut self) -> bool;
+
+    /// Copies up to `out.len()` completions out of the CQ. A completion
+    /// naming a buffer moves it from Posted to Completed; one of the arm
+    /// without `IORING_CQE_F_MORE` ends the arm.
+    fn reap(&mut self, out: &mut [Cqe]) -> usize;
+
+    /// Lends Completed buffer `id` to `lend` and reposts it when `lend`
+    /// returns or unwinds; `None`, calling nothing, for a buffer that is
+    /// not Completed.
+    fn lend<T>(&mut self, id: u16, lend: impl FnOnce(&[u8]) -> T) -> Option<T>;
+
+    /// Buffers Posted now.
+    fn posted(&self) -> u16;
+
+    /// Whether the arm may still write buffers: pushed and its terminal
+    /// completion not yet reaped.
+    fn arm_live(&self) -> bool;
+
+    /// Whether the kernel reported a CQ overflow or dropped completions.
+    fn cq_overflowed(&mut self) -> bool;
+
+    /// With no arm live, unregisters the buffer ring, posts every buffer
+    /// again and registers it once more (design 10.2).
+    ///
+    /// # Errors
+    ///
+    /// The raw errno of the registration, or `EBUSY` while the arm is
+    /// live; the ring is unchanged then.
+    fn reregister(&mut self) -> Result<(), Errno>;
+}
