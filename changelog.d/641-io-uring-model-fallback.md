@@ -1,3 +1,0 @@
-### Added
-
-- The `io_uring` completion model of `karyos-sim` (`tests/uring_model.rs`, karyos#641): seeded runs complete the TX and RX operations of the `io_uring` backend in random order with random results, cancels and resets, and fail on a frame touched while the kernel owns it, a leaked slot or buffer, or a wrong recovery after a reset; a mutant that releases at submission is caught. `karyos_io::uring::select` opens `io_uring` with an explicit `io_uring_or_sockets` fallback (`Fallback(reason)`, a counter, the cause kept) and fails a required `io_uring` instead of falling back. `ci/seccomp/io-uring.json` is Docker's default seccomp profile plus the three `io_uring` calls, for `KARYOS_LINUX_SECCOMP`.

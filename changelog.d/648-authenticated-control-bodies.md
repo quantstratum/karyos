@@ -1,3 +1,0 @@
-### Added
-
-- `karyos_protocol::network::authenticated` decodes and encodes the bodies of GUARD (STATE, STATUS_CHALLENGE, STATUS), SESSION_ABORT and SESSION_ABORT_ACK, following quantstratum-docs `karyos/design/authenticated-control-schemas.md` and ADR-0107. It reproduces that design's 5 blind positive vectors byte for byte and the first error of each of its 11 negative vectors. `decode_bare_status_challenge` accepts only a bare STATUS_CHALLENGE, for a guard authority's endpoint. The trusted decoder still returns `GatedType` for every one of these types, so nothing is enabled (part of karyos#648).

@@ -105,12 +105,13 @@ karyos#975 (the first two).
 | --- | --- | --- |
 | `DivergentPrefix`, `ReplyBeforeDurableMajority`, `Contract` (gap), `OldTermCommit`, `Contract` (`TruncateBelowCommit`) | yes (karyos#678) | |
 | `PositionsOutOfOrder` | yes: a core that reports no last index over a written log | |
+| `CorePanicked` (karyos#976) | yes: a core that panics at its tenth Ready, caught at the harness's core boundary whatever the core; reported only when no other check names a cause | |
 | `AppliedNotDurable` | yes, fault-injected (karyos#1038): a driver that applies a Ready's fresh entries before it writes them | |
 | `ReleasedBeforePersisted` | yes, fault-injected (karyos#1038): a driver that releases `after_persist` before the sync | |
 | `DivergentResponse` | yes, fault-injected (karyos#1038): one server's service alters its answers | |
 | `NotLinearizable` | yes, fault-injected (karyos#1038): a client that records a read with a value no one wrote | |
-| `DurableLost` | no | out of a core's reach through `ConsensusCore` (C4's log and the disk keep durable entries). A driver that reports an unsynced Ready durable and is then crashed was tried (karyos#1038): the reopened log breaks its contract first (`Contract`), or raft-rs panics (`to_commit … out of range`) once the others hold entries it lost, before the check runs |
-| `CommittedTruncated` | no | a core can truncate only through C4's log, which refuses below its stored commit (`TruncateBelowCommit`); above it, a server that stored no commit but holds entries the others applied makes raft-rs itself panic (`to_commit … out of range`) before the check runs (tried) |
+| `DurableLost` | yes, fault-injected (karyos#976): a disk that acknowledges file syncs without making them durable, crashed and restarted; the restarted log no longer holds what was reported durable. The real core panics over the loss afterwards, and the harness now catches a core's panic at its core boundary (`Observation::CorePanicked`), so the run completes and the check sees what came before | |
+| `CommittedTruncated` | yes (karyos#976): a server that never stores a commit, so C4's log has none to refuse, truncates entries the cluster applied. The run's first verdict is the contract breach that follows (its next append is not the next index), so the test asks `durable_kept` directly over the same run's observations | |
 | `Undecided`, `MalformedHistory` | no | properties of C3 and of the client history the harness records, not of a core |
 | `Unverified` | no | a run property (a crashed server never restarted), set by the case, not the core |
 | `QuorumOfVoters`, `ConfigurationNotFromLog`, `ConfigurationConflict`, `LearnerBehind` | no | membership changes: neither adapter takes a configuration change yet; they become reachable with the membership work held behind the core selection (#681 and the M04/M05 membership items) |

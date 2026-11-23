@@ -108,13 +108,12 @@ impl Rig {
             },
         );
         let mut parent = None;
-        for _ in 0..200 {
+        // Bounded by a deadline, not 200 duty cycles: a loaded host can
+        // take longer to answer (karyos#1067).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
             let _ = b.do_work().unwrap();
-            for response in drain(&mut observer).0 {
-                if let Response::NetworkSubscriptionReady { registration, .. } = response {
-                    parent = Some(registration);
-                }
-            }
+            parent = setup_answer(&drain(&mut observer).0, 1).or(parent);
             if parent.is_some() {
                 break;
             }
@@ -187,6 +186,55 @@ impl Rig {
 }
 
 type LogBuffer = karyos_sys::log_buffer::LogBuffer<karyos_sys::term_bytes::HeapTerms>;
+
+/// The registration of the network subscription set up by request
+/// `sequence`, once its readiness is among `responses`. A refusal of that
+/// request fails at once with its code and detail, rather than waiting out
+/// the setup's deadline (karyos#1221 review).
+fn setup_answer(responses: &[Response], sequence: u64) -> Option<u64> {
+    let mut ready = None;
+    for response in responses {
+        match response {
+            Response::NetworkSubscriptionReady { registration, .. } => ready = Some(*registration),
+            Response::Error {
+                request,
+                code,
+                detail,
+            } if request.sequence == sequence => {
+                panic!("the network subscription was refused: {code:?}, detail {detail}")
+            }
+            _ => {}
+        }
+    }
+    ready
+}
+
+#[test]
+#[should_panic(expected = "the network subscription was refused")]
+fn a_refused_setup_fails_at_once() {
+    let refused = Response::Error {
+        request: karyos_protocol::cnc::RequestId {
+            client: 1,
+            sequence: 1,
+        },
+        code: ErrorCode::UnknownRegistration,
+        detail: 7,
+    };
+    let _ = setup_answer(&[refused], 1);
+}
+
+#[test]
+fn another_requests_refusal_is_not_the_setups() {
+    let refused = Response::Error {
+        request: karyos_protocol::cnc::RequestId {
+            client: 1,
+            sequence: 2,
+        },
+        code: ErrorCode::UnknownRegistration,
+        detail: 7,
+    };
+    assert_eq!(setup_answer(&[refused], 1), None);
+}
 
 fn key(responses: &[Response]) -> u64 {
     responses

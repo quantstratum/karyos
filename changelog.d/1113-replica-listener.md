@@ -1,4 +1,0 @@
-### Added
-
-- `karyosd --replica <rec>,<source-ip>,<bind host:port>,<stream>` accepts a recording pushed by a source Archive (ADR-0102; karyos#1113). The replica follows only the newest incarnation of its authorized source on the stream, and drops messages naming another recording. It ignores payload until the request's `streaming` status. It stores what arrives in `<archive>/replicas/<rec>` through `Receiver`, and counts a range only once its seal verifies, recorded with the profile it arrived under. A source start above the replica's last verified range is committed as a durable gap before the first range. Lag reads unknown before any status and after 3 s without one. An interrupted replication raises a warning and a counter. It needs `--replication-trusted-network`, `--archive-copy-location` and `--network on`.
-- `EmbeddedDriver::network_image_from(stream_id, source)`: the newest exposed network image of a stream from a source address.
