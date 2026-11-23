@@ -1708,6 +1708,8 @@ fn eos_on_every_lane_ends_the_image_cleanly_after_the_last_message() {
 #[cfg(target_os = "linux")]
 mod ipc;
 
+mod start_join;
+
 /// Writes `command` to a remote client's ring.
 fn write_command(
     producer: &mut karyos_sys::command_ring::RingProducer,
