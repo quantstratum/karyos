@@ -833,6 +833,15 @@ mod shared_log_tests {
 /// What a node reports, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Observation {
+    /// A server's core panicked inside a call through the harness's core
+    /// trait (karyos#976): the server stops, as after a drive error, until
+    /// a restart reopens its log, and the run goes on so that the checks
+    /// see what came before. Whatever the core, its panic is caught at the
+    /// same boundary.
+    CorePanicked {
+        /// The server.
+        node: NodeId,
+    },
     /// A server's [`drive`](super::core::drive) step.
     Drive {
         /// The server.
@@ -1332,6 +1341,12 @@ impl From<LogError> for ServerError {
     }
 }
 
+/// `step`'s value, or `None` when it panicked: a core's panic caught at
+/// the harness's core boundary (karyos#976).
+fn caught<R>(step: impl FnOnce() -> R) -> Option<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)).ok()
+}
+
 impl<C: ConsensusCore> ServerNode<C> {
     /// Server `id` of `peers`, with a new log on `disk`; a crash keeps what
     /// `survives`.
@@ -1348,7 +1363,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         recorder: Shared,
     ) -> Result<Self, LogError> {
         let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
-        let core = C::recover(id, &peers, &mut LogView::new(&mut log));
+        let core = caught(|| C::recover(id, &peers, &mut LogView::new(&mut log)));
         Ok(Self::assemble(
             id,
             peers,
@@ -1394,7 +1409,8 @@ impl<C: ConsensusCore> ServerNode<C> {
         limits: Option<Limits>,
     ) -> Result<Self, ServerError> {
         let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
-        let core = Self::recovered(id, &peers, (limits, None), &mut log)
+        let core = caught(|| Self::recovered(id, &peers, (limits, None), &mut log))
+            .transpose()
             .map_err(ServerError::Unsupported)?;
         Ok(Self::assemble(
             id,
@@ -1407,25 +1423,33 @@ impl<C: ConsensusCore> ServerNode<C> {
         ))
     }
 
-    /// A server running `core` over `log`.
+    /// A server running `core` over `log`; down, with its panic recorded,
+    /// when the core panicked in its recovery (`None`) or in its first
+    /// queries (karyos#976).
     fn assemble(
         id: NodeId,
         peers: Vec<NodeId>,
         (disk, survives): (SimDisk, Survives),
         geometry: Geometry,
         recorder: Shared,
-        (core, log): (C, RaftLog<SimDisk>),
+        (core, log): (Option<C>, RaftLog<SimDisk>),
         limits: Option<Limits>,
     ) -> Self {
-        let commit = core.committed();
-        let configuration = core.configuration();
+        let queried = core.and_then(|core| {
+            caught(|| (core.committed(), core.configuration())).map(|queries| (core, queries))
+        });
+        let (running, commit, configuration) = match queried {
+            Some((core, (commit, configuration))) => (Some((core, log)), commit, configuration),
+            None => (None, None, None),
+        };
+        let panicked = running.is_none();
         let mut server = Self {
             id,
             peers,
             geometry,
             disk,
             survives,
-            running: Some((core, log)),
+            running,
             service: TestService::default(),
             pending: BTreeSet::new(),
             commit,
@@ -1450,6 +1474,9 @@ impl<C: ConsensusCore> ServerNode<C> {
         };
         if let Some(configuration) = configuration {
             server.record_configuration(configuration, None);
+        }
+        if panicked {
+            server.observe(Observation::CorePanicked { node: server.id });
         }
         server
     }
@@ -1494,7 +1521,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             ready: ReadyBuf::default(),
             command: Vec::new(),
         };
-        server.start();
+        let _ = server.guarded(Self::start);
         server
     }
 
@@ -2109,8 +2136,26 @@ impl<C: ConsensusCore> ServerNode<C> {
     }
 }
 
-impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
-    fn tick(&mut self, now: u64, out: &mut Outbox<Wire<C::Message>>) {
+impl<C: ConsensusCore> ServerNode<C> {
+    /// Runs `step` on the server; a panic of its core is caught, recorded
+    /// as [`Observation::CorePanicked`] and stops the server (karyos#976).
+    /// What `step` pushed to `out` before the panic is kept: it was sent.
+    fn guarded<R>(&mut self, step: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| step(&mut *self)));
+        match caught {
+            Ok(value) => Some(value),
+            Err(_) => {
+                // The core and its log view are in an unknown state: both
+                // are dropped, as at a crash, but the disk is kept.
+                self.running = None;
+                self.pending.clear();
+                self.observe(Observation::CorePanicked { node: self.id });
+                None
+            }
+        }
+    }
+
+    fn tick_unguarded(&mut self, now: u64, out: &mut Outbox<Wire<C::Message>>) {
         self.now = now;
         let budget = self.refill();
         if let Some((core, log)) = self.running.as_mut() {
@@ -2141,7 +2186,7 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
         self.duty(out);
     }
 
-    fn deliver(
+    fn deliver_unguarded(
         &mut self,
         from: NodeId,
         message: Wire<C::Message>,
@@ -2298,6 +2343,22 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
         }
         self.duty(out);
     }
+}
+
+impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
+    fn tick(&mut self, now: u64, out: &mut Outbox<Wire<C::Message>>) {
+        let _ = self.guarded(|server| server.tick_unguarded(now, out));
+    }
+
+    fn deliver(
+        &mut self,
+        from: NodeId,
+        message: Wire<C::Message>,
+        now: u64,
+        out: &mut Outbox<Wire<C::Message>>,
+    ) {
+        let _ = self.guarded(|server| server.deliver_unguarded(from, message, now, out));
+    }
 
     fn crash(&mut self) {
         self.running = None;
@@ -2312,7 +2373,7 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
     }
 
     fn restart(&mut self, _now: u64) {
-        self.start();
+        let _ = self.guarded(Self::start);
     }
 }
 

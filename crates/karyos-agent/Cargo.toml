@@ -10,6 +10,10 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Native TLS for karyos-exporter (karyos#887): off by default.
+exporter-tls = ["dep:rustls", "dep:rustls-graviola"]
+
 [dependencies]
 karyos-archive.workspace = true
 karyos-client.workspace = true
@@ -20,6 +24,13 @@ karyos-trace.workspace = true
 # karyos#710; quantstratum-docs: karyos/reviews/dependency-admission-signal-hook-agent.md).
 signal-hook.workspace = true
 thiserror.workspace = true
+# The exporter's TLS (karyos#887; quantstratum-docs:
+# karyos/reviews/dependency-admission-exporter-tls.md, widening the agent
+# HTTP stack record): `rustls` with the `rustls-graviola` provider, behind
+# the `exporter-tls` feature only, off by default, so the default graph
+# does not change.
+rustls = { version = "=0.23.46", default-features = false, features = ["std"], optional = true }
+rustls-graviola = { version = "=0.4.0", default-features = false, optional = true }
 
 [dev-dependencies]
 karyos-driver.workspace = true

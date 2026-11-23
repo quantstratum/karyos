@@ -336,13 +336,18 @@ mod tests {
 /// What `karyos-exporter` prints for a bad command line.
 pub const EXPORTER_USAGE: &str = "\
 usage: karyos-exporter --listen ADDRESS:PORT --driver DIR [--driver DIR]... \
-[--refresh-ms MS] [--agent-id NAME] [--token-file PATH]
+[--refresh-ms MS] [--agent-id NAME] [--token-file PATH] \
+[--tls-cert PEM --tls-key PEM]
 
 Serves the agent's view of each driver in the Prometheus text format on
 http://ADDRESS:PORT/metrics, reading each driver's CnC as a tool every MS
-milliseconds (default 1000). ADDRESS must be a loopback address (127.0.0.1
-or ::1): the exporter has no TLS, so expose it beyond the pod through a
-TLS-terminating sidecar or mesh. --token-file requires every scrape to
+milliseconds (default 1000). Without TLS, ADDRESS must be a loopback
+address (127.0.0.1 or ::1); expose it beyond the pod through a
+TLS-terminating sidecar or mesh, or with --tls-cert and --tls-key (both,
+PEM files: the certificate chain and its private key), which serve
+https://ADDRESS:PORT/metrics over TLS 1.3 on any address, in a build with
+the exporter-tls feature; off loopback --token-file is required too, and
+the key file must have mode 0600. --token-file requires every scrape to
 carry Authorization: Bearer with the token in PATH (32 to 256 bytes of
 visible ASCII, the file mode 0600; a symlink is followed, as a Kubernetes
 secret mount is one), against the other processes of the pod's network
@@ -367,10 +372,14 @@ pub struct ExporterArgs {
     /// The file holding the bearer token every scrape must carry
     /// (`--token-file`).
     pub token_file: Option<PathBuf>,
+    /// The PEM files of the TLS certificate chain and its private key
+    /// (`--tls-cert`, `--tls-key`; karyos#887), both or neither.
+    pub tls: Option<(PathBuf, PathBuf)>,
 }
 
 /// Parses `karyos-exporter`'s `args` (without the program name); `None`
-/// for anything its usage does not describe, a non-loopback address
+/// for anything its usage does not describe: a non-loopback address
+/// without TLS, or one of `--tls-cert` and `--tls-key` without the other,
 /// included.
 #[must_use]
 pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
@@ -379,6 +388,8 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
     let mut refresh = DEFAULT_REFRESH;
     let mut agent_id = None;
     let mut token_file = None;
+    let mut tls_cert = None;
+    let mut tls_key = None;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
@@ -390,11 +401,10 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
                 agent_id = Some(value.clone());
             }
             "--token-file" if token_file.is_none() => token_file = Some(PathBuf::from(value)),
+            "--tls-cert" if tls_cert.is_none() => tls_cert = Some(PathBuf::from(value)),
+            "--tls-key" if tls_key.is_none() => tls_key = Some(PathBuf::from(value)),
             "--listen" if listen.is_none() => {
                 let address: std::net::SocketAddr = value.parse().ok()?;
-                if !address.ip().is_loopback() {
-                    return None;
-                }
                 listen = Some(address);
             }
             "--driver" => drivers.push(PathBuf::from(value)),
@@ -411,18 +421,72 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
     if drivers.is_empty() {
         return None;
     }
+    let tls = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => Some((cert, key)),
+        (None, None) => None,
+        _ => return None,
+    };
+    let listen: std::net::SocketAddr = listen?;
+    // Off loopback only over TLS, and only with a token: the token never
+    // crosses the network in clear, and no scrape is open (karyos#887).
+    if !listen.ip().is_loopback() && (tls.is_none() || token_file.is_none()) {
+        return None;
+    }
     Some(ExporterArgs {
-        listen: listen?,
+        listen,
         drivers,
         refresh,
         agent_id,
         token_file,
+        tls,
     })
 }
 
 #[cfg(test)]
 mod exporter_tests {
     use super::*;
+
+    /// karyos#887: off loopback only with TLS and a token, and TLS takes
+    /// both files.
+    #[test]
+    fn a_non_loopback_address_needs_both_tls_files() {
+        let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            parse_exporter(&args("--listen 0.0.0.0:9464 --driver /d")),
+            None
+        );
+        assert_eq!(
+            parse_exporter(&args(
+                "--listen 0.0.0.0:9464 --driver /d --tls-cert /c --tls-key /k"
+            )),
+            None,
+            "off loopback without a token"
+        );
+        let parsed = parse_exporter(&args(
+            "--listen 0.0.0.0:9464 --driver /d --tls-cert /c --tls-key /k --token-file /t",
+        ))
+        .unwrap();
+        assert_eq!(parsed.tls, Some((PathBuf::from("/c"), PathBuf::from("/k"))));
+        assert_eq!(
+            parse_exporter(&args("--listen 0.0.0.0:9464 --driver /d --tls-cert /c")),
+            None
+        );
+        assert_eq!(
+            parse_exporter(&args("--listen 127.0.0.1:9464 --driver /d --tls-key /k")),
+            None
+        );
+        let loopback = parse_exporter(&args(
+            "--listen 127.0.0.1:9464 --driver /d --tls-cert /c --tls-key /k",
+        ))
+        .unwrap();
+        assert!(loopback.tls.is_some());
+        assert_eq!(
+            parse_exporter(&args("--listen 127.0.0.1:9464 --driver /d"))
+                .unwrap()
+                .tls,
+            None
+        );
+    }
 
     fn args(line: &str) -> Vec<String> {
         line.split_whitespace().map(str::to_owned).collect()
