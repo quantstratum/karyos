@@ -9,6 +9,7 @@
 #
 # Usage: scripts/xdp-object.sh build [OUT]   build and record provenance
 #        scripts/xdp-object.sh lock          (re)generate the crate's lock
+# KARYOS_XDP_REVISION names the source revision where the tree has no .git.
 # Needs Docker and network access to crates.io, static.rust-lang.org and
 # github.com. Never part of the default build or of make pre-push.
 set -euo pipefail
@@ -22,7 +23,7 @@ exec docker run --rm \
     -v "$out":/out \
     -e MODE="$mode" \
     -e IMAGE="$image" \
-    -e REVISION="$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)" \
+    -e REVISION="${KARYOS_XDP_REVISION:-$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)}" \
     "$image" bash -euo pipefail -c '
 toolchain=nightly-2026-11-10
 version=0.13.0
