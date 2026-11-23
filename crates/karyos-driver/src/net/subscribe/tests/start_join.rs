@@ -217,8 +217,10 @@ fn a_legacy_attach_joins_at_the_head_and_withdraws_its_cell() {
     });
     let mut subscription = rig.take(key(&responses));
     assert_eq!(first_message(&mut subscription), None);
-    // The cell is gone: a later parent-aware attach joins at the head too,
-    // and is told what it missed.
+    // The lane admits one optional reader by default: the legacy one leaves
+    // first. Its cell is gone, so a later parent-aware attach joins at the
+    // head too, and is told what it missed.
+    drop(subscription);
     let (responses, events) = rig.send(rig.attach_of(3));
     let _late = rig.take(key(&responses));
     assert!(
