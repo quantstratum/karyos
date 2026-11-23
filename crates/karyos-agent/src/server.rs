@@ -1503,10 +1503,10 @@ mod tests {
         let first = window
             .buckets(cursor, 6, None, crate::api::MAX_BUCKET_REPLY)
             .unwrap();
-        // The reply, padded past any socket buffer so a peer that does not
-        // read blocks the write.
+        // The reply, padded past this host's socket buffer so a peer that
+        // does not read blocks the write.
         let mut reply = json::trace_buckets(&first).into_bytes();
-        reply.resize(16 << 20, b' ');
+        reply.resize(past_socket_buffer(), b' ');
         reply.push(b'\n');
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         let start = std::time::Instant::now();
@@ -1540,6 +1540,26 @@ mod tests {
         assert_eq!(read.join().unwrap(), reply);
     }
 
+    /// A reply size past what this host's Unix stream socket buffers hold,
+    /// measured by filling a fresh pair without blocking: a host may tune
+    /// its default send buffer far above a fixed padding (one with
+    /// `net.core.wmem_default` at 128 MiB wrote a 64 MiB reply whole, so a
+    /// deadline test passed nothing to cut). Twice the measured bytes, at
+    /// least 16 MiB, and the fill stops at 1 GiB.
+    fn past_socket_buffer() -> usize {
+        let (writer, _reader) = UnixStream::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        let chunk = vec![0u8; 64 << 10];
+        let mut held = 0usize;
+        while held < (1 << 30) {
+            match (&writer).write(&chunk) {
+                Ok(written) if written > 0 => held = held.saturating_add(written),
+                Ok(_) | Err(_) => break,
+            }
+        }
+        held.saturating_mul(2).max(16 << 20)
+    }
+
     /// Review B1 of #826: a client that reads a few KiB at a time, often
     /// enough for each write to progress, still cannot stretch a reply past
     /// its deadline: it is checked after every write.
@@ -1558,7 +1578,7 @@ mod tests {
             }
             total
         });
-        let reply = vec![b'z'; 64 << 20];
+        let reply = vec![b'z'; past_socket_buffer()];
         let start = std::time::Instant::now();
         assert!(!write_within(&mut writer, &reply, WRITE_DEADLINE));
         let took = start.elapsed();

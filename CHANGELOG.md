@@ -224,6 +224,8 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- The agent's reply deadline tests pad their reply past the host's measured Unix socket buffer instead of a fixed 16 or 64 MiB, which a host with `net.core.wmem_default` at 128 MiB held whole, so the write never blocked and both tests failed there.
+
 - `libkaryos` and `karyosd` are released as separate artifacts, unsigned for 0.1.0-alpha.4 by owner deferral of 2026-11-23; both MANIFESTs say `signed=no` (karyos#700).
 
 - `SegmentStore::read` keeps the last finished segment it opened and reads through that handle, instead of opening the segment's data file for every read: a catch-up scan with `RaftLog::entries` opened it twice per entry (karyos#1001). The handle is dropped before any segment file is created, cut or purged. The item 37 catch-up bench also prints the read cost per entry.
