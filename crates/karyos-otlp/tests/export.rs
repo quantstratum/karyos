@@ -20,27 +20,44 @@ use std::time::{Duration, Instant};
 use karyos_agent::exporter::{
     MetricFamily, MetricKind, MetricSample, MetricValue, render_families,
 };
-use karyos_otlp::{OtlpConfig, OtlpError, OtlpExport};
+use karyos_otlp::{MAX_SERIES, OtlpConfig, OtlpError, OtlpExport, unsigned_point};
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value;
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point;
 use prost::Message as _;
 
+/// How the collector stub treats a connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Answers 200, its body kept first.
+    Answer,
+    /// Reads the request and never answers; records when the exporter
+    /// closes the connection.
+    Stall,
+}
+
 /// A collector stub: the first `refuse` connections are dropped unread
-/// (an unavailable collector), the rest answered 200 with their body
-/// kept.
+/// (an unavailable collector), the rest treated as `mode`. Each request
+/// must be an HTTP/1.1 origin-form `POST /v1/metrics` with a `Host`
+/// header naming the stub, or the test fails.
 struct Collector {
     address: SocketAddr,
     bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+    closed: Arc<AtomicUsize>,
 }
 
 impl Collector {
     fn start(refuse: usize) -> Self {
+        Self::with(refuse, Mode::Answer)
+    }
+
+    fn with(refuse: usize, mode: Mode) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let bodies = Arc::new(Mutex::new(Vec::new()));
-        let kept = Arc::clone(&bodies);
+        let closed = Arc::new(AtomicUsize::new(0));
+        let (kept, closing) = (Arc::clone(&bodies), Arc::clone(&closed));
         let seen = AtomicUsize::new(0);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -49,12 +66,15 @@ impl Collector {
                     drop(stream);
                     continue;
                 }
-                if let Some(body) = answer(stream) {
-                    kept.lock().unwrap().push(body);
-                }
+                let (kept, closing) = (Arc::clone(&kept), Arc::clone(&closing));
+                std::thread::spawn(move || serve(stream, address, mode, &kept, &closing));
             }
         });
-        Self { address, bodies }
+        Self {
+            address,
+            bodies,
+            closed,
+        }
     }
 
     fn bodies(&self) -> Vec<Vec<u8>> {
@@ -62,35 +82,61 @@ impl Collector {
     }
 }
 
-/// Reads one request and answers it 200; its body.
-fn answer(stream: TcpStream) -> Option<Vec<u8>> {
+/// Reads one request, checks its head, and treats it as `mode`.
+fn serve(
+    stream: TcpStream,
+    address: SocketAddr,
+    mode: Mode,
+    kept: &Mutex<Vec<Vec<u8>>>,
+    closed: &AtomicUsize,
+) {
     stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok()?;
-    let mut reader = BufReader::new(stream.try_clone().ok()?);
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).unwrap();
+    assert_eq!(request_line.trim_end(), "POST /v1/metrics HTTP/1.1");
     let mut length = 0;
+    let mut host = None;
     loop {
         let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
+        reader.read_line(&mut line).unwrap();
         let line = line.trim_end();
         if line.is_empty() {
             break;
         }
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            length = value.trim().parse().ok()?;
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = value.trim().parse().unwrap();
+            } else if name.eq_ignore_ascii_case("host") {
+                host = Some(value.trim().to_owned());
+            }
         }
     }
+    assert_eq!(host, Some(address.to_string()), "the Host header");
     let mut body = vec![0u8; length];
-    reader.read_exact(&mut body).ok()?;
-    let mut stream = stream;
-    stream
-        .write_all(
-            b"HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: 0\r\n\r\n",
-        )
-        .ok()?;
-    Some(body)
+    reader.read_exact(&mut body).unwrap();
+    match mode {
+        Mode::Answer => {
+            // Kept before the answer: a flush that returns has its body
+            // recorded.
+            kept.lock().unwrap().push(body);
+            let mut stream = stream;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/x-protobuf\r\ncontent-length: 0\r\n\r\n",
+                )
+                .unwrap();
+        }
+        Mode::Stall => {
+            // Never answered: wait for the exporter to close.
+            let mut rest = [0u8; 64];
+            if matches!(reader.read(&mut rest), Ok(0)) {
+                closed.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
 }
 
 /// One sampling pass with a counter, an unsigned gauge and a signed
@@ -298,4 +344,88 @@ fn a_remote_collector_needs_its_opt_in() {
     ));
     let export = OtlpExport::start(&OtlpConfig::new(remote).allowing_remote()).unwrap();
     drop(export);
+}
+
+/// A collector that accepts and never answers: the export fails at its
+/// timeout, and its connection is closed then, not left open (karyos#1225
+/// review).
+#[test]
+fn a_stalled_collector_s_connection_is_closed_at_the_timeout() {
+    let collector = Collector::with(0, Mode::Stall);
+    let export = OtlpExport::start(
+        &OtlpConfig::new(collector.address)
+            .with_interval(Duration::from_secs(3600))
+            .with_timeout(Duration::from_millis(300)),
+    )
+    .unwrap();
+    export.publish(pass());
+    assert!(export.flush().is_err());
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while collector.closed.load(Ordering::Acquire) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the stalled connection stayed open"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// More series in one family than the SDK's default limit of 2,000: every
+/// one is exported with its labels and value, as Prometheus writes it,
+/// none folded into an overflow point.
+#[test]
+fn series_past_the_sdk_default_limit_are_all_exported() {
+    const SERIES: u64 = 2_500;
+    assert!(usize::try_from(SERIES).unwrap() < MAX_SERIES);
+    let collector = Collector::start(0);
+    let export = OtlpExport::start(
+        &OtlpConfig::new(collector.address).with_interval(Duration::from_secs(3600)),
+    )
+    .unwrap();
+    let families = vec![MetricFamily {
+        name: "karyos_application_gauge",
+        kind: MetricKind::Gauge,
+        help: "An application's gauge.",
+        samples: (0..SERIES)
+            .map(|index| MetricSample {
+                labels: vec![("driver", "/d".to_owned()), ("name", format!("g{index}"))],
+                value: MetricValue::Unsigned(index),
+            })
+            .collect(),
+    }];
+    export.publish(families.clone());
+    export.flush().unwrap();
+    let (series, _) = otlp(collector.bodies().last().unwrap());
+    assert_eq!(series.len(), usize::try_from(SERIES).unwrap());
+    assert_eq!(series, prometheus(&render_families(&families)));
+    export.shutdown().unwrap();
+}
+
+/// A value past `i64::MAX`, which an OTLP integer point cannot hold, is
+/// exported as `i64::MAX`, never as 0: a counter never appears to reset.
+#[test]
+fn a_value_past_i64_max_is_exported_saturated() {
+    let max = i64::MAX.unsigned_abs();
+    assert_eq!(unsigned_point(max), max);
+    assert_eq!(unsigned_point(max + 1), max);
+    assert_eq!(unsigned_point(u64::MAX), max);
+    let collector = Collector::start(0);
+    let export = OtlpExport::start(
+        &OtlpConfig::new(collector.address).with_interval(Duration::from_secs(3600)),
+    )
+    .unwrap();
+    export.publish(vec![MetricFamily {
+        name: "karyos_events_total",
+        kind: MetricKind::Counter,
+        help: "A CnC event counter.",
+        samples: vec![MetricSample {
+            labels: vec![("driver", "/d".to_owned())],
+            value: MetricValue::Unsigned(u64::MAX),
+        }],
+    }]);
+    export.flush().unwrap();
+    let (series, _) = otlp(collector.bodies().last().unwrap());
+    let values: Vec<&str> = series.iter().map(|(_, _, value)| value.as_str()).collect();
+    assert_eq!(values, [i64::MAX.to_string()]);
+    export.shutdown().unwrap();
 }

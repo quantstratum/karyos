@@ -12,12 +12,17 @@
 //!   is a `u64`. Each family name of
 //!   [`FAMILIES`] is one instrument, read
 //!   from the last [`OtlpExport::publish`]ed pass.
-//! - **How.** OTLP/HTTP with binary protobuf, HTTP/1.1 in clear, to
-//!   `http://ADDRESS:PORT/v1/metrics`, from the SDK's periodic reader at
-//!   the configured interval. Requests run on a current-thread `tokio`
+//! - **How.** OTLP/HTTP with binary protobuf, HTTP/1.1 in clear, as an
+//!   origin-form `POST /v1/metrics` with a `Host` header, to
+//!   `ADDRESS:PORT`, at the configured interval from a thread of its own.
+//!   Each export pins one pass, so every family of one request comes from
+//!   the same sampling pass. Requests run on a current-thread `tokio`
 //!   runtime on a thread of their own ([`Client`]), each bounded by the
-//!   request timeout, with at most [`MAX_RESPONSE`] bytes of response
-//!   read. Only a loopback collector is accepted unless
+//!   request timeout, its connection closed when it ends, however it ends,
+//!   with at most [`MAX_RESPONSE`] bytes of response read. Up to
+//!   [`MAX_SERIES`] series per family are exported, far above the SDK's
+//!   default, and a value past `i64::MAX` is exported saturated
+//!   ([`unsigned_point`]). Only a loopback collector is accepted unless
 //!   [`OtlpConfig::allow_remote`] (then `karyos-exporter-otlp` writes a
 //!   warning at start).
 //! - **Off by default.** Nothing here runs unless a collector is
@@ -43,7 +48,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{AsyncInstrument, MeterProvider as _};
 use opentelemetry_http::{HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{WithExportConfig, WithHttpConfig};
-use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::metrics::{Instrument, PeriodicReader, SdkMeterProvider, Stream};
 
 /// The longest response body read from the collector, in bytes.
 pub const MAX_RESPONSE: usize = 64 * 1024;
@@ -121,20 +126,42 @@ pub enum OtlpError {
     Export(String),
 }
 
-/// The last sampling pass, which the instruments' callbacks read.
-type Pass = Arc<Mutex<Vec<MetricFamily>>>;
+/// The latest pass published, and the pass an export reads: an export
+/// pins the latest before the SDK collects, so every instrument of one
+/// request reads the same pass (karyos#1225 review).
+#[derive(Debug, Default)]
+struct Passes {
+    latest: Mutex<Arc<Vec<MetricFamily>>>,
+    pinned: Mutex<Arc<Vec<MetricFamily>>>,
+    /// Held for one export: pin, then collect and send.
+    exporting: Mutex<()>,
+}
+
+/// The series per instrument the SDK keeps before folding the rest into
+/// an overflow point: far above any supported host's, so OTLP exports
+/// every series Prometheus does (the SDK's default is 2,000).
+pub const MAX_SERIES: usize = 1 << 20;
+
+/// The reader's own interval: never reached, since [`OtlpExport`]'s
+/// thread exports on its interval through [`OtlpExport::flush`].
+const READER_INTERVAL: Duration = Duration::from_secs(365 * 24 * 3600);
 
 /// The OTLP export of the agent's view: see the module docs.
 #[derive(Debug)]
 pub struct OtlpExport {
     provider: SdkMeterProvider,
-    pass: Pass,
-    runtime: Runtime,
+    passes: Arc<Passes>,
+    stop: Arc<AtomicBool>,
+    exporter: Option<JoinHandle<()>>,
+    /// Kept alive for the client's requests; dropped last, after the
+    /// provider, which is declared first.
+    _runtime: Runtime,
 }
 
 impl OtlpExport {
-    /// Starts exporting to `config`'s collector. Nothing is sent before
-    /// the first [`OtlpExport::publish`].
+    /// Starts exporting to `config`'s collector every
+    /// [`OtlpConfig::interval`]. Nothing is sent before the first
+    /// [`OtlpExport::publish`]: an empty pass has no series.
     ///
     /// # Errors
     ///
@@ -158,34 +185,66 @@ impl OtlpExport {
             .build()
             .map_err(|error| OtlpError::Build(error.to_string()))?;
         let reader = PeriodicReader::builder(exporter)
-            .with_interval(config.interval)
+            .with_interval(READER_INTERVAL)
             .build();
-        let provider = SdkMeterProvider::builder().with_reader(reader).build();
-        let pass: Pass = Arc::new(Mutex::new(Vec::new()));
-        register(&provider, &pass);
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader)
+            .with_view(|_: &Instrument| {
+                Stream::builder()
+                    .with_cardinality_limit(MAX_SERIES)
+                    .build()
+                    .ok()
+            })
+            .build();
+        let passes = Arc::new(Passes::default());
+        register(&provider, &passes);
+        let stop = Arc::new(AtomicBool::new(false));
+        let exporter = {
+            let (provider, passes, stop) =
+                (provider.clone(), Arc::clone(&passes), Arc::clone(&stop));
+            let interval = config.interval;
+            std::thread::Builder::new()
+                .name("karyos-otlp-export".to_owned())
+                .spawn(move || {
+                    let step = Duration::from_millis(20).min(interval);
+                    let mut waited = Duration::ZERO;
+                    while !stop.load(Ordering::Acquire) {
+                        std::thread::sleep(step);
+                        waited = waited.saturating_add(step);
+                        if waited >= interval {
+                            waited = Duration::ZERO;
+                            let _ = export(&provider, &passes);
+                        }
+                    }
+                })?
+        };
         Ok(Self {
             provider,
-            pass,
-            runtime,
+            passes,
+            stop,
+            exporter: Some(exporter),
+            _runtime: runtime,
         })
     }
 
     /// Replaces the pass exported with `families`, the agent's latest.
     /// Never waits on the collector.
     pub fn publish(&self, families: Vec<MetricFamily>) {
-        *self.pass.lock().unwrap_or_else(PoisonError::into_inner) = families;
+        *self
+            .passes
+            .latest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Arc::new(families);
     }
 
-    /// Exports the current pass now, waiting for the collector's answer
+    /// Exports the latest pass now, waiting for the collector's answer
     /// (bounded by the request timeout).
     ///
     /// # Errors
     ///
     /// [`OtlpError::Export`] when the export fails.
     pub fn flush(&self) -> Result<(), OtlpError> {
-        self.provider
-            .force_flush()
-            .map_err(|error| OtlpError::Export(error.to_string()))
+        export(&self.provider, &self.passes)
     }
 
     /// Exports what is left and stops.
@@ -193,20 +252,46 @@ impl OtlpExport {
     /// # Errors
     ///
     /// [`OtlpError::Export`] when the last export fails.
-    pub fn shutdown(self) -> Result<(), OtlpError> {
+    pub fn shutdown(mut self) -> Result<(), OtlpError> {
+        self.stop.store(true, Ordering::Release);
+        if let Some(exporter) = self.exporter.take() {
+            let _ = exporter.join();
+        }
+        let flushed = export(&self.provider, &self.passes);
         let result = self
             .provider
             .shutdown()
             .map_err(|error| OtlpError::Export(error.to_string()));
-        drop(self.runtime);
-        result
+        flushed.and(result)
     }
+}
+
+impl Drop for OtlpExport {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(exporter) = self.exporter.take() {
+            let _ = exporter.join();
+        }
+    }
+}
+
+/// One export: the latest pass pinned, then collected and sent.
+fn export(provider: &SdkMeterProvider, passes: &Passes) -> Result<(), OtlpError> {
+    let _exporting = passes
+        .exporting
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let latest = Arc::clone(&passes.latest.lock().unwrap_or_else(PoisonError::into_inner));
+    *passes.pinned.lock().unwrap_or_else(PoisonError::into_inner) = latest;
+    provider
+        .force_flush()
+        .map_err(|error| OtlpError::Export(error.to_string()))
 }
 
 /// One observable instrument per family name, reading the last pass: a
 /// `counter` family a `u64` observable counter, a `gauge` family a `u64`
 /// or, for [`SIGNED_FAMILIES`], an `i64` observable gauge.
-fn register(provider: &SdkMeterProvider, pass: &Pass) {
+fn register(provider: &SdkMeterProvider, pass: &Arc<Passes>) {
     let meter = provider.meter("karyos-exporter");
     for (name, kind, _) in FAMILIES {
         if SIGNED_FAMILIES.contains(&name) {
@@ -227,7 +312,7 @@ fn register(provider: &SdkMeterProvider, pass: &Pass) {
         let unsigned = move |observer: &dyn AsyncInstrument<u64>| {
             observe(&pass, name, |value, attributes| {
                 if let MetricValue::Unsigned(value) = value {
-                    observer.observe(value, attributes);
+                    observer.observe(unsigned_point(value), attributes);
                 }
             });
         };
@@ -245,9 +330,19 @@ fn register(provider: &SdkMeterProvider, pass: &Pass) {
     }
 }
 
-/// Calls `record` with each sample of family `name` in the last pass.
-fn observe(pass: &Pass, name: &str, mut record: impl FnMut(MetricValue, &[KeyValue])) {
-    let pass = pass.lock().unwrap_or_else(PoisonError::into_inner);
+/// An unsigned value as OTLP carries it. An OTLP integer point is an
+/// `i64`, and the encoder writes a larger `u64` as 0, which would read as
+/// a counter reset; a value above `i64::MAX` is exported as `i64::MAX`
+/// instead (karyos#1225 review), so a counter never appears to go back.
+/// Prometheus writes the exact value; the two differ only past `i64::MAX`.
+#[must_use]
+pub fn unsigned_point(value: u64) -> u64 {
+    value.min(i64::MAX.unsigned_abs())
+}
+
+/// Calls `record` with each sample of family `name` in the pinned pass.
+fn observe(passes: &Passes, name: &str, mut record: impl FnMut(MetricValue, &[KeyValue])) {
+    let pass = Arc::clone(&passes.pinned.lock().unwrap_or_else(PoisonError::into_inner));
     for family in pass.iter().filter(|family| family.name == name) {
         for sample in &family.samples {
             let attributes: Vec<KeyValue> = sample
@@ -330,24 +425,45 @@ impl HttpClient for Client {
     }
 }
 
-/// Sends `request` over one HTTP/1.1 connection to its URI's authority.
+/// Aborts the connection task when dropped: on success, on an error and
+/// when the request's timeout cancels [`send`], so a stalled collector
+/// never keeps a socket past its request (karyos#1225 review).
+struct Connection(tokio::task::JoinHandle<Result<(), hyper::Error>>);
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Sends `request` over one HTTP/1.1 connection to its URI's authority,
+/// as an HTTP/1.1 origin-form request: the path as its target and the
+/// authority as its `Host` header (karyos#1225 review).
 async fn send(request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-    let authority = request
-        .uri()
+    let (mut parts, body) = request.into_parts();
+    let authority = parts
+        .uri
         .authority()
         .ok_or_else(|| HttpError::from("no authority in the URI"))?
-        .as_str()
-        .to_owned();
-    let stream = tokio::net::TcpStream::connect(authority).await?;
+        .clone();
+    let target = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| "/".to_owned(), |target| target.as_str().to_owned())
+        .parse::<hyper::Uri>()?;
+    parts.uri = target;
+    parts.headers.insert(
+        hyper::header::HOST,
+        hyper::header::HeaderValue::from_str(authority.as_str())?,
+    );
+    let stream = tokio::net::TcpStream::connect(authority.as_str()).await?;
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await?;
-    let driving = tokio::spawn(connection);
-    let (parts, body) = request.into_parts();
+    let _connection = Connection(tokio::spawn(connection));
     let answer = sender
         .send_request(hyper::Request::from_parts(parts, Full::new(body)))
         .await?;
     let (parts, body) = answer.into_parts();
     let body = Limited::new(body, MAX_RESPONSE).collect().await?.to_bytes();
-    driving.abort();
     Ok(Response::from_parts(parts, body))
 }

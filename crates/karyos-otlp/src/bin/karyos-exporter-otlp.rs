@@ -31,8 +31,13 @@ milliseconds (default 1000), taking one of each driver's tool slots
 Off unless started: without it, no OTLP is sent. Linux only.
 ";
 
-/// A parsed command line.
+/// A parsed command line. Off Linux only its parsing runs, before the
+/// process refuses to serve.
 #[derive(Debug)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "read only by the Linux serve")
+)]
 struct Args {
     endpoint: SocketAddr,
     drivers: Vec<PathBuf>,
@@ -71,7 +76,11 @@ fn parse(args: &[String]) -> Option<Args> {
             "--otlp-interval-ms" => interval = millis(value)?,
             "--otlp-timeout-ms" => timeout = millis(value)?,
             "--refresh-ms" => refresh = millis(value)?,
-            "--agent-id" => agent_id = Some(value.clone()),
+            // Refused here, as karyos-exporter refuses it, rather than
+            // dropped by the agent's configuration (karyos#1225 review).
+            "--agent-id" if karyos_agent::api::valid_agent_id(value) => {
+                agent_id = Some(value.clone());
+            }
             _ => return None,
         }
     }
