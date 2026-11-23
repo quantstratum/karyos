@@ -374,6 +374,13 @@ impl<S: FeedSequencer> Arbiter<S> {
         })
     }
 
+    /// The feed's sequencer, for a caller that checks a message as the
+    /// arbiter would before pushing it (karyos#647).
+    #[must_use]
+    pub const fn sequencer(&self) -> &S {
+        &self.sequencer
+    }
+
     /// The counters so far.
     #[must_use]
     pub const fn counters(&self) -> Counters {

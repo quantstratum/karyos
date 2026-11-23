@@ -1049,6 +1049,7 @@ fn setup(disk: &FaultDisk) {
                     retain_until_ns: 0,
                     state: CopyState::Verified,
                     enforcement: Enforcement::ObjectLock,
+                    profile: crate::integrity::copies::ArrivalProfile::Local,
                 },
                 &mut journal,
             )

@@ -331,6 +331,7 @@ fn copy(location: [u8; 32], state: CopyState, enforcement: Enforcement) -> CopyR
         retain_until_ns: 1_000,
         state,
         enforcement,
+        profile: crate::integrity::copies::ArrivalProfile::Local,
     }
 }
 
