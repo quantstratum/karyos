@@ -1032,6 +1032,11 @@ impl core::fmt::Debug for Command {
             Self::StopGroup(id, _) => f.debug_tuple("StopGroup").field(id).finish(),
             Self::Retain(request, _) => f.debug_tuple("Retain").field(request).finish(),
             Self::Verify(id, _) => f.debug_tuple("Verify").field(id).finish(),
+            Self::RetentionState { from_id, max, .. } => f
+                .debug_struct("RetentionState")
+                .field("from_id", from_id)
+                .field("max", max)
+                .finish_non_exhaustive(),
             Self::Replicate(request, _, _) => f.debug_tuple("Replicate").field(request).finish(),
             Self::StopReplication(stop, _) => f.debug_tuple("StopReplication").field(stop).finish(),
             Self::TimeEvidence(entry, _) => f.debug_tuple("TimeEvidence").field(entry).finish(),
