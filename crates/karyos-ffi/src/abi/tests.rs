@@ -3206,6 +3206,138 @@ fn without_its_network_an_embedded_driver_refuses_a_udp_channel() {
     refuses_udp(client);
 }
 
+/// ADR-0100 (karyos#844), through the C ABI: an optional network
+/// subscription whose client does not poll while the publisher sends past
+/// the image's window attaches late; its awaiting cell is raised to the
+/// floor, and `karyos_subscription_next_image_change` reports the range
+/// it did not read, `[join_loss_from, join_loss_to)`, after the image's
+/// attach.
+#[test]
+#[cfg_attr(miri, ignore = "driver integration; covered natively")]
+fn a_late_attach_reports_its_join_loss_through_the_c_abi() {
+    let _drivers = crate::test_drivers::drivers(1);
+    const STREAM: i32 = 736;
+    let (status, driver, publisher) = network_driver(api::driver::NETWORK_ON);
+    assert_eq!(status, Status::Ok.code());
+    let mut subscriber = 0;
+    // SAFETY: a live, aligned `u64`; no detail.
+    let status = unsafe { karyos_driver_connect(driver, &mut subscriber, core::ptr::null_mut()) };
+    assert_eq!(status, Status::Ok.code());
+    let mut opened = Opened {
+        driver,
+        client: publisher,
+        ..Opened::default()
+    };
+    let port = test_port();
+    let receive = std::ffi::CString::new(format!("karyos:udp?endpoint=127.0.0.1:{port}")).unwrap();
+    let send = std::ffi::CString::new(format!(
+        "karyos:udp?endpoint=127.0.0.1:{port}|interface=127.0.0.1|term-length=65536"
+    ))
+    .unwrap();
+    let mut options = subscription_defaults();
+    options.role = crate::abi::ROLE_OPTIONAL;
+    let mut subscription = 0;
+    // SAFETY: live C string, options and `u64`; no detail.
+    let status = unsafe {
+        karyos_client_add_subscription_with(
+            subscriber,
+            receive.as_ptr(),
+            STREAM,
+            &options,
+            &mut subscription,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::Ok.code());
+    // The subscription reaches the driver before the image exists.
+    for _ in 0..50 {
+        let _ = poll(subscriber);
+        idle();
+    }
+    let mut publication = 0;
+    // SAFETY: a live C string and `u64`; no detail.
+    let status = unsafe {
+        karyos_client_add_publication(
+            publisher,
+            send.as_ptr(),
+            STREAM,
+            &mut publication,
+            core::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, Status::Ok.code());
+    opened.publication = publication;
+    // Past the image's window (half a 64 KiB term) while the subscriber
+    // does not poll, so the floor passes its awaiting cell.
+    let payload = [7u8; 1000];
+    let (mut sent, start) = (0usize, std::time::Instant::now());
+    while sent < 256 * 1000 {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "sent {sent}"
+        );
+        let mut done = accepted();
+        // SAFETY: `payload` and `done` are live for the call.
+        let offered = unsafe {
+            karyos_publication_offer(publication, 0, payload.as_ptr(), payload.len(), &mut done)
+        };
+        if offered == Status::Ok.code() {
+            sent += payload.len();
+        }
+        let _ = poll(publisher);
+    }
+    // Now the subscriber attaches, and is told what it did not read.
+    let mut loss = None;
+    let start = std::time::Instant::now();
+    while loss.is_none() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "no join loss"
+        );
+        let _ = poll(subscriber);
+        let mut delivered = 0;
+        let mut seen = 0u32;
+        // SAFETY: a live context and count.
+        let _ = unsafe {
+            karyos_subscription_poll(
+                subscription,
+                Some(count_message),
+                (&raw mut seen).cast(),
+                16,
+                &mut delivered,
+            )
+        };
+        let mut change = ImageChange {
+            size: IMAGE_CHANGE_SIZE_JOIN_LOSS,
+            session_id: 0,
+            image_id: 0,
+            lane: 0,
+            available: 0,
+            end_reason: 0,
+            reserved: 0,
+            end_position: 0,
+            seal_code: 0,
+            join_loss_from: 0,
+            join_loss_to: 0,
+        };
+        let mut has = 0;
+        // SAFETY: live, aligned out-parameters of their sizes.
+        let status =
+            unsafe { karyos_subscription_next_image_change(subscription, &mut change, &mut has) };
+        assert_eq!(status, Status::Ok.code());
+        if has == 1 && change.join_loss_to > change.join_loss_from {
+            loss = Some(change);
+        }
+        idle();
+    }
+    let loss = loss.unwrap();
+    assert_eq!(loss.available, 1);
+    assert_ne!(loss.image_id, 0, "the attach it belongs to");
+    assert!(loss.join_loss_to - loss.join_loss_from >= 32 * 1024);
+    opened.subscription = subscription;
+    assert_eq!(karyos_client_close(subscriber), Status::Ok.code());
+}
+
 /// ADR-0099: a network publication is exclusive, so a driver with its
 /// network refuses a concurrent handle on a `karyos:udp` channel with
 /// `KARYOS_E_UNSUPPORTED_CHANNEL`, and its output is left untouched. That is why no
