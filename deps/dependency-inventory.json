@@ -5,8 +5,10 @@
       "block-buffer v0.12.1",
       "bytes v1.12.2",
       "cfg-if v1.0.5",
+      "cmov v0.5.4",
       "cpufeatures v0.3.1",
       "crypto-common v0.2.2",
+      "ctutils v0.4.8",
       "curve25519-dalek v5.0.0",
       "digest v0.11.3",
       "displaydoc v0.2.7",
@@ -17,6 +19,7 @@
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
+      "hmac v0.13.0",
       "http v1.5.0",
       "http-body v1.1.0",
       "httparse v1.10.1",
@@ -108,8 +111,10 @@
       "block-buffer v0.12.1",
       "bytes v1.12.2",
       "cfg-if v1.0.5",
+      "cmov v0.5.4",
       "cpufeatures v0.3.1",
       "crypto-common v0.2.2",
+      "ctutils v0.4.8",
       "curve25519-dalek v5.0.0",
       "digest v0.11.3",
       "displaydoc v0.2.7",
@@ -120,6 +125,7 @@
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
+      "hmac v0.13.0",
       "http v1.5.0",
       "http-body v1.1.0",
       "httparse v1.10.1",
@@ -213,8 +219,10 @@
       "block-buffer v0.12.1",
       "bytes v1.12.2",
       "cfg-if v1.0.5",
+      "cmov v0.5.4",
       "cpufeatures v0.3.1",
       "crypto-common v0.2.2",
+      "ctutils v0.4.8",
       "curve25519-dalek v5.0.0",
       "curve25519-dalek-derive v0.1.1",
       "digest v0.11.3",
@@ -226,6 +234,7 @@
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
+      "hmac v0.13.0",
       "http v1.5.0",
       "http-body v1.1.0",
       "httparse v1.10.1",
@@ -509,7 +518,9 @@
           "uses_default_features": true
         }
       ],
-      "features": [],
+      "features": [
+        "zeroize"
+      ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#block-buffer@0.12.1",
       "license": "MIT OR Apache-2.0",
       "name": "block-buffer",
@@ -914,6 +925,30 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#ctutils@0.4.8",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#cmov@0.5.4",
+      "license": "Apache-2.0 OR MIT",
+      "name": "cmov",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.5.4"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
           "kind": "normal",
           "target": "cfg(target_arch = \"x86_64\")",
@@ -1051,6 +1086,30 @@
       "version": "0.2.2"
     },
     {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        }
+      ],
+      "features": [],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#ctutils@0.4.8",
+      "license": "Apache-2.0 OR MIT",
+      "name": "ctutils",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.4.8"
+    },
+    {
       "build_script": true,
       "edges": [
         {
@@ -1118,6 +1177,15 @@
           "uses_default_features": false
         },
         {
+          "features": [
+            "mac"
+          ],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#hmac@0.13.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": true
+        },
+        {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.1",
           "kind": "normal",
@@ -1127,7 +1195,9 @@
       ],
       "features": [
         "block-api",
-        "default"
+        "default",
+        "mac",
+        "zeroize"
       ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3",
       "license": "MIT OR Apache-2.0",
@@ -1675,6 +1745,34 @@
       "proc_macro": false,
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "version": "0.17.1"
+    },
+    {
+      "build_script": false,
+      "edges": [
+        {
+          "features": [
+            "zeroize"
+          ],
+          "from": "workspace:karyos-protocol@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        }
+      ],
+      "features": [
+        "zeroize"
+      ],
+      "id": "registry+https://github.com/rust-lang/crates.io-index#hmac@0.13.0",
+      "license": "MIT OR Apache-2.0",
+      "name": "hmac",
+      "paths": {
+        "runtime": [
+          []
+        ]
+      },
+      "proc_macro": false,
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "version": "0.13.0"
     },
     {
       "build_script": false,
@@ -4777,6 +4875,15 @@
       "build_script": false,
       "edges": [
         {
+          "features": [
+            "zeroize"
+          ],
+          "from": "workspace:karyos-protocol@0.1.0-alpha.3",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
           "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#ed25519-dalek@3.0.0",
           "kind": "normal",
@@ -4791,7 +4898,9 @@
           "uses_default_features": false
         }
       ],
-      "features": [],
+      "features": [
+        "zeroize"
+      ],
       "id": "registry+https://github.com/rust-lang/crates.io-index#sha2@0.11.1",
       "license": "MIT OR Apache-2.0",
       "name": "sha2",
@@ -7254,7 +7363,21 @@
       "edges": [
         {
           "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#block-buffer@0.12.1",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
           "from": "registry+https://github.com/rust-lang/crates.io-index#curve25519-dalek@5.0.0",
+          "kind": "normal",
+          "target": null,
+          "uses_default_features": false
+        },
+        {
+          "features": [],
+          "from": "registry+https://github.com/rust-lang/crates.io-index#digest@0.11.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
