@@ -3135,6 +3135,8 @@ fn optional_receiver_closes(
     }
     // NAKs flow again: C's hole is below the floor.
     a.net.as_mut().unwrap().sender_ignores_naks_of(None);
+    // C's planted datagram arrives again from here on (karyos#1067).
+    c.net.as_mut().unwrap().drop_receiver_data_at(&[]);
     let closes = |c: &EmbeddedDriver| {
         c.net.as_ref().unwrap().receiver_counters().map(|counters| {
             (
@@ -3578,6 +3580,8 @@ fn a_slow_optional_receiver_under_min_is_bounded_and_repaired() {
     }
     assert!(sent < total, "flow control bounds the sender at C's window");
     a.net.as_mut().unwrap().sender_ignores_naks_of(None);
+    // C's planted datagram arrives again from here on (karyos#1067).
+    c.net.as_mut().unwrap().drop_receiver_data_at(&[]);
     // Bounded by time, not by duties: on a loaded host forty thousand
     // duties did not always reach the last message (karyos#1067).
     let deadline = std::time::Instant::now() + Duration::from_secs(60);

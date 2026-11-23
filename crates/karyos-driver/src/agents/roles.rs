@@ -788,8 +788,9 @@ pub struct ReceiverRole<T: StreamTerms = HeapTerms> {
     #[cfg(test)]
     dropped: Option<HeldRanges>,
     /// Test only: term offsets of the first term whose DATA datagram is
-    /// lost on its first arrival only (karyos#1067): a hole planted by
-    /// position, which natural loss before it does not move.
+    /// lost on every arrival until the test releases it (karyos#1067): a
+    /// hole planted by position, which natural loss before it does not
+    /// move and a repair for another receiver does not fill.
     #[cfg(test)]
     drop_once_at: Vec<u32>,
     /// Test only: DATA datagrams seen since the hook was set.
@@ -2791,8 +2792,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
         self.data_seen = 0;
     }
 
-    /// Loses the first arrival of the DATA datagram at each term offset of
-    /// `at`, in the first term (tests).
+    /// Loses every arrival of the DATA datagram at each term offset of
+    /// `at`, in the first term, until called again (`&[]` releases)
+    /// (tests).
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn drop_data_at(&mut self, at: &[u32]) {
         self.drop_once_at = at.to_vec();
@@ -4623,12 +4625,14 @@ impl<T: StreamTerms> Intake<'_, T> {
                 self.role.data_seen = next;
             }
             if let Some((_, at, _)) = drop_tail_frame(bytes)
-                && let Some(index) = self.role.drop_once_at.iter().position(|held| *held == at)
+                && self.role.drop_once_at.contains(&at)
             {
-                let _ = self.role.drop_once_at.swap_remove(index);
+                // Every arrival, repairs included, until the test releases
+                // it: a repair B's NAK sends to the group must not fill it.
                 if let (Some(dropped), Ok(length)) =
                     (self.role.dropped.as_ref(), u64::try_from(bytes.len()))
                     && let Ok(mut held) = dropped.lock()
+                    && !held.iter().any(|&(start, _)| start == u64::from(at))
                 {
                     held.push((u64::from(at), length));
                 }
@@ -7037,22 +7041,31 @@ impl<T: StreamTerms> SenderRole<T> {
         format!("held {held:?} answered {:?}", self.nak_log)
     }
 
-    /// Whether `nak` is one [`SenderRole::ignore_naks_of`] holds back: its
-    /// receiver's, overlapping a held range (tests).
+    /// The parts of `nak` to answer when [`SenderRole::ignore_naks_of`]
+    /// holds part of it: the held receiver's NAK minus the first held range
+    /// it overlaps; `None` for a NAK answered whole (tests).
     #[cfg(test)]
-    fn holds_nak(&self, nak: &Nak) -> bool {
-        let Some((boot_id, held)) = self.ignore_naks_of.as_ref() else {
-            return false;
-        };
+    fn held_nak_parts(&self, nak: &Nak) -> Option<[Option<Nak>; 2]> {
+        let (boot_id, held) = self.ignore_naks_of.as_ref()?;
         if *boot_id != nak.receiver.receiver_boot_id {
-            return false;
+            return None;
         }
         let start = nak.range.start;
         let end = start.saturating_add(u64::from(nak.range.length));
-        held.lock().is_ok_and(|held| {
-            held.iter()
-                .any(|&(at, length)| at < end && start < at.saturating_add(length))
-        })
+        let held = held.lock().ok()?;
+        let &(at, length) = held
+            .iter()
+            .find(|&&(at, length)| at < end && start < at.saturating_add(length))?;
+        let part = |from: u64, to: u64| {
+            let length = u32::try_from(to.checked_sub(from)?)
+                .ok()
+                .filter(|l| *l > 0)?;
+            let mut part = *nak;
+            part.range.start = from;
+            part.range.length = length;
+            Some(part)
+        };
+        Some([part(start, at), part(at.saturating_add(length), end)])
     }
 
     /// Reads NAKs again after [`SenderRole::ignore_naks`] (tests).
@@ -7536,7 +7549,16 @@ impl<T: StreamTerms> SenderRole<T> {
         now: u64,
     ) {
         #[cfg(test)]
-        if self.ignore_naks || self.holds_nak(nak) {
+        if self.ignore_naks {
+            return;
+        }
+        // The held receiver's NAK is answered without the held bytes: the
+        // parts before and after them, each as its own NAK (karyos#1067).
+        #[cfg(test)]
+        if let Some(parts) = self.held_nak_parts(nak) {
+            for part in parts.into_iter().flatten() {
+                self.nak(halves, endpoint, source, &part, now);
+            }
             return;
         }
         #[cfg(test)]
