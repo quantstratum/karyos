@@ -895,6 +895,9 @@ fn a_unicast_subscription_is_not_multicast() {
 #[test]
 fn a_channel_with_paths_is_refused_until_paths_are_isolated() {
     let mut driver = driver(ThreadingMode::Shared);
+    // A backend that cannot isolate path sockets (macOS; Linux isolates
+    // them, karyos#624).
+    driver.net.as_mut().unwrap().assume_unisolated_paths();
     let group = SocketAddr::from(([239, 7, 9, 1], free_port()));
     let channel = UdpConfig {
         destination: Destination::Multicast { group, ttl: None },
