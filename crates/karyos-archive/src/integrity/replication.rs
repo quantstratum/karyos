@@ -167,6 +167,10 @@ impl Replica {
         if end < start {
             return Err(ReplicationError::InvertedRange { start, end });
         }
+        // An empty range checks no byte: nothing to invalidate.
+        if end == start {
+            return Ok(0);
+        }
         let counted: Vec<CopyRecord> = copies
             .current()?
             .into_iter()

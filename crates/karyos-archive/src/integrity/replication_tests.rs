@@ -403,6 +403,16 @@ fn only_the_replicas_own_check_invalidates_a_verified_copy() {
             .unwrap();
     }
     let (first, _) = f.ranges[0].clone();
+    // An empty range inside a verified copy checks nothing and changes
+    // nothing.
+    let records = f.copies.records().len();
+    assert_eq!(
+        replica()
+            .invalidate(&mut f.copies, &mut f.journal, RECORDING, 4, 4)
+            .unwrap(),
+        0
+    );
+    assert_eq!(f.copies.records().len(), records);
     assert_eq!(
         replica()
             .invalidate(
