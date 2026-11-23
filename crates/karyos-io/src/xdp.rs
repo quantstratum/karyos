@@ -8,7 +8,7 @@
 //! ([`XDP_OBJECT`]), committed with its source (`bpf/karyos-xdp`), its
 //! provenance manifest (`src/xdp/karyos_xdp.manifest.toml`) and the
 //! notices of the code it contains (`src/xdp/NOTICE`), and its loader
-//! over the admitted `aya` ([`load`]). The sockets, UMEM and rings follow
+//! over the admitted `aya` (`load`, Linux only). The sockets, UMEM and rings follow
 //! in their own issue.
 
 #![forbid(unsafe_code)]
@@ -85,6 +85,24 @@ mod tests {
         assert!(!is_bpf_object(b"\x7fELF\x02\x01"));
     }
 
+    /// Whether `error` comes from the environment refusing BPF (`EPERM`,
+    /// `EACCES` or `ENOSYS` somewhere in its source chain), the only
+    /// failure the test may skip: a malformed object, a missing program
+    /// or a verifier rejection always fails it.
+    #[cfg(all(feature = "xdp", target_os = "linux"))]
+    fn environment_denied(error: &aya::EbpfError) -> bool {
+        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+        while let Some(current) = source {
+            if let Some(io) = current.downcast_ref::<std::io::Error>()
+                && matches!(io.raw_os_error(), Some(1 | 13 | 38))
+            {
+                return true;
+            }
+            source = current.source();
+        }
+        false
+    }
+
     /// Loads the object through the kernel verifier. Where the
     /// capabilities are missing the test says so and returns, unless
     /// `KARYOS_XDP_REQUIRED` is set.
@@ -100,8 +118,11 @@ mod tests {
                 assert!(ebpf.map(XSKS_MAP).is_some());
                 assert!(ebpf.map(ENDPOINTS_MAP).is_some());
             }
-            Err(error) if std::env::var_os("KARYOS_XDP_REQUIRED").is_none() => {
-                eprintln!("XDP load unavailable here ({error}); skipped");
+            Err(error)
+                if std::env::var_os("KARYOS_XDP_REQUIRED").is_none()
+                    && environment_denied(&error) =>
+            {
+                eprintln!("XDP load denied by this environment ({error}); skipped");
             }
             Err(error) => panic!("load: {error}"),
         }

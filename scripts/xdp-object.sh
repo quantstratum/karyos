@@ -18,6 +18,8 @@ mode="${1:-build}"
 out="${2:-$root/build/xdp}"
 image="rust:1.99@sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07"
 mkdir -p "$out"
+# Absolute, so Docker binds the directory instead of creating a named volume.
+out="$(cd "$out" && pwd)"
 exec docker run --rm \
     -v "$root":/work:ro \
     -v "$out":/out \

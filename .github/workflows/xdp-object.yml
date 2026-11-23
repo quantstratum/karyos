@@ -21,8 +21,14 @@ jobs:
         run: scripts/xdp-object.sh build "$RUNNER_TEMP/xdp"
       - name: Compare with the committed object
         run: |
-          want="$(sed -n 's/^sha256 = "\(.*\)"$/\1/p' crates/karyos-io/src/xdp/karyos_xdp.manifest.toml)"
+          want="$(sed -n '/^\[object\]/,/^\[/ s/^sha256 = "\(.*\)"$/\1/p' crates/karyos-io/src/xdp/karyos_xdp.manifest.toml | head -n 1)"
           got="$(sha256sum "$RUNNER_TEMP/xdp/karyos_xdp.bpf.o" | cut -d' ' -f1)"
           echo "manifest $want, rebuilt $got"
-          test -n "$want" && test "$want" = "$got"
-          cmp "$RUNNER_TEMP/xdp/karyos_xdp.bpf.o" crates/karyos-io/src/xdp/karyos_xdp.bpf.o
+          if [ -z "$want" ] || [ "$want" != "$got" ]; then
+            echo "the rebuilt object does not match the manifest" >&2
+            exit 1
+          fi
+          if ! cmp "$RUNNER_TEMP/xdp/karyos_xdp.bpf.o" crates/karyos-io/src/xdp/karyos_xdp.bpf.o; then
+            echo "the rebuilt object differs from the committed one" >&2
+            exit 1
+          fi
