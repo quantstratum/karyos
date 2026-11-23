@@ -598,7 +598,7 @@ mod kernel {
             out.extend_from_slice(&u16::try_from(4 + payload.len()).unwrap().to_ne_bytes());
             out.extend_from_slice(&kind.to_ne_bytes());
             out.extend_from_slice(payload);
-            while out.len() % 4 != 0 {
+            while !out.len().is_multiple_of(4) {
                 out.push(0);
             }
             out
@@ -646,6 +646,23 @@ mod kernel {
             Ok(())
         }
 
+        /// Deletes link `name`; deleting one end of a veth pair deletes
+        /// both. Errors are ignored: the link may not exist.
+        pub fn delete(name: &str) {
+            let mut link = ifinfo(0, 0, 0);
+            link.extend(attr(3, format!("{name}\0").as_bytes()));
+            let _ = request(17, 0, &link);
+        }
+
+        /// Removes the pair when dropped, on every exit of the test.
+        pub struct Pair(pub &'static str);
+
+        impl Drop for Pair {
+            fn drop(&mut self) {
+                delete(self.0);
+            }
+        }
+
         /// Creates `a` and `b`, brings both up and gives each an address
         /// of `10.77.0.0/24`.
         pub fn create(a: &str, b: &str, a_host: u8, b_host: u8) -> Result<(), i32> {
@@ -680,6 +697,9 @@ mod kernel {
     #[test]
     fn the_kernel_stack_accepts_the_headers_the_backend_writes() {
         let _umem = umem_lock();
+        // A pair left by an earlier run would make the creation fail.
+        veth::delete("kx0");
+        let _pair = veth::Pair("kx0");
         if let Err(errno) = veth::create("kx0", "kx1", 1, 2) {
             if required() {
                 panic!("veth setup failed with errno {errno}");
@@ -756,6 +776,16 @@ mod kernel {
             rx_frames: RX,
         };
         let missing = 0x7fff_fff0;
+        // Unprivileged (no CAP_NET_RAW, or no AF_XDP), the open stops
+        // before the bind: there is nothing to check here then.
+        if let Err(crate::backend::OpenError::Os { operation, errno }) =
+            OsXsk::open(missing, 0, sizes)
+            && operation != "xsk_bind"
+            && !required()
+        {
+            eprintln!("AF_XDP unavailable here ({operation}, errno {errno}); skipped");
+            return;
+        }
         for choice in [XdpChoice::AfXdp, XdpChoice::AfXdpOrSockets] {
             let selected = select(choice, || OsXsk::open(missing, 0, sizes), || Ok(()));
             assert!(

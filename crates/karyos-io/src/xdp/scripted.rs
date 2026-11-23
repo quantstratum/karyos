@@ -128,6 +128,19 @@ impl ScriptedXsk {
         self.tx_published.len()
     }
 
+    /// RX frames in the fill ring now (not their states): the frames the
+    /// kernel can still write.
+    #[must_use]
+    pub fn fill_len(&self) -> usize {
+        self.fill.len()
+    }
+
+    /// RX descriptors the endpoint has not reaped.
+    #[must_use]
+    pub fn rx_pending(&self) -> usize {
+        self.rx_ring.len()
+    }
+
     /// Kicks so far.
     #[must_use]
     pub fn kicks(&self) -> u32 {

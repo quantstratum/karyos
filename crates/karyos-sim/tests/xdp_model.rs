@@ -80,15 +80,20 @@ impl CompletionHandler for Releases {
 }
 
 #[derive(Default)]
-struct Count(u32);
+struct Count {
+    delivered: u32,
+    dropped: u32,
+}
 
 impl RxHandler for Count {
     fn datagram(&mut self, _: RxDatagram<'_>) -> ControlFlow<()> {
-        self.0 += 1;
+        self.delivered += 1;
         ControlFlow::Continue(())
     }
 
-    fn dropped(&mut self, _: RxDrop) {}
+    fn dropped(&mut self, _: RxDrop) {
+        self.dropped += 1;
+    }
 }
 
 fn inbound(payload: &[u8]) -> Vec<u8> {
@@ -119,9 +124,18 @@ struct Run {
     released: usize,
     committed: u32,
     returned: u16,
+    /// Frames the kernel wrote into RX frames, and the handler's count of
+    /// them once drained.
+    received_frames: u32,
+    handled_frames: u32,
+    /// RX frames not back in the fill ring, and descriptors never reaped.
+    fill_missing: usize,
+    rx_unreaped: usize,
+    /// Submitted items at the retirement of an undrained run.
+    submitted_at_retire: usize,
 }
 
-fn run(seed: u64, mutant: bool) -> Run {
+fn run(seed: u64, mutant: bool, drain: bool) -> Run {
     let mut rng = Rng::new(seed);
     let config = XdpEndpointConfig {
         local: local(),
@@ -149,6 +163,8 @@ fn run(seed: u64, mutant: bool) -> Run {
         .unwrap();
     let mut report = TxReport::new();
     let mut releases = Releases::default();
+    // Every payload committed, as (byte, length): what the kernel must read.
+    let mut expected: Vec<(u8, usize)> = Vec::new();
     let mut received = Count::default();
     let mut out = Run::default();
     let budget = Budget::new(16, u64::MAX, 4);
@@ -171,6 +187,7 @@ fn run(seed: u64, mutant: bool) -> Run {
                         .is_ok()
                     {
                         out.committed += 1;
+                        expected.push((byte, len));
                     }
                 }
             }
@@ -203,7 +220,9 @@ fn run(seed: u64, mutant: bool) -> Run {
                 } else {
                     inbound(b"inbound")
                 };
-                endpoint.xsk_mut().unwrap().receive(&frame);
+                if endpoint.xsk_mut().unwrap().receive(&frame) {
+                    out.received_frames += 1;
+                }
             }
             5 => {
                 endpoint.poll_rx(budget, &mut received);
@@ -223,9 +242,10 @@ fn run(seed: u64, mutant: bool) -> Run {
         }
     }
     // need_wakeup liveness: with the flag set and the kernel sending only
-    // inside kicks, polling alone drains every outstanding descriptor.
+    // inside kicks, polling alone drains every outstanding descriptor. An
+    // undrained run retires with its descriptors still outstanding.
     endpoint.xsk_mut().unwrap().set_need_wakeup(true);
-    for _ in 0..64 {
+    for _ in 0..(if drain { 64 } else { 0 }) {
         endpoint.poll_completions(budget, &mut releases);
         let xsk = endpoint.xsk_mut().unwrap();
         if xsk.kicks() > kicks_seen {
@@ -234,19 +254,32 @@ fn run(seed: u64, mutant: bool) -> Run {
         }
     }
     endpoint.poll_completions(budget, &mut releases);
-    out.stuck_after_polling = endpoint.xsk().unwrap().tx_outstanding();
+    if drain {
+        out.stuck_after_polling = endpoint.xsk().unwrap().tx_outstanding();
+    }
     for _ in 0..8 {
         endpoint.poll_rx(budget, &mut received);
     }
     let xsk = endpoint.xsk().unwrap();
     out.rx_not_reposted = RX - xsk.rx_posted();
+    out.fill_missing = usize::try_from(RX).unwrap() - xsk.fill_len();
+    out.rx_unreaped = xsk.rx_pending();
+    out.handled_frames = received.delivered + received.dropped;
     out.touches_while_owned = xsk.touches_while_owned();
     for (_, bytes) in xsk.sent() {
         match headers::validate(bytes, peer(), MAC_PEER, 256) {
             Checked::Datagram { offset, len, .. } => {
+                // The payload must be one that was committed, byte for byte
+                // and length for length; each is matched once.
                 let payload = &bytes[offset..offset + len];
-                if payload.iter().any(|byte| *byte != payload[0]) {
-                    out.corrupted_sends += 1;
+                let matched = expected.iter().position(|&(byte, length)| {
+                    length == len && payload.iter().all(|value| *value == byte)
+                });
+                match matched {
+                    Some(index) => {
+                        expected.swap_remove(index);
+                    }
+                    None => out.corrupted_sends += 1,
                 }
             }
             Checked::Drop(..) => out.corrupted_sends += 1,
@@ -254,6 +287,7 @@ fn run(seed: u64, mutant: bool) -> Run {
     }
     out.double_releases = releases.0.values().filter(|&&count| count > 1).count();
     out.released = releases.0.len();
+    out.submitted_at_retire = endpoint.submitted();
     loop {
         match endpoint.retire(&mut report) {
             Teardown::More { returned } => out.returned += returned,
@@ -277,7 +311,16 @@ fn run(seed: u64, mutant: bool) -> Run {
 #[test]
 fn no_frame_is_touched_while_the_kernel_owns_it_and_none_leaks() {
     for seed in seeds() {
-        let run = run(seed, false);
+        let run = run(seed, false, true);
+        assert_eq!(
+            run.fill_missing, 0,
+            "seed {seed}: an RX frame never returned to the fill ring: {run:?}"
+        );
+        assert_eq!(run.rx_unreaped, 0, "seed {seed}: {run:?}");
+        assert_eq!(
+            run.handled_frames, run.received_frames,
+            "seed {seed}: a received frame neither delivered nor dropped: {run:?}"
+        );
         assert_eq!(run.touches_while_owned, 0, "seed {seed}: {run:?}");
         assert_eq!(run.corrupted_sends, 0, "seed {seed}: {run:?}");
         assert_eq!(run.double_releases, 0, "seed {seed}: {run:?}");
@@ -302,9 +345,37 @@ fn no_frame_is_touched_while_the_kernel_owns_it_and_none_leaks() {
 }
 
 #[test]
+fn a_teardown_with_descriptors_outstanding_reports_each_unknown() {
+    let mut outstanding = 0;
+    for seed in seeds() {
+        let run = run(seed, false, false);
+        assert_eq!(
+            usize::from(run.unknown),
+            run.submitted_at_retire,
+            "seed {seed}: {run:?}"
+        );
+        assert_eq!(
+            u32::from(run.kernel_owned_at_teardown),
+            u32::from(run.unknown),
+            "seed {seed}: {run:?}"
+        );
+        assert_eq!(
+            run.committed,
+            u32::try_from(run.released).unwrap() + u32::from(run.returned) + u32::from(run.unknown),
+            "seed {seed}: {run:?}"
+        );
+        outstanding += run.submitted_at_retire;
+    }
+    assert!(
+        outstanding > 0,
+        "some run retires with descriptors outstanding"
+    );
+}
+
+#[test]
 fn the_model_catches_an_endpoint_that_frees_frames_at_submission() {
     let caught = seeds().into_iter().any(|seed| {
-        let run = run(seed, true);
+        let run = run(seed, true, true);
         run.touches_while_owned > 0 || run.corrupted_sends > 0 || run.double_releases > 0
     });
     assert!(
