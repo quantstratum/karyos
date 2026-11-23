@@ -5686,16 +5686,37 @@ fn a_stopped_recording_replicates_on_demand() {
 #[test]
 fn a_stopped_replication_drops_its_output_and_reports_itself_gone() {
     use crate::replication::transport::Outgoing;
-    use crate::replication::{Mode, ReplicateRecording, State, StopReplication};
+    use crate::replication::{ReplicateRecording, State, StopReplication};
     let dir = temp_dir("replicate-stop");
     let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
-    let (id, _) = sealed_recording(&agent);
+    // A recording that keeps recording: its replication never ends on
+    // its own.
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(4));
+    let id = agent
+        .start(StartRecording {
+            stream_id: 10,
+            session_id: 3,
+            channel: b"karyos:ipc".to_vec(),
+            geometry: Geometry::new(4096, 8192).unwrap(),
+            policy: SyncPolicy::Every {
+                interval_ns: 1_000_000,
+            },
+            mode: Mode::Required,
+            format: format(),
+            source: Box::new(Paced {
+                position: 0,
+                next: 0,
+                released: Arc::clone(&released),
+            }),
+            origin: RecordedFrom::Local,
+        })
+        .unwrap();
     let request = ReplicateRecording {
         correlation_id: 9,
         recording_id: id,
         from: 0,
         until: u64::MAX,
-        mode: Mode::Continuous,
+        mode: crate::replication::Mode::Continuous,
     };
     assert!(!answer(agent.post_replication_active(9)).unwrap());
     let messages = answer(agent.post_replicate(request, 1)).unwrap();
