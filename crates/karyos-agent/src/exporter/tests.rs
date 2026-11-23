@@ -936,6 +936,17 @@ mod over_tls {
         name: &'static str,
         request: &str,
     ) -> (Option<String>, Vec<Answered>) {
+        exchange_tls_after(exporter, roots, name, request, Duration::ZERO)
+    }
+
+    /// [`exchange_tls`], the request sent `pause` after the handshake.
+    fn exchange_tls_after(
+        exporter: &mut Exporter,
+        roots: rustls::RootCertStore,
+        name: &'static str,
+        request: &str,
+        pause: Duration,
+    ) -> (Option<String>, Vec<Answered>) {
         let port = exporter.local_addr().unwrap().port();
         let request = request.to_owned();
         let client = std::thread::spawn(move || {
@@ -954,6 +965,12 @@ mod over_tls {
             let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
             tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
             let mut stream = rustls::StreamOwned::new(connection, tcp);
+            if !pause.is_zero() {
+                while stream.conn.is_handshaking() {
+                    stream.conn.complete_io(&mut stream.sock).ok()?;
+                }
+                std::thread::sleep(pause);
+            }
             stream.write_all(request.as_bytes()).ok()?;
             let mut answer = String::new();
             stream.read_to_string(&mut answer).ok()?;
@@ -1055,7 +1072,70 @@ mod over_tls {
             b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03",
         );
         assert_eq!(answered, vec![Answered::Dropped]);
+        assert_eq!(exporter.deadline(), TLS_CONNECTION_DEADLINE);
+        assert!(took < TLS_CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
+        // A shorter deadline is honoured.
+        let mut short = self::exporter("0.0.0.0:0", "trickle-short")
+            .with_deadline(CONNECTION_DEADLINE)
+            .unwrap();
+        let (answered, took) = trickle(&mut short, b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03");
+        assert_eq!(answered, vec![Answered::Dropped]);
         assert!(took < CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
+    }
+
+    /// karyos#887 review: a deadline outside 1 ms to 30 s is a typed
+    /// error, and the step follows the transport however often it is set.
+    #[test]
+    fn a_deadline_is_bounded_and_its_step_follows_the_transport() {
+        for bad in [
+            Duration::ZERO,
+            MAX_CONNECTION_DEADLINE + Duration::from_millis(1),
+            Duration::MAX,
+        ] {
+            assert!(matches!(
+                exporter("127.0.0.1:0", "bad-deadline").with_deadline(bad),
+                Err(ExportError::InvalidDeadline(_))
+            ));
+        }
+        let tls = exporter("127.0.0.1:0", "tls-step")
+            .with_deadline(Duration::from_millis(50))
+            .unwrap()
+            .with_deadline(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(
+            (tls.deadline(), tls.step),
+            (Duration::from_secs(3), Duration::from_secs(3))
+        );
+        let plain = bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_deadline(Duration::from_millis(50))
+            .unwrap()
+            .with_deadline(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(
+            (plain.deadline(), plain.step),
+            (Duration::from_secs(3), IO_TIMEOUT)
+        );
+    }
+
+    /// A remote scraper whose request comes a long round trip after the
+    /// handshake, past `IO_TIMEOUT` but within the TLS deadline, is still
+    /// answered (karyos#887 review).
+    #[test]
+    fn a_scraper_on_a_slow_network_is_answered_within_the_tls_deadline() {
+        let mut exporter = exporter("127.0.0.1:0", "slow-network");
+        let (answer, answered) = exchange_tls_after(
+            &mut exporter,
+            roots(true),
+            "localhost",
+            &format!(
+                "GET /metrics HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+                "k".repeat(32)
+            ),
+            Duration::from_millis(400),
+        );
+        assert_eq!(answered, vec![Answered::Metrics]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 200 OK"));
     }
 
     #[test]
