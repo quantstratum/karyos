@@ -134,3 +134,44 @@ fn a_second_metered_view_read_allocates_nothing() {
     );
     assert!(out.is_empty());
 }
+
+/// Reads that cross segments still allocate (the store reopens its reader
+/// file per crossing, with its path; ADR-0105's (c) removes it), but
+/// per crossing, never per entry: 400 entries over a few 4 KiB segments
+/// must count far fewer allocations than entries.
+#[test]
+fn a_read_across_segments_allocates_per_crossing_not_per_entry() {
+    let _serial = serial();
+    let dir = TempDir::new("cross");
+    let geometry = Geometry::new(4096, 4096).unwrap();
+    let mut log = RaftLog::create(StdDisk, &dir.0, geometry, 1).unwrap();
+    let written: Vec<Entry> = (1..=400u64)
+        .map(|index| Entry {
+            index,
+            term: 1,
+            event_time: index,
+            payload: vec![7; 60],
+        })
+        .collect();
+    assert_eq!(log.append(&written).unwrap(), Some(400));
+    log.sync().unwrap();
+    let bytes: u64 = written.iter().map(|entry| entry.encoded_len().unwrap()).sum();
+    let segments = bytes / 4096 + 1;
+    let (mut out, mut buffer) = (Vec::new(), Vec::new());
+    log.entries_into(1..401, u64::MAX, &mut out, &mut buffer)
+        .unwrap();
+    let (read, counts) = window(|| {
+        let _enrolled = enroll();
+        log.entries_into(1..401, u64::MAX, &mut out, &mut buffer)
+    })
+    .unwrap();
+    read.unwrap();
+    assert_eq!(out, written);
+    println!("crossing read: {segments} segments, {counts:?}");
+    // At most a few allocations per segment the read enters.
+    assert!(
+        counts.allocations <= 8 * segments,
+        "{counts:?} over {segments} segments"
+    );
+    assert!(8 * segments < 400 / 2);
+}
