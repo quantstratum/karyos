@@ -532,3 +532,308 @@ fn a_crashed_offload_is_released_and_uncounted_before_its_files_go() {
                 && copy.start < 128)
     );
 }
+
+fn restore(archive: &mut Archive, bucket: &mut Bucket) -> Result<SealRecord, TieringError> {
+    tiering().restore_segment(
+        &mut archive.copies,
+        &mut archive.journal,
+        &mut archive.store,
+        bucket,
+    )
+}
+
+fn read_range(archive: &mut Archive, start: u64, end: u64) -> Vec<u8> {
+    let mut bytes = vec![0u8; usize::try_from(end - start).unwrap()];
+    archive.store.read(start, &mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn an_offloaded_segment_is_restored_byte_for_byte_with_its_original_index() {
+    let mut archive = fresh();
+    let original = read_range(&mut archive, 0, 384);
+    let (data, index) = archive.store.segment_paths(0);
+    let (data, index) = (
+        read_all(&archive.disk, &data),
+        read_all(&archive.disk, &index),
+    );
+    let mut bucket = Bucket::default();
+    let _ = offload(&mut archive, &mut bucket, 3);
+    let _ = offload(&mut archive, &mut bucket, 3);
+    assert_eq!(archive.store.start(), 256);
+
+    // From the segment just below the start downward.
+    let second = restore(&mut archive, &mut bucket).unwrap();
+    assert_eq!(second.kind, SealKind::Restore);
+    assert_eq!((second.start, second.end), (128, 256));
+    assert_eq!(archive.store.start(), 128);
+    let first = restore(&mut archive, &mut bucket).unwrap();
+    assert_eq!((first.start, first.end), (0, 128));
+    assert_eq!(archive.store.start(), 0);
+    assert_eq!(archive.store.lowest_retained(), 0);
+    // Nothing is below the offload floor: the next restore is refused.
+    assert!(matches!(
+        restore(&mut archive, &mut bucket),
+        Err(TieringError::NotEligible { .. })
+    ));
+    let (restored_data, restored_index) = archive.store.segment_paths(0);
+    assert_eq!(read_all(&archive.disk, &restored_index), index);
+    assert_eq!(read_all(&archive.disk, &restored_data), data);
+    assert_eq!(read_range(&mut archive, 0, 384), original);
+    assert!(offloaded(&archive.journal.records().unwrap()).is_empty());
+    // The local copies count again, only with the restore record.
+    let local: Vec<_> = archive
+        .copies
+        .current()
+        .unwrap()
+        .into_iter()
+        .filter(|copy| copy.location == ARCHIVE && copy.state == CopyState::Verified)
+        .map(|copy| (copy.start, copy.end))
+        .collect();
+    let mut local = local;
+    local.sort_unstable();
+    assert_eq!(local, vec![(0, 128), (128, 256)]);
+
+    // After a restart the restored recording recovers as any other.
+    let disk = archive.disk.clone();
+    drop(archive);
+    let mut archive = open(disk);
+    assert_eq!(archive.store.start(), 0);
+    assert_eq!(read_range(&mut archive, 0, 384), original);
+
+    // A restored segment is ordinary: it offloads again, its objects
+    // already there.
+    let objects = bucket.objects.len();
+    let _ = offload(&mut archive, &mut bucket, 3);
+    assert_eq!(archive.store.start(), 128);
+    assert_eq!(bucket.objects.len(), objects);
+}
+
+#[test]
+fn a_restore_whose_objects_do_not_verify_changes_nothing() {
+    let mut archive = fresh();
+    let mut bucket = Bucket::default();
+    let _ = offload(&mut archive, &mut bucket, 3);
+    let counter = archive.journal.next_counter();
+    let before = names(&archive.disk);
+    // A corrupt index object.
+    let key = ObjectKey::index(ARCHIVE, RECORDING, 0);
+    let good = bucket.objects.get(&key).cloned().unwrap();
+    let mut bad = good.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    bucket.objects.insert(key, bad);
+    assert!(matches!(
+        restore(&mut archive, &mut bucket),
+        Err(TieringError::IndexMismatch)
+    ));
+    // A corrupt range object.
+    bucket.objects.insert(key, good);
+    bucket.corrupt_on_read = true;
+    assert!(restore(&mut archive, &mut bucket).is_err());
+    assert_eq!(archive.journal.next_counter(), counter);
+    assert_eq!(names(&archive.disk), before);
+    assert_eq!(archive.store.start(), 128);
+}
+
+#[test]
+fn files_that_do_not_scan_whole_are_never_restored() {
+    let mut archive = fresh();
+    let (data, index) = archive.store.segment_paths(0);
+    let (data, index) = (
+        read_all(&archive.disk, &data),
+        read_all(&archive.disk, &index),
+    );
+    let _ = offload(&mut archive, &mut Bucket::default(), 3);
+    let before = names(&archive.disk);
+    // An index missing its last entry does not reach the start.
+    let short = &index[..index.len() - 32];
+    assert!(matches!(
+        archive.store.restore_below(&data, short),
+        Err(crate::segment::SegmentError::InvalidRestore { .. })
+    ));
+    let mut torn = data.clone();
+    torn[3] ^= 1;
+    assert!(matches!(
+        archive.store.restore_below(&torn, &index),
+        Err(crate::segment::SegmentError::InvalidRestore { .. })
+    ));
+    assert_eq!(names(&archive.disk), before, "temporary files removed");
+    assert_eq!(archive.store.start(), 128);
+}
+
+#[test]
+fn a_crash_after_the_start_was_lowered_gets_its_restore_record_on_open() {
+    let mut archive = fresh();
+    let (data, index) = archive.store.segment_paths(0);
+    let (data, index) = (
+        read_all(&archive.disk, &data),
+        read_all(&archive.disk, &index),
+    );
+    let _ = offload(&mut archive, &mut Bucket::default(), 3);
+    // The crash: the start is lowered, the restore record never chained.
+    assert_eq!(archive.store.restore_below(&data, &index).unwrap(), 0);
+    let disk = archive.disk.clone();
+    drop(archive);
+    let mut journal = super::journal::IntegrityJournal::open(disk.clone(), Path::new(DIR))
+        .unwrap()
+        .journal;
+    let records = journal.records().unwrap();
+    drop(journal);
+    // The offload record at the lowered start is not raised over.
+    assert!(
+        reconcile_floors(&mut disk.clone(), Path::new(DIR), &records)
+            .unwrap()
+            .is_empty()
+    );
+    let mut archive = open(disk);
+    assert_eq!(archive.store.start(), 0);
+    tiering()
+        .reconcile(
+            &mut archive.copies,
+            &mut archive.journal,
+            &mut archive.store,
+            &mut NoRelease,
+        )
+        .unwrap();
+    assert!(offloaded(&archive.journal.records().unwrap()).is_empty());
+    assert_eq!(segment_names(&archive.disk, 0), 2);
+    assert_eq!(archive.store.start(), 0);
+}
+
+#[test]
+fn a_restore_cut_short_before_its_rename_leaves_only_files_recovery_removes() {
+    let mut archive = fresh();
+    let _ = offload(&mut archive, &mut Bucket::default(), 3);
+    let before = names(&archive.disk);
+    let mut disk = archive.disk.clone();
+    drop(archive);
+    for name in [
+        format!("{RECORDING:016x}-{:016x}.seg.restoring", 0),
+        format!("{RECORDING:016x}-{:016x}.idx.restoring", 0),
+    ] {
+        let file = disk.create(&Path::new(DIR).join(name)).unwrap();
+        disk.write_at(&file, 0, b"partial").unwrap();
+    }
+    let archive = open(disk);
+    assert_eq!(names(&archive.disk), before);
+    assert_eq!(archive.store.start(), 128);
+}
+
+#[test]
+fn a_restore_recorded_without_its_copy_records_is_counted_on_reconcile() {
+    let mut archive = fresh();
+    let (data, index) = archive.store.segment_paths(0);
+    let (data, index) = (
+        read_all(&archive.disk, &data),
+        read_all(&archive.disk, &index),
+    );
+    let record = offload(&mut archive, &mut Bucket::default(), 3);
+    // The crash: the start lowered and the restore record chained, no
+    // copy record yet.
+    assert_eq!(archive.store.restore_below(&data, &index).unwrap(), 0);
+    let _ = archive
+        .journal
+        .record_restore(RECORDING, record.start, record.end, record.content)
+        .unwrap();
+    let local = |archive: &Archive| {
+        archive
+            .copies
+            .current()
+            .unwrap()
+            .into_iter()
+            .filter(|copy| {
+                copy.location == ARCHIVE
+                    && copy.state == CopyState::Verified
+                    && (copy.start, copy.end) == (0, 128)
+            })
+            .count()
+    };
+    assert_eq!(local(&archive), 0);
+    for _ in 0..2 {
+        tiering()
+            .reconcile(
+                &mut archive.copies,
+                &mut archive.journal,
+                &mut archive.store,
+                &mut NoRelease,
+            )
+            .unwrap();
+        assert_eq!(local(&archive), 1, "counted once, idempotently");
+    }
+}
+
+#[test]
+fn a_segment_a_purge_cut_is_never_offloaded() {
+    let disk = FaultDisk::default();
+    let dir = Path::new(DIR);
+    {
+        let geometry = super::retention_tests::geometry();
+        let mut store = crate::segment::SegmentStore::create(
+            disk.clone(),
+            dir,
+            RECORDING,
+            geometry,
+            crate::segment::SyncPolicy::None,
+            0,
+        )
+        .unwrap();
+        let mut journal = super::journal::IntegrityJournal::open(disk.clone(), dir)
+            .unwrap()
+            .journal;
+        for index in 0..6u8 {
+            let bytes = [index; 64];
+            store.append(u64::from(index) * 64, &bytes).unwrap();
+            let _ = journal
+                .seal_segment(RECORDING, u64::from(index) * 64, &bytes, false)
+                .unwrap();
+        }
+        store.close_synced().unwrap();
+        let mut copies = super::copies::CopyCatalog::open(disk.clone(), dir, &mut journal).unwrap();
+        for location in [[30; 32], [31; 32]] {
+            copies
+                .record(
+                    super::copies::CopyRecord {
+                        sequence: 0,
+                        recording: RECORDING,
+                        start: 0,
+                        end: 384,
+                        location,
+                        digest: [1; 32],
+                        retain_until_ns: 0,
+                        state: CopyState::Verified,
+                        enforcement: Enforcement::ObjectLock,
+                    },
+                    &mut journal,
+                )
+                .unwrap();
+        }
+        // A purge to a seal boundary inside the first segment.
+        let mut store = crate::segment::SegmentStore::recover(
+            disk.clone(),
+            dir,
+            RECORDING,
+            geometry,
+            crate::segment::SyncPolicy::None,
+        )
+        .unwrap()
+        .store;
+        let _ = store.sync().unwrap();
+        assert_eq!(store.purge_before(64).unwrap(), 64);
+        let _ = journal.record_purge(RECORDING, 0, 64, [2; 32]).unwrap();
+    }
+    let mut archive = open(disk);
+    assert_eq!(archive.store.lowest_finished_segment(), Some((64, 128)));
+    let mut bucket = Bucket::default();
+    let uploaded = upload(&mut archive, &mut bucket, 3).unwrap();
+    let counter = archive.journal.next_counter();
+    assert!(matches!(
+        commit(&mut archive, &uploaded, 3),
+        Err(TieringError::NotEligible {
+            why: "a purge cut the segment",
+            ..
+        })
+    ));
+    assert_eq!(archive.journal.next_counter(), counter);
+    assert_eq!(archive.store.start(), 64);
+}

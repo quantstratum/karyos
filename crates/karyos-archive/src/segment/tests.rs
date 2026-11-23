@@ -2240,6 +2240,7 @@ fn a_leftover_floor_temporary_is_removed_at_recovery() {
                 Floor {
                     start: 300,
                     offloaded: None,
+                    restored: false,
                 },
             ),
         )
@@ -2261,10 +2262,12 @@ fn a_floor_record_with_an_offload_floor_round_trips_and_an_inverted_one_is_damag
     let plain = Floor {
         start: 300,
         offloaded: None,
+        restored: false,
     };
     let tiered = Floor {
         start: 256,
         offloaded: Some(0),
+        restored: false,
     };
     assert_eq!(encode_floor(RECORDING, plain).len(), FLOOR_LEN);
     assert_eq!(encode_floor(RECORDING, tiered).len(), OFFLOAD_FLOOR_LEN);
@@ -2282,6 +2285,7 @@ fn a_floor_record_with_an_offload_floor_round_trips_and_an_inverted_one_is_damag
     let inverted = Floor {
         start: 0,
         offloaded: Some(128),
+        restored: false,
     };
     assert_eq!(
         decode_floor(RECORDING, &encode_floor(RECORDING, inverted)),
@@ -2341,7 +2345,59 @@ fn raising_a_floor_before_a_scan_never_lowers_it() {
         read_floor(&mut probe, Path::new(DIR), RECORDING).unwrap(),
         Some(Floor {
             start: 128,
-            offloaded: Some(0)
+            offloaded: Some(0),
+            restored: false
         })
     );
+}
+
+#[test]
+fn a_restore_whose_lost_ranges_would_exceed_the_bound_is_refused() {
+    let disk = FaultDisk::default();
+    let mut store = SegmentStore::create(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+        0,
+    )
+    .unwrap();
+    // Segment 0 holds a lost range; the recording goes on past segment 1.
+    let mut at = store.append(0, &stream(40)).unwrap();
+    at = store.append_gap(at, 80).unwrap();
+    for chunk in stream(420).chunks(40) {
+        at = store.append(at, chunk).unwrap();
+    }
+    let _ = store.sync().unwrap();
+    let (data, index) = store.segment_paths(0);
+    let mut probe = disk.clone();
+    let read = |probe: &mut FaultDisk, path: &Path| {
+        let file = probe.open_read(path).unwrap();
+        let mut bytes = vec![0u8; usize::try_from(probe.len(&file).unwrap()).unwrap()];
+        probe.read_at(&file, 0, &mut bytes).unwrap();
+        bytes
+    };
+    let (data, index) = (read(&mut probe, &data), read(&mut probe, &index));
+    assert_eq!(store.raise_start_for_offload().unwrap(), 128);
+    let left = store.files_left_below_floor().unwrap();
+    let bases: Vec<u64> = left.iter().map(|(base, _, _)| *base).collect();
+    store.remove_left_below_floor(&bases).unwrap();
+    // The recording's own lost ranges, at the bound already.
+    let fake: Vec<(u64, u64)> = (0..MAX_GAPS as u64)
+        .map(|index| ((1 << 40) | (index * 2), (1 << 40) | (index * 2 + 1)))
+        .collect();
+    store.gaps = fake.clone();
+    let before = probe.list(Path::new(DIR)).unwrap();
+    assert!(matches!(
+        store.restore_below(&data, &index),
+        Err(SegmentError::InvalidRestore { .. })
+    ));
+    assert_eq!(probe.list(Path::new(DIR)).unwrap(), before);
+    assert_eq!(store.start(), 128);
+    // One fewer: the restored range fits, merged in order.
+    store.gaps = fake[1..].to_vec();
+    assert_eq!(store.restore_below(&data, &index).unwrap(), 0);
+    assert_eq!(store.gaps.len(), MAX_GAPS);
+    assert_eq!(store.gaps.first(), Some(&(40, 80)));
 }
