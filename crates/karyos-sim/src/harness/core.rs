@@ -714,6 +714,26 @@ pub fn drive<C: ConsensusCore, D: Disk + Clone>(
     drive_metered(core, log, (None, None), send, apply, observe)
 }
 
+/// A fault injected into [`drive_faulty`], so the harness checks can be
+/// shown to catch what a faulty driver or disk would do with a real core
+/// behind it (karyos#1038). Tests only: every production path drives with
+/// [`DriveFault::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DriveFault {
+    /// None: the five steps in order.
+    #[default]
+    None,
+    /// Messages that wait for persistence leave before it (step 4 before
+    /// step 2).
+    ReleaseEarly,
+    /// A Ready's fresh entries are applied before they are written, as a
+    /// driver that took them for committed would.
+    ApplyFresh,
+    /// The log is not synced, yet the Ready's last entry is reported
+    /// durable, as a disk that acknowledges an unsynced write would.
+    SkipSync,
+}
+
 /// [`drive`], the core's reads spending `budget` when one is given, and
 /// its views naming `base` as the node's latest snapshot.
 ///
@@ -724,6 +744,29 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
     core: &mut C,
     log: &mut RaftLog<D>,
     (budget, base): (Option<&ReadBudget>, Option<SnapshotBase>),
+    send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
+    apply: &mut dyn FnMut(&Entry, Applying),
+    observe: &mut dyn FnMut(Step),
+) -> Result<(), DriveError> {
+    drive_faulty(
+        core,
+        log,
+        (budget, base, DriveFault::None),
+        send,
+        apply,
+        observe,
+    )
+}
+
+/// [`drive_metered`] with `fault` injected (karyos#1038, tests).
+///
+/// # Errors
+///
+/// As [`drive`].
+pub fn drive_faulty<C: ConsensusCore, D: Disk + Clone>(
+    core: &mut C,
+    log: &mut RaftLog<D>,
+    (budget, base, fault): (Option<&ReadBudget>, Option<SnapshotBase>, DriveFault),
     send: &mut dyn FnMut(NodeId, C::Message, Option<Release>),
     apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
@@ -742,6 +785,32 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
         for (to, message) in ready.messages {
             send(to, message, None);
         }
+        let needs = ready.entries.last().map(|entry| entry.index);
+        let mut after_persist = ready.after_persist;
+        // Faults that act before persistence (tests).
+        match fault {
+            DriveFault::ReleaseEarly => {
+                for (to, message) in after_persist.drain(..) {
+                    let release = Release {
+                        needs,
+                        needs_state: ready.hard_state,
+                        durable: log.durable_index(),
+                        stored_state: log.hard_state(),
+                    };
+                    send(to, message, Some(release));
+                }
+            }
+            DriveFault::ApplyFresh => {
+                for entry in &ready.entries {
+                    let applying = Applying {
+                        durable: log.durable_index(),
+                        logged_term: log.term(entry.index),
+                    };
+                    apply(entry, applying);
+                }
+            }
+            DriveFault::None | DriveFault::SkipSync => {}
+        }
         // 2. Persistence.
         if let Some(from) = ready.truncate_from {
             log.truncate_suffix(from)?;
@@ -752,7 +821,11 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
             if !ready.entries.is_empty() {
                 let _ = log.append(&ready.entries)?;
             }
-            log.sync()?
+            match fault {
+                // Reported durable, never synced (tests).
+                DriveFault::SkipSync => needs.or_else(|| log.durable_index()),
+                _ => log.sync()?,
+            }
         };
         if let Some(state) = ready.hard_state {
             log.save_hard_state(state)?;
@@ -776,8 +849,7 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
                 .collect(),
         });
         // 4. What depends on it.
-        let needs = ready.entries.last().map(|entry| entry.index);
-        for (to, message) in ready.after_persist {
+        for (to, message) in after_persist {
             let release = Release {
                 needs,
                 needs_state: ready.hard_state,

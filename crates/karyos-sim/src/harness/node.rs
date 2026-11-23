@@ -49,9 +49,9 @@ use karyos_cluster::snapshot::{Section, SectionKind, SnapshotConfig, SnapshotSto
 use karyos_cluster::{Entry, LogError, RaftLog};
 
 use super::core::{
-    Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, Limit, Limits,
-    LogView, NotLeader, ReadBudget, Refused, Release, SnapshotBase, Step, TransferRefused,
-    Unsupported, drive_metered,
+    Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, DriveFault, Limit,
+    Limits, LogView, NotLeader, ReadBudget, Refused, Release, SnapshotBase, Step, TransferRefused,
+    Unsupported, drive_faulty,
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
@@ -1283,6 +1283,10 @@ pub struct ServerNode<C: ConsensusCore> {
     snapshots: Option<SnapshotStore<SimDisk>>,
     /// Its latest snapshot's base.
     base: Option<SnapshotBase>,
+    /// The fault its driver injects (karyos#1038, tests).
+    drive_fault: DriveFault,
+    /// Its service records altered answers (karyos#1038, tests).
+    alters_responses: bool,
 }
 
 /// Why a server could not be created.
@@ -1410,6 +1414,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             compaction: None,
             snapshots: None,
             base: None,
+            drive_fault: DriveFault::None,
+            alters_responses: false,
         };
         if let Some(configuration) = configuration {
             server.record_configuration(configuration, None);
@@ -1451,6 +1457,8 @@ impl<C: ConsensusCore> ServerNode<C> {
             compaction: None,
             snapshots: None,
             base: None,
+            drive_fault: DriveFault::None,
+            alters_responses: false,
         };
         server.start();
         server
@@ -1754,6 +1762,17 @@ impl<C: ConsensusCore> ServerNode<C> {
         self.recorder.borrow_mut().observations.push(observation);
     }
 
+    /// The server with `drive` injected into its driver and, with
+    /// `alters_responses`, its service's recorded answers altered: the
+    /// faults that show the harness checks catch a faulty driver, disk or
+    /// service with a real core behind them (karyos#1038, tests).
+    #[must_use]
+    pub fn with_faults(mut self, drive: DriveFault, alters_responses: bool) -> Self {
+        self.drive_fault = drive;
+        self.alters_responses = alters_responses;
+        self
+    }
+
     /// Drives the core, then records its commit and positions.
     fn duty(&mut self, out: &mut Outbox<Wire<C::Message>>) {
         let Some((mut core, mut log)) = self.running.take() else {
@@ -1764,10 +1783,10 @@ impl<C: ConsensusCore> ServerNode<C> {
         let mut applied = Vec::new();
         let mut snapshot_to = Vec::new();
         let budget = self.limits.is_some().then_some(&self.budget);
-        let driven = drive_metered(
+        let driven = drive_faulty(
             &mut core,
             &mut log,
-            (budget, self.base),
+            (budget, self.base, self.drive_fault),
             &mut |to, message, release| {
                 if let Some(release) = release {
                     recorder
@@ -1858,7 +1877,13 @@ impl<C: ConsensusCore> ServerNode<C> {
             let deduplicated = self.service.deduplicated();
             let answer = self.service.apply(&served);
             let replayed = self.service.deduplicated() > deduplicated;
-            let response = answer.as_ref().map(|(_, ret)| ret.canonical());
+            let mut response = answer.as_ref().map(|(_, ret)| ret.canonical());
+            // A faulty service's answer (tests): its last byte flipped.
+            if self.alters_responses
+                && let Some(last) = response.as_mut().and_then(|bytes| bytes.last_mut())
+            {
+                *last ^= 0xFF;
+            }
             if let Some((command, ret)) = answer
                 && self.pending.remove(&(command.client, command.sequence))
                 && acts
@@ -2373,6 +2398,9 @@ pub struct ClientNode {
     recorder: Shared,
     /// The highest generation it has seen, 0 before the first answer.
     generation: u64,
+    /// It records each read with a value no one wrote (karyos#1038,
+    /// tests): a faulty client.
+    corrupts_reads: bool,
 }
 
 impl ClientNode {
@@ -2389,7 +2417,16 @@ impl ClientNode {
             refused: false,
             recorder,
             generation: 0,
+            corrupts_reads: false,
         }
+    }
+
+    /// The client recording each read with a value no one wrote: a faulty
+    /// client (karyos#1038, tests).
+    #[must_use]
+    pub fn corrupting_reads(mut self) -> Self {
+        self.corrupts_reads = true;
+        self
     }
 
     /// Its open request's sequence number, if one waits for its answer.
@@ -2488,6 +2525,13 @@ impl<M> Node<Wire<M>> for ClientNode {
                     return;
                 }
                 self.generation = generation;
+                let ret = match ret {
+                    Ret::Values(mut values) if self.corrupts_reads => {
+                        values.push(b"never written".to_vec());
+                        Ret::Values(values)
+                    }
+                    other => other,
+                };
                 let mut recorder = self.recorder.borrow_mut();
                 let _ = recorder.history.ret(self.id, ret);
                 recorder.observations.push(Observation::Success {

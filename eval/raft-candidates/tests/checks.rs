@@ -22,7 +22,7 @@
 
 use karyos_raft_eval::raft_rs::RaftRs;
 use karyos_sim::harness::check::Violation;
-use karyos_sim::harness::core::{ConsensusCore, LogView, Persisted, Ready, Refused};
+use karyos_sim::harness::core::{ConsensusCore, DriveFault, LogView, Persisted, Ready, Refused};
 use karyos_sim::harness::node::Breach;
 use karyos_sim::harness::workloads::{self, Case, W1};
 use karyos_sim::net::NodeId;
@@ -241,6 +241,87 @@ fn a_core_that_reports_no_last_index_over_a_written_log_is_caught() {
     let violation = violation::<Mutant<UNREPORTED>>();
     assert!(
         matches!(violation, Violation::PositionsOutOfOrder { .. }),
+        "{violation:?}"
+    );
+}
+
+/// The case with `faults` injected around the unmutated adapter
+/// (karyos#1038): the core is real, the driver, disk, service or client
+/// is faulty.
+fn faulty(faults: workloads::Faults, schedule: Vec<(u64, workloads::Action)>) -> Violation {
+    let mut case = case();
+    case.faults = faults;
+    case.schedule.extend(schedule);
+    case.schedule.sort_by_key(|(at, _)| *at);
+    let outcome = workloads::run::<RaftRs>(&case, 1).unwrap();
+    outcome.safety.unwrap_err()
+}
+
+fn drive(node: NodeId, fault: DriveFault) -> workloads::Faults {
+    workloads::Faults {
+        drive: vec![(node, fault)],
+        ..workloads::Faults::default()
+    }
+}
+
+#[test]
+fn a_driver_that_applies_fresh_entries_is_caught() {
+    let violation = faulty(drive(1, DriveFault::ApplyFresh), Vec::new());
+    assert!(
+        matches!(violation, Violation::AppliedNotDurable { .. }),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_driver_that_releases_before_persistence_is_caught() {
+    let violation = faulty(drive(1, DriveFault::ReleaseEarly), Vec::new());
+    assert!(
+        matches!(violation, Violation::ReleasedBeforePersisted { .. }),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_disk_that_acknowledges_unsynced_writes_loses_them_on_a_crash() {
+    let violation = faulty(
+        drive(1, DriveFault::SkipSync),
+        vec![
+            (300, workloads::Action::Crash(1)),
+            (340, workloads::Action::Restart(1)),
+        ],
+    );
+    assert!(
+        matches!(
+            violation,
+            Violation::DurableLost { node: 1, .. } | Violation::CommittedTruncated { node: 1, .. }
+        ),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_service_that_answers_differently_is_caught() {
+    let faults = workloads::Faults {
+        altered_responses: vec![1],
+        ..workloads::Faults::default()
+    };
+    let violation = faulty(faults, Vec::new());
+    assert!(
+        matches!(violation, Violation::DivergentResponse { .. }),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_client_that_reads_a_value_never_written_is_caught() {
+    let faults = workloads::Faults {
+        corrupt_reads: vec![0],
+        ..workloads::Faults::default()
+    };
+    let violation = faulty(faults, Vec::new());
+    assert!(
+        matches!(violation, Violation::NotLinearizable(_)),
         "{violation:?}"
     );
 }

@@ -547,6 +547,21 @@ pub struct Case {
     /// follower must really be that far behind, or the case fails
     /// ([`Failed::NotBehind`]; karyos#899 review).
     pub behind: Option<(NodeId, u64)>,
+    /// Faults injected into servers and clients, so the checks can be
+    /// shown to catch a faulty driver, disk, service or client with a real
+    /// core behind them (karyos#1038). Empty in every workload.
+    pub faults: Faults,
+}
+
+/// What [`Case::faults`] injects (karyos#1038, tests).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Faults {
+    /// Servers whose driver injects a fault.
+    pub drive: Vec<(NodeId, super::core::DriveFault)>,
+    /// Servers whose service records altered answers.
+    pub altered_responses: Vec<NodeId>,
+    /// Clients, by index, that record each read with a value no one wrote.
+    pub corrupt_reads: Vec<usize>,
 }
 
 impl Case {
@@ -595,6 +610,7 @@ impl Case {
             compaction: None,
             handover: None,
             retried: false,
+            faults: Faults::default(),
         }
     }
 }
@@ -893,6 +909,16 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         if let Some(compaction) = case.compaction {
             server = server.with_compaction(compaction);
         }
+        let drive_fault = case
+            .faults
+            .drive
+            .iter()
+            .find(|(node, _)| *node == id)
+            .map_or(super::core::DriveFault::None, |(_, fault)| *fault);
+        let alters = case.faults.altered_responses.contains(&id);
+        if drive_fault != super::core::DriveFault::None || alters {
+            server = server.with_faults(drive_fault, alters);
+        }
         let index = usize::try_from(id).map_err(|_| RunError::Count)?;
         let drift = case.drift_ppm.get(index).copied().unwrap_or(0);
         let _ = sim
@@ -910,8 +936,11 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             .ok()
             .and_then(|index| standby_end.checked_add(index))
             .ok_or(RunError::Count)?;
-        let client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
+        let mut client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
             .with_retry_after(case.retry_after);
+        if case.faults.corrupt_reads.contains(&index) {
+            client = client.corrupting_reads();
+        }
         let added = sim
             .add_node(Member::Client(client), 0, 0)
             .map_err(RunError::Sim)?;
