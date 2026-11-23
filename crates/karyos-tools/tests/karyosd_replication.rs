@@ -275,6 +275,14 @@ fn a_recording_replicates_between_two_daemons_and_counts_only_after_verifying() 
     assert!(replica.stop().success());
     let first = counted(&replica_archive);
     assert!(!first.is_empty());
+    // The baseline covers the recording from its start, without a hole.
+    let mut sorted = first.clone();
+    sorted.sort_unstable_by_key(|(start, _, _)| *start);
+    assert_eq!(sorted[0].0, 0, "{sorted:?}");
+    assert!(
+        sorted.windows(2).all(|pair| pair[0].1 == pair[1].0),
+        "{sorted:?}"
+    );
     assert!(
         first
             .iter()
@@ -313,7 +321,15 @@ fn a_recording_replicates_between_two_daemons_and_counts_only_after_verifying() 
         assert!(Instant::now() < deadline, "{}", log(&source_log));
         std::thread::sleep(Duration::from_millis(20));
     }
-    std::thread::sleep(Duration::from_secs(2));
+    // Proof of the replay: the restarted replica verifies again, on its
+    // own bytes, the seal of every range it had counted.
+    wait_for(
+        &second_log,
+        "replica range already counted",
+        first.len(),
+        "restarted replica",
+        &source_log,
+    );
     assert!(replica.stop().success());
     let again = counted(&replica_archive);
     assert!(

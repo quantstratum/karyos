@@ -64,6 +64,11 @@ use crate::args::ReplicaOption;
 /// intervals (ADR-0102 decision 8).
 pub const LAG_STALE: Duration = Duration::from_secs(3);
 
+/// How long a replica stays away to make its source ask again from its
+/// start: past the default image liveness timeout (10 s), so the source's
+/// publication sees the receiver gone, then back (ADR-0102 decision 7).
+pub const REJOIN_PAUSE: Duration = Duration::from_secs(12);
+
 /// Messages read per duty at most.
 const MESSAGES_PER_DUTY: usize = 16;
 
@@ -122,6 +127,11 @@ pub struct ReplicaCounters {
     pub interrupted: u64,
     /// Incarnations followed.
     pub incarnations: u64,
+    /// Rejoins: payload was lost, so the replica left for the source to
+    /// ask again from its start.
+    pub rejoins: u64,
+    /// Seals of ranges already counted, replayed and verified again.
+    pub already_counted: u64,
     /// Store, journal or catalog failures.
     pub failures: u64,
 }
@@ -136,6 +146,8 @@ struct ReplicaListener {
     /// one still exposed after the newest retired is never followed again.
     newest: Option<u64>,
     state: ReplicaState<StdDisk>,
+    /// Away until then, to make the source ask again.
+    away_until: Option<Instant>,
     buf: Vec<u8>,
 }
 
@@ -160,6 +172,12 @@ struct ReplicaState<D: Disk + Clone> {
     /// The store failed: it refuses everything until reopened, which the
     /// next request's start does first.
     store_failed: bool,
+    /// The request whose start setup failed: its payload is lost.
+    failed_start: Option<u64>,
+    /// Payload of the request was lost (a failed start, or bytes past the
+    /// tail): the source must ask again from its start, which the
+    /// listener makes it do by leaving for [`REJOIN_PAUSE`].
+    rejoin: bool,
 }
 
 /// Every replica of a daemon.
@@ -303,6 +321,7 @@ impl Replicas {
                 subscription,
                 image: None,
                 newest: None,
+                away_until: None,
                 state: ReplicaState {
                     recording_id: option.recording_id,
                     started: None,
@@ -315,6 +334,8 @@ impl Replicas {
                     dir,
                     disk: StdDisk,
                     store_failed: false,
+                    failed_start: None,
+                    rejoin: false,
                 },
                 buf: vec![0; MAX_MESSAGE],
             });
@@ -393,6 +414,28 @@ impl ReplicaListener {
         now: Instant,
         counters: &mut ReplicaCounters,
     ) -> bool {
+        if let Some(until) = self.away_until {
+            if now < until {
+                return false;
+            }
+            match driver
+                .add_network_subscription(self.option.stream_id, &listen_channel(self.option.bind))
+            {
+                Ok(subscription) => {
+                    self.subscription = subscription;
+                    self.away_until = None;
+                    tracing::info!(
+                        recording_id = self.option.recording_id,
+                        "replica back: the source asks again from its start"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "replica subscription not added again");
+                    self.away_until = now.checked_add(Duration::from_secs(1));
+                    return false;
+                }
+            }
+        }
         let mut worked = self.follow(driver, counters);
         for _ in 0..MESSAGES_PER_DUTY {
             let Some((_, _, reader)) = self.image.as_mut() else {
@@ -417,8 +460,34 @@ impl ReplicaListener {
             self.state
                 .take(buf.get(..length).unwrap_or_default(), now, counters);
             self.buf = buf;
+            if self.state.rejoin {
+                self.leave(driver, now, counters);
+                return true;
+            }
         }
         worked
+    }
+
+    /// Leaves the stream for [`REJOIN_PAUSE`]: the source sees its
+    /// receiver gone, then back, and asks again from its start, so payload
+    /// this replica lost is sent again (ADR-0102 decision 7).
+    fn leave(
+        &mut self,
+        driver: &mut EmbeddedDriver<SharedTerms>,
+        now: Instant,
+        counters: &mut ReplicaCounters,
+    ) {
+        self.state.rejoin = false;
+        self.state.started = None;
+        self.state.failed_start = None;
+        self.image = None;
+        let _ = driver.remove_network_subscription(self.subscription);
+        self.away_until = now.checked_add(REJOIN_PAUSE);
+        counters.rejoins = counters.rejoins.saturating_add(1);
+        tracing::warn!(
+            recording_id = self.option.recording_id,
+            "replica lost payload: it leaves so the source asks again from its start"
+        );
     }
 
     /// Follows the newest image of the stream from the source's address:
@@ -532,6 +601,7 @@ impl<D: Disk + Clone> ReplicaState<D> {
                 }
                 if self.started != Some(bytes.correlation_id) {
                     counters.ignored = counters.ignored.saturating_add(1);
+                    self.rejoin |= self.failed_start == Some(bytes.correlation_id);
                     return;
                 }
                 match self
@@ -541,6 +611,7 @@ impl<D: Disk + Clone> ReplicaState<D> {
                     Ok(_) => {}
                     Err(ReceiveError::PastTail { tail, start }) => {
                         counters.replication_gaps = counters.replication_gaps.saturating_add(1);
+                        self.rejoin = true;
                         tracing::warn!(
                             recording_id,
                             tail,
@@ -566,6 +637,7 @@ impl<D: Disk + Clone> ReplicaState<D> {
             ReplicationMessage::SourceSeal(seal) => {
                 if self.started != Some(seal.correlation_id) {
                     counters.ignored = counters.ignored.saturating_add(1);
+                    self.rejoin |= self.failed_start == Some(seal.correlation_id);
                     return;
                 }
                 // The bytes are durable before the range they hold counts.
@@ -599,6 +671,15 @@ impl<D: Disk + Clone> ReplicaState<D> {
                             "replica seal does not verify on its bytes: nothing counted"
                         );
                     }
+                    Ok(Verdict::AlreadyCounted) => {
+                        counters.already_counted = counters.already_counted.saturating_add(1);
+                        tracing::info!(
+                            recording_id,
+                            start = seal.seal.start,
+                            end = seal.seal.end,
+                            "replica range already counted"
+                        );
+                    }
                     Ok(_) => {}
                     Err(ReceiveError::SealOutOfRange { start, end, .. }) => {
                         counters.mismatches = counters.mismatches.saturating_add(1);
@@ -630,16 +711,23 @@ impl<D: Disk + Clone> ReplicaState<D> {
                 }
                 // Started only once its start is set up; a failure is
                 // tried again on the next status, at least once a second.
-                if self.started != Some(status.correlation_id)
-                    && self.start_at(status.source_start, counters)
-                {
-                    self.started = Some(status.correlation_id);
-                    tracing::info!(
-                        recording_id,
-                        correlation_id = status.correlation_id,
-                        source_start = status.source_start,
-                        "replica request started"
-                    );
+                let correlation_id = status.correlation_id;
+                if self.started != Some(correlation_id) {
+                    if !self.start_at(status.source_start, counters) {
+                        self.failed_start = Some(correlation_id);
+                    } else if !(self.rejoin && self.failed_start == Some(correlation_id)) {
+                        // Unless payload after a failed start was lost:
+                        // the listener then leaves, and the next request
+                        // starts over.
+                        self.failed_start = None;
+                        self.started = Some(correlation_id);
+                        tracing::info!(
+                            recording_id,
+                            correlation_id,
+                            source_start = status.source_start,
+                            "replica request started"
+                        );
+                    }
                 }
             }
             State::Interrupted => {
@@ -835,6 +923,8 @@ mod tests {
             dir: dir.clone(),
             disk: disk.clone(),
             store_failed: false,
+            failed_start: None,
+            rejoin: false,
         };
         (state, disk, dir)
     }
@@ -877,6 +967,53 @@ mod tests {
         );
         assert_eq!(state.store.written(), 100);
         assert_eq!(counters.gaps_recorded, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `RecordingBytes` of request `correlation_id` at `start`.
+    fn bytes(correlation_id: u64, start: u64) -> Vec<u8> {
+        let mut out = vec![0u8; MAX_MESSAGE];
+        let length =
+            ReplicationMessage::RecordingBytes(karyos_archive::replication::RecordingBytes {
+                correlation_id,
+                recording_id: RECORDING,
+                start,
+                bytes: &[1; 32],
+            })
+            .encode(&mut out)
+            .unwrap();
+        out.truncate(length);
+        out
+    }
+
+    /// Codex P2 2 (#1219): payload after a failed start is lost, and the
+    /// source has moved on: the replica does not start that request late,
+    /// but asks to leave, so the source asks again from its start. A start
+    /// that fails with nothing lost is simply retried (above).
+    #[test]
+    fn payload_lost_after_a_failed_start_makes_the_replica_rejoin() {
+        let (mut state, disk, dir) = state("rejoin");
+        let mut counters = ReplicaCounters::default();
+        disk.armed.set(1);
+        state.take(&streaming(5, 100), Instant::now(), &mut counters);
+        assert_eq!(state.failed_start, Some(5));
+        assert!(!state.rejoin);
+        // The request's payload arrives while it is not started: lost.
+        state.take(&bytes(5, 100), Instant::now(), &mut counters);
+        assert!(state.rejoin, "lost payload asks for a rejoin");
+        assert_eq!(counters.ignored, 1);
+        // The next status reopens the store but does not start the request.
+        state.take(&streaming(5, 100), Instant::now(), &mut counters);
+        assert_eq!(state.started, None);
+        assert!(state.rejoin);
+        // Bytes past the tail of a started request ask for a rejoin too.
+        state.rejoin = false;
+        state.failed_start = None;
+        state.take(&streaming(6, 100), Instant::now(), &mut counters);
+        assert_eq!(state.started, Some(6));
+        state.take(&bytes(6, 500), Instant::now(), &mut counters);
+        assert!(state.rejoin);
+        assert_eq!(counters.replication_gaps, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

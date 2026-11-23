@@ -509,6 +509,26 @@ mod transport {
         ));
     }
 
+    /// Codex P2 1 (#1219): a purge between the accept and the first poll
+    /// interrupts the request before any start marker, so the purged start
+    /// is never advertised as the request's.
+    #[test]
+    fn a_purge_before_the_first_poll_interrupts_without_a_start_marker() {
+        let (_dirs, source_dir, _) = dirs("purge-first");
+        let (mut store, seals) = source(&source_dir);
+        let mut sender =
+            Sender::accept(request(0, u64::MAX, Mode::Continuous), true, 0, &seals).unwrap();
+        assert_eq!(store.purge_before(100).unwrap(), 100);
+        let mut out = Vec::new();
+        sender
+            .poll(&mut store, &seals, false, usize::MAX, &mut out)
+            .unwrap();
+        assert!(
+            matches!(out.as_slice(), [Outgoing::Status(status)] if status.state == State::Interrupted && status.source_start == 100),
+            "{out:?}"
+        );
+    }
+
     #[test]
     fn requests_are_refused_with_their_codes() {
         let (_dirs, source_dir, _) = dirs("refused");

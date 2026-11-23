@@ -242,6 +242,13 @@ impl Sender {
         }
         let recording = self.request.recording_id;
         let sealed_end = sealed_end(seals, recording, store.start());
+        // A purge past the next position interrupts the request first:
+        // a start marker would advertise the purged start as the request's,
+        // which the source would then read as an interior gap.
+        if store.start() > self.next {
+            out.push(self.finish(State::Interrupted, store, sealed_end));
+            return Ok(());
+        }
         // The start comes first: a `streaming` status, whose
         // `source_start` is where the request starts, before any bytes
         // (ADR-0102 decision 6).
@@ -252,10 +259,6 @@ impl Sender {
                 store,
                 sealed_end,
             )));
-        }
-        if store.start() > self.next {
-            out.push(self.finish(State::Interrupted, store, sealed_end));
-            return Ok(());
         }
         let mut left = budget;
         let wanted = |seal: &SealRecord, sent_end: u64, until: u64| {
