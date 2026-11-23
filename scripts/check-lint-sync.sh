@@ -40,13 +40,13 @@ io_expects="$(cd "$io" && find src -name '*.rs' -print0 | sort -z | xargs -0 per
 while IFS= read -r file; do
     [ -z "$file" ] && continue
     case "$file" in
-        src/uring.rs | src/xdp.rs) ;;
+        src/uring.rs | src/xdp.rs | src/lib.rs) ;;
         *)
-            echo "karyos-io expects unsafe_code outside src/uring.rs and src/xdp.rs: $file" >&2
+            echo "karyos-io expects unsafe_code outside src/uring.rs, src/xdp.rs and lib.rs's mod linux_sys: $file" >&2
             status=1
             ;;
     esac
-    if ! perl -0ne 'exit(/#\[expect\(\s*unsafe_code,\s*reason\s*=\s*"[^"]+",?\s*\)\]\s*pub mod ring;/ ? 0 : 1)' "$io/$file"; then
+    if ! perl -0ne 'exit(/#\[expect\(\s*unsafe_code,\s*reason\s*=\s*"[^"]+",?\s*\)\]\s*(pub mod ring|mod linux_sys);/ ? 0 : 1)' "$io/$file"; then
         echo "karyos-io $file: the expect(unsafe_code, reason = \"...\") must sit on mod ring" >&2
         status=1
     fi

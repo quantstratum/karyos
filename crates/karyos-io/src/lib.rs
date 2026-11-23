@@ -23,6 +23,12 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
 
 pub mod backend;
 pub mod lanes;
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "the error queue recvmsg of the etf route, under the joint libc record (SPEC.md §14)"
+)]
+mod linux_sys;
 pub mod sockets;
 #[cfg(any(feature = "uring", feature = "test-hooks", test))]
 pub mod uring;
