@@ -37,6 +37,9 @@
 //!   participant.
 //! - **Cost.** The exporter attaches to each driver as a tool, so it takes
 //!   one of the driver's tool slots (`max_tools`) while attached.
+//! - **One definition** (karyos#706): [`families`] is the pass as metric
+//!   families, which [`render`] writes and `karyos-otlp` exports over
+//!   OTLP, so the two views share every name, label and value.
 //! - **Trace latencies** are the agent's window (M6c): observed latencies,
 //!   never trace verdicts; a quantile's bound past the histogram's range is
 //!   left out rather than written as infinite.
@@ -158,16 +161,112 @@ const TYPE_APPLICATION_EVENT: u64 = karyos_sys::counters::TYPE_APPLICATION_EVENT
 const TYPE_APPLICATION_GAUGE: u64 = karyos_sys::counters::TYPE_APPLICATION_GAUGE;
 const TYPE_TRACE_POINT: u64 = karyos_sys::counters::TYPE_TRACE_POINT;
 
-/// One metric family: its type, help and sample lines.
-struct Family {
-    kind: &'static str,
-    help: &'static str,
-    samples: Vec<String>,
+/// A metric family's type, as Prometheus and OTLP both name it: a
+/// `counter` is cumulative and monotonic (an OTLP monotonic sum), a
+/// `gauge` a value at the sampling pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MetricKind {
+    /// Cumulative and monotonic: Prometheus `counter`, OTLP monotonic sum.
+    Counter,
+    /// The value at the sampling pass: Prometheus and OTLP `gauge`.
+    Gauge,
+}
+
+impl MetricKind {
+    /// Its Prometheus `TYPE` name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+        }
+    }
+
+    fn of(kind: &str) -> Self {
+        if kind == "counter" {
+            Self::Counter
+        } else {
+            Self::Gauge
+        }
+    }
+}
+
+/// A sample's value: unsigned, or signed for the families of
+/// [`SIGNED_FAMILIES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MetricValue {
+    /// An unsigned value.
+    Unsigned(u64),
+    /// A signed value.
+    Signed(i64),
+}
+
+impl std::fmt::Display for MetricValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsigned(value) => value.fmt(f),
+            Self::Signed(value) => value.fmt(f),
+        }
+    }
+}
+
+impl From<u64> for MetricValue {
+    fn from(value: u64) -> Self {
+        Self::Unsigned(value)
+    }
+}
+
+impl From<u8> for MetricValue {
+    fn from(value: u8) -> Self {
+        Self::Unsigned(value.into())
+    }
+}
+
+impl From<i64> for MetricValue {
+    fn from(value: i64) -> Self {
+        Self::Signed(value)
+    }
+}
+
+/// The families whose values are signed, every one a `gauge`; every other
+/// family's values are unsigned. An OTLP export registers each family as
+/// an instrument of its value's type before any pass is read, so the two
+/// sets are fixed here (karyos#706).
+pub const SIGNED_FAMILIES: [&str; 3] = [
+    "karyos_lane_headroom",
+    "karyos_subscriber_lag",
+    "karyos_trace_latency_ns",
+];
+
+/// One sample of a family: its labels, in order, and its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricSample {
+    /// Label names and values, unescaped.
+    pub labels: Vec<(&'static str, String)>,
+    /// The value.
+    pub value: MetricValue,
+}
+
+/// One metric family of a sampling pass: the one definition both the
+/// Prometheus exposition and the OTLP export are written from
+/// (karyos#706), so the two never disagree on a name, a label or a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricFamily {
+    /// Its name, one of [`FAMILIES`].
+    pub name: &'static str,
+    /// Its type.
+    pub kind: MetricKind,
+    /// Its help text.
+    pub help: &'static str,
+    /// Its samples, in the order they were taken.
+    pub samples: Vec<MetricSample>,
 }
 
 /// The families of one exposition, by name, in name order.
 #[derive(Default)]
-struct Families(BTreeMap<&'static str, Family>);
+struct Families(BTreeMap<&'static str, MetricFamily>);
 
 impl Families {
     /// Adds a sample of family `name`.
@@ -176,44 +275,52 @@ impl Families {
         name: &'static str,
         kind: &'static str,
         help: &'static str,
-        labels: &[(&str, String)],
-        value: impl std::fmt::Display,
+        labels: &[(&'static str, String)],
+        value: impl Into<MetricValue>,
     ) {
-        let mut line = String::from(name);
-        if !labels.is_empty() {
-            line.push('{');
-            for (index, (key, value)) in labels.iter().enumerate() {
-                if index > 0 {
-                    line.push(',');
-                }
-                let _ = write!(line, "{key}=\"{}\"", escape(value));
-            }
-            line.push('}');
-        }
-        let _ = write!(line, " {value}");
         self.0
             .entry(name)
-            .or_insert_with(|| Family {
-                kind,
+            .or_insert_with(|| MetricFamily {
+                name,
+                kind: MetricKind::of(kind),
                 help,
                 samples: Vec::new(),
             })
             .samples
-            .push(line);
+            .push(MetricSample {
+                labels: labels.to_vec(),
+                value: value.into(),
+            });
     }
 
-    fn render(self) -> String {
-        let mut out = String::new();
-        for (name, family) in self.0 {
-            let _ = writeln!(out, "# HELP {name} {}", family.help);
-            let _ = writeln!(out, "# TYPE {name} {}", family.kind);
-            for sample in family.samples {
-                out.push_str(&sample);
-                out.push('\n');
-            }
-        }
-        out
+    fn into_families(self) -> Vec<MetricFamily> {
+        self.0.into_values().collect()
     }
+}
+
+/// `families` in the Prometheus text exposition format (version 0.0.4).
+#[must_use]
+pub fn render_families(families: &[MetricFamily]) -> String {
+    let mut out = String::new();
+    for family in families {
+        let _ = writeln!(out, "# HELP {} {}", family.name, family.help);
+        let _ = writeln!(out, "# TYPE {} {}", family.name, family.kind.name());
+        for sample in &family.samples {
+            out.push_str(family.name);
+            if !sample.labels.is_empty() {
+                out.push('{');
+                for (index, (key, value)) in sample.labels.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    let _ = write!(out, "{key}=\"{}\"", escape(value));
+                }
+                out.push('}');
+            }
+            let _ = writeln!(out, " {}", sample.value);
+        }
+    }
+    out
 }
 
 /// A label value as the text format writes it.
@@ -230,9 +337,17 @@ fn escape(value: &str) -> String {
     out
 }
 
-/// `view` in the Prometheus text exposition format.
+/// `view` in the Prometheus text exposition format: [`families`] written
+/// by [`render_families`].
 #[must_use]
 pub fn render(view: &AgentView) -> String {
+    render_families(&families(view))
+}
+
+/// The metric families of `view`, in name order: what [`render`] writes,
+/// and what an OTLP export sends (karyos#706).
+#[must_use]
+pub fn families(view: &AgentView) -> Vec<MetricFamily> {
     let mut families = Families::default();
     // Its own identity, as the agent's (R-CORE-24): the exporter is an
     // agent of its own, attached to each driver as a tool.
@@ -244,7 +359,7 @@ pub fn render(view: &AgentView) -> String {
             ("id", view.agent.id.clone().unwrap_or_default()),
             ("pid", view.agent.pid.to_string()),
         ],
-        1,
+        1_u64,
     );
     families.sample(
         "karyos_exporter_started_ns",
@@ -256,7 +371,7 @@ pub fn render(view: &AgentView) -> String {
     for driver in &view.drivers {
         render_driver(&mut families, driver);
     }
-    families.render()
+    families.into_families()
 }
 
 fn render_driver(families: &mut Families, driver: &DriverView) {
@@ -306,7 +421,7 @@ fn render_driver(families: &mut Families, driver: &DriverView) {
             "gauge",
             "The driver instance attached: a restarted driver is a new instance, and its series start over.",
             &[("driver", dir.clone()), ("instance", format!("{instance:032x}"))],
-            1,
+            1_u64,
         );
     }
     families.sample(
@@ -545,7 +660,7 @@ fn render_alerts(families: &mut Families, dir: &str, alerts: &[Alert]) {
         "gauge",
         "Alerts firing for the driver.",
         &[("driver", dir.to_owned())],
-        alerts.len(),
+        u64::try_from(alerts.len()).unwrap_or(u64::MAX),
     );
     for alert in alerts {
         let keys = [
