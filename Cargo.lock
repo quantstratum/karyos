@@ -937,7 +937,10 @@ version = "0.1.0-alpha.3"
 dependencies = [
  "ironsbe-codegen",
  "ironsbe-core",
+ "karyos-client",
+ "karyos-driver",
  "karyos-feed",
+ "karyos-protocol",
  "karyos-sys",
  "proptest",
  "thiserror",

@@ -29,6 +29,11 @@ ironsbe-codegen = "=0.9.1"
 [dev-dependencies]
 karyos-sys = { workspace = true, features = ["alloc-count"] }
 proptest.workspace = true
+# The feed adapter's end-to-end test (karyos#647): a client subscribes to
+# the feed's two lines on an embedded driver.
+karyos-client.workspace = true
+karyos-driver.workspace = true
+karyos-protocol.workspace = true
 
 [lints]
 workspace = true
