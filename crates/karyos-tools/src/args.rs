@@ -714,6 +714,19 @@ where
     idle_image_timeout(&mut options)?;
     io_config(&mut options, schema, io).map_err(ArgsError::Config)?;
     options.archive = archive.finish()?;
+    // A replication forwards over UDP: refused with the network off,
+    // rather than started to fail forever.
+    if options
+        .archive
+        .as_ref()
+        .is_some_and(|archive| !archive.replications.is_empty())
+        && options.driver.network.is_none()
+    {
+        return Err(ArgsError::Needs {
+            option: "--replicate",
+            needs: "--network on",
+        });
+    }
     if sizing {
         return Ok(Command::SizingReport(Box::new(options)));
     }
@@ -1835,6 +1848,15 @@ mod tests {
         ];
         let mut trusted = base.to_vec();
         trusted.push("--replication-trusted-network");
+        // With the network off, a replication is refused at configuration.
+        assert_eq!(
+            run(&trusted).unwrap_err(),
+            ArgsError::Needs {
+                option: "--replicate",
+                needs: "--network on",
+            }
+        );
+        trusted.extend(["--network", "on"]);
         let archive = options(&trusted).archive.unwrap();
         assert!(archive.trusted_network);
         assert_eq!(
@@ -1848,8 +1870,10 @@ mod tests {
                 mode: Mode::OnDemand,
             }]
         );
+        let mut untrusted = base.to_vec();
+        untrusted.extend(["--network", "on"]);
         assert_eq!(
-            run(&base).unwrap_err(),
+            run(&untrusted).unwrap_err(),
             ArgsError::Needs {
                 option: "--replicate",
                 needs: "--replication-trusted-network",
