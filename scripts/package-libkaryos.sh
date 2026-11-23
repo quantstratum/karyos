@@ -232,6 +232,7 @@ abi_manifest=share/karyos/abi-manifest.txt
 versions=share/karyos/versions.json
 contents=library
 excludes=karyosd
+signed=no
 EOF
 
 # The library alone (owner item 44): no executable and no karyosd.

@@ -49,6 +49,11 @@ crates, by owner authorisation of 2026-11-23 while hosted CI is off
 (karyos#623). Its release notes record the gates not run as a written
 exception. This exception covers 0.1.0-alpha.4 only.
 
+0.1.0-alpha.4 is also the first release of the `libkaryos` and `karyosd`
+artifacts (karyos#700): unsigned, because the owner deferred signing on
+2026-11-23; both MANIFESTs say `signed=no`, and the release notes record
+the deferral. The deferral covers this release only.
+
 ## Changelog
 
 The author of the release pull request assembles the changelog, in that
@@ -174,6 +179,12 @@ open to anyone until they are published.
 | 2026-10-28 | Go module proxy | `github.com/quantstratum/karyos-go` | free (no public module) |
 | 2026-10-28 | GitHub | `quantstratum/karyos-go` | unknown: an anonymous request cannot tell a missing repository from a private one |
 | 2026-10-28 | crates.io | `karyos`, `libkaryos` | free |
+| 2026-11-23 | PyPI | `karyos`, `quantstratum-karyos` | free (404) |
+| 2026-11-23 | NuGet | `Karyos`, `QuantStratum.Karyos` | free (404) |
+| 2026-11-23 | Maven Central | `com.quantstratum`, `io.github.quantstratum` | free (no artifact); namespace control still unknown |
+| 2026-11-23 | Go module proxy | `github.com/quantstratum/karyos-go` | free (404) |
+| 2026-11-23 | GitHub | `quantstratum/karyos-go` | unknown (404 anonymously) |
+| 2026-11-23 | crates.io | `libkaryos`, `karyos-trace` | free (404); `karyos` published, owners list names only `joaquinbejar` |
 
 The C++ names (CMake `karyos`; Conan and vcpkg deferred) are not
 registry names and are not checked. Each binding's own release repeats

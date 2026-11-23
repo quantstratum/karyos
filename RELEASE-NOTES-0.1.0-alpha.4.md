@@ -56,6 +56,32 @@ archival integrity families: `sha2`, `hmac` and `zeroize` through
 71206). The admission review is in `RELEASING.md`, "Admission review of the
 published graph".
 
+## libkaryos and karyosd
+
+The first release of the C library as its own artifact (owner item 44,
+karyos#700), attached to the GitHub release of `v0.1.0-alpha.4`, built by
+`scripts/release-libkaryos.sh` at the tag for aarch64 and x86_64 Linux and
+aarch64 macOS:
+
+- `libkaryos-<abi>-0.1.0-alpha.4-<triple>.tar.gz`: the header, static and
+  shared libraries, pkg-config files and the ABI manifest. Its MANIFEST
+  says `contents=library` and `excludes=karyosd`: the library holds no
+  daemon.
+- `karyosd-0.1.0-alpha.4-<triple>.tar.gz`: the driver daemon alone
+  (`contents=karyosd`, `excludes=libkaryos`).
+- `SHA256SUMS` per host, the header's ABI version and the struct manifest
+  (`abi-manifest-<abi>.txt`).
+
+The soname carries `0.y` before 1.0 (`soname_policy=0y-exact`, owner item
+48): a binding requires the exact `0.y` line and a library patch at least
+its header's. The conformance test kit (`make libkaryos-testkit`) is not a
+release package and is not attached.
+
+**Unsigned.** The owner deferred signing on 2026-11-23: no release key
+exists yet (karyos-deploy ADR-0003, D1 gates). Both MANIFESTs say
+`signed=no`; verify the archives against `SHA256SUMS` only. A later release
+signs them with `scripts/sign-release.sh`.
+
 ## Changes
 
 See the `0.1.0-alpha.4` section of `CHANGELOG.md`.
