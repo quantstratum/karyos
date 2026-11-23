@@ -47,10 +47,12 @@ impl Drop for TempDir {
     }
 }
 
-/// A log of 40 entries of varied sizes over small segments, so a read
-/// takes both the window path and the last frame's read alone.
+/// A log of 40 entries of varied sizes in one segment, so a read takes
+/// both the window path and the last frame's read alone. One segment: a
+/// read that crosses segments reopens the store's reader file, which
+/// allocates its path; that is the segment store's, not this read's.
 fn log(dir: &TempDir) -> (RaftLog<StdDisk>, Vec<Entry>) {
-    let geometry = Geometry::new(4096, 4096).unwrap();
+    let geometry = Geometry::with_default_length(65_536).unwrap();
     let mut log = RaftLog::create(StdDisk, &dir.0, geometry, 1).unwrap();
     let written: Vec<Entry> = (1..=40u64)
         .map(|index| Entry {
