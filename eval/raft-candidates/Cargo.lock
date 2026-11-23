@@ -571,11 +571,14 @@ name = "karyos-driver"
 version = "0.1.0-alpha.3"
 dependencies = [
  "ed25519-dalek",
+ "hmac",
  "karyos-client",
  "karyos-io",
  "karyos-protocol",
  "karyos-sys",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
