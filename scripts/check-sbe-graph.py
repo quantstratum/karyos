@@ -4,15 +4,19 @@
 IronSBE admission record, quantstratum-docs:
 karyos/reviews/dependency-admission-ironsbe.md; SPEC §18, X17).
 
-Fails, naming each breach, if:
-- a workspace crate other than `karyos-sbe` depends directly on an IronSBE
-  crate (`ironsbe` or `ironsbe-*`), in any dependency kind;
-- an IronSBE crate the record excludes (transport, server, client, channel,
-  market data, the facade) appears anywhere in the resolved graph;
+An allowlist: the record admits `ironsbe-core`, `ironsbe-schema` and
+`ironsbe-codegen` (the last as a build dependency only), in `karyos-sbe`
+only, and excludes every other IronSBE crate. Fails, naming each breach,
+if:
+- any other IronSBE package (`ironsbe` or `ironsbe-*`) is in the resolved
+  graph, directly or transitively;
+- a package other than `karyos-sbe` (or an IronSBE crate itself) depends on
+  an IronSBE crate, a workspace crate directly or any crate transitively;
+- `karyos-sbe` takes `ironsbe-codegen` other than as a build dependency;
 - `karyos-feed` depends on `karyos-sbe`, directly or through other crates.
 
-Reads `cargo metadata` of the workspace at `--manifest-path` (default: the
-current one), every target and feature, offline once the lock is fetched.
+Reads `cargo metadata --frozen` (offline, the lock as committed) of the
+workspace at `--manifest-path` (default: the current one), every feature.
 """
 
 import json
@@ -22,14 +26,8 @@ import sys
 
 SBE = "karyos-sbe"
 FEED = "karyos-feed"
-EXCLUDED = {
-    "ironsbe",
-    "ironsbe-transport",
-    "ironsbe-server",
-    "ironsbe-client",
-    "ironsbe-channel",
-    "ironsbe-marketdata",
-}
+ADMITTED = {"ironsbe-core", "ironsbe-schema", "ironsbe-codegen"}
+BUILD_ONLY = {"ironsbe-codegen"}
 
 
 def is_ironsbe(name):
@@ -38,7 +36,7 @@ def is_ironsbe(name):
 
 def metadata(manifest):
     cargo = os.environ.get("CARGO", "cargo")
-    command = [cargo, "metadata", "--format-version", "1", "--all-features", "--locked"]
+    command = [cargo, "metadata", "--format-version", "1", "--all-features", "--frozen"]
     if manifest:
         command += ["--manifest-path", manifest]
     out = subprocess.run(command, check=True, capture_output=True, text=True).stdout
@@ -48,23 +46,28 @@ def metadata(manifest):
 def breaches(meta):
     found = []
     by_id = {package["id"]: package for package in meta["packages"]}
-    members = set(meta["workspace_members"])
-    for member in sorted(members, key=lambda i: by_id[i]["name"]):
-        package = by_id[member]
-        if package["name"] == SBE:
-            continue
-        for dependency in package["dependencies"]:
-            if is_ironsbe(dependency["name"]):
-                found.append(
-                    f"{package['name']} depends directly on {dependency['name']}: "
-                    f"IronSBE enters only through {SBE}"
-                )
+    name = lambda package_id: by_id[package_id]["name"]
     nodes = {node["id"]: node for node in (meta.get("resolve") or {}).get("nodes", [])}
-    for node_id in sorted(nodes, key=lambda i: by_id[i]["name"]):
-        name = by_id[node_id]["name"]
-        if name in EXCLUDED:
-            found.append(f"{name} is in the graph: the record excludes it from the core")
-    feed = [i for i in members if by_id[i]["name"] == FEED]
+    ordered = sorted(nodes, key=name)
+    for node_id in ordered:
+        if is_ironsbe(name(node_id)) and name(node_id) not in ADMITTED:
+            found.append(
+                f"{name(node_id)} is in the graph: the record admits only "
+                "ironsbe-core, ironsbe-schema and ironsbe-codegen"
+            )
+    for node_id in ordered:
+        parent = name(node_id)
+        for dep in nodes[node_id].get("deps", []):
+            child = name(dep["pkg"])
+            if not is_ironsbe(child) or is_ironsbe(parent):
+                continue
+            if parent != SBE:
+                found.append(f"{parent} depends on {child}: IronSBE enters only through {SBE}")
+            elif child in BUILD_ONLY:
+                kinds = {kind.get("kind") for kind in dep.get("dep_kinds", [])}
+                if kinds - {"build"}:
+                    found.append(f"{SBE} takes {child} other than as a build dependency")
+    feed = [i for i in meta["workspace_members"] if name(i) == FEED]
     seen, stack = set(), list(feed)
     while stack:
         current = stack.pop()
@@ -72,7 +75,7 @@ def breaches(meta):
             if child in seen:
                 continue
             seen.add(child)
-            if by_id[child]["name"] == SBE:
+            if name(child) == SBE:
                 found.append(f"{FEED} depends on {SBE}: the dependency runs the other way")
             stack.append(child)
     return found
