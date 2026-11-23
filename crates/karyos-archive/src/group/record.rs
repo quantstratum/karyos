@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! A recording group's journal records, schema 3 version 2, written by hand
-//! on the `karyos-codec` runtime (`quantstratum-docs:
+//! A recording group's journal records, schema 3 version 2, derived with
+//! `karyos-codec-derive` on the `karyos-codec` runtime (karyos#1104) (`quantstratum-docs:
 //! karyos/design/recording-group-records.md`, phase 3 batch A7a; SPEC
 //! §8.3, ADR-0024).
 //!
@@ -26,6 +26,7 @@
 //! read, as `image` 0; every record is written at version 2.
 
 use karyos_codec::{Block, CodecError, Decoder, Encoder, Envelope, Template};
+use karyos_codec_derive::Message;
 use karyos_sys::frame::{FRAME_ALIGNMENT, Lane};
 use karyos_sys::local_gap::GapReason as LocalGapReason;
 use karyos_sys::log_buffer::SkipReason;
@@ -166,27 +167,36 @@ pub enum Capture {
 }
 
 /// The first record of a journal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = JOURNAL_HEADER, zero = [(28, 4)])]
 pub struct JournalHeader<'a> {
     /// The group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_id: u64,
     /// The first event's `group_seq`, never 0.
+    #[field(offset = 8, check = id)]
     pub first_group_seq: u64,
     /// The payload size above which a recorded source's payload is stored
     /// by reference: 1 to [`MAX_INLINE`].
+    #[field(offset = 16, check = inline_threshold)]
     pub inline_threshold: u32,
     /// The capture contract: [`CONTRACT_VERSION`].
+    #[field(offset = 20, check = contract_version)]
     pub contract_version: u16,
     /// The clock of the logical times.
+    #[field(with = clock_byte, offset = 22, width = 1)]
     pub clock: Clock,
     /// Strict or best effort.
+    #[field(with = capture_byte, offset = 23, width = 1)]
     pub capture: Capture,
     /// The events the reopening window holds (A9): fixed when the group
     /// is made, at most [`MAX_REOPEN_HOLD`]; 0 for a group without
     /// checkpoints. Recovery and the running tracker both take it.
+    #[field(offset = 24, check = reopen_hold)]
     pub reopen_hold: u32,
     /// The caller's identity of what ran, opaque: 1 to [`MAX_MANIFEST`]
     /// bytes.
+    #[field(var, min = 1, max = MAX_MANIFEST)]
     pub manifest: &'a [u8],
 }
 
@@ -229,88 +239,6 @@ pub fn unsupported_header(buf: &[u8]) -> Option<UnsupportedHeader> {
     }
 }
 
-impl<'a> JournalHeader<'a> {
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
-        let inline_threshold = block.u32(16)?;
-        if inline_threshold == 0
-            || usize::try_from(inline_threshold).map_or(true, |t| t > MAX_INLINE)
-        {
-            return Err(out_of_range("inline_threshold"));
-        }
-        let contract_version = block.u16(20)?;
-        if contract_version != CONTRACT_VERSION {
-            return Err(out_of_range("contract_version"));
-        }
-        let clock = match block.u8(22)? {
-            1 => Clock::HostMonotonic,
-            value => return Err(invalid_enum("clock", value)),
-        };
-        let capture = match block.u8(23)? {
-            1 => Capture::Strict,
-            2 => Capture::BestEffort,
-            value => return Err(invalid_enum("capture", value)),
-        };
-        let reopen_hold = block.u32(24)?;
-        if reopen_hold > MAX_REOPEN_HOLD {
-            return Err(out_of_range("reopen_hold"));
-        }
-        if block.u32(28)? != 0 {
-            return Err(out_of_range("reserved"));
-        }
-        let manifest = decoder.bytes("manifest", 1, MAX_MANIFEST)?;
-        decoder.finish()?;
-        Ok(Self {
-            group_id: id("group_id", block.u64(0)?)?,
-            first_group_seq: id("first_group_seq", block.u64(8)?)?,
-            inline_threshold,
-            contract_version,
-            clock,
-            capture,
-            reopen_hold,
-            manifest,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] when `out` is short,
-    /// [`CodecError::ValueOutOfRange`] for a field outside its rule, and
-    /// [`CodecError::LengthOutOfRange`] for the manifest.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &JOURNAL_HEADER)?;
-        if self.inline_threshold == 0
-            || usize::try_from(self.inline_threshold).map_or(true, |t| t > MAX_INLINE)
-        {
-            return Err(out_of_range("inline_threshold"));
-        }
-        if self.contract_version != CONTRACT_VERSION {
-            return Err(out_of_range("contract_version"));
-        }
-        let clock = match self.clock {
-            Clock::HostMonotonic => 1,
-        };
-        let capture = match self.capture {
-            Capture::Strict => 1,
-            Capture::BestEffort => 2,
-        };
-        encoder.u64(0, id("group_id", self.group_id)?)?;
-        encoder.u64(8, id("first_group_seq", self.first_group_seq)?)?;
-        encoder.u32(16, self.inline_threshold)?;
-        encoder.u16(20, self.contract_version)?;
-        encoder.u8(22, clock)?;
-        encoder.u8(23, capture)?;
-        if self.reopen_hold > MAX_REOPEN_HOLD {
-            return Err(out_of_range("reopen_hold"));
-        }
-        encoder.u32(24, self.reopen_hold)?;
-        encoder.u32(28, 0)?;
-        encoder.bytes("manifest", 1, MAX_MANIFEST, self.manifest)?;
-        encoder.finish()
-    }
-}
-
 /// Where a message's payload is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -347,37 +275,51 @@ fn unavailable(length: u32) -> Result<u32, CodecError> {
 }
 
 /// A message delivered from a stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = MESSAGE_EVENT, versioned, check = Self::check)]
 pub struct MessageEvent<'a> {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// When it was dispatched, on the journal's clock.
+    #[field(offset = 8)]
     pub logical_time: u64,
     /// The publication incarnation.
+    #[field(offset = 16)]
     pub incarnation: u64,
     /// The stream position of the message's first frame.
+    #[field(offset = 24)]
     pub position: u64,
     /// The frames' extent from `position`: a multiple of 32 that covers
     /// the payload and at least one frame header.
+    #[field(offset = 52)]
     pub extent: u32,
     /// The stream.
+    #[field(offset = 56)]
     pub stream_id: i32,
     /// The session.
+    #[field(offset = 60)]
     pub session_id: i32,
     /// The lane.
+    #[field(with = lane_byte, offset = 64, width = 1)]
     pub lane: Lane,
     /// The reserved value of the message's first fragment, which the
     /// publisher set.
+    #[field(with = signed, offset = 40, width = 8)]
     pub reserved_value: i64,
     /// The message ended its stream.
+    #[field(with = message_flags, spans = [(66, 1)])]
     pub end_of_stream: bool,
+    /// The payload.
+    #[field(with = payload, spans = [(32, 8), (48, 4), (65, 1)], var)]
+    pub payload: Payload<'a>,
     /// The opaque trace extension the message carried, if any: an input,
     /// which A8's comparison schema may name as excludable.
+    #[field(with = extension, var)]
     pub extension: Option<&'a [u8; EXTENSION]>,
-    /// The payload.
-    pub payload: Payload<'a>,
     /// The registration of the network image the message came from, 0 for
     /// none (ADR-0089).
+    #[field(offset = 67, since = 2)]
     pub image: u64,
 }
 
@@ -405,127 +347,6 @@ fn extent(extent: u32, length: u32) -> Result<u32, CodecError> {
     }
 }
 
-impl<'a> MessageEvent<'a> {
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>, v2: bool) -> Result<Self, CodecError> {
-        let recording_id = block.u64(32)?;
-        let length = block.u32(48)?;
-        let flags = block.u8(66)?;
-        if flags & !(FLAG_END_OF_STREAM | FLAG_EXTENSION) != 0 {
-            return Err(out_of_range("flags"));
-        }
-        let value = decoder.bytes("value", 0, MAX_INLINE)?;
-        let extension = if flags & FLAG_EXTENSION == 0 {
-            decoder.bytes("extension", 0, 0)?;
-            None
-        } else {
-            let bytes = decoder.bytes("extension", EXTENSION, EXTENSION)?;
-            Some(bytes.try_into().map_err(|_| out_of_range("extension"))?)
-        };
-        decoder.finish()?;
-        let payload = match block.u8(65)? {
-            1 if recording_id != 0 => return Err(out_of_range("recording_id")),
-            1 if usize::try_from(length).ok() != Some(value.len()) => {
-                return Err(out_of_range("length"));
-            }
-            1 => Payload::Inline(value),
-            2 if !value.is_empty() => {
-                return Err(CodecError::LengthOutOfRange {
-                    field: "value",
-                    length: value.len(),
-                    min: 0,
-                    max: 0,
-                });
-            }
-            2 => Payload::Reference {
-                recording_id: id("recording_id", recording_id)?,
-                length,
-            },
-            3 if recording_id != 0 => return Err(out_of_range("recording_id")),
-            3 if !value.is_empty() => {
-                return Err(CodecError::LengthOutOfRange {
-                    field: "value",
-                    length: value.len(),
-                    min: 0,
-                    max: 0,
-                });
-            }
-            3 => Payload::Unavailable {
-                length: unavailable(length)?,
-            },
-            value => return Err(invalid_enum("payload", value)),
-        };
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            logical_time: block.u64(8)?,
-            incarnation: block.u64(16)?,
-            position: block.u64(24)?,
-            extent: extent(block.u32(52)?, length)?,
-            stream_id: block.i32(56)?,
-            session_id: block.i32(60)?,
-            lane: lane(block.u8(64)?)?,
-            reserved_value: block.u64(40)?.cast_signed(),
-            end_of_stream: flags & FLAG_END_OF_STREAM != 0,
-            extension,
-            payload,
-            image: if v2 { block.u64(67)? } else { 0 },
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] when `out` is short,
-    /// [`CodecError::ValueOutOfRange`] for a field outside its rule, and
-    /// [`CodecError::LengthOutOfRange`] for an inline payload above
-    /// [`MAX_INLINE`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &MESSAGE_EVENT)?;
-        let (recording_id, length, kind, value) = match self.payload {
-            Payload::Inline(value) => {
-                let length =
-                    u32::try_from(value.len()).map_err(|_| CodecError::LengthOutOfRange {
-                        field: "value",
-                        length: value.len(),
-                        min: 0,
-                        max: MAX_INLINE,
-                    })?;
-                (0, length, 1, value)
-            }
-            Payload::Reference {
-                recording_id,
-                length,
-            } => (id("recording_id", recording_id)?, length, 2, &[][..]),
-            Payload::Unavailable { length } => (0, unavailable(length)?, 3, &[][..]),
-        };
-        let mut flags = 0;
-        if self.end_of_stream {
-            flags |= FLAG_END_OF_STREAM;
-        }
-        if self.extension.is_some() {
-            flags |= FLAG_EXTENSION;
-        }
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, self.logical_time)?;
-        encoder.u64(16, self.incarnation)?;
-        encoder.u64(24, self.position)?;
-        encoder.u64(32, recording_id)?;
-        encoder.u64(40, self.reserved_value.cast_unsigned())?;
-        encoder.u32(48, length)?;
-        encoder.u32(52, extent(self.extent, length)?)?;
-        encoder.i32(56, self.stream_id)?;
-        encoder.i32(60, self.session_id)?;
-        encoder.u8(64, self.lane.get())?;
-        encoder.u8(65, kind)?;
-        encoder.u8(66, flags)?;
-        encoder.u64(67, self.image)?;
-        encoder.bytes("value", 0, MAX_INLINE, value)?;
-        let extension = self.extension.map_or(&[][..], |extension| &extension[..]);
-        encoder.bytes("extension", 0, EXTENSION, extension)?;
-        encoder.finish()
-    }
-}
-
 /// Whether a conflated value was covered by a committed gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -540,107 +361,48 @@ pub enum Freshness {
 }
 
 /// A conflated value as the handler saw it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = CONFLATED_EVENT)]
 pub struct ConflatedEvent<'a> {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// When it was dispatched.
+    #[field(offset = 8)]
     pub logical_time: u64,
     /// The value's version.
+    #[field(offset = 16)]
     pub version: u64,
     /// The value's key.
+    #[field(offset = 32)]
     pub key: u32,
     /// The stream.
+    #[field(offset = 36)]
     pub stream_id: i32,
     /// The session.
+    #[field(offset = 40)]
     pub session_id: i32,
     /// Fresh or stale.
+    #[field(with = freshness, spans = [(24, 8), (44, 1)])]
     pub freshness: Freshness,
     /// The value, 0 to [`MAX_INLINE`] bytes.
+    #[field(var, min = 0, max = MAX_INLINE)]
     pub value: &'a [u8],
 }
 
-impl<'a> ConflatedEvent<'a> {
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
-        let since = block.u64(24)?;
-        let freshness = match block.u8(44)? {
-            1 if since != 0 => return Err(out_of_range("stale_since")),
-            1 => Freshness::Fresh,
-            2 => Freshness::Stale { since },
-            value => return Err(invalid_enum("freshness", value)),
-        };
-        let value = decoder.bytes("value", 0, MAX_INLINE)?;
-        decoder.finish()?;
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            logical_time: block.u64(8)?,
-            version: block.u64(16)?,
-            key: block.u32(32)?,
-            stream_id: block.i32(36)?,
-            session_id: block.i32(40)?,
-            freshness,
-            value,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], [`CodecError::ValueOutOfRange`] and
-    /// [`CodecError::LengthOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &CONFLATED_EVENT)?;
-        let (freshness, since) = match self.freshness {
-            Freshness::Fresh => (1, 0),
-            Freshness::Stale { since } => (2, since),
-        };
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, self.logical_time)?;
-        encoder.u64(16, self.version)?;
-        encoder.u64(24, since)?;
-        encoder.u32(32, self.key)?;
-        encoder.i32(36, self.stream_id)?;
-        encoder.i32(40, self.session_id)?;
-        encoder.u8(44, freshness)?;
-        encoder.bytes("value", 0, MAX_INLINE, self.value)?;
-        encoder.finish()
-    }
-}
-
 /// A timer that fired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = TIMER_EVENT)]
 pub struct TimerEvent {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// The timer's deadline.
+    #[field(offset = 8)]
     pub logical_time: u64,
     /// The timer, never 0.
+    #[field(offset = 16, check = id)]
     pub timer_id: u64,
-}
-
-impl TimerEvent {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            logical_time: block.u64(8)?,
-            timer_id: id("timer_id", block.u64(16)?)?,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &TIMER_EVENT)?;
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, self.logical_time)?;
-        encoder.u64(16, id("timer_id", self.timer_id)?)?;
-        encoder.finish()
-    }
 }
 
 /// Why a subscription ended.
@@ -671,85 +433,38 @@ pub enum LifecycleKind {
 
 /// An image's availability or a subscription's end, delivered to the
 /// handler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = LIFECYCLE_EVENT, versioned)]
 pub struct LifecycleEvent {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// When it was dispatched.
+    #[field(offset = 8)]
     pub logical_time: u64,
     /// The publication incarnation.
+    #[field(offset = 16)]
     pub incarnation: u64,
     /// The position on `lane` the event names (where the stream ended), or
     /// 0 when it names none: image events carry no position.
+    #[field(offset = 24)]
     pub position: u64,
     /// The stream.
+    #[field(offset = 32)]
     pub stream_id: i32,
     /// The session.
+    #[field(offset = 36)]
     pub session_id: i32,
     /// The lane `position` is on.
+    #[field(with = lane_byte, offset = 41, width = 1)]
     pub lane: Lane,
     /// What happened.
+    #[field(with = lifecycle_kind, spans = [(40, 1), (42, 1)])]
     pub kind: LifecycleKind,
     /// The registration of the network image the event names, 0 for none
     /// (ADR-0089).
+    #[field(offset = 43, since = 2)]
     pub image: u64,
-}
-
-impl LifecycleEvent {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>, v2: bool) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let reason = block.u8(42)?;
-        let kind = match (block.u8(40)?, reason) {
-            (1, 0) => LifecycleKind::ImageAvailable,
-            (2, 0) => LifecycleKind::ImageUnavailable,
-            (1 | 2, _) => return Err(out_of_range("reason")),
-            (3, 1) => LifecycleKind::SubscriptionEnded(EndReason::EndOfStream),
-            (3, 2) => LifecycleKind::SubscriptionEnded(EndReason::Overrun),
-            (3, 3) => LifecycleKind::SubscriptionEnded(EndReason::Revoked),
-            (3, 4) => LifecycleKind::SubscriptionEnded(EndReason::Closed),
-            (3, value) => return Err(invalid_enum("reason", value)),
-            (value, _) => return Err(invalid_enum("kind", value)),
-        };
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            logical_time: block.u64(8)?,
-            incarnation: block.u64(16)?,
-            position: block.u64(24)?,
-            stream_id: block.i32(32)?,
-            session_id: block.i32(36)?,
-            lane: lane(block.u8(41)?)?,
-            kind,
-            image: if v2 { block.u64(43)? } else { 0 },
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &LIFECYCLE_EVENT)?;
-        let (kind, reason) = match self.kind {
-            LifecycleKind::ImageAvailable => (1, 0),
-            LifecycleKind::ImageUnavailable => (2, 0),
-            LifecycleKind::SubscriptionEnded(EndReason::EndOfStream) => (3, 1),
-            LifecycleKind::SubscriptionEnded(EndReason::Overrun) => (3, 2),
-            LifecycleKind::SubscriptionEnded(EndReason::Revoked) => (3, 3),
-            LifecycleKind::SubscriptionEnded(EndReason::Closed) => (3, 4),
-        };
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, self.logical_time)?;
-        encoder.u64(16, self.incarnation)?;
-        encoder.u64(24, self.position)?;
-        encoder.i32(32, self.stream_id)?;
-        encoder.i32(36, self.session_id)?;
-        encoder.u8(40, kind)?;
-        encoder.u8(41, self.lane.get())?;
-        encoder.u8(42, reason)?;
-        encoder.u64(43, self.image)?;
-        encoder.finish()
-    }
 }
 
 /// How a rejoin policy resolved an overrun, as the handler was told: the
@@ -814,32 +529,44 @@ pub enum Loss {
 
 /// A loss on a message source, delivered to the handler as an event of
 /// its own (`recording-group-gateway.md` sections 5 and 10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = LOSS_EVENT, versioned, check = Self::positions)]
 pub struct LossEvent {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// When it was dispatched.
+    #[field(offset = 8)]
     pub logical_time: u64,
     /// The publication incarnation.
+    #[field(offset = 16)]
     pub incarnation: u64,
     /// An overrun's first position not delivered; a skip's or an abort's
     /// position.
+    #[field(offset = 24)]
     pub from: u64,
     /// An overrun's end known lost; a skip's or an abort's end.
+    #[field(offset = 32)]
     pub lost_to: u64,
     /// Where delivery resumed; for a skip or an abort, its end. A replayed
     /// overrun's cutover.
+    #[field(offset = 40)]
     pub resume: u64,
     /// The stream.
+    #[field(offset = 48)]
     pub stream_id: i32,
     /// The session.
+    #[field(offset = 52)]
     pub session_id: i32,
     /// The lane.
+    #[field(with = lane_byte, offset = 56, width = 1)]
     pub lane: Lane,
     /// What was lost, and how it resolved.
+    #[field(with = loss, spans = [(57, 1), (58, 1), (59, 1)])]
     pub loss: Loss,
     /// The registration of the network image the loss was on, 0 for none
     /// (ADR-0089).
+    #[field(offset = 60, since = 2)]
     pub image: u64,
 }
 
@@ -946,116 +673,24 @@ impl LossEvent {
         }
         Ok(())
     }
-
-    fn decode(block: Block<'_>, decoder: Decoder<'_>, v2: bool) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let (outcome, reason) = (block.u8(58)?, block.u8(59)?);
-        let loss = match block.u8(57)? {
-            1 => {
-                let outcome = OverrunOutcome::from_code(outcome)?;
-                let fallback = FallbackReason::from_code(reason)?;
-                if fallback.is_some() && !outcome.is_secondary() {
-                    return Err(out_of_range("reason"));
-                }
-                Loss::Overrun { outcome, fallback }
-            }
-            2 | 3 if outcome != 0 => return Err(out_of_range("outcome")),
-            2 => Loss::Skipped(skip_reason(reason)?),
-            3 if reason != 0 => return Err(out_of_range("reason")),
-            3 => Loss::Aborted,
-            value => return Err(invalid_enum("kind", value)),
-        };
-        let event = Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            logical_time: block.u64(8)?,
-            incarnation: block.u64(16)?,
-            from: block.u64(24)?,
-            lost_to: block.u64(32)?,
-            resume: block.u64(40)?,
-            stream_id: block.i32(48)?,
-            session_id: block.i32(52)?,
-            lane: lane(block.u8(56)?)?,
-            loss,
-            image: if v2 { block.u64(60)? } else { 0 },
-        };
-        event.positions()?;
-        Ok(event)
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &LOSS_EVENT)?;
-        self.positions()?;
-        let (kind, outcome, reason) = match self.loss {
-            Loss::Overrun { outcome, fallback } => {
-                if fallback.is_some() && !outcome.is_secondary() {
-                    return Err(out_of_range("reason"));
-                }
-                (1, outcome.code(), fallback.map_or(0, FallbackReason::code))
-            }
-            Loss::Skipped(reason) => (2, 0, skip_code(reason)),
-            Loss::Aborted => (3, 0, 0),
-        };
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, self.logical_time)?;
-        encoder.u64(16, self.incarnation)?;
-        encoder.u64(24, self.from)?;
-        encoder.u64(32, self.lost_to)?;
-        encoder.u64(40, self.resume)?;
-        encoder.i32(48, self.stream_id)?;
-        encoder.i32(52, self.session_id)?;
-        encoder.u8(56, self.lane.get())?;
-        encoder.u8(57, kind)?;
-        encoder.u8(58, outcome)?;
-        encoder.u8(59, reason)?;
-        encoder.u64(60, self.image)?;
-        encoder.finish()
-    }
 }
 
 /// An input from outside Karyos, delivered as an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = EXTERNAL_EVENT)]
 pub struct ExternalEvent<'a> {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// When it was dispatched.
+    #[field(offset = 8)]
     pub logical_time: u64,
     /// The application's own code.
+    #[field(offset = 16)]
     pub kind: u32,
     /// The input, 0 to [`MAX_INLINE`] bytes.
+    #[field(var, min = 0, max = MAX_INLINE)]
     pub value: &'a [u8],
-}
-
-impl<'a> ExternalEvent<'a> {
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
-        let value = decoder.bytes("value", 0, MAX_INLINE)?;
-        decoder.finish()?;
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            logical_time: block.u64(8)?,
-            kind: block.u32(16)?,
-            value,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], [`CodecError::ValueOutOfRange`] and
-    /// [`CodecError::LengthOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &EXTERNAL_EVENT)?;
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, self.logical_time)?;
-        encoder.u32(16, self.kind)?;
-        encoder.bytes("value", 0, MAX_INLINE, self.value)?;
-        encoder.finish()
-    }
 }
 
 /// The call whose outcome was observed.
@@ -1194,24 +829,33 @@ pub enum Outcome {
 }
 
 /// An operation's outcome, as the handler observed it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = OUTCOME_OBSERVATION, check = Self::check)]
 pub struct OutcomeObservation {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// The observation's index within the event, from 0.
+    #[field(offset = 32)]
     pub index: u32,
     /// The stream.
+    #[field(offset = 36)]
     pub stream_id: i32,
     /// The session.
+    #[field(offset = 40)]
     pub session_id: i32,
     /// Offer, claim or commit.
+    #[field(with = operation_byte, offset = 48, width = 1)]
     pub operation: Operation,
     /// What it returned.
+    #[field(with = outcome, spans = [(8, 8), (16, 8), (24, 8), (44, 2), (46, 2), (49, 1), (50, 1)])]
     pub outcome: Outcome,
     /// An offer's payload length, or a commit's claimed bytes' length,
     /// whatever the outcome; 0 for a claim.
+    #[field(offset = 51)]
     pub length: u32,
     /// The CRC-32C of those bytes; 0 for a claim.
+    #[field(offset = 55)]
     pub crc32c: u32,
 }
 
@@ -1224,236 +868,78 @@ const fn returns(operation: Operation, outcome: u8) -> bool {
     }
 }
 
-impl OutcomeObservation {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let operation = match block.u8(48)? {
-            1 => Operation::Offer,
-            2 => Operation::Claim,
-            3 => Operation::Commit,
-            value => return Err(invalid_enum("operation", value)),
-        };
-        let (position, detail, detail2) = (block.u64(8)?, block.u64(16)?, block.u64(24)?);
-        let (error, sub) = (block.u16(44)?, block.u16(46)?);
-        let lane_byte = block.u8(50)?;
-        let code = block.u8(49)?;
-        if !(1..=9).contains(&code) {
-            return Err(invalid_enum("outcome", code));
-        }
-        if !returns(operation, code) {
-            return Err(out_of_range("outcome"));
-        }
-        let positioned = matches!(code, 1 | 8);
-        if !positioned && position != 0 {
-            return Err(out_of_range("position"));
-        }
-        if !positioned && lane_byte != 0 {
-            return Err(out_of_range("lane"));
-        }
-        if code != 9 && (error != 0 || sub != 0 || detail != 0 || detail2 != 0) {
-            return Err(out_of_range("error"));
-        }
-        let outcome = match code {
-            1 => Outcome::Accepted {
-                lane: lane(lane_byte)?,
-                position,
-            },
-            8 => Outcome::Aborted {
-                lane: lane(lane_byte)?,
-                position,
-            },
-            2 => Outcome::BackPressured,
-            3 => Outcome::AdminAction,
-            4 => Outcome::NotConnected,
-            5 => Outcome::Closed,
-            6 => Outcome::Gated,
-            7 => Outcome::RateLimited,
-            _ if error == 0 || error > MAX_ERROR_CODE => return Err(out_of_range("error")),
-            _ if !sub_of(error, sub) => return Err(out_of_range("sub")),
-            _ if !details_fit(error, sub, detail, detail2) => {
-                return Err(out_of_range("detail"));
-            }
-            _ => Outcome::Failed {
-                error,
-                sub,
-                detail,
-                detail2,
-            },
-        };
-        let (length, crc32c) = (block.u32(51)?, block.u32(55)?);
-        if operation == Operation::Claim && (length != 0 || crc32c != 0) {
-            return Err(out_of_range("length"));
-        }
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            index: block.u32(32)?,
-            stream_id: block.i32(36)?,
-            session_id: block.i32(40)?,
-            operation,
-            outcome,
-            length,
-            crc32c,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// an outcome its operation cannot return or an error code outside 1
-    /// to [`MAX_ERROR_CODE`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &OUTCOME_OBSERVATION)?;
-        let none = (0u16, 0u16, 0u64, 0u64);
-        let (outcome, lane, position, (error, sub, detail, detail2)) = match self.outcome {
-            Outcome::Accepted { lane, position } => (1, lane.get(), position, none),
-            Outcome::BackPressured => (2, 0, 0, none),
-            Outcome::AdminAction => (3, 0, 0, none),
-            Outcome::NotConnected => (4, 0, 0, none),
-            Outcome::Closed => (5, 0, 0, none),
-            Outcome::Gated => (6, 0, 0, none),
-            Outcome::RateLimited => (7, 0, 0, none),
-            Outcome::Aborted { lane, position } => (8, lane.get(), position, none),
-            Outcome::Failed { error, .. } if error == 0 || error > MAX_ERROR_CODE => {
-                return Err(out_of_range("error"));
-            }
-            Outcome::Failed { error, sub, .. } if !sub_of(error, sub) => {
-                return Err(out_of_range("sub"));
-            }
-            Outcome::Failed {
-                error,
-                sub,
-                detail,
-                detail2,
-            } if !details_fit(error, sub, detail, detail2) => {
-                return Err(out_of_range("detail"));
-            }
-            Outcome::Failed {
-                error,
-                sub,
-                detail,
-                detail2,
-            } => (9, 0, 0, (error, sub, detail, detail2)),
-        };
-        if !returns(self.operation, outcome) {
-            return Err(out_of_range("outcome"));
-        }
-        if self.operation == Operation::Claim && (self.length != 0 || self.crc32c != 0) {
-            return Err(out_of_range("length"));
-        }
-        let operation = match self.operation {
-            Operation::Offer => 1,
-            Operation::Claim => 2,
-            Operation::Commit => 3,
-        };
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, position)?;
-        encoder.u64(16, detail)?;
-        encoder.u64(24, detail2)?;
-        encoder.u32(32, self.index)?;
-        encoder.i32(36, self.stream_id)?;
-        encoder.i32(40, self.session_id)?;
-        encoder.u16(44, error)?;
-        encoder.u16(46, sub)?;
-        encoder.u8(48, operation)?;
-        encoder.u8(49, outcome)?;
-        encoder.u8(50, lane)?;
-        encoder.u32(51, self.length)?;
-        encoder.u32(55, self.crc32c)?;
-        encoder.finish()
-    }
-}
-
 /// A `poll_outcomes` call on a guarded publication: it precedes the
 /// `count` delivery observations the call presented, so replay can tell
 /// the calls apart, an empty one included.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = DELIVERY_POLL, check = Self::check)]
 pub struct DeliveryPoll {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// The observation's index within the event, from 0.
+    #[field(offset = 8)]
     pub index: u32,
     /// The call's maximum.
+    #[field(offset = 12)]
     pub max: u32,
     /// The records it presented, at most `max`.
+    #[field(offset = 16)]
     pub count: u32,
     /// The stream.
+    #[field(offset = 20)]
     pub stream_id: i32,
     /// The session.
+    #[field(offset = 24)]
     pub session_id: i32,
-}
-
-impl DeliveryPoll {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let (max, count) = (block.u32(12)?, block.u32(16)?);
-        if count > max {
-            return Err(out_of_range("count"));
-        }
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            index: block.u32(8)?,
-            max,
-            count,
-            stream_id: block.i32(20)?,
-            session_id: block.i32(24)?,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// a `count` over `max`.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &DELIVERY_POLL)?;
-        if self.count > self.max {
-            return Err(out_of_range("count"));
-        }
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u32(8, self.index)?;
-        encoder.u32(12, self.max)?;
-        encoder.u32(16, self.count)?;
-        encoder.i32(20, self.stream_id)?;
-        encoder.i32(24, self.session_id)?;
-        encoder.finish()
-    }
 }
 
 /// A guarded publication's delivery outcome, as the outcome ring
 /// presented it to the handler (SPEC §8.3, asynchronous delivery
 /// outcomes): its kind is the ring's code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = DELIVERY_OBSERVATION, check = Self::check)]
 pub struct DeliveryObservation {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// The observation's index within the event, from 0.
+    #[field(offset = 56)]
     pub index: u32,
     /// The stream.
+    #[field(offset = 60)]
     pub stream_id: i32,
     /// The session.
+    #[field(offset = 64)]
     pub session_id: i32,
     /// The ring's kind code: 1 submitted, 2 confirmed cancelled, 3
     /// unknown, 4 rejected, 5 aborted, 16 range, 17 interrupted, 18 ended,
     /// 19 outcomes lost.
+    #[field(with = delivery_kind, offset = 70, width = 1)]
     pub kind: u8,
     /// The lane.
+    #[field(with = lane_byte, offset = 71, width = 1)]
     pub lane: Lane,
     /// The receiver index, for range kinds; else 0.
+    #[field(offset = 68)]
     pub receiver: u16,
     /// The incarnation.
+    #[field(offset = 8)]
     pub incarnation: u64,
     /// The message's start, or a receiver's delivered prefix.
+    #[field(offset = 16)]
     pub start: u64,
     /// The message's end, or the unresolved range's end.
+    #[field(offset = 24)]
     pub end: u64,
     /// The guard epoch at the decision.
+    #[field(offset = 32)]
     pub epoch: u64,
     /// The reason, for the kinds that carry one.
+    #[field(offset = 40)]
     pub reason: u64,
     /// The lost count, for outcomes lost.
+    #[field(offset = 48)]
     pub lost: u64,
 }
 
@@ -1468,72 +954,6 @@ const fn range_side(kind: u8) -> bool {
     matches!(kind, 16..=19)
 }
 
-impl DeliveryObservation {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let kind = block.u8(70)?;
-        if !DELIVERY_KINDS.contains(&kind) {
-            return Err(invalid_enum("kind", kind));
-        }
-        // As the ring itself refuses (`outcome_ring::Record`): a receiver
-        // only on a range-side kind, a lost count only on outcomes lost.
-        if !range_side(kind) && block.u16(68)? != 0 {
-            return Err(out_of_range("receiver"));
-        }
-        if kind != OUTCOMES_LOST && block.u64(48)? != 0 {
-            return Err(out_of_range("lost"));
-        }
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            incarnation: block.u64(8)?,
-            start: block.u64(16)?,
-            end: block.u64(24)?,
-            epoch: block.u64(32)?,
-            reason: block.u64(40)?,
-            lost: block.u64(48)?,
-            index: block.u32(56)?,
-            stream_id: block.i32(60)?,
-            session_id: block.i32(64)?,
-            receiver: block.u16(68)?,
-            kind,
-            lane: lane(block.u8(71)?)?,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], and [`CodecError::ValueOutOfRange`] for
-    /// a kind the ring does not have.
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &DELIVERY_OBSERVATION)?;
-        if !DELIVERY_KINDS.contains(&self.kind) {
-            return Err(out_of_range("kind"));
-        }
-        if !range_side(self.kind) && self.receiver != 0 {
-            return Err(out_of_range("receiver"));
-        }
-        if self.kind != OUTCOMES_LOST && self.lost != 0 {
-            return Err(out_of_range("lost"));
-        }
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, self.incarnation)?;
-        encoder.u64(16, self.start)?;
-        encoder.u64(24, self.end)?;
-        encoder.u64(32, self.epoch)?;
-        encoder.u64(40, self.reason)?;
-        encoder.u64(48, self.lost)?;
-        encoder.u32(56, self.index)?;
-        encoder.i32(60, self.stream_id)?;
-        encoder.i32(64, self.session_id)?;
-        encoder.u16(68, self.receiver)?;
-        encoder.u8(70, self.kind)?;
-        encoder.u8(71, self.lane.get())?;
-        encoder.finish()
-    }
-}
-
 /// A timer created or cancelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1545,96 +965,42 @@ pub enum TimerAction {
 }
 
 /// A timer operation, as the handler made it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = TIMER_OBSERVATION)]
 pub struct TimerObservation {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// The observation's index within the event, from 0.
+    #[field(offset = 24)]
     pub index: u32,
     /// The timer, never 0.
+    #[field(offset = 8, check = id)]
     pub timer_id: u64,
     /// Its deadline; a cancel repeats it.
+    #[field(offset = 16)]
     pub deadline: u64,
     /// Create or cancel.
+    #[field(with = timer_action, offset = 28, width = 1)]
     pub action: TimerAction,
 }
 
-impl TimerObservation {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let action = match block.u8(28)? {
-            1 => TimerAction::Create,
-            2 => TimerAction::Cancel,
-            value => return Err(invalid_enum("action", value)),
-        };
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            index: block.u32(24)?,
-            timer_id: id("timer_id", block.u64(8)?)?,
-            deadline: block.u64(16)?,
-            action,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &TIMER_OBSERVATION)?;
-        let action = match self.action {
-            TimerAction::Create => 1,
-            TimerAction::Cancel => 2,
-        };
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, id("timer_id", self.timer_id)?)?;
-        encoder.u64(16, self.deadline)?;
-        encoder.u32(24, self.index)?;
-        encoder.u8(28, action)?;
-        encoder.finish()
-    }
-}
-
 /// A response from outside Karyos the handler read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = EXTERNAL_OBSERVATION)]
 pub struct ExternalObservation<'a> {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// The observation's index within the event, from 0.
+    #[field(offset = 8)]
     pub index: u32,
     /// The application's own code.
+    #[field(offset = 12)]
     pub kind: u32,
     /// The response, 0 to [`MAX_INLINE`] bytes.
+    #[field(var, min = 0, max = MAX_INLINE)]
     pub value: &'a [u8],
-}
-
-impl<'a> ExternalObservation<'a> {
-    fn decode(block: Block<'a>, mut decoder: Decoder<'a>) -> Result<Self, CodecError> {
-        let value = decoder.bytes("value", 0, MAX_INLINE)?;
-        decoder.finish()?;
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            index: block.u32(8)?,
-            kind: block.u32(12)?,
-            value,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`], [`CodecError::ValueOutOfRange`] and
-    /// [`CodecError::LengthOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &EXTERNAL_OBSERVATION)?;
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u32(8, self.index)?;
-        encoder.u32(12, self.kind)?;
-        encoder.bytes("value", 0, MAX_INLINE, self.value)?;
-        encoder.finish()
-    }
 }
 
 /// Whether an event's capture is whole.
@@ -1648,47 +1014,18 @@ pub enum EndOutcome {
 }
 
 /// The end of an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = EVENT_END)]
 pub struct EventEnd {
     /// The event's sequence in its group, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// How many observations the event has.
+    #[field(offset = 8)]
     pub observations: u32,
     /// Complete or incomplete.
+    #[field(with = end_outcome, offset = 12, width = 1)]
     pub outcome: EndOutcome,
-}
-
-impl EventEnd {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let outcome = match block.u8(12)? {
-            1 => EndOutcome::Complete,
-            2 => EndOutcome::Incomplete,
-            value => return Err(invalid_enum("outcome", value)),
-        };
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            observations: block.u32(8)?,
-            outcome,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &EVENT_END)?;
-        let outcome = match self.outcome {
-            EndOutcome::Complete => 1,
-            EndOutcome::Incomplete => 2,
-        };
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u32(8, self.observations)?;
-        encoder.u8(12, outcome)?;
-        encoder.finish()
-    }
 }
 
 /// Why a best-effort group did not capture events.
@@ -1705,111 +1042,60 @@ pub enum GapReason {
 }
 
 /// Events delivered and not captured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = GAP_MARKER, check = Self::check)]
 pub struct GapMarker {
     /// The first event not captured, never 0.
+    #[field(offset = 0, check = id)]
     pub from_seq: u64,
     /// The last, at least `from_seq`.
+    #[field(offset = 8)]
     pub to_seq: u64,
     /// Why.
+    #[field(with = gap_reason, offset = 16, width = 1)]
     pub reason: GapReason,
-}
-
-impl GapMarker {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let reason = match block.u8(16)? {
-            1 => GapReason::BudgetExceeded,
-            2 => GapReason::RingFull,
-            3 => GapReason::PayloadUnavailable,
-            value => return Err(invalid_enum("reason", value)),
-        };
-        let from_seq = id("from_seq", block.u64(0)?)?;
-        let to_seq = block.u64(8)?;
-        if to_seq < from_seq {
-            return Err(out_of_range("to_seq"));
-        }
-        Ok(Self {
-            from_seq,
-            to_seq,
-            reason,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &GAP_MARKER)?;
-        if self.to_seq < self.from_seq {
-            return Err(out_of_range("to_seq"));
-        }
-        let reason = match self.reason {
-            GapReason::BudgetExceeded => 1,
-            GapReason::RingFull => 2,
-            GapReason::PayloadUnavailable => 3,
-        };
-        encoder.u64(0, id("from_seq", self.from_seq)?)?;
-        encoder.u64(8, self.to_seq)?;
-        encoder.u8(16, reason)?;
-        encoder.finish()
-    }
 }
 
 /// A best-effort group's mark of an event whose payload is by reference to
 /// a recording that stopped or failed before it covered the frames: the
 /// payload will never be there, so the event counts complete with its
 /// payload unavailable (`recording-group-gateway.md` section 7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = REFERENCE_UNAVAILABLE)]
 pub struct ReferenceUnavailable {
     /// The event, already ended, never 0.
+    #[field(offset = 0, check = id)]
     pub group_seq: u64,
     /// The recording its payload names, never 0.
+    #[field(offset = 8, check = id)]
     pub recording_id: u64,
-}
-
-impl ReferenceUnavailable {
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        Ok(Self {
-            group_seq: id("group_seq", block.u64(0)?)?,
-            recording_id: id("recording_id", block.u64(8)?)?,
-        })
-    }
-
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &REFERENCE_UNAVAILABLE)?;
-        encoder.u64(0, id("group_seq", self.group_seq)?)?;
-        encoder.u64(8, id("recording_id", self.recording_id)?)?;
-        encoder.finish()
-    }
 }
 
 /// A checkpoint of the application's state after event `group_seq`,
 /// stored at `position` in the group's checkpoint store (A9). It sits
 /// outside events, as a gap marker does, and is appended once its bytes
 /// are written, so events after `group_seq` may come before it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = CHECKPOINT, check = Self::check)]
 pub struct CheckpointRecord {
     /// The last event the state includes, never 0.
+    #[field(offset = 0)]
     pub group_seq: u64,
     /// Never 0, increasing within the group.
+    #[field(offset = 8)]
     pub checkpoint_id: u64,
     /// Where its range starts in the checkpoint store;
     /// [`CAPTURE_POSITION`] in a replay's capture, which stores nothing.
+    #[field(offset = 16)]
     pub position: u64,
     /// The snapshot's bytes, at least 1.
+    #[field(offset = 24)]
     pub length: u64,
     /// The CRC-32C of the snapshot's bytes.
+    #[field(offset = 32)]
     pub crc32c: u32,
     /// The application's own tag for its snapshot format.
+    #[field(offset = 36)]
     pub format: u32,
 }
 
@@ -1836,36 +1122,696 @@ impl CheckpointRecord {
         }
         Ok(())
     }
+}
 
-    fn decode(block: Block<'_>, decoder: Decoder<'_>) -> Result<Self, CodecError> {
-        decoder.finish()?;
-        let record = Self {
-            group_seq: block.u64(0)?,
-            checkpoint_id: block.u64(8)?,
-            position: block.u64(16)?,
-            length: block.u64(24)?,
-            crc32c: block.u32(32)?,
-            format: block.u32(36)?,
-        };
-        record.check()?;
-        Ok(record)
+// The derive's field modules and checks (karyos#1104): each reads and
+// writes one field, or the fields that share its bytes, as the records'
+// hand-written codecs did.
+
+/// A lane byte, as a `with` field.
+mod lane_byte {
+    use super::{Block, CodecError, Encoder, Lane, lane};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<Lane, CodecError> {
+        lane(block.u8(at)?)
     }
 
-    /// Encodes into `out`; returns the record's length.
-    ///
-    /// # Errors
-    ///
-    /// [`CodecError::Truncated`] and [`CodecError::ValueOutOfRange`].
-    pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
-        let mut encoder = Encoder::new(out, &CHECKPOINT)?;
-        self.check()?;
-        encoder.u64(0, self.group_seq)?;
-        encoder.u64(8, self.checkpoint_id)?;
-        encoder.u64(16, self.position)?;
-        encoder.u64(24, self.length)?;
-        encoder.u32(32, self.crc32c)?;
-        encoder.u32(36, self.format)?;
-        encoder.finish()
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &Lane,
+    ) -> Result<(), CodecError> {
+        encoder.u8(at, value.get())
+    }
+}
+
+/// An `i64` stored as its two's complement `u64`, as a `with` field.
+mod signed {
+    use super::{Block, CodecError, Encoder};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<i64, CodecError> {
+        Ok(block.u64(at)?.cast_signed())
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &i64,
+    ) -> Result<(), CodecError> {
+        encoder.u64(at, value.cast_unsigned())
+    }
+}
+
+/// The header's inline threshold: 1 to [`MAX_INLINE`].
+fn inline_threshold(field: &'static str, value: u32) -> Result<u32, CodecError> {
+    if value == 0 || usize::try_from(value).map_or(true, |value| value > MAX_INLINE) {
+        Err(out_of_range(field))
+    } else {
+        Ok(value)
+    }
+}
+
+/// The header's capture contract: [`CONTRACT_VERSION`].
+fn contract_version(field: &'static str, value: u16) -> Result<u16, CodecError> {
+    if value == CONTRACT_VERSION {
+        Ok(value)
+    } else {
+        Err(out_of_range(field))
+    }
+}
+
+/// The header's reopen hold: at most [`MAX_REOPEN_HOLD`].
+fn reopen_hold(field: &'static str, value: u32) -> Result<u32, CodecError> {
+    if value > MAX_REOPEN_HOLD {
+        Err(out_of_range(field))
+    } else {
+        Ok(value)
+    }
+}
+
+/// The header's [`Clock`], as a `with` field.
+mod clock_byte {
+    use super::{Block, Clock, CodecError, Encoder, invalid_enum};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<Clock, CodecError> {
+        match block.u8(at)? {
+            1 => Ok(Clock::HostMonotonic),
+            value => Err(invalid_enum("clock", value)),
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &Clock,
+    ) -> Result<(), CodecError> {
+        encoder.u8(
+            at,
+            match value {
+                Clock::HostMonotonic => 1,
+            },
+        )
+    }
+}
+
+/// The header's [`Capture`], as a `with` field.
+mod capture_byte {
+    use super::{Block, Capture, CodecError, Encoder, invalid_enum};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<Capture, CodecError> {
+        match block.u8(at)? {
+            1 => Ok(Capture::Strict),
+            2 => Ok(Capture::BestEffort),
+            value => Err(invalid_enum("capture", value)),
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &Capture,
+    ) -> Result<(), CodecError> {
+        encoder.u8(
+            at,
+            match value {
+                Capture::Strict => 1,
+                Capture::BestEffort => 2,
+            },
+        )
+    }
+}
+
+/// A message event's flags byte at 66, read as its known bits only.
+fn flags(block: &Block<'_>) -> Result<u8, CodecError> {
+    let flags = block.u8(66)?;
+    if flags & !(FLAG_END_OF_STREAM | FLAG_EXTENSION) != 0 {
+        Err(out_of_range("flags"))
+    } else {
+        Ok(flags)
+    }
+}
+
+/// A message event's end-of-stream flag; it writes the whole flags byte,
+/// the extension's bit included, which the two fields share.
+mod message_flags {
+    use super::{
+        Block, CodecError, Encoder, FLAG_END_OF_STREAM, FLAG_EXTENSION, MessageEvent, flags,
+    };
+
+    pub(super) fn read(block: &Block<'_>) -> Result<bool, CodecError> {
+        Ok(flags(block)? & FLAG_END_OF_STREAM != 0)
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &MessageEvent<'_>,
+    ) -> Result<(), CodecError> {
+        let mut flags = 0;
+        if message.end_of_stream {
+            flags |= FLAG_END_OF_STREAM;
+        }
+        if message.extension.is_some() {
+            flags |= FLAG_EXTENSION;
+        }
+        encoder.u8(66, flags)
+    }
+}
+
+/// A message event's payload: the recording at 32, the length at 48, the
+/// kind at 65 and the inline value, the first variable field.
+mod payload {
+    use super::{
+        Block, CodecError, Decoder, Encoder, MAX_INLINE, MessageEvent, Payload, id, invalid_enum,
+        out_of_range, unavailable,
+    };
+
+    /// No value where the payload is not inline.
+    fn no_value(value: &[u8]) -> Result<(), CodecError> {
+        if value.is_empty() {
+            Ok(())
+        } else {
+            Err(CodecError::LengthOutOfRange {
+                field: "value",
+                length: value.len(),
+                min: 0,
+                max: 0,
+            })
+        }
+    }
+
+    pub(super) fn read<'a>(
+        block: &Block<'a>,
+        decoder: &mut Decoder<'a>,
+    ) -> Result<Payload<'a>, CodecError> {
+        let recording_id = block.u64(32)?;
+        let length = block.u32(48)?;
+        let value = decoder.bytes("value", 0, MAX_INLINE)?;
+        match block.u8(65)? {
+            1 if recording_id != 0 => Err(out_of_range("recording_id")),
+            1 if usize::try_from(length).ok() != Some(value.len()) => Err(out_of_range("length")),
+            1 => Ok(Payload::Inline(value)),
+            2 => {
+                no_value(value)?;
+                Ok(Payload::Reference {
+                    recording_id: id("recording_id", recording_id)?,
+                    length,
+                })
+            }
+            3 if recording_id != 0 => Err(out_of_range("recording_id")),
+            3 => {
+                no_value(value)?;
+                Ok(Payload::Unavailable {
+                    length: unavailable(length)?,
+                })
+            }
+            value => Err(invalid_enum("payload", value)),
+        }
+    }
+
+    /// The payload's length.
+    pub(super) fn length(payload: &Payload<'_>) -> Result<u32, CodecError> {
+        match *payload {
+            Payload::Inline(value) => {
+                u32::try_from(value.len()).map_err(|_| CodecError::LengthOutOfRange {
+                    field: "value",
+                    length: value.len(),
+                    min: 0,
+                    max: MAX_INLINE,
+                })
+            }
+            Payload::Reference { length, .. } => Ok(length),
+            Payload::Unavailable { length } => unavailable(length),
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &MessageEvent<'_>,
+    ) -> Result<(), CodecError> {
+        let length = length(&message.payload)?;
+        let (recording_id, kind, value) = match message.payload {
+            Payload::Inline(value) => (0, 1, value),
+            Payload::Reference { recording_id, .. } => {
+                (id("recording_id", recording_id)?, 2, &[][..])
+            }
+            Payload::Unavailable { .. } => (0, 3, &[][..]),
+        };
+        encoder.u64(32, recording_id)?;
+        encoder.u32(48, length)?;
+        encoder.u8(65, kind)?;
+        encoder.bytes("value", 0, MAX_INLINE, value)
+    }
+}
+
+/// A message event's trace extension: the second variable field, present
+/// exactly when the flags byte's extension bit is set.
+mod extension {
+    use super::{
+        Block, CodecError, Decoder, EXTENSION, Encoder, FLAG_EXTENSION, MessageEvent, flags,
+        out_of_range,
+    };
+
+    pub(super) fn read<'a>(
+        block: &Block<'a>,
+        decoder: &mut Decoder<'a>,
+    ) -> Result<Option<&'a [u8; EXTENSION]>, CodecError> {
+        if flags(block)? & FLAG_EXTENSION == 0 {
+            decoder.bytes("extension", 0, 0)?;
+            Ok(None)
+        } else {
+            let bytes = decoder.bytes("extension", EXTENSION, EXTENSION)?;
+            Ok(Some(
+                bytes.try_into().map_err(|_| out_of_range("extension"))?,
+            ))
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &MessageEvent<'_>,
+    ) -> Result<(), CodecError> {
+        let extension = message
+            .extension
+            .map_or(&[][..], |extension| &extension[..]);
+        encoder.bytes("extension", 0, EXTENSION, extension)
+    }
+}
+
+impl MessageEvent<'_> {
+    /// The extent covers the payload after one frame header.
+    fn check(&self) -> Result<(), CodecError> {
+        extent(self.extent, payload::length(&self.payload)?).map(|_| ())
+    }
+}
+
+/// A conflated value's [`Freshness`]: the code at 44, a stale value's gap
+/// start at 24.
+mod freshness {
+    use super::{
+        Block, CodecError, ConflatedEvent, Encoder, Freshness, invalid_enum, out_of_range,
+    };
+
+    pub(super) fn read(block: &Block<'_>) -> Result<Freshness, CodecError> {
+        let since = block.u64(24)?;
+        match block.u8(44)? {
+            1 if since != 0 => Err(out_of_range("stale_since")),
+            1 => Ok(Freshness::Fresh),
+            2 => Ok(Freshness::Stale { since }),
+            value => Err(invalid_enum("freshness", value)),
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &ConflatedEvent<'_>,
+    ) -> Result<(), CodecError> {
+        let (freshness, since) = match message.freshness {
+            Freshness::Fresh => (1, 0),
+            Freshness::Stale { since } => (2, since),
+        };
+        encoder.u64(24, since)?;
+        encoder.u8(44, freshness)
+    }
+}
+
+/// A lifecycle event's [`LifecycleKind`]: the kind at 40, an end's reason
+/// at 42.
+mod lifecycle_kind {
+    use super::{
+        Block, CodecError, Encoder, EndReason, LifecycleEvent, LifecycleKind, invalid_enum,
+        out_of_range,
+    };
+
+    pub(super) fn read(block: &Block<'_>) -> Result<LifecycleKind, CodecError> {
+        match (block.u8(40)?, block.u8(42)?) {
+            (1, 0) => Ok(LifecycleKind::ImageAvailable),
+            (2, 0) => Ok(LifecycleKind::ImageUnavailable),
+            (1 | 2, _) => Err(out_of_range("reason")),
+            (3, 1) => Ok(LifecycleKind::SubscriptionEnded(EndReason::EndOfStream)),
+            (3, 2) => Ok(LifecycleKind::SubscriptionEnded(EndReason::Overrun)),
+            (3, 3) => Ok(LifecycleKind::SubscriptionEnded(EndReason::Revoked)),
+            (3, 4) => Ok(LifecycleKind::SubscriptionEnded(EndReason::Closed)),
+            (3, value) => Err(invalid_enum("reason", value)),
+            (value, _) => Err(invalid_enum("kind", value)),
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &LifecycleEvent,
+    ) -> Result<(), CodecError> {
+        let (kind, reason) = match message.kind {
+            LifecycleKind::ImageAvailable => (1, 0),
+            LifecycleKind::ImageUnavailable => (2, 0),
+            LifecycleKind::SubscriptionEnded(EndReason::EndOfStream) => (3, 1),
+            LifecycleKind::SubscriptionEnded(EndReason::Overrun) => (3, 2),
+            LifecycleKind::SubscriptionEnded(EndReason::Revoked) => (3, 3),
+            LifecycleKind::SubscriptionEnded(EndReason::Closed) => (3, 4),
+        };
+        encoder.u8(40, kind)?;
+        encoder.u8(42, reason)
+    }
+}
+
+/// A loss event's [`Loss`]: the kind at 57, an overrun's outcome at 58 and
+/// the reason at 59.
+mod loss {
+    use super::{
+        Block, CodecError, Encoder, FallbackReason, Loss, LossEvent, OverrunOutcome, invalid_enum,
+        out_of_range, skip_code, skip_reason,
+    };
+
+    pub(super) fn read(block: &Block<'_>) -> Result<Loss, CodecError> {
+        let (outcome, reason) = (block.u8(58)?, block.u8(59)?);
+        match block.u8(57)? {
+            1 => {
+                let outcome = OverrunOutcome::from_code(outcome)?;
+                let fallback = FallbackReason::from_code(reason)?;
+                if fallback.is_some() && !outcome.is_secondary() {
+                    return Err(out_of_range("reason"));
+                }
+                Ok(Loss::Overrun { outcome, fallback })
+            }
+            2 | 3 if outcome != 0 => Err(out_of_range("outcome")),
+            2 => Ok(Loss::Skipped(skip_reason(reason)?)),
+            3 if reason != 0 => Err(out_of_range("reason")),
+            3 => Ok(Loss::Aborted),
+            value => Err(invalid_enum("kind", value)),
+        }
+    }
+
+    pub(super) fn write(encoder: &mut Encoder<'_>, message: &LossEvent) -> Result<(), CodecError> {
+        let (kind, outcome, reason) = match message.loss {
+            Loss::Overrun { outcome, fallback } => {
+                if fallback.is_some() && !outcome.is_secondary() {
+                    return Err(out_of_range("reason"));
+                }
+                (1, outcome.code(), fallback.map_or(0, FallbackReason::code))
+            }
+            Loss::Skipped(reason) => (2, 0, skip_code(reason)),
+            Loss::Aborted => (3, 0, 0),
+        };
+        encoder.u8(57, kind)?;
+        encoder.u8(58, outcome)?;
+        encoder.u8(59, reason)
+    }
+}
+
+/// An observation's [`Operation`], as a `with` field.
+mod operation_byte {
+    use super::{Block, CodecError, Encoder, Operation, invalid_enum};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<Operation, CodecError> {
+        match block.u8(at)? {
+            1 => Ok(Operation::Offer),
+            2 => Ok(Operation::Claim),
+            3 => Ok(Operation::Commit),
+            value => Err(invalid_enum("operation", value)),
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &Operation,
+    ) -> Result<(), CodecError> {
+        encoder.u8(
+            at,
+            match value {
+                Operation::Offer => 1,
+                Operation::Claim => 2,
+                Operation::Commit => 3,
+            },
+        )
+    }
+}
+
+/// An outcome's code.
+const fn outcome_code(outcome: &Outcome) -> u8 {
+    match outcome {
+        Outcome::Accepted { .. } => 1,
+        Outcome::BackPressured => 2,
+        Outcome::AdminAction => 3,
+        Outcome::NotConnected => 4,
+        Outcome::Closed => 5,
+        Outcome::Gated => 6,
+        Outcome::RateLimited => 7,
+        Outcome::Aborted { .. } => 8,
+        Outcome::Failed { .. } => 9,
+    }
+}
+
+/// An observation's [`Outcome`]: the code at 49, the lane at 50, the
+/// position at 8, a failure's error at 44, sub at 46 and details at 16
+/// and 24.
+mod outcome {
+    use super::{
+        Block, CodecError, Encoder, MAX_ERROR_CODE, Outcome, OutcomeObservation, details_fit,
+        invalid_enum, lane, out_of_range, sub_of,
+    };
+
+    pub(super) fn read(block: &Block<'_>) -> Result<Outcome, CodecError> {
+        let (position, detail, detail2) = (block.u64(8)?, block.u64(16)?, block.u64(24)?);
+        let (error, sub) = (block.u16(44)?, block.u16(46)?);
+        let lane_byte = block.u8(50)?;
+        let code = block.u8(49)?;
+        if !(1..=9).contains(&code) {
+            return Err(invalid_enum("outcome", code));
+        }
+        let positioned = matches!(code, 1 | 8);
+        if !positioned && position != 0 {
+            return Err(out_of_range("position"));
+        }
+        if !positioned && lane_byte != 0 {
+            return Err(out_of_range("lane"));
+        }
+        if code != 9 && (error != 0 || sub != 0 || detail != 0 || detail2 != 0) {
+            return Err(out_of_range("error"));
+        }
+        Ok(match code {
+            1 => Outcome::Accepted {
+                lane: lane(lane_byte)?,
+                position,
+            },
+            8 => Outcome::Aborted {
+                lane: lane(lane_byte)?,
+                position,
+            },
+            2 => Outcome::BackPressured,
+            3 => Outcome::AdminAction,
+            4 => Outcome::NotConnected,
+            5 => Outcome::Closed,
+            6 => Outcome::Gated,
+            7 => Outcome::RateLimited,
+            _ if error == 0 || error > MAX_ERROR_CODE => return Err(out_of_range("error")),
+            _ if !sub_of(error, sub) => return Err(out_of_range("sub")),
+            _ if !details_fit(error, sub, detail, detail2) => return Err(out_of_range("detail")),
+            _ => Outcome::Failed {
+                error,
+                sub,
+                detail,
+                detail2,
+            },
+        })
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        message: &OutcomeObservation,
+    ) -> Result<(), CodecError> {
+        let none = (0u16, 0u16, 0u64, 0u64);
+        let (lane, position, (error, sub, detail, detail2)) = match message.outcome {
+            Outcome::Accepted { lane, position } | Outcome::Aborted { lane, position } => {
+                (lane.get(), position, none)
+            }
+            Outcome::Failed { error, .. } if error == 0 || error > MAX_ERROR_CODE => {
+                return Err(out_of_range("error"));
+            }
+            Outcome::Failed { error, sub, .. } if !sub_of(error, sub) => {
+                return Err(out_of_range("sub"));
+            }
+            Outcome::Failed {
+                error,
+                sub,
+                detail,
+                detail2,
+            } if !details_fit(error, sub, detail, detail2) => {
+                return Err(out_of_range("detail"));
+            }
+            Outcome::Failed {
+                error,
+                sub,
+                detail,
+                detail2,
+            } => (0, 0, (error, sub, detail, detail2)),
+            _ => (0, 0, none),
+        };
+        encoder.u64(8, position)?;
+        encoder.u64(16, detail)?;
+        encoder.u64(24, detail2)?;
+        encoder.u16(44, error)?;
+        encoder.u16(46, sub)?;
+        encoder.u8(49, super::outcome_code(&message.outcome))?;
+        encoder.u8(50, lane)
+    }
+}
+
+impl OutcomeObservation {
+    /// The operation can return the outcome, and a claim records no
+    /// length or digest.
+    fn check(&self) -> Result<(), CodecError> {
+        if !returns(self.operation, outcome_code(&self.outcome)) {
+            return Err(out_of_range("outcome"));
+        }
+        if self.operation == Operation::Claim && (self.length != 0 || self.crc32c != 0) {
+            return Err(out_of_range("length"));
+        }
+        Ok(())
+    }
+}
+
+impl DeliveryPoll {
+    /// It presented at most its maximum.
+    fn check(&self) -> Result<(), CodecError> {
+        if self.count > self.max {
+            Err(out_of_range("count"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// A delivery's ring kind code, as a `with` field: refused on decode as
+/// an unknown code, on encode as out of range.
+mod delivery_kind {
+    use super::{Block, CodecError, DELIVERY_KINDS, Encoder, invalid_enum, out_of_range};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<u8, CodecError> {
+        let kind = block.u8(at)?;
+        if DELIVERY_KINDS.contains(&kind) {
+            Ok(kind)
+        } else {
+            Err(invalid_enum("kind", kind))
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &u8,
+    ) -> Result<(), CodecError> {
+        if !DELIVERY_KINDS.contains(value) {
+            return Err(out_of_range("kind"));
+        }
+        encoder.u8(at, *value)
+    }
+}
+
+impl DeliveryObservation {
+    /// As the ring itself refuses (`outcome_ring::Record`): a receiver
+    /// only on a range-side kind, a lost count only on outcomes lost.
+    fn check(&self) -> Result<(), CodecError> {
+        if !range_side(self.kind) && self.receiver != 0 {
+            return Err(out_of_range("receiver"));
+        }
+        if self.kind != OUTCOMES_LOST && self.lost != 0 {
+            return Err(out_of_range("lost"));
+        }
+        Ok(())
+    }
+}
+
+/// A timer observation's [`TimerAction`], as a `with` field.
+mod timer_action {
+    use super::{Block, CodecError, Encoder, TimerAction, invalid_enum};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<TimerAction, CodecError> {
+        match block.u8(at)? {
+            1 => Ok(TimerAction::Create),
+            2 => Ok(TimerAction::Cancel),
+            value => Err(invalid_enum("action", value)),
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &TimerAction,
+    ) -> Result<(), CodecError> {
+        encoder.u8(
+            at,
+            match value {
+                TimerAction::Create => 1,
+                TimerAction::Cancel => 2,
+            },
+        )
+    }
+}
+
+/// An event end's [`EndOutcome`], as a `with` field.
+mod end_outcome {
+    use super::{Block, CodecError, Encoder, EndOutcome, invalid_enum};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<EndOutcome, CodecError> {
+        match block.u8(at)? {
+            1 => Ok(EndOutcome::Complete),
+            2 => Ok(EndOutcome::Incomplete),
+            value => Err(invalid_enum("outcome", value)),
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &EndOutcome,
+    ) -> Result<(), CodecError> {
+        encoder.u8(
+            at,
+            match value {
+                EndOutcome::Complete => 1,
+                EndOutcome::Incomplete => 2,
+            },
+        )
+    }
+}
+
+/// A gap marker's [`GapReason`], as a `with` field.
+mod gap_reason {
+    use super::{Block, CodecError, Encoder, GapReason, invalid_enum};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<GapReason, CodecError> {
+        match block.u8(at)? {
+            1 => Ok(GapReason::BudgetExceeded),
+            2 => Ok(GapReason::RingFull),
+            3 => Ok(GapReason::PayloadUnavailable),
+            value => Err(invalid_enum("reason", value)),
+        }
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        value: &GapReason,
+    ) -> Result<(), CodecError> {
+        encoder.u8(
+            at,
+            match value {
+                GapReason::BudgetExceeded => 1,
+                GapReason::RingFull => 2,
+                GapReason::PayloadUnavailable => 3,
+            },
+        )
+    }
+}
+
+impl GapMarker {
+    /// The last event is at least the first.
+    fn check(&self) -> Result<(), CodecError> {
+        if self.to_seq < self.from_seq {
+            Err(out_of_range("to_seq"))
+        } else {
+            Ok(())
+        }
     }
 }
 

@@ -1080,3 +1080,26 @@ fn the_retention_templates_refuse_invalid_fields() {
     }
     assert_eq!(ResponseCode::of(9), None);
 }
+
+/// karyos#1104 (Codex review of #1167): the shared request block encodes
+/// only as one of its listed templates; any other, whose layout no check
+/// covered, is refused before a byte is written.
+#[test]
+fn a_shared_block_encodes_only_as_its_listed_templates() {
+    let request = RecordingRequest {
+        correlation_id: 1,
+        recording_id: 2,
+    };
+    let mut out = [0u8; 64];
+    for template in [HOLD_RECORDING, RELEASE_HOLD, VERIFY_RECORDING] {
+        assert!(request.encode(&mut out, &template).is_ok());
+    }
+    assert_eq!(
+        request.encode(&mut out, &STOP_RECORDING),
+        Err(CodecError::UnsupportedSchema {
+            schema: STOP_RECORDING.schema_id,
+            template: STOP_RECORDING.template_id,
+            version: STOP_RECORDING.version,
+        })
+    );
+}
