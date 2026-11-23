@@ -243,6 +243,13 @@ struct Responses {
     room: Arc<AtomicUsize>,
     /// The longest replication message it takes.
     max: Arc<AtomicUsize>,
+    /// Whether it keeps what it is sent; when not, it only counts, so a
+    /// test can measure the server's own allocations (karyos#1113).
+    keep: Arc<std::sync::atomic::AtomicBool>,
+    /// Replication messages sent while not kept.
+    counted: Arc<AtomicUsize>,
+    /// `RecordingBytes` among them.
+    chunks: Arc<AtomicUsize>,
 }
 
 impl ResponseSink for Responses {
@@ -259,7 +266,15 @@ impl ResponseSink for Responses {
             "{} > {max}",
             message.len()
         );
-        self.sent.lock().unwrap().push(message.to_vec());
+        if self.keep.load(Ordering::Acquire) {
+            self.sent.lock().unwrap().push(message.to_vec());
+        } else if replication {
+            self.counted.fetch_add(1, Ordering::AcqRel);
+            // Template 101, `RecordingBytes`, at bytes 2 to 4.
+            if message.get(2..4) == Some(&101u16.to_le_bytes()[..]) {
+                self.chunks.fetch_add(1, Ordering::AcqRel);
+            }
+        }
         true
     }
 
@@ -296,6 +311,9 @@ impl Rig {
             sent: Arc::default(),
             room: Arc::new(AtomicUsize::new(usize::MAX)),
             max: Arc::new(AtomicUsize::new(usize::MAX)),
+            keep: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            counted: Arc::default(),
+            chunks: Arc::default(),
         };
         let server = ControlServer::new(agent, host, requests.clone(), responses.clone())
             .with_config(config);
@@ -1417,6 +1435,9 @@ fn answer_stream(room: usize) -> Responses {
         sent: Arc::default(),
         room: Arc::new(AtomicUsize::new(room)),
         max: Arc::new(AtomicUsize::new(usize::MAX)),
+        keep: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        counted: Arc::default(),
+        chunks: Arc::default(),
     }
 }
 
@@ -1743,5 +1764,98 @@ fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
     let shared = rig.responses.sent.lock().unwrap().clone();
     assert!(shared.iter().all(|bytes| bytes[4] == 1));
     assert_eq!(answers.sent.lock().unwrap().len(), RECORDINGS + 1);
+    rig.finish();
+}
+
+/// karyos#1113: forwarding a running replication allocates nothing on
+/// the server: its answers' buffers and its batch are reused. The sink
+/// only counts while measured, so the count is the server's own.
+#[test]
+fn forwarding_a_steady_replication_allocates_nothing() {
+    use crate::replication::{Mode, ReplicateRecording, ReplicationMessage};
+    let agent = AgentConfig {
+        seal_interval: Some(Duration::from_millis(1)),
+        ..AgentConfig::default()
+    };
+    // Within one 64 KiB term of the test lane.
+    let all = frames(600, 5);
+    let mut rig = Rig::with(
+        "replication-alloc",
+        Host::of(all.clone(), false),
+        agent,
+        ServerConfig::default(),
+    );
+    // Small messages: many forwarding passes for one recording.
+    rig.responses.max.store(256, Ordering::Release);
+    rig.request(&start(1));
+    let length = u64::try_from(all.len()).unwrap();
+    for _ in 0..10_000 {
+        let _ = rig.server.duty();
+        if rig
+            .server
+            .agent()
+            .describe(1)
+            .is_ok_and(|described| described.durable == length)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    rig.request(&ControlMessage::StopRecording(control::StopRecording {
+        correlation_id: 2,
+        recording_id: 1,
+    }));
+    for _ in 0..500 {
+        rig.server.duty();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut out = vec![0u8; 256];
+    let request = ReplicationMessage::ReplicateRecording(ReplicateRecording {
+        correlation_id: 9,
+        recording_id: 1,
+        from: 0,
+        until: u64::MAX,
+        mode: Mode::OnDemand,
+    });
+    let written = request.encode(&mut out).unwrap();
+    out.truncate(written);
+    rig.responses.keep.store(false, Ordering::Release);
+    rig.raw(out);
+    // Two messages a duty: the replication runs over many duties, at the
+    // sink's pace. Warm up, bounded in time: a full pending batch, then
+    // flushed outside the measurement, so the spare buffers and the batch
+    // have reached their size before it starts.
+    rig.responses.room.store(0, Ordering::Release);
+    let warm = std::time::Instant::now();
+    while rig.server.pending() < super::REPLICATION_FORWARD {
+        assert!(warm.elapsed() < Duration::from_secs(30), "no full batch");
+        rig.server.duty();
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    rig.responses
+        .room
+        .store(super::REPLICATION_FORWARD, Ordering::Release);
+    rig.server.duty();
+    for _ in 0..10 {
+        rig.responses.room.store(2, Ordering::Release);
+        rig.server.duty();
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let before = rig.responses.chunks.load(Ordering::Acquire);
+    let mut allocations = 0;
+    for _ in 0..60 {
+        rig.responses.room.store(2, Ordering::Release);
+        let ((), made) = karyos_sys::alloc_count::count(|| {
+            let _ = rig.server.duty();
+        });
+        allocations += made;
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let forwarded = rig.responses.chunks.load(Ordering::Acquire) - before;
+    assert!(
+        forwarded > 0,
+        "recording bytes went on during the measurement"
+    );
+    assert_eq!(allocations, 0, "forwarded {forwarded} chunks");
     rig.finish();
 }

@@ -283,6 +283,10 @@ const RECORDING_BYTES_OVERHEAD: usize =
 /// bounded channel, so a slow reader holds the agent back (karyos#1113).
 const REPLICATION_FORWARD: usize = 8;
 
+/// Sent answers' buffers kept for reuse: at least what one forwarding
+/// pass and the answers around it need (karyos#1113).
+const SPARE_BUFFERS: usize = 2 * REPLICATION_FORWARD;
+
 /// The server's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -383,6 +387,11 @@ pub struct ControlServer<H, Q, R> {
     waiting: Option<Waiting>,
     /// Answers and signals not sent yet, in order.
     pending: VecDeque<Vec<u8>>,
+    /// Buffers of sent answers, kept for the next ones: a steady
+    /// replication encodes into them and allocates nothing (karyos#1113).
+    spare: Vec<Vec<u8>>,
+    /// The replication messages one forwarding pass takes, reused.
+    forward: Vec<Outgoing>,
     dropped_signals: u64,
     unencoded: u64,
     unattended: u64,
@@ -417,7 +426,9 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
             config: ServerConfig::default(),
             request: vec![0; MAX_REQUEST],
             waiting: None,
-            pending: VecDeque::new(),
+            pending: VecDeque::with_capacity(SPARE_BUFFERS),
+            spare: Vec::with_capacity(SPARE_BUFFERS),
+            forward: Vec::with_capacity(REPLICATION_FORWARD),
             dropped_signals: 0,
             unencoded: 0,
             unattended: 0,
@@ -559,9 +570,26 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                 break;
             }
             sent = true;
-            self.pending.pop_front();
+            if let Some(buffer) = self.pending.pop_front()
+                && self.spare.len() < SPARE_BUFFERS
+            {
+                self.spare.push(buffer);
+            }
         }
         sent
+    }
+
+    /// A buffer of `length` zero bytes: a spare one when there is one, so a
+    /// steady state allocates nothing.
+    fn buffer(&mut self, length: usize) -> Vec<u8> {
+        match self.spare.pop() {
+            Some(mut buffer) => {
+                buffer.clear();
+                buffer.resize(length, 0);
+                buffer
+            }
+            None => vec![0u8; length],
+        }
     }
 
     /// Sends what waits on a retention state answer's own stream; the
@@ -606,7 +634,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
         &mut self,
         encode: impl FnOnce(&mut [u8]) -> Result<usize, CodecError>,
     ) -> bool {
-        let mut out = vec![0u8; MAX_ANSWER];
+        let mut out = self.buffer(MAX_ANSWER);
         // Every message the server builds is valid and fits: a failure is
         // a bug, and the message is counted and dropped rather than sent
         // malformed.
@@ -998,7 +1026,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
         while let Some((correlation_id, recording_id, messages)) = self.replications.get(index) {
             let (correlation_id, recording_id) = (*correlation_id, *recording_id);
             let mut ended = false;
-            let mut batch = Vec::new();
+            let mut batch = core::mem::take(&mut self.forward);
             while taken < REPLICATION_FORWARD
                 && self.pending.len().saturating_add(batch.len()) < REPLICATION_FORWARD
             {
@@ -1014,10 +1042,11 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
                     }
                 }
             }
-            for message in batch {
+            for message in batch.drain(..) {
                 worked = true;
                 self.queue_replication(correlation_id, recording_id, &message);
             }
+            self.forward = batch;
             if ended {
                 self.replications.swap_remove(index);
             } else {
@@ -1029,7 +1058,7 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
 
     /// Queues one of a replication's messages, encoded in schema 6.
     fn queue_replication(&mut self, correlation_id: u64, recording_id: u64, message: &Outgoing) {
-        let mut out = vec![0u8; replication::RECORDING_BYTES.max_length as usize];
+        let mut out = self.buffer(replication::RECORDING_BYTES.max_length as usize);
         let encoded = match message {
             Outgoing::Bytes { start, bytes } => {
                 ReplicationMessage::RecordingBytes(RecordingBytes {
