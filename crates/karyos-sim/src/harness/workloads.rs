@@ -549,11 +549,14 @@ pub struct Case {
     pub behind: Option<(NodeId, u64)>,
     /// Faults injected into servers and clients, so the checks can be
     /// shown to catch a faulty driver, disk, service or client with a real
-    /// core behind them (karyos#1038). Empty in every workload.
+    /// core behind them (karyos#1038; the `test-hooks` feature). Empty in
+    /// every workload.
+    #[cfg(feature = "test-hooks")]
     pub faults: Faults,
 }
 
 /// What [`Case::faults`] injects (karyos#1038, tests).
+#[cfg(feature = "test-hooks")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Faults {
     /// Servers whose driver injects a fault.
@@ -610,6 +613,7 @@ impl Case {
             compaction: None,
             handover: None,
             retried: false,
+            #[cfg(feature = "test-hooks")]
             faults: Faults::default(),
         }
     }
@@ -909,15 +913,18 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         if let Some(compaction) = case.compaction {
             server = server.with_compaction(compaction);
         }
-        let drive_fault = case
-            .faults
-            .drive
-            .iter()
-            .find(|(node, _)| *node == id)
-            .map_or(super::core::DriveFault::None, |(_, fault)| *fault);
-        let alters = case.faults.altered_responses.contains(&id);
-        if drive_fault != super::core::DriveFault::None || alters {
-            server = server.with_faults(drive_fault, alters);
+        #[cfg(feature = "test-hooks")]
+        {
+            let drive_fault = case
+                .faults
+                .drive
+                .iter()
+                .find(|(node, _)| *node == id)
+                .map_or(super::core::DriveFault::None, |(_, fault)| *fault);
+            let alters = case.faults.altered_responses.contains(&id);
+            if drive_fault != super::core::DriveFault::None || alters {
+                server = server.with_faults(drive_fault, alters);
+            }
         }
         let index = usize::try_from(id).map_err(|_| RunError::Count)?;
         let drift = case.drift_ppm.get(index).copied().unwrap_or(0);
@@ -938,6 +945,7 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             .ok_or(RunError::Count)?;
         let mut client = ClientNode::new(id, leader, script(case, index), Rc::clone(&recorder))
             .with_retry_after(case.retry_after);
+        #[cfg(feature = "test-hooks")]
         if case.faults.corrupt_reads.contains(&index) {
             client = client.corrupting_reads();
         }

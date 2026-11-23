@@ -51,7 +51,7 @@ use karyos_cluster::{Entry, LogError, RaftLog};
 use super::core::{
     Applying, Change, ChangeRefused, Configuration, ConsensusCore, DriveError, DriveFault, Limit,
     Limits, LogView, NotLeader, ReadBudget, Refused, Release, SnapshotBase, Step, TransferRefused,
-    Unsupported, drive_faulty,
+    Unsupported, drive_inner,
 };
 use super::standby::{
     self, ExternalLease, FEED_BATCH_BYTES, FEED_PERIOD, FIRST_GENERATION, FeedEntry, FeedFault,
@@ -109,6 +109,21 @@ pub enum Ret {
 }
 
 impl Ret {
+    /// Another valid answer than this one (karyos#1038, tests): a faulty
+    /// service's.
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    fn altered(self) -> Self {
+        match self {
+            Self::Appended(length) => Self::Appended(length.wrapping_add(1_000)),
+            Self::Values(mut values) => {
+                values.push(b"altered".to_vec());
+                Self::Values(values)
+            }
+            Self::Expired => Self::Appended(0),
+        }
+    }
+
     /// The canonical response bytes: a tag, then the length or the values,
     /// each length-prefixed, little endian.
     #[must_use]
@@ -1285,7 +1300,8 @@ pub struct ServerNode<C: ConsensusCore> {
     base: Option<SnapshotBase>,
     /// The fault its driver injects (karyos#1038, tests).
     drive_fault: DriveFault,
-    /// Its service records altered answers (karyos#1038, tests).
+    /// Its service answers differently (karyos#1038, tests).
+    #[cfg(feature = "test-hooks")]
     alters_responses: bool,
 }
 
@@ -1415,6 +1431,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             snapshots: None,
             base: None,
             drive_fault: DriveFault::None,
+            #[cfg(feature = "test-hooks")]
             alters_responses: false,
         };
         if let Some(configuration) = configuration {
@@ -1458,6 +1475,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             snapshots: None,
             base: None,
             drive_fault: DriveFault::None,
+            #[cfg(feature = "test-hooks")]
             alters_responses: false,
         };
         server.start();
@@ -1767,6 +1785,7 @@ impl<C: ConsensusCore> ServerNode<C> {
     /// faults that show the harness checks catch a faulty driver, disk or
     /// service with a real core behind them (karyos#1038, tests).
     #[must_use]
+    #[cfg(feature = "test-hooks")]
     pub fn with_faults(mut self, drive: DriveFault, alters_responses: bool) -> Self {
         self.drive_fault = drive;
         self.alters_responses = alters_responses;
@@ -1783,7 +1802,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         let mut applied = Vec::new();
         let mut snapshot_to = Vec::new();
         let budget = self.limits.is_some().then_some(&self.budget);
-        let driven = drive_faulty(
+        let driven = drive_inner(
             &mut core,
             &mut log,
             (budget, self.base, self.drive_fault),
@@ -1876,14 +1895,15 @@ impl<C: ConsensusCore> ServerNode<C> {
             }
             let deduplicated = self.service.deduplicated();
             let answer = self.service.apply(&served);
+            // A faulty service (tests): another valid answer, both recorded
+            // and sent.
+            #[cfg(feature = "test-hooks")]
+            let answer = match answer {
+                Some((command, ret)) if self.alters_responses => Some((command, ret.altered())),
+                other => other,
+            };
             let replayed = self.service.deduplicated() > deduplicated;
-            let mut response = answer.as_ref().map(|(_, ret)| ret.canonical());
-            // A faulty service's answer (tests): its last byte flipped.
-            if self.alters_responses
-                && let Some(last) = response.as_mut().and_then(|bytes| bytes.last_mut())
-            {
-                *last ^= 0xFF;
-            }
+            let response = answer.as_ref().map(|(_, ret)| ret.canonical());
             if let Some((command, ret)) = answer
                 && self.pending.remove(&(command.client, command.sequence))
                 && acts
@@ -2400,6 +2420,7 @@ pub struct ClientNode {
     generation: u64,
     /// It records each read with a value no one wrote (karyos#1038,
     /// tests): a faulty client.
+    #[cfg(feature = "test-hooks")]
     corrupts_reads: bool,
 }
 
@@ -2417,6 +2438,7 @@ impl ClientNode {
             refused: false,
             recorder,
             generation: 0,
+            #[cfg(feature = "test-hooks")]
             corrupts_reads: false,
         }
     }
@@ -2424,6 +2446,7 @@ impl ClientNode {
     /// The client recording each read with a value no one wrote: a faulty
     /// client (karyos#1038, tests).
     #[must_use]
+    #[cfg(feature = "test-hooks")]
     pub fn corrupting_reads(mut self) -> Self {
         self.corrupts_reads = true;
         self
@@ -2525,6 +2548,7 @@ impl<M> Node<Wire<M>> for ClientNode {
                     return;
                 }
                 self.generation = generation;
+                #[cfg(feature = "test-hooks")]
                 let ret = match ret {
                     Ret::Values(mut values) if self.corrupts_reads => {
                         values.push(b"never written".to_vec());

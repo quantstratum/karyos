@@ -714,7 +714,7 @@ pub fn drive<C: ConsensusCore, D: Disk + Clone>(
     drive_metered(core, log, (None, None), send, apply, observe)
 }
 
-/// A fault injected into [`drive_faulty`], so the harness checks can be
+/// A fault injected into the driver (the `test-hooks` feature), so the harness checks can be
 /// shown to catch what a faulty driver or disk would do with a real core
 /// behind it (karyos#1038). Tests only: every production path drives with
 /// [`DriveFault::None`].
@@ -725,9 +725,11 @@ pub enum DriveFault {
     None,
     /// Messages that wait for persistence leave before it (step 4 before
     /// step 2).
+    #[cfg(feature = "test-hooks")]
     ReleaseEarly,
     /// A Ready's fresh entries are applied before they are written, as a
     /// driver that took them for committed would.
+    #[cfg(feature = "test-hooks")]
     ApplyFresh,
 }
 
@@ -745,7 +747,7 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
     apply: &mut dyn FnMut(&Entry, Applying),
     observe: &mut dyn FnMut(Step),
 ) -> Result<(), DriveError> {
-    drive_faulty(
+    drive_inner(
         core,
         log,
         (budget, base, DriveFault::None),
@@ -755,12 +757,10 @@ pub fn drive_metered<C: ConsensusCore, D: Disk + Clone>(
     )
 }
 
-/// [`drive_metered`] with `fault` injected (karyos#1038, tests).
-///
-/// # Errors
-///
-/// As [`drive`].
-pub fn drive_faulty<C: ConsensusCore, D: Disk + Clone>(
+/// [`drive_metered`]'s steps, with `fault` injected; only
+/// [`DriveFault::None`] exists without the `test-hooks` feature
+/// (karyos#1038).
+pub(crate) fn drive_inner<C: ConsensusCore, D: Disk + Clone>(
     core: &mut C,
     log: &mut RaftLog<D>,
     (budget, base, fault): (Option<&ReadBudget>, Option<SnapshotBase>, DriveFault),
@@ -783,8 +783,12 @@ pub fn drive_faulty<C: ConsensusCore, D: Disk + Clone>(
             send(to, message, None);
         }
         let needs = ready.entries.last().map(|entry| entry.index);
+        #[cfg_attr(not(feature = "test-hooks"), allow(unused_mut))]
         let mut after_persist = ready.after_persist;
         // Faults that act before persistence (tests).
+        #[cfg(not(feature = "test-hooks"))]
+        let DriveFault::None = fault;
+        #[cfg(feature = "test-hooks")]
         match fault {
             DriveFault::ReleaseEarly => {
                 for (to, message) in after_persist.drain(..) {
