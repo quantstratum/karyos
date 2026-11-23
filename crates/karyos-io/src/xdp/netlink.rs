@@ -312,7 +312,21 @@ fn absorb(
             return Err(NetlinkError::Incomplete);
         }
         match message.kind {
-            NLMSG_DONE => return Ok(true),
+            NLMSG_DONE => {
+                // A dump ends with the kernel's status: nonzero is an error,
+                // never a complete answer.
+                let status = message
+                    .payload
+                    .get(..4)
+                    .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                    .map_or(0, i32::from_ne_bytes);
+                if status != 0 {
+                    return Err(NetlinkError::Kernel {
+                        errno: status.checked_neg().unwrap_or(i32::MAX),
+                    });
+                }
+                return Ok(true);
+            }
             NLMSG_ERROR => {
                 let error = message
                     .payload
@@ -385,12 +399,14 @@ pub fn lookup_neighbour(ifindex: u32, next_hop: IpAddr) -> Result<Option<[u8; 6]
     let mut found = None;
     let mut messages_seen = 0;
     for _ in 0..MAX_RECVS {
-        let (len, _, from) = rustix::net::recvfrom(&socket, &mut buffer, RecvFlags::empty())
+        // MSG_TRUNC makes the kernel report the datagram's real length, so
+        // a reply larger than the buffer is caught, never read short.
+        let (len, total, from) = rustix::net::recvfrom(&socket, &mut buffer, RecvFlags::TRUNC)
             .map_err(|errno| match errno {
                 rustix::io::Errno::AGAIN => NetlinkError::Incomplete,
                 errno => os("netlink_recv")(errno),
             })?;
-        if len > buffer.len() {
+        if total > buffer.len() || len > buffer.len() {
             return Err(NetlinkError::Incomplete);
         }
         let from_kernel = from
@@ -581,6 +597,24 @@ mod tests {
                 &mut seen
             ),
             Err(NetlinkError::Kernel { errno: 13 })
+        );
+    }
+
+    #[test]
+    fn a_failed_dump_status_is_an_error() {
+        let done = message(NLMSG_DONE, 2, 3, &(-16_i32).to_ne_bytes());
+        let mut found = None;
+        let mut seen = 0;
+        assert_eq!(
+            absorb(
+                &done,
+                3,
+                1,
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                &mut found,
+                &mut seen
+            ),
+            Err(NetlinkError::Kernel { errno: 16 })
         );
     }
 

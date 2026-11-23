@@ -188,6 +188,24 @@ pub fn write_headers(
     Some(total)
 }
 
+/// The Ethernet group MAC of a multicast address: `01:00:5e` and the low
+/// 23 bits for IPv4 (RFC 1112), `33:33` and the low 32 bits for IPv6
+/// (RFC 2464); `None` for a unicast address.
+#[must_use]
+pub fn group_mac(address: IpAddr) -> Option<[u8; 6]> {
+    match address {
+        IpAddr::V4(v4) if v4.is_multicast() => {
+            let [_, b, c, d] = v4.octets();
+            Some([0x01, 0x00, 0x5e, b & 0x7f, c, d])
+        }
+        IpAddr::V6(v6) if v6.is_multicast() => {
+            let o = v6.octets();
+            Some([0x33, 0x33, o[12], o[13], o[14], o[15]])
+        }
+        _ => None,
+    }
+}
+
 /// What RX validation established about one frame (design 8.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Checked {
@@ -223,7 +241,10 @@ fn validate_inner(
     local_mac: [u8; 6],
     max_datagram: u16,
 ) -> Option<Checked> {
-    if get::<6>(frame, 0)? != local_mac {
+    // The interface's own MAC, or the group MAC of a multicast endpoint
+    // (design 8.2: "the interface or a joined group MAC").
+    let destination_mac = get::<6>(frame, 0)?;
+    if destination_mac != local_mac && Some(destination_mac) != group_mac(local.ip()) {
         return Some(Checked::Drop(RxDropReason::NotLocal, None));
     }
     let (source_ip, destination_ip, udp_at, ip_payload) = match u16_at(frame, 12)? {
@@ -365,6 +386,32 @@ mod tests {
             validate(&frame[..len], destination, MAC_A, 1408),
             Checked::Drop(RxDropReason::NotLocal, None)
         ));
+    }
+
+    #[test]
+    fn a_multicast_endpoint_accepts_its_group_mac() {
+        let group: SocketAddr = "239.1.2.3:5000".parse().unwrap();
+        let source: SocketAddr = "10.0.0.1:4000".parse().unwrap();
+        let mac = group_mac(group.ip()).unwrap();
+        assert_eq!(mac, [0x01, 0x00, 0x5e, 0x01, 0x02, 0x03]);
+        let mut frame = vec![0_u8; 128];
+        let addressing = Addressing {
+            source_mac: MAC_A,
+            destination_mac: mac,
+            source,
+            destination: group,
+            hop_limit: 1,
+        };
+        let len = write_headers(&mut frame, &addressing, 4).unwrap();
+        assert!(matches!(
+            validate(&frame[..len], group, MAC_B, 1408),
+            Checked::Datagram { len: 4, .. }
+        ));
+        assert_eq!(
+            group_mac("[ff02::1:ff00:1]:1".parse::<SocketAddr>().unwrap().ip()),
+            Some([0x33, 0x33, 0xff, 0x00, 0x00, 0x01])
+        );
+        assert_eq!(group_mac(source.ip()), None);
     }
 
     proptest! {

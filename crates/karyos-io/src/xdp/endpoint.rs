@@ -58,6 +58,8 @@ const _: () = assert!(BATCH <= TX_REPORT_CAPACITY);
 const REAP: usize = 64;
 const COMPLETION: &str = "xsk_completion";
 const KICK: &str = "xsk_sendto";
+/// `XDP_PACKET_HEADROOM`: bytes the kernel keeps before each RX packet.
+pub const RX_HEADROOM: usize = 256;
 
 /// The configuration of one endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +91,8 @@ enum Phase {
     Pending,
     Submitted,
     Quarantined,
+    /// Reported `Unknown` by `retire`; terminal.
+    Reported,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,6 +192,8 @@ pub struct XdpEndpoint<O: XskOps> {
     routes: HandleTable<RouteId, RouteEntry>,
     counters: XdpCounters,
     failed: Option<BackendFailure>,
+    /// `retire` has started: no claim, commit, flush, route or queue.
+    retiring: bool,
 }
 
 impl<O: XskOps> XdpEndpoint<O> {
@@ -207,7 +213,9 @@ impl<O: XskOps> XdpEndpoint<O> {
         let frame = usize::try_from(xsk.frame_len()).unwrap_or(0);
         let mtu = usize::try_from(config.mtu).unwrap_or(0);
         let total = datagram.saturating_add(header);
-        if total > frame || total > mtu.saturating_add(headers::ETH) {
+        // The kernel reserves `XDP_PACKET_HEADROOM` before each RX frame
+        // (design 6.1), so a frame holds `F - 256` bytes of packet.
+        if total > frame.saturating_sub(RX_HEADROOM) || total > mtu.saturating_add(headers::ETH) {
             return Err(OpenError::InvalidConfig {
                 field: "max_datagram",
                 value: u64::from(config.max_datagram.get()),
@@ -236,6 +244,7 @@ impl<O: XskOps> XdpEndpoint<O> {
             xsk: Some(xsk),
             counters: XdpCounters::default(),
             failed: None,
+            retiring: false,
         })
     }
 
@@ -284,7 +293,7 @@ impl<O: XskOps> XdpEndpoint<O> {
         destination: SocketAddr,
         next_hop: [u8; 6],
     ) -> Result<RouteId, RouteError> {
-        if self.xsk.is_none() || self.failed.is_some() {
+        if !self.active() {
             return Err(RouteError::NotActive);
         }
         if destination.ip().is_unspecified() || destination.port() == 0 {
@@ -314,7 +323,7 @@ impl<O: XskOps> XdpEndpoint<O> {
     ///
     /// `NotActive`, `RouteUnknown`, then the ledger's errors.
     pub fn open_queue(&mut self, config: TxQueueConfig) -> Result<TxQueueId, QueueError> {
-        if self.xsk.is_none() || self.failed.is_some() {
+        if !self.active() {
             return Err(QueueError::NotActive);
         }
         if self.routes.get(config.route).is_none() {
@@ -344,6 +353,7 @@ impl<O: XskOps> XdpEndpoint<O> {
         let Some(mut writer) = report.writer() else {
             return Teardown::ReportNotEmpty;
         };
+        self.retiring = true;
         let mut returned: u16 = 0;
         for index in 0..self.runs.len() {
             let (count, more) = self.return_pending(index, ReturnReason::Reset, &mut writer);
@@ -357,7 +367,9 @@ impl<O: XskOps> XdpEndpoint<O> {
             let Some(meta) = self.slots.get(slot).copied() else {
                 break;
             };
-            if meta.phase != Phase::Submitted {
+            // Submitted items without a completion, and items quarantined by
+            // an invalid completion, end `Unknown` (11.2 step 5).
+            if !matches!(meta.phase, Phase::Submitted | Phase::Quarantined) {
                 continue;
             }
             if writer.remaining() == 0 {
@@ -368,10 +380,10 @@ impl<O: XskOps> XdpEndpoint<O> {
                 .and_then(|slot| self.entry(slot, meta, TxItemOutcome::Unknown))
                 && writer.push(entry).is_err()
             {
-                debug_assert!(false, "the report had room");
+                return Teardown::More { returned };
             }
             if let Some(slot_meta) = self.slots.get_mut(slot) {
-                slot_meta.phase = Phase::Quarantined;
+                slot_meta.phase = Phase::Reported;
             }
             unknown = unknown.saturating_add(1);
         }
@@ -384,6 +396,20 @@ impl<O: XskOps> XdpEndpoint<O> {
             unknown,
             kernel_owned_frames,
         }
+    }
+
+    /// Whether claims, commits, flushes, routes and queues are accepted.
+    fn active(&self) -> bool {
+        self.xsk.is_some() && self.failed.is_none() && !self.retiring
+    }
+
+    /// The endpoint's own state was found broken (a report entry or a
+    /// ledger charge it promised): it stops until retired.
+    fn broken(&mut self) {
+        bump(&mut self.counters.invalid_completions);
+        self.failed.get_or_insert(BackendFailure::Invariant {
+            operation: "xdp_tx_state",
+        });
     }
 
     fn run_index(&self, queue: TxQueueId) -> Option<usize> {
@@ -473,7 +499,7 @@ impl<O: XskOps> XdpEndpoint<O> {
             if let Some(entry) = self.entry(slot, meta, TxItemOutcome::Returned { reason })
                 && writer.push(entry).is_err()
             {
-                debug_assert!(false, "the report had room");
+                self.broken();
             }
             if let Some(slot_meta) = self.slots.get_mut(slot as usize) {
                 *slot_meta = SlotMeta {
@@ -481,8 +507,9 @@ impl<O: XskOps> XdpEndpoint<O> {
                     ..FREE_META
                 };
             }
-            let released = self.ledger.release_pending(queue, slot);
-            debug_assert!(released, "a pending slot is charged to its queue");
+            if !self.ledger.release_pending(queue, slot) {
+                self.broken();
+            }
             returned = returned.saturating_add(1);
         }
     }
@@ -509,7 +536,7 @@ impl<O: XskOps> XdpEndpoint<O> {
     }
 
     fn report_pending(
-        &self,
+        &mut self,
         writer: &mut ReportWriter<'_>,
         slots: &[u32; BATCH],
         from: usize,
@@ -523,7 +550,7 @@ impl<O: XskOps> XdpEndpoint<O> {
             if let Some(entry) = self.entry(slot, meta, TxItemOutcome::Pending { cause })
                 && writer.push(entry).is_err()
             {
-                debug_assert!(false, "the report had room");
+                self.broken();
             }
         }
     }
@@ -558,7 +585,7 @@ impl<O: XskOps> TxFrame for XdpFrame<'_, O> {
     }
 
     fn commit(mut self, commit: Commit) -> Result<TxTicket, CommitRejected<Self>> {
-        let active = self.endpoint.xsk.is_some() && self.endpoint.failed.is_none();
+        let active = self.endpoint.active();
         if let Err(error) = self.endpoint.ledger.check_commit(
             active,
             self.queue,
@@ -590,8 +617,9 @@ impl<O: XskOps> TxFrame for XdpFrame<'_, O> {
                 error: CommitError::UnknownQueue,
             });
         }
-        let committed = self.endpoint.ledger.pool_mut().commit(self.slot);
-        debug_assert!(committed, "a claimed slot commits");
+        if !self.endpoint.ledger.pool_mut().commit(self.slot) {
+            self.endpoint.broken();
+        }
         if let Some(meta) = self.endpoint.slots.get_mut(self.slot as usize) {
             meta.phase = Phase::Pending;
             meta.token = commit.token;
@@ -624,7 +652,7 @@ impl<O: XskOps> TxBackend for XdpEndpoint<O> {
         Self: 'a;
 
     fn claim_tx(&mut self, queue: TxQueueId, len: usize) -> Result<XdpFrame<'_, O>, ClaimError> {
-        let active = self.xsk.is_some() && self.failed.is_none();
+        let active = self.active();
         if active && self.run_index(queue).is_none() {
             return Err(ClaimError::UnknownQueue);
         }
@@ -761,7 +789,6 @@ impl<O: XskOps> TxBackend for XdpEndpoint<O> {
         // Step 3: headers and descriptors, invisible until the producer
         // store.
         let mut exposed: usize = 0;
-        let header = self.header;
         for &slot in slots.iter().take(permitted) {
             let Some(meta) = self.slots.get(slot as usize).copied() else {
                 break;
@@ -775,12 +802,13 @@ impl<O: XskOps> TxBackend for XdpEndpoint<O> {
             let Some(total) = total.and_then(|total| u32::try_from(total).ok()) else {
                 break;
             };
-            debug_assert!(usize::try_from(total).is_ok_and(|total| total >= header));
             if !xsk.push_tx(frame, total) {
                 break;
             }
-            let popped = self.pop_head(index);
-            debug_assert_eq!(popped.map(|(head, _)| head), Some(slot), "the head is sent");
+            if self.pop_head(index).map(|(head, _)| head) != Some(slot) {
+                // Written, but the FIFO disagrees: stop, never re-send.
+                self.broken();
+            }
             if let Some(slot_meta) = self.slots.get_mut(slot as usize) {
                 slot_meta.phase = Phase::Submitted;
                 slot_meta.next = NO_SLOT;
@@ -810,7 +838,7 @@ impl<O: XskOps> TxBackend for XdpEndpoint<O> {
                 )
                 && writer.push(entry).is_err()
             {
-                debug_assert!(false, "the report had room");
+                self.broken();
             }
         }
         self.report_pending(
@@ -870,7 +898,7 @@ impl<O: XskOps> TxBackend for XdpEndpoint<O> {
                 Phase::Submitted => {}
                 // Kernel ownership ended, but the release evidence was
                 // invalidated earlier: no release is inferred.
-                Phase::Quarantined => continue,
+                Phase::Quarantined | Phase::Reported => continue,
                 Phase::Free | Phase::Claimed | Phase::Pending => {
                     self.completion_invariant();
                     continue;
@@ -890,8 +918,9 @@ impl<O: XskOps> TxBackend for XdpEndpoint<O> {
                     ..FREE_META
                 };
             }
-            let released = self.ledger.release_pending(queue, slot);
-            debug_assert!(released, "a submitted slot is charged to its queue");
+            if !self.ledger.release_pending(queue, slot) {
+                self.broken();
+            }
         }
         outcome
     }
@@ -971,9 +1000,19 @@ impl<O: XskOps> RxBackend for XdpEndpoint<O> {
             outcome.stop = RxStop::Failed(BackendFailure::NotActive);
             return outcome;
         };
+        // Admission before any ring work: a poll with no op left publishes
+        // and kicks nothing.
+        if budget.ops() == 0 {
+            outcome.stop = RxStop::Budget;
+            return outcome;
+        }
         let mut one = [RxDesc::EMPTY; 1];
         loop {
-            if outcome.spent.datagrams >= budget.datagrams() {
+            // A descriptor is taken only while its largest payload still
+            // fits the byte allowance, so no delivery overruns it.
+            let room = budget.bytes().saturating_sub(outcome.spent.bytes);
+            if outcome.spent.datagrams >= budget.datagrams() || room < u64::from(max_datagram.get())
+            {
                 outcome.stop = RxStop::Budget;
                 break;
             }
@@ -1023,7 +1062,7 @@ impl<O: XskOps> RxBackend for XdpEndpoint<O> {
         }
         // The fill producer once per call; a nonblocking wakeup if asked.
         xsk.publish_fill();
-        if xsk.fill_needs_wakeup() && budget.ops() > 0 {
+        if xsk.fill_needs_wakeup() {
             bump(&mut self.counters.rx_kicks);
             outcome.spent.ops = outcome.spent.ops.saturating_add(1);
             let _ = xsk.kick_rx();

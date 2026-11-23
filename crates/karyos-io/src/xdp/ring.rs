@@ -272,10 +272,14 @@ impl OsXsk {
         let frames = u64::from(tx_frames)
             .checked_add(u64::from(rx_frames))
             .ok_or_else(|| invalid("xsk_frames"))?;
+        // The frames registered, `N * F`; the mapping is that rounded up to
+        // whole pages (design 6.1).
         let umem_len = frames
             .checked_mul(u64::from(frame_len))
             .and_then(|len| usize::try_from(len).ok())
             .ok_or_else(|| invalid("xsk_frames"))?;
+        let mapped_len =
+            karyos_sys::xsk_map::page_rounded(umem_len).ok_or_else(|| invalid("xsk_frames"))?;
         let socket = rustix::net::socket_with(
             AddressFamily::XDP,
             SocketType::RAW,
@@ -283,7 +287,7 @@ impl OsXsk {
             None,
         )
         .map_err(errno("xsk_socket"))?;
-        let umem = UmemRegion::new(umem_len).map_err(|_| os("xsk_umem_mmap"))?;
+        let umem = UmemRegion::new(mapped_len).map_err(|_| os("xsk_umem_mmap"))?;
         let umem_addr = u64::try_from(umem.base().as_ptr().expose_provenance())
             .map_err(|_| invalid("xsk_umem"))?;
         rustix::net::sockopt::set_xdp_umem_reg(

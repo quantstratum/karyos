@@ -37,6 +37,13 @@ pub fn live_umem_bytes() -> u64 {
     LIVE_UMEM_BYTES.load(Ordering::Relaxed)
 }
 
+/// `len` rounded up to a whole number of pages, for a [`UmemRegion`] that
+/// must hold `len` bytes (af-xdp-backend.md 6.1); `None` on overflow.
+#[must_use]
+pub fn page_rounded(len: usize) -> Option<usize> {
+    len.checked_next_multiple_of(rustix::param::page_size())
+}
+
 /// An anonymous, private, zero-filled and prefaulted region for a UMEM:
 /// page aligned, `len` a multiple of the page size, never heap memory
 /// (design 6.4).

@@ -3,6 +3,13 @@
 //! The AF_XDP endpoint over [`ScriptedXsk`], and over a real socket on the
 //! loopback interface in generic mode with the `xdp` feature on Linux.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    reason = "tests and their helpers, as ADR-0007 allows"
+)]
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
 
@@ -337,9 +344,51 @@ fn teardown_reports_unknown_and_leaves_no_owned_frame() {
 }
 
 #[test]
+fn retire_reports_quarantined_items_unknown_and_refuses_new_work() {
+    let mut f = fixture();
+    send(&mut f, b"one", 1);
+    let mut report = TxReport::new();
+    f.endpoint.flush(request(f.queue), &mut Permit, &mut report);
+    drain(&mut report);
+    // An invalid completion quarantines the submitted item.
+    f.endpoint.xsk_mut().unwrap().complete_addr(1);
+    f.endpoint
+        .poll_completions(budget(), &mut Events::default());
+    // A full report keeps the retirement going: nothing new is accepted.
+    let teardown = f.endpoint.retire(&mut report);
+    assert_eq!(
+        teardown,
+        Teardown::Complete {
+            returned: 0,
+            unknown: 1,
+            kernel_owned_frames: 1
+        }
+    );
+    assert_eq!(drain(&mut report)[0].outcome, TxItemOutcome::Unknown);
+}
+
+#[test]
+fn rx_admits_only_what_fits_the_byte_and_op_budget() {
+    let mut f = fixture();
+    let xsk = f.endpoint.xsk_mut().unwrap();
+    for _ in 0..3 {
+        assert!(xsk.receive(&frame_to_local(b"0123456789")));
+    }
+    let mut sink = Sink::default();
+    let none = f.endpoint.poll_rx(Budget::new(64, u64::MAX, 0), &mut sink);
+    assert_eq!(none.stop, RxStop::Budget);
+    assert_eq!(none.delivered, 0);
+    // Room for one largest payload (1408) but not two.
+    let one = f.endpoint.poll_rx(Budget::new(64, 1417, 4), &mut sink);
+    assert_eq!(one.delivered, 1);
+    assert!(one.spent.bytes <= 1417);
+}
+
+#[test]
 fn the_frame_bound_of_design_6_1_is_checked() {
     let mut big = config(local(), MAC_LOCAL);
-    big.max_datagram = nz(2048 - 42 + 1);
+    // 42 header bytes and the 256 byte RX headroom in a 2048 byte frame.
+    big.max_datagram = nz(2048 - 256 - 42 + 1);
     big.mtu = 9000;
     assert!(
         XdpEndpoint::open(
