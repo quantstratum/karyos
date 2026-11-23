@@ -2024,12 +2024,12 @@ fn catch_up_reads_cross_windows_and_still_check_every_frame() {
     assert_eq!(log.entries(1..601, span * 300 - 1).unwrap(), written[..299]);
     // Entry 400's payload, in the middle of a window, damaged on disk.
     let at = 399 * span + FRAME_HEADER as u64 + 7;
-    let segment_length = 65_536;
+    let segment_length = geometry().segment_length();
     let base = at - at % segment_length;
     let segment = dir.0.join(format!("{LOG_RECORDING:016x}-{base:016x}.seg"));
     let mut disk = StdDisk;
     let file = disk.open(&segment).unwrap();
-    disk.write_at(&file, at % segment_length, &[0xEE]).unwrap();
+    disk.write_at(&file, at - base, &[0xEE]).unwrap();
     match log.entries(1..601, u64::MAX) {
         Err(LogError::Chain { position, problem }) => {
             assert_eq!((position, problem), (399 * span, ChainProblem::Checksum));
