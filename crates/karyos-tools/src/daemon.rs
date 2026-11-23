@@ -797,6 +797,7 @@ mod tests {
             dir: archive.clone(),
             requests: 100,
             responses: 101,
+            retention_responses: None,
             records: vec![crate::args::RecordOption {
                 stream_id: STREAM.stream_id,
                 session_id: STREAM.session_id,
@@ -841,6 +842,7 @@ mod tests {
             dir: archive.clone(),
             requests: 100,
             responses: 101,
+            retention_responses: None,
             records: Vec::new(),
             min_free: 0,
             seal_interval: crate::args::DEFAULT_ARCHIVE_SEAL_INTERVAL,

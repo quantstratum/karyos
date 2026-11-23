@@ -127,6 +127,9 @@ struct Host {
     refuse: Option<String>,
     hold: bool,
     replays: Vec<(u64, Arc<Mutex<Replayed>>)>,
+    /// The retention state stream (ADR-0101): stream 77 of `karyos:ipc`,
+    /// when given.
+    answers: Option<Responses>,
 }
 
 impl Default for Host {
@@ -138,6 +141,7 @@ impl Default for Host {
             refuse: None,
             hold: false,
             replays: Vec::new(),
+            answers: None,
         }
     }
 }
@@ -200,6 +204,23 @@ impl ArchiveHost for Host {
         }));
         self.replays.push((from, Arc::clone(&replayed)));
         Ok(Box::new(Sink(replayed)))
+    }
+
+    fn open_response(
+        &mut self,
+        stream_id: i32,
+        channel: &str,
+    ) -> Result<Box<dyn ResponseSink + Send>, HostRefusal> {
+        match &self.answers {
+            Some(answers) if stream_id == 77 && channel == "karyos:ipc" => {
+                Ok(Box::new(answers.clone()))
+            }
+            _ => Err(HostRefusal(NO_RESPONSE_STREAM.to_owned())),
+        }
+    }
+
+    fn free_space(&self) -> (u64, u64) {
+        (1 << 30, 8 << 30)
     }
 }
 
@@ -1387,5 +1408,207 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
     let refused = short.sent(1);
     assert_eq!(response(&refused[0]).code, ResponseCode::InvalidRequest);
     short.finish();
+    rig.finish();
+}
+
+/// A response stream of the test's, with room for `room` messages.
+fn answer_stream(room: usize) -> Responses {
+    Responses {
+        sent: Arc::default(),
+        room: Arc::new(AtomicUsize::new(room)),
+        max: Arc::new(AtomicUsize::new(usize::MAX)),
+    }
+}
+
+fn retention_query(correlation_id: u64, stream_id: i32) -> ControlMessage<'static> {
+    ControlMessage::RetentionState(control::RetentionState {
+        correlation_id,
+        from_id: 0,
+        max_count: 100,
+        response_stream_id: stream_id,
+        response_channel: "karyos:ipc",
+    })
+}
+
+/// An Archive with a retention policy, two stopped recordings and a hold
+/// on the first, its rig and its answer stream.
+fn retention_rig(name: &str, room: usize) -> (Rig, Responses) {
+    use crate::integrity::retention::{PurgeMode, RetentionPolicy};
+    let answers = answer_stream(room);
+    let host = Host {
+        answers: Some(answers.clone()),
+        ..Host::of(frames(2, 1), true)
+    };
+    let policy = RetentionPolicy {
+        policy: 1,
+        version: 2,
+        retain_for_ns: 1_000,
+        min_copies: core::num::NonZeroU32::MIN,
+        storage_tier: 0,
+        purge: PurgeMode::Manual,
+    };
+    let agent = AgentConfig {
+        idle: Duration::from_millis(1),
+        seal_interval: Some(Duration::from_millis(1)),
+        ..AgentConfig::default()
+    }
+    .with_copy_location(Some([5u8; 32]))
+    .with_retention_policy(Some(policy));
+    let mut rig = Rig::with(name, host, agent, ServerConfig::default());
+    rig.request(&start(7));
+    rig.sent(3);
+    rig.request(&start(8));
+    rig.sent(6);
+    rig.request(&ControlMessage::HoldRecording(control::HoldRecording {
+        correlation_id: 9,
+        recording_id: 1,
+    }));
+    let sent = rig.sent(7);
+    assert_eq!(response(&sent[6]).code, ResponseCode::Ok);
+    (rig, answers)
+}
+
+/// ADR-0101: a retention state query is answered on the stream it names,
+/// by a descriptor per recording (the hold, the close time, the earliest
+/// expiry from it, the policy) and the summary with their count and the
+/// host's floor and free space; the shared stream carries no version 2
+/// frame.
+#[test]
+fn a_retention_state_query_is_answered_on_its_own_stream() {
+    let (mut rig, answers) = retention_rig("retention-state", usize::MAX);
+    rig.request(&retention_query(11, 77));
+    for _ in 0..5000 {
+        rig.server.duty();
+        if answers.sent.lock().unwrap().len() >= 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let own = answers.sent.lock().unwrap().clone();
+    assert_eq!(own.len(), 3);
+    let descriptors: Vec<control::RetentionDescriptor> = own[..2]
+        .iter()
+        .map(|bytes| match decoded(bytes) {
+            ControlMessage::RetentionDescriptor(descriptor) => descriptor,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    for (descriptor, (id, hold)) in descriptors
+        .iter()
+        .zip([(1, control::HoldState::Held), (2, control::HoldState::None)])
+    {
+        assert_eq!(
+            (
+                descriptor.correlation_id,
+                descriptor.recording_id,
+                descriptor.hold
+            ),
+            (11, id, hold)
+        );
+        assert_ne!(descriptor.close_time_ns, 0, "{descriptor:?}");
+        assert_eq!(
+            descriptor.earliest_expiry_ns,
+            descriptor.close_time_ns + 1_000
+        );
+        assert_eq!((descriptor.policy, descriptor.policy_version), (1, 2));
+        assert_eq!(descriptor.hold_since_ns, 0);
+    }
+    assert_eq!(
+        decoded(&own[2]),
+        ControlMessage::RetentionSummary(control::RetentionSummary {
+            correlation_id: 11,
+            count: 2,
+            min_free_bytes: 1 << 30,
+            free_bytes: 8 << 30,
+        })
+    );
+    // Nothing more on the shared stream, and no version 2 frame there.
+    let shared = rig.sent(7);
+    assert!(shared.iter().all(|bytes| bytes[4] == 1));
+    // One recording: `from_id` it and `max_count` 1.
+    rig.request(&ControlMessage::RetentionState(control::RetentionState {
+        correlation_id: 12,
+        from_id: 2,
+        max_count: 1,
+        response_stream_id: 77,
+        response_channel: "karyos:ipc",
+    }));
+    for _ in 0..5000 {
+        rig.server.duty();
+        if answers.sent.lock().unwrap().len() >= 5 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let own = answers.sent.lock().unwrap().clone();
+    assert!(matches!(
+        decoded(&own[3]),
+        ControlMessage::RetentionDescriptor(control::RetentionDescriptor {
+            correlation_id: 12,
+            recording_id: 2,
+            ..
+        })
+    ));
+    rig.finish();
+}
+
+/// ADR-0101: a query naming a stream the host has not is refused with
+/// code 1 on the shared stream, one frame; the request is version 2, the
+/// refusal version 1.
+#[test]
+fn a_retention_state_query_without_its_stream_is_refused_on_the_shared_stream() {
+    let mut rig = Rig::new("retention-no-stream", Host::default());
+    rig.request(&retention_query(3, 77));
+    let sent = rig.sent(1);
+    assert_eq!(
+        response(&sent[0]),
+        ControlResponse {
+            correlation_id: 3,
+            id: 0,
+            code: ResponseCode::Error,
+            message: NO_RESPONSE_STREAM,
+        }
+    );
+    assert_eq!(sent[0][4], 1, "a version 1 refusal");
+    rig.finish();
+}
+
+/// ADR-0101, isolation: a retention state answer its own stream holds back
+/// never holds back the shared stream: a version 1 request after it is
+/// answered at once, while the version 2 answer waits; a second query
+/// meanwhile is refused with code 1; the waiting answer goes once there is
+/// room.
+#[test]
+fn a_stalled_retention_answer_never_holds_the_shared_stream() {
+    let (mut rig, answers) = retention_rig("retention-stalled", 0);
+    rig.request(&retention_query(11, 77));
+    rig.request(&ControlMessage::ListRecordings(control::ListRecordings {
+        correlation_id: 12,
+        from_id: 0,
+        max_count: 10,
+    }));
+    // The list's two descriptors and its count.
+    let sent = rig.sent(10);
+    assert_eq!(response(&sent[9]).correlation_id, 12);
+    assert!(answers.sent.lock().unwrap().is_empty());
+    rig.request(&retention_query(13, 77));
+    let sent = rig.sent(11);
+    assert_eq!(
+        (
+            response(&sent[10]).correlation_id,
+            response(&sent[10]).message
+        ),
+        (13, RETENTION_ANSWER_BUSY)
+    );
+    assert!(sent.iter().all(|bytes| bytes[4] == 1));
+    answers.room.store(usize::MAX, Ordering::Release);
+    for _ in 0..5000 {
+        rig.server.duty();
+        if answers.sent.lock().unwrap().len() >= 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(answers.sent.lock().unwrap().len(), 3);
     rig.finish();
 }

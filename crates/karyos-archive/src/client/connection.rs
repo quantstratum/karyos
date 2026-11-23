@@ -166,6 +166,29 @@ pub struct Responses<T: TermBytes> {
 }
 
 impl<T: TermBytes> Responses<T> {
+    /// Takes an optional subscription, rejoining at the head, on
+    /// `karyos:ipc` stream `stream_id` of `client`'s driver: a requester's
+    /// own answer stream, which a retention state query names (ADR-0101).
+    /// One control call, which waits up to the client's timeout.
+    ///
+    /// # Errors
+    ///
+    /// The client's error: no such stream, or the driver refused.
+    pub fn open<C>(client: &mut Client<C>, stream_id: i32) -> Result<Self, ClientError>
+    where
+        C: Connection<Terms = T>,
+    {
+        let subscription = client.add_subscription_with(
+            "karyos:ipc",
+            StreamId::new(stream_id),
+            SubscriptionOptions::new(SubscriberRole::Optional, RejoinPolicy::RejoinAtHead),
+        )?;
+        Ok(Self {
+            subscription,
+            oversized: 0,
+        })
+    }
+
     /// Answers dropped because they were longer than the caller's buffer
     /// (`ControlResponses::next`), since the connection was opened. An
     /// answer the Archive sends is at most `MAX_ANSWER` bytes, so with a

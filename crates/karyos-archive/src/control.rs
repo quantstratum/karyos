@@ -86,8 +86,11 @@ mod tests;
 
 /// The Archive's schema id.
 pub const SCHEMA_ID: u16 = 1;
-/// The only version of schema 1.
+/// Schema 1's first version, frozen at the `v0.1.0-alpha.2` tag.
 pub const VERSION: u16 = 1;
+/// Schema 1's second version: only the retention state query (ADR-0101;
+/// archive-control-codec.md section 11), decoded beside version 1.
+pub const VERSION_2: u16 = 2;
 /// The longest channel, in bytes.
 pub const MAX_CHANNEL: usize = 1024;
 /// The longest response message, in bytes.
@@ -139,6 +142,27 @@ pub const RANGE_OUTCOME: Template = template(104, 45, 12 + 45);
 pub const RANGE_REASONS: u32 = (1 << 10) - 1;
 /// A [`RangeOutcome`]'s `first_inconsistent` when there is none.
 pub const NO_INCONSISTENT: u64 = u64::MAX;
+
+const fn template_v2(template_id: u16, block_length: u16, max_length: u32) -> Template {
+    Template {
+        schema_id: SCHEMA_ID,
+        template_id,
+        version: VERSION_2,
+        block_length,
+        max_length,
+    }
+}
+
+/// `RetentionState`, template 10, version 2 (ADR-0101).
+pub const RETENTION_STATE: Template = template_v2(10, 24, 12 + 24 + 2 + 1024);
+/// `RetentionDescriptor`, template 105, version 2 (ADR-0101).
+pub const RETENTION_DESCRIPTOR: Template = template_v2(105, 57, 12 + 57);
+/// `RetentionSummary`, template 106, version 2 (ADR-0101).
+pub const RETENTION_SUMMARY: Template = template_v2(106, 32, 12 + 32);
+/// A [`RetentionDescriptor`]'s `earliest_expiry_ns` with none.
+pub const NO_EXPIRY: u64 = u64::MAX;
+/// A [`RetentionSummary`]'s `free_bytes` when not known.
+pub const FREE_UNKNOWN: u64 = u64::MAX;
 
 fn invalid_enum(field: &'static str, value: impl Into<u64>) -> CodecError {
     CodecError::InvalidEnum {
@@ -988,7 +1012,160 @@ mod signal {
     }
 }
 
-/// Any message of schema 1, version 1.
+/// Asks for the retention state of up to `max_count` recordings from
+/// `from_id`, template 10, version 2 (ADR-0101): answered on the stream
+/// it names, by a [`RetentionDescriptor`] per recording, in increasing id
+/// from `from_id` (inclusive), then one [`RetentionSummary`]. Read only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = RETENTION_STATE)]
+pub struct RetentionState<'a> {
+    /// Echoed in the answers.
+    #[field(offset = 0)]
+    pub correlation_id: u64,
+    /// The first recording id reported: a cursor, 0 from the first.
+    #[field(offset = 8)]
+    pub from_id: u64,
+    /// At most this many descriptors, 1 to [`MAX_LIST_COUNT`].
+    #[field(offset = 16, check = list_count)]
+    pub max_count: u32,
+    /// The stream the answer is published on.
+    #[field(offset = 20)]
+    pub response_stream_id: i32,
+    /// Its channel, 1 to [`MAX_CHANNEL`] bytes.
+    #[field(var, min = 1, max = MAX_CHANNEL)]
+    pub response_channel: &'a str,
+}
+
+/// A recording's hold, as a [`RetentionDescriptor`] reports it (ADR-0101).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HoldState {
+    /// No hold (wire 1).
+    None,
+    /// A hold applied with the operations journal's evidence (wire 2).
+    Held,
+    /// A hold that inhibits purge without being applied with evidence:
+    /// requested and not yet evidenced, or an evidenced hold whose release
+    /// the journal holds but whose resolving marker is not written yet
+    /// (wire 3).
+    Pending,
+    /// The Archive's hold state could not be read since it started
+    /// (wire 4).
+    Unknown,
+}
+
+impl HoldState {
+    /// The wire code.
+    #[must_use]
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::None => 1,
+            Self::Held => 2,
+            Self::Pending => 3,
+            Self::Unknown => 4,
+        }
+    }
+
+    /// The state of wire code `code`.
+    #[must_use]
+    pub const fn of(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::None),
+            2 => Some(Self::Held),
+            3 => Some(Self::Pending),
+            4 => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+/// [`HoldState`] as a field of the derive.
+mod hold_state {
+    use super::{Block, CodecError, Encoder, HoldState, invalid_enum};
+
+    pub(super) fn read(block: &Block<'_>, at: usize) -> Result<HoldState, CodecError> {
+        let code = block.u8(at)?;
+        HoldState::of(code).ok_or_else(|| invalid_enum("hold", code))
+    }
+
+    pub(super) fn write(
+        encoder: &mut Encoder<'_>,
+        at: usize,
+        hold: &HoldState,
+    ) -> Result<(), CodecError> {
+        encoder.u8(at, hold.code())
+    }
+}
+
+/// One recording's retention state, template 105, version 2 (ADR-0101).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = RETENTION_DESCRIPTOR, check = Self::check)]
+pub struct RetentionDescriptor {
+    /// The query's.
+    #[field(offset = 0)]
+    pub correlation_id: u64,
+    /// The recording, never 0.
+    #[field(offset = 8, check = id)]
+    pub recording_id: u64,
+    /// When the hold was applied or received, UTC; 0 without a hold, for
+    /// an unknown state and when not recorded.
+    #[field(offset = 16)]
+    pub hold_since_ns: u64,
+    /// The recorded UTC close time; 0 while it records or without one.
+    #[field(offset = 24)]
+    pub close_time_ns: u64,
+    /// The earliest policy expiry from the close time, a lower bound and
+    /// never purge eligibility; [`NO_EXPIRY`] for none.
+    #[field(offset = 32)]
+    pub earliest_expiry_ns: u64,
+    /// The configured policy's identity; 0 for none.
+    #[field(offset = 40)]
+    pub policy: u64,
+    /// Its version; 0 for none.
+    #[field(offset = 48)]
+    pub policy_version: u64,
+    /// Its hold.
+    #[field(offset = 56, width = 1, with = hold_state)]
+    pub hold: HoldState,
+}
+
+impl RetentionDescriptor {
+    /// The cross-field rules of archive-control-codec.md section 11.
+    fn check(&self) -> Result<(), CodecError> {
+        if self.hold_since_ns != 0 && !matches!(self.hold, HoldState::Held | HoldState::Pending) {
+            return Err(out_of_range("hold_since_ns"));
+        }
+        if (self.policy == 0) != (self.policy_version == 0) {
+            return Err(out_of_range("policy_version"));
+        }
+        if self.earliest_expiry_ns != NO_EXPIRY && (self.policy == 0 || self.close_time_ns == 0) {
+            return Err(out_of_range("earliest_expiry_ns"));
+        }
+        Ok(())
+    }
+}
+
+/// The last answer to a [`RetentionState`], template 106, version 2
+/// (ADR-0101).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Message)]
+#[message(template = RETENTION_SUMMARY)]
+pub struct RetentionSummary {
+    /// The query's.
+    #[field(offset = 0)]
+    pub correlation_id: u64,
+    /// The descriptors sent before it.
+    #[field(offset = 8)]
+    pub count: u64,
+    /// The `--archive-min-free` floor; 0 for none.
+    #[field(offset = 16)]
+    pub min_free_bytes: u64,
+    /// The archive file system's free bytes; [`FREE_UNKNOWN`] when not
+    /// known.
+    #[field(offset = 24)]
+    pub free_bytes: u64,
+}
+
+/// Any message of schema 1, version 1 and version 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ControlMessage<'a> {
@@ -1018,6 +1195,12 @@ pub enum ControlMessage<'a> {
     RecordingSignal(RecordingSignal),
     /// Template 104.
     RangeOutcome(RangeOutcome),
+    /// Template 10, version 2.
+    RetentionState(RetentionState<'a>),
+    /// Template 105, version 2.
+    RetentionDescriptor(RetentionDescriptor),
+    /// Template 106, version 2.
+    RetentionSummary(RetentionSummary),
 }
 
 impl<'a> ControlMessage<'a> {
@@ -1025,9 +1208,10 @@ impl<'a> ControlMessage<'a> {
     ///
     /// # Errors
     ///
-    /// [`CodecError::UnsupportedSchema`] for any tuple but schema 1,
-    /// version 1 and a listed template, and every other [`CodecError`] the
-    /// message's fields can raise.
+    /// [`CodecError::UnsupportedSchema`] for any tuple but schema 1 with a
+    /// listed template of its version (version 2 has only templates 10,
+    /// 105 and 106; ADR-0101), and every other [`CodecError`] the message's
+    /// fields can raise.
     pub fn decode(buf: &'a [u8]) -> Result<Self, CodecError> {
         let envelope = Envelope::read(buf)?;
         let unsupported = CodecError::UnsupportedSchema {
@@ -1035,7 +1219,29 @@ impl<'a> ControlMessage<'a> {
             template: envelope.template_id,
             version: envelope.version,
         };
-        if envelope.schema_id != SCHEMA_ID || envelope.version != VERSION {
+        if envelope.schema_id != SCHEMA_ID {
+            return Err(unsupported);
+        }
+        // A decoder supports (schema, template, version) tuples, not a
+        // version per schema (ADR-0101, decision 2).
+        if envelope.version == VERSION_2 {
+            return Ok(match envelope.template_id {
+                10 => {
+                    let (block, decoder) = Decoder::new(buf, &RETENTION_STATE)?;
+                    Self::RetentionState(RetentionState::decode(block, decoder)?)
+                }
+                105 => {
+                    let (block, decoder) = Decoder::new(buf, &RETENTION_DESCRIPTOR)?;
+                    Self::RetentionDescriptor(RetentionDescriptor::decode(block, decoder)?)
+                }
+                106 => {
+                    let (block, decoder) = Decoder::new(buf, &RETENTION_SUMMARY)?;
+                    Self::RetentionSummary(RetentionSummary::decode(block, decoder)?)
+                }
+                _ => return Err(unsupported),
+            });
+        }
+        if envelope.version != VERSION {
             return Err(unsupported);
         }
         Ok(match envelope.template_id {
@@ -1115,6 +1321,9 @@ impl<'a> ControlMessage<'a> {
             Self::PurgeRecording(message) => message.encode(out),
             Self::VerifyRecording(message) => message.encode(out, &VERIFY_RECORDING),
             Self::RangeOutcome(message) => message.encode(out),
+            Self::RetentionState(message) => message.encode(out),
+            Self::RetentionDescriptor(message) => message.encode(out),
+            Self::RetentionSummary(message) => message.encode(out),
         }
     }
 }

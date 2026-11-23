@@ -1194,3 +1194,118 @@ fn a_sealed_segment_is_recorded_with_the_enforcement_that_applies() {
         Enforcement::Unsupported
     );
 }
+
+/// ADR-0101: each hold as a retention state query reports it: none, held
+/// with evidence, pending without evidence, unknown while the hold state
+/// could not be read.
+#[test]
+fn the_hold_state_reports_none_held_pending_and_unknown() {
+    use crate::control::HoldState;
+    let mut archive = fresh();
+    assert_eq!(archive.retention.hold_state(RECORDING), HoldState::None);
+    let _ = archive.retention.apply_hold(RECORDING);
+    assert_eq!(archive.retention.hold_state(RECORDING), HoldState::Held);
+    let disk = FaultDisk::default();
+    let markers = Markers::open(disk.clone(), Path::new(DIR), PENDING_HOLDS_FILE).unwrap();
+    let mut down = Retention::recover(Down, Some(&[]), markers);
+    let _ = down.apply_hold(RECORDING);
+    assert_eq!(down.hold_state(RECORDING), HoldState::Pending);
+    let markers = Markers::open(disk, Path::new(DIR), PENDING_HOLDS_FILE).unwrap();
+    let unknown = Retention::recover(Down, None, markers);
+    assert_eq!(unknown.hold_state(RECORDING), HoldState::Unknown);
+    assert_eq!(unknown.hold_state(RECORDING + 1), HoldState::Unknown);
+}
+
+/// ADR-0101, a failed resolving marker: a release of an evidenced hold
+/// whose resolving marker write fails reports pending until a retry
+/// writes the marker, then none, across a restart too.
+#[test]
+fn a_release_whose_resolving_marker_fails_reports_pending_until_retried() {
+    use crate::control::HoldState;
+    let mut found = false;
+    for budget in 0..400 {
+        // The setup, the restart's opening and the evidenced hold, then a
+        // release on a disk that crashes after `budget` more units.
+        let setup_disk = FaultDisk::default();
+        setup(&setup_disk);
+        let mut before = open(setup_disk.clone());
+        let _ = before.retention.apply_hold(RECORDING);
+        let used = setup_disk.used();
+        let disk = FaultDisk::with_budget(used + budget);
+        setup(&disk);
+        let mut archive = open(disk.clone());
+        assert!(matches!(
+            archive.retention.apply_hold(RECORDING),
+            HoldReport::Applied { .. }
+        ));
+        let released = archive.retention.release_hold(RECORDING);
+        if released.is_ok() {
+            break;
+        }
+        if released
+            != Err(ReleaseError::Unconfirmed {
+                recording: RECORDING,
+            })
+        {
+            continue;
+        }
+        found = true;
+        // The journal holds the release; the marker is not written.
+        assert_eq!(archive.retention.hold_state(RECORDING), HoldState::Pending);
+        drop(archive);
+        let mut restarted = open(disk.after_crash(Survives::Everything));
+        assert_eq!(
+            restarted.retention.hold_state(RECORDING),
+            HoldState::Pending
+        );
+        restarted.retention.release_hold(RECORDING).unwrap();
+        assert_eq!(restarted.retention.hold_state(RECORDING), HoldState::None);
+    }
+    assert!(found, "no budget failed only the resolving marker");
+}
+
+/// ADR-0101, read only: with an outstanding purge intent and a pending
+/// hold, reading every recording's hold state changes neither the intent,
+/// the operations journal nor the pending holds' ledger.
+#[test]
+fn reading_the_hold_state_changes_nothing() {
+    use crate::control::HoldState;
+    let archive = fresh();
+    let intent = Operation::PurgeIntent {
+        id: 1,
+        recording: RECORDING,
+        before: BEFORE,
+        operator: 42,
+        closed_ns: 0,
+        source: PurgeSource::Operator,
+        from: 0,
+    };
+    OperationsJournal::append(
+        &mut Ops::open(archive.disk.clone(), Path::new(DIR), OPERATIONS_FILE).unwrap(),
+        &intent,
+    )
+    .unwrap();
+    let ops = operations(&archive.disk);
+    let records: Vec<[u8; OPERATION_LENGTH]> = ops.iter().map(Operation::encode).collect();
+    let markers = Markers::open(archive.disk.clone(), Path::new(DIR), PENDING_HOLDS_FILE).unwrap();
+    let mut retention = Retention::recover(Down, Some(&records), markers);
+    let _ = retention.apply_hold(RECORDING);
+    let files = |disk: &FaultDisk| {
+        let mut disk = disk.clone();
+        let ops = read_entries::<_, OPERATION_LENGTH>(&mut disk, Path::new(DIR), OPERATIONS_FILE)
+            .unwrap();
+        let markers =
+            read_entries::<_, MARKER_LENGTH>(&mut disk, Path::new(DIR), PENDING_HOLDS_FILE)
+                .unwrap();
+        (ops, markers)
+    };
+    let before = files(&archive.disk);
+    let outstanding = retention.outstanding();
+    assert_eq!(outstanding.len(), 1);
+    for recording in [RECORDING, RECORDING + 1] {
+        let _ = retention.hold_state(recording);
+    }
+    assert_eq!(retention.hold_state(RECORDING), HoldState::Pending);
+    assert_eq!(retention.outstanding(), outstanding);
+    assert_eq!(files(&archive.disk), before);
+}

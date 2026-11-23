@@ -26,6 +26,7 @@
 //!   path, then the agent, then hands the driver back.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use karyos_archive::agent::{AgentConfig, ArchiveHandle, ReplaySink};
 use karyos_archive::catalog::Recording;
@@ -147,6 +148,23 @@ pub struct DaemonHost {
     inner: DriverHost<SharedTerms>,
     dir: PathBuf,
     min_free: u64,
+    /// The retention state answer stream (`--archive-control`'s third id,
+    /// ADR-0101) and its publication, shared by every answer on it.
+    retention: Option<(i32, Arc<Mutex<Responses>>)>,
+}
+
+/// A retention state answer's sink: the daemon's one retention state
+/// stream, shared by its answers one at a time.
+#[derive(Debug)]
+struct SharedResponses(Arc<Mutex<Responses>>);
+
+impl ResponseSink for SharedResponses {
+    fn send(&mut self, message: &[u8]) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .send(message)
+    }
 }
 
 impl DaemonHost {
@@ -198,6 +216,33 @@ impl ArchiveHost for DaemonHost {
     ) -> Result<Box<dyn ReplaySink + Send>, HostRefusal> {
         self.inner
             .open_replay(request, recording, replay_id, from, to)
+    }
+
+    /// Only the configured retention state stream, on `karyos:ipc`: the
+    /// requester subscribed to it before it asked (ADR-0101).
+    fn open_response(
+        &mut self,
+        stream_id: i32,
+        channel: &str,
+    ) -> Result<Box<dyn ResponseSink + Send>, HostRefusal> {
+        match &self.retention {
+            Some((configured, responses))
+                if *configured == stream_id && channel == "karyos:ipc" =>
+            {
+                Ok(Box::new(SharedResponses(Arc::clone(responses))))
+            }
+            Some((configured, _)) => Err(HostRefusal(format!(
+                "retention state is answered on karyos:ipc stream {configured} only"
+            ))),
+            None => Err(HostRefusal(
+                "no retention state stream is configured (--archive-control's third id)".to_owned(),
+            )),
+        }
+    }
+
+    fn free_space(&self) -> (u64, u64) {
+        let free = karyos_sys::fs::free_bytes(&self.dir).unwrap_or(control::FREE_UNKNOWN);
+        (self.min_free, free)
     }
 }
 
@@ -263,6 +308,7 @@ fn audit_request(bytes: &[u8]) {
         Ok(ControlMessage::ListRecordings(request)) => ("list recordings", request.correlation_id),
         Ok(ControlMessage::Replay(request)) => ("replay", request.correlation_id),
         Ok(ControlMessage::StopReplay(request)) => ("stop replay", request.correlation_id),
+        Ok(ControlMessage::RetentionState(request)) => ("retention state", request.correlation_id),
         Ok(_) => ("not a request", 0),
         Err(_) => ("malformed", 0),
     };
@@ -464,15 +510,30 @@ impl DaemonArchive {
         mut driver: EmbeddedDriver<SharedTerms>,
         terms: &TermOptions,
         options: &ArchiveOptions,
-    ) -> Result<(Self, [StreamHandle; 2]), ArchiveStartError> {
-        let [requests_config, responses_config] = control_configs(terms, options)?;
+    ) -> Result<(Self, Vec<StreamHandle>), ArchiveStartError> {
+        let mut configs = control_configs(terms, options)?.into_iter();
+        let (Some(requests_config), Some(responses_config)) = (configs.next(), configs.next())
+        else {
+            return Err(ArchiveStartError::Stream(DriverError::InvalidConfig));
+        };
+        let retention_config = configs.next();
         let requests = driver
             .add_stream(requests_config)
             .map_err(ArchiveStartError::Stream)?;
         let responses = driver
             .add_stream(responses_config)
             .map_err(ArchiveStartError::Stream)?;
-        for stream in [requests, responses] {
+        let retention_stream = match retention_config {
+            Some(config) => Some(
+                driver
+                    .add_stream(config)
+                    .map_err(ArchiveStartError::Stream)?,
+            ),
+            None => None,
+        };
+        let mut control = vec![requests, responses];
+        control.extend(retention_stream);
+        for &stream in &control {
             driver
                 .audit_grants(stream)
                 .map_err(ArchiveStartError::Stream)?;
@@ -480,6 +541,15 @@ impl DaemonArchive {
         let handle = ArchiveStartError::Handle;
         let reading = Requests(driver.subscribe(requests, Role::Required).map_err(handle)?);
         let writing = Responses(driver.publication(responses).map_err(handle)?);
+        let retention = match (options.retention_responses, retention_stream) {
+            (Some(id), Some(stream)) => Some((
+                id,
+                Arc::new(Mutex::new(Responses(
+                    driver.publication(stream).map_err(handle)?,
+                ))),
+            )),
+            _ => None,
+        };
         let requester = Requester {
             requests: Some(driver.concurrent_publication(requests).map_err(handle)?),
             responses: Some(
@@ -510,6 +580,7 @@ impl DaemonArchive {
             inner: DriverHost::new(driver),
             dir: options.dir.clone(),
             min_free: options.min_free,
+            retention,
         };
         let mut archive = Self {
             server: ControlServer::new(agent, host, reading, writing),
@@ -521,7 +592,7 @@ impl DaemonArchive {
             archive.requester.ask(Asked::Start(*record), "karyos:ipc");
         }
         archive.release_idle_requester();
-        Ok((archive, [requests, responses]))
+        Ok((archive, control))
     }
 
     /// The driver.
@@ -635,8 +706,9 @@ impl DaemonArchive {
 
 /// A control stream's configuration from the daemon's term settings.
 /// The configurations of the Archive's requests and responses control
-/// streams, as [`DaemonArchive::start`] adds them; the sizing report counts
-/// the same two.
+/// streams, and of its retention state stream when configured (ADR-0101),
+/// as [`DaemonArchive::start`] adds them; the sizing report counts the
+/// same.
 ///
 /// # Errors
 ///
@@ -644,7 +716,7 @@ impl DaemonArchive {
 pub(crate) fn control_configs(
     terms: &TermOptions,
     options: &ArchiveOptions,
-) -> Result<[StreamConfig; 2], ArchiveStartError> {
+) -> Result<Vec<StreamConfig>, ArchiveStartError> {
     let control = |stream_id| StreamOption {
         stream_id,
         session_id: 0,
@@ -666,7 +738,17 @@ pub(crate) fn control_configs(
     responses.allow_unconnected = true;
     responses.buffer.max_subscribers = RESPONSE_READERS;
     responses.buffer.spare_slots = RESPONSE_SPARE_SLOTS;
-    Ok([requests, responses])
+    let mut configs = vec![requests, responses];
+    // The retention state stream is configured as the response stream: an
+    // answer nobody reads is not held.
+    if let Some(stream_id) = options.retention_responses {
+        let mut state = control_config(terms, control(stream_id))?;
+        state.allow_unconnected = true;
+        state.buffer.max_subscribers = RESPONSE_READERS;
+        state.buffer.spare_slots = RESPONSE_SPARE_SLOTS;
+        configs.push(state);
+    }
+    Ok(configs)
 }
 
 fn control_config(
@@ -697,6 +779,7 @@ mod tests {
             inner: DriverHost::new(driver),
             dir: archive.to_path_buf(),
             min_free,
+            retention: None,
         }
     }
 

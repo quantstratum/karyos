@@ -25,6 +25,7 @@ use crate::api::{
 };
 use crate::api::{BucketLane, BucketRead, BucketRefusal, TraceBucket};
 use crate::api::{ExportJournal, ExportPage, ExportRefusal};
+use crate::api::{RecordingRetention, RetentionView};
 
 /// A JSON value being written into a string.
 struct Out<'a>(&'a mut String);
@@ -507,6 +508,56 @@ fn catalog_json(out: &mut Out<'_>, catalog: &Catalog) {
             .key("last_error")
             .option(catalog.last_error.as_deref(), |out, error| {
                 out.string(error)
+            });
+        fields
+            .key("retention")
+            .option(catalog.retention.as_ref(), retention_json);
+    });
+}
+
+/// An Archive's retention state (ADR-0101; karyos#967).
+fn retention_json(out: &mut Out<'_>, retention: &RetentionView) {
+    out.object(|fields| {
+        fields
+            .key("recordings")
+            .array(&retention.recordings, |out, recording| {
+                recording_retention(out, recording)
+            });
+        fields.number("min_free_bytes", retention.min_free_bytes);
+        fields
+            .key("free_bytes")
+            .option(retention.free_bytes, |out, free| out.number(free));
+        fields
+            .key("read_at")
+            .option(retention.read_at, |out, at| out.number(at));
+        fields
+            .key("last_error")
+            .option(retention.last_error.as_deref(), |out, error| {
+                out.string(error)
+            });
+    });
+}
+
+fn recording_retention(out: &mut Out<'_>, recording: &RecordingRetention) {
+    out.object(|fields| {
+        fields.number("recording_id", recording.recording_id);
+        fields.string("hold", recording.hold);
+        fields
+            .key("hold_since_ns")
+            .option(recording.hold_since_ns, |out, at| out.number(at));
+        fields
+            .key("close_time_ns")
+            .option(recording.close_time_ns, |out, at| out.number(at));
+        fields
+            .key("earliest_expiry_ns")
+            .option(recording.earliest_expiry_ns, |out, at| out.number(at));
+        fields
+            .key("policy")
+            .option(recording.policy, |out, (policy, version)| {
+                out.object(|fields| {
+                    fields.number("id", policy);
+                    fields.number("version", version);
+                });
             });
     });
 }

@@ -1103,3 +1103,238 @@ fn a_shared_block_encodes_only_as_its_listed_templates() {
         })
     );
 }
+
+/// ADR-0101's vectors S-1 to S-7 (archive-control-codec.md section 11),
+/// derived independently: each decodes to its message and encodes back
+/// byte for byte.
+#[test]
+fn the_retention_state_vectors_round_trip() {
+    let descriptor = |recording_id, hold_since_ns, close_time_ns, earliest, hold| {
+        ControlMessage::RetentionDescriptor(RetentionDescriptor {
+            correlation_id: 10,
+            recording_id,
+            hold_since_ns,
+            close_time_ns,
+            earliest_expiry_ns: earliest,
+            policy: 1,
+            policy_version: 2,
+            hold,
+        })
+    };
+    let vectors: [(&str, ControlMessage<'_>); 7] = [
+        (
+            "01 00 0a 00 02 00 18 00 30 00 00 00 0a 00 00 00 00 00 00 00 \
+             00 00 00 00 00 00 00 00 64 00 00 00 4d 00 00 00 0a 00 \
+             6b 61 72 79 6f 73 3a 69 70 63",
+            ControlMessage::RetentionState(RetentionState {
+                correlation_id: 10,
+                from_id: 0,
+                max_count: 100,
+                response_stream_id: 77,
+                response_channel: "karyos:ipc",
+            }),
+        ),
+        (
+            "01 00 69 00 02 00 39 00 45 00 00 00 0a 00 00 00 00 00 00 00 \
+             2a 00 00 00 00 00 00 00 00 18 00 00 00 00 00 00 00 10 00 00 00 00 00 00 \
+             00 20 00 00 00 00 00 00 01 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 02",
+            descriptor(42, 6144, 4096, 8192, HoldState::Held),
+        ),
+        (
+            "01 00 69 00 02 00 39 00 45 00 00 00 0a 00 00 00 00 00 00 00 \
+             2b 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 \
+             ff ff ff ff ff ff ff ff 01 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 01",
+            descriptor(43, 0, 0, NO_EXPIRY, HoldState::None),
+        ),
+        (
+            "01 00 6a 00 02 00 20 00 2c 00 00 00 0a 00 00 00 00 00 00 00 \
+             02 00 00 00 00 00 00 00 00 00 00 40 00 00 00 00 00 00 00 00 02 00 00 00",
+            ControlMessage::RetentionSummary(RetentionSummary {
+                correlation_id: 10,
+                count: 2,
+                min_free_bytes: 1 << 30,
+                free_bytes: 8 << 30,
+            }),
+        ),
+        (
+            "01 00 65 00 01 00 11 00 28 00 00 00 0a 00 00 00 00 00 00 00 \
+             00 00 00 00 00 00 00 00 04 09 00 6d 61 78 5f 63 6f 75 6e 74",
+            ControlMessage::ControlResponse(ControlResponse {
+                correlation_id: 10,
+                id: 0,
+                code: ResponseCode::InvalidRequest,
+                message: "max_count",
+            }),
+        ),
+        (
+            "01 00 69 00 02 00 39 00 45 00 00 00 0a 00 00 00 00 00 00 00 \
+             2c 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10 00 00 00 00 00 00 \
+             00 20 00 00 00 00 00 00 01 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 03",
+            descriptor(44, 0, 4096, 8192, HoldState::Pending),
+        ),
+        (
+            "01 00 69 00 02 00 39 00 45 00 00 00 0a 00 00 00 00 00 00 00 \
+             2d 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 10 00 00 00 00 00 00 \
+             00 20 00 00 00 00 00 00 01 00 00 00 00 00 00 00 02 00 00 00 00 00 00 00 04",
+            descriptor(45, 0, 4096, 8192, HoldState::Unknown),
+        ),
+    ];
+    for (index, (text, message)) in vectors.iter().enumerate() {
+        let bytes = hex(text);
+        assert_eq!(
+            ControlMessage::decode(&bytes).unwrap(),
+            *message,
+            "S-{}",
+            index + 1
+        );
+        assert_eq!(encoded(message), bytes, "S-{}", index + 1);
+    }
+}
+
+/// ADR-0101's refusals: each rule of section 11 as a mutated vector, and
+/// version 2's templates only at version 2 (and version 1's only at 1).
+#[test]
+fn the_retention_state_refusals() {
+    let s1 = hex(
+        "01 00 0a 00 02 00 18 00 30 00 00 00 0a 00 00 00 00 00 00 00 \
+         00 00 00 00 00 00 00 00 64 00 00 00 4d 00 00 00 0a 00 \
+         6b 61 72 79 6f 73 3a 69 70 63",
+    );
+    let mutated = |at: usize, value: u8| {
+        let mut bytes = s1.clone();
+        bytes[at] = value;
+        ControlMessage::decode(&bytes)
+    };
+    // max_count 0 (block offset 16, byte 28) and above 1000.
+    assert_eq!(
+        mutated(28, 0),
+        Err(CodecError::ValueOutOfRange { field: "max_count" })
+    );
+    let mut many = s1.clone();
+    many[28..32].copy_from_slice(&1001u32.to_le_bytes());
+    assert_eq!(
+        ControlMessage::decode(&many),
+        Err(CodecError::ValueOutOfRange { field: "max_count" })
+    );
+    // A negative stream id is valid: two's complement.
+    let mut negative = s1.clone();
+    negative[32..36].copy_from_slice(&(-5i32).to_le_bytes());
+    assert!(matches!(
+        ControlMessage::decode(&negative),
+        Ok(ControlMessage::RetentionState(RetentionState {
+            response_stream_id: -5,
+            ..
+        }))
+    ));
+    // An empty channel, and one that is not UTF-8.
+    let mut empty = s1[..36].to_vec();
+    empty.extend_from_slice(&[0, 0]);
+    empty[8..12].copy_from_slice(&38u32.to_le_bytes());
+    assert!(matches!(
+        ControlMessage::decode(&empty),
+        Err(CodecError::LengthOutOfRange {
+            field: "response_channel",
+            ..
+        })
+    ));
+    let mut not_utf8 = s1.clone();
+    let last = not_utf8.len() - 1;
+    not_utf8[last] = 0xff;
+    assert!(matches!(
+        ControlMessage::decode(&not_utf8),
+        Err(CodecError::InvalidUtf8 { .. })
+    ));
+    // Version 2 at version 1, and version 1's ListRecordings at version 2.
+    assert!(matches!(
+        mutated(4, 1),
+        Err(CodecError::UnsupportedSchema {
+            template: 10,
+            version: 1,
+            ..
+        })
+    ));
+    let list = encoded(&ControlMessage::ListRecordings(ListRecordings {
+        correlation_id: 1,
+        from_id: 0,
+        max_count: 1,
+    }));
+    let mut list_v2 = list.clone();
+    list_v2[4] = 2;
+    assert!(matches!(
+        ControlMessage::decode(&list_v2),
+        Err(CodecError::UnsupportedSchema {
+            template: 3,
+            version: 2,
+            ..
+        })
+    ));
+    // A descriptor's rules.
+    let base = RetentionDescriptor {
+        correlation_id: 10,
+        recording_id: 42,
+        hold_since_ns: 6144,
+        close_time_ns: 4096,
+        earliest_expiry_ns: 8192,
+        policy: 1,
+        policy_version: 2,
+        hold: HoldState::Held,
+    };
+    let refused = |descriptor: RetentionDescriptor| {
+        let mut out = [0u8; 69];
+        descriptor.encode(&mut out).unwrap_err()
+    };
+    assert_eq!(
+        refused(RetentionDescriptor {
+            recording_id: 0,
+            ..base
+        }),
+        CodecError::ValueOutOfRange {
+            field: "recording_id"
+        }
+    );
+    assert_eq!(
+        refused(RetentionDescriptor {
+            hold: HoldState::None,
+            ..base
+        }),
+        CodecError::ValueOutOfRange {
+            field: "hold_since_ns"
+        }
+    );
+    assert_eq!(
+        refused(RetentionDescriptor {
+            hold: HoldState::Unknown,
+            ..base
+        }),
+        CodecError::ValueOutOfRange {
+            field: "hold_since_ns"
+        }
+    );
+    assert_eq!(
+        refused(RetentionDescriptor {
+            policy_version: 0,
+            ..base
+        }),
+        CodecError::ValueOutOfRange {
+            field: "policy_version"
+        }
+    );
+    assert_eq!(
+        refused(RetentionDescriptor {
+            close_time_ns: 0,
+            ..base
+        }),
+        CodecError::ValueOutOfRange {
+            field: "earliest_expiry_ns"
+        }
+    );
+    let mut bad_hold = encoded(&ControlMessage::RetentionDescriptor(base));
+    bad_hold[68] = 5;
+    assert_eq!(
+        ControlMessage::decode(&bad_hold),
+        Err(CodecError::InvalidEnum {
+            field: "hold",
+            value: 5
+        })
+    );
+}

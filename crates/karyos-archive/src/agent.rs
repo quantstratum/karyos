@@ -914,6 +914,12 @@ enum Command {
     Retain(retention::Request, Reply<RetentionAnswer>),
     /// A seal verification (ADR-0088).
     Verify(u64, Reply<retention::Verified>),
+    /// A retention state snapshot (ADR-0101).
+    RetentionState {
+        from_id: u64,
+        max: usize,
+        reply: Reply<Vec<crate::control::RetentionDescriptor>>,
+    },
     /// A replica's request (ADR-0091; karyos#1113).
     Replicate(
         crate::replication::ReplicateRecording,
@@ -1394,6 +1400,26 @@ impl ArchiveHandle {
         max: usize,
     ) -> Result<Posted<Vec<Described>>, AgentError> {
         self.post(|reply| Command::Snapshot {
+            from_id,
+            max,
+            reply,
+        })
+    }
+
+    /// Posts the retention state of at most `max` recordings from id
+    /// `from_id` on (inclusive), in id order (ADR-0101): each one's hold,
+    /// close time and earliest policy expiry, their correlation ids 0.
+    /// Read only.
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_retention_state(
+        &self,
+        from_id: u64,
+        max: usize,
+    ) -> Result<Posted<Vec<crate::control::RetentionDescriptor>>, AgentError> {
+        self.post(|reply| Command::RetentionState {
             from_id,
             max,
             reply,
@@ -3498,6 +3524,13 @@ where
                 let _ = reply.send(Ok(self.retain(request)));
             }
             Command::Verify(id, reply) => self.verify(id, reply),
+            Command::RetentionState {
+                from_id,
+                max,
+                reply,
+            } => {
+                let _ = reply.send(Ok(self.retention_state(from_id, max)));
+            }
             Command::Replicate(request, chunk, reply) => {
                 let _ = reply.send(self.replicate(request, chunk));
             }

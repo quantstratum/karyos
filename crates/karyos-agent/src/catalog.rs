@@ -4,7 +4,7 @@
 //! karyos/design/management-agent-gap-analysis.md, M11): the recordings
 //! the agent lists over the Archive's control streams, off by default.
 //!
-//! - **Where.** A driver given an Archive (`--archive DIR=REQ,RESP`)
+//! - **Where.** A driver given an Archive (`--archive DIR=REQ,RESP[,STATE]`, the third the retention state stream of ADR-0101)
 //!   names the two control streams its host configured
 //!   (archive-control-codec.md §7a). The request stream is shared by every
 //!   requester, so the host configures it concurrent; the agent takes a
@@ -46,16 +46,28 @@ pub struct ArchiveStreams {
     pub requests: i32,
     /// The response stream id.
     pub responses: i32,
+    /// The stream the Archive answers retention state queries on
+    /// (ADR-0101), when its host configures one.
+    pub retention: Option<i32>,
 }
 
 impl ArchiveStreams {
-    /// The streams `requests` and `responses`.
+    /// The streams `requests` and `responses`, with no retention state
+    /// stream.
     #[must_use]
     pub fn new(requests: i32, responses: i32) -> Self {
         Self {
             requests,
             responses,
+            retention: None,
         }
+    }
+
+    /// With `retention`, the retention state answer stream (ADR-0101).
+    #[must_use]
+    pub const fn with_retention(mut self, retention: i32) -> Self {
+        self.retention = Some(retention);
+        self
     }
 }
 
@@ -113,17 +125,30 @@ mod watch {
     use std::time::{Duration, Instant};
 
     use karyos_archive::catalog::{FailKind, StopReason};
+    use karyos_archive::client::connection::Responses;
     use karyos_archive::client::connection::{ArchiveConnection, ControlStreams};
     use karyos_archive::client::list::{
         ListPoll, ListedRecording, ListerConfig, Listing, RecordingLister,
     };
-    use karyos_archive::control::RecordingState;
+    use karyos_archive::client::retention_state::{RetentionStatePoll, RetentionStateRequester};
+    use karyos_archive::control::{
+        FREE_UNKNOWN, HoldState, MAX_LIST_COUNT, NO_EXPIRY, RecordingState, RetentionDescriptor,
+    };
     use karyos_client::ipc::RemoteClient;
     use karyos_client::{Client, Context};
     use karyos_sys::host_clock::host_monotonic_ns;
 
     use super::CatalogConfig;
-    use crate::api::{Catalog, CatalogRecording};
+    use crate::api::{Catalog, CatalogRecording, RecordingRetention, RetentionView};
+
+    /// The correlation ids' client id of the retention state queries:
+    /// apart from the lister's and the retention operations'.
+    const RETENTION_STATE_CLIENT_ID: u32 = 0x4b52_5354;
+    /// The recordings the view keeps the retention of at most: the pages
+    /// of one query, each [`MAX_LIST_COUNT`] long.
+    const MAX_RETENTION_RECORDINGS: usize = 16 * 1000;
+    /// What the view says of an Archive without version 2 (ADR-0101).
+    pub(crate) const UNSUPPORTED: &str = "retention state unsupported by this Archive";
 
     /// How long the thread sleeps between polls of a listing.
     const TICK: Duration = Duration::from_millis(1);
@@ -230,6 +255,142 @@ mod watch {
         catalog.listed_at = Some(host_monotonic_ns());
         catalog.listings = catalog.listings.checked_add(1).unwrap_or(catalog.listings);
         catalog.last_error = None;
+    }
+
+    /// Keeps a retention state answer, or the failure, in the view.
+    fn retained(shared: &Mutex<Catalog>, read: Result<RetentionView, String>) {
+        let mut catalog = lock(shared);
+        match read {
+            Ok(view) => catalog.retention = Some(view),
+            Err(error) => {
+                let mut view = catalog.retention.take().unwrap_or_default();
+                view.last_error = Some(error);
+                catalog.retention = Some(view);
+            }
+        }
+    }
+
+    /// The view of one descriptor.
+    fn retention_of(descriptor: &RetentionDescriptor) -> RecordingRetention {
+        let some = |value: u64| (value != 0).then_some(value);
+        RecordingRetention {
+            recording_id: descriptor.recording_id,
+            hold: match descriptor.hold {
+                HoldState::None => "none",
+                HoldState::Held => "held",
+                HoldState::Pending => "pending",
+                _ => "unknown",
+            },
+            hold_since_ns: some(descriptor.hold_since_ns),
+            close_time_ns: some(descriptor.close_time_ns),
+            earliest_expiry_ns: (descriptor.earliest_expiry_ns != NO_EXPIRY)
+                .then_some(descriptor.earliest_expiry_ns),
+            policy: (descriptor.policy != 0)
+                .then_some((descriptor.policy, descriptor.policy_version)),
+        }
+    }
+
+    /// Reads the Archive's retention state on a connection of its own
+    /// (ADR-0101): subscribes to its own answer stream `stream_id` first,
+    /// then pages `RetentionState` queries from the first recording until
+    /// a page comes back short, within `config.list_deadline` each. Read
+    /// only. The connection is closed before it returns.
+    fn retention_state(
+        client: &mut Client<RemoteClient>,
+        config: CatalogConfig,
+        stream_id: i32,
+        signals: &Signals,
+    ) -> Result<RetentionView, String> {
+        let own = Responses::open(client, stream_id)
+            .map_err(|error| format!("retention state stream {stream_id}: {error}"))?;
+        let (requests, shared) = match ArchiveConnection::open(
+            client,
+            ControlStreams::new(config.streams.requests, config.streams.responses),
+        ) {
+            Ok(connection) => connection.into_transports(),
+            Err(error) => {
+                own.close(client);
+                return Err(error.to_string());
+            }
+        };
+        let mut requester = RetentionStateRequester::new(
+            RETENTION_STATE_CLIENT_ID,
+            requests,
+            shared,
+            own,
+            stream_id,
+            "karyos:ipc",
+        );
+        let read = pages(client, &mut requester, config, signals);
+        let (requests, shared, own) = requester.into_transports();
+        requests.close(client);
+        shared.close(client);
+        own.close(client);
+        read
+    }
+
+    fn pages(
+        client: &mut Client<RemoteClient>,
+        requester: &mut RetentionStateRequester<
+            karyos_archive::client::connection::Requests<karyos_sys::term_bytes::SharedTerms>,
+            Responses<karyos_sys::term_bytes::SharedTerms>,
+            Responses<karyos_sys::term_bytes::SharedTerms>,
+        >,
+        config: CatalogConfig,
+        signals: &Signals,
+    ) -> Result<RetentionView, String> {
+        let mut view = RetentionView::default();
+        let mut from_id = 0u64;
+        let page = usize::try_from(MAX_LIST_COUNT).unwrap_or(usize::MAX);
+        loop {
+            requester.start(from_id, MAX_LIST_COUNT);
+            let start = Instant::now();
+            let answered = loop {
+                if signalled(signals).is_some() {
+                    return Err("the driver closed".to_owned());
+                }
+                let _ = client.poll();
+                match requester.poll() {
+                    RetentionStatePoll::Answered {
+                        descriptors,
+                        summary,
+                    } => break (descriptors, summary),
+                    RetentionStatePoll::Unsupported => return Err(UNSUPPORTED.to_owned()),
+                    RetentionStatePoll::Refused { code, message } => {
+                        return Err(format!("refused ({code:?}): {message}"));
+                    }
+                    RetentionStatePoll::Invalid => {
+                        return Err("the query does not encode".to_owned());
+                    }
+                    _ => {
+                        if start.elapsed() >= config.list_deadline {
+                            return Err("no retention state within its deadline".to_owned());
+                        }
+                        std::thread::sleep(TICK);
+                    }
+                }
+            };
+            let (descriptors, summary) = answered;
+            let last = descriptors.last().map(|descriptor| descriptor.recording_id);
+            for descriptor in &descriptors {
+                if view.recordings.len() < MAX_RETENTION_RECORDINGS {
+                    view.recordings.push(retention_of(descriptor));
+                }
+            }
+            view.min_free_bytes = summary.min_free_bytes;
+            view.free_bytes = (summary.free_bytes != FREE_UNKNOWN).then_some(summary.free_bytes);
+            match last.and_then(|last| last.checked_add(1)) {
+                Some(next)
+                    if descriptors.len() >= page
+                        && view.recordings.len() < MAX_RETENTION_RECORDINGS =>
+                {
+                    from_id = next;
+                }
+                _ => break,
+            }
+        }
+        view.read_at = Some(host_monotonic_ns());
+        Ok(view)
     }
 
     fn recording(listed: &ListedRecording) -> Option<CatalogRecording> {
@@ -360,6 +521,10 @@ mod watch {
                 match lister.poll() {
                     ListPoll::Done(listing) => {
                         listed(shared, listing);
+                        if let Some(stream_id) = config.streams.retention {
+                            let read = retention_state(&mut client, config, stream_id, signals);
+                            retained(shared, read);
+                        }
                         break;
                     }
                     // The Archive answered: the connection stays.
