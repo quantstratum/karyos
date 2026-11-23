@@ -346,7 +346,8 @@ address (127.0.0.1 or ::1); expose it beyond the pod through a
 TLS-terminating sidecar or mesh, or with --tls-cert and --tls-key (both,
 PEM files: the certificate chain and its private key), which serve
 https://ADDRESS:PORT/metrics over TLS 1.3 on any address, in a build with
-the exporter-tls feature. --token-file requires every scrape to
+the exporter-tls feature; off loopback --token-file is required too, and
+the key file must have mode 0600. --token-file requires every scrape to
 carry Authorization: Bearer with the token in PATH (32 to 256 bytes of
 visible ASCII, the file mode 0600; a symlink is followed, as a Kubernetes
 secret mount is one), against the other processes of the pod's network
@@ -426,9 +427,9 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
         _ => return None,
     };
     let listen: std::net::SocketAddr = listen?;
-    // Off loopback only over TLS: the token never crosses the network in
-    // clear (karyos#887).
-    if tls.is_none() && !listen.ip().is_loopback() {
+    // Off loopback only over TLS, and only with a token: the token never
+    // crosses the network in clear, and no scrape is open (karyos#887).
+    if !listen.ip().is_loopback() && (tls.is_none() || token_file.is_none()) {
         return None;
     }
     Some(ExporterArgs {

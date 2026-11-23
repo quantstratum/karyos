@@ -33,12 +33,29 @@ fn serve(args: karyos_agent::cli::ExporterArgs) -> ExitCode {
 
     use karyos_agent::{Agent, AgentConfig, exporter};
 
+    // The token first: off loopback, no listener starts without a valid
+    // one (karyos#887).
+    let token = match args
+        .token_file
+        .as_deref()
+        .map(exporter::Token::read)
+        .transpose()
+    {
+        Ok(token) => token,
+        Err(error) => {
+            let _ = writeln!(std::io::stderr(), "karyos-exporter: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let bound = match &args.tls {
-        None => exporter::bind(args.listen),
+        None => exporter::bind(args.listen).map(|listener| match token {
+            Some(token) => listener.with_token(token),
+            None => listener,
+        }),
         #[cfg(feature = "exporter-tls")]
         Some((cert, key)) => exporter::tls::server_config(cert, key)
             .map_err(exporter::ExportError::from)
-            .and_then(|config| exporter::bind_tls(args.listen, config)),
+            .and_then(|config| exporter::bind_tls(args.listen, config, token)),
         #[cfg(not(feature = "exporter-tls"))]
         Some(_) => {
             let _ = writeln!(
@@ -55,15 +72,6 @@ fn serve(args: karyos_agent::cli::ExporterArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Some(path) = &args.token_file {
-        match exporter::Token::read(path) {
-            Ok(token) => listener = listener.with_token(token),
-            Err(error) => {
-                let _ = writeln!(std::io::stderr(), "karyos-exporter: {error}");
-                return ExitCode::from(2);
-            }
-        }
-    }
     let mut config = AgentConfig::new(args.drivers);
     if let Some(id) = args.agent_id {
         config = config.with_agent_id(id);

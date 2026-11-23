@@ -856,22 +856,55 @@ mod over_tls {
             .join(name)
     }
 
-    fn exporter(address: &str) -> Exporter {
-        let config = tls::server_config(&fixture("server.pem"), &fixture("server.key")).unwrap();
-        bind_tls(address.parse().unwrap(), config).unwrap()
+    /// `source` copied to a private file of mode `mode` in a test
+    /// directory named `name`.
+    fn copied(source: &std::path::Path, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("karyos-887-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.pem");
+        std::fs::copy(source, &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
     }
 
-    /// A TLS client trusting the fixture CA sends `request` to `port` on
-    /// 127.0.0.1, in a thread, while the exporter is polled; the answer,
-    /// or `None` when the handshake or the read failed.
-    fn exchange_tls(exporter: &mut Exporter, request: &str) -> (Option<String>, Vec<Answered>) {
-        let port = exporter.local_addr().unwrap().port();
-        let request = request.to_owned();
-        let client = std::thread::spawn(move || {
-            let mut roots = rustls::RootCertStore::empty();
+    fn key(name: &str) -> PathBuf {
+        copied(&fixture("server.key"), name, 0o600)
+    }
+
+    fn token() -> Token {
+        Token::new(vec![b'k'; 32]).unwrap()
+    }
+
+    fn exporter(address: &str, name: &str) -> Exporter {
+        let config = tls::server_config(&fixture("server.pem"), &key(name)).unwrap();
+        bind_tls(address.parse().unwrap(), config, Some(token())).unwrap()
+    }
+
+    /// The fixture CA, or none.
+    fn roots(trusted: bool) -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        if trusted {
             for root in CertificateDer::pem_file_iter(fixture("ca.pem")).unwrap() {
                 roots.add(root.unwrap()).unwrap();
             }
+        }
+        roots
+    }
+
+    /// A TLS 1.3 client with `roots`, naming the server `name`, sends
+    /// `request` to the exporter on 127.0.0.1 in a thread while the
+    /// exporter is polled; the answer, or `None` when the handshake or the
+    /// read failed.
+    fn exchange_tls(
+        exporter: &mut Exporter,
+        roots: rustls::RootCertStore,
+        name: &'static str,
+        request: &str,
+    ) -> (Option<String>, Vec<Answered>) {
+        let port = exporter.local_addr().unwrap().port();
+        let request = request.to_owned();
+        let client = std::thread::spawn(move || {
             let config = rustls::ClientConfig::builder_with_provider(Arc::new(
                 rustls_graviola::default_provider(),
             ))
@@ -881,7 +914,7 @@ mod over_tls {
             .with_no_client_auth();
             let connection = rustls::ClientConnection::new(
                 Arc::new(config),
-                ServerName::try_from("localhost").unwrap(),
+                ServerName::try_from(name).unwrap(),
             )
             .unwrap();
             let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -903,61 +936,140 @@ mod over_tls {
         (client.join().unwrap(), answered)
     }
 
-    #[test]
-    fn a_scrape_over_tls_is_answered_and_its_token_guards_it() {
-        let token = Token::new(vec![b'k'; 32]).unwrap();
-        let mut exporter = exporter("127.0.0.1:0").with_token(token);
-        let (answer, answered) = exchange_tls(
-            &mut exporter,
+    fn scrape(
+        exporter: &mut Exporter,
+        roots: rustls::RootCertStore,
+        name: &'static str,
+    ) -> (Option<String>, Vec<Answered>) {
+        exchange_tls(
+            exporter,
+            roots,
+            name,
             &format!(
                 "GET /metrics HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
                 "k".repeat(32)
             ),
-        );
+        )
+    }
+
+    #[test]
+    fn a_scrape_over_tls_is_answered_and_its_token_guards_it() {
+        let mut exporter = exporter("127.0.0.1:0", "guards");
+        let (answer, answered) = scrape(&mut exporter, roots(true), "localhost");
         assert_eq!(answered, vec![Answered::Metrics]);
         let answer = answer.unwrap();
         assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
         assert!(answer.ends_with("karyos_up 1\n"), "{answer}");
-        let (answer, answered) = exchange_tls(&mut exporter, "GET /metrics HTTP/1.1\r\n\r\n");
+        let (answer, answered) = exchange_tls(
+            &mut exporter,
+            roots(true),
+            "localhost",
+            "GET /metrics HTTP/1.1\r\n\r\n",
+        );
         assert_eq!(answered, vec![Answered::Unauthorized]);
         assert!(answer.unwrap().starts_with("HTTP/1.1 401"));
     }
 
     #[test]
-    fn a_non_loopback_address_is_bound_only_with_tls() {
-        assert!(matches!(
-            bind("0.0.0.0:0".parse().unwrap()),
-            Err(ExportError::NotLoopback(_))
-        ));
-        let mut exporter = exporter("0.0.0.0:0");
-        let (answer, answered) = exchange_tls(&mut exporter, "GET /metrics HTTP/1.1\r\n\r\n");
+    fn the_certificate_is_verified_by_its_ip_san_too() {
+        let mut exporter = exporter("127.0.0.1:0", "ip-san");
+        let (answer, answered) = scrape(&mut exporter, roots(true), "127.0.0.1");
         assert_eq!(answered, vec![Answered::Metrics]);
         assert!(answer.unwrap().starts_with("HTTP/1.1 200 OK"));
     }
 
     #[test]
+    fn a_scraper_that_does_not_trust_the_ca_or_names_another_host_gets_nothing() {
+        let mut exporter = exporter("127.0.0.1:0", "untrusted");
+        let (answer, answered) = scrape(&mut exporter, roots(false), "localhost");
+        assert_eq!((answer, answered), (None, vec![Answered::Dropped]));
+        let (answer, answered) = scrape(&mut exporter, roots(true), "metrics.example.com");
+        assert_eq!((answer, answered), (None, vec![Answered::Dropped]));
+    }
+
+    #[test]
+    fn a_non_loopback_address_is_bound_only_with_tls_and_a_token() {
+        assert!(matches!(
+            bind("0.0.0.0:0".parse().unwrap()),
+            Err(ExportError::NotLoopback(_))
+        ));
+        let config = tls::server_config(&fixture("server.pem"), &key("no-token")).unwrap();
+        assert!(matches!(
+            bind_tls("0.0.0.0:0".parse().unwrap(), Arc::clone(&config), None),
+            Err(ExportError::NoToken(_))
+        ));
+        let mut exporter = bind_tls("0.0.0.0:0".parse().unwrap(), config, Some(token())).unwrap();
+        let (answer, answered) = scrape(&mut exporter, roots(true), "localhost");
+        assert_eq!(answered, vec![Answered::Metrics]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 200 OK"));
+        let (answer, answered) = exchange_tls(
+            &mut exporter,
+            roots(true),
+            "localhost",
+            "GET /metrics HTTP/1.1\r\n\r\n",
+        );
+        assert_eq!(answered, vec![Answered::Unauthorized]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
     fn plain_http_to_a_tls_exporter_is_dropped() {
-        let mut exporter = exporter("127.0.0.1:0");
+        let mut exporter = exporter("127.0.0.1:0", "plain");
         let (answer, answered) = exchange(&mut exporter, "GET /metrics HTTP/1.1\r\n\r\n");
         assert_eq!(answered, vec![Answered::Dropped]);
         assert!(!answer.contains("karyos_up"), "{answer}");
     }
 
     #[test]
-    fn a_missing_or_empty_pem_file_is_a_typed_refusal() {
-        let missing = fixture("missing.pem");
+    fn a_bad_key_or_certificate_file_is_a_typed_refusal() {
+        let cert = fixture("server.pem");
         assert!(matches!(
-            tls::server_config(&missing, &fixture("server.key")),
+            tls::server_config(&fixture("missing.pem"), &key("missing")),
             Err(tls::TlsError::Pem { .. })
         ));
+        // A key readable by others.
+        let open = copied(&fixture("server.key"), "open-key", 0o644);
         assert!(matches!(
-            tls::server_config(&fixture("server.key"), &fixture("server.key")),
+            tls::server_config(&cert, &open),
+            Err(tls::TlsError::KeyMode(_))
+        ));
+        // A certificate where the key should be.
+        let not_a_key = copied(&cert, "not-a-key", 0o600);
+        assert!(matches!(
+            tls::server_config(&cert, &not_a_key),
             Err(tls::TlsError::Pem { .. })
         ));
+        // A key where the certificate should be.
         assert!(matches!(
-            tls::server_config(&fixture("server.pem"), &fixture("server.pem")),
+            tls::server_config(&key("no-cert"), &key("no-cert-key")),
             Err(tls::TlsError::Pem { .. })
         ));
+        // A valid key that is not the certificate's.
+        let other = copied(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/other.key"),
+            "other-key",
+            0o600,
+        );
+        assert!(matches!(
+            tls::server_config(&cert, &other),
+            Err(tls::TlsError::Rustls(_))
+        ));
+    }
+
+    /// The suites a scraper can negotiate: the provider's TLS 1.3 suites
+    /// only (recorded in the admission record).
+    #[test]
+    fn only_tls13_suites_are_offered() {
+        let config = tls::server_config(&fixture("server.pem"), &key("suites")).unwrap();
+        let suites: Vec<String> = config
+            .crypto_provider()
+            .cipher_suites
+            .iter()
+            .filter(|suite| suite.version() == &rustls::version::TLS13)
+            .map(|suite| format!("{:?}", suite.suite()))
+            .collect();
+        assert!(!suites.is_empty());
+        println!("TLS 1.3 suites: {suites:?}");
     }
 
     /// The development and CI hosts have the provider's features.

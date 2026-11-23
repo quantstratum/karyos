@@ -19,7 +19,8 @@
 //!   beyond the pod takes a TLS-terminating sidecar or mesh (R-CORE-39,
 //!   karyos#734). Built with the `exporter-tls` feature, [`bind_tls`]
 //!   serves `/metrics` over TLS 1.3 on any address, with a certificate and
-//!   key from files (karyos#887); loopback plain HTTP stays the default.
+//!   key from files and a bearer token required off loopback
+//!   (karyos#887); loopback plain HTTP stays the default.
 //!   An optional bearer [`Token`] (`--token-file`) guards
 //!   scrapes from the other processes of the pod's network namespace: a
 //!   request for `/metrics` without it is answered `401`; only `/metrics`
@@ -683,6 +684,13 @@ pub enum ExportError {
         "{0} is not a loopback address: without TLS the exporter serves loopback only; configure TLS (--tls-cert and --tls-key, in a build with the exporter-tls feature) or expose it through a TLS-terminating sidecar or mesh"
     )]
     NotLoopback(SocketAddr),
+    /// A non-loopback address without a bearer token: off loopback every
+    /// scrape must carry one (karyos#887).
+    #[cfg(feature = "exporter-tls")]
+    #[error(
+        "{0} is not a loopback address: off loopback the exporter requires a bearer token (--token-file)"
+    )]
+    NoToken(SocketAddr),
     /// The TLS configuration was refused (karyos#887).
     #[cfg(feature = "exporter-tls")]
     #[error(transparent)]
@@ -823,22 +831,28 @@ pub fn bind(address: SocketAddr) -> Result<Exporter, ExportError> {
 }
 
 /// Listens on `address`, any address, serving every connection over TLS
-/// 1.3 with `config` ([`tls::server_config`]; karyos#887). A connection
-/// whose handshake fails is [`Answered::Dropped`].
+/// 1.3 with `config` ([`tls::server_config`]; karyos#887), every scrape
+/// guarded by `token`, which a non-loopback address requires. A
+/// connection whose handshake fails is [`Answered::Dropped`].
 ///
 /// # Errors
 ///
-/// The operating system's errors.
+/// [`ExportError::NoToken`] for a non-loopback address without a token,
+/// checked before anything is bound, and the operating system's errors.
 #[cfg(feature = "exporter-tls")]
 pub fn bind_tls(
     address: SocketAddr,
     config: std::sync::Arc<rustls::ServerConfig>,
+    token: Option<Token>,
 ) -> Result<Exporter, ExportError> {
+    if token.is_none() && !address.ip().is_loopback() {
+        return Err(ExportError::NoToken(address));
+    }
     let listener = TcpListener::bind(address)?;
     listener.set_nonblocking(true)?;
     Ok(Exporter {
         listener,
-        token: None,
+        token,
         tls: Some(config),
     })
 }

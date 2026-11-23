@@ -30,7 +30,11 @@ pub enum TlsError {
         /// What was wrong.
         reason: String,
     },
-    /// `rustls` refused the configuration.
+    /// The private key file is readable or writable by group or others.
+    #[error("{0} must be readable and writable by its owner only (mode 0600)")]
+    KeyMode(String),
+    /// `rustls` refused the configuration: a key that does not match the
+    /// certificate among others.
     #[error(transparent)]
     Rustls(#[from] rustls::Error),
 }
@@ -73,15 +77,19 @@ pub fn check_cpu() -> Result<(), TlsError> {
 }
 
 /// The exporter's TLS configuration from the certificate chain in PEM
-/// file `cert` and the private key in PEM file `key`: TLS 1.3 only, no
-/// client certificates, `http/1.1` offered by ALPN.
+/// file `cert` (leaf first) and the private key in PEM file `key`
+/// (PKCS#8, SEC1 or PKCS#1), which only its owner may read or write:
+/// TLS 1.3 only, with the provider's TLS 1.3 suites, no client
+/// certificates, `http/1.1` offered by ALPN. A key that does not match
+/// the leaf certificate is refused.
 ///
 /// # Errors
 ///
 /// [`TlsError::Cpu`] for a CPU without the provider's features,
+/// [`TlsError::KeyMode`] for a key file group or others may access,
 /// [`TlsError::Pem`] for a file that cannot be read or holds no
 /// certificate or key, and [`TlsError::Rustls`] for a chain or key
-/// `rustls` refuses.
+/// `rustls` refuses, a mismatched key included.
 pub fn server_config(cert: &Path, key: &Path) -> Result<Arc<ServerConfig>, TlsError> {
     check_cpu()?;
     let pem = |path: &Path, reason: String| TlsError::Pem {
@@ -95,12 +103,41 @@ pub fn server_config(cert: &Path, key: &Path) -> Result<Arc<ServerConfig>, TlsEr
     if chain.is_empty() {
         return Err(pem(cert, "no certificate".to_owned()));
     }
-    let key = PrivateKeyDer::from_pem_file(key).map_err(|error| pem(key, error.to_string()))?;
-    let mut config =
-        ServerConfig::builder_with_provider(Arc::new(rustls_graviola::default_provider()))
-            .with_protocol_versions(&[&rustls::version::TLS13])?
-            .with_no_client_auth()
-            .with_single_cert(chain, key)?;
+    let key = private_key(key, &pem)?;
+    let provider = Arc::new(rustls_graviola::default_provider());
+    // The key must match the leaf: checked here, so a mismatch is refused
+    // at start, never at the first handshake.
+    let certified = rustls::sign::CertifiedKey::from_der(chain, key, &provider)?;
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(certified)));
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
+}
+
+/// The private key in PEM file `path`, refused when group or others may
+/// access the file; the mode is checked on the handle that is read.
+fn private_key(
+    path: &Path,
+    pem: &impl Fn(&Path, String) -> TlsError,
+) -> Result<PrivateKeyDer<'static>, TlsError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).map_err(|error| pem(path, error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = file
+            .metadata()
+            .map_err(|error| pem(path, error.to_string()))?
+            .permissions()
+            .mode();
+        if mode & 0o077 != 0 {
+            return Err(TlsError::KeyMode(path.display().to_string()));
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| pem(path, error.to_string()))?;
+    PrivateKeyDer::from_pem_slice(&bytes).map_err(|error| pem(path, error.to_string()))
 }
