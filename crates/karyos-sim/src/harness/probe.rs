@@ -70,11 +70,15 @@ pub enum Stage {
     AdvanceFollower,
     /// The read-only queries and every other call.
     Other,
+    /// Counted in the window but not inside a call of the core: a thread
+    /// the adapter declares (`enroll`), working between calls. Derived:
+    /// the totals less every other stage.
+    Unattributed,
 }
 
 impl Stage {
     /// Every stage, in order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::Propose,
         Self::StepLeader,
         Self::StepFollower,
@@ -84,6 +88,7 @@ impl Stage {
         Self::AdvanceLeader,
         Self::AdvanceFollower,
         Self::Other,
+        Self::Unattributed,
     ];
 
     /// The stage of a call, by whether the core led: `(leader, follower)`.
@@ -109,14 +114,15 @@ impl Stage {
             Self::AdvanceLeader => "advance_leader",
             Self::AdvanceFollower => "advance_follower",
             Self::Other => "other",
+            Self::Unattributed => "unattributed",
         }
     }
 }
 
 /// Allocations per stage in the measurement, by [`Stage::slot`].
-static STAGE_ALLOCATIONS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static STAGE_ALLOCATIONS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 /// Frees per stage in the measurement, by [`Stage::slot`].
-static STAGE_FREES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static STAGE_FREES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// Adds one counted call's operations to its stage.
 fn note_stage(stage: Stage, operations: u64, allocations: u64) {
@@ -294,7 +300,8 @@ pub struct AllocationReport {
     pub counts: SetCounts,
     /// Entries the leaders committed past the warm-up.
     pub entries: u64,
-    /// The counts by stage, every stage listed, summing to `counts`.
+    /// The counts by stage, every stage listed, [`Stage::Unattributed`]
+    /// what no call of the core made, so they sum to `counts`.
     pub stages: Vec<(Stage, SetCounts)>,
     /// The run itself.
     pub outcome: Outcome,
@@ -330,30 +337,55 @@ pub enum MeasureError {
 ///
 /// [`MeasureError`].
 pub fn measure<C: ConsensusCore>(case: &Case, seed: u64) -> Result<AllocationReport, MeasureError> {
-    // The leaders' commit index is the window's, as its counts are: reset
-    // and read while this measurement holds it.
-    let ((outcome, committed), counts) = window(|| {
+    // The leaders' commit index and the stage counters are the window's,
+    // as its counts are: reset and read while this measurement holds it.
+    let ((outcome, committed, staged), counts) = window(|| {
         LEADER_COMMITTED.store(0, Ordering::SeqCst);
         for counter in STAGE_ALLOCATIONS.iter().chain(STAGE_FREES.iter()) {
             counter.store(0, Ordering::SeqCst);
         }
         let outcome = run::<Probed<C>>(case, seed);
-        (outcome, LEADER_COMMITTED.load(Ordering::SeqCst))
+        let staged: Vec<(Stage, SetCounts)> = Stage::ALL
+            .iter()
+            .zip(STAGE_ALLOCATIONS.iter().zip(STAGE_FREES.iter()))
+            .map(|(&stage, (allocations, frees))| {
+                (
+                    stage,
+                    SetCounts {
+                        allocations: allocations.load(Ordering::SeqCst),
+                        frees: frees.load(Ordering::SeqCst),
+                    },
+                )
+            })
+            .collect();
+        (outcome, LEADER_COMMITTED.load(Ordering::SeqCst), staged)
     })
     .map_err(|_| MeasureError::WindowOpen)?;
     let outcome = outcome.map_err(MeasureError::Run)?;
     let entries = committed.saturating_sub(WARMUP);
-    let stages = Stage::ALL
-        .iter()
-        .zip(STAGE_ALLOCATIONS.iter().zip(STAGE_FREES.iter()))
-        .map(|(&stage, (allocations, frees))| {
-            (
-                stage,
-                SetCounts {
-                    allocations: allocations.load(Ordering::SeqCst),
-                    frees: frees.load(Ordering::SeqCst),
-                },
-            )
+    let (in_calls, freed_in_calls) =
+        staged
+            .iter()
+            .fold((0u64, 0u64), |(allocations, frees), (_, stage)| {
+                (
+                    allocations.saturating_add(stage.allocations),
+                    frees.saturating_add(stage.frees),
+                )
+            });
+    let stages = staged
+        .into_iter()
+        .map(|(stage, counted)| {
+            if stage == Stage::Unattributed {
+                (
+                    stage,
+                    SetCounts {
+                        allocations: counts.allocations.saturating_sub(in_calls),
+                        frees: counts.frees.saturating_sub(freed_in_calls),
+                    },
+                )
+            } else {
+                (stage, counted)
+            }
         })
         .collect();
     Ok(AllocationReport {

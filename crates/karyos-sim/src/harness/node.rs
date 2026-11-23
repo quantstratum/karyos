@@ -189,7 +189,16 @@ impl Command {
     /// then the value.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut bytes = COMMAND_MAGIC.to_vec();
+        let mut bytes = Vec::new();
+        self.encode_into(&mut bytes);
+        bytes
+    }
+
+    /// [`Command::encode`] into `bytes`, cleared first: a node that keeps
+    /// `bytes` encodes without allocating once it has grown (karyos#691).
+    pub fn encode_into(&self, bytes: &mut Vec<u8>) {
+        bytes.clear();
+        bytes.extend_from_slice(&COMMAND_MAGIC);
         bytes.extend_from_slice(&self.client.to_le_bytes());
         bytes.extend_from_slice(&self.sequence.to_le_bytes());
         match &self.op {
@@ -199,7 +208,6 @@ impl Command {
             }
             Op::Read => bytes.push(1),
         }
-        bytes
     }
 
     /// The command in a log entry's payload, if it is one.
@@ -1305,6 +1313,8 @@ pub struct ServerNode<C: ConsensusCore> {
     alters_responses: bool,
     /// The Ready its core fills in place ([`ConsensusCore::ready_into`]).
     ready: ReadyBuf<C::Message>,
+    /// The bytes of the request it proposes, kept across requests.
+    command: Vec<u8>,
 }
 
 /// Why a server could not be created.
@@ -1436,6 +1446,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             #[cfg(feature = "test-hooks")]
             alters_responses: false,
             ready: ReadyBuf::default(),
+            command: Vec::new(),
         };
         if let Some(configuration) = configuration {
             server.record_configuration(configuration, None);
@@ -1481,6 +1492,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             #[cfg(feature = "test-hooks")]
             alters_responses: false,
             ready: ReadyBuf::default(),
+            command: Vec::new(),
         };
         server.start();
         server
@@ -2163,7 +2175,8 @@ impl<C: ConsensusCore> Node<Wire<C::Message>> for ServerNode<C> {
             )),
             Wire::Request(command) => {
                 let key = (command.client, command.sequence);
-                match core.propose_slice(&command.encode(), &mut view) {
+                command.encode_into(&mut self.command);
+                match core.propose_slice(&self.command, &mut view) {
                     Ok(()) => {
                         let _ = self.pending.insert(key);
                     }

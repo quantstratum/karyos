@@ -481,6 +481,11 @@ impl<M> ReadyBuf<M> {
         into.append(&mut self.spare);
     }
 
+    /// Drops the pool: for a core that never draws from it.
+    pub fn release_spare(&mut self) {
+        self.spare = Vec::new();
+    }
+
     /// Empties the Ready, keeping every vector's capacity and returning its
     /// entries to the pool.
     pub fn recycle(&mut self) {
@@ -581,8 +586,10 @@ pub trait ConsensusCore: Sized {
     /// karyos#691): whether the core had anything ready. A core that fills
     /// `out` in place, its entries through [`ReadyBuf::entry`], allocates
     /// nothing for the Ready itself once the buffers have grown. The
-    /// default moves [`ConsensusCore::ready`]'s Ready into it.
+    /// default moves [`ConsensusCore::ready`]'s Ready into it and releases
+    /// the pool, which a core that does not draw from it never empties.
     fn ready_into(&mut self, out: &mut ReadyBuf<Self::Message>, log: &mut LogView<'_>) -> bool {
+        out.release_spare();
         match self.ready(log) {
             Some(ready) => {
                 out.ready = ready;
