@@ -67,6 +67,8 @@ pub mod rate_limit;
 pub mod rate_policy_slot;
 mod retry;
 pub mod schedule_ring;
+#[cfg(target_os = "linux")]
+pub mod xsk_map;
 // Used only by `log_buffer`, which Loom builds leave out.
 #[cfg(not(loom))]
 pub mod receive;

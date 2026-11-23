@@ -785,6 +785,8 @@ dependencies = [
  "karyos-sys",
  "karyos-trace",
  "proptest",
+ "rustls",
+ "rustls-graviola",
  "signal-hook",
  "thiserror",
 ]
