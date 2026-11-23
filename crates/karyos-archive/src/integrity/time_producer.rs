@@ -120,16 +120,24 @@ const fn is_zero(clock: &ClockKey) -> bool {
 }
 
 impl Snapshot {
-    /// Whether the producer published past `largest` for `clock`: a
-    /// calibration of it whose validity starts after `largest`. The agent
-    /// waits for this before producing a range (ADR-0098 item 3); the
-    /// complete check per cited target is [`produce`]'s.
+    /// Whether the producer published past every in-session event of
+    /// `events` for the target it would cite: each such event has a
+    /// calibration of `clock` valid at its time whose target passes
+    /// [`produce`]'s completeness boundary over the largest timestamp.
+    /// The agent waits for this before producing a range (ADR-0098 item
+    /// 3), on the same target-specific boundary `produce` checks.
     #[must_use]
-    pub fn reaches(&self, clock: &EventClock, largest: u64) -> bool {
+    pub fn reaches(&self, clock: &EventClock, events: &[Event]) -> bool {
         let key = clock.key();
-        self.calibrations
-            .iter()
-            .any(|(later, _)| later.from == key && later.valid_from > largest)
+        let largest = events.iter().map(|event| event.time).max().unwrap_or(0);
+        events.iter().filter(|event| event.in_session).all(|event| {
+            let t = i128::from(event.time);
+            self.calibrations.iter().any(|(calibration, _)| {
+                calibration.from == key
+                    && calibration.covers(t, t)
+                    && complete(self, &key, &calibration.to, largest)
+            })
+        })
     }
 }
 

@@ -1496,6 +1496,157 @@ mod groups {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Runs `group` (id `id`) in `groups` with the declared clock: one
+    /// referencing event, durable, sealed; returns its sender.
+    fn evidence_event(
+        agent: &ArchiveHandle,
+        groups: &Path,
+        id: u64,
+        evidence: Option<crate::agent::GroupTimeEvidence>,
+        new: bool,
+    ) {
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        let mut group = start_group(groups, new.then_some(Capture::Strict));
+        group.group_id = id;
+        group.time_evidence = evidence;
+        let mut sender = agent.start_group(group).unwrap();
+        sender.admit().unwrap();
+        let seq = sender.view().snapshot().0 + 1;
+        sender.send(&referencing(seq, recording), seq).unwrap();
+        let waiter = sender.waiter();
+        agent.stop(recording).unwrap();
+        assert_eq!(waiter.wait_durable(seq, Duration::from_secs(5)), Ok(seq));
+    }
+
+    fn sealing_config() -> AgentConfig {
+        AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        }
+    }
+
+    fn declared(wait: Duration) -> crate::agent::GroupTimeEvidence {
+        crate::agent::GroupTimeEvidence::new(
+            crate::integrity::time_producer::EventClock {
+                clock: [1, 0, 2, 3, 4],
+                granularity: 1,
+            },
+            wait,
+        )
+    }
+
+    /// #1171 review: two groups with time evidence in one directory share
+    /// its store's one writer, and each gets its entries.
+    #[test]
+    fn two_groups_in_one_directory_share_its_store() {
+        use crate::integrity::time_evidence::{DIR, read_sealed};
+        let dir = temp_dir("group-evidence-shared");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing_config()).unwrap();
+        agent
+            .set_calibration_source(Box::new(calibrations()))
+            .unwrap();
+        evidence_event(
+            &agent,
+            &groups,
+            GROUP,
+            Some(declared(Duration::from_secs(5))),
+            true,
+        );
+        evidence_event(
+            &agent,
+            &groups,
+            GROUP + 1,
+            Some(declared(Duration::from_secs(5))),
+            true,
+        );
+        agent.shutdown().unwrap();
+        let entries = read_sealed(StdDisk, &groups).unwrap();
+        for id in [GROUP, GROUP + 1] {
+            assert!(
+                entries.iter().any(|entry| entry.recording == id),
+                "{id}: {entries:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #1171 review: records sealed without entries (here: captured with
+    /// no declaration) are not skipped by a later session: it resumes at
+    /// the group's last entry, or the journal's start, and gives the
+    /// earlier session's records the zero identity. And a close produces
+    /// a pending batch without waiting more: with no calibration source
+    /// and a long wait, the entries are there once the agent shuts down.
+    #[test]
+    fn a_later_session_covers_earlier_records_and_a_close_finishes() {
+        use crate::integrity::time_evidence::{DIR, NO_BOUND, read_sealed};
+        let dir = temp_dir("group-evidence-resume");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing_config()).unwrap();
+        evidence_event(&agent, &groups, GROUP, None, true);
+        agent.shutdown().unwrap();
+        assert!(read_sealed(StdDisk, &groups).unwrap().is_empty());
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing_config()).unwrap();
+        evidence_event(
+            &agent,
+            &groups,
+            GROUP,
+            Some(declared(Duration::from_secs(3600))),
+            false,
+        );
+        agent.shutdown().unwrap();
+        let entries = read_sealed(StdDisk, &groups).unwrap();
+        assert!(entries.len() >= 2, "{entries:?}");
+        // The earlier session's event: zero identity, the sentinel.
+        assert_eq!(entries[0].clock, [0; 5]);
+        assert_eq!(entries[0].bound_min_ns, NO_BOUND);
+        // The tiling has no hole: each entry starts where the last ended.
+        for pair in entries.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start, "{entries:?}");
+        }
+        // This session's event: the declared clock, no calibrations.
+        let last = entries.last().unwrap();
+        assert_eq!(last.clock, [1, 0, 2, 3, 4]);
+        assert_eq!(last.bound_min_ns, NO_BOUND);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #1171 review: the zero identity is refused before any file is
+    /// made, sealing or not, so a retry with a valid clock starts.
+    #[test]
+    fn a_zero_clock_is_refused_before_any_file_is_made() {
+        let dir = temp_dir("group-zero-first");
+        let groups = groups_dir(&dir);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let zero = crate::agent::GroupTimeEvidence::new(
+            crate::integrity::time_producer::EventClock {
+                clock: [0; 5],
+                granularity: 1,
+            },
+            Duration::ZERO,
+        );
+        assert!(matches!(
+            agent.start_group(start_group(&groups, Some(Capture::Strict)).with_time_evidence(zero)),
+            Err(AgentError::ZeroEventClock)
+        ));
+        assert!(
+            std::fs::read_dir(&groups).unwrap().next().is_none(),
+            "no file made"
+        );
+        agent
+            .start_group(
+                start_group(&groups, Some(Capture::Strict))
+                    .with_time_evidence(declared(Duration::ZERO)),
+            )
+            .unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// karyos#1137: the all zero clock identity is reserved; declaring it
     /// is refused.
     #[test]

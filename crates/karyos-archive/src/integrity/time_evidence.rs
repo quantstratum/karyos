@@ -385,6 +385,25 @@ impl<D: Disk + Clone> EntryStore<D> {
         &mut self.journal
     }
 
+    /// The entries this store holds, in order (karyos#1137: a group's
+    /// production resumes after its last).
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] for a read or a malformed entry.
+    pub fn entries(&mut self) -> Result<Vec<Entry>, StoreError> {
+        let length = ENTRY_LENGTH as u64;
+        let mut out = Vec::new();
+        let mut at = self.store.start();
+        let mut bytes = [0u8; ENTRY_LENGTH];
+        while at.saturating_add(length) <= self.store.written() {
+            self.store.read(at, &mut bytes)?;
+            out.push(Entry::decode(&bytes)?);
+            at = at.saturating_add(length);
+        }
+        Ok(out)
+    }
+
     /// Appends `entry`, durable, and seals it: its seal is the entry's
     /// evidence. Call it only after the entry's own range was sealed.
     ///
