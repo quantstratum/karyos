@@ -98,13 +98,20 @@ fn a_release_refused_for_now_is_retried_not_dropped() {
         .build()
         .unwrap();
     let mut client = Client::with_conductor(receive.recv().unwrap(), context);
+    // The leases before the subscriptions: at the end both registrations
+    // must be gone, not only the first's (#1203 review).
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while leases.load(Ordering::Acquire) == u64::MAX {
+        assert!(Instant::now() < deadline, "the driver never reported");
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    let before = leases.load(Ordering::Acquire);
     let first = client
         .add_subscription("karyos:ipc", StreamId::new(2))
         .unwrap();
     let second = client
         .add_subscription("karyos:ipc", StreamId::new(2))
         .unwrap();
-    let held = leases.load(Ordering::Acquire);
     // The driver stops serving: nothing pending completes.
     paused.store(true, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -123,7 +130,7 @@ fn a_release_refused_for_now_is_retried_not_dropped() {
     paused.store(false, Ordering::Release);
     until(&mut client, |client| client.pending_releases() == 0);
     let deadline = Instant::now() + Duration::from_secs(120);
-    while leases.load(Ordering::Acquire) >= held {
+    while leases.load(Ordering::Acquire) != before {
         assert!(
             Instant::now() < deadline,
             "the registrations were never removed"

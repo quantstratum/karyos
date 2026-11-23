@@ -558,6 +558,10 @@ mod sealed {
     pub trait Sealed {}
 }
 
+/// The held-back releases a client tries again per service at most
+/// (karyos#1067).
+const RELEASE_RETRIES: usize = 64;
+
 /// What became of a released handle (karyos#1067).
 #[doc(hidden)]
 #[derive(Debug)]
@@ -1479,7 +1483,7 @@ impl<C: Connection> Client<C> {
             late_released: 0,
             releases_failed: 0,
             subscription_releases_failed: 0,
-            pending_releases: Vec::new(),
+            pending_releases: Vec::with_capacity(RELEASE_RETRIES),
             completions: Vec::new(),
             events: Vec::new(),
             adding: None,
@@ -2405,15 +2409,23 @@ impl<C: Connection> Client<C> {
     }
 
     /// The releases a full ring or the pending limit held back, tried
-    /// again; those still held back wait for the next service.
+    /// again, at most [`RELEASE_RETRIES`] per service. The first one still
+    /// refused stops the round: the ring or the limit is still full, so
+    /// the rest wait for the next service. Popped and pushed back in place,
+    /// so a backlog under sustained backpressure never allocates.
     fn retry_releases(&mut self) {
-        let mut retry = std::mem::take(&mut self.pending_releases);
-        for subscription in retry.drain(..) {
-            self.release(subscription);
-        }
-        // The emptied list keeps its capacity for the next time.
-        if self.pending_releases.is_empty() {
-            self.pending_releases = retry;
+        for _ in 0..RELEASE_RETRIES {
+            let Some(subscription) = self.pending_releases.pop() else {
+                return;
+            };
+            match self.connection.release_subscription(subscription) {
+                ReleaseOutcome::Submitted => {}
+                ReleaseOutcome::Retry(subscription) => {
+                    self.pending_releases.push(subscription);
+                    return;
+                }
+                ReleaseOutcome::Dropped => bump(&mut self.subscription_releases_failed),
+            }
         }
     }
 
