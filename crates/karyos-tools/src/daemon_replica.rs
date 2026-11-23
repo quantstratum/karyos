@@ -75,6 +75,8 @@ const MAX_MESSAGE: usize = karyos_archive::replication::RECORDING_BYTES.max_leng
 pub enum ReplicaStartError {
     /// A replica on a network nobody declared trusted (decision 10).
     Untrusted,
+    /// Two replicas of one recording: they would share a directory.
+    Duplicate(u64),
     /// A replica's directory, store, journal or catalog failed to open.
     Store(String),
     /// The network subscription was refused.
@@ -89,6 +91,9 @@ impl std::fmt::Display for ReplicaStartError {
                 "replica refused: no --replication-trusted-network, and no authenticated \
                  profile is selected"
             ),
+            Self::Duplicate(recording) => {
+                write!(f, "recording {recording} is replicated here twice")
+            }
             Self::Store(error) => write!(f, "replica store: {error}"),
             Self::Subscribe(error) => write!(f, "replica subscription refused: {error}"),
         }
@@ -127,6 +132,9 @@ struct ReplicaListener {
     subscription: NetworkSubscription,
     /// The followed incarnation: its session, aggregate and reader.
     image: Option<(i32, AggregateHandle, ClientSubscription<SharedTerms>)>,
+    /// The registration of the newest incarnation ever followed: an older
+    /// one still exposed after the newest retired is never followed again.
+    newest: Option<u64>,
     /// The current request: its correlation id, once its `streaming`
     /// status was seen in this incarnation.
     started: Option<u64>,
@@ -152,6 +160,17 @@ impl std::fmt::Debug for Replicas {
             .field("listeners", &self.listeners.len())
             .field("counters", &self.counters)
             .finish_non_exhaustive()
+    }
+}
+
+/// Whether an image of `registration` may be followed, the newest
+/// followed so far being `newest`: never one older, a superseded
+/// incarnation (ADR-0102 decision 3). Registrations grow with each image
+/// the driver exposes.
+const fn follows(newest: Option<u64>, registration: u64) -> bool {
+    match newest {
+        Some(newest) => registration >= newest,
+        None => true,
     }
 }
 
@@ -230,6 +249,16 @@ impl Replicas {
         if !options.is_empty() && !trusted_network {
             return Err(ReplicaStartError::Untrusted);
         }
+        // One replica per recording: two would open one directory twice.
+        for (index, option) in options.iter().enumerate() {
+            if options
+                .iter()
+                .skip(index.saturating_add(1))
+                .any(|other| other.recording_id == option.recording_id)
+            {
+                return Err(ReplicaStartError::Duplicate(option.recording_id));
+            }
+        }
         let mut listeners = Vec::with_capacity(options.len());
         for option in options {
             let (store, journal, copies) = open_replica(
@@ -247,6 +276,7 @@ impl Replicas {
                 option: *option,
                 subscription,
                 image: None,
+                newest: None,
                 started: None,
                 receiver: Receiver::new(option.recording_id, replica),
                 replica,
@@ -355,7 +385,11 @@ impl ReplicaListener {
         driver: &mut EmbeddedDriver<SharedTerms>,
         counters: &mut ReplicaCounters,
     ) -> bool {
-        let newest = driver.network_image_from(self.option.stream_id, self.option.source);
+        // An image older than the newest followed is a superseded
+        // incarnation: never followed again.
+        let newest = driver
+            .network_image_from(self.subscription, self.option.source)
+            .filter(|(_, handle)| follows(self.newest, handle.registration()));
         let current = self
             .image
             .as_ref()
@@ -381,6 +415,7 @@ impl ReplicaListener {
                     source = %self.option.source,
                     "replica follows the source's newest incarnation"
                 );
+                self.newest = Some(handle.registration());
                 self.image = Some((session, handle, reader));
             }
             Err(error) => {
@@ -483,6 +518,15 @@ impl ReplicaListener {
                         );
                     }
                     Ok(_) => {}
+                    Err(ReceiveError::SealOutOfRange { start, end, .. }) => {
+                        counters.mismatches = counters.mismatches.saturating_add(1);
+                        tracing::warn!(
+                            recording_id,
+                            start,
+                            end,
+                            "replica seal outside its stored bytes: refused"
+                        );
+                    }
                     Err(error) => {
                         counters.failures = counters.failures.saturating_add(1);
                         tracing::warn!(recording_id, %error, "replica seal not checked");
@@ -498,8 +542,11 @@ impl ReplicaListener {
         self.status = Some((*status, now));
         match status.state {
             State::Streaming => {
-                if self.started != Some(status.correlation_id) {
-                    self.start_at(status.source_start, counters);
+                // Started only once its start is set up; a failure is
+                // tried again on the next status, at least once a second.
+                if self.started != Some(status.correlation_id)
+                    && self.start_at(status.source_start, counters)
+                {
                     self.started = Some(status.correlation_id);
                 }
             }
@@ -519,7 +566,8 @@ impl ReplicaListener {
     /// A request starts at the source's `start`: above the replica's last
     /// verified end, the interval between is a gap of the copy, recorded
     /// before the first range, and the copy starts again at `start`.
-    fn start_at(&mut self, start: u64, counters: &mut ReplicaCounters) {
+    /// Returns whether the copy is ready for the request's first range.
+    fn start_at(&mut self, start: u64, counters: &mut ReplicaCounters) -> bool {
         let recording_id = self.option.recording_id;
         let verified_end = match self.copies.current() {
             Ok(copies) => copies
@@ -535,11 +583,11 @@ impl ReplicaListener {
             Err(error) => {
                 counters.failures = counters.failures.saturating_add(1);
                 tracing::warn!(recording_id, %error, "replica copy catalog unreadable");
-                return;
+                return false;
             }
         };
         if start <= verified_end {
-            return;
+            return true;
         }
         // Unverified bytes past the verified end are not part of the
         // boundary: they go, and the store resumes at the source's start.
@@ -548,7 +596,7 @@ impl ReplicaListener {
         {
             counters.failures = counters.failures.saturating_add(1);
             tracing::warn!(recording_id, %error, "replica unverified tail not cut");
-            return;
+            return false;
         }
         let tail = self.store.written();
         if tail < start
@@ -556,7 +604,14 @@ impl ReplicaListener {
         {
             counters.failures = counters.failures.saturating_add(1);
             tracing::warn!(recording_id, %error, "replica gap not stored");
-            return;
+            return false;
+        }
+        // The store's gap is durable before the catalog commits it: a
+        // crash never leaves a committed gap past the store's tail.
+        if let Err(error) = self.store.sync() {
+            counters.failures = counters.failures.saturating_add(1);
+            tracing::warn!(recording_id, %error, "replica gap not synced");
+            return false;
         }
         match self.replica.gap(
             &mut self.copies,
@@ -575,10 +630,12 @@ impl ReplicaListener {
                     to = start,
                     "replica records a gap: the source no longer holds it"
                 );
+                true
             }
             Err(error) => {
                 counters.failures = counters.failures.saturating_add(1);
                 tracing::warn!(recording_id, %error, "replica gap not recorded");
+                false
             }
         }
     }
@@ -595,6 +652,16 @@ mod tests {
         let channel = listen_channel("0.0.0.0:4000".parse().unwrap());
         assert!(channel.reliable);
         assert_eq!(channel.security, Security::Trusted);
+    }
+
+    /// Codex P2 6: after the newest incarnation retires, an older image
+    /// still exposed is not followed again.
+    #[test]
+    fn a_superseded_incarnation_is_never_followed_again() {
+        assert!(follows(None, 3));
+        assert!(follows(Some(5), 5));
+        assert!(follows(Some(5), 9));
+        assert!(!follows(Some(5), 4));
     }
 
     #[test]

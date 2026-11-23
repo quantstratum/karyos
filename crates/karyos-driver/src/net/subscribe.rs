@@ -267,23 +267,27 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         self.exposed_network_image(stream_id, session_id)
     }
 
-    /// The newest exposed image of `stream_id` whose datagrams come from
-    /// `source`'s address, any port: its session and the aggregate
-    /// exposing it (karyos#1113). A replica follows only the newest
-    /// incarnation of its authorized source (ADR-0102 decision 3), which
-    /// it tells apart by this source and the session. Allocates nothing.
+    /// The newest exposed image of `subscription`'s stream, arrived on
+    /// its endpoint, whose datagrams come from `source`'s address, any
+    /// port: its session and the aggregate exposing it (karyos#1113). A
+    /// replica follows only the newest incarnation of its authorized
+    /// source (ADR-0102 decision 3); an image of the same source and
+    /// stream on another endpoint is not its. Allocates nothing.
     #[must_use]
     pub fn network_image_from(
         &self,
-        stream_id: i32,
+        subscription: NetworkSubscription,
         source: std::net::IpAddr,
     ) -> Option<(i32, AggregateHandle)> {
+        let stream_id = subscription.stream_id();
         self.net
             .as_ref()?
             .exposed_images_with_source()
             .rev()
-            .filter(|(from, _)| from.ip() == source)
-            .find_map(|(_, handle)| {
+            .filter(|(endpoint, from, _)| {
+                *endpoint == subscription.endpoint() && from.ip() == source
+            })
+            .find_map(|(_, _, handle)| {
                 self.streams
                     .iter()
                     .find(|stream| {

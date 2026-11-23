@@ -452,6 +452,36 @@ mod transport {
         assert_eq!(copies.verified_copies(RECORDING, 100, 40_100).unwrap(), 1);
     }
 
+    /// A seal whose range the store does not hold whole is refused before
+    /// anything is read or allocated.
+    #[test]
+    fn a_seal_outside_the_stored_bytes_is_refused_before_reading() {
+        let (_dirs, source_dir, replica_dir) = dirs("seal-range");
+        let (_, seals) = source(&source_dir);
+        let mut store = store(&replica_dir);
+        let mut journal = IntegrityJournal::open(StdDisk, &replica_dir)
+            .unwrap()
+            .journal;
+        let mut copies = CopyCatalog::open(StdDisk, &replica_dir, &mut journal).unwrap();
+        let receiver = Receiver::new(
+            RECORDING,
+            Replica::new([9; 32], 0, Enforcement::Unsupported),
+        );
+        let _ = receiver.bytes(RECORDING, 0, &[1; 100], &mut store).unwrap();
+        // The second range, [100, 40100), is not stored.
+        assert!(matches!(
+            receiver.seal(&seals[1], &mut store, &mut copies, &mut journal),
+            Err(ReceiveError::SealOutOfRange { tail: 100, .. })
+        ));
+        let mut huge = seals[0];
+        huge.end = u64::MAX;
+        assert!(matches!(
+            receiver.seal(&huge, &mut store, &mut copies, &mut journal),
+            Err(ReceiveError::SealOutOfRange { .. })
+        ));
+        assert!(copies.records().is_empty());
+    }
+
     #[test]
     fn requests_are_refused_with_their_codes() {
         let (_dirs, source_dir, _) = dirs("refused");

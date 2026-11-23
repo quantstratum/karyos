@@ -1371,6 +1371,20 @@ impl Archive {
                 needs: "--replication-trusted-network",
             });
         }
+        // One replica per recording: two would share its directory.
+        for (index, replica) in self.replicas.iter().enumerate() {
+            if self
+                .replicas
+                .iter()
+                .skip(index.saturating_add(1))
+                .any(|other| other.recording_id == replica.recording_id)
+            {
+                return Err(ArgsError::InvalidValue {
+                    option: "--replica",
+                    value: format!("recording {} given twice", replica.recording_id),
+                });
+            }
+        }
         // A replica's copies are catalogued at this Archive's location.
         if !self.replicas.is_empty() && self.copy_location.is_none() {
             return Err(ArgsError::Needs {
@@ -2015,6 +2029,15 @@ mod tests {
                 needs: "--network on",
             }
         );
+        let mut twice = full.clone();
+        twice.extend(["--replica", "5,10.0.0.2,0.0.0.0:4001,41"]);
+        assert!(matches!(
+            run(&twice).unwrap_err(),
+            ArgsError::InvalidValue {
+                option: "--replica",
+                ..
+            }
+        ));
         for bad in [
             "0,10.0.0.1,0.0.0.0:4000,40",
             "5,host,0.0.0.0:4000,40",

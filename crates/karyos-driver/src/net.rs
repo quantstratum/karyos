@@ -2018,10 +2018,13 @@ impl<T: StreamTerms> Network<T> {
     /// first.
     pub(crate) fn exposed_images_with_source(
         &self,
-    ) -> impl DoubleEndedIterator<Item = (SocketAddr, crate::embedded::AggregateHandle)> + '_ {
-        self.net_images
-            .iter()
-            .filter_map(|image| image.exposed.map(|handle| (image.source, handle)))
+    ) -> impl DoubleEndedIterator<Item = (EndpointId, SocketAddr, crate::embedded::AggregateHandle)> + '_
+    {
+        self.net_images.iter().filter_map(|image| {
+            image
+                .exposed
+                .map(|handle| (image.endpoint, image.source, handle))
+        })
     }
 
     /// Each exposed image's aggregate, in install order.
