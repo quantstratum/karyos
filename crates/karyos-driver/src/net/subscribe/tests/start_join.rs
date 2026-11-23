@@ -108,7 +108,10 @@ impl Rig {
             },
         );
         let mut parent = None;
-        for _ in 0..200 {
+        // Bounded by a deadline, not 200 duty cycles: a loaded host can
+        // take longer to answer (karyos#1067).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while std::time::Instant::now() < deadline {
             let _ = b.do_work().unwrap();
             for response in drain(&mut observer).0 {
                 if let Response::NetworkSubscriptionReady { registration, .. } = response {
