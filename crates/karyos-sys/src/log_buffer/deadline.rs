@@ -109,6 +109,12 @@ pub(super) struct ConcurrentDeadlines {
     span: Option<Span>,
     walk_budget: u32,
     scan_budget: u32,
+    /// The stream positions of the blocks the last call aborted, in
+    /// abort order (karyos#1141): a guard close labels exactly these
+    /// `GUARD_CLOSED`. Reserved at issue for the most one call aborts,
+    /// `2 * (P + S) + 2` (a guard close's pass serves the marked blocks and
+    /// the span twice), so recording never allocates.
+    aborted_at: Vec<u64>,
 }
 
 /// The clock, read at most once and only when needed.
@@ -140,7 +146,30 @@ impl ConcurrentDeadlines {
             span: None,
             walk_budget: WALK_BUDGET,
             scan_budget: SCAN_BUDGET,
+            aborted_at: Vec::with_capacity(
+                (publishers + SCAN_BUDGET as usize)
+                    .saturating_mul(2)
+                    .saturating_add(2),
+            ),
         }
+    }
+
+    /// The most positions one call records: the reserved bound.
+    pub(super) fn max_aborted_positions(&self) -> usize {
+        self.aborted_at.capacity()
+    }
+
+    /// Forgets the last call's positions: a call that returns before it
+    /// serves anything leaves none recorded.
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn clear_aborted(&mut self) {
+        self.aborted_at.clear();
+    }
+
+    /// The stream positions of the blocks the last service call or guard
+    /// close pass aborted, in abort order.
+    pub(super) fn aborted_positions(&self) -> &[u64] {
+        &self.aborted_at
     }
 
     /// Test hook: smaller budgets.
@@ -189,6 +218,7 @@ impl ConcurrentDeadlines {
         report: &mut DeadlineReport,
         after_marked: &mut dyn FnMut(),
     ) -> Result<(), SysError> {
+        self.aborted_at.clear();
         // The clock of points already observed below the admitted head.
         let mut now = Now { clock, value: None };
         self.serve_marked(buffer, &mut now, deadline, report)?;
@@ -278,6 +308,10 @@ impl ConcurrentDeadlines {
             let extent = marked.extent;
             if abort_block(word, marked.reserved, aborted(buffer, extent)) {
                 count_abort(report, extent)?;
+                record(
+                    &mut self.aborted_at,
+                    buffer.position(marked.count, marked.offset),
+                )?;
             } else {
                 bump(&mut report.resolved)?;
             }
@@ -352,6 +386,10 @@ impl ConcurrentDeadlines {
                     aborted(buffer, extent),
                 );
                 count_abort(report, extent)?;
+                record(
+                    &mut self.aborted_at,
+                    buffer.position(span.count, span.start),
+                )?;
                 self.span = None;
             }
             None => self.span = Some(span),
@@ -385,6 +423,10 @@ impl ConcurrentDeadlines {
         let first = unsafe { word(buffer, span.slot, span.start) };
         if abort_block(first, reserved, aborted(buffer, extent)) {
             count_abort(report, extent)?;
+            record(
+                &mut self.aborted_at,
+                buffer.position(span.count, span.start),
+            )?;
         } else {
             bump(&mut report.resolved)?;
         }
@@ -742,6 +784,19 @@ fn bump(count: &mut u32) -> Result<(), SysError> {
     *count = count.checked_add(1).ok_or(LayoutError::LengthOverflow {
         value: u64::from(*count),
     })?;
+    Ok(())
+}
+
+/// Records an aborted block's stream position within the reserved bound;
+/// past it, a broken bound, refused rather than allocated.
+fn record(positions: &mut Vec<u64>, position: u64) -> Result<(), SysError> {
+    if positions.len() >= positions.capacity() {
+        return Err(LayoutError::LengthOverflow {
+            value: u64::try_from(positions.len()).unwrap_or(u64::MAX),
+        }
+        .into());
+    }
+    positions.push(position);
     Ok(())
 }
 

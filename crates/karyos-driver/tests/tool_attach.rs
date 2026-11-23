@@ -613,9 +613,30 @@ fn region(socket: &OwnedFd, index: u64, region: &Region) {
     );
 }
 
-/// This process's open descriptors.
-fn descriptors() -> usize {
-    std::fs::read_dir("/proc/self/fd").unwrap().count()
+/// This process's open descriptors, each with what it refers to.
+fn descriptors() -> std::collections::BTreeSet<(String, std::path::PathBuf)> {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let target = std::fs::read_link(entry.path()).ok()?;
+            Some((entry.file_name().to_string_lossy().into_owned(), target))
+        })
+        .collect()
+}
+
+/// Asserts that no descriptor open now was not open `before`: whatever an
+/// attach opened is closed. A descriptor open before and closed since (one
+/// a previous test's thread let go of late) is not a leak, so the count
+/// alone could fall below `before` and is not compared (karyos#1067).
+fn none_left(before: &std::collections::BTreeSet<(String, std::path::PathBuf)>, case: &str) {
+    let now = descriptors();
+    let left: Vec<_> = now
+        .difference(before)
+        // The read of `/proc/self/fd` itself.
+        .filter(|(_, target)| !target.starts_with("/proc"))
+        .collect();
+    assert!(left.is_empty(), "{case}: left open {left:?}");
 }
 
 /// This process's mappings of region memfds.
@@ -695,7 +716,8 @@ fn a_tool_attaches_to_a_fake_driver_and_releases_everything_on_drop() {
     assert!(tool.driver_closed().unwrap());
     assert_eq!(region_mappings(), before.1 + 6);
     drop(tool);
-    assert_eq!((descriptors(), region_mappings()), before);
+    none_left(&before.0, "drop");
+    assert_eq!(region_mappings(), before.1);
 }
 
 /// Every bootstrap that breaks the rules rolls the attach back: the error
@@ -908,6 +930,7 @@ fn a_bad_tool_bootstrap_rolls_back_with_every_descriptor_closed() {
         let before = (descriptors(), region_mappings());
         let error = against_fake(&dir, &fake, script).unwrap_err();
         assert!(expected(&error), "{case}: {error:?}");
-        assert_eq!((descriptors(), region_mappings()), before, "{case}");
+        none_left(&before.0, case);
+        assert_eq!(region_mappings(), before.1, "{case}");
     }
 }

@@ -248,6 +248,10 @@ impl ResponseSink for Responses {
         }
         sent
     }
+
+    fn max_message(&self) -> usize {
+        usize::try_from(self.0.max_message_length()).unwrap_or(usize::MAX)
+    }
 }
 
 /// Logs a request: its correlation id (requester half not authenticated)
@@ -488,6 +492,12 @@ impl DaemonArchive {
             started: Vec::new(),
             next: 1,
         };
+        if options.time_evidence {
+            let entries = karyos_archive::integrity::time_evidence::entries_dir(&options.dir);
+            std::fs::create_dir_all(&entries).map_err(|error| {
+                ArchiveStartError::Agent(format!("{}: {error}", entries.display()))
+            })?;
+        }
         let config = AgentConfig::default()
             .with_seal_interval(Some(options.seal_interval))
             .with_copy_location(options.copy_location)

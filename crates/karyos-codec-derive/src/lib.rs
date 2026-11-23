@@ -38,8 +38,21 @@
 //! ranges, `#[field(with = PATH, spans = [(OFFSET, WIDTH), ...])]`,
 //! through `PATH::read(&block)` and `PATH::write(&mut encoder, &value)`:
 //! one value whose bytes sit at offsets that are not adjacent (a mode and
-//! its on-lap byte, a sync policy and its interval). Groups stay hand
-//! written.
+//! its on-lap byte, a sync policy and its interval). Also (karyos#1104,
+//! the group records): a tied field's `PATH::write(&mut encoder, self)`
+//! takes the whole message, so two fields that share a byte (a flags
+//! byte) are written together; a variable tied field `#[field(with =
+//! PATH, spans = [...], var)]` (its spans may be empty), read through
+//! `PATH::read(&block, &mut decoder)` and written through
+//! `PATH::write(&mut encoder, self)` in the variable fields' order; a
+//! versioned message `#[message(versioned)]` whose `decode` takes `v2:
+//! bool` and whose fields `#[field(offset = N, since = 2)]` read as their
+//! default from a version 1 block; and reserved bytes `#[message(zero =
+//! [(OFFSET, WIDTH), ...])]`, refused unless zero on decode and left zero
+//! on encode. A block several templates share takes `#[message(templates =
+//! [PATH, ...])]` in place of `template`: its fields are checked against
+//! every one, and its `encode(&self, out, template)` (crate visible) takes
+//! the template the caller encodes.
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -66,6 +79,9 @@ enum Kind {
         method: Ident,
         offset: usize,
         check: Option<Path>,
+        /// Read only from a version 2 block (`since = 2`), else its
+        /// default (karyos#1104).
+        since: bool,
     },
     /// Any type at `offset`, `width` bytes wide, through
     /// `with::read(&block, offset)` and `with::write(&mut encoder, offset,
@@ -76,9 +92,17 @@ enum Kind {
         width: usize,
     },
     /// Any type over several block ranges `spans` (offset, width), through
-    /// `with::read(&block)` and `with::write(&mut encoder, &value)`
-    /// (karyos#1104).
+    /// `with::read(&block)` and `with::write(&mut encoder, self)`, the
+    /// whole message (karyos#1104).
     Tied {
+        with: Path,
+        spans: Vec<(usize, usize)>,
+    },
+    /// Any type over the block ranges `spans` (none or more) and the
+    /// variable data, through `with::read(&block, &mut decoder)` and
+    /// `with::write(&mut encoder, self)`, in the variable fields' order
+    /// (karyos#1104).
+    TiedVar {
         with: Path,
         spans: Vec<(usize, usize)>,
     },
@@ -105,23 +129,41 @@ impl Field {
                 vec![(*offset, offset.saturating_add(size(method)))]
             }
             Kind::With { offset, width, .. } => vec![(*offset, offset.saturating_add(*width))],
-            Kind::Tied { spans, .. } => spans
+            Kind::Tied { spans, .. } | Kind::TiedVar { spans, .. } => spans
                 .iter()
                 .map(|(offset, width)| (*offset, offset.saturating_add(*width)))
                 .collect(),
             Kind::Var { .. } => Vec::new(),
         }
     }
+
+    /// Whether it reads from the variable data.
+    const fn reads_var(&self) -> bool {
+        matches!(self.kind, Kind::Var { .. } | Kind::TiedVar { .. })
+    }
 }
 
 /// The `#[message(...)]` of a struct.
 struct Message {
-    template: Path,
+    /// The template, or the templates a shared block serves.
+    templates: Vec<Path>,
+    /// Whether `encode` takes the template (`templates = [...]`).
+    shared: bool,
     check: Option<Path>,
+    /// Its `decode` takes `v2: bool` (karyos#1104).
+    versioned: bool,
+    /// Reserved block ranges, zero (karyos#1104).
+    zero: Vec<(usize, usize)>,
 }
 
 fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
-    let Message { template, check } = message(input)?;
+    let Message {
+        templates,
+        shared,
+        check,
+        versioned,
+        zero,
+    } = message(input)?;
     let Data::Struct(data) = &input.data else {
         return Err(syn::Error::new_spanned(
             &input.ident,
@@ -154,22 +196,36 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         .iter()
         .map(field)
         .collect::<syn::Result<Vec<_>>>()?;
-    overlaps(&fields)?;
+    if !versioned
+        && let Some(field) = fields
+            .iter()
+            .find(|field| matches!(field.kind, Kind::Fixed { since: true, .. }))
+    {
+        return Err(syn::Error::new_spanned(
+            &field.name,
+            "a field with `since` needs #[message(versioned)]",
+        ));
+    }
+    overlaps(&fields, &zero)?;
     let ident = &input.ident;
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
     let input_lifetime = lifetime.map_or_else(|| quote! { '_ }, |lifetime| quote! { #lifetime });
-    let vars = fields.iter().filter_map(|field| match &field.kind {
-        Kind::Var { min, max, text } => {
-            let name = &field.name;
-            let label = name.to_string();
-            Some(if *text {
+    let vars = fields.iter().filter_map(|field| {
+        let name = &field.name;
+        let label = name.to_string();
+        match &field.kind {
+            Kind::Var { min, max, text } => Some(if *text {
                 quote! { let #name = decoder.str(#label, #min, #max)?; }
             } else {
                 quote! { let #name = decoder.bytes(#label, #min, #max)?; }
-            })
+            }),
+            Kind::TiedVar { with, .. } => {
+                Some(quote! { let #name = #with::read(&block, &mut decoder)?; })
+            }
+            _ => None,
         }
-        _ => None,
     });
+    let v2_read = Ident::new("__karyos_v2", Span::mixed_site());
     let reads = fields.iter().map(|field| {
         let name = &field.name;
         let label = name.to_string();
@@ -178,16 +234,23 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 method,
                 offset,
                 check,
+                since,
             } => {
-                let read = quote! { block.#method(#offset)? };
-                match check {
-                    Some(check) => quote! { #name: #check(#label, #read)? },
-                    None => quote! { #name: #read },
+                let read = match check {
+                    Some(check) => quote! { #check(#label, block.#method(#offset)?)? },
+                    None => quote! { block.#method(#offset)? },
+                };
+                if *since {
+                    quote! {
+                        #name: if #v2_read { #read } else { ::core::default::Default::default() }
+                    }
+                } else {
+                    quote! { #name: #read }
                 }
             }
             Kind::With { with, offset, .. } => quote! { #name: #with::read(&block, #offset)? },
             Kind::Tied { with, .. } => quote! { #name: #with::read(&block)? },
-            Kind::Var { .. } => quote! { #name },
+            Kind::Var { .. } | Kind::TiedVar { .. } => quote! { #name },
         }
     });
     let writes = fields.iter().map(|field| {
@@ -198,6 +261,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                 method,
                 offset,
                 check,
+                ..
             } => {
                 let value = match check {
                     Some(check) => quote! { #check(#label, self.#name)? },
@@ -208,8 +272,8 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             Kind::With { with, offset, .. } => {
                 quote! { #with::write(&mut encoder, #offset, &self.#name)?; }
             }
-            Kind::Tied { with, .. } => quote! { #with::write(&mut encoder, &self.#name)?; },
-            Kind::Var { .. } => quote! {},
+            Kind::Tied { with, .. } => quote! { #with::write(&mut encoder, self)?; },
+            Kind::Var { .. } | Kind::TiedVar { .. } => quote! {},
         }
     });
     let var_writes = fields.iter().filter_map(|field| match &field.kind {
@@ -223,6 +287,7 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             };
             Some(quote! { encoder.bytes(#label, #min, #max, #value)?; })
         }
+        Kind::TiedVar { with, .. } => Some(quote! { #with::write(&mut encoder, self)?; }),
         _ => None,
     });
     let ends = fields.iter().flat_map(|field| {
@@ -230,22 +295,116 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             "field `{}` runs past the template's block length",
             field.name
         );
-        let template = &template;
+        let templates = &templates;
         field
             .spans()
             .into_iter()
-            .map(move |(_, end)| {
-                quote! {
-                    ::core::assert!(#end <= #template.block_length as usize, #message);
-                }
+            .flat_map(move |(_, end)| {
+                let message = message.clone();
+                templates.iter().map(move |template| {
+                    quote! {
+                        ::core::assert!(#end <= #template.block_length as usize, #message);
+                    }
+                })
             })
             .collect::<Vec<_>>()
     });
-    // `mut` only when a variable field reads from the decoder.
-    let decoder_binding = if fields
-        .iter()
-        .any(|field| matches!(field.kind, Kind::Var { .. }))
+    let zero_ends = zero.iter().flat_map(|(offset, width)| {
+        let end = offset.saturating_add(*width);
+        templates.iter().map(move |template| {
+            quote! {
+                ::core::assert!(
+                    #end <= #template.block_length as usize,
+                    "a reserved range runs past the template's block length"
+                );
+            }
+        })
+    });
+    // One template, or the one the caller passes for a shared block.
+    let (encode_head, encode_template) = match (shared, templates.first()) {
+        (false, Some(template)) => (
+            quote! {
+                /// Encodes into `out`; returns the message's length.
+                ///
+                /// # Errors
+                ///
+                /// `CodecError::Truncated` when `out` is short, and a field's
+                /// or the message's check error.
+                pub fn encode(
+                    &self,
+                    out: &mut [u8],
+                ) -> ::core::result::Result<usize, ::karyos_codec::CodecError>
+            },
+            quote! { &#template },
+        ),
+        _ => (
+            quote! {
+                /// Encodes into `out` as `template`, one of the templates
+                /// the block serves; returns the message's length.
+                ///
+                /// # Errors
+                ///
+                /// `CodecError::Truncated` when `out` is short, and a field's
+                /// or the message's check error.
+                pub(crate) fn encode(
+                    &self,
+                    out: &mut [u8],
+                    template: &::karyos_codec::Template,
+                ) -> ::core::result::Result<usize, ::karyos_codec::CodecError>
+            },
+            quote! { template },
+        ),
+    };
+    // A shared block encodes only as one of its listed templates, whose
+    // layouts the checks above cover: any other is refused before a byte
+    // is written (karyos#1104, Codex review of #1167).
+    let template_guard = if shared {
+        quote! {
+            if ![#(#templates),*].contains(template) {
+                return ::core::result::Result::Err(
+                    ::karyos_codec::CodecError::UnsupportedSchema {
+                        schema: template.schema_id,
+                        template: template.template_id,
+                        version: template.version,
+                    },
+                );
+            }
+        }
+    } else {
+        quote! {}
+    };
+    // Each reserved byte zero, refused otherwise (karyos#1104).
+    let zero_checks = zero.iter().map(|(offset, width)| {
+        let end = offset.saturating_add(*width);
+        quote! {
+            for at in #offset..#end {
+                if block.u8(at)? != 0 {
+                    return ::core::result::Result::Err(
+                        ::karyos_codec::CodecError::ValueOutOfRange { field: "reserved" },
+                    );
+                }
+            }
+        }
+    });
+    // Hygienic, so no field named `v2` shadows it (karyos#1104).
+    let v2 = Ident::new("__karyos_v2", Span::mixed_site());
+    let version = if versioned {
+        quote! { #v2: bool, }
+    } else {
+        quote! {}
+    };
+    // A versioned message with no versioned field still takes `v2`.
+    let version_used = if versioned
+        && !fields
+            .iter()
+            .any(|field| matches!(field.kind, Kind::Fixed { since: true, .. }))
     {
+        quote! { let _ = #v2; }
+    } else {
+        quote! {}
+    };
+    // `mut` only when a variable field reads from the decoder.
+    let decoder_binding = if fields.iter().any(Field::reads_var) {
         quote! { mut decoder }
     } else {
         quote! { decoder }
@@ -257,31 +416,26 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
     Ok(quote! {
         // Every field within the block, checked when the crate compiles
         // (karyos#1066).
-        const _: () = { #(#ends)* };
+        const _: () = { #(#ends)* #(#zero_ends)* };
 
         impl #impl_generics #ident #ty_generics #where_clause {
             fn decode(
                 block: ::karyos_codec::Block<#input_lifetime>,
                 #decoder_binding: ::karyos_codec::Decoder<#input_lifetime>,
+                #version
             ) -> ::core::result::Result<Self, ::karyos_codec::CodecError> {
+                #version_used
                 #(#vars)*
                 decoder.finish()?;
+                #(#zero_checks)*
                 let message = Self { #(#reads,)* };
                 #decode_check
                 ::core::result::Result::Ok(message)
             }
 
-            /// Encodes into `out`; returns the message's length.
-            ///
-            /// # Errors
-            ///
-            /// `CodecError::Truncated` when `out` is short, and a field's
-            /// or the message's check error.
-            pub fn encode(
-                &self,
-                out: &mut [u8],
-            ) -> ::core::result::Result<usize, ::karyos_codec::CodecError> {
-                let mut encoder = ::karyos_codec::Encoder::new(out, &#template)?;
+            #encode_head {
+                #template_guard
+                let mut encoder = ::karyos_codec::Encoder::new(out, #encode_template)?;
                 #encode_check
                 #(#writes)*
                 #(#var_writes)*
@@ -294,28 +448,79 @@ fn expand(input: &DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 /// The `#[message(template = PATH, check = PATH)]` of `input`.
 fn message(input: &DeriveInput) -> syn::Result<Message> {
     let mut template = None;
+    let mut shared: Option<Vec<Path>> = None;
     let mut check = None;
+    let mut versioned = false;
+    let mut zero = None;
     for attr in input
         .attrs
         .iter()
         .filter(|attr| attr.path().is_ident("message"))
     {
         attr.parse_nested_meta(|meta| {
+            // An option given twice is refused: the second would replace
+            // the first (karyos#1104).
+            let once = |taken: bool| {
+                if taken {
+                    Err(meta.error("a message option given twice"))
+                } else {
+                    Ok(())
+                }
+            };
             if meta.path.is_ident("template") {
+                once(template.is_some())?;
                 template = Some(meta.value()?.parse::<Path>()?);
                 Ok(())
             } else if meta.path.is_ident("check") {
+                once(check.is_some())?;
                 check = Some(meta.value()?.parse::<Path>()?);
                 Ok(())
+            } else if meta.path.is_ident("templates") {
+                once(shared.is_some())?;
+                let value = meta.value()?;
+                let list;
+                syn::bracketed!(list in value);
+                let paths = list.parse_terminated(Path::parse_mod_style, syn::Token![,])?;
+                shared = Some(paths.into_iter().collect());
+                Ok(())
+            } else if meta.path.is_ident("versioned") {
+                once(versioned)?;
+                versioned = true;
+                Ok(())
+            } else if meta.path.is_ident("zero") {
+                once(zero.is_some())?;
+                zero = Some(parse_spans(meta.value()?)?);
+                Ok(())
             } else {
-                Err(meta.error("expected `template = PATH` or `check = PATH`"))
+                Err(meta.error(
+                    "expected `template = PATH`, `templates = [PATH, ...]`, `check = PATH`, `versioned` or `zero = [(N, N), ...]`",
+                ))
             }
         })?;
     }
-    let template = template.ok_or_else(|| {
-        syn::Error::new_spanned(&input.ident, "missing #[message(template = PATH)]")
-    })?;
-    Ok(Message { template, check })
+    let (templates, shared) = match (template, shared) {
+        (Some(template), None) => (vec![template], false),
+        (None, Some(templates)) if !templates.is_empty() => (templates, true),
+        (None, None) => {
+            return Err(syn::Error::new_spanned(
+                &input.ident,
+                "missing #[message(template = PATH)]",
+            ));
+        }
+        _ => {
+            return Err(syn::Error::new_spanned(
+                &input.ident,
+                "#[message] takes `template = PATH` or `templates = [PATH, ...]`, one of them",
+            ));
+        }
+    };
+    Ok(Message {
+        templates,
+        shared,
+        check,
+        versioned,
+        zero: zero.unwrap_or_default(),
+    })
 }
 
 /// Whether `ty` is `&str` (`Some(true)`) or `&[u8]` (`Some(false)`).
@@ -341,6 +546,7 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
     let (mut offset, mut check, mut with, mut width) = (None, None, None, None);
     let mut spans: Option<Vec<(usize, usize)>> = None;
     let (mut var, mut min, mut max) = (false, None, None);
+    let mut since = None;
     for attr in field
         .attrs
         .iter()
@@ -380,9 +586,16 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
             } else if meta.path.is_ident("max") {
                 once(max.is_some())?;
                 max = Some(meta.value()?.parse::<Expr>()?);
+            } else if meta.path.is_ident("since") {
+                once(since.is_some())?;
+                let version = meta.value()?.parse::<LitInt>()?;
+                if version.base10_parse::<u16>()? != 2 {
+                    return Err(syn::Error::new(version.span(), "`since = 2`, the only later version"));
+                }
+                since = Some(());
             } else {
                 return Err(meta.error(
-                    "expected `offset = N`, `check = PATH`, `with = PATH`, `width = N`, `spans = [(N, N), ...]`, `var`, `min = EXPR` or `max = EXPR`",
+                    "expected `offset = N`, `check = PATH`, `with = PATH`, `width = N`, `spans = [(N, N), ...]`, `var`, `min = EXPR`, `max = EXPR` or `since = 2`",
                 ));
             }
             Ok(())
@@ -390,6 +603,28 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
     }
     // Every option belongs to one kind: one that kind does not read is
     // refused, never dropped (karyos#1104).
+    if since.is_some() && (var || with.is_some() || spans.is_some()) {
+        return Err(syn::Error::new_spanned(
+            &name,
+            "`since` belongs to a fixed field",
+        ));
+    }
+    if var && let Some(with) = with {
+        if offset.is_some() || check.is_some() || width.is_some() || min.is_some() || max.is_some()
+        {
+            return Err(syn::Error::new_spanned(
+                &name,
+                "a variable tied field takes `with`, `spans` and `var` only: its module checks its value",
+            ));
+        }
+        return Ok(Field {
+            name,
+            kind: Kind::TiedVar {
+                with,
+                spans: spans.unwrap_or_default(),
+            },
+        });
+    }
     if var {
         if offset.is_some()
             || check.is_some()
@@ -487,6 +722,7 @@ fn field(field: &syn::Field) -> syn::Result<Field> {
             method: method(&field.ty)?,
             offset,
             check,
+            since: since.is_some(),
         },
     })
 }
@@ -528,9 +764,23 @@ fn size(method: &Ident) -> usize {
     }
 }
 
-/// Refuses two fields whose byte ranges overlap, naming both.
-fn overlaps(fields: &[Field]) -> syn::Result<()> {
+/// Refuses two fields whose byte ranges overlap, naming both, and a field
+/// over a reserved range.
+fn overlaps(fields: &[Field], zero: &[(usize, usize)]) -> syn::Result<()> {
     let mut taken: Vec<(usize, usize, &Ident)> = Vec::new();
+    for field in fields {
+        for (start, end) in field.spans() {
+            if zero
+                .iter()
+                .any(|(offset, width)| start < offset.saturating_add(*width) && *offset < end)
+            {
+                return Err(syn::Error::new_spanned(
+                    &field.name,
+                    format!("field `{}` overlaps a reserved range", field.name),
+                ));
+            }
+        }
+    }
     for field in fields {
         for (start, end) in field.spans() {
             if let Some((_, _, first)) = taken
@@ -660,7 +910,7 @@ mod tests {
         let tokens = expand(&input).unwrap().to_string();
         for part in [
             "p : policy :: read (& block) ?",
-            "policy :: write (& mut encoder , & self . p) ?",
+            "policy :: write (& mut encoder , self) ?",
             "16usize <= T . block_length",
             "17usize <= T . block_length",
         ] {
@@ -742,6 +992,198 @@ mod tests {
         assert_eq!(error(self_overlap), "field `a`'s spans overlap");
     }
 
+    /// karyos#1104: a variable tied field reads with the decoder in the
+    /// variable fields' order and writes with the message.
+    #[test]
+    fn a_variable_tied_field_reads_with_the_decoder_in_order() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M<'a> {
+                #[field(offset = 0)]
+                a: u64,
+                #[field(with = payload, spans = [(8, 4)], var)]
+                p: Payload<'a>,
+                #[field(with = extension, var)]
+                e: Option<&'a [u8; 4]>,
+            }
+        };
+        let tokens = expand(&input).unwrap().to_string();
+        let p = tokens
+            .find("let p = payload :: read (& block , & mut decoder) ?")
+            .unwrap();
+        let e = tokens
+            .find("let e = extension :: read (& block , & mut decoder) ?")
+            .unwrap();
+        assert!(p < e, "{tokens}");
+        let pw = tokens
+            .find("payload :: write (& mut encoder , self) ?")
+            .unwrap();
+        let ew = tokens
+            .find("extension :: write (& mut encoder , self) ?")
+            .unwrap();
+        assert!(pw < ew, "{tokens}");
+        assert!(tokens.contains("mut decoder"), "{tokens}");
+        assert!(tokens.contains("12usize <= T . block_length"), "{tokens}");
+        let with_offset: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M<'a> { #[field(with = p, var, offset = 0)] a: A<'a> }
+        };
+        assert_eq!(
+            error(with_offset),
+            "a variable tied field takes `with`, `spans` and `var` only: its module checks its value"
+        );
+    }
+
+    /// karyos#1104: a versioned message's decode takes `v2`, and a field
+    /// `since = 2` reads its default from a version 1 block.
+    #[test]
+    fn a_versioned_field_reads_its_default_before_version_2() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[message(template = T, versioned)]
+            struct M {
+                #[field(offset = 0)]
+                a: u64,
+                #[field(offset = 8, since = 2)]
+                image: u64,
+            }
+        };
+        let tokens = expand(&input).unwrap().to_string();
+        for part in [
+            "__karyos_v2 : bool ,",
+            "image : if __karyos_v2 { block . u64 (8usize) ? } else { :: core :: default :: Default :: default () }",
+            "encoder . u64 (8usize , self . image) ?",
+        ] {
+            assert!(tokens.contains(part), "{part}: {tokens}");
+        }
+        let plain: DeriveInput = syn::parse_quote! {
+            #[message(template = T, versioned)]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        assert!(
+            expand(&plain)
+                .unwrap()
+                .to_string()
+                .contains("let _ = __karyos_v2 ;")
+        );
+        // A field named `v2` does not shadow the version: the generated
+        // parameter is hygienic, and the field reads as any other.
+        let named: DeriveInput = syn::parse_quote! {
+            #[message(template = T, versioned)]
+            struct M<'a> {
+                #[field(var, min = 0, max = 4)]
+                v2: &'a [u8],
+                #[field(offset = 0, since = 2)]
+                image: u64,
+            }
+        };
+        let tokens = expand(&named).unwrap().to_string();
+        assert!(tokens.contains("let v2 = decoder . bytes"), "{tokens}");
+        assert!(tokens.contains("image : if __karyos_v2 {"), "{tokens}");
+        let unversioned: DeriveInput = syn::parse_quote! {
+            #[message(template = T)]
+            struct M { #[field(offset = 0, since = 2)] a: u64 }
+        };
+        assert_eq!(
+            error(unversioned),
+            "a field with `since` needs #[message(versioned)]"
+        );
+        let three: DeriveInput = syn::parse_quote! {
+            #[message(template = T, versioned)]
+            struct M { #[field(offset = 0, since = 3)] a: u64 }
+        };
+        assert_eq!(error(three), "`since = 2`, the only later version");
+        let tied: DeriveInput = syn::parse_quote! {
+            #[message(template = T, versioned)]
+            struct M { #[field(with = t, spans = [(0, 1)], since = 2)] a: A }
+        };
+        assert_eq!(error(tied), "`since` belongs to a fixed field");
+    }
+
+    /// karyos#1104: reserved ranges are refused unless zero, checked
+    /// against the block length, and no field may cover them.
+    #[test]
+    fn a_reserved_range_is_checked_zero_and_kept_free() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[message(template = T, zero = [(8, 4)])]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        let tokens = expand(&input).unwrap().to_string();
+        for part in [
+            "for at in 8usize .. 12usize",
+            "ValueOutOfRange { field : \"reserved\" }",
+            "12usize <= T . block_length",
+        ] {
+            assert!(tokens.contains(part), "{part}: {tokens}");
+        }
+        let covered: DeriveInput = syn::parse_quote! {
+            #[message(template = T, zero = [(4, 4)])]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        assert_eq!(error(covered), "field `a` overlaps a reserved range");
+        // A second `zero` would replace the first: refused, as is any
+        // message option given twice.
+        for twice in [
+            syn::parse_quote! {
+                #[message(template = T, zero = [(8, 4)], zero = [(0, 1)])]
+                struct M { #[field(offset = 0)] a: u8 }
+            },
+            syn::parse_quote! {
+                #[message(template = T)]
+                #[message(template = U)]
+                struct M { #[field(offset = 0)] a: u8 }
+            },
+            syn::parse_quote! {
+                #[message(template = T, versioned, versioned)]
+                struct M { #[field(offset = 0)] a: u8 }
+            },
+        ] {
+            assert_eq!(error(twice), "a message option given twice");
+        }
+        let unknown: DeriveInput = syn::parse_quote! {
+            #[message(template = T, zeros = [(4, 4)])]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        assert_eq!(
+            error(unknown),
+            "expected `template = PATH`, `templates = [PATH, ...]`, `check = PATH`, `versioned` or `zero = [(N, N), ...]`"
+        );
+    }
+
+    /// karyos#1104: a block several templates share is checked against
+    /// each, and encodes as the template its caller passes.
+    #[test]
+    fn a_shared_block_encodes_as_the_template_passed() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[message(templates = [A, B])]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        let tokens = expand(&input).unwrap().to_string();
+        for part in [
+            "8usize <= A . block_length",
+            "8usize <= B . block_length",
+            "pub (crate) fn encode (& self , out : & mut [u8] , template : & :: karyos_codec :: Template ,)",
+            "Encoder :: new (out , template) ?",
+        ] {
+            assert!(tokens.contains(part), "{part}: {tokens}");
+        }
+        let both: DeriveInput = syn::parse_quote! {
+            #[message(template = A, templates = [A, B])]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        assert_eq!(
+            error(both),
+            "#[message] takes `template = PATH` or `templates = [PATH, ...]`, one of them"
+        );
+        let none: DeriveInput = syn::parse_quote! {
+            #[message(templates = [])]
+            struct M { #[field(offset = 0)] a: u64 }
+        };
+        assert_eq!(
+            error(none),
+            "#[message] takes `template = PATH` or `templates = [PATH, ...]`, one of them"
+        );
+    }
+
     #[test]
     fn a_wrong_shape_is_a_compile_error() {
         let cases: [(DeriveInput, &str); 5] = [
@@ -767,7 +1209,7 @@ mod tests {
                 syn::parse_quote! {
                     #[message(template = T)] struct M { #[field(offset = 0, size = 1)] a: u8 }
                 },
-                "expected `offset = N`, `check = PATH`, `with = PATH`, `width = N`, `spans = [(N, N), ...]`, `var`, `min = EXPR` or `max = EXPR`",
+                "expected `offset = N`, `check = PATH`, `with = PATH`, `width = N`, `spans = [(N, N), ...]`, `var`, `min = EXPR`, `max = EXPR` or `since = 2`",
             ),
         ];
         let overlap: DeriveInput = syn::parse_quote! {

@@ -220,6 +220,8 @@ impl RequestSource for Requests {
 struct Responses {
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
     room: Arc<AtomicUsize>,
+    /// The longest replication message it takes.
+    max: Arc<AtomicUsize>,
 }
 
 impl ResponseSink for Responses {
@@ -228,8 +230,20 @@ impl ResponseSink for Responses {
             return false;
         }
         self.room.fetch_sub(1, Ordering::AcqRel);
+        let max = self.max.load(Ordering::Acquire);
+        let replication =
+            message.get(..2) == Some(&crate::replication::SCHEMA_ID.to_le_bytes()[..]);
+        assert!(
+            !replication || message.len() <= max,
+            "{} > {max}",
+            message.len()
+        );
         self.sent.lock().unwrap().push(message.to_vec());
         true
+    }
+
+    fn max_message(&self) -> usize {
+        self.max.load(Ordering::Acquire)
     }
 }
 
@@ -260,6 +274,7 @@ impl Rig {
         let responses = Responses {
             sent: Arc::default(),
             room: Arc::new(AtomicUsize::new(usize::MAX)),
+            max: Arc::new(AtomicUsize::new(usize::MAX)),
         };
         let server = ControlServer::new(agent, host, requests.clone(), responses.clone())
             .with_config(config);
@@ -1267,5 +1282,110 @@ fn the_agents_engine_answers_retention_requests() {
     }
     assert_eq!(ranges.first().unwrap().start, 0);
     assert_eq!(ranges.last().unwrap().end, 192);
+    rig.finish();
+}
+
+/// karyos#1113 review: replication over the control streams. While the
+/// response stream has no room, the server holds few answers and the rest
+/// wait in the agent; each bytes message fits the stream's longest
+/// message; once there is room, the recording's bytes all arrive, in
+/// order. A stream too short for any bytes refuses the request.
+#[test]
+fn replication_keeps_backpressure_and_fits_the_stream() {
+    use crate::replication::{self, Mode, ReplicateRecording, ReplicationMessage};
+    let agent = AgentConfig {
+        seal_interval: Some(Duration::from_millis(1)),
+        ..AgentConfig::default()
+    };
+    let mut rig = Rig::with(
+        "replication",
+        Host::of(frames(64, 3), false),
+        agent,
+        ServerConfig::default(),
+    );
+    rig.responses.max.store(1024, Ordering::Release);
+    rig.request(&start(1));
+    let all = frames(64, 3);
+    let length = u64::try_from(all.len()).unwrap();
+    let ended_before = rig.sent(2).len();
+    for _ in 0..5000 {
+        if rig.server.agent().describe(1).unwrap().durable == length {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // Stopped, so each range is sealed; its answer and signal go out.
+    rig.request(&ControlMessage::StopRecording(control::StopRecording {
+        correlation_id: 2,
+        recording_id: 1,
+    }));
+    for _ in 0..500 {
+        rig.server.duty();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let ended = rig.responses.sent.lock().unwrap().len();
+    assert!(ended > ended_before);
+    let encode = |message: ReplicationMessage<'_>| {
+        let mut out = vec![0u8; 256];
+        let length = message.encode(&mut out).unwrap();
+        out.truncate(length);
+        out
+    };
+    let request = || {
+        ReplicationMessage::ReplicateRecording(ReplicateRecording {
+            correlation_id: 9,
+            recording_id: 1,
+            from: 0,
+            until: u64::MAX,
+            mode: Mode::OnDemand,
+        })
+    };
+    rig.responses.room.store(0, Ordering::Release);
+    rig.raw(encode(request()));
+    for _ in 0..2000 {
+        rig.server.duty();
+        assert!(rig.server.pending() <= super::REPLICATION_FORWARD);
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    assert_eq!(rig.responses.sent.lock().unwrap().len(), ended);
+    rig.responses.room.store(usize::MAX, Ordering::Release);
+    let mut bytes = Vec::new();
+    let mut done = false;
+    for _ in 0..10_000 {
+        rig.server.duty();
+        let sent = rig.responses.sent.lock().unwrap().clone();
+        bytes.clear();
+        done = false;
+        for message in &sent[ended..] {
+            match ReplicationMessage::decode(message).unwrap() {
+                ReplicationMessage::RecordingBytes(chunk) => {
+                    assert_eq!(chunk.start, u64::try_from(bytes.len()).unwrap());
+                    bytes.extend_from_slice(chunk.bytes);
+                }
+                ReplicationMessage::ReplicationStatus(status) => {
+                    done |= status.state != replication::State::Streaming;
+                }
+                _ => {}
+            }
+        }
+        if done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(done, "a final status");
+    assert!(!bytes.is_empty());
+    assert_eq!(bytes[..], all[..bytes.len()]);
+    let mut short = Rig::with(
+        "replication-short",
+        Host::of(frames(1, 3), true),
+        AgentConfig::default(),
+        ServerConfig::default(),
+    );
+    short.responses.max.store(30, Ordering::Release);
+    short.raw(encode(request()));
+    let refused = short.sent(1);
+    assert_eq!(response(&refused[0]).code, ResponseCode::InvalidRequest);
+    short.finish();
     rig.finish();
 }

@@ -168,6 +168,8 @@ Archive:
   --archive-purge <mode>            retention policy: manual or after-expiry
   --archive-min-copies <n>          retention policy: verified copies elsewhere before a
                                     purge (the three together, with --archive-copy-location)
+  --archive-time-evidence           keep time evidence entries: makes <archive>/time-evidence
+                                    (with a signer, the trust file needs a time-journal line)
 
 Shutdown:
   --shutdown-linger <duration>      time clients have to leave after SIGTERM or SIGINT [5s]
@@ -333,6 +335,11 @@ pub struct ArchiveOptions {
     /// (`--archive-retain-for`, `--archive-purge`, `--archive-min-copies`;
     /// karyos#1093). Needs `copy_location`.
     pub retention: Option<karyos_archive::integrity::retention::RetentionPolicy>,
+    /// Whether the Archive keeps time evidence entries
+    /// (`--archive-time-evidence`, ADR-0095 and ADR-0098): the daemon
+    /// makes `<archive>/time-evidence/` before the agent starts. With a
+    /// signer, the trust file needs its `time-journal` line.
+    pub time_evidence: bool,
 }
 
 /// The head signer of an Archive (`--archive-signer`,
@@ -543,6 +550,10 @@ where
         }
         if text == "--sizing-report" {
             sizing = true;
+            continue;
+        }
+        if text == "--archive-time-evidence" {
+            archive.time_evidence = true;
             continue;
         }
         let (name, inline) = match text.split_once('=') {
@@ -1216,6 +1227,7 @@ struct Archive {
     retain_for: Option<Duration>,
     purge: Option<karyos_archive::integrity::retention::PurgeMode>,
     min_copies: Option<std::num::NonZeroU32>,
+    time_evidence: bool,
 }
 
 impl Archive {
@@ -1241,6 +1253,7 @@ impl Archive {
                 (self.retain_for.is_some(), "--archive-retain-for"),
                 (self.purge.is_some(), "--archive-purge"),
                 (self.min_copies.is_some(), "--archive-min-copies"),
+                (self.time_evidence, "--archive-time-evidence"),
             ] {
                 if given {
                     return Err(ArgsError::Needs {
@@ -1306,6 +1319,7 @@ impl Archive {
             signer,
             copy_location: self.copy_location,
             retention,
+            time_evidence: self.time_evidence,
         }))
     }
 }
@@ -1766,6 +1780,7 @@ mod tests {
                 signer: None,
                 copy_location: None,
                 retention: None,
+                time_evidence: false,
             })
         );
         let guarded = options(&[
@@ -1890,6 +1905,20 @@ mod tests {
         .archive
         .unwrap();
         assert_eq!(parsed.copy_location, Some([5; 32]));
+        assert!(!parsed.time_evidence);
+        // karyos#1137 review: never accepted without --archive.
+        assert_eq!(
+            run(&["--dir", "d", "--archive-time-evidence"]),
+            Err(ArgsError::Needs {
+                option: "--archive-time-evidence",
+                needs: "--archive",
+            })
+        );
+        // karyos#1137: a flag, no value.
+        let kept = options(&[&base[..], &["--archive-time-evidence"]].concat())
+            .archive
+            .unwrap();
+        assert!(kept.time_evidence);
         assert_eq!(
             parsed.retention,
             Some(RetentionPolicy {

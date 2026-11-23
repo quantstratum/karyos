@@ -1240,6 +1240,7 @@ mod groups {
                 in_flight: 64,
             },
             checkpoints: None,
+            time_evidence: None,
         }
     }
 
@@ -1374,6 +1375,446 @@ mod groups {
             journal.read_bytes(range.start, &mut bytes).unwrap();
             verify_range(range, &bytes).unwrap();
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The calibrations of clock `[1, 0, 2, 3, 4]` into a UTC-traceable
+    /// clock over `[0, 100]`, its UTC reference, and the producer's later
+    /// records: a snapshot proving coverage of times up to 100.
+    fn calibrations() -> crate::integrity::time_producer::Snapshot {
+        use karyos_trace::clocks::utc::{Scale, Source, SyncState, UtcReference};
+        use karyos_trace::clocks::{Calibration, ClockKey};
+        use karyos_trace::journal::ObserverId;
+        let key = |[low, high, journal, domain, epoch]: [u64; 5]| ClockKey {
+            observer: ObserverId {
+                driver: [low, high],
+                journal,
+            },
+            domain,
+            epoch,
+        };
+        let calibration = |valid_from, valid_to| {
+            Calibration {
+                from: key([1, 0, 2, 3, 4]),
+                to: key([9, 0, 9, 9, 9]),
+                reference: valid_from,
+                offset: 10,
+                offset_uncertainty: 2,
+                drift: 0,
+                drift_uncertainty: 0,
+                valid_from,
+                valid_to,
+            }
+            .encode()
+            .unwrap()
+        };
+        let reference = |valid_from, valid_to| {
+            UtcReference {
+                clock: key([9, 0, 9, 9, 9]),
+                source: Source::Gnss,
+                sync_state: SyncState::Synchronised,
+                bound: 100,
+                valid_from,
+                valid_to,
+                tick_fs: 1_000_000,
+                scale: Scale::Tai,
+                origin: 0,
+                origin_scale_ns: 2_000_000_000_000_000_000,
+                leap_table: 69,
+                transform_uncertainty_ns: 0,
+            }
+            .encode()
+            .unwrap()
+        };
+        crate::integrity::time_producer::Snapshot::new(
+            &[
+                calibration(0, 100),
+                reference(0, 1999),
+                calibration(1000, 2000),
+                reference(2000, 3000),
+            ],
+            true,
+        )
+    }
+
+    /// karyos#1137: a group started with a declared event clock, in a
+    /// directory whose host made `time-evidence/`, gets its time evidence
+    /// entries as its journal is sealed: in the group's own store, naming
+    /// the group, covering its journal from the session's start, bounded
+    /// through the calibration source's records.
+    #[test]
+    fn a_sealed_group_range_gets_its_time_evidence() {
+        use crate::agent::GroupTimeEvidence;
+        use crate::integrity::time_evidence::{DIR, NO_BOUND, read_sealed};
+        use crate::integrity::time_producer::EventClock;
+        let dir = temp_dir("group-time-evidence");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        agent
+            .set_calibration_source(Box::new(calibrations()))
+            .unwrap();
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        let clock = EventClock {
+            clock: [1, 0, 2, 3, 4],
+            granularity: 1,
+        };
+        let mut sender = agent
+            .start_group(
+                start_group(&groups, Some(Capture::Strict))
+                    .with_time_evidence(GroupTimeEvidence::new(clock, Duration::from_secs(5))),
+            )
+            .unwrap();
+        sender.admit().unwrap();
+        // Its `logical_time` is its sequence, 1.
+        sender.send(&referencing(1, recording), 1).unwrap();
+        let waiter = sender.waiter();
+        assert_eq!(agent.stop(recording).unwrap().position, 3000);
+        assert_eq!(waiter.wait_durable(1, Duration::from_secs(5)), Ok(1));
+        let mut entries = Vec::new();
+        for _ in 0..5000 {
+            entries = read_sealed(StdDisk, &groups).unwrap();
+            if !entries.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        agent.shutdown().unwrap();
+        assert!(!entries.is_empty(), "no entry produced");
+        for entry in &entries {
+            assert_eq!(entry.recording, GROUP);
+            assert_eq!(entry.clock, [1, 0, 2, 3, 4]);
+            assert_eq!((entry.min_time, entry.max_time), (1, 1));
+            assert_ne!(entry.bound_min_ns, NO_BOUND);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs `group` (id `id`) in `groups` with the declared clock: one
+    /// referencing event, durable, sealed; returns its sender.
+    fn evidence_event(
+        agent: &ArchiveHandle,
+        groups: &Path,
+        id: u64,
+        evidence: Option<crate::agent::GroupTimeEvidence>,
+        new: bool,
+    ) {
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        let mut group = start_group(groups, new.then_some(Capture::Strict));
+        group.group_id = id;
+        group.time_evidence = evidence;
+        let mut sender = agent.start_group(group).unwrap();
+        sender.admit().unwrap();
+        let seq = sender.view().snapshot().0 + 1;
+        sender.send(&referencing(seq, recording), seq).unwrap();
+        let waiter = sender.waiter();
+        agent.stop(recording).unwrap();
+        assert_eq!(waiter.wait_durable(seq, Duration::from_secs(5)), Ok(seq));
+    }
+
+    fn sealing_config() -> AgentConfig {
+        AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        }
+    }
+
+    fn declared(wait: Duration) -> crate::agent::GroupTimeEvidence {
+        crate::agent::GroupTimeEvidence::new(
+            crate::integrity::time_producer::EventClock {
+                clock: [1, 0, 2, 3, 4],
+                granularity: 1,
+            },
+            wait,
+        )
+    }
+
+    /// #1171 review: two groups with time evidence in one directory share
+    /// its store's one writer, and each gets its entries.
+    #[test]
+    fn two_groups_in_one_directory_share_its_store() {
+        use crate::integrity::time_evidence::{DIR, read_sealed};
+        let dir = temp_dir("group-evidence-shared");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing_config()).unwrap();
+        agent
+            .set_calibration_source(Box::new(calibrations()))
+            .unwrap();
+        evidence_event(
+            &agent,
+            &groups,
+            GROUP,
+            Some(declared(Duration::from_secs(5))),
+            true,
+        );
+        evidence_event(
+            &agent,
+            &groups,
+            GROUP + 1,
+            Some(declared(Duration::from_secs(5))),
+            true,
+        );
+        agent.shutdown().unwrap();
+        let entries = read_sealed(StdDisk, &groups).unwrap();
+        for id in [GROUP, GROUP + 1] {
+            assert!(
+                entries.iter().any(|entry| entry.recording == id),
+                "{id}: {entries:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #1171 review: records sealed without entries (here: captured with
+    /// no declaration) are not skipped by a later session: it resumes at
+    /// the group's last entry, or the journal's start, and gives the
+    /// earlier session's records the zero identity. And a close produces
+    /// a pending batch without waiting more: with no calibration source
+    /// and a long wait, the entries are there once the agent shuts down.
+    #[test]
+    fn a_later_session_covers_earlier_records_and_a_close_finishes() {
+        use crate::integrity::time_evidence::{DIR, NO_BOUND, read_sealed};
+        let dir = temp_dir("group-evidence-resume");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing_config()).unwrap();
+        evidence_event(&agent, &groups, GROUP, None, true);
+        agent.shutdown().unwrap();
+        assert!(read_sealed(StdDisk, &groups).unwrap().is_empty());
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing_config()).unwrap();
+        evidence_event(
+            &agent,
+            &groups,
+            GROUP,
+            Some(declared(Duration::from_secs(3600))),
+            false,
+        );
+        agent.shutdown().unwrap();
+        let entries = read_sealed(StdDisk, &groups).unwrap();
+        assert!(entries.len() >= 2, "{entries:?}");
+        // The earlier session's event: zero identity, the sentinel.
+        assert_eq!(entries[0].clock, [0; 5]);
+        assert_eq!(entries[0].bound_min_ns, NO_BOUND);
+        // The tiling has no hole: each entry starts where the last ended.
+        for pair in entries.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start, "{entries:?}");
+        }
+        // This session's event: the declared clock, no calibrations.
+        let last = entries.last().unwrap();
+        assert_eq!(last.clock, [1, 0, 2, 3, 4]);
+        assert_eq!(last.bound_min_ns, NO_BOUND);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// #1171 review: the zero identity is refused before any file is
+    /// made, sealing or not, so a retry with a valid clock starts.
+    #[test]
+    fn a_zero_clock_is_refused_before_any_file_is_made() {
+        let dir = temp_dir("group-zero-first");
+        let groups = groups_dir(&dir);
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
+        let zero = crate::agent::GroupTimeEvidence::new(
+            crate::integrity::time_producer::EventClock {
+                clock: [0; 5],
+                granularity: 1,
+            },
+            Duration::ZERO,
+        );
+        assert!(matches!(
+            agent.start_group(start_group(&groups, Some(Capture::Strict)).with_time_evidence(zero)),
+            Err(AgentError::ZeroEventClock)
+        ));
+        assert!(
+            std::fs::read_dir(&groups).unwrap().next().is_none(),
+            "no file made"
+        );
+        agent
+            .start_group(
+                start_group(&groups, Some(Capture::Strict))
+                    .with_time_evidence(declared(Duration::ZERO)),
+            )
+            .unwrap();
+        agent.shutdown().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// karyos#1137 (ADR-0098 item 2): a signing Archive signs and anchors
+    /// a group store's journal with its own signer, under the group
+    /// declaration's journal identity; a group declaring none, or one of
+    /// the Archive's own, is refused.
+    #[test]
+    fn a_signing_archive_signs_a_group_store() {
+        use crate::agent::{ArchiveSigning, GroupTimeEvidence};
+        use crate::integrity::journal::IntegrityJournal;
+        use crate::integrity::ledger::{Ledger, read_entries};
+        use crate::integrity::signing::{BacklogPolicy, SigningConfig};
+        use crate::integrity::test_key::TestKey;
+        use crate::integrity::time_evidence::{DIR, entries_dir, read_sealed};
+        use crate::integrity::time_producer::EventClock;
+        use crate::integrity::trust::{
+            Algorithm, Custody, HEADS_FILE, KEYS_FILE, KeyRegistry, REGISTRY_ENTRY_LENGTH,
+            RegistryAction, RegistryEntry, SIGNED_HEAD_LENGTH, TrustRoot, key_id,
+        };
+        let dir = temp_dir("group-signed-evidence");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let archive = [7u8; 32];
+        let authority = TestKey::from_seed([1; 32]);
+        let archival = TestKey::from_seed([9; 32]);
+        let trust = TrustRoot {
+            archive_id: archive,
+            authorities: vec![authority.public()],
+        };
+        // The operator registers the archival key in each journal it signs.
+        for journal_dir in [dir.clone(), entries_dir(&groups)] {
+            let mut journal = IntegrityJournal::open(StdDisk, &journal_dir)
+                .unwrap()
+                .journal;
+            let mut keys =
+                Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(StdDisk, &journal_dir, KEYS_FILE).unwrap();
+            let mut entry = RegistryEntry {
+                action: RegistryAction::Register,
+                algorithm: Algorithm::Ed25519,
+                custody: Custody::Declared,
+                sequence: 0,
+                key_id: key_id(&archival.public()),
+                public: archival.public(),
+                effective: 0,
+                evidence: [0; 32],
+                endorsement: [0; 64],
+            };
+            entry.endorsement = authority.sign_bytes(&entry.endorsement_bytes(&archive));
+            KeyRegistry::new(trust.clone())
+                .append(&entry, &mut journal, &mut keys)
+                .unwrap();
+        }
+        let signing = ArchiveSigning {
+            trust,
+            journal_id: 1,
+            time_evidence_journal_id: None,
+            config: SigningConfig::new(Some(60_000_000_000), BacklogPolicy::Coalesce).unwrap(),
+            signer: Box::new(archival),
+        };
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn_signing(StdDisk, &dir, config, signing).unwrap();
+        agent
+            .set_calibration_source(Box::new(calibrations()))
+            .unwrap();
+        let clock = EventClock {
+            clock: [1, 0, 2, 3, 4],
+            granularity: 1,
+        };
+        let declared = GroupTimeEvidence::new(clock, Duration::from_secs(5));
+        let started = |evidence: GroupTimeEvidence| {
+            agent.start_group(
+                start_group(&groups, Some(Capture::Strict)).with_time_evidence(evidence),
+            )
+        };
+        assert!(matches!(
+            started(declared),
+            Err(AgentError::NoTimeEvidenceJournal)
+        ));
+        assert!(matches!(
+            started(declared.with_journal_id(1)),
+            Err(AgentError::SharedJournalId)
+        ));
+        let drained = Arc::new(AtomicBool::new(false));
+        let recording = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        let mut sender = started(declared.with_journal_id(3)).unwrap();
+        sender.admit().unwrap();
+        sender.send(&referencing(1, recording), 1).unwrap();
+        let waiter = sender.waiter();
+        assert_eq!(agent.stop(recording).unwrap().position, 3000);
+        assert_eq!(waiter.wait_durable(1, Duration::from_secs(5)), Ok(1));
+        // Another group of the directory under another identity: refused.
+        let mut other = start_group(&groups, Some(Capture::Strict))
+            .with_time_evidence(declared.with_journal_id(4));
+        other.group_id = GROUP + 1;
+        assert!(matches!(
+            agent.start_group(other),
+            Err(AgentError::GroupStoreJournalId {
+                signed: 3,
+                declared: 4
+            })
+        ));
+        let store = entries_dir(&groups);
+        let mut signed = Vec::new();
+        for _ in 0..5000 {
+            signed = read_entries::<_, SIGNED_HEAD_LENGTH>(&mut StdDisk, &store, HEADS_FILE)
+                .unwrap_or_default();
+            if !signed.is_empty() && !read_sealed(StdDisk, &groups).unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // #1172 review P1: stopping the group with its store's signing in
+        // flight never stalls the shared signer: the directory's signing
+        // lives on, so the Archive's own heads keep being signed.
+        let own = |dir: &Path| {
+            read_entries::<_, SIGNED_HEAD_LENGTH>(&mut StdDisk, dir, HEADS_FILE)
+                .unwrap_or_default()
+                .len()
+        };
+        agent.stop_group(GROUP).unwrap();
+        let before = own(&dir);
+        let drained = Arc::new(AtomicBool::new(false));
+        let later = agent.start(start(chunks(3000, false, &drained))).unwrap();
+        wait(&drained);
+        agent.stop(later).unwrap();
+        let mut after = before;
+        for _ in 0..10_000 {
+            after = own(&dir);
+            if after > before {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        agent.shutdown().unwrap();
+        assert!(after > before, "the Archive's heads are still signed");
+        assert!(!signed.is_empty(), "the group store's head is signed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// karyos#1137: the all zero clock identity is reserved; declaring it
+    /// is refused.
+    #[test]
+    fn a_zero_event_clock_is_refused() {
+        use crate::agent::GroupTimeEvidence;
+        use crate::integrity::time_evidence::DIR;
+        use crate::integrity::time_producer::EventClock;
+        let dir = temp_dir("group-zero-clock");
+        let groups = groups_dir(&dir);
+        std::fs::create_dir(groups.join(DIR)).unwrap();
+        let config = AgentConfig {
+            seal_interval: Some(Duration::from_millis(1)),
+            ..AgentConfig::default()
+        };
+        let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
+        let zero = EventClock {
+            clock: [0; 5],
+            granularity: 1,
+        };
+        assert!(matches!(
+            agent.start_group(
+                start_group(&groups, Some(Capture::Strict))
+                    .with_time_evidence(GroupTimeEvidence::new(zero, Duration::ZERO)),
+            ),
+            Err(AgentError::ZeroEventClock)
+        ));
+        agent.shutdown().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2523,6 +2964,7 @@ mod checkpoints {
                 max_checkpoint: 300_000,
                 reopen_hold: None,
             }),
+            time_evidence: None,
         }
     }
 
@@ -3735,6 +4177,122 @@ fn a_recording_is_sealed_and_its_catalog_changes_chained() {
         .filter(|record| record.kind == SealKind::Catalog && record.subject == id)
         .collect();
     assert_eq!(catalog.len(), 2, "the start and the stop");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1088 (SPEC §8.4, "Sealing and tamper evidence"): a journal recorded as an Archive recording,
+/// such as a sequencer's admission journal, is sealed and verified like
+/// any recording, with no step of its own. Its producer, the Sequencer,
+/// lives in the commercial karyos-sequencer repository (SPEC §20.5,
+/// ADR-0064); here an admission-journal-shaped recording, one entry per
+/// frame, is recorded into a sealing Archive. Its ranges are sealed in the
+/// chain and verify clean, and a byte of an entry changed on disk no
+/// longer matches its seal.
+#[test]
+fn an_admission_journal_recorded_into_the_archive_is_sealed_and_verified() {
+    use crate::integrity::journal::IntegrityJournal;
+    use crate::integrity::{SealKind, verify_chain, verify_range};
+
+    const MARKER: &[u8] = b"admission entry ";
+    // One admission entry per 96-byte frame: a marker and its sequence.
+    let entry = |sequence: u8| {
+        let mut frame = vec![0u8; 96];
+        frame[..4].copy_from_slice(&96i32.to_le_bytes());
+        frame[32..32 + MARKER.len()].copy_from_slice(MARKER);
+        frame[32 + MARKER.len()] = sequence;
+        frame
+    };
+    let chunks: Vec<Vec<u8>> = (0..3u8)
+        .map(|chunk| [entry(2 * chunk), entry(2 * chunk + 1)].concat())
+        .collect();
+    let all = chunks.concat();
+    let dir = temp_dir("admission-journal");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let id = agent
+        .start(start(Chunks {
+            chunks: chunks.into(),
+            seal: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    agent.shutdown().unwrap();
+    // Its ranges are sealed in the Archive's chain, the last closing, and
+    // each matches the entries recorded.
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    drop(journal);
+    assert!(verify_chain(records.iter()).is_ok());
+    let ranges: Vec<_> = records
+        .iter()
+        .filter(|record| record.kind.is_range() && record.subject == id)
+        .collect();
+    assert_eq!(ranges.first().unwrap().start, 0);
+    let last = ranges.last().unwrap();
+    assert_eq!(
+        (last.end, last.kind),
+        (all.len() as u64, SealKind::ClosedSegment)
+    );
+    for range in &ranges {
+        let bytes = &all[range.start as usize..range.end as usize];
+        assert!(verify_range(range, bytes).is_ok());
+    }
+    // One byte of one entry changed in the segment file: what the Archive
+    // now holds no longer matches its seals.
+    let segment = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "seg"))
+        .unwrap();
+    let mut file = std::fs::read(&segment).unwrap();
+    let at = file
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .unwrap();
+    file[at] ^= 0xFF;
+    std::fs::write(&segment, &file).unwrap();
+    // What the Archive now holds of the recording, read from its segment
+    // file as stored: replay and recovery refuse the changed frame, so the
+    // seal is checked against the stored bytes themselves. The recording
+    // starts in the file where its first recorded bytes do.
+    let base = file
+        .windows(32)
+        .position(|window| window == &all[..32])
+        .unwrap();
+    let held = file[base..base + all.len()].to_vec();
+    // The stored bytes are the whole recording and differ from what was
+    // recorded in exactly the one byte changed, so the check below sees the
+    // change, not a short or empty read (Codex review of #1170).
+    let changed = all
+        .windows(MARKER.len())
+        .position(|window| window == MARKER)
+        .unwrap();
+    let mut expected = all.clone();
+    expected[changed] ^= 0xFF;
+    assert_eq!(held.len(), all.len(), "the whole recording is read");
+    assert_eq!(held, expected, "only the changed byte differs");
+    // The sealed range holding it rejects the stored bytes; every other
+    // range still matches.
+    for range in &ranges {
+        let bytes = &held[range.start as usize..range.end as usize];
+        let holds_change = (range.start as usize..range.end as usize).contains(&changed);
+        assert_eq!(
+            verify_range(range, bytes).is_err(),
+            holds_change,
+            "range [{}, {})",
+            range.start,
+            range.end
+        );
+    }
+    assert!(
+        ranges
+            .iter()
+            .any(|range| (range.start as usize..range.end as usize).contains(&changed)),
+        "a sealed range covers the changed byte"
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -5070,6 +5628,58 @@ fn a_verification_retried_on_its_answer_is_not_refused() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// karyos#1113: the agent serves a replica's on demand request for a
+/// stopped, sealed recording: its bytes in order, each range's seal after
+/// its bytes, then a caught up status; an unknown recording is refused
+/// with code 2.
+#[test]
+fn a_stopped_recording_replicates_on_demand() {
+    use crate::replication::transport::{Outgoing, Refusal};
+    use crate::replication::{MAX_CHUNK, Mode, ReplicateRecording, State};
+    let dir = temp_dir("replicate");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    let (id, all) = sealed_recording(&agent);
+    let request = |recording_id| ReplicateRecording {
+        correlation_id: 7,
+        recording_id,
+        from: 0,
+        until: u64::MAX,
+        mode: Mode::OnDemand,
+    };
+    let unknown = answer(agent.post_replicate(request(id + 100), MAX_CHUNK));
+    assert!(matches!(
+        unknown,
+        Err(AgentError::ReplicationRefused(Refusal::UnknownRecording))
+    ));
+    let messages = answer(agent.post_replicate(request(id), 100)).unwrap();
+    let mut bytes = Vec::new();
+    let mut sealed_to = 0;
+    let mut last = None;
+    while let Ok(message) = messages.recv_timeout(Duration::from_secs(5)) {
+        match message {
+            Outgoing::Bytes {
+                start,
+                bytes: chunk,
+            } => {
+                assert!(chunk.len() <= 100, "{}", chunk.len());
+                assert_eq!(start, u64::try_from(bytes.len()).unwrap());
+                bytes.extend_from_slice(&chunk);
+            }
+            Outgoing::Seal(seal) => {
+                assert_eq!(seal.end, u64::try_from(bytes.len()).unwrap());
+                sealed_to = seal.end;
+            }
+            Outgoing::Status(status) => last = Some(status),
+        }
+    }
+    assert_eq!(bytes, all);
+    assert_eq!(sealed_to, u64::try_from(all.len()).unwrap());
+    let last = last.unwrap();
+    assert!(matches!(last.state, State::CaughtUp | State::Ended));
+    assert_eq!(last.sealed_end, sealed_to);
+    agent.shutdown().unwrap();
+}
+
 /// The answer to a posted retention command, waiting up to five seconds.
 fn answered<T>(posted: Result<Posted<T>, AgentError>) -> T {
     let posted = posted.unwrap();
@@ -5849,4 +6459,134 @@ fn a_recovered_purge_is_chained_before_a_new_policy_version() {
     let second = position(&|record| record.kind == SealKind::Policy && record.start == 2);
     assert!(first < purge && purge < second, "{first} {purge} {second}");
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// karyos#1143: on a host whose process holds `CAP_LINUX_IMMUTABLE`, a
+/// running Archive's sealed segments take the immutable attribute: they
+/// cannot be opened for writing or removed, the store still opens them
+/// for reading, and a purge releases each before it deletes it. Ignored
+/// by default: run it with `KARYOS_LINUX_CAPS=LINUX_IMMUTABLE
+/// scripts/linux-test.sh -p karyos-archive --lib -- --ignored
+/// immutable_segments`. It fails, rather than skips, without the
+/// capability, and also where the temporary directory's filesystem does
+/// not support the immutable flag (`FS_IOC_SETFLAGS`, as ext4, xfs and
+/// btrfs do; tmpfs does not): the runner must provide both.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "needs CAP_LINUX_IMMUTABLE: scripts/linux-test.sh with KARYOS_LINUX_CAPS=LINUX_IMMUTABLE"]
+fn immutable_segments_are_released_only_by_a_purge() {
+    use crate::integrity::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+    use crate::server::RetentionAnswer;
+
+    // Releases whatever is still immutable and removes the directory,
+    // whether the test passes or fails, so a persistent runner keeps no
+    // immutable files.
+    struct Cleanup(PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            if let Ok(entries) = std::fs::read_dir(&self.0) {
+                for entry in entries.flatten() {
+                    let _ = crate::integrity::copies::ImmutableAttribute.release(&entry.path());
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let dir = temp_dir("purge-immutable");
+    let _cleanup = Cleanup(dir.clone());
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    // Four writes of 2880 bytes: two segments of the test geometry.
+    let chunks: Vec<Vec<u8>> = (1..=4).map(|fill| frames(30, fill)).collect();
+    let all = chunks.concat();
+    let id = agent
+        .start(start(Chunks {
+            chunks: chunks.into(),
+            seal: true,
+            ..Chunks::default()
+        }))
+        .unwrap();
+    assert!(matches!(
+        agent.event(Duration::from_secs(5)).unwrap(),
+        Event::Ended { .. }
+    ));
+    let end = u64::try_from(all.len()).unwrap();
+    agent.shutdown().unwrap();
+    let segments = segment_lengths(&dir);
+    assert!(segments.len() >= 2, "{segments:?}");
+
+    let mut journal = IntegrityJournal::open(StdDisk, &dir).unwrap().journal;
+    let records = journal.records().unwrap();
+    // The cutoff: the recording's end, its one closing seal's end. The
+    // store keeps its last segment, which holds the end; the purge removes
+    // every segment wholly below it.
+    let cutoff = end;
+    let mut copies = CopyCatalog::open(StdDisk, &dir, &mut journal).unwrap();
+    assert!(
+        copies
+            .current()
+            .unwrap()
+            .iter()
+            .any(|copy| copy.recording == id && copy.enforcement == Enforcement::ImmutableAttribute),
+        "the local copy is not immutable: the process needs CAP_LINUX_IMMUTABLE and {} on a filesystem with the immutable flag (ext4, xfs, btrfs; not tmpfs)",
+        dir.display()
+    );
+    for (path, _) in &segments {
+        let written = std::fs::OpenOptions::new().write(true).open(path);
+        assert!(written.is_err(), "{} opened for writing", path.display());
+        assert!(
+            std::fs::remove_file(path).is_err(),
+            "{} removed",
+            path.display()
+        );
+    }
+    let recording = Catalog::open(StdDisk, &dir)
+        .unwrap()
+        .catalog
+        .get(id)
+        .cloned()
+        .unwrap();
+    let mut store = SegmentStore::open_verified(
+        crate::disk::ReadOnly(StdDisk),
+        &dir,
+        id,
+        recording.geometry,
+        SyncPolicy::None,
+    )
+    .unwrap();
+    let mut read = vec![0u8; all.len()];
+    store.read(0, &mut read).unwrap();
+    assert_eq!(read, all);
+    drop(store);
+    copies
+        .record(
+            CopyRecord {
+                sequence: 0,
+                recording: id,
+                start: 0,
+                end,
+                location: [6u8; 32],
+                digest: crate::integrity::retention::seals_digest(&records, id, 0, end),
+                retain_until_ns: 0,
+                state: CopyState::Verified,
+                enforcement: Enforcement::Unsupported,
+            },
+            &mut journal,
+        )
+        .unwrap();
+    drop(copies);
+    drop(journal);
+
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, purge_config(0)).unwrap();
+    assert_eq!(
+        answered(agent.post_purge(id, cutoff, 1, 9)),
+        RetentionAnswer::Done
+    );
+    agent.shutdown().unwrap();
+    let (first, _) = &segments[0];
+    assert!(!first.exists(), "{} left after the purge", first.display());
+    // The segment holding the cutoff stays, still immutable.
+    let (last, _) = &segments[segments.len() - 1];
+    assert!(last.exists());
+    assert!(std::fs::OpenOptions::new().write(true).open(last).is_err());
 }
