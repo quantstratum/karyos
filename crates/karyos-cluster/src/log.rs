@@ -127,6 +127,14 @@ pub const SEAL_CHUNK: u64 = 1 << 20;
 /// unsealed by default before [`RaftLog::tick`] seals it: 1 s of the
 /// caller's clock (karyos#1050 review).
 pub const DEFAULT_SEAL_INTERVAL_NS: u64 = 1_000_000_000;
+/// The file keeping where the log began and the last snapshot it
+/// installed: the boundaries the entry mapping tells apart from a purge
+/// (R-CORE-8, karyos#745).
+pub const ORIGIN_FILE: &str = "log-origin";
+/// The origin record: the creation index, the installed snapshot's base
+/// index (`u64::MAX` for none), then their CRC-32C.
+const ORIGIN_LEN: usize = 20;
+
 /// The file keeping the log's first index.
 pub const FIRST_INDEX_FILE: &str = "first-index";
 /// A frame's header length.
@@ -445,6 +453,11 @@ pub struct RaftLog<D: Disk + Clone> {
     /// The term of entry `first_index - 1` after an install, which only a
     /// snapshot holds.
     base_term: Option<u64>,
+    /// The index the log was created at, when its origin file holds it:
+    /// below it the recording never held an entry.
+    origin: Option<u64>,
+    /// The base of the last snapshot installed, kept across purges.
+    snapshot_base: Option<u64>,
     hard_state: Option<HardState>,
     poisoned: bool,
     /// The watermark's file, its newest slot and the mark it holds.
@@ -504,6 +517,33 @@ pub struct Opened<D: Disk + Clone> {
     /// reopened [`RaftLog::last_index`] is what was kept, above the
     /// watermark either way.
     pub cut: Option<u64>,
+}
+
+fn encode_origin(origin: u64, snapshot_base: Option<u64>) -> [u8; ORIGIN_LEN] {
+    let mut bytes = [0u8; ORIGIN_LEN];
+    let (body, crc) = bytes.split_at_mut(16);
+    let (first, base) = body.split_at_mut(8);
+    first.copy_from_slice(&origin.to_le_bytes());
+    base.copy_from_slice(&snapshot_base.unwrap_or(u64::MAX).to_le_bytes());
+    let digest = crc32c(body);
+    crc.copy_from_slice(&digest.to_le_bytes());
+    bytes
+}
+
+/// The origin and the installed base, when the record is whole.
+fn decode_origin(bytes: &[u8]) -> Option<(u64, Option<u64>)> {
+    let record: &[u8; ORIGIN_LEN] = bytes.try_into().ok()?;
+    let (body, crc) = record.split_first_chunk::<16>()?;
+    let crc: [u8; 4] = crc.try_into().ok()?;
+    let (origin, base) = body.split_first_chunk::<8>()?;
+    let base: [u8; 8] = base.try_into().ok()?;
+    let base = u64::from_le_bytes(base);
+    (u32::from_le_bytes(crc) == crc32c(body)).then(|| {
+        (
+            u64::from_le_bytes(*origin),
+            (base != u64::MAX).then_some(base),
+        )
+    })
 }
 
 fn encode_first(first: u64) -> [u8; FIRST_LEN] {
@@ -583,8 +623,19 @@ impl<D: Disk + Clone> RaftLog<D> {
             }
         }
         let mark_file = mark::create(&mut disk, dir)?;
+        // The origin before the first index: a log whose first-index file
+        // exists knows where it began.
+        file::replace(
+            &mut disk,
+            dir,
+            ORIGIN_FILE,
+            &encode_origin(first_index, None),
+        )?;
         file::replace(&mut disk, dir, FIRST_INDEX_FILE, &encode_first(first_index))?;
-        Self::create_store(disk, dir, geometry, first_index, mark_file, CREATED, None)
+        let mut log =
+            Self::create_store(disk, dir, geometry, first_index, mark_file, CREATED, None)?;
+        log.origin = Some(first_index);
+        Ok(log)
     }
 
     fn create_store(
@@ -612,6 +663,8 @@ impl<D: Disk + Clone> RaftLog<D> {
             first_index,
             entries: Vec::new(),
             base_term: None,
+            origin: None,
+            snapshot_base: None,
             hard_state,
             poisoned: false,
             mark_file,
@@ -680,6 +733,14 @@ impl<D: Disk + Clone> RaftLog<D> {
             }
             None => None,
         };
+        // The origin file, when the log keeps one; an install cut short
+        // before updating it still names its base in the first-index
+        // record.
+        let (origin, kept_base) = match file::read(&mut disk, dir, ORIGIN_FILE, ORIGIN_LEN)? {
+            Read::Bytes(bytes) => decode_origin(&bytes).ok_or(LogError::FirstIndex)?,
+            Read::Missing | Read::TooLong(_) => (u64::MAX, None),
+        };
+        let origin = ((origin != u64::MAX).then_some(origin), kept_base.max(base));
         let hard_state = match file::read(&mut disk, dir, HARD_STATE_FILE, HARD_STATE_LEN)? {
             Read::Missing => None,
             Read::Bytes(bytes) => Some(HardState::decode(&bytes).map_err(LogError::HardState)?),
@@ -742,6 +803,7 @@ impl<D: Disk + Clone> RaftLog<D> {
                 hard_state,
             )?;
             log.base_term = base_term;
+            (log.origin, log.snapshot_base) = origin;
             log.finish_install()?;
             return Ok(Opened { log, cut: None });
         };
@@ -841,6 +903,8 @@ impl<D: Disk + Clone> RaftLog<D> {
             first_index,
             entries: walk.entries,
             base_term,
+            origin: None,
+            snapshot_base: None,
             hard_state,
             poisoned: false,
             mark_file,
@@ -862,6 +926,7 @@ impl<D: Disk + Clone> RaftLog<D> {
         }
         // What recovery kept is durable: the mark follows it.
         log.write_mark(log.last_index())?;
+        (log.origin, log.snapshot_base) = origin;
         log.finish_install()?;
         Ok(Opened {
             log,
@@ -1016,6 +1081,18 @@ impl<D: Disk + Clone> RaftLog<D> {
             self.poisoned = true;
             return Err(LogError::Io(error));
         }
+        // The installed base outlives later purges of the first-index
+        // record: kept in the origin file.
+        if let Err(error) = file::replace(
+            &mut self.disk,
+            &self.dir,
+            ORIGIN_FILE,
+            &encode_origin(self.origin.unwrap_or(u64::MAX), Some(base_index)),
+        ) {
+            self.poisoned = true;
+            return Err(LogError::Io(error));
+        }
+        self.snapshot_base = Some(base_index);
         self.write_mark(None)?;
         if let Some(&(start, _)) = self.entries.first() {
             let cut = self.store.truncate(start);

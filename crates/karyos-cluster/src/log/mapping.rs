@@ -23,13 +23,21 @@
 //!   is a variant, never an error: not yet durable, purged under
 //!   retention, below an installed snapshot, not an entry's start, of
 //!   another epoch.
-//! - **Bounded by the durable prefix.** Nothing past the log's durable
-//!   index is answered: a mapping never promises what a crash could still
-//!   take away. Such a request answers [`EntryAnswer::NotYet`] or
-//!   [`SlotAnswer::NotYet`], with the durable index now.
+//! - **Bounded by the stable prefix.** Only entries both durable and
+//!   committed are answered: a crash cannot take them away, and no leader
+//!   can replace them (a follower's uncommitted suffix can be truncated
+//!   and its positions written again within one epoch). Past that, a
+//!   request answers [`EntryAnswer::NotYet`] or [`SlotAnswer::NotYet`],
+//!   with the last stable index now.
+//! - **Never recorded versus purged.** A log may begin at any index; the
+//!   index it began at is kept (`log-origin`), so an index below it reads
+//!   [`EntryAnswer::NotRecorded`], and only one a purge removed reads
+//!   [`EntryAnswer::Purged`]. A log written before the origin file reads
+//!   every index below its first as purged.
 //! - **Snapshot install.** Entries up to an installed snapshot's base are
 //!   no longer in the log: their index answers
-//!   [`EntryAnswer::BelowSnapshot`], and a slot of an earlier epoch
+//!   [`EntryAnswer::BelowSnapshot`], after later purges too (the base is
+//!   kept in `log-origin`), and a slot of an earlier epoch
 //!   [`SlotAnswer::OtherEpoch`]. A replay below the base starts from the
 //!   snapshot.
 //! - **Determinism.** Under ADR-0024 a replay of the same range applies
@@ -72,11 +80,17 @@ impl EntrySlot {
 pub enum EntryAnswer {
     /// The entry is durable at this slot.
     Recorded(EntrySlot),
-    /// Not durable yet, or not written: past the durable prefix, nothing
-    /// is promised. `durable` is the log's durable index now.
+    /// Not durable and committed yet, or not written: past the stable
+    /// prefix, nothing is promised.
     NotYet {
-        /// The last durable index, `None` while none is.
-        durable: Option<u64>,
+        /// The last index both durable and committed, `None` while none
+        /// is.
+        stable: Option<u64>,
+    },
+    /// Below the index the log began at: the recording never held it.
+    NotRecorded {
+        /// The index the log began at.
+        origin: u64,
     },
     /// Purged under retention: the log starts at `first` now.
     Purged {
@@ -103,10 +117,11 @@ pub enum SlotAnswer {
         /// The entry whose frame holds the position.
         within: u64,
     },
-    /// At or past the durable prefix's end: nothing promised yet.
+    /// At or past the stable prefix's end: nothing promised yet.
     NotYet {
-        /// The last durable index, `None` while none is.
-        durable: Option<u64>,
+        /// The last index both durable and committed, `None` while none
+        /// is.
+        stable: Option<u64>,
     },
     /// Below the recording's start: purged under retention.
     Purged {
@@ -132,20 +147,33 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// answered.
     #[must_use]
     pub fn slot_of(&self, index: u64) -> EntryAnswer {
-        let durable = self.durable_index();
+        let stable = self.stable_index();
         if index < self.first_index {
-            return match self.base() {
-                Some((base, _)) if index <= base => EntryAnswer::BelowSnapshot { base },
-                _ => EntryAnswer::Purged {
-                    first: self.first_index,
-                },
+            if let Some(base) = self.snapshot_base.filter(|base| index <= *base) {
+                return EntryAnswer::BelowSnapshot { base };
+            }
+            if let Some(origin) = self.origin.filter(|origin| index < *origin) {
+                return EntryAnswer::NotRecorded { origin };
+            }
+            return EntryAnswer::Purged {
+                first: self.first_index,
             };
         }
-        if durable.is_none_or(|durable| index > durable) {
-            return EntryAnswer::NotYet { durable };
+        if stable.is_none_or(|stable| index > stable) {
+            return EntryAnswer::NotYet { stable };
         }
         self.recorded(index)
-            .map_or(EntryAnswer::NotYet { durable }, EntryAnswer::Recorded)
+            .map_or(EntryAnswer::NotYet { stable }, EntryAnswer::Recorded)
+    }
+
+    /// The last index both durable and committed: no crash takes it, no
+    /// leader replaces it.
+    fn stable_index(&self) -> Option<u64> {
+        let commit = self.hard_state.and_then(|state| state.commit);
+        match (self.durable_index(), commit) {
+            (Some(durable), Some(commit)) => Some(durable.min(commit)),
+            _ => None,
+        }
     }
 
     /// The entry whose frame starts at `position` of the log's recording
@@ -159,16 +187,17 @@ impl<D: Disk + Clone> RaftLog<D> {
         if position < start {
             return SlotAnswer::Purged { start };
         }
-        let durable = self.durable_index();
-        let Some(last) = durable else {
-            return SlotAnswer::NotYet { durable };
+        let stable = self.stable_index();
+        let Some(last) = stable else {
+            return SlotAnswer::NotYet { stable };
         };
-        let durable_end = match self.recorded(last).and_then(|slot| slot.next_position()) {
+        // Below the first index, a commit names nothing the log holds.
+        let stable_end = match self.recorded(last).and_then(|slot| slot.next_position()) {
             Some(end) => end,
-            None => return SlotAnswer::NotYet { durable },
+            None => return SlotAnswer::NotYet { stable },
         };
-        if position >= durable_end {
-            return SlotAnswer::NotYet { durable };
+        if position >= stable_end {
+            return SlotAnswer::NotYet { stable };
         }
         // The frame starting at or before `position`.
         let holding = self
@@ -181,12 +210,12 @@ impl<D: Disk + Clone> RaftLog<D> {
             .ok()
             .and_then(|slot| self.first_index.checked_add(slot))
         else {
-            return SlotAnswer::NotYet { durable };
+            return SlotAnswer::NotYet { stable };
         };
         match self.recorded(index) {
             Some(found) if found.position == position => SlotAnswer::Entry(found),
             Some(_) => SlotAnswer::NotAnEntry { within: index },
-            None => SlotAnswer::NotYet { durable },
+            None => SlotAnswer::NotYet { stable },
         }
     }
 

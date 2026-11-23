@@ -66,6 +66,15 @@ fn log(dir: &Path, last: u64, commit: u64) -> RaftLog<StdDisk> {
     log
 }
 
+fn commit(log: &mut RaftLog<StdDisk>, term: u64, commit: u64) {
+    log.save_hard_state(HardState {
+        current_term: term,
+        voted_for: None,
+        commit: Some(commit),
+    })
+    .unwrap();
+}
+
 fn recorded(log: &RaftLog<StdDisk>, index: u64) -> EntrySlot {
     match log.slot_of(index) {
         EntryAnswer::Recorded(slot) => slot,
@@ -127,7 +136,7 @@ fn past_the_durable_prefix_the_answer_is_not_yet() {
     for index in [11, 12, 13, u64::MAX] {
         assert_eq!(
             log.slot_of(index),
-            EntryAnswer::NotYet { durable: Some(10) },
+            EntryAnswer::NotYet { stable: Some(10) },
             "{index}"
         );
     }
@@ -135,19 +144,19 @@ fn past_the_durable_prefix_the_answer_is_not_yet() {
     let end = last.next_position().unwrap();
     assert_eq!(
         log.entry_at(last.epoch, end),
-        SlotAnswer::NotYet { durable: Some(10) }
+        SlotAnswer::NotYet { stable: Some(10) }
     );
     assert_eq!(
         log.entry_at(last.epoch, u64::MAX),
-        SlotAnswer::NotYet { durable: Some(10) }
+        SlotAnswer::NotYet { stable: Some(10) }
     );
     // An empty log answers not yet for everything.
     let empty = TempDir::new("empty");
     let fresh = RaftLog::create(StdDisk, &empty.0, small(), 1).unwrap();
-    assert_eq!(fresh.slot_of(1), EntryAnswer::NotYet { durable: None });
+    assert_eq!(fresh.slot_of(1), EntryAnswer::NotYet { stable: None });
     assert_eq!(
         fresh.entry_at(fresh.epoch(), 0),
-        SlotAnswer::NotYet { durable: None }
+        SlotAnswer::NotYet { stable: None }
     );
 }
 
@@ -210,9 +219,92 @@ fn after_an_install_the_snapshot_holds_what_the_log_no_longer_does() {
     // The next entries map in the new epoch, from the same positions.
     let _ = log.append(&[entry(21, 2), entry(22, 2)]).unwrap();
     let _ = log.sync().unwrap();
+    commit(&mut log, 2, 22);
     let next = recorded(&log, 21);
     assert_eq!(next.epoch, log.epoch());
     assert_eq!(replay(&mut log, next), vec![entry(21, 2), entry(22, 2)]);
     // A slot of the old epoch no longer reads.
     assert!(log.read_slot(&before).is_err());
+}
+
+/// Codex P1 (#1224): a durable entry that is not committed can still be
+/// truncated and its positions written again in the same epoch, so it is
+/// not answered until committed.
+#[test]
+fn an_uncommitted_entry_is_not_answered_until_committed() {
+    let dir = TempDir::new("uncommitted");
+    let mut log = log(&dir.0, 10, 5);
+    assert_eq!(log.slot_of(8), EntryAnswer::NotYet { stable: Some(5) });
+    let fifth = recorded(&log, 5);
+    let end = fifth.next_position().unwrap();
+    assert_eq!(
+        log.entry_at(fifth.epoch, end),
+        SlotAnswer::NotYet { stable: Some(5) }
+    );
+    // The suffix is replaced by a new leader's entries: the positions it
+    // used are written again, and only what is committed is answered.
+    log.truncate_suffix(6).unwrap();
+    let _ = log.append(&[entry(6, 2), entry(7, 2)]).unwrap();
+    let _ = log.sync().unwrap();
+    commit(&mut log, 2, 7);
+    let sixth = recorded(&log, 6);
+    assert_eq!((sixth.position, sixth.term), (end, 2));
+}
+
+/// Codex P2 (#1224): a log begun at index 10 never held index 9: it reads
+/// not recorded, not purged, before and after a reopen; a purge then reads
+/// purged.
+#[test]
+fn an_index_below_the_logs_start_is_never_recorded_not_purged() {
+    let dir = TempDir::new("origin");
+    let mut log = RaftLog::create(StdDisk, &dir.0, small(), 10).unwrap();
+    let batch: Vec<Entry> = (10..=40).map(|index| entry(index, 1)).collect();
+    let _ = log.append(&batch).unwrap();
+    let _ = log.sync().unwrap();
+    commit(&mut log, 1, 40);
+    assert_eq!(log.slot_of(9), EntryAnswer::NotRecorded { origin: 10 });
+    drop(log);
+    let mut log = RaftLog::open(StdDisk, &dir.0, small()).unwrap().log;
+    assert_eq!(log.slot_of(9), EntryAnswer::NotRecorded { origin: 10 });
+    let first = log.purge_prefix(30).unwrap();
+    assert_eq!(log.slot_of(12), EntryAnswer::Purged { first });
+    assert_eq!(log.slot_of(3), EntryAnswer::NotRecorded { origin: 10 });
+}
+
+/// Codex P2 (#1224): after an install, a later purge keeps the snapshot's
+/// boundary: indexes at or below it read below the snapshot, those above
+/// it purged, across a reopen.
+#[test]
+fn the_snapshot_boundary_survives_a_later_purge() {
+    let dir = TempDir::new("install-purge");
+    let snapshots_dir = TempDir::new("install-purge-snapshots");
+    let mut log = log(&dir.0, 10, 5);
+    let mut snapshots = SnapshotStore::open(
+        StdDisk,
+        &snapshots_dir.0,
+        small(),
+        SnapshotConfig::default(),
+    )
+    .unwrap()
+    .store;
+    let _ = snapshots
+        .write(20, 2, &[Section::new(SectionKind::Service, 1, b"state")])
+        .unwrap();
+    log.install(20, 2, &snapshots).unwrap();
+    let batch: Vec<Entry> = (21..=60).map(|index| entry(index, 2)).collect();
+    let _ = log.append(&batch).unwrap();
+    let _ = log.sync().unwrap();
+    commit(&mut log, 2, 60);
+    let first = log.purge_prefix(50).unwrap();
+    assert!(first > 21);
+    assert_eq!(log.slot_of(15), EntryAnswer::BelowSnapshot { base: 20 });
+    assert_eq!(log.slot_of(20), EntryAnswer::BelowSnapshot { base: 20 });
+    assert_eq!(log.slot_of(21), EntryAnswer::Purged { first });
+    drop(log);
+    let log = RaftLog::open_with(StdDisk, &dir.0, small(), Some(&snapshots))
+        .unwrap()
+        .log;
+    assert_eq!(log.slot_of(15), EntryAnswer::BelowSnapshot { base: 20 });
+    assert_eq!(log.slot_of(21), EntryAnswer::Purged { first });
+    assert_eq!(log.slot_of(1), EntryAnswer::BelowSnapshot { base: 20 });
 }
