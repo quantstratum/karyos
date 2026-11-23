@@ -49,7 +49,9 @@ impl Ed25519Verifier {
     /// [`AuthorityKeyError`] for each refused case.
     pub fn from_bytes(bytes: &[u8; KEY_LEN]) -> Result<Self, AuthorityKeyError> {
         let key = VerifyingKey::from_bytes(bytes).map_err(|_| AuthorityKeyError::Malformed)?;
-        if key.to_bytes() != *bytes {
+        // `VerifyingKey` keeps the bytes it was given, so the check
+        // re-encodes the decoded point itself.
+        if key.to_edwards().compress().to_bytes() != *bytes {
             return Err(AuthorityKeyError::NonCanonical);
         }
         if key.is_weak() {

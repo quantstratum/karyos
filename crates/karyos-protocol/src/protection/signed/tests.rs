@@ -8,7 +8,7 @@ use karyos_sys::alloc_count::count;
 /// domain 2, 64 body bytes of `0x5a`, reproduced by a second
 /// implementation. The signature itself is checked in `karyos-driver`,
 /// which holds the Ed25519 implementation.
-const VECTOR: &str = "a00000000100200004400200feffffffe90300000403020194776655443322115a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a23e1287f01810dc8de74cadaba317d27f7b92da8b85b6909759bfdbcca61786edf4917329b2bdd213aa43d2f13955fc9d1b7b93b4cd993536d05a5f9d0008101";
+const VECTOR: &str = "a00000000100200004400200feffffffe90300000403020194776655443322115a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a23e1287f01810dc8de74cadaba317d27f7b92da8b85b6909759bfdbcca61786edf4917329b2bdd213aa43d2f13955fc9d1b7b93b4cd993536d05a5f9d0008101";
 const SEQ: u64 = 1_234_605_616_436_508_564;
 
 const BINDING: SignedBinding = SignedBinding {
