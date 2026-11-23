@@ -404,13 +404,14 @@ fn hex32(text: &[u8], out: &mut [u8; KEY_LEN]) -> Option<()> {
     if text.len() != 2 * KEY_LEN {
         return None;
     }
-    for (slot, pair) in out.iter_mut().zip(text.chunks_exact(2)) {
+    for (slot, pair) in out.iter_mut().zip(text.as_chunks::<2>().0) {
         let nibble = |b: u8| match b {
             b'0'..=b'9' => Some(b - b'0'),
             b'a'..=b'f' => Some(b - b'a' + 10),
             _ => None,
         };
-        let (hi, lo) = (nibble(*pair.first()?)?, nibble(*pair.get(1)?)?);
+        let [hi, lo] = *pair;
+        let (hi, lo) = (nibble(hi)?, nibble(lo)?);
         *slot = (hi << 4) | lo;
     }
     Some(())
@@ -606,10 +607,12 @@ impl Context {
                 if let Some((boot, nonce)) = unicast {
                     let mut salt = [0_u8; 32];
                     for (slot, word) in salt
-                        .chunks_exact_mut(8)
+                        .as_chunks_mut::<8>()
+                        .0
+                        .iter_mut()
                         .zip([boot[0], boot[1], nonce[0], nonce[1]])
                     {
-                        slot.copy_from_slice(&word.to_le_bytes());
+                        *slot = word.to_le_bytes();
                     }
                     info.salt = Some(salt);
                 }
