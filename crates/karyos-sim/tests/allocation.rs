@@ -13,9 +13,9 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use karyos_sim::harness::core::{ConsensusCore, LogView, Persisted, Ready, Refused};
+use karyos_sim::harness::core::{ConsensusCore, LogView, Persisted, Ready, ReadyBuf, Refused};
 use karyos_sim::harness::corpus::Evidence;
-use karyos_sim::harness::probe::{WARMUP, measure};
+use karyos_sim::harness::probe::{Stage, WARMUP, measure};
 use karyos_sim::harness::reference::Reference;
 use karyos_sim::harness::workloads::W1;
 use karyos_sim::net::NodeId;
@@ -114,6 +114,17 @@ fn a_measurement_of_the_reference_fixture_sees_its_allocations() {
         "nothing past the {WARMUP}-entry warm-up"
     );
     let (allocations, frees) = report.per_entry().unwrap();
+    // Every counted operation belongs to one stage (karyos#691).
+    let (staged_allocations, staged_frees) =
+        report.stages.iter().fold((0, 0), |(a, f), (_, counts)| {
+            (a + counts.allocations, f + counts.frees)
+        });
+    assert_eq!(
+        (staged_allocations, staged_frees),
+        (report.counts.allocations, report.counts.frees),
+        "{report:?}"
+    );
+    assert_eq!(report.stages.len(), Stage::ALL.len());
     assert!(
         report.counts.allocations > 0,
         "the fixture allocates; a zero would mean the probe missed it"
@@ -278,4 +289,32 @@ fn a_refused_metered_read_allocates_nothing() {
     let (refused, operations) = count(|| view.entries(1..5, u64::MAX));
     assert!(matches!(refused, Err(ReadError::Budget)));
     assert_eq!(operations, 0, "a refused read allocates and frees nothing");
+}
+
+/// A recycled `ReadyBuf` hands its entries' payload buffers back: once the
+/// pool holds an entry large enough, filling the Ready again allocates
+/// nothing (plan issue 073, karyos#691).
+#[test]
+fn a_recycled_ready_buf_reuses_its_buffers() {
+    let _serial = serial();
+    let mut buf: ReadyBuf<()> = ReadyBuf::default();
+    let fill = |buf: &mut ReadyBuf<()>| {
+        for index in 1..=4 {
+            let entry = buf.entry(index, 1, 0, &[7u8; 64]);
+            buf.ready.entries.push(entry);
+        }
+        let committed = buf.entry(5, 1, 0, &[7u8; 64]);
+        buf.ready.committed.push(committed);
+        buf.ready.messages.push((1, ()));
+    };
+    fill(&mut buf);
+    buf.recycle();
+    assert!(buf.is_empty());
+    let ((), counts) = window(|| {
+        let _enrolled = enroll();
+        fill(&mut buf);
+        buf.recycle();
+    })
+    .unwrap();
+    assert_eq!(counts, SetCounts::default());
 }
