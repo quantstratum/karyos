@@ -56,7 +56,8 @@ proptest.workspace = true
 # rules of SPEC.md §14. Keep the clippy list in sync with the workspace.
 [lints.rust]
 missing_docs = "deny"
-# `unsafe` only where a module expects it: `uring::ring` (SPEC.md §14).
+# `unsafe` only where a module expects it: `uring::ring` and `xdp::ring`
+# (SPEC.md §14).
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
