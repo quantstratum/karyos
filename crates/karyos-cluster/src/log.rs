@@ -1432,7 +1432,7 @@ impl<D: Disk + Clone> RaftLog<D> {
                 .map_err(|_| LogError::Store(SegmentError::PositionOverflow))?;
             window.clear();
             window.resize(length, 0);
-            self.store.read(start, &mut window)?;
+            self.store.read(start, window)?;
             for at in first..slot {
                 let Some(&(position, term)) = self.entries.get(at) else {
                     break;
