@@ -55,7 +55,7 @@ struct karyos_message_info size=40 align=8
   session_id offset=28 size=4
   flags offset=32 size=4
   reserved offset=36 size=4
-struct karyos_image_change size=48 align=8
+struct karyos_image_change size=64 align=8
   size offset=0 size=4
   session_id offset=4 size=4
   image_id offset=8 size=8
@@ -65,6 +65,8 @@ struct karyos_image_change size=48 align=8
   reserved offset=28 size=4
   end_position offset=32 size=8
   seal_code offset=40 size=8
+  join_loss_from offset=48 size=8
+  join_loss_to offset=56 size=8
 struct karyos_driver_options size=80 align=8
   size offset=0 size=4
   max_clients offset=4 size=4
@@ -268,6 +270,7 @@ const KARYOS_E_ADMISSION_REFUSED=401
 const KARYOS_E_PROTOCOL=402
 const KARYOS_E_INTERNAL=500
 const KARYOS_IMAGE_CHANGE_SIZE_ENDS=48
+const KARYOS_IMAGE_CHANGE_SIZE_JOIN_LOSS=64
 const KARYOS_REPLAY_FULL=1
 const KARYOS_REPLAY_AS_RECORDED=2
 const KARYOS_REPLAY_SCALED=3
