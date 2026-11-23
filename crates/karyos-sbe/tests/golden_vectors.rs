@@ -19,6 +19,7 @@
 
 mod common;
 
+use ironsbe_core::decoder::SbeDecoder;
 use karyos_sbe::car::v1::{BooleanType, BoostType, Model};
 use karyos_sbe::{FrameError, car, decode_car};
 
