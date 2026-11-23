@@ -905,9 +905,7 @@ impl Exporter {
     ///
     /// # Errors
     ///
-    /// [`ExportError::InvalidDeadline`] for a deadline outside that range;
-    /// the exporter is returned unchanged inside the error's caller only
-    /// by rebuilding it.
+    /// [`ExportError::InvalidDeadline`] for a deadline outside that range.
     pub fn with_deadline(mut self, deadline: Duration) -> Result<Self, ExportError> {
         if deadline < Duration::from_millis(1) || deadline > MAX_CONNECTION_DEADLINE {
             return Err(ExportError::InvalidDeadline(deadline));
