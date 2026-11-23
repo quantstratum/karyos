@@ -15,9 +15,12 @@
 //!   to a loopback address only ([`bind`] refuses any other), read-only,
 //!   one request per connection with [`IO_TIMEOUT`] on its reads and
 //!   writes. It is off unless the `karyos-exporter` binary is started with
-//!   an address. No TLS: it serves loopback only, and exposing it beyond
-//!   the pod takes a TLS-terminating sidecar or mesh (R-CORE-39,
-//!   karyos#734). An optional bearer [`Token`] (`--token-file`) guards
+//!   an address. Without TLS it serves loopback only, and exposing it
+//!   beyond the pod takes a TLS-terminating sidecar or mesh (R-CORE-39,
+//!   karyos#734). Built with the `exporter-tls` feature, [`bind_tls`]
+//!   serves `/metrics` over TLS 1.3 on any address, with a certificate and
+//!   key from files (karyos#887); loopback plain HTTP stays the default.
+//!   An optional bearer [`Token`] (`--token-file`) guards
 //!   scrapes from the other processes of the pod's network namespace: a
 //!   request for `/metrics` without it is answered `401`; only `/metrics`
 //!   needs it, any other path being `404` or `405` either way. A request head that is not one
@@ -675,11 +678,15 @@ fn render_application(families: &mut Families, dir: &str, counter: &Counter) -> 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ExportError {
-    /// The address is not a loopback address.
+    /// The address is not a loopback address, and no TLS is configured.
     #[error(
-        "{0} is not a loopback address: the exporter has no TLS, so it serves loopback only; expose it beyond the pod through a TLS-terminating sidecar or mesh"
+        "{0} is not a loopback address: without TLS the exporter serves loopback only; configure TLS (--tls-cert and --tls-key, in a build with the exporter-tls feature) or expose it through a TLS-terminating sidecar or mesh"
     )]
     NotLoopback(SocketAddr),
+    /// The TLS configuration was refused (karyos#887).
+    #[cfg(feature = "exporter-tls")]
+    #[error(transparent)]
+    Tls(#[from] tls::TlsError),
     /// The operating system's error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -707,6 +714,10 @@ pub struct Exporter {
     listener: TcpListener,
     /// The bearer token every scrape must carry, when configured.
     token: Option<Token>,
+    /// The TLS configuration every connection is served with, when
+    /// configured (karyos#887).
+    #[cfg(feature = "exporter-tls")]
+    tls: Option<std::sync::Arc<rustls::ServerConfig>>,
 }
 
 /// A scrape token (`--token-file`, karyos#734): 32 to 256 bytes of visible
@@ -806,6 +817,29 @@ pub fn bind(address: SocketAddr) -> Result<Exporter, ExportError> {
     Ok(Exporter {
         listener,
         token: None,
+        #[cfg(feature = "exporter-tls")]
+        tls: None,
+    })
+}
+
+/// Listens on `address`, any address, serving every connection over TLS
+/// 1.3 with `config` ([`tls::server_config`]; karyos#887). A connection
+/// whose handshake fails is [`Answered::Dropped`].
+///
+/// # Errors
+///
+/// The operating system's errors.
+#[cfg(feature = "exporter-tls")]
+pub fn bind_tls(
+    address: SocketAddr,
+    config: std::sync::Arc<rustls::ServerConfig>,
+) -> Result<Exporter, ExportError> {
+    let listener = TcpListener::bind(address)?;
+    listener.set_nonblocking(true)?;
+    Ok(Exporter {
+        listener,
+        token: None,
+        tls: Some(config),
     })
 }
 
@@ -837,27 +871,55 @@ impl Exporter {
         let mut answered = Vec::new();
         while answered.len() < MAX_PER_POLL {
             match self.listener.accept() {
-                Ok((stream, _)) => answered.push(answer(stream, self.token.as_ref(), &body)),
+                Ok((stream, _)) => answered.push(self.answer(stream, &body)),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error.into()),
             }
         }
         Ok(answered)
     }
+
+    /// Answers one connection, over TLS when configured.
+    fn answer(&self, stream: TcpStream, body: &impl Fn() -> String) -> Answered {
+        let ready = stream.set_nonblocking(false).is_ok()
+            && stream.set_read_timeout(Some(IO_TIMEOUT)).is_ok()
+            && stream.set_write_timeout(Some(IO_TIMEOUT)).is_ok();
+        if !ready {
+            return Answered::Dropped;
+        }
+        #[cfg(feature = "exporter-tls")]
+        if let Some(config) = &self.tls {
+            let Ok(connection) = rustls::ServerConnection::new(std::sync::Arc::clone(config))
+            else {
+                return Answered::Dropped;
+            };
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            // The handshake, within the same timeouts.
+            while stream.conn.is_handshaking() {
+                if stream.conn.complete_io(&mut stream.sock).is_err() {
+                    return Answered::Dropped;
+                }
+            }
+            let answered = serve(&mut stream, self.token.as_ref(), body);
+            stream.conn.send_close_notify();
+            let _ = stream.conn.complete_io(&mut stream.sock);
+            return answered;
+        }
+        let mut stream = stream;
+        serve(&mut stream, self.token.as_ref(), body)
+    }
 }
 
-/// Answers one connection.
-fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) -> Answered {
-    let ready = stream.set_nonblocking(false).is_ok()
-        && stream.set_read_timeout(Some(IO_TIMEOUT)).is_ok()
-        && stream.set_write_timeout(Some(IO_TIMEOUT)).is_ok();
-    if !ready {
-        return Answered::Dropped;
-    }
+/// Serves one request on `stream`, plain or TLS.
+fn serve<S: Read + Write>(
+    stream: &mut S,
+    token: Option<&Token>,
+    body: &impl Fn() -> String,
+) -> Answered {
     let Some(limit) = u64::try_from(MAX_REQUEST).ok() else {
         return Answered::Dropped;
     };
-    let mut reader = BufReader::new((&stream).take(limit));
+    let mut reader = BufReader::new(Read::by_ref(stream).take(limit));
     let mut line = String::new();
     if !matches!(reader.read_line(&mut line), Ok(read) if read > 0) {
         return Answered::Dropped;
@@ -893,6 +955,7 @@ fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) 
         }
         header.clear();
     }
+    drop(reader);
     let mut words = line.split_whitespace();
     let request = (words.next(), words.next(), words.next(), words.next());
     let authorized = token.is_none_or(|token| offered.as_deref().is_some_and(|o| token.matches(o)));
@@ -943,7 +1006,6 @@ fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) 
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{challenge}Connection: close\r\n\r\n",
         content.len()
     );
-    let mut stream = stream;
     let written = stream
         .write_all(head.as_bytes())
         .and_then(|()| stream.write_all(content.as_bytes()))
@@ -953,6 +1015,9 @@ fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) 
     }
     answered
 }
+
+#[cfg(feature = "exporter-tls")]
+pub mod tls;
 
 #[cfg(test)]
 mod tests;

@@ -839,3 +839,130 @@ fn a_head_with_a_header_that_is_not_utf8_is_refused() {
         String::from_utf8_lossy(&answer)
     );
 }
+
+/// karyos#887: the exporter over TLS.
+#[cfg(feature = "exporter-tls")]
+mod over_tls {
+    use std::sync::Arc;
+
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, ServerName};
+
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../karyos-control/tests/fixtures")
+            .join(name)
+    }
+
+    fn exporter(address: &str) -> Exporter {
+        let config = tls::server_config(&fixture("server.pem"), &fixture("server.key")).unwrap();
+        bind_tls(address.parse().unwrap(), config).unwrap()
+    }
+
+    /// A TLS client trusting the fixture CA sends `request` to `port` on
+    /// 127.0.0.1, in a thread, while the exporter is polled; the answer,
+    /// or `None` when the handshake or the read failed.
+    fn exchange_tls(exporter: &mut Exporter, request: &str) -> (Option<String>, Vec<Answered>) {
+        let port = exporter.local_addr().unwrap().port();
+        let request = request.to_owned();
+        let client = std::thread::spawn(move || {
+            let mut roots = rustls::RootCertStore::empty();
+            for root in CertificateDer::pem_file_iter(fixture("ca.pem")).unwrap() {
+                roots.add(root.unwrap()).unwrap();
+            }
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls_graviola::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            let connection = rustls::ClientConnection::new(
+                Arc::new(config),
+                ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap();
+            let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, tcp);
+            stream.write_all(request.as_bytes()).ok()?;
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).ok()?;
+            Some(answer)
+        });
+        let mut answered = Vec::new();
+        for _ in 0..400 {
+            answered = exporter.poll(|| "karyos_up 1\n".to_owned()).unwrap();
+            if !answered.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (client.join().unwrap(), answered)
+    }
+
+    #[test]
+    fn a_scrape_over_tls_is_answered_and_its_token_guards_it() {
+        let token = Token::new(vec![b'k'; 32]).unwrap();
+        let mut exporter = exporter("127.0.0.1:0").with_token(token);
+        let (answer, answered) = exchange_tls(
+            &mut exporter,
+            &format!(
+                "GET /metrics HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+                "k".repeat(32)
+            ),
+        );
+        assert_eq!(answered, vec![Answered::Metrics]);
+        let answer = answer.unwrap();
+        assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+        assert!(answer.ends_with("karyos_up 1\n"), "{answer}");
+        let (answer, answered) = exchange_tls(&mut exporter, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert_eq!(answered, vec![Answered::Unauthorized]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn a_non_loopback_address_is_bound_only_with_tls() {
+        assert!(matches!(
+            bind("0.0.0.0:0".parse().unwrap()),
+            Err(ExportError::NotLoopback(_))
+        ));
+        let mut exporter = exporter("0.0.0.0:0");
+        let (answer, answered) = exchange_tls(&mut exporter, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert_eq!(answered, vec![Answered::Metrics]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn plain_http_to_a_tls_exporter_is_dropped() {
+        let mut exporter = exporter("127.0.0.1:0");
+        let (answer, answered) = exchange(&mut exporter, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert_eq!(answered, vec![Answered::Dropped]);
+        assert!(!answer.contains("karyos_up"), "{answer}");
+    }
+
+    #[test]
+    fn a_missing_or_empty_pem_file_is_a_typed_refusal() {
+        let missing = fixture("missing.pem");
+        assert!(matches!(
+            tls::server_config(&missing, &fixture("server.key")),
+            Err(tls::TlsError::Pem { .. })
+        ));
+        assert!(matches!(
+            tls::server_config(&fixture("server.key"), &fixture("server.key")),
+            Err(tls::TlsError::Pem { .. })
+        ));
+        assert!(matches!(
+            tls::server_config(&fixture("server.pem"), &fixture("server.pem")),
+            Err(tls::TlsError::Pem { .. })
+        ));
+    }
+
+    /// The development and CI hosts have the provider's features.
+    #[test]
+    fn this_cpu_runs_the_provider() {
+        assert!(tls::check_cpu().is_ok());
+    }
+}

@@ -33,7 +33,22 @@ fn serve(args: karyos_agent::cli::ExporterArgs) -> ExitCode {
 
     use karyos_agent::{Agent, AgentConfig, exporter};
 
-    let mut listener = match exporter::bind(args.listen) {
+    let bound = match &args.tls {
+        None => exporter::bind(args.listen),
+        #[cfg(feature = "exporter-tls")]
+        Some((cert, key)) => exporter::tls::server_config(cert, key)
+            .map_err(exporter::ExportError::from)
+            .and_then(|config| exporter::bind_tls(args.listen, config)),
+        #[cfg(not(feature = "exporter-tls"))]
+        Some(_) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "karyos-exporter: --tls-cert and --tls-key need a build with the exporter-tls feature"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let mut listener = match bound {
         Ok(listener) => listener,
         Err(error) => {
             let _ = writeln!(std::io::stderr(), "karyos-exporter: {error}");
