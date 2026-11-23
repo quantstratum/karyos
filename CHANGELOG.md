@@ -224,6 +224,8 @@ release may break APIs, wire formats and shared-memory layouts.
 
 ### Changed
 
+- `libkaryos` and `karyosd` are released as separate artifacts, unsigned for 0.1.0-alpha.4 by owner deferral of 2026-11-23; both MANIFESTs say `signed=no` (karyos#700).
+
 - `SegmentStore::read` keeps the last finished segment it opened and reads through that handle, instead of opening the segment's data file for every read: a catch-up scan with `RaftLog::entries` opened it twice per entry (karyos#1001). The handle is dropped before any segment file is created, cut or purged. The item 37 catch-up bench also prints the read cost per entry.
 
 - The running Archive's signing poll reads only the integrity journal records chained since the last poll and replays the key registry only when a key registry record is chained, instead of rereading the whole journal each second (`IntegrityJournal::records_from`). `ArchiveHandle::signing_lag` reports the coverage lag, and `karyosd` logs a warning when signed coverage falls behind `--archive-anchor-interval` and when it recovers (karyos#1031).
