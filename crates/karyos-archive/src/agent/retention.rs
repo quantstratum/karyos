@@ -363,7 +363,7 @@ impl<D: Disk + Clone> State<D> {
                 .and_then(|stop| stop.closed_utc_ns)
                 .unwrap_or(0);
             for intent in self.retention.outstanding() {
-                if intent.recording != id || store.start() >= intent.before {
+                if intent.recording != id || store.lowest_retained() >= intent.before {
                     continue;
                 }
                 if intent.before > store.written() {
@@ -686,6 +686,13 @@ mod tests {
                     counter: 0,
                 },
                 "splits_seal",
+            ),
+            (
+                PurgeRefusal::Offloaded {
+                    lowest: 0,
+                    start: 1,
+                },
+                "offloaded",
             ),
         ];
         for (refusal, name) in purges {

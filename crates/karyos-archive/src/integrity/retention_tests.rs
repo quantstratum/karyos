@@ -28,12 +28,12 @@ use crate::segment::{Geometry, SegmentStore, SyncPolicy};
 
 use ed25519_dalek::Signer as _;
 
-const RECORDING: u64 = 3;
+pub(super) const RECORDING: u64 = 3;
 const BEFORE: u64 = 256;
 const REPLICA_A: Digest = [30; 32];
 const REPLICA_B: Digest = [31; 32];
 
-type Ops = Ledger<FaultDisk, OPERATION_LENGTH>;
+pub(super) type Ops = Ledger<FaultDisk, OPERATION_LENGTH>;
 type Markers = Ledger<FaultDisk, MARKER_LENGTH>;
 
 /// No anchor store reaches anything.
@@ -63,7 +63,7 @@ impl OperationsJournal for Down {
     }
 }
 
-fn geometry() -> Geometry {
+pub(super) fn geometry() -> Geometry {
     Geometry::new(64, 128).unwrap()
 }
 
@@ -71,7 +71,7 @@ fn chunk(index: u64) -> Vec<u8> {
     vec![u8::try_from(index).unwrap(); 64]
 }
 
-fn policy(retain_for_ns: u64, min_copies: u32) -> RetentionPolicy {
+pub(super) fn policy(retain_for_ns: u64, min_copies: u32) -> RetentionPolicy {
     RetentionPolicy {
         policy: 1,
         version: 1,
@@ -82,7 +82,7 @@ fn policy(retain_for_ns: u64, min_copies: u32) -> RetentionPolicy {
     }
 }
 
-fn request() -> PurgeRequest {
+pub(super) fn request() -> PurgeRequest {
     PurgeRequest {
         id: 1,
         recording: RECORDING,
@@ -99,7 +99,7 @@ fn request() -> PurgeRequest {
 /// An archive on `disk`: the archival key registered, a recording of six
 /// 64-byte writes over three segments, each segment sealed, and two
 /// verified copies elsewhere.
-fn setup(disk: &FaultDisk) {
+pub(super) fn setup(disk: &FaultDisk) {
     let dir = Path::new(DIR);
     let mut journal = IntegrityJournal::open(disk.clone(), dir).unwrap().journal;
     let mut keys = Ledger::<_, REGISTRY_ENTRY_LENGTH>::open(disk.clone(), dir, KEYS_FILE).unwrap();
@@ -162,16 +162,16 @@ fn setup(disk: &FaultDisk) {
     }
 }
 
-struct Archive {
-    disk: FaultDisk,
-    journal: IntegrityJournal<FaultDisk>,
-    store: SegmentStore<FaultDisk>,
-    copies: CopyCatalog<FaultDisk>,
-    retention: Retention<Ops, FaultDisk>,
+pub(super) struct Archive {
+    pub(super) disk: FaultDisk,
+    pub(super) journal: IntegrityJournal<FaultDisk>,
+    pub(super) store: SegmentStore<FaultDisk>,
+    pub(super) copies: CopyCatalog<FaultDisk>,
+    pub(super) retention: Retention<Ops, FaultDisk>,
 }
 
 /// Opens the archive on `disk` as a restart does.
-fn open(disk: FaultDisk) -> Archive {
+pub(super) fn open(disk: FaultDisk) -> Archive {
     let dir = Path::new(DIR);
     let mut journal = IntegrityJournal::open(disk.clone(), dir).unwrap().journal;
     let store = SegmentStore::recover(disk.clone(), dir, RECORDING, geometry(), SyncPolicy::None)
@@ -191,7 +191,7 @@ fn open(disk: FaultDisk) -> Archive {
     }
 }
 
-fn fresh() -> Archive {
+pub(super) fn fresh() -> Archive {
     let disk = FaultDisk::default();
     setup(&disk);
     open(disk)
@@ -220,7 +220,7 @@ fn operations(disk: &FaultDisk) -> Vec<Operation> {
 }
 
 impl Archive {
-    fn purge(
+    pub(super) fn purge(
         &mut self,
         policy: &RetentionPolicy,
         now_ns: u64,

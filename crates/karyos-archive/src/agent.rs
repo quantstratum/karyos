@@ -2071,6 +2071,25 @@ fn run<D>(
             return;
         }
     };
+    // An offload a crash cut short has its start raised before any
+    // recording is scanned (ADR-0104, decision 4), so its segment is never
+    // taken for a local one, nor purged.
+    if let Some(integrity) = integrity.as_mut()
+        && integrity.journal.tiered()
+    {
+        let reconciled = integrity
+            .journal
+            .records()
+            .map_err(AgentError::from)
+            .and_then(|records| {
+                crate::integrity::tiering::reconcile_floors(&mut disk.clone(), &dir, &records)
+                    .map_err(AgentError::from)
+            });
+        if let Err(error) = reconciled {
+            let _ = ready.send(Err(error));
+            return;
+        }
+    }
     // The configured retention policy is chained in the integrity journal
     // when its terms changed (SPEC.md 8.4; karyos#1123), but only after
     // the purges a crash cut short are reconciled: they are rechecked, and
