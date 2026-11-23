@@ -586,10 +586,16 @@ impl<R: RxRingOps> RxBackend for UringRx<R> {
             outcome.stop = RxStop::Failed(BackendFailure::NotActive);
             return outcome;
         }
+        // Admission before anything is published: arming needs the enter
+        // that submits it, which is one op of the budget.
+        if budget.ops() == 0 {
+            outcome.stop = RxStop::Budget;
+            return outcome;
+        }
         if !self.armed && !self.ring.arm_live() {
             self.arm();
         }
-        if budget.ops() > 0 && self.ring.needs_enter() {
+        if self.ring.needs_enter() {
             outcome.spent.ops = 1;
             if let Some(stop) = self.enter() {
                 outcome.stop = stop;
@@ -598,7 +604,12 @@ impl<R: RxRingOps> RxBackend for UringRx<R> {
         }
         let mut one = [Cqe::EMPTY; 1];
         loop {
-            if outcome.spent.datagrams >= budget.datagrams() {
+            // A completion is taken only when its largest possible payload
+            // still fits the byte allowance, so no delivery overruns it.
+            let room = budget.bytes().saturating_sub(outcome.spent.bytes);
+            if outcome.spent.datagrams >= budget.datagrams()
+                || room < u64::from(self.config.max_datagram.get())
+            {
                 outcome.stop = RxStop::Budget;
                 break;
             }

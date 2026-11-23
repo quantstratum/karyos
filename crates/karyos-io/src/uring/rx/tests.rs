@@ -9,6 +9,7 @@ use std::ops::ControlFlow;
 
 use super::*;
 use crate::backend::InstanceId;
+use crate::uring::ops::{CancelTarget, RxRingOps, UserData};
 use crate::uring::scripted::ScriptedRxRing;
 
 const BUFFERS: u16 = 8;
@@ -289,6 +290,42 @@ fn the_configuration_bounds_the_buffers() {
     assert_eq!(UringRxConfig::default().cq_entries(), 512);
 }
 
+#[test]
+fn a_second_arm_and_an_arm_identity_cancel_are_refused() {
+    let mut ring = ScriptedRxRing::new(BUFFERS, config().buffer_len());
+    assert_eq!(ring.arm(UserData::new(0, 1)), Ok(()));
+    assert!(
+        ring.arm(UserData::new(0, 2)).is_err(),
+        "one outstanding arm"
+    );
+    assert_eq!(ring.arm_user_data(), Some(UserData::new(0, 1)));
+    assert!(
+        ring.push_cancel(CancelTarget::All, UserData::new(0, 3))
+            .is_err()
+    );
+}
+
+#[test]
+fn polls_respect_the_byte_and_op_budget() {
+    let mut rx = rx();
+    let mut sink = Sink::default();
+    // No op: nothing is armed or entered.
+    let none = rx.poll_rx(Budget::new(64, u64::MAX, 0), &mut sink);
+    assert_eq!(none.stop, RxStop::Budget);
+    assert_eq!(rx.ring().arms(), 0);
+    rx.poll_rx(budget(), &mut sink);
+    for _ in 0..3 {
+        rx.ring_mut().deliver(b"0123456789", source(), 0);
+    }
+    // Room for one worst case payload (64) but not two: one delivery.
+    let one = rx.poll_rx(Budget::new(64, 70, 4), &mut sink);
+    assert_eq!(one.delivered, 1);
+    assert!(one.spent.bytes <= 70);
+    assert_eq!(one.stop, RxStop::Budget);
+    let rest = rx.poll_rx(budget(), &mut sink);
+    assert_eq!(rest.delivered, 2);
+}
+
 /// The real ring on this kernel; skipped where `io_uring` is denied unless
 /// `KARYOS_URING_REQUIRED` is set.
 #[cfg(all(feature = "uring", target_os = "linux"))]
@@ -382,6 +419,41 @@ mod kernel {
             sink.datagrams.get(1).map(|d| d.0.clone()),
             Some(b"again".to_vec())
         );
+    }
+
+    #[test]
+    fn a_ring_of_more_than_one_page_of_entries_receives_through_every_buffer() {
+        let mut many = config();
+        many.rx_buffers = NonZeroU16::new(1024).unwrap_or(NonZeroU16::MIN);
+        let Some(mut rx) = open(&many) else {
+            return;
+        };
+        let Ok(to) = rx.ring().local_addr() else {
+            panic!("local_addr");
+        };
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut sink = CountingSink(0);
+        rx.poll_rx(budget(), &mut sink);
+        // More datagrams than one page holds entries (256): the kernel walks
+        // entries past the first page.
+        let datagrams = 400_u32;
+        for sent in 1..=datagrams {
+            assert!(sender.send_to(b"page", to).is_ok());
+            if sent % 50 == 0 {
+                poll_until(&mut rx, &mut sink, |sink| sink.0 >= sent);
+            }
+        }
+        assert_eq!(sink.0, datagrams);
+        assert_eq!(rx.posted(), 1024);
+    }
+
+    #[test]
+    fn the_real_ring_refuses_a_second_arm() {
+        let Some(mut rx) = open(&config()) else {
+            return;
+        };
+        rx.poll_rx(budget(), &mut CountingSink(0));
+        assert!(rx.ring_mut().arm(UserData::new(0, 99)).is_err());
     }
 
     #[test]

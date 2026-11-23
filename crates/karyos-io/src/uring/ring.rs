@@ -673,13 +673,13 @@ const _: () = {
 };
 
 impl BufPage {
-    fn new() -> Box<Self> {
-        Box::new(Self(std::array::from_fn(|_| BufEntry {
+    fn new() -> Self {
+        Self(std::array::from_fn(|_| BufEntry {
             addr: AtomicU64::new(0),
             len: AtomicU32::new(0),
             bid: AtomicU16::new(0),
             resv: AtomicU16::new(0),
-        })))
+        }))
     }
 }
 
@@ -692,7 +692,7 @@ enum BufState {
 
 /// Writes the entry at `tail` for buffer `id` and publishes the new tail
 /// with a Release store (design 6.2).
-fn post_entry(pages: &[Box<BufPage>], tail: &mut u16, mask: u16, addr: u64, len: u32, id: u16) {
+fn post_entry(pages: &[BufPage], tail: &mut u16, mask: u16, addr: u64, len: u32, id: u16) {
     let at = usize::from(*tail & mask);
     if let Some(entry) = pages
         .get(at / ENTRIES_PER_PAGE)
@@ -713,7 +713,7 @@ pub struct OsRxRing {
     ring: IoUring,
     socket: Option<OwnedFd>,
     fixed: bool,
-    pages: Box<[Box<BufPage>]>,
+    pages: Box<[BufPage]>,
     buffers: Box<[Box<[u8]>]>,
     state: Box<[BufState]>,
     tail: u16,
@@ -722,6 +722,8 @@ pub struct OsRxRing {
     /// count.
     msg: Box<MsgHdr>,
     arm: Option<UserData>,
+    /// Whether the buffer group is registered now.
+    registered: bool,
 }
 
 impl std::fmt::Debug for OsRxRing {
@@ -817,6 +819,7 @@ impl OsRxRing {
                 flags: 0,
             }),
             arm: None,
+            registered: false,
         };
         rx.register()
             .map_err(|errno| os("io_uring_register_pbuf_ring", errno.0))?;
@@ -837,10 +840,9 @@ impl OsRxRing {
 
     /// Registers the buffer ring and posts every buffer.
     fn register(&mut self) -> Result<(), Errno> {
-        let addr = self
-            .pages
-            .first()
-            .map_or(0, |page| ptr::from_ref::<BufPage>(page).expose_provenance());
+        // One contiguous, page aligned allocation of every entry: the
+        // kernel walks `entries * 16` bytes from this address.
+        let addr = self.pages.as_ptr().expose_provenance();
         let entries = self.buffers();
         // SAFETY: the ring memory is `self.pages`, page aligned and
         // `entries` entries long; it stays allocated until the group is
@@ -855,6 +857,7 @@ impl OsRxRing {
             )
         };
         registered.map_err(|error| Errno(io_errno(&error)))?;
+        self.registered = true;
         self.tail = 0;
         for id in 0..entries {
             self.post(id);
@@ -898,6 +901,11 @@ impl RxRingOps for OsRxRing {
     }
 
     fn arm(&mut self, user_data: UserData) -> Result<(), PushError> {
+        // One outstanding arm, always at index 0: a second one would
+        // replace the tracked identity while the first may still write.
+        if self.arm.is_some() || user_data.index() != 0 || !self.registered {
+            return Err(PushError::KernelOwned);
+        }
         let msg = ptr::from_ref::<MsgHdr>(&self.msg);
         let entry = if self.fixed {
             opcode::RecvMsgMulti::new(types::Fixed(0), msg.cast(), BGID).build()
@@ -911,6 +919,10 @@ impl RxRingOps for OsRxRing {
     }
 
     fn push_cancel(&mut self, target: CancelTarget, user_data: UserData) -> Result<(), PushError> {
+        // Index 0 is the arm's: a cancel never carries it.
+        if user_data.index() == 0 {
+            return Err(PushError::OutOfRange);
+        }
         let entry = match target {
             CancelTarget::One(target) => opcode::AsyncCancel::new(target.get()).build(),
             CancelTarget::All => {
@@ -959,7 +971,7 @@ impl RxRingOps for OsRxRing {
 
     fn lend<T>(&mut self, id: u16, lend: impl FnOnce(&[u8]) -> T) -> Option<T> {
         struct Repost<'a> {
-            pages: &'a [Box<BufPage>],
+            pages: &'a [BufPage],
             tail: &'a mut u16,
             mask: u16,
             state: &'a mut BufState,
@@ -1014,10 +1026,13 @@ impl RxRingOps for OsRxRing {
         if self.arm.is_some() {
             return Err(Errno(16));
         }
-        self.ring
-            .submitter()
-            .unregister_buf_ring(BGID)
-            .map_err(|error| Errno(io_errno(&error)))?;
+        if self.registered {
+            self.ring
+                .submitter()
+                .unregister_buf_ring(BGID)
+                .map_err(|error| Errno(io_errno(&error)))?;
+            self.registered = false;
+        }
         for page in &*self.pages {
             for entry in &page.0 {
                 entry.resv.store(0, Ordering::Relaxed);
@@ -1076,6 +1091,8 @@ impl Drop for OsRxRing {
             }
             return;
         }
-        let _ = self.ring.submitter().unregister_buf_ring(BGID);
+        if self.registered {
+            let _ = self.ring.submitter().unregister_buf_ring(BGID);
+        }
     }
 }

@@ -455,6 +455,9 @@ impl RxRingOps for ScriptedRxRing {
     }
 
     fn arm(&mut self, user_data: UserData) -> Result<(), PushError> {
+        if self.arm.is_some() || user_data.index() != 0 {
+            return Err(PushError::KernelOwned);
+        }
         if self.unconsumed >= LOG {
             return Err(PushError::Full);
         }
@@ -465,6 +468,9 @@ impl RxRingOps for ScriptedRxRing {
     }
 
     fn push_cancel(&mut self, target: CancelTarget, user_data: UserData) -> Result<(), PushError> {
+        if user_data.index() == 0 {
+            return Err(PushError::OutOfRange);
+        }
         self.unconsumed = self.unconsumed.saturating_add(1);
         self.pushed.push(Pushed::Cancel { target, user_data });
         Ok(())
