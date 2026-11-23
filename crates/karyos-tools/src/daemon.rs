@@ -810,6 +810,8 @@ mod tests {
             copy_location: None,
             retention: None,
             time_evidence: false,
+            replications: Vec::new(),
+            trusted_network: false,
         });
         let daemon = Daemon::start(&options).unwrap();
         // The configured stream and the two control streams.
@@ -852,6 +854,8 @@ mod tests {
             copy_location: None,
             retention: None,
             time_evidence: false,
+            replications: Vec::new(),
+            trusted_network: false,
         });
         assert!(matches!(
             Daemon::start(&options),

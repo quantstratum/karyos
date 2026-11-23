@@ -1004,6 +1004,9 @@ enum Command {
     ),
     /// A replica's stop.
     StopReplication(crate::replication::StopReplication, Reply<()>),
+    /// Whether a replication with this `correlation_id` is still active
+    /// (ADR-0102 decision 3).
+    ReplicationActive(u64, Reply<bool>),
     /// A time evidence entry to record (karyos#1128).
     TimeEvidence(Box<crate::integrity::time_evidence::Entry>, Reply<u64>),
     /// The calibration source for groups' time evidence (karyos#1137).
@@ -1124,6 +1127,10 @@ impl core::fmt::Debug for Command {
                 .finish_non_exhaustive(),
             Self::Replicate(request, _, _) => f.debug_tuple("Replicate").field(request).finish(),
             Self::StopReplication(stop, _) => f.debug_tuple("StopReplication").field(stop).finish(),
+            Self::ReplicationActive(correlation_id, _) => f
+                .debug_tuple("ReplicationActive")
+                .field(correlation_id)
+                .finish(),
             Self::TimeEvidence(entry, _) => f.debug_tuple("TimeEvidence").field(entry).finish(),
             Self::CalibrationSource(source, _) => {
                 f.debug_tuple("CalibrationSource").field(source).finish()
@@ -1382,6 +1389,19 @@ impl ArchiveHandle {
         stop: crate::replication::StopReplication,
     ) -> Result<Posted<()>, AgentError> {
         self.post(|reply| Command::StopReplication(stop, reply))
+    }
+
+    /// Whether a replication with `correlation_id` is still active in the
+    /// agent, posted: answered from the agent's own state whatever the
+    /// response buffers hold, so a requester can confirm that a stopped
+    /// request is gone before it starts a replacement (ADR-0102 decision
+    /// 3).
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_replication_active(&self, correlation_id: u64) -> Result<Posted<bool>, AgentError> {
+        self.post(|reply| Command::ReplicationActive(correlation_id, reply))
     }
 
     /// Verifies `recording`'s seals (ADR-0088), posted.
@@ -3295,6 +3315,9 @@ where
                 (None, Some(active)) => replication.sender.stop(active.recorder.store(), sealed),
                 (None, None) => continue,
             };
+            // The stop drops the replication's pending output (ADR-0102
+            // decision 3): only the stopped status is left to hand over.
+            replication.queued.clear();
             replication.queued.push_back(status);
         }
     }
@@ -3771,6 +3794,12 @@ where
             Command::StopReplication(stop, reply) => {
                 self.stop_replication(stop);
                 let _ = reply.send(Ok(()));
+            }
+            Command::ReplicationActive(correlation_id, reply) => {
+                let active = self.replications.iter().any(|replication| {
+                    replication.sender.request().correlation_id == correlation_id
+                });
+                let _ = reply.send(Ok(active));
             }
             Command::TimeEvidence(entry, reply) => {
                 let _ = reply.send(self.record_time_evidence(&entry));

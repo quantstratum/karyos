@@ -147,6 +147,13 @@ Archive:
                                     Under same-uid admission every admitted client may
                                     control the Archive: the trust boundary is the daemon's
                                     uid. Per-client authorization comes with owner item 43.
+  --replicate <rec>,<host:port>,<stream>,<req>,<resp>[,on-demand]
+                                    push a recording to a replica (ADR-0102): its own
+                                    control pair <req>,<resp>, forwarded on a reliable UDP
+                                    stream; continuous unless on-demand; repeatable; needs
+                                    --replication-trusted-network and --network on
+  --replication-trusted-network     declare the replication network trusted: required for
+                                    --replicate while no authenticated profile is selected
   --archive-min-free <size>         refuse a recording while the archive's file system has
                                     less free space [1g]
   --archive-seal-interval <duration>
@@ -306,6 +313,24 @@ pub struct RecordOption {
     pub sync: karyos_archive::segment::SyncPolicy,
 }
 
+/// A replication this source pushes (`--replicate`, ADR-0102 decision 1):
+/// each one an explicit authorization by the source's operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicateOption {
+    /// The recording replicated.
+    pub recording_id: u64,
+    /// The replica's network endpoint.
+    pub endpoint: std::net::SocketAddr,
+    /// The forwarding stream's id.
+    pub stream_id: i32,
+    /// The replication's own control request stream's id.
+    pub requests: i32,
+    /// Its control response stream's id.
+    pub responses: i32,
+    /// Continuous or on demand.
+    pub mode: karyos_archive::replication::Mode,
+}
+
 /// The Archive agent's settings (`--archive`, `--archive-control`,
 /// `--record`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -345,6 +370,12 @@ pub struct ArchiveOptions {
     /// makes `<archive>/time-evidence/` before the agent starts. With a
     /// signer, the trust file needs its `time-journal` line.
     pub time_evidence: bool,
+    /// The replications this source pushes (`--replicate`; ADR-0102).
+    pub replications: Vec<ReplicateOption>,
+    /// The operator declares the replication network trusted
+    /// (`--replication-trusted-network`, ADR-0102 decision 10): without it
+    /// no replication starts.
+    pub trusted_network: bool,
 }
 
 /// The head signer of an Archive (`--archive-signer`,
@@ -561,6 +592,10 @@ where
             archive.time_evidence = true;
             continue;
         }
+        if text == "--replication-trusted-network" {
+            archive.trusted_network = true;
+            continue;
+        }
         let (name, inline) = match text.split_once('=') {
             Some((name, value)) if name.starts_with("--") => (name, Some(OsString::from(value))),
             _ => (text, None),
@@ -632,6 +667,9 @@ where
             }
             "--archive-control" => control(&value).map(|control| archive.control = Some(control)),
             "--record" => record(&value).map(|record| archive.records.push(record)),
+            "--replicate" => {
+                replicate(&value).map(|replicate| archive.replications.push(replicate))
+            }
             "--archive-min-free" => size(&value).map(|size| archive.min_free = Some(size)),
             "--archive-signer" => {
                 archive.signer = Some(PathBuf::from(&value));
@@ -676,6 +714,19 @@ where
     idle_image_timeout(&mut options)?;
     io_config(&mut options, schema, io).map_err(ArgsError::Config)?;
     options.archive = archive.finish()?;
+    // A replication forwards over UDP: refused with the network off,
+    // rather than started to fail forever.
+    if options
+        .archive
+        .as_ref()
+        .is_some_and(|archive| !archive.replications.is_empty())
+        && options.driver.network.is_none()
+    {
+        return Err(ArgsError::Needs {
+            option: "--replicate",
+            needs: "--network on",
+        });
+    }
     if sizing {
         return Ok(Command::SizingReport(Box::new(options)));
     }
@@ -808,6 +859,7 @@ const OPTIONS: &[&str] = &[
     "--archive",
     "--archive-control",
     "--record",
+    "--replicate",
     "--archive-min-free",
     "--archive-seal-interval",
     "--archive-anchor-interval",
@@ -1233,6 +1285,8 @@ struct Archive {
     purge: Option<karyos_archive::integrity::retention::PurgeMode>,
     min_copies: Option<std::num::NonZeroU32>,
     time_evidence: bool,
+    replications: Vec<ReplicateOption>,
+    trusted_network: bool,
 }
 
 impl Archive {
@@ -1259,6 +1313,8 @@ impl Archive {
                 (self.purge.is_some(), "--archive-purge"),
                 (self.min_copies.is_some(), "--archive-min-copies"),
                 (self.time_evidence, "--archive-time-evidence"),
+                (!self.replications.is_empty(), "--replicate"),
+                (self.trusted_network, "--replication-trusted-network"),
             ] {
                 if given {
                     return Err(ArgsError::Needs {
@@ -1269,6 +1325,14 @@ impl Archive {
             }
             return Ok(None);
         };
+        // Trust fails closed: no replication on a network nobody declared
+        // trusted (ADR-0102 decision 10).
+        if !self.replications.is_empty() && !self.trusted_network {
+            return Err(ArgsError::Needs {
+                option: "--replicate",
+                needs: "--replication-trusted-network",
+            });
+        }
         let (requests, responses, retention_responses) = self.control.ok_or(ArgsError::Needs {
             option: "--archive",
             needs: "--archive-control",
@@ -1326,6 +1390,8 @@ impl Archive {
             copy_location: self.copy_location,
             retention,
             time_evidence: self.time_evidence,
+            replications: self.replications,
+            trusted_network: self.trusted_network,
         }))
     }
 }
@@ -1396,6 +1462,36 @@ fn control(value: &str) -> Option<(i32, i32, Option<i32>)> {
         return None;
     }
     Some((requests, responses, state))
+}
+
+/// `<recording>,<host:port>,<stream>,<req>,<resp>[,on-demand]`: a
+/// replication, continuous unless `on-demand`; its four stream ids
+/// distinct.
+fn replicate(value: &str) -> Option<ReplicateOption> {
+    use karyos_archive::replication::Mode;
+
+    let mut parts = value.split(',');
+    let recording_id: u64 = parts.next()?.parse().ok().filter(|id| *id != 0)?;
+    let endpoint = parts.next()?.parse().ok()?;
+    let stream_id: i32 = parts.next()?.parse().ok()?;
+    let requests: i32 = parts.next()?.parse().ok()?;
+    let responses: i32 = parts.next()?.parse().ok()?;
+    let mode = match parts.next() {
+        None => Mode::Continuous,
+        Some("on-demand") => Mode::OnDemand,
+        Some(_) => return None,
+    };
+    if parts.next().is_some() || requests == responses {
+        return None;
+    }
+    Some(ReplicateOption {
+        recording_id,
+        endpoint,
+        stream_id,
+        requests,
+        responses,
+        mode,
+    })
 }
 
 /// `<stream_id>:<session_id>[:<sync>]`, the sync `none`, `segment` or a
@@ -1732,6 +1828,69 @@ mod tests {
         }
     }
 
+    /// ADR-0102: a replication is the operator's explicit triple, and
+    /// refused without `--replication-trusted-network`.
+    #[test]
+    fn a_replication_parses_and_fails_closed_without_a_trusted_network() {
+        use karyos_archive::replication::Mode;
+
+        let base = [
+            "--dir",
+            "/run/k",
+            "--archive",
+            "/var/archive",
+            "--archive-control",
+            "100,101",
+            "--archive-anchor-interval",
+            "3600s",
+            "--replicate",
+            "5,10.0.0.2:4000,40,110,111,on-demand",
+        ];
+        let mut trusted = base.to_vec();
+        trusted.push("--replication-trusted-network");
+        // With the network off, a replication is refused at configuration.
+        assert_eq!(
+            run(&trusted).unwrap_err(),
+            ArgsError::Needs {
+                option: "--replicate",
+                needs: "--network on",
+            }
+        );
+        trusted.extend(["--network", "on"]);
+        let archive = options(&trusted).archive.unwrap();
+        assert!(archive.trusted_network);
+        assert_eq!(
+            archive.replications,
+            vec![ReplicateOption {
+                recording_id: 5,
+                endpoint: "10.0.0.2:4000".parse().unwrap(),
+                stream_id: 40,
+                requests: 110,
+                responses: 111,
+                mode: Mode::OnDemand,
+            }]
+        );
+        let mut untrusted = base.to_vec();
+        untrusted.extend(["--network", "on"]);
+        assert_eq!(
+            run(&untrusted).unwrap_err(),
+            ArgsError::Needs {
+                option: "--replicate",
+                needs: "--replication-trusted-network",
+            }
+        );
+        for bad in [
+            "0,10.0.0.2:4000,40,110,111",
+            "5,nowhere,40,110,111",
+            "5,10.0.0.2:4000,40,110,110",
+            "5,10.0.0.2:4000,40,110,111,sometimes",
+        ] {
+            let mut args = trusted.clone();
+            args[9] = bad;
+            assert!(run(&args).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn errors_display_as_one_line() {
         for error in [
@@ -1800,6 +1959,8 @@ mod tests {
                 copy_location: None,
                 retention: None,
                 time_evidence: false,
+                replications: Vec::new(),
+                trusted_network: false,
             })
         );
         let guarded = options(&[

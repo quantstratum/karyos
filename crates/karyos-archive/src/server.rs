@@ -468,6 +468,12 @@ impl<H: ArchiveHost, Q: RequestSource, R: ResponseSink> ControlServer<H, Q, R> {
         &mut self.host
     }
 
+    /// The agent and the host, mutably, at once: for a host part that
+    /// posts to the agent while it drives the host (karyos#1113).
+    pub const fn agent_and_host_mut(&mut self) -> (&ArchiveHandle, &mut H) {
+        (&self.agent, &mut self.host)
+    }
+
     /// Answers and signals waiting for room on the response stream.
     #[must_use]
     pub fn pending(&self) -> usize {
