@@ -906,6 +906,7 @@ fn server_of(observation: &Observation) -> Option<NodeId> {
         | Observation::Released { node, .. }
         | Observation::Reply { node, .. }
         | Observation::Crashed { node }
+        | Observation::CorePanicked { node }
         | Observation::Recovered { node, .. }
         | Observation::Contract { node, .. }
         | Observation::Commit { node, .. }
