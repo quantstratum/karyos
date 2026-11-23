@@ -948,3 +948,429 @@ fn the_retention_backend_reaches_an_archive_over_its_control_streams() {
         RetentionReply::Refused { code: 4, .. }
     ));
 }
+
+/// karyos#967 (ADR-0101): the view shows the holds in force, each
+/// recording's earliest expiry and the floor, read from a running
+/// Archive (its control server and agent, over this driver) on the
+/// retention state stream the Archive's host names.
+#[test]
+fn the_view_shows_the_retention_state_of_a_running_archive() {
+    use karyos_agent::catalog::{ArchiveStreams, CatalogConfig};
+    use karyos_archive::agent::{AgentConfig as ArchiveConfig, ArchiveHandle, ReplaySink};
+    use karyos_archive::catalog::{Recording, SourceIncarnation, StreamFormat};
+    use karyos_archive::control::{self, ControlMessage};
+    use karyos_archive::disk::StdDisk;
+    use karyos_archive::integrity::retention::{PurgeMode, RetentionPolicy};
+    use karyos_archive::recorder::{FrameSource, Frames, SourceError};
+    use karyos_archive::server::{
+        ArchiveHost, ControlServer, HostRecording, HostRefusal, MAX_REQUEST, RequestSource,
+        ResponseSink,
+    };
+    use karyos_client::{ClientPublication, ClientSubscription, MessageLimit, OfferOutcome};
+    use karyos_driver::{LossPolicy, StreamConfig};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    const REQUESTS: i32 = 100;
+    const RESPONSES: i32 = 101;
+    const STATE: i32 = 77;
+
+    /// Two 96-byte frames, then sealed.
+    struct Sealed {
+        position: u64,
+        bytes: Option<Vec<u8>>,
+    }
+    impl FrameSource for Sealed {
+        fn position(&self) -> u64 {
+            self.position
+        }
+        fn read(&mut self, out: &mut [u8]) -> Result<Frames, SourceError> {
+            let Some(bytes) = self.bytes.take() else {
+                return Ok(Frames::Sealed { at: self.position });
+            };
+            let position = self.position;
+            out[..bytes.len()].copy_from_slice(&bytes);
+            self.position += bytes.len() as u64;
+            Ok(Frames::Copied {
+                position,
+                len: bytes.len(),
+                next: self.position,
+            })
+        }
+        fn consumed(&mut self, _position: u64) -> Result<(), SourceError> {
+            Ok(())
+        }
+        fn resume(&mut self, to: u64) -> Result<u64, SourceError> {
+            self.position = to;
+            Ok(to)
+        }
+    }
+    struct Published(ClientPublication<SharedTerms>);
+    impl ResponseSink for Published {
+        fn send(&mut self, message: &[u8]) -> bool {
+            matches!(self.0.offer(message), Ok(OfferOutcome::Accepted { .. }))
+        }
+    }
+    struct Read(ClientSubscription<SharedTerms>);
+    impl RequestSource for Read {
+        fn next(&mut self, out: &mut [u8]) -> Option<usize> {
+            let mut length = None;
+            let _ = self.0.poll(
+                |bytes, _| {
+                    out[..bytes.len()].copy_from_slice(bytes);
+                    length = Some(bytes.len());
+                },
+                MessageLimit::new(1),
+            );
+            length
+        }
+    }
+    /// The retention state stream, shared by its answers.
+    struct Shared(std::sync::Arc<Mutex<Published>>);
+    impl ResponseSink for Shared {
+        fn send(&mut self, message: &[u8]) -> bool {
+            self.0.lock().unwrap().send(message)
+        }
+    }
+    /// The Archive's host: sealed lanes, and the retention state stream.
+    struct Host(std::sync::Arc<Mutex<Published>>);
+    impl ArchiveHost for Host {
+        fn open_recording(
+            &mut self,
+            _request: &control::StartRecording<'_>,
+        ) -> Result<HostRecording, HostRefusal> {
+            let mut frames = Vec::new();
+            for _ in 0..2 {
+                let mut frame = vec![1u8; 96];
+                frame[..4].copy_from_slice(&96i32.to_le_bytes());
+                frames.extend_from_slice(&frame);
+            }
+            Ok(HostRecording::new(
+                Box::new(Sealed {
+                    position: 0,
+                    bytes: Some(frames),
+                }),
+                MIN_TERM_LENGTH,
+                StreamFormat {
+                    lane: Lane::ZERO,
+                    initial_term_id: 0,
+                    mtu: core::num::NonZeroU32::new(1408).unwrap(),
+                    source: SourceIncarnation {
+                        driver: [1, 2],
+                        registration: 3,
+                        incarnation: 1,
+                    },
+                },
+            ))
+        }
+        fn open_replay(
+            &mut self,
+            _request: &control::Replay<'_>,
+            _recording: &Recording,
+            _replay_id: u64,
+            _from: u64,
+            _to: u64,
+        ) -> Result<Box<dyn ReplaySink + Send>, HostRefusal> {
+            Err(HostRefusal("no replays here".to_owned()))
+        }
+        fn open_response(
+            &mut self,
+            stream_id: i32,
+            channel: &str,
+        ) -> Result<Box<dyn ResponseSink + Send>, HostRefusal> {
+            if stream_id == STATE && channel == "karyos:ipc" {
+                Ok(Box::new(Shared(std::sync::Arc::clone(&self.0))))
+            } else {
+                Err(HostRefusal("no such stream".to_owned()))
+            }
+        }
+        fn free_space(&self) -> (u64, u64) {
+            (1 << 30, 8 << 30)
+        }
+    }
+
+    let stream = |stream_id, publication| StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 8,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    };
+    let _serial = serial();
+    let dir = dir("retention-state");
+    let archive_dir = dir.with_extension("archive");
+    let _ = std::fs::remove_dir_all(&archive_dir);
+    std::fs::create_dir_all(&archive_dir).unwrap();
+    let mut driver = driver(&dir, DriverConfig::default(), 4);
+    let requests = driver
+        .add_stream(stream(
+            REQUESTS,
+            PublicationMode::Concurrent {
+                publishers: 3,
+                allow_non_lse: true,
+            },
+        ))
+        .unwrap();
+    let responses = driver
+        .add_stream(stream(RESPONSES, PublicationMode::Exclusive))
+        .unwrap();
+    let state = driver
+        .add_stream(stream(STATE, PublicationMode::Exclusive))
+        .unwrap();
+    let policy = RetentionPolicy {
+        policy: 1,
+        version: 2,
+        retain_for_ns: 1_000,
+        min_copies: core::num::NonZeroU32::MIN,
+        storage_tier: 0,
+        purge: PurgeMode::Manual,
+    };
+    let archive = ArchiveHandle::spawn(
+        StdDisk,
+        &archive_dir,
+        ArchiveConfig::default()
+            .with_seal_interval(Some(Duration::from_millis(1)))
+            .with_copy_location(Some([5u8; 32]))
+            .with_retention_policy(Some(policy)),
+    )
+    .unwrap();
+    let mut server = ControlServer::new(
+        archive,
+        Host(std::sync::Arc::new(Mutex::new(Published(
+            driver.publication(state).unwrap(),
+        )))),
+        Read(driver.subscribe(requests, Role::Required).unwrap()),
+        Published(driver.publication(responses).unwrap()),
+    );
+    // Two recordings, the first held: asked on the request stream.
+    let mut asking = driver.concurrent_publication(requests).unwrap();
+    let mut out = vec![0u8; MAX_REQUEST];
+    let mut ask = |message: &ControlMessage<'_>,
+                   driver: &mut IpcDriver,
+                   server: &mut ControlServer<Host, Read, Published>| {
+        let length = message.encode(&mut out).unwrap();
+        while !matches!(
+            asking.offer(&out[..length]),
+            Ok(karyos_client::ConcurrentOfferOutcome::Accepted { .. })
+        ) {
+            let _ = driver.do_work().unwrap();
+            server.duty();
+        }
+        for _ in 0..500 {
+            let _ = driver.do_work().unwrap();
+            server.duty();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    for correlation_id in [1, 2] {
+        ask(
+            &ControlMessage::StartRecording(control::StartRecording {
+                correlation_id,
+                stream_id: 9,
+                session_id: 1,
+                mode: karyos_archive::recorder::Mode::Required,
+                sync_policy: karyos_archive::segment::SyncPolicy::PerSegment,
+                segment_length: 0,
+                channel: "karyos:ipc",
+            }),
+            &mut driver,
+            &mut server,
+        );
+    }
+    ask(
+        &ControlMessage::HoldRecording(control::HoldRecording {
+            correlation_id: 3,
+            recording_id: 1,
+        }),
+        &mut driver,
+        &mut server,
+    );
+    let agent = Agent::new(
+        AgentConfig::new(vec![dir.clone()]).with_archive(
+            dir.clone(),
+            CatalogConfig::new(ArchiveStreams::new(REQUESTS, RESPONSES).with_retention(STATE))
+                .with_timing(
+                    Duration::from_secs(2),
+                    Duration::from_secs(5),
+                    Duration::from_millis(50),
+                ),
+        ),
+    );
+    let start = Instant::now();
+    let retention = loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            agent.view().drivers[0].catalog
+        );
+        let _ = driver.do_work().unwrap();
+        server.duty();
+        if let Some(retention) = agent.view().drivers[0]
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.retention.clone())
+            .filter(|retention| retention.read_at.is_some())
+        {
+            break retention;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let holds: Vec<(u64, &str)> = retention
+        .recordings
+        .iter()
+        .map(|recording| (recording.recording_id, recording.hold))
+        .collect();
+    assert_eq!(holds, [(1, "held"), (2, "none")], "{retention:?}");
+    for recording in &retention.recordings {
+        let close = recording.close_time_ns.unwrap();
+        assert_eq!(recording.earliest_expiry_ns, Some(close + 1_000));
+        assert_eq!(recording.policy, Some((1, 2)));
+    }
+    assert_eq!(
+        (retention.min_free_bytes, retention.free_bytes),
+        (1 << 30, Some(8 << 30))
+    );
+    assert_eq!(retention.last_error, None);
+    drop(agent);
+    server.shutdown().unwrap();
+    let _ = std::fs::remove_dir_all(&archive_dir);
+}
+
+/// ADR-0101 and the Codex review of #1177: a version 1 Archive's host has
+/// no retention state stream, so the agent cannot subscribe to it; it asks
+/// all the same over its lister's handles, the Archive answers the
+/// version 2 query with code 5, and the view says the retention state is
+/// unsupported by this Archive, not a stream error.
+#[test]
+fn a_version_1_archive_shows_its_retention_state_unsupported() {
+    use karyos_agent::catalog::{ArchiveStreams, CatalogConfig};
+    use karyos_archive::control::{ControlMessage, ControlResponse, ResponseCode};
+    use karyos_archive::server::MAX_ANSWER;
+    use karyos_client::{MessageLimit, OfferOutcome};
+    use karyos_driver::{LossPolicy, StreamConfig};
+    use karyos_sys::frame::Lane;
+    use karyos_sys::log_buffer::{LogBufferConfig, PublicationMode, Role};
+    use karyos_sys::sizing::{DEFAULT_MTU, MIN_TERM_LENGTH, TermLength};
+    use karyos_sys::term::TermId;
+
+    const REQUESTS: i32 = 100;
+    const RESPONSES: i32 = 101;
+    let stream = |stream_id, publication| StreamConfig {
+        buffer: LogBufferConfig {
+            term_length: TermLength::try_new(MIN_TERM_LENGTH).unwrap(),
+            spare_slots: 6,
+            max_subscribers: 4,
+            mtu: DEFAULT_MTU,
+            max_reserved: MIN_TERM_LENGTH / 8,
+            initial_term_id: TermId::new(7),
+            lane: Lane::ZERO,
+            session_id: 1,
+            stream_id,
+            claim_deadline: karyos_sys::log_buffer::DEFAULT_CLAIM_DEADLINE,
+            publication,
+            schedule_capacity: 0,
+        },
+        allow_unconnected: true,
+        on_required_loss: LossPolicy::Hold,
+        conflation: None,
+    };
+    let _serial = serial();
+    let dir = dir("retention-v1");
+    let mut driver = driver(&dir, DriverConfig::default(), 4);
+    // Only the two control streams: a version 1 host has no state stream.
+    let requests = driver
+        .add_stream(stream(
+            REQUESTS,
+            PublicationMode::Concurrent {
+                publishers: 2,
+                allow_non_lse: true,
+            },
+        ))
+        .unwrap();
+    let responses = driver
+        .add_stream(stream(RESPONSES, PublicationMode::Exclusive))
+        .unwrap();
+    let mut reading = driver.subscribe(requests, Role::Optional).unwrap();
+    let mut answering = driver.publication(responses).unwrap();
+    let agent = Agent::new(
+        AgentConfig::new(vec![dir.clone()]).with_archive(
+            dir.clone(),
+            CatalogConfig::new(ArchiveStreams::new(REQUESTS, RESPONSES).with_retention(77))
+                .with_timing(
+                    Duration::from_secs(2),
+                    Duration::from_secs(5),
+                    Duration::from_millis(50),
+                ),
+        ),
+    );
+    let mut out = vec![0u8; MAX_ANSWER];
+    let start = Instant::now();
+    let retention = loop {
+        assert!(start.elapsed() < Duration::from_secs(30), "no answer");
+        let _ = driver.do_work().unwrap();
+        // The version 1 Archive: an empty catalog, and code 5, with the
+        // request's correlation id (bytes 12 to 19), for anything else.
+        let mut asked = Vec::new();
+        let _ = reading.poll(
+            |bytes, _| {
+                let correlation_id = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
+                let listing = matches!(
+                    ControlMessage::decode(bytes),
+                    Ok(ControlMessage::ListRecordings(_))
+                ) && bytes[4] == 1;
+                asked.push((correlation_id, listing));
+            },
+            MessageLimit::new(8),
+        );
+        for (correlation_id, listing) in asked {
+            let (code, message) = if listing {
+                (ResponseCode::Ok, "")
+            } else {
+                (ResponseCode::UnsupportedSchema, "unsupported")
+            };
+            let length = ControlMessage::ControlResponse(ControlResponse {
+                correlation_id,
+                id: 0,
+                code,
+                message,
+            })
+            .encode(&mut out)
+            .unwrap();
+            while !matches!(
+                answering.offer(&out[..length]),
+                Ok(OfferOutcome::Accepted { .. })
+            ) {
+                let _ = driver.do_work().unwrap();
+            }
+        }
+        if let Some(retention) = agent.view().drivers[0]
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.retention.clone())
+        {
+            break retention;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(
+        retention.last_error.as_deref(),
+        Some("retention state unsupported by this Archive"),
+        "{retention:?}"
+    );
+    assert!(retention.recordings.is_empty());
+    drop(agent);
+}

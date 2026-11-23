@@ -9,7 +9,7 @@ use std::time::Duration;
 pub const USAGE: &str = "\
 usage: karyos-agent --api-dir DIR --driver DIR [--driver DIR]... \
 --role UID=ROLE [--role UID=ROLE]... [--refresh-ms MS] [--lag-bytes N] \
-[--lag-refreshes N] [--loss-quiet N] [--archive DIR=REQ,RESP]... \
+[--lag-refreshes N] [--loss-quiet N] [--archive DIR=REQ,RESP[,STATE]]... \
 [--journal DIR] [--agent-id NAME] [--relay UID=ID]... \
 [--principal NAME=OPERATOR:ROLE]... [--relay-group GID] [--stop-timeout-ms MS]
 
@@ -192,17 +192,29 @@ pub fn parse(args: &[String]) -> Option<Args> {
             }
             "--archive" => {
                 let (dir, streams) = value.split_once('=')?;
-                let (requests, responses) = streams.split_once(',')?;
-                let (requests, responses) = (requests.parse().ok()?, responses.parse().ok()?);
+                let mut ids = streams.split(',');
+                let requests: i32 = ids.next()?.parse().ok()?;
+                let responses: i32 = ids.next()?.parse().ok()?;
+                // The third, the retention state answer stream (ADR-0101),
+                // is optional, as on karyosd's --archive-control.
+                let retention = match ids.next() {
+                    None => None,
+                    Some(id) => Some(id.parse::<i32>().ok()?),
+                };
                 let dir = PathBuf::from(dir);
-                // One Archive per driver, on two distinct streams.
-                if requests == responses || archives.iter().any(|(taken, _)| *taken == dir) {
+                // One Archive per driver, on distinct streams.
+                if ids.next().is_some()
+                    || requests == responses
+                    || retention.is_some_and(|id| id == requests || id == responses)
+                    || archives.iter().any(|(taken, _)| *taken == dir)
+                {
                     return None;
                 }
-                archives.push((
-                    dir,
-                    crate::catalog::ArchiveStreams::new(requests, responses),
-                ));
+                let mut streams = crate::catalog::ArchiveStreams::new(requests, responses);
+                if let Some(id) = retention {
+                    streams = streams.with_retention(id);
+                }
+                archives.push((dir, streams));
             }
             _ => return None,
         }

@@ -121,6 +121,7 @@ fn view() -> AgentView {
             listings: 3,
             failures: 1,
             last_error: None,
+            retention: None,
         }),
         attachment: crate::api::Attachment::default(),
     };

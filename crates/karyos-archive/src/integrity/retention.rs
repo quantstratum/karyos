@@ -1124,6 +1124,32 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         replayed
     }
 
+    /// Whether the hold state could be read since the engine started:
+    /// while it could not, every hold is unknown and every purge refused
+    /// (`holds_unknown`). Read only (ADR-0101).
+    #[must_use]
+    pub const fn holds_known(&self) -> bool {
+        !self.holds_unknown
+    }
+
+    /// `recording`'s hold as a retention state query reports it
+    /// (ADR-0101): unknown while the hold state is; pending for a hold in
+    /// force without evidence, an evidenced hold whose release the journal
+    /// holds but whose resolving marker is not written yet included; held
+    /// with evidence; else none. Read only.
+    #[must_use]
+    pub fn hold_state(&self, recording: u64) -> crate::control::HoldState {
+        use crate::control::HoldState;
+        if self.holds_unknown {
+            return HoldState::Unknown;
+        }
+        match self.holds.get(&recording) {
+            None => HoldState::None,
+            Some(Hold::Pending) => HoldState::Pending,
+            Some(Hold::Applied { .. }) => HoldState::Held,
+        }
+    }
+
     /// The hold on `recording`.
     #[must_use]
     pub fn hold(&self, recording: u64) -> Option<Hold> {

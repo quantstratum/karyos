@@ -135,9 +135,11 @@ Streams:
 
 Archive:
   --archive <path>                  run the Archive agent, its catalog in this directory
-  --archive-control <req>,<resp>    the Archive's request and response stream ids, which the
+  --archive-control <req>,<resp>[,<state>]
+                                    the Archive's request and response stream ids, which the
                                     daemon adds (the request stream concurrent); required
-                                    with --archive
+                                    with --archive. <state>, when given, is the stream the
+                                    Archive answers retention state queries on (ADR-0101)
   --record <stream_id>:<session_id>[:<sync>]
                                     start recording a configured stream at boot, through the
                                     control path; sync is none, segment or a duration
@@ -314,6 +316,9 @@ pub struct ArchiveOptions {
     pub requests: i32,
     /// The control response stream's id.
     pub responses: i32,
+    /// The stream retention state queries are answered on (ADR-0101),
+    /// when configured: without it they are refused, code 1.
+    pub retention_responses: Option<i32>,
     /// The recordings started at boot, in command-line order.
     pub records: Vec<RecordOption>,
     /// The free bytes of the archive's file system below which a
@@ -1215,7 +1220,7 @@ fn stream(value: &str) -> Option<StreamOption> {
 #[derive(Debug, Default)]
 struct Archive {
     dir: Option<PathBuf>,
-    control: Option<(i32, i32)>,
+    control: Option<(i32, i32, Option<i32>)>,
     records: Vec<RecordOption>,
     min_free: Option<u64>,
     seal_interval: Option<Duration>,
@@ -1264,7 +1269,7 @@ impl Archive {
             }
             return Ok(None);
         };
-        let (requests, responses) = self.control.ok_or(ArgsError::Needs {
+        let (requests, responses, retention_responses) = self.control.ok_or(ArgsError::Needs {
             option: "--archive",
             needs: "--archive-control",
         })?;
@@ -1312,6 +1317,7 @@ impl Archive {
             dir,
             requests,
             responses,
+            retention_responses,
             records: self.records,
             min_free: self.min_free.unwrap_or(DEFAULT_ARCHIVE_MIN_FREE),
             seal_interval: self.seal_interval.unwrap_or(DEFAULT_ARCHIVE_SEAL_INTERVAL),
@@ -1373,11 +1379,23 @@ fn retention(
     }
 }
 
-/// `<req>,<resp>`: two distinct stream ids.
-fn control(value: &str) -> Option<(i32, i32)> {
-    let (requests, responses) = value.split_once(',')?;
-    let (requests, responses) = (requests.parse().ok()?, responses.parse().ok()?);
-    (requests != responses).then_some((requests, responses))
+/// `<req>,<resp>[,<state>]`: two or three distinct stream ids, the third
+/// the retention state answer stream (ADR-0101).
+fn control(value: &str) -> Option<(i32, i32, Option<i32>)> {
+    let mut ids = value.split(',');
+    let requests: i32 = ids.next()?.parse().ok()?;
+    let responses: i32 = ids.next()?.parse().ok()?;
+    let state = match ids.next() {
+        None => None,
+        Some(state) => Some(state.parse::<i32>().ok()?),
+    };
+    if ids.next().is_some()
+        || requests == responses
+        || state.is_some_and(|state| state == requests || state == responses)
+    {
+        return None;
+    }
+    Some((requests, responses, state))
 }
 
 /// `<stream_id>:<session_id>[:<sync>]`, the sync `none`, `segment` or a
@@ -1762,6 +1780,7 @@ mod tests {
                 dir: PathBuf::from("/var/archive"),
                 requests: 100,
                 responses: 101,
+                retention_responses: None,
                 records: vec![
                     record(7, 1, SyncPolicy::PerSegment),
                     record(8, 2, SyncPolicy::None),
@@ -1954,6 +1973,16 @@ mod tests {
         ));
     }
 
+    /// `--archive-control`'s third id, the retention state stream
+    /// (ADR-0101), is optional and distinct from the other two.
+    #[test]
+    fn the_archive_control_takes_a_retention_state_stream() {
+        assert_eq!(control("1,2"), Some((1, 2, None)));
+        assert_eq!(control("1,2,3"), Some((1, 2, Some(3))));
+        assert_eq!(control("1,2,-3"), Some((1, 2, Some(-3))));
+        assert_eq!(control("1,2,2"), None);
+    }
+
     /// The Archive's options need each other, and their values are checked.
     #[test]
     fn the_archive_options_are_checked() {
@@ -1987,6 +2016,10 @@ mod tests {
             ("--archive-control", "1"),
             ("--archive-control", "1,1"),
             ("--archive-control", "1,x"),
+            ("--archive-control", "1,2,1"),
+            ("--archive-control", "1,2,2"),
+            ("--archive-control", "1,2,3,4"),
+            ("--archive-control", "1,2,x"),
             ("--record", "1"),
             ("--record", "1:x"),
             ("--record", "1:2:sometimes"),

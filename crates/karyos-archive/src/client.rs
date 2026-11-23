@@ -55,6 +55,7 @@ pub mod connection;
 pub mod list;
 pub mod replay;
 pub mod retention;
+pub mod retention_state;
 
 #[cfg(test)]
 mod tests;
