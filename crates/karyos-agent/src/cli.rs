@@ -353,7 +353,8 @@ visible ASCII, the file mode 0600; a symlink is followed, as a Kubernetes
 secret mount is one), against the other processes of the pod's network
 namespace; only /metrics needs it. --agent-id names the exporter in its
 karyos_exporter_info (1 to 64 bytes of A-Z a-z 0-9 . _ : / -). It takes
-one of each driver's tool slots (max_tools) while attached. No OTLP.
+one of each driver's tool slots (max_tools) while attached. OTLP export
+of the same metrics is karyos-exporter-otlp, a separate binary.
 Linux only.
 ";
 
