@@ -227,6 +227,8 @@ struct Responses {
     keep: Arc<std::sync::atomic::AtomicBool>,
     /// Replication messages sent while not kept.
     counted: Arc<AtomicUsize>,
+    /// `RecordingBytes` among them.
+    chunks: Arc<AtomicUsize>,
 }
 
 impl ResponseSink for Responses {
@@ -247,6 +249,10 @@ impl ResponseSink for Responses {
             self.sent.lock().unwrap().push(message.to_vec());
         } else if replication {
             self.counted.fetch_add(1, Ordering::AcqRel);
+            // Template 101, `RecordingBytes`, at bytes 2 to 4.
+            if message.get(2..4) == Some(&101u16.to_le_bytes()[..]) {
+                self.chunks.fetch_add(1, Ordering::AcqRel);
+            }
         }
         true
     }
@@ -286,6 +292,7 @@ impl Rig {
             max: Arc::new(AtomicUsize::new(usize::MAX)),
             keep: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             counted: Arc::default(),
+            chunks: Arc::default(),
         };
         let server = ControlServer::new(agent, host, requests.clone(), responses.clone())
             .with_config(config);
@@ -1456,13 +1463,26 @@ fn forwarding_a_steady_replication_allocates_nothing() {
     rig.responses.keep.store(false, Ordering::Release);
     rig.raw(out);
     // Two messages a duty: the replication runs over many duties, at the
-    // sink's pace. Warm up: the spare buffers and the batch reach size.
-    for _ in 0..20 {
+    // sink's pace. Warm up, bounded in time: a full pending batch, then
+    // flushed outside the measurement, so the spare buffers and the batch
+    // have reached their size before it starts.
+    rig.responses.room.store(0, Ordering::Release);
+    let warm = std::time::Instant::now();
+    while rig.server.pending() < super::REPLICATION_FORWARD {
+        assert!(warm.elapsed() < Duration::from_secs(30), "no full batch");
+        rig.server.duty();
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    rig.responses
+        .room
+        .store(super::REPLICATION_FORWARD, Ordering::Release);
+    rig.server.duty();
+    for _ in 0..10 {
         rig.responses.room.store(2, Ordering::Release);
         rig.server.duty();
         std::thread::sleep(Duration::from_micros(200));
     }
-    let before = rig.responses.counted.load(Ordering::Acquire);
+    let before = rig.responses.chunks.load(Ordering::Acquire);
     let mut allocations = 0;
     for _ in 0..60 {
         rig.responses.room.store(2, Ordering::Release);
@@ -1472,7 +1492,11 @@ fn forwarding_a_steady_replication_allocates_nothing() {
         allocations += made;
         std::thread::sleep(Duration::from_micros(200));
     }
-    let forwarded = rig.responses.counted.load(Ordering::Acquire) - before;
-    assert!(forwarded > 0, "the replication was still running");
-    assert_eq!(allocations, 0, "forwarded {forwarded} messages");
+    let forwarded = rig.responses.chunks.load(Ordering::Acquire) - before;
+    assert!(
+        forwarded > 0,
+        "recording bytes went on during the measurement"
+    );
+    assert_eq!(allocations, 0, "forwarded {forwarded} chunks");
+    rig.finish();
 }
