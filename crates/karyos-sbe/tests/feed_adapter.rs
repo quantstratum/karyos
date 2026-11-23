@@ -156,7 +156,9 @@ fn record(seen: &mut Vec<Seen>) -> impl FnMut(SbeEvent<'_>) + '_ {
             header,
             frame,
         } => {
-            assert_eq!(header.schema_id, CAR_SCHEMA_ID);
+            // The header is packed: its field is copied out, not borrowed.
+            let schema_id = header.schema_id;
+            assert_eq!(schema_id, CAR_SCHEMA_ID);
             let car = decode_car(frame).unwrap();
             assert_eq!(car.serial_number(), identity.sequence);
             seen.push(Seen::Message(line, identity.sequence));
