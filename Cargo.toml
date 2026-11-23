@@ -63,7 +63,7 @@ publish = false
 karyos-sys = { path = "crates/karyos-sys", version = "0.1.0-alpha.4" }
 karyos-io = { path = "crates/karyos-io", version = "0.1.0-alpha.4" }
 karyos-protocol = { path = "crates/karyos-protocol", version = "0.1.0-alpha.4" }
-karyos-codec = { path = "crates/karyos-codec", version = "0.1.0-alpha.4" }
+karyos-codec = { path = "crates/karyos-codec", version = "=0.1.0-alpha.4" }
 karyos-codec-derive = { path = "crates/karyos-codec-derive", version = "=0.1.0-alpha.4" }
 karyos-client = { path = "crates/karyos-client", version = "0.1.0-alpha.4" }
 karyos-driver = { path = "crates/karyos-driver", version = "0.1.0-alpha.4" }

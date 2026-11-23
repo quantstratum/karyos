@@ -200,7 +200,7 @@ answered by the owner on 2026-11-17, when 0.1.0-alpha.3 was published
 
 | Point | Answer (2026-11-17) |
 | --- | --- |
-| Which crates, in which order | The facade and everything it depends on, in dependency order: `karyos-sys`, `karyos-protocol`, `karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`, `karyos-cluster`, `karyos`; and, from the alpha after 0.1.0-alpha.3, `karyos-trace` after `karyos-protocol` (its one Karyos dependency) for karyos-insights (ADR-0068, INS-Q4; karyos#997); and, from 0.1.0-alpha.4, `karyos-codec-derive` after `karyos-codec` and before `karyos-archive`, which depends on it since karyos#661 (owner decision 2026-11-23, karyos#1206; ADR-0108), required at the exact workspace version (`=0.1.0-alpha.N` in the workspace `Cargo.toml`) so a proc macro of one alpha never expands into another's crates. Every other crate keeps `publish = false` |
+| Which crates, in which order | The facade and everything it depends on, in dependency order: `karyos-sys`, `karyos-protocol`, `karyos-codec`, `karyos-client`, `karyos-io`, `karyos-archive`, `karyos-cluster`, `karyos`; and, from the alpha after 0.1.0-alpha.3, `karyos-trace` after `karyos-protocol` (its one Karyos dependency) for karyos-insights (ADR-0068, INS-Q4; karyos#997); and, from 0.1.0-alpha.4, `karyos-codec-derive` after `karyos-codec` and before `karyos-archive`, which depends on it since karyos#661 (owner decision 2026-11-23, karyos#1206; ADR-0108), required, with `karyos-codec`, at the exact workspace version (`=0.1.0-alpha.N` in the workspace `Cargo.toml`) so a registry build never mixes a derive of one alpha with the codec runtime of another. Every other crate keeps `publish = false` |
 | Version scheme | `0.1.0-alpha.N`, the workspace version, the same for every published crate |
 | Ownership | The owner's crates.io account |
 | Gate that authorised 0.1.0-alpha.3 | For alpha.3 only, a written exception: `CHANGELOG_RELEASE=1 make pre-push` run locally at the release head, plus `cargo publish --dry-run`, while hosted CI was off (karyos#623). Later releases run the full release gates of this file or record their own written exception |
@@ -225,6 +225,11 @@ answered by the owner on 2026-11-17, when 0.1.0-alpha.3 was published
    packaged sources, so it checks the new versions before any is on the
    index; a separate dry run per crate cannot, because a dependant's new
    dependency version is not published yet.
+   Then check the packaged requirements of the codec pair: in every
+   packaged manifest that names them,
+   `tar -xzOf target/package/<crate>-<version>.crate <crate>-<version>/Cargo.toml`
+   requires `karyos-codec` and `karyos-codec-derive` as `=<version>`
+   (ADR-0108). Any other requirement blocks the upload.
 5. Tag the release, then `cargo publish --locked -p <crate>` in the order
    above. Before publishing the next crate, wait until the previous one
    is in the index: `cargo info <crate>@<version>` (or
