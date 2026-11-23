@@ -13,11 +13,22 @@ publish.workspace = true
 # The SBE adapters plug into the feed's A/B arbitration (SPEC §7.2, §10.1):
 # `karyos-sbe` depends on `karyos-feed`, never the reverse, which
 # `make sbe-graph-check` enforces (karyos#631). The IronSBE crates admitted
-# by quantstratum-docs karyos/reviews/dependency-admission-ironsbe.md enter
-# with their first use (karyos#646), pinned `=0.8.0`, `ironsbe-codegen` as a
-# build dependency only.
+# by quantstratum-docs karyos/reviews/dependency-admission-ironsbe.md are
+# pinned exactly (`=0.9.1`, the record's condition 1), `ironsbe-codegen` as a
+# build dependency only (karyos#646). `ironsbe-schema` is not taken: only the
+# generator reads the schemas, at build time, and it brings the parser
+# itself.
 [dependencies]
 karyos-feed = { path = "../karyos-feed" }
+ironsbe-core = "=0.9.1"
+thiserror.workspace = true
+
+[build-dependencies]
+ironsbe-codegen = "=0.9.1"
+
+[dev-dependencies]
+karyos-sys = { workspace = true, features = ["alloc-count"] }
+proptest.workspace = true
 
 [lints]
 workspace = true
