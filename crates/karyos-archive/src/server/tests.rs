@@ -1684,11 +1684,14 @@ fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
     for index in 0..RECORDINGS {
         rig.request(&start(index as u64 + 1));
     }
-    for _ in 0..120_000 {
+    // Their signals come from the Archive's agent thread, which a loaded
+    // host slows: wait on the signals themselves, bounded by a deadline
+    // far above any load seen, not by a count of duties (karyos#967).
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    while rig.responses.sent.lock().unwrap().len() < 3 * RECORDINGS
+        && std::time::Instant::now() < deadline
+    {
         rig.server.duty();
-        if rig.responses.sent.lock().unwrap().len() >= 3 * RECORDINGS {
-            break;
-        }
         std::thread::sleep(Duration::from_micros(200));
     }
     let before = rig.responses.sent.lock().unwrap().len();
@@ -1720,7 +1723,7 @@ fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
     let mut page = None;
     let mut started = None;
     let begun = std::time::Instant::now();
-    while (page.is_none() || started.is_none()) && begun.elapsed() < Duration::from_secs(30) {
+    while (page.is_none() || started.is_none()) && begun.elapsed() < Duration::from_secs(120) {
         rig.server.duty();
         if page.is_none() {
             match ask(&mut agent) {
@@ -1748,11 +1751,9 @@ fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
     assert!(took < ReplayerConfig::new(0x5250).deadline, "{took:?}");
     // The replay finishes into its target.
     let replayed = Arc::clone(&rig.server.host().replays[0].1);
-    for _ in 0..5000 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while replayed.lock().unwrap().finished.is_none() && std::time::Instant::now() < deadline {
         rig.server.duty();
-        if replayed.lock().unwrap().finished.is_some() {
-            break;
-        }
         std::thread::sleep(Duration::from_millis(1));
     }
     let finished = replayed.lock().unwrap().finished;

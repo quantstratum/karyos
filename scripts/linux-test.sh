@@ -37,10 +37,12 @@ name_args=()
 if [ -n "${KARYOS_LINUX_NAME:-}" ]; then
     name_args=(--name "$KARYOS_LINUX_NAME")
 fi
-# The simulator's seed selection, and KARYOS_URING_REQUIRED (the io_uring
-# tests fail instead of skipping where io_uring is denied), pass through.
+# The simulator's seed selection, KARYOS_URING_REQUIRED (the io_uring
+# tests fail instead of skipping where io_uring is denied),
+# KARYOS_URING_EXPECT_DENIED and KARYOS_XDP_REQUIRED (the XDP load test
+# fails instead of skipping) pass through to the container.
 env_args=()
-for name in KARYOS_SIM_SEED KARYOS_SIM_SEEDS KARYOS_URING_REQUIRED; do
+for name in KARYOS_SIM_SEED KARYOS_SIM_SEEDS KARYOS_URING_REQUIRED KARYOS_URING_EXPECT_DENIED KARYOS_XDP_REQUIRED; do
     if [ -n "${!name+set}" ]; then
         env_args+=(-e "$name=${!name}")
     fi

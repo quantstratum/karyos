@@ -1967,17 +1967,19 @@ mod groups {
             // The test never opens it before: an open of its own would
             // take the lock and make the agent's open fail. The agent
             // creates the file and locks it at once, so once the file
-            // exists a single open must see `Locked`.
+            // exists a single open must see `Locked`. Under load the
+            // file can exist a moment before its lock: wait, by deadline,
+            // for the agent's first record, which it writes only holding
+            // the lock.
             let journal_file = groups.join(crate::integrity::journal::JOURNAL_FILE);
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while !journal_file.exists() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            while std::fs::metadata(&journal_file).map_or(0, |metadata| metadata.len()) == 0 {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "round {round}: the agent never opened the journal"
+                    "round {round}: the agent never sealed into the journal"
                 );
                 std::thread::sleep(Duration::from_micros(200));
             }
-            std::thread::sleep(Duration::from_millis(1));
             match IntegrityJournal::open(StdDisk, &groups) {
                 Err(crate::integrity::journal::IntegrityError::Locked) => {}
                 other => panic!("round {round}: the agent does not hold the lock: {other:?}"),
@@ -5677,6 +5679,68 @@ fn a_stopped_recording_replicates_on_demand() {
     let last = last.unwrap();
     assert!(matches!(last.state, State::CaughtUp | State::Ended));
     assert_eq!(last.sealed_end, sealed_to);
+    agent.shutdown().unwrap();
+}
+
+/// ADR-0102 decision 3: a stop drops the replication's pending output,
+/// its last status is `stopped`, and the agent's own answer says when
+/// the request is gone, whatever the channel holds.
+#[test]
+fn a_stopped_replication_drops_its_output_and_reports_itself_gone() {
+    use crate::replication::transport::Outgoing;
+    use crate::replication::{ReplicateRecording, State, StopReplication};
+    let dir = temp_dir("replicate-stop");
+    let agent = ArchiveHandle::spawn(StdDisk, &dir, sealing()).unwrap();
+    // A recording that keeps recording: its replication never ends on
+    // its own.
+    let released = Arc::new(std::sync::atomic::AtomicUsize::new(4));
+    let id = agent
+        .start(StartRecording {
+            stream_id: 10,
+            session_id: 3,
+            channel: b"karyos:ipc".to_vec(),
+            geometry: Geometry::new(4096, 8192).unwrap(),
+            policy: SyncPolicy::Every {
+                interval_ns: 1_000_000,
+            },
+            mode: Mode::Required,
+            format: format(),
+            source: Box::new(Paced {
+                position: 0,
+                next: 0,
+                released: Arc::clone(&released),
+            }),
+            origin: RecordedFrom::Local,
+        })
+        .unwrap();
+    let request = ReplicateRecording {
+        correlation_id: 9,
+        recording_id: id,
+        from: 0,
+        until: u64::MAX,
+        mode: crate::replication::Mode::Continuous,
+    };
+    assert!(!answer(agent.post_replication_active(9)).unwrap());
+    let messages = answer(agent.post_replicate(request, 1)).unwrap();
+    assert!(answer(agent.post_replication_active(9)).unwrap());
+    assert!(!answer(agent.post_replication_active(10)).unwrap());
+    answer(agent.post_stop_replication(StopReplication {
+        correlation_id: 9,
+        recording_id: id,
+    }))
+    .unwrap();
+    let mut last = None;
+    while let Ok(message) = messages.recv_timeout(Duration::from_secs(5)) {
+        if let Outgoing::Status(status) = message {
+            last = Some(status.state);
+        }
+    }
+    assert_eq!(last, Some(State::Stopped));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while answer(agent.post_replication_active(9)).unwrap() {
+        assert!(std::time::Instant::now() < deadline, "still active");
+        std::thread::sleep(Duration::from_millis(5));
+    }
     agent.shutdown().unwrap();
 }
 

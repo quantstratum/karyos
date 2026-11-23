@@ -26,3 +26,5 @@ pub mod lanes;
 pub mod sockets;
 #[cfg(any(feature = "uring", feature = "test-hooks", test))]
 pub mod uring;
+#[cfg(any(feature = "xdp", test))]
+pub mod xdp;

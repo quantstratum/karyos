@@ -60,6 +60,16 @@
 //!   segment is missing, or past the written position, is refused, never
 //!   skipped. A floor's temporary file left by a crash is removed at
 //!   recovery.
+//! - **Offload.** Tiering (ADR-0104) removes whole segments from the
+//!   start, oldest first, after their remote copies verify.
+//!   [`SegmentStore::raise_start_for_offload`] moves the start past the
+//!   lowest segment exactly as a purge publishes its floor, and the floor
+//!   record then also keeps the offload floor: the start before the first
+//!   offload, the lowest position the recording still retains, locally or
+//!   remotely. That second position is a cache of the integrity journal's
+//!   offload records, which win over it. A floor record with an offload
+//!   floor is 36 bytes with its own magic, "KYSO"; an older build refuses
+//!   it as damaged, as it refuses the journal's offload records.
 //! - **Headers.** Only the last segment can be one being created, and
 //!   recovery removes it: its index header is missing, short or zeroed, or
 //!   torn (failing its CRC) with no data and no entry behind it; or its
@@ -119,6 +129,24 @@ const FLOOR_MAGIC: [u8; 4] = *b"KYSF";
 /// The floor record: magic, reserved, recording, the floor (the
 /// recording's start), CRC-32C of the first 24 bytes.
 const FLOOR_LEN: usize = 28;
+/// "KYSO", the magic of a floor record with an offload floor (ADR-0104).
+const OFFLOAD_FLOOR_MAGIC: [u8; 4] = *b"KYSO";
+/// The floor record with an offload floor: magic, reserved, recording, the
+/// start, the offload floor, CRC-32C of the first 32 bytes.
+const OFFLOAD_FLOOR_LEN: usize = 36;
+
+/// A recording's floor record: its start, and the lowest position it
+/// retains when segments below the start are offloaded (ADR-0104).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Floor {
+    start: u64,
+    offloaded: Option<u64>,
+    /// The start was last moved down by a restore (ADR-0104, decision 6):
+    /// an offload record at the start is a restore whose record a crash
+    /// cut short, never an offload whose start was not raised. Bit 0 of
+    /// the reserved word of an offload floor record.
+    restored: bool,
+}
 
 /// Finished segments the interval policy keeps open for its next tick; a
 /// roll past this many syncs them inline, so a store that is never ticked
@@ -182,7 +210,8 @@ impl Geometry {
     }
 
     /// The base of the segment holding `position`.
-    const fn base_of(&self, position: u64) -> u64 {
+    #[must_use]
+    pub const fn base_of(&self, position: u64) -> u64 {
         position - position % self.segment_length
     }
 }
@@ -338,6 +367,8 @@ pub struct RecoveryPlan {
     /// The segments removed, in order.
     pub dropped: Vec<DroppedSegment>,
     gaps: Vec<(u64, u64)>,
+    /// The floor record's offload floor and restored mark (ADR-0104).
+    offloaded: Option<(u64, bool)>,
 }
 
 /// The segment store's errors.
@@ -443,6 +474,16 @@ pub enum SegmentError {
         /// The durable position.
         durable: u64,
     },
+    /// A restore was refused (ADR-0104, decision 6): nothing below the
+    /// start is offloaded, the start is not a segment's base, or the
+    /// files did not scan whole. Nothing changed.
+    #[error("cannot restore below {start}: {why}")]
+    InvalidRestore {
+        /// The recording's start.
+        start: u64,
+        /// Why.
+        why: &'static str,
+    },
     /// The recording's floor record is not one this version wrote whole,
     /// or names another recording.
     #[error("the floor record of recording {recording} is damaged")]
@@ -526,6 +567,11 @@ pub struct SegmentStore<D: Disk> {
     geometry: Geometry,
     policy: SyncPolicy,
     start: u64,
+    /// The lowest position retained when segments below the start are
+    /// offloaded (ADR-0104): the floor record's offload floor.
+    offloaded: Option<u64>,
+    /// A restore last moved the start: the floor record's restored mark.
+    restored: bool,
     written: u64,
     durable: u64,
     current: Option<Open<D::File>>,
@@ -734,54 +780,160 @@ fn floor_name(recording: u64) -> String {
     format!("{recording:016x}.floor")
 }
 
-fn encode_floor(recording: u64, floor: u64) -> [u8; FLOOR_LEN] {
-    let mut bytes = [0u8; FLOOR_LEN];
-    let (body, crc) = bytes.split_at_mut(24);
-    let (magic, rest) = body.split_at_mut(4);
-    magic.copy_from_slice(&FLOOR_MAGIC);
-    let (_, rest) = rest.split_at_mut(4);
-    let (id, rest) = rest.split_at_mut(8);
-    id.copy_from_slice(&recording.to_le_bytes());
-    rest.copy_from_slice(&floor.to_le_bytes());
-    let sum = crc32c(body);
-    crc.copy_from_slice(&sum.to_le_bytes());
+fn encode_floor(recording: u64, floor: Floor) -> Vec<u8> {
+    let (magic, length) = match floor.offloaded {
+        None => (FLOOR_MAGIC, FLOOR_LEN),
+        Some(_) => (OFFLOAD_FLOOR_MAGIC, OFFLOAD_FLOOR_LEN),
+    };
+    let mut bytes = Vec::with_capacity(length);
+    bytes.extend_from_slice(&magic);
+    let flags: u32 = if floor.restored && floor.offloaded.is_some() {
+        1
+    } else {
+        0
+    };
+    bytes.extend_from_slice(&flags.to_le_bytes());
+    bytes.extend_from_slice(&recording.to_le_bytes());
+    bytes.extend_from_slice(&floor.start.to_le_bytes());
+    if let Some(offloaded) = floor.offloaded {
+        bytes.extend_from_slice(&offloaded.to_le_bytes());
+    }
+    let sum = crc32c(&bytes);
+    bytes.extend_from_slice(&sum.to_le_bytes());
     bytes
 }
 
 /// The floor in `bytes`, if they are a whole record of `recording`.
-fn decode_floor(recording: u64, bytes: &[u8]) -> Option<u64> {
-    let bytes: &[u8; FLOOR_LEN] = bytes.try_into().ok()?;
-    let (body, crc) = bytes.split_first_chunk::<24>()?;
-    let crc: [u8; 4] = crc.try_into().ok()?;
-    if u32::from_le_bytes(crc) != crc32c(body) {
+fn decode_floor(recording: u64, bytes: &[u8]) -> Option<Floor> {
+    let (body, crc) = bytes.split_last_chunk::<4>()?;
+    if u32::from_le_bytes(*crc) != crc32c(body) {
         return None;
     }
     let (magic, rest) = body.split_first_chunk::<4>()?;
     let (reserved, rest) = rest.split_first_chunk::<4>()?;
     let (id, rest) = rest.split_first_chunk::<8>()?;
-    let floor: [u8; 8] = rest.try_into().ok()?;
-    (*magic == FLOOR_MAGIC && *reserved == [0; 4] && u64::from_le_bytes(*id) == recording)
-        .then_some(u64::from_le_bytes(floor))
+    let (start, rest) = rest.split_first_chunk::<8>()?;
+    let flags = u32::from_le_bytes(*reserved);
+    if u64::from_le_bytes(*id) != recording {
+        return None;
+    }
+    let start = u64::from_le_bytes(*start);
+    match (*magic, rest.len()) {
+        (FLOOR_MAGIC, 0) if flags == 0 => Some(Floor {
+            start,
+            offloaded: None,
+            restored: false,
+        }),
+        (OFFLOAD_FLOOR_MAGIC, 8) => {
+            let offloaded: [u8; 8] = rest.try_into().ok()?;
+            let offloaded = u64::from_le_bytes(offloaded);
+            // The offload floor lies at or below the start.
+            (offloaded <= start && flags <= 1).then_some(Floor {
+                start,
+                offloaded: Some(offloaded),
+                restored: flags == 1,
+            })
+        }
+        _ => None,
+    }
 }
 
-/// The floor of `recording` in `dir`: `None` when it was never purged.
+/// The floor of `recording` in `dir`: `None` when it was never purged or
+/// offloaded.
 fn read_floor<D: Disk>(
     disk: &mut D,
     dir: &Path,
     recording: u64,
-) -> Result<Option<u64>, SegmentError> {
+) -> Result<Option<Floor>, SegmentError> {
     let file = match disk.open_read(&dir.join(floor_name(recording))) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
     let damaged = SegmentError::FloorDamaged { recording };
-    if disk.len(&file)? != u64::try_from(FLOOR_LEN).map_err(|_| SegmentError::PositionOverflow)? {
-        return Err(damaged);
-    }
-    let mut bytes = [0u8; FLOOR_LEN];
+    let length = disk.len(&file)?;
+    let length = match usize::try_from(length) {
+        Ok(length) if length == FLOOR_LEN || length == OFFLOAD_FLOOR_LEN => length,
+        _ => return Err(damaged),
+    };
+    let mut bytes = vec![0u8; length];
     disk.read_at(&file, 0, &mut bytes)?;
     decode_floor(recording, &bytes).map(Some).ok_or(damaged)
+}
+
+/// Replaces `recording`'s floor record in `dir` atomically: written to a
+/// temporary file, synced, renamed over the record, its directory synced.
+fn write_floor<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+    recording: u64,
+    floor: Floor,
+) -> Result<(), SegmentError> {
+    let temporary = dir.join(format!("{}.tmp", floor_name(recording)));
+    let file = disk.create(&temporary)?;
+    disk.write_at(&file, 0, &encode_floor(recording, floor))?;
+    disk.sync(&file)?;
+    drop(file);
+    disk.rename(&temporary, &dir.join(floor_name(recording)))?;
+    disk.sync_dir(dir)?;
+    Ok(())
+}
+
+/// The floor record of `recording` in `dir`, for tiering's
+/// reconciliation (ADR-0104): its start, its offload floor and whether a
+/// restore last moved the start. `None` when there is none.
+///
+/// # Errors
+///
+/// [`SegmentError::FloorDamaged`], and the operating system's errors.
+pub fn floor_of<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+    recording: u64,
+) -> Result<Option<(u64, Option<u64>, bool)>, SegmentError> {
+    Ok(read_floor(disk, dir, recording)?
+        .map(|floor| (floor.start, floor.offloaded, floor.restored)))
+}
+
+/// Raises `recording`'s start in `dir` to `start`, with `offloaded` as its
+/// offload floor, before any scan of its segments: the reconciliation of
+/// an offload record whose start a crash left unraised (ADR-0104,
+/// decision 4). Never lowers the start; returns whether it wrote.
+///
+/// # Errors
+///
+/// [`SegmentError::FloorDamaged`], and the operating system's errors.
+pub fn raise_floor<D: Disk>(
+    disk: &mut D,
+    dir: &Path,
+    recording: u64,
+    start: u64,
+    offloaded: u64,
+) -> Result<bool, SegmentError> {
+    let current = read_floor(disk, dir, recording)?;
+    if current.is_some_and(|floor| floor.start >= start) {
+        return Ok(false);
+    }
+    let lowest = current
+        .and_then(|floor| floor.offloaded)
+        .map_or(offloaded, |known| known.min(offloaded));
+    write_floor(
+        disk,
+        dir,
+        recording,
+        Floor {
+            start,
+            offloaded: Some(lowest.min(start)),
+            restored: false,
+        },
+    )?;
+    Ok(true)
+}
+
+/// The temporary name a restore writes a segment file under, before it
+/// is scanned and renamed into place (ADR-0104, decision 6).
+fn restoring_name(name: &str) -> String {
+    format!("{name}.restoring")
 }
 
 /// The segment bases of `recording` among `names`, in order.
@@ -842,6 +994,8 @@ impl<D: Disk> SegmentStore<D> {
             geometry,
             policy,
             start,
+            offloaded: None,
+            restored: false,
             written: start,
             durable: start,
             current: None,
@@ -872,6 +1026,290 @@ impl<D: Disk> SegmentStore<D> {
     #[must_use]
     pub const fn start(&self) -> u64 {
         self.start
+    }
+
+    /// Whether a restore last moved the start (ADR-0104): the floor
+    /// record's restored mark.
+    #[must_use]
+    pub const fn restored(&self) -> bool {
+        self.restored
+    }
+
+    /// The offload floor: the start before the first offload, when
+    /// segments below the start are offloaded (ADR-0104). A cache of the
+    /// integrity journal's offload records, which win over it.
+    #[must_use]
+    pub const fn offload_floor(&self) -> Option<u64> {
+        self.offloaded
+    }
+
+    /// The recording's lowest retained position, local or offloaded: the
+    /// offload floor when segments are offloaded, the start otherwise
+    /// (ADR-0104, decision 5). Purge recovery and purge evidence start
+    /// here, never at the local start.
+    #[must_use]
+    pub const fn lowest_retained(&self) -> u64 {
+        match self.offloaded {
+            Some(offloaded) if offloaded < self.start => offloaded,
+            _ => self.start,
+        }
+    }
+
+    /// The data and index files of the segment at `base`.
+    #[must_use]
+    pub fn segment_paths(&self, base: u64) -> (PathBuf, PathBuf) {
+        (
+            self.dir.join(data_name(self.recording, base)),
+            self.dir.join(index_name(self.recording, base)),
+        )
+    }
+
+    /// The range the lowest local segment holds, `[start, end)`, when it
+    /// is a finished segment (not the one being written) and wholly
+    /// durable: the only segment an offload may take (ADR-0104, decision
+    /// 1). `None` otherwise.
+    #[must_use]
+    pub fn lowest_finished_segment(&self) -> Option<(u64, u64)> {
+        let base = self.geometry.base_of(self.start);
+        let end = base.checked_add(self.geometry.segment_length)?;
+        let open = self.current.as_ref()?;
+        (open.base > base && end <= self.durable && self.start < end).then_some((self.start, end))
+    }
+
+    /// Raises the start past the lowest local segment for its offload
+    /// (ADR-0104, decision 4), as a purge publishes its floor: the floor
+    /// record, with the offload floor, is replaced durably before
+    /// anything is removed. The segment's files stay on disk; the caller
+    /// releases their immutability and removes them through
+    /// [`SegmentStore::files_left_below_floor`] and
+    /// [`SegmentStore::remove_left_below_floor`], and a crash in between
+    /// leaves only files below the floor, which recovery drops. Returns
+    /// the new start.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::InvalidPurge`] unless the lowest segment is one
+    /// [`SegmentStore::lowest_finished_segment`] names, changing nothing;
+    /// [`SegmentError::Failed`] after an earlier failure; the operating
+    /// system's errors, after which the store fails until recovered.
+    pub fn raise_start_for_offload(&mut self) -> Result<u64, SegmentError> {
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        let Some((_, end)) = self.lowest_finished_segment() else {
+            return Err(SegmentError::InvalidPurge {
+                position: self.start,
+                start: self.start,
+                durable: self.durable,
+            });
+        };
+        self.reader = None;
+        self.failed = true;
+        let offloaded = self.lowest_retained();
+        write_floor(
+            &mut self.disk,
+            &self.dir,
+            self.recording,
+            Floor {
+                start: end,
+                offloaded: Some(offloaded),
+                restored: false,
+            },
+        )?;
+        self.start = end;
+        self.offloaded = Some(offloaded);
+        self.restored = false;
+        self.finished.retain(|open| open.base >= end);
+        self.gaps.retain(|(_, to)| *to > end);
+        if let Some(first) = self.gaps.first_mut() {
+            first.0 = first.0.max(end);
+        }
+        self.failed = false;
+        Ok(end)
+    }
+
+    /// Clears the floor record's restored mark durably, before an offload
+    /// chains its record (ADR-0104): from then on an offload record at the
+    /// start is an offload whose start was not raised, never a restore.
+    ///
+    /// # Errors
+    ///
+    /// The operating system's errors, after which the store fails until
+    /// recovered.
+    pub fn clear_restored(&mut self) -> Result<(), SegmentError> {
+        if !self.restored {
+            return Ok(());
+        }
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        self.failed = true;
+        write_floor(
+            &mut self.disk,
+            &self.dir,
+            self.recording,
+            Floor {
+                start: self.start,
+                offloaded: self.offloaded,
+                restored: false,
+            },
+        )?;
+        self.restored = false;
+        self.failed = false;
+        Ok(())
+    }
+
+    /// Restores the segment just below the start from its original
+    /// `index` file and its `data` file (ADR-0104, decision 6), and lowers
+    /// the start to its first retained position, never below the offload
+    /// floor. Both files are written under temporary names and synced; the
+    /// store's own recovery scanner runs over them, and the restore is
+    /// refused unless they scan whole, with nothing cut. Then they are
+    /// renamed into place, the directory synced, and the start lowered
+    /// durably, with the floor record marked restored. A crash before the
+    /// start moves leaves only files below it, which recovery removes.
+    /// Returns the new start.
+    ///
+    /// # Errors
+    ///
+    /// [`SegmentError::InvalidRestore`], which changes nothing but the
+    /// temporary files it removes; [`SegmentError::Failed`] after an
+    /// earlier failure; the operating system's errors, after which the
+    /// store fails until recovered.
+    pub fn restore_below(&mut self, data: &[u8], index: &[u8]) -> Result<u64, SegmentError> {
+        if self.failed {
+            return Err(SegmentError::Failed);
+        }
+        let start = self.start;
+        let refuse = move |why| SegmentError::InvalidRestore { start, why };
+        let lowest = self.lowest_retained();
+        if lowest >= self.start {
+            return Err(refuse("nothing below the start is offloaded"));
+        }
+        if self.geometry.base_of(self.start) != self.start {
+            return Err(refuse("the start is not a segment's base"));
+        }
+        let base = self
+            .start
+            .checked_sub(self.geometry.segment_length)
+            .ok_or(SegmentError::PositionOverflow)?;
+        let restored_start = base.max(lowest);
+        let (data_path, index_path) = self.segment_paths(base);
+        let (data_temporary, index_temporary) = (
+            self.dir
+                .join(restoring_name(&data_name(self.recording, base))),
+            self.dir
+                .join(restoring_name(&index_name(self.recording, base))),
+        );
+        self.reader = None;
+        self.failed = true;
+        for (path, bytes) in [(&data_temporary, data), (&index_temporary, index)] {
+            let file = self.disk.create(path)?;
+            self.disk.write_at(&file, 0, bytes)?;
+            self.disk.sync(&file)?;
+        }
+        let scanned = self.scan_restored(base, restored_start, (&data_temporary, &index_temporary));
+        // The restored segment's lost ranges joined to the recording's, the
+        // touching ones merged, within the bound recovery holds the
+        // recording to: checked before anything moves.
+        let merged = scanned.map(|found| {
+            found.and_then(|restored| {
+                let mut merged: Vec<(u64, u64)> = Vec::with_capacity(restored.len());
+                for (from, to) in restored.into_iter().chain(self.gaps.iter().copied()) {
+                    if !push_gap(&mut merged, from, to) {
+                        return None;
+                    }
+                }
+                Some(merged)
+            })
+        });
+        let gaps = match merged {
+            Ok(Some(gaps)) => gaps,
+            other => {
+                for path in [&data_temporary, &index_temporary] {
+                    self.disk.remove(path)?;
+                }
+                self.disk.sync_dir(&self.dir)?;
+                self.failed = false;
+                other?;
+                return Err(refuse(
+                    "the restored files do not scan whole, or their lost ranges exceed the bound",
+                ));
+            }
+        };
+        self.disk.rename(&data_temporary, &data_path)?;
+        self.disk.rename(&index_temporary, &index_path)?;
+        self.disk.sync_dir(&self.dir)?;
+        let offloaded = (lowest < restored_start).then_some(lowest);
+        write_floor(
+            &mut self.disk,
+            &self.dir,
+            self.recording,
+            Floor {
+                start: restored_start,
+                offloaded: Some(offloaded.unwrap_or(restored_start)),
+                restored: true,
+            },
+        )?;
+        self.start = restored_start;
+        self.offloaded = Some(offloaded.unwrap_or(restored_start));
+        self.restored = true;
+        self.gaps = gaps;
+        self.failed = false;
+        Ok(restored_start)
+    }
+
+    /// Scans a restored segment's files at `paths` with the recovery
+    /// scanner: its lost ranges from `from` on when it scans whole up to
+    /// the start, every entry kept and nothing cut; `None` otherwise.
+    fn scan_restored(
+        &mut self,
+        base: u64,
+        from: u64,
+        paths: (&Path, &Path),
+    ) -> Result<Option<Vec<(u64, u64)>>, SegmentError> {
+        let mut scan = Scan {
+            start: None,
+            written: None,
+            cut: None,
+            kept: None,
+            dropped: Vec::new(),
+            gaps: Vec::new(),
+        };
+        let kept = match scan_segment(
+            &mut self.disk,
+            paths,
+            self.recording,
+            self.geometry,
+            base,
+            false,
+            Access::Read,
+            &mut scan,
+        ) {
+            Ok(Ok(kept)) => kept,
+            Ok(Err(_)) | Err(SegmentError::BadHeader { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let index_length = self.disk.len(&kept.index)?;
+        let entries = index_length
+            .checked_sub(HEADER)
+            .filter(|bytes| bytes.is_multiple_of(ENTRY))
+            .map(|bytes| bytes / ENTRY);
+        let whole = scan.cut.is_none()
+            && kept.index_length.is_none()
+            && entries == Some(kept.entries)
+            && scan.written == Some(self.start)
+            && scan.start.is_some_and(|start| start <= from)
+            && self.disk.len(&kept.data)? <= self.start.saturating_sub(base);
+        if !whole {
+            return Ok(None);
+        }
+        let mut gaps = scan.gaps;
+        gaps.retain(|(_, to)| *to > from);
+        if let Some(first) = gaps.first_mut() {
+            first.0 = first.0.max(from);
+        }
+        Ok(Some(gaps))
     }
 
     /// The end of the last indexed write.
@@ -1550,15 +1988,16 @@ impl<D: Disk> SegmentStore<D> {
             return Err(refused);
         }
         self.failed = true;
-        let temporary = self.dir.join(format!("{}.tmp", floor_name(self.recording)));
-        let file = self.disk.create(&temporary)?;
-        self.disk
-            .write_at(&file, 0, &encode_floor(self.recording, position))?;
-        self.disk.sync(&file)?;
-        drop(file);
-        self.disk
-            .rename(&temporary, &self.dir.join(floor_name(self.recording)))?;
-        self.disk.sync_dir(&self.dir)?;
+        write_floor(
+            &mut self.disk,
+            &self.dir,
+            self.recording,
+            Floor {
+                start: position,
+                offloaded: self.offloaded,
+                restored: false,
+            },
+        )?;
         // Lowest first: a removal cut short leaves only segments below the
         // floor's, which recovery drops.
         let mut base = self.geometry.base_of(self.start);
@@ -1573,6 +2012,7 @@ impl<D: Disk> SegmentStore<D> {
             self.disk.sync_dir(&self.dir)?;
         }
         self.start = position;
+        self.restored = false;
         self.finished.retain(|open| open.base >= floor_base);
         self.gaps.retain(|(_, to)| *to > position);
         if let Some(first) = self.gaps.first_mut() {
@@ -1820,8 +2260,21 @@ impl<D: Disk> SegmentStore<D> {
         // Only where there is one: a recovery that writes nothing else runs
         // on a read-only directory too.
         let temporary = format!("{}.tmp", floor_name(recording));
-        if disk.list(dir)?.contains(&temporary) {
-            disk.remove(&dir.join(temporary))?;
+        let names = disk.list(dir)?;
+        // A restore's files not renamed into place: it never began
+        // (ADR-0104, decision 6).
+        let prefix = format!("{recording:016x}-");
+        let mut stale: Vec<&String> = names
+            .iter()
+            .filter(|name| {
+                **name == temporary || (name.starts_with(&prefix) && name.ends_with(".restoring"))
+            })
+            .collect();
+        stale.sort();
+        for name in &stale {
+            disk.remove(&dir.join(name))?;
+        }
+        if !stale.is_empty() {
             disk.sync_dir(dir)?;
         }
         if let (Some(kept), Some((_, index))) = (plan.kept, &files)
@@ -1852,6 +2305,7 @@ impl<D: Disk> SegmentStore<D> {
             kept,
             (data, index),
             plan.gaps,
+            plan.offloaded,
         );
         Ok(Recovered {
             store,
@@ -1884,7 +2338,15 @@ impl<D: Disk> SegmentStore<D> {
             return Err(SegmentError::NotFound { recording });
         };
         Ok(Self::recovered(
-            disk, dir, recording, geometry, policy, kept, files, plan.gaps,
+            disk,
+            dir,
+            recording,
+            geometry,
+            policy,
+            kept,
+            files,
+            plan.gaps,
+            plan.offloaded,
         ))
     }
 
@@ -1899,6 +2361,7 @@ impl<D: Disk> SegmentStore<D> {
         kept: KeptSegment,
         (data, index): KeptFiles<D>,
         gaps: Vec<(u64, u64)>,
+        offloaded: Option<(u64, bool)>,
     ) -> Self {
         Self {
             disk,
@@ -1907,6 +2370,8 @@ impl<D: Disk> SegmentStore<D> {
             geometry,
             policy,
             start: kept.start,
+            offloaded: offloaded.map(|(offloaded, _)| offloaded),
+            restored: offloaded.is_some_and(|(_, restored)| restored),
             written: kept.written,
             durable: kept.written,
             current: Some(Open {
@@ -2001,6 +2466,8 @@ fn scan_recording<D: Disk>(
     let last = bases.last().copied();
     // Every segment from the floor's on is the recording; the floor's own
     // segment must be there to start it.
+    let floor_record = floor;
+    let floor = floor_record.map(|floor| floor.start);
     let floor_base = floor.map(|floor| geometry.base_of(floor));
     if let (Some(floor), Some(floor_base)) = (floor, floor_base)
         && !bases.contains(&floor_base)
@@ -2024,8 +2491,19 @@ fn scan_recording<D: Disk>(
             continue;
         }
         let is_last = Some(base) == last;
+        let (data_path, index_path) = (
+            dir.join(data_name(recording, base)),
+            dir.join(index_name(recording, base)),
+        );
         match scan_segment(
-            disk, dir, recording, geometry, base, is_last, access, &mut scan,
+            disk,
+            (&data_path, &index_path),
+            recording,
+            geometry,
+            base,
+            is_last,
+            access,
+            &mut scan,
         )? {
             // The previous kept segment is finished; this one is the newest.
             Ok(kept) => scan.kept = Some(kept),
@@ -2084,6 +2562,8 @@ fn scan_recording<D: Disk>(
             cut: scan.cut,
             dropped: scan.dropped,
             gaps: scan.gaps,
+            offloaded: floor_record
+                .and_then(|floor| floor.offloaded.map(|offloaded| (offloaded, floor.restored))),
         },
         files,
     ))
@@ -2149,7 +2629,7 @@ fn remove_segment<D: Disk>(
 )]
 fn scan_segment<D: Disk>(
     disk: &mut D,
-    dir: &Path,
+    (data_path, index_path): (&Path, &Path),
     recording: u64,
     geometry: Geometry,
     base: u64,
@@ -2158,8 +2638,6 @@ fn scan_segment<D: Disk>(
     scan: &mut Scan<D::File>,
 ) -> Result<Result<Kept<D::File>, DropReason>, SegmentError> {
     let bad = |problem| SegmentError::BadHeader { base, problem };
-    let data_path = dir.join(data_name(recording, base));
-    let index_path = dir.join(index_name(recording, base));
     // The data file is created before the index, but a crash can keep the
     // index's directory entry and lose the data file's: on the last
     // segment with no entry, that is a creation cut short.
@@ -2167,12 +2645,12 @@ fn scan_segment<D: Disk>(
         Access::Read => disk.open_read(path),
         Access::Write => disk.open(path),
     };
-    let data = match open(disk, &data_path) {
+    let data = match open(disk, data_path) {
         Ok(data) => Some(data),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let index = match open(disk, &index_path) {
+    let index = match open(disk, index_path) {
         Ok(index) => Some(index),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),

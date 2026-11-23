@@ -65,8 +65,8 @@ use futures_channel::oneshot;
 use futures_util::StreamExt;
 use karyos_cluster::{Entry, HardState};
 use karyos_sim::harness::core::{
-    ConsensusCore, Limits, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
-    Unsupported,
+    ConsensusCore, Limits, LogView, NotLeader, Persisted, Ready, ReadyBuf, Refused,
+    TransferRefused, Unsupported,
 };
 use karyos_sim::harness::reference::{decode_configuration, encode_configuration};
 use karyos_sim::net::NodeId;
@@ -176,6 +176,26 @@ fn to_harness(entry: &OEntry) -> Option<Entry> {
         event_time: 0,
         payload,
     })
+}
+
+/// [`to_harness`], a normal entry's payload copied into a buffer from
+/// `spare` (plan issue 073, karyos#691); a membership entry is encoded anew.
+fn to_harness_into(spare: &mut Vec<Entry>, entry: &OEntry) -> Option<Entry> {
+    let EntryPayload::Normal(command) = &entry.payload else {
+        return to_harness(entry);
+    };
+    let mut harness = spare.pop().unwrap_or(Entry {
+        index: 0,
+        term: 0,
+        event_time: 0,
+        payload: Vec::new(),
+    });
+    harness.index = entry.log_id.index.checked_add(1)?;
+    harness.term = entry.log_id.leader_id.term;
+    harness.event_time = 0;
+    harness.payload.clear();
+    harness.payload.extend_from_slice(&command.0);
+    Some(harness)
 }
 
 /// A harness entry as OpenRaft holds it.
@@ -386,6 +406,9 @@ struct Io {
     callbacks: Vec<IOFlushed<C>>,
     vote_waiters: Vec<oneshot::Sender<()>>,
     committed: Vec<Entry>,
+    /// Entries the node is done with, their payload buffers kept for the
+    /// next conversion (plan issue 073, karyos#691).
+    spare: Vec<Entry>,
     outbox: Vec<(NodeId, Message)>,
     /// Handed in a Ready, released at its advance.
     flushing: Vec<IOFlushed<C>>,
@@ -489,7 +512,8 @@ impl RaftLogStorage<C> for LogStore {
     {
         let mut io = lock(&self.io);
         for entry in entries {
-            let harness = to_harness(&entry).ok_or_else(|| io::Error::other("index overflow"))?;
+            let harness = to_harness_into(&mut io.spare, &entry)
+                .ok_or_else(|| io::Error::other("index overflow"))?;
             io.entries.push(harness);
             let _ = io.log.insert(entry.log_id.index, entry);
         }
@@ -573,8 +597,8 @@ impl RaftStateMachine<C> for StateMachine {
                 if let EntryPayload::Membership(membership) = &entry.payload {
                     io.membership = StoredMembership::new(Some(entry.log_id), membership.clone());
                 }
-                let harness =
-                    to_harness(&entry).ok_or_else(|| io::Error::other("index overflow"))?;
+                let harness = to_harness_into(&mut io.spare, &entry)
+                    .ok_or_else(|| io::Error::other("index overflow"))?;
                 io.committed.push(harness);
             }
             if let Some(responder) = responder {
@@ -739,7 +763,7 @@ type Handle = Raft<C, StateMachine>;
 
 /// `openraft` 0.10.0-alpha.37 behind [`ConsensusCore`], pre-vote on when
 /// `PRE_VOTE` (see the module).
-pub struct OpenRaftCore<const PRE_VOTE: bool> {
+pub struct OpenRaftCore<const PRE_VOTE: bool, const BATCH: u64 = 0> {
     executor: Executor,
     /// `None` when OpenRaft refused to start: the node stays silent.
     raft: Option<Handle>,
@@ -759,7 +783,33 @@ pub type OpenRaft = OpenRaftCore<true>;
 /// `openraft` with pre-vote off: only a negative control.
 pub type OpenRaftNoPreVote = OpenRaftCore<false>;
 
-impl<const PRE_VOTE: bool> fmt::Debug for OpenRaftCore<PRE_VOTE> {
+/// [`OpenRaft`] with a batch entry cap of 16 (`max_payload_entries`), W1's
+/// primary batch limit (quantstratum-docs:
+/// karyos/evaluations/c5-raft-comparison-v1.md, W1; karyos#691).
+pub type OpenRaftBatch16 = OpenRaftCore<true, 16>;
+
+/// The entries an outgoing message appends and their payload bytes, for a
+/// test that observes appends (karyos#691); `None` for any other message.
+#[must_use]
+pub fn append_shape(message: &Message) -> Option<(usize, u64)> {
+    let Message::Request {
+        request: Request::Append(rpc),
+        ..
+    } = message
+    else {
+        return None;
+    };
+    let bytes = rpc
+        .entries
+        .iter()
+        .filter_map(to_harness)
+        .fold(0u64, |sum, entry| {
+            sum.saturating_add(u64::try_from(entry.payload.len()).unwrap_or(u64::MAX))
+        });
+    Some((rpc.entries.len(), bytes))
+}
+
+impl<const PRE_VOTE: bool, const BATCH: u64> fmt::Debug for OpenRaftCore<PRE_VOTE, BATCH> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenRaftCore")
             .field("pre_vote", &PRE_VOTE)
@@ -775,7 +825,7 @@ fn seed_of(id: NodeId) -> u64 {
     crate::executor::splitmix64(u64::from(id) ^ 0x0000_43C5)
 }
 
-impl<const PRE_VOTE: bool> OpenRaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> OpenRaftCore<PRE_VOTE, BATCH> {
     /// The node's executor.
     #[must_use]
     pub fn executor(&self) -> &Executor {
@@ -936,8 +986,15 @@ impl<const PRE_VOTE: bool> OpenRaftCore<PRE_VOTE> {
             // RPC_TIMEOUT ticks, and OpenRaft then sends the next append
             // while the first may still be in flight or unacknowledged
             // (karyos#975).
-            max_payload_entries: limits
-                .map_or(DEFAULT_PAYLOAD_ENTRIES, |limits| limits.in_flight_entries),
+            // A capped variant (`BATCH` > 0, W1's batch limit, karyos#691)
+            // never sends more than `BATCH` entries an append, under
+            // declared limits too: the smaller of the two.
+            max_payload_entries: match (limits, BATCH) {
+                (Some(limits), 0) => limits.in_flight_entries,
+                (Some(limits), batch) => limits.in_flight_entries.min(batch),
+                (None, 0) => DEFAULT_PAYLOAD_ENTRIES,
+                (None, batch) => batch,
+            },
             // The durable vote is C4's `HardState`, which has no place for
             // OpenRaft's `committed` bit, so a restarted leader comes back
             // with an uncommitted vote. Leader restoration is off to match:
@@ -951,7 +1008,7 @@ impl<const PRE_VOTE: bool> OpenRaftCore<PRE_VOTE> {
     }
 }
 
-impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for OpenRaftCore<PRE_VOTE, BATCH> {
     type Message = Message;
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
@@ -1058,18 +1115,27 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
     }
 
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
+        let mut out = ReadyBuf::default();
+        self.ready_into(&mut out, log).then_some(out.ready)
+    }
+
+    /// The Ready swapped into `out` in place: the node's outgoing vectors
+    /// trade places with `out`'s empty ones, which keep their capacity, and
+    /// `out`'s spare entries go back to the node's pool.
+    fn ready_into(&mut self, out: &mut ReadyBuf<Self::Message>, log: &mut LogView<'_>) -> bool {
         if self.out {
-            return None;
+            return false;
         }
         self.pump();
         let mut io = lock(&self.io);
-        let mut messages = std::mem::take(&mut io.outbox);
+        out.take_spare(&mut io.spare);
+        std::mem::swap(&mut out.ready.messages, &mut io.outbox);
         // Under declared limits, an append leaves only once its logged
         // entries were read back through the metered log (karyos#1040);
         // one held back is lost to its peer, and its RPC times out and is
         // retried, as after a loss on the network.
         if self.limits.is_some() {
-            messages.retain(|(_, message)| match message {
+            out.ready.messages.retain(|(_, message)| match message {
                 Message::Request {
                     request: Request::Append(rpc),
                     ..
@@ -1080,28 +1146,23 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
                 _ => true,
             });
         }
-        let ready = Ready {
-            messages,
-            truncate_from: io.truncate_from.take(),
-            entries: std::mem::take(&mut io.entries),
-            hard_state: io.hard_state.take(),
-            after_persist: Vec::new(),
-            committed: std::mem::take(&mut io.committed),
-            snapshot_to: Vec::new(),
-        };
-        if ready == Ready::default() && io.callbacks.is_empty() && io.vote_waiters.is_empty() {
-            return None;
+        out.ready.truncate_from = io.truncate_from.take();
+        std::mem::swap(&mut out.ready.entries, &mut io.entries);
+        out.ready.hard_state = io.hard_state.take();
+        std::mem::swap(&mut out.ready.committed, &mut io.committed);
+        if out.is_empty() && io.callbacks.is_empty() && io.vote_waiters.is_empty() {
+            return false;
         }
-        if let Some(last) = ready.entries.last() {
+        if let Some(last) = out.ready.entries.last() {
             io.handed = Some(last.index);
         }
-        let callbacks = std::mem::take(&mut io.callbacks);
-        io.flushing.extend(callbacks);
-        let waiters = std::mem::take(&mut io.vote_waiters);
-        io.voting.extend(waiters);
+        // Appended, not taken: the emptied vectors keep their capacity.
+        let inner = &mut *io;
+        inner.flushing.append(&mut inner.callbacks);
+        inner.voting.append(&mut inner.vote_waiters);
         drop(io);
         self.out = true;
-        Some(ready)
+        true
     }
 
     fn advance(&mut self, _persisted: Persisted, _log: &mut LogView<'_>) {
@@ -1113,14 +1174,26 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
                 std::mem::take(&mut io.voting),
             )
         };
+        let (mut flushing, mut voting) = (flushing, voting);
         self.executor.enter(|| {
-            for callback in flushing {
+            for callback in flushing.drain(..) {
                 callback.io_completed(Ok(()));
             }
-            for waiter in voting {
+            for waiter in voting.drain(..) {
                 let _ = waiter.send(());
             }
         });
+        // The emptied vectors go back, keeping their capacity, unless the
+        // callbacks queued new ones meanwhile.
+        {
+            let mut io = lock(&self.io);
+            if io.flushing.is_empty() {
+                io.flushing = flushing;
+            }
+            if io.voting.is_empty() {
+                io.voting = voting;
+            }
+        }
         self.pump();
     }
 
@@ -1183,7 +1256,9 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
     }
 }
 
-impl<const PRE_VOTE: bool> crate::process::Wire for OpenRaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire
+    for OpenRaftCore<PRE_VOTE, BATCH>
+{
     fn encode(message: &Message) -> Option<Vec<u8>> {
         crate::openraft_wire::encode(message)
     }

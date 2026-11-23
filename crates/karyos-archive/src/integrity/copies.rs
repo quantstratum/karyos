@@ -486,6 +486,33 @@ impl<D: Disk> CopyCatalog<D> {
         journal: &mut IntegrityJournal<D>,
     ) -> Result<SealRecord, IntegrityError> {
         record.sequence = self.next_sequence();
+        self.check(journal)?;
+        let bytes = record.encode();
+        self.ledger.append(bytes)?;
+        let chained = match journal.record_copy_change(record.recording, record.sequence, &bytes) {
+            Ok(chained) => chained,
+            Err(error) => {
+                // The record may or may not be on the journal: the live
+                // counts are uncertain until the catalog is reopened.
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        self.records.push(record);
+        Ok(chained)
+    }
+
+    /// Checks that this catalog holds every change `journal` chains, as
+    /// [`CopyCatalog::record`] does before it writes, without writing: a
+    /// decision read from [`CopyCatalog::current`] stands only if this
+    /// passes (karyos#1113).
+    ///
+    /// # Errors
+    ///
+    /// As [`CopyCatalog::record`]'s checks:
+    /// [`IntegrityError::Poisoned`], [`IntegrityError::ForeignLedger`],
+    /// [`IntegrityError::StaleJournal`] and [`IntegrityError::StaleCatalog`].
+    pub fn check(&self, journal: &mut IntegrityJournal<D>) -> Result<(), IntegrityError> {
         if self.poisoned {
             return Err(IntegrityError::Poisoned);
         }
@@ -503,22 +530,10 @@ impl<D: Disk> CopyCatalog<D> {
         if !journal.is_current()? {
             return Err(IntegrityError::StaleJournal);
         }
-        if journal.copy_changes() != record.sequence {
+        if journal.copy_changes() != self.next_sequence() {
             return Err(IntegrityError::StaleCatalog);
         }
-        let bytes = record.encode();
-        self.ledger.append(bytes)?;
-        let chained = match journal.record_copy_change(record.recording, record.sequence, &bytes) {
-            Ok(chained) => chained,
-            Err(error) => {
-                // The record may or may not be on the journal: the live
-                // counts are uncertain until the catalog is reopened.
-                self.poisoned = true;
-                return Err(error);
-            }
-        };
-        self.records.push(record);
-        Ok(chained)
+        Ok(())
     }
 
     /// Enforces immutability on the closed, sealed segment file `path`

@@ -154,6 +154,7 @@ fn key(recording: u64) -> ObjectKey {
         recording,
         start: 0,
         end: 16,
+        kind: karyos_archive::integrity::tiering::ObjectKind::Range,
     }
 }
 

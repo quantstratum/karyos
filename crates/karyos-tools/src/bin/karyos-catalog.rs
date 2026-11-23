@@ -32,6 +32,18 @@ fn main() -> ExitCode {
             &mut std::io::stdout(),
             &mut std::io::stderr(),
         )),
+        Some(Some("export")) => ExitCode::from(karyos_tools::catalog_export::run_export(
+            args,
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )),
+        Some(Some("verify-export")) => {
+            ExitCode::from(karyos_tools::catalog_export::run_verify_export(
+                args,
+                &mut std::io::stdout(),
+                &mut std::io::stderr(),
+            ))
+        }
         None | Some(Some("-h" | "--help")) => {
             let _ = std::io::stdout().write_all(catalog::HELP.as_bytes());
             ExitCode::SUCCESS

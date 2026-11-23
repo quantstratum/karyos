@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! The replica side of recording replication: what arrives is stored as
-//! unverified, and a range counts as a copy only once it verified against
-//! its source seal (quantstratum-docs: karyos/SPEC.md §8.4, "Replication";
-//! karyos#669).
+//! The replica side of recording replication: a range counts as a copy
+//! only once its stored bytes verified against its source seal
+//! (quantstratum-docs: karyos/SPEC.md §8.4, "Replication"; ADR-0102
+//! decision 5; karyos#669, #1113).
 //!
-//! Copying bytes is not a copy. A range that arrives before its seal is
-//! recorded [`CopyState::Unverified`] and counts towards nothing; when the
-//! source seal arrives, [`Replica::verify`] checks the stored bytes against
-//! it through [`verify_range`] and only a match is recorded
-//! [`CopyState::Verified`]. A mismatch is reported and recorded nowhere as
-//! verified, so `min_copies` (karyos#667) never counts a corrupt copy.
+//! Copying bytes is not a copy. Bytes that arrive change no copy record;
+//! when the source seal arrives, [`Replica::verify`] checks the stored
+//! bytes against it through [`verify_range`] before anything is recorded,
+//! and only a match is recorded [`CopyState::Verified`], once. A mismatch
+//! is reported and records nothing: it neither counts towards
+//! `min_copies` (karyos#667) nor downgrades a copy verified before. Only
+//! the replica's own check of its stored bytes, [`Replica::invalidate`],
+//! does that.
 //!
 //! The transport, Karyos streams from a source Archive, is not here: this
 //! module is what a replica does with what the transport delivers.
 
 use super::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
 use super::journal::{IntegrityError, IntegrityJournal};
-use super::{Digest, GENESIS, Inconsistency, SealRecord, verify_range};
+use super::{Digest, Inconsistency, SealRecord, verify_range};
 use crate::disk::Disk;
 
 /// Why a replica could not take a range.
@@ -30,18 +32,8 @@ pub enum ReplicationError {
         /// The record's counter.
         counter: u64,
     },
-    /// The replica stored no arrival for the sealed range.
-    #[error("no arrival of recording {recording} covers [{start}, {end})")]
-    NotArrived {
-        /// The recording.
-        recording: u64,
-        /// The sealed range's start.
-        start: u64,
-        /// Its end, exclusive.
-        end: u64,
-    },
-    /// The arrival's range is inverted.
-    #[error("arrival [{start}, {end}) ends before it starts")]
+    /// The range is inverted.
+    #[error("range [{start}, {end}) ends before it starts")]
     InvertedRange {
         /// The start.
         start: u64,
@@ -53,14 +45,18 @@ pub enum ReplicationError {
     Integrity(#[from] IntegrityError),
 }
 
-/// The outcome of checking an arrival against its source seal.
+/// The outcome of checking stored bytes against their source seal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum Verdict {
     /// The bytes match the seal: the range now counts as a copy, recorded
     /// by this catalog change.
     Counted(SealRecord),
-    /// The bytes differ from the seal: nothing counts.
+    /// The bytes match the seal and the range already counted here: no
+    /// catalog change.
+    AlreadyCounted,
+    /// The bytes differ from the seal: nothing was recorded, and the range
+    /// keeps the state it had.
     Corrupt(Inconsistency),
 }
 
@@ -104,37 +100,16 @@ impl Replica {
         self.location
     }
 
-    /// Records that `[start, end)` of `recording` arrived, before its seal:
-    /// the copy is [`CopyState::Unverified`] and counts towards nothing.
+    /// Checks the replica's stored `bytes` of a range against its source
+    /// `seal` before anything is recorded. A match for a range not yet
+    /// counted here is recorded [`CopyState::Verified`]; a match for one
+    /// already counted changes nothing ([`Verdict::AlreadyCounted`]), so
+    /// a replayed seal is idempotent; a mismatch records nothing and is
+    /// returned as [`Verdict::Corrupt`].
     ///
     /// # Errors
     ///
-    /// [`ReplicationError::InvertedRange`], or the catalog's error.
-    pub fn arrived<D: Disk>(
-        &self,
-        copies: &mut CopyCatalog<D>,
-        journal: &mut IntegrityJournal<D>,
-        recording: u64,
-        start: u64,
-        end: u64,
-    ) -> Result<SealRecord, ReplicationError> {
-        if end < start {
-            return Err(ReplicationError::InvertedRange { start, end });
-        }
-        Ok(copies.record(
-            self.record(recording, start, end, GENESIS, CopyState::Unverified),
-            journal,
-        )?)
-    }
-
-    /// Checks the stored `bytes` of a range against its source `seal`.
-    /// Only a match is recorded [`CopyState::Verified`]; a mismatch leaves
-    /// the arrival unverified and is returned as [`Verdict::Corrupt`].
-    ///
-    /// # Errors
-    ///
-    /// [`ReplicationError::NotARange`] for a seal of no range,
-    /// [`ReplicationError::NotArrived`] when no arrival covers it, or the
+    /// [`ReplicationError::NotARange`] for a seal of no range, or the
     /// catalog's error.
     pub fn verify<D: Disk>(
         &self,
@@ -148,39 +123,23 @@ impl Replica {
                 counter: seal.counter,
             });
         }
-        let arrived = copies.current()?.into_iter().any(|copy| {
+        if let Err(inconsistency) = verify_range(seal, bytes) {
+            return Ok(Verdict::Corrupt(inconsistency));
+        }
+        let counted = copies.current()?.into_iter().any(|copy| {
             copy.location == self.location
                 && copy.recording == seal.subject
-                && copy.start <= seal.start
-                && copy.end >= seal.end
-                && copy.state != CopyState::Removed
+                && copy.start == seal.start
+                && copy.end == seal.end
+                && copy.digest == seal.content
+                && copy.state == CopyState::Verified
         });
-        if !arrived {
-            return Err(ReplicationError::NotArrived {
-                recording: seal.subject,
-                start: seal.start,
-                end: seal.end,
-            });
-        }
-        if let Err(inconsistency) = verify_range(seal, bytes) {
-            // A copy counted before is no longer one: every verified copy
-            // here overlapping the range stops counting.
-            let counted: Vec<CopyRecord> = copies
-                .current()?
-                .into_iter()
-                .filter(|copy| {
-                    copy.location == self.location
-                        && copy.recording == seal.subject
-                        && copy.state == CopyState::Verified
-                        && copy.start < seal.end
-                        && seal.start < copy.end
-                })
-                .collect();
-            for mut copy in counted {
-                copy.state = CopyState::Unverified;
-                copies.record(copy, journal)?;
-            }
-            return Ok(Verdict::Corrupt(inconsistency));
+        if counted {
+            // The snapshot answers only if it is the journal's state: a
+            // copy another handle invalidated or removed since is not
+            // counted from a stale view.
+            copies.check(journal)?;
+            return Ok(Verdict::AlreadyCounted);
         }
         let record = self.record(
             seal.subject,
@@ -190,6 +149,50 @@ impl Replica {
             CopyState::Verified,
         );
         Ok(Verdict::Counted(copies.record(record, journal)?))
+    }
+
+    /// Downgrades every copy here of `recording` that is verified and
+    /// overlaps `[start, end)` to [`CopyState::Unverified`]. Only for the
+    /// replica's own check of its stored bytes failing (a scrub, a verify
+    /// of the integrity journal), never for what the source sends
+    /// (ADR-0102 decision 5). Returns how many copies stopped counting.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicationError::InvertedRange`], or the catalog's error.
+    pub fn invalidate<D: Disk>(
+        &self,
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+        recording: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, ReplicationError> {
+        if end < start {
+            return Err(ReplicationError::InvertedRange { start, end });
+        }
+        // An empty range checks no byte: nothing to invalidate.
+        if end == start {
+            return Ok(0);
+        }
+        let counted: Vec<CopyRecord> = copies
+            .current()?
+            .into_iter()
+            .filter(|copy| {
+                copy.location == self.location
+                    && copy.recording == recording
+                    && copy.state == CopyState::Verified
+                    && copy.start < end
+                    && start < copy.end
+            })
+            .collect();
+        let mut downgraded = 0u64;
+        for mut copy in counted {
+            copy.state = CopyState::Unverified;
+            copies.record(copy, journal)?;
+            downgraded = downgraded.saturating_add(1);
+        }
+        Ok(downgraded)
     }
 
     /// The replication lag of `recording` against the source, whose

@@ -1004,6 +1004,9 @@ enum Command {
     ),
     /// A replica's stop.
     StopReplication(crate::replication::StopReplication, Reply<()>),
+    /// Whether a replication with this `correlation_id` is still active
+    /// (ADR-0102 decision 3).
+    ReplicationActive(u64, Reply<bool>),
     /// A time evidence entry to record (karyos#1128).
     TimeEvidence(Box<crate::integrity::time_evidence::Entry>, Reply<u64>),
     /// The calibration source for groups' time evidence (karyos#1137).
@@ -1124,6 +1127,10 @@ impl core::fmt::Debug for Command {
                 .finish_non_exhaustive(),
             Self::Replicate(request, _, _) => f.debug_tuple("Replicate").field(request).finish(),
             Self::StopReplication(stop, _) => f.debug_tuple("StopReplication").field(stop).finish(),
+            Self::ReplicationActive(correlation_id, _) => f
+                .debug_tuple("ReplicationActive")
+                .field(correlation_id)
+                .finish(),
             Self::TimeEvidence(entry, _) => f.debug_tuple("TimeEvidence").field(entry).finish(),
             Self::CalibrationSource(source, _) => {
                 f.debug_tuple("CalibrationSource").field(source).finish()
@@ -1382,6 +1389,19 @@ impl ArchiveHandle {
         stop: crate::replication::StopReplication,
     ) -> Result<Posted<()>, AgentError> {
         self.post(|reply| Command::StopReplication(stop, reply))
+    }
+
+    /// Whether a replication with `correlation_id` is still active in the
+    /// agent, posted: answered from the agent's own state whatever the
+    /// response buffers hold, so a requester can confirm that a stopped
+    /// request is gone before it starts a replacement (ADR-0102 decision
+    /// 3).
+    ///
+    /// # Errors
+    ///
+    /// As [`ArchiveHandle::post_start`].
+    pub fn post_replication_active(&self, correlation_id: u64) -> Result<Posted<bool>, AgentError> {
+        self.post(|reply| Command::ReplicationActive(correlation_id, reply))
     }
 
     /// Verifies `recording`'s seals (ADR-0088), posted.
@@ -2071,6 +2091,17 @@ fn run<D>(
             return;
         }
     };
+    // An offload a crash cut short is finished before any recording is
+    // scanned (ADR-0104, decision 4): its local copy stops counting, its
+    // files are released and removed, and its start raised, so its segment
+    // is never taken for a local one, nor purged.
+    if let Some(integrity) = integrity.as_mut()
+        && integrity.journal.tiered()
+        && let Err(error) = reconcile_offloads(&disk, &dir, integrity, &catalog)
+    {
+        let _ = ready.send(Err(error));
+        return;
+    }
     // The configured retention policy is chained in the integrity journal
     // when its terms changed (SPEC.md 8.4; karyos#1123), but only after
     // the purges a crash cut short are reconciled: they are rechecked, and
@@ -3295,6 +3326,9 @@ where
                 (None, Some(active)) => replication.sender.stop(active.recorder.store(), sealed),
                 (None, None) => continue,
             };
+            // The stop drops the replication's pending output (ADR-0102
+            // decision 3): only the stopped status is left to hand over.
+            replication.queued.clear();
             replication.queued.push_back(status);
         }
     }
@@ -3771,6 +3805,12 @@ where
             Command::StopReplication(stop, reply) => {
                 self.stop_replication(stop);
                 let _ = reply.send(Ok(()));
+            }
+            Command::ReplicationActive(correlation_id, reply) => {
+                let active = self.replications.iter().any(|replication| {
+                    replication.sender.request().correlation_id == correlation_id
+                });
+                let _ = reply.send(Ok(active));
             }
             Command::TimeEvidence(entry, reply) => {
                 let _ = reply.send(self.record_time_evidence(&entry));
@@ -4556,6 +4596,77 @@ fn local_enforcement(
         }
     }
     enforcement
+}
+
+/// Finishes, at start, every offload of a tiered Archive a crash cut
+/// short (ADR-0104, decision 4): each offloaded recording's data files
+/// below its offloaded end are released from immutability first, then,
+/// with a copy catalog, its store is recovered and
+/// [`crate::integrity::tiering::Tiering::reconcile`] uncounts the local
+/// copy, raises the start and removes the files; without one, only the
+/// start is raised.
+fn reconcile_offloads<D: Disk + Clone>(
+    disk: &D,
+    dir: &Path,
+    integrity: &mut Integrity<D>,
+    catalog: &Catalog<D>,
+) -> Result<(), AgentError> {
+    use crate::integrity::tiering::{Releasing, Tiering, offloaded, reconcile_floors};
+    let tiering_error = |error: crate::integrity::tiering::TieringError| {
+        AgentError::Io(std::io::Error::other(error.to_string()))
+    };
+    let records = integrity.journal.records()?;
+    #[cfg(target_os = "linux")]
+    let mut backend = crate::integrity::copies::ImmutableAttribute;
+    #[cfg(not(target_os = "linux"))]
+    let mut backend = crate::integrity::copies::NoImmutability;
+    let names = disk.clone().list(dir)?;
+    for (id, offloads) in offloaded(&records) {
+        let Some(recording) = catalog.get(id) else {
+            continue;
+        };
+        let end = offloads
+            .iter()
+            .map(|offload| offload.end)
+            .max()
+            .unwrap_or(0);
+        let floor_base = recording.geometry.base_of(end);
+        let prefix = format!("{id:016x}-");
+        for name in &names {
+            let below = name
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.strip_suffix(".seg"))
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                .is_some_and(|base| base < floor_base);
+            if below {
+                crate::integrity::copies::ImmutabilityBackend::release(
+                    &mut backend,
+                    &dir.join(name),
+                )?;
+            }
+        }
+        if let Some((copies, local)) = integrity.copies.as_mut() {
+            let mut store =
+                SegmentStore::recover(disk.clone(), dir, id, recording.geometry, recording.policy)?
+                    .store;
+            // The destination plays no part after the offload record.
+            Tiering {
+                local: *local,
+                remote: *local,
+            }
+            .reconcile(
+                copies,
+                &mut integrity.journal,
+                &mut store,
+                &mut Releasing(&mut backend),
+            )
+            .map_err(tiering_error)?;
+        }
+    }
+    if integrity.copies.is_none() {
+        let _ = reconcile_floors(&mut disk.clone(), dir, &records)?;
+    }
+    Ok(())
 }
 
 impl<D: Disk> Integrity<D> {

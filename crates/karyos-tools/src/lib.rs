@@ -30,12 +30,15 @@ pub mod archive_signer;
 pub mod args;
 pub mod capability_log;
 pub mod catalog;
+pub mod catalog_export;
 pub mod catalog_verify;
 pub mod compat;
 pub mod config;
 pub mod daemon;
 #[cfg(target_os = "linux")]
 pub mod daemon_archive;
+#[cfg(target_os = "linux")]
+pub mod daemon_replication;
 pub mod errors;
 pub mod idle;
 #[cfg(target_os = "linux")]

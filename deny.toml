@@ -19,6 +19,14 @@ allow = [
     "Unicode-3.0",
 ]
 confidence-threshold = 0.93
+# `foldhash` 0.2.0 (Zlib) enters through `hashbrown`'s `default-hasher`,
+# which `aya` 0.16.0 enables itself: the scoped exception of the aya R8
+# record (quantstratum-docs karyos/reviews/dependency-admission-aya-af-xdp.md,
+# condition 2). A second consumer of `default-hasher` is a scope change
+# with its own record.
+exceptions = [
+    { allow = ["Zlib"], crate = "foldhash@0.2.0" },
+]
 unused-allowed-license = "allow"
 
 [bans]

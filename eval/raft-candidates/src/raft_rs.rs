@@ -61,8 +61,8 @@
 
 use karyos_cluster::{Entry, HardState};
 use karyos_sim::harness::core::{
-    ConsensusCore, Limit, Limits, LogView, NotLeader, Persisted, Ready, Refused, TransferRefused,
-    Unsupported,
+    ConsensusCore, Limit, Limits, LogView, NotLeader, Persisted, Ready, ReadyBuf, Refused,
+    TransferRefused, Unsupported,
 };
 use karyos_sim::net::NodeId;
 use raft::eraftpb::{self, ConfState, Snapshot};
@@ -96,6 +96,30 @@ pub type RaftRs = RaftCore<true>;
 /// `raft` 0.7.0 with pre-vote off: only the negative control of the
 /// pre-vote test, never evaluated.
 pub type RaftRsNoPreVote = RaftCore<false>;
+
+/// [`RaftRs`] with a batch entry cap of 16, W1's primary batch limit
+/// (quantstratum-docs: karyos/evaluations/c5-raft-comparison-v1.md, W1;
+/// karyos#691), for W1's allocation case of [`BATCH_PAYLOAD`]-byte
+/// payloads. raft-rs caps an append by bytes (`max_size_per_msg`), not by
+/// entries, so the configuration sets the cap, from startup, to `BATCH`
+/// encoded entries of that case's command at index 1 and term 1, the
+/// smallest such an entry is: an append then holds at most 16 of them,
+/// fewer at larger indices. It is not an entry count: entries smaller than
+/// the case's (a new leader's empty entry) could let more through, which
+/// the append observation test (`tests/batch.rs`) would catch.
+pub type RaftRsBatch16 = RaftCore<true, 16>;
+
+/// The entries an outgoing message appends and their payload bytes, for a
+/// test that observes appends (karyos#691); `None` for any other message.
+#[must_use]
+pub fn append_shape(message: &eraftpb::Message) -> Option<(usize, u64)> {
+    (message.get_msg_type() == eraftpb::MessageType::MsgAppend).then(|| {
+        let bytes = message.entries.iter().fold(0u64, |sum, entry| {
+            sum.saturating_add(u64::try_from(entry.data.len()).unwrap_or(u64::MAX))
+        });
+        (message.entries.len(), bytes)
+    })
+}
 
 /// Node `id`'s election timeout among `voters`, `[min, max)` in ticks:
 /// one value, so raft-rs's `thread_rng` draw is deterministic, staggered
@@ -202,6 +226,14 @@ pub fn from_raft(entry: &eraftpb::Entry) -> Entry {
     }
 }
 
+/// [`from_raft`] into a buffer of `out`'s pool (plan issue 073,
+/// karyos#691): the payload is copied into a kept buffer, not a new one.
+fn from_raft_into<M>(out: &mut ReadyBuf<M>, entry: &eraftpb::Entry) -> Entry {
+    let context: &[u8] = entry.context.as_ref();
+    let event_time = <[u8; 8]>::try_from(context).map_or(0, u64::from_le_bytes);
+    out.entry(entry.index, entry.term, event_time, entry.data.as_ref())
+}
+
 /// Whether the entries of an outgoing append, `sent`, that C4's log holds
 /// were read back through the metered `log` within the duty's budget and
 /// equal the log's (karyos#975, karyos#1040): both adapters send an append
@@ -224,6 +256,42 @@ pub(crate) fn read_back(sent: &[Entry], log: &mut LogView<'_>) -> bool {
     let unread = sent.get(read.len()).map(|entry| entry.index);
     let held = unread.is_some_and(|index| log.last_index().is_some_and(|last| index <= last));
     matches && !held
+}
+
+/// The W1 payload [`RaftRsBatch16`]'s byte cap is sized for (W1's
+/// allocation case, `W1 n=3 payload=32 clients=32`).
+pub const BATCH_PAYLOAD: usize = 32;
+
+/// The command a client of W1's allocation case proposes: an append of a
+/// [`BATCH_PAYLOAD`]-byte value; its encoded length does not depend on the
+/// client or the sequence number.
+fn batch_command() -> Vec<u8> {
+    karyos_sim::harness::node::Command {
+        client: 0,
+        sequence: 1,
+        op: karyos_sim::harness::node::Op::Append(vec![0u8; BATCH_PAYLOAD]),
+    }
+    .encode()
+}
+
+/// The append byte cap that holds `entries` entries carrying `command`,
+/// each sized at index 1 and term 1 with the adapter's 8-byte event time
+/// context: the smallest such an entry can be.
+fn batch_cap(entries: u64, command: &[u8]) -> u64 {
+    use protobuf::Message as _;
+    entries.saturating_mul(u64::from(sized_entry(1, command).compute_size()))
+}
+
+/// An entry of term 1 at `index` carrying `command` and an 8-byte context,
+/// as the adapter proposes it: what [`batch_cap`] sizes.
+fn sized_entry(index: u64, command: &[u8]) -> eraftpb::Entry {
+    eraftpb::Entry {
+        term: 1,
+        index,
+        data: command.to_vec().into(),
+        context: vec![0u8; 8].into(),
+        ..eraftpb::Entry::default()
+    }
 }
 
 /// raft-rs's hard state as C4 stores it.
@@ -251,24 +319,26 @@ fn raft_hard_state(state: &HardState) -> eraftpb::HardState {
     }
 }
 
-fn messages_of(messages: Vec<eraftpb::Message>) -> Vec<(NodeId, eraftpb::Message)> {
-    messages
-        .into_iter()
-        .filter_map(|message| Some((node_id(message.to)?, message)))
-        .collect()
+fn push_messages(out: &mut Vec<(NodeId, eraftpb::Message)>, messages: Vec<eraftpb::Message>) {
+    out.extend(
+        messages
+            .into_iter()
+            .filter_map(|message| Some((node_id(message.to)?, message))),
+    );
 }
 
 /// `raft` 0.7.0's `RawNode` behind [`ConsensusCore`], pre-vote on when
 /// `PRE_VOTE` (see the module).
-pub struct RaftCore<const PRE_VOTE: bool> {
+pub struct RaftCore<const PRE_VOTE: bool, const BATCH: u64 = 0> {
     /// `None` when the log could not be read or raft-rs refused its
     /// configuration at recovery: the node stays silent (it never votes,
     /// leads or answers), which is safe, and the harness sees it as down.
     node: Option<RawNode<MemStorage>>,
     /// The raft-rs Ready handed out and not yet advanced.
     pending: Option<raft::Ready>,
-    /// What raft-rs released after the last persistence, not handed out.
-    light: Option<Ready<eraftpb::Message>>,
+    /// What raft-rs released after the last persistence, not handed out,
+    /// with the hard state its commit advance asks to save.
+    light: Option<(raft::LightReady, Option<HardState>)>,
     /// The clock at the last tick.
     last_tick: Option<u64>,
     /// The clock at the last tick, as the event time of what it proposes.
@@ -277,7 +347,7 @@ pub struct RaftCore<const PRE_VOTE: bool> {
     limits: Option<Limits>,
 }
 
-impl<const PRE_VOTE: bool> std::fmt::Debug for RaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> std::fmt::Debug for RaftCore<PRE_VOTE, BATCH> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RaftCore")
             .field("pre_vote", &PRE_VOTE)
@@ -288,7 +358,7 @@ impl<const PRE_VOTE: bool> std::fmt::Debug for RaftCore<PRE_VOTE> {
     }
 }
 
-impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> RaftCore<PRE_VOTE, BATCH> {
     /// Whether the core is running: its log was read and raft-rs took its
     /// configuration.
     #[must_use]
@@ -317,18 +387,10 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
     /// it is held back this duty, as a lost message, and raft-rs resends
     /// it. Entries the log does not hold yet (a leader's own, sent before
     /// its persistence) are not a log read. Unmetered, `messages` as is.
-    fn meter(
-        &self,
-        messages: Vec<(NodeId, eraftpb::Message)>,
-        log: &mut LogView<'_>,
-    ) -> Vec<(NodeId, eraftpb::Message)> {
-        if self.limits.is_none() {
-            return messages;
+    fn meter(&self, messages: &mut Vec<(NodeId, eraftpb::Message)>, log: &mut LogView<'_>) {
+        if self.limits.is_some() {
+            messages.retain(|(_, message)| Self::read_back(message, log));
         }
-        messages
-            .into_iter()
-            .filter(|(_, message)| Self::read_back(message, log))
-            .collect()
     }
 
     /// Whether `message`'s logged entries were read back through `log`.
@@ -396,6 +458,8 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
             // karyos#975).
             max_size_per_msg: if limits.is_some() {
                 0
+            } else if BATCH > 0 {
+                batch_cap(BATCH, &batch_command())
             } else {
                 MAX_SIZE_PER_MSG
             },
@@ -412,7 +476,7 @@ impl<const PRE_VOTE: bool> RaftCore<PRE_VOTE> {
     }
 }
 
-impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for RaftCore<PRE_VOTE, BATCH> {
     type Message = eraftpb::Message;
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
@@ -492,33 +556,51 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
     }
 
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
-        if let Some(mut light) = self.light.take() {
-            light.messages = self.meter(std::mem::take(&mut light.messages), log);
-            return Some(light);
+        let mut out = ReadyBuf::default();
+        self.ready_into(&mut out, log).then_some(out.ready)
+    }
+
+    /// raft-rs's Ready copied into `out` in place: its messages moved over,
+    /// its entries' payloads copied into `out`'s kept buffers.
+    fn ready_into(&mut self, out: &mut ReadyBuf<Self::Message>, log: &mut LogView<'_>) -> bool {
+        if let Some((mut light, hard_state)) = self.light.take() {
+            push_messages(&mut out.ready.messages, light.take_messages());
+            self.meter(&mut out.ready.messages, log);
+            out.ready.hard_state = hard_state;
+            for entry in &light.take_committed_entries() {
+                let entry = from_raft_into(out, entry);
+                out.ready.committed.push(entry);
+            }
+            return true;
         }
         if self.pending.is_some() {
-            return None;
+            return false;
         }
         let mirrored = self.mirrored_last();
-        let node = self.node.as_mut()?;
+        let Some(node) = self.node.as_mut() else {
+            return false;
+        };
         if !node.has_ready() {
-            return None;
+            return false;
         }
         let mut raw = node.ready();
         let first = raw.entries().first().map(|entry| entry.index);
-        let messages = messages_of(raw.take_messages());
-        let after_persist = messages_of(raw.take_persisted_messages());
-        let ready = Ready {
-            messages: self.meter(messages, log),
-            truncate_from: first.filter(|first| mirrored.is_some_and(|last| *first <= last)),
-            entries: raw.entries().iter().map(from_raft).collect(),
-            hard_state: raw.hs().map(hard_state_of),
-            after_persist: self.meter(after_persist, log),
-            committed: raw.take_committed_entries().iter().map(from_raft).collect(),
-            snapshot_to: Vec::new(),
-        };
+        push_messages(&mut out.ready.messages, raw.take_messages());
+        self.meter(&mut out.ready.messages, log);
+        push_messages(&mut out.ready.after_persist, raw.take_persisted_messages());
+        self.meter(&mut out.ready.after_persist, log);
+        out.ready.truncate_from = first.filter(|first| mirrored.is_some_and(|last| *first <= last));
+        for entry in raw.entries() {
+            let entry = from_raft_into(out, entry);
+            out.ready.entries.push(entry);
+        }
+        out.ready.hard_state = raw.hs().map(hard_state_of);
+        for entry in &raw.take_committed_entries() {
+            let entry = from_raft_into(out, entry);
+            out.ready.committed.push(entry);
+        }
         self.pending = Some(raw);
-        Some(ready)
+        true
     }
 
     fn advance(&mut self, _persisted: Persisted, _log: &mut LogView<'_>) {
@@ -542,27 +624,19 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
             self.fault();
             return;
         }
-        let mut light = node.advance(raw);
+        let light = node.advance(raw);
         let hard_state = light.commit_index().map(|commit| {
             let mut state = node.raft.hard_state();
             state.commit = commit;
             hard_state_of(&state)
         });
-        let ready = Ready {
-            messages: messages_of(light.take_messages()),
-            hard_state,
-            committed: light
-                .take_committed_entries()
-                .iter()
-                .map(from_raft)
-                .collect(),
-            ..Ready::default()
-        };
-        if !ready.committed.is_empty() {
+        let committed = !light.committed_entries().is_empty();
+        if committed {
             node.advance_apply();
         }
-        if ready != Ready::default() {
-            self.light = Some(ready);
+        // Handed out by the next `ready_into`, converted there.
+        if committed || hard_state.is_some() || !light.messages().is_empty() {
+            self.light = Some((light, hard_state));
         }
     }
 
@@ -608,7 +682,7 @@ impl<const PRE_VOTE: bool> ConsensusCore for RaftCore<PRE_VOTE> {
     }
 }
 
-impl<const PRE_VOTE: bool> crate::process::Wire for RaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire for RaftCore<PRE_VOTE, BATCH> {
     fn encode(message: &eraftpb::Message) -> Option<Vec<u8>> {
         protobuf::Message::write_to_bytes(message).ok()
     }
@@ -622,6 +696,29 @@ impl<const PRE_VOTE: bool> crate::process::Wire for RaftCore<PRE_VOTE> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The batch cap of [`RaftRsBatch16`] keeps an append at 16 entries or
+    /// fewer of the command it was sized for, at any index (karyos#691).
+    #[test]
+    fn the_batch_cap_holds_at_most_sixteen_entries() {
+        let command = batch_command();
+        let cap = batch_cap(16, &command);
+        for first in [1u64, 200, 70_000] {
+            let mut entries: Vec<eraftpb::Entry> = (first..first + 40)
+                .map(|index| sized_entry(index, &command))
+                .collect();
+            raft::util::limit_size(&mut entries, Some(cap));
+            assert!(
+                (1..=16).contains(&entries.len()),
+                "{first}: {}",
+                entries.len()
+            );
+        }
+        // Entries of the size it was computed for: exactly 16.
+        let mut sized: Vec<eraftpb::Entry> = (0..40).map(|_| sized_entry(1, &command)).collect();
+        raft::util::limit_size(&mut sized, Some(cap));
+        assert_eq!(sized.len(), 16);
+    }
 
     #[test]
     fn an_entry_round_trips_through_raft_rs_with_its_event_time() {
