@@ -462,3 +462,382 @@ mod offline {
         );
     }
 }
+
+/// The exporter's assembly reproduces the blind vectors X-5 to X-12 byte
+/// for byte from their inputs (design section 8), built with the Archive's
+/// own record types.
+mod assembly {
+    use super::super::assemble::{ExportContents, JournalExport, RecordingExport, assemble};
+    use super::vector;
+    use crate::integrity::anchor::{Anchor, AnchorKind};
+    use crate::integrity::test_key::TestKey;
+    use crate::integrity::time::{Source, SyncState};
+    use crate::integrity::time_evidence::Entry;
+    use crate::integrity::trust::{
+        Algorithm, ChainHead, Custody, RegistryAction, RegistryEntry, SignedHead, key_id,
+    };
+    use crate::integrity::{GENESIS, SealKind, SealRecord, digest};
+
+    const ARCHIVE: [u8; 32] = [7; 32];
+
+    fn authority() -> TestKey {
+        TestKey::from_seed([1; 32])
+    }
+
+    fn archival() -> TestKey {
+        TestKey::from_seed([9; 32])
+    }
+
+    /// A registry entry, endorsed by the authority.
+    fn entry(
+        action: RegistryAction,
+        sequence: u64,
+        key: &TestKey,
+        effective: u64,
+        evidence: [u8; 32],
+    ) -> RegistryEntry {
+        let register = action == RegistryAction::Register;
+        let mut entry = RegistryEntry {
+            action,
+            algorithm: Algorithm::Ed25519,
+            custody: Custody::Declared,
+            sequence,
+            key_id: key_id(&key.public()),
+            public: if register { key.public() } else { [0; 32] },
+            effective,
+            evidence,
+            endorsement: [0; 64],
+        };
+        entry.endorsement = authority().sign_bytes(&entry.endorsement_bytes(&ARCHIVE));
+        entry
+    }
+
+    /// What a record seals, before its counter and link.
+    enum Seal {
+        Registry(RegistryEntry),
+        Range(SealKind, u64, u64, Vec<u8>),
+        Policy(u64, u64, [u8; 30]),
+        Binding(u64, [u8; 64]),
+    }
+
+    fn chain(seals: &[Seal]) -> Vec<SealRecord> {
+        let mut records: Vec<SealRecord> = Vec::new();
+        for (counter, seal) in (0u64..).zip(seals) {
+            let (kind, subject, start, end, content) = match seal {
+                Seal::Registry(entry) => (
+                    SealKind::KeyRegistry,
+                    u64::from_le_bytes(*entry.key_id.first_chunk::<8>().unwrap()),
+                    entry.sequence,
+                    entry.sequence,
+                    digest(&entry.encode()),
+                ),
+                Seal::Range(kind, subject, start, bytes) => (
+                    *kind,
+                    *subject,
+                    *start,
+                    start + bytes.len() as u64,
+                    digest(bytes),
+                ),
+                Seal::Policy(policy, version, canonical) => (
+                    SealKind::Policy,
+                    *policy,
+                    *version,
+                    *version,
+                    digest(canonical),
+                ),
+                Seal::Binding(sequence, row) => (
+                    SealKind::Catalog,
+                    u64::MAX,
+                    *sequence,
+                    *sequence,
+                    digest(row),
+                ),
+            };
+            let previous = records.last().map_or(GENESIS, SealRecord::digest);
+            records.push(SealRecord {
+                kind,
+                counter,
+                subject,
+                start,
+                end,
+                content,
+                previous,
+            });
+        }
+        records
+    }
+
+    fn head(journal: u64, records: &[SealRecord], counter: usize) -> SignedHead {
+        let head = ChainHead {
+            archive_id: ARCHIVE,
+            journal_id: journal,
+            counter: counter as u64,
+            digest: records[counter].digest(),
+        };
+        SignedHead {
+            head,
+            key_id: key_id(&archival().public()),
+            custody: Custody::Declared,
+            signature: archival().sign_bytes(&head.signed_bytes(Custody::Declared)),
+        }
+    }
+
+    fn anchor(signed: SignedHead) -> Anchor {
+        Anchor {
+            kind: AnchorKind::OperatorExport,
+            location: [0x0A; 32],
+            external_counter: 1,
+            receipt: [0x0B; 32],
+            signed,
+        }
+    }
+
+    fn recording(id: u64, session: i32, start: u64, bytes: Vec<u8>) -> RecordingExport {
+        RecordingExport {
+            recording: id,
+            start,
+            segment_length: 4096,
+            stream_id: 10,
+            session_id: session,
+            initial_term_id: 0,
+            mtu: 1408,
+            bytes,
+        }
+    }
+
+    fn r0() -> RegistryEntry {
+        entry(RegistryAction::Register, 0, &archival(), 0, [0; 32])
+    }
+
+    fn r1() -> RegistryEntry {
+        entry(RegistryAction::Revoke, 1, &archival(), 2, [0x0C; 32])
+    }
+
+    fn e1() -> Entry {
+        Entry {
+            source: Source::Gnss,
+            sync_state: SyncState::Synchronised,
+            clock: [1, 0, 2, 3, 4],
+            recording: 7,
+            start: 0,
+            end: 64,
+            min_time: 1000,
+            max_time: 2000,
+            granularity: 1,
+            bound_min_ns: 150,
+            bound_max_ns: 160,
+            calibration: [0xAA; 32],
+            utc_reference: [0xBB; 32],
+            tick_fs: 1_000_000,
+        }
+    }
+
+    fn e2() -> Entry {
+        Entry {
+            min_time: 1500,
+            ..e1()
+        }
+    }
+
+    fn archive_journal(
+        seals: &[Seal],
+        heads: &[usize],
+        anchors: &[usize],
+        registry: Vec<RegistryEntry>,
+    ) -> JournalExport {
+        let records = chain(seals);
+        JournalExport {
+            id: 1,
+            role: 1,
+            heads: heads.iter().map(|at| head(1, &records, *at)).collect(),
+            anchors: anchors
+                .iter()
+                .map(|at| anchor(head(1, &records, *at)))
+                .collect(),
+            records,
+            registry,
+        }
+    }
+
+    fn sevens() -> Vec<u8> {
+        vec![7; 64]
+    }
+
+    fn x5(with_r1: bool) -> ExportContents {
+        let registry = if with_r1 {
+            vec![r0(), r1()]
+        } else {
+            vec![r0()]
+        };
+        ExportContents {
+            archive_id: ARCHIVE,
+            journals: vec![archive_journal(
+                &[
+                    Seal::Registry(r0()),
+                    Seal::Range(SealKind::OpenSegment, 7, 0, sevens()),
+                    Seal::Registry(r1()),
+                ],
+                &[1],
+                &[1],
+                registry,
+            )],
+            recordings: vec![recording(7, 3, 0, sevens())],
+            ..ExportContents::default()
+        }
+    }
+
+    fn base_journal() -> Vec<Seal> {
+        vec![
+            Seal::Registry(r0()),
+            Seal::Range(SealKind::OpenSegment, 7, 0, sevens()),
+        ]
+    }
+
+    fn x6(
+        entries: &[Entry],
+        carried: Vec<Entry>,
+        heads: &[usize],
+        anchors: &[usize],
+    ) -> ExportContents {
+        let mut seals = vec![Seal::Registry(r0())];
+        let mut at = 0u64;
+        for entry in entries {
+            let bytes = entry.encode().unwrap().to_vec();
+            seals.push(Seal::Range(SealKind::OpenSegment, 1, at, bytes));
+            at += 200;
+        }
+        let records = chain(&seals);
+        let entries_journal = JournalExport {
+            id: 2,
+            role: 2,
+            heads: heads.iter().map(|at| head(2, &records, *at)).collect(),
+            anchors: anchors
+                .iter()
+                .map(|at| anchor(head(2, &records, *at)))
+                .collect(),
+            records,
+            registry: vec![r0()],
+        };
+        ExportContents {
+            archive_id: ARCHIVE,
+            journals: vec![
+                archive_journal(&base_journal(), &[1], &[1], vec![r0()]),
+                entries_journal,
+            ],
+            recordings: vec![recording(7, 3, 0, sevens())],
+            time_evidence: Some((2, carried)),
+            ..ExportContents::default()
+        }
+    }
+
+    fn p1() -> [u8; 30] {
+        let mut canonical = [0u8; 30];
+        let fields: Vec<u8> = 1u64
+            .to_le_bytes()
+            .into_iter()
+            .chain(1u64.to_le_bytes())
+            .chain(3_600_000_000_000u64.to_le_bytes())
+            .chain(1u32.to_le_bytes())
+            .chain([0, 1])
+            .collect();
+        canonical.copy_from_slice(&fields);
+        canonical
+    }
+
+    fn binding(
+        selector: u8,
+        policy: u64,
+        recording: u64,
+        stream_id: i32,
+        channel: [u8; 32],
+    ) -> [u8; 64] {
+        let mut row = [0u8; 64];
+        row[0] = 2;
+        row[1] = selector;
+        row[8..16].copy_from_slice(&policy.to_le_bytes());
+        row[16..24].copy_from_slice(&recording.to_le_bytes());
+        row[24..28].copy_from_slice(&stream_id.to_le_bytes());
+        row[32..].copy_from_slice(&channel);
+        row
+    }
+
+    fn x7(extra: bool) -> ExportContents {
+        let b0 = binding(1, 1, 7, 0, [0; 32]);
+        let b1 = binding(2, 1, 0, 10, digest(b"karyos:ipc"));
+        let mut seals = base_journal();
+        seals.push(Seal::Policy(1, 1, p1()));
+        seals.push(Seal::Binding(0, b0));
+        seals.push(Seal::Binding(1, b1));
+        seals.push(Seal::Range(SealKind::OpenSegment, 8, 0, vec![8; 64]));
+        if extra {
+            seals.push(Seal::Binding(2, binding(1, 2, 7, 0, [0; 32])));
+        }
+        ExportContents {
+            archive_id: ARCHIVE,
+            journals: vec![archive_journal(&seals, &[5], &[5], vec![r0()])],
+            recordings: vec![
+                recording(7, 3, 0, sevens()),
+                recording(8, 4, 0, vec![8; 64]),
+            ],
+            policies: vec![p1()],
+            bindings: vec![b0, b1],
+            ..ExportContents::default()
+        }
+    }
+
+    fn x8() -> ExportContents {
+        let key = TestKey::from_seed([0x0D; 32]);
+        let r2 = entry(RegistryAction::Register, 1, &key, 3, [0; 32]);
+        let mut seals = base_journal();
+        seals.push(Seal::Range(SealKind::OpenSegment, 9, 0, vec![9; 8]));
+        seals.push(Seal::Registry(r2));
+        seals.push(Seal::Range(SealKind::OpenSegment, 7, 64, vec![0x17; 64]));
+        let mut bytes = sevens();
+        bytes.extend_from_slice(&[0x17; 64]);
+        ExportContents {
+            archive_id: ARCHIVE,
+            journals: vec![archive_journal(&seals, &[1, 4], &[1], vec![r0(), r2])],
+            recordings: vec![recording(7, 3, 0, bytes)],
+            ..ExportContents::default()
+        }
+    }
+
+    fn check(name: &str, contents: &ExportContents) {
+        let built = assemble(contents).unwrap();
+        let expected = vector(name);
+        let first = built.iter().zip(&expected).position(|(a, b)| a != b);
+        assert!(
+            built == expected,
+            "{name}: lengths {} vs {}, first difference at {first:?}",
+            built.len(),
+            expected.len()
+        );
+    }
+
+    /// #1189 review P2: a range ending past `u64::MAX` is refused, typed.
+    #[test]
+    fn an_overflowing_range_is_refused() {
+        use super::super::assemble::AssembleError;
+        let contents = ExportContents {
+            archive_id: ARCHIVE,
+            recordings: vec![recording(7, 3, u64::MAX, vec![1])],
+            ..ExportContents::default()
+        };
+        assert_eq!(
+            assemble(&contents),
+            Err(AssembleError::RangeOverflow { recording: 7 })
+        );
+    }
+
+    #[test]
+    fn the_assembly_reproduces_x5_to_x12() {
+        check("X-5", &x5(true));
+        check("X-6", &x6(&[e1(), e2()], vec![e1()], &[], &[]));
+        check("X-7", &x7(false));
+        check("X-8", &x8());
+        check("X-9", &x5(false));
+        check("X-10", &x7(true));
+        check("X-11", &x6(&[], Vec::new(), &[], &[]));
+        check("X-12", &x6(&[e1(), e2()], vec![e1(), e2()], &[1, 2], &[1]));
+    }
+}
