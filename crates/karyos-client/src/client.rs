@@ -426,6 +426,22 @@ pub struct ImageChange {
     /// seal: `None` for an attached image, and for one released unsealed
     /// (its client closed first).
     pub end: Option<ImageEnd>,
+    /// The range of the image's lane its attach did not read (ADR-0100,
+    /// `ImageJoinLoss`): the attach started above the lane's join. A change
+    /// that carries it reports that loss, after the image's attach; every
+    /// other change has `None`.
+    pub join_loss: Option<JoinLoss>,
+}
+
+/// What an image's attach did not read (ADR-0100): it started at `to`,
+/// above the lane's join `from`, so `[from, to)` was not delivered to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JoinLoss {
+    /// The lane's join.
+    pub from: u64,
+    /// Where the reader started.
+    pub to: u64,
 }
 
 /// How a retired image's stream ended: its terminal seal.
@@ -471,6 +487,7 @@ impl ImageChange {
             available,
             registration: None,
             end: None,
+            join_loss: None,
         }
     }
 
@@ -589,10 +606,13 @@ pub trait Connection: sealed::Sealed {
     /// Attaches to lane 0 of the image `image` of the alias `stream`
     /// (`quantstratum-docs: karyos/design/per-source-images.md`, D2-5).
     #[doc(hidden)]
+    /// `parent` is the network subscription the image was announced to:
+    /// the attach adopts its awaiting cell (ADR-0100).
     fn add_image_subscription(
         &mut self,
         stream: StreamKey,
         image: u64,
+        parent: u64,
         role: SubscriberRole,
     ) -> Result<u64, ConductorError>;
 
@@ -762,12 +782,14 @@ impl Connection for ClientConductor {
         &mut self,
         stream: StreamKey,
         image: u64,
+        parent: u64,
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         ClientConductor::add_image_subscription(
             self,
             stream,
             image,
+            parent,
             karyos_sys::frame::Lane::ZERO,
             role,
         )
@@ -965,9 +987,10 @@ impl Connection for crate::ipc::RemoteClient {
         &mut self,
         stream: StreamKey,
         image: u64,
+        parent: u64,
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
-        crate::ipc::RemoteClient::add_image_subscription(self, stream, image, role)
+        crate::ipc::RemoteClient::add_image_subscription(self, stream, image, parent, role)
     }
 
     fn add_publication_on_lane(
@@ -1173,6 +1196,9 @@ struct InboxState<T: TermBytes> {
     closed: Option<ClientError>,
     /// Images refused: beyond the bound, or their attach failed.
     refused: u64,
+    /// `ImageJoinLoss` events for this subscription not yet reported
+    /// (ADR-0100), at most `max_images`: each is one attach's.
+    join_losses: Vec<(u64, karyos_sys::frame::Lane, JoinLoss)>,
 }
 
 /// An attached image: its attach id (the request sequence), its session
@@ -1197,6 +1223,7 @@ impl<T: TermBytes> Inbox<T> {
                 retired: Vec::with_capacity(max_images),
                 closed: None,
                 refused: 0,
+                join_losses: Vec::with_capacity(max_images),
             }),
         }
     }
@@ -2148,6 +2175,13 @@ impl<C: Connection> Client<C> {
                 image,
                 ..
             } => self.image_unavailable(registration, image),
+            Event::ImageJoinLoss {
+                parent,
+                image,
+                lane,
+                from,
+                to,
+            } => self.image_join_loss(parent, image, lane, JoinLoss { from, to }),
             _ => {}
         }
     }
@@ -2174,7 +2208,7 @@ impl<C: Connection> Client<C> {
         }
         match self
             .connection
-            .add_image_subscription(stream, image, network.role)
+            .add_image_subscription(stream, image, registration, network.role)
         {
             Ok(sequence) => {
                 network.slots.push(Slot {
@@ -2191,6 +2225,32 @@ impl<C: Connection> Client<C> {
             }
             Err(_) => inbox.update(|state| bump(&mut state.refused)),
         }
+    }
+
+    /// An attach of the network subscription `parent` started above its
+    /// lane's join (ADR-0100): the subscription reports it with its next
+    /// image changes. One beyond `max_images` pending is dropped, counted
+    /// as a lost change.
+    fn image_join_loss(
+        &mut self,
+        parent: u64,
+        image: u64,
+        lane: karyos_sys::frame::Lane,
+        loss: JoinLoss,
+    ) {
+        let Some(inbox) = self
+            .networks
+            .iter()
+            .find(|network| network.registration == parent && !network.closed)
+            .and_then(|network| network.inbox.upgrade())
+        else {
+            return;
+        };
+        inbox.update(|state| {
+            if state.join_losses.len() < state.join_losses.capacity() {
+                state.join_losses.push((image, lane, loss));
+            }
+        });
     }
 
     fn image_unavailable(&mut self, registration: u64, image: u64) {
@@ -2648,6 +2708,7 @@ impl<T: TermBytes> Images<T> {
             } else {
                 image.subscription.terminal_seal()
             },
+            join_loss: None,
         }
     }
 
@@ -2738,6 +2799,33 @@ impl<T: TermBytes> Images<T> {
             );
         }
         self.images.append(&mut state.arrived);
+        // An attach's join loss (ADR-0100), after its image's attach: a
+        // change of that image, available, carrying the range.
+        for (registration, lane, loss) in state.join_losses.drain(..) {
+            let image = self
+                .images
+                .iter()
+                .find(|image| image.registration == registration);
+            let change = ImageChange {
+                image_id: image.map_or(0, |image| image.id),
+                session_id: image.map_or(0, |image| image.session_id),
+                lane,
+                available: true,
+                registration: Some(registration),
+                end: None,
+                join_loss: Some(loss),
+            };
+            if !self.held.is_empty() && self.held.len() < self.held.capacity() {
+                self.held.push_back(Held::Change(change));
+            } else {
+                Self::queue(
+                    &mut self.changes,
+                    self.max_changes,
+                    &mut self.changes_lost,
+                    change,
+                );
+            }
+        }
         if self.closed.is_none() {
             self.closed = state.closed;
         }

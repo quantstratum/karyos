@@ -1027,10 +1027,11 @@ impl RemoteClient {
         &mut self,
         stream: StreamKey,
         image: u64,
+        parent: u64,
         role: SubscriberRole,
     ) -> Result<u64, ConductorError> {
         self.conductor_mut()?
-            .add_image_subscription(stream, image, Lane::ZERO, role)
+            .add_image_subscription(stream, image, parent, Lane::ZERO, role)
     }
 
     /// Requests an exclusive publication of `stream_id` on the channel
