@@ -11,7 +11,13 @@
 //! gapped append), `OldTermCommit`, `Contract` with
 //! `TruncateBelowCommit` (applied entries truncated: C4's log refuses
 //! it), and `PositionsOutOfOrder` (a core that reports no last index over
-//! a written log; karyos#976). The other checks of
+//! a written log; karyos#976). **Fault-injected** around the unmutated
+//! adapter (karyos#1038), the core real and its surroundings faulty:
+//! `AppliedNotDurable` (a driver that applies a Ready's fresh entries),
+//! `ReleasedBeforePersisted` (a driver that releases before the sync),
+//! `DivergentResponse` (a service that alters one server's answers) and
+//! `NotLinearizable` (a client that records a value no one wrote). The
+//! other checks of
 //! `karyos_sim::harness::check::Violation` keep their fixture negative
 //! cases (`crates/karyos-sim/tests/harness.rs`); why each has no mutant
 //! here is recorded in `eval/raft-candidates/README.md` (karyos#976).
@@ -22,7 +28,7 @@
 
 use karyos_raft_eval::raft_rs::RaftRs;
 use karyos_sim::harness::check::Violation;
-use karyos_sim::harness::core::{ConsensusCore, LogView, Persisted, Ready, Refused};
+use karyos_sim::harness::core::{ConsensusCore, DriveFault, LogView, Persisted, Ready, Refused};
 use karyos_sim::harness::node::Breach;
 use karyos_sim::harness::workloads::{self, Case, W1};
 use karyos_sim::net::NodeId;
@@ -241,6 +247,85 @@ fn a_core_that_reports_no_last_index_over_a_written_log_is_caught() {
     let violation = violation::<Mutant<UNREPORTED>>();
     assert!(
         matches!(violation, Violation::PositionsOutOfOrder { .. }),
+        "{violation:?}"
+    );
+}
+
+/// The case with `faults` injected around the unmutated adapter
+/// (karyos#1038): the core is real, the driver, disk, service or client
+/// is faulty.
+fn faulty(faults: workloads::Faults, schedule: Vec<(u64, workloads::Action)>) -> Violation {
+    let mut case = case();
+    case.faults = faults;
+    case.schedule.extend(schedule);
+    case.schedule.sort_by_key(|(at, _)| *at);
+    let outcome = workloads::run::<RaftRs>(&case, 1).unwrap();
+    outcome.safety.unwrap_err()
+}
+
+fn drive(node: NodeId, fault: DriveFault) -> workloads::Faults {
+    workloads::Faults {
+        drive: vec![(node, fault)],
+        ..workloads::Faults::default()
+    }
+}
+
+#[test]
+fn a_driver_that_applies_fresh_entries_is_caught() {
+    let violation = faulty(drive(1, DriveFault::ApplyFresh), Vec::new());
+    assert!(
+        matches!(violation, Violation::AppliedNotDurable { .. }),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_driver_that_releases_before_persistence_is_caught() {
+    let violation = faulty(drive(1, DriveFault::ReleaseEarly), Vec::new());
+    assert!(
+        matches!(violation, Violation::ReleasedBeforePersisted { .. }),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_service_that_answers_differently_is_caught() {
+    let faults = workloads::Faults {
+        altered_responses: vec![1],
+        ..workloads::Faults::default()
+    };
+    let violation = faulty(faults, Vec::new());
+    assert!(
+        matches!(violation, Violation::DivergentResponse { .. }),
+        "{violation:?}"
+    );
+}
+
+#[test]
+fn a_client_that_reads_a_value_never_written_is_caught() {
+    let faults = workloads::Faults {
+        corrupt_reads: vec![0],
+        ..workloads::Faults::default()
+    };
+    let violation = faulty(faults, Vec::new());
+    assert!(
+        matches!(violation, Violation::NotLinearizable(_)),
+        "{violation:?}"
+    );
+}
+
+/// The faulty service's answer is the one sent, not only the one
+/// recorded: when every server answers the same altered way, no two
+/// responses diverge, and the clients' history is what refuses it.
+#[test]
+fn an_altered_answer_reaches_the_client() {
+    let faults = workloads::Faults {
+        altered_responses: vec![0, 1, 2],
+        ..workloads::Faults::default()
+    };
+    let violation = faulty(faults, Vec::new());
+    assert!(
+        matches!(violation, Violation::NotLinearizable(_)),
         "{violation:?}"
     );
 }

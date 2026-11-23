@@ -61,5 +61,6 @@ print_stderr = "deny"
 [dev-dependencies]
 # The allocation gate's probe (karyos-sim harness::probe) and the
 # counting allocator it needs (ADR-0008).
-karyos-sim = { path = "../../crates/karyos-sim", features = ["alloc-probe"] }
+# The fault injection of tests/checks.rs (karyos#1038).
+karyos-sim = { path = "../../crates/karyos-sim", features = ["alloc-probe", "test-hooks"] }
 karyos-sys = { path = "../../crates/karyos-sys", features = ["test-hooks"] }

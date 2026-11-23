@@ -23,6 +23,10 @@ karyos-cluster.workspace = true
 # it needs karyos-sys's counting allocator, a test hook, so the library
 # builds without it unless asked.
 alloc-probe = ["karyos-sys/test-hooks"]
+# Fault injection around a real core: a faulty driver, service or client
+# (harness::workloads::Faults; karyos#1038). Tests only: enabled by the
+# Raft evaluation crate's dev-dependency, never in a shipped build.
+test-hooks = []
 
 [dev-dependencies]
 # The scripted sockets of the timed scenarios (tests/timed.rs).

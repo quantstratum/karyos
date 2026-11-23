@@ -13,6 +13,9 @@ use sha2::{Digest as _, Sha256};
 
 use super::Digest;
 
+pub mod assemble;
+pub mod offline;
+
 #[cfg(test)]
 mod tests;
 
