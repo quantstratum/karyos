@@ -53,6 +53,8 @@ struct Seen {
     answer_mode: Option<String>,
     /// HEADs answered, with their version.
     heads: Vec<String>,
+    /// The query of each GET.
+    gets: Vec<String>,
 }
 
 /// An S3 stand-in: PUT stores (only with the right SHA-256 checksum, as
@@ -155,10 +157,13 @@ fn stand_in(seen: Arc<Mutex<Seen>>) -> u16 {
                         _ => ("404 Not Found", Vec::new()),
                     }
                 }
-                "GET" => match seen.objects.get(&path) {
-                    Some(object) => ("200 OK", object.clone()),
-                    None => ("404 Not Found", seen.not_found_body.clone()),
-                },
+                "GET" => {
+                    seen.gets.push(query.clone());
+                    match seen.objects.get(&path) {
+                        Some(object) => ("200 OK", object.clone()),
+                        None => ("404 Not Found", seen.not_found_body.clone()),
+                    }
+                }
                 _ => ("400 Bad Request", Vec::new()),
             };
             drop(seen);
@@ -381,4 +386,29 @@ fn rfc3339_dates_parse_back_to_their_nanoseconds() {
     ] {
         assert_eq!(parse_rfc3339(bad), None, "{bad}");
     }
+}
+
+#[test]
+fn an_absurd_year_is_refused_not_wrapped() {
+    assert_eq!(parse_rfc3339("18446744073709551615-01-01T00:00:00Z"), None);
+    assert_eq!(parse_rfc3339("10000-01-01T00:00:00Z"), None);
+    // Within the year bound but past u64 nanoseconds (about 2554): none,
+    // never a wrapped value.
+    assert_eq!(parse_rfc3339("9999-12-31T23:59:59Z"), None);
+    assert!(parse_rfc3339("2500-12-31T23:59:59Z").is_some());
+}
+
+#[test]
+fn a_read_back_names_the_version_the_put_wrote() {
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let port = stand_in(Arc::clone(&seen));
+    let mut store = S3Store::new(config(port, true)).unwrap();
+    let _ = store.put(&key(1), b"first", 1).unwrap();
+    let _ = store.get(&key(1)).unwrap();
+    let gets = seen.lock().unwrap().gets.clone();
+    assert_eq!(gets.len(), 1);
+    assert!(
+        gets[0].split('&').any(|pair| pair == "versionId=v1"),
+        "{gets:?}"
+    );
 }

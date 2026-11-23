@@ -61,6 +61,12 @@ pub enum OfflineError {
     /// checked.
     #[error("the Archive records no local copy: run karyosd with --archive-copy-location first")]
     NoLocalCopy,
+    /// The object store is not the destination the Archive recorded its
+    /// remote copies at: nothing is changed.
+    #[error(
+        "the object store is not the destination this Archive's remote copies were recorded at"
+    )]
+    DestinationMismatch,
     /// The Archive records local copies at more than one location.
     #[error("the Archive records local copies at several locations")]
     AmbiguousLocation,
@@ -350,12 +356,16 @@ impl<D: Disk + Clone> Offline<D> {
         let Some(stop) = recording.stop.as_ref() else {
             return Ok(None);
         };
+        // The catalog's history, not its current state: the local copy's
+        // first registration stays the Archive's record of its location
+        // after an offload removes it (#1207 review).
         Ok(self
             .copies
-            .current()?
-            .into_iter()
+            .records()
+            .iter()
             .filter(|copy| {
                 copy.recording == recording.id
+                    && copy.state == CopyState::Verified
                     && copy.retain_until_ns == 0
                     && copy.start <= recording.start
                     && copy.end >= stop.position
@@ -672,11 +682,36 @@ impl<D: Disk + Clone> Offline<D> {
         let recording = self.recording(id)?;
         let records = self.journal.records()?;
         let offloads = offloaded(&records).remove(&id).unwrap_or_default();
+        // The store must be the destination the copies were recorded at:
+        // another bucket under the same location would turn healthy copies
+        // into missing ones (#1207 review).
+        let history = self.copies.records();
+        for offload in &offloads {
+            let recorded = records
+                .iter()
+                .filter(|record| {
+                    record.kind.is_range()
+                        && record.subject == id
+                        && record.start >= offload.start
+                        && record.end <= offload.end
+                })
+                .all(|seal| {
+                    history.iter().any(|copy| {
+                        copy.location == tiering.remote
+                            && copy.recording == id
+                            && copy.start <= seal.start
+                            && copy.end >= seal.end
+                    })
+                });
+            if !recorded {
+                return Err(OfflineError::DestinationMismatch);
+            }
+        }
         let mut reports = Vec::new();
         for offload in offloads {
             let base = recording.geometry.base_of(offload.start);
             let key = ObjectKey::index(tiering.local, id, base);
-            let state = match store.get(&key) {
+            let index_state = match store.get(&key) {
                 Ok(bytes) if index_digest(&bytes) == offload.content => ObjectState::Verified,
                 Ok(_) => ObjectState::Corrupt,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => ObjectState::Missing,
@@ -687,7 +722,7 @@ impl<D: Disk + Clone> Offline<D> {
                 recording: id,
                 start: base,
                 end: base,
-                state,
+                state: index_state,
             });
             for seal in records.iter().filter(|record| {
                 record.kind.is_range()
@@ -704,8 +739,15 @@ impl<D: Disk + Clone> Offline<D> {
                     }
                     Err(error) => return Err(TieringError::Store(error).into()),
                 };
-                if state != ObjectState::Verified {
-                    self.downgrade(tiering, seal, state)?;
+                // A segment whose index is missing or corrupt cannot be
+                // restored: its range copies stop counting too.
+                let counted = if state == ObjectState::Verified {
+                    index_state
+                } else {
+                    state
+                };
+                if counted != ObjectState::Verified {
+                    self.downgrade(tiering, seal, counted)?;
                 }
                 reports.push(ObjectReport {
                     object: key.name(),

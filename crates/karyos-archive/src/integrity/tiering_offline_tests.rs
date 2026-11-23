@@ -347,3 +347,75 @@ fn under_a_retention_deadline_an_object_without_an_enforcing_lock_skips_the_segm
         .unwrap();
     assert_eq!(report.offloaded.len(), 2, "{report:?}");
 }
+
+#[test]
+fn a_missing_index_downgrades_its_segments_range_copies() {
+    let disk = FaultDisk::default();
+    let id = archive(&disk);
+    let mut offline = open(&disk);
+    let mut bucket = Bucket::default();
+    let _ = offline
+        .offload(&tiering(), id, &mut bucket, &options(true))
+        .unwrap();
+    let index = bucket
+        .objects
+        .keys()
+        .copied()
+        .find(|key| key.kind == super::tiering::ObjectKind::Index && key.start == 0)
+        .unwrap();
+    let _ = bucket.objects.remove(&index);
+    let reports = offline.verify(&tiering(), id, &mut bucket).unwrap();
+    assert!(
+        reports
+            .iter()
+            .any(|report| report.start == report.end && report.state == ObjectState::Missing)
+    );
+    // The range object is there and sound, but cannot be restored.
+    let first: Vec<CopyState> = offline
+        .copies()
+        .current()
+        .unwrap()
+        .into_iter()
+        .filter(|copy| copy.location == BUCKET && copy.start == 0)
+        .map(|copy| copy.state)
+        .collect();
+    assert!(!first.is_empty());
+    assert!(
+        first.iter().all(|state| *state != CopyState::Verified),
+        "{first:?}"
+    );
+}
+
+#[test]
+fn a_store_the_copies_were_not_recorded_at_changes_nothing() {
+    let disk = FaultDisk::default();
+    let id = archive(&disk);
+    let mut offline = open(&disk);
+    let mut bucket = Bucket::default();
+    let _ = offline
+        .offload(&tiering(), id, &mut bucket, &options(true))
+        .unwrap();
+    let elsewhere = Tiering {
+        local: LOCAL,
+        remote: [41; 32],
+    };
+    let counter = offline.journal().next_counter();
+    assert!(matches!(
+        offline.verify(&elsewhere, id, &mut Bucket::default()),
+        Err(OfflineError::DestinationMismatch)
+    ));
+    assert_eq!(offline.journal().next_counter(), counter);
+}
+
+#[test]
+fn the_location_check_holds_after_the_local_copy_is_offloaded() {
+    let disk = FaultDisk::default();
+    let id = archive(&disk);
+    let mut offline = open(&disk);
+    let _ = offline
+        .offload(&tiering(), id, &mut Bucket::default(), &options(true))
+        .unwrap();
+    drop(offline);
+    let offline = open(&disk);
+    offline.check_location(&LOCAL).unwrap();
+}

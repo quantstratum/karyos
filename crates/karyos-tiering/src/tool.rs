@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! karyos-tiering offload|restore|verify --dir <archive> --recording <id>
-//!     --location <hex> --remote-location <hex>
+//!     --location <hex>
 //!     --endpoint <https url> --bucket <name> --region <region> [--path-style]
 //!     --roots <pem file> --credentials <file> [--object-lock]
 //!     [--timeout-ms <ms>] [--max-object <bytes>]
@@ -23,7 +23,9 @@
 //!   the file `--credentials` names (its first line the access key id, its
 //!   second the secret), never from the environment.
 //! - `--location` must be the location the Archive records for its own
-//!   copies; `--remote-location` is the object store's location in the
+//!   copies; the object store's location in the copy catalog is derived
+//!   from its endpoint and bucket ([`store_location`]), so another bucket
+//!   is never taken for the one the copies were recorded at;
 //!   copy catalog.
 //! - The first tiering commit of a directory makes it unreadable by builds
 //!   before ADR-0104; it needs `--accept-downgrade-break`.
@@ -54,7 +56,7 @@ pub const EXIT_USAGE: i32 = 2;
 
 /// The usage text.
 pub const USAGE: &str = "usage: karyos-tiering offload|restore|verify --dir <archive> --recording <id> \
---location <hex> --remote-location <hex> --endpoint <https url> --bucket <name> --region <region> \
+--location <hex> --endpoint <https url> --bucket <name> --region <region> \
 [--path-style] --roots <pem file> --credentials <file> [--object-lock] [--timeout-ms <ms>] \
 [--max-object <bytes>] [--min-copies <n>] [--limit <segments>] [--accept-downgrade-break]\n";
 
@@ -80,8 +82,6 @@ pub struct Args {
     pub recording: u64,
     /// This Archive's location.
     pub location: Digest,
-    /// The object store's location in the copy catalog.
-    pub remote_location: Digest,
     /// The endpoint.
     pub endpoint: String,
     /// The bucket.
@@ -142,8 +142,8 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
             "--path-style" => path_style = true,
             "--object-lock" => object_lock = true,
             "--accept-downgrade-break" => accept = true,
-            name @ ("--dir" | "--recording" | "--location" | "--remote-location" | "--endpoint"
-            | "--bucket" | "--region" | "--roots" | "--credentials" | "--timeout-ms"
+            name @ ("--dir" | "--recording" | "--location" | "--endpoint" | "--bucket"
+            | "--region" | "--roots" | "--credentials" | "--timeout-ms"
             | "--max-object" | "--min-copies" | "--limit") => {
                 let value = args.next().ok_or_else(|| format!("{name} needs a value"))?;
                 if values.insert(name, value.clone()).is_some() {
@@ -168,10 +168,6 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         location(&text).ok_or_else(|| format!("{name}: 64 hex digits expected"))
     };
     let local = location_of("--location", take("--location")?)?;
-    let remote = location_of("--remote-location", take("--remote-location")?)?;
-    if local == remote {
-        return Err("--location and --remote-location must differ".to_owned());
-    }
     let endpoint = take("--endpoint")?;
     let bucket = take("--bucket")?;
     let region = take("--region")?;
@@ -205,7 +201,6 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         dir,
         recording,
         location: local,
-        remote_location: remote,
         endpoint,
         bucket,
         region,
@@ -219,6 +214,19 @@ pub fn parse(args: &[String]) -> Result<Args, String> {
         limit,
         accept_downgrade_break: accept,
     })
+}
+
+/// The object store's location in the copy catalog: the SHA-256 of
+/// `s3`, its endpoint and its bucket, each on its own line. Derived, never
+/// given, so verifying against another bucket finds no copy recorded there
+/// and refuses instead of downgrading healthy copies (#1207 review).
+#[must_use]
+pub fn store_location(endpoint: &str, bucket: &str) -> Digest {
+    use graviola::hashing::{Hash, Sha256};
+    let identity = format!("s3\n{}\n{bucket}", endpoint.trim_end_matches('/'));
+    let mut out = [0u8; 32];
+    out.copy_from_slice(Sha256::hash(identity.as_bytes()).as_ref());
+    out
 }
 
 /// The access key id and the secret from a credentials file: its first two
@@ -327,7 +335,7 @@ fn execute<O: karyos_archive::integrity::tiering::ObjectStore>(
     offline.check_location(&args.location)?;
     let tiering = Tiering {
         local: args.location,
-        remote: args.remote_location,
+        remote: store_location(&args.endpoint, &args.bucket),
     };
     match args.command {
         Command::Offload => {
@@ -452,8 +460,6 @@ mod tests {
             "3",
             "--location",
             &"0a".repeat(32),
-            "--remote-location",
-            &"28".repeat(32),
             "--endpoint",
             "https://localhost:9000",
             "--bucket",
@@ -484,7 +490,15 @@ mod tests {
         assert_eq!(args.command, Command::Offload);
         assert_eq!(args.recording, 3);
         assert_eq!(args.location, [10; 32]);
-        assert_eq!(args.remote_location, [40; 32]);
+        // The store's location is derived from its identity.
+        assert_eq!(
+            store_location("https://localhost:9000/", "archive"),
+            store_location("https://localhost:9000", "archive")
+        );
+        assert_ne!(
+            store_location("https://localhost:9000", "archive"),
+            store_location("https://localhost:9000", "other")
+        );
         assert!(args.object_lock && args.accept_downgrade_break && !args.path_style);
         assert_eq!(args.min_copies, NonZeroU32::new(2));
         assert_eq!(args.timeout, Duration::from_secs(30));
@@ -495,13 +509,11 @@ mod tests {
         ] {
             assert!(parse(&bad).unwrap_err().contains(why), "{why}");
         }
-        let mut same = line(&[]);
-        let at = same
-            .iter()
-            .position(|arg| arg == "--remote-location")
-            .unwrap();
-        same[at + 1] = "0a".repeat(32);
-        assert!(parse(&same).unwrap_err().contains("must differ"));
+        assert!(
+            parse(&line(&["--remote-location", "00"]))
+                .unwrap_err()
+                .contains("unknown flag")
+        );
         let missing: Vec<String> = line(&[])
             .into_iter()
             .take_while(|arg| arg != "--credentials")

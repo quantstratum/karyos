@@ -336,10 +336,14 @@ impl ObjectStore for S3Store {
 
     fn get(&mut self, key: &ObjectKey) -> io::Result<Vec<u8>> {
         let name = key.name();
-        let url = self
-            .bucket
-            .get_object(Some(&self.credentials), &name)
-            .sign(SIGNED_FOR);
+        // The version this store's last PUT of the key wrote, when it
+        // knows one: a read back never sees a later writer's version
+        // (#1207 review).
+        let mut action = self.bucket.get_object(Some(&self.credentials), &name);
+        if let Some(version) = self.versions.get(&name) {
+            action.query_mut().insert("versionId", version.clone());
+        }
+        let url = action.sign(SIGNED_FOR);
         let (status, _, body) = self.send(hyper::Method::GET, &url, &[], None)?;
         match status {
             StatusCode::OK => Ok(body),
@@ -418,7 +422,7 @@ pub fn parse_rfc3339(text: &str) -> Option<u64> {
     if date.next().is_some()
         || !(1..=12).contains(&month)
         || !(1..=31).contains(&day)
-        || year < 1970
+        || !(1970..=9999).contains(&year)
     {
         return None;
     }
