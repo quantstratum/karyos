@@ -763,7 +763,7 @@ type Handle = Raft<C, StateMachine>;
 
 /// `openraft` 0.10.0-alpha.37 behind [`ConsensusCore`], pre-vote on when
 /// `PRE_VOTE` (see the module).
-pub struct OpenRaftCore<const PRE_VOTE: bool> {
+pub struct OpenRaftCore<const PRE_VOTE: bool, const BATCH: u64 = 0> {
     executor: Executor,
     /// `None` when OpenRaft refused to start: the node stays silent.
     raft: Option<Handle>,
@@ -783,7 +783,12 @@ pub type OpenRaft = OpenRaftCore<true>;
 /// `openraft` with pre-vote off: only a negative control.
 pub type OpenRaftNoPreVote = OpenRaftCore<false>;
 
-impl<const PRE_VOTE: bool> fmt::Debug for OpenRaftCore<PRE_VOTE> {
+/// [`OpenRaft`] with a batch entry cap of 16 (`max_payload_entries`), W1's
+/// primary batch limit (quantstratum-docs:
+/// karyos/evaluations/c5-raft-comparison-v1.md, W1; karyos#691).
+pub type OpenRaftBatch16 = OpenRaftCore<true, 16>;
+
+impl<const PRE_VOTE: bool, const BATCH: u64> fmt::Debug for OpenRaftCore<PRE_VOTE, BATCH> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenRaftCore")
             .field("pre_vote", &PRE_VOTE)
@@ -799,7 +804,7 @@ fn seed_of(id: NodeId) -> u64 {
     crate::executor::splitmix64(u64::from(id) ^ 0x0000_43C5)
 }
 
-impl<const PRE_VOTE: bool> OpenRaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> OpenRaftCore<PRE_VOTE, BATCH> {
     /// The node's executor.
     #[must_use]
     pub fn executor(&self) -> &Executor {
@@ -960,8 +965,16 @@ impl<const PRE_VOTE: bool> OpenRaftCore<PRE_VOTE> {
             // RPC_TIMEOUT ticks, and OpenRaft then sends the next append
             // while the first may still be in flight or unacknowledged
             // (karyos#975).
-            max_payload_entries: limits
-                .map_or(DEFAULT_PAYLOAD_ENTRIES, |limits| limits.in_flight_entries),
+            // Without limits, `BATCH` entries per append when it is set
+            // (W1's batch limit, karyos#691).
+            max_payload_entries: limits.map_or(
+                if BATCH > 0 {
+                    BATCH
+                } else {
+                    DEFAULT_PAYLOAD_ENTRIES
+                },
+                |limits| limits.in_flight_entries,
+            ),
             // The durable vote is C4's `HardState`, which has no place for
             // OpenRaft's `committed` bit, so a restarted leader comes back
             // with an uncommitted vote. Leader restoration is off to match:
@@ -975,7 +988,7 @@ impl<const PRE_VOTE: bool> OpenRaftCore<PRE_VOTE> {
     }
 }
 
-impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> ConsensusCore for OpenRaftCore<PRE_VOTE, BATCH> {
     type Message = Message;
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
@@ -1223,7 +1236,9 @@ impl<const PRE_VOTE: bool> ConsensusCore for OpenRaftCore<PRE_VOTE> {
     }
 }
 
-impl<const PRE_VOTE: bool> crate::process::Wire for OpenRaftCore<PRE_VOTE> {
+impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire
+    for OpenRaftCore<PRE_VOTE, BATCH>
+{
     fn encode(message: &Message) -> Option<Vec<u8>> {
         crate::openraft_wire::encode(message)
     }

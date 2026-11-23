@@ -18,8 +18,8 @@
 use std::io::Write as _;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use karyos_raft_eval::openraft_core::{OpenRaft, VARIANT as OPENRAFT_VARIANT};
-use karyos_raft_eval::raft_rs::{RaftRs, VARIANT};
+use karyos_raft_eval::openraft_core::{OpenRaftBatch16, VARIANT as OPENRAFT_VARIANT};
+use karyos_raft_eval::raft_rs::{RaftRsBatch16, VARIANT};
 use karyos_sim::harness::probe::{AllocationReport, WARMUP, measure};
 use karyos_sim::harness::workloads::{self, Case, W1};
 use karyos_sys::alloc_count::CountingAllocator;
@@ -54,7 +54,7 @@ fn report(core: &str, variant: &str, case: &Case, seed: u64, report: &Allocation
     let _ = writeln!(
         std::io::stderr(),
         "{{\"evidence\":\"C5 v1\",\"core\":\"{core}\",\"variant\":\"{variant}\",\
-         \"forms\":\"borrowed: propose_slice, ready_into\",\"workload\":\"W1\",\
+         \"forms\":\"borrowed: propose_slice, ready_into\",\"workload\":\"W1\",\"batch_entries\":16,\
          \"case\":\"{}\",\"servers\":{},\"clients\":{},\"operations\":{},\
          \"payload\":{},\"seed\":{seed},\"warmup\":{WARMUP},\"entries\":{},\
          \"allocations\":{},\"frees\":{},\"allocations_per_entry\":{allocations},\
@@ -73,10 +73,11 @@ fn report(core: &str, variant: &str, case: &Case, seed: u64, report: &Allocation
 
 #[test]
 fn raft_replication_path_allocates_and_the_gate_reports_it() {
-    // 32 clients, 32-byte payloads, three servers: W1's second case.
+    // 32 clients, 32-byte payloads, three servers: W1's second case, with
+    // the frozen W1 batch limit of 16 entries per append (karyos#691).
     let _serial = serial();
     let case = W1::skeleton().cases().into_iter().nth(1).unwrap();
-    let measured = measure::<RaftRs>(&case, 1).unwrap();
+    let measured = measure::<RaftRsBatch16>(&case, 1).unwrap();
     assert_eq!(workloads::pass(&case, &measured.outcome), Ok(None));
     report("raft 0.7.0", VARIANT.label(), &case, 1, &measured);
     // The gate is 0 and 0: it fails, and says so.
@@ -91,7 +92,7 @@ fn raft_replication_path_allocates_and_the_gate_reports_it() {
 fn openraft_replication_path_allocates_and_the_gate_reports_it() {
     let _serial = serial();
     let case = W1::skeleton().cases().into_iter().nth(1).unwrap();
-    let measured = measure::<OpenRaft>(&case, 1).unwrap();
+    let measured = measure::<OpenRaftBatch16>(&case, 1).unwrap();
     assert_eq!(workloads::pass(&case, &measured.outcome), Ok(None));
     report(
         "openraft 0.10.0-alpha.37",
