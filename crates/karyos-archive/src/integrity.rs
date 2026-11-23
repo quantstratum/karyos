@@ -79,6 +79,8 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tiering_tests;
+#[cfg(test)]
 mod trust_tests;
 #[cfg(test)]
 mod verify_tests;
@@ -139,6 +141,16 @@ pub enum SealKind {
     /// recording, `start` and `end` the copy record's sequence, the digest
     /// that of the copy record's canonical bytes.
     Copy = 8,
+    /// A whole segment offloaded to object storage (ADR-0104): `subject`
+    /// is the recording, `[start, end)` the range the segment covers (its
+    /// base is the segment of `start` under the recording's geometry), the
+    /// digest the SHA-256 of the segment's original index file, computed
+    /// locally before the upload; the index object's key is
+    /// [`tiering::ObjectKey::index`] of the base.
+    Offload = 9,
+    /// A whole segment restored from object storage (ADR-0104): the same
+    /// fields as the [`SealKind::Offload`] record it reverses.
+    Restore = 10,
 }
 
 impl SealKind {
@@ -155,6 +167,8 @@ impl SealKind {
             6 => Self::KeyRegistry,
             7 => Self::Purge,
             8 => Self::Copy,
+            9 => Self::Offload,
+            10 => Self::Restore,
             _ => return None,
         })
     }

@@ -2232,7 +2232,17 @@ fn a_leftover_floor_temporary_is_removed_at_recovery() {
     let temporary = Path::new(DIR).join(format!("{}.tmp", floor_name(RECORDING)));
     let file = probe.create(&temporary).unwrap();
     probe
-        .write_at(&file, 0, &encode_floor(RECORDING, 300))
+        .write_at(
+            &file,
+            0,
+            &encode_floor(
+                RECORDING,
+                Floor {
+                    start: 300,
+                    offloaded: None,
+                },
+            ),
+        )
         .unwrap();
     let recovered = recover_checked(
         disk.clone(),
@@ -2244,4 +2254,94 @@ fn a_leftover_floor_temporary_is_removed_at_recovery() {
     .unwrap();
     assert_eq!(recovered.store.start(), 0);
     assert!(probe.open(&temporary).is_err());
+}
+
+#[test]
+fn a_floor_record_with_an_offload_floor_round_trips_and_an_inverted_one_is_damaged() {
+    let plain = Floor {
+        start: 300,
+        offloaded: None,
+    };
+    let tiered = Floor {
+        start: 256,
+        offloaded: Some(0),
+    };
+    assert_eq!(encode_floor(RECORDING, plain).len(), FLOOR_LEN);
+    assert_eq!(encode_floor(RECORDING, tiered).len(), OFFLOAD_FLOOR_LEN);
+    for floor in [plain, tiered] {
+        assert_eq!(
+            decode_floor(RECORDING, &encode_floor(RECORDING, floor)),
+            Some(floor)
+        );
+        assert_eq!(
+            decode_floor(RECORDING + 1, &encode_floor(RECORDING, floor)),
+            None
+        );
+    }
+    // An offload floor above the start is never written whole.
+    let inverted = Floor {
+        start: 0,
+        offloaded: Some(128),
+    };
+    assert_eq!(
+        decode_floor(RECORDING, &encode_floor(RECORDING, inverted)),
+        None
+    );
+    let mut torn = encode_floor(RECORDING, tiered);
+    torn[20] ^= 1;
+    assert_eq!(decode_floor(RECORDING, &torn), None);
+}
+
+#[test]
+fn an_offload_raises_the_start_and_recovery_keeps_the_offload_floor() {
+    let disk = FaultDisk::default();
+    let mut store = purgeable(disk.clone(), 500);
+    // Segments at 0, 128 and 256 are finished; 384 is being written.
+    assert_eq!(store.lowest_finished_segment(), Some((0, 128)));
+    assert_eq!(store.raise_start_for_offload().unwrap(), 128);
+    assert_eq!(store.raise_start_for_offload().unwrap(), 256);
+    assert_eq!((store.start(), store.offload_floor()), (256, Some(0)));
+    assert_eq!(store.lowest_retained(), 0);
+    // The files stay until the caller removes them; recovery drops them.
+    let left = store.files_left_below_floor().unwrap();
+    assert_eq!(left.len(), 4);
+    drop(store);
+    let recovered = recover_checked(
+        disk.clone(),
+        Path::new(DIR),
+        RECORDING,
+        geometry(),
+        SyncPolicy::PerSegment,
+    )
+    .unwrap();
+    assert_eq!(recovered.store.start(), 256);
+    assert_eq!(recovered.store.offload_floor(), Some(0));
+    assert_eq!(recovered.store.lowest_retained(), 0);
+    let mut store = recovered.store;
+    // The segment being written is never offloaded.
+    assert_eq!(store.raise_start_for_offload().unwrap(), 384);
+    assert_eq!(store.lowest_finished_segment(), None);
+    assert!(matches!(
+        store.raise_start_for_offload(),
+        Err(SegmentError::InvalidPurge { .. })
+    ));
+}
+
+#[test]
+fn raising_a_floor_before_a_scan_never_lowers_it() {
+    let disk = FaultDisk::default();
+    let mut store = purgeable(disk.clone(), 500);
+    let _ = store.sync().unwrap();
+    drop(store);
+    let mut probe = disk.clone();
+    assert!(raise_floor(&mut probe, Path::new(DIR), RECORDING, 128, 0).unwrap());
+    assert!(!raise_floor(&mut probe, Path::new(DIR), RECORDING, 128, 0).unwrap());
+    assert!(!raise_floor(&mut probe, Path::new(DIR), RECORDING, 64, 0).unwrap());
+    assert_eq!(
+        read_floor(&mut probe, Path::new(DIR), RECORDING).unwrap(),
+        Some(Floor {
+            start: 128,
+            offloaded: Some(0)
+        })
+    );
 }

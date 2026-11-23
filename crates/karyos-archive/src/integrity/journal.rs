@@ -139,6 +139,9 @@ pub struct IntegrityJournal<D: Disk> {
     check: ChainCheck,
     /// The copy changes chained: the sequence the next one must carry.
     copy_changes: u64,
+    /// Whether an offload or restore record is chained (ADR-0104): the
+    /// directory has been tiered.
+    tiered: bool,
     /// The identity of the key registry history chained: a running digest
     /// of every key registry record's entry digest, in chain order.
     registry_identity: Digest,
@@ -169,6 +172,7 @@ impl<D: Disk> IntegrityJournal<D> {
         let mut check = ChainCheck::new();
         let mut registry_identity = super::trust::EMPTY_REGISTRY;
         let mut copy_changes = 0u64;
+        let mut tiered = false;
         let mut kept = whole;
         let mut buf = [0u8; SEAL_RECORD_LENGTH];
         for index in 0..whole {
@@ -191,6 +195,7 @@ impl<D: Disk> IntegrityJournal<D> {
                     .checked_add(1)
                     .ok_or(IntegrityError::Overflow)?;
             }
+            tiered |= matches!(record.kind, SealKind::Offload | SealKind::Restore);
             if record.kind == SealKind::KeyRegistry {
                 registry_identity =
                     super::trust::extend_identity(&registry_identity, &record.content);
@@ -212,6 +217,7 @@ impl<D: Disk> IntegrityJournal<D> {
                 handle: next_handle(),
                 check,
                 copy_changes,
+                tiered,
                 registry_identity,
                 poisoned: false,
             },
@@ -233,6 +239,15 @@ impl<D: Disk> IntegrityJournal<D> {
     #[inline]
     pub const fn copy_changes(&self) -> u64 {
         self.copy_changes
+    }
+
+    /// Whether the journal chains an offload or restore record: the
+    /// directory has been tiered (ADR-0104), and a build before it refuses
+    /// the journal.
+    #[must_use]
+    #[inline]
+    pub const fn tiered(&self) -> bool {
+        self.tiered
     }
 
     /// The identity of the key registry history this journal chains, as
@@ -424,6 +439,7 @@ impl<D: Disk> IntegrityJournal<D> {
         }
         self.check = next;
         self.copy_changes = copy_changes;
+        self.tiered |= matches!(kind, SealKind::Offload | SealKind::Restore);
         if kind == SealKind::KeyRegistry {
             self.registry_identity =
                 super::trust::extend_identity(&self.registry_identity, &content);
@@ -596,6 +612,40 @@ impl<D: Disk> IntegrityJournal<D> {
         segment_digest: Digest,
     ) -> Result<SealRecord, IntegrityError> {
         self.append(SealKind::Purge, recording, start, end, segment_digest)
+    }
+
+    /// Chains the offload of the segment covering `[start, end)` of
+    /// `recording`, with the SHA-256 of its original index file
+    /// (ADR-0104, decision 4).
+    ///
+    /// # Errors
+    ///
+    /// As [`IntegrityJournal::append`].
+    pub fn record_offload(
+        &mut self,
+        recording: u64,
+        start: u64,
+        end: u64,
+        index_digest: Digest,
+    ) -> Result<SealRecord, IntegrityError> {
+        self.append(SealKind::Offload, recording, start, end, index_digest)
+    }
+
+    /// Chains the restore of the segment covering `[start, end)` of
+    /// `recording`, with the SHA-256 of the index file restored
+    /// (ADR-0104, decision 6).
+    ///
+    /// # Errors
+    ///
+    /// As [`IntegrityJournal::append`].
+    pub fn record_restore(
+        &mut self,
+        recording: u64,
+        start: u64,
+        end: u64,
+        index_digest: Digest,
+    ) -> Result<SealRecord, IntegrityError> {
+        self.append(SealKind::Restore, recording, start, end, index_digest)
     }
 }
 

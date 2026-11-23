@@ -25,6 +25,17 @@
 //! An index shortened by media damage below a seal reads back as missing
 //! bytes and is `inconsistent` with [`Reason::ShortenedIndex`].
 //!
+//! Residency is reported apart from the outcome ([`RangeReport::residency`],
+//! ADR-0104 decision 5): a range whose segment a later offload record
+//! (kind 9) covers, with a copy record chained between the range and the
+//! offload and no later restore or purge, is [`Residency::Offloaded`]. Its
+//! bytes are remote, so they are not read or rechecked here
+//! ([`OFFLOADED_COVERAGE`]); it gets the outcome its seal and chain give
+//! under the usual trust checks, the offload record's evidence included,
+//! and is never `inconsistent` for a shortened index. A range below the
+//! start with neither record still reads back missing and is
+//! `inconsistent`. Remote bytes are checked by `karyos-tiering verify`.
+//!
 //! The integrity outcome is reported apart from time evidence
 //! ([`Verification::time`]): the integrity path never yields a time
 //! verdict. C-EXTRACT's "unverifiable" is [`Outcome::is_unverifiable`].
@@ -55,6 +66,36 @@ pub enum Outcome {
     /// Inconsistent: see the reasons and the first inconsistent record.
     Inconsistent,
 }
+
+/// Where a range's bytes are (ADR-0104, decision 5), apart from its
+/// outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Residency {
+    /// In the local segment store, read and checked here.
+    Local,
+    /// Offloaded to object storage by the offload record at `record`
+    /// (its counter): the bytes are remote, not rechecked locally.
+    Offloaded {
+        /// The offload record's counter.
+        record: u64,
+    },
+}
+
+impl Residency {
+    /// The residency's name in reports.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Offloaded { .. } => "offloaded",
+        }
+    }
+}
+
+/// The coverage note of an offloaded range: its outcome rests on its seal
+/// and the chain, and its bytes were not read.
+pub const OFFLOADED_COVERAGE: &str = "bytes remote, not rechecked locally";
 
 /// The tamper-evidence statement of `verified`.
 pub const VERIFIED_STATEMENT: &str = "tamper evident: sealed, chained, signed under the external trust and at or below an external anchor";
@@ -172,6 +213,8 @@ pub struct RangeReport {
     pub reasons: Vec<Reason>,
     /// For `inconsistent`, the first inconsistent record's counter.
     pub first_inconsistent: Option<u64>,
+    /// Where the range's bytes are.
+    pub residency: Residency,
 }
 
 /// Time evidence, which this verifier does not evaluate: its verdicts
@@ -417,6 +460,7 @@ pub fn verify(
     // The purge covering each sealed range of the accepted prefix, found
     // once for the whole chain.
     let purge_of = purges_by_range(records, &in_prefix);
+    let offloads = Offloads::of(records, &in_prefix);
     let mut ranges = Vec::new();
     let mut sealed_ends: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     for (position, record) in records.iter().enumerate() {
@@ -433,6 +477,7 @@ pub fn verify(
             outcome: Outcome::Inconsistent,
             reasons: Vec::new(),
             first_inconsistent: None,
+            residency: Residency::Local,
         };
         if let Some(broken) = chain_break.filter(|broken| *broken <= position) {
             report.reasons.push(Reason::Corruption);
@@ -462,19 +507,40 @@ pub fn verify(
             ranges.push(report);
             continue;
         }
-        match read(record.subject, record.start, record.end) {
-            RangeBytes::Missing => {
-                report.reasons.push(Reason::ShortenedIndex);
-                report.first_inconsistent = Some(counter);
+        // An offloaded range: its bytes are remote and not read here; its
+        // outcome rests on its seal, the chain and the offload record's
+        // evidence (ADR-0104, decision 5).
+        if let Some(offload) = usize::try_from(position)
+            .ok()
+            .and_then(|position| offloads.covering(position, record))
+        {
+            report.residency = Residency::Offloaded {
+                record: offload.counter,
+            };
+            if !signed(offload.counter) {
+                for &reason in &global {
+                    push_unique(&mut report.reasons, reason);
+                }
+                push_unique(&mut report.reasons, Reason::MissingEvidence);
+                report.first_inconsistent = Some(offload.counter);
                 ranges.push(report);
                 continue;
             }
-            RangeBytes::Bytes(bytes) => {
-                if verify_range(record, &bytes).is_err() {
-                    report.reasons.push(Reason::Corruption);
+        } else {
+            match read(record.subject, record.start, record.end) {
+                RangeBytes::Missing => {
+                    report.reasons.push(Reason::ShortenedIndex);
                     report.first_inconsistent = Some(counter);
                     ranges.push(report);
                     continue;
+                }
+                RangeBytes::Bytes(bytes) => {
+                    if verify_range(record, &bytes).is_err() {
+                        report.reasons.push(Reason::Corruption);
+                        report.first_inconsistent = Some(counter);
+                        ranges.push(report);
+                        continue;
+                    }
                 }
             }
         }
@@ -509,6 +575,7 @@ pub fn verify(
                 outcome: Outcome::Unsealed,
                 reasons: Vec::new(),
                 first_inconsistent: None,
+                residency: Residency::Local,
             });
         }
     }
@@ -668,6 +735,66 @@ impl Scrub {
 /// covers a run of them found by binary search, and each range is
 /// assigned once (a next-unassigned forest skips the assigned ones):
 /// `O((ranges + purges) log ranges)` however many purges a recording has.
+/// The offload, restore and copy records of a chain's accepted prefix,
+/// by recording, for [`Residency`].
+struct Offloads<'a> {
+    /// Offload and restore records, in chain order, with their positions.
+    events: std::collections::BTreeMap<u64, Vec<(usize, &'a SealRecord)>>,
+    /// The positions of copy records, in order.
+    copies: std::collections::BTreeMap<u64, Vec<usize>>,
+}
+
+impl<'a> Offloads<'a> {
+    fn of(records: &'a [SealRecord], in_prefix: &impl Fn(u64) -> bool) -> Self {
+        let mut events: std::collections::BTreeMap<u64, Vec<(usize, &SealRecord)>> =
+            std::collections::BTreeMap::new();
+        let mut copies: std::collections::BTreeMap<u64, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (position, record) in records.iter().enumerate() {
+            if !in_prefix(u64::try_from(position).unwrap_or(u64::MAX)) {
+                break;
+            }
+            match record.kind {
+                SealKind::Offload | SealKind::Restore => {
+                    events
+                        .entry(record.subject)
+                        .or_default()
+                        .push((position, record));
+                }
+                SealKind::Copy => copies.entry(record.subject).or_default().push(position),
+                _ => {}
+            }
+        }
+        Self { events, copies }
+    }
+
+    /// The offload record that holds the range `record` at `position`
+    /// remotely: the last offload or restore record after it covering its
+    /// range is an offload, and a copy record of the recording is chained
+    /// between the range and that offload.
+    fn covering(&self, position: usize, record: &SealRecord) -> Option<&'a SealRecord> {
+        let last = self
+            .events
+            .get(&record.subject)?
+            .iter()
+            .rev()
+            .find(|(at, event)| {
+                *at > position && event.start <= record.start && record.end <= event.end
+            })
+            .copied()?;
+        let (at, event) = last;
+        if event.kind != SealKind::Offload {
+            return None;
+        }
+        let copies = self.copies.get(&record.subject)?;
+        let first_after = copies.partition_point(|copy| *copy <= position);
+        copies
+            .get(first_after)
+            .is_some_and(|copy| *copy < at)
+            .then_some(event)
+    }
+}
+
 fn purges_by_range<'a>(
     records: &'a [SealRecord],
     in_prefix: &impl Fn(u64) -> bool,

@@ -849,6 +849,16 @@ pub enum PurgeRefusal {
     /// records, or it stopped before close times were recorded.
     #[error("the recording has no recorded close time")]
     NoCloseTime,
+    /// Segments of the recording are offloaded to object storage
+    /// (ADR-0104, decision 5): no purge interval may intersect them, so
+    /// the recording cannot be purged until they are restored.
+    #[error("the recording's segments from {lowest} to {start} are offloaded")]
+    Offloaded {
+        /// The recording's lowest retained position, the offload floor.
+        lowest: u64,
+        /// Its local start, the end of the offloaded segments.
+        start: u64,
+    },
 }
 
 impl PurgeRefusal {
@@ -871,6 +881,7 @@ impl PurgeRefusal {
             Self::ManualOnly => "manual_only",
             Self::SplitsSeal { .. } => "splits_seal",
             Self::NoCloseTime => "no_close_time",
+            Self::Offloaded { .. } => "offloaded",
         }
     }
 
@@ -892,6 +903,7 @@ impl PurgeRefusal {
             Self::ManualOnly => 12,
             Self::NotSealed { .. } => 13,
             Self::NoCloseTime => 14,
+            Self::Offloaded { .. } => 15,
         }
     }
 }
@@ -1393,6 +1405,7 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             Err(PurgeRefusal::DuplicateId { id: request.id })
         } else {
             self.check(request, context, store.start())
+                .and_then(|()| Self::not_offloaded(store))
                 .and_then(|()| Self::boundaries(request, store, journal))
         };
         if let Err(refusal) = checked {
@@ -1405,7 +1418,7 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             operator: request.authorisation.operator,
             closed_ns: request.closed_ns,
             source: request.source,
-            from: store.start(),
+            from: store.lowest_retained(),
         };
         if self.operations.append(&intent).is_err() {
             return Err(PurgeError::Refused {
@@ -1414,8 +1427,20 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             });
         }
         self.intents.insert(request.id, *request);
-        self.froms.insert(request.id, store.start());
+        self.froms.insert(request.id, store.lowest_retained());
         self.complete(request, store, journal)
+    }
+
+    /// Refuses a purge of a recording with offloaded segments (ADR-0104,
+    /// decision 5): every purge interval starts at the lowest retained
+    /// position, the offload floor, so it intersects them whatever the
+    /// cutoff.
+    fn not_offloaded<D2: Disk>(store: &SegmentStore<D2>) -> Result<(), PurgeRefusal> {
+        let (lowest, start) = (store.lowest_retained(), store.start());
+        if lowest < start {
+            return Err(PurgeRefusal::Offloaded { lowest, start });
+        }
+        Ok(())
     }
 
     /// The cutoff's boundaries, checked before any floor advances: it
@@ -1486,7 +1511,9 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
         // The primitive purges only below the durable position, which a
         // recovered store reports as nothing until it syncs.
         store.sync()?;
-        let start = store.start();
+        // The lowest retained position, never the local start: an
+        // offloaded range is never counted purged (ADR-0104, decision 5).
+        let start = store.lowest_retained();
         let records = journal.records()?;
         // The purge record may already be there: a crash after it.
         let existing = records.iter().find(|record| {
@@ -1582,7 +1609,10 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
                 continue;
             }
             request.authorisation.authorised = authorised(request.authorisation.operator);
-            if store.start() >= request.before {
+            // The completion shortcut takes the lowest retained position,
+            // so an offloaded range below the start is never taken for a
+            // purged one (ADR-0104, decision 5).
+            if store.lowest_retained() >= request.before {
                 outcomes.push(Ok(self.complete(&request, store, journal)?));
                 continue;
             }
@@ -1591,6 +1621,7 @@ impl<J: OperationsJournal, D: Disk> Retention<J, D> {
             // come to cover the cutoff since the intent.
             let checked = self
                 .check(&request, context, store.start())
+                .and_then(|()| Self::not_offloaded(store))
                 .and_then(|()| Self::boundaries(&request, store, journal));
             match checked {
                 Ok(()) => outcomes.push(Ok(self.complete(&request, store, journal)?)),
