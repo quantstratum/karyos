@@ -102,6 +102,20 @@ fn every_negative_variant_is_refused() {
         assert!(parse(name, text.as_bytes()).is_err(), "case {index}");
     }
     assert!(parse("3-3.key", &[b'a'; MAX_FILE_LEN + 1]).is_err());
+    // A profile is compared before it is narrowed (design section 2.2).
+    for profile in ["4", "256", "18446744073709551615"] {
+        assert_eq!(
+            parse(
+                "3-3.key",
+                CHANNEL
+                    .replace("profile_id=1", &format!("profile_id={profile}"))
+                    .as_bytes()
+            )
+            .map(|_| ()),
+            Err(KeyFileError::ProfileMismatch),
+            "profile {profile}"
+        );
+    }
 }
 
 /// K-1 to K-5 of the design's section 4, derived blind by an independent

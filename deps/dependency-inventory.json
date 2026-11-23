@@ -19,7 +19,6 @@
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
-      "hkdf v0.13.0",
       "hmac v0.13.0",
       "http v1.5.0",
       "http-body v1.1.0",
@@ -126,7 +125,6 @@
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
-      "hkdf v0.13.0",
       "hmac v0.13.0",
       "http v1.5.0",
       "http-body v1.1.0",
@@ -236,7 +234,6 @@
       "futures-core v0.3.34",
       "getrandom v0.4.3",
       "graviola v0.4.2",
-      "hkdf v0.13.0",
       "hmac v0.13.0",
       "http v1.5.0",
       "http-body v1.1.0",
@@ -1762,29 +1759,14 @@
       "build_script": false,
       "edges": [
         {
-          "features": [],
+          "features": [
+            "zeroize"
+          ],
           "from": "workspace:karyos-driver@0.1.0-alpha.3",
           "kind": "normal",
           "target": null,
           "uses_default_features": false
-        }
-      ],
-      "features": [],
-      "id": "registry+https://github.com/rust-lang/crates.io-index#hkdf@0.13.0",
-      "license": "MIT OR Apache-2.0",
-      "name": "hkdf",
-      "paths": {
-        "runtime": [
-          []
-        ]
-      },
-      "proc_macro": false,
-      "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.13.0"
-    },
-    {
-      "build_script": false,
-      "edges": [
+        },
         {
           "features": [
             "zeroize"
@@ -1793,13 +1775,6 @@
           "kind": "normal",
           "target": null,
           "uses_default_features": false
-        },
-        {
-          "features": [],
-          "from": "registry+https://github.com/rust-lang/crates.io-index#hkdf@0.13.0",
-          "kind": "normal",
-          "target": null,
-          "uses_default_features": true
         }
       ],
       "features": [

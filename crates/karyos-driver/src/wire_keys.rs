@@ -5,18 +5,19 @@
 //! and 3; ADR-0086 sections 4 and 8).
 //!
 //! This module parses one key file's bytes into a [`KeyFile`] and derives
-//! the per-purpose MAC keys with HKDF-SHA-256. The key directory, the
+//! the per-purpose MAC keys with HKDF-SHA-256 (RFC 5869), written over
+//! `hmac` so that the PRK and every MAC output are erased. The key directory, the
 //! durable key state and reload are separate parts of quantstratum/karyos#648.
 //! Parsing allocates nothing, reads no clock and touches no file. Secrets
 //! live in [`zeroize::Zeroizing`] buffers and are erased on drop, and the
 //! caller's input buffer is never kept.
 
-use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit, Mac};
 use karyos_protocol::network::Identity;
 use karyos_protocol::protection::hmac_sha256::LABEL;
 use sha2::Sha256;
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::authority::{AuthorityKeyError, Ed25519Verifier};
 
@@ -267,14 +268,17 @@ pub fn parse(name: &str, bytes: &[u8]) -> Result<KeyFile, KeyFileError> {
         .ok()
         .filter(|v| *v >= 1)
         .ok_or(KeyFileError::Value { line: 3 })?;
-    let profile_id = u8::try_from(number(4)?).map_err(|_| KeyFileError::Value { line: 5 })?;
-    let expected_profile = match purpose {
+    let profile = number(4)?;
+    let expected_profile: u8 = match purpose {
         Purpose::Channel | Purpose::Pairwise => 1,
         Purpose::AuthoritySigning | Purpose::AuthorityPublic => 4,
     };
-    if profile_id != expected_profile {
+    // Compared before any narrowing, so `256` is a mismatch, not a range
+    // error (design section 2.2).
+    if profile != u64::from(expected_profile) {
         return Err(KeyFileError::ProfileMismatch);
     }
+    let profile_id = expected_profile;
     let not_before = timestamp(value(5)).ok_or(KeyFileError::Value { line: 6 })?;
     let not_after = timestamp(value(6)).ok_or(KeyFileError::Value { line: 7 })?;
     let bound = match purpose {
@@ -676,11 +680,27 @@ impl Context {
     /// nothing; the result is erased on drop.
     #[must_use]
     pub fn derive(&self, secret: &[u8; KEY_LEN]) -> Zeroizing<[u8; KEY_LEN]> {
+        // HKDF-SHA-256 (RFC 5869) for one 32-byte block, written out so
+        // every intermediate is erased: the PRK, and each MAC output once
+        // copied. The keyed MAC states erase themselves (`hmac` feature
+        // `zeroize`, `sha2` feature `zeroize`).
         let info = self.info();
-        let hkdf = Hkdf::<Sha256>::new(info.salt.as_ref().map(|s| &s[..]), secret);
+        let salt = info.salt.unwrap_or([0_u8; 32]);
+        let mut prk = Zeroizing::new([0_u8; KEY_LEN]);
         let mut okm = Zeroizing::new([0_u8; KEY_LEN]);
-        // 32 bytes is far below HKDF's 255 × 32 limit, so this never fails.
-        let _ = hkdf.expand(info.bytes(), &mut okm[..]);
+        if let Ok(mut extract) = <Hmac<Sha256> as KeyInit>::new_from_slice(&salt) {
+            extract.update(secret);
+            let mut out = extract.finalize().into_bytes();
+            prk.copy_from_slice(&out);
+            out.as_mut_slice().zeroize();
+        }
+        if let Ok(mut expand) = <Hmac<Sha256> as KeyInit>::new_from_slice(&prk[..]) {
+            expand.update(info.bytes());
+            expand.update(&[1]);
+            let mut out = expand.finalize().into_bytes();
+            okm.copy_from_slice(&out);
+            out.as_mut_slice().zeroize();
+        }
         okm
     }
 }
