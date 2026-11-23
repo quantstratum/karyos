@@ -37,10 +37,12 @@ name_args=()
 if [ -n "${KARYOS_LINUX_NAME:-}" ]; then
     name_args=(--name "$KARYOS_LINUX_NAME")
 fi
-# The simulator's seed selection, and KARYOS_XDP_REQUIRED (the XDP load test
-# fails instead of skipping), pass through to the container.
+# The simulator's seed selection, KARYOS_URING_REQUIRED (the io_uring
+# tests fail instead of skipping where io_uring is denied),
+# KARYOS_URING_EXPECT_DENIED and KARYOS_XDP_REQUIRED (the XDP load test
+# fails instead of skipping) pass through to the container.
 env_args=()
-for name in KARYOS_SIM_SEED KARYOS_SIM_SEEDS KARYOS_XDP_REQUIRED; do
+for name in KARYOS_SIM_SEED KARYOS_SIM_SEEDS KARYOS_URING_REQUIRED KARYOS_URING_EXPECT_DENIED KARYOS_XDP_REQUIRED; do
     if [ -n "${!name+set}" ]; then
         env_args+=(-e "$name=${!name}")
     fi
@@ -54,6 +56,14 @@ if [ -n "${KARYOS_LINUX_CAPS:-}" ]; then
         cap_args+=(--cap-add "$cap")
     done
 fi
+# KARYOS_LINUX_SECCOMP sets the container's seccomp profile, for example
+# "unconfined" for the io_uring tests: Docker's default profile denies the
+# io_uring system calls (quantstratum-docs karyos/design/io-uring-backend.md
+# section 9).
+seccomp_args=()
+if [ -n "${KARYOS_LINUX_SECCOMP:-}" ]; then
+    seccomp_args=(--security-opt "seccomp=$KARYOS_LINUX_SECCOMP")
+fi
 args=("$@")
 if [ ${#args[@]} -eq 0 ]; then
     args=(--workspace --locked)
@@ -62,6 +72,7 @@ fi
 exec docker run --rm \
     ${platform_args[@]+"${platform_args[@]}"} \
     ${name_args[@]+"${name_args[@]}"} \
+    ${seccomp_args[@]+"${seccomp_args[@]}"} \
     ${cap_args[@]+"${cap_args[@]}"} \
     -v "$root":/work \
     -v "$target":/target \

@@ -24,5 +24,7 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
 pub mod backend;
 pub mod lanes;
 pub mod sockets;
+#[cfg(any(feature = "uring", feature = "test-hooks", test))]
+pub mod uring;
 #[cfg(any(feature = "xdp", test))]
 pub mod xdp;

@@ -17,6 +17,9 @@ categories = ["network-programming", "concurrency"]
 # The scripted `SocketOps` test double for tests of dependent crates; never
 # enabled outside dev-dependencies.
 test-hooks = []
+# The optional `io_uring` backend (SPEC.md §16.4, owner item 2), Linux
+# only: quantstratum-docs karyos/reviews/dependency-admission-io-uring.md.
+uring = ["dep:io-uring"]
 # The AF_XDP copy-mode backend (SPEC.md §16.3, owner item 3), Linux only:
 # quantstratum-docs karyos/reviews/dependency-admission-aya-af-xdp.md.
 xdp = ["dep:aya"]
@@ -35,6 +38,10 @@ thiserror.workspace = true
 # for `net` only; no `event` (decision O-6).
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", default-features = false, features = ["std", "net"] }
+# The `io_uring` ring of the `uring` feature (`src/uring/ring.rs`): the
+# ADR-0033 family `io-uring`, resolution admitted under R8 at 0.7.x with no
+# feature (quantstratum-docs: karyos/reviews/dependency-admission-io-uring.md).
+io-uring = { version = "0.7.16", default-features = false, optional = true }
 # The loader of the prebuilt XDP object of the `xdp` feature (ADR-0038):
 # the ADR-0033 family `aya`, admitted under R8 at exactly 0.16.0 with no
 # feature (quantstratum-docs: karyos/reviews/dependency-admission-aya-af-xdp.md).
@@ -49,6 +56,8 @@ proptest.workspace = true
 # rules of SPEC.md §14. Keep the clippy list in sync with the workspace.
 [lints.rust]
 missing_docs = "deny"
+# `unsafe` only where a module expects it: `uring::ring` (SPEC.md §14).
+unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]
