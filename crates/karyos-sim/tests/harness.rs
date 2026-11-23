@@ -842,3 +842,24 @@ fn test_harness_the_test_service_ignores_the_event_time() {
     }
     assert_eq!(stamped, zeroed);
 }
+
+/// karyos#976: a core's panic is a verdict of its own, reported after
+/// every other check, linearizability included, and a server down since its panic is not reported
+/// as unverified.
+#[test]
+fn a_core_panic_is_reported_last_and_is_not_unverified() {
+    let panicked = vec![Observation::CorePanicked { node: 1 }];
+    // Not a group verdict: it comes after the history's (`check::all`).
+    assert!(check::group(&panicked, 3).is_ok());
+    assert!(matches!(
+        check::all(&panicked, &History::default(), 3),
+        Err(Violation::CorePanicked { node: 1 })
+    ));
+    assert!(check::durable_kept(&panicked).is_ok());
+    // A crash after the panic makes it an ordinary down server again.
+    let crashed = vec![
+        Observation::CorePanicked { node: 1 },
+        Observation::Crashed { node: 1 },
+    ];
+    assert!(check::durable_kept(&crashed).is_ok());
+}
