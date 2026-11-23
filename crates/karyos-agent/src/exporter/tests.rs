@@ -840,6 +840,40 @@ fn a_head_with_a_header_that_is_not_utf8_is_refused() {
     );
 }
 
+/// A peer that connects to `exporter` and trickles one byte of `bytes`
+/// every 40 ms, each within [`IO_TIMEOUT`], until the exporter hangs up;
+/// returns what one poll answered and how long it took (karyos#887
+/// review).
+fn trickle(exporter: &mut Exporter, bytes: &'static [u8]) -> (Vec<Answered>, Duration) {
+    let address = exporter.local_addr().unwrap();
+    let peer = std::thread::spawn(move || {
+        let mut peer = TcpStream::connect(address).unwrap();
+        for byte in bytes.iter().cycle().take(200) {
+            if peer.write_all(&[*byte]).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    let started = std::time::Instant::now();
+    let mut answered = Vec::new();
+    while answered.is_empty() && started.elapsed() < Duration::from_secs(5) {
+        answered = exporter.poll(|| "karyos_up 1\n".to_owned()).unwrap();
+    }
+    let took = started.elapsed();
+    drop(peer);
+    (answered, took)
+}
+
+#[test]
+fn a_peer_that_trickles_its_request_is_cut_off_at_the_deadline() {
+    let mut exporter = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let (answered, took) = trickle(&mut exporter, b"GET /metrics HTTP/1.1\r\nX: ");
+    assert_eq!(answered, vec![Answered::Dropped]);
+    assert!(took < CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
+}
+
 /// karyos#887: the exporter over TLS.
 #[cfg(feature = "exporter-tls")]
 mod over_tls {
@@ -1010,6 +1044,18 @@ mod over_tls {
         );
         assert_eq!(answered, vec![Answered::Unauthorized]);
         assert!(answer.unwrap().starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn a_peer_that_trickles_its_handshake_is_cut_off_at_the_deadline() {
+        let mut exporter = exporter("0.0.0.0:0", "trickle");
+        // A TLS record header of a ClientHello, then its body byte by byte.
+        let (answered, took) = trickle(
+            &mut exporter,
+            b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03",
+        );
+        assert_eq!(answered, vec![Answered::Dropped]);
+        assert!(took < CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
     }
 
     #[test]
