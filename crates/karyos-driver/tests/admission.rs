@@ -513,7 +513,7 @@ fn hellos_that_break_the_profile_are_refused() {
     );
     // Version 2, an alpha.2 client's (karyos#637: version 3 since the
     // roles commands).
-    assert_eq!(VERSION, 4);
+    assert_eq!(VERSION, 5);
     assert_eq!(
         raw_hello(
             &mut driver,
@@ -524,12 +524,22 @@ fn hellos_that_break_the_profile_are_refused() {
         refused(refusal::INCOMPATIBLE_VERSION)
     );
     // Version 3, an alpha.3 client's (karyos#740: version 4 since the rate
-    // change command).
+    // change command), and version 4, an unreleased build's before
+    // karyos#844 (ADR-0100: version 5 since the parent-aware image attach).
     assert_eq!(
         raw_hello(
             &mut driver,
             &dir,
             &encode(&Message::Hello { version: 3 }),
+            Some(&own)
+        ),
+        refused(refusal::INCOMPATIBLE_VERSION)
+    );
+    assert_eq!(
+        raw_hello(
+            &mut driver,
+            &dir,
+            &encode(&Message::Hello { version: 4 }),
             Some(&own)
         ),
         refused(refusal::INCOMPATIBLE_VERSION)
@@ -541,7 +551,7 @@ fn hellos_that_break_the_profile_are_refused() {
     );
     assert_eq!(driver.clients(), 0);
     // Each refusal reached the error log, keyed by its code: three
-    // profile refusals and four version refusals (P7 o3).
+    // profile refusals and five version refusals (P7 o3).
     let mut occurrences = std::collections::HashMap::new();
     let _ = driver.error_log().scan(&mut 0, |record| {
         assert_eq!(
@@ -553,7 +563,7 @@ fn hellos_that_break_the_profile_are_refused() {
     assert_eq!(occurrences.get(&[0, refusal::PROFILE]), Some(&3));
     assert_eq!(
         occurrences.get(&[0, refusal::INCOMPATIBLE_VERSION]),
-        Some(&4)
+        Some(&5)
     );
     assert_eq!(occurrences.len(), 2);
 }
