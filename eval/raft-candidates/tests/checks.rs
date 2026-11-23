@@ -16,8 +16,10 @@
 //! `AppliedNotDurable` (a driver that applies a Ready's fresh entries),
 //! `ReleasedBeforePersisted` (a driver that releases before the sync),
 //! `DivergentResponse` (a service that alters one server's answers) and
-//! `NotLinearizable` (a client that records a value no one wrote). The
-//! other checks of
+//! `NotLinearizable` (a client that records a value no one wrote), and,
+//! with the harness catching a core's panic (karyos#976), `DurableLost` (a
+//! disk that lies about syncs), `CommittedTruncated` (a server that stores
+//! no commit) and `CorePanicked` itself. The other checks of
 //! `karyos_sim::harness::check::Violation` keep their fixture negative
 //! cases (`crates/karyos-sim/tests/harness.rs`); why each has no mutant
 //! here is recorded in `eval/raft-candidates/README.md` (karyos#976).
