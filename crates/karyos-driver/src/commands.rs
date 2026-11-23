@@ -1235,6 +1235,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 // the floor, or a head join for want of an awaiting cell.
                 let mut adopted_loss: Option<(u64, u64)> = None;
                 let mut head_join = false;
+                let mut adopted_start = false;
                 // A stream configured allow_unconnected grants it to every
                 // publication, as its in-process handles get it
                 // (EmbeddedDriver::publication); a client may still ask for
@@ -1300,6 +1301,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                                     Ok(inner) => {
                                         subscriber = Some((inner.cell(), cell.export(), role));
                                         adopted_loss = raised;
+                                        adopted_start = true;
                                         (Capability::Subscription(inner), Kind::Subscription)
                                     }
                                     Err(_) => {
@@ -1351,6 +1353,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     self.pending_join_loss =
                         join_loss(target, parent, join, adopted_loss, head_join);
                 }
+                self.adopted_start = adopted_start;
                 // A timed lane's settings are fixed, and written for the
                 // handle to read, once its capability is taken and before
                 // it is issued (TT-6b); a refusal gives the capability back.
@@ -1622,11 +1625,14 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             _ => return Err("a command this driver does not serve"),
         };
         // The join loss the attach owes, once it succeeded (ADR-0100).
-        if let Some(event) = self.pending_join_loss.take()
-            && matches!(response, Response::SubscriptionReady { .. })
-        {
+        let attached = matches!(response, Response::SubscriptionReady { .. });
+        if attached && let Some(event) = self.pending_join_loss.take() {
+            self.counters.add(Event::ImageStartJoinsLate, 1);
             self.emit(&event);
+        } else if attached && self.adopted_start {
+            self.counters.add(Event::ImageStartJoins, 1);
         }
+        self.adopted_start = false;
         Ok(response)
     }
 
@@ -2431,6 +2437,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             self.pending_join_loss =
                 join_loss(target, parent, join, adopted_loss, adopted.is_none());
         }
+        self.adopted_start = adopted.is_some();
         // Recorded by the driver, never taken from the client. Checked
         // (SPEC.md §14), as for a local subscription: if the sum did not
         // fit, the add is refused and the cell ended, which the grant never

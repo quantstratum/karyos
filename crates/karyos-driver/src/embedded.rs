@@ -1346,6 +1346,9 @@ pub struct EmbeddedDriver<T: StreamTerms = HeapTerms> {
     /// The `ImageJoinLoss` an attach owes its client (ADR-0100), sent once
     /// the attach succeeded; cleared at each command.
     pub(crate) pending_join_loss: Option<karyos_protocol::cnc::Event>,
+    /// Whether the current attach adopted an awaiting cell (ADR-0100), for
+    /// its counter; cleared at each command.
+    pub(crate) adopted_start: bool,
     /// Network resources refused because their client owned its most.
     pub(crate) owned_refusals: u64,
     /// `owned_refusals` reached its end and kept its value (SPEC §14).
@@ -1788,6 +1791,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             awaiting_entries: Vec::new(),
             attach_of: None,
             pending_join_loss: None,
+            adopted_start: false,
             owned_refusals: 0,
             owned_refusals_overflowed: false,
             capabilities: crate::capabilities::CapabilityCells::default(),
@@ -5185,6 +5189,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         // announced subscription, so none is told twice.
         self.announce_existing_images();
         self.serve_images();
+        self.expire_awaiting();
         // The network journals' answers, after the images they name.
         self.serve_network_trace();
         // The guarded publications the sender refused or returned: their
@@ -5615,6 +5620,43 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                     .conductor
                     .end_subscriber(waiting.cell.cell(), waiting.cell.export());
             }
+        }
+    }
+
+    /// Ends the required awaiting cells whose `image_join_deadline` passed
+    /// (ADR-0100): the floor and the reliable sender move on, and a later
+    /// attach joins at the head with an `ImageJoinLoss`.
+    fn expire_awaiting(&mut self) {
+        let Some(deadline) = self
+            .config
+            .network
+            .as_ref()
+            .map(|network| network.images.image_join_deadline)
+        else {
+            return;
+        };
+        let now = self.clock.now();
+        let mut expired = 0u64;
+        for stream in &mut self.streams {
+            if stream.awaiting.is_empty() {
+                continue;
+            }
+            let conductor = &mut stream.conductor;
+            stream.awaiting.retain(|awaiting| {
+                let due = awaiting.role == Role::Required
+                    && now
+                        .checked_sub(awaiting.since)
+                        .is_some_and(|held| held >= deadline);
+                if due {
+                    let _ = conductor.end_subscriber(awaiting.cell.cell(), awaiting.cell.export());
+                    expired = expired.saturating_add(1);
+                }
+                !due
+            });
+        }
+        if expired > 0 {
+            self.counters
+                .add(crate::counters::Event::ImageStartJoinsExpired, expired);
         }
     }
 

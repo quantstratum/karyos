@@ -167,7 +167,7 @@ pub const TYPE_SPIN_TIME: u64 = 3;
 pub const TYPE_TIMESTAMP: u64 = karyos_sys::counters::TYPE_TIMESTAMP;
 
 /// Counters the driver allocates, in cell order.
-const LABELS: [(u64, &str); 78] = [
+const LABELS: [(u64, &str); 81] = [
     (TYPE_EVENTS, "clients admitted"),
     (TYPE_EVENTS, "clients retired"),
     (TYPE_EVENTS, "clients faulty"),
@@ -246,6 +246,9 @@ const LABELS: [(u64, &str); 78] = [
     (TYPE_GAUGE, "trace points per client"),
     (TYPE_GAUGE, "trace point registrations per client"),
     (TYPE_EVENTS, "trace point copies dropped"),
+    (TYPE_EVENTS, "image start joins"),
+    (TYPE_EVENTS, "image start joins late"),
+    (TYPE_EVENTS, "image start joins expired"),
 ];
 
 /// The fixed counters, which every counters region must hold: the labels,
@@ -496,6 +499,13 @@ pub(crate) enum Event {
     /// Trace points registered with no driver-written copy, because
     /// `max_trace_point_copies` copies were live (karyos#869).
     TracePointCopiesDropped,
+    /// Attaches that adopted an awaiting cell at the image's join
+    /// (ADR-0100). After the earlier counters, so none of their ids moves.
+    ImageStartJoins,
+    /// Attaches that owed an `ImageJoinLoss` (ADR-0100).
+    ImageStartJoinsLate,
+    /// Required awaiting cells ended by `image_join_deadline` (ADR-0100).
+    ImageStartJoinsExpired,
 }
 
 /// The driver's counters region and its counter capabilities.
@@ -864,6 +874,9 @@ mod tests {
                 "trace point registrations per client",
             ),
             (Event::TracePointCopiesDropped, "trace point copies dropped"),
+            (Event::ImageStartJoins, "image start joins"),
+            (Event::ImageStartJoinsLate, "image start joins late"),
+            (Event::ImageStartJoinsExpired, "image start joins expired"),
         ];
         assert_eq!(events.len(), LABELS.len());
         let reader = counters.reader();
