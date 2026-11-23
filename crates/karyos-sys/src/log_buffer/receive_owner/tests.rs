@@ -1954,3 +1954,19 @@ fn an_awaiting_required_cell_is_handed_over_in_place() {
     adopted.acknowledge();
     assert_eq!(owner.consumption(Lane::ZERO), Some(128));
 }
+
+/// ADR-0100: an image lane registers its awaiting cells before its
+/// conductor is taken; once taken, the buffer-level registration is
+/// refused, and the conductor still finds the cell.
+#[test]
+fn awaiting_cells_are_registered_before_the_conductor() {
+    let buffer = image(64);
+    let awaiting = buffer.register_awaiting(Role::Optional, false, 11).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    assert_eq!(conductor.cell_position(awaiting.cell()), Some(64));
+    assert!(matches!(
+        buffer.register_awaiting(Role::Optional, false, 12),
+        Err(crate::error::SysError::InvalidPublicationMode { .. })
+    ));
+    assert_eq!(conductor.raise_to_floor(&awaiting), Ok(None));
+}
