@@ -3812,25 +3812,27 @@ fn an_admission_journal_recorded_into_the_archive_is_sealed_and_verified() {
         .unwrap();
     file[at] ^= 0xFF;
     std::fs::write(&segment, &file).unwrap();
-    let agent = ArchiveHandle::spawn(StdDisk, &dir, AgentConfig::default()).unwrap();
-    let seen = Arc::new(std::sync::Mutex::new(Seen::default()));
-    let _ = agent
-        .replay(replay_of(id, all.len() as u64, Sink::new(&seen)))
+    // What the Archive now holds of the recording, read from its segment
+    // file as stored: replay and recovery refuse the changed frame, so the
+    // seal is checked against the stored bytes themselves. The recording
+    // starts in the file where its first recorded bytes do.
+    let base = file
+        .windows(32)
+        .position(|window| window == &all[..32])
         .unwrap();
-    let _ = replay_ended(&agent);
-    let held = seen.lock().unwrap().bytes.clone();
-    // The replay is complete and differs from what was recorded in exactly
-    // the one byte changed, so the check below sees the change, not a
-    // short or empty replay (Codex review of #1170).
+    let held = file[base..base + all.len()].to_vec();
+    // The stored bytes are the whole recording and differ from what was
+    // recorded in exactly the one byte changed, so the check below sees the
+    // change, not a short or empty read (Codex review of #1170).
     let changed = all
         .windows(MARKER.len())
         .position(|window| window == MARKER)
         .unwrap();
     let mut expected = all.clone();
     expected[changed] ^= 0xFF;
-    assert_eq!(held.len(), all.len(), "the whole recording is replayed");
+    assert_eq!(held.len(), all.len(), "the whole recording is read");
     assert_eq!(held, expected, "only the changed byte differs");
-    // The sealed range holding it rejects the replayed bytes; every other
+    // The sealed range holding it rejects the stored bytes; every other
     // range still matches.
     for range in &ranges {
         let bytes = &held[range.start as usize..range.end as usize];
@@ -3849,7 +3851,6 @@ fn an_admission_journal_recorded_into_the_archive_is_sealed_and_verified() {
             .any(|range| (range.start as usize..range.end as usize).contains(&changed)),
         "a sealed range covers the changed byte"
     );
-    agent.shutdown().unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
