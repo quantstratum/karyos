@@ -1,0 +1,3 @@
+### Fixed
+
+- The retention-floor e2e tests (`an_optional_receivers_*` and `a_slow_optional_receiver_under_min_is_bounded_and_repaired`) no longer fail on a loaded host because of datagrams the host really loses (karyos#1067). The sender used to hold back every NAK so that C's planted hole stayed open, which left B's and C's real losses unrepaired. It now holds back only C's NAK for that hole. The hole is planted by term offset instead of by arrival count, which an earlier real loss shifted. `pump` waits up to 30 s instead of a fixed number of duties. A failure now prints every driver's counters, its receive sessions, a trace of what each receiver saw, and the NAKs the sender answered.

@@ -3218,8 +3218,10 @@ impl<T: StreamTerms> Network<T> {
     pub(crate) fn agent_counters(&self) -> String {
         match &self.agents {
             Agents::Shared(agents) => format!(
-                "sender {:?} receiver {:?} images {:?}",
+                "sender {:?} send_sessions {:?} outbound0 {:?} receiver {:?} images {:?}",
                 agents.sender.counters(),
+                agents.sender.session_counters(),
+                agents.sender.outbound_counters(0),
                 agents.receiver.counters(),
                 self.images.counters()
             ),
@@ -3235,6 +3237,62 @@ impl<T: StreamTerms> Network<T> {
             Agents::Shared(agents) => agents
                 .receiver
                 .subscription_multicast(subscription.endpoint, subscription.stream_id),
+            _ => None,
+        }
+    }
+
+    /// The Shared receiver's session table, ignored controls and path
+    /// counters, for a test's failure message (karyos#1067).
+    #[cfg(test)]
+    pub(crate) fn receiver_sessions_debug(&self) -> String {
+        match &self.agents {
+            Agents::Shared(agents) => format!(
+                "{} boot {:x} naks {}",
+                agents.receiver.sessions_debug(),
+                agents.receiver.boot_id_debug(),
+                agents.sender.nak_debug()
+            ),
+            _ => String::new(),
+        }
+    }
+
+    /// Makes the sender drop the NAKs of one receiver, by its boot id,
+    /// that ask for a range in `held`, and answer every other (`None`:
+    /// answer all) (tests, Shared mode only).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn sender_ignores_naks_of(
+        &mut self,
+        held: Option<([u64; 2], crate::agents::roles::HeldRanges)>,
+    ) {
+        if let Agents::Shared(agents) = &mut self.agents {
+            agents.sender.ignore_naks_of(held);
+        }
+    }
+
+    /// Loses the first arrival of the receiver's DATA datagram at each
+    /// term offset of `at`, in the first term: a hole planted by position
+    /// (tests, Shared mode only).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn drop_receiver_data_at(&mut self, at: &[u32]) {
+        if let Agents::Shared(agents) = &mut self.agents {
+            agents.receiver.drop_data_at(at);
+        }
+    }
+
+    /// Makes the receiver's `drop_receiver_data` record what it loses in
+    /// `held` (tests, Shared mode only).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn share_dropped_data(&mut self, held: crate::agents::roles::HeldRanges) {
+        if let Agents::Shared(agents) = &mut self.agents {
+            agents.receiver.share_dropped(held);
+        }
+    }
+
+    /// The Shared receiver's boot id, for tests.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn receiver_boot_id(&self) -> Option<[u64; 2]> {
+        match &self.agents {
+            Agents::Shared(agents) => Some(agents.receiver.boot_id()),
             _ => None,
         }
     }

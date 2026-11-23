@@ -1551,11 +1551,29 @@ pub struct ReceiverAgent<O: SocketOps, T: StreamTerms = HeapTerms> {
 }
 
 impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
+    /// Its session table, ignored controls and path counters (tests).
+    #[cfg(test)]
+    pub(crate) fn sessions_debug(&self) -> String {
+        self.role.sessions_debug()
+    }
+
     /// Retired images whose `StorageReclaimed` the receiver handled, still
     /// in quarantine (tests).
     #[cfg(test)]
     pub(crate) fn reclaimed_tombstones(&self) -> usize {
         self.role.reclaimed_tombstones()
+    }
+
+    /// This receiver's boot id's first word, for a failure message (tests).
+    #[cfg(test)]
+    pub(crate) fn boot_id_debug(&self) -> u64 {
+        self.role.boot_id()[0]
+    }
+
+    /// This receiver's boot id (tests).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn boot_id(&self) -> [u64; 2] {
+        self.role.boot_id()
     }
 
     /// The receive sessions' counters: SOLICITs, challenges, installs
@@ -1714,6 +1732,23 @@ impl<O: SocketOps, T: StreamTerms> SenderAgent<O, T> {
         self.role.heed_naks();
     }
 
+    /// Drops the NAKs of receiver boot id `boot_id` unread, or none
+    /// (tests).
+    #[cfg(test)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "used by the Linux multicast tests (T9)")
+    )]
+    pub(crate) fn ignore_naks_of(&mut self, held: Option<([u64; 2], roles::HeldRanges)>) {
+        self.role.ignore_naks_of(held);
+    }
+
+    /// [`roles::SenderRole::nak_debug`] (tests).
+    #[cfg(test)]
+    pub(crate) fn nak_debug(&self) -> String {
+        self.role.nak_debug()
+    }
+
     /// After a stop: the halves of `Attach` commands the agent never read
     /// (DN-8). The conductor reclaims them with the held ones.
     pub fn take_unread_halves(&mut self) -> Vec<(EndpointId, Half<O>)> {
@@ -1806,6 +1841,19 @@ impl<O: SocketOps, T: StreamTerms> ReceiverAgent<O, T> {
     #[cfg(test)]
     pub(crate) fn drop_data(&mut self, nth: &[u64]) {
         self.role.drop_data(nth);
+    }
+
+    /// Loses the first arrival of the DATA at each first term offset of
+    /// `at` (tests).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn drop_data_at(&mut self, at: &[u32]) {
+        self.role.drop_data_at(at);
+    }
+
+    /// Shares the positions `drop_data` loses (tests).
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn share_dropped(&mut self, held: roles::HeldRanges) {
+        self.role.share_dropped(held);
     }
 
     /// Loses the receiver's DATA with a payload at or past `term_offset`
