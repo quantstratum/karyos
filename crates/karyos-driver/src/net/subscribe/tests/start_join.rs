@@ -57,6 +57,12 @@ struct Rig {
 
 impl Rig {
     fn new(role: SubscriberRole, deadline: u64) -> Self {
+        Self::with_client(role, deadline, false)
+    }
+
+    /// As [`Rig::new`]; with `remote`, the client is admitted with an
+    /// export ledger, so its attaches are grants (`add_remote`).
+    fn with_client(role: SubscriberRole, deadline: u64, remote: bool) -> Self {
         let a = driver(ThreadingMode::Shared);
         let mut network = NetworkConfig {
             threading: ThreadingMode::Shared,
@@ -70,7 +76,12 @@ impl Rig {
         .unwrap();
         let address = SocketAddr::new(LOOPBACK, free_port());
         let mut observer = b.broadcast.receiver();
-        let (_client, mut producer, link) = local_client(&mut b);
+        let (_client, mut producer, link) = if remote {
+            let (client, producer) = super::remote_client(&mut b);
+            (client, producer, Arc::new(ClientLink::new()))
+        } else {
+            local_client(&mut b)
+        };
         write_command(
             &mut producer,
             Command::AddNetworkSubscription {
@@ -278,4 +289,48 @@ fn an_attach_naming_another_parent_is_refused() {
     let (responses, _) = rig.send(rig.attach_of(3));
     let mut subscription = rig.take(key(&responses));
     assert_eq!(first_message(&mut subscription), Some(early));
+}
+
+/// A required subscription that attaches before its deadline adopts its
+/// awaiting cell and reads from the join, with no loss.
+#[test]
+fn an_awaiting_required_subscription_reads_from_the_join() {
+    let mut rig = Rig::new(SubscriberRole::Required, 10_000_000_000);
+    let early = rig.offer(b"early");
+    let (responses, events) = rig.send(rig.attach_of(2));
+    let mut subscription = rig.take(key(&responses));
+    assert_eq!(first_message(&mut subscription), Some(early));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, Event::ImageJoinLoss { .. })),
+        "{events:?}"
+    );
+}
+
+/// A remote client's parent-aware attach is granted the awaiting cell
+/// itself, under the export the cell was registered with at the build,
+/// and the driver's export counter does not move back.
+#[test]
+fn a_remote_attach_is_granted_the_awaiting_cell() {
+    let mut rig = Rig::with_client(SubscriberRole::Optional, 10_000_000_000, true);
+    let _early = rig.offer(b"early");
+    let before = rig.b.next_export;
+    let (responses, _) = rig.send(rig.attach_of(2));
+    assert!(
+        responses
+            .iter()
+            .any(|response| matches!(response, Response::SubscriptionReady { .. })),
+        "{responses:?}"
+    );
+    let client = rig
+        .b
+        .clients
+        .iter()
+        .find(|slot| slot.ledger.is_some())
+        .map(|slot| slot.id)
+        .unwrap();
+    let grant = *rig.b.ledger(client).unwrap().grants().last().unwrap();
+    assert!(grant.export < before, "the cell's export, from the build");
+    assert!(rig.b.next_export >= before);
 }
