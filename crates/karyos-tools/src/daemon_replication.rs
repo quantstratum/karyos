@@ -306,6 +306,11 @@ struct Replication {
     /// it is back.
     lost: bool,
     back_since: Option<Instant>,
+    /// The current incarnation reached the replica once: a refusal for no
+    /// receiver before that is the join, not a loss.
+    joined: bool,
+    /// The current request's first `streaming` status was forwarded.
+    streamed: bool,
     /// The agent's answer to "is the stopped request still active".
     confirming: Option<Posted<bool>>,
     buf: Vec<u8>,
@@ -436,6 +441,8 @@ impl Replications {
                 pending: None,
                 lost: false,
                 back_since: None,
+                joined: false,
+                streamed: false,
                 confirming: None,
                 buf: vec![0; MAX_MESSAGE],
             });
@@ -473,6 +480,9 @@ impl Replications {
     /// Removes every forwarding publication; the pair's streams are the
     /// caller's to remove ([`Self::streams`]).
     pub fn shutdown(self, driver: &mut EmbeddedDriver<SharedTerms>) {
+        if !self.replications.is_empty() {
+            tracing::info!(counters = ?self.counters, "replications stopped");
+        }
         for replication in self.replications {
             if let Some((aggregate, publication)) = replication.forward {
                 drop(publication);
@@ -770,6 +780,8 @@ impl Replication {
         self.start = from;
         self.lost = false;
         self.back_since = None;
+        self.joined = false;
+        self.streamed = false;
         let request = ReplicateRecording {
             correlation_id,
             recording_id,
@@ -910,7 +922,7 @@ impl Replication {
                 }
             }
             Offered::NotConnected => {
-                self.lost = true;
+                self.lose();
                 self.back_since = None;
                 return worked;
             }
@@ -977,7 +989,7 @@ impl Replication {
             }
             refused => {
                 if refused == OfferOutcome::NotConnected {
-                    self.lost = true;
+                    self.lose();
                     self.back_since = None;
                 }
                 // Held with the phase change it moves: an end or a restart
@@ -993,7 +1005,21 @@ impl Replication {
         false
     }
 
+    /// The publication found no receiver: a loss once the incarnation
+    /// had reached the replica, before that only its join.
+    fn lose(&mut self) {
+        if self.joined && !self.lost {
+            tracing::info!(
+                recording_id = self.option.recording_id,
+                endpoint = %self.option.endpoint,
+                "replica connection lost"
+            );
+        }
+        self.lost |= self.joined;
+    }
+
     fn connected(&mut self, now: Instant) {
+        self.joined = true;
         if self.lost && self.back_since.is_none() {
             self.back_since = Some(now);
         }
@@ -1036,6 +1062,15 @@ impl Replication {
         let recording_id = self.option.recording_id;
         match status.state {
             State::Streaming => {
+                if !self.streamed {
+                    self.streamed = true;
+                    tracing::info!(
+                        recording_id,
+                        source_start = status.source_start,
+                        sealed_end = status.sealed_end,
+                        "replication streaming"
+                    );
+                }
                 self.start = status.source_start;
                 // A request that streams resets the backoff only once its
                 // connection held.

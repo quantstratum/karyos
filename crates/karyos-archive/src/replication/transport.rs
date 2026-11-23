@@ -137,6 +137,9 @@ pub struct Sender {
     sent_end: u64,
     /// Set once a final status was produced: nothing more is sent.
     done: Option<State>,
+    /// The request's first status, its start marker, was produced: it
+    /// comes before any bytes (ADR-0102 decision 6).
+    started: bool,
     /// The most bytes one [`Outgoing::Bytes`] carries, 1 to [`MAX_CHUNK`].
     chunk: usize,
     /// Where dropped chunks return their buffers, and where they are
@@ -174,6 +177,7 @@ impl Sender {
             next: request.from,
             sent_end: request.from,
             done: None,
+            started: false,
             chunk: MAX_CHUNK,
             give,
             pool,
@@ -238,6 +242,17 @@ impl Sender {
         }
         let recording = self.request.recording_id;
         let sealed_end = sealed_end(seals, recording, store.start());
+        // The start comes first: a `streaming` status, whose
+        // `source_start` is where the request starts, before any bytes
+        // (ADR-0102 decision 6).
+        if !self.started {
+            self.started = true;
+            out.push(Outgoing::Status(self.report(
+                State::Streaming,
+                store,
+                sealed_end,
+            )));
+        }
         if store.start() > self.next {
             out.push(self.finish(State::Interrupted, store, sealed_end));
             return Ok(());

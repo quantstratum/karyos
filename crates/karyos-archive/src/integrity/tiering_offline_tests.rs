@@ -140,6 +140,7 @@ fn archive(disk: &FaultDisk) -> u64 {
                     retain_until_ns: if location == LOCAL { 0 } else { 1 },
                     state: CopyState::Verified,
                     enforcement: Enforcement::Unsupported,
+                    profile: crate::integrity::copies::ArrivalProfile::Local,
                 },
                 &mut journal,
             )

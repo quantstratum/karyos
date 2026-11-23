@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use karyos_archive::control::{ControlMessage, ResponseCode};
-use karyos_archive::disk::StdDisk;
+use karyos_archive::disk::{Disk, StdDisk};
 use karyos_archive::integrity::copies::{ArrivalProfile, CopyCatalog, CopyState, Enforcement};
 use karyos_archive::integrity::journal::IntegrityJournal;
 use karyos_archive::integrity::replication::{Replica, ReplicationLag, Verdict};
@@ -135,17 +135,31 @@ struct ReplicaListener {
     /// The registration of the newest incarnation ever followed: an older
     /// one still exposed after the newest retired is never followed again.
     newest: Option<u64>,
+    state: ReplicaState<StdDisk>,
+    buf: Vec<u8>,
+}
+
+/// What a replica holds of its recording and does with the messages of
+/// the incarnation it follows, apart from the driver (and so testable on
+/// any disk).
+struct ReplicaState<D: Disk + Clone> {
+    recording_id: u64,
     /// The current request: its correlation id, once its `streaming`
-    /// status was seen in this incarnation.
+    /// status was seen and its start set up.
     started: Option<u64>,
     receiver: Receiver,
     replica: Replica,
-    store: SegmentStore<StdDisk>,
-    journal: IntegrityJournal<StdDisk>,
-    copies: CopyCatalog<StdDisk>,
+    store: SegmentStore<D>,
+    journal: IntegrityJournal<D>,
+    copies: CopyCatalog<D>,
     /// The last status and when it arrived.
     status: Option<(ReplicationStatus, Instant)>,
-    buf: Vec<u8>,
+    /// The store's directory and disk, to reopen it once it failed.
+    dir: PathBuf,
+    disk: D,
+    /// The store failed: it refuses everything until reopened, which the
+    /// next request's start does first.
+    store_failed: bool,
 }
 
 /// Every replica of a daemon.
@@ -205,30 +219,44 @@ fn geometry() -> Result<Geometry, SegmentError> {
 }
 
 /// What one replica holds, opened or created in `dir`.
-type Opened = (
-    SegmentStore<StdDisk>,
-    IntegrityJournal<StdDisk>,
-    CopyCatalog<StdDisk>,
-);
+type Opened<D> = (SegmentStore<D>, IntegrityJournal<D>, CopyCatalog<D>);
 
-fn open_replica(dir: &Path, recording: u64) -> Result<Opened, ReplicaStartError> {
+/// The store of `recording` in `dir`, recovered.
+fn recover_store<D: Disk>(
+    disk: D,
+    dir: &Path,
+    recording: u64,
+) -> Result<SegmentStore<D>, SegmentError> {
+    SegmentStore::recover(disk, dir, recording, geometry()?, SyncPolicy::PerSegment)
+        .map(|recovered| recovered.store)
+}
+
+fn open_replica<D: Disk + Clone>(
+    disk: &D,
+    dir: &Path,
+    recording: u64,
+) -> Result<Opened<D>, ReplicaStartError> {
     let failed = |error: String| ReplicaStartError::Store(format!("{}: {error}", dir.display()));
     std::fs::create_dir_all(dir).map_err(|error| failed(error.to_string()))?;
     let geometry = geometry().map_err(|error| failed(error.to_string()))?;
-    let store =
-        match SegmentStore::recover(StdDisk, dir, recording, geometry, SyncPolicy::PerSegment) {
-            Ok(recovered) => recovered.store,
-            Err(SegmentError::NotFound { .. }) => {
-                SegmentStore::create(StdDisk, dir, recording, geometry, SyncPolicy::PerSegment, 0)
-                    .map_err(|error| failed(error.to_string()))?
-            }
-            Err(error) => return Err(failed(error.to_string())),
-        };
-    let mut journal = IntegrityJournal::open(StdDisk, dir)
+    let store = match recover_store(disk.clone(), dir, recording) {
+        Ok(store) => store,
+        Err(SegmentError::NotFound { .. }) => SegmentStore::create(
+            disk.clone(),
+            dir,
+            recording,
+            geometry,
+            SyncPolicy::PerSegment,
+            0,
+        )
+        .map_err(|error| failed(error.to_string()))?,
+        Err(error) => return Err(failed(error.to_string())),
+    };
+    let mut journal = IntegrityJournal::open(disk.clone(), dir)
         .map_err(|error| failed(error.to_string()))?
         .journal;
-    let copies =
-        CopyCatalog::open(StdDisk, dir, &mut journal).map_err(|error| failed(error.to_string()))?;
+    let copies = CopyCatalog::open(disk.clone(), dir, &mut journal)
+        .map_err(|error| failed(error.to_string()))?;
     Ok((store, journal, copies))
 }
 
@@ -261,10 +289,8 @@ impl Replicas {
         }
         let mut listeners = Vec::with_capacity(options.len());
         for option in options {
-            let (store, journal, copies) = open_replica(
-                &replica_dir(archive, option.recording_id),
-                option.recording_id,
-            )?;
+            let dir = replica_dir(archive, option.recording_id);
+            let (store, journal, copies) = open_replica(&StdDisk, &dir, option.recording_id)?;
             let subscription = driver
                 .add_network_subscription(option.stream_id, &listen_channel(option.bind))
                 .map_err(ReplicaStartError::Subscribe)?;
@@ -277,13 +303,19 @@ impl Replicas {
                 subscription,
                 image: None,
                 newest: None,
-                started: None,
-                receiver: Receiver::new(option.recording_id, replica),
-                replica,
-                store,
-                journal,
-                copies,
-                status: None,
+                state: ReplicaState {
+                    recording_id: option.recording_id,
+                    started: None,
+                    receiver: Receiver::new(option.recording_id, replica),
+                    replica,
+                    store,
+                    journal,
+                    copies,
+                    status: None,
+                    dir,
+                    disk: StdDisk,
+                    store_failed: false,
+                },
                 buf: vec![0; MAX_MESSAGE],
             });
         }
@@ -318,9 +350,19 @@ impl Replicas {
 
     /// Drops every reader and subscription, and syncs every store.
     pub fn shutdown(self, driver: &mut EmbeddedDriver<SharedTerms>) {
+        if !self.listeners.is_empty() {
+            tracing::info!(counters = ?self.counters, "replicas stopped");
+        }
         for mut listener in self.listeners {
+            if let Some((status, _)) = listener.state.status {
+                tracing::info!(
+                    recording_id = listener.option.recording_id,
+                    ?status,
+                    "replica's last status"
+                );
+            }
             listener.image = None;
-            if let Err(error) = listener.store.sync() {
+            if let Err(error) = listener.state.store.sync() {
                 tracing::warn!(%error, "replica store not synced at shutdown");
             }
             let _ = driver.remove_network_subscription(listener.subscription);
@@ -330,13 +372,14 @@ impl Replicas {
 
 impl ReplicaListener {
     fn lag(&self, now: Instant) -> Option<ReplicationLag> {
-        let (status, at) = self.status?;
+        let (status, at) = self.state.status?;
         if now.saturating_duration_since(at) > LAG_STALE {
             return None;
         }
-        self.replica
+        self.state
+            .replica
             .lag(
-                &self.copies,
+                &self.state.copies,
                 self.option.recording_id,
                 status.source_start,
                 status.sealed_end,
@@ -371,7 +414,8 @@ impl ReplicaListener {
             };
             worked = true;
             let buf = std::mem::take(&mut self.buf);
-            self.take(buf.get(..length).unwrap_or_default(), now, counters);
+            self.state
+                .take(buf.get(..length).unwrap_or_default(), now, counters);
             self.buf = buf;
         }
         worked
@@ -399,7 +443,7 @@ impl ReplicaListener {
         }
         // The older image is retired: nothing it still delivers is read.
         self.image = None;
-        self.started = None;
+        self.state.started = None;
         let Some((session, handle)) = newest else {
             return true;
         };
@@ -424,10 +468,40 @@ impl ReplicaListener {
         }
         true
     }
+}
+
+impl<D: Disk + Clone> ReplicaState<D> {
+    /// Reopens a store that failed, recovered to what it made durable;
+    /// returns whether the store is usable.
+    fn heal(&mut self, counters: &mut ReplicaCounters) -> bool {
+        if !self.store_failed {
+            return true;
+        }
+        match recover_store(self.disk.clone(), &self.dir, self.recording_id) {
+            Ok(store) => {
+                self.store = store;
+                self.store_failed = false;
+                tracing::info!(
+                    recording_id = self.recording_id,
+                    "replica store reopened after a failure"
+                );
+                true
+            }
+            Err(error) => {
+                counters.failures = counters.failures.saturating_add(1);
+                tracing::warn!(
+                    recording_id = self.recording_id,
+                    %error,
+                    "replica store not reopened"
+                );
+                false
+            }
+        }
+    }
 
     /// Acts on one message of the followed incarnation.
     fn take(&mut self, message: &[u8], now: Instant, counters: &mut ReplicaCounters) {
-        let recording_id = self.option.recording_id;
+        let recording_id = self.recording_id;
         if let Ok(ControlMessage::ControlResponse(response)) = ControlMessage::decode(message) {
             if response.code != ResponseCode::Ok {
                 tracing::warn!(
@@ -484,6 +558,7 @@ impl ReplicaListener {
                     }
                     Err(error) => {
                         counters.failures = counters.failures.saturating_add(1);
+                        self.store_failed |= matches!(error, ReceiveError::Store(_));
                         tracing::warn!(recording_id, %error, "replica bytes not stored");
                     }
                 }
@@ -496,6 +571,7 @@ impl ReplicaListener {
                 // The bytes are durable before the range they hold counts.
                 if let Err(error) = self.store.sync() {
                     counters.failures = counters.failures.saturating_add(1);
+                    self.store_failed = true;
                     tracing::warn!(recording_id, %error, "replica store not synced");
                     return;
                 }
@@ -507,6 +583,12 @@ impl ReplicaListener {
                 ) {
                     Ok(Verdict::Counted(_)) => {
                         counters.counted = counters.counted.saturating_add(1);
+                        tracing::info!(
+                            recording_id,
+                            start = seal.seal.start,
+                            end = seal.seal.end,
+                            "replica range counted"
+                        );
                     }
                     Ok(Verdict::Corrupt(_)) => {
                         counters.mismatches = counters.mismatches.saturating_add(1);
@@ -538,16 +620,26 @@ impl ReplicaListener {
     }
 
     fn status(&mut self, status: &ReplicationStatus, now: Instant, counters: &mut ReplicaCounters) {
-        let recording_id = self.option.recording_id;
+        let recording_id = self.recording_id;
         self.status = Some((*status, now));
         match status.state {
             State::Streaming => {
+                // A failed store is reopened first, whatever the request.
+                if !self.heal(counters) {
+                    return;
+                }
                 // Started only once its start is set up; a failure is
                 // tried again on the next status, at least once a second.
                 if self.started != Some(status.correlation_id)
                     && self.start_at(status.source_start, counters)
                 {
                     self.started = Some(status.correlation_id);
+                    tracing::info!(
+                        recording_id,
+                        correlation_id = status.correlation_id,
+                        source_start = status.source_start,
+                        "replica request started"
+                    );
                 }
             }
             State::Interrupted => {
@@ -568,7 +660,7 @@ impl ReplicaListener {
     /// before the first range, and the copy starts again at `start`.
     /// Returns whether the copy is ready for the request's first range.
     fn start_at(&mut self, start: u64, counters: &mut ReplicaCounters) -> bool {
-        let recording_id = self.option.recording_id;
+        let recording_id = self.recording_id;
         let verified_end = match self.copies.current() {
             Ok(copies) => copies
                 .into_iter()
@@ -595,6 +687,7 @@ impl ReplicaListener {
             && let Err(error) = self.store.truncate(verified_end)
         {
             counters.failures = counters.failures.saturating_add(1);
+            self.store_failed = true;
             tracing::warn!(recording_id, %error, "replica unverified tail not cut");
             return false;
         }
@@ -603,6 +696,7 @@ impl ReplicaListener {
             && let Err(error) = self.store.append_gap(tail, start)
         {
             counters.failures = counters.failures.saturating_add(1);
+            self.store_failed = true;
             tracing::warn!(recording_id, %error, "replica gap not stored");
             return false;
         }
@@ -610,6 +704,7 @@ impl ReplicaListener {
         // crash never leaves a committed gap past the store's tail.
         if let Err(error) = self.store.sync() {
             counters.failures = counters.failures.saturating_add(1);
+            self.store_failed = true;
             tracing::warn!(recording_id, %error, "replica gap not synced");
             return false;
         }
@@ -647,6 +742,165 @@ mod tests {
 
     use super::*;
 
+    /// The operating system's files, whose next `armed` syncs fail.
+    #[derive(Debug, Clone, Default)]
+    struct FlakyDisk {
+        armed: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+
+    impl Disk for FlakyDisk {
+        type File = <StdDisk as Disk>::File;
+
+        fn create(&mut self, path: &Path) -> std::io::Result<Self::File> {
+            StdDisk.create(path)
+        }
+        fn create_new(&mut self, path: &Path) -> std::io::Result<Self::File> {
+            StdDisk.create_new(path)
+        }
+        fn open(&mut self, path: &Path) -> std::io::Result<Self::File> {
+            StdDisk.open(path)
+        }
+        fn open_read(&mut self, path: &Path) -> std::io::Result<Self::File> {
+            StdDisk.open_read(path)
+        }
+        fn write_at(
+            &mut self,
+            file: &Self::File,
+            offset: u64,
+            bytes: &[u8],
+        ) -> std::io::Result<()> {
+            StdDisk.write_at(file, offset, bytes)
+        }
+        fn read_at(
+            &mut self,
+            file: &Self::File,
+            offset: u64,
+            buf: &mut [u8],
+        ) -> std::io::Result<()> {
+            StdDisk.read_at(file, offset, buf)
+        }
+        fn len(&mut self, file: &Self::File) -> std::io::Result<u64> {
+            StdDisk.len(file)
+        }
+        fn set_len(&mut self, file: &Self::File, len: u64) -> std::io::Result<()> {
+            StdDisk.set_len(file, len)
+        }
+        fn sync(&mut self, file: &Self::File) -> std::io::Result<()> {
+            let armed = self.armed.get();
+            if armed > 0 {
+                self.armed.set(armed - 1);
+                return Err(std::io::Error::other("injected sync failure"));
+            }
+            StdDisk.sync(file)
+        }
+        fn sync_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+            StdDisk.sync_dir(dir)
+        }
+        fn list(&mut self, dir: &Path) -> std::io::Result<Vec<String>> {
+            StdDisk.list(dir)
+        }
+        fn remove(&mut self, path: &Path) -> std::io::Result<()> {
+            StdDisk.remove(path)
+        }
+        fn modified(&mut self, path: &Path) -> std::io::Result<u64> {
+            StdDisk.modified(path)
+        }
+        fn rename(&mut self, from: &Path, to: &Path) -> std::io::Result<()> {
+            StdDisk.rename(from, to)
+        }
+        fn lock(&mut self, file: &Self::File) -> std::io::Result<()> {
+            StdDisk.lock(file)
+        }
+    }
+
+    const RECORDING: u64 = 7;
+
+    fn state(name: &str) -> (ReplicaState<FlakyDisk>, FlakyDisk, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("karyosd-replica-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let disk = FlakyDisk::default();
+        let (store, journal, copies) = open_replica(&disk, &dir, RECORDING).unwrap();
+        let replica = Replica::new([3; 32], 0, Enforcement::Unsupported)
+            .with_profile(ArrivalProfile::Trusted);
+        let state = ReplicaState {
+            recording_id: RECORDING,
+            started: None,
+            receiver: Receiver::new(RECORDING, replica),
+            replica,
+            store,
+            journal,
+            copies,
+            status: None,
+            dir: dir.clone(),
+            disk: disk.clone(),
+            store_failed: false,
+        };
+        (state, disk, dir)
+    }
+
+    /// A `streaming` status of request `correlation_id` from `source_start`.
+    fn streaming(correlation_id: u64, source_start: u64) -> Vec<u8> {
+        let mut out = vec![0u8; MAX_MESSAGE];
+        let length = ReplicationMessage::ReplicationStatus(ReplicationStatus {
+            correlation_id,
+            recording_id: RECORDING,
+            source_start,
+            sealed_end: source_start,
+            written: source_start,
+            state: State::Streaming,
+        })
+        .encode(&mut out)
+        .unwrap();
+        out.truncate(length);
+        out
+    }
+
+    /// Codex P2 4 (#1202): a request whose start setup fails once is not
+    /// started, so its payload is not taken; the next status reopens the
+    /// store and starts it.
+    #[test]
+    fn a_start_that_fails_once_is_retried_on_the_next_status() {
+        let (mut state, disk, dir) = state("retry");
+        let mut counters = ReplicaCounters::default();
+        disk.armed.set(1);
+        state.take(&streaming(9, 100), Instant::now(), &mut counters);
+        assert_eq!(state.started, None, "a failed start is not started");
+        assert!(state.store_failed);
+        assert_eq!(counters.failures, 1);
+        state.take(&streaming(9, 100), Instant::now(), &mut counters);
+        assert_eq!(state.started, Some(9));
+        assert!(!state.store_failed);
+        assert_eq!(
+            state.replica.gaps(&state.copies, RECORDING).unwrap(),
+            vec![(0, 100)]
+        );
+        assert_eq!(state.store.written(), 100);
+        assert_eq!(counters.gaps_recorded, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Codex P2 5 (#1202): the store's gap is synced before the copy
+    /// catalog commits it. With the store's sync failing, the catalog
+    /// holds no gap: a crash there never leaves a committed gap past the
+    /// store's durable tail.
+    #[test]
+    fn a_gap_reaches_the_catalog_only_after_the_store_synced_it() {
+        let (mut state, disk, dir) = state("crash-order");
+        let mut counters = ReplicaCounters::default();
+        disk.armed.set(1);
+        state.take(&streaming(4, 64), Instant::now(), &mut counters);
+        assert!(state.copies.records().is_empty(), "no gap committed");
+        drop(state);
+        // As after a crash: everything reopened from the files.
+        let (store, mut journal, copies) = open_replica(&StdDisk, &dir, RECORDING).unwrap();
+        let replica = Replica::new([3; 32], 0, Enforcement::Unsupported);
+        assert!(replica.gaps(&copies, RECORDING).unwrap().is_empty());
+        assert!(store.written() <= 64);
+        assert!(copies.check(&mut journal).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_listening_channel_is_reliable_and_trusted() {
         let channel = listen_channel("0.0.0.0:4000".parse().unwrap());
@@ -678,11 +932,11 @@ mod tests {
     fn a_replica_reopens_its_store() {
         let dir = std::env::temp_dir().join(format!("karyosd-replica-open-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let (mut store, _, _) = open_replica(&dir, 7).unwrap();
+        let (mut store, _, _) = open_replica(&StdDisk, &dir, 7).unwrap();
         store.append(0, &[1; 64]).unwrap();
         store.sync().unwrap();
         drop(store);
-        let (store, _, copies) = open_replica(&dir, 7).unwrap();
+        let (store, _, copies) = open_replica(&StdDisk, &dir, 7).unwrap();
         assert_eq!(store.written(), 64);
         assert!(copies.records().is_empty());
         let _ = std::fs::remove_dir_all(&dir);

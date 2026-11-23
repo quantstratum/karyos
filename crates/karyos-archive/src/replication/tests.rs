@@ -482,6 +482,33 @@ mod transport {
         assert!(copies.records().is_empty());
     }
 
+    /// ADR-0102 decision 6: a request's first message is its `streaming`
+    /// status, with the start, before any bytes; it is not sent again.
+    #[test]
+    fn the_start_comes_before_any_bytes() {
+        let (_dirs, source_dir, _) = dirs("start-first");
+        let (mut store, seals) = source(&source_dir);
+        let mut sender =
+            Sender::accept(request(0, u64::MAX, Mode::Continuous), true, 0, &seals).unwrap();
+        let mut out = Vec::new();
+        sender
+            .poll(&mut store, &seals, false, 50, &mut out)
+            .unwrap();
+        let Some(Outgoing::Status(first)) = out.first() else {
+            panic!("{out:?}");
+        };
+        assert_eq!((first.state, first.source_start), (State::Streaming, 0));
+        assert!(matches!(out.get(1), Some(Outgoing::Bytes { start: 0, .. })));
+        out.clear();
+        sender
+            .poll(&mut store, &seals, false, 50, &mut out)
+            .unwrap();
+        assert!(matches!(
+            out.first(),
+            Some(Outgoing::Bytes { start: 50, .. })
+        ));
+    }
+
     #[test]
     fn requests_are_refused_with_their_codes() {
         let (_dirs, source_dir, _) = dirs("refused");
@@ -501,8 +528,12 @@ mod transport {
         sender
             .poll(&mut store, &seals, false, usize::MAX, &mut out)
             .unwrap();
+        // The start marker first, then the bytes from `from`.
+        assert!(
+            matches!(out.first(), Some(Outgoing::Status(status)) if status.state == State::Streaming)
+        );
         assert!(matches!(
-            out.first(),
+            out.get(1),
             Some(Outgoing::Bytes { start: 100, .. })
         ));
         assert!(
@@ -609,9 +640,15 @@ mod transport {
                 .count()
         };
         assert_eq!(held(&out), CHUNK_POOL, "stopped at the pool's size");
+        // Only the start marker, first: no final status while chunks wait.
+        assert_eq!(
+            out.iter()
+                .filter(|message| matches!(message, Outgoing::Status(_)))
+                .count(),
+            1
+        );
         assert!(
-            !out.iter()
-                .any(|message| matches!(message, Outgoing::Status(_)))
+            matches!(out.first(), Some(Outgoing::Status(status)) if status.state == State::Streaming)
         );
         // Still held: nothing more.
         let mut more = Vec::new();
