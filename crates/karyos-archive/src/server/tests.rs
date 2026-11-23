@@ -1612,3 +1612,137 @@ fn a_stalled_retention_answer_never_holds_the_shared_stream() {
     assert_eq!(answers.sent.lock().unwrap().len(), 3);
     rig.finish();
 }
+
+/// A reader of a test response stream: each reader sees every message
+/// sent, from its own cursor, as a subscriber of the stream would.
+struct Reader {
+    sent: Arc<Mutex<Vec<Vec<u8>>>>,
+    next: usize,
+}
+
+impl crate::client::ControlResponses for Reader {
+    fn next(&mut self, out: &mut [u8]) -> Option<usize> {
+        let sent = self.sent.lock().unwrap();
+        let message = sent.get(self.next)?;
+        out[..message.len()].copy_from_slice(message);
+        self.next += 1;
+        Some(message.len())
+    }
+}
+
+/// The request stream as a requester writes it.
+struct Asking(Requests);
+
+impl crate::client::ControlRequests for Asking {
+    fn send(&mut self, message: &[u8]) -> bool {
+        self.0.0.lock().unwrap().push_back(message.to_vec());
+        true
+    }
+}
+
+/// ADR-0101's mixed-version validation: a version 1 replay client (the
+/// real `Replayer`) and a version 2 agent's requester (the real
+/// `RetentionStateRequester`) share one Archive's request and response
+/// streams. The agent pages the retention state of 1000 recordings to its
+/// own stream while the replay client starts a replay on the shared one:
+/// no version 2 frame reaches the shared stream, the replay's start is
+/// answered within the replay client's deadline, and the replay finishes.
+#[test]
+fn a_version_1_replay_and_a_version_2_page_share_one_archive() {
+    use crate::client::replay::{ReplaySpec, Replayer, ReplayerConfig, ReplayerEvent};
+    use crate::client::retention_state::{RetentionStatePoll, RetentionStateRequester};
+
+    const RECORDINGS: usize = 1000;
+    let answers = answer_stream(usize::MAX);
+    let host = Host {
+        answers: Some(answers.clone()),
+        ..Host::of(frames(2, 1), true)
+    };
+    let mut rig = Rig::new("mixed-versions", host);
+    // 1000 stopped recordings: each start, its started and stopped signals.
+    for index in 0..RECORDINGS {
+        rig.request(&start(index as u64 + 1));
+    }
+    for _ in 0..120_000 {
+        rig.server.duty();
+        if rig.responses.sent.lock().unwrap().len() >= 3 * RECORDINGS {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    let before = rig.responses.sent.lock().unwrap().len();
+    assert_eq!(before, 3 * RECORDINGS, "the recordings started and stopped");
+    let shared = |next| Reader {
+        sent: Arc::clone(&rig.responses.sent),
+        next,
+    };
+    let mut replayer = Replayer::new(
+        ReplayerConfig::new(0x5250),
+        Asking(rig.requests.clone()),
+        shared(before),
+    );
+    let mut agent = RetentionStateRequester::new(
+        0x4b52_5354,
+        Asking(rig.requests.clone()),
+        shared(before),
+        Reader {
+            sent: Arc::clone(&answers.sent),
+            next: 0,
+        },
+        77,
+        "karyos:ipc",
+    );
+    // The agent's query first, then the replay behind it.
+    agent.start(0, 1000);
+    assert_eq!(agent.poll(), RetentionStatePoll::Pending);
+    let asked = std::time::Instant::now();
+    replayer.start(&ReplaySpec::new(1, 0, 20), asked).unwrap();
+    let mut page = None;
+    let mut started = None;
+    let begun = std::time::Instant::now();
+    while (page.is_none() || started.is_none()) && begun.elapsed() < Duration::from_secs(30) {
+        rig.server.duty();
+        if page.is_none() {
+            match agent.poll() {
+                RetentionStatePoll::Pending => {}
+                RetentionStatePoll::Answered {
+                    descriptors,
+                    summary,
+                } => page = Some((descriptors.len(), summary.count)),
+                other => panic!("{other:?}"),
+            }
+        }
+        if started.is_none()
+            && let Some(event) = replayer.poll(std::time::Instant::now())
+        {
+            started = Some((event, asked.elapsed()));
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    assert_eq!(page, Some((RECORDINGS, RECORDINGS as u64)), "the full page");
+    let (event, took) = started.unwrap();
+    assert!(
+        matches!(event, ReplayerEvent::Started { .. }),
+        "{event:?} after {took:?}"
+    );
+    assert!(took < ReplayerConfig::new(0x5250).deadline, "{took:?}");
+    // The replay finishes into its target.
+    let replayed = Arc::clone(&rig.server.host().replays[0].1);
+    for _ in 0..5000 {
+        rig.server.duty();
+        if replayed.lock().unwrap().finished.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let finished = replayed.lock().unwrap().finished;
+    assert!(
+        matches!(finished, Some((end, _)) if end == frames(2, 1).len() as u64),
+        "{finished:?}"
+    );
+    // No version 2 frame on the shared stream; all 1001 on the agent's.
+    let shared = rig.responses.sent.lock().unwrap().clone();
+    assert!(shared.iter().all(|bytes| bytes[4] == 1));
+    assert_eq!(answers.sent.lock().unwrap().len(), RECORDINGS + 1);
+    rig.finish();
+}
