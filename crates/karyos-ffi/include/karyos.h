@@ -113,7 +113,7 @@ extern "C" {
 /**
  * The ABI patch version.
  */
-#define KARYOS_ABI_VERSION_PATCH 7
+#define KARYOS_ABI_VERSION_PATCH 8
 
 /**
  * No handle names an object with this value.
@@ -417,7 +417,7 @@ extern "C" {
  * The protocol version an embedded client and its driver speak: both come
  * from this library's build.
  */
-#define KARYOS_PROTOCOL_VERSION 5
+#define KARYOS_PROTOCOL_VERSION 6
 
 /**
  * Publication modes of a stream (karyos_stream_options): one exclusive
