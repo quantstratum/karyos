@@ -17,7 +17,7 @@
 //! The transport, Karyos streams from a source Archive, is not here: this
 //! module is what a replica does with what the transport delivers.
 
-use super::copies::{CopyCatalog, CopyRecord, CopyState, Enforcement};
+use super::copies::{ArrivalProfile, CopyCatalog, CopyRecord, CopyState, Enforcement};
 use super::journal::{IntegrityError, IntegrityJournal};
 use super::{Digest, Inconsistency, SealRecord, verify_range};
 use crate::disk::Disk;
@@ -78,6 +78,7 @@ pub struct Replica {
     location: Digest,
     retain_until_ns: u64,
     enforcement: Enforcement,
+    profile: ArrivalProfile,
 }
 
 impl Replica {
@@ -90,7 +91,80 @@ impl Replica {
             location,
             retain_until_ns,
             enforcement,
+            profile: ArrivalProfile::Local,
         }
+    }
+
+    /// This replica recording each copy as arrived under `profile`
+    /// (ADR-0102 decision 10).
+    #[must_use]
+    #[inline]
+    pub const fn with_profile(mut self, profile: ArrivalProfile) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    /// Records `[start, end)` of `recording` as a gap of this replica's
+    /// copy: bytes it never received that the source no longer holds
+    /// (ADR-0102 decision 6). Durable, never filled, counts towards
+    /// nothing; an empty range records nothing. Returns whether a record
+    /// was written: a gap already recorded is not recorded again.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplicationError::InvertedRange`], or the catalog's error.
+    pub fn gap<D: Disk>(
+        &self,
+        copies: &mut CopyCatalog<D>,
+        journal: &mut IntegrityJournal<D>,
+        recording: u64,
+        start: u64,
+        end: u64,
+    ) -> Result<bool, ReplicationError> {
+        if end < start {
+            return Err(ReplicationError::InvertedRange { start, end });
+        }
+        if end == start {
+            return Ok(false);
+        }
+        let recorded = copies.current()?.into_iter().any(|copy| {
+            copy.location == self.location
+                && copy.recording == recording
+                && copy.start == start
+                && copy.end == end
+                && copy.state == CopyState::Gap
+        });
+        if recorded {
+            copies.check(journal)?;
+            return Ok(false);
+        }
+        copies.record(
+            self.record(recording, start, end, [0; 32], CopyState::Gap),
+            journal,
+        )?;
+        Ok(true)
+    }
+
+    /// The gaps recorded for `recording` here, in catalog order.
+    ///
+    /// # Errors
+    ///
+    /// The catalog's error.
+    pub fn gaps<D: Disk>(
+        &self,
+        copies: &CopyCatalog<D>,
+        recording: u64,
+    ) -> Result<Vec<(u64, u64)>, IntegrityError> {
+        Ok(copies
+            .current()?
+            .into_iter()
+            .filter(|copy| {
+                copy.location == self.location
+                    && copy.recording == recording
+                    && copy.state == CopyState::Gap
+            })
+            .map(|copy| (copy.start, copy.end))
+            .collect())
     }
 
     /// Where this replica's copies are catalogued.
@@ -253,6 +327,7 @@ impl Replica {
             retain_until_ns: self.retain_until_ns,
             state,
             enforcement: self.enforcement,
+            profile: self.profile,
         }
     }
 }

@@ -811,6 +811,7 @@ mod tests {
             retention: None,
             time_evidence: false,
             replications: Vec::new(),
+            replicas: Vec::new(),
             trusted_network: false,
         });
         let daemon = Daemon::start(&options).unwrap();
@@ -855,6 +856,7 @@ mod tests {
             retention: None,
             time_evidence: false,
             replications: Vec::new(),
+            replicas: Vec::new(),
             trusted_network: false,
         });
         assert!(matches!(

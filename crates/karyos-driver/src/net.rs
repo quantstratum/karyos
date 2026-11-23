@@ -774,6 +774,8 @@ struct NetImage<T: StreamTerms> {
     slot: SlotRef,
     /// The endpoint it arrived on, which its subscription names.
     endpoint: EndpointId,
+    /// The datagram source its binding names (per-source-images.md, D2-1).
+    source: SocketAddr,
     /// The publication it receives, as its trace journals name it.
     traced: karyos_protocol::trace_hook::PublicationIdentity,
     /// Its lane count.
@@ -1909,6 +1911,7 @@ impl<T: StreamTerms> Network<T> {
         self.net_images.push(NetImage {
             slot,
             endpoint: source.endpoint,
+            source: source.source,
             traced,
             lanes: lanes.len(),
             exposed,
@@ -2009,6 +2012,19 @@ impl<T: StreamTerms> Network<T> {
     /// Forgets the reclaimed image `slot`.
     pub(crate) fn forget_image(&mut self, slot: SlotRef) {
         self.net_images.retain(|image| image.slot != slot);
+    }
+
+    /// Each exposed image with its datagram source, oldest installed
+    /// first.
+    pub(crate) fn exposed_images_with_source(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (EndpointId, SocketAddr, crate::embedded::AggregateHandle)> + '_
+    {
+        self.net_images.iter().filter_map(|image| {
+            image
+                .exposed
+                .map(|handle| (image.endpoint, image.source, handle))
+        })
     }
 
     /// Each exposed image's aggregate, in install order.

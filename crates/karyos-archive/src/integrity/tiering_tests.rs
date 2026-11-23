@@ -447,6 +447,7 @@ fn a_range_the_destination_already_holds_still_gets_its_copy_record() {
                 retain_until_ns: 0,
                 state: CopyState::Verified,
                 enforcement: Enforcement::ObjectLock,
+                profile: crate::integrity::copies::ArrivalProfile::Local,
             },
             &mut archive.journal,
         )
@@ -501,6 +502,7 @@ fn a_crashed_offload_is_released_and_uncounted_before_its_files_go() {
                 retain_until_ns: 0,
                 state: CopyState::Verified,
                 enforcement: Enforcement::Unsupported,
+                profile: crate::integrity::copies::ArrivalProfile::Local,
             },
             &mut archive.journal,
         )
@@ -803,6 +805,7 @@ fn a_segment_a_purge_cut_is_never_offloaded() {
                         retain_until_ns: 0,
                         state: CopyState::Verified,
                         enforcement: Enforcement::ObjectLock,
+                        profile: crate::integrity::copies::ArrivalProfile::Local,
                     },
                     &mut journal,
                 )
