@@ -1341,6 +1341,12 @@ impl From<LogError> for ServerError {
     }
 }
 
+/// `step`'s value, or `None` when it panicked: a core's panic caught at
+/// the harness's core boundary (karyos#976).
+fn caught<R>(step: impl FnOnce() -> R) -> Option<R> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(step)).ok()
+}
+
 impl<C: ConsensusCore> ServerNode<C> {
     /// Server `id` of `peers`, with a new log on `disk`; a crash keeps what
     /// `survives`.
@@ -1357,7 +1363,7 @@ impl<C: ConsensusCore> ServerNode<C> {
         recorder: Shared,
     ) -> Result<Self, LogError> {
         let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
-        let core = C::recover(id, &peers, &mut LogView::new(&mut log));
+        let core = caught(|| C::recover(id, &peers, &mut LogView::new(&mut log)));
         Ok(Self::assemble(
             id,
             peers,
@@ -1403,7 +1409,8 @@ impl<C: ConsensusCore> ServerNode<C> {
         limits: Option<Limits>,
     ) -> Result<Self, ServerError> {
         let mut log = RaftLog::create(disk.clone(), Path::new(LOG_DIR), geometry, 1)?;
-        let core = Self::recovered(id, &peers, (limits, None), &mut log)
+        let core = caught(|| Self::recovered(id, &peers, (limits, None), &mut log))
+            .transpose()
             .map_err(ServerError::Unsupported)?;
         Ok(Self::assemble(
             id,
@@ -1416,25 +1423,33 @@ impl<C: ConsensusCore> ServerNode<C> {
         ))
     }
 
-    /// A server running `core` over `log`.
+    /// A server running `core` over `log`; down, with its panic recorded,
+    /// when the core panicked in its recovery (`None`) or in its first
+    /// queries (karyos#976).
     fn assemble(
         id: NodeId,
         peers: Vec<NodeId>,
         (disk, survives): (SimDisk, Survives),
         geometry: Geometry,
         recorder: Shared,
-        (core, log): (C, RaftLog<SimDisk>),
+        (core, log): (Option<C>, RaftLog<SimDisk>),
         limits: Option<Limits>,
     ) -> Self {
-        let commit = core.committed();
-        let configuration = core.configuration();
+        let queried = core.and_then(|core| {
+            caught(|| (core.committed(), core.configuration())).map(|queries| (core, queries))
+        });
+        let (running, commit, configuration) = match queried {
+            Some((core, (commit, configuration))) => (Some((core, log)), commit, configuration),
+            None => (None, None, None),
+        };
+        let panicked = running.is_none();
         let mut server = Self {
             id,
             peers,
             geometry,
             disk,
             survives,
-            running: Some((core, log)),
+            running,
             service: TestService::default(),
             pending: BTreeSet::new(),
             commit,
@@ -1459,6 +1474,9 @@ impl<C: ConsensusCore> ServerNode<C> {
         };
         if let Some(configuration) = configuration {
             server.record_configuration(configuration, None);
+        }
+        if panicked {
+            server.observe(Observation::CorePanicked { node: server.id });
         }
         server
     }
@@ -1503,7 +1521,7 @@ impl<C: ConsensusCore> ServerNode<C> {
             ready: ReadyBuf::default(),
             command: Vec::new(),
         };
-        server.start();
+        let _ = server.guarded(Self::start);
         server
     }
 

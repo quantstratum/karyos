@@ -52,6 +52,9 @@ const UNREPORTED: u8 = 5;
 /// Server 2's core panics at its tenth Ready (karyos#976): any core's
 /// panic, not a particular library's.
 const PANICS: u8 = 6;
+/// Server 1's core panics in its recovery, at the run's first start
+/// (karyos#976 review).
+const PANICS_AT_RECOVERY: u8 = 8;
 /// Server 2 never stores a commit, then truncates its whole log once the
 /// cluster has applied some (karyos#976): C4's log has no stored commit
 /// to refuse the truncation below.
@@ -142,6 +145,10 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     type Message = <RaftRs as ConsensusCore>::Message;
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        assert!(
+            !(KIND == PANICS_AT_RECOVERY && id == 1),
+            "a core that panics in its recovery (karyos#976)"
+        );
         Self {
             id,
             core: RaftRs::recover(id, peers, log),
@@ -414,5 +421,18 @@ fn a_server_that_forgets_its_commit_and_truncates_applied_entries_is_caught() {
             Err(Violation::CommittedTruncated { node: 2, .. })
         ),
         "{truncated:?}"
+    );
+}
+
+/// A core that panics in its first recovery, when the run builds its
+/// servers, is caught there too: the run completes, with that server down
+/// from the start (karyos#976 review).
+#[test]
+fn a_core_that_panics_in_its_recovery_is_caught_and_reported() {
+    let outcome = workloads::run::<Mutant<PANICS_AT_RECOVERY>>(&case(), 1).unwrap();
+    assert!(
+        matches!(outcome.safety, Err(Violation::CorePanicked { node: 1 })),
+        "{:?}",
+        outcome.safety
     );
 }

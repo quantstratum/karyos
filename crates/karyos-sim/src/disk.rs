@@ -689,11 +689,22 @@ impl Disk for SimDisk {
             }
             return Err(failure);
         }
-        #[cfg(feature = "test-hooks")]
-        if state.lies {
+        let lies = {
+            #[cfg(feature = "test-hooks")]
+            {
+                state.lies
+            }
+            #[cfg(not(feature = "test-hooks"))]
+            {
+                false
+            }
+        };
+        let entry = Self::file(&mut state, file)?;
+        // A lying disk finds the file as an honest one would, then makes
+        // nothing durable (karyos#976).
+        if lies {
             return Ok(());
         }
-        let entry = Self::file(&mut state, file)?;
         entry.durable = entry.live()?;
         entry.pending.clear();
         Ok(())

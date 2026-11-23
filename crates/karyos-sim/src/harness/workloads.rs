@@ -1226,7 +1226,10 @@ fn safety(
         check::standby(observations, standby)?;
         check::linearizable(&check::across_promotion(&recorded.history, observations))?;
     }
-    check::membership(observations, case.promotion_lag)
+    check::membership(observations, case.promotion_lag)?;
+    // Last: a core's panic is reported only when no other check, client
+    // history and membership included, names its cause (karyos#976).
+    check::no_core_panic(observations)
 }
 
 /// The pass predicate of W1, W3, W4 and W6: every safety check holds,
