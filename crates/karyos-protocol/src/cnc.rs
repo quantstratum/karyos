@@ -36,6 +36,7 @@
 //! | `0x12` | `AddNetworkPublicationWithRoles` | sequence | stream id as `AddNetworkPublication` | flags as `AddNetworkPublication` | channel URI length |
 //! | `0x13` | `AddNetworkSubscriptionAs` | sequence | stream id as `AddNetworkSubscription` | role as `AddSubscription` | channel URI length |
 //! | `0x14` | `RateChange` | sequence | stream and session as above | expected version | authority, operation id, operator uid, parameters digest, then the policy (see below) |
+//! | `0x16` | `GuardCloseAt` | sequence | guard | expected open epoch | operation id, operator uid, then the parameters digest |
 //! | `0x15` | `AddImageSubscriptionOf` | sequence | image registration (nonzero) | parent network subscription registration (nonzero) | lane as `AddPublication` |
 //! | `0x81` | `PublicationReady` | client | sequence | registration | hand-over key |
 //! | `0x82` | `SubscriptionReady` | client | sequence | registration | hand-over key |
@@ -85,9 +86,11 @@
 //!   `0100000000000000 0200000000000000 0300000000000000
 //!   BB9C060003000000 00000000000080FE 0100000000000000`.
 //!
-//! `GuardClose` and `GuardReopen` (`quantstratum-docs:
+//! `GuardClose`, `GuardCloseAt` and `GuardReopen` (`quantstratum-docs:
 //! karyos/design/guards-and-abort.md`, local guards): a local operator
-//! closes a guard, or reopens one closed at the epoch it names, on the
+//! closes a guard, closes one only if it is still open at the epoch it
+//! names (`GuardCloseAt`, karyos#738: the close an operator previewed),
+//! or reopens one closed at the epoch it names, on the
 //! driver's control path, authorized by the calling process's credentials
 //! (G1). The operation id is the requester's own id for the audit record
 //! (Audit A). The operator uid names the person a tool acts for
@@ -101,8 +104,8 @@
 //! the client, whose uid admission proved equal to its own (G1), and the
 //! tool that sets the operator (the management agent) authenticates its
 //! own caller. The driver answers `GuardState` with the guard's word after
-//! the transition, or `Error` with `UnknownGuard`, `GuardNotClosedAt`
-//! (detail: the current guard word), `GuardExhausted` or `NotAuthorized`.
+//! the transition, or `Error` with `UnknownGuard`, `GuardNotClosedAt` or
+//! `GuardNotOpenAt` (detail: the current guard word), `GuardExhausted` or `NotAuthorized`.
 //!
 //! `RateChange` and `RateState` (R-CORE-21, karyos#740; admission
 //! [`VERSION`](crate::admission::VERSION) 4; `quantstratum-docs:
@@ -389,6 +392,7 @@ const ADD_NETWORK_PUBLICATION_WITH_ROLES: u32 = 0x12;
 const ADD_NETWORK_SUBSCRIPTION_AS: u32 = 0x13;
 const RATE_CHANGE: u32 = 0x14;
 const ADD_IMAGE_SUBSCRIPTION_OF: u32 = 0x15;
+const GUARD_CLOSE_AT: u32 = 0x16;
 const PUBLICATION_READY: u32 = 0x81;
 const SUBSCRIPTION_READY: u32 = 0x82;
 const OPERATION_SUCCEEDED: u32 = 0x83;
@@ -402,6 +406,11 @@ const NETWORK_SUBSCRIPTION_READY: u32 = 0x8A;
 const RATE_STATE: u32 = 0x8B;
 /// Words of an encoded `RateChange`.
 const RATE_CHANGE_WORDS: usize = 11;
+
+/// Whether `epoch` is one a guard can be open at (`karyos_sys::guard`).
+const fn open_epoch(epoch: u64) -> bool {
+    karyos_sys::guard::encode(karyos_sys::guard::GuardState { epoch, open: true }).is_some()
+}
 
 /// Whether `epoch` is one a guard can be closed at (`karyos_sys::guard`).
 const fn closed_epoch(epoch: u64) -> bool {
@@ -1068,6 +1077,24 @@ pub enum Command {
         /// [`guard_parameters`] of the request, for the audit record.
         parameters: u64,
     },
+    /// Close a guard open at `expected` (karyos#738, local control, G1): a
+    /// close checked against the state an operator previewed. Refused with
+    /// `GuardNotOpenAt` (detail: the current guard word) when the guard
+    /// moved since.
+    GuardCloseAt {
+        /// Request sequence.
+        sequence: u64,
+        /// The guard.
+        guard: u64,
+        /// The open epoch the close replaces.
+        expected: u64,
+        /// The requester's operation id, for the audit record.
+        operation: u64,
+        /// The operator uid the requester acts for; [`NO_OPERATOR`] for none.
+        operator: u64,
+        /// [`guard_parameters`] of the request, for the audit record.
+        parameters: u64,
+    },
     /// Change a guarded stream's rate policy from version `expected`
     /// (R-CORE-21, local control, G1).
     RateChange {
@@ -1307,6 +1334,9 @@ pub enum ErrorCode {
     GuardNotClosedAt,
     /// A reopen would exceed the guard's last epoch; it stays closed.
     GuardExhausted,
+    /// A close at an expected epoch named one the guard is not open at
+    /// (karyos#738); the detail is the current guard word.
+    GuardNotOpenAt,
     /// The calling process is not authorized for this guard (G1).
     NotAuthorized,
     /// The channel URI does not parse; the detail is the parse error's
@@ -1452,6 +1482,7 @@ error_code_table! {
     TracePointIdsExhausted = 26,
     InvalidLabel = 27,
     GuardHandlesExhausted = 28,
+    GuardNotOpenAt = 29,
 }
 
 impl ErrorCode {
@@ -1695,6 +1726,7 @@ impl Command {
             Self::AddConflatedSubscription { .. } => ADD_CONFLATED_SUBSCRIPTION,
             Self::GuardClose { .. } => GUARD_CLOSE,
             Self::GuardReopen { .. } => GUARD_REOPEN,
+            Self::GuardCloseAt { .. } => GUARD_CLOSE_AT,
             Self::AddNetworkPublication { .. } => ADD_NETWORK_PUBLICATION,
             Self::AddNetworkSubscription { .. } => ADD_NETWORK_SUBSCRIPTION,
             Self::AddImageSubscription { .. } => ADD_IMAGE_SUBSCRIPTION,
@@ -1723,6 +1755,7 @@ impl Command {
             | Self::AddConflatedSubscription { sequence, .. }
             | Self::GuardClose { sequence, .. }
             | Self::GuardReopen { sequence, .. }
+            | Self::GuardCloseAt { sequence, .. }
             | Self::AddNetworkPublication { sequence, .. }
             | Self::AddNetworkSubscription { sequence, .. }
             | Self::AddImageSubscription { sequence, .. }
@@ -1879,6 +1912,24 @@ impl Command {
                 if !closed_epoch(expected) || !operator_word(operator) {
                     return Err(CncError::Reserved {
                         type_id: GUARD_REOPEN,
+                    });
+                }
+                write_words(
+                    &[sequence, guard, expected, operation, operator, parameters],
+                    out,
+                )
+            }
+            Self::GuardCloseAt {
+                sequence,
+                guard,
+                expected,
+                operation,
+                operator,
+                parameters,
+            } => {
+                if !open_epoch(expected) || !operator_word(operator) {
+                    return Err(CncError::Reserved {
+                        type_id: GUARD_CLOSE_AT,
                     });
                 }
                 write_words(
@@ -2218,6 +2269,23 @@ impl Command {
                     return Err(CncError::Reserved { type_id });
                 }
                 Ok(Self::GuardReopen {
+                    sequence,
+                    guard,
+                    expected,
+                    operation,
+                    operator,
+                    parameters,
+                })
+            }
+            GUARD_CLOSE_AT => {
+                let [sequence, guard, expected, operation, operator, parameters] =
+                    read_words::<6>(type_id, bytes)?;
+                // Only an open epoch can be closed at: even, 2 to MAX_EPOCH;
+                // and the operator word is a uid or none.
+                if !open_epoch(expected) || !operator_word(operator) {
+                    return Err(CncError::Reserved { type_id });
+                }
+                Ok(Self::GuardCloseAt {
                     sequence,
                     guard,
                     expected,
@@ -5331,6 +5399,38 @@ mod journal_tests {
         assert_eq!(reopen.type_id(), 0x0E);
         assert_eq!(words_of(&out[..length]), [6, 3, 1, 78, 1000, 9]);
         assert_eq!(Command::decode(0x0E, &out[..length]), Ok(reopen));
+        // karyos#738: a close at an expected open epoch.
+        let close_at = Command::GuardCloseAt {
+            sequence: 7,
+            guard: 3,
+            expected: 2,
+            operation: 79,
+            operator: 1000,
+            parameters: 9,
+        };
+        let length = close_at.encode(&mut out).unwrap();
+        assert_eq!(close_at.type_id(), 0x16);
+        assert_eq!(words_of(&out[..length]), [7, 3, 2, 79, 1000, 9]);
+        assert_eq!(Command::decode(0x16, &out[..length]), Ok(close_at));
+        // A closed (odd) or zero epoch is no open epoch: refused both ways.
+        for expected in [0, 1, 3] {
+            assert_eq!(
+                Command::decode(0x16, &bytes_of(&[7, 3, expected, 79, 1000, 9])),
+                Err(CncError::Reserved { type_id: 0x16 })
+            );
+            let bad = Command::GuardCloseAt {
+                sequence: 7,
+                guard: 3,
+                expected,
+                operation: 79,
+                operator: 1000,
+                parameters: 9,
+            };
+            assert_eq!(
+                bad.encode(&mut out),
+                Err(CncError::Reserved { type_id: 0x16 })
+            );
+        }
         let request = RequestId {
             client: 2,
             sequence: 6,
@@ -5356,6 +5456,7 @@ mod journal_tests {
             (ErrorCode::GuardExhausted, 10),
             (ErrorCode::NotAuthorized, 11),
             (ErrorCode::GuardHandlesExhausted, 28),
+            (ErrorCode::GuardNotOpenAt, 29),
         ] {
             let refused = Response::Error {
                 request,
@@ -5907,6 +6008,7 @@ mod properties {
             ADD_IMAGE_SUBSCRIPTION,
             RATE_CHANGE,
             ADD_IMAGE_SUBSCRIPTION_OF,
+            GUARD_CLOSE_AT,
         ],
     };
 
@@ -6644,6 +6746,7 @@ mod properties {
                     (ADD_CONFLATED_SUBSCRIPTION, 2),
                     (GUARD_CLOSE, 5),
                     (GUARD_REOPEN, 6),
+                    (GUARD_CLOSE_AT, 6),
                     (ADD_IMAGE_SUBSCRIPTION, 4),
                     (ADD_IMAGE_SUBSCRIPTION_OF, 4),
                 ],

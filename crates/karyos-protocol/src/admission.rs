@@ -179,7 +179,9 @@ use thiserror::Error;
 /// The protocol version a client announces in `Hello`: 5 since
 /// karyos#844 (ADR-0100) added `AddImageSubscriptionOf` and
 /// `ImageJoinLoss` (`cnc`), so that a client using them and a driver that
-/// would retire it on the unknown command never pass `Hello`. Version 4
+/// would retire it on the unknown command never pass `Hello`. Version 5 is
+/// not released yet, so karyos#738's `GuardCloseAt` and `GuardNotOpenAt`
+/// join it rather than a version 6. Version 4
 /// (karyos#740's `RateChange` and `RateState`) was never released; alpha.3
 /// published version 3 (karyos#637's `AddNetworkPublicationWithRoles` and
 /// `AddNetworkSubscriptionAs`).
