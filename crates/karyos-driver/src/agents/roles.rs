@@ -2612,7 +2612,7 @@ impl<T: StreamTerms> ReceiverRole<T> {
     fn note(&mut self, line: String) {
         self.dropped_notes = self.dropped_notes.wrapping_add(1);
         if self.debug_trace.len() < 48
-            || self.dropped_notes % 64 == 0 && self.debug_trace.len() < 160
+            || self.dropped_notes.is_multiple_of(64) && self.debug_trace.len() < 160
         {
             self.debug_trace.push(line);
         }
