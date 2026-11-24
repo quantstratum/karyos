@@ -65,6 +65,9 @@ pub enum GuardAnswer {
     UnknownDriver,
     /// The agent could not attach to the driver: not sent.
     Unattached,
+    /// The driver attached to is not the instance the operation was
+    /// previewed on (karyos#738 review): not sent.
+    InstanceChanged,
     /// Sent, and no answer came: it may or may not have taken effect.
     NoAnswer {
         /// The operation id.
@@ -79,6 +82,10 @@ pub(crate) struct Command<'a> {
     pub(crate) guard: u64,
     /// The transition, and the epoch it acts at.
     pub(crate) transition: Transition,
+    /// The driver instance it must reach, for a previewed operation
+    /// (karyos#738 review): checked against the attached client's before
+    /// anything is sent.
+    pub(crate) instance: Option<u128>,
     pub(crate) operation: u64,
     /// The operator's uid: the peer that asked.
     pub(crate) operator: u32,
@@ -181,6 +188,14 @@ fn send(command: &Command<'_>) -> GuardAnswer {
     let Ok(mut client) = attach(command.dir, command.timeout, MAX_PENDING) else {
         return GuardAnswer::Unattached;
     };
+    // A previewed operation reaches only the instance previewed: a driver
+    // that restarted since is another target.
+    if command
+        .instance
+        .is_some_and(|instance| instance != client.instance())
+    {
+        return GuardAnswer::InstanceChanged;
+    }
     let operation = command.operation;
     let submitted = match command.transition {
         Transition::Close => client.guard_close(

@@ -223,6 +223,10 @@ pub struct Agent {
     /// The outcomes of the operation ids used, retained for retries and
     /// rebuilt from the journal at start (karyos#738).
     outcomes: crate::preview::Outcomes,
+    /// Every operation id used, the agent's own and the ones callers chose,
+    /// rebuilt from the journal at start (karyos#738): one accounting, so
+    /// no two operations share an id.
+    used_ids: std::collections::HashSet<u64>,
 }
 
 impl Agent {
@@ -267,11 +271,12 @@ impl Agent {
                 Err(error) => (None, Some(error.to_string())),
             },
         };
-        let outcomes = journal
+        let operations = journal
             .as_mut()
-            .map_or_else(crate::preview::Outcomes::default, |journal| {
-                crate::preview::Outcomes::rebuild(&journal.take_operations(), start)
-            });
+            .map(Journal::take_operations)
+            .unwrap_or_default();
+        let outcomes = crate::preview::Outcomes::rebuild(&operations, start);
+        let used_ids = operations.iter().map(|record| record.operation).collect();
         let unopened_gap = journal_error.as_ref().map(|_| Gap {
             position: UNOPENED_POSITION,
             reason: GapReason::JournalUnavailableAtStart,
@@ -292,6 +297,7 @@ impl Agent {
             rates: Vec::new(),
             previews: crate::preview::Previews::default(),
             outcomes,
+            used_ids,
         }
     }
 
@@ -371,11 +377,12 @@ impl Agent {
         requester: Requester,
         reason: &[u8],
     ) -> crate::retention::RetentionAnswer {
-        let id = self.next_operation;
-        if self.retention.is_some() {
-            // Checked: at their end the ids keep the last one.
-            self.next_operation = id.checked_add(1).unwrap_or(id);
-        }
+        // An id is taken only when the operation can be sent.
+        let id = if self.retention.is_some() {
+            self.allocate_operation()
+        } else {
+            self.next_operation
+        };
         let command = crate::retention::Command {
             operation,
             recording,
@@ -402,7 +409,7 @@ impl Agent {
             operations::Transition::Close,
             Requester::local(uid),
             reason,
-            None,
+            (None, None),
         )
     }
 
@@ -422,7 +429,7 @@ impl Agent {
             operations::Transition::Close,
             requester,
             reason,
-            None,
+            (None, None),
         )
     }
 
@@ -441,7 +448,7 @@ impl Agent {
             operations::Transition::Reopen(expected),
             requester,
             reason,
-            None,
+            (None, None),
         )
     }
 
@@ -462,7 +469,7 @@ impl Agent {
             operations::Transition::Reopen(expected),
             Requester::local(uid),
             reason,
-            None,
+            (None, None),
         )
     }
 
@@ -521,7 +528,7 @@ impl Agent {
         requester: Requester,
         reason: &[u8],
     ) -> Result<GuardAnswer, crate::preview::SubmitRefusal> {
-        use crate::preview::{Bound, PreviewKind, Used};
+        use crate::preview::{Bound, PreviewKind, SubmitRefusal, Used};
         let instance = self
             .drivers
             .iter()
@@ -538,6 +545,11 @@ impl Agent {
         if let Some(answer) = self.outcomes.answer(operation, &bound, host_monotonic_ns()) {
             return answer;
         }
+        // An id the agent used for an operation of its own (karyos#738
+        // review): a conflict, never sent.
+        if self.used_ids.contains(&operation) {
+            return Err(SubmitRefusal::OperationConflict);
+        }
         let epoch = self
             .previews
             .take(token, &bound, instance, std::time::Instant::now())?;
@@ -545,12 +557,20 @@ impl Agent {
             PreviewKind::Close => operations::Transition::CloseAt(epoch),
             PreviewKind::Reopen => operations::Transition::Reopen(epoch),
         };
-        let answer = self.guard_command(dir, guard, transition, requester, reason, Some(operation));
+        let answer = self.guard_command(
+            dir,
+            guard,
+            transition,
+            requester,
+            reason,
+            (Some(operation), instance),
+        );
         // Sent: the id is used up, whatever came of it.
         if matches!(
             answer,
             GuardAnswer::State { .. } | GuardAnswer::Refused { .. } | GuardAnswer::NoAnswer { .. }
         ) {
+            let _ = self.used_ids.insert(operation);
             let used = Used {
                 kind,
                 dir: Some(bound.dir),
@@ -564,6 +584,23 @@ impl Agent {
         Ok(answer)
     }
 
+    /// The next operation id of the agent's own, skipping any a caller
+    /// already used (karyos#738 review), and taken: no two operations share
+    /// an id. Checked: at the end of the ids the last one is kept.
+    fn allocate_operation(&mut self) -> u64 {
+        loop {
+            let id = self.next_operation;
+            let Some(next) = id.checked_add(1) else {
+                let _ = self.used_ids.insert(id);
+                return id;
+            };
+            self.next_operation = next;
+            if self.used_ids.insert(id) {
+                return id;
+            }
+        }
+    }
+
     fn guard_command(
         &mut self,
         dir: &Path,
@@ -571,21 +608,20 @@ impl Agent {
         transition: operations::Transition,
         requester: Requester,
         reason: &[u8],
-        chosen: Option<u64>,
+        (chosen, instance): (Option<u64>, Option<u128>),
     ) -> GuardAnswer {
         if !self.drivers.iter().any(|driver| driver.dir == dir) {
             return GuardAnswer::UnknownDriver;
         }
-        let operation = chosen.unwrap_or_else(|| {
-            let operation = self.next_operation;
-            // Checked: at their end the ids keep the last one.
-            self.next_operation = operation.checked_add(1).unwrap_or(operation);
-            operation
-        });
+        let operation = match chosen {
+            Some(operation) => operation,
+            None => self.allocate_operation(),
+        };
         let command = operations::Command {
             dir,
             guard,
             transition,
+            instance,
             operation,
             operator: requester.operator,
             relay: requester.relay,
@@ -619,9 +655,7 @@ impl Agent {
         if !self.drivers.iter().any(|driver| driver.dir == dir) {
             return RateAnswer::UnknownDriver;
         }
-        let operation = self.next_operation;
-        // Checked: at their end the ids keep the last one.
-        self.next_operation = operation.checked_add(1).unwrap_or(operation);
+        let operation = self.allocate_operation();
         let command = operations::RateCommand {
             dir,
             stream,
