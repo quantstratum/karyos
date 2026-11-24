@@ -2342,9 +2342,8 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         let now = self.clock.now();
         let closed = self.guards.close(
             guard,
-            operation,
-            crate::guards::Requester::InProcess,
-            0,
+            None,
+            (operation, crate::guards::Requester::InProcess, 0),
             now,
         );
         match &closed {

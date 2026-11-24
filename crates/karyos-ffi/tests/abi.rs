@@ -13,14 +13,15 @@ mod support {
 
 use support::abi;
 
-/// 0.1.7: `KARYOS_PROTOCOL_VERSION` 5 (karyos#844, ADR-0100's image
+/// 0.1.8: `KARYOS_PROTOCOL_VERSION` 6 (karyos#738, the close at an
+/// epoch) on 0.1.7's `KARYOS_PROTOCOL_VERSION` 5 (karyos#844, ADR-0100's image
 /// attach) on 0.1.6's `KARYOS_PROTOCOL_VERSION` 4 (karyos#740, the rate
 /// change command), 0.1.5's driver options' stream cap (karyos#818), 0.1.4's embedded
 /// network (karyos#735), 0.1.3's readiness calls (karyos#794) and 0.1.2's
 /// roles calls (karyos#637).
 #[test]
-fn the_abi_version_is_0_1_7() {
-    assert_eq!(abi::abi_version(), (0, [0, 1, 7]));
+fn the_abi_version_is_0_1_8() {
+    assert_eq!(abi::abi_version(), (0, [0, 1, 8]));
 }
 
 #[test]

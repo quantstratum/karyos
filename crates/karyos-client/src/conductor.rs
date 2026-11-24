@@ -1451,6 +1451,46 @@ impl<T: TermBytes> ClientConductor<T> {
         })
     }
 
+    /// Closes guard `guard` only if it is open at `expected` (karyos#738):
+    /// a close checked against the state an operator previewed, audited as
+    /// [`ClientConductor::guard_close`] audits one, its digest over
+    /// `expected`. It completes as [`Outcome::GuardState`], or is refused
+    /// with `UnknownGuard`, `GuardNotOpenAt` (detail: the current guard
+    /// word) or `NotAuthorized`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConductorError::InvalidGuardEpoch`] when `expected` is not
+    /// an open epoch, and the other [`ConductorError`]s; nothing is
+    /// submitted on error.
+    pub fn guard_close_at(
+        &mut self,
+        guard: u64,
+        expected: u64,
+        operation: u64,
+        operator: Option<u32>,
+        reason: &[u8],
+    ) -> Result<u64, ConductorError> {
+        let operator = operator_word(operator);
+        let open = karyos_sys::guard::GuardState {
+            epoch: expected,
+            open: true,
+        };
+        if karyos_sys::guard::encode(open).is_none() {
+            return Err(ConductorError::InvalidGuardEpoch);
+        }
+        let parameters =
+            karyos_protocol::cnc::guard_parameters(guard, expected, operation, operator, reason);
+        self.submit(Kind::Guard, None, |sequence| Command::GuardCloseAt {
+            sequence,
+            guard,
+            expected,
+            operation,
+            operator,
+            parameters,
+        })
+    }
+
     /// Reopens guard `guard`, closed at `expected`, as
     /// [`ClientConductor::guard_close`] closes one: audited alike, its
     /// digest over `expected`. It completes as [`Outcome::GuardState`], or
