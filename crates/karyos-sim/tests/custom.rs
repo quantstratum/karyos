@@ -219,3 +219,43 @@ fn the_lost_reply_whoever_leads_passes_on_its_own_witness() {
     assert_eq!(at(cut - 1), Err(Failed::NotShown("cut")));
     assert_ne!(at(cut), Err(Failed::NotShown("cut")));
 }
+
+/// W5\x27s snapshot cases through the core\x27s snapshot install (#682):
+/// compaction under load, a follower behind the compaction point, a
+/// follower crashing around its install and one crashing between builds
+/// all pass on every seed. Version 1\x27s retry case needs a handover, which
+/// the core does not take: not demonstrated, never passed.
+#[test]
+fn w5_snapshots_pass_and_the_handover_retry_is_not_demonstrated() {
+    use karyos_sim::harness::workloads::{RunError, W5};
+    let cases = W5::skeleton().cases().unwrap();
+    assert_eq!(cases.len(), 5);
+    for case in &cases {
+        for seed in SEEDS {
+            let run = workloads::run::<Custom>(case, seed);
+            if case.handover.is_some() {
+                assert!(
+                    matches!(run, Err(RunError::Unsupported(_))),
+                    "{} seed {seed}: {run:?}",
+                    case.name
+                );
+                continue;
+            }
+            let outcome = run.unwrap();
+            assert_eq!(
+                workloads::pass(case, &outcome),
+                Ok(None),
+                "{} seed {seed}",
+                case.name
+            );
+            assert!(
+                outcome
+                    .observations
+                    .iter()
+                    .any(|observation| matches!(observation, Observation::Compacted { .. })),
+                "{} seed {seed}: no compaction",
+                case.name
+            );
+        }
+    }
+}

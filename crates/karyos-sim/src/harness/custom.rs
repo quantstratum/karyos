@@ -59,9 +59,20 @@
 //! on the replication path allocates (ADR-0105, decision 3). The pool is
 //! bounded ([`MAX_POOLED_ENTRIES`], [`MAX_POOLED_VECTORS`]).
 //!
-//! **Not taken yet:** snapshots, compaction and leadership transfer (W5)
-//! answer [`Unsupported`], which the harness reports as not
-//! demonstrated, until the core's snapshot install (#682).
+//! **Snapshots** (W5, #682): the node's compactions go to
+//! [`Core::compacted`]; a leader's [`Effects::send_snapshot`] asks the
+//! node to send its latest snapshot (`Ready::snapshot_to`); a follower's
+//! install is reported to [`Core::install`] once the node has written the
+//! snapshot and restarted its log after the base, and a restart over a
+//! snapshot recovers with [`Core::with_snapshot`]. Committed entries are
+//! handed out from the log's first index after a restart, and from the
+//! base after an install: below them the snapshot holds the state. A
+//! refused install (the core holds the base or more, or leads) is
+//! [`InstallRefused::Stale`].
+//!
+//! **Not taken:** leadership transfer answers
+//! [`TransferRefused::Unsupported`]; C5 version 2's W5 retry changes the
+//! leader by a crash, which needs no handover.
 
 use std::cell::RefCell;
 
@@ -72,8 +83,8 @@ use karyos_cluster::consensus::{
 use karyos_cluster::{Entry, HardState};
 
 use super::core::{
-    ConsensusCore, Limit, Limits, LogView, NotLeader, Persisted, Ready, ReadyBuf, Refused,
-    Unsupported,
+    ConsensusCore, InstallRefused, Limit, Limits, LogView, NotLeader, Persisted, Ready, ReadyBuf,
+    Refused, SnapshotBase, Unsupported,
 };
 use crate::net::NodeId;
 
@@ -317,7 +328,11 @@ impl LogTerms for View<'_, '_> {
         }
         match self.truncate {
             Some(from) => from.saturating_sub(1),
-            None => self.log.last_index().unwrap_or(0),
+            None => self
+                .log
+                .last_index()
+                .or_else(|| self.log.base().map(|base| base.index))
+                .unwrap_or(0),
         }
     }
 
@@ -425,14 +440,22 @@ impl Custom {
         let commit = stored.and_then(|state| state.commit).unwrap_or(0);
         Ok(Self {
             id,
-            core: Core::new(config, term_vote, commit),
+            // Over the node's latest snapshot, if it holds one.
+            core: match log.base() {
+                Some(base) => {
+                    Core::new(config, term_vote, commit).with_snapshot(base.index, base.term)
+                }
+                None => Core::new(config, term_vote, commit),
+            },
             read_bytes: limits.map_or(u64::MAX, |limits| limits.log_read_bytes),
             pending: Vec::with_capacity(READY_CAPACITY),
             truncate: None,
             term_vote,
             dirty: false,
             // The node applies from its log's start after a restart.
-            handed: 0,
+            // The node applies from its log's start after a restart: below
+            // it, its snapshot holds the state.
+            handed: log.first_index().saturating_sub(1),
             outgoing: Vec::with_capacity(READY_CAPACITY),
             snapshot_to: Vec::new(),
             after: Vec::with_capacity(READY_CAPACITY),
@@ -440,7 +463,9 @@ impl Custom {
             sent_after: Vec::with_capacity(READY_CAPACITY),
             now: 0,
             ticked: None,
-            received: log.last_index(),
+            received: log
+                .last_index()
+                .or_else(|| log.base().map(|base| base.index)),
             terms: Vec::new(),
             // The log's largest read window (1 MiB), so its first read
             // after the warm-up does not allocate.
@@ -561,7 +586,9 @@ impl Custom {
                 .map(|entry| entry.index)
                 .or_else(|| match self.truncate {
                     Some(from) => from.checked_sub(1).filter(|last| *last > 0),
-                    None => log.last_index(),
+                    None => log
+                        .last_index()
+                        .or_else(|| log.base().map(|base| base.index)),
                 });
         result
     }
@@ -792,5 +819,37 @@ impl ConsensusCore for Custom {
     fn committed(&self) -> Option<u64> {
         let commit = self.core.commit();
         (commit > 0).then_some(commit)
+    }
+
+    fn compacted(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), Unsupported> {
+        let _ = log;
+        // The node compacts only what it applied, which the core
+        // committed: an uncommitted base would be the node's error, and the
+        // core keeps its own base then.
+        let _ = self.core.compacted(base.index, base.term);
+        Ok(())
+    }
+
+    fn install(&mut self, base: SnapshotBase, log: &mut LogView<'_>) -> Result<(), InstallRefused> {
+        self.core
+            .can_install(base.index)
+            .map_err(|_| InstallRefused::Stale)?;
+        let mut none = Vec::new();
+        self.call(log, &mut none, |core, _, sink| {
+            core.install(base.index, base.term, sink)
+        })
+        .map_err(|_| InstallRefused::Stale)?;
+        // The log restarted after the base: what was pending at or below
+        // it is gone with it, and the service holds the state up to it.
+        let keep = self
+            .pending
+            .iter()
+            .position(|entry| entry.index > base.index)
+            .unwrap_or(self.pending.len());
+        let mut dropped: Vec<Entry> = self.pending.drain(..keep).collect();
+        release(&mut dropped);
+        self.truncate = None;
+        self.handed = self.handed.max(base.index);
+        Ok(())
     }
 }
