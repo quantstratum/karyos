@@ -842,6 +842,7 @@ fn a_submit_without_a_token_reaches_the_agent() {
 fn a_relay_id_of_zero_is_refused_at_bind() {
     let _serial = serial();
     let dir = dir("zero-relay");
+    std::fs::create_dir_all(&dir).unwrap();
     let api = dir.join("api");
     let zero = ApiConfig::new(api.clone(), vec![(own(), Role::Viewer)])
         .with_relays(vec![(own(), 0)], Vec::new());
