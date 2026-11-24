@@ -37,6 +37,10 @@ pub enum Evidence {
     /// candidate: the `Reference` fixture, or a core not named in the
     /// manifest's run record.
     HarnessValidation,
+    /// A run of a core version 2 of the C5 comparison names (`raft`,
+    /// `openraft` and the custom core of ADR-0105; karyos#691): evidence
+    /// once that version's run record names the commit it ran at.
+    C5Version2,
 }
 
 impl Evidence {
@@ -45,6 +49,7 @@ impl Evidence {
     pub const fn text(self) -> &'static str {
         match self {
             Self::HarnessValidation => "harness validation, not C5 evidence",
+            Self::C5Version2 => "C5 version 2",
         }
     }
 }

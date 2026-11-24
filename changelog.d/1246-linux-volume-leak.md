@@ -1,0 +1,3 @@
+### Fixed
+
+- `scripts/linux-test.sh` no longer leaks its Docker target volumes (owner-reported disk leak: a host running many one-off clones filled its disk). The target volume is created with the labels `karyos.linux-target=1` and `karyos.root=<tree path>`, and before each run `scripts/linux-test.sh` and `scripts/netem-test.sh` remove, by exact name, every labelled target volume whose tree no longer exists on the host and that no container uses, printing each removal; unlabelled volumes are never touched and `KARYOS_LINUX_KEEP_VOLUMES=1` skips the pruning. A leading `--clean` (or `KARYOS_LINUX_CLEAN=1`) removes the tree's own volume once the tests finish, for one-off gate clones.

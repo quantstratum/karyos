@@ -33,6 +33,10 @@ rustls = { version = "=0.23.46", default-features = false, features = ["std"], o
 rustls-graviola = { version = "=0.4.0", default-features = false, optional = true }
 
 [dev-dependencies]
+# The fixture product Cluster of the admin command tests (karyos#772): a
+# ClusteredService in C10's service container. Tests only; the library
+# does not depend on the Cluster (owner item 52).
+karyos-cluster.workspace = true
 karyos-driver.workspace = true
 # The join parser's and the registry's properties (karyos#893).
 proptest.workspace = true

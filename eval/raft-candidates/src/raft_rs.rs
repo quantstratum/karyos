@@ -121,6 +121,36 @@ pub fn append_shape(message: &eraftpb::Message) -> Option<(usize, u64)> {
     })
 }
 
+/// An append's leader term and its entries as (index, payload bytes),
+/// read from the message itself for an oracle that never trusts the
+/// adapter's counters (C5 version 2's W2 byte case; karyos#691); `None`
+/// for any other message.
+#[must_use]
+pub fn append_entries(message: &eraftpb::Message) -> Option<(u64, Vec<(u64, u64)>)> {
+    (message.get_msg_type() == eraftpb::MessageType::MsgAppend).then(|| {
+        let entries = message
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.index,
+                    u64::try_from(entry.data.len()).unwrap_or(u64::MAX),
+                )
+            })
+            .collect();
+        (message.term, entries)
+    })
+}
+
+/// The term and index an accepted append response acknowledges; `None`
+/// for any other message, a rejection or a heartbeat's answer (which
+/// proves no matching prefix).
+#[must_use]
+pub fn append_ack(message: &eraftpb::Message) -> Option<(u64, u64)> {
+    (message.get_msg_type() == eraftpb::MessageType::MsgAppendResponse && !message.reject)
+        .then_some((message.term, message.index))
+}
+
 /// Node `id`'s election timeout among `voters`, `[min, max)` in ticks:
 /// one value, so raft-rs's `thread_rng` draw is deterministic, staggered
 /// by the node's position among the voters (and itself) in id order, so
@@ -696,6 +726,36 @@ impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire for RaftCore<P
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The oracle's reading of raft-rs's appends (karyos#691): each
+    /// entry's index and payload bytes, an accepted answer's index, and
+    /// nothing from a rejection or a heartbeat's answer.
+    #[test]
+    fn appends_and_their_answers_are_read_from_the_message() {
+        let mut append = eraftpb::Message::default();
+        append.set_msg_type(eraftpb::MessageType::MsgAppend);
+        append.term = 4;
+        for (index, bytes) in [(5_u64, 100_usize), (6, 0)] {
+            append.entries.push(eraftpb::Entry {
+                index,
+                data: vec![1; bytes].into(),
+                ..eraftpb::Entry::default()
+            });
+        }
+        assert_eq!(append_entries(&append), Some((4, vec![(5, 100), (6, 0)])));
+        let mut reply = eraftpb::Message::default();
+        reply.set_msg_type(eraftpb::MessageType::MsgAppendResponse);
+        reply.term = 4;
+        reply.index = 6;
+        assert_eq!(append_ack(&reply), Some((4, 6)));
+        reply.reject = true;
+        assert_eq!(append_ack(&reply), None);
+        let mut beat = eraftpb::Message::default();
+        beat.set_msg_type(eraftpb::MessageType::MsgHeartbeatResponse);
+        beat.term = 4;
+        assert_eq!(append_ack(&beat), None);
+        assert_eq!(append_entries(&beat), None);
+    }
 
     /// The batch cap of [`RaftRsBatch16`] keeps an append at 16 entries or
     /// fewer of the command it was sized for, at any index (karyos#691).

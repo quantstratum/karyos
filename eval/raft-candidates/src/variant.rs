@@ -11,14 +11,23 @@ pub enum Variant {
     Baseline,
     /// The release with the local patches its [`PatchRecord`]s list.
     Patched(&'static [PatchRecord]),
+    /// The custom core (ADR-0105), built from this repository's
+    /// `karyos-cluster` at the run's commit: no external release, so no
+    /// patch (C5 version 2; karyos#681, karyos#691).
+    InTree,
 }
+
+/// The build of the custom core the comparison runs:
+/// [`karyos_sim::harness::custom::Custom`] over `karyos-cluster`'s
+/// [`Core`](karyos_cluster::consensus::Core).
+pub const CUSTOM: Variant = Variant::InTree;
 
 impl Variant {
     /// The patches it carries: none for the baseline.
     #[must_use]
     pub fn patches(&self) -> &'static [PatchRecord] {
         match self {
-            Self::Baseline => &[],
+            Self::Baseline | Self::InTree => &[],
             Self::Patched(patches) => patches,
         }
     }
@@ -29,6 +38,7 @@ impl Variant {
         match self {
             Self::Baseline => "baseline",
             Self::Patched(_) => "patched",
+            Self::InTree => "in-tree",
         }
     }
 }
