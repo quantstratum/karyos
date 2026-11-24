@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Wire authentication key files and KDF contexts
-//! (`quantstratum-docs: karyos/design/wire-key-files.md` sections 2.2, 2.3
+//! (`quantstratum-docs: karyos/design/wire-key-files.md` sections 2.1 to 2.6
 //! and 3; ADR-0086 sections 4 and 8).
 //!
 //! This module parses one key file's bytes into a [`KeyFile`] and derives
 //! the per-purpose MAC keys with HKDF-SHA-256 (RFC 5869), written over
-//! `hmac` so that the PRK and every MAC output are erased. The key directory, the
-//! durable key state and reload are separate parts of quantstratum/karyos#648.
+//! `hmac` so that the PRK and every MAC output are erased. [`store`] loads
+//! and reloads the key directory against the durable key state of
+//! [`state`] (design sections 2.1, 2.4 and 2.6).
 //! Parsing allocates nothing, reads no clock and touches no file. Secrets
 //! live in [`zeroize::Zeroizing`] buffers and are erased on drop, and the
 //! caller's input buffer is never kept.
+
+pub mod state;
+pub mod store;
 
 use hmac::{Hmac, KeyInit, Mac};
 use karyos_protocol::network::Identity;
