@@ -93,6 +93,13 @@ pub trait LogTerms {
     /// The size in bytes the entry at `index` takes in an append, `None`
     /// past the end or for index 0.
     fn size(&self, index: u64) -> Option<u64>;
+    /// What reading the entry at `index` to send it costs a duty, in
+    /// bytes ([`Limits::read_bytes`]): its size by default; a driver
+    /// whose log reads whole frames, or that holds the entry unwritten,
+    /// says so here.
+    fn cost(&self, index: u64) -> Option<u64> {
+        self.size(index)
+    }
 }
 
 /// What the core asks its driver to do, in the order of the calls.
@@ -1311,15 +1318,15 @@ impl Core {
 
     /// The previous index, and the entries, bytes and reads of what `at`
     /// can be sent now, within what is left of the duty's `budget`.
-    fn fit(&self, at: usize, budget: Duty, log: &impl LogTerms) -> (u64, u64, u64, u64) {
+    fn fit(&self, at: usize, budget: Duty, log: &impl LogTerms) -> (u64, u64, u64, (u64, u64)) {
         let Some(peer) = self.peers.get(at) else {
-            return (0, 0, 0, 0);
+            return (0, 0, 0, (0, 0));
         };
         let limits = self.config.limits;
         let last = log.last_index();
         let prev_index = peer.next.saturating_sub(1).min(last);
         if peer.sends.is_full() {
-            return (prev_index, 0, 0, 0);
+            return (prev_index, 0, 0, (0, 0));
         }
         let most = last
             .saturating_sub(prev_index)
@@ -1327,10 +1334,12 @@ impl Core {
             .min(limits.in_flight_entries.saturating_sub(peer.flight));
         let mut entries = 0;
         let mut bytes = 0_u64;
+        let mut cost = 0_u64;
         let mut reads = 0;
         while entries < most && reads < budget.reads {
             reads += 1;
-            let Some(size) = log.size(prev_index.saturating_add(entries).saturating_add(1)) else {
+            let index = prev_index.saturating_add(entries).saturating_add(1);
+            let (Some(size), Some(read)) = (log.size(index), log.cost(index)) else {
                 break;
             };
             let total = peer.bytes.saturating_add(bytes).saturating_add(size);
@@ -1341,16 +1350,17 @@ impl Core {
                 break;
             }
             // The duty's log read bound has no exception.
-            if bytes.saturating_add(size) > budget.bytes {
+            if cost.saturating_add(read) > budget.bytes {
                 break;
             }
+            cost = cost.saturating_add(read);
             bytes = bytes.saturating_add(size);
             entries += 1;
             if total > limits.in_flight_bytes {
                 break;
             }
         }
-        (prev_index, entries, bytes, reads)
+        (prev_index, entries, bytes, (reads, cost))
     }
 
     /// Sends `at` what fits, or a heartbeat when nothing does and
@@ -1392,9 +1402,9 @@ impl Core {
             }
             return;
         }
-        let (prev_index, entries, bytes, reads) = self.fit(at, *budget, log);
+        let (prev_index, entries, bytes, (reads, cost)) = self.fit(at, *budget, log);
         budget.reads = budget.reads.saturating_sub(reads);
-        budget.bytes = budget.bytes.saturating_sub(bytes);
+        budget.bytes = budget.bytes.saturating_sub(cost);
         if entries == 0 && !heartbeat {
             return;
         }
