@@ -509,15 +509,23 @@ fn pending_on(fd: &OwnedFd) -> u32 {
     count
 }
 
-/// Sends 4 datagrams from each of 64 new sockets on `from` to `to`.
-fn spray(from: std::net::IpAddr, to: SocketAddr) {
+/// Sends 4 datagrams from each of 64 new sockets on `from` to `to`, and
+/// counts what reaches `first` and `second`, draining both after each
+/// sender so no receive buffer fills (the default one holds fewer than 256
+/// small datagrams on some kernels).
+fn spray(from: std::net::IpAddr, to: SocketAddr, first: &OwnedFd, second: &OwnedFd) -> (u32, u32) {
+    let (mut to_first, mut to_second) = (0, 0);
     for _ in 0..64 {
         let sender = std::net::UdpSocket::bind(SocketAddr::new(from, 0)).unwrap();
         for _ in 0..4 {
             sender.send_to(b"spray", to).unwrap();
         }
+        std::thread::sleep(Duration::from_millis(1));
+        to_first += pending_on(first);
+        to_second += pending_on(second);
     }
     std::thread::sleep(Duration::from_millis(50));
+    (to_first + pending_on(first), to_second + pending_on(second))
 }
 
 /// A reuseport group of a first socket at `local` and an etf socket: the
@@ -550,17 +558,15 @@ fn steering_in_group(local: SocketAddr) {
         }
         Err(error) => panic!("{error}"),
     };
-    spray(local.ip(), local);
-    let (to_first, to_etf) = (pending_on(&first), pending_on(&etf.fd));
+    let (to_first, to_etf) = spray(local.ip(), local, &first, &etf.fd);
     assert_eq!(to_first + to_etf, 256);
     assert!(
         to_etf > 0,
         "without the program the hash spreads the group: {to_first} and {to_etf}"
     );
     crate::linux_sys::attach_reuseport_first(first.as_fd()).unwrap();
-    spray(local.ip(), local);
     assert_eq!(
-        (pending_on(&first), pending_on(&etf.fd)),
+        spray(local.ip(), local, &first, &etf.fd),
         (256, 0),
         "with the program every datagram reaches the first socket"
     );
@@ -617,7 +623,14 @@ fn an_ipv6_etf_socket_joins_the_endpoint_group() {
         eprintln!("IPv6 etf queue unavailable here ({error}); skipped");
         return;
     }
-    spray(local.ip(), local);
+    // The endpoint's receive buffer holds all 256 (the etf route's RX
+    // buffer is sized by the endpoint configuration).
+    for _ in 0..64 {
+        let sender = std::net::UdpSocket::bind(SocketAddr::new(local.ip(), 0)).unwrap();
+        for _ in 0..4 {
+            sender.send_to(b"spray", local).unwrap();
+        }
+    }
     assert_eq!(
         route::received_on(&mut rx, local),
         256,
