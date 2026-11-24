@@ -117,7 +117,8 @@ fi
 # container) and still cleans up once the client has exited.
 "${run[@]}" &
 pid=$!
-trap 'kill -TERM "$pid" 2> /dev/null || true' TERM INT HUP
+stopped=0
+trap 'stopped=1; kill -TERM "$pid" 2> /dev/null || true' TERM INT HUP
 status=0
 wait "$pid" || status=$?
 while kill -0 "$pid" 2> /dev/null; do
@@ -125,6 +126,10 @@ while kill -0 "$pid" 2> /dev/null; do
     wait "$pid" || status=$?
 done
 trap - TERM INT HUP
+# A stopped run never reads as a pass, whatever the client returned.
+if [ "$stopped" = 1 ] && [ "$status" -eq 0 ]; then
+    status=143
+fi
 if ! karyos_target_volume_clean "$target" "$root" && [ "$status" -eq 0 ]; then
     status=1
 fi
