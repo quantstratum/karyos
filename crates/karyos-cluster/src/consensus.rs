@@ -115,7 +115,11 @@ pub trait Effects {
     /// The commit index rose to `index`.
     fn commit(&mut self, index: u64);
     /// Send the node's latest snapshot to `to`: it needs entries the log
-    /// no longer holds.
+    /// no longer holds. The core asks at most once per follower per
+    /// minimum election timeout until a base is acknowledged; each request
+    /// supersedes the follower's earlier ones, so a driver keeps at most
+    /// one transfer per follower, replacing or dropping a queued one. A
+    /// transfer is not charged to [`Limits`]: they bound appends.
     fn send_snapshot(&mut self, to: u64);
 }
 
@@ -217,7 +221,8 @@ pub enum Message {
         term: u64,
         /// Whether it matched.
         outcome: AppendOutcome,
-        /// The epoch of the append it answers.
+        /// The epoch of the append it answers; 0 for the acknowledgement of
+        /// an installed snapshot, which answers none.
         epoch: u64,
     },
 }
@@ -701,12 +706,39 @@ impl Core {
         Ok(())
     }
 
+    /// Whether [`Core::install`] would take a snapshot whose base is
+    /// `index`: the admission a driver checks before it publishes the
+    /// snapshot over its service and log, with no other call to the core
+    /// in between, so the install it then reports is never refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`Core::install`].
+    pub fn can_install(&self, index: u64) -> Result<(), InstallError> {
+        if self.role == Role::Leader {
+            return Err(InstallError::Leader);
+        }
+        if index <= self.commit {
+            return Err(InstallError::Stale);
+        }
+        Ok(())
+    }
+
     /// The node installed a leader's snapshot whose base is `index`, of
     /// `term`: its service holds the state up to `index` and its log
     /// restarts after it, durably. A log that holds the base's entry keeps
     /// the entries after it, which the leader may already count (Raft's
     /// figure 13, step 6); any other log is emptied. The base is
     /// committed, and it is acknowledged to the leader once durable.
+    ///
+    /// A snapshot holds only committed entries, which every later leader's
+    /// log holds too, so a snapshot sent in an earlier term is still safe
+    /// to install, and its acknowledgement goes to the leader the node
+    /// follows now, whoever sent it: that leader's log matches it up to
+    /// the base. A node that knows no leader acknowledges nothing; the
+    /// leader's next heartbeat at its base is acknowledged instead. The
+    /// acknowledgement answers no append, so it carries epoch 0: an
+    /// accepted reply is never checked against an epoch.
     ///
     /// # Errors
     ///
@@ -718,12 +750,7 @@ impl Core {
         term: u64,
         out: &mut impl Effects,
     ) -> Result<(), InstallError> {
-        if self.role == Role::Leader {
-            return Err(InstallError::Leader);
-        }
-        if index <= self.commit {
-            return Err(InstallError::Stale);
-        }
+        self.can_install(index)?;
         self.base = (index, term);
         self.commit = index;
         self.elapsed = 0;
@@ -778,12 +805,14 @@ impl Core {
             }
             let (retry, base) = (self.config.election_min, self.base.0);
             for peer in &mut self.peers {
-                if let Some((asked, ticks)) = peer.snapshot.as_mut() {
+                if let Some((_, ticks)) = peer.snapshot.as_mut() {
                     *ticks = ticks.saturating_add(1);
                     if *ticks >= retry {
                         // Unacknowledged: lost, or not yet installed. Ask
-                        // again, for the latest snapshot.
-                        *asked = base;
+                        // again; the driver sends its latest snapshot, and
+                        // an acknowledgement of the first base asked still
+                        // counts, so a slow install is never outrun by
+                        // compaction.
                         *ticks = 0;
                         peer.next = base.saturating_add(1);
                         out.send_snapshot(peer.id);
@@ -1340,13 +1369,14 @@ impl Core {
         }
         let commit = self.commit;
         let term = self.term_vote.term;
-        if self.snapshot_needed(at, log, out) {
+        if self.snapshot_needed(at, budget, log, out) {
             // A heartbeat at the base keeps it following, and its answer
             // acknowledges the snapshot once installed.
+            let (base, prev_term) = self.base;
             if heartbeat
+                && base > 0
                 && let Some(peer) = self.peers.get(at)
-                && let Some((base, _)) = peer.snapshot
-                && let Some(prev_term) = log.term(base)
+                && peer.snapshot.is_some()
             {
                 out.send(
                     peer.id,
@@ -1400,7 +1430,13 @@ impl Core {
     /// Whether `at` waits for a snapshot: one asked for, or one it needs
     /// now because the log no longer holds what it would be sent, which
     /// is then asked for. A follower waiting for one is sent no entries.
-    fn snapshot_needed(&mut self, at: usize, log: &impl LogTerms, out: &mut impl Effects) -> bool {
+    fn snapshot_needed(
+        &mut self,
+        at: usize,
+        budget: &mut Duty,
+        log: &impl LogTerms,
+        out: &mut impl Effects,
+    ) -> bool {
         let base = self.base.0;
         let Some(peer) = self.peers.get_mut(at) else {
             return true;
@@ -1410,11 +1446,24 @@ impl Core {
         }
         let last = log.last_index();
         let prev = peer.next.saturating_sub(1).min(last);
-        // Compaction drops a prefix: when the previous entry is held, so
-        // is every later one, except after index 0, which always "holds"
-        // (term 0). Only terms are read, so no read budget is spent.
-        let gone = log.term(prev).is_none() || (prev == 0 && last > 0 && log.term(1).is_none());
-        if !gone || base == 0 {
+        if base == 0 {
+            return false;
+        }
+        // Below the base a log may keep terms without entries: the next
+        // entry's size says whether it can still be sent. That read is
+        // charged to the duty, and with none left nothing is decided.
+        let gone = if log.term(prev).is_none() {
+            true
+        } else if prev < base && prev < last {
+            if budget.reads == 0 {
+                return false;
+            }
+            budget.reads -= 1;
+            log.size(prev.saturating_add(1)).is_none()
+        } else {
+            false
+        };
+        if !gone {
             return false;
         }
         peer.snapshot = Some((base, 0));

@@ -870,3 +870,389 @@ fn a_restart_over_a_snapshot_resumes_from_its_base() {
     assert_eq!(node.commit(), 7);
     assert_eq!(node.snapshot_base(), (7, 2));
 }
+
+/// Follower 2 of term `term` following leader `leader`.
+fn follower_of(leader: u64, term: u64) -> Core {
+    let mut node = core(2, term);
+    let heartbeat = Message::Append {
+        term,
+        prev_index: 0,
+        prev_term: 0,
+        entries: 0,
+        commit: 0,
+        epoch: 1,
+    };
+    let mut recorded = Recorded::default();
+    let log = TestLog::default();
+    assert_eq!(
+        node.step(leader, heartbeat, &[], &log, &mut recorded),
+        Ok(())
+    );
+    assert_eq!(
+        node.role(),
+        Role::Follower {
+            leader: Some(leader)
+        }
+    );
+    node
+}
+
+#[test]
+fn a_snapshot_of_an_earlier_term_is_installed_and_acknowledged_to_the_current_leader() {
+    // Leader 1 of term 4 sent it; the follower now follows leader 3 of
+    // term 5. The snapshot holds committed entries only, which leader 3
+    // holds too: it is installed, and acknowledged to leader 3 in term 5.
+    let mut node = follower_of(3, 5);
+    assert_eq!(node.can_install(6), Ok(()));
+    let mut recorded = Recorded::default();
+    assert_eq!(node.install(6, 4, &mut recorded), Ok(()));
+    assert_eq!(
+        recorded.trace,
+        vec![Effect::SendAfter(
+            3,
+            Message::AppendReply {
+                term: 5,
+                outcome: AppendOutcome::Accepted { index: 6 },
+                epoch: 0,
+            }
+        )]
+    );
+    assert_eq!(node.term_vote().term, 5, "the term is unchanged");
+}
+
+#[test]
+fn a_deposed_leader_refuses_a_later_terms_snapshot_and_follows_on_the_next_heartbeat() {
+    let (mut node, log) = compacted_leader();
+    assert_eq!(node.can_install(20), Err(InstallError::Leader));
+    let mut recorded = Recorded::default();
+    assert_eq!(
+        node.install(20, 3, &mut recorded),
+        Err(InstallError::Leader)
+    );
+    assert!(recorded.trace.is_empty());
+    // The new leader's heartbeat deposes it; then it takes the snapshot.
+    let heartbeat = Message::Append {
+        term: 3,
+        prev_index: 20,
+        prev_term: 3,
+        entries: 0,
+        commit: 20,
+        epoch: 1,
+    };
+    assert_eq!(node.step(2, heartbeat, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(node.role(), Role::Follower { leader: Some(2) });
+    assert_eq!(node.can_install(20), Ok(()));
+    let mut recorded = Recorded::default();
+    assert_eq!(node.install(20, 3, &mut recorded), Ok(()));
+    assert_eq!(node.commit(), 20);
+}
+
+#[test]
+fn admission_matches_install_while_a_snapshot_is_staged() {
+    // Admitted, then the commit passes the base while it is staged: the
+    // driver checks again before publishing, and both refuse alike.
+    let mut node = follower_of(1, 2);
+    assert_eq!(node.can_install(3), Ok(()));
+    let held = TestLog {
+        base: 0,
+        terms: vec![1, 1, 1, 1],
+        ids: vec![1, 2, 3, 4],
+    };
+    let probe = Message::Append {
+        term: 2,
+        prev_index: 4,
+        prev_term: 1,
+        entries: 0,
+        commit: 4,
+        epoch: 1,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(1, probe, &[], &held, &mut recorded), Ok(()));
+    assert_eq!(node.commit(), 4);
+    assert_eq!(node.can_install(3), Err(InstallError::Stale));
+    let mut recorded = Recorded::default();
+    assert_eq!(node.install(3, 1, &mut recorded), Err(InstallError::Stale));
+    assert!(recorded.trace.is_empty());
+}
+
+#[test]
+fn an_acknowledgement_of_the_first_base_counts_after_compaction_moved_on() {
+    // The install takes longer than the retry interval while the leader
+    // compacts again: the acknowledgement of the first base asked still
+    // ends the transfer, and a new one starts for what is gone since.
+    let (mut node, mut log) = compacted_leader();
+    asks_for_a_snapshot(&rewind(&mut node, &log, 2));
+    for _ in 0..10 {
+        let mut recorded = Recorded::default();
+        node.tick(&log, &mut recorded);
+    }
+    log.compact(7);
+    assert_eq!(node.compacted(7, 1), Ok(()));
+    let ack = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Accepted { index: 5 },
+        epoch: 0,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, ack, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(recorded.trace.first(), Some(&Effect::Snapshot(2)));
+    // Its heartbeats are at the current base, whose term the core keeps.
+    let mut beat = None;
+    for _ in 0..3 {
+        let mut recorded = Recorded::default();
+        node.tick(&log, &mut recorded);
+        beat = beat.or(recorded.trace.iter().find_map(|effect| match effect {
+            Effect::Send(2, Message::Append { prev_index, .. }) => Some(*prev_index),
+            _ => None,
+        }));
+    }
+    assert_eq!(beat, Some(7));
+}
+
+/// A log that keeps terms below its entries, and counts size reads.
+struct TermsOnly<'a> {
+    log: &'a TestLog,
+    terms_from: u64,
+    reads: std::cell::Cell<u64>,
+}
+
+impl LogTerms for TermsOnly<'_> {
+    fn last_index(&self) -> u64 {
+        self.log.last_index()
+    }
+
+    fn term(&self, index: u64) -> Option<u64> {
+        if index >= self.terms_from && index <= self.log.base {
+            return Some(1);
+        }
+        self.log.term(index)
+    }
+
+    fn size(&self, index: u64) -> Option<u64> {
+        self.reads.set(self.reads.get() + 1);
+        self.log.size(index)
+    }
+}
+
+#[test]
+fn a_kept_term_without_its_entry_still_asks_for_a_snapshot() {
+    let (mut node, log) = compacted_leader();
+    let terms = TermsOnly {
+        log: &log,
+        terms_from: 1,
+        reads: std::cell::Cell::new(0),
+    };
+    let mut recorded = Recorded::default();
+    node.replicate(&terms, &mut recorded);
+    let reject = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 8, hint: 2 },
+        epoch: node.pipeline_epoch(2).unwrap_or(0),
+    };
+    let before = terms.reads.get();
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, reject, &[], &terms, &mut recorded), Ok(()));
+    asks_for_a_snapshot(&recorded);
+    assert_eq!(terms.reads.get() - before, 1, "the one size read decides");
+}
+
+#[test]
+fn a_blocked_transfer_is_asked_for_once_per_timeout_per_follower() {
+    let (mut node, log) = compacted_leader();
+    asks_for_a_snapshot(&rewind(&mut node, &log, 2));
+    let mut asked = 0;
+    for tick in 1..=100 {
+        let mut recorded = Recorded::default();
+        node.tick(&log, &mut recorded);
+        let ack = Message::AppendReply {
+            term: 2,
+            outcome: AppendOutcome::Accepted { index: 8 },
+            epoch: node.pipeline_epoch(3).unwrap_or(0),
+        };
+        let mut ignored = Recorded::default();
+        assert_eq!(node.step(3, ack, &[], &log, &mut ignored), Ok(()));
+        asked += recorded
+            .trace
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Snapshot(_)))
+            .count();
+        assert!(asked <= tick / 10, "{asked} requests by tick {tick}");
+        assert!(
+            !recorded.trace.contains(&Effect::Snapshot(3)),
+            "a follower that holds the log is never sent one"
+        );
+    }
+    assert_eq!(asked, 10);
+}
+
+#[test]
+fn old_pipeline_replies_around_a_snapshot_neither_rewind_nor_refund() {
+    // A leader with a full window to follower 2 at index 9..: the log is
+    // compacted past it and the follower rejects, so a snapshot is asked.
+    let mut log = TestLog {
+        base: 5,
+        terms: vec![1, 1],
+        ids: vec![6, 7],
+    };
+    let mut node = leader(1, &log).with_snapshot(5, 1);
+    for id in 8..=20 {
+        log.push(2, id);
+    }
+    let mut recorded = Recorded::default();
+    node.persisted(20, &log, &mut recorded);
+    node.replicate(&log, &mut recorded);
+    let old_epoch = node.pipeline_epoch(2).unwrap_or(0);
+    let ack3 = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Accepted { index: 20 },
+        epoch: node.pipeline_epoch(3).unwrap_or(0),
+    };
+    assert_eq!(node.step(3, ack3, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(node.commit(), 20);
+    log.compact(15);
+    assert_eq!(node.compacted(15, 2), Ok(()));
+    let reject = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 7, hint: 3 },
+        epoch: old_epoch,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, reject, &[], &log, &mut recorded), Ok(()));
+    asks_snapshot_of(&recorded, 15);
+    assert_eq!(node.in_flight(2), Some((0, 0)));
+    // Old replies before the acknowledgement change nothing.
+    for outcome in [
+        AppendOutcome::Accepted { index: 9 },
+        AppendOutcome::Rejected { probe: 9, hint: 1 },
+    ] {
+        let old = Message::AppendReply {
+            term: 2,
+            outcome,
+            epoch: old_epoch,
+        };
+        let mut recorded = Recorded::default();
+        assert_eq!(node.step(2, old, &[], &log, &mut recorded), Ok(()));
+        assert!(recorded.trace.is_empty(), "{:?}", recorded.trace);
+        assert_eq!(node.in_flight(2), Some((0, 0)));
+    }
+    // The acknowledgement resumes appends after the base, charged once.
+    let ack = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Accepted { index: 15 },
+        epoch: 0,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, ack, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(node.in_flight(2), Some((4, 400)));
+    // A duplicate of it, and old replies after it, change nothing.
+    for (outcome, epoch) in [
+        (AppendOutcome::Accepted { index: 15 }, 0),
+        (AppendOutcome::Accepted { index: 9 }, old_epoch),
+        (AppendOutcome::Rejected { probe: 9, hint: 1 }, old_epoch),
+    ] {
+        let old = Message::AppendReply {
+            term: 2,
+            outcome,
+            epoch,
+        };
+        let mut recorded = Recorded::default();
+        assert_eq!(node.step(2, old, &[], &log, &mut recorded), Ok(()));
+        assert_eq!(node.in_flight(2), Some((4, 400)), "{outcome:?}");
+    }
+}
+
+/// The call asked for a snapshot for follower 2, then sent it only a
+/// heartbeat at `base`.
+fn asks_snapshot_of(recorded: &Recorded, base: u64) {
+    assert_eq!(recorded.trace.first(), Some(&Effect::Snapshot(2)));
+    for effect in recorded.trace.iter().skip(1) {
+        assert!(
+            matches!(
+                effect,
+                Effect::Send(
+                    2,
+                    Message::Append {
+                        prev_index,
+                        entries: 0,
+                        ..
+                    }
+                ) if *prev_index == base
+            ),
+            "{effect:?}"
+        );
+    }
+}
+
+#[test]
+fn a_node_recovered_over_only_a_snapshot_campaigns_and_leads_from_its_base() {
+    let log = TestLog {
+        base: 7,
+        ..TestLog::default()
+    };
+    let config = Config::new(1, &[1, 2, 3], 10, 20, 3, 4, 1);
+    assert!(config.is_ok());
+    let config = config.unwrap_or_else(|_| unreachable!());
+    let mut node = Core::new(
+        config,
+        TermVote {
+            term: 3,
+            voted_for: None,
+        },
+        0,
+    )
+    .with_snapshot(7, 2);
+    let mut pre = None;
+    for _ in 0..100 {
+        let mut recorded = Recorded::default();
+        node.tick(&log, &mut recorded);
+        pre = pre.or(recorded.trace.iter().find_map(|effect| match effect {
+            Effect::Send(_, message @ Message::PreVote { .. }) => Some(*message),
+            _ => None,
+        }));
+        if pre.is_some() {
+            break;
+        }
+    }
+    let Some(Message::PreVote {
+        last_index,
+        last_term,
+        round,
+        ..
+    }) = pre
+    else {
+        unreachable!("no pre-vote")
+    };
+    assert_eq!((last_index, last_term), (7, 2));
+    let mut recorded = Recorded::default();
+    let reply = Message::PreVoteReply {
+        term: 4,
+        granted: true,
+        round,
+    };
+    assert_eq!(node.step(2, reply, &[], &log, &mut recorded), Ok(()));
+    assert!(recorded.trace.iter().any(|effect| matches!(
+        effect,
+        Effect::SendAfter(
+            _,
+            Message::Vote {
+                last_index: 7,
+                last_term: 2,
+                ..
+            }
+        )
+    )));
+    let vote = Message::VoteReply {
+        term: 4,
+        granted: true,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(3, vote, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(recorded.trace, vec![Effect::Append(8, 4)]);
+    // With a kept suffix, the suffix gives the last index and term.
+    let kept = TestLog {
+        base: 7,
+        terms: vec![3],
+        ids: vec![8],
+    };
+    assert_eq!(node.propose(100, &kept), Ok((9, 4)));
+}
