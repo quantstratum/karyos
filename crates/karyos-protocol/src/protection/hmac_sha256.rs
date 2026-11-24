@@ -26,7 +26,8 @@
 //! HMAC-SHA-256 over `label || header || inner frames`, where the label is
 //! the 20 bytes `karyos-wire-auth-v1\0`, never transmitted. Every field is
 //! checked against the channel's [`Binding`] before the tag, and the tag
-//! is compared in constant time by `hmac`'s `verify_truncated_left`.
+//! is compared in constant time by [`HmacState::verify_truncated_left`].
+//! The key is held as an [`HmacKey`], whose padded copies are erased.
 //!
 //! This module implements the MAC domains only (DATA, receiver to
 //! publisher, SETUP proof and RSP_SETUP). The signed authority domains, key
@@ -35,9 +36,7 @@
 
 use core::cell::Cell;
 
-use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
-
+use super::hmac_key::{HmacKey, HmacState};
 use super::{Protection, Rejection, SealError, Verdict};
 
 /// The label every MAC input starts with (ADR-0086 section 1).
@@ -98,9 +97,9 @@ pub struct Opened {
 ///
 /// A value seals with consecutive envelope sequences from `first_seq`; it
 /// is meant for one sender thread and is not `Sync`. The keyed MAC state is
-/// erased on drop (`hmac` feature `zeroize`).
+/// erased on drop (`sha2` feature `zeroize`).
 pub struct HmacSha256 {
-    mac: Hmac<Sha256>,
+    mac: HmacKey,
     binding: Binding,
     next_seq: Cell<u64>,
 }
@@ -129,7 +128,7 @@ impl HmacSha256 {
         if key.is_empty() {
             return Err(EmptyKey);
         }
-        let mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).map_err(|_| EmptyKey)?;
+        let mac = HmacKey::new(key);
         Ok(Self {
             mac,
             binding,
@@ -150,8 +149,8 @@ impl HmacSha256 {
     }
 
     /// The keyed MAC over `label || authed`.
-    fn mac_over(&self, authed: &[u8]) -> Hmac<Sha256> {
-        let mut mac = self.mac.clone();
+    fn mac_over(&self, authed: &[u8]) -> HmacState {
+        let mut mac = self.mac.mac();
         mac.update(LABEL);
         mac.update(authed);
         mac
@@ -197,7 +196,7 @@ impl HmacSha256 {
             needed: authed_len,
             available: total,
         })?;
-        let full = self.mac_over(authed).finalize().into_bytes();
+        let full = self.mac_over(authed).finalize();
         if let (Some(slot), Some(value)) = (tag.get_mut(..TAG_LEN), full.get(..TAG_LEN)) {
             slot.copy_from_slice(value);
         }
@@ -272,9 +271,9 @@ impl HmacSha256 {
         let (authed, tag) = datagram
             .split_at_checked(authed_len)
             .ok_or(Rejection::Short)?;
-        self.mac_over(authed)
-            .verify_truncated_left(tag)
-            .map_err(|_| Rejection::Tag)?;
+        if !self.mac_over(authed).verify_truncated_left(tag) {
+            return Err(Rejection::Tag);
+        }
         let frames = authed_len.checked_sub(HEADER_LEN).ok_or(Rejection::Short)?;
         Ok(Opened {
             start: HEADER_LEN,
