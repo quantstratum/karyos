@@ -9,7 +9,8 @@
 use std::net::SocketAddr;
 
 use super::endpoint::{BufferSize, Membership, SocketsConfig};
-use crate::backend::{CapabilityState, OpenError};
+use super::errqueue::ErrEntry;
+use crate::backend::{CapabilityState, EtfQueue, OpenError, Reason};
 
 /// The destination of a route, stored once at `add_route` so sends never
 /// convert or allocate: on Linux it also holds the `rustix` socket address
@@ -245,6 +246,65 @@ pub trait SocketOps: Sized {
     /// cannot be measured, always on macOS, which selects the declared
     /// fallback.
     fn route_mtu(&mut self, route: &RouteAddr) -> Option<u32>;
+
+    /// Opens the `etf` socket of the etf queue at table index `queue`
+    /// (ADR-0109 points 2 and 5): it joins this socket's `SO_REUSEPORT`
+    /// group after this socket's steering program is attached, so it sends
+    /// from the endpoint's address and port and receives nothing, with
+    /// `SO_TXTIME` and the declared `SO_PRIORITY`. Only a socket opened
+    /// with [`SocketsConfig::etf_route`] has the group. The default, for a
+    /// platform without the route, refuses.
+    ///
+    /// # Errors
+    ///
+    /// Why the queue is refused: a failed attach, `SO_TXTIME` or
+    /// `SO_PRIORITY` among them.
+    fn open_etf(&mut self, queue: u16, etf: &EtfQueue) -> Result<(), Reason> {
+        let _ = (queue, etf);
+        Err(Reason::Platform)
+    }
+
+    /// Closes the `etf` socket of queue index `queue`, if any.
+    /// [`SocketOps::close`] closes every one, before the socket itself.
+    fn close_etf(&mut self, queue: u16) {
+        let _ = queue;
+    }
+
+    /// Sends one datagram to `route` on the `etf` socket of queue index
+    /// `queue`, released at `txtime_ns` of `CLOCK_TAI`, without blocking:
+    /// `Sent { sent: 1, .. }`, the call's error, or `OutOfAbi` for a short
+    /// send. `EBADF` without a system call when the queue has no `etf`
+    /// socket.
+    fn send_etf(
+        &mut self,
+        queue: u16,
+        route: &RouteAddr,
+        datagram: &[u8],
+        txtime_ns: u64,
+    ) -> SendResult {
+        let _ = (queue, route, datagram, txtime_ns);
+        SendResult::Error(Errno::BADF)
+    }
+
+    /// Drains up to `out.len()` entries of the error queue of queue index
+    /// `queue`'s `etf` socket without blocking; returns how many.
+    ///
+    /// # Errors
+    ///
+    /// The errno of the receive other than `EAGAIN`; `EBADF` when the
+    /// queue has no `etf` socket.
+    fn drain_etf(&mut self, queue: u16, out: &mut [ErrEntry]) -> Result<usize, Errno> {
+        let _ = (queue, out);
+        Err(Errno::BADF)
+    }
+
+    /// Now, in nanoseconds of `CLOCK_TAI`, read once per flush of an etf
+    /// queue to tell a time still ahead from one already past (ADR-0109
+    /// point 3); `None` where the clock cannot be read, which sends every
+    /// timed datagram at once, late.
+    fn tai_now_ns(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 /// What [`SocketOps::open`] established about the new socket: the platform

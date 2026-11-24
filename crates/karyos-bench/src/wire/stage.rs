@@ -826,6 +826,7 @@ pub fn send_role<P: Protection>(
             authority: Authority::FIRST,
             route,
             max_pending: NonZeroU16::new(QUEUE_DEPTH).unwrap_or(NonZeroU16::MIN),
+            etf: None,
         })
         .map_err(|error| BenchError(format!("queue: {error:?}")))?;
     let mut send = vec![MISSING; prepared.measured];

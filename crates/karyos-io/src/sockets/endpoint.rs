@@ -40,10 +40,11 @@ pub use config::{
     MAX_TX_SLOTS, MIN_DATAGRAM, Membership, MulticastConfig, ObservationPoints, Platform,
     Protection, QueueAssignment, SOCKETS_MAX_BATCH, SocketsConfig,
 };
-pub use tx::{RouteInfo, SocketsFrame, TxCommitment};
+pub use tx::{EtfDrainError, RouteInfo, SocketsFrame, TxCommitment};
 
 use self::rx::RxCore;
 use self::tx::TxCore;
+use super::errqueue::ErrEntry;
 use super::ops::{SocketOps, SocketProbes};
 use crate::backend::{
     BackendEpoch, Budget, CancelOutcome, CapabilityState, ClaimError, CompletionHandler,
@@ -553,10 +554,31 @@ impl<O: SocketOps> SocketsTx<O> {
     /// # Errors
     ///
     /// Returns a [`QueueError`], checked in this order: `NotActive`,
-    /// `RouteUnknown`, `QueueLimit`, `OverCommitted` (decision S-6),
-    /// `IdentityExhausted`.
+    /// `RouteUnknown`, `EtfRefused` (an etf queue on an endpoint without
+    /// [`SocketsConfig::etf_route`], or to a multicast destination),
+    /// `QueueLimit`, `OverCommitted` (decision S-6), `IdentityExhausted`,
+    /// then `EtfUnavailable` when the etf queue's socket cannot be set up
+    /// (ADR-0109 points 2 and 5).
     pub fn open_queue(&mut self, config: TxQueueConfig) -> Result<TxQueueId, QueueError> {
-        self.core.open_queue(config)
+        self.core.open_queue(&mut self.ops, config)
+    }
+
+    /// Drains up to `out.len()` entries of the error queue of etf queue
+    /// `queue`'s socket without blocking (ADR-0109 points 6 and 7); returns
+    /// how many it wrote. An [`ErrEntry::Txtime`] is a datagram the `etf`
+    /// qdisc dropped, named by its send time, with its code.
+    ///
+    /// # Errors
+    ///
+    /// [`EtfDrainError::Queue`] with `NotActive`, `UnknownQueue`, or
+    /// `EtfRefused` for a queue that is not an etf queue; the receive's
+    /// errno otherwise.
+    pub fn drain_etf(
+        &mut self,
+        queue: TxQueueId,
+        out: &mut [ErrEntry],
+    ) -> Result<usize, EtfDrainError> {
+        self.core.drain_etf(&mut self.ops, queue, out)
     }
 
     /// Returns the pending items of `queue` with `QueueClosed`, up to the
@@ -572,7 +594,7 @@ impl<O: SocketOps> SocketsTx<O> {
         queue: TxQueueId,
         report: &mut TxReport,
     ) -> Result<CancelOutcome, QueueError> {
-        self.core.close_queue(queue, report)
+        self.core.close_queue(&mut self.ops, queue, report)
     }
 
     /// Clears a send fault; the head is attempted again at the next flush.

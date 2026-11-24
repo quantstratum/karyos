@@ -337,13 +337,20 @@ impl<O: XskOps> XdpEndpoint<O> {
     ///
     /// # Errors
     ///
-    /// `NotActive`, `RouteUnknown`, then the ledger's errors.
+    /// `NotActive`, `RouteUnknown`, `EtfUnavailable` for an etf queue (the
+    /// `etf` route is the sockets backend's, ADR-0109 point 2), then the
+    /// ledger's errors.
     pub fn open_queue(&mut self, config: TxQueueConfig) -> Result<TxQueueId, QueueError> {
         if !self.active() {
             return Err(QueueError::NotActive);
         }
         if self.routes.get(config.route).is_none() {
             return Err(QueueError::RouteUnknown);
+        }
+        if config.etf.is_some() {
+            return Err(QueueError::EtfUnavailable {
+                reason: crate::backend::Reason::Platform,
+            });
         }
         let id = self.ledger.open_queue(config)?;
         match self.runs.get_mut(usize::from(id.index())) {
@@ -448,6 +455,7 @@ impl<O: XskOps> XdpEndpoint<O> {
             token: meta.token,
             len: meta.len,
             outcome,
+            late: false,
         })
     }
 
