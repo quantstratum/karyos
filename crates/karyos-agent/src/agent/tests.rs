@@ -413,7 +413,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     // Another principal cannot submit it.
     assert_eq!(
         agent.guard_submit_for(
-            (4242, token),
+            (4242, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -425,7 +425,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     // The previewed close, under the caller's id.
     let answer = serving(&mut driver, || {
         agent.guard_submit_for(
-            (4242, token),
+            (4242, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -444,7 +444,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     // The token is used up, and the id too.
     assert_eq!(
         agent.guard_submit_for(
-            (4243, token),
+            (4243, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -457,7 +457,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     let garbage = Token::parse(&"0".repeat(32)).unwrap();
     let audited = driver.guard_audit().records.len();
     let retried = agent.guard_submit_for(
-        (4242, garbage),
+        (4242, Some(garbage)),
         PreviewKind::Close,
         &driver_dir,
         guard.id(),
@@ -469,7 +469,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     // The same id for anything else: a conflict, unsent.
     assert_eq!(
         agent.guard_submit_for(
-            (4242, garbage),
+            (4242, Some(garbage)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -480,7 +480,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     );
     assert_eq!(
         agent.guard_submit_for(
-            (4242, garbage),
+            (4242, Some(garbage)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -503,7 +503,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     assert!(matches!(closed, GuardAnswer::State { state, .. } if state.epoch == 5));
     let moved = serving(&mut driver, || {
         agent.guard_submit_for(
-            (4244, token),
+            (4244, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -536,7 +536,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     };
     assert_eq!(
         agent.guard_submit_for(
-            (taken, garbage),
+            (taken, Some(garbage)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -550,7 +550,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     let claimed = agent.next_operation;
     let submitted = serving(&mut driver, || {
         agent.guard_submit_for(
-            (claimed, token),
+            (claimed, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -577,7 +577,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     let _ = replacement.add_guard("orders").unwrap();
     let elsewhere = serving(&mut replacement, || {
         agent.guard_submit_for(
-            (777_777, token),
+            (777_777, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -595,8 +595,9 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
             .with_attach_timeout(Duration::from_secs(5))
             .with_journal(dir.join("journal")),
     );
+    // A retry needs no token (karyos#738 review).
     let again = agent.guard_submit_for(
-        (4242, garbage),
+        (4242, None),
         PreviewKind::Close,
         &driver_dir,
         guard.id(),
@@ -604,20 +605,30 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
         b"halt",
     );
     assert_eq!(again, answer);
-    assert!(matches!(
+    // The whole reply survives the restart, the refusal's detail too.
+    assert_eq!(
         agent.guard_submit_for(
-            (4244, garbage),
+            (4244, None),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
             operator,
             b"halt",
         ),
-        Ok(GuardAnswer::Refused {
-            operation: 4244,
-            ..
-        })
-    ));
+        moved
+    );
+    // The same id on another driver is a conflict, not that outcome.
+    assert_eq!(
+        agent.guard_submit_for(
+            (4244, None),
+            PreviewKind::Close,
+            &dir.join("other"),
+            guard.id(),
+            operator,
+            b"halt",
+        ),
+        Err(SubmitRefusal::OperationConflict)
+    );
     drop(agent);
     let _ = std::fs::remove_dir_all(&dir);
 }

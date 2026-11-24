@@ -227,6 +227,8 @@ pub struct Agent {
     /// rebuilt from the journal at start (karyos#738): one accounting, so
     /// no two operations share an id.
     used_ids: std::collections::HashSet<u64>,
+    /// This host's boot identity, journalled with each submit (karyos#738).
+    boot: Vec<u8>,
 }
 
 impl Agent {
@@ -275,8 +277,11 @@ impl Agent {
             .as_mut()
             .map(Journal::take_operations)
             .unwrap_or_default();
-        let outcomes = crate::preview::Outcomes::rebuild(&operations, start);
-        let used_ids = operations.iter().map(|record| record.operation).collect();
+        let boot = crate::preview::boot_id();
+        let outcomes = crate::preview::Outcomes::rebuild(&operations, (start, &boot));
+        // Only callers' ids: the agent's own direct ids are not journalled
+        // as submits, and its allocator starts past them (karyos#738).
+        let used_ids = outcomes.ids().collect();
         let unopened_gap = journal_error.as_ref().map(|_| Gap {
             position: UNOPENED_POSITION,
             reason: GapReason::JournalUnavailableAtStart,
@@ -298,6 +303,7 @@ impl Agent {
             previews: crate::preview::Previews::default(),
             outcomes,
             used_ids,
+            boot,
         }
     }
 
@@ -521,7 +527,7 @@ impl Agent {
     /// sent.
     pub fn guard_submit_for(
         &mut self,
-        (operation, token): (u64, crate::preview::Token),
+        (operation, token): (u64, Option<crate::preview::Token>),
         kind: crate::preview::PreviewKind,
         dir: &Path,
         guard: u64,
@@ -550,6 +556,8 @@ impl Agent {
         if self.used_ids.contains(&operation) {
             return Err(SubmitRefusal::OperationConflict);
         }
+        // A fresh id needs its preview's token; a retry above needs none.
+        let token = token.ok_or(SubmitRefusal::TokenUnknown)?;
         let epoch = self
             .previews
             .take(token, &bound, instance, std::time::Instant::now())?;
@@ -578,8 +586,19 @@ impl Agent {
                 requester,
                 reason: bound.reason,
             };
-            self.outcomes
-                .record(operation, used, answer, host_monotonic_ns());
+            let now = host_monotonic_ns();
+            // Journalled as one submit, with the driver target, the full
+            // outcome and the boot: what a restart rebuilds (karyos#738).
+            if let Some(journal) = self.journal.as_mut() {
+                let record = crate::preview::submitted_record(
+                    operation,
+                    &used,
+                    (epoch, answer),
+                    (now, &self.boot),
+                );
+                let _ = journal.append(&record, now);
+            }
+            self.outcomes.record(operation, used, answer, now);
         }
         Ok(answer)
     }

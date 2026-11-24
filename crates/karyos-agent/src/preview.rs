@@ -40,14 +40,20 @@
 //!     journalled; past that, the id is a tombstone: a retry is answered
 //!     `operation expired`, distinct from a fresh operation and from a
 //!     retained outcome, and is not sent either.
-//!   - **Restarts.** With a journal, the retained outcomes and tombstones
-//!     are rebuilt at start from its guard records, so a restart keeps
-//!     them: a request without an outcome is an unknown outcome. Records
-//!     carry no driver directory, so an id rebuilt from the journal
-//!     compares the rest; and records written before this host's last
-//!     boot, whose monotonic times do not compare, are tombstones. A
-//!     journal that cannot be resumed (a new recording) starts with none,
-//!     and records the unknown interval it opens with.
+//!   - **Restarts.** With a journal, each sent submit is journalled as a
+//!     `Submitted` record (its operation, driver directory, guard,
+//!     principal, reason, epoch, full outcome and this host's boot
+//!     identity), and the retained outcomes, tombstones and caller ids
+//!     are rebuilt at start from those records only, so a restart keeps
+//!     them: the agent's own ids of direct operations are not among them.
+//!     A record of another boot (Linux's `boot_id`), whose monotonic time
+//!     does not compare, is a tombstone. A submit that was not sent (no
+//!     attach) is not journalled as one, and its id stays free. A journal
+//!     that cannot be resumed (a new recording) starts with none, and
+//!     records the unknown interval it opens with.
+//!   - **Retries need no token.** `submit OPID - ...` names no token: it
+//!     reaches a used id's retained outcome, and a fresh id without a
+//!     token is `token unknown`.
 //!   - **Id 0** is no operation id: refused as `operation id conflict`.
 
 use std::path::PathBuf;
@@ -351,7 +357,7 @@ pub(crate) fn last_state(audit: &[crate::api::GuardEntry], guard: u64) -> Option
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Used {
     pub(crate) kind: PreviewKind,
-    /// `None` when rebuilt from the journal, whose records carry none.
+    /// The driver's directory, journalled with the id (karyos#738 review).
     pub(crate) dir: Option<PathBuf>,
     pub(crate) guard: u64,
     pub(crate) requester: Requester,
@@ -362,7 +368,7 @@ impl Used {
     /// Whether `bound` asks for the same operation.
     fn same(&self, bound: &Bound) -> bool {
         self.kind == bound.kind
-            && self.dir.as_ref().is_none_or(|dir| *dir == bound.dir)
+            && self.dir.as_ref() == Some(&bound.dir)
             && self.guard == bound.guard
             && self.requester == bound.requester
             && self.reason == bound.reason
@@ -431,40 +437,53 @@ impl Outcomes {
         );
     }
 
-    /// Rebuilds the outcomes from the journal's guard records, oldest
-    /// first, at host time `now`: a request without an outcome is an
-    /// unknown one; a record timed after `now` is from before this boot,
-    /// a tombstone.
-    pub(crate) fn rebuild(records: &[crate::journal::JournalRecord], now: u64) -> Self {
+    /// Rebuilds the outcomes from the journal's [`Kind::Submitted`]
+    /// records, oldest first, at host time `now` on boot `boot`: only
+    /// caller-chosen ids that were sent are there. A record of another
+    /// boot (or of an unknown one) is a tombstone, as is one older than
+    /// [`RETAINED`] when answered.
+    ///
+    /// [`Kind::Submitted`]: crate::journal::Kind::Submitted
+    pub(crate) fn rebuild(
+        records: &[crate::journal::JournalRecord],
+        (now, boot): (u64, &[u8]),
+    ) -> Self {
         use crate::journal::{Kind, UNKNOWN_OUTCOME};
         use crate::operations::GuardAnswer;
         let mut outcomes = Self::default();
-        for record in records {
-            let kind = match record.kind {
-                Kind::CloseRequest | Kind::CloseOutcome => PreviewKind::Close,
-                _ => PreviewKind::Reopen,
+        for record in records
+            .iter()
+            .filter(|record| record.kind == Kind::Submitted)
+        {
+            let kind = if record.parameters == 2 {
+                PreviewKind::Reopen
+            } else {
+                PreviewKind::Close
             };
             let operation = record.operation;
-            let answer = match record.kind {
-                Kind::CloseRequest | Kind::ReopenRequest => GuardAnswer::NoAnswer { operation },
-                _ if record.code == UNKNOWN_OUTCOME => GuardAnswer::NoAnswer { operation },
-                _ if record.code == 0 => match karyos_sys::guard::decode(record.word) {
+            let answer = if record.code == UNKNOWN_OUTCOME {
+                GuardAnswer::NoAnswer { operation }
+            } else if record.code == 0 {
+                match karyos_sys::guard::decode(record.word) {
                     Ok(state) => GuardAnswer::State {
                         operation,
                         guard: record.guard,
                         state,
                     },
                     Err(_) => GuardAnswer::NoAnswer { operation },
-                },
-                _ => GuardAnswer::Refused {
+                }
+            } else {
+                GuardAnswer::Refused {
                     operation,
                     code: record.code,
                     detail: record.word,
-                },
+                }
             };
             let used = Used {
                 kind,
-                dir: None,
+                dir: Some(PathBuf::from(
+                    <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&record.target),
+                )),
                 guard: record.guard,
                 requester: Requester::relayed(
                     u32::try_from(record.operator).unwrap_or(u32::MAX),
@@ -472,17 +491,76 @@ impl Outcomes {
                 ),
                 reason: record.reason.clone(),
             };
+            let same_boot = !boot.is_empty() && record.boot == boot;
             let _ = outcomes.by_id.insert(
                 operation,
                 Outcome {
                     used,
                     answer,
-                    at: (record.time <= now).then_some(record.time),
+                    at: (same_boot && record.time <= now).then_some(record.time),
                 },
             );
         }
         outcomes
     }
+
+    /// The operation ids the outcomes hold: the caller ids used.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.by_id.keys().copied()
+    }
+}
+
+/// This host's boot identity (Linux's `boot_id`), or empty when it cannot
+/// be read: then no journalled outcome is taken for this boot's.
+pub(crate) fn boot_id() -> Vec<u8> {
+    std::fs::read("/proc/sys/kernel/random/boot_id")
+        .map(|mut id| {
+            while id.last().is_some_and(u8::is_ascii_whitespace) {
+                let _ = id.pop();
+            }
+            id
+        })
+        .unwrap_or_default()
+}
+
+/// The [`crate::journal::Kind::Submitted`] record of a caller's operation
+/// `operation` that was sent and answered `answer`, at `time` on `boot`.
+pub(crate) fn submitted_record(
+    operation: u64,
+    used: &Used,
+    (epoch, answer): (u64, crate::operations::GuardAnswer),
+    (time, boot): (u64, &[u8]),
+) -> crate::journal::JournalRecord {
+    use crate::journal::{JournalRecord, Kind, UNKNOWN_OUTCOME};
+    use crate::operations::GuardAnswer;
+    let mut record = JournalRecord::new(Kind::Submitted, time);
+    record.operation = operation;
+    record.guard = used.guard;
+    record.expected = epoch;
+    record.parameters = match used.kind {
+        PreviewKind::Close => 1,
+        PreviewKind::Reopen => 2,
+    };
+    record.operator = u64::from(used.requester.operator);
+    record.relay = used.requester.relay;
+    record.reason = used.reason.clone();
+    match answer {
+        GuardAnswer::State { state, .. } => {
+            record.word = karyos_sys::guard::encode(state).unwrap_or(0);
+        }
+        GuardAnswer::Refused { code, detail, .. } => {
+            record.code = code;
+            record.word = detail;
+        }
+        _ => record.code = UNKNOWN_OUTCOME,
+    }
+    record.target = used
+        .dir
+        .as_ref()
+        .map(|dir| std::os::unix::ffi::OsStrExt::as_bytes(dir.as_os_str()).to_vec())
+        .unwrap_or_default();
+    record.boot = boot.to_vec();
+    record
 }
 
 #[cfg(test)]
