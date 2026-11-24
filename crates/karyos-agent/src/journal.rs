@@ -433,9 +433,18 @@ pub struct Journal {
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
+    /// The guard operations' records the open read, until taken.
+    operations: Vec<JournalRecord>,
 }
 
 impl Journal {
+    /// The guard operations' records the open read, oldest first, taken
+    /// once (karyos#738): the agent rebuilds its retained outcomes from
+    /// them.
+    pub fn take_operations(&mut self) -> Vec<JournalRecord> {
+        std::mem::take(&mut self.operations)
+    }
+
     /// Opens the journal in `dir` at host time `now`, creating the
     /// directory if need be: resumes its open recording, or starts one,
     /// then records an unknown interval when the last run may have lost a
@@ -504,6 +513,7 @@ impl Journal {
             seal_chunk,
             #[cfg(test)]
             scanned: scan.all.clone(),
+            operations: scan.operations,
         };
         let last = scan.last.as_ref().map(|last| last.kind);
         let reason = if cut {
@@ -785,6 +795,9 @@ struct Scan {
     /// Every record, for tests that read a journal back.
     #[cfg(test)]
     all: Vec<JournalRecord>,
+    /// The guard operations' records, oldest first: the agent's retained
+    /// outcomes and used ids are rebuilt from them (karyos#738).
+    operations: Vec<JournalRecord>,
 }
 
 /// Reads every frame of `store`, oldest first.
@@ -840,6 +853,15 @@ fn scan(store: &mut SegmentStore<StdDisk>) -> Result<Scan, JournalError> {
                 }
                 #[cfg(test)]
                 found.all.push(record.clone());
+                if matches!(
+                    record.kind,
+                    Kind::CloseRequest
+                        | Kind::CloseOutcome
+                        | Kind::ReopenRequest
+                        | Kind::ReopenOutcome
+                ) {
+                    found.operations.push(record.clone());
+                }
                 found.last = Some(record);
             }
             u64::from(length)

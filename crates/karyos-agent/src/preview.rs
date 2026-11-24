@@ -28,8 +28,27 @@
 //!   sends it, whatever its outcome.
 //! - **The operation id.** A submit journals and audits its request and
 //!   outcome under `OPID`, as one operation: the preview itself leaves no
-//!   record. An id this agent already used in this run is refused
-//!   (`operation id reused`).
+//!   record. An id is used up by its first submit that is sent, whatever
+//!   came of it, and never takes a second operation:
+//!   - **A retry** (the same id, operation, guard, principal and reason,
+//!     with any token or none) is answered with the operation's retained
+//!     outcome, unsent: its state, its refusal, or `no answer` for an
+//!     unknown outcome, which is never retried as a new operation.
+//!   - **A conflict** (the same id with any of those different) is refused
+//!     `operation id conflict`, unsent.
+//!   - **Expiry.** An outcome is retained for [`RETAINED`] after it was
+//!     journalled; past that, the id is a tombstone: a retry is answered
+//!     `operation expired`, distinct from a fresh operation and from a
+//!     retained outcome, and is not sent either.
+//!   - **Restarts.** With a journal, the retained outcomes and tombstones
+//!     are rebuilt at start from its guard records, so a restart keeps
+//!     them: a request without an outcome is an unknown outcome. Records
+//!     carry no driver directory, so an id rebuilt from the journal
+//!     compares the rest; and records written before this host's last
+//!     boot, whose monotonic times do not compare, are tombstones. A
+//!     journal that cannot be resumed (a new recording) starts with none,
+//!     and records the unknown interval it opens with.
+//!   - **Id 0** is no operation id: refused as `operation id conflict`.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -37,6 +56,10 @@ use std::time::{Duration, Instant};
 use karyos_sys::guard::GuardState;
 
 use crate::agent::Requester;
+
+/// How long a submitted operation's outcome is retained for a retry
+/// (karyos#738); past it the id is a tombstone.
+pub const RETAINED: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long a preview's token stays valid.
 pub const PREVIEW_TTL: Duration = Duration::from_secs(60);
@@ -188,8 +211,10 @@ pub enum SubmitRefusal {
     ParametersMismatch,
     /// The driver is a new instance since the preview.
     TargetChanged,
-    /// The operation id was already used in this run, or is 0.
-    OperationReused,
+    /// The operation id was used for another operation, or is 0.
+    OperationConflict,
+    /// The operation id's retained outcome expired: a tombstone.
+    OperationExpired,
 }
 
 impl SubmitRefusal {
@@ -203,7 +228,8 @@ impl SubmitRefusal {
             Self::TargetMismatch => "target mismatch",
             Self::ParametersMismatch => "parameters mismatch",
             Self::TargetChanged => "target changed",
-            Self::OperationReused => "operation id reused",
+            Self::OperationConflict => "operation id conflict",
+            Self::OperationExpired => "operation expired",
         }
     }
 }
@@ -312,6 +338,145 @@ pub(crate) fn last_state(audit: &[crate::api::GuardEntry], guard: u64) -> Option
         .rev()
         .filter(|entry| entry.guard == guard && entry.after != 0)
         .find_map(|entry| karyos_sys::guard::decode(entry.after).ok())
+}
+
+/// What an operation id was used for: the operation, its target and its
+/// principal, compared on a retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Used {
+    pub(crate) kind: PreviewKind,
+    /// `None` when rebuilt from the journal, whose records carry none.
+    pub(crate) dir: Option<PathBuf>,
+    pub(crate) guard: u64,
+    pub(crate) requester: Requester,
+    pub(crate) reason: Vec<u8>,
+}
+
+impl Used {
+    /// Whether `bound` asks for the same operation.
+    fn same(&self, bound: &Bound) -> bool {
+        self.kind == bound.kind
+            && self.dir.as_ref().is_none_or(|dir| *dir == bound.dir)
+            && self.guard == bound.guard
+            && self.requester == bound.requester
+            && self.reason == bound.reason
+    }
+}
+
+/// A used operation id's entry.
+#[derive(Debug, Clone)]
+struct Outcome {
+    used: Used,
+    answer: crate::operations::GuardAnswer,
+    /// When it was journalled, host monotonic nanoseconds; `None` for one
+    /// from before this host's boot, a tombstone.
+    at: Option<u64>,
+}
+
+/// The outcomes of the operation ids used (karyos#738).
+#[derive(Debug, Default)]
+pub(crate) struct Outcomes {
+    by_id: std::collections::HashMap<u64, Outcome>,
+}
+
+impl Outcomes {
+    /// The answer to a submit of `bound` under `operation` at host time
+    /// `now`, if the id was used: the retained outcome of a retry, or the
+    /// refusal of a conflict or an expired id. `None` for a fresh id.
+    pub(crate) fn answer(
+        &self,
+        operation: u64,
+        bound: &Bound,
+        now: u64,
+    ) -> Option<Result<crate::operations::GuardAnswer, SubmitRefusal>> {
+        if operation == 0 {
+            return Some(Err(SubmitRefusal::OperationConflict));
+        }
+        let outcome = self.by_id.get(&operation)?;
+        if !outcome.used.same(bound) {
+            return Some(Err(SubmitRefusal::OperationConflict));
+        }
+        let retained = u64::try_from(RETAINED.as_nanos()).unwrap_or(u64::MAX);
+        let live = outcome
+            .at
+            .is_some_and(|at| now.checked_sub(at).is_some_and(|age| age <= retained));
+        Some(if live {
+            Ok(outcome.answer)
+        } else {
+            Err(SubmitRefusal::OperationExpired)
+        })
+    }
+
+    /// Records `operation`'s use for `used`, answered `answer` at `at`.
+    pub(crate) fn record(
+        &mut self,
+        operation: u64,
+        used: Used,
+        answer: crate::operations::GuardAnswer,
+        at: u64,
+    ) {
+        let _ = self.by_id.insert(
+            operation,
+            Outcome {
+                used,
+                answer,
+                at: Some(at),
+            },
+        );
+    }
+
+    /// Rebuilds the outcomes from the journal's guard records, oldest
+    /// first, at host time `now`: a request without an outcome is an
+    /// unknown one; a record timed after `now` is from before this boot,
+    /// a tombstone.
+    pub(crate) fn rebuild(records: &[crate::journal::JournalRecord], now: u64) -> Self {
+        use crate::journal::{Kind, UNKNOWN_OUTCOME};
+        use crate::operations::GuardAnswer;
+        let mut outcomes = Self::default();
+        for record in records {
+            let kind = match record.kind {
+                Kind::CloseRequest | Kind::CloseOutcome => PreviewKind::Close,
+                _ => PreviewKind::Reopen,
+            };
+            let operation = record.operation;
+            let answer = match record.kind {
+                Kind::CloseRequest | Kind::ReopenRequest => GuardAnswer::NoAnswer { operation },
+                _ if record.code == UNKNOWN_OUTCOME => GuardAnswer::NoAnswer { operation },
+                _ if record.code == 0 => match karyos_sys::guard::decode(record.word) {
+                    Ok(state) => GuardAnswer::State {
+                        operation,
+                        guard: record.guard,
+                        state,
+                    },
+                    Err(_) => GuardAnswer::NoAnswer { operation },
+                },
+                _ => GuardAnswer::Refused {
+                    operation,
+                    code: record.code,
+                    detail: record.word,
+                },
+            };
+            let used = Used {
+                kind,
+                dir: None,
+                guard: record.guard,
+                requester: Requester::relayed(
+                    u32::try_from(record.operator).unwrap_or(u32::MAX),
+                    record.relay,
+                ),
+                reason: record.reason.clone(),
+            };
+            let _ = outcomes.by_id.insert(
+                operation,
+                Outcome {
+                    used,
+                    answer,
+                    at: (record.time <= now).then_some(record.time),
+                },
+            );
+        }
+        outcomes
+    }
 }
 
 #[cfg(test)]

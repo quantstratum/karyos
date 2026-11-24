@@ -453,7 +453,31 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
         ),
         Err(SubmitRefusal::TokenUnknown)
     );
+    // A retry of 4242, whatever its token: the retained outcome, unsent.
     let garbage = Token::parse(&"0".repeat(32)).unwrap();
+    let audited = driver.guard_audit().records.len();
+    let retried = agent.guard_submit_for(
+        (4242, garbage),
+        PreviewKind::Close,
+        &driver_dir,
+        guard.id(),
+        operator,
+        b"halt",
+    );
+    assert_eq!(retried, answer);
+    assert_eq!(driver.guard_audit().records.len(), audited);
+    // The same id for anything else: a conflict, unsent.
+    assert_eq!(
+        agent.guard_submit_for(
+            (4242, garbage),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            Requester::local(1001),
+            b"halt",
+        ),
+        Err(SubmitRefusal::OperationConflict)
+    );
     assert_eq!(
         agent.guard_submit_for(
             (4242, garbage),
@@ -461,9 +485,9 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
             &driver_dir,
             guard.id(),
             operator,
-            b"halt",
+            b"other",
         ),
-        Err(SubmitRefusal::OperationReused)
+        Err(SubmitRefusal::OperationConflict)
     );
     // A guard that moved after the preview: the driver refuses the close at
     // the previewed epoch, atomically, and audits the refusal.
@@ -498,6 +522,37 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
         ),
         "{moved:?}"
     );
+    // A restart keeps the outcomes: rebuilt from the journal, a retry of
+    // 4242 still answers its outcome, and 4244's refusal too.
+    drop(agent);
+    let mut agent = Agent::new(
+        AgentConfig::new(vec![driver_dir.clone()])
+            .with_attach_timeout(Duration::from_secs(5))
+            .with_journal(dir.join("journal")),
+    );
+    let again = agent.guard_submit_for(
+        (4242, garbage),
+        PreviewKind::Close,
+        &driver_dir,
+        guard.id(),
+        operator,
+        b"halt",
+    );
+    assert_eq!(again, answer);
+    assert!(matches!(
+        agent.guard_submit_for(
+            (4244, garbage),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        ),
+        Ok(GuardAnswer::Refused {
+            operation: 4244,
+            ..
+        })
+    ));
     drop(agent);
     let _ = std::fs::remove_dir_all(&dir);
 }

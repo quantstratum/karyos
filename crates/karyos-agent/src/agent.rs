@@ -220,8 +220,9 @@ pub struct Agent {
     rates: Vec<crate::api::RateView>,
     /// The guard previews whose tokens a submit may name (karyos#738).
     previews: crate::preview::Previews,
-    /// The caller-chosen operation ids submitted in this run (karyos#738).
-    submitted: std::collections::HashSet<u64>,
+    /// The outcomes of the operation ids used, retained for retries and
+    /// rebuilt from the journal at start (karyos#738).
+    outcomes: crate::preview::Outcomes,
 }
 
 impl Agent {
@@ -259,13 +260,18 @@ impl Agent {
             })
             .collect();
         let start = host_monotonic_ns();
-        let (journal, journal_error) = match config.journal.as_deref() {
+        let (mut journal, journal_error) = match config.journal.as_deref() {
             None => (None, None),
             Some(dir) => match Journal::open(dir, start) {
                 Ok(journal) => (Some(journal), None),
                 Err(error) => (None, Some(error.to_string())),
             },
         };
+        let outcomes = journal
+            .as_mut()
+            .map_or_else(crate::preview::Outcomes::default, |journal| {
+                crate::preview::Outcomes::rebuild(&journal.take_operations(), start)
+            });
         let unopened_gap = journal_error.as_ref().map(|_| Gap {
             position: UNOPENED_POSITION,
             reason: GapReason::JournalUnavailableAtStart,
@@ -285,7 +291,7 @@ impl Agent {
             retention: None,
             rates: Vec::new(),
             previews: crate::preview::Previews::default(),
-            submitted: std::collections::HashSet::new(),
+            outcomes,
         }
     }
 
@@ -515,10 +521,7 @@ impl Agent {
         requester: Requester,
         reason: &[u8],
     ) -> Result<GuardAnswer, crate::preview::SubmitRefusal> {
-        use crate::preview::{Bound, PreviewKind, SubmitRefusal};
-        if operation == 0 || self.submitted.contains(&operation) {
-            return Err(SubmitRefusal::OperationReused);
-        }
+        use crate::preview::{Bound, PreviewKind, Used};
         let instance = self
             .drivers
             .iter()
@@ -531,15 +534,34 @@ impl Agent {
             requester,
             reason: operations::cut_reason(reason).to_vec(),
         };
+        // A used id: its retained outcome, or its refusal; never sent.
+        if let Some(answer) = self.outcomes.answer(operation, &bound, host_monotonic_ns()) {
+            return answer;
+        }
         let epoch = self
             .previews
             .take(token, &bound, instance, std::time::Instant::now())?;
-        let _ = self.submitted.insert(operation);
         let transition = match kind {
             PreviewKind::Close => operations::Transition::CloseAt(epoch),
             PreviewKind::Reopen => operations::Transition::Reopen(epoch),
         };
-        Ok(self.guard_command(dir, guard, transition, requester, reason, Some(operation)))
+        let answer = self.guard_command(dir, guard, transition, requester, reason, Some(operation));
+        // Sent: the id is used up, whatever came of it.
+        if matches!(
+            answer,
+            GuardAnswer::State { .. } | GuardAnswer::Refused { .. } | GuardAnswer::NoAnswer { .. }
+        ) {
+            let used = Used {
+                kind,
+                dir: Some(bound.dir),
+                guard,
+                requester,
+                reason: bound.reason,
+            };
+            self.outcomes
+                .record(operation, used, answer, host_monotonic_ns());
+        }
+        Ok(answer)
     }
 
     fn guard_command(

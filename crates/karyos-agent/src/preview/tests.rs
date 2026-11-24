@@ -196,3 +196,108 @@ fn the_newest_transition_gives_the_state() {
     );
     assert_eq!(last_state(&audit, 9), None);
 }
+
+/// karyos#738: a used id answers its retained outcome to a retry, refuses
+/// a conflict, and is a tombstone past `RETAINED` or from before the boot.
+#[test]
+fn a_used_id_is_retained_then_a_tombstone() {
+    use crate::operations::GuardAnswer;
+    let mut outcomes = Outcomes::default();
+    let close = bound(PreviewKind::Close, 1000, b"halt");
+    let answer = GuardAnswer::State {
+        operation: 5,
+        guard: 7,
+        state: GuardState {
+            epoch: 3,
+            open: false,
+        },
+    };
+    let used = Used {
+        kind: PreviewKind::Close,
+        dir: Some(close.dir.clone()),
+        guard: 7,
+        requester: close.requester,
+        reason: close.reason.clone(),
+    };
+    let at = 1_000;
+    assert_eq!(outcomes.answer(5, &close, at), None);
+    assert_eq!(
+        outcomes.answer(0, &close, at),
+        Some(Err(SubmitRefusal::OperationConflict))
+    );
+    outcomes.record(5, used, answer, at);
+    assert_eq!(outcomes.answer(5, &close, at + 1), Some(Ok(answer)));
+    assert_eq!(
+        outcomes.answer(5, &bound(PreviewKind::Reopen, 1000, b"halt"), at + 1),
+        Some(Err(SubmitRefusal::OperationConflict))
+    );
+    let retained = u64::try_from(RETAINED.as_nanos()).unwrap();
+    assert_eq!(outcomes.answer(5, &close, at + retained), Some(Ok(answer)));
+    assert_eq!(
+        outcomes.answer(5, &close, at + retained + 1),
+        Some(Err(SubmitRefusal::OperationExpired))
+    );
+}
+
+/// The journal's guard records rebuild the outcomes: an outcome's state or
+/// refusal, a request without an outcome as unknown, and a record from
+/// before the boot (timed after now) as a tombstone.
+#[test]
+fn outcomes_are_rebuilt_from_the_journal() {
+    use crate::journal::{JournalRecord, Kind, UNKNOWN_OUTCOME};
+    use crate::operations::GuardAnswer;
+    let record = |kind, operation, time, code, word| {
+        let mut record = JournalRecord::new(kind, time);
+        record.guard = 7;
+        record.operation = operation;
+        record.operator = 1000;
+        record.reason = b"halt".to_vec();
+        record.code = code;
+        record.word = word;
+        record
+    };
+    let records = [
+        record(Kind::CloseRequest, 1, 10, 0, 0),
+        record(Kind::CloseOutcome, 1, 11, 0, 6),
+        record(Kind::CloseRequest, 2, 12, 0, 0),
+        record(Kind::CloseRequest, 3, 13, 0, 0),
+        record(Kind::CloseOutcome, 3, 14, UNKNOWN_OUTCOME, 0),
+        record(Kind::CloseRequest, 4, 15, 0, 0),
+        record(Kind::CloseOutcome, 4, 16, 29, 5),
+        record(Kind::CloseRequest, 5, 900, 0, 0),
+        record(Kind::CloseOutcome, 5, 901, 0, 6),
+    ];
+    let outcomes = Outcomes::rebuild(&records, 100);
+    let close = bound(PreviewKind::Close, 1000, b"halt");
+    assert_eq!(
+        outcomes.answer(1, &close, 100),
+        Some(Ok(GuardAnswer::State {
+            operation: 1,
+            guard: 7,
+            state: GuardState {
+                epoch: 3,
+                open: false
+            }
+        }))
+    );
+    assert_eq!(
+        outcomes.answer(2, &close, 100),
+        Some(Ok(GuardAnswer::NoAnswer { operation: 2 }))
+    );
+    assert_eq!(
+        outcomes.answer(3, &close, 100),
+        Some(Ok(GuardAnswer::NoAnswer { operation: 3 }))
+    );
+    assert_eq!(
+        outcomes.answer(4, &close, 100),
+        Some(Ok(GuardAnswer::Refused {
+            operation: 4,
+            code: 29,
+            detail: 5
+        }))
+    );
+    assert_eq!(
+        outcomes.answer(5, &close, 100),
+        Some(Err(SubmitRefusal::OperationExpired))
+    );
+}
