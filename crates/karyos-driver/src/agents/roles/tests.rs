@@ -7259,3 +7259,86 @@ fn a_plain_send_never_overtakes_a_waiting_control() {
 }
 
 mod registration;
+
+/// On an authenticated channel a control goes sealed: it opens under its
+/// domain's key, holds the bare control's bytes, and a control that cannot
+/// be sealed sends nothing.
+#[test]
+fn a_sealed_control_opens_under_its_key_and_an_unsealable_one_is_not_sent() {
+    use std::sync::{Arc, Mutex};
+
+    use karyos_io::backend::InstanceId;
+    use karyos_io::sockets::endpoint::SocketsEndpoint;
+    use karyos_io::sockets::scripted::ScriptedSocket;
+    use karyos_protocol::network::{Datagram, classify};
+
+    use super::super::control::{ControlRoutes, ControlSendError};
+    use crate::wire_auth::{Party, Proof, ProofKind, Sealer, Verifier};
+
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            record.lock().unwrap().push(datagram.to_vec());
+        }
+    }));
+    for _ in 0..4 {
+        observer.push_send(karyos_io::sockets::ops::SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let endpoint = SocketsEndpoint::open(&loopback(), InstanceId::FIRST, socket).unwrap();
+    let (mut tx, _rx) = endpoint.split().unwrap();
+    let mut routes = ControlRoutes::new(2);
+    let pair = crate::wire_keys::parse(
+        "9-1.key",
+        b"format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=2222222222222222222222222222222222222222222222222222222222222222\nreceiver_id=66\npublisher_id=5\n",
+    )
+    .unwrap();
+    let party = Party::Receiver {
+        identity: identity(),
+        receiver_boot_id: [7, 8],
+        receiver_id: 66,
+    };
+    let control = Control::Solicit(RspSolicit {
+        alias: alias(),
+        challenge: ChallengeBlock {
+            receiver_boot_id: [7, 8],
+            nonce: [9, 9],
+        },
+    });
+    let to = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    // Domain 6, under the pair's RSP_SETUP proof.
+    let kind = ProofKind::RspSetup { receiver_id: 66 };
+    let mut proof = Proof::new(kind, alias(), Some(&pair), [&pair], 1).unwrap();
+    routes
+        .send_sealed(&mut tx, to, &control, &mut proof)
+        .unwrap();
+    // Domain 4, under the receiver's session key.
+    let mut sealer = Sealer::new(&pair, party, alias()).unwrap();
+    routes
+        .send_sealed(&mut tx, to, &control, &mut sealer)
+        .unwrap();
+    // A verify-only proof cannot seal: nothing goes.
+    let mut verify_only = Proof::new(kind, alias(), None, [&pair], 1).unwrap();
+    assert_eq!(
+        routes.send_sealed(&mut tx, to, &control, &mut verify_only),
+        Err(ControlSendError::Encode)
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let proved = proof.verify(&seen[0]).unwrap();
+    let inner = &seen[0][proved.opened.start..][..proved.opened.frames];
+    assert_eq!(classify(inner), Ok(Datagram::Control(control)));
+    let mut verifier = Verifier::new([&pair], party, alias()).unwrap();
+    let opened = verifier.open(&seen[1], 0).unwrap();
+    let inner = &seen[1][opened.start..][..opened.frames];
+    assert_eq!(classify(inner), Ok(Datagram::Control(control)));
+    // Neither is a bare control on the wire.
+    for bytes in seen.iter() {
+        assert!(!matches!(classify(bytes), Ok(Datagram::Control(_))));
+    }
+}

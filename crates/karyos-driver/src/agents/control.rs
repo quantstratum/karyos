@@ -35,6 +35,8 @@ use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::network::{Control, MAX_CONTROL_LENGTH};
 
+use crate::wire_auth::{ENVELOPE_LEN, Proof, Sealer};
+
 use super::EndpointId;
 
 /// The SM slot of one image (network-sessions.md S1: an SM slot per
@@ -375,6 +377,28 @@ fn wait_key(
         _ => None,
     };
     (control.kind(), alias)
+}
+
+/// Seals one encoded control: the `frames` bytes at the start of a buffer
+/// with room for the envelope, returning the sealed length, or `None` when
+/// it cannot be sealed (nothing is sent). A pairwise or sender control is
+/// sealed by the session's [`Sealer`] (domains 4 and 1), a SETUP or an
+/// RSP_SETUP by the channel's or pair's [`Proof`] (domains 5 and 6).
+pub trait ControlSeal {
+    /// Seals the control.
+    fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize>;
+}
+
+impl ControlSeal for Sealer {
+    fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
+        self.seal(buffer, frames).ok()
+    }
+}
+
+impl ControlSeal for Proof {
+    fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
+        self.seal(buffer, frames).ok()
+    }
 }
 
 /// Datagrams one control queue holds: controls are sent at once.
@@ -904,6 +928,31 @@ impl ControlRoutes {
         }
     }
 
+    /// [`ControlRoutes::send`] of a control on an authenticated channel:
+    /// sealed by `seal` in the domain its kind belongs to (ADR-0086
+    /// section 7a), encoded and sealed afresh at the send, so every
+    /// transmission takes a fresh envelope sequence. A sealed control never
+    /// waits for a later cycle; while another control to `address` waits
+    /// it is refused `Blocked`, and one that cannot be sealed is refused
+    /// `Encode` without anything being queued.
+    ///
+    /// # Errors
+    ///
+    /// As [`ControlRoutes::send`].
+    pub fn send_sealed<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        control: &Control,
+        seal: &mut dyn ControlSeal,
+    ) -> Result<(), ControlSendError> {
+        self.send_waiting(tx);
+        if self.waiting.iter().any(|(at, _)| *at == address) {
+            return Err(ControlSendError::Blocked);
+        }
+        self.send_encoded(tx, address, control, false, Some(seal))
+    }
+
     fn send_now<O: SocketOps>(
         &mut self,
         tx: &mut SocketsTx<O>,
@@ -911,10 +960,29 @@ impl ControlRoutes {
         control: &Control,
         transient: bool,
     ) -> Result<(), ControlSendError> {
-        let mut bytes = [0u8; MAX_CONTROL_LENGTH];
-        let length = control
-            .encode(&mut bytes)
+        self.send_encoded(tx, address, control, transient, None)
+    }
+
+    fn send_encoded<O: SocketOps>(
+        &mut self,
+        tx: &mut SocketsTx<O>,
+        address: SocketAddr,
+        control: &Control,
+        transient: bool,
+        seal: Option<&mut dyn ControlSeal>,
+    ) -> Result<(), ControlSendError> {
+        let mut bytes = [0u8; MAX_CONTROL_LENGTH + ENVELOPE_LEN];
+        let plain = bytes
+            .get_mut(..MAX_CONTROL_LENGTH)
+            .ok_or(ControlSendError::Encode)?;
+        let mut length = control
+            .encode(plain)
             .map_err(|_| ControlSendError::Encode)?;
+        if let Some(seal) = seal {
+            length = seal
+                .seal_control(&mut bytes, length)
+                .ok_or(ControlSendError::Encode)?;
+        }
         let encoded = bytes.get(..length).ok_or(ControlSendError::Encode)?;
         // A reply that reuses a destination's own route (karyos#977
         // review): failing, it must not take that route with it.

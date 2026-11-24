@@ -35,6 +35,9 @@ use zeroize::Zeroizing;
 
 use crate::wire_keys::{Context, KEY_LEN, KeyFile, Material, Purpose, Scope};
 
+/// Bytes the envelope adds to a datagram: the 32-byte header and the
+/// 16-byte tag (ADR-0086 section 5, `E`).
+pub const ENVELOPE_LEN: usize = HEADER_LEN + karyos_protocol::protection::hmac_sha256::TAG_LEN;
 /// The HMAC-SHA-256 usage limit: tags per key (manifest 4.3).
 pub const TAG_CAP: u64 = 1 << 48;
 /// Where a sender moves to the next in-band key epoch: 75% of
@@ -281,6 +284,19 @@ impl Sealer {
     #[must_use]
     pub fn party_epoch(&self) -> u8 {
         self.party_epoch
+    }
+
+    /// Whether [`Sealer::seal`] can seal one more datagram: false once the
+    /// usage limit is reached with no in-band epoch left. A sender asks
+    /// before it reads anything it would then have to drop.
+    #[must_use]
+    pub fn can_seal(&self) -> bool {
+        let seq = self.profile.next_seq();
+        if seq >= ROTATE_AT {
+            self.party_epoch < u8::MAX
+        } else {
+            seq < TAG_CAP
+        }
     }
 
     /// Seals the first `frames` bytes of `datagram` with a fresh envelope
