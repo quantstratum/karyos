@@ -78,6 +78,38 @@ fn large_config(local: SocketAddr) -> SocketsConfig {
     config
 }
 
+/// Flushes `queue` without committing anything; returns the report.
+fn flush_only(node: &mut Node, queue: TxQueueId) -> (FlushOutcome, Vec<TxEntry>) {
+    let mut report = TxReport::new();
+    let outcome = node.tx.flush(
+        FlushRequest {
+            queue,
+            max_datagrams: nz(64),
+            max_bytes: u32::MAX,
+        },
+        &mut Gate::default(),
+        &mut report,
+    );
+    (outcome, drain(&mut report))
+}
+
+/// Commits `bytes` on `queue` unless the queue or the pool is full;
+/// returns whether it did.
+fn commit_if_room(node: &mut Node, queue: TxQueueId, bytes: &[u8], token: u64) -> bool {
+    let Ok(mut frame) = node.tx.claim_tx(queue, bytes.len()) else {
+        return false;
+    };
+    frame.bytes_mut().copy_from_slice(bytes);
+    frame
+        .commit(Commit {
+            len: bytes.len(),
+            token: SenderToken::new(token),
+            options: TxOptions::none(),
+        })
+        .unwrap();
+    true
+}
+
 /// A multicast endpoint on `local`, joined to `group` on the interface
 /// `index`, which also carries what it sends (`IP_MULTICAST_IF`).
 fn joined(local: SocketAddr, group: Ipv4Addr, index: u32, loopback: bool) -> Node {
@@ -217,8 +249,17 @@ fn privileged_an_mtu_shrink_faults_the_queue() {
             cause: PendingCause::Faulted(faulted)
         }]
     );
-    let returned = node.retire();
-    assert_eq!(returned.len(), 1);
+    // The fault is stored: with the MTU back, the queue still exposes
+    // nothing until it is retried, and the retried head then goes out.
+    let (outcome, entries) = flush_only(&mut node, queue);
+    assert_eq!(outcome.stop, FlushStop::Faulted(faulted));
+    assert_eq!((outcome.submitted, outcome.spent.ops), (0, 0));
+    assert!(entries.is_empty());
+    node.tx.retry_queue(queue).unwrap();
+    let (outcome, entries) = flush_only(&mut node, queue);
+    assert_eq!(outcome.submitted, 1);
+    assert!(all_submitted(&entries));
+    node.shutdown();
 }
 
 /// Section 12 (section 9 environment), a small `SO_SNDBUF`: behind `s0`'s
@@ -237,30 +278,28 @@ fn privileged_a_small_send_buffer_gives_eagain() {
     let mut node = Node::open(&config);
     let queue = node.queue_to(SocketAddr::from((Ipv4Addr::new(10, 79, 0, 2), 9)));
     let datagram = [3_u8; 1400];
-    let burst: [&[u8]; 8] = [&datagram; 8];
-    let (mut outcome, mut entries) = node.send(queue, &burst);
-    // At 100 kbit/s one datagram leaves every 112 ms; ten flushes in a
-    // row cannot drain the buffer between them.
-    for _ in 0..10 {
+    // At 100 kbit/s one datagram leaves every 112 ms. The queue is kept
+    // full and flushed until a flush reports the refusal, within a bounded
+    // time, so a scheduling pause that lets the buffer drain only delays it.
+    let deadline = Instant::now() + PATIENCE;
+    let mut token = 0_u64;
+    let (outcome, entries) = loop {
+        while commit_if_room(&mut node, queue, &datagram, token) {
+            token += 1;
+        }
+        let (outcome, entries) = flush_only(&mut node, queue);
         if outcome.stop == FlushStop::WouldBlock {
-            break;
+            break (outcome, entries);
         }
         assert!(
             matches!(outcome.stop, FlushStop::Exposed | FlushStop::ErrorLost),
             "{outcome:?}"
         );
-        let mut report = TxReport::new();
-        outcome = node.tx.flush(
-            FlushRequest {
-                queue,
-                max_datagrams: nz(64),
-                max_bytes: u32::MAX,
-            },
-            &mut Gate::default(),
-            &mut report,
+        assert!(
+            Instant::now() < deadline,
+            "no EAGAIN behind a 100 kbit/s link"
         );
-        entries = drain(&mut report);
-    }
+    };
     assert_eq!(outcome.stop, FlushStop::WouldBlock, "{outcome:?}");
     assert_eq!(outcome.submitted, 0);
     assert_eq!(

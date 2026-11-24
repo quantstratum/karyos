@@ -45,10 +45,11 @@ volumes=(
 )
 test_args=(-p karyos-io --lib --locked)
 
-# Each run's log must show at least one test passed and none failed.
+# Each run's log must show exactly the expected number of tests passed,
+# so a test renamed out of the filter fails the gate.
 check_ran() {
-    if ! grep -Eq "test result: ok\. [1-9][0-9]* passed" "$1"; then
-        echo "FAILED: no privileged test ran in $2"
+    if ! grep -Eq "test result: ok\. $3 passed" "$1"; then
+        echo "FAILED: $2 did not pass exactly $3 privileged tests"
         exit 4
     fi
 }
@@ -115,7 +116,7 @@ docker run --rm --cap-add NET_ADMIN --cap-add SYS_ADMIN \
     ' sh "${test_args[@]}" 2>&1 | tee "$log"
 status=${PIPESTATUS[0]}
 [ "$status" -eq 0 ] || exit "$status"
-check_ran "$log" network
+check_ran "$log" network 4
 
 for profile in enosys:38 eperm:1; do
     name="${profile%%:*}"
@@ -131,6 +132,6 @@ for profile in enosys:38 eperm:1; do
         2>&1 | tee "$log"
     status=${PIPESTATUS[0]}
     [ "$status" -eq 0 ] || exit "$status"
-    check_ran "$log" "seccomp $name"
+    check_ran "$log" "seccomp $name" 1
 done
 echo "privileged gate: every step passed"
