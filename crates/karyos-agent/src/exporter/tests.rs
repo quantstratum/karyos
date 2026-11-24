@@ -839,3 +839,374 @@ fn a_head_with_a_header_that_is_not_utf8_is_refused() {
         String::from_utf8_lossy(&answer)
     );
 }
+
+/// A peer that connects to `exporter` and trickles one byte of `bytes`
+/// every 40 ms, each within [`IO_TIMEOUT`], until the exporter hangs up;
+/// returns what one poll answered and how long it took (karyos#887
+/// review).
+fn trickle(exporter: &mut Exporter, bytes: &'static [u8]) -> (Vec<Answered>, Duration) {
+    let address = exporter.local_addr().unwrap();
+    let peer = std::thread::spawn(move || {
+        let mut peer = TcpStream::connect(address).unwrap();
+        for byte in bytes.iter().cycle().take(200) {
+            if peer.write_all(&[*byte]).is_err() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    let started = std::time::Instant::now();
+    let mut answered = Vec::new();
+    while answered.is_empty() && started.elapsed() < Duration::from_secs(5) {
+        answered = exporter.poll(|| "karyos_up 1\n".to_owned()).unwrap();
+    }
+    let took = started.elapsed();
+    drop(peer);
+    (answered, took)
+}
+
+#[test]
+fn a_peer_that_trickles_its_request_is_cut_off_at_the_deadline() {
+    let mut exporter = bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let (answered, took) = trickle(&mut exporter, b"GET /metrics HTTP/1.1\r\nX: ");
+    assert_eq!(answered, vec![Answered::Dropped]);
+    assert!(took < CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
+}
+
+/// karyos#887: the exporter over TLS.
+#[cfg(feature = "exporter-tls")]
+mod over_tls {
+    use std::sync::Arc;
+
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, ServerName};
+
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../karyos-control/tests/fixtures")
+            .join(name)
+    }
+
+    /// `source` copied to a private file of mode `mode` in a test
+    /// directory named `name`.
+    fn copied(source: &std::path::Path, name: &str, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("karyos-887-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("key.pem");
+        std::fs::copy(source, &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    }
+
+    fn key(name: &str) -> PathBuf {
+        copied(&fixture("server.key"), name, 0o600)
+    }
+
+    fn token() -> Token {
+        Token::new(vec![b'k'; 32]).unwrap()
+    }
+
+    fn exporter(address: &str, name: &str) -> Exporter {
+        let config = tls::server_config(&fixture("server.pem"), &key(name)).unwrap();
+        bind_tls(address.parse().unwrap(), config, Some(token())).unwrap()
+    }
+
+    /// The fixture CA, or none.
+    fn roots(trusted: bool) -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        if trusted {
+            for root in CertificateDer::pem_file_iter(fixture("ca.pem")).unwrap() {
+                roots.add(root.unwrap()).unwrap();
+            }
+        }
+        roots
+    }
+
+    /// A TLS 1.3 client with `roots`, naming the server `name`, sends
+    /// `request` to the exporter on 127.0.0.1 in a thread while the
+    /// exporter is polled; the answer, or `None` when the handshake or the
+    /// read failed.
+    fn exchange_tls(
+        exporter: &mut Exporter,
+        roots: rustls::RootCertStore,
+        name: &'static str,
+        request: &str,
+    ) -> (Option<String>, Vec<Answered>) {
+        exchange_tls_after(exporter, roots, name, request, Duration::ZERO)
+    }
+
+    /// [`exchange_tls`], the request sent `pause` after the handshake.
+    fn exchange_tls_after(
+        exporter: &mut Exporter,
+        roots: rustls::RootCertStore,
+        name: &'static str,
+        request: &str,
+        pause: Duration,
+    ) -> (Option<String>, Vec<Answered>) {
+        let port = exporter.local_addr().unwrap().port();
+        let request = request.to_owned();
+        let client = std::thread::spawn(move || {
+            let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls_graviola::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            let connection = rustls::ClientConnection::new(
+                Arc::new(config),
+                ServerName::try_from(name).unwrap(),
+            )
+            .unwrap();
+            let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            tcp.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut stream = rustls::StreamOwned::new(connection, tcp);
+            if !pause.is_zero() {
+                while stream.conn.is_handshaking() {
+                    stream.conn.complete_io(&mut stream.sock).ok()?;
+                }
+                std::thread::sleep(pause);
+            }
+            stream.write_all(request.as_bytes()).ok()?;
+            let mut answer = String::new();
+            stream.read_to_string(&mut answer).ok()?;
+            Some(answer)
+        });
+        let mut answered = Vec::new();
+        for _ in 0..400 {
+            answered = exporter.poll(|| "karyos_up 1\n".to_owned()).unwrap();
+            if !answered.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (client.join().unwrap(), answered)
+    }
+
+    fn scrape(
+        exporter: &mut Exporter,
+        roots: rustls::RootCertStore,
+        name: &'static str,
+    ) -> (Option<String>, Vec<Answered>) {
+        exchange_tls(
+            exporter,
+            roots,
+            name,
+            &format!(
+                "GET /metrics HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+                "k".repeat(32)
+            ),
+        )
+    }
+
+    #[test]
+    fn a_scrape_over_tls_is_answered_and_its_token_guards_it() {
+        let mut exporter = exporter("127.0.0.1:0", "guards");
+        let (answer, answered) = scrape(&mut exporter, roots(true), "localhost");
+        assert_eq!(answered, vec![Answered::Metrics]);
+        let answer = answer.unwrap();
+        assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
+        assert!(answer.ends_with("karyos_up 1\n"), "{answer}");
+        let (answer, answered) = exchange_tls(
+            &mut exporter,
+            roots(true),
+            "localhost",
+            "GET /metrics HTTP/1.1\r\n\r\n",
+        );
+        assert_eq!(answered, vec![Answered::Unauthorized]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn the_certificate_is_verified_by_its_ip_san_too() {
+        let mut exporter = exporter("127.0.0.1:0", "ip-san");
+        let (answer, answered) = scrape(&mut exporter, roots(true), "127.0.0.1");
+        assert_eq!(answered, vec![Answered::Metrics]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn a_scraper_that_does_not_trust_the_ca_or_names_another_host_gets_nothing() {
+        let mut exporter = exporter("127.0.0.1:0", "untrusted");
+        let (answer, answered) = scrape(&mut exporter, roots(false), "localhost");
+        assert_eq!((answer, answered), (None, vec![Answered::Dropped]));
+        let (answer, answered) = scrape(&mut exporter, roots(true), "metrics.example.com");
+        assert_eq!((answer, answered), (None, vec![Answered::Dropped]));
+    }
+
+    #[test]
+    fn a_non_loopback_address_is_bound_only_with_tls_and_a_token() {
+        assert!(matches!(
+            bind("0.0.0.0:0".parse().unwrap()),
+            Err(ExportError::NotLoopback(_))
+        ));
+        let config = tls::server_config(&fixture("server.pem"), &key("no-token")).unwrap();
+        assert!(matches!(
+            bind_tls("0.0.0.0:0".parse().unwrap(), Arc::clone(&config), None),
+            Err(ExportError::NoToken(_))
+        ));
+        let mut exporter = bind_tls("0.0.0.0:0".parse().unwrap(), config, Some(token())).unwrap();
+        let (answer, answered) = scrape(&mut exporter, roots(true), "localhost");
+        assert_eq!(answered, vec![Answered::Metrics]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 200 OK"));
+        let (answer, answered) = exchange_tls(
+            &mut exporter,
+            roots(true),
+            "localhost",
+            "GET /metrics HTTP/1.1\r\n\r\n",
+        );
+        assert_eq!(answered, vec![Answered::Unauthorized]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 401"));
+    }
+
+    #[test]
+    fn a_peer_that_trickles_its_handshake_is_cut_off_at_the_deadline() {
+        let mut exporter = exporter("0.0.0.0:0", "trickle");
+        // A TLS record header of a ClientHello, then its body byte by byte.
+        let (answered, took) = trickle(
+            &mut exporter,
+            b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03",
+        );
+        assert_eq!(answered, vec![Answered::Dropped]);
+        assert_eq!(exporter.deadline(), TLS_CONNECTION_DEADLINE);
+        assert!(took < TLS_CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
+        // A shorter deadline is honoured.
+        let mut short = self::exporter("0.0.0.0:0", "trickle-short")
+            .with_deadline(CONNECTION_DEADLINE)
+            .unwrap();
+        let (answered, took) = trickle(&mut short, b"\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03");
+        assert_eq!(answered, vec![Answered::Dropped]);
+        assert!(took < CONNECTION_DEADLINE + IO_TIMEOUT * 3, "{took:?}");
+    }
+
+    /// karyos#887 review: a deadline outside 1 ms to 30 s is a typed
+    /// error, and the step follows the transport however often it is set.
+    #[test]
+    fn a_deadline_is_bounded_and_its_step_follows_the_transport() {
+        for bad in [
+            Duration::ZERO,
+            MAX_CONNECTION_DEADLINE + Duration::from_millis(1),
+            Duration::MAX,
+        ] {
+            assert!(matches!(
+                exporter("127.0.0.1:0", "bad-deadline").with_deadline(bad),
+                Err(ExportError::InvalidDeadline(_))
+            ));
+        }
+        let tls = exporter("127.0.0.1:0", "tls-step")
+            .with_deadline(Duration::from_millis(50))
+            .unwrap()
+            .with_deadline(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(
+            (tls.deadline(), tls.step),
+            (Duration::from_secs(3), Duration::from_secs(3))
+        );
+        let plain = bind("127.0.0.1:0".parse().unwrap())
+            .unwrap()
+            .with_deadline(Duration::from_millis(50))
+            .unwrap()
+            .with_deadline(Duration::from_secs(3))
+            .unwrap();
+        assert_eq!(
+            (plain.deadline(), plain.step),
+            (Duration::from_secs(3), IO_TIMEOUT)
+        );
+    }
+
+    /// A remote scraper whose request comes a long round trip after the
+    /// handshake, past `IO_TIMEOUT` but within the TLS deadline, is still
+    /// answered (karyos#887 review).
+    #[test]
+    fn a_scraper_on_a_slow_network_is_answered_within_the_tls_deadline() {
+        let mut exporter = exporter("127.0.0.1:0", "slow-network");
+        let (answer, answered) = exchange_tls_after(
+            &mut exporter,
+            roots(true),
+            "localhost",
+            &format!(
+                "GET /metrics HTTP/1.1\r\nAuthorization: Bearer {}\r\n\r\n",
+                "k".repeat(32)
+            ),
+            Duration::from_millis(400),
+        );
+        assert_eq!(answered, vec![Answered::Metrics]);
+        assert!(answer.unwrap().starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn plain_http_to_a_tls_exporter_is_dropped() {
+        let mut exporter = exporter("127.0.0.1:0", "plain");
+        let (answer, answered) = exchange(&mut exporter, "GET /metrics HTTP/1.1\r\n\r\n");
+        assert_eq!(answered, vec![Answered::Dropped]);
+        assert!(!answer.contains("karyos_up"), "{answer}");
+    }
+
+    #[test]
+    fn a_bad_key_or_certificate_file_is_a_typed_refusal() {
+        let cert = fixture("server.pem");
+        assert!(matches!(
+            tls::server_config(&fixture("missing.pem"), &key("missing")),
+            Err(tls::TlsError::Pem { .. })
+        ));
+        // A key readable by others.
+        let open = copied(&fixture("server.key"), "open-key", 0o644);
+        assert!(matches!(
+            tls::server_config(&cert, &open),
+            Err(tls::TlsError::KeyMode(_))
+        ));
+        // A certificate where the key should be.
+        let not_a_key = copied(&cert, "not-a-key", 0o600);
+        assert!(matches!(
+            tls::server_config(&cert, &not_a_key),
+            Err(tls::TlsError::Pem { .. })
+        ));
+        // A key where the certificate should be.
+        assert!(matches!(
+            tls::server_config(&key("no-cert"), &key("no-cert-key")),
+            Err(tls::TlsError::Pem { .. })
+        ));
+        // A valid key that is not the certificate's.
+        let other = copied(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/other.key"),
+            "other-key",
+            0o600,
+        );
+        assert!(matches!(
+            tls::server_config(&cert, &other),
+            Err(tls::TlsError::Rustls(_))
+        ));
+    }
+
+    /// The suites a scraper can negotiate: the provider's TLS 1.3 suites
+    /// only (recorded in the admission record).
+    #[test]
+    fn only_tls13_suites_are_offered() {
+        let config = tls::server_config(&fixture("server.pem"), &key("suites")).unwrap();
+        let suites: Vec<String> = config
+            .crypto_provider()
+            .cipher_suites
+            .iter()
+            .filter(|suite| suite.version() == &rustls::version::TLS13)
+            .map(|suite| format!("{:?}", suite.suite()))
+            .collect();
+        assert_eq!(
+            suites,
+            [
+                "TLS13_AES_128_GCM_SHA256",
+                "TLS13_AES_256_GCM_SHA384",
+                "TLS13_CHACHA20_POLY1305_SHA256"
+            ]
+        );
+    }
+
+    /// The development and CI hosts have the provider's features.
+    #[test]
+    fn this_cpu_runs_the_provider() {
+        assert!(tls::check_cpu().is_ok());
+    }
+}

@@ -16,8 +16,10 @@
 //! `AppliedNotDurable` (a driver that applies a Ready's fresh entries),
 //! `ReleasedBeforePersisted` (a driver that releases before the sync),
 //! `DivergentResponse` (a service that alters one server's answers) and
-//! `NotLinearizable` (a client that records a value no one wrote). The
-//! other checks of
+//! `NotLinearizable` (a client that records a value no one wrote), and,
+//! with the harness catching a core's panic (karyos#976), `DurableLost` (a
+//! disk that lies about syncs), `CommittedTruncated` (a server that stores
+//! no commit) and `CorePanicked` itself. The other checks of
 //! `karyos_sim::harness::check::Violation` keep their fixture negative
 //! cases (`crates/karyos-sim/tests/harness.rs`); why each has no mutant
 //! here is recorded in `eval/raft-candidates/README.md` (karyos#976).
@@ -47,6 +49,16 @@ const TRUNCATE: u8 = 4;
 /// Each server reports no last index while its log holds entries
 /// (karyos#976).
 const UNREPORTED: u8 = 5;
+/// Server 2's core panics at its tenth Ready (karyos#976): any core's
+/// panic, not a particular library's.
+const PANICS: u8 = 6;
+/// Server 1's core panics in its recovery, at the run's first start
+/// (karyos#976 review).
+const PANICS_AT_RECOVERY: u8 = 8;
+/// Server 2 never stores a commit, then truncates its whole log once the
+/// cluster has applied some (karyos#976): C4's log has no stored commit
+/// to refuse the truncation below.
+const FORGETS: u8 = 7;
 
 #[derive(Debug)]
 struct Mutant<const KIND: u8> {
@@ -58,6 +70,8 @@ struct Mutant<const KIND: u8> {
     applied: u64,
     /// Whether it truncated already (`TRUNCATE`).
     truncated: bool,
+    /// Readys taken (`PANICS`).
+    readies: u32,
 }
 
 impl<const KIND: u8> Mutant<KIND> {
@@ -100,6 +114,17 @@ impl<const KIND: u8> Mutant<KIND> {
                     entry.index += 1;
                 }
             }
+            FORGETS if self.id == 2 => {
+                if let Some(state) = ready.hard_state.as_mut() {
+                    state.commit = None;
+                }
+                if !self.truncated && self.applied >= 4 {
+                    ready.truncate_from = Some(1);
+                    ready.entries.clear();
+                    self.truncated = true;
+                }
+                self.applied += u64::try_from(ready.committed.len()).unwrap();
+            }
             TRUNCATE if self.id == 2 => {
                 if !self.truncated && self.applied >= 4 {
                     // Drops the entries it applied, and appends nothing:
@@ -120,12 +145,17 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     type Message = <RaftRs as ConsensusCore>::Message;
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
+        assert!(
+            !(KIND == PANICS_AT_RECOVERY && id == 1),
+            "a core that panics in its recovery (karyos#976)"
+        );
         Self {
             id,
             core: RaftRs::recover(id, peers, log),
             handed: 0,
             applied: 0,
             truncated: false,
+            readies: 0,
         }
     }
 
@@ -142,6 +172,10 @@ impl<const KIND: u8> ConsensusCore for Mutant<KIND> {
     }
 
     fn ready(&mut self, log: &mut LogView<'_>) -> Option<Ready<Self::Message>> {
+        if KIND == PANICS && self.id == 2 {
+            self.readies += 1;
+            assert!(self.readies < 10, "a core that panics (karyos#976)");
+        }
         let ready = self.core.ready(log)?;
         Some(self.mutate(ready))
     }
@@ -327,5 +361,78 @@ fn an_altered_answer_reaches_the_client() {
     assert!(
         matches!(violation, Violation::NotLinearizable(_)),
         "{violation:?}"
+    );
+}
+
+/// A core that panics is caught at the harness's core boundary, whatever
+/// the core: the run completes, and the panic is its verdict when nothing
+/// else names a cause (karyos#976).
+#[test]
+fn a_core_that_panics_is_caught_and_reported() {
+    let case = case();
+    let outcome = workloads::run::<Mutant<PANICS>>(&case, 1).unwrap();
+    assert!(
+        matches!(outcome.safety, Err(Violation::CorePanicked { node: 2 })),
+        "{:?}",
+        outcome.safety
+    );
+}
+
+/// A disk that acknowledges file syncs without making them durable loses
+/// them at a crash: the restarted server's log no longer holds what it
+/// reported durable, and `DurableLost` names it even though the real core
+/// may panic over the loss afterwards (karyos#976).
+#[test]
+fn a_disk_that_lies_about_syncs_loses_durable_entries_at_a_crash() {
+    let faults = workloads::Faults {
+        lying_disks: vec![1],
+        ..workloads::Faults::default()
+    };
+    let violation = faulty(
+        faults,
+        vec![
+            (300, workloads::Action::Crash(1)),
+            (340, workloads::Action::Restart(1)),
+        ],
+    );
+    assert!(
+        matches!(violation, Violation::DurableLost { node: 1, .. }),
+        "{violation:?}"
+    );
+}
+
+/// A server that stores no commit lets C4's log truncate entries the
+/// cluster applied (karyos#976). The run's first verdict is the contract
+/// breach that follows (its next append is no longer the next index), so
+/// the check is asked directly over the same run's observations:
+/// `CommittedTruncated` names the truncation itself.
+#[test]
+fn a_server_that_forgets_its_commit_and_truncates_applied_entries_is_caught() {
+    let outcome = workloads::run::<Mutant<FORGETS>>(&case(), 1).unwrap();
+    assert!(
+        matches!(outcome.safety, Err(Violation::Contract { node: 2, .. })),
+        "{:?}",
+        outcome.safety
+    );
+    let truncated = karyos_sim::harness::check::durable_kept(&outcome.observations);
+    assert!(
+        matches!(
+            truncated,
+            Err(Violation::CommittedTruncated { node: 2, .. })
+        ),
+        "{truncated:?}"
+    );
+}
+
+/// A core that panics in its first recovery, when the run builds its
+/// servers, is caught there too: the run completes, with that server down
+/// from the start (karyos#976 review).
+#[test]
+fn a_core_that_panics_in_its_recovery_is_caught_and_reported() {
+    let outcome = workloads::run::<Mutant<PANICS_AT_RECOVERY>>(&case(), 1).unwrap();
+    assert!(
+        matches!(outcome.safety, Err(Violation::CorePanicked { node: 1 })),
+        "{:?}",
+        outcome.safety
     );
 }

@@ -15,6 +15,9 @@
 # (scripts/package-testkit.sh) is never put here: it is not a release
 # package. Signing is a separate step, scripts/sign-release.sh, run by the
 # release key's custodian; this script signs nothing.
+# Both MANIFESTs say `signed=no`: a signature is a detached file beside
+# the archive, never inside it, so an archive states that it carries none
+# and its release notes say whether one was published (RELEASING.md).
 #
 # The archives are deterministic for a commit, a toolchain and a host
 # tar: sorted entries, owner 0, modes from the file's kind (not the
@@ -92,6 +95,7 @@ rustc=$(rustc -V)
 profile=release
 contents=karyosd
 excludes=libkaryos
+signed=no
 EOF
 
 # `sha256sum`'s output for the files given (GNU coreutils, or shasum).
@@ -152,6 +156,9 @@ tar -tzf "$work/out/$daemon_name.tar.gz" | grep -q 'libkaryos' &&
     fail "the karyosd artifact holds libkaryos"
 
 rm -rf "$dest"
+# DEST's parent may not exist yet, as with a CARGO_TARGET_DIR outside
+# the tree, where `target/` is never created.
+mkdir -p "$(dirname "$dest")"
 mv "$work/out" "$dest"
 echo "release artifacts of core $commit in $dest:"
 cat "$dest/SHA256SUMS"

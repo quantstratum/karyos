@@ -8,10 +8,34 @@
 //! ([`XDP_OBJECT`]), committed with its source (`bpf/karyos-xdp`), its
 //! provenance manifest (`src/xdp/karyos_xdp.manifest.toml`) and the
 //! notices of the code it contains (`src/xdp/NOTICE`), and its loader
-//! over the admitted `aya` (`load`, Linux only). The sockets, UMEM and rings follow
-//! in their own issue.
+//! over the admitted `aya` (`load`, Linux only); the copy-mode endpoint
+//! ([`endpoint::XdpEndpoint`]) over the [`ops::XskOps`] seam, the real
+//! socket with its UMEM and rings (`ring`, the only `unsafe`), the
+//! attachment (`attach`), the headers ([`headers`]), the read-only netlink
+//! adapter (`netlink`) and the scripted double (`scripted`).
+//!
+//! Copy mode only. Busy polling, NUMA placement, zero copy and
+//! multi-buffer frames are deferred (owner item 3) and not implemented;
+//! nothing here claims a hardware timestamp or launch time.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+#[cfg(all(feature = "xdp", target_os = "linux"))]
+pub mod attach;
+pub mod endpoint;
+pub mod headers;
+#[cfg(target_os = "linux")]
+pub mod netlink;
+pub mod ops;
+#[cfg(all(feature = "xdp", target_os = "linux"))]
+#[expect(
+    unsafe_code,
+    reason = "the mapped AF_XDP rings and UMEM frames (SPEC.md §14, af-xdp-backend.md section 2)"
+)]
+pub mod ring;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod scripted;
+pub mod select;
 
 /// The XDP program, built by `scripts/xdp-object.sh` in the pinned
 /// container; its SHA-256 is in the manifest beside it. User builds never

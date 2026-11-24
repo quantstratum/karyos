@@ -1406,8 +1406,9 @@ pub struct RxDrop {
     pub source: Option<SocketAddr>,
 }
 
-/// Why the backend dropped a datagram. Backend drops cover only size and
-/// address family (ambiguity A-7).
+/// Why the backend dropped a datagram. Socket backends drop only for size
+/// and address family (ambiguity A-7); a backend that parses frames itself
+/// also drops malformed, foreign and corrupted ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RxDropReason {
     /// More than the datagram limit; `received` when the kernel says.
@@ -1419,6 +1420,15 @@ pub enum RxDropReason {
     },
     /// Source is not an IPv4 or IPv6 UDP endpoint.
     UnsupportedSource,
+    /// A backend that parses frames itself (AF_XDP) found an Ethernet, IP
+    /// or UDP header outside the accepted form (af-xdp-backend.md 8.2).
+    Malformed,
+    /// As [`RxDropReason::Malformed`], for a frame addressed to another
+    /// MAC, address or port than the endpoint's.
+    NotLocal,
+    /// As [`RxDropReason::Malformed`], for an IP header or UDP checksum
+    /// that does not verify.
+    Checksum,
 }
 
 /// The result of one `poll_rx` call.
@@ -1555,6 +1565,9 @@ pub enum Capability {
     /// The `io_uring` ring with every probe `open` requires
     /// (io-uring-backend.md 4.1, `uring_ring`).
     UringRing,
+    /// The AF_XDP socket, UMEM and attachment with every step `open`
+    /// requires (af-xdp-backend.md 4.1, `xdp_socket`).
+    XdpSocket,
 }
 
 /// The probed state of one capability.

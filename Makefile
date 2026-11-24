@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri miri-sys-log-buffer miri-sys-rest miri-ffi build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit libkaryos-release-check abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check codec-derive-check sbe-graph-check raft-eval lint-sync changelog-check lint-linux pre-push
+.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri miri-sys-log-buffer miri-sys-rest miri-ffi build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit libkaryos-release-check abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check otlp-graph-check codec-derive-check sbe-graph-check raft-eval lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -41,7 +41,7 @@ loom-full:
 
 sim:
 	@start=$$(date +%s); \
-	KARYOS_SIM_SEED= KARYOS_SIM_SEEDS=2000 $(CARGO) test -p karyos-sim --release --locked --test scenarios --test uring_model; status=$$?; \
+	KARYOS_SIM_SEED= KARYOS_SIM_SEEDS=2000 $(CARGO) test -p karyos-sim --release --locked --test scenarios --test uring_model --test xdp_model; status=$$?; \
 	end=$$(date +%s); \
 	printf 'simulator sweep elapsed: %s seconds (fixed seeds 1..=2000)\n' "$$((end - start))"; \
 	exit $$status
@@ -166,6 +166,12 @@ deps-check:
 control-plane-graph-check:
 	scripts/check-control-plane-graph.sh
 
+# The OTLP export's graph stays out of the agent's and the default build's,
+# with no TLS and no HTTP/2 (karyos#706; the opentelemetry admission record,
+# conditions 2 and 3).
+otlp-graph-check:
+	scripts/check-otlp-graph.sh
+
 # The object storage client stays out of every data-path graph and the
 # default build's, with no native crypto (karyos#965; the object storage
 # admission record, conditions 3 and 4).
@@ -209,4 +215,4 @@ changelog-check:
 netem:
 	scripts/netem-test.sh
 
-pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check tiering-graph-check header-check codec-derive-check sbe-graph-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check
+pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check otlp-graph-check tiering-graph-check header-check codec-derive-check sbe-graph-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check

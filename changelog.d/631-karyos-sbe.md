@@ -1,3 +1,0 @@
-### Added
-
-- `karyos-sbe`, the home of the SBE 1.0 integration (SPEC §10.1; ADR-0052; karyos#631): an empty crate for now, forbidding `unsafe`, internal and unstable in alpha, depending on `karyos-feed` and never the reverse. `make sbe-graph-check`, in `make pre-push`, keeps the IronSBE admission record's boundary as an allowlist: only `ironsbe-core`, `ironsbe-schema` and `ironsbe-codegen` (a build dependency only) may be in the graph, only `karyos-sbe` may depend on them, and `karyos-feed` never depends on `karyos-sbe`, with negative controls for each. No IronSBE crate is added yet: the first one enters with the framing (karyos#646).

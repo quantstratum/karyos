@@ -949,13 +949,14 @@ fn a_reincarnation_does_not_wait_for_the_linger() {
 }
 
 /// karyos#652: a channel's `linger` overrides the network's
-/// `publication_linger` for that publication. The network lingers 30 s;
-/// the channel's 300 ms frees the stream after its own linger, with its
-/// EOS repeated through it, long before the network's would end.
+/// `publication_linger` for that publication. The network lingers 60 s,
+/// its bound; the channel's 1 s frees the stream after its own linger,
+/// with its EOS repeated through it, long before the network's would end.
+/// Both margins are wide so a loaded host cannot close them (karyos#1067).
 #[test]
 fn a_channels_linger_overrides_the_networks() {
-    let linger = Duration::from_millis(300);
-    let (mut a, mut b) = (lingering(30_000 * MS), lingering(30_000 * MS));
+    let linger = Duration::from_secs(1);
+    let (mut a, mut b) = (lingering(60_000 * MS), lingering(60_000 * MS));
     let _ = b
         .add_network_subscription(10, &channel(ANY_PORT, true))
         .unwrap();
@@ -983,7 +984,7 @@ fn a_channels_linger_overrides_the_networks() {
     });
     let elapsed = removed.elapsed();
     assert!(elapsed >= linger, "{elapsed:?}");
-    assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(60), "{elapsed:?}");
     assert!(eos_sent(&a) >= 2, "repeated through the linger");
 }
 

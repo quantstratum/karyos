@@ -1,3 +1,0 @@
-### Added
-
-- `karyos-catalog verify` reports each copy the copy catalog commits, with its location, state and enforcement (immutable attribute, object lock or none), in text and JSON (`copies::replay_current` reads them without opening the catalog for writing), replayed from the journal snapshot it verified up to its first inconsistent record, and the immutable attribute each copy in the directory actually carries, read from its segment files on Linux and macOS; a recorded attribute the files do not carry, or a copy change the copy catalog does not hold, is reported inconsistent (exit 1). The running Archive's retention releases each removed segment's immutable attribute before a purge deletes it (karyos#1087).

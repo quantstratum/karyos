@@ -15,9 +15,13 @@
 //!   to a loopback address only ([`bind`] refuses any other), read-only,
 //!   one request per connection with [`IO_TIMEOUT`] on its reads and
 //!   writes. It is off unless the `karyos-exporter` binary is started with
-//!   an address. No TLS: it serves loopback only, and exposing it beyond
-//!   the pod takes a TLS-terminating sidecar or mesh (R-CORE-39,
-//!   karyos#734). An optional bearer [`Token`] (`--token-file`) guards
+//!   an address. Without TLS it serves loopback only, and exposing it
+//!   beyond the pod takes a TLS-terminating sidecar or mesh (R-CORE-39,
+//!   karyos#734). Built with the `exporter-tls` feature, `bind_tls`
+//!   serves `/metrics` over TLS 1.3 on any address, with a certificate and
+//!   key from files and a bearer token required off loopback
+//!   (karyos#887); loopback plain HTTP stays the default.
+//!   An optional bearer [`Token`] (`--token-file`) guards
 //!   scrapes from the other processes of the pod's network namespace: a
 //!   request for `/metrics` without it is answered `401`; only `/metrics`
 //!   needs it, any other path being `404` or `405` either way. A request head that is not one
@@ -33,6 +37,9 @@
 //!   participant.
 //! - **Cost.** The exporter attaches to each driver as a tool, so it takes
 //!   one of the driver's tool slots (`max_tools`) while attached.
+//! - **One definition** (karyos#706): [`families`] is the pass as metric
+//!   families, which [`render`] writes and `karyos-otlp` exports over
+//!   OTLP, so the two views share every name, label and value.
 //! - **Trace latencies** are the agent's window (M6c): observed latencies,
 //!   never trace verdicts; a quantile's bound past the histogram's range is
 //!   left out rather than written as infinite.
@@ -53,6 +60,23 @@ pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 pub const MAX_REQUEST: usize = 1024;
 /// The read and write timeout of each connection.
 pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
+/// The whole of one plain-HTTP connection on loopback, its request and
+/// answer included, at most: a peer that trickles bytes, each within
+/// [`IO_TIMEOUT`], is still cut off here, so it cannot hold the single
+/// polling thread (karyos#887 review). Loopback has no network round
+/// trip, so the answer's size alone sets the time.
+pub const CONNECTION_DEADLINE: Duration = Duration::from_millis(250);
+/// The whole of one TLS connection by default, its handshake, request and
+/// answer included (karyos#887 review). A remote scraper on a real
+/// network spends about one round trip on the TLS 1.3 handshake, half of
+/// one on its request, and then the answer: an exposition of about
+/// 100 KiB, sent from a TCP initial window of 10 segments (about 14 KiB)
+/// doubling each round trip, needs about three more. Five round trips of
+/// up to 300 ms are 1.5 s; 2 s leaves margin. A deployment with longer
+/// round trips or a larger exposition sets its own (`--deadline-ms`).
+pub const TLS_CONNECTION_DEADLINE: Duration = Duration::from_secs(2);
+/// The longest deadline `--deadline-ms` takes.
+pub const MAX_CONNECTION_DEADLINE: Duration = Duration::from_secs(30);
 /// Connections answered per [`Exporter::poll`] at most, so a burst cannot
 /// hold the agent's refresh.
 pub const MAX_PER_POLL: usize = 16;
@@ -149,16 +173,112 @@ const TYPE_APPLICATION_EVENT: u64 = karyos_sys::counters::TYPE_APPLICATION_EVENT
 const TYPE_APPLICATION_GAUGE: u64 = karyos_sys::counters::TYPE_APPLICATION_GAUGE;
 const TYPE_TRACE_POINT: u64 = karyos_sys::counters::TYPE_TRACE_POINT;
 
-/// One metric family: its type, help and sample lines.
-struct Family {
-    kind: &'static str,
-    help: &'static str,
-    samples: Vec<String>,
+/// A metric family's type, as Prometheus and OTLP both name it: a
+/// `counter` is cumulative and monotonic (an OTLP monotonic sum), a
+/// `gauge` a value at the sampling pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MetricKind {
+    /// Cumulative and monotonic: Prometheus `counter`, OTLP monotonic sum.
+    Counter,
+    /// The value at the sampling pass: Prometheus and OTLP `gauge`.
+    Gauge,
+}
+
+impl MetricKind {
+    /// Its Prometheus `TYPE` name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+        }
+    }
+
+    fn of(kind: &str) -> Self {
+        if kind == "counter" {
+            Self::Counter
+        } else {
+            Self::Gauge
+        }
+    }
+}
+
+/// A sample's value: unsigned, or signed for the families of
+/// [`SIGNED_FAMILIES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MetricValue {
+    /// An unsigned value.
+    Unsigned(u64),
+    /// A signed value.
+    Signed(i64),
+}
+
+impl std::fmt::Display for MetricValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsigned(value) => value.fmt(f),
+            Self::Signed(value) => value.fmt(f),
+        }
+    }
+}
+
+impl From<u64> for MetricValue {
+    fn from(value: u64) -> Self {
+        Self::Unsigned(value)
+    }
+}
+
+impl From<u8> for MetricValue {
+    fn from(value: u8) -> Self {
+        Self::Unsigned(value.into())
+    }
+}
+
+impl From<i64> for MetricValue {
+    fn from(value: i64) -> Self {
+        Self::Signed(value)
+    }
+}
+
+/// The families whose values are signed, every one a `gauge`; every other
+/// family's values are unsigned. An OTLP export registers each family as
+/// an instrument of its value's type before any pass is read, so the two
+/// sets are fixed here (karyos#706).
+pub const SIGNED_FAMILIES: [&str; 3] = [
+    "karyos_lane_headroom",
+    "karyos_subscriber_lag",
+    "karyos_trace_latency_ns",
+];
+
+/// One sample of a family: its labels, in order, and its value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricSample {
+    /// Label names and values, unescaped.
+    pub labels: Vec<(&'static str, String)>,
+    /// The value.
+    pub value: MetricValue,
+}
+
+/// One metric family of a sampling pass: the one definition both the
+/// Prometheus exposition and the OTLP export are written from
+/// (karyos#706), so the two never disagree on a name, a label or a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricFamily {
+    /// Its name, one of [`FAMILIES`].
+    pub name: &'static str,
+    /// Its type.
+    pub kind: MetricKind,
+    /// Its help text.
+    pub help: &'static str,
+    /// Its samples, in the order they were taken.
+    pub samples: Vec<MetricSample>,
 }
 
 /// The families of one exposition, by name, in name order.
 #[derive(Default)]
-struct Families(BTreeMap<&'static str, Family>);
+struct Families(BTreeMap<&'static str, MetricFamily>);
 
 impl Families {
     /// Adds a sample of family `name`.
@@ -167,44 +287,52 @@ impl Families {
         name: &'static str,
         kind: &'static str,
         help: &'static str,
-        labels: &[(&str, String)],
-        value: impl std::fmt::Display,
+        labels: &[(&'static str, String)],
+        value: impl Into<MetricValue>,
     ) {
-        let mut line = String::from(name);
-        if !labels.is_empty() {
-            line.push('{');
-            for (index, (key, value)) in labels.iter().enumerate() {
-                if index > 0 {
-                    line.push(',');
-                }
-                let _ = write!(line, "{key}=\"{}\"", escape(value));
-            }
-            line.push('}');
-        }
-        let _ = write!(line, " {value}");
         self.0
             .entry(name)
-            .or_insert_with(|| Family {
-                kind,
+            .or_insert_with(|| MetricFamily {
+                name,
+                kind: MetricKind::of(kind),
                 help,
                 samples: Vec::new(),
             })
             .samples
-            .push(line);
+            .push(MetricSample {
+                labels: labels.to_vec(),
+                value: value.into(),
+            });
     }
 
-    fn render(self) -> String {
-        let mut out = String::new();
-        for (name, family) in self.0 {
-            let _ = writeln!(out, "# HELP {name} {}", family.help);
-            let _ = writeln!(out, "# TYPE {name} {}", family.kind);
-            for sample in family.samples {
-                out.push_str(&sample);
-                out.push('\n');
-            }
-        }
-        out
+    fn into_families(self) -> Vec<MetricFamily> {
+        self.0.into_values().collect()
     }
+}
+
+/// `families` in the Prometheus text exposition format (version 0.0.4).
+#[must_use]
+pub fn render_families(families: &[MetricFamily]) -> String {
+    let mut out = String::new();
+    for family in families {
+        let _ = writeln!(out, "# HELP {} {}", family.name, family.help);
+        let _ = writeln!(out, "# TYPE {} {}", family.name, family.kind.name());
+        for sample in &family.samples {
+            out.push_str(family.name);
+            if !sample.labels.is_empty() {
+                out.push('{');
+                for (index, (key, value)) in sample.labels.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    let _ = write!(out, "{key}=\"{}\"", escape(value));
+                }
+                out.push('}');
+            }
+            let _ = writeln!(out, " {}", sample.value);
+        }
+    }
+    out
 }
 
 /// A label value as the text format writes it.
@@ -221,9 +349,17 @@ fn escape(value: &str) -> String {
     out
 }
 
-/// `view` in the Prometheus text exposition format.
+/// `view` in the Prometheus text exposition format: [`families`] written
+/// by [`render_families`].
 #[must_use]
 pub fn render(view: &AgentView) -> String {
+    render_families(&families(view))
+}
+
+/// The metric families of `view`, in name order: what [`render`] writes,
+/// and what an OTLP export sends (karyos#706).
+#[must_use]
+pub fn families(view: &AgentView) -> Vec<MetricFamily> {
     let mut families = Families::default();
     // Its own identity, as the agent's (R-CORE-24): the exporter is an
     // agent of its own, attached to each driver as a tool.
@@ -235,7 +371,7 @@ pub fn render(view: &AgentView) -> String {
             ("id", view.agent.id.clone().unwrap_or_default()),
             ("pid", view.agent.pid.to_string()),
         ],
-        1,
+        1_u64,
     );
     families.sample(
         "karyos_exporter_started_ns",
@@ -247,7 +383,7 @@ pub fn render(view: &AgentView) -> String {
     for driver in &view.drivers {
         render_driver(&mut families, driver);
     }
-    families.render()
+    families.into_families()
 }
 
 fn render_driver(families: &mut Families, driver: &DriverView) {
@@ -297,7 +433,7 @@ fn render_driver(families: &mut Families, driver: &DriverView) {
             "gauge",
             "The driver instance attached: a restarted driver is a new instance, and its series start over.",
             &[("driver", dir.clone()), ("instance", format!("{instance:032x}"))],
-            1,
+            1_u64,
         );
     }
     families.sample(
@@ -536,7 +672,7 @@ fn render_alerts(families: &mut Families, dir: &str, alerts: &[Alert]) {
         "gauge",
         "Alerts firing for the driver.",
         &[("driver", dir.to_owned())],
-        alerts.len(),
+        u64::try_from(alerts.len()).unwrap_or(u64::MAX),
     );
     for alert in alerts {
         let keys = [
@@ -675,11 +811,26 @@ fn render_application(families: &mut Families, dir: &str, counter: &Counter) -> 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ExportError {
-    /// The address is not a loopback address.
+    /// The address is not a loopback address, and no TLS is configured.
     #[error(
-        "{0} is not a loopback address: the exporter has no TLS, so it serves loopback only; expose it beyond the pod through a TLS-terminating sidecar or mesh"
+        "{0} is not a loopback address: without TLS the exporter serves loopback only; configure TLS (--tls-cert and --tls-key, in a build with the exporter-tls feature) or expose it through a TLS-terminating sidecar or mesh"
     )]
     NotLoopback(SocketAddr),
+    /// A non-loopback address without a bearer token: off loopback every
+    /// scrape must carry one (karyos#887).
+    #[cfg(feature = "exporter-tls")]
+    #[error(
+        "{0} is not a loopback address: off loopback the exporter requires a bearer token (--token-file)"
+    )]
+    NoToken(SocketAddr),
+    /// The TLS configuration was refused (karyos#887).
+    #[cfg(feature = "exporter-tls")]
+    #[error(transparent)]
+    Tls(#[from] tls::TlsError),
+    /// A connection deadline outside 1 ms to [`MAX_CONNECTION_DEADLINE`]
+    /// (karyos#887 review).
+    #[error("a connection deadline of {0:?} is outside 1 ms to 30 s")]
+    InvalidDeadline(Duration),
     /// The operating system's error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -707,6 +858,16 @@ pub struct Exporter {
     listener: TcpListener,
     /// The bearer token every scrape must carry, when configured.
     token: Option<Token>,
+    /// The TLS configuration every connection is served with, when
+    /// configured (karyos#887).
+    #[cfg(feature = "exporter-tls")]
+    tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+    /// The whole of one connection at most, and the time after which a
+    /// poll takes no further connection.
+    deadline: Duration,
+    /// One read or write at most: [`IO_TIMEOUT`] on plain loopback; the
+    /// whole deadline over TLS, where one step may wait a round trip.
+    step: Duration,
 }
 
 /// A scrape token (`--token-file`, karyos#734): 32 to 256 bytes of visible
@@ -806,6 +967,39 @@ pub fn bind(address: SocketAddr) -> Result<Exporter, ExportError> {
     Ok(Exporter {
         listener,
         token: None,
+        #[cfg(feature = "exporter-tls")]
+        tls: None,
+        deadline: CONNECTION_DEADLINE,
+        step: IO_TIMEOUT,
+    })
+}
+
+/// Listens on `address`, any address, serving every connection over TLS
+/// 1.3 with `config` ([`tls::server_config`]; karyos#887), every scrape
+/// guarded by `token`, which a non-loopback address requires. A
+/// connection whose handshake fails is [`Answered::Dropped`].
+///
+/// # Errors
+///
+/// [`ExportError::NoToken`] for a non-loopback address without a token,
+/// checked before anything is bound, and the operating system's errors.
+#[cfg(feature = "exporter-tls")]
+pub fn bind_tls(
+    address: SocketAddr,
+    config: std::sync::Arc<rustls::ServerConfig>,
+    token: Option<Token>,
+) -> Result<Exporter, ExportError> {
+    if token.is_none() && !address.ip().is_loopback() {
+        return Err(ExportError::NoToken(address));
+    }
+    let listener = TcpListener::bind(address)?;
+    listener.set_nonblocking(true)?;
+    Ok(Exporter {
+        listener,
+        token,
+        tls: Some(config),
+        deadline: TLS_CONNECTION_DEADLINE,
+        step: TLS_CONNECTION_DEADLINE,
     })
 }
 
@@ -818,6 +1012,46 @@ impl Exporter {
         self
     }
 
+    /// Allows each connection `deadline` in all (`--deadline-ms`), 1 ms to
+    /// [`MAX_CONNECTION_DEADLINE`]: over TLS one read or write may then
+    /// wait as long; on plain loopback each still waits at most
+    /// [`IO_TIMEOUT`]. The step follows the exporter's transport, however
+    /// many times this is called.
+    ///
+    /// # Errors
+    ///
+    /// [`ExportError::InvalidDeadline`] for a deadline outside that range.
+    pub fn with_deadline(mut self, deadline: Duration) -> Result<Self, ExportError> {
+        if deadline < Duration::from_millis(1) || deadline > MAX_CONNECTION_DEADLINE {
+            return Err(ExportError::InvalidDeadline(deadline));
+        }
+        self.deadline = deadline;
+        self.step = if self.over_tls() {
+            deadline
+        } else {
+            IO_TIMEOUT.min(deadline)
+        };
+        Ok(self)
+    }
+
+    /// Whether every connection is served over TLS.
+    fn over_tls(&self) -> bool {
+        #[cfg(feature = "exporter-tls")]
+        {
+            self.tls.is_some()
+        }
+        #[cfg(not(feature = "exporter-tls"))]
+        {
+            false
+        }
+    }
+
+    /// The whole of one connection at most.
+    #[must_use]
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
     /// The address bound.
     ///
     /// # Errors
@@ -828,36 +1062,119 @@ impl Exporter {
     }
 
     /// Answers up to [`MAX_PER_POLL`] pending connections with `body`'s
-    /// exposition. Never waits for a connection.
+    /// exposition, taking no further one once the poll has run for its
+    /// deadline, so a poll ends within about twice the deadline. Never
+    /// waits for a connection.
     ///
     /// # Errors
     ///
     /// The operating system's error when `accept` fails.
     pub fn poll(&mut self, body: impl Fn() -> String) -> Result<Vec<Answered>, ExportError> {
         let mut answered = Vec::new();
-        while answered.len() < MAX_PER_POLL {
+        let started = std::time::Instant::now();
+        while answered.len() < MAX_PER_POLL && started.elapsed() < self.deadline {
             match self.listener.accept() {
-                Ok((stream, _)) => answered.push(answer(stream, self.token.as_ref(), &body)),
+                Ok((stream, _)) => answered.push(self.answer(stream, &body)),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error.into()),
             }
         }
         Ok(answered)
     }
+
+    /// Answers one connection, over TLS when configured, within its
+    /// deadline.
+    fn answer(&self, stream: TcpStream, body: &impl Fn() -> String) -> Answered {
+        if stream.set_nonblocking(false).is_err() {
+            return Answered::Dropped;
+        }
+        let stream = Deadlined {
+            stream,
+            // Bounded by `with_deadline`, so this does not overflow; a
+            // failure is a connection with no time left.
+            deadline: std::time::Instant::now()
+                .checked_add(self.deadline)
+                .unwrap_or_else(std::time::Instant::now),
+            step: self.step,
+        };
+        #[cfg(feature = "exporter-tls")]
+        if let Some(config) = &self.tls {
+            let Ok(connection) = rustls::ServerConnection::new(std::sync::Arc::clone(config))
+            else {
+                return Answered::Dropped;
+            };
+            let mut stream = rustls::StreamOwned::new(connection, stream);
+            // The handshake, within the connection's deadline.
+            while stream.conn.is_handshaking() {
+                if stream.conn.complete_io(&mut stream.sock).is_err() {
+                    return Answered::Dropped;
+                }
+            }
+            let answered = serve(&mut stream, self.token.as_ref(), body);
+            stream.conn.send_close_notify();
+            let _ = stream.conn.complete_io(&mut stream.sock);
+            return answered;
+        }
+        let mut stream = stream;
+        serve(&mut stream, self.token.as_ref(), body)
+    }
 }
 
-/// Answers one connection.
-fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) -> Answered {
-    let ready = stream.set_nonblocking(false).is_ok()
-        && stream.set_read_timeout(Some(IO_TIMEOUT)).is_ok()
-        && stream.set_write_timeout(Some(IO_TIMEOUT)).is_ok();
-    if !ready {
-        return Answered::Dropped;
+/// A connection whose every read and write waits at most `step` and
+/// never past its `deadline`: past it, each fails with
+/// [`std::io::ErrorKind::TimedOut`] (karyos#887 review).
+struct Deadlined {
+    stream: TcpStream,
+    deadline: std::time::Instant,
+    step: Duration,
+}
+
+impl Deadlined {
+    /// The time left for the next operation, at most `step`.
+    fn remaining(&self) -> std::io::Result<Duration> {
+        let left = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the connection's deadline passed",
+            ));
+        }
+        Ok(left.min(self.step))
     }
+}
+
+impl Read for Deadlined {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.remaining()?;
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for Deadlined {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.remaining()?;
+        self.stream.set_write_timeout(Some(left))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// Serves one request on `stream`, plain or TLS.
+fn serve<S: Read + Write>(
+    stream: &mut S,
+    token: Option<&Token>,
+    body: &impl Fn() -> String,
+) -> Answered {
     let Some(limit) = u64::try_from(MAX_REQUEST).ok() else {
         return Answered::Dropped;
     };
-    let mut reader = BufReader::new((&stream).take(limit));
+    let mut reader = BufReader::new(Read::by_ref(stream).take(limit));
     let mut line = String::new();
     if !matches!(reader.read_line(&mut line), Ok(read) if read > 0) {
         return Answered::Dropped;
@@ -893,6 +1210,7 @@ fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) 
         }
         header.clear();
     }
+    drop(reader);
     let mut words = line.split_whitespace();
     let request = (words.next(), words.next(), words.next(), words.next());
     let authorized = token.is_none_or(|token| offered.as_deref().is_some_and(|o| token.matches(o)));
@@ -943,7 +1261,6 @@ fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) 
         "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{challenge}Connection: close\r\n\r\n",
         content.len()
     );
-    let mut stream = stream;
     let written = stream
         .write_all(head.as_bytes())
         .and_then(|()| stream.write_all(content.as_bytes()))
@@ -953,6 +1270,9 @@ fn answer(stream: TcpStream, token: Option<&Token>, body: &impl Fn() -> String) 
     }
     answered
 }
+
+#[cfg(feature = "exporter-tls")]
+pub mod tls;
 
 #[cfg(test)]
 mod tests;

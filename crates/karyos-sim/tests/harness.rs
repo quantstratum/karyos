@@ -768,8 +768,9 @@ fn a_server_stopped_by_its_disk_is_verified_at_its_restart() {
     // Node 2's disk crashes at an operation inside a duty: the drive
     // error stops the node while it is up. Its entries stay unverified
     // until a restart reopens its log. The budgets count the log's
-    // integrity journal among the creation's operations (karyos#990).
-    for budget in [35, 50] {
+    // integrity journal (karyos#990) and its origin file (karyos#745)
+    // among the creation's operations.
+    for budget in [40, 55] {
         for seed in scenarios::seeds() {
             let disks = vec![SimDisk::new(), SimDisk::new(), SimDisk::with_budget(budget)];
             let (mut sim, recorder, _) = fresh(seed, disks, appends(6));
@@ -841,4 +842,25 @@ fn test_harness_the_test_service_ignores_the_event_time() {
         );
     }
     assert_eq!(stamped, zeroed);
+}
+
+/// karyos#976: a core's panic is a verdict of its own, reported after
+/// every other check, linearizability included, and a server down since its panic is not reported
+/// as unverified.
+#[test]
+fn a_core_panic_is_reported_last_and_is_not_unverified() {
+    let panicked = vec![Observation::CorePanicked { node: 1 }];
+    // Not a group verdict: it comes after the history's (`check::all`).
+    assert!(check::group(&panicked, 3).is_ok());
+    assert!(matches!(
+        check::all(&panicked, &History::default(), 3),
+        Err(Violation::CorePanicked { node: 1 })
+    ));
+    assert!(check::durable_kept(&panicked).is_ok());
+    // A crash after the panic makes it an ordinary down server again.
+    let crashed = vec![
+        Observation::CorePanicked { node: 1 },
+        Observation::Crashed { node: 1 },
+    ];
+    assert!(check::durable_kept(&crashed).is_ok());
 }
