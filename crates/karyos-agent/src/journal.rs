@@ -134,6 +134,20 @@ pub enum Kind {
     /// rebuilds its retained outcomes and caller ids from these records
     /// only.
     Submitted,
+    /// A product Cluster's admin command, before it is sent (R-CORE-41,
+    /// karyos#772): the operation, the operator, the relay, the reason,
+    /// the parameters' digest, and after the relay word the Cluster's name
+    /// ([`JournalRecord::target`]), the command's name
+    /// ([`JournalRecord::command`]) and an empty evidence.
+    ClusterRequest,
+    /// What the admin command came to: `code` 0 for sequenced, the log
+    /// index in `word`, the term in `expected` and the product's evidence
+    /// in [`JournalRecord::evidence`]; the product's refusal code; or
+    /// [`UNKNOWN_OUTCOME`].
+    ClusterOutcome,
+    /// An admin command the agent refused before sending it: its
+    /// [`crate::cluster_admin::RefusalCode`] in `code`.
+    ClusterRefused,
 }
 
 impl Kind {
@@ -158,6 +172,9 @@ impl Kind {
             Self::RateRequest => 17,
             Self::RateOutcome => 18,
             Self::Submitted => 19,
+            Self::ClusterRequest => 20,
+            Self::ClusterOutcome => 21,
+            Self::ClusterRefused => 22,
         }
     }
 
@@ -182,6 +199,9 @@ impl Kind {
             17 => Self::RateRequest,
             18 => Self::RateOutcome,
             19 => Self::Submitted,
+            20 => Self::ClusterRequest,
+            21 => Self::ClusterOutcome,
+            22 => Self::ClusterRefused,
             _ => return None,
         })
     }
@@ -196,6 +216,16 @@ impl Kind {
                 | Self::PurgeRequest
                 | Self::VerifyRequest
                 | Self::RateRequest
+                | Self::ClusterRequest
+        )
+    }
+
+    /// Whether its record carries the Cluster fields after the relay word
+    /// (karyos#772).
+    pub(crate) const fn is_cluster(self) -> bool {
+        matches!(
+            self,
+            Self::ClusterRequest | Self::ClusterOutcome | Self::ClusterRefused
         )
     }
 }
@@ -232,12 +262,20 @@ pub struct JournalRecord {
     /// a request made on the local socket, which no relay carried. The
     /// operator is then the authenticated requester, never the relay.
     pub relay: u64,
-    /// A [`Kind::Submitted`] record's driver directory, as bytes; empty
-    /// for every other kind.
+    /// A [`Kind::Submitted`] record's driver directory, or a Cluster
+    /// record's Cluster name (karyos#772), as bytes; empty for every other
+    /// kind.
     pub target: Vec<u8>,
     /// A [`Kind::Submitted`] record's host boot identity (Linux's
     /// `boot_id`), as bytes; empty for every other kind, or when unknown.
     pub boot: Vec<u8>,
+    /// A Cluster record's command name (karyos#772); empty for every other
+    /// kind.
+    pub command: Vec<u8>,
+    /// A [`Kind::ClusterOutcome`] record's evidence,
+    /// `<algorithm>:<hex digest>`; empty when none was attached, and for
+    /// every other kind.
+    pub evidence: Vec<u8>,
 }
 
 impl JournalRecord {
@@ -258,6 +296,8 @@ impl JournalRecord {
             relay: 0,
             target: Vec::new(),
             boot: Vec::new(),
+            command: Vec::new(),
+            evidence: Vec::new(),
         }
     }
 
@@ -265,7 +305,10 @@ impl JournalRecord {
     /// version, the kind, then the fields in declaration order, then the
     /// reason's length) and the reason, cut to [`MAX_REASON`] bytes; then,
     /// for a relayed request only, the relay as one more little-endian
-    /// word (karyos#708). A record no relay carried is byte for byte what
+    /// word (karyos#708). A [`Kind::Submitted`] record always has the relay
+    /// word, then its target and boot, each after its length word; a
+    /// Cluster record (karyos#772) the relay word, then its target, command
+    /// and evidence the same way. A record no relay carried is byte for byte what
     /// it was before relays, and a reader of the layout that stops at the
     /// reason reads either.
     #[must_use]
@@ -286,11 +329,18 @@ impl JournalRecord {
         ];
         let mut out: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
         out.extend_from_slice(reason);
-        if self.kind == Kind::Submitted {
+        let fields: &[&Vec<u8>] = if self.kind == Kind::Submitted {
             // The relay word always, then the target and the boot, each
             // after its length word (karyos#738).
+            &[&self.target, &self.boot]
+        } else if self.kind.is_cluster() {
+            &[&self.target, &self.command, &self.evidence]
+        } else {
+            &[]
+        };
+        if !fields.is_empty() {
             out.extend_from_slice(&self.relay.to_le_bytes());
-            for field in [&self.target, &self.boot] {
+            for field in fields {
                 out.extend_from_slice(&u64::try_from(field.len()).unwrap_or(0).to_le_bytes());
                 out.extend_from_slice(field);
             }
@@ -317,8 +367,12 @@ impl JournalRecord {
         let reason = payload.get(start..end)?;
         let kind = Kind::from_code(word(1)?)?;
         let tail = payload.get(end..)?;
-        let (relay, target, boot) = if kind == Kind::Submitted {
-            // The relay word, then the target and the boot by length.
+        let mut target = Vec::new();
+        let mut boot = Vec::new();
+        let mut command = Vec::new();
+        let mut evidence = Vec::new();
+        let relay = if kind == Kind::Submitted || kind.is_cluster() {
+            // The relay word, then the fields by length.
             let (relay, mut rest) = tail.split_first_chunk::<8>()?;
             let mut field = || -> Option<Vec<u8>> {
                 let (length, after) = rest.split_first_chunk::<8>()?;
@@ -327,19 +381,23 @@ impl JournalRecord {
                 rest = after.get(length..)?;
                 Some(bytes.to_vec())
             };
-            let target = field()?;
-            let boot = field()?;
+            target = field()?;
+            if kind == Kind::Submitted {
+                boot = field()?;
+            } else {
+                command = field()?;
+                evidence = field()?;
+            }
             if !rest.is_empty() {
                 return None;
             }
-            (u64::from_le_bytes(*relay), target, boot)
+            u64::from_le_bytes(*relay)
         } else {
             // The relay word, when one follows the reason; nothing else may.
-            let relay = match tail {
+            match tail {
                 [] => 0,
                 tail => u64::from_le_bytes(tail.try_into().ok()?),
-            };
-            (relay, Vec::new(), Vec::new())
+            }
         };
         Some(Self {
             kind,
@@ -355,6 +413,8 @@ impl JournalRecord {
             relay,
             target,
             boot,
+            command,
+            evidence,
         })
     }
 }
@@ -490,9 +550,9 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// The [`Kind::Submitted`] records the open read, oldest first, taken
-    /// once (karyos#738): the agent rebuilds its retained outcomes and
-    /// caller ids from them.
+    /// The [`Kind::Submitted`] and [`Kind::ClusterRequest`] records the
+    /// open read, oldest first, taken once (karyos#738, karyos#772): the
+    /// agent rebuilds its retained outcomes and caller ids from them.
     pub fn take_operations(&mut self) -> Vec<JournalRecord> {
         std::mem::take(&mut self.operations)
     }
@@ -847,8 +907,9 @@ struct Scan {
     /// Every record, for tests that read a journal back.
     #[cfg(test)]
     all: Vec<JournalRecord>,
-    /// The [`Kind::Submitted`] records, oldest first: the agent's retained
-    /// outcomes and caller ids are rebuilt from them (karyos#738).
+    /// The [`Kind::Submitted`] and [`Kind::ClusterRequest`] records, oldest
+    /// first: the agent's retained outcomes and caller ids are rebuilt from
+    /// them (karyos#738, karyos#772).
     operations: Vec<JournalRecord>,
 }
 
@@ -905,7 +966,7 @@ fn scan(store: &mut SegmentStore<StdDisk>) -> Result<Scan, JournalError> {
                 }
                 #[cfg(test)]
                 found.all.push(record.clone());
-                if record.kind == Kind::Submitted {
+                if matches!(record.kind, Kind::Submitted | Kind::ClusterRequest) {
                     found.operations.push(record.clone());
                 }
                 found.last = Some(record);
