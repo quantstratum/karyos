@@ -43,7 +43,7 @@ impl HmacKey {
             let mut hashed = Sha256::new();
             hashed.update(key);
             let mut digest = Zeroizing::new([0_u8; OUT_LEN]);
-            digest.copy_from_slice(&hashed.finalize());
+            hashed.finalize_into((&mut *digest).into());
             if let Some(slot) = pad.get_mut(..OUT_LEN) {
                 slot.copy_from_slice(digest.as_slice());
             }
@@ -89,11 +89,13 @@ impl HmacState {
     #[must_use]
     pub fn finalize(self) -> Zeroizing<[u8; OUT_LEN]> {
         let Self { inner, mut outer } = self;
+        // Each digest is written straight into erased storage, never to a
+        // plain temporary.
         let mut inner_out = Zeroizing::new([0_u8; OUT_LEN]);
-        inner_out.copy_from_slice(&inner.finalize());
+        inner.finalize_into((&mut *inner_out).into());
         outer.update(inner_out.as_slice());
         let mut out = Zeroizing::new([0_u8; OUT_LEN]);
-        out.copy_from_slice(&outer.finalize());
+        outer.finalize_into((&mut *out).into());
         out
     }
 
