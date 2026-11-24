@@ -209,8 +209,9 @@ pub trait SocketOps: Sized {
     /// received by another path's socket (`quantstratum-docs:
     /// karyos/design/redundant-paths.md`). Without it every datagram would
     /// count on every path, so the driver refuses a channel with `paths`.
-    /// `false` until a backend can guarantee it (owner item 12: on Linux,
-    /// `IP_MULTICAST_ALL` off per path socket).
+    /// `false` unless a backend guarantees it: the Linux backend does, with
+    /// `IP_MULTICAST_ALL` off per joined socket (owner item 12); macOS stays
+    /// refused until an equivalent isolation test passes there.
     #[must_use]
     fn isolates_paths() -> bool {
         false

@@ -419,8 +419,14 @@ pub(crate) struct SenderChannel {
     pub(crate) destinations: Vec<SocketAddr>,
     /// The required ones among them, by endpoint (MD-11).
     pub(crate) required_destinations: Vec<SocketAddr>,
-    /// The local address of each path's endpoint, the founding path first.
-    pub(crate) binds: Vec<SocketAddr>,
+    /// The local address of each path's endpoint and where that path
+    /// sends, the founding path first: every path of a multicast channel
+    /// sends to its group, path `i` of a paired unicast paths channel to
+    /// its own endpoint (karyos#1043).
+    pub(crate) binds: Vec<publish::Path>,
+    /// Whether it is a paired unicast paths channel, whose interface
+    /// addresses this host must have (karyos#1043).
+    pub(crate) paired: bool,
     /// Whether it is reliable.
     pub(crate) reliable: bool,
     /// Its lanes' quanta.
@@ -552,8 +558,9 @@ struct NetSubscription {
     /// driver's table for that path's interface (RC-15; karyos#1064).
     later_controls: [Option<EndpointId>; LATER_PATHS],
     /// The routes the channel asked for its later paths: a second handle
-    /// of the key must ask for the same ones.
-    later_routes: [Option<(SocketAddr, MulticastConfig)>; LATER_PATHS],
+    /// of the key must ask for the same ones. A paired unicast path joins
+    /// no group (karyos#1043).
+    later_routes: [Option<LaterRoute>; LATER_PATHS],
     /// The control group entries of the driver's table its paths joined,
     /// whether its own channel's `nak-control` added them or not, released
     /// with the key (karyos#1086).
@@ -665,6 +672,11 @@ impl NetworkViewCounters {
 /// The later paths a network subscription holds beside its first: the
 /// channel URI allows four paths (karyos-protocol `channel.rs`).
 pub(crate) const LATER_PATHS: usize = 3;
+
+/// A later path's local bind and the multicast group it joins there; none
+/// for a paired unicast path, which receives at its own endpoint
+/// (karyos#1043).
+pub(crate) type LaterRoute = (SocketAddr, Option<MulticastConfig>);
 
 /// The control group the table names for each path of a key, first path
 /// first (karyos#1086 review).
@@ -1060,6 +1072,28 @@ impl<T: StreamTerms> Network<T> {
         self.hold_endpoint(bind, None)
     }
 
+    /// [`Self::hold_send_endpoint`] for a path of a paired unicast paths
+    /// channel (karyos#1043): an address no interface of this host has
+    /// (`EADDRNOTAVAIL` at the bind) is [`DriverError::UnknownInterface`],
+    /// refused at channel admission.
+    pub(crate) fn hold_path_endpoint(
+        &mut self,
+        bind: SocketAddr,
+    ) -> Result<EndpointId, DriverError> {
+        self.hold_for_open(bind, None, EndpointPurpose::Data, true)
+            .map_err(|(error, errno)| match errno {
+                Some(errno)
+                    if std::io::Error::from_raw_os_error(errno).kind()
+                        == std::io::ErrorKind::AddrNotAvailable =>
+                {
+                    DriverError::UnknownInterface {
+                        interface: bind.ip(),
+                    }
+                }
+                _ => error,
+            })
+    }
+
     /// The data endpoint bound to `bind`, joined to `multicast` if any,
     /// opened on first use; one more user holds it.
     fn hold_endpoint(
@@ -1080,20 +1114,33 @@ impl<T: StreamTerms> Network<T> {
         purpose: EndpointPurpose,
         share: bool,
     ) -> Result<EndpointId, DriverError> {
+        self.hold_for_open(bind, multicast, purpose, share)
+            .map_err(|(error, _)| error)
+    }
+
+    /// [`Self::hold_for`], with the OS error number of a socket that could
+    /// not open, if that is why it failed.
+    fn hold_for_open(
+        &mut self,
+        bind: SocketAddr,
+        multicast: Option<MulticastConfig>,
+        purpose: EndpointPurpose,
+        share: bool,
+    ) -> Result<EndpointId, (DriverError, Option<i32>)> {
         if let Some(entry) = self.send_endpoints.iter_mut().find(|entry| {
             share && (entry.bind, entry.multicast, entry.purpose) == (bind, multicast, purpose)
         }) {
             entry.users = entry
                 .users
                 .checked_add(1)
-                .ok_or(DriverError::NetworkEndpoint)?;
+                .ok_or((DriverError::NetworkEndpoint, None))?;
             return Ok(entry.endpoint);
         }
         // An endpoint retiring at this fixed address still holds it: the
         // add is refused as retryable, and taken once it has retired
         // (karyos#994).
         if self.endpoints.retiring_at(bind) {
-            return Err(DriverError::NetworkBusy);
+            return Err((DriverError::NetworkBusy, None));
         }
         let mut config = SocketsConfig::new(bind);
         config.multicast = multicast;
@@ -1109,7 +1156,15 @@ impl<T: StreamTerms> Network<T> {
         let endpoint = self
             .endpoints
             .open(&self.links, config, OsSocket::new())
-            .map_err(|_| DriverError::NetworkEndpoint)?;
+            .map_err(|error| {
+                let errno = match error {
+                    crate::agents::endpoints::EndpointError::Open(
+                        karyos_io::backend::OpenError::Os { errno, .. },
+                    ) => Some(errno),
+                    _ => None,
+                };
+                (DriverError::NetworkEndpoint, errno)
+            })?;
         self.send_endpoints.push(SendEndpoint {
             bind,
             multicast,
@@ -1151,7 +1206,7 @@ impl<T: StreamTerms> Network<T> {
         &mut self,
         stream_id: i32,
         (bind, multicast): (SocketAddr, Option<MulticastConfig>),
-        later: &[(SocketAddr, MulticastConfig)],
+        later: &[LaterRoute],
         max_term_length: u32,
         (reliable, own_port, names_control): (bool, bool, bool),
         (identity, conflated, register_at, path_skew): KeyOptions,
@@ -1346,7 +1401,7 @@ impl<T: StreamTerms> Network<T> {
             .zip(later)
         {
             *route = Some((*bind, *config));
-            let Ok(path) = self.hold_endpoint(*bind, Some(*config)) else {
+            let Ok(path) = self.hold_endpoint(*bind, *config) else {
                 self.count_path_failure();
                 continue;
             };
@@ -1366,15 +1421,15 @@ impl<T: StreamTerms> Network<T> {
             }
             // Its own NAK control group, if the table names one for its
             // interface (karyos#1064), as the first path's.
-            let path_control = if reliable {
-                self.hold_control_group(*bind, *config)
-            } else {
-                None
+            // A paired unicast path joins no group, so it has none
+            // (karyos#1043).
+            let path_control = match config {
+                Some(config) if reliable => self.hold_control_group(*bind, *config),
+                _ => None,
             };
-            let path_slot = if reliable {
-                self.control_group_of(*bind, *config).map(|(at, _)| at)
-            } else {
-                None
+            let path_slot = match config {
+                Some(config) if reliable => self.control_group_of(*bind, *config).map(|(at, _)| at),
+                _ => None,
             };
             let posted = self
                 .links
@@ -1385,7 +1440,7 @@ impl<T: StreamTerms> Network<T> {
                     stream_id,
                     max_term_length,
                     reliable,
-                    multicast: true,
+                    multicast: config.is_some(),
                     control_group: path_control,
                     identity,
                     conflated: conflated.map(|(lane, _)| lane),
@@ -1619,6 +1674,13 @@ impl<T: StreamTerms> Network<T> {
         self.paths_isolated = true;
     }
 
+    /// Refuses channels with `paths`, as a backend that cannot isolate their
+    /// sockets does (tests of the refusal on a backend that can, karyos#624).
+    #[cfg(test)]
+    pub(crate) fn assume_unisolated_paths(&mut self) {
+        self.paths_isolated = false;
+    }
+
     /// The endpoint joined to the NAK control group of the data group
     /// `config` on `bind`'s port, and the group's address: `None` when the
     /// table names none, or when the join failed (counted, RC-15). The
@@ -1670,15 +1732,16 @@ impl<T: StreamTerms> Network<T> {
         &self,
         bind: SocketAddr,
         multicast: Option<MulticastConfig>,
-        later: &[(SocketAddr, MulticastConfig)],
+        later: &[LaterRoute],
     ) -> ControlAsked {
         let mut asked = [None; LATER_PATHS + 1];
         let Some(config) = multicast else {
             return asked;
         };
-        let routes = std::iter::once((bind, config)).chain(later.iter().copied());
+        let routes = std::iter::once((bind, Some(config))).chain(later.iter().copied());
         for (slot, (bind, config)) in asked.iter_mut().zip(routes) {
-            *slot = self.control_group_of(bind, config).map(|(_, group)| group);
+            *slot = config
+                .and_then(|config| self.control_group_of(bind, config).map(|(_, group)| group));
         }
         asked
     }

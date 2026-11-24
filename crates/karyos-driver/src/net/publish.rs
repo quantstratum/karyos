@@ -17,7 +17,8 @@
 //!   path's interface address, every path toward the channel's group: one
 //!   routed publication. Refused while the sockets cannot be isolated per
 //!   path ([`SocketOps::isolates_paths`], owner item 12), as subscriptions
-//!   are, and unicast `paths` need a destination per path (owner item 11).
+//!   are. Unicast paths are paired (owner item 11, karyos#1043): path `i`
+//!   binds the address of its interface and sends to its own endpoint.
 //!   Item 12 also covers the sending side: each path's socket must pick its
 //!   multicast interface (`IP_MULTICAST_IF`), not only bind its address.
 //! - **Readers.** Each lane's sender reader is a required participant of
@@ -65,13 +66,18 @@ pub(crate) fn skew_ns(channel: &UdpConfig) -> Result<Option<u64>, DriverError> {
         .transpose()
 }
 
-/// Where a channel sends, and the local address its endpoint binds: one
-/// per path for a channel with `paths`, the founding path first (control
-/// path, may allocate). A `control-mode=dynamic` channel is served only
-/// when `dynamic` (its publication carries an allowlist): its endpoint
-/// binds `control`, where receivers register, and it has no destination
-/// until one joins.
-fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAddr>), DriverError> {
+/// Where a channel sends, and the local address each path's endpoint
+/// binds with where that path sends: one per path for a channel with
+/// `paths`, the founding path first (control path, may allocate). Every
+/// path of a multicast channel sends to its group; path `i` of a paired
+/// unicast paths channel sends to its own `endpoints[i]` (karyos#1043). A
+/// `control-mode=dynamic` channel is served only when `dynamic` (its
+/// publication carries an allowlist): its endpoint binds `control`, where
+/// receivers register, and it has no destination until one joins.
+fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<Path>), DriverError> {
+    if let Destination::PairedPaths { endpoints } = &channel.destination {
+        return paired_route(channel, endpoints);
+    }
     let destination = match &channel.destination {
         // Port 0 asks a subscription for an ephemeral port; a publication
         // cannot send to it (karyos#656).
@@ -106,7 +112,7 @@ fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAd
             {
                 return Err(DriverError::UnsupportedChannel);
             }
-            return Ok((*control, vec![*control]));
+            return Ok((*control, vec![(*control, *control)]));
         }
         Destination::MultiDestination {
             mode: ControlMode::Dynamic,
@@ -129,7 +135,7 @@ fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAd
             let Interface::Address(ip @ IpAddr::V4(_)) = path else {
                 return Err(DriverError::UnsupportedChannel);
             };
-            binds.push(SocketAddr::new(*ip, 0));
+            binds.push((SocketAddr::new(*ip, 0), destination));
         }
         return Ok((destination, binds));
     }
@@ -140,7 +146,68 @@ fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<SocketAd
         None if destination.is_ipv4() => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         None => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
-    Ok((destination, vec![SocketAddr::new(ip, 0)]))
+    Ok((destination, vec![(SocketAddr::new(ip, 0), destination)]))
+}
+
+/// Each paired path's source address belongs to an interface of this host
+/// (karyos#1043): probed by binding a throwaway UDP socket to it, which
+/// fails with `EADDRNOTAVAIL` for an address no interface has, refused as
+/// [`DriverError::UnknownInterface`]. The unspecified address and a
+/// channel without paired paths pass. Control path.
+fn paired_sources_owned(channel: &UdpConfig) -> Result<(), DriverError> {
+    if !matches!(channel.destination, Destination::PairedPaths { .. }) {
+        return Ok(());
+    }
+    for path in &channel.paths {
+        let Interface::Address(ip) = path else {
+            continue;
+        };
+        if ip.is_unspecified() {
+            continue;
+        }
+        if let Err(error) = std::net::UdpSocket::bind(SocketAddr::new(*ip, 0))
+            && error.kind() == std::io::ErrorKind::AddrNotAvailable
+        {
+            return Err(DriverError::UnknownInterface { interface: *ip });
+        }
+    }
+    Ok(())
+}
+
+/// A path of a publication: the local address its endpoint binds, and
+/// where it sends.
+pub(crate) type Path = (SocketAddr, SocketAddr);
+
+/// The paths of a paired unicast paths channel (owner item 11,
+/// karyos#1043): path `i` binds the address of its interface
+/// `paths[i]` on a port the kernel picks and sends to `endpoints[i]`, one
+/// logical receiver over each; the founding path's endpoint is the
+/// channel's destination. An interface named by name is refused (a name
+/// would need the interface's own address, which this driver does not
+/// look up), as is an address of another family than its endpoint, or a
+/// count that is not one endpoint per path (a hand-built channel).
+fn paired_route(
+    channel: &UdpConfig,
+    endpoints: &[SocketAddr],
+) -> Result<(SocketAddr, Vec<Path>), DriverError> {
+    if endpoints.is_empty()
+        || endpoints.len() != channel.paths.len()
+        || endpoints.len() > MAX_ROUTES
+    {
+        return Err(DriverError::UnsupportedChannel);
+    }
+    let mut paths = Vec::with_capacity(endpoints.len());
+    for (interface, endpoint) in channel.paths.iter().zip(endpoints) {
+        let Interface::Address(ip) = interface else {
+            return Err(DriverError::UnsupportedChannel);
+        };
+        if ip.is_ipv4() != endpoint.is_ipv4() {
+            return Err(DriverError::UnsupportedChannel);
+        }
+        paths.push((SocketAddr::new(*ip, 0), *endpoint));
+    }
+    let destination = *endpoints.first().ok_or(DriverError::UnsupportedChannel)?;
+    Ok((destination, paths))
 }
 
 /// The destinations of a multi-destination channel and its required ones
@@ -606,6 +673,16 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             net.count_paths_refused();
             return Err(DriverError::UnsupportedChannel);
         }
+        // A paired path's source address must be this host's before its
+        // route is checked, so an unassigned one is named as such
+        // (karyos#1043, Codex review of #1230).
+        paired_sources_owned(channel)?;
+        if let Err(error) = super::subscribe::paths_on_distinct_interfaces(channel)
+            .and_then(|()| super::subscribe::paired_paths_on_distinct_interfaces(channel))
+        {
+            net.count_paths_refused();
+            return Err(error);
+        }
         let (destination, binds) = route(channel, allowlist.is_some())?;
         let max_destinations = net.max_destinations();
         // An allowlist belongs to a dynamic channel only. Its required
@@ -711,6 +788,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             destinations: destinations.0,
             required_destinations: destinations.1,
             binds,
+            paired: matches!(channel.destination, Destination::PairedPaths { .. }),
             reliable: channel.reliable,
             quanta,
             guard,
@@ -1036,6 +1114,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             destinations,
             required_destinations,
             binds,
+            paired,
             reliable,
             quanta,
             guard,
@@ -1147,11 +1226,18 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             &crate::agents::PUBLICATION_CELLS,
         );
         let net = self.net.as_mut().ok_or(DriverError::NetworkUnavailable)?;
-        // One send endpoint per path, all or nothing.
+        // One send endpoint per path, all or nothing. A paired unicast
+        // path's interface address that this host does not have is
+        // refused, typed (karyos#1043).
         let mut held: Vec<(EndpointId, SocketAddr)> = Vec::with_capacity(binds.len());
-        for bind in &binds {
-            match net.hold_send_endpoint(*bind) {
-                Ok(endpoint) => held.push((endpoint, destination)),
+        for &(bind, to) in &binds {
+            let opened = if paired {
+                net.hold_path_endpoint(bind)
+            } else {
+                net.hold_send_endpoint(bind)
+            };
+            match opened {
+                Ok(endpoint) => held.push((endpoint, to)),
                 Err(error) => {
                     for (endpoint, _) in held {
                         net.release_send_endpoint(endpoint);
