@@ -22,7 +22,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use karyos_archive::segment::{Geometry, SegmentError};
-use karyos_cluster::LogError;
+use karyos_cluster::{Entry, LogError};
 
 use super::check::{self, Violation};
 use super::core::{Change, ConsensusCore, Limits, Unsupported};
@@ -406,23 +406,29 @@ impl W5 {
 /// karyos/evaluations/c5-raft-comparison-v2.md, "W5: the lost reply,
 /// leader change and retry, whoever leads"), by triggers relative to
 /// whoever leads rather than steps and fixed servers, so a core reaches it
-/// whichever server it elects and with or without a handover:
+/// whichever server it elects and with or without a handover. Each
+/// trigger is checked after every step, from [`LostReply::from`]:
 ///
-/// 1. **Cut**: from step [`LostReply::from`], the first step at which
-///    exactly one up server leads the highest term led, `L`, the link from
-///    `L` to client [`LostReply::client`] is cut, one way.
+/// 1. **Cut**: the first step at which exactly one up server leads, and
+///    it leads the highest term any up server holds, `L`: the link from
+///    `L` to client [`LostReply::client`] is cut, one way. The request
+///    the client has open then, if any, is the one awaited.
 /// 2. **Lost**: the first reply `L` releases to that client after the cut
-///    is lost; its request is `R`.
-/// 3. **Crash**: at the next step, `L` crashes.
-/// 4. **Restart**: [`LostReply::down`] steps later, `L` restarts and every
-///    link is restored. The client retries `R` after its
-///    [`Case::retry_after`].
+///    for the awaited request, or with none open, for a request the client
+///    had no answer to: that request is `R`, at index `i` in term `T`,
+///    and its reply is lost.
+/// 3. **Crash**: before the next step is processed, `L` crashes.
+/// 4. **Restart**: [`LostReply::down`] steps after the crash, before that
+///    step is processed, `L` restarts and every link is restored. The
+///    client retries `R` after its [`Case::retry_after`].
 ///
-/// The case passes only if `R`'s retry is answered from deduplication by
-/// a server other than `L` after the crash ([`pass`]): with `L` the only
-/// leader of its term and down, that server leads a later term. A trigger
-/// not reached by [`LostReply::deadline`] fails the case
-/// ([`Failed::NotShown`]), never passes it.
+/// The case passes only if, by the end of step [`LostReply::deadline`],
+/// `R`'s retry (its client and sequence) is answered from deduplication
+/// by a server leading a term above `T` (`L` included, if it leads again),
+/// and the client gets that answer ([`pass`]); `R` taking effect once is
+/// the pass predicate's check of the state against the history. A trigger not reached by the deadline fails the
+/// case naming it ([`Failed::NotShown`]), never passes it. The case takes
+/// no static schedule ([`RunError::Schedule`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LostReply {
     /// The client, by session index.
@@ -466,14 +472,19 @@ impl W5 {
 /// Where a [`LostReply`]'s triggers stand.
 #[derive(Debug, Clone, Copy)]
 enum Lost {
-    /// Waiting for a single leader, from the step named.
+    /// Waiting for a single leader of the highest term.
     Cut,
-    /// `L` cut from the client; waiting for its reply past this many
+    /// `L` cut from the client; waiting for its reply to the awaited
+    /// request (`None`: any request not answered yet), past this many
     /// observations.
-    Reply { leader: NodeId, seen: usize },
-    /// Crash `L` at this step.
+    Reply {
+        leader: NodeId,
+        awaited: Option<u64>,
+        seen: usize,
+    },
+    /// Crash `L` before step `at` is processed.
     Crash { leader: NodeId, at: u64 },
-    /// Restart `L` and heal at this step.
+    /// Restart `L` and heal before step `at` is processed.
     Restart { leader: NodeId, at: u64 },
     /// Every trigger acted.
     Done,
@@ -825,6 +836,9 @@ pub enum RunError {
     Geometry(SegmentError),
     /// A count beyond the node id range.
     Count,
+    /// A [`LostReply`] case with a static schedule: its triggers act at
+    /// steps the schedule cannot be ordered with.
+    Schedule,
     /// The case declares limits its core does not take: what it would
     /// show is not demonstrated for that core, never passed.
     Unsupported(Unsupported),
@@ -1203,67 +1217,16 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         }
     }
     if let Some(lost) = case.lost_reply {
-        // Step by step, each trigger checked after every step.
+        if !case.schedule.is_empty() {
+            return Err(RunError::Schedule);
+        }
         let client = clients.get(lost.client).copied().ok_or(RunError::Count)?;
         let mut state = Lost::Cut;
         while done < case.steps {
-            sim.run_for(1).map_err(RunError::Sim)?;
-            done += 1;
+            let step = done + 1;
+            // What acts before this step is processed.
             state = match state {
-                Lost::Cut if done >= lost.from && done <= lost.deadline => {
-                    let leaders: Vec<(NodeId, u64)> = peers
-                        .iter()
-                        .filter_map(|id| {
-                            let core = sim.node(*id).and_then(Member::server)?.core()?;
-                            core.leads().then(|| (*id, core.term()))
-                        })
-                        .collect();
-                    let top = leaders.iter().map(|(_, term)| *term).max();
-                    let mut at_top = leaders.iter().filter(|(_, term)| Some(*term) == top);
-                    match (at_top.next(), at_top.next()) {
-                        (Some(&(leader, _)), None) => {
-                            sim.net_mut().cut(leader, client);
-                            let mut recorded = recorder.borrow_mut();
-                            recorded.observations.push(Observation::Triggered {
-                                what: "cut",
-                                node: leader,
-                                client,
-                            });
-                            Lost::Reply {
-                                leader,
-                                seen: recorded.observations.len(),
-                            }
-                        }
-                        _ => Lost::Cut,
-                    }
-                }
-                Lost::Reply { leader, seen } if done <= lost.deadline => {
-                    let mut recorded = recorder.borrow_mut();
-                    let replied = recorded.observations.iter().skip(seen).any(|observation| {
-                        matches!(
-                            observation,
-                            Observation::Reply { node, client: to, .. }
-                                if *node == leader && *to == client
-                        )
-                    });
-                    if replied {
-                        recorded.observations.push(Observation::Triggered {
-                            what: "lost",
-                            node: leader,
-                            client,
-                        });
-                        Lost::Crash {
-                            leader,
-                            at: done + 1,
-                        }
-                    } else {
-                        Lost::Reply {
-                            leader,
-                            seen: recorded.observations.len(),
-                        }
-                    }
-                }
-                Lost::Crash { leader, at } if done >= at => {
+                Lost::Crash { leader, at } if at == step => {
                     match sim.crash(leader) {
                         Ok(()) | Err(NodeError::AlreadyDown(_)) => {}
                         Err(error) => return Err(RunError::Node(error)),
@@ -1275,13 +1238,15 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                             what: "crash",
                             node: leader,
                             client,
+                            at: step,
+                            request: None,
                         });
                     Lost::Restart {
                         leader,
-                        at: done.saturating_add(lost.down),
+                        at: step.saturating_add(lost.down),
                     }
                 }
-                Lost::Restart { leader, at } if done >= at => {
+                Lost::Restart { leader, at } if at == step => {
                     sim.restart(leader).map_err(RunError::Node)?;
                     sim.net_mut().heal();
                     let mut recorded = recorder.borrow_mut();
@@ -1290,11 +1255,102 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
                         what: "restart",
                         node: leader,
                         client,
+                        at: step,
+                        request: None,
                     });
                     Lost::Done
                 }
                 other => other,
             };
+            sim.run_for(1).map_err(RunError::Sim)?;
+            done = step;
+            // What this step showed.
+            let open = step >= lost.from && step <= lost.deadline;
+            state = match state {
+                Lost::Cut if open => {
+                    let up: Vec<(NodeId, bool, u64)> = peers
+                        .iter()
+                        .filter_map(|id| {
+                            let server = sim.node(*id).and_then(Member::server)?;
+                            if !server.is_up() {
+                                return None;
+                            }
+                            let core = server.core()?;
+                            Some((*id, core.leads(), core.term()))
+                        })
+                        .collect();
+                    let highest = up.iter().map(|(_, _, term)| *term).max();
+                    let mut leaders = up
+                        .iter()
+                        .filter(|(_, leads, term)| *leads && Some(*term) == highest);
+                    match (leaders.next(), leaders.next()) {
+                        (Some(&(leader, _, _)), None) => {
+                            sim.net_mut().cut(leader, client);
+                            let awaited = sim
+                                .node(client)
+                                .and_then(Member::client)
+                                .and_then(ClientNode::open);
+                            let mut recorded = recorder.borrow_mut();
+                            recorded.observations.push(Observation::Triggered {
+                                what: "cut",
+                                node: leader,
+                                client,
+                                at: step,
+                                request: None,
+                            });
+                            Lost::Reply {
+                                leader,
+                                awaited,
+                                seen: recorded.observations.len(),
+                            }
+                        }
+                        _ => Lost::Cut,
+                    }
+                }
+                Lost::Reply {
+                    leader,
+                    awaited,
+                    seen,
+                } if open => {
+                    let mut recorded = recorder.borrow_mut();
+                    let request =
+                        lost_request(&recorded.observations, (leader, client), seen, awaited);
+                    let seen = recorded.observations.len();
+                    match request {
+                        Some(request) => {
+                            recorded.observations.push(Observation::Triggered {
+                                what: "lost",
+                                node: leader,
+                                client,
+                                at: step,
+                                request: Some(request),
+                            });
+                            Lost::Crash {
+                                leader,
+                                at: step + 1,
+                            }
+                        }
+                        None => Lost::Reply {
+                            leader,
+                            awaited,
+                            seen,
+                        },
+                    }
+                }
+                other => other,
+            };
+            if step == lost.deadline {
+                recorder
+                    .borrow_mut()
+                    .observations
+                    .push(Observation::Triggered {
+                        what: "deadline",
+                        node: 0,
+                        client,
+                        at: step,
+                        request: None,
+                    });
+            }
         }
     } else if let Some(steps) = case.steps.checked_sub(done).filter(|steps| *steps > 0) {
         sim.run_for(steps).map_err(RunError::Sim)?;
@@ -1381,40 +1437,134 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
     })
 }
 
-/// A [`LostReply`] case's own condition: every trigger acted by its
-/// deadline, and the lost request's retry was answered from deduplication
-/// by a server other than the crashed leader, after the crash.
+/// The command an entry carries: its client and sequence.
+fn command_of(entry: &Entry) -> Option<(NodeId, u64)> {
+    let command = super::node::Command::decode(&entry.payload)?;
+    Some((command.client, command.sequence))
+}
+
+/// The request whose reply `leader` released to `client` past `seen`
+/// observations: the awaited sequence, or with none, one the client had
+/// no answer to; as (index, term, sequence).
+fn lost_request(
+    observations: &[Observation],
+    (leader, client): (NodeId, NodeId),
+    seen: usize,
+    awaited: Option<u64>,
+) -> Option<(u64, u64, u64)> {
+    observations.iter().skip(seen).find_map(|observation| {
+        let Observation::Reply {
+            node,
+            client: to,
+            index,
+            term,
+            ..
+        } = observation
+        else {
+            return None;
+        };
+        if *node != leader || *to != client {
+            return None;
+        }
+        // Its command, from what the leader applied at that index.
+        let sequence = observations.iter().find_map(|applied| match applied {
+            Observation::Applied { node, entry, .. } if *node == leader && entry.index == *index => {
+                command_of(entry).filter(|(c, _)| *c == client).map(|(_, s)| s)
+            }
+            _ => None,
+        })?;
+        let answered = observations.iter().any(|earlier| {
+            matches!(earlier, Observation::Success { client: c, index: i, .. } if *c == client && i == index)
+        });
+        let wanted = match awaited {
+            Some(awaited) => sequence == awaited,
+            None => !answered,
+        };
+        wanted.then_some((*index, *term, sequence))
+    })
+}
+
+/// A [`LostReply`] case's own condition (see it): every trigger acted by
+/// the deadline, and `R`'s retry was answered from deduplication by a
+/// leader of a term above `R`'s, by the deadline, and its answer
+/// delivered to the client. That `R` takes effect once is the
+/// pass predicate's own check of the state against the history.
 fn lost_reply_shown(observations: &[Observation]) -> Result<(), Failed> {
     let triggered = |what: &str| {
         observations.iter().position(|observation| {
             matches!(observation, Observation::Triggered { what: w, .. } if *w == what)
         })
     };
-    let Some(crash) = triggered("crash") else {
-        return Err(Failed::NotShown("lost reply"));
+    let deadline = triggered("deadline").unwrap_or(observations.len());
+    let before = |at: Option<usize>, name: &'static str| match at {
+        Some(at) if at < deadline => Ok(at),
+        _ => Err(Failed::NotShown(name)),
     };
-    if triggered("restart").is_none() {
-        return Err(Failed::NotShown("lost reply"));
-    }
+    before(triggered("cut"), "cut")?;
+    let lost = before(triggered("lost"), "lost reply")?;
+    let crash = before(triggered("crash"), "crash")?;
     let Some(Observation::Triggered {
-        node: leader,
         client,
+        request: Some((_, term, sequence)),
         ..
-    }) = observations.get(crash)
+    }) = observations.get(lost)
     else {
         return Err(Failed::NotShown("lost reply"));
     };
-    let answered = observations.iter().skip(crash).any(|observation| {
-        matches!(
-            observation,
-            Observation::Deduplicated { node, client: c, .. } if node != leader && c == client
-        )
+    // The retry, answered from deduplication after the crash by a server
+    // leading a term above `T`; then that server's reply to the client,
+    // and the client's success for it, all before the deadline. The retry
+    // is a new entry the service answers from deduplication, so the answer
+    // names that entry's index, not `R`'s.
+    let window = || observations.iter().enumerate().take(deadline).skip(crash);
+    let answered = window().find_map(|(at, observation)| {
+        let Observation::Deduplicated {
+            node,
+            client: c,
+            sequence: s,
+        } = observation
+        else {
+            return None;
+        };
+        let led = observations
+            .iter()
+            .take(at)
+            .rev()
+            .find_map(|earlier| match earlier {
+                Observation::Commit {
+                    node: n,
+                    term,
+                    leader: true,
+                    ..
+                } if n == node => Some(*term),
+                Observation::Crashed { node: n } if n == node => Some(0),
+                _ => None,
+            });
+        (c == client && s == sequence && led.is_some_and(|led| led > *term)).then_some((at, *node))
     });
-    if answered {
-        Ok(())
-    } else {
-        Err(Failed::NotShown("retry"))
+    let Some((at, server)) = answered else {
+        return Err(Failed::NotShown("retry"));
+    };
+    let reply = window()
+        .skip_while(|(seen, _)| *seen <= at)
+        .find_map(|(seen, observation)| match observation {
+            Observation::Reply {
+                node,
+                client: c,
+                index,
+                ..
+            } if *node == server && c == client => Some((seen, *index)),
+            _ => None,
+        });
+    let delivered = reply.is_some_and(|(seen, index)| {
+        window().skip_while(|(later, _)| *later <= seen).any(|(_, observation)| {
+            matches!(observation, Observation::Success { client: c, index: i, .. } if c == client && *i == index)
+        })
+    });
+    if !delivered {
+        return Err(Failed::NotShown("retry"));
     }
+    Ok(())
 }
 
 /// The safety checks of a run: every check over all of it, or with a

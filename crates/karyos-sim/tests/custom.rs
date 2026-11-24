@@ -124,13 +124,34 @@ fn w2_passes_and_its_burst_is_refused_by_the_queue() {
     }
 }
 
+/// The step and the request of a trigger, from a run.
+type Trigger = (u64, karyos_sim::net::NodeId, Option<(u64, u64, u64)>);
+
+fn trigger(observations: &[Observation], name: &str) -> Option<Trigger> {
+    observations
+        .iter()
+        .find_map(|observation| match observation {
+            Observation::Triggered {
+                what,
+                node,
+                at,
+                request,
+                ..
+            } if *what == name => Some((*at, *node, *request)),
+            _ => None,
+        })
+}
+
 /// C5 version 2's W5 retry, relative to whoever leads: the custom core
-/// passes it on every seed, and a deadline before the cut can act makes
-/// it fail as not shown, never pass.
+/// passes it on every seed, its triggers in the frozen order (cut, lost,
+/// crash before the next step, restart 40 steps after the crash) on one
+/// leader; the witness is the lost request's own retry, from a later
+/// term; and a trigger not reached by the deadline fails, inclusively.
 #[test]
-fn the_lost_reply_whoever_leads_passes_and_an_unreached_trigger_fails() {
+fn the_lost_reply_whoever_leads_passes_on_its_own_witness() {
     use karyos_sim::harness::workloads::{Failed, W5};
     let case = W5::manifest().lost_reply_whoever_leads();
+    let mut first = None;
     for seed in SEEDS {
         let outcome = workloads::run::<Custom>(&case, seed).unwrap();
         assert_eq!(
@@ -139,14 +160,62 @@ fn the_lost_reply_whoever_leads_passes_and_an_unreached_trigger_fails() {
             "{} seed {seed}",
             case.name
         );
+        let observations = &outcome.observations;
+        let (cut, leader, _) = trigger(observations, "cut").unwrap();
+        let (lost, lost_on, request) = trigger(observations, "lost").unwrap();
+        let (crash, crashed, _) = trigger(observations, "crash").unwrap();
+        let (restart, restarted, _) = trigger(observations, "restart").unwrap();
+        assert!(cut >= 12 && cut <= lost, "seed {seed}");
+        assert_eq!(crash, lost + 1, "seed {seed}");
+        assert_eq!(restart, crash + 40, "seed {seed}");
+        assert!(
+            [lost_on, crashed, restarted]
+                .iter()
+                .all(|node| *node == leader)
+        );
+        assert!(request.is_some(), "seed {seed}");
+        first.get_or_insert((outcome, cut));
     }
-    let mut late = case.clone();
-    if let Some(lost) = late.lost_reply.as_mut() {
-        lost.deadline = lost.from - 1;
-    }
-    let outcome = workloads::run::<Custom>(&late, 1).unwrap();
+    let (outcome, cut) = first.unwrap();
+    let mutated = |change: &dyn Fn(&mut Observation)| {
+        let mut outcome = outcome.clone();
+        for observation in &mut outcome.observations {
+            change(observation);
+        }
+        workloads::pass(&case, &outcome)
+    };
+    // Another request's deduplication is no witness.
     assert_eq!(
-        workloads::pass(&late, &outcome),
-        Err(Failed::NotShown("lost reply"))
+        mutated(&|observation| {
+            if let Observation::Deduplicated { sequence, .. } = observation {
+                *sequence += 1_000;
+            }
+        }),
+        Err(Failed::NotShown("retry"))
     );
+    // Nor is an answer from a term not above the lost reply's.
+    assert_eq!(
+        mutated(&|observation| {
+            if let Observation::Triggered {
+                request: Some((_, term, _)),
+                ..
+            } = observation
+            {
+                *term = u64::MAX;
+            }
+        }),
+        Err(Failed::NotShown("retry"))
+    );
+    // The deadline is inclusive: at the cut's step the cut counts, one
+    // before it does not.
+    let at = |deadline| {
+        let mut late = case.clone();
+        if let Some(lost) = late.lost_reply.as_mut() {
+            lost.deadline = deadline;
+        }
+        let outcome = workloads::run::<Custom>(&late, SEEDS[0]).unwrap();
+        workloads::pass(&late, &outcome)
+    };
+    assert_eq!(at(cut - 1), Err(Failed::NotShown("cut")));
+    assert_ne!(at(cut), Err(Failed::NotShown("cut")));
 }
