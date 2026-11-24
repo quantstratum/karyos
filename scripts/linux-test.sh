@@ -94,8 +94,8 @@ if [ ${#args[@]} -eq 0 ]; then
 fi
 
 karyos_target_volume_prepare "$target" "$root"
-status=0
-docker run --rm \
+# shellcheck disable=SC2016 # expanded by the container's shell
+run=(docker run --rm \
     ${platform_args[@]+"${platform_args[@]}"} \
     ${name_args[@]+"${name_args[@]}"} \
     ${seccomp_args[@]+"${seccomp_args[@]}"} \
@@ -108,10 +108,24 @@ docker run --rm \
     -w /work \
     "$image" \
     sh -c 'echo "kernel $(uname -r) $(uname -m) target volume $1"; shift; cargo test "$@"' \
-    sh "$target" "${args[@]}" || status=$?
-if [ "$clean" = 1 ]; then
-    if docker volume rm "$target" > /dev/null; then
-        printf 'removed target volume %s (--clean)\n' "$target" >&2
-    fi
+    sh "$target" "${args[@]}")
+if [ "$clean" != 1 ]; then
+    exec "${run[@]}"
+fi
+# With --clean the script outlives the container to remove its volume, so
+# it forwards a termination to the Docker client (which stops the
+# container) and still cleans up once the client has exited.
+"${run[@]}" &
+pid=$!
+trap 'kill -TERM "$pid" 2> /dev/null || true' TERM INT HUP
+status=0
+wait "$pid" || status=$?
+while kill -0 "$pid" 2> /dev/null; do
+    status=0
+    wait "$pid" || status=$?
+done
+trap - TERM INT HUP
+if ! karyos_target_volume_clean "$target" "$root" && [ "$status" -eq 0 ]; then
+    status=1
 fi
 exit "$status"
