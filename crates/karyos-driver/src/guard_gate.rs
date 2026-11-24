@@ -214,6 +214,18 @@ pub struct GateCounts {
     pub control_held: u64,
 }
 
+/// The words of [`GuardGate::rate_cells`] (R-CORE-40, karyos#741).
+pub const RATE_CELLS: usize = 12;
+/// A bit of [`GuardGate::rate_cells`]'s first word: the publication's
+/// bucket exists.
+pub const RATE_LIMITERS_PUBLICATION: u64 = 1;
+/// A bit of the first word: the publication's bucket limits bytes too.
+pub const RATE_LIMITERS_PUBLICATION_BYTES: u64 = 2;
+/// A bit of the first word: the control bucket exists (a control reserve).
+pub const RATE_LIMITERS_CONTROL: u64 = 4;
+/// A bit of the first word: the control bucket limits bytes too.
+pub const RATE_LIMITERS_CONTROL_BYTES: u64 = 8;
+
 /// What [`GuardGate::admit_control`] decided for a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
@@ -913,6 +925,71 @@ impl GuardGate {
     #[must_use]
     pub fn policy_version(&self) -> u64 {
         self.policy.as_ref().map_or(0, |slot| slot.version)
+    }
+
+    /// What the agent reads of the gate's rate limiters (R-CORE-40,
+    /// karyos#741), in the order of the rate cells of
+    /// `crate::agents::PUBLICATION_CELLS`: which buckets exist
+    /// ([`RATE_LIMITERS_PUBLICATION`] and the other bits), the policy
+    /// version ([`Self::policy_version`]), the publication's message rate
+    /// and burst, its byte rate and burst, its refusals, then the control
+    /// bucket's four rates and bursts and its refusals. Each bucket's
+    /// refusals are what it held back: `GateCounts::rate_held`, and
+    /// `GateCounts::control_held` in the bucket control frames spend, the
+    /// publication's without a reserve ([`Self::admit_control`]). A bucket
+    /// that does not exist reads 0 throughout, and its bit says so: a 0 is
+    /// never taken for "refused nothing" without it. `None` for a sum past
+    /// `u64::MAX`, whose cell keeps its last value. Reads of fields already
+    /// held: no allocation, for the sender's duty cycle.
+    #[must_use]
+    pub fn rate_cells(&self) -> [Option<u64>; RATE_CELLS] {
+        let publication = self.limiter.as_ref().map(RateLimiter::policy);
+        let control = self.control_policy();
+        let bits = [
+            (publication.is_some(), RATE_LIMITERS_PUBLICATION),
+            (
+                publication.is_some_and(|policy| policy.bytes.is_some()),
+                RATE_LIMITERS_PUBLICATION_BYTES,
+            ),
+            (control.is_some(), RATE_LIMITERS_CONTROL),
+            (
+                control.is_some_and(|policy| policy.bytes.is_some()),
+                RATE_LIMITERS_CONTROL_BYTES,
+            ),
+        ]
+        .into_iter()
+        .fold(0, |bits, (set, bit)| if set { bits | bit } else { bits });
+        let rates = |policy: Option<RatePolicy>| {
+            let bytes = policy.and_then(|policy| policy.bytes);
+            [
+                policy.map_or(0, |policy| policy.messages.per_second),
+                policy.map_or(0, |policy| policy.messages.burst),
+                bytes.map_or(0, |bytes| bytes.per_second),
+                bytes.map_or(0, |bytes| bytes.burst),
+            ]
+        };
+        let [p0, p1, p2, p3] = rates(publication);
+        let [c0, c1, c2, c3] = rates(control);
+        let counts = &self.counts;
+        let (publication_refusals, control_refusals) = if control.is_some() {
+            (Some(counts.rate_held), counts.control_held)
+        } else {
+            (counts.rate_held.checked_add(counts.control_held), 0)
+        };
+        [
+            Some(bits),
+            Some(self.policy_version()),
+            Some(p0),
+            Some(p1),
+            Some(p2),
+            Some(p3),
+            publication_refusals,
+            Some(c0),
+            Some(c1),
+            Some(c2),
+            Some(c3),
+            Some(control_refusals),
+        ]
     }
 
     /// Records a datagram committed to `lane`'s queue, at its tail, in both

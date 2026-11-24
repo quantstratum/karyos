@@ -594,6 +594,10 @@ fn per_stream_network_counters_reach_the_cnc_in_every_mode() {
         });
         // Nothing was lost on the loopback: nothing to repair.
         assert_eq!(keyed(&a, "network retransmits", sent), [0], "{mode:?}");
+        // No guard, so no rate limiter: none is read, rather than a
+        // limiter that refused nothing (R-CORE-40, karyos#741).
+        assert_eq!(keyed(&a, "network rate limiters", sent), [0], "{mode:?}");
+        assert_eq!(keyed(&a, "network rate refusals", sent), [0], "{mode:?}");
         // The removal frees the publication's cells, and the image retires
         // with its EOS, freeing its own.
         drop(lane);
