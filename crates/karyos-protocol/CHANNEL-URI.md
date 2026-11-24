@@ -337,4 +337,8 @@ path        = interface "@" socket-address
   once. A driver whose sockets cannot isolate paths (karyos#624; not
   Linux) refuses a paired-paths channel, `UnsupportedChannel`, for a
   publication and a subscription. A path interface named by name is
-  refused by a driver that does not look interfaces up by name.
+  refused by a driver that does not look interfaces up by name. A
+  publication path is refused unless the route to its endpoint leaves by
+  the interface owning its address, and the paths' routes leave by
+  distinct interfaces; IPv6 paired paths, whose routes the driver cannot
+  read, are refused as unverifiable.
