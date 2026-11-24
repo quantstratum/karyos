@@ -1104,6 +1104,28 @@ pub fn accept(listener: BorrowedFd<'_>) -> Result<Option<OwnedFd>, SysError> {
     }
 }
 
+/// Sets the send buffer (`SO_SNDBUF`) of `socket` to `bytes`. The kernel
+/// may adjust the size it keeps (Linux doubles it, for its bookkeeping);
+/// [`send_buffer`] reads back what it kept.
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when `setsockopt` fails.
+pub fn set_send_buffer(socket: BorrowedFd<'_>, bytes: u32) -> Result<(), SysError> {
+    let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+    rustix::net::sockopt::set_socket_send_buffer_size(socket, bytes)
+        .map_err(os("setsockopt(SO_SNDBUF)"))
+}
+
+/// The send buffer (`SO_SNDBUF`) of `socket`, as the kernel keeps it.
+///
+/// # Errors
+///
+/// Returns [`SysError::Os`] when `getsockopt` fails.
+pub fn send_buffer(socket: BorrowedFd<'_>) -> Result<usize, SysError> {
+    rustix::net::sockopt::socket_send_buffer_size(socket).map_err(os("getsockopt(SO_SNDBUF)"))
+}
+
 /// Whether `error`, from [`send`] or [`recv`] on a connected socket, says
 /// its peer is gone (`EPIPE` or `ECONNRESET`): the peer closed it, or the
 /// peer process is exiting (karyos#827).
