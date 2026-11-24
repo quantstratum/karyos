@@ -334,6 +334,7 @@ pub fn guard_answer(answer: &crate::operations::GuardAnswer) -> String {
         GuardAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
         GuardAnswer::UnknownDriver => fields.string("error", "unknown driver"),
         GuardAnswer::Unattached => fields.string("error", "driver unavailable"),
+        GuardAnswer::InstanceChanged => fields.string("error", "target changed"),
     });
     text
 }

@@ -196,3 +196,25 @@ fn the_newest_transition_gives_the_state() {
     );
     assert_eq!(last_state(&audit, 9), None);
 }
+
+/// karyos#738 review: a guard closed at the last epoch can never reopen,
+/// so a reopen preview there gives no epoch after and no token.
+#[test]
+fn no_reopen_is_previewed_past_the_last_epoch() {
+    let mut previews = Previews::default();
+    let last = Seen {
+        instance: 9,
+        state: Some(GuardState {
+            epoch: karyos_sys::guard::MAX_EPOCH,
+            open: false,
+        }),
+    };
+    assert!(matches!(
+        previews.preview(bound(PreviewKind::Reopen, 1, b""), last, Instant::now()),
+        PreviewAnswer::Previewed {
+            epoch_after: None,
+            token: None,
+            ..
+        }
+    ));
+}

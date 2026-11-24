@@ -220,8 +220,10 @@ pub struct Agent {
     rates: Vec<crate::api::RateView>,
     /// The guard previews whose tokens a submit may name (karyos#738).
     previews: crate::preview::Previews,
-    /// The caller-chosen operation ids submitted in this run (karyos#738).
-    submitted: std::collections::HashSet<u64>,
+    /// Every operation id used in this run, the agent's own and the ones
+    /// callers chose (karyos#738): one accounting, so no two operations
+    /// share an id.
+    used_ids: std::collections::HashSet<u64>,
 }
 
 impl Agent {
@@ -285,7 +287,7 @@ impl Agent {
             retention: None,
             rates: Vec::new(),
             previews: crate::preview::Previews::default(),
-            submitted: std::collections::HashSet::new(),
+            used_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -365,11 +367,12 @@ impl Agent {
         requester: Requester,
         reason: &[u8],
     ) -> crate::retention::RetentionAnswer {
-        let id = self.next_operation;
-        if self.retention.is_some() {
-            // Checked: at their end the ids keep the last one.
-            self.next_operation = id.checked_add(1).unwrap_or(id);
-        }
+        // An id is taken only when the operation can be sent.
+        let id = if self.retention.is_some() {
+            self.allocate_operation()
+        } else {
+            self.next_operation
+        };
         let command = crate::retention::Command {
             operation,
             recording,
@@ -396,7 +399,7 @@ impl Agent {
             operations::Transition::Close,
             Requester::local(uid),
             reason,
-            None,
+            (None, None),
         )
     }
 
@@ -416,7 +419,7 @@ impl Agent {
             operations::Transition::Close,
             requester,
             reason,
-            None,
+            (None, None),
         )
     }
 
@@ -435,7 +438,7 @@ impl Agent {
             operations::Transition::Reopen(expected),
             requester,
             reason,
-            None,
+            (None, None),
         )
     }
 
@@ -456,7 +459,7 @@ impl Agent {
             operations::Transition::Reopen(expected),
             Requester::local(uid),
             reason,
-            None,
+            (None, None),
         )
     }
 
@@ -516,7 +519,8 @@ impl Agent {
         reason: &[u8],
     ) -> Result<GuardAnswer, crate::preview::SubmitRefusal> {
         use crate::preview::{Bound, PreviewKind, SubmitRefusal};
-        if operation == 0 || self.submitted.contains(&operation) {
+        // One accounting with the agent's own ids (karyos#738 review).
+        if operation == 0 || self.used_ids.contains(&operation) {
             return Err(SubmitRefusal::OperationReused);
         }
         let instance = self
@@ -534,12 +538,36 @@ impl Agent {
         let epoch = self
             .previews
             .take(token, &bound, instance, std::time::Instant::now())?;
-        let _ = self.submitted.insert(operation);
+        let _ = self.used_ids.insert(operation);
         let transition = match kind {
             PreviewKind::Close => operations::Transition::CloseAt(epoch),
             PreviewKind::Reopen => operations::Transition::Reopen(epoch),
         };
-        Ok(self.guard_command(dir, guard, transition, requester, reason, Some(operation)))
+        Ok(self.guard_command(
+            dir,
+            guard,
+            transition,
+            requester,
+            reason,
+            (Some(operation), instance),
+        ))
+    }
+
+    /// The next operation id of the agent's own, skipping any a caller
+    /// already used (karyos#738 review), and taken: no two operations share
+    /// an id. Checked: at the end of the ids the last one is kept.
+    fn allocate_operation(&mut self) -> u64 {
+        loop {
+            let id = self.next_operation;
+            let Some(next) = id.checked_add(1) else {
+                let _ = self.used_ids.insert(id);
+                return id;
+            };
+            self.next_operation = next;
+            if self.used_ids.insert(id) {
+                return id;
+            }
+        }
     }
 
     fn guard_command(
@@ -549,21 +577,20 @@ impl Agent {
         transition: operations::Transition,
         requester: Requester,
         reason: &[u8],
-        chosen: Option<u64>,
+        (chosen, instance): (Option<u64>, Option<u128>),
     ) -> GuardAnswer {
         if !self.drivers.iter().any(|driver| driver.dir == dir) {
             return GuardAnswer::UnknownDriver;
         }
-        let operation = chosen.unwrap_or_else(|| {
-            let operation = self.next_operation;
-            // Checked: at their end the ids keep the last one.
-            self.next_operation = operation.checked_add(1).unwrap_or(operation);
-            operation
-        });
+        let operation = match chosen {
+            Some(operation) => operation,
+            None => self.allocate_operation(),
+        };
         let command = operations::Command {
             dir,
             guard,
             transition,
+            instance,
             operation,
             operator: requester.operator,
             relay: requester.relay,
@@ -597,9 +624,7 @@ impl Agent {
         if !self.drivers.iter().any(|driver| driver.dir == dir) {
             return RateAnswer::UnknownDriver;
         }
-        let operation = self.next_operation;
-        // Checked: at their end the ids keep the last one.
-        self.next_operation = operation.checked_add(1).unwrap_or(operation);
+        let operation = self.allocate_operation();
         let command = operations::RateCommand {
             dir,
             stream,

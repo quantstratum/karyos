@@ -498,6 +498,71 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
         ),
         "{moved:?}"
     );
+    // karyos#738 review: one id accounting across the paths. A direct
+    // operation's id cannot be submitted again, and the agent's own ids
+    // skip one a caller took.
+    let direct = serving(&mut driver, || {
+        agent.guard_reopen(&driver_dir, guard.id(), 5, 1000, b"")
+    });
+    let GuardAnswer::State {
+        operation: taken, ..
+    } = direct
+    else {
+        panic!("{direct:?}");
+    };
+    assert_eq!(
+        agent.guard_submit_for(
+            (taken, garbage),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        ),
+        Err(SubmitRefusal::OperationReused)
+    );
+    serving(&mut driver, || agent.refresh());
+    let (_, _, token) = preview(&mut agent);
+    let claimed = agent.next_operation;
+    let submitted = serving(&mut driver, || {
+        agent.guard_submit_for(
+            (claimed, token),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        )
+    });
+    assert!(matches!(submitted, Ok(GuardAnswer::State { operation, .. }) if operation == claimed));
+    let next = serving(&mut driver, || {
+        agent.guard_close(&driver_dir, guard.id(), 1000, b"")
+    });
+    assert!(matches!(next, GuardAnswer::State { operation, .. } if operation != claimed));
+    // karyos#738 review: a driver that restarted between the preview and
+    // the submit's attach is another target: refused unsent, even with the
+    // agent's cached instance still the previewed one.
+    let reopened = serving(&mut driver, || {
+        agent.guard_reopen(&driver_dir, guard.id(), 7, 1000, b"")
+    });
+    assert!(matches!(reopened, GuardAnswer::State { state, .. } if state.open));
+    serving(&mut driver, || agent.refresh());
+    let (_, _, token) = preview(&mut agent);
+    drop(driver);
+    let mut replacement = super::tests::driver(&driver_dir);
+    let _ = replacement.add_guard("orders").unwrap();
+    let elsewhere = serving(&mut replacement, || {
+        agent.guard_submit_for(
+            (777_777, token),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        )
+    });
+    assert_eq!(elsewhere, Ok(GuardAnswer::InstanceChanged));
+    drop(replacement);
     drop(agent);
     let _ = std::fs::remove_dir_all(&dir);
 }

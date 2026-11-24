@@ -222,7 +222,13 @@ impl Previews {
         let (kind, guard) = (bound.kind, bound.guard);
         let change = seen.state.and_then(|state| match (kind, state.open) {
             (PreviewKind::Close, true) | (PreviewKind::Reopen, false) => {
-                state.epoch.checked_add(1).map(|after| (state.epoch, after))
+                // Never past the guard's last epoch: a reopen there is
+                // exhausted, so there is nothing to preview a token for.
+                state
+                    .epoch
+                    .checked_add(1)
+                    .filter(|after| *after <= karyos_sys::guard::MAX_EPOCH)
+                    .map(|after| (state.epoch, after))
             }
             _ => None,
         });
