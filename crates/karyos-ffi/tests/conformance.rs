@@ -30,6 +30,58 @@ mod support {
 
 use support::{abi, semantic, sha256};
 
+/// Builds `bin` of `karyos-tools` with `features` in the test's own
+/// profile, into a target directory of its own beside the test's
+/// (`conformance-<bin>`), and returns the binary's path. Each binary has its
+/// own directory, so a build with other features never rebuilds what
+/// another one left there; and every such build of this process, and of
+/// any other test process on the same target directory, runs alone, under
+/// a process-wide mutex and an exclusive lock on `conformance.lock`
+/// (karyos#1067: parallel nested builds into one directory removed each
+/// other's files). Cargo makes a fresh binary a no-op.
+#[cfg(target_os = "linux")]
+fn build_tool(bin: &str, features: &[&str]) -> PathBuf {
+    static BUILDS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let exe = std::env::current_exe().unwrap();
+    let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
+    let base = profile.parent().unwrap();
+    let target = base.join(format!("conformance-{bin}"));
+    // Cargo names the dev profile's directory `debug`.
+    let name = match profile.file_name().and_then(|name| name.to_str()) {
+        Some("debug") | None => "dev",
+        Some(name) => name,
+    };
+    let _process = BUILDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(base.join("conformance.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let mut command = std::process::Command::new(cargo);
+    command.args([
+        "build",
+        "--locked",
+        "-p",
+        "karyos-tools",
+        "--bin",
+        bin,
+        "--profile",
+        name,
+    ]);
+    if !features.is_empty() {
+        command.args(["--features", &features.join(",")]);
+    }
+    let status = command.env("CARGO_TARGET_DIR", &target).status().unwrap();
+    lock.unlock().unwrap();
+    assert!(status.success(), "{bin} did not build");
+    target.join(profile.file_name().unwrap()).join(bin)
+}
+
 /// The format versions this runner reads.
 const FORMATS: [&str; 2] = ["1", "2"];
 
@@ -2804,45 +2856,13 @@ mod incompatible_host {
             if let Ok(path) = std::env::var("KARYOS_ADMISSION_STUB") {
                 return PathBuf::from(path);
             }
-            let exe = std::env::current_exe().unwrap();
-            let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
-            // Its own target directory: rebuilding into the shared one would
-            // replace a binary another test built with other features.
-            let target = profile.parent().unwrap().join("conformance");
-            let built = target
-                .join(profile.file_name().unwrap())
-                .join("karyos-admission-stub");
             // Built every run, once per process: a binary left by an earlier
-            // build is stale (a stub of an older protocol
-            // VERSION admits at this one; karyos#1063). Cargo makes a fresh
-            // binary a no-op.
-            static BUILT: std::sync::Once = std::sync::Once::new();
-            BUILT.call_once(|| {
-                // Cargo names the dev profile's directory `debug`.
-                let name = match profile.file_name().and_then(|name| name.to_str()) {
-                    Some("debug") | None => "dev",
-                    Some(name) => name,
-                };
-                let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-                let status = Command::new(cargo)
-                    .args([
-                        "build",
-                        "--locked",
-                        "-p",
-                        "karyos-tools",
-                        "--features",
-                        "test-hooks",
-                        "--bin",
-                        "karyos-admission-stub",
-                        "--profile",
-                        name,
-                    ])
-                    .env("CARGO_TARGET_DIR", &target)
-                    .status()
-                    .unwrap();
-                assert!(status.success(), "karyos-admission-stub did not build");
-            });
-            built
+            // build is stale (a stub of an older protocol VERSION admits at
+            // this one; karyos#1063).
+            static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+            BUILT
+                .get_or_init(|| super::super::build_tool("karyos-admission-stub", &["test-hooks"]))
+                .clone()
         }
 
         impl Stub {
@@ -2978,41 +2998,11 @@ mod archive_host {
             if let Ok(path) = std::env::var("KARYOS_KARYOSD") {
                 return PathBuf::from(path);
             }
-            let exe = std::env::current_exe().unwrap();
-            let profile = exe.parent().unwrap().parent().unwrap().to_path_buf();
-            // Its own target directory: rebuilding into the shared one would
-            // replace a binary another test built with other features.
-            let target = profile.parent().unwrap().join("conformance");
-            let built = target.join(profile.file_name().unwrap()).join("karyosd");
-            // Built every run, once per process: a binary left by an earlier
-            // build is stale (a stub of an older protocol
-            // VERSION admits at this one; karyos#1063). Cargo makes a fresh
-            // binary a no-op.
-            static BUILT: std::sync::Once = std::sync::Once::new();
-            BUILT.call_once(|| {
-                // Cargo names the dev profile's directory `debug`.
-                let name = match profile.file_name().and_then(|name| name.to_str()) {
-                    Some("debug") | None => "dev",
-                    Some(name) => name,
-                };
-                let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
-                let status = Command::new(cargo)
-                    .args([
-                        "build",
-                        "--locked",
-                        "-p",
-                        "karyos-tools",
-                        "--bin",
-                        "karyosd",
-                        "--profile",
-                        name,
-                    ])
-                    .env("CARGO_TARGET_DIR", &target)
-                    .status()
-                    .unwrap();
-                assert!(status.success(), "karyosd did not build");
-            });
-            built
+            // Built every run, once per process, as the admission stub.
+            static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+            BUILT
+                .get_or_init(|| super::super::build_tool("karyosd", &[]))
+                .clone()
         }
 
         impl Karyosd {
