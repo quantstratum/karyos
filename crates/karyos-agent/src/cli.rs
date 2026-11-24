@@ -55,7 +55,11 @@ join-get DIR KIND KEY [AT_NS] and join-list DIR [KIND KEY], KIND being
 stream, point or counter, or KARYOS-AGENT 1 rate-change DIR STREAM_ID
 SESSION_ID EXPECTED AUTHORITY MSG_RATE MSG_BURST BYTE_RATE BYTE_BURST
 [REASON], AUTHORITY safety (operator, risk-officer, administrator) or
-administrator (administrator), byte rate and burst 0 0 for no byte limit.
+administrator (administrator), byte rate and burst 0 0 for no byte limit,
+or KARYOS-AGENT 1 guard-close-preview DIR GUARD [REASON] and
+guard-reopen-preview DIR GUARD [REASON], then submit OPID TOKEN
+guard-close|guard-reopen DIR GUARD [REASON] with the preview's token and
+the caller's operation id (the roles of the operation).
 ";
 
 /// The default bound of a signal stop (karyos#710).
@@ -337,7 +341,7 @@ mod tests {
 pub const EXPORTER_USAGE: &str = "\
 usage: karyos-exporter --listen ADDRESS:PORT --driver DIR [--driver DIR]... \
 [--refresh-ms MS] [--agent-id NAME] [--token-file PATH] \
-[--tls-cert PEM --tls-key PEM]
+[--tls-cert PEM --tls-key PEM] [--deadline-ms MS]
 
 Serves the agent's view of each driver in the Prometheus text format on
 http://ADDRESS:PORT/metrics, reading each driver's CnC as a tool every MS
@@ -347,7 +351,10 @@ TLS-terminating sidecar or mesh, or with --tls-cert and --tls-key (both,
 PEM files: the certificate chain and its private key), which serve
 https://ADDRESS:PORT/metrics over TLS 1.3 on any address, in a build with
 the exporter-tls feature; off loopback --token-file is required too, and
-the key file must have mode 0600. --token-file requires every scrape to
+the key file must have mode 0600. --deadline-ms bounds each connection
+in all, handshake, request and answer included (1 to 30000; default 250
+on plain loopback, 2000 over TLS, which fits a remote scrape of about
+100 KiB at round trips up to 300 ms). --token-file requires every scrape to
 carry Authorization: Bearer with the token in PATH (32 to 256 bytes of
 visible ASCII, the file mode 0600; a symlink is followed, as a Kubernetes
 secret mount is one), against the other processes of the pod's network
@@ -376,6 +383,9 @@ pub struct ExporterArgs {
     /// The PEM files of the TLS certificate chain and its private key
     /// (`--tls-cert`, `--tls-key`; karyos#887), both or neither.
     pub tls: Option<(PathBuf, PathBuf)>,
+    /// The whole of one connection at most (`--deadline-ms`), when not
+    /// the default.
+    pub deadline: Option<Duration>,
 }
 
 /// Parses `karyos-exporter`'s `args` (without the program name); `None`
@@ -391,6 +401,7 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
     let mut token_file = None;
     let mut tls_cert = None;
     let mut tls_key = None;
+    let mut deadline = None;
     let mut args = args.iter();
     while let Some(flag) = args.next() {
         let value = args.next()?;
@@ -416,6 +427,14 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
                 }
                 refresh = Duration::from_millis(millis);
             }
+            "--deadline-ms" if deadline.is_none() => {
+                let millis: u64 = value.parse().ok()?;
+                let chosen = Duration::from_millis(millis);
+                if millis == 0 || chosen > crate::exporter::MAX_CONNECTION_DEADLINE {
+                    return None;
+                }
+                deadline = Some(chosen);
+            }
             _ => return None,
         }
     }
@@ -440,12 +459,37 @@ pub fn parse_exporter(args: &[String]) -> Option<ExporterArgs> {
         agent_id,
         token_file,
         tls,
+        deadline,
     })
 }
 
 #[cfg(test)]
 mod exporter_tests {
     use super::*;
+
+    /// karyos#887 review: `--deadline-ms` takes 1 to 30000 once.
+    #[test]
+    fn a_deadline_is_bounded() {
+        let args = |line: &str| line.split(' ').map(str::to_owned).collect::<Vec<_>>();
+        let base = "--listen 127.0.0.1:9464 --driver /d";
+        assert_eq!(parse_exporter(&args(base)).unwrap().deadline, None);
+        assert_eq!(
+            parse_exporter(&args(&format!("{base} --deadline-ms 5000")))
+                .unwrap()
+                .deadline,
+            Some(Duration::from_secs(5))
+        );
+        for bad in ["0", "30001", "x"] {
+            assert_eq!(
+                parse_exporter(&args(&format!("{base} --deadline-ms {bad}"))),
+                None
+            );
+        }
+        assert_eq!(
+            parse_exporter(&args(&format!("{base} --deadline-ms 1 --deadline-ms 2"))),
+            None
+        );
+    }
 
     /// karyos#887: off loopback only with TLS and a token, and TLS takes
     /// both files.

@@ -19,6 +19,7 @@ pub mod etf;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod ops;
+pub mod path_interface;
 #[cfg(target_os = "macos")]
 pub mod portable;
 #[cfg(any(test, feature = "test-hooks"))]

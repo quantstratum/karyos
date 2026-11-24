@@ -768,8 +768,9 @@ fn a_server_stopped_by_its_disk_is_verified_at_its_restart() {
     // Node 2's disk crashes at an operation inside a duty: the drive
     // error stops the node while it is up. Its entries stay unverified
     // until a restart reopens its log. The budgets count the log's
-    // integrity journal among the creation's operations (karyos#990).
-    for budget in [35, 50] {
+    // integrity journal (karyos#990) and its origin file (karyos#745)
+    // among the creation's operations.
+    for budget in [40, 55] {
         for seed in scenarios::seeds() {
             let disks = vec![SimDisk::new(), SimDisk::new(), SimDisk::with_budget(budget)];
             let (mut sim, recorder, _) = fresh(seed, disks, appends(6));

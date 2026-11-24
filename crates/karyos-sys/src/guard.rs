@@ -51,6 +51,15 @@ pub enum GuardError {
         /// The guard's current state.
         current: GuardState,
     },
+    /// A close at an expected epoch named one the guard is not open at
+    /// (karyos#738): it was closed, or reopened at another epoch, since.
+    #[error("the guard is not open at epoch {expected} (now {current:?})")]
+    NotOpenAt {
+        /// The open epoch the close expected to replace.
+        expected: u64,
+        /// The guard's current state.
+        current: GuardState,
+    },
     /// A reopen would need an epoch above [`MAX_EPOCH`]; the guard stays
     /// closed for good.
     #[error("the guard's epochs are exhausted")]
@@ -172,6 +181,26 @@ pub fn close(word: &AtomicU64) -> Result<Closed, GuardError> {
     };
     word.store(epoch << 1, Ordering::Release);
     Ok(Closed::Now { epoch })
+}
+
+/// Closes the guard only if it is open at `expected` (karyos#738),
+/// returning the new closed epoch: a close checked against the state an
+/// operator saw, so it never closes a guard that moved since. Owner only.
+///
+/// # Errors
+///
+/// [`GuardError::NotOpenAt`] when the guard is closed or open at another
+/// epoch; [`GuardError::Corrupt`] for a broken word. Nothing is stored on
+/// error.
+pub fn close_at(word: &AtomicU64, expected: u64) -> Result<u64, GuardError> {
+    let current = decode(word.load(Ordering::Relaxed))?;
+    if !current.open || current.epoch != expected {
+        return Err(GuardError::NotOpenAt { expected, current });
+    }
+    // An open epoch is even and below MAX_EPOCH, which is odd.
+    let epoch = current.epoch.checked_add(1).ok_or(GuardError::Exhausted)?;
+    word.store(epoch << 1, Ordering::Release);
+    Ok(epoch)
 }
 
 /// Reopens a guard closed at `expected`, returning the new open epoch. A

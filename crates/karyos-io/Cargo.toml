@@ -38,8 +38,10 @@ thiserror.workspace = true
 # for `net` only; no `event` (decision O-6).
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "time", "linux_4_11"] }
-# The error queue of the `etf` route (`src/linux_sys.rs`, the only caller):
-# the joint Linux `libc` record of owner items 12 and 29
+# The Linux `libc` calls `rustix` 1.1.5 has no API for (`src/linux_sys.rs`,
+# the only caller): `IP_MULTICAST_ALL`/`IPV6_MULTICAST_ALL` off on a path
+# socket and the error queue of the `etf` route, under the joint Linux
+# `libc` record of owner items 12 and 29
 # (quantstratum-docs: karyos/reviews/dependency-admission-libc-linux-sockets.md),
 # which also records `rustix`'s `time` feature above, for `SO_TXTIME`'s
 # clock id, and `linux_4_11`, which exposes `CLOCK_TAI` (it also drops
@@ -64,8 +66,8 @@ proptest.workspace = true
 # rules of SPEC.md §14. Keep the clippy list in sync with the workspace.
 [lints.rust]
 missing_docs = "deny"
-# `unsafe` only where a module expects it: `uring::ring` and `xdp::ring`
-# (SPEC.md §14).
+# `unsafe` only where a module expects it: `uring::ring`, `xdp::ring` and,
+# on Linux, `linux_sys` (SPEC.md §14; the io-uring and libc R8 records).
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 

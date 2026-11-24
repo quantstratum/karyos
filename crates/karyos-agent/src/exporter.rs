@@ -60,11 +60,23 @@ pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 pub const MAX_REQUEST: usize = 1024;
 /// The read and write timeout of each connection.
 pub const IO_TIMEOUT: Duration = Duration::from_millis(100);
-/// The whole of one connection, its TLS handshake, request and answer
-/// included, at most: a peer that trickles bytes, each within
+/// The whole of one plain-HTTP connection on loopback, its request and
+/// answer included, at most: a peer that trickles bytes, each within
 /// [`IO_TIMEOUT`], is still cut off here, so it cannot hold the single
-/// polling thread (karyos#887 review).
+/// polling thread (karyos#887 review). Loopback has no network round
+/// trip, so the answer's size alone sets the time.
 pub const CONNECTION_DEADLINE: Duration = Duration::from_millis(250);
+/// The whole of one TLS connection by default, its handshake, request and
+/// answer included (karyos#887 review). A remote scraper on a real
+/// network spends about one round trip on the TLS 1.3 handshake, half of
+/// one on its request, and then the answer: an exposition of about
+/// 100 KiB, sent from a TCP initial window of 10 segments (about 14 KiB)
+/// doubling each round trip, needs about three more. Five round trips of
+/// up to 300 ms are 1.5 s; 2 s leaves margin. A deployment with longer
+/// round trips or a larger exposition sets its own (`--deadline-ms`).
+pub const TLS_CONNECTION_DEADLINE: Duration = Duration::from_secs(2);
+/// The longest deadline `--deadline-ms` takes.
+pub const MAX_CONNECTION_DEADLINE: Duration = Duration::from_secs(30);
 /// Connections answered per [`Exporter::poll`] at most, so a burst cannot
 /// hold the agent's refresh.
 pub const MAX_PER_POLL: usize = 16;
@@ -815,6 +827,10 @@ pub enum ExportError {
     #[cfg(feature = "exporter-tls")]
     #[error(transparent)]
     Tls(#[from] tls::TlsError),
+    /// A connection deadline outside 1 ms to [`MAX_CONNECTION_DEADLINE`]
+    /// (karyos#887 review).
+    #[error("a connection deadline of {0:?} is outside 1 ms to 30 s")]
+    InvalidDeadline(Duration),
     /// The operating system's error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -846,6 +862,12 @@ pub struct Exporter {
     /// configured (karyos#887).
     #[cfg(feature = "exporter-tls")]
     tls: Option<std::sync::Arc<rustls::ServerConfig>>,
+    /// The whole of one connection at most, and the time after which a
+    /// poll takes no further connection.
+    deadline: Duration,
+    /// One read or write at most: [`IO_TIMEOUT`] on plain loopback; the
+    /// whole deadline over TLS, where one step may wait a round trip.
+    step: Duration,
 }
 
 /// A scrape token (`--token-file`, karyos#734): 32 to 256 bytes of visible
@@ -947,6 +969,8 @@ pub fn bind(address: SocketAddr) -> Result<Exporter, ExportError> {
         token: None,
         #[cfg(feature = "exporter-tls")]
         tls: None,
+        deadline: CONNECTION_DEADLINE,
+        step: IO_TIMEOUT,
     })
 }
 
@@ -974,6 +998,8 @@ pub fn bind_tls(
         listener,
         token,
         tls: Some(config),
+        deadline: TLS_CONNECTION_DEADLINE,
+        step: TLS_CONNECTION_DEADLINE,
     })
 }
 
@@ -986,6 +1012,46 @@ impl Exporter {
         self
     }
 
+    /// Allows each connection `deadline` in all (`--deadline-ms`), 1 ms to
+    /// [`MAX_CONNECTION_DEADLINE`]: over TLS one read or write may then
+    /// wait as long; on plain loopback each still waits at most
+    /// [`IO_TIMEOUT`]. The step follows the exporter's transport, however
+    /// many times this is called.
+    ///
+    /// # Errors
+    ///
+    /// [`ExportError::InvalidDeadline`] for a deadline outside that range.
+    pub fn with_deadline(mut self, deadline: Duration) -> Result<Self, ExportError> {
+        if deadline < Duration::from_millis(1) || deadline > MAX_CONNECTION_DEADLINE {
+            return Err(ExportError::InvalidDeadline(deadline));
+        }
+        self.deadline = deadline;
+        self.step = if self.over_tls() {
+            deadline
+        } else {
+            IO_TIMEOUT.min(deadline)
+        };
+        Ok(self)
+    }
+
+    /// Whether every connection is served over TLS.
+    fn over_tls(&self) -> bool {
+        #[cfg(feature = "exporter-tls")]
+        {
+            self.tls.is_some()
+        }
+        #[cfg(not(feature = "exporter-tls"))]
+        {
+            false
+        }
+    }
+
+    /// The whole of one connection at most.
+    #[must_use]
+    pub fn deadline(&self) -> Duration {
+        self.deadline
+    }
+
     /// The address bound.
     ///
     /// # Errors
@@ -996,14 +1062,17 @@ impl Exporter {
     }
 
     /// Answers up to [`MAX_PER_POLL`] pending connections with `body`'s
-    /// exposition. Never waits for a connection.
+    /// exposition, taking no further one once the poll has run for its
+    /// deadline, so a poll ends within about twice the deadline. Never
+    /// waits for a connection.
     ///
     /// # Errors
     ///
     /// The operating system's error when `accept` fails.
     pub fn poll(&mut self, body: impl Fn() -> String) -> Result<Vec<Answered>, ExportError> {
         let mut answered = Vec::new();
-        while answered.len() < MAX_PER_POLL {
+        let started = std::time::Instant::now();
+        while answered.len() < MAX_PER_POLL && started.elapsed() < self.deadline {
             match self.listener.accept() {
                 Ok((stream, _)) => answered.push(self.answer(stream, &body)),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -1013,15 +1082,20 @@ impl Exporter {
         Ok(answered)
     }
 
-    /// Answers one connection, over TLS when configured, within
-    /// [`CONNECTION_DEADLINE`].
+    /// Answers one connection, over TLS when configured, within its
+    /// deadline.
     fn answer(&self, stream: TcpStream, body: &impl Fn() -> String) -> Answered {
         if stream.set_nonblocking(false).is_err() {
             return Answered::Dropped;
         }
         let stream = Deadlined {
             stream,
-            deadline: std::time::Instant::now() + CONNECTION_DEADLINE,
+            // Bounded by `with_deadline`, so this does not overflow; a
+            // failure is a connection with no time left.
+            deadline: std::time::Instant::now()
+                .checked_add(self.deadline)
+                .unwrap_or_else(std::time::Instant::now),
+            step: self.step,
         };
         #[cfg(feature = "exporter-tls")]
         if let Some(config) = &self.tls {
@@ -1046,16 +1120,17 @@ impl Exporter {
     }
 }
 
-/// A connection whose every read and write waits at most [`IO_TIMEOUT`]
-/// and never past its `deadline`: past it, each fails with
+/// A connection whose every read and write waits at most `step` and
+/// never past its `deadline`: past it, each fails with
 /// [`std::io::ErrorKind::TimedOut`] (karyos#887 review).
 struct Deadlined {
     stream: TcpStream,
     deadline: std::time::Instant,
+    step: Duration,
 }
 
 impl Deadlined {
-    /// The time left for the next operation, at most [`IO_TIMEOUT`].
+    /// The time left for the next operation, at most `step`.
     fn remaining(&self) -> std::io::Result<Duration> {
         let left = self
             .deadline
@@ -1066,7 +1141,7 @@ impl Deadlined {
                 "the connection's deadline passed",
             ));
         }
-        Ok(left.min(IO_TIMEOUT))
+        Ok(left.min(self.step))
     }
 }
 

@@ -123,6 +123,17 @@ pub enum Kind {
     /// What the change did: the version after it in `word`, or the
     /// refusal's code in `code` and its detail in `word`.
     RateOutcome,
+    /// A caller-chosen operation id's submit that was sent (R-CORE-18,
+    /// karyos#738), after its request and outcome records: the operation
+    /// (`parameters`: 1 a close, 2 a reopen), the guard, the epoch it
+    /// acted at in `expected`, the operator, the relay and the reason; its
+    /// outcome (`code` 0 and the guard word after it in `word`, a refusal's
+    /// code and detail, or [`UNKNOWN_OUTCOME`]); and, after the relay
+    /// word, the driver's directory and this host's boot identity
+    /// ([`JournalRecord::target`], [`JournalRecord::boot`]). The agent
+    /// rebuilds its retained outcomes and caller ids from these records
+    /// only.
+    Submitted,
 }
 
 impl Kind {
@@ -146,6 +157,7 @@ impl Kind {
             Self::VerifyOutcome => 16,
             Self::RateRequest => 17,
             Self::RateOutcome => 18,
+            Self::Submitted => 19,
         }
     }
 
@@ -169,6 +181,7 @@ impl Kind {
             16 => Self::VerifyOutcome,
             17 => Self::RateRequest,
             18 => Self::RateOutcome,
+            19 => Self::Submitted,
             _ => return None,
         })
     }
@@ -219,6 +232,12 @@ pub struct JournalRecord {
     /// a request made on the local socket, which no relay carried. The
     /// operator is then the authenticated requester, never the relay.
     pub relay: u64,
+    /// A [`Kind::Submitted`] record's driver directory, as bytes; empty
+    /// for every other kind.
+    pub target: Vec<u8>,
+    /// A [`Kind::Submitted`] record's host boot identity (Linux's
+    /// `boot_id`), as bytes; empty for every other kind, or when unknown.
+    pub boot: Vec<u8>,
 }
 
 impl JournalRecord {
@@ -237,6 +256,8 @@ impl JournalRecord {
             word: 0,
             reason: Vec::new(),
             relay: 0,
+            target: Vec::new(),
+            boot: Vec::new(),
         }
     }
 
@@ -265,7 +286,15 @@ impl JournalRecord {
         ];
         let mut out: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
         out.extend_from_slice(reason);
-        if self.relay != 0 {
+        if self.kind == Kind::Submitted {
+            // The relay word always, then the target and the boot, each
+            // after its length word (karyos#738).
+            out.extend_from_slice(&self.relay.to_le_bytes());
+            for field in [&self.target, &self.boot] {
+                out.extend_from_slice(&u64::try_from(field.len()).unwrap_or(0).to_le_bytes());
+                out.extend_from_slice(field);
+            }
+        } else if self.relay != 0 {
             out.extend_from_slice(&self.relay.to_le_bytes());
         }
         out
@@ -286,13 +315,34 @@ impl JournalRecord {
         let start = WORDS.checked_mul(8)?;
         let end = start.checked_add(length)?;
         let reason = payload.get(start..end)?;
-        // The relay word, when one follows the reason; nothing else may.
-        let relay = match payload.get(end..)? {
-            [] => 0,
-            tail => u64::from_le_bytes(tail.try_into().ok()?),
+        let kind = Kind::from_code(word(1)?)?;
+        let tail = payload.get(end..)?;
+        let (relay, target, boot) = if kind == Kind::Submitted {
+            // The relay word, then the target and the boot by length.
+            let (relay, mut rest) = tail.split_first_chunk::<8>()?;
+            let mut field = || -> Option<Vec<u8>> {
+                let (length, after) = rest.split_first_chunk::<8>()?;
+                let length = usize::try_from(u64::from_le_bytes(*length)).ok()?;
+                let bytes = after.get(..length)?;
+                rest = after.get(length..)?;
+                Some(bytes.to_vec())
+            };
+            let target = field()?;
+            let boot = field()?;
+            if !rest.is_empty() {
+                return None;
+            }
+            (u64::from_le_bytes(*relay), target, boot)
+        } else {
+            // The relay word, when one follows the reason; nothing else may.
+            let relay = match tail {
+                [] => 0,
+                tail => u64::from_le_bytes(tail.try_into().ok()?),
+            };
+            (relay, Vec::new(), Vec::new())
         };
         Some(Self {
-            kind: Kind::from_code(word(1)?)?,
+            kind,
             time: word(2)?,
             guard: word(3)?,
             expected: word(4)?,
@@ -303,6 +353,8 @@ impl JournalRecord {
             word: word(9)?,
             reason: reason.to_vec(),
             relay,
+            target,
+            boot,
         })
     }
 }
@@ -433,9 +485,18 @@ pub struct Journal {
     /// The records the open read, for tests.
     #[cfg(test)]
     pub(crate) scanned: Vec<JournalRecord>,
+    /// The [`Kind::Submitted`] records the open read, until taken.
+    operations: Vec<JournalRecord>,
 }
 
 impl Journal {
+    /// The [`Kind::Submitted`] records the open read, oldest first, taken
+    /// once (karyos#738): the agent rebuilds its retained outcomes and
+    /// caller ids from them.
+    pub fn take_operations(&mut self) -> Vec<JournalRecord> {
+        std::mem::take(&mut self.operations)
+    }
+
     /// Opens the journal in `dir` at host time `now`, creating the
     /// directory if need be: resumes its open recording, or starts one,
     /// then records an unknown interval when the last run may have lost a
@@ -504,6 +565,7 @@ impl Journal {
             seal_chunk,
             #[cfg(test)]
             scanned: scan.all.clone(),
+            operations: scan.operations,
         };
         let last = scan.last.as_ref().map(|last| last.kind);
         let reason = if cut {
@@ -785,6 +847,9 @@ struct Scan {
     /// Every record, for tests that read a journal back.
     #[cfg(test)]
     all: Vec<JournalRecord>,
+    /// The [`Kind::Submitted`] records, oldest first: the agent's retained
+    /// outcomes and caller ids are rebuilt from them (karyos#738).
+    operations: Vec<JournalRecord>,
 }
 
 /// Reads every frame of `store`, oldest first.
@@ -840,6 +905,9 @@ fn scan(store: &mut SegmentStore<StdDisk>) -> Result<Scan, JournalError> {
                 }
                 #[cfg(test)]
                 found.all.push(record.clone());
+                if record.kind == Kind::Submitted {
+                    found.operations.push(record.clone());
+                }
                 found.last = Some(record);
             }
             u64::from(length)

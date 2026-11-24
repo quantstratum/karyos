@@ -75,7 +75,10 @@ fn measure(label: &str, routed: bool) {
     let subscribing = channel(group, two);
     let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
     for side in [&mut a, &mut b] {
-        side.net.as_mut().unwrap().assume_isolated_paths();
+        assert!(
+            side.net.as_ref().unwrap().paths_isolated(),
+            "Linux sockets isolate paths (owner item 12)"
+        );
     }
     let _ = b.add_network_subscription(10, &subscribing).unwrap();
     let publication = a

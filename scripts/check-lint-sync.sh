@@ -27,10 +27,11 @@ for crate in karyos-sys karyos-io karyos-ffi; do
     done <<<"$workspace_lints"
 done
 
-# karyos-io (SPEC.md §14): unsafe_code denied for the crate, expected only
-# on exactly these declarations, each checked against the item it
-# annotates: `pub mod ring` of src/uring.rs and src/xdp.rs, and
-# `mod linux_sys` of src/lib.rs (the joint libc record); never allowed.
+# karyos-io (SPEC.md §14; the io-uring and libc R8 records): unsafe_code
+# denied for the crate, expected only on exactly these declarations, each
+# checked against the item it annotates: `pub mod ring` of src/uring.rs and
+# src/xdp.rs, and the Linux-only `mod linux_sys` of src/lib.rs (the joint
+# libc record); never allowed.
 io="$root/crates/karyos-io"
 if ! awk '/^\[lints.rust\]/{f=1;next} /^\[/{f=0} f' "$io/Cargo.toml" | grep -qx 'unsafe_code = "deny"'; then
     echo 'karyos-io must set unsafe_code = "deny" in [lints.rust]' >&2

@@ -1350,6 +1350,24 @@ impl RemoteClient {
             .guard_close(guard, operation, operator, reason)
     }
 
+    /// Closes guard `guard` only if it is open at `expected` (karyos#738),
+    /// as [`ClientConductor::guard_close_at`].
+    ///
+    /// # Errors
+    ///
+    /// As [`ClientConductor::guard_close_at`].
+    pub fn guard_close_at(
+        &mut self,
+        guard: u64,
+        expected: u64,
+        operation: u64,
+        operator: Option<u32>,
+        reason: &[u8],
+    ) -> Result<u64, ConductorError> {
+        self.conductor_mut()?
+            .guard_close_at(guard, expected, operation, operator, reason)
+    }
+
     /// Reopens guard `guard` closed at `expected`, as
     /// [`ClientConductor::guard_reopen`].
     ///

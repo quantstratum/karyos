@@ -895,6 +895,9 @@ fn a_unicast_subscription_is_not_multicast() {
 #[test]
 fn a_channel_with_paths_is_refused_until_paths_are_isolated() {
     let mut driver = driver(ThreadingMode::Shared);
+    // A backend that cannot isolate path sockets (macOS; Linux isolates
+    // them, karyos#624).
+    driver.net.as_mut().unwrap().assume_unisolated_paths();
     let group = SocketAddr::from(([239, 7, 9, 1], free_port()));
     let channel = UdpConfig {
         destination: Destination::Multicast { group, ttl: None },
@@ -1017,18 +1020,11 @@ fn unicast_paths_are_refused() {
         driver.add_network_subscription(6, &channel),
         Err(crate::error::DriverError::UnsupportedChannel)
     );
-    // Paired unicast paths parse (karyos#635) and stay refused, typed,
-    // for a subscription and a publication, until unicast paths pass on
-    // real sockets (karyos#624), even where paths are taken as isolated.
-    let Ok(karyos_protocol::channel::ChannelConfig {
-        media: karyos_protocol::channel::Media::Udp(paired),
-        ..
-    }) = karyos_protocol::channel::ChannelConfig::parse(
-        "karyos:udp?paths=127.0.0.1@127.0.0.1:9;127.0.0.2@127.0.0.2:9",
-    )
-    else {
-        panic!("paired paths do not parse");
-    };
+    // Paired unicast paths (karyos#635) are served where path sockets are
+    // isolated (karyos#1043), and stay refused, typed and counted, for a
+    // subscription and a publication where they are not (macOS).
+    driver.net.as_mut().unwrap().assume_unisolated_paths();
+    let paired = paired_channel("127.0.0.1@127.0.0.1:9;127.0.0.2@127.0.0.2:9");
     assert_eq!(
         driver.add_network_subscription(7, &paired),
         Err(crate::error::DriverError::UnsupportedChannel)
@@ -1037,6 +1033,104 @@ fn unicast_paths_are_refused() {
         driver.add_network_publication(aggregate(7, 3, 1), &paired),
         Err(crate::error::DriverError::UnsupportedChannel)
     ));
+    assert_eq!(driver.network_path_counters().0, 2);
+}
+
+/// The channel of a paired unicast paths URI `paths` value (karyos#635).
+fn paired_channel(paths: &str) -> UdpConfig {
+    let Ok(karyos_protocol::channel::ChannelConfig {
+        media: karyos_protocol::channel::Media::Udp(paired),
+        ..
+    }) = karyos_protocol::channel::ChannelConfig::parse(&format!("karyos:udp?paths={paths}"))
+    else {
+        panic!("paired paths do not parse: {paths}");
+    };
+    paired
+}
+
+/// karyos#1043: a paired unicast paths subscription receives path `i` at
+/// its own endpoint `endpoints[i]`, joining no group; the interface before
+/// each `@` is the sender's, so a name there is no refusal here.
+#[test]
+fn paired_paths_receive_each_path_at_its_endpoint() {
+    let paired = paired_channel("eth1@127.0.0.1:40123;eth2@127.0.0.2:40124");
+    assert_eq!(
+        super::receive_route(&paired, false),
+        Ok((SocketAddr::from(([127, 0, 0, 1], 40123)), None))
+    );
+    assert_eq!(
+        super::later_routes(&paired),
+        Ok(vec![(SocketAddr::from(([127, 0, 0, 2], 40124)), None)])
+    );
+    // A hand-built channel with one endpoint per path missing.
+    let mut short = paired.clone();
+    short.paths.pop();
+    assert_eq!(
+        super::later_routes(&short),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+}
+
+/// karyos#1043 (Codex review of #1230): a paired path's datagrams leave by
+/// the route to its endpoint, not by its source address, so the egress
+/// interface of that route must be the one owning the path's address, and
+/// the paths' egress interfaces must differ. A path whose route leaves by
+/// another interface than its source's is refused; two paths whose routes
+/// leave by one NIC are refused; a path that cannot be resolved is
+/// refused; IPv6 paired paths are refused as unverifiable here.
+#[cfg(target_os = "linux")]
+#[test]
+fn paired_paths_must_leave_through_distinct_interfaces() {
+    use super::super::subscribe::paired_paths_on_distinct_interfaces_with;
+    // A host with 10.0.x.x on eth0 and 10.1.x.x on eth1: an address
+    // belongs to the interface of its second octet, and the route to a
+    // target leaves by the interface of the target's.
+    let host = |address: Ipv4Addr, to: Ipv4Addr| {
+        let by = if address.is_unspecified() {
+            to
+        } else {
+            address
+        };
+        Some(format!("eth{}", by.octets()[1]))
+    };
+    let paired = paired_channel("10.0.0.5@10.0.0.9:40123;10.1.0.5@10.1.0.9:40123");
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&paired, host),
+        Ok(())
+    );
+    // The unspecified source takes the route's own interface.
+    let any = paired_channel("0.0.0.0@10.0.0.9:40123;10.1.0.5@10.1.0.9:40123");
+    assert_eq!(paired_paths_on_distinct_interfaces_with(&any, host), Ok(()));
+    // Path 2's source is on eth1, but the route to its endpoint leaves by
+    // eth0: its datagrams would not take its interface.
+    let crossed = paired_channel("10.0.0.5@10.0.0.9:40123;10.1.0.5@10.0.0.10:40123");
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&crossed, host),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    // Both routes leave by one NIC, even though the sources differ.
+    let one_nic = |address: Ipv4Addr, _: Ipv4Addr| {
+        Some(if address.is_unspecified() {
+            "eth0".to_owned()
+        } else {
+            format!("eth{}", address.octets()[1])
+        })
+    };
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&paired, one_nic),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    // Nothing resolves.
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&paired, |_, _| None),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    // IPv6 has no route lookup here: refused as unverifiable.
+    let ipv6 = paired_channel("::1@[::1]:40123");
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&ipv6, host),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
 }
 
 /// #294 tests: an unsubscription the receiver's full ring refuses waits,
@@ -2627,4 +2721,111 @@ fn a_second_handle_of_an_unreliable_key_cannot_add_nak_control() {
     );
     assert_eq!(b.network_control_groups_in_use(), 0);
     assert!(b.remove_network_subscription(first).unwrap());
+}
+
+/// Owner item 12 (karyos#624): the sockets backend isolates redundant
+/// paths on Linux, so the driver admits a channel with `paths` there with
+/// no switch assumed; elsewhere (macOS, until an equivalent isolation test
+/// passes) the channel is refused, typed, and counted.
+#[test]
+fn paths_are_isolated_on_linux_and_refused_elsewhere() {
+    let mut driver = driver(ThreadingMode::Shared);
+    let isolated = driver.net.as_ref().unwrap().paths_isolated();
+    assert_eq!(isolated, cfg!(target_os = "linux"));
+    if isolated {
+        return;
+    }
+    let group = SocketAddr::from(([239, 7, 9, 4], free_port()));
+    let any = Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let refused = driver.network_path_counters().0;
+    assert_eq!(
+        driver.add_network_subscription(6, &path_channel(group, vec![any])),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    assert_eq!(driver.network_path_counters().0, refused + 1);
+}
+
+/// Codex review of #1218 (karyos#624): paths whose addresses resolve to one
+/// interface are refused, the same address twice shares its endpoint, and
+/// an unresolvable path is refused where the isolation is real.
+#[cfg(target_os = "linux")]
+#[test]
+fn paths_resolving_to_one_interface_are_refused() {
+    use super::super::subscribe::paths_on_distinct_interfaces_with;
+    let group = SocketAddr::from(([239, 7, 9, 6], 4000));
+    let any = Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    let lan = Ipv4Addr::new(10, 1, 0, 5);
+    // The group routes through the LAN interface, as Codex's example.
+    let resolve = |address: Ipv4Addr, _group: Ipv4Addr| {
+        Some(if address.is_loopback() { "lo" } else { "eth1" }.to_owned())
+    };
+    let channel = |paths| path_channel(group, paths);
+    assert_eq!(
+        paths_on_distinct_interfaces_with(
+            &channel(vec![any.clone(), Interface::Address(IpAddr::V4(lan))]),
+            resolve
+        ),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    assert_eq!(
+        paths_on_distinct_interfaces_with(
+            &channel(vec![any.clone(), Interface::Address(LOOPBACK)]),
+            resolve
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        paths_on_distinct_interfaces_with(&channel(vec![any.clone(), any.clone()]), resolve),
+        Ok(())
+    );
+    assert_eq!(
+        paths_on_distinct_interfaces_with(
+            &channel(vec![any, Interface::Address(LOOPBACK)]),
+            |_, _| None
+        ),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+}
+
+/// The same refusal through the driver on this host: the unspecified path
+/// and the explicit address of the interface the group routes through are
+/// one interface, refused and counted.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_subscription_with_two_paths_on_one_interface_is_refused() {
+    let Some(lan) = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|probe| {
+            probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+            probe.local_addr()
+        })
+        .ok()
+        .and_then(|local| match local.ip() {
+            IpAddr::V4(address) if !address.is_loopback() => Some(address),
+            _ => None,
+        })
+    else {
+        return;
+    };
+    let group = SocketAddr::from(([239, 7, 9, 7], free_port()));
+    let via_group = karyos_io::sockets::path_interface::path_interface(
+        Ipv4Addr::UNSPECIFIED,
+        Ipv4Addr::new(239, 7, 9, 7),
+    );
+    let of_lan =
+        karyos_io::sockets::path_interface::path_interface(lan, Ipv4Addr::new(239, 7, 9, 7));
+    if via_group.is_none() || via_group != of_lan {
+        // The group routes elsewhere on this host: no single interface here.
+        return;
+    }
+    let mut driver = driver(ThreadingMode::Shared);
+    let refused = driver.network_path_counters().0;
+    let any = Interface::Address(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    assert_eq!(
+        driver.add_network_subscription(
+            6,
+            &path_channel(group, vec![any, Interface::Address(IpAddr::V4(lan))])
+        ),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    assert_eq!(driver.network_path_counters().0, refused + 1);
 }
