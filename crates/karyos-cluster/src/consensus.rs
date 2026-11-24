@@ -1610,6 +1610,10 @@ impl<L: LogTerms> LogTerms for Based<'_, L> {
     fn size(&self, index: u64) -> Option<u64> {
         self.log.size(index)
     }
+
+    fn cost(&self, index: u64) -> Option<u64> {
+        self.log.cost(index)
+    }
 }
 
 fn last(log: &impl LogTerms) -> (u64, u64) {
