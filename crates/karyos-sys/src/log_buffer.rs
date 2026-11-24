@@ -3390,17 +3390,32 @@ impl<O: BufferOwner> Subscription<O> {
         if outcome != PollOutcome::Pending || self.cursor.pending.is_some() {
             return Ok(outcome);
         }
-        // Only where the poll found nothing: the seal is positioned once
-        // every block below it is terminal, so a cursor at the position has
-        // read everything (`quantstratum-docs: karyos/design/publication-seal.md`).
+        self.at_seal_or_pending()
+    }
+
+    /// Where a poll found nothing: `Closed` once the seal is positioned at
+    /// or below the cursor, as every block below it is terminal, so a
+    /// cursor at the position has read everything
+    /// (`quantstratum-docs: karyos/design/publication-seal.md`); else
+    /// `Pending`. A reader revoked meanwhile gets `Revoked` instead: its
+    /// loan attempt may have read the flag clear just before the driver
+    /// revoked it and sealed (karyos#1067).
+    fn at_seal_or_pending(&self) -> Result<PollOutcome, SysError> {
         match decode_seal(self.buffer.seal().load(Ordering::Acquire)) {
             SealWord::Positioned(position) if self.cursor.position >= position => {
-                // The Acquire load above observed the seal: the reason
-                // stored before its swap is visible.
+                // The driver sets the flag (SeqCst) before it seals, so the
+                // Acquire load above that observed the seal makes the flag
+                // visible here, as it does the reason stored before the
+                // seal swap.
+                if self.buffer.cell(self.cursor.cell)?.revoked.load(Ordering::SeqCst) != 0 {
+                    return Ok(PollOutcome::Revoked {
+                        position: self.cursor.position,
+                    });
+                }
                 let reason = SealReason::from_code(seal_reason(self.buffer.seal_reason_word()));
                 Ok(PollOutcome::Closed { position, reason })
             }
-            _ => Ok(outcome),
+            _ => Ok(PollOutcome::Pending),
         }
     }
 

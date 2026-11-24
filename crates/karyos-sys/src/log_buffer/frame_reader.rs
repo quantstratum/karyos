@@ -234,6 +234,17 @@ impl<O: BufferOwner> FrameReader<O> {
         &self.subscription
     }
 
+    /// The seal check a serve between messages ends with, for the tests of
+    /// a revocation that lands during a serve (karyos#1067).
+    #[cfg(test)]
+    pub(crate) fn pending_at_seal(&mut self) -> FrameStep {
+        SubscriptionContext {
+            buffer: &self.subscription.buffer,
+            cursor: &mut self.subscription.cursor,
+        }
+        .pending()
+    }
+
     /// Whether a complete message awaits [`FrameReader::take`].
     #[must_use]
     pub fn ready(&self) -> bool {
@@ -597,6 +608,19 @@ impl<T: TermBytes> SubscriptionContext<'_, T> {
     fn pending(&self) -> FrameStep {
         match decode_seal(self.buffer.seal().load(Ordering::Acquire)) {
             SealWord::Positioned(position) if self.cursor.position >= position => {
+                // A reader revoked meanwhile is revoked, not closed, as in
+                // `Subscription::poll` (karyos#1067): the driver sets the
+                // flag before it seals, so the seal observed above makes
+                // it visible.
+                if self
+                    .buffer
+                    .cell(self.cursor.cell)
+                    .is_ok_and(|cell| cell.revoked.load(Ordering::SeqCst) != 0)
+                {
+                    return FrameStep::Ended(FrameEnd::Revoked {
+                        position: self.cursor.position,
+                    });
+                }
                 // The Acquire load above observed the seal: the reason
                 // stored before its swap is visible.
                 let reason = SealReason::from_code(seal_reason(self.buffer.seal_reason_word()));

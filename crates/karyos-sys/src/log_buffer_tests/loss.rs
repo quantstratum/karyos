@@ -378,3 +378,50 @@ fn test_log_buffer_loss_no_admission_into_a_lost_cell_while_its_reader_may_touch
         assert_eq!(found.loan.load(Ordering::Acquire), 0);
     }
 }
+
+/// karyos#1067: a poll whose loan attempt read the revocation flag clear,
+/// just before the driver revoked its reader under `abort` and sealed,
+/// then finds the seal positioned at its cursor. It reports the
+/// revocation, not the seal; the seal check is the poll's tail after that
+/// loan attempt.
+#[test]
+fn test_log_buffer_loss_a_reader_revoked_during_its_poll_is_revoked_not_closed() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let mut required = conductor.subscribe_as(Role::Required, false, 7).unwrap();
+    assert_eq!(poll(&mut required), PollOutcome::Pending);
+    assert_eq!(
+        conductor.revoke_participant(required.cell(), 7, LossPolicy::Abort),
+        Ok(Revocation::Sealed)
+    );
+    let _ = conductor.duty_cycle().unwrap();
+    assert!(matches!(
+        decode_seal(buffer.seal().load(Ordering::Acquire)),
+        SealWord::Positioned(0)
+    ));
+    assert_eq!(
+        required.at_seal_or_pending(),
+        Ok(PollOutcome::Revoked { position: 0 })
+    );
+    assert_eq!(poll(&mut required), PollOutcome::Revoked { position: 0 });
+}
+
+/// karyos#1067: the same window for a frame reader between messages.
+#[test]
+fn test_log_buffer_loss_a_frame_reader_revoked_during_its_serve_is_revoked_not_closed() {
+    let buffer = new_buffer(config(3, 2)).unwrap();
+    let mut conductor = buffer.conductor().unwrap();
+    let required = conductor.subscribe_as(Role::Required, false, 7).unwrap();
+    let cell = required.cell();
+    let mut reader = FrameReader::new(required);
+    assert_eq!(reader.serve_frame().unwrap(), FrameStep::Pending);
+    assert_eq!(
+        conductor.revoke_participant(cell, 7, LossPolicy::Abort),
+        Ok(Revocation::Sealed)
+    );
+    let _ = conductor.duty_cycle().unwrap();
+    assert_eq!(
+        reader.pending_at_seal(),
+        FrameStep::Ended(FrameEnd::Revoked { position: 0 })
+    );
+}
