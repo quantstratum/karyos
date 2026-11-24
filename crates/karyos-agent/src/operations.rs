@@ -65,6 +65,9 @@ pub enum GuardAnswer {
     UnknownDriver,
     /// The agent could not attach to the driver: not sent.
     Unattached,
+    /// The driver attached to is not the instance the operation was
+    /// previewed on (karyos#738 review): not sent.
+    InstanceChanged,
     /// Sent, and no answer came: it may or may not have taken effect.
     NoAnswer {
         /// The operation id.
@@ -77,8 +80,12 @@ pub enum GuardAnswer {
 pub(crate) struct Command<'a> {
     pub(crate) dir: &'a Path,
     pub(crate) guard: u64,
-    /// `Some(expected)` for a reopen.
-    pub(crate) reopen: Option<u64>,
+    /// The transition, and the epoch it acts at.
+    pub(crate) transition: Transition,
+    /// The driver instance it must reach, for a previewed operation
+    /// (karyos#738 review): checked against the attached client's before
+    /// anything is sent.
+    pub(crate) instance: Option<u128>,
     pub(crate) operation: u64,
     /// The operator's uid: the peer that asked.
     pub(crate) operator: u32,
@@ -94,12 +101,12 @@ impl Command<'_> {
     fn record(&self, kind: Kind, now: u64) -> JournalRecord {
         let mut record = JournalRecord::new(kind, now);
         record.guard = self.guard;
-        record.expected = self.reopen.unwrap_or(0);
+        record.expected = self.transition.expected();
         record.operation = self.operation;
         record.operator = u64::from(self.operator);
         record.parameters = karyos_protocol::cnc::guard_parameters(
             self.guard,
-            self.reopen.unwrap_or(0),
+            self.transition.expected(),
             self.operation,
             u64::from(self.operator),
             self.reason,
@@ -110,6 +117,28 @@ impl Command<'_> {
     }
 }
 
+/// A guard command's transition (karyos#738).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Transition {
+    /// Close whatever the epoch.
+    Close,
+    /// Close only if open at this epoch: a previewed close, journalled as
+    /// a close with the epoch in `expected`.
+    CloseAt(u64),
+    /// Reopen if closed at this epoch.
+    Reopen(u64),
+}
+
+impl Transition {
+    /// The epoch it acts at; 0 for a plain close.
+    const fn expected(self) -> u64 {
+        match self {
+            Self::Close => 0,
+            Self::CloseAt(epoch) | Self::Reopen(epoch) => epoch,
+        }
+    }
+}
+
 /// `reason` cut to the [`MAX_REASON`] bytes a journal record keeps.
 pub(crate) fn cut_reason(reason: &[u8]) -> &[u8] {
     reason.get(..MAX_REASON).unwrap_or(reason)
@@ -117,25 +146,27 @@ pub(crate) fn cut_reason(reason: &[u8]) -> &[u8] {
 
 /// Makes `command`, journalled in `journal` when there is one.
 pub(crate) fn guard_command(journal: Option<&mut Journal>, command: &Command<'_>) -> GuardAnswer {
-    let (request, outcome) = match command.reopen {
-        None => (Kind::CloseRequest, Kind::CloseOutcome),
-        Some(_) => (Kind::ReopenRequest, Kind::ReopenOutcome),
+    let reopen = matches!(command.transition, Transition::Reopen(_));
+    let (request, outcome) = if reopen {
+        (Kind::ReopenRequest, Kind::ReopenOutcome)
+    } else {
+        (Kind::CloseRequest, Kind::CloseOutcome)
     };
     let mut journal = journal;
     let record = command.record(request, host_monotonic_ns());
-    match (command.reopen, journal.as_deref_mut()) {
+    match (reopen, journal.as_deref_mut()) {
         // A reopen needs its record on disk before it is sent.
-        (Some(_), None) => return GuardAnswer::JournalUnavailable,
-        (Some(_), Some(journal)) => {
+        (true, None) => return GuardAnswer::JournalUnavailable,
+        (true, Some(journal)) => {
             if journal.append_durable(&record, record.time).is_err() {
                 return GuardAnswer::JournalUnavailable;
             }
         }
         // A close goes ahead: a failed append is counted in the journal.
-        (None, Some(journal)) => {
+        (false, Some(journal)) => {
             let _ = journal.append(&record, record.time);
         }
-        (None, None) => {}
+        (false, None) => {}
     }
     let answer = send(command);
     if let Some(journal) = journal {
@@ -157,15 +188,30 @@ fn send(command: &Command<'_>) -> GuardAnswer {
     let Ok(mut client) = attach(command.dir, command.timeout, MAX_PENDING) else {
         return GuardAnswer::Unattached;
     };
+    // A previewed operation reaches only the instance previewed: a driver
+    // that restarted since is another target.
+    if command
+        .instance
+        .is_some_and(|instance| instance != client.instance())
+    {
+        return GuardAnswer::InstanceChanged;
+    }
     let operation = command.operation;
-    let submitted = match command.reopen {
-        None => client.guard_close(
+    let submitted = match command.transition {
+        Transition::Close => client.guard_close(
             command.guard,
             operation,
             Some(command.operator),
             command.reason,
         ),
-        Some(expected) => client.guard_reopen(
+        Transition::CloseAt(expected) => client.guard_close_at(
+            command.guard,
+            expected,
+            operation,
+            Some(command.operator),
+            command.reason,
+        ),
+        Transition::Reopen(expected) => client.guard_reopen(
             command.guard,
             expected,
             operation,

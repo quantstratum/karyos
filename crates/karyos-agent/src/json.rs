@@ -245,6 +245,57 @@ fn journal_view(out: &mut Out<'_>, journal: &JournalView) {
     });
 }
 
+/// A guard preview's answer (R-CORE-18, karyos#738): what the operation
+/// would do, each field it cannot give written `"unavailable"`, never a
+/// zero or a false (RR-CON-0008).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn preview_answer(answer: &crate::preview::PreviewAnswer) -> String {
+    use crate::preview::{PREVIEW_TTL, PreviewAnswer};
+    const UNAVAILABLE: &str = "unavailable";
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match answer {
+        PreviewAnswer::Previewed {
+            kind,
+            guard,
+            instance,
+            state,
+            epoch_after,
+            token,
+        } => {
+            fields.key("preview").object(|fields| {
+                fields.string("operation", kind.name());
+                fields.number("guard", *guard);
+                fields.string("instance", &format!("{instance:032x}"));
+                match state {
+                    Some(state) => fields.key("state").object(|fields| {
+                        fields.number("epoch", state.epoch);
+                        fields.key("open").bool(state.open);
+                    }),
+                    None => fields.string("state", UNAVAILABLE),
+                }
+                match epoch_after {
+                    Some(epoch) => fields.number("epoch_after", *epoch),
+                    None => fields.string("epoch_after", UNAVAILABLE),
+                }
+            });
+            match token {
+                Some(token) => {
+                    fields.string("token", &token.hex());
+                    fields.number(
+                        "expires_in_ms",
+                        u64::try_from(PREVIEW_TTL.as_millis()).unwrap_or(u64::MAX),
+                    );
+                }
+                None => fields.string("token", UNAVAILABLE),
+            }
+        }
+        PreviewAnswer::UnknownDriver => fields.string("error", "unknown driver"),
+        PreviewAnswer::Unattached => fields.string("error", "driver unavailable"),
+    });
+    text
+}
+
 /// A guard operation's answer (M10b): the guard's state after it, or why
 /// it came to nothing; `operation` is the id it was journalled and audited
 /// under, when it was sent.
@@ -283,6 +334,7 @@ pub fn guard_answer(answer: &crate::operations::GuardAnswer) -> String {
         GuardAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
         GuardAnswer::UnknownDriver => fields.string("error", "unknown driver"),
         GuardAnswer::Unattached => fields.string("error", "driver unavailable"),
+        GuardAnswer::InstanceChanged => fields.string("error", "target changed"),
     });
     text
 }

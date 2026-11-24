@@ -54,7 +54,14 @@
 //!   BYTE_BURST [REASON]` (R-CORE-21, karyos#740; a byte rate and burst
 //!   of 0 and 0 for no byte limit), AUTHORITY `safety` for an operator, a
 //!   risk officer or an administrator and `administrator` for an
-//!   administrator only. A `join-put` line may
+//!   administrator only; `guard-close-preview DIR GUARD [REASON]` and
+//!   `guard-reopen-preview DIR GUARD [REASON]`, then `submit OPID TOKEN
+//!   guard-close|guard-reopen DIR GUARD [REASON]` (R-CORE-18, karyos#738;
+//!   see [`crate::preview`]), each for the roles that may make the
+//!   operation, the submit refused as `{"error":"token unknown"}`, `token
+//!   expired`, `principal mismatch`, `target mismatch`, `parameters
+//!   mismatch`, `target changed` or `operation id reused` with nothing
+//!   sent. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
@@ -795,6 +802,55 @@ impl Server {
                     forbidden()
                 }
             }
+            (
+                Some((requester, role)),
+                Request::GuardPreview {
+                    kind,
+                    dir,
+                    guard,
+                    reason,
+                },
+            ) => {
+                if may(role, kind) {
+                    let answer = agent.guard_preview_for(
+                        kind,
+                        Path::new(dir),
+                        guard,
+                        requester,
+                        reason.as_bytes(),
+                    );
+                    (json::preview_answer(&answer), Served::View)
+                } else {
+                    forbidden()
+                }
+            }
+            (
+                Some((requester, role)),
+                Request::Submit {
+                    operation,
+                    token,
+                    kind,
+                    dir,
+                    guard,
+                    reason,
+                },
+            ) => {
+                if may(role, kind) {
+                    match agent.guard_submit_for(
+                        (operation, token),
+                        kind,
+                        Path::new(dir),
+                        guard,
+                        requester,
+                        reason.as_bytes(),
+                    ) {
+                        Ok(answer) => (json::guard_answer(&answer), Served::Operated),
+                        Err(refusal) => (json::error(refusal.text(), None), Served::Refused),
+                    }
+                } else {
+                    forbidden()
+                }
+            }
             (Some((requester, role)), Request::GapAck { position }) => {
                 if role.may_acknowledge() {
                     let answer = match agent.acknowledge_gap_for(position, requester) {
@@ -1025,6 +1081,24 @@ enum Request<'a> {
     GapAck {
         position: u64,
     },
+    /// `guard-close-preview DIR GUARD [REASON]` and
+    /// `guard-reopen-preview DIR GUARD [REASON]` (R-CORE-18, karyos#738).
+    GuardPreview {
+        kind: crate::preview::PreviewKind,
+        dir: &'a str,
+        guard: u64,
+        reason: &'a str,
+    },
+    /// `submit OPID TOKEN guard-close|guard-reopen DIR GUARD [REASON]`
+    /// (R-CORE-18, karyos#738).
+    Submit {
+        operation: u64,
+        token: crate::preview::Token,
+        kind: crate::preview::PreviewKind,
+        dir: &'a str,
+        guard: u64,
+        reason: &'a str,
+    },
     /// `legal-hold RECORDING [REASON]`, `hold-release RECORDING [REASON]`,
     /// `purge RECORDING BEFORE [REASON]` and `seal-verify RECORDING`
     /// (M12).
@@ -1238,6 +1312,46 @@ fn rate_change(arguments: &str) -> Option<Request<'_>> {
 }
 
 /// A v1 request and its arguments.
+/// Whether `role` may preview or submit `kind`: as it may make it.
+const fn may(role: Role, kind: crate::preview::PreviewKind) -> bool {
+    match kind {
+        crate::preview::PreviewKind::Close => role.may_close(),
+        crate::preview::PreviewKind::Reopen => role.may_reopen(),
+    }
+}
+
+/// The request name of a preview of `kind` (`preview`), or of `kind`.
+const fn name_of(kind: crate::preview::PreviewKind, preview: bool) -> &'static str {
+    match (kind, preview) {
+        (crate::preview::PreviewKind::Close, true) => "guard-close-preview",
+        (crate::preview::PreviewKind::Reopen, true) => "guard-reopen-preview",
+        (kind, false) => kind.name(),
+    }
+}
+
+/// `OPID TOKEN guard-close|guard-reopen DIR GUARD [REASON]` (karyos#738).
+fn submit(arguments: &str) -> Option<Request<'_>> {
+    let mut fields = arguments.splitn(6, ' ');
+    let operation = fields.next()?.parse::<u64>().ok()?;
+    let token = crate::preview::Token::parse(fields.next()?)?;
+    let kind = match fields.next()? {
+        "guard-close" => crate::preview::PreviewKind::Close,
+        "guard-reopen" => crate::preview::PreviewKind::Reopen,
+        _ => return None,
+    };
+    let dir = fields.next().filter(|dir| !dir.is_empty())?;
+    let guard = fields.next()?.parse::<u64>().ok()?;
+    let reason = fields.next().unwrap_or("");
+    Some(Request::Submit {
+        operation,
+        token,
+        kind,
+        dir,
+        guard,
+        reason,
+    })
+}
+
 fn request(rest: &str) -> Option<Request<'_>> {
     let (name, arguments) = rest.split_once(' ').unwrap_or((rest, ""));
     let number = |word: &str| word.parse::<u64>().ok();
@@ -1269,6 +1383,29 @@ fn request(rest: &str) -> Option<Request<'_>> {
             })
         }
         "rate-change" => rate_change(arguments).or(Some(Request::BadArguments("rate-change"))),
+        "guard-close-preview" | "guard-reopen-preview" => {
+            let kind = if name == "guard-close-preview" {
+                crate::preview::PreviewKind::Close
+            } else {
+                crate::preview::PreviewKind::Reopen
+            };
+            let mut fields = arguments.splitn(3, ' ');
+            let target = fields
+                .next()
+                .filter(|dir| !dir.is_empty())
+                .zip(fields.next().and_then(number));
+            let Some((dir, guard)) = target else {
+                return Some(Request::BadArguments(name_of(kind, true)));
+            };
+            let reason = fields.next().unwrap_or("");
+            Some(Request::GuardPreview {
+                kind,
+                dir,
+                guard,
+                reason,
+            })
+        }
+        "submit" => submit(arguments).or(Some(Request::BadArguments("submit"))),
         "legal-hold" | "hold-release" | "seal-verify" => {
             let (recording, reason) = arguments.split_once(' ').unwrap_or((arguments, ""));
             let operation = match name {

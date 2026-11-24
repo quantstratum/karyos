@@ -218,6 +218,12 @@ pub struct Agent {
     /// The rate policy versions rate changes were answered with
     /// (karyos#740), least recently answered first.
     rates: Vec<crate::api::RateView>,
+    /// The guard previews whose tokens a submit may name (karyos#738).
+    previews: crate::preview::Previews,
+    /// Every operation id used in this run, the agent's own and the ones
+    /// callers chose (karyos#738): one accounting, so no two operations
+    /// share an id.
+    used_ids: std::collections::HashSet<u64>,
 }
 
 impl Agent {
@@ -280,6 +286,8 @@ impl Agent {
             registry: Registry::new(start),
             retention: None,
             rates: Vec::new(),
+            previews: crate::preview::Previews::default(),
+            used_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -359,11 +367,12 @@ impl Agent {
         requester: Requester,
         reason: &[u8],
     ) -> crate::retention::RetentionAnswer {
-        let id = self.next_operation;
-        if self.retention.is_some() {
-            // Checked: at their end the ids keep the last one.
-            self.next_operation = id.checked_add(1).unwrap_or(id);
-        }
+        // An id is taken only when the operation can be sent.
+        let id = if self.retention.is_some() {
+            self.allocate_operation()
+        } else {
+            self.next_operation
+        };
         let command = crate::retention::Command {
             operation,
             recording,
@@ -384,7 +393,14 @@ impl Agent {
     /// Closes guard `guard` of the driver in `dir` for operator `uid`
     /// with `reason`, journalled (M10b; see `operations`).
     pub fn guard_close(&mut self, dir: &Path, guard: u64, uid: u32, reason: &[u8]) -> GuardAnswer {
-        self.guard_command(dir, guard, None, Requester::local(uid), reason)
+        self.guard_command(
+            dir,
+            guard,
+            operations::Transition::Close,
+            Requester::local(uid),
+            reason,
+            (None, None),
+        )
     }
 
     /// As [`Agent::guard_close`], for `requester`, whom a relay may have
@@ -397,7 +413,14 @@ impl Agent {
         requester: Requester,
         reason: &[u8],
     ) -> GuardAnswer {
-        self.guard_command(dir, guard, None, requester, reason)
+        self.guard_command(
+            dir,
+            guard,
+            operations::Transition::Close,
+            requester,
+            reason,
+            (None, None),
+        )
     }
 
     /// As [`Agent::guard_reopen`], for `requester` (karyos#708).
@@ -409,7 +432,14 @@ impl Agent {
         requester: Requester,
         reason: &[u8],
     ) -> GuardAnswer {
-        self.guard_command(dir, guard, Some(expected), requester, reason)
+        self.guard_command(
+            dir,
+            guard,
+            operations::Transition::Reopen(expected),
+            requester,
+            reason,
+            (None, None),
+        )
     }
 
     /// Reopens guard `guard`, closed at `expected`, of the driver in `dir`
@@ -423,27 +453,144 @@ impl Agent {
         uid: u32,
         reason: &[u8],
     ) -> GuardAnswer {
-        self.guard_command(dir, guard, Some(expected), Requester::local(uid), reason)
+        self.guard_command(
+            dir,
+            guard,
+            operations::Transition::Reopen(expected),
+            Requester::local(uid),
+            reason,
+            (None, None),
+        )
+    }
+
+    /// Previews guard operation `kind` on guard `guard` of the driver in
+    /// `dir` for `requester` with `reason` (R-CORE-18, karyos#738; see
+    /// [`crate::preview`]): the guard's state as last followed in the
+    /// driver's audit, the epoch after, and a token a submit names.
+    pub fn guard_preview_for(
+        &mut self,
+        kind: crate::preview::PreviewKind,
+        dir: &Path,
+        guard: u64,
+        requester: Requester,
+        reason: &[u8],
+    ) -> crate::preview::PreviewAnswer {
+        use crate::preview::{Bound, PreviewAnswer, Seen, last_state};
+        let Some(driver) = self.drivers.iter().find(|driver| driver.dir == dir) else {
+            return PreviewAnswer::UnknownDriver;
+        };
+        let (Some(_), Some(instance)) = (driver.tool.as_ref(), driver.instance) else {
+            return PreviewAnswer::Unattached;
+        };
+        let audit = driver.guards.feed().records;
+        let seen = Seen {
+            instance,
+            state: last_state(&audit, guard),
+        };
+        let bound = Bound {
+            kind,
+            dir: dir.to_path_buf(),
+            guard,
+            requester,
+            reason: operations::cut_reason(reason).to_vec(),
+        };
+        self.previews
+            .preview(bound, seen, std::time::Instant::now())
+    }
+
+    /// Submits the previewed operation `kind` named by `token`, under the
+    /// caller's operation id `operation` (R-CORE-18, karyos#738; see
+    /// [`crate::preview`]): sent only when the token's principal, target
+    /// and parameters are this request's and the driver is the instance
+    /// previewed, at the previewed epoch, which the driver checks with the
+    /// transition.
+    ///
+    /// # Errors
+    ///
+    /// The [`crate::preview::SubmitRefusal`] that refused it, with nothing
+    /// sent.
+    pub fn guard_submit_for(
+        &mut self,
+        (operation, token): (u64, crate::preview::Token),
+        kind: crate::preview::PreviewKind,
+        dir: &Path,
+        guard: u64,
+        requester: Requester,
+        reason: &[u8],
+    ) -> Result<GuardAnswer, crate::preview::SubmitRefusal> {
+        use crate::preview::{Bound, PreviewKind, SubmitRefusal};
+        // One accounting with the agent's own ids (karyos#738 review).
+        if operation == 0 || self.used_ids.contains(&operation) {
+            return Err(SubmitRefusal::OperationReused);
+        }
+        let instance = self
+            .drivers
+            .iter()
+            .find(|driver| driver.dir == dir)
+            .and_then(|driver| driver.instance);
+        let bound = Bound {
+            kind,
+            dir: dir.to_path_buf(),
+            guard,
+            requester,
+            reason: operations::cut_reason(reason).to_vec(),
+        };
+        let epoch = self
+            .previews
+            .take(token, &bound, instance, std::time::Instant::now())?;
+        let _ = self.used_ids.insert(operation);
+        let transition = match kind {
+            PreviewKind::Close => operations::Transition::CloseAt(epoch),
+            PreviewKind::Reopen => operations::Transition::Reopen(epoch),
+        };
+        Ok(self.guard_command(
+            dir,
+            guard,
+            transition,
+            requester,
+            reason,
+            (Some(operation), instance),
+        ))
+    }
+
+    /// The next operation id of the agent's own, skipping any a caller
+    /// already used (karyos#738 review), and taken: no two operations share
+    /// an id. Checked: at the end of the ids the last one is kept.
+    fn allocate_operation(&mut self) -> u64 {
+        loop {
+            let id = self.next_operation;
+            let Some(next) = id.checked_add(1) else {
+                let _ = self.used_ids.insert(id);
+                return id;
+            };
+            self.next_operation = next;
+            if self.used_ids.insert(id) {
+                return id;
+            }
+        }
     }
 
     fn guard_command(
         &mut self,
         dir: &Path,
         guard: u64,
-        reopen: Option<u64>,
+        transition: operations::Transition,
         requester: Requester,
         reason: &[u8],
+        (chosen, instance): (Option<u64>, Option<u128>),
     ) -> GuardAnswer {
         if !self.drivers.iter().any(|driver| driver.dir == dir) {
             return GuardAnswer::UnknownDriver;
         }
-        let operation = self.next_operation;
-        // Checked: at their end the ids keep the last one.
-        self.next_operation = operation.checked_add(1).unwrap_or(operation);
+        let operation = match chosen {
+            Some(operation) => operation,
+            None => self.allocate_operation(),
+        };
         let command = operations::Command {
             dir,
             guard,
-            reopen,
+            transition,
+            instance,
             operation,
             operator: requester.operator,
             relay: requester.relay,
@@ -477,9 +624,7 @@ impl Agent {
         if !self.drivers.iter().any(|driver| driver.dir == dir) {
             return RateAnswer::UnknownDriver;
         }
-        let operation = self.next_operation;
-        // Checked: at their end the ids keep the last one.
-        self.next_operation = operation.checked_add(1).unwrap_or(operation);
+        let operation = self.allocate_operation();
         let command = operations::RateCommand {
             dir,
             stream,
@@ -878,6 +1023,10 @@ impl Agent {
                     // The safety path is a closer's; an administrator's
                     // change needs the journal, which the answer reports.
                     "rate-change" => (None, close || acknowledge),
+                    // A preview and its submit serve the operations they
+                    // preview; a reopen's submit still needs the journal,
+                    // which its answer reports (karyos#738).
+                    "guard-preview" | "submit" => (None, close || reopen),
                     // A name added to CAPABILITIES must be classified here.
                     _ => (Some("not_configured"), true),
                 };

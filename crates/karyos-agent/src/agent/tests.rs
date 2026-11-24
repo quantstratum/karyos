@@ -341,3 +341,228 @@ fn an_acknowledgement_log_names_the_relay() {
         "operator 50001 relay 7"
     );
 }
+
+/// R-CORE-18 (karyos#738): a preview gives the guard's state and a token,
+/// and a submit with it performs exactly the previewed operation under the
+/// caller's operation id; another principal, a reused id, an unknown state
+/// and a guard that moved since are each refused, the last by the driver
+/// atomically with the close.
+#[test]
+fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
+    use crate::preview::{PreviewAnswer, PreviewKind, SubmitRefusal, Token};
+
+    let dir = std::env::temp_dir().join(format!("karyos-agent-preview-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let driver_dir = dir.join("driver");
+    let mut driver = driver(&driver_dir);
+    let guard = driver.add_guard("orders").unwrap();
+    let config = AgentConfig::new(vec![driver_dir.clone()])
+        .with_attach_timeout(Duration::from_secs(5))
+        .with_journal(dir.join("journal"));
+    let mut agent = Agent::new(config);
+    let operator = Requester::local(1000);
+    serving(&mut driver, || agent.refresh());
+    // No transition followed yet: the state, and so the token, are
+    // unavailable, never a default (RR-CON-0008).
+    let unknown = agent.guard_preview_for(
+        PreviewKind::Close,
+        &driver_dir,
+        guard.id(),
+        operator,
+        b"halt",
+    );
+    assert!(
+        matches!(
+            unknown,
+            PreviewAnswer::Previewed {
+                state: None,
+                epoch_after: None,
+                token: None,
+                ..
+            }
+        ),
+        "{unknown:?}"
+    );
+    let text = crate::json::preview_answer(&unknown);
+    assert!(text.contains(r#""state":"unavailable""#), "{text}");
+    assert!(text.contains(r#""token":"unavailable""#), "{text}");
+    // Open it, and let the agent follow the transition.
+    let reopened = serving(&mut driver, || {
+        agent.guard_reopen(&driver_dir, guard.id(), 1, 1000, b"")
+    });
+    assert!(matches!(reopened, GuardAnswer::State { state, .. } if state.open));
+    serving(&mut driver, || agent.refresh());
+    let preview = |agent: &mut Agent| match agent.guard_preview_for(
+        PreviewKind::Close,
+        &driver_dir,
+        guard.id(),
+        operator,
+        b"halt",
+    ) {
+        PreviewAnswer::Previewed {
+            state: Some(state),
+            epoch_after: Some(after),
+            token: Some(token),
+            ..
+        } => (state, after, token),
+        other => panic!("{other:?}"),
+    };
+    let (state, after, token) = preview(&mut agent);
+    assert_eq!((state.epoch, state.open, after), (2, true, 3));
+    // Another principal cannot submit it.
+    assert_eq!(
+        agent.guard_submit_for(
+            (4242, token),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            Requester::local(1001),
+            b"halt",
+        ),
+        Err(SubmitRefusal::PrincipalMismatch)
+    );
+    // The previewed close, under the caller's id.
+    let answer = serving(&mut driver, || {
+        agent.guard_submit_for(
+            (4242, token),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        )
+    });
+    assert!(
+        matches!(
+            answer,
+            Ok(GuardAnswer::State { operation: 4242, state, .. }) if state.epoch == 3 && !state.open
+        ),
+        "{answer:?}"
+    );
+    assert_eq!(driver.guard_audit().records.last().unwrap().operation, 4242);
+    // The token is used up, and the id too.
+    assert_eq!(
+        agent.guard_submit_for(
+            (4243, token),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        ),
+        Err(SubmitRefusal::TokenUnknown)
+    );
+    let garbage = Token::parse(&"0".repeat(32)).unwrap();
+    assert_eq!(
+        agent.guard_submit_for(
+            (4242, garbage),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        ),
+        Err(SubmitRefusal::OperationReused)
+    );
+    // A guard that moved after the preview: the driver refuses the close at
+    // the previewed epoch, atomically, and audits the refusal.
+    let reopened = serving(&mut driver, || {
+        agent.guard_reopen(&driver_dir, guard.id(), 3, 1000, b"")
+    });
+    assert!(matches!(reopened, GuardAnswer::State { state, .. } if state.epoch == 4));
+    serving(&mut driver, || agent.refresh());
+    let (_, _, token) = preview(&mut agent);
+    let closed = serving(&mut driver, || {
+        agent.guard_close(&driver_dir, guard.id(), 1000, b"other")
+    });
+    assert!(matches!(closed, GuardAnswer::State { state, .. } if state.epoch == 5));
+    let moved = serving(&mut driver, || {
+        agent.guard_submit_for(
+            (4244, token),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        )
+    });
+    assert!(
+        matches!(
+            moved,
+            Ok(GuardAnswer::Refused {
+                operation: 4244,
+                code,
+                ..
+            }) if code == karyos_protocol::cnc::ErrorCode::GuardNotOpenAt.code()
+        ),
+        "{moved:?}"
+    );
+    // karyos#738 review: one id accounting across the paths. A direct
+    // operation's id cannot be submitted again, and the agent's own ids
+    // skip one a caller took.
+    let direct = serving(&mut driver, || {
+        agent.guard_reopen(&driver_dir, guard.id(), 5, 1000, b"")
+    });
+    let GuardAnswer::State {
+        operation: taken, ..
+    } = direct
+    else {
+        panic!("{direct:?}");
+    };
+    assert_eq!(
+        agent.guard_submit_for(
+            (taken, garbage),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        ),
+        Err(SubmitRefusal::OperationReused)
+    );
+    serving(&mut driver, || agent.refresh());
+    let (_, _, token) = preview(&mut agent);
+    let claimed = agent.next_operation;
+    let submitted = serving(&mut driver, || {
+        agent.guard_submit_for(
+            (claimed, token),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        )
+    });
+    assert!(matches!(submitted, Ok(GuardAnswer::State { operation, .. }) if operation == claimed));
+    let next = serving(&mut driver, || {
+        agent.guard_close(&driver_dir, guard.id(), 1000, b"")
+    });
+    assert!(matches!(next, GuardAnswer::State { operation, .. } if operation != claimed));
+    // karyos#738 review: a driver that restarted between the preview and
+    // the submit's attach is another target: refused unsent, even with the
+    // agent's cached instance still the previewed one.
+    let reopened = serving(&mut driver, || {
+        agent.guard_reopen(&driver_dir, guard.id(), 7, 1000, b"")
+    });
+    assert!(matches!(reopened, GuardAnswer::State { state, .. } if state.open));
+    serving(&mut driver, || agent.refresh());
+    let (_, _, token) = preview(&mut agent);
+    drop(driver);
+    let mut replacement = super::tests::driver(&driver_dir);
+    let _ = replacement.add_guard("orders").unwrap();
+    let elsewhere = serving(&mut replacement, || {
+        agent.guard_submit_for(
+            (777_777, token),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        )
+    });
+    assert_eq!(elsewhere, Ok(GuardAnswer::InstanceChanged));
+    drop(replacement);
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&dir);
+}
