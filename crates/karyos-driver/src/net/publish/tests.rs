@@ -1160,6 +1160,86 @@ fn a_publication_holds_a_send_endpoint_per_path() {
     );
 }
 
+/// The channel of a paired unicast paths URI `paths` value (karyos#635).
+fn paired_channel(paths: &str) -> UdpConfig {
+    let Ok(karyos_protocol::channel::ChannelConfig {
+        media: karyos_protocol::channel::Media::Udp(paired),
+        ..
+    }) = karyos_protocol::channel::ChannelConfig::parse(&format!("karyos:udp?paths={paths}"))
+    else {
+        panic!("paired paths do not parse: {paths}");
+    };
+    paired
+}
+
+/// karyos#1043: path `i` of a paired unicast paths publication binds its
+/// interface's address and sends to its own endpoint, the founding path's
+/// endpoint being the channel's destination. An interface named by name,
+/// a family other than its endpoint's, or a count that is not one
+/// endpoint per path is refused.
+#[test]
+fn a_paired_path_sends_from_its_interface_to_its_endpoint() {
+    let paired = paired_channel("127.0.0.1@127.0.0.1:40123;10.0.0.5@10.1.0.5:40124");
+    assert_eq!(
+        super::route(&paired, false),
+        Ok((
+            SocketAddr::from(([127, 0, 0, 1], 40123)),
+            vec![
+                (
+                    SocketAddr::from(([127, 0, 0, 1], 0)),
+                    SocketAddr::from(([127, 0, 0, 1], 40123))
+                ),
+                (
+                    SocketAddr::from(([10, 0, 0, 5], 0)),
+                    SocketAddr::from(([10, 1, 0, 5], 40124))
+                ),
+            ]
+        ))
+    );
+    assert_eq!(
+        super::route(&paired_channel("eth1@10.0.0.5:40123"), false),
+        Err(DriverError::UnsupportedChannel)
+    );
+    let mut mixed = paired.clone();
+    if let Some(path) = mixed.paths.first_mut() {
+        *path = Interface::Address(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+    }
+    assert_eq!(
+        super::route(&mixed, false),
+        Err(DriverError::UnsupportedChannel)
+    );
+    let mut short = paired;
+    short.paths.pop();
+    assert_eq!(
+        super::route(&short, false),
+        Err(DriverError::UnsupportedChannel)
+    );
+}
+
+/// karyos#1043: a paired path whose interface address this host does not
+/// have is refused at channel admission, typed, and nothing is held.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_paired_path_on_an_address_this_host_lacks_is_refused() {
+    let mut driver = driver();
+    assert!(driver.net.as_ref().unwrap().paths_isolated());
+    let port = free_port();
+    // 192.0.2.77 (TEST-NET-1) is no interface's address here.
+    let paired = paired_channel(&format!(
+        "127.0.0.1@127.0.0.1:{port};192.0.2.77@127.0.0.2:{port}"
+    ));
+    match driver.add_network_publication(aggregate(10, 1), &paired) {
+        Err(DriverError::UnknownInterface { interface }) => {
+            assert_eq!(interface, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77)));
+        }
+        // A host with no route toward TEST-NET resolves no interface for
+        // the path: refused before any bind, which this test cannot use.
+        Err(DriverError::UnsupportedChannel) => return,
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(driver.net.as_ref().unwrap().send_endpoints(), 0);
+}
+
 /// A port no socket holds now, for a group or destination of a test,
 /// outside the ephemeral range (karyos#520, [`crate::test_ports`]).
 fn free_port() -> u16 {

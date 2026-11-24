@@ -1020,18 +1020,11 @@ fn unicast_paths_are_refused() {
         driver.add_network_subscription(6, &channel),
         Err(crate::error::DriverError::UnsupportedChannel)
     );
-    // Paired unicast paths parse (karyos#635) and stay refused, typed,
-    // for a subscription and a publication, until unicast paths pass on
-    // real sockets (karyos#624), even where paths are taken as isolated.
-    let Ok(karyos_protocol::channel::ChannelConfig {
-        media: karyos_protocol::channel::Media::Udp(paired),
-        ..
-    }) = karyos_protocol::channel::ChannelConfig::parse(
-        "karyos:udp?paths=127.0.0.1@127.0.0.1:9;127.0.0.2@127.0.0.2:9",
-    )
-    else {
-        panic!("paired paths do not parse");
-    };
+    // Paired unicast paths (karyos#635) are served where path sockets are
+    // isolated (karyos#1043), and stay refused, typed and counted, for a
+    // subscription and a publication where they are not (macOS).
+    driver.net.as_mut().unwrap().assume_unisolated_paths();
+    let paired = paired_channel("127.0.0.1@127.0.0.1:9;127.0.0.2@127.0.0.2:9");
     assert_eq!(
         driver.add_network_subscription(7, &paired),
         Err(crate::error::DriverError::UnsupportedChannel)
@@ -1040,6 +1033,81 @@ fn unicast_paths_are_refused() {
         driver.add_network_publication(aggregate(7, 3, 1), &paired),
         Err(crate::error::DriverError::UnsupportedChannel)
     ));
+    assert_eq!(driver.network_path_counters().0, 2);
+}
+
+/// The channel of a paired unicast paths URI `paths` value (karyos#635).
+fn paired_channel(paths: &str) -> UdpConfig {
+    let Ok(karyos_protocol::channel::ChannelConfig {
+        media: karyos_protocol::channel::Media::Udp(paired),
+        ..
+    }) = karyos_protocol::channel::ChannelConfig::parse(&format!("karyos:udp?paths={paths}"))
+    else {
+        panic!("paired paths do not parse: {paths}");
+    };
+    paired
+}
+
+/// karyos#1043: a paired unicast paths subscription receives path `i` at
+/// its own endpoint `endpoints[i]`, joining no group; the interface before
+/// each `@` is the sender's, so a name there is no refusal here.
+#[test]
+fn paired_paths_receive_each_path_at_its_endpoint() {
+    let paired = paired_channel("eth1@127.0.0.1:40123;eth2@127.0.0.2:40124");
+    assert_eq!(
+        super::receive_route(&paired, false),
+        Ok((SocketAddr::from(([127, 0, 0, 1], 40123)), None))
+    );
+    assert_eq!(
+        super::later_routes(&paired),
+        Ok(vec![(SocketAddr::from(([127, 0, 0, 2], 40124)), None)])
+    );
+    // A hand-built channel with one endpoint per path missing.
+    let mut short = paired.clone();
+    short.paths.pop();
+    assert_eq!(
+        super::later_routes(&short),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+}
+
+/// karyos#1043: a paired unicast paths publication whose two paths leave
+/// through one interface is one physical path counted twice: refused; on
+/// distinct interfaces it passes; a path that cannot be resolved where
+/// resolution is real is refused.
+#[cfg(target_os = "linux")]
+#[test]
+fn paired_paths_must_leave_through_distinct_interfaces() {
+    use super::super::subscribe::paired_paths_on_distinct_interfaces_with;
+    let paired = paired_channel("10.0.0.5@10.0.0.9:40123;10.1.0.5@10.1.0.9:40123");
+    let by_net = |address: Ipv4Addr, _: Ipv4Addr| Some(format!("eth{}", address.octets()[1]));
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&paired, by_net),
+        Ok(())
+    );
+    let one = |_: Ipv4Addr, _: Ipv4Addr| Some("eth0".to_owned());
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&paired, one),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&paired, |_, _| None),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    // The unspecified address resolves through the route to its endpoint.
+    let any = paired_channel("0.0.0.0@10.0.0.9:40123;10.1.0.5@10.1.0.9:40123");
+    let routed = |address: Ipv4Addr, to: Ipv4Addr| {
+        let target = if address.is_unspecified() {
+            to
+        } else {
+            address
+        };
+        Some(format!("eth{}", target.octets()[1]))
+    };
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&any, routed),
+        Ok(())
+    );
 }
 
 /// #294 tests: an unsubscription the receiver's full ring refuses waits,

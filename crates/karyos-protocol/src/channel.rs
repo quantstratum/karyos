@@ -271,9 +271,9 @@ pub enum Destination {
     },
     /// Paired unicast paths (owner item 11, karyos#635): one logical
     /// receiver reached over each path, path `i` sending from
-    /// `UdpConfig::paths[i]` to `endpoints[i]`. Parsed and validated;
-    /// a driver refuses it until unicast paths pass on real sockets
-    /// (karyos#624).
+    /// `UdpConfig::paths[i]` to `endpoints[i]`. A driver serves it where
+    /// its path sockets are isolated (karyos#624, karyos#1043) and refuses
+    /// it elsewhere.
     PairedPaths {
         /// Each path's receiver endpoint, in the order of `paths`.
         endpoints: Vec<SocketAddr>,

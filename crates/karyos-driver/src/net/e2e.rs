@@ -3978,6 +3978,166 @@ fn a_tail_lost_on_one_path_arrives_by_the_other() {
     );
 }
 
+/// Two drivers on a paired unicast paths channel (owner item 11,
+/// karyos#1043) over two real interfaces of this host, loopback and the
+/// interface toward a public route: path 1 from and to loopback, path 2
+/// from and to that interface's address, each to its own port. Both
+/// paths bound at the receiver: the publication and B's image. `None`
+/// on a host with no second interface, said on stderr.
+#[cfg(target_os = "linux")]
+fn paired_paths(
+    label: &str,
+    reliable: bool,
+) -> Option<(
+    EmbeddedDriver,
+    EmbeddedDriver,
+    crate::embedded::AggregateHandle,
+    crate::embedded::AggregateHandle,
+)> {
+    use std::io::Write as _;
+
+    let lan = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        .and_then(|probe| {
+            probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
+            probe.local_addr()
+        })
+        .ok()
+        .and_then(|local| match local.ip() {
+            IpAddr::V4(address) if !address.is_loopback() => Some(address),
+            _ => None,
+        });
+    let Some(lan) = lan else {
+        let _ = writeln!(std::io::stderr(), "SKIPPED {label}: no second interface");
+        return None;
+    };
+    let uri = format!(
+        "karyos:udp?paths=127.0.0.1@127.0.0.1:{};{lan}@{lan}:{}|reliable={reliable}",
+        free_port(),
+        free_port()
+    );
+    let Ok(karyos_protocol::channel::ChannelConfig {
+        media: karyos_protocol::channel::Media::Udp(channel),
+        ..
+    }) = karyos_protocol::channel::ChannelConfig::parse(&uri)
+    else {
+        panic!("{uri} does not parse");
+    };
+    let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
+    let _ = b.add_network_subscription(10, &channel).unwrap();
+    let publication = a
+        .add_network_publication(aggregate(10, 4, 1), &channel)
+        .unwrap();
+    let mut image = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        image = drivers[1].network_image(10, 4);
+        image.is_some()
+    });
+    let image = image?;
+    // Path 2 binds at its own SETUP answer, after the image exists.
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1]
+            .net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .unwrap()
+            .paths_bound
+            >= 1
+    });
+    assert_eq!(b.network_path_counters(), (0, 0), "no path refused or lost");
+    Some((a, b, publication, image))
+}
+
+/// karyos#1043 (owner item 11): a publication over two paired unicast
+/// paths reaches one logical receiver: every message once and in order,
+/// though each path carries a copy; both paths are bound end to end, the
+/// receiver's SMs reaching the sender on each path's own endpoint. Linux,
+/// on loopback and the host's other interface.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_paired_paths_publication_reaches_one_logical_receiver() {
+    let Some((mut a, mut b, publication, image)) = paired_paths(
+        "a_paired_paths_publication_reaches_one_logical_receiver",
+        true,
+    ) else {
+        return;
+    };
+    let mut reader = b.subscribe_aggregate(&image, Role::Required).unwrap();
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let (mut sent, mut seen) = (0u32, 0u32);
+    pump(&mut [&mut a, &mut b], |_| {
+        while sent < 128 {
+            let mut payload = [0u8; 1000];
+            payload[..4].copy_from_slice(&sent.to_le_bytes());
+            match lane.offer(&payload).unwrap() {
+                OfferOutcome::Accepted { .. } => sent += 1,
+                _ => break,
+            }
+        }
+        let _ = reader.poll(
+            |bytes, _, _| {
+                let index = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+                assert_eq!(index, seen, "in order, exactly once");
+                seen += 1;
+            },
+            BUDGET,
+        );
+        seen == 128
+    });
+    let registration = publication.registration();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        let bound = drivers[0]
+            .net
+            .as_ref()
+            .unwrap()
+            .publication_path_bindings(registration);
+        bound.len() == 2 && bound.iter().all(|bound| *bound > 0)
+    });
+    // Nothing more arrives: each path's copy of every message was dropped
+    // as the other's duplicate.
+    for _ in 0..200 {
+        for driver in [&mut a, &mut b] {
+            let _ = driver.do_work().unwrap();
+        }
+        let _ = reader.poll(|_, _, _| seen += 1, BUDGET);
+    }
+    assert_eq!(seen, 128, "one logical receiver: no message twice");
+}
+
+/// karyos#1043 (owner item 11): one path failing loses nothing. The tail
+/// of the stream lost on one paired unicast path arrives by the other,
+/// with no gap and nothing sealed.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_paired_path_failing_keeps_the_stream_delivering() {
+    let Some((mut a, mut b, publication, image)) =
+        paired_paths("a_paired_path_failing_keeps_the_stream_delivering", false)
+    else {
+        return;
+    };
+    let (delivered, gaps) = lose_the_tail(
+        &mut a,
+        &mut b,
+        &publication,
+        &image,
+        true,
+        |delivered, _| delivered.len() == 3,
+    );
+    assert_eq!(delivered, [0, 1, 2]);
+    assert!(gaps.is_empty());
+    assert_eq!(
+        b.net
+            .as_ref()
+            .unwrap()
+            .receiver_counters()
+            .unwrap()
+            .gaps_sealed,
+        0
+    );
+}
+
 /// rp-w4b2c: a publication over two paths reaches a subscription over the
 /// same two paths, on real sockets that isolate the paths (owner item 12,
 /// karyos#624): every message once, in

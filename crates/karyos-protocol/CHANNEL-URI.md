@@ -327,8 +327,14 @@ path        = interface "@" socket-address
   `interface` with `paths` stays a `Conflict`; `ttl`, `fc` and
   `control-mode` do not apply.
 - **Interfaces that do not exist** are the driver's to refuse; the URI
-  cannot know the host's interfaces.
-- **Not served yet.** A driver refuses a paired-paths channel,
-  `UnsupportedChannel`, for a publication and a subscription, until
-  unicast paths pass on real sockets (karyos#624). The grammar is recorded
-  and parsed first, as the common URI rule requires.
+  cannot know the host's interfaces. A driver refuses, at channel
+  admission, a publication path whose interface address no interface of
+  its host has (karyos#1043).
+- **Serving.** A publication sends path `i` from the address of its
+  interface to `endpoints[i]`; a subscription receives path `i` at
+  `endpoints[i]`, the interfaces being the sender's (karyos#1043). One
+  logical receiver: the paths bind one image, which delivers each message
+  once. A driver whose sockets cannot isolate paths (karyos#624; not
+  Linux) refuses a paired-paths channel, `UnsupportedChannel`, for a
+  publication and a subscription. A path interface named by name is
+  refused by a driver that does not look interfaces up by name.
