@@ -18,7 +18,6 @@
 //! daemon between hosts and a grandmaster, which is an owner decision
 //! (karyos#749); this tool does neither.
 
-#[cfg(target_os = "linux")]
 use std::io::Write;
 
 use karyos_trace::calibrate::FitConfig;
@@ -45,7 +44,23 @@ this host, with measured uncertainties (Linux).
 
 Usage: karyos-tools calibrate phc [--device /dev/ptp0] [--reads 4096]
            [--keep 25] [--interval-us 500] [--extension-ms 0]
-           [--source-domain N] [--target-domain N] [--epoch N]
+           [--source-domain N] [--target-domain N] [--epoch N] [--reverse]
+       karyos-tools calibrate link --samples <file> [--server-domain N]
+           [--client-domain N] [--epoch N]
+       karyos-tools calibrate compose <record> <record> [<record>...]
+
+`phc --reverse` reads the PHC, the raw clock and the PHC again, so the
+record converts PHC times into the raw clock (the receiving host of a link).
+`link` reads a PTP client's samples (one line each: the client PHC's
+time, offsetFromMaster and meanPathDelay in ns, as `pmc` prints them; a
+header line and a `DONE` line are skipped) and prints a calibration from
+the server's PHC to the client's, bounded by the largest offset plus the
+whole path delay (any asymmetry), valid over the samples. `compose` chains
+records, each starting where the previous ends, into the one direct
+record a cross-host latency needs. A record is the 18 words `phc`, `link`
+and `compose` print after `record`.
+
+`phc`:
 
 It reads CLOCK_MONOTONIC_RAW (the TSC at a fixed scale on a host whose
 clock source is tsc), the PHC, and CLOCK_MONOTONIC_RAW again, --reads
@@ -76,6 +91,8 @@ pub struct Settings {
     pub target_domain: u64,
     /// The calibration epoch.
     pub epoch: u64,
+    /// Read the PHC around the raw clock: the record converts PHC times.
+    pub reverse: bool,
 }
 
 impl Default for Settings {
@@ -89,6 +106,7 @@ impl Default for Settings {
             source_domain: 0,
             target_domain: 1,
             epoch: 1,
+            reverse: false,
         }
     }
 }
@@ -105,6 +123,10 @@ pub fn parse(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Option<Se
         let arg = arg.to_str().ok_or("an argument is not UTF-8")?.to_owned();
         if arg == "-h" || arg == "--help" {
             return Ok(None);
+        }
+        if arg == "--reverse" {
+            settings.reverse = true;
+            continue;
         }
         let value = args
             .next()
@@ -183,8 +205,12 @@ pub fn collect(
     let mut reads = Vec::with_capacity(settings.reads);
     let pause = std::time::Duration::from_micros(settings.interval_us);
     for _ in 0..settings.reads {
-        let (before, target, after) = karyos_sys::host_clock::phc_paired_read(phc)
-            .ok_or("the kernel refused a clock read")?;
+        let read = if settings.reverse {
+            karyos_sys::host_clock::phc_paired_read_reversed(phc)
+        } else {
+            karyos_sys::host_clock::phc_paired_read(phc)
+        };
+        let (before, target, after) = read.ok_or("the kernel refused a clock read")?;
         reads.push(PairedRead {
             before,
             target,
@@ -209,6 +235,8 @@ pub fn run(
     let mut args = args;
     match args.next().as_ref().and_then(|arg| arg.to_str()) {
         Some("phc") => {}
+        Some("link") => return run_link(args, out, err),
+        Some("compose") => return run_compose(args, out, err),
         None | Some("-h" | "--help") => {
             let _ = out.write_all(HELP.as_bytes());
             return 0;
@@ -335,11 +363,7 @@ pub fn run(
         ),
     ];
     let record = match calibration.encode() {
-        Ok(words) => words
-            .iter()
-            .map(|word| format!("{word:#018x}"))
-            .collect::<Vec<_>>()
-            .join(" "),
+        Ok(words) => format_record(&words),
         Err(error) => {
             let _ = writeln!(err, "karyos-tools calibrate: {error}");
             return EXIT_ERROR;
@@ -355,6 +379,237 @@ pub fn run(
             err,
             "karyos-tools calibrate: cannot write the result: {error}"
         );
+        return EXIT_ERROR;
+    }
+    0
+}
+
+/// A record's text: its 18 words, as `phc` prints them.
+#[must_use]
+pub fn format_record(words: &[u64; karyos_trace::clocks::CALIBRATION_WORDS]) -> String {
+    words
+        .iter()
+        .map(|word| format!("{word:#018x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A record from its 18 words (hexadecimal with `0x`, or decimal).
+///
+/// # Errors
+///
+/// A message for a word that does not parse, the wrong count, or a record
+/// [`karyos_trace::clocks::Calibration::decode`] refuses.
+pub fn parse_record(words: &[&str]) -> Result<karyos_trace::clocks::Calibration, String> {
+    let mut parsed = [0_u64; karyos_trace::clocks::CALIBRATION_WORDS];
+    if words.len() != parsed.len() {
+        return Err(format!(
+            "a record has {} words, not {}",
+            parsed.len(),
+            words.len()
+        ));
+    }
+    for (slot, word) in parsed.iter_mut().zip(words) {
+        *slot = match word.strip_prefix("0x") {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => word.parse(),
+        }
+        .map_err(|_| format!("{word} is not a record word"))?;
+    }
+    karyos_trace::clocks::Calibration::decode(&parsed).map_err(|error| error.to_string())
+}
+
+/// Parses `link` samples: lines of the client PHC's time, the offset and
+/// the mean path delay; a header line and a `DONE` line are skipped.
+///
+/// # Errors
+///
+/// A message naming the line at fault.
+pub fn parse_samples(
+    text: &str,
+) -> Result<Vec<karyos_trace::calibrate::chain::LinkSample>, String> {
+    let mut samples = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.is_empty()
+            || line.trim() == "DONE"
+            || fields
+                .first()
+                .is_some_and(|first| first.parse::<u64>().is_err() && number == 0)
+        {
+            continue;
+        }
+        let [time, offset, delay] = fields.as_slice() else {
+            return Err(format!("line {}: three fields expected", number + 1));
+        };
+        // pmc prints the offset and the delay with a fraction: whole ns.
+        let whole = |field: &str| field.split('.').next().unwrap_or(field).to_owned();
+        samples.push(karyos_trace::calibrate::chain::LinkSample {
+            time: time
+                .parse()
+                .map_err(|_| format!("line {}: bad time", number + 1))?,
+            offset: whole(offset)
+                .parse()
+                .map_err(|_| format!("line {}: bad offset", number + 1))?,
+            path_delay: whole(delay)
+                .parse()
+                .map_err(|_| format!("line {}: bad delay", number + 1))?,
+        });
+    }
+    Ok(samples)
+}
+
+/// Runs `karyos-tools calibrate link`.
+pub fn run_link(
+    args: impl Iterator<Item = std::ffi::OsString>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let mut args = args;
+    let (mut samples, mut server, mut client, mut epoch) = (None, 2_u64, 3_u64, 1_u64);
+    while let Some(arg) = args.next() {
+        let arg = arg.to_string_lossy().into_owned();
+        let Some(value) = args
+            .next()
+            .map(|value| value.to_string_lossy().into_owned())
+        else {
+            let _ = writeln!(err, "karyos-tools calibrate link: {arg} needs a value");
+            return EXIT_ERROR;
+        };
+        let number = value.parse::<u64>();
+        match (arg.as_str(), number) {
+            ("--samples", _) => samples = Some(value),
+            ("--server-domain", Ok(number)) => server = number,
+            ("--client-domain", Ok(number)) => client = number,
+            ("--epoch", Ok(number)) => epoch = number,
+            _ => {
+                let _ = writeln!(
+                    err,
+                    "karyos-tools calibrate link: bad argument {arg} {value}"
+                );
+                return EXIT_ERROR;
+            }
+        }
+    }
+    let Some(path) = samples else {
+        let _ = writeln!(err, "karyos-tools calibrate link: --samples names the file");
+        return EXIT_ERROR;
+    };
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|error| error.to_string())
+        .and_then(|text| parse_samples(&text));
+    let key = |domain| ClockKey {
+        observer: ObserverId {
+            driver: [0, 0],
+            journal: 0,
+        },
+        domain,
+        epoch,
+    };
+    let linked = parsed.and_then(|samples| {
+        let count = samples.len();
+        karyos_trace::calibrate::chain::link(key(server), key(client), &samples)
+            .map(|calibration| (calibration, count))
+            .map_err(|error| error.to_string())
+    });
+    let (calibration, count) = match linked {
+        Ok(linked) => linked,
+        Err(error) => {
+            let _ = writeln!(err, "karyos-tools calibrate link: {error}");
+            return EXIT_ERROR;
+        }
+    };
+    print_record(
+        &calibration,
+        &format!(
+            "link of {count} samples: offset 0 ns +/- {} ns (largest offset plus the whole path delay), valid server PHC {} to {}",
+            calibration.offset_uncertainty, calibration.valid_from, calibration.valid_to
+        ),
+        out,
+        err,
+    )
+}
+
+/// Runs `karyos-tools calibrate compose`.
+pub fn run_compose(
+    args: impl Iterator<Item = std::ffi::OsString>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let text: Vec<String> = args.map(|arg| arg.to_string_lossy().into_owned()).collect();
+    let words: Vec<&str> = text
+        .iter()
+        .flat_map(|arg| arg.split_whitespace())
+        .filter(|word| *word != "record")
+        .collect();
+    let width = karyos_trace::clocks::CALIBRATION_WORDS;
+    if words.len() < 2 * width || !words.len().is_multiple_of(width) {
+        let _ = writeln!(
+            err,
+            "karyos-tools calibrate compose: two or more records of {width} words each"
+        );
+        return EXIT_ERROR;
+    }
+    let mut composed: Option<karyos_trace::clocks::Calibration> = None;
+    for chunk in words.chunks(width) {
+        let next = match parse_record(chunk) {
+            Ok(next) => next,
+            Err(error) => {
+                let _ = writeln!(err, "karyos-tools calibrate compose: {error}");
+                return EXIT_ERROR;
+            }
+        };
+        composed = Some(match composed {
+            None => next,
+            Some(before) => match karyos_trace::calibrate::chain::compose(&before, &next) {
+                Ok(joined) => joined,
+                Err(error) => {
+                    let _ = writeln!(err, "karyos-tools calibrate compose: {error}");
+                    return EXIT_ERROR;
+                }
+            },
+        });
+    }
+    let Some(calibration) = composed else {
+        return EXIT_ERROR;
+    };
+    print_record(
+        &calibration,
+        &format!(
+            "composed: offset {} ns +/- {} ns, drift {} ppb +/- {} ppb at {}, valid {} to {}",
+            calibration.offset,
+            calibration.offset_uncertainty,
+            calibration.drift,
+            calibration.drift_uncertainty,
+            calibration.reference,
+            calibration.valid_from,
+            calibration.valid_to
+        ),
+        out,
+        err,
+    )
+}
+
+/// Prints `summary` and the record, or fails.
+fn print_record(
+    calibration: &karyos_trace::clocks::Calibration,
+    summary: &str,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
+    let record = match calibration.encode() {
+        Ok(words) => format_record(&words),
+        Err(error) => {
+            let _ = writeln!(err, "karyos-tools calibrate: {error}");
+            return EXIT_ERROR;
+        }
+    };
+    if writeln!(out, "{summary}")
+        .and_then(|()| writeln!(out, "record {record}"))
+        .and_then(|()| out.flush())
+        .is_err()
+    {
+        let _ = writeln!(err, "karyos-tools calibrate: cannot write the result");
         return EXIT_ERROR;
     }
     0
@@ -405,6 +660,73 @@ mod tests {
         assert_eq!(
             (config.from.domain, config.to.domain, config.to.epoch),
             (7, 8, 9)
+        );
+    }
+
+    #[test]
+    fn link_samples_parse_as_pmc_prints_them() {
+        let samples = super::parse_samples("ingress_ns\toffset_ns\tmean_path_delay_ns\n1795557786352172275\t-8.0\t3219.0\n1795557787476413916\t12.0\t3227.0\nDONE\n").unwrap();
+        assert_eq!(samples.len(), 2);
+        assert_eq!((samples[0].offset, samples[0].path_delay), (-8, 3219));
+        assert!(super::parse_samples("1 2\n").is_err());
+    }
+
+    #[test]
+    fn a_record_round_trips_and_compose_chains_records() {
+        let key = |domain| karyos_trace::clocks::ClockKey {
+            observer: karyos_trace::journal::ObserverId {
+                driver: [0, 0],
+                journal: 0,
+            },
+            domain,
+            epoch: 1,
+        };
+        let first = karyos_trace::clocks::Calibration {
+            from: key(1),
+            to: key(2),
+            reference: 1_000,
+            offset: 100,
+            offset_uncertainty: 5,
+            drift: 0,
+            drift_uncertainty: 0,
+            valid_from: 0,
+            valid_to: 10_000,
+        };
+        let second = karyos_trace::clocks::Calibration {
+            from: key(2),
+            to: key(3),
+            reference: 3_000,
+            offset: 0,
+            offset_uncertainty: 1,
+            drift: 0,
+            drift_uncertainty: 0,
+            valid_from: 0,
+            valid_to: 20_000,
+        };
+        let text = |calibration: &karyos_trace::clocks::Calibration| {
+            super::format_record(&calibration.encode().unwrap())
+        };
+        let words = text(&first);
+        assert_eq!(
+            super::parse_record(&words.split(' ').collect::<Vec<_>>()).unwrap(),
+            first
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = super::run_compose(
+            vec![format!("record {words}").into(), text(&second).into()].into_iter(),
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
+        let printed = String::from_utf8(out).unwrap();
+        assert!(
+            printed.contains("composed: offset 100 ns +/- 7 ns"),
+            "{printed}"
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            super::run_compose(vec![words.into()].into_iter(), &mut out, &mut err),
+            super::EXIT_ERROR
         );
     }
 
