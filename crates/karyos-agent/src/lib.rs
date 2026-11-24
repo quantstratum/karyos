@@ -33,6 +33,13 @@
 //!   [`catalog`] lists its recordings over the Archive's control streams
 //!   on a thread of its own, as a full IPC client of that driver; off by
 //!   default.
+//! - **Clocks and rate limits** (R-CORE-40, karyos#741): `clocks DIR`
+//!   reads the clocks of the trace journals the agent follows and the
+//!   calibrations it can see, each without a valid calibration unavailable
+//!   with its reason; `rate-limits DIR` reads each network publication's
+//!   rate limiters, policy, version and refusals from the driver's counter
+//!   cells. Until karyos#118 produces calibrations, a clocks view
+//!   legitimately shows no cross-host calibration.
 //! - **Not yet.** An endpoint's capability gauges read as one group in
 //!   the view (M6b's `karyos_client::capabilities` reads them).
 //! - **Operations journal** (M10b): [`journal`] keeps the agent's guard
@@ -76,6 +83,11 @@ pub mod json;
 )]
 mod model;
 pub mod registry;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the attach that uses it is Linux only")
+)]
+mod resources;
 pub mod retention;
 pub mod trace_export;
 #[cfg_attr(

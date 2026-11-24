@@ -203,7 +203,7 @@ pub enum CapabilityState {
 
 /// The capability names of API v1, a closed list: a later agent may add
 /// names, and a client ignores the ones it does not know.
-pub const CAPABILITIES: [&str; 15] = [
+pub const CAPABILITIES: [&str; 17] = [
     "view",
     "guard-close",
     "guard-reopen",
@@ -218,6 +218,8 @@ pub const CAPABILITIES: [&str; 15] = [
     "rate-change",
     "guard-preview",
     "submit",
+    "clocks",
+    "rate-limits",
     "cluster-command",
 ];
 
@@ -1145,4 +1147,185 @@ pub enum ExportRefusal {
     },
     /// The ring's bounds were being written on every attempt: retry.
     Busy,
+}
+
+/// What a `clocks DIR` read reports of one driver (R-CORE-40, karyos#741):
+/// the clocks of the trace journals the agent follows in the driver's
+/// trace mirror, and the calibrations the agent can see.
+///
+/// A clock without a valid calibration reads as unavailable with a reason,
+/// never as a number, and no latency is derived here (`karyos_trace`'s
+/// clocks module). Until karyos#118 produces calibrations, the agent sees
+/// none: `calibrations` is empty with `calibrations_unavailable`
+/// `"no_producer"`, and every clock's calibration is unavailable, which a
+/// clocks view shows as "no cross-host calibration" rather than hiding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClocksRead {
+    /// The driver's directory.
+    pub dir: PathBuf,
+    /// Host `CLOCK_MONOTONIC` nanoseconds of the agent's read.
+    pub read_ns: u64,
+    /// The driver instance whose journals these are.
+    pub driver: u128,
+    /// One per local trace journal the agent follows, by journal number:
+    /// at most the trace window's `max_journals`. Network journals carry
+    /// no clock of this host and are not listed.
+    pub clocks: Vec<ClockState>,
+    /// Every calibration the agent can see.
+    pub calibrations: Vec<CalibrationView>,
+    /// Why `calibrations` is empty when no source of them exists:
+    /// `"no_producer"` until karyos#118; `None` when the agent reads a
+    /// source, so an empty list then means none was published.
+    pub calibrations_unavailable: Option<&'static str>,
+}
+
+/// One clock: a trace journal's clock as its records observed it
+/// (`karyos_trace::ClockKey`: the journal's observer, the domain and the
+/// calibration epoch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClockState {
+    /// The journal number, the observer's within the driver instance.
+    pub journal: u64,
+    /// What the journal declared of its clock's origin: `"std_monotonic"`,
+    /// `"host_monotonic"` or `"opaque"`.
+    pub provenance: &'static str,
+    /// Whether the driver found the journal's writer in its own time
+    /// namespace.
+    pub same_namespace: bool,
+    /// The clock domain of its last record; `None` before any.
+    pub domain: Option<u64>,
+    /// The calibration epoch of its last record; `None` before any.
+    pub epoch: Option<u64>,
+    /// The time of its last record, in the clock's unit; `None` before any.
+    pub time: Option<u64>,
+    /// The largest uncertainty (half-width, the clock's unit) of its
+    /// records in that epoch; `None` before any.
+    pub uncertainty: Option<u64>,
+    /// Whether a calibration from this clock holds at `time`.
+    pub calibration: CalibrationState,
+}
+
+/// Whether a clock has a calibration valid at its last observed time
+/// (R-CORE-40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CalibrationState {
+    /// `count` calibrations from the clock, each to another clock, hold at
+    /// its last observed time.
+    Valid {
+        /// How many.
+        count: usize,
+    },
+    /// None holds, for `reason`.
+    Unavailable {
+        /// Why.
+        reason: CalibrationUnavailable,
+    },
+}
+
+/// Why a clock has no valid calibration (R-CORE-40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CalibrationUnavailable {
+    /// No calibration from the clock (`"no_calibration"`): the state of
+    /// every clock until karyos#118.
+    NoCalibration,
+    /// The clock has no observed time to check one against
+    /// (`"not_observed"`).
+    NotObserved,
+    /// Every calibration from it ended before its last time (`"expired"`).
+    Expired,
+    /// None from it has started by its last time (`"not_yet_valid"`).
+    NotYetValid,
+    /// Two hold for one target clock (`"ambiguous"`): neither is used.
+    Ambiguous,
+}
+
+impl CalibrationUnavailable {
+    /// Its name in the API.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NoCalibration => "no_calibration",
+            Self::NotObserved => "not_observed",
+            Self::Expired => "expired",
+            Self::NotYetValid => "not_yet_valid",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+}
+
+/// A calibration the agent can see, with its validity range and whether
+/// it holds at its source clock's last observed time (R-CORE-40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CalibrationView {
+    /// The calibration, as `karyos_trace` defines it.
+    pub calibration: karyos_trace::Calibration,
+    /// Whether it holds: `"valid"`, `"expired"`, `"not_yet_valid"`, or
+    /// `"not_observed"` when its source clock has no observed time.
+    pub state: &'static str,
+}
+
+/// What a `rate-limits DIR` read reports of one driver (R-CORE-40,
+/// karyos#741), from the agent's last sampling pass of its counters: the
+/// rate limiters of its network publications' sender gates, where the
+/// authoritative buckets live (R-CORE-21), with the policy in force, its
+/// version and the refusals counted.
+///
+/// Each value is a counter cell the sender writes at the end of its duty
+/// cycle; a pass reads each cell on its own, so a pass may mix two cycles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RateLimitsRead {
+    /// The driver's directory.
+    pub dir: PathBuf,
+    /// Host `CLOCK_MONOTONIC` nanoseconds of the pass read; `None` when
+    /// the pass had no counter.
+    pub read_ns: Option<u64>,
+    /// One per network publication with counter cells, by stream
+    /// registration.
+    pub publications: Vec<PublicationRates>,
+}
+
+/// A network publication's rate limiters (R-CORE-40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PublicationRates {
+    /// The stream registration its cells are keyed by.
+    pub registration: u64,
+    /// The publication's own buckets, which its messages spend.
+    pub publication: Limiter,
+    /// The control bucket of its cancel and resolve traffic (R-CORE-21's
+    /// control reserve).
+    pub control: Limiter,
+    /// The version of the published rate policy the gate applies; 0 for
+    /// the policy it was built with, or for none; `None` when the driver
+    /// publishes no such cell (one older than karyos#741).
+    pub version: Option<u64>,
+}
+
+/// One rate limiter as the agent reads it (R-CORE-40).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Limiter {
+    /// The driver publishes no cell for it (one older than karyos#741):
+    /// nothing is known (`"not_counted"`).
+    Unknown,
+    /// The gate has no such bucket (`"none"`): nothing is limited and
+    /// nothing counted.
+    None,
+    /// The bucket in force and its refusals (`"limited"`).
+    Limited {
+        /// The policy in force.
+        policy: karyos_sys::rate_limit::RatePolicy,
+        /// The checks at which the bucket could not pay for what was due:
+        /// a datagram or control frame that waits is counted at each check
+        /// that holds it. 0 means it refused nothing; a limiter that
+        /// counts nothing is [`Limiter::None`] or [`Limiter::Unknown`],
+        /// never 0.
+        refusals: u64,
+    },
 }

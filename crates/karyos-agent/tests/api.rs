@@ -179,6 +179,8 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"rate-change","state":"forbidden","reason":"role"},"#,
             r#"{"name":"guard-preview","state":"forbidden","reason":"role"},"#,
             r#"{"name":"submit","state":"forbidden","reason":"role"},"#,
+            r#"{"name":"clocks","state":"served","reason":null},"#,
+            r#"{"name":"rate-limits","state":"served","reason":null},"#,
             r#"{"name":"cluster-command","state":"unavailable","reason":"not_configured"}]}"#,
             "\n"
         )
@@ -595,6 +597,84 @@ fn trace_buckets_are_served_over_the_socket() {
     );
 }
 
+/// R-CORE-40 (karyos#741): `clocks` and `rate-limits` over the socket,
+/// for a viewer. A driver with no trace journal and no network publication
+/// has no clock and no limiter to list, and says why no calibration is
+/// listed; an unknown directory gets the guard operations' answer, and
+/// stray arguments the request's own error. The view a v1 client reads is
+/// unchanged by them.
+#[test]
+fn clocks_and_rate_limits_are_served_over_the_socket() {
+    let _serial = serial();
+    let (_driver, mut agent, dir) = attached("clocks");
+    let mut server =
+        Server::bind(ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])).unwrap();
+    let driver_dir = dir.join("driver");
+    let view_before = ask(&mut server, &mut agent, "KARYOS-AGENT 1 view\n");
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!("KARYOS-AGENT 1 clocks {}\n", driver_dir.display()),
+    );
+    assert_eq!(served, [Served::Clocks]);
+    assert!(
+        answer.starts_with(&format!(r#"{{"dir":"{}","driver":""#, driver_dir.display())),
+        "{answer}"
+    );
+    assert!(
+        answer.ends_with(
+            r#","clocks":[],"calibrations":[],"calibrations_unavailable":"no_producer"}
+"#
+        ),
+        "{answer}"
+    );
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!("KARYOS-AGENT 1 rate-limits {}\n", driver_dir.display()),
+    );
+    assert_eq!(served, [Served::RateLimits]);
+    assert!(
+        answer.starts_with(&format!(r#"{{"dir":"{}","read_ns":"#, driver_dir.display())),
+        "{answer}"
+    );
+    assert!(
+        answer.ends_with(
+            r#","publications":[]}
+"#
+        ),
+        "{answer}"
+    );
+    for request in ["clocks", "rate-limits"] {
+        let (answer, served) = ask(
+            &mut server,
+            &mut agent,
+            &format!("KARYOS-AGENT 1 {request} /nowhere\n"),
+        );
+        assert_eq!(served, [Served::Refused]);
+        assert_eq!(answer, "{\"error\":\"unknown driver\"}\n");
+        let (answer, served) = ask(
+            &mut server,
+            &mut agent,
+            &format!("KARYOS-AGENT 1 {request}\n"),
+        );
+        assert_eq!(served, [Served::Refused]);
+        assert_eq!(
+            answer,
+            format!("{{\"error\":\"bad arguments\",\"request\":\"{request}\"}}\n")
+        );
+    }
+    // Reads change nothing the view reports, but its read times.
+    let view_after = ask(&mut server, &mut agent, "KARYOS-AGENT 1 view\n");
+    assert_eq!(view_before.1, view_after.1);
+    let fields = |view: &str| {
+        view.split(',')
+            .map(|field| field.split(':').next().unwrap_or("").to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(fields(&view_before.0), fields(&view_after.0));
+}
+
 /// R-CORE-13: `trace-export` over the socket: a page of the attached
 /// driver's mirror, with its instance as the epoch; a cursor of another
 /// instance gets the typed refusal; an unknown directory, the guard
@@ -834,4 +914,22 @@ fn a_submit_without_a_token_reaches_the_agent() {
         answer,
         "{\"error\":\"bad arguments\",\"request\":\"submit\"}\n"
     );
+}
+
+/// Relay id 0 is the local socket's: a library configuration that names it
+/// is refused at bind, as the CLI refuses it, so a relayed request is never
+/// served the local answer (karyos#726).
+#[test]
+fn a_relay_id_of_zero_is_refused_at_bind() {
+    let _serial = serial();
+    let dir = dir("zero-relay");
+    std::fs::create_dir_all(&dir).unwrap();
+    let api = dir.join("api");
+    let zero = ApiConfig::new(api.clone(), vec![(own(), Role::Viewer)])
+        .with_relays(vec![(own(), 0)], Vec::new());
+    assert!(matches!(Server::bind(zero), Err(ServeError::ZeroRelay)));
+    assert!(!api.exists(), "nothing is created");
+    let one =
+        ApiConfig::new(api, vec![(own(), Role::Viewer)]).with_relays(vec![(own(), 1)], Vec::new());
+    Server::bind(one).unwrap();
 }

@@ -1361,7 +1361,7 @@ pub(crate) const SENDER_CELLS: [&str; 35] = [
 /// M2b), keyed by its stream's registration: datagrams and their bytes
 /// staged for sending (PAD and ABORTED records included), repair
 /// datagrams submitted, and NAKs received.
-pub(crate) const PUBLICATION_CELLS: [&str; 6] = [
+pub(crate) const PUBLICATION_CELLS: [&str; 18] = [
     "network frames sent",
     "network bytes sent",
     "network retransmits",
@@ -1374,7 +1374,52 @@ pub(crate) const PUBLICATION_CELLS: [&str; 6] = [
     // reached while the driver validates first, so a non-zero value is a
     // broken invariant, visible to the agent.
     "network rate policies refused",
+    // Its sender gate's rate limiters (R-CORE-40, karyos#741), in
+    // `GuardGate::rate_cells` order, all 0 without a gate: a gauge of
+    // which buckets exist (bits `guard_gate::RATE_LIMITERS_*`), a gauge of
+    // the policy version applied, then per bucket (the publication's, then
+    // the control reserve's) four gauges of its policy and the count of
+    // its refusals.
+    "network rate limiters",
+    "network rate policy version",
+    "network rate messages per second",
+    "network rate message burst",
+    "network rate bytes per second",
+    "network rate byte burst",
+    "network rate refusals",
+    "network control rate messages per second",
+    "network control rate message burst",
+    "network control rate bytes per second",
+    "network control rate byte burst",
+    "network control rate refusals",
 ];
+
+/// The first of [`PUBLICATION_CELLS`]' rate cells, `GuardGate::rate_cells`'
+/// first word.
+pub(crate) const PUBLICATION_RATE_CELLS: usize = 6;
+
+/// The [`PUBLICATION_CELLS`] that are gauges of a rate policy, not counts
+/// (karyos#741): which buckets exist, the version applied, and each
+/// bucket's rates and bursts. A consumer of the counter region must read a
+/// lower value of one as a new setting, never as a counter reset. The two
+/// refusal cells stay counts.
+pub(crate) const PUBLICATION_RATE_GAUGES: [&str; 10] = [
+    "network rate limiters",
+    "network rate policy version",
+    "network rate messages per second",
+    "network rate message burst",
+    "network rate bytes per second",
+    "network rate byte burst",
+    "network control rate messages per second",
+    "network control rate message burst",
+    "network control rate bytes per second",
+    "network control rate byte burst",
+];
+
+const _: () = assert!(
+    PUBLICATION_RATE_CELLS + crate::guard_gate::RATE_CELLS == PUBLICATION_CELLS.len(),
+    "the rate cells end the publication's cells"
+);
 
 /// A network image's counters in the CnC (M2b), keyed by its stream's
 /// registration: NAKs sent, losses detected, losses repaired.

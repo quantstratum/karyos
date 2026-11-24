@@ -112,14 +112,26 @@
 //! 0) and written the same way by its agent. Publication: `network frames
 //! sent`, `network bytes sent`, `network retransmits`, `network naks
 //! received`, `network admission` (a gauge) and `network rate policies
-//! refused`. Image: `network naks sent`, `network losses`, `network
+//! refused`, then its sender gate's rate limiters (R-CORE-40, karyos#741;
+//! all 0 without a guard's gate): `network rate limiters`, a gauge of
+//! which buckets exist (bit 1 the publication's, 2 its byte limit, 4 the
+//! control reserve's, 8 its byte limit), `network rate policy version`, a
+//! gauge of the published policy version the gate applies (0 for the
+//! policy it was built with), and per bucket the gauges of its policy and
+//! the event counter of its refusals, the checks at which it held a
+//! datagram or a control frame back (one that waits is counted at each
+//! check): `network rate messages per second`, `network rate message
+//! burst`, `network rate bytes per second`, `network rate byte burst`,
+//! `network rate refusals`, and the same five as `network control rate
+//! ...`. A refusal count of 0 with its bucket's bit set is "refused
+//! nothing"; without the bit nothing was counted. Image: `network naks sent`, `network losses`, `network
 //! repaired`. They are allocated all or none with the publication, or
 //! once the image is installed and exposed; when the region has no room
 //! for the whole group, `counters unavailable` counts one and the stream
 //! runs without cells, never retried. They are freed when the publication
 //! is removed, the image retires or the network closes; cells still in
 //! flight to the receiver at the close are left pending release, which
-//! the allocator reuses. Size the region for 6 cells per network
+//! the allocator reuses. Size the region for 18 cells per network
 //! publication and 3 per image on top of the rest.
 //!
 //! Position cells (`quantstratum-docs: karyos/design/observability-and-tools.md`,

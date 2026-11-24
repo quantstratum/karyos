@@ -6137,7 +6137,14 @@ pub(crate) fn stream_network_cells(
     let mut cells = Vec::with_capacity(labels.len());
     for label in labels {
         // The first refusal is counted; nothing more is asked.
-        let Some(cell) = counters.allocate_keyed(TYPE_EVENTS, label, keys) else {
+        // A rate policy's settings are gauges (karyos#741); every other
+        // network cell is a count.
+        let kind = if crate::agents::PUBLICATION_RATE_GAUGES.contains(label) {
+            crate::counters::TYPE_GAUGE
+        } else {
+            TYPE_EVENTS
+        };
+        let Some(cell) = counters.allocate_keyed(kind, label, keys) else {
             for cell in cells {
                 counters.free(cell);
             }
@@ -7191,20 +7198,20 @@ mod stream_cells_tests {
             .count()
     }
 
-    /// With room for five cells, a publication's six are refused whole:
-    /// the five taken are freed, `counters unavailable` counts one, and
-    /// the region holds what it held. With room, all six are keyed by the
-    /// stream's registration.
+    /// With room for seventeen cells, a publication's eighteen are refused
+    /// whole: the seventeen taken are freed, `counters unavailable` counts
+    /// one, and the region holds what it held. With room, all eighteen are
+    /// keyed by the stream's registration.
     #[test]
     fn a_full_region_refuses_the_whole_group_once() {
         let labels = &crate::agents::PUBLICATION_CELLS;
-        assert_eq!(labels.len(), 6);
-        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 5).unwrap();
+        assert_eq!(labels.len(), 18);
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 17).unwrap();
         let before = allocated(&counters);
         assert!(stream_network_cells(&mut counters, 7, labels).is_none());
         assert_eq!(allocated(&counters), before);
         assert_eq!(counters.value(Event::CountersUnavailable), 1);
-        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 6).unwrap();
+        let mut counters = DriverCounters::with_capacity(FIXED_COUNTERS + 18).unwrap();
         let mut cells = stream_network_cells(&mut counters, 7, labels).unwrap();
         assert_eq!(counters.value(Event::CountersUnavailable), 0);
         let reader = counters.reader();
@@ -7217,6 +7224,24 @@ mod stream_cells_tests {
             })
             .collect();
         assert_eq!(keyed, labels);
+        // The rate policy's settings are gauges, every other cell a count
+        // (karyos#741).
+        let gauges: Vec<_> = (0..reader.capacity())
+            .filter_map(|index| match reader.read(index) {
+                CellRead::Allocated { metadata, .. }
+                    if metadata.keys.stream == 7
+                        && metadata.type_id == crate::counters::TYPE_GAUGE =>
+                {
+                    Some(String::from_utf8(metadata.label().to_vec()).unwrap())
+                }
+                CellRead::Allocated { metadata, .. } if metadata.keys.stream == 7 => {
+                    assert_eq!(metadata.type_id, TYPE_EVENTS);
+                    None
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gauges, crate::agents::PUBLICATION_RATE_GAUGES);
         for cell in cells.take() {
             counters.free(cell);
         }
