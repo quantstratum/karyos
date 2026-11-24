@@ -1347,10 +1347,23 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
     let all = frames(64, 3);
     let length = u64::try_from(all.len()).unwrap();
     let ended_before = rig.sent(2).len();
-    for _ in 0..5000 {
-        if rig.server.agent().describe(1).unwrap().durable == length {
+    // The whole lane written before the stop, which seals what the
+    // recorder wrote (#1067 review): a deadline, not a silent
+    // fall-through. Written, not durable: `start` asks for
+    // `SyncPolicy::PerSegment` with the default segment, which this lane
+    // never finishes, so the durable position moves only at the stop's
+    // close (`SyncPolicy::PerSegment`: when a segment is finished, and at
+    // the close).
+    let begun = std::time::Instant::now();
+    loop {
+        let end = rig.server.agent().describe(1).unwrap().end;
+        if end == length {
             break;
         }
+        assert!(
+            begun.elapsed() < Duration::from_secs(30),
+            "written {end} of {length}"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // Stopped, so each range is sealed; its answer and signal go out.
@@ -1439,8 +1452,7 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(done, "a final status");
-    assert!(!bytes.is_empty());
-    assert_eq!(bytes[..], all[..bytes.len()]);
+    assert_eq!(bytes, all, "the whole recording, in order");
     let mut short = Rig::with(
         "replication-short",
         Host::of(frames(1, 3), true),
