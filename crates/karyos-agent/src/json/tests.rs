@@ -415,7 +415,8 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "join-put",
             "rate-change",
             "guard-preview",
-            "submit"
+            "submit",
+            "cluster-command"
         ]
     );
     let known = Capability {

@@ -38,6 +38,10 @@
 //! - **Operations journal** (M10b): [`journal`] keeps the agent's guard
 //!   operations as an Archive recording (owner item 51(7) of the
 //!   2026-10-21 decisions, interim; the gap analysis's new owner item 7).
+//! - **Cluster admin commands** (R-CORE-41, karyos#772): [`cluster_admin`]
+//!   forwards an authorised, journalled admin command to a product's
+//!   Cluster through the gateway the product attaches, and returns its
+//!   sequenced outcome with the product's evidence digest.
 //! - **Crate graph** (owner item 52): it depends on `karyos-archive`,
 //!   `karyos-client`, `karyos-sys` and `karyos-trace`, never on the driver
 //!   or the tools; neither the driver, the client nor the Archive depends
@@ -62,6 +66,7 @@ pub mod alerts;
 pub mod api;
 pub mod catalog;
 pub mod cli;
+pub mod cluster_admin;
 pub mod exporter;
 pub mod journal;
 pub mod json;

@@ -62,7 +62,13 @@
 //!   expired`, `principal mismatch`, `target mismatch`, `parameters
 //!   mismatch`, `target changed`, `operation id conflict` or `operation
 //!   expired` with nothing sent; a retry of a used id is answered with its
-//!   retained outcome, unsent. A `join-put` line may
+//!   retained outcome, unsent; `cluster-command OPID CLUSTER COMMAND
+//!   PARAMETERS [REASON]` (R-CORE-41, karyos#772; see
+//!   [`crate::cluster_admin`], which states its contract), a product
+//!   Cluster's registered admin command, `PARAMETERS` hex or `-`, for the
+//!   roles its registration names, a refusal journalled as
+//!   `{"error":"forbidden"}`, `unregistered command`, `unknown cluster` or
+//!   `operation id conflict` with nothing sent. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
@@ -852,6 +858,32 @@ impl Server {
                     forbidden()
                 }
             }
+            (
+                Some((requester, role)),
+                Request::ClusterCommand {
+                    operation,
+                    cluster,
+                    command,
+                    parameters,
+                    reason,
+                },
+            ) => {
+                // The role is checked against the command's registration,
+                // and a refusal journalled, by the agent (karyos#772).
+                let parameters =
+                    crate::cluster_admin::parse_parameters(parameters).unwrap_or_default();
+                let answer = agent.cluster_command_for(
+                    (cluster, command, &parameters),
+                    operation,
+                    (requester, clearance(role)),
+                    reason.as_bytes(),
+                );
+                let served = match answer {
+                    crate::cluster_admin::ClusterAnswer::Rejected(_) => Served::Refused,
+                    _ => Served::Operated,
+                };
+                (json::cluster_answer(&answer), served)
+            }
             (Some((requester, role)), Request::GapAck { position }) => {
                 if role.may_acknowledge() {
                     let answer = match agent.acknowledge_gap_for(position, requester) {
@@ -1098,6 +1130,15 @@ enum Request<'a> {
         kind: crate::preview::PreviewKind,
         dir: &'a str,
         guard: u64,
+        reason: &'a str,
+    },
+    /// `cluster-command OPID CLUSTER COMMAND PARAMETERS [REASON]`
+    /// (R-CORE-41, karyos#772): `parameters` checked to parse.
+    ClusterCommand {
+        operation: u64,
+        cluster: &'a str,
+        command: &'a str,
+        parameters: &'a str,
         reason: &'a str,
     },
     /// `legal-hold RECORDING [REASON]`, `hold-release RECORDING [REASON]`,
@@ -1358,6 +1399,36 @@ fn submit(arguments: &str) -> Option<Request<'_>> {
     })
 }
 
+/// `OPID CLUSTER COMMAND PARAMETERS [REASON]` (karyos#772): a nonzero id,
+/// valid names and parameters that parse.
+fn cluster_command(arguments: &str) -> Option<Request<'_>> {
+    use crate::cluster_admin::{parse_parameters, valid_name};
+    let mut fields = arguments.splitn(5, ' ');
+    let operation = fields.next()?.parse::<u64>().ok().filter(|id| *id != 0)?;
+    let cluster = fields.next().filter(|name| valid_name(name))?;
+    let command = fields.next().filter(|name| valid_name(name))?;
+    let parameters = fields
+        .next()
+        .filter(|text| parse_parameters(text).is_some())?;
+    Some(Request::ClusterCommand {
+        operation,
+        cluster,
+        command,
+        parameters,
+        reason: fields.next().unwrap_or(""),
+    })
+}
+
+/// What `role` grants for a product Cluster's admin commands (karyos#772).
+const fn clearance(role: Role) -> crate::cluster_admin::Clearance {
+    use crate::cluster_admin::Clearance;
+    match role {
+        Role::Administrator => Clearance::Administrator,
+        Role::Operator | Role::RiskOfficer => Clearance::Operator,
+        Role::Viewer | Role::Registrar => Clearance::None,
+    }
+}
+
 fn request(rest: &str) -> Option<Request<'_>> {
     let (name, arguments) = rest.split_once(' ').unwrap_or((rest, ""));
     let number = |word: &str| word.parse::<u64>().ok();
@@ -1412,6 +1483,9 @@ fn request(rest: &str) -> Option<Request<'_>> {
             })
         }
         "submit" => submit(arguments).or(Some(Request::BadArguments("submit"))),
+        "cluster-command" => {
+            cluster_command(arguments).or(Some(Request::BadArguments("cluster-command")))
+        }
         "legal-hold" | "hold-release" | "seal-verify" => {
             let (recording, reason) = arguments.split_once(' ').unwrap_or((arguments, ""));
             let operation = match name {

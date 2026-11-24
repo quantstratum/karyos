@@ -429,6 +429,61 @@ pub fn retention_answer(answer: &crate::retention::RetentionAnswer) -> String {
     text
 }
 
+/// A product Cluster's admin command's answer (R-CORE-41, karyos#772):
+/// `{"operation":N,"outcome":"sequenced","index":N,"term":N,"reply":HEX,
+/// "evidence":{"algorithm":S,"digest":HEX}|null}`; a product's refusal
+/// `{"error":"refused","operation":N,"outcome":"refused","code":N,
+/// "reason":S}`; an unknown outcome `{"error":"no answer","operation":N,
+/// "outcome":"unknown"}`; the agent's refusals as `{"error":TEXT}`.
+#[must_use]
+pub fn cluster_answer(answer: &crate::cluster_admin::ClusterAnswer) -> String {
+    use crate::cluster_admin::{ClusterAnswer, hex};
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match answer {
+        ClusterAnswer::Sequenced {
+            operation,
+            index,
+            term,
+            reply,
+            evidence,
+        } => {
+            fields.number("operation", operation);
+            fields.string("outcome", "sequenced");
+            fields.number("index", index);
+            fields.number("term", term);
+            fields.string("reply", &hex(reply));
+            fields
+                .key("evidence")
+                .option(evidence.as_ref(), |out, evidence| {
+                    out.object(|fields| {
+                        fields.string("algorithm", &evidence.algorithm);
+                        fields.string("digest", &hex(&evidence.digest));
+                    });
+                });
+        }
+        ClusterAnswer::Refused {
+            operation,
+            code,
+            reason,
+        } => {
+            fields.string("error", "refused");
+            fields.number("operation", operation);
+            fields.string("outcome", "refused");
+            fields.number("code", code);
+            fields.string("reason", reason);
+        }
+        ClusterAnswer::NoAnswer { operation } => {
+            fields.string("error", "no answer");
+            fields.number("operation", operation);
+            fields.string("outcome", "unknown");
+        }
+        ClusterAnswer::Rejected(code) => fields.string("error", code.text()),
+        ClusterAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
+        ClusterAnswer::Busy => fields.string("error", "busy"),
+    });
+    text
+}
+
 /// The answer to an acknowledged unknown interval (M10b).
 #[must_use]
 pub fn acknowledged(position: u64) -> String {

@@ -312,10 +312,19 @@ fn the_retention_kinds_keep_the_existing_codes() {
         assert_eq!(JournalRecord::decode(&record.encode()), Some(record));
     }
     // 17 and 18 are the rate change's (karyos#740), 19 a submit's
-    // (karyos#738); 20 is no kind yet.
+    // (karyos#738); 20 to 22 a Cluster admin command's (karyos#772); 23
+    // is no kind yet.
     assert_eq!(Kind::from_code(19), Some(Kind::Submitted));
     assert_eq!(Kind::Submitted.code(), 19);
-    assert_eq!(Kind::from_code(20), None);
+    for (code, kind) in (20u64..).zip([
+        Kind::ClusterRequest,
+        Kind::ClusterOutcome,
+        Kind::ClusterRefused,
+    ]) {
+        assert_eq!(kind.code(), code);
+        assert_eq!(Kind::from_code(code), Some(kind));
+    }
+    assert_eq!(Kind::from_code(23), None);
 }
 
 /// karyos#985: each durable append seals the recording to its durable end,

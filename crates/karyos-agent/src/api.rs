@@ -203,7 +203,7 @@ pub enum CapabilityState {
 
 /// The capability names of API v1, a closed list: a later agent may add
 /// names, and a client ignores the ones it does not know.
-pub const CAPABILITIES: [&str; 14] = [
+pub const CAPABILITIES: [&str; 15] = [
     "view",
     "guard-close",
     "guard-reopen",
@@ -218,6 +218,7 @@ pub const CAPABILITIES: [&str; 14] = [
     "rate-change",
     "guard-preview",
     "submit",
+    "cluster-command",
 ];
 
 /// The byte bound of a `trace-buckets` reply (R-CORE-23). A reply holds
