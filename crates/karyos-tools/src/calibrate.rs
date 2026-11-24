@@ -47,6 +47,7 @@ Usage: karyos-tools calibrate phc [--device /dev/ptp0] [--reads 4096]
            [--source-domain N] [--target-domain N] [--epoch N] [--reverse]
        karyos-tools calibrate link --samples <file> [--server-domain N]
            [--client-domain N] [--epoch N] [--max-gap-ms 2000]
+           [--max-bound-ns 10000]
        karyos-tools calibrate compose <record> <record> [<record>...]
 
 `phc --reverse` reads the PHC, the raw clock and the PHC again, so the
@@ -56,7 +57,8 @@ time, offsetFromMaster and meanPathDelay in ns, as `pmc` prints them; a
 header line and a `DONE` line are skipped) and prints a calibration from
 the server's PHC to the client's, bounded by the largest offset plus the
 whole path delay (any asymmetry) and the largest change between samples,
-valid over the samples, which must be no more than --max-gap-ms apart. `compose` chains
+valid over the samples, which must be no more than --max-gap-ms apart.
+A bound past --max-bound-ns (a link that lost its lock) prints no record. `compose` chains
 records, each starting where the previous ends, into the one direct
 record a cross-host latency needs. A record is the 18 words `phc`, `link`
 and `compose` print after `record`.
@@ -480,6 +482,7 @@ pub fn run_link(
     let mut args = args;
     let (mut samples, mut server, mut client, mut epoch) = (None, 2_u64, 3_u64, 1_u64);
     let mut max_gap_ms = 2_000_u64;
+    let mut max_bound_ns = 10_000_u64;
     while let Some(arg) = args.next() {
         let arg = arg.to_string_lossy().into_owned();
         let Some(value) = args
@@ -496,6 +499,7 @@ pub fn run_link(
             ("--client-domain", Ok(number)) => client = number,
             ("--epoch", Ok(number)) => epoch = number,
             ("--max-gap-ms", Ok(number)) => max_gap_ms = number,
+            ("--max-bound-ns", Ok(number)) => max_bound_ns = number,
             _ => {
                 let _ = writeln!(
                     err,
@@ -527,6 +531,7 @@ pub fn run_link(
             key(client),
             &samples,
             max_gap_ms.saturating_mul(1_000_000),
+            max_bound_ns,
         )
         .map(|calibration| (calibration, count))
         .map_err(|error| error.to_string())

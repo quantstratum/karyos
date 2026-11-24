@@ -50,6 +50,14 @@ pub enum ChainError {
     /// No samples, or samples out of time order.
     #[error("the link samples are empty or out of time order")]
     Samples,
+    /// The link's bound is past the allowed one: the lock did not hold.
+    #[error("the link bound of {bound} ns is past the allowed {max_bound} ns")]
+    TooWide {
+        /// The bound the samples give.
+        bound: u64,
+        /// The allowed bound.
+        max_bound: u64,
+    },
     /// Two link samples further apart than allowed.
     #[error("two link samples are {gap} ns apart, more than allowed")]
     Gap {
@@ -88,12 +96,15 @@ pub enum ChainError {
 ///
 /// [`ChainError::Samples`] for no samples or samples out of order;
 /// [`ChainError::Gap`] for two samples further apart than `max_gap`;
-/// [`ChainError::Overflow`].
+/// [`ChainError::TooWide`] for a bound past `max_bound` ns, so no
+/// calibration (and so no latency) is ever made from a link that did not
+/// hold its lock; [`ChainError::Overflow`].
 pub fn link(
     server: ClockKey,
     client: ClockKey,
     samples: &[LinkSample],
     max_gap: u64,
+    max_bound: u64,
 ) -> Result<Calibration, ChainError> {
     let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
         return Err(ChainError::Samples);
@@ -127,6 +138,12 @@ pub fn link(
         .unwrap_or(0);
     // +1 for the samples' whole-nanosecond rounding (rounded outwards).
     let bound = largest_offset + change + largest_delay + 1;
+    if bound > i128::from(max_bound) {
+        return Err(ChainError::TooWide {
+            bound: u64::try_from(bound).unwrap_or(u64::MAX),
+            max_bound,
+        });
+    }
     // In the server's time: the client's sample times less their offset,
     // widened by the bound so the span is the server's for certain.
     let server_time = |sample: &LinkSample, widen: i128| {

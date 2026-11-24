@@ -116,13 +116,21 @@ fn a_link_bounds_the_offset_by_the_samples_and_the_whole_path_delay() {
             path_delay: 3_218,
         })
         .collect();
-    let calibration = link(key(2), key(3), &samples, 2_000_000_000).unwrap();
+    let calibration = link(key(2), key(3), &samples, 2_000_000_000, 1_000_000).unwrap();
     // The largest offset, the largest change between samples (12 to -46
     // and back: 58) and the whole delay.
     assert_eq!(calibration.offset_uncertainty, 46 + 58 + 3_218 + 1);
     assert_eq!(
-        link(key(2), key(3), &samples, 999_999_999),
+        link(key(2), key(3), &samples, 999_999_999, 1_000_000),
         Err(ChainError::Gap { gap: 1_000_000_000 })
+    );
+    // A bound past the threshold: no calibration at all.
+    assert_eq!(
+        link(key(2), key(3), &samples, 2_000_000_000, 3_000),
+        Err(ChainError::TooWide {
+            bound: 46 + 58 + 3_218 + 1,
+            max_bound: 3_000
+        })
     );
     assert_eq!(
         (
@@ -135,13 +143,13 @@ fn a_link_bounds_the_offset_by_the_samples_and_the_whole_path_delay() {
     // Valid over the samples' span only, in the server's time.
     assert!(calibration.valid_from > 1_000_000_000 && calibration.valid_to < 100_000_000_000);
     assert_eq!(
-        link(key(2), key(3), &[], 2_000_000_000),
+        link(key(2), key(3), &[], 2_000_000_000, 1_000_000),
         Err(ChainError::Samples)
     );
     let mut reversed = samples.clone();
     reversed.swap(0, 1);
     assert_eq!(
-        link(key(2), key(3), &reversed, 2_000_000_000),
+        link(key(2), key(3), &reversed, 2_000_000_000, 1_000_000),
         Err(ChainError::Samples)
     );
 }
@@ -162,7 +170,7 @@ fn a_cross_host_latency_becomes_a_value_through_the_chain() {
             path_delay: 3_200,
         })
         .collect();
-    let ptp = link(key(2), key(3), &samples, 2_000_000_000).unwrap();
+    let ptp = link(key(2), key(3), &samples, 2_000_000_000, 1_000_000).unwrap();
     let b_raw = -1_699_999_000_000_000_000_i128;
     let phc_to_raw = fitted(3, 4, phc_start, b_raw, -68_000);
     let a_to_b = compose(&compose(&raw_to_phc, &ptp).unwrap(), &phc_to_raw).unwrap();
