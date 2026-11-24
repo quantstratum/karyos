@@ -1,11 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Both adapters in real processes (plan issues 060 and 076, karyos#678
+//! Every variant in real processes (plan issues 060 and 076, karyos#678
 //! and karyos#690: each adapter "runs unchanged under `karyos-sim` and in
-//! real processes"): three `raft-eval-node` processes, each running
-//! `RaftRs` or `OpenRaft`, the very types the simulator tests drive, over C4's log on
-//! real files and UDP on the loopback, elect a leader, commit its
-//! commands, and all apply the same commands in the same order.
+//! real processes"; C5 v2, "Processes", karyos#691): three and five
+//! `raft-eval-node` processes, each running `RaftRs`, `OpenRaft` or the
+//! custom core (`harness::custom::Custom`), the very types the simulator
+//! tests drive, over C4's log on real files and UDP on the loopback,
+//! elect a leader, commit its commands, and all apply the same commands
+//! in the same order.
+//!
+//! Each node's core is wrapped in the allocation probe
+//! (`harness::probe::Probed`), with the encoding and decoding of its
+//! messages counted as the `encoding` stage, and each run writes one line
+//! to stdout for the C5 v2 run record (quantstratum-docs:
+//! karyos/evaluations/c5-raft-comparison-v2-run-record.md): the variant,
+//! the processes, the commit, the tick, the encoding, the host, and the
+//! counts in total and per stage, summed over the nodes, with `entries`
+//! the entries the leaders committed past the warm-up. The test asserts
+//! that the run applies every command and that the probe measured
+//! entries; the counts are the gate's evidence, not asserted here (the
+//! gate is the report's to score). These are functional runs on one host
+//! (version 1, Environments): five processes on it are not five failure
+//! domains, and nothing here is a performance result.
+//!
+//! **Buffer recycling on this path** (C5 v2, "Buffer recycling"), for
+//! the run record:
+//! - The runner reuses its receive buffer and its outbox between loops,
+//!   outside the core's calls; it builds each datagram's header in a new
+//!   vector, outside the core's calls and the encoding, so the probe does
+//!   not count it.
+//! - `raft` (raft-rs 0.7.0): recycles nothing; raft-rs's messages and
+//!   entries are owned `protobuf` values, and their encoding
+//!   (`protobuf` 2.28.0) builds a new vector per message.
+//! - `openraft` (0.10.0-alpha.37): recycles nothing; its encoding
+//!   (`openraft_wire`) builds a new vector per message.
+//! - `custom`: the adapter's own pool, one per thread, prefilled at
+//!   initialisation, as in the simulator (`harness::custom`); its
+//!   encoding (`custom_wire`) builds a new vector per message, and its
+//!   decoding a new entry vector and payload per append.
 
 // Test helpers outside #[test] functions are not covered by clippy.toml's
 // test exemptions (ADR-0007 exempts tests from these lints).
@@ -15,13 +47,13 @@ use std::net::UdpSocket;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const NODES: u32 = 3;
-const COMMANDS: u64 = 20;
+/// Commands per run: past the probe's warm-up of 16, so it measures.
+const COMMANDS: u64 = 64;
 
 /// Distinct free loopback addresses, one per node: every socket stays
 /// bound until all are chosen, so the OS cannot hand out one port twice.
-fn free_addresses() -> Vec<String> {
-    let sockets: Vec<UdpSocket> = (0..NODES)
+fn free_addresses(nodes: u32) -> Vec<String> {
+    let sockets: Vec<UdpSocket> = (0..nodes)
         .map(|_| UdpSocket::bind("127.0.0.1:0").unwrap())
         .collect();
     sockets
@@ -35,10 +67,13 @@ fn free_addresses() -> Vec<String> {
 /// retried, with fresh ports (karyos#956 review).
 const ATTEMPTS: usize = 3;
 
-fn three_processes_commit_and_apply_the_same_commands(core: &str) {
+fn processes_commit_and_apply_the_same_commands(core: &str, nodes: u32) {
     for attempt in 1..=ATTEMPTS {
-        match run_once(core) {
-            Ok(()) => return,
+        match run_once(core, nodes) {
+            Ok(probes) => {
+                record(core, nodes, &probes);
+                return;
+            }
             Err(stderr) if attempt < ATTEMPTS && stderr.contains("in use") => {}
             Err(stderr) => panic!("{stderr}"),
         }
@@ -84,8 +119,110 @@ fn reserve_root(core: &str) -> std::path::PathBuf {
     }
 }
 
-fn run_once(core: &str) -> Result<(), String> {
-    let peers: Vec<String> = free_addresses()
+/// One node's probe line: entries, allocations, frees, and the stages by
+/// name with their allocations and frees.
+#[derive(Debug, Default)]
+struct Probe {
+    entries: u64,
+    allocations: u64,
+    frees: u64,
+    stages: Vec<(String, u64, u64)>,
+}
+
+fn probe_of(line: &str) -> Probe {
+    let fields: Vec<&str> = line.split(' ').collect();
+    assert_eq!(fields.len(), 6, "{line}");
+    assert_eq!(fields[0], "probe", "{line}");
+    assert_eq!(fields[1], "16", "the warm-up: {line}");
+    let stages = fields[5]
+        .split(',')
+        .map(|stage| {
+            let (name, counts) = stage.split_once('=').unwrap();
+            let (allocations, frees) = counts.split_once(':').unwrap();
+            (
+                name.to_owned(),
+                allocations.parse().unwrap(),
+                frees.parse().unwrap(),
+            )
+        })
+        .collect();
+    Probe {
+        entries: fields[2].parse().unwrap(),
+        allocations: fields[3].parse().unwrap(),
+        frees: fields[4].parse().unwrap(),
+        stages,
+    }
+}
+
+/// The variant, its revision and its encoding, as the run record names
+/// them.
+fn variant(core: &str) -> (&'static str, &'static str) {
+    match core {
+        "raft" => ("raft 0.7.0, baseline", "protobuf 2.28.0 (raft-proto)"),
+        "openraft" => (
+            "openraft 0.10.0-alpha.37, baseline",
+            "openraft_wire (eval/raft-candidates)",
+        ),
+        "custom" => (
+            "custom core (karyos_cluster::consensus)",
+            "custom_wire (eval/raft-candidates)",
+        ),
+        _ => panic!("{core}"),
+    }
+}
+
+/// The output of `program args`, trimmed; `unknown` when it cannot run.
+fn output_of(program: &str, args: &[&str]) -> String {
+    Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map_or_else(|| "unknown".to_owned(), |text| text.trim().to_owned())
+}
+
+/// The run's line for the C5 v2 run record, on stdout, summed over the
+/// nodes; the probe measured entries past the warm-up on the leaders.
+fn record(core: &str, nodes: u32, probes: &[Probe]) {
+    use std::io::Write as _;
+    let entries: u64 = probes.iter().map(|probe| probe.entries).sum();
+    assert!(entries > 0, "the probe measured no entry: {probes:?}");
+    let allocations: u64 = probes.iter().map(|probe| probe.allocations).sum();
+    let frees: u64 = probes.iter().map(|probe| probe.frees).sum();
+    let stages: Vec<String> = probes[0]
+        .stages
+        .iter()
+        .map(|(name, _, _)| {
+            let (allocated, freed) = probes.iter().fold((0u64, 0u64), |(a, f), probe| {
+                let (_, more_a, more_f) = probe
+                    .stages
+                    .iter()
+                    .find(|(other, _, _)| other == name)
+                    .unwrap();
+                (a + more_a, f + more_f)
+            });
+            format!("\"{name}\":[{allocated},{freed}]")
+        })
+        .collect();
+    let (variant, encoding) = variant(core);
+    let commit =
+        std::env::var("KARYOS_COMMIT").unwrap_or_else(|_| output_of("git", &["rev-parse", "HEAD"]));
+    let host = output_of("uname", &["-n"]);
+    let _ = writeln!(
+        std::io::stdout(),
+        "{{\"evidence\":\"C5 v2 processes\",\"variant\":\"{variant}\",\
+         \"processes\":{nodes},\"commit\":\"{commit}\",\"tick_ms\":{},\
+         \"encoding\":\"{encoding}\",\"host\":\"{host}\",\"warmup\":16,\
+         \"entries\":{entries},\"allocations\":{allocations},\"frees\":{frees},\
+         \"stages\":{{{}}}}}",
+        karyos_raft_eval::process::TICK_MS,
+        stages.join(","),
+    );
+}
+
+fn run_once(core: &str, nodes: u32) -> Result<Vec<Probe>, String> {
+    let peers: Vec<String> = free_addresses(nodes)
         .into_iter()
         .enumerate()
         .map(|(id, address)| format!("{id}={address}"))
@@ -97,7 +234,7 @@ fn run_once(core: &str) -> Result<(), String> {
     };
     // Each child joins the guard as it starts, so a later spawn failing
     // still stops the earlier ones.
-    for id in 0..NODES {
+    for id in 0..nodes {
         let child = Command::new(env!("CARGO_BIN_EXE_raft-eval-node"))
             .arg(core)
             .arg(id.to_string())
@@ -134,11 +271,15 @@ fn run_once(core: &str) -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(50));
     }
     let mut reports = Vec::new();
+    let mut probes = Vec::new();
     let mut failed = None;
     for child in std::mem::take(&mut run.children) {
         let output = child.wait_with_output().unwrap();
         if output.status.success() {
-            reports.push(String::from_utf8(output.stdout).unwrap().trim().to_owned());
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let (applied, probe) = stdout.trim().split_once('\n').unwrap();
+            reports.push(applied.to_owned());
+            probes.push(probe_of(probe));
         } else if failed.as_ref().is_none_or(String::is_empty) {
             failed = Some(String::from_utf8_lossy(&output.stderr).into_owned());
         }
@@ -180,7 +321,7 @@ fn run_once(core: &str) -> Result<(), String> {
         firsts.push(number);
     }
     assert_eq!(firsts, (1..=COMMANDS).collect::<Vec<_>>(), "{sequence:?}");
-    Ok(())
+    Ok(probes)
 }
 
 /// A malformed argument is a usage error, exit 2, never a panic: a count
@@ -208,7 +349,12 @@ fn a_malformed_argument_is_a_usage_error() {
 
 #[test]
 fn raft_three_processes_commit_and_apply_the_same_commands() {
-    three_processes_commit_and_apply_the_same_commands("raft");
+    processes_commit_and_apply_the_same_commands("raft", 3);
+}
+
+#[test]
+fn raft_five_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("raft", 5);
 }
 
 /// OpenRaft on its manually pumped executor, the same `OpenRaft` type the
@@ -216,7 +362,24 @@ fn raft_three_processes_commit_and_apply_the_same_commands() {
 /// calls, so a process needs no runtime of its own (karyos#690).
 #[test]
 fn openraft_three_processes_commit_and_apply_the_same_commands() {
-    three_processes_commit_and_apply_the_same_commands("openraft");
+    processes_commit_and_apply_the_same_commands("openraft", 3);
+}
+
+#[test]
+fn openraft_five_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("openraft", 5);
+}
+
+/// The custom core (ADR-0105), the `Custom` adapter the simulator drives,
+/// over the runner's own encoding (`custom_wire`).
+#[test]
+fn custom_three_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("custom", 3);
+}
+
+#[test]
+fn custom_five_processes_commit_and_apply_the_same_commands() {
+    processes_commit_and_apply_the_same_commands("custom", 5);
 }
 
 /// The P1 of the karyos#959 review: a restarted process draws a new

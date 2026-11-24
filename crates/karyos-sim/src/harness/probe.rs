@@ -27,9 +27,17 @@
 //!   time in a process: a second one while a window is open is refused
 //!   ([`MeasureError::WindowOpen`]). The simulator runs on the calling
 //!   thread, so the window ends when its work does.
+//! - **On real processes** (quantstratum-docs:
+//!   karyos/evaluations/c5-raft-comparison-v2.md, "Processes";
+//!   c5-raft-comparison-v1.md, Hard gates: "adapters and encoding
+//!   included"): [`measure_with`] opens the same window around any run,
+//!   such as one node's loop, and [`encoding`] counts a message's encoding
+//!   and decoding, which a process does between the core's calls, as the
+//!   [`Stage::Encoding`] of the declared path once the measured core is
+//!   past its warm-up.
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use karyos_sys::alloc_count::{SetCounts, count, count_allocations, enroll, window};
 
@@ -68,6 +76,9 @@ pub enum Stage {
     AdvanceLeader,
     /// `advance` on a follower: persistence acknowledgement.
     AdvanceFollower,
+    /// A message encoded for the wire or decoded from it, between the
+    /// core's calls, on a real process ([`encoding`]).
+    Encoding,
     /// The read-only queries and every other call.
     Other,
     /// Counted in the window but not inside a call of the core: a thread
@@ -78,7 +89,7 @@ pub enum Stage {
 
 impl Stage {
     /// Every stage, in order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Propose,
         Self::StepLeader,
         Self::StepFollower,
@@ -87,6 +98,7 @@ impl Stage {
         Self::ReadyFollower,
         Self::AdvanceLeader,
         Self::AdvanceFollower,
+        Self::Encoding,
         Self::Other,
         Self::Unattributed,
     ];
@@ -113,6 +125,7 @@ impl Stage {
             Self::ReadyFollower => "ready_follower",
             Self::AdvanceLeader => "advance_leader",
             Self::AdvanceFollower => "advance_follower",
+            Self::Encoding => "encoding",
             Self::Other => "other",
             Self::Unattributed => "unattributed",
         }
@@ -120,9 +133,27 @@ impl Stage {
 }
 
 /// Allocations per stage in the measurement, by [`Stage::slot`].
-static STAGE_ALLOCATIONS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static STAGE_ALLOCATIONS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 /// Frees per stage in the measurement, by [`Stage::slot`].
-static STAGE_FREES: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static STAGE_FREES: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+/// Whether a core of the measurement is past its warm-up, so that
+/// [`encoding`] counts.
+static PAST: AtomicBool = AtomicBool::new(false);
+
+/// Runs `call`, a message's encoding or decoding between the core's calls,
+/// counted as [`Stage::Encoding`] once a core of the open measurement is
+/// past its warm-up. A real process runs one core, so its warm-up is the
+/// node's; outside a measurement nothing counts.
+pub fn encoding<R>(call: impl FnOnce() -> R) -> R {
+    if !PAST.load(Ordering::Relaxed) {
+        return call();
+    }
+    let _enrolled = enroll();
+    let ((result, allocations), operations) = count(|| count_allocations(call));
+    note_stage(Stage::Encoding, operations, allocations);
+    result
+}
 
 /// Adds one counted call's operations to its stage.
 fn note_stage(stage: Stage, operations: u64, allocations: u64) {
@@ -175,6 +206,7 @@ impl<C: ConsensusCore> Probed<C> {
         }
         if committed.is_some_and(|committed| committed >= WARMUP) {
             self.past.set(true);
+            PAST.store(true, Ordering::Relaxed);
         }
         result
     }
@@ -337,14 +369,63 @@ pub enum MeasureError {
 ///
 /// [`MeasureError`].
 pub fn measure<C: ConsensusCore>(case: &Case, seed: u64) -> Result<AllocationReport, MeasureError> {
-    // The leaders' commit index and the stage counters are the window's,
-    // as its counts are: reset and read while this measurement holds it.
-    let ((outcome, committed, staged), counts) = window(|| {
+    let (outcome, measured) = measure_with(|| run::<Probed<C>>(case, seed))?;
+    let outcome = outcome.map_err(MeasureError::Run)?;
+    Ok(AllocationReport {
+        counts: measured.counts,
+        entries: measured.entries,
+        stages: measured.stages,
+        outcome,
+    })
+}
+
+/// The counts of a measurement opened by [`measure_with`]: its totals, the
+/// entries the leaders committed past the warm-up, and the counts by
+/// stage, as an [`AllocationReport`] has them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Measured {
+    /// Allocations and frees on the declared path after the warm-up.
+    pub counts: SetCounts,
+    /// Entries the leaders committed past the warm-up.
+    pub entries: u64,
+    /// The counts by stage, every stage listed, [`Stage::Unattributed`]
+    /// what no call of the core made, so they sum to `counts`.
+    pub stages: Vec<(Stage, SetCounts)>,
+}
+
+impl Measured {
+    /// Allocations and frees per replicated entry, rounded up; `None`
+    /// with no entry past the warm-up (nothing was measured).
+    #[must_use]
+    pub fn per_entry(&self) -> Option<(u64, u64)> {
+        (self.entries > 0).then(|| {
+            (
+                self.counts.allocations.div_ceil(self.entries),
+                self.counts.frees.div_ceil(self.entries),
+            )
+        })
+    }
+}
+
+/// Runs `run`, whose cores are [`Probed`], in one measurement window: a
+/// simulator run, as [`measure`] does, or one node's loop on a real
+/// process. Its counts are those [`measure`] reports.
+///
+/// # Errors
+///
+/// [`MeasureError::WindowOpen`] while another measurement is open.
+pub fn measure_with<R>(run: impl FnOnce() -> R) -> Result<(R, Measured), MeasureError> {
+    // The leaders' commit index, the warm-up flag and the stage counters
+    // are the window's, as its counts are: reset and read while this
+    // measurement holds it.
+    let ((result, committed, staged), counts) = window(|| {
         LEADER_COMMITTED.store(0, Ordering::SeqCst);
+        PAST.store(false, Ordering::SeqCst);
         for counter in STAGE_ALLOCATIONS.iter().chain(STAGE_FREES.iter()) {
             counter.store(0, Ordering::SeqCst);
         }
-        let outcome = run::<Probed<C>>(case, seed);
+        let result = run();
+        PAST.store(false, Ordering::SeqCst);
         let staged: Vec<(Stage, SetCounts)> = Stage::ALL
             .iter()
             .zip(STAGE_ALLOCATIONS.iter().zip(STAGE_FREES.iter()))
@@ -358,10 +439,9 @@ pub fn measure<C: ConsensusCore>(case: &Case, seed: u64) -> Result<AllocationRep
                 )
             })
             .collect();
-        (outcome, LEADER_COMMITTED.load(Ordering::SeqCst), staged)
+        (result, LEADER_COMMITTED.load(Ordering::SeqCst), staged)
     })
     .map_err(|_| MeasureError::WindowOpen)?;
-    let outcome = outcome.map_err(MeasureError::Run)?;
     let entries = committed.saturating_sub(WARMUP);
     let (in_calls, freed_in_calls) =
         staged
@@ -388,10 +468,12 @@ pub fn measure<C: ConsensusCore>(case: &Case, seed: u64) -> Result<AllocationRep
             }
         })
         .collect();
-    Ok(AllocationReport {
-        counts,
-        entries,
-        stages,
-        outcome,
-    })
+    Ok((
+        result,
+        Measured {
+            counts,
+            entries,
+            stages,
+        },
+    ))
 }

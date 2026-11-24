@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use karyos_archive::disk::StdDisk;
 use karyos_cluster::{Entry, LogError, RaftLog};
 use karyos_sim::harness::core::{ConsensusCore, DriveError, LogView, drive};
+use karyos_sim::harness::probe::{self, Probed};
 use karyos_sim::harness::workloads;
 use karyos_sim::net::NodeId;
 
@@ -35,6 +36,21 @@ pub trait Wire: ConsensusCore {
 
     /// The message in `bytes`; `None` when they are not one.
     fn decode(bytes: &[u8]) -> Option<Self::Message>;
+}
+
+/// A probed core's messages are its inner core's, their encoding and
+/// decoding counted as the declared path's
+/// [`Stage::Encoding`](karyos_sim::harness::probe::Stage::Encoding) once
+/// the core is past its warm-up (C5 v2, "Processes"; version 1's
+/// allocation gate counts "adapters and encoding included").
+impl<C: Wire> Wire for Probed<C> {
+    fn encode(message: &Self::Message) -> Option<Vec<u8>> {
+        probe::encoding(|| C::encode(message))
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self::Message> {
+        probe::encoding(|| C::decode(bytes))
+    }
 }
 
 /// The largest datagram a node sends or reads.
