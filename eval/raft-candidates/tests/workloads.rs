@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! ADR-0043's workloads W1 to W6 over both candidates' adapters, `raft`
+//! ADR-0043's workloads W1 to W6 over both candidates' adapters and,
+//! in C5 version 2, the custom core (ADR-0105; karyos#681, karyos#691), `raft`
 //! 0.7.0 (plan issue 060, karyos#678) and `openraft` 0.10.0-alpha.37 on
 //! the manually pumped executor (plan issue 076, karyos#690), with the
 //! same cases, seeds and parameters for both: what passes, which gaps are
@@ -14,9 +15,10 @@
 use karyos_raft_eval::openraft_core::OpenRaft;
 use karyos_raft_eval::raft_rs::{MAX_IN_FLIGHT_ENTRIES, RaftRs};
 use karyos_sim::harness::core::{ConsensusCore, Limit, Limits, Unsupported};
+use karyos_sim::harness::custom::Custom;
 use karyos_sim::harness::node::Observation;
 use karyos_sim::harness::workloads::{
-    self, Failed, Liveness, RunError, W1, W2, W3, W3Fault, W4, W5, W6,
+    self, Case, Failed, Liveness, RunError, W1, W2, W3, W3Fault, W4, W5, W6,
 };
 
 /// Seeds every sweep runs.
@@ -305,6 +307,17 @@ macro_rules! suite {
             fn a_seed_reproduces_its_run() {
                 super::a_seed_reproduces_its_run::<$core>();
             }
+        }
+    };
+}
+
+/// The tests whose expectations are the two candidates' (ADR-0043): the
+/// custom core meters a follower's bytes in flight and takes any entry
+/// cap its configuration does, so it has its own below.
+macro_rules! candidate {
+    ($module:ident, $core:ty) => {
+        mod $module {
+            use super::*;
 
             #[test]
             fn w2_byte_cap_binds_before_the_entry_cap() {
@@ -326,6 +339,103 @@ macro_rules! suite {
 
 suite!(raft, RaftRs);
 suite!(openraft, OpenRaft);
+suite!(custom, Custom);
+candidate!(raft_candidate, RaftRs);
+candidate!(openraft_candidate, OpenRaft);
+
+/// The custom core (ADR-0105) in C5 version 2: every W2 case passes on
+/// the metered log, none short.
+#[test]
+fn custom_w2_honours_its_limits() {
+    w2::<Custom>(&[], true);
+}
+
+/// The refusals a run's observations name.
+fn refusals(outcome: &workloads::Outcome) -> Vec<Limit> {
+    outcome
+        .observations
+        .iter()
+        .filter_map(|observation| match observation {
+            Observation::Backpressure { limit, .. } => Some(*limit),
+            _ => None,
+        })
+        .collect()
+}
+
+/// W2 with `payload_bytes` commands against `in_flight_bytes` and
+/// `in_flight_entries`, its first case.
+fn byte_case(payload_bytes: usize, in_flight_entries: u64, in_flight_bytes: u64) -> Case {
+    let w2 = W2 {
+        payload_bytes,
+        limits: Limits {
+            in_flight_entries,
+            in_flight_bytes,
+            ..W2::skeleton().limits
+        },
+        ..W2::skeleton()
+    };
+    w2.cases().unwrap().into_iter().next().unwrap()
+}
+
+/// A command larger than a follower's whole byte window could never be
+/// sent: the custom core refuses it with the candidates' typed
+/// `Backpressure(InFlightBytes)`, and nothing else.
+#[test]
+fn custom_refuses_a_command_over_the_whole_byte_window() {
+    let case = byte_case(2048, 8, 1024);
+    let outcome = workloads::run::<Custom>(&case, 1).unwrap();
+    assert!(outcome.safety.is_ok(), "{}", case.name);
+    let pushed = refusals(&outcome);
+    assert!(!pushed.is_empty(), "{}", case.name);
+    assert!(
+        pushed.iter().all(|limit| *limit == Limit::InFlightBytes),
+        "{}: {pushed:?}",
+        case.name
+    );
+}
+
+// The custom core's byte window, its fill and its bound, and version 2's
+// W2 in-flight byte case on all three cores, are measured from the
+// messages in `tests/w2_bytes.rs` (ADR-0105, decisions 2 and 4).
+
+/// An entry cap of 0 is refused before startup as unsupported limits.
+#[test]
+fn custom_refuses_a_zero_entry_cap_as_unsupported() {
+    let mut case = W2::skeleton().cases().unwrap().into_iter().next().unwrap();
+    case.limits = Some(Limits {
+        in_flight_entries: 0,
+        ..W2::skeleton().limits
+    });
+    assert!(matches!(
+        workloads::run::<Custom>(&case, 1),
+        Err(RunError::Unsupported(Unsupported))
+    ));
+}
+
+/// W5 on the custom core: a case it cannot run yet (snapshot install
+/// through the adapter, karyos#682; leadership transfer) is not
+/// demonstrated, never passed; a case it runs keeps safety and passes or
+/// is not shown.
+#[test]
+fn custom_w5_passes_or_is_not_demonstrated() {
+    for case in W5::skeleton().cases().unwrap() {
+        match workloads::run::<Custom>(&case, 1) {
+            Err(RunError::Unsupported(Unsupported)) => {}
+            Ok(outcome) => {
+                assert!(outcome.safety.is_ok(), "{}", case.name);
+                assert!(
+                    matches!(
+                        workloads::pass(&case, &outcome),
+                        Ok(None) | Err(Failed::NotShown(_))
+                    ),
+                    "{}",
+                    case.name
+                );
+            }
+            Err(error) => panic!("{}: {error:?}", case.name),
+        }
+    }
+}
 
 #[test]
 fn raft_w2_honours_its_limits() {
