@@ -1,7 +1,3 @@
 ### Added
 
 - The per-session keys of the wire authentication profile, unicast, in `karyos_driver::wire_auth` (part of karyos#648; quantstratum-docs: karyos/adr/0086-wire-authentication-profile-v1.md sections 4, 6, 7 and 7a). `Sealer` tags domain 1 (sender) and domain 4 (receiver to publisher) datagrams under a key derived per party, file epoch and in-band key epoch, moves to the next in-band epoch at 75% of the 2^48 HMAC usage limit and refuses to send at 100%. `Verifier` checks the tag before the replay window of the key that verified it, accepts the current and previous in-band epoch and at most two file epochs, and keeps every window whose key still verifies across a reload. `Proof` tags and checks the SETUP proof (domain 5) and RSP_SETUP (domain 6), reporting whether the current file epoch verified. `BootTable` applies the publisher rule for a new `receiver_boot_id`. Nothing is wired into the data path, and `authenticated` channels are still refused.
-
-### Fixed
-
-- HMAC keys are now held as `karyos_protocol::protection::hmac_key::HmacKey`, whose padded key block is erased: the HMAC profile, HKDF in `wire_keys::Context::derive` and the key state fingerprints all used `hmac`'s key setup, which leaves a padded copy of the key unerased. `hmac` is now a test-only dependency of `karyos-driver` and no longer one of `karyos-protocol`.
