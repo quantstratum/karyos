@@ -1715,6 +1715,8 @@ mod tests {
     fn a_full_non_blocking_socket_reports_would_block() {
         let (a, _b) = seqpacket_pair().unwrap();
         rustix::io::ioctl_fionbio(&a, true).unwrap();
+        // A host may raise wmem_default far past what 10_000 sends fill.
+        rustix::net::sockopt::set_socket_send_buffer_size(&a, 4096).unwrap();
         let message = [0u8; 4096];
         let mut outcome = Sent::Sent;
         for _ in 0..10_000 {
