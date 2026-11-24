@@ -402,6 +402,83 @@ impl W5 {
     }
 }
 
+/// C5 version 2's W5 retry (quantstratum-docs
+/// karyos/evaluations/c5-raft-comparison-v2.md, "W5: the lost reply,
+/// leader change and retry, whoever leads"), by triggers relative to
+/// whoever leads rather than steps and fixed servers, so a core reaches it
+/// whichever server it elects and with or without a handover:
+///
+/// 1. **Cut**: from step [`LostReply::from`], the first step at which
+///    exactly one up server leads the highest term led, `L`, the link from
+///    `L` to client [`LostReply::client`] is cut, one way.
+/// 2. **Lost**: the first reply `L` releases to that client after the cut
+///    is lost; its request is `R`.
+/// 3. **Crash**: at the next step, `L` crashes.
+/// 4. **Restart**: [`LostReply::down`] steps later, `L` restarts and every
+///    link is restored. The client retries `R` after its
+///    [`Case::retry_after`].
+///
+/// The case passes only if `R`'s retry is answered from deduplication by
+/// a server other than `L` after the crash ([`pass`]): with `L` the only
+/// leader of its term and down, that server leads a later term. A trigger
+/// not reached by [`LostReply::deadline`] fails the case
+/// ([`Failed::NotShown`]), never passes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LostReply {
+    /// The client, by session index.
+    pub client: usize,
+    /// The first step the cut may act at.
+    pub from: u64,
+    /// Steps `L` stays down.
+    pub down: u64,
+    /// The step by which every trigger must have acted.
+    pub deadline: u64,
+}
+
+impl W5 {
+    /// C5 version 2's W5 retry ([`LostReply`]): version 1's W5 shape (3
+    /// servers, 2 clients, 8 operations each, 256 B payloads, no
+    /// compaction, 2,000 steps), the cut from step 12, `L` down 40 steps,
+    /// every trigger by step 1,000.
+    #[must_use]
+    pub fn lost_reply_whoever_leads(&self) -> Case {
+        let mut case = Case::healthy(
+            &format!(
+                "W5 n={} lost reply, leader crash and retry, whoever leads",
+                self.processes
+            ),
+            self.processes,
+            self.clients.max(1),
+            8,
+        );
+        case.payload = self.payload_bytes;
+        case.steps = 2_000;
+        case.lost_reply = Some(LostReply {
+            client: 0,
+            from: 12,
+            down: 40,
+            deadline: 1_000,
+        });
+        case
+    }
+}
+
+/// Where a [`LostReply`]'s triggers stand.
+#[derive(Debug, Clone, Copy)]
+enum Lost {
+    /// Waiting for a single leader, from the step named.
+    Cut,
+    /// `L` cut from the client; waiting for its reply past this many
+    /// observations.
+    Reply { leader: NodeId, seen: usize },
+    /// Crash `L` at this step.
+    Crash { leader: NodeId, at: u64 },
+    /// Restart `L` and heal at this step.
+    Restart { leader: NodeId, at: u64 },
+    /// Every trigger acted.
+    Done,
+}
+
 /// A scheduled change to a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -547,6 +624,9 @@ pub struct Case {
     /// follower must really be that far behind, or the case fails
     /// ([`Failed::NotBehind`]; karyos#899 review).
     pub behind: Option<(NodeId, u64)>,
+    /// A lost reply relative to whoever leads (C5 version 2's W5 retry),
+    /// if the case has one: see [`LostReply`].
+    pub lost_reply: Option<LostReply>,
     /// Faults injected into servers and clients, so the checks can be
     /// shown to catch a faulty driver, disk, service or client with a real
     /// core behind them (karyos#1038; the `test-hooks` feature). Empty in
@@ -616,6 +696,7 @@ impl Case {
             compaction: None,
             handover: None,
             retried: false,
+            lost_reply: None,
             #[cfg(feature = "test-hooks")]
             faults: Faults::default(),
         }
@@ -1121,7 +1202,101 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
             }
         }
     }
-    if let Some(steps) = case.steps.checked_sub(done).filter(|steps| *steps > 0) {
+    if let Some(lost) = case.lost_reply {
+        // Step by step, each trigger checked after every step.
+        let client = clients.get(lost.client).copied().ok_or(RunError::Count)?;
+        let mut state = Lost::Cut;
+        while done < case.steps {
+            sim.run_for(1).map_err(RunError::Sim)?;
+            done += 1;
+            state = match state {
+                Lost::Cut if done >= lost.from && done <= lost.deadline => {
+                    let leaders: Vec<(NodeId, u64)> = peers
+                        .iter()
+                        .filter_map(|id| {
+                            let core = sim.node(*id).and_then(Member::server)?.core()?;
+                            core.leads().then(|| (*id, core.term()))
+                        })
+                        .collect();
+                    let top = leaders.iter().map(|(_, term)| *term).max();
+                    let mut at_top = leaders.iter().filter(|(_, term)| Some(*term) == top);
+                    match (at_top.next(), at_top.next()) {
+                        (Some(&(leader, _)), None) => {
+                            sim.net_mut().cut(leader, client);
+                            let mut recorded = recorder.borrow_mut();
+                            recorded.observations.push(Observation::Triggered {
+                                what: "cut",
+                                node: leader,
+                                client,
+                            });
+                            Lost::Reply {
+                                leader,
+                                seen: recorded.observations.len(),
+                            }
+                        }
+                        _ => Lost::Cut,
+                    }
+                }
+                Lost::Reply { leader, seen } if done <= lost.deadline => {
+                    let mut recorded = recorder.borrow_mut();
+                    let replied = recorded.observations.iter().skip(seen).any(|observation| {
+                        matches!(
+                            observation,
+                            Observation::Reply { node, client: to, .. }
+                                if *node == leader && *to == client
+                        )
+                    });
+                    if replied {
+                        recorded.observations.push(Observation::Triggered {
+                            what: "lost",
+                            node: leader,
+                            client,
+                        });
+                        Lost::Crash {
+                            leader,
+                            at: done + 1,
+                        }
+                    } else {
+                        Lost::Reply {
+                            leader,
+                            seen: recorded.observations.len(),
+                        }
+                    }
+                }
+                Lost::Crash { leader, at } if done >= at => {
+                    match sim.crash(leader) {
+                        Ok(()) | Err(NodeError::AlreadyDown(_)) => {}
+                        Err(error) => return Err(RunError::Node(error)),
+                    }
+                    recorder
+                        .borrow_mut()
+                        .observations
+                        .push(Observation::Triggered {
+                            what: "crash",
+                            node: leader,
+                            client,
+                        });
+                    Lost::Restart {
+                        leader,
+                        at: done.saturating_add(lost.down),
+                    }
+                }
+                Lost::Restart { leader, at } if done >= at => {
+                    sim.restart(leader).map_err(RunError::Node)?;
+                    sim.net_mut().heal();
+                    let mut recorded = recorder.borrow_mut();
+                    recorded.observations.push(Observation::Healed);
+                    recorded.observations.push(Observation::Triggered {
+                        what: "restart",
+                        node: leader,
+                        client,
+                    });
+                    Lost::Done
+                }
+                other => other,
+            };
+        }
+    } else if let Some(steps) = case.steps.checked_sub(done).filter(|steps| *steps > 0) {
         sim.run_for(steps).map_err(RunError::Sim)?;
     }
 
@@ -1204,6 +1379,42 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         deduplicated,
         promoted,
     })
+}
+
+/// A [`LostReply`] case's own condition: every trigger acted by its
+/// deadline, and the lost request's retry was answered from deduplication
+/// by a server other than the crashed leader, after the crash.
+fn lost_reply_shown(observations: &[Observation]) -> Result<(), Failed> {
+    let triggered = |what: &str| {
+        observations.iter().position(|observation| {
+            matches!(observation, Observation::Triggered { what: w, .. } if *w == what)
+        })
+    };
+    let Some(crash) = triggered("crash") else {
+        return Err(Failed::NotShown("lost reply"));
+    };
+    if triggered("restart").is_none() {
+        return Err(Failed::NotShown("lost reply"));
+    }
+    let Some(Observation::Triggered {
+        node: leader,
+        client,
+        ..
+    }) = observations.get(crash)
+    else {
+        return Err(Failed::NotShown("lost reply"));
+    };
+    let answered = observations.iter().skip(crash).any(|observation| {
+        matches!(
+            observation,
+            Observation::Deduplicated { node, client: c, .. } if node != leader && c == client
+        )
+    });
+    if answered {
+        Ok(())
+    } else {
+        Err(Failed::NotShown("retry"))
+    }
 }
 
 /// The safety checks of a run: every check over all of it, or with a
@@ -1314,6 +1525,9 @@ pub fn pass(case: &Case, outcome: &Outcome) -> Result<Option<Liveness>, Failed> 
         }
     } else if case.retried {
         return Err(Failed::NotShown("retry"));
+    }
+    if case.lost_reply.is_some() {
+        lost_reply_shown(&outcome.observations)?;
     }
     if let Some((follower, required)) = case.behind {
         match gap_at_heal(&outcome.observations, follower) {

@@ -77,12 +77,15 @@ use super::core::{
 };
 use crate::net::NodeId;
 
-/// The shortest election timeout, in ticks (version 1's timing).
-pub const ELECTION_MIN: u32 = 10;
-/// The election timeouts are drawn from `ELECTION_MIN..ELECTION_MAX`.
-pub const ELECTION_MAX: u32 = 20;
+/// The shortest election timeout, in ticks: the C5 manifest's timing
+/// (version 1, kept by version 2), one harness step per tick.
+pub const ELECTION_MIN: u32 = 15;
+/// The election timeouts are drawn uniformly from
+/// `ELECTION_MIN..ELECTION_MAX`, again at every reset, from the core's
+/// seeded source.
+pub const ELECTION_MAX: u32 = 30;
 /// Ticks between a leader's heartbeats.
-pub const HEARTBEAT: u32 = 2;
+pub const HEARTBEAT: u32 = 5;
 /// Entries per append at most: W1's primary batch limit.
 pub const BATCH: u64 = 16;
 /// Ticks one [`ConsensusCore::tick`] call runs at most.

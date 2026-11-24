@@ -123,3 +123,30 @@ fn w2_passes_and_its_burst_is_refused_by_the_queue() {
         assert_eq!(workloads::pass(case, &outcome), Ok(None), "{}", case.name);
     }
 }
+
+/// C5 version 2's W5 retry, relative to whoever leads: the custom core
+/// passes it on every seed, and a deadline before the cut can act makes
+/// it fail as not shown, never pass.
+#[test]
+fn the_lost_reply_whoever_leads_passes_and_an_unreached_trigger_fails() {
+    use karyos_sim::harness::workloads::{Failed, W5};
+    let case = W5::manifest().lost_reply_whoever_leads();
+    for seed in SEEDS {
+        let outcome = workloads::run::<Custom>(&case, seed).unwrap();
+        assert_eq!(
+            workloads::pass(&case, &outcome),
+            Ok(None),
+            "{} seed {seed}",
+            case.name
+        );
+    }
+    let mut late = case.clone();
+    if let Some(lost) = late.lost_reply.as_mut() {
+        lost.deadline = lost.from - 1;
+    }
+    let outcome = workloads::run::<Custom>(&late, 1).unwrap();
+    assert_eq!(
+        workloads::pass(&late, &outcome),
+        Err(Failed::NotShown("lost reply"))
+    );
+}

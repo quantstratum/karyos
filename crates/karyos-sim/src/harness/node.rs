@@ -1058,6 +1058,17 @@ pub enum Observation {
     /// The harness healed every link ([`super::workloads::Action::Heal`]):
     /// a mark in the order of observations.
     Healed,
+    /// A leader-relative trigger of a case acted ([`super::workloads::LostReply`],
+    /// C5 version 2's W5 retry): `what` names it, `node` is the server it
+    /// acted on and `client` the client concerned.
+    Triggered {
+        /// The trigger: `"cut"`, `"lost"`, `"crash"` or `"restart"`.
+        what: &'static str,
+        /// The server.
+        node: NodeId,
+        /// The client.
+        client: NodeId,
+    },
     /// A server took a snapshot of its service and compacted its log
     /// below `first` (W5): what it dropped, the snapshot holds.
     Compacted {
