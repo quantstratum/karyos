@@ -18,7 +18,7 @@ use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, OwnedFd};
 
-use rustix::net::sockopt::{set_socket_reuseport, set_txtime};
+use rustix::net::sockopt::{set_ipv6_v6only, set_socket_reuseport, set_txtime};
 use rustix::net::{
     AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrAny,
     SocketFlags, SocketType, TxTimeFlags,
@@ -59,7 +59,7 @@ impl EtfSocket {
     ///
     /// # Errors
     ///
-    /// [`OpenError::Os`] naming `socket`, `so_reuseport`, `bind`,
+    /// [`OpenError::Os`] naming `socket`, `ipv6_v6only`, `so_reuseport`, `bind`,
     /// `so_txtime` or `so_priority`.
     pub fn open_in_group(local: SocketAddr, priority: u32) -> Result<Self, OpenError> {
         Self::create(local, Some(priority))
@@ -83,6 +83,12 @@ impl EtfSocket {
             None,
         )
         .map_err(os("socket"))?;
+        // `IPV6_V6ONLY` as the endpoint socket sets it, before the bind: a
+        // socket that differs joins another reuseport group, which the
+        // endpoint's steering program does not cover (ADR-0109 point 5).
+        if local.is_ipv6() {
+            set_ipv6_v6only(&fd, true).map_err(os("ipv6_v6only"))?;
+        }
         if group.is_some() {
             set_socket_reuseport(&fd, true).map_err(os("so_reuseport"))?;
         }
