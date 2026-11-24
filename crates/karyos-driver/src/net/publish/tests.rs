@@ -1237,7 +1237,11 @@ fn a_paired_path_on_an_address_this_host_lacks_is_refused() {
         Err(DriverError::UnsupportedChannel) => return,
         other => panic!("{other:?}"),
     }
-    assert_eq!(driver.net.as_ref().unwrap().send_endpoints(), 0);
+    // The first path's endpoint, held before the refusal, is released and
+    // closes at the next duties.
+    until(&mut driver, |driver| {
+        driver.net.as_ref().unwrap().send_endpoints() == 0
+    });
 }
 
 /// A port no socket holds now, for a group or destination of a test,
