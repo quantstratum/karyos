@@ -181,7 +181,8 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"guard-preview","state":"forbidden","reason":"role"},"#,
             r#"{"name":"submit","state":"forbidden","reason":"role"},"#,
             r#"{"name":"clocks","state":"served","reason":null},"#,
-            r#"{"name":"rate-limits","state":"served","reason":null}]}"#,
+            r#"{"name":"rate-limits","state":"served","reason":null},"#,
+            r#"{"name":"cluster-command","state":"unavailable","reason":"not_configured"}]}"#,
             "\n"
         )
     );
@@ -914,4 +915,22 @@ fn a_submit_without_a_token_reaches_the_agent() {
         answer,
         "{\"error\":\"bad arguments\",\"request\":\"submit\"}\n"
     );
+}
+
+/// Relay id 0 is the local socket's: a library configuration that names it
+/// is refused at bind, as the CLI refuses it, so a relayed request is never
+/// served the local answer (karyos#726).
+#[test]
+fn a_relay_id_of_zero_is_refused_at_bind() {
+    let _serial = serial();
+    let dir = dir("zero-relay");
+    std::fs::create_dir_all(&dir).unwrap();
+    let api = dir.join("api");
+    let zero = ApiConfig::new(api.clone(), vec![(own(), Role::Viewer)])
+        .with_relays(vec![(own(), 0)], Vec::new());
+    assert!(matches!(Server::bind(zero), Err(ServeError::ZeroRelay)));
+    assert!(!api.exists(), "nothing is created");
+    let one =
+        ApiConfig::new(api, vec![(own(), Role::Viewer)]).with_relays(vec![(own(), 1)], Vec::new());
+    Server::bind(one).unwrap();
 }

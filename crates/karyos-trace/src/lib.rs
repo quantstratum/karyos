@@ -46,6 +46,7 @@
 
 pub mod agent;
 pub mod attribution;
+pub mod calibrate;
 pub mod clocks;
 pub mod error;
 pub mod histogram;

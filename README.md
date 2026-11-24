@@ -95,6 +95,19 @@ scripts/linux-test.sh                     # cargo test in a Linux container
 scripts/linux-test.sh -p karyos-sys --locked  # any cargo test arguments
 ```
 
+Each tree gets its own Docker target volume (25 to 50 GB once warm),
+labelled `karyos.linux-target=1` and `karyos.root=<tree path>`. Before
+each run, `scripts/linux-test.sh` and `scripts/netem-test.sh` remove by
+exact name every labelled target volume whose tree no longer exists on the
+host and that no container uses; unlabelled volumes are never touched, and
+`KARYOS_LINUX_KEEP_VOLUMES=1` skips the pruning. From a one-off clone (a
+gate on a fresh checkout), pass `--clean` first (or set
+`KARYOS_LINUX_CLEAN=1`) to remove the tree's volume once the tests finish:
+
+```sh
+scripts/linux-test.sh --clean --workspace --all-features --locked --no-fail-fast
+```
+
 CI runs on every push to `main` and every pull request, and is
 informational: a merge waits on the local gates above, not on CI
 (ADR-0046).

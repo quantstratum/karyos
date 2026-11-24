@@ -1,23 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Wire authentication key files and KDF contexts
-//! (`quantstratum-docs: karyos/design/wire-key-files.md` sections 2.2, 2.3
+//! (`quantstratum-docs: karyos/design/wire-key-files.md` sections 2.1 to 2.6
 //! and 3; ADR-0086 sections 4 and 8).
 //!
 //! This module parses one key file's bytes into a [`KeyFile`] and derives
 //! the per-purpose MAC keys with HKDF-SHA-256 (RFC 5869), written over
-//! `hmac` so that the PRK and every MAC output are erased. The key directory, the
-//! durable key state and reload are separate parts of quantstratum/karyos#648.
+//! [`HmacKey`] so that the PRK, every padded key and every MAC output are
+//! erased. [`store`] loads
+//! and reloads the key directory against the durable key state of
+//! [`state`] (design sections 2.1, 2.4 and 2.6).
 //! Parsing allocates nothing, reads no clock and touches no file. Secrets
 //! live in [`zeroize::Zeroizing`] buffers and are erased on drop, and the
 //! caller's input buffer is never kept.
 
-use hmac::{Hmac, KeyInit, Mac};
+pub mod state;
+pub mod store;
+
 use karyos_protocol::network::Identity;
+use karyos_protocol::protection::hmac_key::HmacKey;
 use karyos_protocol::protection::hmac_sha256::LABEL;
-use sha2::Sha256;
 use thiserror::Error;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::authority::{AuthorityKeyError, Ed25519Verifier};
 
@@ -680,27 +684,21 @@ impl Context {
     /// nothing; the result is erased on drop.
     #[must_use]
     pub fn derive(&self, secret: &[u8; KEY_LEN]) -> Zeroizing<[u8; KEY_LEN]> {
-        // HKDF-SHA-256 (RFC 5869) for one 32-byte block, written out so
-        // every intermediate is erased: the PRK, and each MAC output once
-        // copied. The keyed MAC states erase themselves (`hmac` feature
-        // `zeroize`, `sha2` feature `zeroize`).
+        // HKDF-SHA-256 (RFC 5869) for one 32-byte block, over `HmacKey`
+        // so every intermediate is erased: the padded salt and PRK, the PRK
+        // itself and each MAC output, whose `Zeroizing` buffers erase on
+        // drop, as do the SHA-256 states (`sha2` feature `zeroize`).
         let info = self.info();
         let salt = info.salt.unwrap_or([0_u8; 32]);
-        let mut prk = Zeroizing::new([0_u8; KEY_LEN]);
+        let mut extract = HmacKey::new(&salt).mac();
+        extract.update(secret);
+        let prk = extract.finalize();
+        let mut expand = HmacKey::new(prk.as_slice()).mac();
+        expand.update(info.bytes());
+        expand.update(&[1]);
+        let out = expand.finalize();
         let mut okm = Zeroizing::new([0_u8; KEY_LEN]);
-        if let Ok(mut extract) = <Hmac<Sha256> as KeyInit>::new_from_slice(&salt) {
-            extract.update(secret);
-            let mut out = extract.finalize().into_bytes();
-            prk.copy_from_slice(&out);
-            out.as_mut_slice().zeroize();
-        }
-        if let Ok(mut expand) = <Hmac<Sha256> as KeyInit>::new_from_slice(&prk[..]) {
-            expand.update(info.bytes());
-            expand.update(&[1]);
-            let mut out = expand.finalize().into_bytes();
-            okm.copy_from_slice(&out);
-            out.as_mut_slice().zeroize();
-        }
+        okm.copy_from_slice(out.as_slice());
         okm
     }
 }

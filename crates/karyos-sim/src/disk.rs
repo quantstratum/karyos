@@ -351,6 +351,81 @@ impl File {
         }
         Ok(bytes)
     }
+
+    /// The live contents' length, without building them.
+    fn live_len(&self) -> io::Result<usize> {
+        let too_large = || error(io::ErrorKind::InvalidInput, "a file past usize");
+        let mut len = self.durable.len();
+        for op in &self.pending {
+            len = match op {
+                DataOp::Write { offset, bytes } => usize::try_from(*offset)
+                    .ok()
+                    .and_then(|start| start.checked_add(bytes.len()))
+                    .ok_or_else(too_large)?
+                    .max(len),
+                DataOp::SetLen(to) => usize::try_from(*to).map_err(|_| too_large())?,
+            };
+        }
+        Ok(len)
+    }
+
+    /// The live contents from `start` into `buf`, built from the durable
+    /// bytes and the pending operations over that range only, as
+    /// [`File::live`] would hold them: a read copies what it returns and
+    /// allocates nothing (karyos#681, the allocation probe charges a
+    /// core's log reads). Bytes at or past the live length read as an
+    /// error, as past the end.
+    fn read_live(&self, start: usize, buf: &mut [u8]) -> io::Result<()> {
+        let too_large = || error(io::ErrorKind::InvalidInput, "a file past usize");
+        let eof = || error(io::ErrorKind::UnexpectedEof, "read past the end");
+        let end = start.checked_add(buf.len()).ok_or_else(eof)?;
+        // Within `buf`, every byte at or past `len` is zero: what a
+        // truncation drops and a later extension adds.
+        buf.fill(0);
+        let mut len = self.durable.len();
+        let overlap = |from: usize, to: usize| (from.max(start), to.min(end));
+        let (from, to) = overlap(0, len);
+        if from < to
+            && let (Some(target), Some(source)) = (
+                buf.get_mut(from - start..to - start),
+                self.durable.get(from..to),
+            )
+        {
+            target.copy_from_slice(source);
+        }
+        for op in &self.pending {
+            match op {
+                DataOp::Write { offset, bytes } => {
+                    let at = usize::try_from(*offset).map_err(|_| too_large())?;
+                    let past = at.checked_add(bytes.len()).ok_or_else(too_large)?;
+                    len = len.max(past);
+                    let (from, to) = overlap(at, past);
+                    if from < to
+                        && let (Some(target), Some(source)) = (
+                            buf.get_mut(from - start..to - start),
+                            bytes.get(from - at..to - at),
+                        )
+                    {
+                        target.copy_from_slice(source);
+                    }
+                }
+                DataOp::SetLen(to) => {
+                    let to = usize::try_from(*to).map_err(|_| too_large())?;
+                    let (from, past) = overlap(to, end);
+                    if from < past
+                        && let Some(dropped) = buf.get_mut(from - start..past - start)
+                    {
+                        dropped.fill(0);
+                    }
+                    len = to;
+                }
+            }
+        }
+        if end > len {
+            return Err(eof());
+        }
+        Ok(())
+    }
 }
 
 impl Dir {
@@ -656,18 +731,15 @@ impl Disk for SimDisk {
 
     fn read_at(&mut self, file: &SimFile, offset: u64, buf: &mut [u8]) -> io::Result<()> {
         let mut state = self.step("read_at")?;
-        let live = Self::file(&mut state, file)?.live()?;
         let eof = || error(io::ErrorKind::UnexpectedEof, "read past the end");
         let start = usize::try_from(offset).map_err(|_| eof())?;
-        let end = start.checked_add(buf.len()).ok_or_else(eof)?;
-        buf.copy_from_slice(live.get(start..end).ok_or_else(eof)?);
-        Ok(())
+        Self::file(&mut state, file)?.read_live(start, buf)
     }
 
     fn len(&mut self, file: &SimFile) -> io::Result<u64> {
         let mut state = self.step("len")?;
-        let live = Self::file(&mut state, file)?.live()?;
-        u64::try_from(live.len()).map_err(|_| overflow())
+        let len = Self::file(&mut state, file)?.live_len()?;
+        u64::try_from(len).map_err(|_| overflow())
     }
 
     fn set_len(&mut self, file: &SimFile, len: u64) -> io::Result<()> {
@@ -766,5 +838,58 @@ impl Disk for SimDisk {
             .pending
             .push(NameOp::Rename { from, to });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::{DataOp, File};
+
+    /// A read of any range agrees with the whole live contents, over
+    /// writes, truncations and extensions (karyos#681).
+    #[test]
+    fn a_ranged_read_agrees_with_the_live_contents() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = |below: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % below
+        };
+        for _ in 0..500 {
+            let durable: Vec<u8> = (0..next(40))
+                .map(|_| u8::try_from(next(255) + 1).unwrap_or(1))
+                .collect();
+            let mut pending = Vec::new();
+            for _ in 0..next(6) {
+                if next(3) == 0 {
+                    pending.push(DataOp::SetLen(next(48)));
+                } else {
+                    let len = next(12);
+                    pending.push(DataOp::Write {
+                        offset: next(48),
+                        bytes: (0..len)
+                            .map(|_| u8::try_from(next(255) + 1).unwrap_or(1))
+                            .collect(),
+                    });
+                }
+            }
+            let file = File { durable, pending };
+            let live = file.live().unwrap_or_default();
+            assert_eq!(file.live_len().ok(), Some(live.len()));
+            for start in 0..56 {
+                for len in 0..12 {
+                    let mut buf = vec![0xAA; len];
+                    let read = file.read_live(start, &mut buf);
+                    match live.get(start..start + len) {
+                        Some(expected) => {
+                            assert!(read.is_ok(), "{start}+{len}");
+                            assert_eq!(buf, expected, "{start}+{len}");
+                        }
+                        None => assert!(read.is_err(), "{start}+{len}"),
+                    }
+                }
+            }
+        }
     }
 }

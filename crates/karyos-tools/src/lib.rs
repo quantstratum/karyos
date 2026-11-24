@@ -28,6 +28,7 @@
 pub mod archive;
 pub mod archive_signer;
 pub mod args;
+pub mod calibrate;
 pub mod capability_log;
 pub mod catalog;
 pub mod catalog_export;

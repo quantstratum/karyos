@@ -42,7 +42,15 @@
 //!   [REASON]` and `guard-reopen DIR GUARD EPOCH [REASON]`, made for the
 //!   peer's uid as the operator, the reason being the rest of the line
 //!   (M10b; a `DIR` holds no space); `gap-ack POSITION`, an
-//!   administrator's acknowledgement of the journal's unknown interval;
+//!   administrator's acknowledgement of the journal's unknown interval,
+//!   relayed or local, never any other role's. Relayed, it answers
+//!   `{"acknowledged":{"position","reason","from","to"},"events":"unknown"}`
+//!   and refuses a position that is no open interval with
+//!   `"refusal":"not_an_unknown_interval"` (karyos#726). The
+//!   acknowledgement records that the interval was seen, by whom and
+//!   through which relay, and nothing more: a front end shows it as
+//!   "unknown interval acknowledged by NAME; what happened in it remains
+//!   unknown", never as resolved, repaired or verified;
 //!   `limits [DIMENSION=VALUE ...]`, the negotiation of the bounds below
 //!   (R-CORE-38); `capabilities`, each capability of the closed v1 list
 //!   served, unavailable in this deployment or forbidden for the peer's
@@ -63,7 +71,13 @@
 //!   mismatch`, `target changed`, `operation id conflict` or `operation
 //!   expired` with nothing sent; a retry of a used id is answered with its
 //!   retained outcome, unsent; `clocks DIR` and `rate-limits DIR`
-//!   (R-CORE-40, karyos#741), for every role, see below. A `join-put` line may
+//!   (R-CORE-40, karyos#741), for every role, see below; `cluster-command OPID CLUSTER COMMAND
+//!   PARAMETERS [REASON]` (R-CORE-41, karyos#772; see
+//!   [`crate::cluster_admin`], which states its contract), a product
+//!   Cluster's registered admin command, `PARAMETERS` hex or `-`, for the
+//!   roles its registration names, a refusal journalled as
+//!   `{"error":"forbidden"}`, `unregistered command`, `unknown cluster` or
+//!   `operation id conflict` with nothing sent. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
@@ -476,6 +490,7 @@ impl ApiConfig {
     }
 
     /// The same, also serving `relays` for `principals` (karyos#708).
+    /// Each relay id must be 1 or more: [`Server::bind`] refuses 0.
     #[must_use]
     pub fn with_relays(mut self, relays: Vec<(u32, u64)>, principals: Vec<Principal>) -> Self {
         self.relays = relays;
@@ -578,6 +593,10 @@ pub enum ServeError {
     /// Another agent is serving in this directory.
     #[error("a live agent holds {}", .0.display())]
     Live(PathBuf),
+    /// A relay configured with id 0, which the journal reserves for the
+    /// local socket: its requests would read as local ones (karyos#726).
+    #[error("a relay id must be 1 or more: 0 is the local socket's")]
+    ZeroRelay,
     /// The operating system's error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -632,6 +651,13 @@ impl Server {
     /// socket, or a call that fails.
     pub fn bind(config: ApiConfig) -> Result<Self, ServeError> {
         use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+        // Relay id 0 is the local socket's in the journal and in the
+        // answers: a relay under it would be served as the local peer
+        // (karyos#726), so it is refused before anything changes, as the
+        // CLI refuses it.
+        if config.relays.iter().any(|(_, relay)| *relay == 0) {
+            return Err(ServeError::ZeroRelay);
+        }
         // Without a relay group, owner only; with one, the group may
         // reach the socket and nothing else.
         let (dir_mode, socket_mode) = match config.relay_group {
@@ -878,10 +904,46 @@ impl Server {
                     forbidden()
                 }
             }
+            (
+                Some((requester, role)),
+                Request::ClusterCommand {
+                    operation,
+                    cluster,
+                    command,
+                    parameters,
+                    reason,
+                },
+            ) => {
+                // The role is checked against the command's registration,
+                // and a refusal journalled, by the agent (karyos#772).
+                let parameters =
+                    crate::cluster_admin::parse_parameters(parameters).unwrap_or_default();
+                let answer = agent.cluster_command_for(
+                    (cluster, command, &parameters),
+                    operation,
+                    (requester, clearance(role)),
+                    reason.as_bytes(),
+                );
+                let served = match answer {
+                    crate::cluster_admin::ClusterAnswer::Rejected { .. }
+                    | crate::cluster_admin::ClusterAnswer::BadArguments => Served::Refused,
+                    _ => Served::Operated,
+                };
+                (json::cluster_answer(&answer), served)
+            }
             (Some((requester, role)), Request::GapAck { position }) => {
                 if role.may_acknowledge() {
+                    // A relayed request is answered with the interval and
+                    // that its events remain unknown, so a console cannot
+                    // show the acknowledgement as a repair (karyos#726);
+                    // the local answer is unchanged.
+                    let relayed = requester.relay != 0;
                     let answer = match agent.acknowledge_gap_for(position, requester) {
-                        Ok(()) => json::acknowledged(position),
+                        Ok(gap) if relayed => json::acknowledged_interval(&gap),
+                        Ok(_) => json::acknowledged(position),
+                        Err(crate::journal::JournalError::NoGap) if relayed => {
+                            json::not_an_unknown_interval(position)
+                        }
                         Err(crate::journal::JournalError::NoGap) => {
                             json::error("no such unknown interval", None)
                         }
@@ -1132,6 +1194,15 @@ enum Request<'a> {
         kind: crate::preview::PreviewKind,
         dir: &'a str,
         guard: u64,
+        reason: &'a str,
+    },
+    /// `cluster-command OPID CLUSTER COMMAND PARAMETERS [REASON]`
+    /// (R-CORE-41, karyos#772): `parameters` checked to parse.
+    ClusterCommand {
+        operation: u64,
+        cluster: &'a str,
+        command: &'a str,
+        parameters: &'a str,
         reason: &'a str,
     },
     /// `legal-hold RECORDING [REASON]`, `hold-release RECORDING [REASON]`,
@@ -1400,6 +1471,36 @@ fn submit(arguments: &str) -> Option<Request<'_>> {
     })
 }
 
+/// `OPID CLUSTER COMMAND PARAMETERS [REASON]` (karyos#772): a nonzero id,
+/// valid names and parameters that parse.
+fn cluster_command(arguments: &str) -> Option<Request<'_>> {
+    use crate::cluster_admin::{parse_parameters, valid_name};
+    let mut fields = arguments.splitn(5, ' ');
+    let operation = fields.next()?.parse::<u64>().ok().filter(|id| *id != 0)?;
+    let cluster = fields.next().filter(|name| valid_name(name))?;
+    let command = fields.next().filter(|name| valid_name(name))?;
+    let parameters = fields
+        .next()
+        .filter(|text| parse_parameters(text).is_some())?;
+    Some(Request::ClusterCommand {
+        operation,
+        cluster,
+        command,
+        parameters,
+        reason: fields.next().unwrap_or(""),
+    })
+}
+
+/// What `role` grants for a product Cluster's admin commands (karyos#772).
+const fn clearance(role: Role) -> crate::cluster_admin::Clearance {
+    use crate::cluster_admin::Clearance;
+    match role {
+        Role::Administrator => Clearance::Administrator,
+        Role::Operator | Role::RiskOfficer => Clearance::Operator,
+        Role::Viewer | Role::Registrar => Clearance::None,
+    }
+}
+
 fn request(rest: &str) -> Option<Request<'_>> {
     let (name, arguments) = rest.split_once(' ').unwrap_or((rest, ""));
     let number = |word: &str| word.parse::<u64>().ok();
@@ -1464,6 +1565,9 @@ fn request(rest: &str) -> Option<Request<'_>> {
             })
         }
         "submit" => submit(arguments).or(Some(Request::BadArguments("submit"))),
+        "cluster-command" => {
+            cluster_command(arguments).or(Some(Request::BadArguments("cluster-command")))
+        }
         "legal-hold" | "hold-release" | "seal-verify" => {
             let (recording, reason) = arguments.split_once(' ').unwrap_or((arguments, ""));
             let operation = match name {

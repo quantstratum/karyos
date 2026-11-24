@@ -884,6 +884,7 @@ version = "0.1.0-alpha.4"
 dependencies = [
  "karyos-archive",
  "karyos-client",
+ "karyos-cluster",
  "karyos-driver",
  "karyos-protocol",
  "karyos-sys",
@@ -1051,11 +1052,11 @@ dependencies = [
 name = "karyos-protocol"
 version = "0.1.0-alpha.4"
 dependencies = [
- "hmac",
  "karyos-sys",
  "proptest",
  "sha2",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]

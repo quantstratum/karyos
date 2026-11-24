@@ -433,11 +433,126 @@ pub fn retention_answer(answer: &crate::retention::RetentionAnswer) -> String {
     text
 }
 
+/// A product Cluster's admin command's answer (R-CORE-41, karyos#772):
+/// `{"operation":N,"outcome":"sequenced","index":N,"term":N,"reply":HEX,
+/// "evidence":{"algorithm":S,"digest":HEX}|null}`; a product's refusal
+/// `{"error":"refused","operation":N,"outcome":"refused","code":N,
+/// "reason":S}`; an unknown outcome `{"error":"no answer","operation":N,
+/// "outcome":"unknown"}`; each with `"journalled":false` added when its
+/// outcome record could not be written (the result stands; the record is
+/// missing). The agent's refusals: `{"error":TEXT,"journalled":B}` for
+/// one it journals, `{"error":TEXT}` for `journal unavailable` and
+/// `busy`, and `bad arguments` for an id of 0 or parameters too long.
+#[must_use]
+pub fn cluster_answer(answer: &crate::cluster_admin::ClusterAnswer) -> String {
+    use crate::cluster_admin::{ClusterAnswer, hex};
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match answer {
+        ClusterAnswer::Sequenced {
+            operation,
+            index,
+            term,
+            reply,
+            evidence,
+            journalled,
+        } => {
+            fields.number("operation", operation);
+            fields.string("outcome", "sequenced");
+            fields.number("index", index);
+            fields.number("term", term);
+            fields.string("reply", &hex(reply));
+            fields
+                .key("evidence")
+                .option(evidence.as_ref(), |out, evidence| {
+                    out.object(|fields| {
+                        fields.string("algorithm", &evidence.algorithm);
+                        fields.string("digest", &hex(&evidence.digest));
+                    });
+                });
+            if !journalled {
+                fields.key("journalled").bool(false);
+            }
+        }
+        ClusterAnswer::Refused {
+            operation,
+            code,
+            reason,
+            journalled,
+        } => {
+            fields.string("error", "refused");
+            fields.number("operation", operation);
+            fields.string("outcome", "refused");
+            fields.number("code", code);
+            fields.string("reason", reason);
+            if !journalled {
+                fields.key("journalled").bool(false);
+            }
+        }
+        ClusterAnswer::NoAnswer {
+            operation,
+            journalled,
+        } => {
+            fields.string("error", "no answer");
+            fields.number("operation", operation);
+            fields.string("outcome", "unknown");
+            if !journalled {
+                fields.key("journalled").bool(false);
+            }
+        }
+        ClusterAnswer::Rejected { code, journalled } => {
+            fields.string("error", code.text());
+            fields.key("journalled").bool(*journalled);
+        }
+        ClusterAnswer::BadArguments => {
+            fields.string("error", "bad arguments");
+            fields.string("request", "cluster-command");
+        }
+        ClusterAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
+        ClusterAnswer::Busy => fields.string("error", "busy"),
+    });
+    text
+}
+
 /// The answer to an acknowledged unknown interval (M10b).
 #[must_use]
 pub fn acknowledged(position: u64) -> String {
     let mut text = String::new();
     Out(&mut text).object(|fields| fields.number("acknowledged", position));
+    text
+}
+
+/// A relayed `gap-ack`'s answer (karyos#726): the interval acknowledged,
+/// and that the events in it remain unknown. An acknowledgement records
+/// that an administrator saw the interval; it repairs, verifies and
+/// explains nothing, and the answer says so for a console to show:
+/// `{"acknowledged":{"position":P,"reason":R,"from":F,"to":T},
+/// "events":"unknown"}`.
+#[must_use]
+pub fn acknowledged_interval(gap: &crate::api::GapView) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.key("acknowledged").object(|interval| {
+            interval.number("position", gap.position);
+            interval.string("reason", gap.reason);
+            interval.number("from", gap.from);
+            interval.number("to", gap.to);
+        });
+        fields.string("events", "unknown");
+    });
+    text
+}
+
+/// A relayed `gap-ack`'s refusal of a position that is no open unknown
+/// interval (karyos#726): `{"error":"no such unknown interval",
+/// "refusal":"not_an_unknown_interval","position":P}`.
+#[must_use]
+pub fn not_an_unknown_interval(position: u64) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.string("error", "no such unknown interval");
+        fields.string("refusal", "not_an_unknown_interval");
+        fields.number("position", position);
+    });
     text
 }
 

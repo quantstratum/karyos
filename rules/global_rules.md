@@ -379,6 +379,12 @@ completion handling (ADR-0008).
   (the issue number before the PR exists), and the PR names the volume.
   Never `docker system prune` or `docker volume prune`; remove only your
   own volume, by exact name.
+- `scripts/linux-test.sh` and `scripts/netem-test.sh` label the volumes
+  they create (`karyos.linux-target=1`, `karyos.root=<tree path>`) and,
+  before each run, remove the labelled ones whose tree is gone and that no
+  container uses (`KARYOS_LINUX_KEEP_VOLUMES=1` opts out). A gate from a
+  one-off clone passes `--clean` (or `KARYOS_LINUX_CLEAN=1`) so its volume
+  goes when the run ends.
 - One heavy gate (`make pre-push`, a linux-test, a netem run) at a time per
   session on a shared host. Never stop another session's gate by name
   (`pkill -f`); stop your own by PID.

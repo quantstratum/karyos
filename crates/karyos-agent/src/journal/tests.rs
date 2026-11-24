@@ -99,6 +99,35 @@ fn a_journal_resumes_its_recording() {
     assert!(!journal.unavailable());
 }
 
+/// R-CORE-19 (karyos#726): a relayed acknowledgement records the
+/// authenticated requester and the relay as separate fields of the same
+/// `GapAcknowledged` record, naming the interval, and survives a restart.
+#[test]
+fn a_relayed_acknowledgement_records_the_requester_and_the_relay_apart() {
+    let dir = dir("relayed-ack");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    let _ = journal
+        .append_durable(&request(Kind::CloseRequest, 15, 3), 15)
+        .unwrap();
+    drop(journal);
+    let mut journal = Journal::open(&dir, 100).unwrap();
+    let gap = journal.gap().unwrap();
+    journal
+        .acknowledge_gap_relayed(gap.position, 50_001, 7, 110)
+        .unwrap();
+    journal.stop(111).unwrap();
+    drop(journal);
+    let journal = Journal::open(&dir, 200).unwrap();
+    assert_eq!(journal.gap(), None);
+    let acks: Vec<_> = journal
+        .scanned
+        .iter()
+        .filter(|record| record.kind == Kind::GapAcknowledged)
+        .map(|record| (record.expected, record.operator, record.relay))
+        .collect();
+    assert_eq!(acks, [(gap.position, 50_001, 7)]);
+}
+
 /// A request with no outcome after it means an operation may have taken
 /// effect unrecorded: the next start records an unknown interval from the
 /// request's time, which stays open across restarts until an
@@ -312,10 +341,19 @@ fn the_retention_kinds_keep_the_existing_codes() {
         assert_eq!(JournalRecord::decode(&record.encode()), Some(record));
     }
     // 17 and 18 are the rate change's (karyos#740), 19 a submit's
-    // (karyos#738); 20 is no kind yet.
+    // (karyos#738); 20 to 22 a Cluster admin command's (karyos#772); 23
+    // is no kind yet.
     assert_eq!(Kind::from_code(19), Some(Kind::Submitted));
     assert_eq!(Kind::Submitted.code(), 19);
-    assert_eq!(Kind::from_code(20), None);
+    for (code, kind) in (20u64..).zip([
+        Kind::ClusterRequest,
+        Kind::ClusterOutcome,
+        Kind::ClusterRefused,
+    ]) {
+        assert_eq!(kind.code(), code);
+        assert_eq!(Kind::from_code(code), Some(kind));
+    }
+    assert_eq!(Kind::from_code(23), None);
 }
 
 /// karyos#985: each durable append seals the recording to its durable end,

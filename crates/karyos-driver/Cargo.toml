@@ -14,8 +14,8 @@ publish.workspace = true
 # Guard and abort authority (owner decision D51; quantstratum-docs:
 # karyos/reviews/dependency-admission-wire-auth-hmac.md, driver scope).
 ed25519-dalek.workspace = true
-hmac.workspace = true
-sha2.workspace = true
+# `zeroize` erases the SHA-256 states of the keyed fingerprints on drop.
+sha2 = { workspace = true, features = ["zeroize"] }
 zeroize.workspace = true
 karyos-client.workspace = true
 karyos-io.workspace = true
@@ -28,6 +28,8 @@ thiserror.workspace = true
 test-hooks = []
 
 [dev-dependencies]
+# Cross-checks the erased HMAC of the key state fingerprints.
+hmac.workspace = true
 karyos-driver = { path = ".", features = ["test-hooks"] }
 karyos-io = { workspace = true, features = ["test-hooks"] }
 karyos-sys = { workspace = true, features = ["test-hooks"] }
