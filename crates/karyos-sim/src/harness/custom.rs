@@ -15,33 +15,54 @@
 //! - Node ids: the harness numbers servers from 0, the core's voter ids
 //!   start at 1, so core id = node id + 1. The hard state stores node ids.
 //! - The log view: the core sees the node's written log, minus a pending
-//!   truncation, plus the entries not yet handed to [`drive`]
-//!   (proposals, a new leader's no-op, a follower's received suffix). An
-//!   entry's size is its frame's (`RaftLog::frame_span`, or
-//!   `Entry::encoded_len` before it is written): what the duty reads to
-//!   send it, and at least its payload, so the in-flight byte cap on
-//!   payloads holds.
+//!   truncation, plus the entries not yet handed to
+//!   [`drive`](super::core::drive) (proposals, a new leader's no-op, a
+//!   follower's received suffix). An entry's size is its payload's, which
+//!   W2's in-flight byte cap bounds; its read cost is its frame's
+//!   (`RaftLog::frame_span`), which the harness's metered log charges a
+//!   duty, and nothing for an entry not yet written, which no read
+//!   touches.
 //! - Effects: [`Effects::persist`] and [`Effects::commit`] become the
 //!   Ready's hard state; [`Effects::write`] truncates and takes the
 //!   stepped append's entries; [`Effects::append`] adds the no-op;
-//!   [`Effects::send`] goes in `messages`, [`Effects::send_after_persist`]
-//!   in `after_persist`, which [`drive`] releases once the Ready is
-//!   durable (persist then send).
-//! - Appends: the core sends positions and counts. Building the Ready,
-//!   the adapter fills each append with its entries, from the pending
-//!   ones or read from C4's log through the duty's metered [`LogView`];
-//!   an append whose entries the budget refuses is not sent, as if the
-//!   network lost it, and the core's window recovers it as it recovers a
-//!   loss (a heartbeat's rejection rewinds it).
-//! - Limits: [`Limits`] map one to one: `log_read_bytes` is the core's
-//!   [`CoreLimits::read_bytes`]; each core call is a duty for its size
-//!   lookups. Refusals map to [`Limit`].
-//! - Time: one harness tick is one core tick, at most
-//!   [`MAX_TICKS_PER_CALL`] per call.
+//!   [`Effects::send`] goes in `messages` and
+//!   [`Effects::send_after_persist`] in `after_persist`, which
+//!   [`drive`](super::core::drive) releases once the Ready is durable
+//!   (persist then send).
+//! - Appends: the core sends positions and counts. Each append is filled
+//!   with its entries as soon as the core emits it, from the same view
+//!   the core read: the pending entries, or C4's log through the duty's
+//!   metered [`LogView`]. An append whose entries the budget refuses is
+//!   not sent, as if the network lost it, and the core's window recovers
+//!   it as it recovers a loss (a heartbeat's rejection rewinds it).
+//! - Committed entries are handed to apply in order, each once, as many
+//!   per Ready as the duty's read budget covers; the rest follow in the
+//!   next. After a restart they are applied again from the log's start,
+//!   as the node rebuilds its state.
+//! - Limits: [`Limits`] map to the core's: `log_read_bytes` is
+//!   [`CoreLimits::read_bytes`], charged in frame bytes, and a proposal
+//!   whose frame is larger is refused with [`Limit::LogRead`]; the core's
+//!   lookup count is unbounded here (the harness has no such limit).
+//!   Every entry of a harness log is admitted by `propose` under the same
+//!   limits or is a new leader's empty no-op, so the core's send-alone
+//!   exception for an entry larger than the byte window never applies.
+//! - Time: the first tick sets the clock's baseline; each later tick runs
+//!   the core once per unit of time passed, at most
+//!   [`MAX_TICKS_PER_CALL`] per call, and the rest in the next calls.
+//!
+//! **Buffers.** Entries and their vectors come from one pool per thread,
+//! shared by every node the simulation runs on it: what a follower is
+//! done with (a message's entries, a Ready's recycled ones) goes back to
+//! it, and a leader's next append takes from it. It stands for a
+//! transport that hands a sent buffer back, so after the warm-up nothing
+//! on the replication path allocates (ADR-0105, decision 3). The pool is
+//! bounded ([`MAX_POOLED_ENTRIES`], [`MAX_POOLED_VECTORS`]).
 //!
 //! **Not taken yet:** snapshots, compaction and leadership transfer (W5)
 //! answer [`Unsupported`], which the harness reports as not
 //! demonstrated, until the core's snapshot install (#682).
+
+use std::cell::RefCell;
 
 use karyos_cluster::consensus::{
     Backpressure, Config, Core, Effects, Limits as CoreLimits, LogTerms, Message as CoreMessage,
@@ -65,6 +86,24 @@ pub const HEARTBEAT: u32 = 2;
 pub const BATCH: u64 = 16;
 /// Ticks one [`ConsensusCore::tick`] call runs at most.
 pub const MAX_TICKS_PER_CALL: u64 = 64;
+/// Entries the thread's pool keeps at most.
+pub const MAX_POOLED_ENTRIES: usize = 4096;
+/// Entry vectors the thread's pool keeps at most.
+pub const MAX_POOLED_VECTORS: usize = 1024;
+/// Entries the thread's pool is filled with before the first core
+/// starts, and the payload bytes each holds: W1's largest command
+/// (16,000 bytes) fits, so no buffer grows on the replication path.
+pub const PREFILLED_ENTRIES: usize = 1024;
+/// See [`PREFILLED_ENTRIES`].
+pub const PREFILLED_PAYLOAD: usize = 16 * 1024;
+/// The bytes C4's log reads at once at most (`RaftLog`'s read window).
+pub const READ_WINDOW: usize = 1 << 20;
+/// Messages, entries and committed entries one Ready holds before its
+/// vectors grow: reserved when the core starts, so a node's first Ready
+/// after the warm-up does not allocate.
+pub const READY_CAPACITY: usize = 256;
+/// Entry vectors the pool is filled with, each holding [`BATCH`].
+pub const PREFILLED_VECTORS: usize = 256;
 
 /// The adapter's messages: the core's, and an append's entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,11 +114,96 @@ pub struct Message {
     pub entries: Vec<Entry>,
 }
 
+/// The thread's buffers (see the module).
+#[derive(Default)]
+struct Pool {
+    entries: Vec<Entry>,
+    vectors: Vec<Vec<Entry>>,
+    filled: bool,
+}
+
+thread_local! {
+    static POOL: RefCell<Pool> = RefCell::new(Pool::default());
+}
+
+/// Fills the thread's pool once, at initialisation: everything the
+/// replication path takes from it after that was allocated here.
+fn prefill() {
+    POOL.with_borrow_mut(|pool| {
+        if pool.filled {
+            return;
+        }
+        pool.filled = true;
+        pool.entries.reserve_exact(MAX_POOLED_ENTRIES);
+        pool.vectors.reserve_exact(MAX_POOLED_VECTORS);
+        for _ in 0..PREFILLED_ENTRIES {
+            pool.entries.push(Entry {
+                index: 0,
+                term: 0,
+                event_time: 0,
+                payload: Vec::with_capacity(PREFILLED_PAYLOAD),
+            });
+        }
+        let batch = usize::try_from(BATCH).unwrap_or(0);
+        for _ in 0..PREFILLED_VECTORS {
+            pool.vectors.push(Vec::with_capacity(batch));
+        }
+    });
+}
+
+/// An entry with these fields, its buffer from the pool when one is free.
+fn pooled(index: u64, term: u64, event_time: u64, payload: &[u8]) -> Entry {
+    let mut entry = POOL
+        .with_borrow_mut(|pool| pool.entries.pop())
+        .unwrap_or(Entry {
+            index,
+            term,
+            event_time,
+            payload: Vec::new(),
+        });
+    entry.index = index;
+    entry.term = term;
+    entry.event_time = event_time;
+    entry.payload.clear();
+    entry.payload.extend_from_slice(payload);
+    entry
+}
+
+/// Gives `entries` back to the pool, leaving it empty.
+fn release(entries: &mut Vec<Entry>) {
+    POOL.with_borrow_mut(|pool| {
+        let room = MAX_POOLED_ENTRIES.saturating_sub(pool.entries.len());
+        let keep = entries.len().min(room);
+        pool.entries.extend(entries.drain(..keep));
+    });
+    entries.clear();
+}
+
+/// An empty vector from the pool.
+fn vector() -> Vec<Entry> {
+    POOL.with_borrow_mut(|pool| pool.vectors.pop())
+        .unwrap_or_default()
+}
+
+/// Gives `entries`, emptied, back to the pool.
+fn recycle(mut entries: Vec<Entry>) {
+    release(&mut entries);
+    if entries.capacity() > 0 {
+        POOL.with_borrow_mut(|pool| {
+            if pool.vectors.len() < MAX_POOLED_VECTORS {
+                pool.vectors.push(entries);
+            }
+        });
+    }
+}
+
 /// The custom core under the harness (see the module).
 #[derive(Debug)]
 pub struct Custom {
     id: NodeId,
     core: Core,
+    /// The proposal size limit by frame: W2's `log_read_bytes`.
+    read_bytes: u64,
     /// Entries not yet handed to the node to persist, consecutive.
     pending: Vec<Entry>,
     /// The first index to remove before they are written.
@@ -90,27 +214,32 @@ pub struct Custom {
     dirty: bool,
     /// The last index handed out to apply.
     handed: u64,
-    /// Core messages to send at once, and after persistence.
-    outgoing: Vec<(u64, CoreMessage)>,
-    after: Vec<(u64, CoreMessage)>,
-    /// The clock at the last tick.
+    /// Messages to send at once, and after persistence, filled.
+    outgoing: Vec<(NodeId, Message)>,
+    after: Vec<(NodeId, Message)>,
+    /// What one core call sent, before it is filled.
+    sent: Vec<(u64, CoreMessage)>,
+    sent_after: Vec<(u64, CoreMessage)>,
+    /// The latest clock reading: the event time of its entries.
     now: u64,
+    /// The clock the core has ticked up to; `None` before the first tick.
+    ticked: Option<u64>,
     /// The last index, written or not, after the last call.
     received: Option<u64>,
-    /// Entries whose buffers are free, from the node's pool.
-    spare: Vec<Entry>,
-    /// Entry vectors free for appends.
-    vectors: Vec<Vec<Entry>>,
-    /// Scratch: an append's entry terms, and the log's read window.
+    /// Scratch: an append's entry terms, the log's read window, and the
+    /// entries the node is done with on their way to the pool.
     terms: Vec<u64>,
     window: Vec<u8>,
+    spare: Vec<Entry>,
+    /// Vectors reserved at start, swapped into the node's Ready when its
+    /// own are smaller (see [`READY_CAPACITY`]).
+    reserved: Ready<Message>,
 }
 
 /// What one core call asked for, applied after it.
-#[derive(Default)]
 struct Sink<'a> {
-    outgoing: Option<&'a mut Vec<(u64, CoreMessage)>>,
-    after: Option<&'a mut Vec<(u64, CoreMessage)>>,
+    sent: &'a mut Vec<(u64, CoreMessage)>,
+    sent_after: &'a mut Vec<(u64, CoreMessage)>,
     persist: Option<TermVote>,
     commit: Option<u64>,
     write: Option<(u64, u64)>,
@@ -131,15 +260,11 @@ impl Effects for Sink<'_> {
     }
 
     fn send(&mut self, to: u64, message: CoreMessage) {
-        if let Some(outgoing) = self.outgoing.as_mut() {
-            outgoing.push((to, message));
-        }
+        self.sent.push((to, message));
     }
 
     fn send_after_persist(&mut self, to: u64, message: CoreMessage) {
-        if let Some(after) = self.after.as_mut() {
-            after.push((to, message));
-        }
+        self.sent_after.push((to, message));
     }
 
     fn commit(&mut self, index: u64) {
@@ -194,7 +319,19 @@ impl LogTerms for View<'_, '_> {
 
     fn size(&self, index: u64) -> Option<u64> {
         if let Some(entry) = self.pending(index) {
-            return entry.encoded_len();
+            return u64::try_from(entry.payload.len()).ok();
+        }
+        if self.written(index) {
+            // The frame less its header: the payload, without a read.
+            let header = frame_len(0)?;
+            return self.log.frame_span(index)?.checked_sub(header);
+        }
+        None
+    }
+
+    fn cost(&self, index: u64) -> Option<u64> {
+        if self.pending(index).is_some() {
+            return Some(0);
         }
         if self.written(index) {
             return self.log.frame_span(index);
@@ -212,7 +349,7 @@ fn node_id(id: u64) -> Option<NodeId> {
     NodeId::try_from(id.checked_sub(1)?).ok()
 }
 
-/// An entry's frame size before it is written.
+/// An entry's frame size for a payload of `payload` bytes.
 fn frame_len(payload: usize) -> Option<u64> {
     let empty = Entry {
         index: 0,
@@ -253,12 +390,13 @@ impl Custom {
                     in_flight_entries: limits.in_flight_entries,
                     in_flight_bytes: limits.in_flight_bytes,
                     queue: limits.queue,
-                    reads: limits.in_flight_entries.saturating_mul(2).max(1),
+                    reads: u64::MAX,
                     read_bytes: limits.log_read_bytes,
                 })
                 .map_err(|_| Unsupported)?,
             None => config,
         };
+        prefill();
         let stored = log.hard_state();
         let term_vote = stored.map_or_else(TermVote::default, |state| TermVote {
             term: state.current_term,
@@ -271,35 +409,51 @@ impl Custom {
         Ok(Self {
             id,
             core: Core::new(config, term_vote, commit),
-            pending: Vec::new(),
+            read_bytes: limits.map_or(u64::MAX, |limits| limits.log_read_bytes),
+            pending: Vec::with_capacity(READY_CAPACITY),
             truncate: None,
             term_vote,
             dirty: false,
             // The node applies from its log's start after a restart.
             handed: 0,
-            outgoing: Vec::new(),
-            after: Vec::new(),
+            outgoing: Vec::with_capacity(READY_CAPACITY),
+            after: Vec::with_capacity(READY_CAPACITY),
+            sent: Vec::with_capacity(READY_CAPACITY),
+            sent_after: Vec::with_capacity(READY_CAPACITY),
             now: 0,
+            ticked: None,
             received: log.last_index(),
-            spare: Vec::new(),
-            vectors: Vec::new(),
             terms: Vec::new(),
-            window: Vec::new(),
+            // The log's largest read window (1 MiB), so its first read
+            // after the warm-up does not allocate.
+            window: Vec::with_capacity(READ_WINDOW),
+            spare: Vec::with_capacity(READY_CAPACITY),
+            reserved: Ready {
+                messages: Vec::with_capacity(READY_CAPACITY),
+                entries: Vec::with_capacity(READY_CAPACITY),
+                after_persist: Vec::with_capacity(READY_CAPACITY),
+                committed: Vec::with_capacity(READY_CAPACITY),
+                ..Ready::default()
+            },
         })
     }
 
-    /// Runs one core call over the node's view, then applies what it
-    /// asked for; `incoming` is the stepped append's entries.
+    /// Runs one core call over the node's view, applies what it asked
+    /// for, and fills what it sent; `incoming` is the stepped append's
+    /// entries.
     fn call<R>(
         &mut self,
-        log: &LogView<'_>,
+        log: &mut LogView<'_>,
         incoming: &mut Vec<Entry>,
         run: impl FnOnce(&mut Core, &View<'_, '_>, &mut Sink<'_>) -> R,
     ) -> R {
         let mut sink = Sink {
-            outgoing: Some(&mut self.outgoing),
-            after: Some(&mut self.after),
-            ..Sink::default()
+            sent: &mut self.sent,
+            sent_after: &mut self.sent_after,
+            persist: None,
+            commit: None,
+            write: None,
+            append: None,
         };
         let view = View {
             log,
@@ -323,7 +477,13 @@ impl Custom {
             self.dirty = true;
         }
         if let Some((index, skip)) = write {
-            self.pending.retain(|entry| entry.index < index);
+            let keep = self
+                .pending
+                .iter()
+                .position(|entry| entry.index >= index)
+                .unwrap_or(self.pending.len());
+            let mut dropped = self.pending.split_off(keep);
+            release(&mut dropped);
             if index <= written && self.pending.is_empty() {
                 self.truncate = Some(self.truncate.map_or(index, |from| from.min(index)));
             }
@@ -333,17 +493,48 @@ impl Custom {
             self.pending.extend(incoming.drain(skip..));
         }
         if let Some((index, term)) = append {
-            let mut entry = self.spare.pop().unwrap_or(Entry {
-                index,
-                term,
-                event_time: self.now,
-                payload: Vec::new(),
-            });
-            entry.index = index;
-            entry.term = term;
-            entry.event_time = self.now;
-            entry.payload.clear();
-            self.pending.push(entry);
+            self.pending.push(pooled(index, term, self.now, &[]));
+        }
+        // Each append filled now, from the view the core just read.
+        let mut sent = std::mem::take(&mut self.sent);
+        for (to, message) in sent.drain(..) {
+            let Some(to) = node_id(to) else {
+                continue;
+            };
+            let mut entries = vector();
+            if let CoreMessage::Append {
+                prev_index,
+                entries: count,
+                ..
+            } = message
+                && count > 0
+            {
+                let first = prev_index.saturating_add(1);
+                if self.fill(log, (first, count), &mut entries) != count {
+                    // Refused by the duty's budget or the log: lost.
+                    recycle(entries);
+                    continue;
+                }
+            }
+            self.outgoing.push((
+                to,
+                Message {
+                    core: message,
+                    entries,
+                },
+            ));
+        }
+        self.sent = sent;
+        for (to, message) in self.sent_after.drain(..) {
+            if let Some(to) = node_id(to) {
+                self.after.push((
+                    to,
+                    Message {
+                        core: message,
+                        entries: Vec::new(),
+                    },
+                ));
+            }
         }
         self.received =
             self.pending
@@ -356,44 +547,50 @@ impl Custom {
         result
     }
 
-    /// Fills `entries` with `first..first + count`: pending ones copied,
-    /// written ones read through the duty's metered log. False when the
-    /// budget or the log refuses any of them.
+    /// Fills `out` with the entries from `first`, at most `count`, in
+    /// order: written ones read through the duty's metered log, pending
+    /// ones copied; how many it holds. A read the budget or the log
+    /// refuses stops it there.
     fn fill(
         &mut self,
-        out: &mut ReadyBuf<Message>,
         log: &mut LogView<'_>,
         (first, count): (u64, u64),
-        entries: &mut Vec<Entry>,
-    ) -> bool {
-        entries.clear();
-        let Some(end) = first.checked_add(count) else {
-            return false;
-        };
+        out: &mut Vec<Entry>,
+    ) -> u64 {
+        release(out);
+        let end = first.saturating_add(count);
         let pending_first = self.pending.first().map_or(u64::MAX, |entry| entry.index);
         let written_end = end.min(pending_first);
         if first < written_end {
+            // Entries from the pool, for the read to reuse.
+            let wanted = usize::try_from(written_end - first).unwrap_or(0);
+            while out.len() < wanted {
+                out.push(pooled(0, 0, 0, &[]));
+            }
             if log
-                .entries_into(first..written_end, u64::MAX, entries, &mut self.window)
+                .entries_into(first..written_end, u64::MAX, out, &mut self.window)
                 .is_err()
             {
-                return false;
+                release(out);
+                return 0;
             }
-            let read = u64::try_from(entries.len()).unwrap_or(0);
-            if read != written_end - first {
-                return false;
+            if out.len() != wanted {
+                return u64::try_from(out.len()).unwrap_or(0);
             }
         }
         for index in first.max(pending_first)..end {
-            let Some(entry) = self
-                .pending
-                .get(usize::try_from(index - pending_first).unwrap_or(usize::MAX))
-            else {
-                return false;
+            let at = usize::try_from(index - pending_first).unwrap_or(usize::MAX);
+            let Some(entry) = self.pending.get(at) else {
+                break;
             };
-            entries.push(out.entry(entry.index, entry.term, entry.event_time, &entry.payload));
+            out.push(pooled(
+                entry.index,
+                entry.term,
+                entry.event_time,
+                &entry.payload,
+            ));
         }
-        true
+        u64::try_from(out.len()).unwrap_or(0)
     }
 
     fn leading(&self) -> bool {
@@ -414,9 +611,10 @@ impl ConsensusCore for Custom {
     type Message = Message;
 
     fn recover(id: NodeId, peers: &[NodeId], log: &mut LogView<'_>) -> Self {
-        // A membership the core refuses (not 3 or 5 voters) starts an
-        // inert follower over a 3-voter view of itself: it never leads,
-        // so the harness reports no progress, never a pass.
+        // A membership the core refuses (not 3 or 5 voters) starts a
+        // follower over a 3-voter view of itself: the others are not
+        // there, so it never leads and the harness reports no progress,
+        // never a pass.
         let inert = [id, id.wrapping_add(1), id.wrapping_add(2)];
         let mut core = Self::start(id, peers, None, log);
         if core.is_err() {
@@ -441,7 +639,8 @@ impl ConsensusCore for Custom {
     }
 
     fn propose_slice(&mut self, command: &[u8], log: &mut LogView<'_>) -> Result<(), Refused> {
-        let size = frame_len(command.len()).ok_or(Refused::Backpressure(Limit::InFlightBytes))?;
+        let size = u64::try_from(command.len())
+            .map_err(|_| Refused::Backpressure(Limit::InFlightBytes))?;
         let mut none = Vec::new();
         let proposed = self.call(log, &mut none, |core, view, _| core.propose(size, view));
         let (index, term) = proposed.map_err(|error| match error {
@@ -454,18 +653,11 @@ impl ConsensusCore for Custom {
                 Refused::Backpressure(Limit::LogRead)
             }
         })?;
-        let mut entry = self.spare.pop().unwrap_or(Entry {
-            index,
-            term,
-            event_time: self.now,
-            payload: Vec::new(),
-        });
-        entry.index = index;
-        entry.term = term;
-        entry.event_time = self.now;
-        entry.payload.clear();
-        entry.payload.extend_from_slice(command);
-        self.pending.push(entry);
+        // A frame no duty could read to send it.
+        if frame_len(command.len()).is_none_or(|frame| frame > self.read_bytes) {
+            return Err(Refused::Backpressure(Limit::LogRead));
+        }
+        self.pending.push(pooled(index, term, self.now, command));
         self.call(log, &mut none, |core, view, sink| {
             core.replicate(view, sink)
         });
@@ -483,13 +675,18 @@ impl ConsensusCore for Custom {
             state.step(core_id(from), core, &terms, view, sink)
         });
         self.terms = terms;
-        self.spare.append(&mut entries);
-        self.vectors.push(entries);
+        recycle(entries);
     }
 
     fn tick(&mut self, now: u64, log: &mut LogView<'_>) {
-        let ticks = now.saturating_sub(self.now).min(MAX_TICKS_PER_CALL);
         self.now = self.now.max(now);
+        let Some(ticked) = self.ticked else {
+            // The first reading is the baseline.
+            self.ticked = Some(now);
+            return;
+        };
+        let ticks = now.saturating_sub(ticked).min(MAX_TICKS_PER_CALL);
+        self.ticked = Some(ticked.saturating_add(ticks));
         let mut none = Vec::new();
         for _ in 0..ticks {
             self.call(log, &mut none, |core, view, sink| core.tick(view, sink));
@@ -503,64 +700,37 @@ impl ConsensusCore for Custom {
     }
 
     fn ready_into(&mut self, out: &mut ReadyBuf<Message>, log: &mut LogView<'_>) -> bool {
+        // What the node is done with goes back to the thread's pool.
         out.take_spare(&mut self.spare);
-        let outgoing = std::mem::take(&mut self.outgoing);
-        for &(to, message) in &outgoing {
-            let Some(to) = node_id(to) else {
-                continue;
-            };
-            let mut entries = self.vectors.pop().unwrap_or_default();
-            if let CoreMessage::Append {
-                prev_index,
-                entries: count,
-                ..
-            } = message
-                && count > 0
-                && !self.fill(
-                    out,
-                    log,
-                    (prev_index.saturating_add(1), count),
-                    &mut entries,
-                )
-            {
-                // Refused by the duty's budget or the log: lost.
-                self.spare.append(&mut entries);
-                self.vectors.push(entries);
-                continue;
-            }
-            out.ready.messages.push((
-                to,
-                Message {
-                    core: message,
-                    entries,
-                },
-            ));
+        release(&mut self.spare);
+        // The node's vectors, grown to the reserved ones' size once.
+        let (ready, reserved) = (&mut out.ready, &mut self.reserved);
+        if ready.messages.capacity() < READY_CAPACITY {
+            std::mem::swap(&mut ready.messages, &mut reserved.messages);
         }
-        self.outgoing = outgoing;
-        self.outgoing.clear();
-        for (to, message) in self.after.drain(..) {
-            if let Some(to) = node_id(to) {
-                out.ready.after_persist.push((
-                    to,
-                    Message {
-                        core: message,
-                        entries: Vec::new(),
-                    },
-                ));
-            }
+        if ready.after_persist.capacity() < READY_CAPACITY {
+            std::mem::swap(&mut ready.after_persist, &mut reserved.after_persist);
         }
+        if ready.entries.capacity() < READY_CAPACITY {
+            std::mem::swap(&mut ready.entries, &mut reserved.entries);
+        }
+        if ready.committed.capacity() < READY_CAPACITY {
+            std::mem::swap(&mut ready.committed, &mut reserved.committed);
+        }
+        out.ready.messages.append(&mut self.outgoing);
+        out.ready.after_persist.append(&mut self.after);
         // Committed entries, written or in this Ready, from the last
-        // handed out: `drive` applies them once this Ready is durable.
+        // handed out, as many as the duty's reads cover: `drive` applies
+        // them once this Ready is durable.
         let commit = self.core.commit();
         if commit > self.handed {
             let first = self.handed.saturating_add(1);
             let mut committed = std::mem::take(&mut out.ready.committed);
-            if self.fill(out, log, (first, commit - self.handed), &mut committed) {
-                self.handed = commit;
-            } else {
-                // A refused read applies none; the next Ready retries.
-                self.spare.append(&mut committed);
-            }
+            // At most a reserved Ready's worth: the rest in the next.
+            let most =
+                (commit - self.handed).min(u64::try_from(READY_CAPACITY).unwrap_or(u64::MAX));
+            let filled = self.fill(log, (first, most), &mut committed);
+            self.handed = self.handed.saturating_add(filled);
             out.ready.committed = committed;
         }
         out.ready.truncate_from = self.truncate.take();

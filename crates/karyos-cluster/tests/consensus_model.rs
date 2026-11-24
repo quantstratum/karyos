@@ -1442,6 +1442,10 @@ impl LogTerms for Counting<'_> {
         self.reads.set(self.reads.get() + 1);
         self.log.size(index)
     }
+    // One lookup per entry: the cost is read with the size.
+    fn cost(&self, index: u64) -> Option<u64> {
+        self.log.size(index)
+    }
 }
 
 #[test]
@@ -1514,4 +1518,47 @@ fn a_duty_sends_at_most_its_log_read_bytes() {
         Err(ProposeError::Backpressure(Backpressure::LogRead))
     );
     assert!(node.propose(600, &log).is_ok());
+}
+
+/// A log whose entries cost a duty more to read than their size: frames
+/// read whole, a 50-byte header each.
+struct Framed<'a>(&'a TestLog);
+
+impl LogTerms for Framed<'_> {
+    fn last_index(&self) -> u64 {
+        self.0.last_index()
+    }
+
+    fn term(&self, index: u64) -> Option<u64> {
+        self.0.term(index)
+    }
+
+    fn size(&self, index: u64) -> Option<u64> {
+        self.0.size(index)
+    }
+
+    fn cost(&self, index: u64) -> Option<u64> {
+        self.0.size(index).map(|size| size + 50)
+    }
+}
+
+#[test]
+fn a_duty_charges_the_read_cost_and_the_window_the_size() {
+    let limits = Limits {
+        in_flight_entries: 8,
+        in_flight_bytes: 400,
+        queue: 64,
+        reads: 64,
+        read_bytes: 600,
+    };
+    let mut node = leader_with(1, &hundreds(4), Some(limits));
+    let log = hundreds(30);
+    let framed = Framed(&log);
+    let mut recorded = Recorded::default();
+    node.replicate(&framed, &mut recorded);
+    // 4 entries fit the 400-byte window by size (150 each to read: 600),
+    // and the duty has nothing left for the second follower.
+    assert_eq!(appends_to(&recorded, 2), vec![(4, 4)]);
+    assert_eq!(node.in_flight(2), Some((4, 400)));
+    assert_eq!(appends_to(&recorded, 3), vec![(4, 0)]);
 }
