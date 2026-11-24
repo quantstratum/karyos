@@ -1449,3 +1449,97 @@ fn a_zero_reserve_is_refused() {
     }
     assert_eq!(f.gate.control_message_tokens(), Some(1));
 }
+
+/// R-CORE-40, karyos#741: what the agent reads of the gate's limiters. A
+/// gate with no bucket reads no limiter at all, so its zero refusals are
+/// never taken for "refused nothing"; a gate with buckets reads their
+/// policies, the version applied and each bucket's own refusals.
+#[test]
+fn the_rate_cells_tell_a_bucket_that_refused_nothing_from_no_bucket() {
+    use karyos_sys::rate_policy_slot::{SLOT_WORDS, publish};
+
+    let none = Fixture::new(1, None);
+    assert_eq!(none.gate.rate_cells(), [Some(0); RATE_CELLS]);
+
+    let mut f = Fixture::new(1, Some(rate(2, 2)));
+    f.gate.set_control_reserve(reserve(1, 1), 0).unwrap();
+    let control = f.gate.control_policy().unwrap();
+    let control_bytes = control.bytes.unwrap();
+    // Nothing refused yet: counted, and 0.
+    let both = RATE_LIMITERS_PUBLICATION | RATE_LIMITERS_CONTROL | RATE_LIMITERS_CONTROL_BYTES;
+    assert_eq!(
+        f.gate.rate_cells(),
+        [
+            Some(both),
+            Some(0),
+            Some(2),
+            Some(2),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(1),
+            Some(control_bytes.per_second),
+            Some(control_bytes.burst),
+            Some(0),
+        ]
+    );
+    // Three due, two tokens: the third is held, a publication refusal.
+    for _ in 0..3 {
+        f.stage(0);
+    }
+    f.accept(2);
+    let _ = f.serve(0);
+    let held = f.gate.counts().rate_held;
+    assert!(held > 0);
+    // The control bucket holds its second frame: a control refusal.
+    let abort = |gate: &mut GuardGate| gate.admit_control(FrameType::SessionAbort, 32);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Admitted);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Held);
+    let cells = f.gate.rate_cells();
+    assert_eq!((cells[6], cells[11]), (Some(held), Some(1)));
+    // A newer published version, with a byte limit, is read as applied.
+    let slot = Arc::new(HeapWords::zeroed(SLOT_WORDS));
+    f.gate
+        .set_policy_slot(Arc::clone(&slot) as Arc<dyn SharedWords>);
+    let next = RatePolicy {
+        messages: Rate {
+            per_second: 1,
+            burst: 1,
+        },
+        bytes: Some(Rate {
+            per_second: u64::from(MAX_FRAME),
+            burst: u64::from(MAX_FRAME),
+        }),
+    };
+    publish(slot.words(), 0, 3, &next);
+    f.gate.set_now(1);
+    let cells = f.gate.rate_cells();
+    assert_eq!(
+        cells[..6],
+        [
+            Some(both | RATE_LIMITERS_PUBLICATION_BYTES),
+            Some(3),
+            Some(1),
+            Some(1),
+            Some(u64::from(MAX_FRAME)),
+            Some(u64::from(MAX_FRAME)),
+        ]
+    );
+}
+
+/// R-CORE-40: without a control reserve, control frames spend the
+/// publication's bucket, so what it holds back of them is that bucket's
+/// refusal, and no control bucket is read.
+#[test]
+fn without_a_reserve_held_control_frames_are_the_publications_refusals() {
+    let mut f = Fixture::new(1, Some(rate(1, 1)));
+    f.gate.set_now(0);
+    let abort = |gate: &mut GuardGate| gate.admit_control(FrameType::SessionAbort, 32);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Admitted);
+    assert_eq!(abort(&mut f.gate), ControlAdmission::Held);
+    let cells = f.gate.rate_cells();
+    assert_eq!(cells[0], Some(RATE_LIMITERS_PUBLICATION));
+    assert_eq!(cells[6], Some(1));
+    assert_eq!(cells[7..], [Some(0); 5]);
+}
