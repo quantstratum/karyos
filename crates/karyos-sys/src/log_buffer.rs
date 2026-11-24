@@ -3407,7 +3407,13 @@ impl<O: BufferOwner> Subscription<O> {
                 // Acquire load above that observed the seal makes the flag
                 // visible here, as it does the reason stored before the
                 // seal swap.
-                if self.buffer.cell(self.cursor.cell)?.revoked.load(Ordering::SeqCst) != 0 {
+                if self
+                    .buffer
+                    .cell(self.cursor.cell)?
+                    .revoked
+                    .load(Ordering::SeqCst)
+                    != 0
+                {
                     return Ok(PollOutcome::Revoked {
                         position: self.cursor.position,
                     });
