@@ -37,10 +37,26 @@
 //! entries and in bytes, whatever is lost or delayed: an entry leaves
 //! only when it fits the window, and the window frees only on an
 //! acknowledgement, so a lost append or reply holds its share until a
-//! heartbeat's answer or a rejection settles it. A leader also bounds its
-//! uncommitted entries (the request queue) and the entries it reads from
-//! the log per duty, and refuses a proposal it cannot hold with a typed
-//! [`Backpressure`], never by growing anything. The core holds no entry
+//! heartbeat's answer or a rejection settles it. Each send is recorded
+//! (first index, last index, bytes) in a fixed ring per follower, so an
+//! acknowledgement frees exactly the sends it covers, and a send it covers
+//! only in part stays counted whole. A rejection rewinds the follower's
+//! pipeline and starts a new epoch, carried by every append and echoed in
+//! its reply: a rejection of an earlier epoch (a duplicate, a delayed
+//! reply, an append of an earlier term) changes nothing, so no credit is
+//! refunded twice. The one exception to the byte window is an entry larger
+//! than the whole window, which [`Core::propose`] never admits but a log
+//! written under a larger limit may hold: it is sent alone, into an empty
+//! window, so replication cannot stall on it.
+//!
+//! A leader also bounds the entries clients may add while uncommitted
+//! (the request queue): a new leader's no-op and the entries it inherits
+//! are not refused, since refusing them would stall the very commits that
+//! drain the queue. Per duty it looks up at most [`Limits::reads`] entry
+//! sizes, counting every lookup, and sends at most [`Limits::read_bytes`]
+//! bytes of entries, which is what its driver reads from the log for
+//! that duty (W2's log read bound, in bytes). It refuses a proposal it cannot
+//! hold with a typed [`Backpressure`], never by growing anything. The core holds no entry
 //! buffer: messages carry positions and counts, and the driver reads the
 //! entries from C4's log. Snapshot install comes in a later part.
 
@@ -171,6 +187,9 @@ pub enum Message {
         entries: u64,
         /// The leader's commit index.
         commit: u64,
+        /// The leader's pipeline epoch for this follower, echoed in the
+        /// reply.
+        epoch: u64,
     },
     /// An append answer.
     AppendReply {
@@ -178,6 +197,8 @@ pub enum Message {
         term: u64,
         /// Whether it matched.
         outcome: AppendOutcome,
+        /// The epoch of the append it answers.
+        epoch: u64,
     },
 }
 
@@ -227,11 +248,16 @@ pub struct Limits {
     pub in_flight_entries: u64,
     /// Bytes of those entries.
     pub in_flight_bytes: u64,
-    /// Entries written by the leader and not committed.
+    /// Entries clients may have written and not committed: a proposal
+    /// past it is refused. A new leader's no-op is not.
     pub queue: u64,
-    /// Entries read from the log per duty ([`Core::replicate`], or one
-    /// reply's refill).
+    /// Entry sizes read from the log per duty ([`Core::replicate`], or
+    /// one reply's resend or refill), every read counted.
     pub reads: u64,
+    /// Bytes of entries sent per duty, across all followers: what the
+    /// driver reads from the log for it (W2's `log_read_bytes`). A
+    /// proposal larger than it is refused, since it could never be read.
+    pub read_bytes: u64,
 }
 
 /// Which limit refused a proposal.
@@ -242,6 +268,9 @@ pub enum Backpressure {
     InFlightBytes,
     /// The leader holds its limit of uncommitted entries.
     Queue,
+    /// The entry is larger than a duty's log read, so it could never be
+    /// read to be sent.
+    LogRead,
 }
 
 /// Why a proposal is refused.
@@ -345,6 +374,7 @@ impl Config {
                 in_flight_bytes: u64::MAX,
                 queue: u64::MAX,
                 reads: u64::MAX,
+                read_bytes: u64::MAX,
             },
         })
     }
@@ -360,6 +390,7 @@ impl Config {
             || limits.in_flight_bytes == 0
             || limits.queue == 0
             || limits.reads == 0
+            || limits.read_bytes == 0
         {
             return Err(ConfigError::Limits);
         }
@@ -396,15 +427,99 @@ struct Peer {
     next: u64,
     /// The highest index known durable on it.
     matched: u64,
-    /// The entries sent and not acknowledged: the last `flight` before
-    /// `next`.
+    /// The entries of `sends`, in flight.
     flight: u64,
     /// Their bytes.
     bytes: u64,
+    /// The sends not yet acknowledged, oldest first.
+    sends: Sends,
+    /// The current pipeline epoch.
+    epoch: u64,
     /// Whether it granted this round's pre-vote or vote.
     granted: bool,
     /// Whether it answered this leader since the last quorum check.
     recent: bool,
+}
+
+/// The most sends in flight to one follower: a window full of one-entry
+/// appends.
+pub const MAX_SENDS: usize = 64;
+
+/// One append sent: entries `first..=last` and their bytes.
+#[derive(Debug, Clone, Copy, Default)]
+struct Send {
+    first: u64,
+    last: u64,
+    bytes: u64,
+}
+
+/// A fixed ring of sends, oldest first.
+#[derive(Debug, Clone, Copy)]
+struct Sends {
+    ring: [Send; MAX_SENDS],
+    head: usize,
+    len: usize,
+}
+
+impl Default for Sends {
+    fn default() -> Self {
+        Self {
+            ring: [Send::default(); MAX_SENDS],
+            head: 0,
+            len: 0,
+        }
+    }
+}
+
+impl Sends {
+    const fn is_full(&self) -> bool {
+        self.len == MAX_SENDS
+    }
+
+    fn slot(&self, from_head: usize) -> usize {
+        (self.head + from_head) % MAX_SENDS
+    }
+
+    fn push(&mut self, send: Send) {
+        if self.is_full() {
+            return;
+        }
+        let at = self.slot(self.len);
+        if let Some(slot) = self.ring.get_mut(at) {
+            *slot = send;
+            self.len += 1;
+        }
+    }
+
+    fn front(&self) -> Option<Send> {
+        if self.len == 0 {
+            return None;
+        }
+        self.ring.get(self.head).copied()
+    }
+
+    fn pop_front(&mut self) {
+        if self.len > 0 {
+            self.head = (self.head + 1) % MAX_SENDS;
+            self.len -= 1;
+        }
+    }
+
+    fn back_mut(&mut self) -> Option<&mut Send> {
+        if self.len == 0 {
+            return None;
+        }
+        let at = self.slot(self.len - 1);
+        self.ring.get_mut(at)
+    }
+
+    fn pop_back(&mut self) {
+        self.len = self.len.saturating_sub(1);
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
 }
 
 /// The custom Raft core of one node.
@@ -422,6 +537,8 @@ pub struct Core {
     round: u64,
     /// Ticks since a leader's last quorum check.
     quorum_elapsed: u32,
+    /// The last pipeline epoch given to a follower.
+    epoch: u64,
 }
 
 impl Core {
@@ -444,10 +561,14 @@ impl Core {
             rng: config.seed ^ config.id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
             round: 0,
             quorum_elapsed: 0,
+            epoch: 0,
         };
         // A restarted node starts its rounds at a fresh random point, so
         // a reply to a round before the restart is not counted.
         core.round = core.draw();
+        // Epochs too, so a reply to an append before the restart is not
+        // taken for one of this run.
+        core.epoch = core.draw();
         core.reset_timer();
         core
     }
@@ -484,6 +605,21 @@ impl Core {
             .take(self.config.count)
             .find(|peer| peer.id == id)?;
         Some((peer.flight, peer.bytes))
+    }
+
+    /// A leader's pipeline epoch for voter `id`, which its appends carry
+    /// and their replies echo; `None` unless it leads and `id` is another
+    /// voter.
+    #[must_use]
+    pub fn pipeline_epoch(&self, id: u64) -> Option<u64> {
+        if self.role != Role::Leader || id == self.config.id {
+            return None;
+        }
+        self.peers
+            .iter()
+            .take(self.config.count)
+            .find(|peer| peer.id == id)
+            .map(|peer| peer.epoch)
     }
 
     /// The current election timeout, in ticks.
@@ -550,6 +686,9 @@ impl Core {
         if size > limits.in_flight_bytes {
             return Err(ProposeError::Backpressure(Backpressure::InFlightBytes));
         }
+        if size > limits.read_bytes {
+            return Err(ProposeError::Backpressure(Backpressure::LogRead));
+        }
         let last = log.last_index();
         if last.saturating_sub(self.commit) >= limits.queue {
             return Err(ProposeError::Backpressure(Backpressure::Queue));
@@ -576,9 +715,9 @@ impl Core {
         if self.role != Role::Leader {
             return;
         }
-        let mut budget = self.config.limits.reads;
+        let mut budget = Duty::of(self.config.limits);
         for at in 0..self.config.count {
-            self.send_append(at, &mut budget, log, out);
+            self.send_append(at, &mut budget, true, log, out);
         }
     }
 
@@ -640,8 +779,10 @@ impl Core {
                 prev_term,
                 entries,
                 commit,
+                epoch,
             } => {
                 let append = Append {
+                    epoch,
                     term,
                     prev_index,
                     prev_term,
@@ -650,9 +791,13 @@ impl Core {
                 };
                 self.on_append(from, append, terms, log, out)
             }
-            Message::AppendReply { term, outcome } => {
+            Message::AppendReply {
+                term,
+                outcome,
+                epoch,
+            } => {
                 self.observe(term, out);
-                self.on_append_reply(from, term, outcome, log, out);
+                self.on_append_reply(from, term, (outcome, epoch), log, out);
                 Ok(())
             }
         }
@@ -812,10 +957,13 @@ impl Core {
         self.quorum_elapsed = 0;
         let next = log.last_index().saturating_add(1);
         for peer in self.peers.iter_mut().take(self.config.count) {
+            self.epoch = self.epoch.wrapping_add(1);
             peer.next = next;
             peer.matched = 0;
             peer.flight = 0;
             peer.bytes = 0;
+            peer.sends.clear();
+            peer.epoch = self.epoch;
             peer.recent = false;
         }
         // A no-op of the new term, so earlier-term entries can commit.
@@ -850,6 +998,7 @@ impl Core {
                         probe: append.prev_index,
                         hint: log.last_index(),
                     },
+                    epoch: append.epoch,
                 },
             );
             return Ok(());
@@ -900,6 +1049,7 @@ impl Core {
             Message::AppendReply {
                 term: self.term_vote.term,
                 outcome,
+                epoch: append.epoch,
             },
         );
         Ok(())
@@ -909,7 +1059,7 @@ impl Core {
         &mut self,
         from: u64,
         term: u64,
-        outcome: AppendOutcome,
+        (outcome, epoch): (AppendOutcome, u64),
         log: &impl LogTerms,
         out: &mut impl Effects,
     ) {
@@ -923,118 +1073,140 @@ impl Core {
             return;
         };
         peer.recent = true;
-        let mut budget = self.config.limits.reads;
+        let mut budget = Duty::of(self.config.limits);
         match outcome {
             AppendOutcome::Accepted { index } => {
                 if index > peer.matched {
-                    let sent = peer.next.saturating_sub(1);
-                    let base = sent.saturating_sub(peer.flight);
-                    if index >= sent {
-                        peer.flight = 0;
-                        peer.bytes = 0;
-                    } else if index > base {
-                        let freed = sizes(log, base, index);
-                        peer.bytes = peer.bytes.saturating_sub(freed);
-                        peer.flight = sent - index;
+                    // Free the sends the acknowledgement covers whole; one
+                    // it covers in part stays counted.
+                    while let Some(send) = peer.sends.front() {
+                        if send.last > index {
+                            break;
+                        }
+                        peer.flight = peer.flight.saturating_sub(send.last - send.first + 1);
+                        peer.bytes = peer.bytes.saturating_sub(send.bytes);
+                        peer.sends.pop_front();
                     }
                     peer.matched = index;
                     peer.next = peer.next.max(index.saturating_add(1));
                     self.advance_commit(log, out);
                     // The window opened: refill it.
-                    if index < log.last_index() {
-                        self.send_more(at, &mut budget, log, out);
-                    }
+                    self.send_append(at, &mut budget, false, log, out);
                 }
             }
-            // A rejection of a prefix since acknowledged is stale: it must
-            // not rewind the pipeline.
-            AppendOutcome::Rejected { probe, .. } if probe <= peer.matched => {}
+            // A rejection of a prefix since acknowledged, or of an earlier
+            // pipeline, is stale: it must not rewind or refund anything.
+            AppendOutcome::Rejected { probe, .. }
+                if probe <= peer.matched || epoch != peer.epoch => {}
             AppendOutcome::Rejected { hint, .. } => {
                 let sent = peer.next.saturating_sub(1);
-                let base = sent.saturating_sub(peer.flight);
                 let retry = sent.min(hint.saturating_add(1));
                 peer.next = retry.max(peer.matched.saturating_add(1)).max(1);
-                // What is past the retry point is no longer in flight.
+                // What is past the retry point is no longer in flight; a
+                // send straddling it keeps its whole bytes.
                 let kept = peer.next.saturating_sub(1);
-                if kept <= base {
-                    peer.flight = 0;
-                    peer.bytes = 0;
-                } else {
-                    peer.flight = kept - base;
-                    peer.bytes = sizes(log, base, kept);
+                while let Some(send) = peer.sends.back_mut() {
+                    if send.first > kept {
+                        let (count, bytes) = (send.last - send.first + 1, send.bytes);
+                        peer.sends.pop_back();
+                        peer.flight = peer.flight.saturating_sub(count);
+                        peer.bytes = peer.bytes.saturating_sub(bytes);
+                    } else {
+                        if send.last > kept {
+                            peer.flight = peer.flight.saturating_sub(send.last - kept);
+                            send.last = kept;
+                        }
+                        break;
+                    }
                 }
-                self.send_append(at, &mut budget, log, out);
+                self.epoch = self.epoch.wrapping_add(1);
+                peer.epoch = self.epoch;
+                self.send_append(at, &mut budget, true, log, out);
             }
         }
     }
 
-    /// Sends `at` entries only when some fit, no heartbeat.
-    fn send_more(
-        &mut self,
-        at: usize,
-        budget: &mut u64,
-        log: &impl LogTerms,
-        out: &mut impl Effects,
-    ) {
-        if self.fit(at, *budget, log).1 > 0 {
-            self.send_append(at, budget, log, out);
-        }
-    }
-
-    /// The previous index and the count of entries `at` can be sent now.
-    fn fit(&self, at: usize, budget: u64, log: &impl LogTerms) -> (u64, u64, u64) {
+    /// The previous index, and the entries, bytes and reads of what `at`
+    /// can be sent now, within what is left of the duty's `budget`.
+    fn fit(&self, at: usize, budget: Duty, log: &impl LogTerms) -> (u64, u64, u64, u64) {
         let Some(peer) = self.peers.get(at) else {
-            return (0, 0, 0);
+            return (0, 0, 0, 0);
         };
         let limits = self.config.limits;
         let last = log.last_index();
         let prev_index = peer.next.saturating_sub(1).min(last);
+        if peer.sends.is_full() {
+            return (prev_index, 0, 0, 0);
+        }
         let most = last
             .saturating_sub(prev_index)
             .min(self.config.batch)
-            .min(limits.in_flight_entries.saturating_sub(peer.flight))
-            .min(budget);
+            .min(limits.in_flight_entries.saturating_sub(peer.flight));
         let mut entries = 0;
-        let mut bytes = peer.bytes;
-        while entries < most {
+        let mut bytes = 0_u64;
+        let mut reads = 0;
+        while entries < most && reads < budget.reads {
+            reads += 1;
             let Some(size) = log.size(prev_index.saturating_add(entries).saturating_add(1)) else {
                 break;
             };
-            let Some(total) = bytes.checked_add(size) else {
+            let total = peer.bytes.saturating_add(bytes).saturating_add(size);
+            // An entry larger than the whole window goes alone into an
+            // empty one (see the module notes).
+            let alone = entries == 0 && peer.flight == 0;
+            if total > limits.in_flight_bytes && !alone {
                 break;
-            };
+            }
+            // The duty's log read bound has no exception.
+            if bytes.saturating_add(size) > budget.bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            entries += 1;
             if total > limits.in_flight_bytes {
                 break;
             }
-            bytes = total;
-            entries += 1;
         }
-        (prev_index, entries, bytes)
+        (prev_index, entries, bytes, reads)
     }
 
+    /// Sends `at` what fits, or a heartbeat when nothing does and
+    /// `heartbeat` is set.
     fn send_append(
         &mut self,
         at: usize,
-        budget: &mut u64,
+        budget: &mut Duty,
+        heartbeat: bool,
         log: &impl LogTerms,
         out: &mut impl Effects,
     ) {
         let id = self.config.id;
+        if self.peers.get(at).is_none_or(|peer| peer.id == id) {
+            return;
+        }
         let commit = self.commit;
         let term = self.term_vote.term;
-        let (prev_index, entries, bytes) = self.fit(at, *budget, log);
-        let Some(peer) = self.peers.get_mut(at) else {
-            return;
-        };
-        if peer.id == id {
+        let (prev_index, entries, bytes, reads) = self.fit(at, *budget, log);
+        budget.reads = budget.reads.saturating_sub(reads);
+        budget.bytes = budget.bytes.saturating_sub(bytes);
+        if entries == 0 && !heartbeat {
             return;
         }
         let Some(prev_term) = log.term(prev_index) else {
             return;
         };
-        *budget = budget.saturating_sub(entries);
-        peer.flight = peer.flight.saturating_add(entries);
-        peer.bytes = bytes;
+        let Some(peer) = self.peers.get_mut(at) else {
+            return;
+        };
+        if entries > 0 {
+            peer.sends.push(Send {
+                first: prev_index.saturating_add(1),
+                last: prev_index.saturating_add(entries),
+                bytes,
+            });
+            peer.flight = peer.flight.saturating_add(entries);
+            peer.bytes = peer.bytes.saturating_add(bytes);
+        }
         peer.next = prev_index.saturating_add(entries).saturating_add(1);
         out.send(
             peer.id,
@@ -1044,6 +1216,7 @@ impl Core {
                 prev_term,
                 entries,
                 commit,
+                epoch: peer.epoch,
             },
         );
     }
@@ -1114,21 +1287,33 @@ impl Core {
     }
 }
 
+/// What is left of a duty's reads.
+#[derive(Debug, Clone, Copy)]
+struct Duty {
+    /// Entry size lookups.
+    reads: u64,
+    /// Bytes of entries sent, read by the driver.
+    bytes: u64,
+}
+
+impl Duty {
+    const fn of(limits: Limits) -> Self {
+        Self {
+            reads: limits.reads,
+            bytes: limits.read_bytes,
+        }
+    }
+}
+
 /// An append's header.
 #[derive(Debug, Clone, Copy)]
 struct Append {
+    epoch: u64,
     term: u64,
     prev_index: u64,
     prev_term: u64,
     entries: u64,
     commit: u64,
-}
-
-/// The bytes of the entries in `after + 1..=upto`.
-fn sizes(log: &impl LogTerms, after: u64, upto: u64) -> u64 {
-    (after.saturating_add(1)..=upto)
-        .map(|index| log.size(index).unwrap_or(0))
-        .fold(0, u64::saturating_add)
 }
 
 fn last(log: &impl LogTerms) -> (u64, u64) {
