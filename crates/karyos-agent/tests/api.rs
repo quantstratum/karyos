@@ -834,3 +834,20 @@ fn a_submit_without_a_token_reaches_the_agent() {
         "{\"error\":\"bad arguments\",\"request\":\"submit\"}\n"
     );
 }
+
+/// Relay id 0 is the local socket's: a library configuration that names it
+/// is refused at bind, as the CLI refuses it, so a relayed request is never
+/// served the local answer (karyos#726).
+#[test]
+fn a_relay_id_of_zero_is_refused_at_bind() {
+    let _serial = serial();
+    let dir = dir("zero-relay");
+    let api = dir.join("api");
+    let zero = ApiConfig::new(api.clone(), vec![(own(), Role::Viewer)])
+        .with_relays(vec![(own(), 0)], Vec::new());
+    assert!(matches!(Server::bind(zero), Err(ServeError::ZeroRelay)));
+    assert!(!api.exists(), "nothing is created");
+    let one = ApiConfig::new(api, vec![(own(), Role::Viewer)])
+        .with_relays(vec![(own(), 1)], Vec::new());
+    Server::bind(one).unwrap();
+}

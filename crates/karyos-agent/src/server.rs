@@ -462,6 +462,7 @@ impl ApiConfig {
     }
 
     /// The same, also serving `relays` for `principals` (karyos#708).
+    /// Each relay id must be 1 or more: [`Server::bind`] refuses 0.
     #[must_use]
     pub fn with_relays(mut self, relays: Vec<(u32, u64)>, principals: Vec<Principal>) -> Self {
         self.relays = relays;
@@ -564,6 +565,10 @@ pub enum ServeError {
     /// Another agent is serving in this directory.
     #[error("a live agent holds {}", .0.display())]
     Live(PathBuf),
+    /// A relay configured with id 0, which the journal reserves for the
+    /// local socket: its requests would read as local ones (karyos#726).
+    #[error("a relay id must be 1 or more: 0 is the local socket's")]
+    ZeroRelay,
     /// The operating system's error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -614,6 +619,13 @@ impl Server {
     /// socket, or a call that fails.
     pub fn bind(config: ApiConfig) -> Result<Self, ServeError> {
         use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+        // Relay id 0 is the local socket's in the journal and in the
+        // answers: a relay under it would be served as the local peer
+        // (karyos#726), so it is refused before anything changes, as the
+        // CLI refuses it.
+        if config.relays.iter().any(|(_, relay)| *relay == 0) {
+            return Err(ServeError::ZeroRelay);
+        }
         // Without a relay group, owner only; with one, the group may
         // reach the socket and nothing else.
         let (dir_mode, socket_mode) = match config.relay_group {
