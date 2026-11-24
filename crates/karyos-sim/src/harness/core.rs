@@ -316,6 +316,14 @@ impl<'a> LogView<'a> {
             .entries_into(range.start..end, u64::MAX, out, window)?)
     }
 
+    /// The frame bytes of entry `index` as the log lays it out, if it
+    /// holds it: what reading it costs, read from the log's index without
+    /// reading the entry (karyos#681).
+    #[must_use]
+    pub fn frame_span(&self, index: u64) -> Option<u64> {
+        self.log.frame_span(index)
+    }
+
     /// It, with `base` as the node's latest snapshot.
     #[must_use]
     pub fn with_base(mut self, base: Option<SnapshotBase>) -> Self {
