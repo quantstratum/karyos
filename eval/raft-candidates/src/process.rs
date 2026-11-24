@@ -264,7 +264,12 @@ pub fn run_node<C: Wire>(config: &NodeConfig) -> Result<Report, ProcessError> {
             &mut log,
             &mut |to, message, _| outbox.push((to, message)),
             &mut |entry: &Entry, _| {
-                if let Some(number) = number_of(&entry.payload) {
+                // The application, the command read from the entry, is the
+                // declared path's apply stage once a probed core is past
+                // its warm-up (version 1's allocation gate counts
+                // "application"); what follows is the run's report on
+                // itself, kept outside the count.
+                if let Some(number) = probe::application(|| number_of(&entry.payload)) {
                     report.sequence.push((entry.index, number));
                     report.digest = mix(mix(report.digest, entry.index), number);
                     if seen.insert(number) {

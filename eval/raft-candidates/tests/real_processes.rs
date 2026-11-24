@@ -16,7 +16,10 @@
 //! karyos/evaluations/c5-raft-comparison-v2-run-record.md): the variant,
 //! the processes, the commit, the tick, the encoding, the host, and the
 //! counts in total and per stage, summed over the nodes, with `entries`
-//! the entries the leaders committed past the warm-up. The test asserts
+//! the most any node committed past the warm-up while it led: each leader
+//! reports its own highest commit index, so the maximum, as the
+//! simulator's probe takes it across leaders, counts every entry once
+//! (Codex review of #1256). The test asserts
 //! that the run applies every command and that the probe measured
 //! entries; the counts are the gate's evidence, not asserted here (the
 //! gate is the report's to score). These are functional runs on one host
@@ -172,6 +175,27 @@ fn variant(core: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// `text` as the inside of a JSON string: quotes, backslashes and control
+/// characters escaped, so a run's line is always one parseable line
+/// (Codex review of #1256).
+fn json_escaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if control.is_control() => {
+                out.push_str(&format!("\\u{:04x}", u32::from(control)));
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// The output of `program args`, trimmed; `unknown` when it cannot run.
 fn output_of(program: &str, args: &[&str]) -> String {
     Command::new(program)
@@ -187,7 +211,7 @@ fn output_of(program: &str, args: &[&str]) -> String {
 /// nodes; the probe measured entries past the warm-up on the leaders.
 fn record(core: &str, nodes: u32, probes: &[Probe]) {
     use std::io::Write as _;
-    let entries: u64 = probes.iter().map(|probe| probe.entries).sum();
+    let entries: u64 = probes.iter().map(|probe| probe.entries).max().unwrap_or(0);
     assert!(entries > 0, "the probe measured no entry: {probes:?}");
     let allocations: u64 = probes.iter().map(|probe| probe.allocations).sum();
     let frees: u64 = probes.iter().map(|probe| probe.frees).sum();
@@ -207,9 +231,11 @@ fn record(core: &str, nodes: u32, probes: &[Probe]) {
         })
         .collect();
     let (variant, encoding) = variant(core);
-    let commit =
-        std::env::var("KARYOS_COMMIT").unwrap_or_else(|_| output_of("git", &["rev-parse", "HEAD"]));
-    let host = output_of("uname", &["-n"]);
+    let commit = json_escaped(
+        &std::env::var("KARYOS_COMMIT")
+            .unwrap_or_else(|_| output_of("git", &["rev-parse", "HEAD"])),
+    );
+    let host = json_escaped(&output_of("uname", &["-n"]));
     let _ = writeln!(
         std::io::stdout(),
         "{{\"evidence\":\"C5 v2 processes\",\"variant\":\"{variant}\",\
@@ -323,6 +349,14 @@ fn run_once(core: &str, nodes: u32) -> Result<Vec<Probe>, String> {
     }
     assert_eq!(firsts, (1..=COMMANDS).collect::<Vec<_>>(), "{sequence:?}");
     Ok(probes)
+}
+
+/// The run record's strings are escaped: a quote, a backslash and a
+/// control character cannot break its line (Codex review of #1256).
+#[test]
+fn the_run_record_escapes_its_strings() {
+    assert_eq!(json_escaped("plain-host"), "plain-host");
+    assert_eq!(json_escaped("a\"b\\c\nd\u{1}"), "a\\\"b\\\\c\\nd\\u0001");
 }
 
 /// A malformed argument is a usage error, exit 2, never a panic: a count

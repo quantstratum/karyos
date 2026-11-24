@@ -31,10 +31,11 @@
 //!   karyos/evaluations/c5-raft-comparison-v2.md, "Processes";
 //!   c5-raft-comparison-v1.md, Hard gates: "adapters and encoding
 //!   included"): [`measure_with`] opens the same window around any run,
-//!   such as one node's loop, and [`encoding`] counts a message's encoding
-//!   and decoding, which a process does between the core's calls, as the
-//!   [`Stage::Encoding`] of the declared path once the measured core is
-//!   past its warm-up.
+//!   such as one node's loop; [`encoding`] counts a message's encoding
+//!   and decoding, and [`application`] the application of a committed
+//!   entry, which a process does between the core's calls, as the
+//!   [`Stage::Encoding`] and [`Stage::Apply`] of the declared path once
+//!   the measured core is past its warm-up.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -79,6 +80,9 @@ pub enum Stage {
     /// A message encoded for the wire or decoded from it, between the
     /// core's calls, on a real process ([`encoding`]).
     Encoding,
+    /// A committed entry applied, between the core's calls, on a real
+    /// process ([`application`]).
+    Apply,
     /// The read-only queries and every other call.
     Other,
     /// Counted in the window but not inside a call of the core: a thread
@@ -89,7 +93,7 @@ pub enum Stage {
 
 impl Stage {
     /// Every stage, in order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Propose,
         Self::StepLeader,
         Self::StepFollower,
@@ -99,6 +103,7 @@ impl Stage {
         Self::AdvanceLeader,
         Self::AdvanceFollower,
         Self::Encoding,
+        Self::Apply,
         Self::Other,
         Self::Unattributed,
     ];
@@ -126,6 +131,7 @@ impl Stage {
             Self::AdvanceLeader => "advance_leader",
             Self::AdvanceFollower => "advance_follower",
             Self::Encoding => "encoding",
+            Self::Apply => "apply",
             Self::Other => "other",
             Self::Unattributed => "unattributed",
         }
@@ -133,9 +139,9 @@ impl Stage {
 }
 
 /// Allocations per stage in the measurement, by [`Stage::slot`].
-static STAGE_ALLOCATIONS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static STAGE_ALLOCATIONS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 /// Frees per stage in the measurement, by [`Stage::slot`].
-static STAGE_FREES: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+static STAGE_FREES: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 /// Whether a core of the measurement is past its warm-up, so that
 /// [`encoding`] counts.
@@ -146,12 +152,26 @@ static PAST: AtomicBool = AtomicBool::new(false);
 /// past its warm-up. A real process runs one core, so its warm-up is the
 /// node's; outside a measurement nothing counts.
 pub fn encoding<R>(call: impl FnOnce() -> R) -> R {
+    between(Stage::Encoding, call)
+}
+
+/// Runs `call`, the application of a committed entry between the core's
+/// calls, counted as [`Stage::Apply`] under the same rule as [`encoding`].
+/// What a run keeps only to report on itself is the caller's to keep
+/// outside `call`.
+pub fn application<R>(call: impl FnOnce() -> R) -> R {
+    between(Stage::Apply, call)
+}
+
+/// Runs `call` between the core's calls, counted as `stage` once a core of
+/// the open measurement is past its warm-up.
+fn between<R>(stage: Stage, call: impl FnOnce() -> R) -> R {
     if !PAST.load(Ordering::Relaxed) {
         return call();
     }
     let _enrolled = enroll();
     let ((result, allocations), operations) = count(|| count_allocations(call));
-    note_stage(Stage::Encoding, operations, allocations);
+    note_stage(stage, operations, allocations);
     result
 }
 
