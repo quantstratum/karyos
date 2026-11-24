@@ -46,6 +46,14 @@ pub enum AuthUnsupported {
     /// A sealer for a publication that was never made authenticated.
     #[error("the publication is not authenticated")]
     NotAuthenticated,
+    /// The publication has already staged or sent bare datagrams: it
+    /// must be authenticated from its creation, before any traffic.
+    #[error("the publication already sent bare datagrams")]
+    Started,
+    /// A second sealer for the establishment already keyed: it would
+    /// restart the envelope sequence under the same key.
+    #[error("the establishment is already keyed")]
+    SameEstablishment,
 }
 
 impl SenderAuth {
@@ -103,22 +111,44 @@ impl<T: StreamTerms> Outbound<T> {
         if self.routed.is_some() || self.fanout.is_some() || self.registration.is_some() {
             return Err(AuthUnsupported::NotUnicast);
         }
-        if matches!(self.auth, SenderAuth::Off) {
-            self.auth = SenderAuth::Pending;
+        if !matches!(self.auth, SenderAuth::Off) {
+            return Ok(());
         }
+        // Nothing bare may be queued or sent before: a staged datagram
+        // would still leave unsealed (ADR-0086 section 2).
+        let staged = self.tracks.iter().any(|track| !track.staged.is_empty())
+            || (0..self.readers.len()).any(|lane| self.sender.pending(lane).unwrap_or(0) > 0);
+        if self.counters.staged > 0 || staged {
+            return Err(AuthUnsupported::Started);
+        }
+        if let Some(repair) = self.repair.as_deref_mut() {
+            repair.reserve_envelope(ENVELOPE_LEN);
+        }
+        self.auth = SenderAuth::Pending;
         Ok(())
     }
 
-    /// Installs the session's sealer, made at establishment, replacing any
-    /// earlier one (a re-establishment derives a new key).
+    /// Installs the session's sealer, made at establishment. A
+    /// re-establishment (a new receiver boot id or nonce) derives a new
+    /// key and replaces it; the same establishment keeps the installed one
+    /// and its envelope sequence.
     ///
     /// # Errors
     ///
     /// [`AuthUnsupported::NotAuthenticated`] unless
-    /// [`Outbound::require_auth`] was called first.
+    /// [`Outbound::require_auth`] was called first, and
+    /// [`AuthUnsupported::SameEstablishment`] for a sealer of the
+    /// establishment already installed, or of another domain.
     pub fn install_sealer(&mut self, sealer: Sealer) -> Result<(), AuthUnsupported> {
-        if matches!(self.auth, SenderAuth::Off) {
-            return Err(AuthUnsupported::NotAuthenticated);
+        match &self.auth {
+            SenderAuth::Off => return Err(AuthUnsupported::NotAuthenticated),
+            SenderAuth::Sealing(current) if current.party() == sealer.party() => {
+                return Err(AuthUnsupported::SameEstablishment);
+            }
+            SenderAuth::Pending | SenderAuth::Sealing(_) => {}
+        }
+        if sealer.domain() != karyos_protocol::protection::hmac_sha256::Domain::Data {
+            return Err(AuthUnsupported::SameEstablishment);
         }
         self.auth = SenderAuth::Sealing(Box::new(sealer));
         Ok(())

@@ -873,12 +873,16 @@ impl<T: StreamTerms> Outbound<T> {
         if self.fanout.is_some() {
             return self.enable_fanout_repair(config, term_length, identity);
         }
-        self.repair = Some(Box::new(RepairPath::new(
+        let mut repair = RepairPath::new(
             config,
             self.drr,
             self.mtu,
             (term_length, self.alias, identity),
-        )?));
+        )?;
+        if self.authenticated() {
+            repair.reserve_envelope(crate::wire_auth::ENVELOPE_LEN);
+        }
+        self.repair = Some(Box::new(repair));
         Ok(())
     }
 
@@ -2409,9 +2413,10 @@ pub(crate) mod testing {
         destination: SocketAddr,
         term: TermParams,
         wire: u32,
+        reliable: bool,
     ) -> (Box<Outbound>, TestLog) {
         WIRE_MTU.with(|cell| cell.set(Some(wire)));
-        outbound(endpoint, alias, destination, term, 1, false)
+        outbound(endpoint, alias, destination, term, 1, reliable)
     }
 
     /// A publication of `lanes` lanes with `term`, read for `alias` on

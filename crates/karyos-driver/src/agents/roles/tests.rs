@@ -7317,11 +7317,27 @@ fn a_sealed_control_opens_under_its_key_and_an_unsealable_one_is_not_sent() {
     routes
         .send_sealed(&mut tx, to, &control, &mut proof)
         .unwrap();
-    // Domain 4, under the receiver's session key.
+    // Domain 4, under the receiver's session key: a NAK, never an
+    // RSP_SETUP, which is domain 6's.
     let mut sealer = Sealer::new(&pair, party, alias()).unwrap();
-    routes
-        .send_sealed(&mut tx, to, &control, &mut sealer)
-        .unwrap();
+    assert_eq!(
+        routes.send_sealed(&mut tx, to, &control, &mut sealer),
+        Err(ControlSendError::Encode)
+    );
+    let nak = Control::Nak(karyos_protocol::network::Nak {
+        alias: alias(),
+        identity: identity(),
+        receiver: karyos_protocol::network::Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 66,
+        },
+        range: karyos_protocol::network::NakRange {
+            lane: karyos_protocol::frame::Lane::ZERO,
+            length: 32,
+            start: 0,
+        },
+    });
+    routes.send_sealed(&mut tx, to, &nak, &mut sealer).unwrap();
     // A verify-only proof cannot seal: nothing goes.
     let mut verify_only = Proof::new(kind, alias(), None, [&pair], 1).unwrap();
     assert_eq!(
@@ -7336,7 +7352,7 @@ fn a_sealed_control_opens_under_its_key_and_an_unsealable_one_is_not_sent() {
     let mut verifier = Verifier::new([&pair], party, alias()).unwrap();
     let opened = verifier.open(&seen[1], 0).unwrap();
     let inner = &seen[1][opened.start..][..opened.frames];
-    assert_eq!(classify(inner), Ok(Datagram::Control(control)));
+    assert_eq!(classify(inner), Ok(Datagram::Control(nak)));
     // Neither is a bare control on the wire.
     for bytes in seen.iter() {
         assert!(!matches!(classify(bytes), Ok(Datagram::Control(_))));

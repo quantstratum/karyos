@@ -35,6 +35,8 @@ use karyos_io::sockets::endpoint::SocketsTx;
 use karyos_io::sockets::ops::SocketOps;
 use karyos_protocol::network::{Control, MAX_CONTROL_LENGTH};
 
+use karyos_protocol::protection::hmac_sha256::Domain;
+
 use crate::wire_auth::{ENVELOPE_LEN, Proof, Sealer};
 
 use super::EndpointId;
@@ -385,19 +387,48 @@ fn wait_key(
 /// sealed by the session's [`Sealer`] (domains 4 and 1), a SETUP or an
 /// RSP_SETUP by the channel's or pair's [`Proof`] (domains 5 and 6).
 pub trait ControlSeal {
+    /// The domain it seals in.
+    fn domain(&self) -> Domain;
     /// Seals the control.
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize>;
 }
 
 impl ControlSeal for Sealer {
+    fn domain(&self) -> Domain {
+        Sealer::domain(self)
+    }
+
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         self.seal(buffer, frames).ok()
     }
 }
 
 impl ControlSeal for Proof {
+    fn domain(&self) -> Domain {
+        Proof::domain(self)
+    }
+
     fn seal_control(&mut self, buffer: &mut [u8], frames: usize) -> Option<usize> {
         self.seal(buffer, frames).ok()
+    }
+}
+
+/// Whether `control` belongs in `domain` (ADR-0086 section 7a): SETUP in
+/// 5, RSP_SETUP in 6, the receiver's SM, NAK and RTTM in 4, the sender's
+/// PATH_HB, ERR and RTTM in 1. ERR UNBOUND is prebinding and stays bare.
+fn sealable_in(control: &Control, domain: Domain) -> bool {
+    match control {
+        Control::SetupAnnounce(_) | Control::SetupAnswer(_) => domain == Domain::SetupProof,
+        Control::Challenge(_) | Control::Solicit(_) | Control::Register(_) => {
+            domain == Domain::RspSetup
+        }
+        Control::Status(_) | Control::Nak(_) => domain == Domain::ReceiverToPublisher,
+        Control::NakReply(_) | Control::Registration(_) | Control::PathHeartbeat(_) => {
+            domain == Domain::Data
+        }
+        Control::Rttm(_) => matches!(domain, Domain::Data | Domain::ReceiverToPublisher),
+        // ERR UNBOUND, and any kind this profile does not name.
+        _ => false,
     }
 }
 
@@ -979,6 +1010,9 @@ impl ControlRoutes {
             .encode(plain)
             .map_err(|_| ControlSendError::Encode)?;
         if let Some(seal) = seal {
+            if !sealable_in(control, seal.domain()) {
+                return Err(ControlSendError::Encode);
+            }
             length = seal
                 .seal_control(&mut bytes, length)
                 .ok_or(ControlSendError::Encode)?;

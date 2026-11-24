@@ -1427,7 +1427,7 @@ fn recorded_path() -> (
     };
     let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
     let (path, mut log) =
-        super::testing::outbound_wire(EndpointId(1), AUTH_ALIAS, destination, term, 1408);
+        super::testing::outbound_wire(EndpointId(1), AUTH_ALIAS, destination, term, 1408, false);
     let publication = &mut log.publications[0];
     let _ = publication
         .append(&[1u8; 3000], AppendOptions::default())
@@ -1589,5 +1589,112 @@ fn only_a_unicast_publication_is_authenticated() {
     assert_eq!(
         fanned.require_auth(),
         Err(super::AuthUnsupported::NotUnicast)
+    );
+}
+
+/// Authentication is set before any traffic: a publication that already
+/// staged or sent bare datagrams refuses it, so nothing bare can still
+/// leave from its queue. A second sealer of the same establishment is
+/// refused, keeping the sequence; a re-establishment's replaces it.
+#[test]
+fn authentication_starts_before_traffic_and_each_establishment_keys_once() {
+    use crate::wire_auth::{Party, Sealer, Verifier};
+    let (mut tx, seen, mut path, _log) = recorded_path();
+    let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    assert!(!seen.lock().unwrap().is_empty());
+    assert_eq!(path.require_auth(), Err(super::AuthUnsupported::Started));
+    assert!(!path.authenticated());
+
+    let (mut tx, seen, mut path, _log) = recorded_path();
+    let (file, party) = sender_key();
+    path.require_auth().unwrap();
+    path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap())
+        .unwrap();
+    let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    assert_eq!(
+        path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap()),
+        Err(super::AuthUnsupported::SameEstablishment)
+    );
+    // A receiver-side sealer is never a publication's.
+    let pair = crate::wire_keys::parse(
+        "9-1.key",
+        b"format=karyos-wire-key-v1\nkey_id=9\nfile_epoch=1\npurpose=pairwise\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=2222222222222222222222222222222222222222222222222222222222222222\nreceiver_id=66\npublisher_id=5\n",
+    )
+    .unwrap();
+    let receiver = Party::Receiver {
+        identity: karyos_protocol::network::Identity {
+            driver_id: [1, 2],
+            registration_id: 1,
+            incarnation: 1,
+        },
+        receiver_boot_id: [3, 4],
+        receiver_id: 66,
+    };
+    assert!(
+        path.install_sealer(Sealer::new(&pair, receiver, AUTH_ALIAS).unwrap())
+            .is_err()
+    );
+    // The sequence went on under the one key: every datagram opens in
+    // order.
+    let mut verifier = Verifier::new([&file], party, AUTH_ALIAS).unwrap();
+    for _ in 0..4 {
+        let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    }
+    let sent = seen.lock().unwrap().clone();
+    assert!(sent.len() >= 3);
+    for bytes in &sent {
+        verifier.open(bytes, 0).unwrap();
+    }
+    // A re-establishment (a new receiver boot id) keys anew.
+    let Party::Sender {
+        identity,
+        lane_count,
+        nonce,
+        ..
+    } = party
+    else {
+        unreachable!()
+    };
+    let again = Party::Sender {
+        identity,
+        lane_count,
+        receiver_boot_id: [9, 9],
+        nonce,
+    };
+    path.install_sealer(Sealer::new(&file, again, AUTH_ALIAS).unwrap())
+        .unwrap();
+}
+
+/// An authenticated EOS is the trusted EOS sealed.
+#[test]
+fn an_authenticated_eos_is_the_bare_one_sealed() {
+    use crate::wire_auth::{Sealer, Verifier};
+    let (mut bare_tx, bare_seen, mut bare, _bare_log) = recorded_path();
+    let (mut tx, seen, mut path, _log) = recorded_path();
+    let (file, party) = sender_key();
+    path.require_auth().unwrap();
+    path.install_sealer(Sealer::new(&file, party, AUTH_ALIAS).unwrap())
+        .unwrap();
+    // Open the queues, then send an EOS at the same position on both.
+    let _ = bare.serve(&mut bare_tx, AUTH_BUDGET, None, 0).unwrap();
+    let _ = path.serve(&mut tx, AUTH_BUDGET, None, 0).unwrap();
+    let bare_before = bare_seen.lock().unwrap().len();
+    let before = seen.lock().unwrap().len();
+    assert!(bare.write_heartbeat(&mut bare_tx, 0, 4096, true));
+    assert!(path.write_heartbeat(&mut tx, 0, 4096, true));
+    let bare_eos = bare_seen.lock().unwrap()[bare_before..]
+        .last()
+        .unwrap()
+        .clone();
+    let seen = seen.lock().unwrap();
+    let mut verifier = Verifier::new([&file], party, AUTH_ALIAS).unwrap();
+    for bytes in &seen[..before] {
+        let _ = verifier.open(bytes, 0);
+    }
+    let sealed = seen[before..].last().unwrap();
+    let opened = verifier.open(sealed, 0).unwrap();
+    assert_eq!(
+        &sealed[opened.start..][..opened.frames],
+        bare_eos.as_slice()
     );
 }

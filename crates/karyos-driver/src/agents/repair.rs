@@ -248,6 +248,8 @@ impl RepairCounts {
 #[derive(Debug)]
 struct Scratch {
     bytes: Vec<u8>,
+    /// Its length already leaves room for an envelope.
+    reserved: bool,
     /// Lane, position and length of the staged head.
     staged: Option<(u8, u64, usize)>,
 }
@@ -322,6 +324,7 @@ impl RepairPath {
             scheduler: Scheduler::new(drr),
             scratch: RefCell::new(Scratch {
                 bytes: vec![0; mtu],
+                reserved: false,
                 staged: None,
             }),
             queues: [None; MAX_ROUTES],
@@ -574,6 +577,20 @@ impl RepairPath {
         now: u64,
     ) -> Report {
         self.serve_routes(&mut [Some(tx)], readers, limits, budget, now, None)
+    }
+
+    /// Leaves room for an envelope of `envelope` bytes in every repair
+    /// datagram: reads stop that much short of the MTU, so a sealed repair
+    /// stays within it (ADR-0086 section 5). Allocates nothing; once is
+    /// enough.
+    pub(crate) fn reserve_envelope(&mut self, envelope: usize) {
+        if let Ok(mut scratch) = self.scratch.try_borrow_mut()
+            && !scratch.reserved
+        {
+            let inner = scratch.bytes.len().saturating_sub(envelope);
+            scratch.bytes.truncate(inner);
+            scratch.reserved = true;
+        }
     }
 
     /// [`RepairPath::serve`] over the live routes of a routed publication

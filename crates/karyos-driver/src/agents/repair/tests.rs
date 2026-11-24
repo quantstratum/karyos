@@ -903,3 +903,95 @@ fn an_unserved_guarded_publication_applies_a_close() {
     assert_eq!((applied.epoch, applied.in_flight), (3, 0));
     rig.finish();
 }
+
+/// An authenticated publication's repairs are sealed, each copy under a
+/// fresh envelope sequence, and read short enough that the sealed datagram
+/// stays within the MTU: two small frames that would fill it bare go as
+/// one inner read of at most the MTU less the envelope.
+#[test]
+fn an_authenticated_repair_is_sealed_within_the_mtu() {
+    use crate::wire_auth::{ENVELOPE_LEN, Party, Sealer, Verifier};
+    let socket = ScriptedSocket::new();
+    let observer = socket.observer();
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&sent);
+    observer.set_send_hook(Box::new(move |_, datagrams| {
+        for datagram in datagrams {
+            record.lock().unwrap().push(datagram.to_vec());
+        }
+    }));
+    for _ in 0..64 {
+        observer.push_send(SendResult::Sent {
+            sent: 1,
+            error: None,
+        });
+    }
+    let local = SocketsConfig::new(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let endpoint = SocketsEndpoint::open(&local, InstanceId::FIRST, socket).unwrap();
+    let (mut tx, _rx) = endpoint.split().unwrap();
+    let term = TermParams {
+        term_length: 65_536,
+        initial_term_id: 9,
+        mtu: 1360,
+    };
+    let destination = SocketAddr::from(([127, 0, 0, 1], 41_000));
+    let (mut path, mut log) = super::super::data::testing::outbound_wire(
+        EndpointId(1),
+        alias(),
+        destination,
+        term,
+        1408,
+        true,
+    );
+    path.enable_repair(&RepairConfig::default(), term.term_length, identity())
+        .unwrap();
+    let text = "format=karyos-wire-key-v1\nkey_id=3\nfile_epoch=1\npurpose=channel\nprofile_id=1\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-01-30T00:00:00Z\nsecret=1111111111111111111111111111111111111111111111111111111111111111\nchannel_id=7\nstream_id=6\n";
+    let file = crate::wire_keys::parse("3-1.key", text.as_bytes()).unwrap();
+    let party = Party::Sender {
+        identity: identity(),
+        lane_count: 1,
+        receiver_boot_id: [3, 4],
+        nonce: [5, 6],
+    };
+    path.require_auth().unwrap();
+    path.install_sealer(Sealer::new(&file, party, alias()).unwrap())
+        .unwrap();
+    // Frames of 672 aligned bytes: two fill 1344 of a bare 1408 read.
+    for i in 0..4_u8 {
+        let _ = log.publications[0]
+            .append(&[i; 640], AppendOptions::default())
+            .unwrap();
+    }
+    let _ = path.serve(&mut tx, BUDGET, None, 0).unwrap();
+    let first = sent.lock().unwrap().len();
+    assert!(first > 0);
+    let nak = Nak {
+        alias: alias(),
+        identity: identity(),
+        receiver: Receiver {
+            receiver_boot_id: [7, 8],
+            receiver_id: 1,
+        },
+        range: NakRange {
+            lane: Lane::ZERO,
+            length: 4 * 672,
+            start: 0,
+        },
+    };
+    assert_eq!(path.nak(&nak, MEMBER, 1), NakOutcome::Queued);
+    let mut budget = RepairBudget::default();
+    assert!(path.serve_repair(&mut tx, &mut budget, 2) > 0);
+    let all = sent.lock().unwrap().clone();
+    assert!(all.len() > first, "no repair sent");
+    let mut verifier = Verifier::new([&file], party, alias()).unwrap();
+    let mut seqs = Vec::new();
+    for bytes in &all {
+        assert!(bytes.len() <= 1408, "{} bytes over the MTU", bytes.len());
+        let opened = verifier.open(bytes, 0).unwrap();
+        assert!(opened.frames <= 1408 - ENVELOPE_LEN);
+        seqs.push(opened.seq);
+    }
+    // The repairs repeat frames already sent, under sequences of their
+    // own: the window never refuses them as replays.
+    assert!(seqs.windows(2).all(|pair| pair[1] > pair[0]), "{seqs:?}");
+}

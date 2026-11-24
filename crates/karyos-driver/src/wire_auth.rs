@@ -280,6 +280,18 @@ impl Sealer {
         })
     }
 
+    /// The domain this sealer tags in: 1 for a sender, 4 for a receiver.
+    #[must_use]
+    pub fn domain(&self) -> Domain {
+        self.party.domain()
+    }
+
+    /// The party, and so the establishment, its key was derived for.
+    #[must_use]
+    pub fn party(&self) -> Party {
+        self.party
+    }
+
     /// The in-band key epoch the next datagram carries.
     #[must_use]
     pub fn party_epoch(&self) -> u8 {
@@ -612,6 +624,7 @@ impl Slot {
 /// challenge transcript (ADR-0086 sections 6 and 7), and `envelope_seq` is
 /// a per-start counter.
 pub struct Proof {
+    kind: ProofKind,
     key_id: u32,
     /// The current file epoch of the key, from the durable lineage: only a
     /// proof under it may bind.
@@ -726,6 +739,7 @@ impl Proof {
         current: u32,
     ) -> Result<Self, KeyError> {
         let mut proof = Self {
+            kind,
             key_id: 0,
             current,
             signing: None,
@@ -753,6 +767,12 @@ impl Proof {
             return Err(KeyError::NoKey);
         }
         Ok(proof)
+    }
+
+    /// The domain this proof tags in: 5 for SETUP, 6 for RSP_SETUP.
+    #[must_use]
+    pub fn domain(&self) -> Domain {
+        self.kind.domain()
     }
 
     /// Seals the first `frames` bytes of `datagram` under the signing key.
