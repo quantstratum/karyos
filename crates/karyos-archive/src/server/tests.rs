@@ -1358,7 +1358,23 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
         correlation_id: 2,
         recording_id: 1,
     }));
-    for _ in 0..500 {
+    // The stop ends with the recording's `Stopped` signal: waited for, so
+    // a slow host never measures `ended` before it went out.
+    let stopped = |sent: &[Vec<u8>]| {
+        sent.iter().any(|message| {
+            matches!(
+                decoded(message),
+                ControlMessage::RecordingSignal(RecordingSignal {
+                    recording_id: 1,
+                    signal: Signal::Stopped { .. },
+                    ..
+                })
+            )
+        })
+    };
+    let begun = std::time::Instant::now();
+    while !stopped(&rig.responses.sent.lock().unwrap()) {
+        assert!(begun.elapsed() < Duration::from_secs(30), "never stopped");
         rig.server.duty();
         std::thread::sleep(Duration::from_millis(1));
     }
