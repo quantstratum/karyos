@@ -1351,6 +1351,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                     authority: Authority::FIRST,
                     route,
                     max_pending: NonZeroU16::new(STAGED_PER_LANE).unwrap_or(NonZeroU16::MIN),
+                    etf: None,
                 }) {
                     Ok(queue) => {
                         if let Some(held) = slot.queues.get_mut(lane) {
@@ -1411,6 +1412,7 @@ impl<T: crate::embedded::StreamTerms> Outbound<T> {
                         authority: Authority::FIRST,
                         route,
                         max_pending: NonZeroU16::MIN,
+                        etf: None,
                     })
                     .ok();
                 if queue.is_none() {

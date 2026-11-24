@@ -16,12 +16,12 @@
 use std::io::IoSlice;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 
-use rustix::net::sockopt::set_txtime;
+use rustix::net::sockopt::{set_ipv6_v6only, set_socket_reuseport, set_txtime};
 use rustix::net::{
-    AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketFlags, SocketType,
-    TxTimeFlags,
+    AddressFamily, SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrAny,
+    SocketFlags, SocketType, TxTimeFlags,
 };
 use rustix::time::ClockId;
 
@@ -47,6 +47,25 @@ impl EtfSocket {
     ///
     /// [`OpenError::Os`] naming `socket`, `bind` or `so_txtime`.
     pub fn open(local: SocketAddr) -> Result<Self, OpenError> {
+        Self::create(local, None)
+    }
+
+    /// As [`EtfSocket::open`], joining the `SO_REUSEPORT` group of the
+    /// endpoint socket bound at `local` and sending at socket priority
+    /// `priority` (ADR-0109 points 2 and 5): its datagrams leave from the
+    /// endpoint's own address and port. The endpoint socket must already
+    /// carry its steering program, so no inbound datagram reaches this
+    /// one.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError::Os`] naming `socket`, `ipv6_v6only`, `so_reuseport`, `bind`,
+    /// `so_txtime` or `so_priority`.
+    pub fn open_in_group(local: SocketAddr, priority: u32) -> Result<Self, OpenError> {
+        Self::create(local, Some(priority))
+    }
+
+    fn create(local: SocketAddr, group: Option<u32>) -> Result<Self, OpenError> {
         let family = match local {
             SocketAddr::V4(_) => AddressFamily::INET,
             SocketAddr::V6(_) => AddressFamily::INET6,
@@ -64,8 +83,25 @@ impl EtfSocket {
             None,
         )
         .map_err(os("socket"))?;
+        // `IPV6_V6ONLY` as the endpoint socket sets it, before the bind: a
+        // socket that differs joins another reuseport group, which the
+        // endpoint's steering program does not cover (ADR-0109 point 5).
+        if local.is_ipv6() {
+            set_ipv6_v6only(&fd, true).map_err(os("ipv6_v6only"))?;
+        }
+        if group.is_some() {
+            set_socket_reuseport(&fd, true).map_err(os("so_reuseport"))?;
+        }
         rustix::net::bind(&fd, &local).map_err(os("bind"))?;
         set_txtime(&fd, ClockId::Tai, TxTimeFlags::REPORT_ERRORS).map_err(os("so_txtime"))?;
+        if let Some(priority) = group {
+            crate::linux_sys::set_priority(fd.as_fd(), priority).map_err(|error| {
+                OpenError::Os {
+                    operation: "so_priority",
+                    errno: error.raw_os_error().unwrap_or(0),
+                }
+            })?;
+        }
         Ok(Self { fd })
     }
 
@@ -81,35 +117,31 @@ impl EtfSocket {
     }
 
     /// Sends `bytes` to `destination` with `SCM_TXTIME` = `txtime_ns`
-    /// (nanoseconds of `CLOCK_TAI`), without blocking.
+    /// (nanoseconds of `CLOCK_TAI`), without blocking; returns the bytes
+    /// the kernel took, which for a datagram socket is all of them.
     ///
     /// # Errors
     ///
     /// The errno of `sendmsg`, for example `EAGAIN`.
     pub fn send(
         &self,
-        destination: SocketAddr,
+        destination: &SocketAddrAny,
         bytes: &[u8],
         txtime_ns: u64,
-    ) -> Result<(), EtfErrno> {
+    ) -> Result<usize, EtfErrno> {
         let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(TxTime(1))];
         let mut control = SendAncillaryBuffer::new(&mut space);
         if !control.push(SendAncillaryMessage::TxTime(txtime_ns)) {
             return Err(EtfErrno(105));
         }
-        let sent = rustix::net::sendmsg_addr(
+        rustix::net::sendmsg_addr(
             &self.fd,
-            &destination,
+            destination,
             &[IoSlice::new(bytes)],
             &mut control,
             SendFlags::DONTWAIT,
         )
-        .map_err(|errno| EtfErrno(errno.raw_os_error()))?;
-        if sent == bytes.len() {
-            Ok(())
-        } else {
-            Err(EtfErrno(90))
-        }
+        .map_err(|errno| EtfErrno(errno.raw_os_error()))
     }
 
     /// Drains up to `out.len()` error queue entries (ETF drops and others)

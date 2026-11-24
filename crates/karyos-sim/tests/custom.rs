@@ -123,3 +123,213 @@ fn w2_passes_and_its_burst_is_refused_by_the_queue() {
         assert_eq!(workloads::pass(case, &outcome), Ok(None), "{}", case.name);
     }
 }
+
+/// The step and the request of a trigger, from a run.
+type Trigger = (u64, karyos_sim::net::NodeId, Option<(u64, u64, u64)>);
+
+fn trigger(observations: &[Observation], name: &str) -> Option<Trigger> {
+    observations
+        .iter()
+        .find_map(|observation| match observation {
+            Observation::Triggered {
+                what,
+                node,
+                at,
+                request,
+                ..
+            } if *what == name => Some((*at, *node, *request)),
+            _ => None,
+        })
+}
+
+/// C5 version 2's W5 retry, relative to whoever leads: the custom core
+/// passes it on every seed, its triggers in the frozen order (cut, lost,
+/// crash before the next step, restart 40 steps after the crash) on one
+/// leader; the witness is the lost request's own retry, from a later
+/// term; and a trigger not reached by the deadline fails, inclusively.
+#[test]
+fn the_lost_reply_whoever_leads_passes_on_its_own_witness() {
+    use karyos_sim::harness::workloads::{Failed, W5};
+    let case = W5::manifest().lost_reply_whoever_leads();
+    let mut first = None;
+    for seed in SEEDS {
+        let outcome = workloads::run::<Custom>(&case, seed).unwrap();
+        assert_eq!(
+            workloads::pass(&case, &outcome),
+            Ok(None),
+            "{} seed {seed}",
+            case.name
+        );
+        let observations = &outcome.observations;
+        let (cut, leader, _) = trigger(observations, "cut").unwrap();
+        let (lost, lost_on, request) = trigger(observations, "lost").unwrap();
+        let (crash, crashed, _) = trigger(observations, "crash").unwrap();
+        let (restart, restarted, _) = trigger(observations, "restart").unwrap();
+        assert!(cut >= 12 && cut <= lost, "seed {seed}");
+        assert_eq!(crash, lost + 1, "seed {seed}");
+        assert_eq!(restart, crash + 40, "seed {seed}");
+        assert!(
+            [lost_on, crashed, restarted]
+                .iter()
+                .all(|node| *node == leader)
+        );
+        assert!(request.is_some(), "seed {seed}");
+        first.get_or_insert((outcome, cut));
+    }
+    let (outcome, cut) = first.unwrap();
+    let mutated = |change: &dyn Fn(&mut Observation)| {
+        let mut outcome = outcome.clone();
+        for observation in &mut outcome.observations {
+            change(observation);
+        }
+        workloads::pass(&case, &outcome)
+    };
+    // Another request's deduplication is no witness.
+    assert_eq!(
+        mutated(&|observation| {
+            if let Observation::Deduplicated { sequence, .. } = observation {
+                *sequence += 1_000;
+            }
+        }),
+        Err(Failed::NotShown("retry"))
+    );
+    // Nor is an answer from a term not above the lost reply's.
+    assert_eq!(
+        mutated(&|observation| {
+            if let Observation::Triggered {
+                request: Some((_, term, _)),
+                ..
+            } = observation
+            {
+                *term = u64::MAX;
+            }
+        }),
+        Err(Failed::NotShown("retry"))
+    );
+    // The deadline is inclusive: at the cut's step the cut counts, one
+    // before it does not.
+    let at = |deadline| {
+        let mut late = case.clone();
+        if let Some(lost) = late.lost_reply.as_mut() {
+            lost.deadline = deadline;
+        }
+        let outcome = workloads::run::<Custom>(&late, SEEDS[0]).unwrap();
+        workloads::pass(&late, &outcome)
+    };
+    assert_eq!(at(cut - 1), Err(Failed::NotShown("cut")));
+    assert_ne!(at(cut), Err(Failed::NotShown("cut")));
+}
+
+/// W5\x27s snapshot cases through the core\x27s snapshot install (#682):
+/// compaction under load, a follower behind the compaction point, a
+/// follower crashing around its install and one crashing between builds
+/// all pass on every seed. Version 1\x27s retry case needs a handover, which
+/// the core does not take: not demonstrated, never passed.
+#[test]
+fn w5_snapshots_pass_and_the_handover_retry_is_not_demonstrated() {
+    use karyos_sim::harness::workloads::{RunError, W5};
+    let cases = W5::skeleton().cases().unwrap();
+    assert_eq!(cases.len(), 5);
+    for case in &cases {
+        for seed in SEEDS {
+            let run = workloads::run::<Custom>(case, seed);
+            if case.handover.is_some() {
+                assert!(
+                    matches!(run, Err(RunError::Unsupported(_))),
+                    "{} seed {seed}: {run:?}",
+                    case.name
+                );
+                continue;
+            }
+            let outcome = run.unwrap();
+            assert_eq!(
+                workloads::pass(case, &outcome),
+                Ok(None),
+                "{} seed {seed}",
+                case.name
+            );
+            assert!(
+                outcome
+                    .observations
+                    .iter()
+                    .any(|observation| matches!(observation, Observation::Compacted { .. })),
+                "{} seed {seed}: no compaction",
+                case.name
+            );
+        }
+    }
+}
+
+/// The replication path's buffers hold to the bounds derived from the
+/// limits ([`Bounds`]): over W1 to W6, no pooled entry is made past the
+/// prefill, the entries out of the pool at once stay within the bound,
+/// and every Ready within its reserved sizes. W1, run without limits,
+/// takes [`DEFAULT_LIMITS`] and never reaches any of them: no refusal,
+/// and every follower's window below both caps.
+#[test]
+fn the_buffers_hold_to_the_bounds_the_limits_give() {
+    use karyos_sim::harness::custom::{
+        Bounds, DEFAULT_LIMITS, READY_MESSAGES, pool_stats, reset_pool_peaks,
+    };
+    use karyos_sim::harness::workloads::{Case, W5};
+    let mut cases: Vec<Case> = W1::skeleton().cases();
+    cases.extend(W2::skeleton().cases().unwrap());
+    cases.extend(W3::skeleton().cases());
+    cases.extend(W4::skeleton(1).cases());
+    cases.extend(
+        W5::skeleton()
+            .cases()
+            .unwrap()
+            .into_iter()
+            .filter(|case| case.handover.is_none()),
+    );
+    cases.push(W5::manifest().lost_reply_whoever_leads());
+    cases.extend(W6::skeleton().cases());
+    for case in &cases {
+        let limits = case.limits.unwrap_or(DEFAULT_LIMITS);
+        let bounds = Bounds::of(&limits, case.servers).unwrap();
+        reset_pool_peaks();
+        let outcome = workloads::run::<Custom>(case, 1).unwrap();
+        let stats = pool_stats();
+        assert_eq!(stats.created, stats.prefilled, "{}: {stats:?}", case.name);
+        assert_eq!(stats.vector_misses, 0, "{}: {stats:?}", case.name);
+        assert_eq!(stats.payload_misses, 0, "{}: {stats:?}", case.name);
+        assert!(
+            stats.peak_out <= bounds.pool_entries,
+            "{}: {stats:?} {bounds:?}",
+            case.name
+        );
+        let [messages, after, entries, committed] = stats.peak_ready;
+        assert!(
+            messages <= READY_MESSAGES && after <= READY_MESSAGES,
+            "{}: {stats:?}",
+            case.name
+        );
+        assert!(
+            entries <= bounds.ready_entries,
+            "{}: {stats:?} {bounds:?}",
+            case.name
+        );
+        assert!(
+            committed <= bounds.committed,
+            "{}: {stats:?} {bounds:?}",
+            case.name
+        );
+        if case.name.starts_with("W1") {
+            assert!(
+                !outcome
+                    .observations
+                    .iter()
+                    .any(|observation| matches!(observation, Observation::Backpressure { .. })),
+                "{}: W1 reached a limit",
+                case.name
+            );
+            let (window, bytes) = stats.peak_window;
+            assert!(
+                window < DEFAULT_LIMITS.in_flight_entries && bytes < DEFAULT_LIMITS.in_flight_bytes,
+                "{}: W1 reached the in-flight caps: {stats:?}",
+                case.name
+            );
+        }
+    }
+}

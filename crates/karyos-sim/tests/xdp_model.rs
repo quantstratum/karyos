@@ -159,6 +159,7 @@ fn run(seed: u64, mutant: bool, drain: bool) -> Run {
             authority: Authority::new(NonZeroU64::MIN),
             route,
             max_pending: nz(TX),
+            etf: None,
         })
         .unwrap();
     let mut report = TxReport::new();

@@ -30,6 +30,7 @@ use crate::backend::{
     RouteId, SendError, SenderGate, SenderToken, Spent, SubmissionId, TX_REPORT_CAPACITY, TxEntry,
     TxFrame, TxItemOutcome, TxQueueConfig, TxQueueId, TxReport, TxTicket,
 };
+use crate::sockets::errqueue::ErrEntry;
 use crate::sockets::ops::{Errno, RouteAddr, SendResult, SocketOps};
 
 /// The end of a pending list.
@@ -80,6 +81,8 @@ struct SlotMeta {
     /// be taken off its FIFO; whatever later pops it quarantines it without
     /// a second report (at most one terminal report per ticket).
     terminal: bool,
+    /// The send time of a timed commit (ADR-0109 point 1).
+    txtime: Option<u64>,
 }
 
 const EMPTY_META: SlotMeta = SlotMeta {
@@ -89,6 +92,7 @@ const EMPTY_META: SlotMeta = SlotMeta {
     len: 0,
     next: NO_SLOT,
     terminal: false,
+    txtime: None,
 };
 
 /// One pending item as a flush or a return reports it: everything its
@@ -102,6 +106,8 @@ struct Item {
     len: u16,
     /// Reported `Unknown` already ([`SlotMeta::terminal`]).
     terminal: bool,
+    /// [`SlotMeta::txtime`].
+    txtime: Option<u64>,
 }
 
 impl Item {
@@ -111,6 +117,7 @@ impl Item {
             token: self.token,
             len: self.len,
             outcome,
+            late: false,
         }
     }
 }
@@ -135,6 +142,9 @@ struct QueueRun {
     fault: Option<Fault>,
     /// `close_queue` has started; the queue takes no new claim or commit.
     closing: bool,
+    /// An etf queue (ADR-0109): it owns an `etf` socket of the endpoint's
+    /// [`SocketOps`], and its flush splits into runs by route.
+    etf: bool,
 }
 
 const IDLE_RUN: QueueRun = QueueRun {
@@ -144,6 +154,7 @@ const IDLE_RUN: QueueRun = QueueRun {
     len: 0,
     fault: None,
     closing: false,
+    etf: false,
 };
 
 /// What a send result established about the permitted prefix.
@@ -401,6 +412,7 @@ impl TxCore {
             token: meta.token,
             len: meta.len,
             terminal: meta.terminal,
+            txtime: meta.txtime,
         };
         Some((item, meta.next))
     }
@@ -508,23 +520,66 @@ impl TxCore {
     // Queues (3.3, 3.8, 6.3, 7.2)
     // -----------------------------------------------------------------
 
-    /// Opens a queue: `NotActive`, `RouteUnknown`, then the ledger's
-    /// `QueueLimit`, `OverCommitted` and `IdentityExhausted`.
-    pub(super) fn open_queue(&mut self, config: TxQueueConfig) -> Result<TxQueueId, QueueError> {
+    /// Opens a queue: `NotActive`, `RouteUnknown`, `EtfRefused` for an
+    /// etf queue of an endpoint without [`SocketsConfig::etf_route`] or to
+    /// a multicast destination, then the ledger's `QueueLimit`,
+    /// `OverCommitted` and `IdentityExhausted`; last, for an etf queue,
+    /// its `etf` socket, whose failure undoes the open as
+    /// `EtfUnavailable` (ADR-0109 points 2 and 5).
+    pub(super) fn open_queue<O: SocketOps>(
+        &mut self,
+        ops: &mut O,
+        config: TxQueueConfig,
+    ) -> Result<TxQueueId, QueueError> {
         if !self.active() {
             return Err(QueueError::NotActive);
         }
-        if self.routes.get(config.route).is_none() {
+        let Some(route) = self.routes.get(config.route) else {
             return Err(QueueError::RouteUnknown);
+        };
+        if config.etf.is_some()
+            && (!self.config.etf_route || route.address.address().ip().is_multicast())
+        {
+            return Err(QueueError::EtfRefused);
         }
         let queue = self.ledger.open_queue(config)?;
+        if let Some(etf) = config.etf
+            && let Err(reason) = ops.open_etf(queue.index(), &etf)
+        {
+            let closed = self.ledger.close_queue(queue);
+            debug_assert!(closed.is_ok(), "a queue just opened closes");
+            return Err(QueueError::EtfUnavailable { reason });
+        }
         if let Some(run) = self.runs.get_mut(usize::from(queue.index())) {
             *run = QueueRun {
                 id: Some(queue),
+                etf: config.etf.is_some(),
                 ..IDLE_RUN
             };
         }
         Ok(queue)
+    }
+
+    /// Drains the error queue of etf queue `queue`'s `etf` socket into
+    /// `out` (ADR-0109 points 6 and 7): each [`ErrEntry::Txtime`] is a drop
+    /// named by its send time and code. Returns how many entries it wrote.
+    pub(super) fn drain_etf<O: SocketOps>(
+        &self,
+        ops: &mut O,
+        queue: TxQueueId,
+        out: &mut [ErrEntry],
+    ) -> Result<usize, EtfDrainError> {
+        if !self.active() {
+            return Err(EtfDrainError::Queue(QueueError::NotActive));
+        }
+        let run = self
+            .run(queue)
+            .ok_or(EtfDrainError::Queue(QueueError::UnknownQueue))?;
+        if !run.etf {
+            return Err(EtfDrainError::Queue(QueueError::EtfRefused));
+        }
+        ops.drain_etf(queue.index(), out)
+            .map_err(|errno| EtfDrainError::Os { errno: errno.raw() })
     }
 
     /// Clears a send fault; an invariant fault gives `NeedsReset`. A queue
@@ -584,8 +639,9 @@ impl TxCore {
     /// Returns pending items of `queue` with `QueueClosed`; once none
     /// remains, closes it (7.2). While `more` is true the queue takes no
     /// claim, commit or flush.
-    pub(super) fn close_queue(
+    pub(super) fn close_queue<O: SocketOps>(
         &mut self,
+        ops: &mut O,
         queue: TxQueueId,
         report: &mut TxReport,
     ) -> Result<CancelOutcome, QueueError> {
@@ -602,6 +658,9 @@ impl TxCore {
         if !more {
             self.ledger.close_queue(queue)?;
             if let Some(run) = self.runs.get_mut(usize::from(queue.index())) {
+                if run.etf {
+                    ops.close_etf(queue.index());
+                }
                 *run = IDLE_RUN;
             }
         }
@@ -787,6 +846,8 @@ impl TxCore {
         let Some(address) = self.routes.get(route).map(|entry| &entry.address) else {
             return stopped(FlushStop::Queue(QueueError::RouteUnknown));
         };
+        // An etf queue splits into runs by route (ADR-0109 point 3).
+        let etf = run.etf.then_some(queue.index());
         if run.head == NO_SLOT {
             return stopped(FlushStop::QueueEmpty);
         }
@@ -888,7 +949,14 @@ impl TxCore {
 
         // Step 3: one exposure of the permitted prefix. The bytes are
         // checked before the call; a slot outside the pool or a byte count
-        // that cannot be summed is an invariant fault with nothing sent.
+        // that cannot be summed is an invariant fault with nothing sent. An
+        // etf queue reads `CLOCK_TAI` once, here, to tell a time still
+        // ahead from one already past (ADR-0109 point 3).
+        let now = match etf {
+            Some(_) => ops.tai_now_ns(),
+            None => None,
+        };
+        let batched = self.batched;
         let exposed = items
             .get(..permitted_at)
             .and_then(|prefix| {
@@ -909,9 +977,16 @@ impl TxCore {
                     }
                 }
                 let prefix = datagrams.get(..permitted_at)?;
-                Some((bytes, ops.send(address, prefix)))
+                let sent = match etf {
+                    Some(index) => {
+                        let timed = items.get(..permitted_at)?;
+                        send_runs(ops, index, address, prefix, timed, now, batched)
+                    }
+                    None => (ops.send(address, prefix), None),
+                };
+                Some((bytes, sent))
             });
-        let Some(Some((exposed_bytes, result))) = exposed else {
+        let Some(Some((exposed_bytes, (result, run_calls)))) = exposed else {
             self.broken("the permitted prefix lies in the pool");
             self.fault_invariant(queue);
             let failure = BackendFailure::Invariant { operation: FLUSH };
@@ -930,7 +1005,10 @@ impl TxCore {
         // result `classify` already takes as outside the ABI; the flush
         // then fails as an invariant violation and `ops` reports the most
         // calls the single send path makes for one exposure.
-        let ops = self.send_ops(result, permitted);
+        let ops = match etf {
+            Some(_) => run_calls,
+            None => self.send_ops(result, permitted),
+        };
         let spent = Spent {
             datagrams: u32::from(permitted),
             bytes: u64::from(exposed_bytes),
@@ -964,12 +1042,11 @@ impl TxCore {
             debug_assert!(released, "a submitted item was pending");
             submitted = count;
             submitted_bytes = bytes;
-            push(
-                &mut writer,
-                item.entry(TxItemOutcome::Submitted {
-                    release: Release::AtSubmission,
-                }),
-            );
+            let mut entry = item.entry(TxItemOutcome::Submitted {
+                release: Release::AtSubmission,
+            });
+            entry.late = item.txtime.is_some() && ahead(item.txtime, now).is_none();
+            push(&mut writer, entry);
         }
         let stop = match next {
             Next::Done => FlushStop::Exposed,
@@ -1220,6 +1297,182 @@ impl Drop for TxCore {
     }
 }
 
+/// Why an etf queue's error queue was not drained
+/// ([`SocketsTx::drain_etf`](super::SocketsTx::drain_etf)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtfDrainError {
+    /// `NotActive`, `UnknownQueue`, or `EtfRefused` for a queue that is
+    /// not an etf queue.
+    Queue(QueueError),
+    /// The receive failed with this raw OS error number.
+    Os {
+        /// Raw OS error number.
+        errno: i32,
+    },
+}
+
+/// The send time of `item` when it is still ahead of `now`: it goes to
+/// the `etf` socket. `None` for an item without one, or one already past
+/// or with no clock, which goes on the endpoint socket (ADR-0109 points 3
+/// and 4).
+fn ahead(txtime: Option<u64>, now: Option<u64>) -> Option<u64> {
+    let now = now?;
+    txtime.filter(|txtime| *txtime > now)
+}
+
+/// Sends the permitted prefix of an etf queue as runs by route, in
+/// submission order (ADR-0109 point 3): each run of times still ahead on
+/// the `etf` socket of queue index `queue`, one call per datagram; each run
+/// of other datagrams on the endpoint socket, as an immediate queue sends.
+/// A run accepted only in part, or failed, ends the exposure there: the
+/// result is over the whole prefix, as one send call's would be, so
+/// `classify` reads it unchanged. Also returns the system calls made, by
+/// the send path of each run; `None` for a count a run's path cannot give,
+/// an invariant violation of the socket.
+fn send_runs<O: SocketOps>(
+    ops: &mut O,
+    queue: u16,
+    address: &RouteAddr,
+    datagrams: &[&[u8]],
+    items: &[Option<Item>],
+    now: Option<u64>,
+    batched: bool,
+) -> (SendResult, Option<u32>) {
+    let to_etf = |at: usize| {
+        items
+            .get(at)
+            .copied()
+            .flatten()
+            .and_then(|item| ahead(item.txtime, now))
+    };
+    let mut base: usize = 0;
+    let mut calls: u32 = 0;
+    while base < datagrams.len() {
+        let etf = to_etf(base).is_some();
+        let end = (base..datagrams.len())
+            .find(|at| to_etf(*at).is_some() != etf)
+            .unwrap_or(datagrams.len());
+        let run = datagrams.get(base..end).unwrap_or_default();
+        let (result, run_calls) = if etf {
+            send_etf_run(ops, queue, address, run, |at| {
+                base.checked_add(at).and_then(to_etf).unwrap_or(0)
+            })
+        } else {
+            let result = ops.send(address, run);
+            (result, endpoint_calls(result, run.len(), batched))
+        };
+        let calls_so_far = run_calls.and_then(|run_calls| calls.checked_add(run_calls));
+        // The run's result, offset by the datagrams of earlier runs.
+        let offset = |count: usize| base.checked_add(count).unwrap_or(base);
+        let stop = match result {
+            SendResult::Sent { sent, error: None } if sent == run.len() => None,
+            SendResult::Sent { sent, .. } if sent > run.len() => {
+                Some(SendResult::OutOfAbi { proven: base })
+            }
+            SendResult::Sent {
+                sent: 0,
+                error: None,
+            } => Some(SendResult::OutOfAbi { proven: base }),
+            SendResult::Sent {
+                sent,
+                error: Some(_),
+            } if sent == run.len() => Some(SendResult::OutOfAbi {
+                proven: offset(sent),
+            }),
+            SendResult::Sent { sent, error } => Some(SendResult::Sent {
+                sent: offset(sent),
+                error,
+            }),
+            SendResult::Error(errno) if base == 0 => Some(SendResult::Error(errno)),
+            SendResult::Error(errno) => Some(SendResult::Sent {
+                sent: base,
+                error: Some(errno),
+            }),
+            SendResult::OutOfAbi { proven } => Some(SendResult::OutOfAbi {
+                proven: offset(proven.min(run.len())),
+            }),
+        };
+        let Some(total) = calls_so_far else {
+            let result = stop.unwrap_or(SendResult::OutOfAbi { proven: end });
+            return (result, None);
+        };
+        calls = total;
+        if let Some(result) = stop {
+            return (result, Some(calls));
+        }
+        base = end;
+    }
+    (
+        SendResult::Sent {
+            sent: datagrams.len(),
+            error: None,
+        },
+        Some(calls),
+    )
+}
+
+/// Sends a run of timed datagrams on queue index `queue`'s `etf` socket,
+/// one call each, stopping at the first that is not accepted, as the
+/// single send path does (4.3). `txtime(at)` is the time of the run's
+/// datagram `at`. Returns the result over the run and the calls made.
+fn send_etf_run<O: SocketOps>(
+    ops: &mut O,
+    queue: u16,
+    address: &RouteAddr,
+    run: &[&[u8]],
+    txtime: impl Fn(usize) -> u64,
+) -> (SendResult, Option<u32>) {
+    for (sent, datagram) in run.iter().enumerate() {
+        let calls = sent
+            .checked_add(1)
+            .and_then(|calls| u32::try_from(calls).ok());
+        let result = match ops.send_etf(queue, address, datagram, txtime(sent)) {
+            SendResult::Sent {
+                sent: 1,
+                error: None,
+            } => continue,
+            SendResult::Error(errno) if sent == 0 => SendResult::Error(errno),
+            SendResult::Error(errno) => SendResult::Sent {
+                sent,
+                error: Some(errno),
+            },
+            SendResult::Sent { .. } | SendResult::OutOfAbi { .. } => {
+                SendResult::OutOfAbi { proven: sent }
+            }
+        };
+        return (result, calls);
+    }
+    let calls = u32::try_from(run.len()).ok();
+    (
+        SendResult::Sent {
+            sent: run.len(),
+            error: None,
+        },
+        calls,
+    )
+}
+
+/// The system calls of one endpoint socket send of `len` datagrams, as
+/// [`TxCore::send_ops`] counts them for a whole exposure.
+fn endpoint_calls(result: SendResult, len: usize, batched: bool) -> Option<u32> {
+    if batched {
+        return Some(1);
+    }
+    let after = |count: usize| count.checked_add(1);
+    let calls = match result {
+        SendResult::Sent { sent, error: None } => Some(sent),
+        SendResult::Sent {
+            sent,
+            error: Some(_),
+        } => after(sent),
+        SendResult::Error(_) => Some(1),
+        SendResult::OutOfAbi { proven } => after(proven),
+    };
+    calls
+        .filter(|calls| (1..=len).contains(calls))
+        .and_then(|calls| u32::try_from(calls).ok())
+}
+
 /// A flush that changed nothing.
 const fn stopped(stop: FlushStop) -> FlushOutcome {
     FlushOutcome {
@@ -1356,6 +1609,7 @@ impl TxFrame for SocketsFrame<'_> {
                 len,
                 next: NO_SLOT,
                 terminal: false,
+                txtime: commit.options.txtime_ns(),
             };
         }
         let tail = core.run(queue).map_or(NO_SLOT, |run| run.tail);

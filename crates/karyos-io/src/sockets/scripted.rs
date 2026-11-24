@@ -27,13 +27,18 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use super::endpoint::{BufferSize, SocketsConfig};
+use super::errqueue::ErrEntry;
 use super::ops::{Errno, RecvResult, RouteAddr, SendResult, SocketOps, SocketProbes};
-use crate::backend::{CapabilityState, OpenError};
+use crate::backend::{CapabilityState, EtfQueue, OpenError, Reason};
 
 /// A hook that sees every send call before its scripted result is returned,
 /// for example to check the bytes it is handed or to close a guard between
 /// the gate check and the system call.
 pub type SendHook = Box<dyn FnMut(&RouteAddr, &[&[u8]]) + Send>;
+
+/// A hook that sees every `etf` send call (ADR-0109) with its queue index,
+/// bytes and send time before its scripted result is returned.
+pub type EtfSendHook = Box<dyn FnMut(u16, &[u8], u64) + Send>;
 
 /// One scripted receive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,12 +77,25 @@ struct Script {
     open_calls: u64,
     live: u64,
     send_hook: Option<SendHook>,
+    etf_opens: Vec<Result<(), Reason>>,
+    next_etf_open: usize,
+    etf_sends: Vec<SendResult>,
+    next_etf_send: usize,
+    etf_errors: Vec<ErrEntry>,
+    next_etf_error: usize,
+    etf_send_hook: Option<EtfSendHook>,
+    /// Etf sockets opened and not closed, over every queue index.
+    etf_live: u64,
+    etf_send_calls: u64,
+    tai_now_ns: Option<u64>,
 }
 
 /// A [`SocketOps`] that returns scripted results and counts its calls.
 pub struct ScriptedSocket {
     script: Arc<Mutex<Script>>,
     live: bool,
+    /// Etf sockets this handle opened and has not closed.
+    etf: u64,
 }
 
 /// The probes an unscripted [`SocketOps::open`] returns: the address of
@@ -116,6 +134,7 @@ impl ScriptedSocket {
         Self {
             script: Arc::new(Mutex::new(Script::default())),
             live: false,
+            etf: 0,
         }
     }
 
@@ -127,6 +146,7 @@ impl ScriptedSocket {
         Self {
             script: Arc::clone(&self.script),
             live: false,
+            etf: 0,
         }
     }
 
@@ -185,6 +205,51 @@ impl ScriptedSocket {
     pub fn set_send_hook(&self, hook: SendHook) -> &Self {
         self.lock().send_hook = Some(hook);
         self
+    }
+
+    /// Appends the result of a later `open_etf`; an unscripted one
+    /// succeeds.
+    pub fn push_etf_open(&self, result: Result<(), Reason>) -> &Self {
+        self.lock().etf_opens.push(result);
+        self
+    }
+
+    /// Appends the result of a later `send_etf`; an unscripted one returns
+    /// `EAGAIN`.
+    pub fn push_etf_send(&self, result: SendResult) -> &Self {
+        self.lock().etf_sends.push(result);
+        self
+    }
+
+    /// Appends an entry a later `drain_etf` returns.
+    pub fn push_etf_error(&self, entry: ErrEntry) -> &Self {
+        self.lock().etf_errors.push(entry);
+        self
+    }
+
+    /// Installs a hook run at the start of every `send_etf` call.
+    pub fn set_etf_send_hook(&self, hook: EtfSendHook) -> &Self {
+        self.lock().etf_send_hook = Some(hook);
+        self
+    }
+
+    /// Sets what `tai_now_ns` returns; `None`, the initial value, is a
+    /// clock that cannot be read.
+    pub fn set_tai_now_ns(&self, now: Option<u64>) -> &Self {
+        self.lock().tai_now_ns = now;
+        self
+    }
+
+    /// `send_etf` calls made.
+    #[must_use]
+    pub fn etf_send_calls(&self) -> u64 {
+        self.lock().etf_send_calls
+    }
+
+    /// Etf sockets open now, over every queue index.
+    #[must_use]
+    pub fn etf_live(&self) -> u64 {
+        self.lock().etf_live
     }
 
     /// Send calls made.
@@ -395,7 +460,10 @@ impl SocketOps for ScriptedSocket {
     fn close(&mut self) {
         if self.live {
             self.live = false;
+            let own = std::mem::take(&mut self.etf);
             let mut script = self.lock();
+            // A closed socket closes its etf sockets, as the Linux one does.
+            script.etf_live = script.etf_live.saturating_sub(own);
             // Every live handle was counted when it became live.
             if let Some(live) = script.live.checked_sub(1) {
                 script.live = live;
@@ -415,11 +483,87 @@ impl SocketOps for ScriptedSocket {
         Ok(Self {
             script: Arc::clone(&self.script),
             live: true,
+            etf: 0,
         })
     }
 
     fn route_mtu(&mut self, _route: &RouteAddr) -> Option<u32> {
         self.lock().route_mtu
+    }
+
+    /// Scripted; counts a live `etf` socket on success. It keeps no table
+    /// per queue index: `close_etf` and `close` count them down.
+    fn open_etf(&mut self, _queue: u16, _etf: &EtfQueue) -> Result<(), Reason> {
+        let mut script = self.lock();
+        let result = match script.etf_opens.get(script.next_etf_open) {
+            Some(result) => {
+                let result = *result;
+                bump_cursor(&mut script.next_etf_open);
+                result
+            }
+            None => Ok(()),
+        };
+        if result.is_ok() {
+            bump(&mut script.etf_live, 1);
+        }
+        drop(script);
+        if result.is_ok() {
+            bump(&mut self.etf, 1);
+        }
+        result
+    }
+
+    fn close_etf(&mut self, _queue: u16) {
+        if let Some(own) = self.etf.checked_sub(1) {
+            self.etf = own;
+            let mut script = self.lock();
+            script.etf_live = script.etf_live.saturating_sub(1);
+        }
+    }
+
+    fn send_etf(
+        &mut self,
+        queue: u16,
+        _route: &RouteAddr,
+        datagram: &[u8],
+        txtime_ns: u64,
+    ) -> SendResult {
+        let live = self.live;
+        let mut guard = self.lock();
+        let script = &mut *guard;
+        bump(&mut script.etf_send_calls, 1);
+        if !live {
+            return SendResult::Error(Errno::BADF);
+        }
+        if let Some(hook) = script.etf_send_hook.as_mut() {
+            hook(queue, datagram, txtime_ns);
+        }
+        match script.etf_sends.get(script.next_etf_send) {
+            Some(result) => {
+                let result = *result;
+                bump_cursor(&mut script.next_etf_send);
+                result
+            }
+            None => SendResult::Error(Errno::AGAIN),
+        }
+    }
+
+    fn drain_etf(&mut self, _queue: u16, out: &mut [ErrEntry]) -> Result<usize, Errno> {
+        let mut script = self.lock();
+        let mut drained: usize = 0;
+        for slot in out.iter_mut() {
+            let Some(entry) = script.etf_errors.get(script.next_etf_error).copied() else {
+                break;
+            };
+            *slot = entry;
+            bump_cursor(&mut script.next_etf_error);
+            drained = drained.saturating_add(1);
+        }
+        Ok(drained)
+    }
+
+    fn tai_now_ns(&mut self) -> Option<u64> {
+        self.lock().tai_now_ns
     }
 }
 

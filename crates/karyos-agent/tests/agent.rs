@@ -56,6 +56,7 @@ fn driver(dir: &Path, config: DriverConfig, max_tools: usize) -> IpcDriver {
             max_regions_per_fetch: 4,
             max_fetch_bytes: 1 << 30,
             max_tools,
+            client_send_buffer: None,
         },
         Box::new(SystemClock::new()),
     )
