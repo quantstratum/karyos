@@ -1075,9 +1075,10 @@ fn a_recording_whose_store_cannot_be_created_stops_empty() {
 #[test]
 fn a_prepared_replay_never_attached_expires() {
     let dir = temp_dir("expire");
+    let timeout = Duration::from_millis(200);
     let config = AgentConfig {
         max_replays: 1,
-        prepared_timeout: Duration::from_millis(200),
+        prepared_timeout: timeout,
         ..AgentConfig::default()
     };
     let agent = ArchiveHandle::spawn(StdDisk, &dir, config).unwrap();
@@ -1088,6 +1089,11 @@ fn a_prepared_replay_never_attached_expires() {
         length: u64::MAX,
         rate: Rate::Full,
     };
+    // Read before the lost replay is posted, so before the agent stamps
+    // it on its own monotonic clock (the same `Instant` clock): its
+    // expiry, at least the timeout after that stamp, is then at least the
+    // timeout after this, however late the test thread runs.
+    let begun = std::time::Instant::now();
     let lost = answer(agent.post_prepare_replay(prepare)).unwrap();
     assert!(matches!(
         answer(agent.post_prepare_replay(prepare)),
@@ -1095,7 +1101,6 @@ fn a_prepared_replay_never_attached_expires() {
     ));
     // Refused while the lost one holds the slot, then taken once it
     // expired: at most five seconds.
-    let begun = std::time::Instant::now();
     let again = loop {
         match answer(agent.post_prepare_replay(prepare)) {
             Ok(again) => break again,
@@ -1106,7 +1111,7 @@ fn a_prepared_replay_never_attached_expires() {
             Err(error) => panic!("{error:?}"),
         }
     };
-    assert!(begun.elapsed() >= Duration::from_millis(100));
+    assert!(begun.elapsed() >= timeout);
     assert_ne!(again.replay_id, lost.replay_id);
     let seen = Arc::default();
     assert!(matches!(
