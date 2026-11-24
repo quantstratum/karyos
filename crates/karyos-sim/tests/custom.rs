@@ -259,3 +259,77 @@ fn w5_snapshots_pass_and_the_handover_retry_is_not_demonstrated() {
         }
     }
 }
+
+/// The replication path's buffers hold to the bounds derived from the
+/// limits ([`Bounds`]): over W1 to W6, no pooled entry is made past the
+/// prefill, the entries out of the pool at once stay within the bound,
+/// and every Ready within its reserved sizes. W1, run without limits,
+/// takes [`DEFAULT_LIMITS`] and never reaches any of them: no refusal,
+/// and every follower's window below both caps.
+#[test]
+fn the_buffers_hold_to_the_bounds_the_limits_give() {
+    use karyos_sim::harness::custom::{
+        Bounds, DEFAULT_LIMITS, READY_MESSAGES, pool_stats, reset_pool_peaks,
+    };
+    use karyos_sim::harness::workloads::{Case, W5};
+    let mut cases: Vec<Case> = W1::skeleton().cases();
+    cases.extend(W2::skeleton().cases().unwrap());
+    cases.extend(W3::skeleton().cases());
+    cases.extend(W4::skeleton(1).cases());
+    cases.extend(
+        W5::skeleton()
+            .cases()
+            .unwrap()
+            .into_iter()
+            .filter(|case| case.handover.is_none()),
+    );
+    cases.push(W5::manifest().lost_reply_whoever_leads());
+    cases.extend(W6::skeleton().cases());
+    for case in &cases {
+        let limits = case.limits.unwrap_or(DEFAULT_LIMITS);
+        let bounds = Bounds::of(&limits, case.servers).unwrap();
+        reset_pool_peaks();
+        let outcome = workloads::run::<Custom>(case, 1).unwrap();
+        let stats = pool_stats();
+        assert_eq!(stats.created, stats.prefilled, "{}: {stats:?}", case.name);
+        assert_eq!(stats.vector_misses, 0, "{}: {stats:?}", case.name);
+        assert_eq!(stats.payload_misses, 0, "{}: {stats:?}", case.name);
+        assert!(
+            stats.peak_out <= bounds.pool_entries,
+            "{}: {stats:?} {bounds:?}",
+            case.name
+        );
+        let [messages, after, entries, committed] = stats.peak_ready;
+        assert!(
+            messages <= READY_MESSAGES && after <= READY_MESSAGES,
+            "{}: {stats:?}",
+            case.name
+        );
+        assert!(
+            entries <= bounds.ready_entries,
+            "{}: {stats:?} {bounds:?}",
+            case.name
+        );
+        assert!(
+            committed <= bounds.committed,
+            "{}: {stats:?} {bounds:?}",
+            case.name
+        );
+        if case.name.starts_with("W1") {
+            assert!(
+                !outcome
+                    .observations
+                    .iter()
+                    .any(|observation| matches!(observation, Observation::Backpressure { .. })),
+                "{}: W1 reached a limit",
+                case.name
+            );
+            let (window, bytes) = stats.peak_window;
+            assert!(
+                window < DEFAULT_LIMITS.in_flight_entries && bytes < DEFAULT_LIMITS.in_flight_bytes,
+                "{}: W1 reached the in-flight caps: {stats:?}",
+                case.name
+            );
+        }
+    }
+}

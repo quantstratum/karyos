@@ -57,7 +57,7 @@
 //! it, and a leader's next append takes from it. It stands for a
 //! transport that hands a sent buffer back, so after the warm-up nothing
 //! on the replication path allocates (ADR-0105, decision 3). The pool is
-//! bounded ([`MAX_POOLED_ENTRIES`], [`MAX_POOLED_VECTORS`]).
+//! bounded, and prefilled once, from the declared limits ([`Bounds`]).
 //!
 //! **Snapshots** (W5, #682): the node's compactions go to
 //! [`Core::compacted`]; a leader's [`Effects::send_snapshot`] asks the
@@ -74,6 +74,24 @@
 //! [`TransferRefused::Unsupported`](super::core::TransferRefused::Unsupported); C5 version 2's W5 retry changes the
 //! leader by a crash, which needs no handover.
 
+thread_local! { /// Debug.
+pub static DBG_ARMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+macro_rules! DBG {
+    ($name:expr, $body:block) => {{
+        #[cfg(feature = "alloc-probe")]
+        {
+            let (r, n) = karyos_sys::alloc_count::count_allocations(|| $body);
+            if n > 0 && DBG_ARMED.with(|a| a.get()) {
+                println!("DBG {} {}", $name, n);
+            }
+            r
+        }
+        #[cfg(not(feature = "alloc-probe"))]
+        {
+            $body
+        }
+    }};
+}
 use std::cell::RefCell;
 
 use karyos_cluster::consensus::{
@@ -101,24 +119,104 @@ pub const HEARTBEAT: u32 = 5;
 pub const BATCH: u64 = 16;
 /// Ticks one [`ConsensusCore::tick`] call runs at most.
 pub const MAX_TICKS_PER_CALL: u64 = 64;
-/// Entries the thread's pool keeps at most.
-pub const MAX_POOLED_ENTRIES: usize = 4096;
-/// Entry vectors the thread's pool keeps at most.
-pub const MAX_POOLED_VECTORS: usize = 1024;
-/// Entries the thread's pool is filled with before the first core
-/// starts, and the payload bytes each holds: W1's largest command
-/// (16,000 bytes) fits, so no buffer grows on the replication path.
-pub const PREFILLED_ENTRIES: usize = 1024;
-/// See [`PREFILLED_ENTRIES`].
-pub const PREFILLED_PAYLOAD: usize = 16 * 1024;
 /// The bytes C4's log reads at once at most (`RaftLog`'s read window).
 pub const READ_WINDOW: usize = 1 << 20;
-/// Messages, entries and committed entries one Ready holds before its
-/// vectors grow: reserved when the core starts, so a node's first Ready
-/// after the warm-up does not allocate.
-pub const READY_CAPACITY: usize = 256;
-/// Entry vectors the pool is filled with, each holding [`BATCH`].
-pub const PREFILLED_VECTORS: usize = 256;
+/// Messages one Ready holds, at once and after persistence, before its
+/// vectors grow: reserved when the core starts. Unlike the entries, no
+/// declared limit bounds them; the tests check no run passes it.
+pub const READY_MESSAGES: usize = 256;
+/// The limits the adapter takes as its own when the harness declares
+/// none (W1): the manifest's W2 limits, which no W1 case reaches (its
+/// tests check it), so that every buffer the replication path uses has a
+/// bound to be preallocated from.
+pub const DEFAULT_LIMITS: Limits = Limits::W2;
+/// The most bytes of entry buffers a thread's pool preallocates; a
+/// configuration whose bound passes it is refused ([`Unsupported`]).
+pub const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
+
+/// What the replication path holds at once, from the declared limits
+/// (`limits`) and the voters: the sizes the adapter reserves, so nothing
+/// on that path allocates after initialisation (ADR-0105, decision 3).
+///
+/// - A Ready's new entries: a leader's uncommitted ones, at most
+///   `queue` and its no-op, or a follower's received ones, at most
+///   `in_flight_entries`.
+/// - A Ready's committed entries: at most `in_flight_entries` (the rest
+///   follow in the next).
+/// - Entries out of the pool at once: for the leader, its pending entries,
+///   one Ready's committed ones and the previous Ready's, returned
+///   through the node (2 (queue + 1) + 2 in_flight_entries); for each
+///   follower, the same with in_flight_entries pending (4
+///   in_flight_entries); and in the network, each follower's in-flight
+///   window ((voters - 1) in_flight_entries).
+/// - Each entry's payload capacity: `in_flight_bytes /
+///   in_flight_entries`, the most a full window's entries hold on average.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    /// New entries in one Ready.
+    pub ready_entries: usize,
+    /// Committed entries in one Ready.
+    pub committed: usize,
+    /// Entries out of the thread's pool at once.
+    pub pool_entries: usize,
+    /// Payload bytes each pooled entry is preallocated with.
+    pub payload: usize,
+    /// Entry vectors in flight at once: one per append in a window.
+    pub vectors: usize,
+}
+
+impl Bounds {
+    /// The bounds of `limits` over `voters` servers; `None` when one does
+    /// not fit a `usize` or the pool would pass [`MAX_POOL_BYTES`].
+    #[must_use]
+    pub fn of(limits: &Limits, voters: usize) -> Option<Self> {
+        let window = usize::try_from(limits.in_flight_entries).ok()?.max(1);
+        let queue = usize::try_from(limits.queue).ok()?;
+        let followers = voters.checked_sub(1)?;
+        let leader = queue
+            .checked_add(1)?
+            .checked_mul(2)?
+            .checked_add(window.checked_mul(2)?)?;
+        let pool_entries = leader.checked_add(followers.checked_mul(window)?.checked_mul(5)?)?;
+        let payload =
+            usize::try_from(limits.in_flight_bytes / limits.in_flight_entries.max(1)).ok()?;
+        if pool_entries.checked_mul(payload)? > MAX_POOL_BYTES {
+            return None;
+        }
+        Some(Self {
+            ready_entries: queue.checked_add(1)?.checked_add(window)?,
+            committed: window,
+            pool_entries,
+            payload,
+            vectors: followers.checked_mul(window)?.checked_add(voters)?,
+        })
+    }
+}
+
+/// What a thread's pool and the adapters on it have shown, for the tests
+/// and the run record ([`pool_stats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolStats {
+    /// Entries preallocated.
+    pub prefilled: usize,
+    /// Entries ever made, preallocated or not: more than `prefilled`
+    /// means the bound was passed and the path allocated.
+    pub created: usize,
+    /// The most entries out of the pool at once since the last reset.
+    pub peak_out: usize,
+    /// Payload bytes each preallocated entry holds.
+    pub payload: usize,
+    /// Appends that found no vector large enough in the pool.
+    pub vector_misses: usize,
+    /// Entries that found no payload buffer large enough in the pool.
+    pub payload_misses: usize,
+    /// The largest Ready since the last reset: messages, messages after
+    /// persistence, new entries, committed entries.
+    pub peak_ready: [usize; 4],
+    /// The most a leader had in flight to one follower since the last
+    /// reset, as (entries, bytes).
+    pub peak_window: (u64, u64),
+}
 
 /// The adapter's messages: the core's, and an append's entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,42 +232,105 @@ pub struct Message {
 struct Pool {
     entries: Vec<Entry>,
     vectors: Vec<Vec<Entry>>,
-    filled: bool,
+    stats: PoolStats,
+    /// The entries and vectors it keeps at most: the bounds it was filled
+    /// to.
+    keep: (usize, usize),
 }
 
 thread_local! {
     static POOL: RefCell<Pool> = RefCell::new(Pool::default());
 }
 
-/// Fills the thread's pool once, at initialisation: everything the
-/// replication path takes from it after that was allocated here.
-fn prefill() {
+/// The thread's pool and adapter statistics.
+#[must_use]
+pub fn pool_stats() -> PoolStats {
+    POOL.with_borrow(|pool| pool.stats)
+}
+
+/// Resets the peaks of [`pool_stats`], before a run that measures them.
+pub fn reset_pool_peaks() {
     POOL.with_borrow_mut(|pool| {
-        if pool.filled {
-            return;
+        pool.stats.peak_out = 0;
+        pool.stats.vector_misses = 0;
+        pool.stats.payload_misses = 0;
+        pool.stats.peak_ready = [0; 4];
+        pool.stats.peak_window = (0, 0);
+    });
+}
+
+/// Fills the thread's pool to `bounds`, at initialisation (every core's
+/// start, a restart included): everything the
+/// replication path takes from it after that was allocated here. A pool
+/// filled for smaller bounds grows to these; one filled for larger keeps
+/// them.
+fn prefill(bounds: &Bounds) {
+    POOL.with_borrow_mut(|pool| {
+        let entries = bounds.pool_entries.max(pool.keep.0);
+        let vectors = bounds.vectors.max(pool.keep.1);
+        let payload = bounds.payload.max(pool.stats.payload);
+        pool.keep = (entries, vectors);
+        pool.entries
+            .reserve_exact(entries.saturating_sub(pool.entries.len()));
+        pool.vectors
+            .reserve_exact(vectors.saturating_sub(pool.vectors.len()));
+        for entry in &mut pool.entries {
+            entry
+                .payload
+                .reserve_exact(payload.saturating_sub(entry.payload.len()));
         }
-        pool.filled = true;
-        pool.entries.reserve_exact(MAX_POOLED_ENTRIES);
-        pool.vectors.reserve_exact(MAX_POOLED_VECTORS);
-        for _ in 0..PREFILLED_ENTRIES {
+        // Topped up at every start: a crashed node's buffers never come
+        // back, and a restart is an initialisation.
+        while pool.entries.len() < entries {
             pool.entries.push(Entry {
                 index: 0,
                 term: 0,
                 event_time: 0,
-                payload: Vec::with_capacity(PREFILLED_PAYLOAD),
+                payload: Vec::with_capacity(payload),
             });
+            pool.stats.prefilled += 1;
+            pool.stats.created += 1;
         }
         let batch = usize::try_from(BATCH).unwrap_or(0);
-        for _ in 0..PREFILLED_VECTORS {
+        while pool.vectors.len() < vectors {
             pool.vectors.push(Vec::with_capacity(batch));
         }
+        pool.stats.payload = payload;
     });
+}
+
+/// The position, nearest the top of the pool, of an item whose capacity
+/// is at least `needed`. The simulated network delivers clones, whose
+/// buffers are exactly as large as what they hold; the pool hands each use
+/// one that fits, so a clone of a short vector or an empty entry is never
+/// grown.
+fn fitting<T>(items: &[T], needed: usize, capacity: impl Fn(&T) -> usize) -> Option<usize> {
+    items.iter().rposition(|item| capacity(item) >= needed)
 }
 
 /// An entry with these fields, its buffer from the pool when one is free.
 fn pooled(index: u64, term: u64, event_time: u64, payload: &[u8]) -> Entry {
     let mut entry = POOL
-        .with_borrow_mut(|pool| pool.entries.pop())
+        .with_borrow_mut(|pool| {
+            let fit = fitting(&pool.entries, payload.len(), |entry| {
+                entry.payload.capacity()
+            });
+            let entry = match fit {
+                Some(at) => Some(pool.entries.swap_remove(at)),
+                None => {
+                    if !pool.entries.is_empty() {
+                        pool.stats.payload_misses += 1;
+                    }
+                    pool.entries.pop()
+                }
+            };
+            if entry.is_none() {
+                pool.stats.created += 1;
+            }
+            let out = pool.stats.created.saturating_sub(pool.entries.len());
+            pool.stats.peak_out = pool.stats.peak_out.max(out);
+            entry
+        })
         .unwrap_or(Entry {
             index,
             term,
@@ -187,17 +348,24 @@ fn pooled(index: u64, term: u64, event_time: u64, payload: &[u8]) -> Entry {
 /// Gives `entries` back to the pool, leaving it empty.
 fn release(entries: &mut Vec<Entry>) {
     POOL.with_borrow_mut(|pool| {
-        let room = MAX_POOLED_ENTRIES.saturating_sub(pool.entries.len());
+        let room = pool.keep.0.saturating_sub(pool.entries.len());
         let keep = entries.len().min(room);
         pool.entries.extend(entries.drain(..keep));
     });
     entries.clear();
 }
 
-/// An empty vector from the pool.
-fn vector() -> Vec<Entry> {
-    POOL.with_borrow_mut(|pool| pool.vectors.pop())
-        .unwrap_or_default()
+/// An empty vector from the pool, holding `entries` without growing.
+fn vector(entries: usize) -> Vec<Entry> {
+    POOL.with_borrow_mut(|pool| {
+        let vector =
+            fitting(&pool.vectors, entries, Vec::capacity).map(|at| pool.vectors.swap_remove(at));
+        if vector.is_none() {
+            pool.stats.vector_misses += 1;
+        }
+        vector
+    })
+    .unwrap_or_default()
 }
 
 /// Gives `entries`, emptied, back to the pool.
@@ -205,7 +373,7 @@ fn recycle(mut entries: Vec<Entry>) {
     release(&mut entries);
     if entries.capacity() > 0 {
         POOL.with_borrow_mut(|pool| {
-            if pool.vectors.len() < MAX_POOLED_VECTORS {
+            if pool.vectors.len() < pool.keep.1 {
                 pool.vectors.push(entries);
             }
         });
@@ -248,8 +416,10 @@ pub struct Custom {
     terms: Vec<u64>,
     window: Vec<u8>,
     spare: Vec<Entry>,
+    /// What the replication path holds at once, from the limits.
+    bounds: Bounds,
     /// Vectors reserved at start, swapped into the node's Ready when its
-    /// own are smaller (see [`READY_CAPACITY`]).
+    /// own are smaller (see [`Bounds`] and [`READY_MESSAGES`]).
     reserved: Ready<Message>,
 }
 
@@ -402,6 +572,10 @@ impl Custom {
         log: &mut LogView<'_>,
     ) -> Result<Self, Unsupported> {
         let voters: Vec<u64> = peers.iter().map(|&peer| core_id(peer)).collect();
+        let limits = Some(limits.unwrap_or(&DEFAULT_LIMITS));
+        let bounds = limits
+            .and_then(|limits| Bounds::of(limits, peers.len()))
+            .ok_or(Unsupported)?;
         // A batch never larger than the entries a follower may have in
         // flight.
         let batch = limits.map_or(BATCH, |limits| BATCH.min(limits.in_flight_entries));
@@ -428,7 +602,7 @@ impl Custom {
                 .map_err(|_| Unsupported)?,
             None => config,
         };
-        prefill();
+        prefill(&bounds);
         let stored = log.hard_state();
         let term_vote = stored.map_or_else(TermVote::default, |state| TermVote {
             term: state.current_term,
@@ -448,7 +622,7 @@ impl Custom {
                 None => Core::new(config, term_vote, commit),
             },
             read_bytes: limits.map_or(u64::MAX, |limits| limits.log_read_bytes),
-            pending: Vec::with_capacity(READY_CAPACITY),
+            pending: Vec::with_capacity(bounds.ready_entries),
             truncate: None,
             term_vote,
             dirty: false,
@@ -456,26 +630,28 @@ impl Custom {
             // The node applies from its log's start after a restart: below
             // it, its snapshot holds the state.
             handed: log.first_index().saturating_sub(1),
-            outgoing: Vec::with_capacity(READY_CAPACITY),
-            snapshot_to: Vec::new(),
-            after: Vec::with_capacity(READY_CAPACITY),
-            sent: Vec::with_capacity(READY_CAPACITY),
-            sent_after: Vec::with_capacity(READY_CAPACITY),
+            outgoing: Vec::with_capacity(READY_MESSAGES),
+            snapshot_to: Vec::with_capacity(voters.len()),
+            after: Vec::with_capacity(READY_MESSAGES),
+            sent: Vec::with_capacity(READY_MESSAGES),
+            sent_after: Vec::with_capacity(READY_MESSAGES),
             now: 0,
             ticked: None,
             received: log
                 .last_index()
                 .or_else(|| log.base().map(|base| base.index)),
-            terms: Vec::new(),
+            terms: Vec::with_capacity(usize::try_from(batch).unwrap_or(0)),
             // The log's largest read window (1 MiB), so its first read
             // after the warm-up does not allocate.
             window: Vec::with_capacity(READ_WINDOW),
-            spare: Vec::with_capacity(READY_CAPACITY),
+            spare: Vec::with_capacity(bounds.ready_entries.saturating_add(bounds.committed)),
+            bounds,
             reserved: Ready {
-                messages: Vec::with_capacity(READY_CAPACITY),
-                entries: Vec::with_capacity(READY_CAPACITY),
-                after_persist: Vec::with_capacity(READY_CAPACITY),
-                committed: Vec::with_capacity(READY_CAPACITY),
+                messages: Vec::with_capacity(READY_MESSAGES),
+                entries: Vec::with_capacity(bounds.ready_entries),
+                after_persist: Vec::with_capacity(READY_MESSAGES),
+                committed: Vec::with_capacity(bounds.committed),
+                snapshot_to: Vec::with_capacity(voters.len()),
                 ..Ready::default()
             },
         })
@@ -545,7 +721,9 @@ impl Custom {
             let Some(to) = node_id(to) else {
                 continue;
             };
-            let mut entries = vector();
+            // Only an append with entries takes a vector: a heartbeat or a
+            // reply carries an empty one, which allocates nothing.
+            let mut entries = Vec::new();
             if let CoreMessage::Append {
                 prev_index,
                 entries: count,
@@ -553,6 +731,7 @@ impl Custom {
             } = message
                 && count > 0
             {
+                entries = vector(usize::try_from(count).unwrap_or(usize::MAX));
                 let first = prev_index.saturating_add(1);
                 if self.fill(log, (first, count), &mut entries) != count {
                     // Refused by the duty's budget or the log: lost.
@@ -637,6 +816,16 @@ impl Custom {
             ));
         }
         u64::try_from(out.len()).unwrap_or(0)
+    }
+
+    /// The most this core, leading, has in flight to one follower now.
+    fn peak_window(&self) -> (u64, u64) {
+        let voters = u64::try_from(karyos_cluster::consensus::MAX_VOTERS).unwrap_or(0);
+        (1..=voters)
+            .filter_map(|id| self.core.in_flight(id))
+            .fold((0, 0), |(entries, bytes), (e, b)| {
+                (entries.max(e), bytes.max(b))
+            })
     }
 
     fn leading(&self) -> bool {
@@ -747,24 +936,32 @@ impl ConsensusCore for Custom {
 
     fn ready_into(&mut self, out: &mut ReadyBuf<Message>, log: &mut LogView<'_>) -> bool {
         // What the node is done with goes back to the thread's pool.
-        out.take_spare(&mut self.spare);
-        release(&mut self.spare);
+        if self.core.commit() > 16 {
+            DBG_ARMED.with(|a| a.set(true));
+        }
+        DBG!("take_spare", { out.take_spare(&mut self.spare) });
+        DBG!("release", { release(&mut self.spare) });
         // The node's vectors, grown to the reserved ones' size once.
         let (ready, reserved) = (&mut out.ready, &mut self.reserved);
-        if ready.messages.capacity() < READY_CAPACITY {
+        if ready.messages.capacity() < reserved.messages.capacity() {
             std::mem::swap(&mut ready.messages, &mut reserved.messages);
         }
-        if ready.after_persist.capacity() < READY_CAPACITY {
+        if ready.after_persist.capacity() < reserved.after_persist.capacity() {
             std::mem::swap(&mut ready.after_persist, &mut reserved.after_persist);
         }
-        if ready.entries.capacity() < READY_CAPACITY {
+        if ready.entries.capacity() < reserved.entries.capacity() {
             std::mem::swap(&mut ready.entries, &mut reserved.entries);
         }
-        if ready.committed.capacity() < READY_CAPACITY {
+        if ready.committed.capacity() < reserved.committed.capacity() {
             std::mem::swap(&mut ready.committed, &mut reserved.committed);
         }
-        out.ready.messages.append(&mut self.outgoing);
-        out.ready.after_persist.append(&mut self.after);
+        if ready.snapshot_to.capacity() < reserved.snapshot_to.capacity() {
+            std::mem::swap(&mut ready.snapshot_to, &mut reserved.snapshot_to);
+        }
+        DBG!("messages", {
+            out.ready.messages.append(&mut self.outgoing)
+        });
+        DBG!("after", { out.ready.after_persist.append(&mut self.after) });
         out.ready.snapshot_to.append(&mut self.snapshot_to);
         // Committed entries, written or in this Ready, from the last
         // handed out, as many as the duty's reads cover: `drive` applies
@@ -773,15 +970,15 @@ impl ConsensusCore for Custom {
         if commit > self.handed {
             let first = self.handed.saturating_add(1);
             let mut committed = std::mem::take(&mut out.ready.committed);
-            // At most a reserved Ready's worth: the rest in the next.
-            let most =
-                (commit - self.handed).min(u64::try_from(READY_CAPACITY).unwrap_or(u64::MAX));
-            let filled = self.fill(log, (first, most), &mut committed);
+            // At most a Ready's bound: the rest in the next.
+            let most = (commit - self.handed)
+                .min(u64::try_from(self.bounds.committed).unwrap_or(u64::MAX));
+            let filled = DBG!("fill", { self.fill(log, (first, most), &mut committed) });
             self.handed = self.handed.saturating_add(filled);
             out.ready.committed = committed;
         }
         out.ready.truncate_from = self.truncate.take();
-        out.ready.entries.append(&mut self.pending);
+        DBG!("entries", { out.ready.entries.append(&mut self.pending) });
         if self.dirty {
             self.dirty = false;
             let commit = self.core.commit();
@@ -791,6 +988,22 @@ impl ConsensusCore for Custom {
                 commit: (commit > 0).then_some(commit),
             });
         }
+        let ready = &out.ready;
+        let sizes = [
+            ready.messages.len(),
+            ready.after_persist.len(),
+            ready.entries.len(),
+            ready.committed.len(),
+        ];
+        let window = self.peak_window();
+        POOL.with_borrow_mut(|pool| {
+            for (peak, size) in pool.stats.peak_ready.iter_mut().zip(sizes) {
+                *peak = (*peak).max(size);
+            }
+            let (entries, bytes) = &mut pool.stats.peak_window;
+            *entries = (*entries).max(window.0);
+            *bytes = (*bytes).max(window.1);
+        });
         !out.is_empty()
     }
 
