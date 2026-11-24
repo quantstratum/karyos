@@ -93,6 +93,7 @@ enum Effect {
     Send(u64, Message),
     SendAfter(u64, Message),
     Commit(u64),
+    Snapshot(u64),
 }
 
 impl Effects for Recorded {
@@ -113,6 +114,10 @@ impl Effects for Recorded {
     }
     fn commit(&mut self, index: u64) {
         self.trace.push(Effect::Commit(index));
+    }
+    fn send_snapshot(&mut self, to: u64) {
+        // This model never compacts: no snapshot is ever needed.
+        self.trace.push(Effect::Snapshot(to));
     }
 }
 
@@ -250,6 +255,7 @@ impl Cluster {
                     appended = true;
                 }
                 Effect::Commit(_) | Effect::Send(..) | Effect::SendAfter(..) => {}
+                Effect::Snapshot(to) => assert_eq!(to, 0, "a snapshot asked without compaction"),
             }
         }
         assert_eq!(

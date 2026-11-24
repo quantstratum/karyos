@@ -58,7 +58,24 @@
 //! that duty (W2's log read bound, in bytes). It refuses a proposal it cannot
 //! hold with a typed [`Backpressure`], never by growing anything. The core holds no entry
 //! buffer: messages carry positions and counts, and the driver reads the
-//! entries from C4's log. Snapshot install comes in a later part.
+//! entries from C4's log.
+//!
+//! **Snapshots** (quantstratum/karyos#682). The core keeps the base of
+//! the node's latest snapshot, the last index it includes and that
+//! entry's term, and reads the log through it: the base's term comes
+//! from the core, entries below it may be gone. [`Core::compacted`]
+//! moves the base up to a committed index once the driver has compacted
+//! below it. A leader that would send a follower an entry the log no
+//! longer holds asks its driver for [`Effects::send_snapshot`] instead,
+//! holds that follower's appends to heartbeats at the base, and asks
+//! again, for the latest snapshot, when no acknowledgement arrives within
+//! the minimum election timeout (a lost snapshot is retried, never
+//! awaited forever).
+//! The follower's driver installs the snapshot and restarts its log after
+//! the base, then calls [`Core::install`], which commits the base and
+//! acknowledges it to the leader once durable. The core sees no snapshot
+//! bytes: the store and its CRC-32C checks are the driver's, and those
+//! checks detect corruption only; they claim no tamper evidence.
 
 use crate::hard_state::HardState;
 
@@ -97,6 +114,9 @@ pub trait Effects {
     fn send_after_persist(&mut self, to: u64, message: Message);
     /// The commit index rose to `index`.
     fn commit(&mut self, index: u64);
+    /// Send the node's latest snapshot to `to`: it needs entries the log
+    /// no longer holds.
+    fn send_snapshot(&mut self, to: u64);
 }
 
 /// The persistent term and vote.
@@ -295,6 +315,24 @@ pub enum StepError {
     CommittedConflict,
 }
 
+/// Why [`Core::compacted`] is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactError {
+    /// The base is past the commit index: only committed entries may be
+    /// compacted.
+    Uncommitted,
+}
+
+/// Why [`Core::install`] is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallError {
+    /// The core already holds the base, or a later commit.
+    Stale,
+    /// The node leads: a leader's log already holds every committed
+    /// entry.
+    Leader,
+}
+
 /// A proposal refused because the node does not lead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NotLeader {
@@ -439,6 +477,8 @@ struct Peer {
     granted: bool,
     /// Whether it answered this leader since the last quorum check.
     recent: bool,
+    /// A snapshot asked for it: its base index and the ticks since.
+    snapshot: Option<(u64, u32)>,
 }
 
 /// The most sends in flight to one follower: a window full of one-entry
@@ -539,6 +579,8 @@ pub struct Core {
     quorum_elapsed: u32,
     /// The last pipeline epoch given to a follower.
     epoch: u64,
+    /// The latest snapshot's base: its last index and that entry's term.
+    base: (u64, u64),
 }
 
 impl Core {
@@ -562,6 +604,7 @@ impl Core {
             round: 0,
             quorum_elapsed: 0,
             epoch: 0,
+            base: (0, 0),
         };
         // A restarted node starts its rounds at a fresh random point, so
         // a reply to a round before the restart is not counted.
@@ -622,6 +665,84 @@ impl Core {
             .map(|peer| peer.epoch)
     }
 
+    /// The same core recovered over a snapshot whose base is `index`, of
+    /// `term`: the base is committed, and the log starts after it.
+    #[must_use]
+    pub const fn with_snapshot(mut self, index: u64, term: u64) -> Self {
+        if index > self.base.0 {
+            self.base = (index, term);
+        }
+        if index > self.commit {
+            self.commit = index;
+        }
+        self
+    }
+
+    /// The latest snapshot's base, as (index, term); (0, 0) for none.
+    #[must_use]
+    pub const fn snapshot_base(&self) -> (u64, u64) {
+        self.base
+    }
+
+    /// The node compacted its log below a snapshot whose base is
+    /// `index`, of `term`: entries up to it may be gone from the log.
+    ///
+    /// # Errors
+    ///
+    /// [`CompactError::Uncommitted`] when `index` is past the commit
+    /// index; nothing changes.
+    pub const fn compacted(&mut self, index: u64, term: u64) -> Result<(), CompactError> {
+        if index > self.commit {
+            return Err(CompactError::Uncommitted);
+        }
+        if index > self.base.0 {
+            self.base = (index, term);
+        }
+        Ok(())
+    }
+
+    /// The node installed a leader's snapshot whose base is `index`, of
+    /// `term`: its service holds the state up to `index` and its log
+    /// restarts after it, durably. A log that holds the base's entry keeps
+    /// the entries after it, which the leader may already count (Raft's
+    /// figure 13, step 6); any other log is emptied. The base is
+    /// committed, and it is acknowledged to the leader once durable.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::Stale`] when the core already committed `index`;
+    /// [`InstallError::Leader`] when it leads. Nothing changes.
+    pub fn install(
+        &mut self,
+        index: u64,
+        term: u64,
+        out: &mut impl Effects,
+    ) -> Result<(), InstallError> {
+        if self.role == Role::Leader {
+            return Err(InstallError::Leader);
+        }
+        if index <= self.commit {
+            return Err(InstallError::Stale);
+        }
+        self.base = (index, term);
+        self.commit = index;
+        self.elapsed = 0;
+        if let Role::Follower {
+            leader: Some(leader),
+        } = self.role
+        {
+            out.send_after_persist(
+                leader,
+                Message::AppendReply {
+                    term: self.term_vote.term,
+                    outcome: AppendOutcome::Accepted { index },
+                    epoch: 0,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// The current election timeout, in ticks.
     #[must_use]
     pub const fn election_timeout(&self) -> u32 {
@@ -633,6 +754,7 @@ impl Core {
     /// not answered it within the minimum election timeout (check
     /// quorum), so followers it still reaches stop refusing pre-votes.
     pub fn tick(&mut self, log: &impl LogTerms, out: &mut impl Effects) {
+        let log = &Based::new(log, self.base);
         self.elapsed = self.elapsed.saturating_add(1);
         if self.role == Role::Leader {
             self.quorum_elapsed = self.quorum_elapsed.saturating_add(1);
@@ -654,6 +776,20 @@ impl Core {
                     return;
                 }
             }
+            let (retry, base) = (self.config.election_min, self.base.0);
+            for peer in &mut self.peers {
+                if let Some((asked, ticks)) = peer.snapshot.as_mut() {
+                    *ticks = ticks.saturating_add(1);
+                    if *ticks >= retry {
+                        // Unacknowledged: lost, or not yet installed. Ask
+                        // again, for the latest snapshot.
+                        *asked = base;
+                        *ticks = 0;
+                        peer.next = base.saturating_add(1);
+                        out.send_snapshot(peer.id);
+                    }
+                }
+            }
             if self.elapsed >= self.config.heartbeat {
                 self.elapsed = 0;
                 self.replicate(log, out);
@@ -673,6 +809,7 @@ impl Core {
     /// [`ProposeError::Backpressure`] when the entry exceeds the byte
     /// window or the leader holds its queue of uncommitted entries.
     pub fn propose(&self, size: u64, log: &impl LogTerms) -> Result<(u64, u64), ProposeError> {
+        let log = &Based::new(log, self.base);
         match self.role {
             Role::Leader => {}
             Role::Follower { leader } => {
@@ -698,6 +835,7 @@ impl Core {
 
     /// The leader's own log is durable up to `index`.
     pub fn persisted(&mut self, index: u64, log: &impl LogTerms, out: &mut impl Effects) {
+        let log = &Based::new(log, self.base);
         if self.role != Role::Leader {
             return;
         }
@@ -712,6 +850,7 @@ impl Core {
     /// fit a batch, its in-flight window and this duty's read budget, or
     /// a heartbeat.
     pub fn replicate(&mut self, log: &impl LogTerms, out: &mut impl Effects) {
+        let log = &Based::new(log, self.base);
         if self.role != Role::Leader {
             return;
         }
@@ -736,6 +875,7 @@ impl Core {
         log: &impl LogTerms,
         out: &mut impl Effects,
     ) -> Result<(), StepError> {
+        let log = &Based::new(log, self.base);
         if from == self.config.id || !self.config.voters().any(|voter| voter == from) {
             return Err(StepError::UnknownSender);
         }
@@ -965,6 +1105,7 @@ impl Core {
             peer.sends.clear();
             peer.epoch = self.epoch;
             peer.recent = false;
+            peer.snapshot = None;
         }
         // A no-op of the new term, so earlier-term entries can commit.
         out.append(next, self.term_vote.term);
@@ -1022,7 +1163,12 @@ impl Core {
         self.observe(append.term, out);
         self.role = Role::Follower { leader: Some(from) };
         self.elapsed = 0;
-        let outcome = if append.prev_index > log.last_index() {
+        let outcome = if append.prev_index < self.base.0 {
+            // Up to the base the log holds a committed prefix, which
+            // matches every leader's: acknowledge it, and the leader
+            // resends from after it.
+            AppendOutcome::Accepted { index: self.base.0 }
+        } else if append.prev_index > log.last_index() {
             AppendOutcome::Rejected {
                 probe: append.prev_index,
                 hint: log.last_index(),
@@ -1073,6 +1219,14 @@ impl Core {
             return;
         };
         peer.recent = true;
+        match (peer.snapshot, outcome) {
+            (Some((base, _)), AppendOutcome::Accepted { index }) if index >= base => {
+                peer.snapshot = None;
+            }
+            // Until the snapshot is acknowledged, nothing else moves it.
+            (Some(_), _) => return,
+            (None, _) => {}
+        }
         let mut budget = Duty::of(self.config.limits);
         match outcome {
             AppendOutcome::Accepted { index } => {
@@ -1186,6 +1340,28 @@ impl Core {
         }
         let commit = self.commit;
         let term = self.term_vote.term;
+        if self.snapshot_needed(at, log, out) {
+            // A heartbeat at the base keeps it following, and its answer
+            // acknowledges the snapshot once installed.
+            if heartbeat
+                && let Some(peer) = self.peers.get(at)
+                && let Some((base, _)) = peer.snapshot
+                && let Some(prev_term) = log.term(base)
+            {
+                out.send(
+                    peer.id,
+                    Message::Append {
+                        term,
+                        prev_index: base,
+                        prev_term,
+                        entries: 0,
+                        commit,
+                        epoch: peer.epoch,
+                    },
+                );
+            }
+            return;
+        }
         let (prev_index, entries, bytes, reads) = self.fit(at, *budget, log);
         budget.reads = budget.reads.saturating_sub(reads);
         budget.bytes = budget.bytes.saturating_sub(bytes);
@@ -1219,6 +1395,37 @@ impl Core {
                 epoch: peer.epoch,
             },
         );
+    }
+
+    /// Whether `at` waits for a snapshot: one asked for, or one it needs
+    /// now because the log no longer holds what it would be sent, which
+    /// is then asked for. A follower waiting for one is sent no entries.
+    fn snapshot_needed(&mut self, at: usize, log: &impl LogTerms, out: &mut impl Effects) -> bool {
+        let base = self.base.0;
+        let Some(peer) = self.peers.get_mut(at) else {
+            return true;
+        };
+        if peer.snapshot.is_some() {
+            return true;
+        }
+        let last = log.last_index();
+        let prev = peer.next.saturating_sub(1).min(last);
+        // Compaction drops a prefix: when the previous entry is held, so
+        // is every later one, except after index 0, which always "holds"
+        // (term 0). Only terms are read, so no read budget is spent.
+        let gone = log.term(prev).is_none() || (prev == 0 && last > 0 && log.term(1).is_none());
+        if !gone || base == 0 {
+            return false;
+        }
+        peer.snapshot = Some((base, 0));
+        peer.next = base.saturating_add(1);
+        peer.sends.clear();
+        peer.flight = 0;
+        peer.bytes = 0;
+        self.epoch = self.epoch.wrapping_add(1);
+        peer.epoch = self.epoch;
+        out.send_snapshot(peer.id);
+        true
     }
 
     /// The highest index a majority holds durably, committed when its
@@ -1314,6 +1521,36 @@ struct Append {
     prev_term: u64,
     entries: u64,
     commit: u64,
+}
+
+/// The node's log read through the snapshot base: the base's term is
+/// known, and the log ends no earlier than the base.
+struct Based<'a, L> {
+    log: &'a L,
+    base: (u64, u64),
+}
+
+impl<'a, L: LogTerms> Based<'a, L> {
+    const fn new(log: &'a L, base: (u64, u64)) -> Self {
+        Self { log, base }
+    }
+}
+
+impl<L: LogTerms> LogTerms for Based<'_, L> {
+    fn last_index(&self) -> u64 {
+        self.log.last_index().max(self.base.0)
+    }
+
+    fn term(&self, index: u64) -> Option<u64> {
+        if index == self.base.0 {
+            return Some(self.base.1);
+        }
+        self.log.term(index)
+    }
+
+    fn size(&self, index: u64) -> Option<u64> {
+        self.log.size(index)
+    }
 }
 
 fn last(log: &impl LogTerms) -> (u64, u64) {
