@@ -41,6 +41,8 @@
 
 use crate::clocks::{Calibration, CalibrationError, ClockKey};
 
+pub mod chain;
+
 /// Parts per billion, as the calibration's drift.
 const BILLION: i128 = 1_000_000_000;
 

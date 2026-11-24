@@ -68,6 +68,7 @@ fn config(dir: &Path, pending: usize) -> IpcConfig {
         max_regions_per_fetch: 4,
         max_fetch_bytes: 1 << 30,
         max_tools: karyos_driver::DEFAULT_MAX_TOOLS,
+        client_send_buffer: None,
     }
 }
 

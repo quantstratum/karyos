@@ -90,6 +90,7 @@ fn ipc_driver_configured(dir: &Path, config: DriverConfig) -> IpcDriver {
             max_regions_per_fetch: 4,
             max_fetch_bytes: 1 << 30,
             max_tools: crate::admission::DEFAULT_MAX_TOOLS,
+            client_send_buffer: None,
         },
         Box::new(SystemClock::new()),
     )

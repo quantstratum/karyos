@@ -227,6 +227,7 @@ fn privileged_an_mtu_shrink_faults_the_queue() {
             authority: Authority::FIRST,
             route,
             max_pending: nz(8),
+            etf: None,
         })
         .unwrap();
     let datagram = [7_u8; 1400];

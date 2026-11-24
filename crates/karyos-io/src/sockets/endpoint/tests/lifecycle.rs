@@ -311,6 +311,7 @@ fn reset_returns_items_and_invalidates_handles() {
             authority: Authority::FIRST,
             route,
             max_pending: nz(70),
+            etf: None,
         })
         .unwrap();
     assert_eq!(
@@ -339,6 +340,7 @@ fn reset_returns_items_and_invalidates_handles() {
             authority: Authority::FIRST,
             route: old_route,
             max_pending: nz(1),
+            etf: None,
         }),
         Err(QueueError::RouteUnknown)
     );
@@ -1001,6 +1003,7 @@ fn idle_close() {
             authority: Authority::FIRST,
             route: h.route,
             max_pending: nz(2),
+            etf: None,
         })
         .unwrap();
     h.commit_to(faulted, b"head", 1);

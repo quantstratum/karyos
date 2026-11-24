@@ -98,6 +98,7 @@ impl Fixture {
                     authority: Authority::FIRST,
                     route,
                     max_pending: NonZeroU16::new(BOUND).unwrap(),
+                    etf: None,
                 })
                 .unwrap()
             })
@@ -376,6 +377,7 @@ fn a_closed_queue_holds_its_lane_until_reopened() {
             authority: Authority::FIRST,
             route: f.route,
             max_pending: NonZeroU16::new(BOUND).unwrap(),
+            etf: None,
         })
         .unwrap();
     f.queues[0] = queue;
@@ -646,6 +648,7 @@ pub(in crate::lanes) mod fake {
                         token: SenderToken::new(1),
                         len: u16::try_from(request.max_bytes).unwrap(),
                         outcome,
+                        late: false,
                     })
                     .unwrap();
             }
@@ -785,6 +788,7 @@ fn a_head_returned_for_its_neighbour_is_dropped_and_the_next_one_served() {
         outcome: TxItemOutcome::Returned {
             reason: crate::backend::ReturnReason::NeighbourUnresolved,
         },
+        late: false,
     };
     report.writer().unwrap().push(returned).unwrap();
     assert_eq!(report.pop_front(), Some(returned));

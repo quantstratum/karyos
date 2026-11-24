@@ -57,6 +57,7 @@ fn fixture_with(sq: usize) -> Fixture {
         authority: Authority::new(NonZeroU64::MIN),
         route,
         max_pending: nz(SLOTS),
+        etf: None,
     });
     let Ok(queue) = queue else {
         panic!("queue: {queue:?}");
@@ -607,6 +608,7 @@ fn closing_a_queue_waits_for_its_submitted_items_and_strands_no_slot() {
                 authority: Authority::new(NonZeroU64::MIN),
                 route: f.route,
                 max_pending: nz(SLOTS),
+                etf: None,
             })
             .unwrap();
     }
@@ -682,6 +684,7 @@ mod kernel {
             authority: Authority::new(NonZeroU64::MIN),
             route,
             max_pending: nz(SLOTS),
+            etf: None,
         }) else {
             panic!("queue");
         };
@@ -813,4 +816,25 @@ mod kernel {
         assert_eq!(probes.sqpoll, CapabilityState::NotRequested);
         drop(ring);
     }
+}
+
+#[test]
+fn an_etf_queue_is_an_unavailable_capability() {
+    let mut f = fixture();
+    let etf = crate::backend::EtfQueue {
+        interface: 1,
+        priority: 3,
+        delta_ns: 300_000,
+    };
+    assert_eq!(
+        f.tx.open_queue(TxQueueConfig {
+            authority: Authority::new(NonZeroU64::MIN),
+            route: f.route,
+            max_pending: nz(1),
+            etf: Some(etf),
+        }),
+        Err(QueueError::EtfUnavailable {
+            reason: crate::backend::Reason::Platform
+        })
+    );
 }
