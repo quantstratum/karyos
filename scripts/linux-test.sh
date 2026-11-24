@@ -6,8 +6,13 @@
 # evidence only: the kernel is a VM kernel. Prints the kernel and
 # architecture first so the evidence names them.
 #
-# Usage: scripts/linux-test.sh [cargo test arguments...]
+# Usage: scripts/linux-test.sh [--clean] [cargo test arguments...]
 # Default: cargo test --workspace --locked
+#
+# --clean (or KARYOS_LINUX_CLEAN=1) removes this tree's target volume once
+# the tests finish, whatever their result; use it from one-off clones (a
+# gate on a fresh checkout) so the 25 to 50 GB volume does not outlive the
+# run. Only a leading --clean is taken; everything else goes to cargo test.
 #
 # Every tree is mounted at the same /work path, so cargo cannot tell trees
 # apart inside a shared target directory: concurrent runs from different
@@ -17,9 +22,23 @@
 # karyos-linux-target-<basename>-<checksum>: the basename of the
 # repository root, for reading, and the POSIX cksum of its full physical
 # path, so that two trees with the same basename get different volumes.
+#
+# The volume is created with the labels karyos.linux-target=1 and
+# karyos.root=<physical root path>, and before each run every labelled
+# target volume whose tree no longer exists on this host and that no
+# container uses is removed by exact name; unlabelled volumes are never
+# touched. KARYOS_LINUX_KEEP_VOLUMES=1 skips that pruning. Details in
+# scripts/linux-target-volume.sh.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=scripts/linux-target-volume.sh
+. "$root/scripts/linux-target-volume.sh"
+clean="${KARYOS_LINUX_CLEAN:-}"
+if [ "${1:-}" = --clean ]; then
+    clean=1
+    shift
+fi
 image="${KARYOS_LINUX_IMAGE:-rust:1.99}"
 tree="$(basename "$root" | tr -c 'A-Za-z0-9_.\n-' '-')"
 sum="$(printf '%s' "$root" | cksum | cut -d ' ' -f 1)"
@@ -74,7 +93,9 @@ if [ ${#args[@]} -eq 0 ]; then
     args=(--workspace --locked)
 fi
 
-exec docker run --rm \
+karyos_target_volume_prepare "$target" "$root"
+status=0
+docker run --rm \
     ${platform_args[@]+"${platform_args[@]}"} \
     ${name_args[@]+"${name_args[@]}"} \
     ${seccomp_args[@]+"${seccomp_args[@]}"} \
@@ -87,4 +108,10 @@ exec docker run --rm \
     -w /work \
     "$image" \
     sh -c 'echo "kernel $(uname -r) $(uname -m) target volume $1"; shift; cargo test "$@"' \
-    sh "$target" "${args[@]}"
+    sh "$target" "${args[@]}" || status=$?
+if [ "$clean" = 1 ]; then
+    if docker volume rm "$target" > /dev/null; then
+        printf 'removed target volume %s (--clean)\n' "$target" >&2
+    fi
+fi
+exit "$status"
