@@ -415,6 +415,13 @@ fn spawn_agent(dir: &Path) -> Child {
 /// it is killed, so that attempt cannot show the failure: it is set aside
 /// and the scenario starts again on a fresh driver and directory, up to
 /// five times.
+///
+/// So is an attempt whose attach the driver did not admit within the
+/// agent's guard timeout (`DEFAULT_ATTACH_TIMEOUT`, 1 s), which a loaded
+/// host can exceed: the agent then journals the close as not sent and
+/// answers `driver unavailable`, never attaching (karyos#1067). That is the
+/// agent's right answer to a driver that does not admit it in time, so the
+/// attempt is set aside rather than failed.
 #[test]
 fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
     const ATTEMPTS: u32 = 5;
@@ -425,7 +432,7 @@ fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
         attempt += 1;
         assert!(
             attempt <= ATTEMPTS,
-            "every admitting cycle served the close"
+            "every attempt was served or not admitted in time"
         );
         let dir = dir(&format!("killed-{attempt}"));
         let mut driver = driver(&dir.join("driver"));
@@ -451,11 +458,38 @@ fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
             guard.id()
         );
         stream.write_all(close.as_bytes()).unwrap();
-        let start = Instant::now();
+        // Waits for the attach, or for the agent's answer that its attach
+        // timed out: the stream reads nothing before an answer.
+        stream.set_nonblocking(true).unwrap();
+        let (start, mut answered) = (Instant::now(), Vec::new());
         while clients_connected(&driver) == 0 {
-            assert!(start.elapsed() < Duration::from_secs(10), "never attached");
+            assert!(start.elapsed() < Duration::from_secs(30), "never attached");
             let _ = driver.do_work().unwrap();
+            let mut chunk = [0u8; 256];
+            if let Ok(read) = stream.read(&mut chunk) {
+                answered.extend_from_slice(&chunk[..read]);
+            }
+            if answered.ends_with(b"\n") {
+                break;
+            }
             std::thread::sleep(Duration::from_micros(200));
+        }
+        stream.set_nonblocking(false).unwrap();
+        if !answered.is_empty() {
+            // A close served in the cycle that admitted the client can be
+            // answered before this read: set aside like any served attempt
+            // (Codex review of #1252). Otherwise the only answer before an
+            // attach is the guard timeout's.
+            if driver.guard_audit().records.len() == audited {
+                let answered = String::from_utf8_lossy(&answered);
+                assert_eq!(
+                    answered, "{\"error\":\"driver unavailable\"}\n",
+                    "an answer before the attach"
+                );
+            }
+            let _ = child.kill();
+            let _ = child.wait().unwrap();
+            continue;
         }
         // Attached, so its request record is written. An unchanged audit
         // proves no answer exists, and with the driver no longer served
@@ -497,6 +531,73 @@ fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
     assert_eq!(answer, format!("{{\"acknowledged\":{}}}\n", gap.position));
     let journal = agent.view().journal.unwrap();
     assert_eq!((journal.gap, journal.alerts.len()), (None, 0));
+}
+
+/// A driver that does not admit the agent within its guard timeout (1 s):
+/// the agent answers `driver unavailable` and journals the close as not
+/// sent, so the next agent on that journal shows only the kill's unclean
+/// stop, never a request without an outcome. This is the answer `an_agent_killed_during_a_close_leaves_a_request_without_outcome`
+/// sets aside when a loaded host admits too late (karyos#1067).
+#[test]
+fn a_close_the_driver_does_not_admit_in_time_is_journalled_as_not_sent() {
+    let _serial = serial();
+    let dir = dir("unadmitted");
+    let mut driver = driver(&dir.join("driver"));
+    let guard = driver.add_guard("orders").unwrap();
+    let _ = driver.reopen_guard(guard, 1, 1).unwrap();
+    let audited = driver.guard_audit().records.len();
+    let mut child = spawn_agent(&dir);
+    let socket = dir.join("api").join(karyos_agent::server::SOCKET_NAME);
+    let start = Instant::now();
+    let mut stream = loop {
+        let _ = driver.do_work().unwrap();
+        if let Ok(stream) = UnixStream::connect(&socket) {
+            break stream;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "no agent socket");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let close = format!(
+        "KARYOS-AGENT 1 guard-close {} {}\n",
+        dir.join("driver").display(),
+        guard.id()
+    );
+    let sent = karyos_sys::host_clock::host_monotonic_ns();
+    stream.write_all(close.as_bytes()).unwrap();
+    // The driver is not served: the agent's attach cannot be admitted. The
+    // read is bounded, so an agent that never answers fails the test
+    // rather than hanging it (Codex review of #1252).
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let mut answer = String::new();
+    let read = stream.read_to_string(&mut answer);
+    child.kill().unwrap();
+    let _ = child.wait().unwrap();
+    read.expect("the agent answered within 30 s");
+    assert_eq!(answer, "{\"error\":\"driver unavailable\"}\n");
+    // Served now, the driver closes nothing: the close was never sent.
+    for _ in 0..100 {
+        let _ = driver.do_work().unwrap();
+    }
+    assert_eq!(driver.guard_audit().records.len(), audited);
+    // The kill is itself an unclean stop, which the next agent shows; the
+    // close is not an open request: its outcome was journalled. The
+    // interval runs from the last record read, so an interval from after
+    // the close was sent shows a record of the close, and as the reason is
+    // not `request_without_outcome`, that record is its outcome (Codex
+    // review of #1252): a close journalled not at all would leave the
+    // agent's start as the last record, before `sent`.
+    let agent = agent(&dir, true);
+    let journal = agent.view().journal.unwrap();
+    let gap = journal.gap.unwrap();
+    assert_eq!(gap.reason, "unclean_stop");
+    assert!(
+        gap.from >= sent,
+        "{} < {sent}: the close left no record",
+        gap.from
+    );
+    assert_eq!(journal.alerts.len(), 1, "one interval, the stop's");
 }
 
 /// R-CORE-19 (karyos#726): a relayed `gap-ack`. A relayed operator is

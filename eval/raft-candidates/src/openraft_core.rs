@@ -809,6 +809,61 @@ pub fn append_shape(message: &Message) -> Option<(usize, u64)> {
     Some((rpc.entries.len(), bytes))
 }
 
+/// An append's leader term and its entries as (harness index, payload
+/// bytes), read from the message itself for an oracle that never trusts
+/// the adapter's counters (C5 version 2's W2 byte case; karyos#691);
+/// `None` for any other message.
+#[must_use]
+pub fn append_entries(message: &Message) -> Option<(u64, Vec<(u64, u64)>)> {
+    let Message::Request {
+        request: Request::Append(rpc),
+        ..
+    } = message
+    else {
+        return None;
+    };
+    let entries = rpc
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let harness = to_harness(entry)?;
+            let bytes = match &entry.payload {
+                EntryPayload::Normal(command) => command.0.len(),
+                _ => 0,
+            };
+            Some((harness.index, u64::try_from(bytes).unwrap_or(u64::MAX)))
+        })
+        .collect();
+    Some((rpc.vote.leader_id.term, entries))
+}
+
+/// The leader term and harness index an append's answer acknowledges:
+/// the echoed request's last entry (or, for an empty one, its previous
+/// entry) on `Success`, the matched entry on `PartialSuccess`; `None` for
+/// any other message or answer, and for an empty append with no previous
+/// entry, which acknowledges nothing.
+#[must_use]
+pub fn append_ack(message: &Message) -> Option<(u64, u64)> {
+    let Message::Response {
+        request: Request::Append(rpc),
+        response: Some(Response::Append(response)),
+        ..
+    } = message
+    else {
+        return None;
+    };
+    let matched = match &**response {
+        AppendEntriesResponse::Success => rpc
+            .entries
+            .last()
+            .map(|entry| entry.log_id)
+            .or(rpc.prev_log_id),
+        AppendEntriesResponse::PartialSuccess(Some(id)) => Some(*id),
+        _ => None,
+    }?;
+    Some((rpc.vote.leader_id.term, matched.index.checked_add(1)?))
+}
+
 impl<const PRE_VOTE: bool, const BATCH: u64> fmt::Debug for OpenRaftCore<PRE_VOTE, BATCH> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenRaftCore")
@@ -1271,6 +1326,82 @@ impl<const PRE_VOTE: bool, const BATCH: u64> crate::process::Wire
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn append_rpc(term: u64, prev: Option<(u64, u64)>, entries: &[(u64, &[u8])]) -> Request {
+        Request::Append(Arc::new(AppendEntriesRequest {
+            vote: OVote {
+                leader_id: openraft::impls::leader_id_std::LeaderId { term, voted_for: 1 },
+                committed: true,
+            },
+            prev_log_id: prev.map(|(term, index)| log_id(term, index)),
+            entries: entries
+                .iter()
+                .map(|(index, payload)| OEntry {
+                    log_id: log_id(term, *index),
+                    payload: if payload.is_empty() {
+                        EntryPayload::Blank
+                    } else {
+                        EntryPayload::Normal(Command(payload.to_vec()))
+                    },
+                })
+                .collect(),
+            leader_commit: None,
+        }))
+    }
+
+    fn answer(request: Request, response: AppendEntriesResponse<C>) -> Message {
+        Message::Response {
+            id: 1,
+            incarnation: 1,
+            request,
+            response: Some(Response::Append(Arc::new(response))),
+        }
+    }
+
+    /// The oracle's reading of OpenRaft's appends (karyos#691): harness
+    /// indices are OpenRaft's plus one, payload bytes are the commands',
+    /// and each answer acknowledges exactly what it covers.
+    #[test]
+    fn appends_and_their_answers_are_read_in_harness_indices() {
+        let rpc = append_rpc(3, Some((2, 4)), &[(5, &[7; 100]), (6, &[]), (7, &[7; 10])]);
+        let request = Message::Request {
+            id: 1,
+            incarnation: 1,
+            request: rpc.clone(),
+        };
+        assert_eq!(
+            append_entries(&request),
+            Some((3, vec![(6, 100), (7, 0), (8, 10)]))
+        );
+        assert_eq!(
+            append_ack(&answer(rpc.clone(), AppendEntriesResponse::Success)),
+            Some((3, 8))
+        );
+        assert_eq!(
+            append_ack(&answer(
+                rpc.clone(),
+                AppendEntriesResponse::PartialSuccess(Some(log_id(3, 5)))
+            )),
+            Some((3, 6))
+        );
+        assert_eq!(
+            append_ack(&answer(rpc.clone(), AppendEntriesResponse::Conflict)),
+            None
+        );
+        // An empty append acknowledges its previous entry, OpenRaft's 0
+        // being the harness's 1; with none, nothing.
+        let heartbeat = append_rpc(3, Some((1, 0)), &[]);
+        assert_eq!(
+            append_ack(&answer(heartbeat, AppendEntriesResponse::Success)),
+            Some((3, 1))
+        );
+        let empty = append_rpc(3, None, &[]);
+        assert_eq!(
+            append_ack(&answer(empty, AppendEntriesResponse::Success)),
+            None
+        );
+        assert_eq!(append_ack(&request), None);
+    }
 
     /// The regression of the karyos#959 review: after a restart the RPC
     /// numbers start again, so an answer to an earlier incarnation's
