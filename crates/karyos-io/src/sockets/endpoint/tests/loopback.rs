@@ -73,6 +73,7 @@ impl Node {
                 authority: Authority::FIRST,
                 route,
                 max_pending: nz(8),
+                etf: None,
             })
             .unwrap()
     }

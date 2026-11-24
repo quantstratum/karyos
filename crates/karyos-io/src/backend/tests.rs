@@ -25,6 +25,7 @@ fn entry(slot: u32) -> TxEntry {
         outcome: TxItemOutcome::Submitted {
             release: Release::AtSubmission,
         },
+        late: false,
     }
 }
 

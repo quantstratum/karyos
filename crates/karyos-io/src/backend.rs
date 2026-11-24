@@ -440,6 +440,26 @@ pub struct TxQueueConfig {
     pub route: RouteId,
     /// Claimed plus pending frames this queue may hold.
     pub max_pending: NonZeroU16,
+    /// The etf declaration of a queue of the `etf` route of timed sends
+    /// (ADR-0109 point 2), or `None` for an immediate queue. Only the
+    /// sockets backend opens one; every other backend refuses it with
+    /// [`QueueError::EtfUnavailable`].
+    pub etf: Option<EtfQueue>,
+}
+
+/// The etf declaration of a TX queue (ADR-0109 point 2): where the
+/// deployment configured the `etf` leaf that releases the queue's timed
+/// datagrams. Karyos changes no qdisc and cannot probe one from a socket;
+/// the declaration is recorded, and only `priority` reaches the kernel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EtfQueue {
+    /// The index of the interface holding the `etf` leaf.
+    pub interface: u32,
+    /// The `SO_PRIORITY` that the interface's root qdisc (`mqprio` or
+    /// `taprio`) maps to the TX queue holding the leaf.
+    pub priority: u32,
+    /// The leaf's `delta`, in nanoseconds.
+    pub delta_ns: u32,
 }
 
 /// A claimed, private TX frame. It borrows its backend, so only one frame
@@ -477,11 +497,12 @@ pub struct Commit {
     pub options: TxOptions,
 }
 
-/// Per datagram options. The baseline accepts only [`TxOptions::none`];
-/// launch time or other offloads are added by their own designs.
+/// Per datagram options: none, or a send time (ADR-0109 point 1), which
+/// only a queue opened with an [`EtfQueue`] accepts; any other queue
+/// rejects it with [`CommitError::UnsupportedOption`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TxOptions {
-    _private: (),
+    txtime: Option<u64>,
 }
 
 impl TxOptions {
@@ -489,14 +510,32 @@ impl TxOptions {
     #[inline]
     #[must_use]
     pub const fn none() -> Self {
-        Self { _private: () }
+        Self { txtime: None }
     }
 
-    /// Whether no option is set. Always true in the baseline.
+    /// A send time in nanoseconds of `CLOCK_TAI`: the `etf` leaf releases
+    /// the datagram then. A time already past when the queue is flushed
+    /// sends it at once, reported late ([`TxEntry::late`]).
+    #[inline]
+    #[must_use]
+    pub const fn txtime(time_ns: u64) -> Self {
+        Self {
+            txtime: Some(time_ns),
+        }
+    }
+
+    /// Whether no option is set.
     #[inline]
     #[must_use]
     pub const fn is_none(self) -> bool {
-        true
+        self.txtime.is_none()
+    }
+
+    /// The send time, if any, in nanoseconds of `CLOCK_TAI`.
+    #[inline]
+    #[must_use]
+    pub const fn txtime_ns(self) -> Option<u64> {
+        self.txtime
     }
 }
 
@@ -671,6 +710,10 @@ pub struct TxEntry {
     pub len: u16,
     /// What happened to the item.
     pub outcome: TxItemOutcome,
+    /// A timed item ([`TxOptions::txtime`]) whose time had already passed
+    /// at its flush: it was submitted at once on the immediate route, late
+    /// (ADR-0109 point 4). Always `false` for any other item.
+    pub late: bool,
 }
 
 /// What one call established about one item.
@@ -1228,6 +1271,18 @@ pub enum QueueError {
     /// clears it.
     #[error("tx queue needs an endpoint reset")]
     NeedsReset,
+    /// An etf queue (ADR-0109) is unavailable: a backend without the
+    /// `etf` route, or a socket option of the route the kernel refused
+    /// (`SO_TXTIME`, `SO_PRIORITY`, the steering program).
+    #[error("etf queue unavailable: {reason:?}")]
+    EtfUnavailable {
+        /// Why.
+        reason: Reason,
+    },
+    /// An etf queue on an endpoint not opened for the `etf` route, or to a
+    /// multicast destination (ADR-0109 point 5: unicast only).
+    #[error("etf queue refused by its endpoint or route")]
+    EtfRefused,
 }
 
 /// Why a route operation failed.

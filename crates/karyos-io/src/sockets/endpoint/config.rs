@@ -240,6 +240,10 @@ pub struct SocketsConfig {
     pub require: CapabilitySet,
     /// The protection profile; [`Protection::Trusted`] only (5.2).
     pub protection: Protection,
+    /// The endpoint carries etf queues (ADR-0109 point 5): its socket sets
+    /// `SO_REUSEPORT` before it binds, so each etf queue's socket can join
+    /// its port. Unicast only: refused with a multicast group.
+    pub etf_route: bool,
 }
 
 impl SocketsConfig {
@@ -263,6 +267,7 @@ impl SocketsConfig {
             rx_budget_datagrams: DEFAULT_RX_BUDGET_DATAGRAMS,
             require: CapabilitySet::EMPTY,
             protection: Protection::Trusted,
+            etf_route: false,
         }
     }
 
@@ -345,6 +350,11 @@ impl SocketsConfig {
             let same_family = multicast.group.is_ipv4() == self.local.is_ipv4();
             if !multicast.group.is_multicast() || !same_family {
                 return Err(invalid("multicast.group", 0));
+            }
+            // Multicast delivery is not decided by the reuseport
+            // selection that keeps inbound datagrams off the etf socket.
+            if self.etf_route {
+                return Err(invalid("etf_route", 1));
             }
         }
         if self.protection != Protection::Trusted {

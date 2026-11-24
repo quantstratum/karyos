@@ -1227,6 +1227,7 @@ impl<T: StreamTerms> Outbound<T> {
                     authority: Authority::FIRST,
                     route,
                     max_pending,
+                    etf: None,
                 }) {
                     Ok(opened) if lane => {
                         if let Some(queue) = target.queues.get_mut(at) {
@@ -2431,6 +2432,7 @@ mod tests {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::MIN,
+                etf: None,
             })
             .unwrap();
         let frame = tx.claim_tx(queue, 8).unwrap();
@@ -2464,6 +2466,7 @@ mod tests {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::MIN,
+                etf: None,
             })
             .unwrap();
         let mut queues = [None; OPENED_QUEUES];
@@ -2542,6 +2545,7 @@ mod tests {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::MIN,
+                etf: None,
             })
             .unwrap();
         let frame = tx.claim_tx(queue, 1408).unwrap();

@@ -1304,6 +1304,7 @@ impl<T: StreamTerms> Outbound<T> {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::new(STAGED_PER_LANE).unwrap_or(NonZeroU16::MIN),
+                etf: None,
             });
             let opened = match opened {
                 Ok(opened) => opened,
@@ -1346,6 +1347,7 @@ impl<T: StreamTerms> Outbound<T> {
                     authority: Authority::FIRST,
                     route,
                     max_pending: NonZeroU16::MIN,
+                    etf: None,
                 })
                 .ok();
             if queue.is_none() {

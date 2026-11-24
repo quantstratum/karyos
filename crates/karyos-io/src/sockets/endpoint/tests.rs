@@ -7,6 +7,7 @@
 //! Rows that need more are listed, with their batch, in `DEFERRED_ROWS`.
 
 mod borrowed;
+mod etf;
 mod lifecycle;
 mod loopback;
 mod model;
@@ -222,6 +223,7 @@ impl Harness {
                 authority: Authority::FIRST,
                 route,
                 max_pending: nz(max_pending),
+                etf: None,
             })
             .unwrap();
         Self {

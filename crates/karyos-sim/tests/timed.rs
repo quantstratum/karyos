@@ -193,6 +193,7 @@ impl Wire {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::new(BOUND).ok_or("bound")?,
+                etf: None,
             })
             .map_err(|error| format!("queue: {error:?}"))
         };
