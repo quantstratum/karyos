@@ -10,13 +10,16 @@
 //! replicated session table ([`dedup`]); and C8a's snapshot store, typed
 //! sections published by a manifest ([`snapshot`]); and C10's service
 //! container, a [`service::ClusteredService`] fed committed entries
-//! ([`service`]). The consensus core and guards do not exist yet.
+//! ([`service`]); and the custom Raft core's state machine of ADR-0105
+//! ([`consensus`]), not yet driven over the log. The guards do not exist
+//! yet.
 //!
 //! Internal to the Karyos workspace and unstable in alpha, with no
 //! compatibility promise. The supported API is the `karyos` facade,
 //! `karyos-client` and `karyos-archive`, and the C ABI of `karyos-ffi`
 //! under its own `0.y.z` rule.
 
+pub mod consensus;
 pub mod dedup;
 mod file;
 pub mod hard_state;
