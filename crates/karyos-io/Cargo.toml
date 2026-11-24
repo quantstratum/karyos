@@ -37,12 +37,16 @@ thiserror.workspace = true
 # directly rather than through the workspace entry so that this crate asks
 # for `net` only; no `event` (decision O-6).
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1.5", default-features = false, features = ["std", "net"] }
-# `IP_MULTICAST_ALL` and `IPV6_MULTICAST_ALL` off on a path socket
-# (`src/linux_sys.rs`, owner item 12), which `rustix` 1.1.5 cannot set:
-# the R8 record quantstratum-docs:
-# karyos/reviews/dependency-admission-libc-linux-sockets.md, at the
-# version `Cargo.lock` resolves, no feature.
+rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "time", "linux_4_11"] }
+# The Linux `libc` calls `rustix` 1.1.5 has no API for (`src/linux_sys.rs`,
+# the only caller): `IP_MULTICAST_ALL`/`IPV6_MULTICAST_ALL` off on a path
+# socket and the error queue of the `etf` route, under the joint Linux
+# `libc` record of owner items 12 and 29
+# (quantstratum-docs: karyos/reviews/dependency-admission-libc-linux-sockets.md),
+# which also records `rustix`'s `time` feature above, for `SO_TXTIME`'s
+# clock id, and `linux_4_11`, which exposes `CLOCK_TAI` (it also drops
+# rustix's pre-4.11 `statx` probe and fallback, which no Karyos code calls;
+# every kernel floor of the core is above 4.11).
 libc = { version = "0.2.190", default-features = false }
 # The `io_uring` ring of the `uring` feature (`src/uring/ring.rs`): the
 # ADR-0033 family `io-uring`, resolution admitted under R8 at 0.7.x with no

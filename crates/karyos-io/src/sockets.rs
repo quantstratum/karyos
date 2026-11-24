@@ -13,6 +13,9 @@
 #![forbid(unsafe_code)]
 
 pub mod endpoint;
+pub mod errqueue;
+#[cfg(target_os = "linux")]
+pub mod etf;
 #[cfg(target_os = "linux")]
 pub mod linux;
 pub mod ops;

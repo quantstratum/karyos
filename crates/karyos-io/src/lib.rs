@@ -26,7 +26,7 @@ pub mod lanes;
 #[cfg(target_os = "linux")]
 #[expect(
     unsafe_code,
-    reason = "the libc socket option calls rustix has no API for, behind a safe interface (owner item 12; quantstratum-docs: karyos/reviews/dependency-admission-libc-linux-sockets.md)"
+    reason = "the libc calls rustix has no API for (multicast-all off, the etf route's error queue recvmsg), behind a safe interface under the joint libc record (SPEC.md §14; owner items 12 and 29)"
 )]
 mod linux_sys;
 pub mod sockets;
