@@ -279,6 +279,24 @@ pub struct W5 {
     pub compaction: Compaction,
 }
 
+/// The log bytes of one W5 entry: a client's append of `payload` bytes,
+/// as the log frames it.
+fn w5_frame(payload: usize) -> u64 {
+    let command = super::node::Command {
+        client: 0,
+        sequence: 1,
+        op: Op::Append(vec![0; payload]),
+    };
+    Entry {
+        index: 1,
+        term: 1,
+        event_time: 0,
+        payload: command.encode(),
+    }
+    .encoded_len()
+    .unwrap_or(0)
+}
+
 impl W5 {
     /// The follower held behind: not the reference's leader.
     pub const BEHIND: NodeId = 2;
@@ -293,6 +311,7 @@ impl W5 {
             compaction: Compaction {
                 every: 1_000,
                 keep: 100,
+                frame: w5_frame(256),
             },
         }
     }
@@ -305,6 +324,7 @@ impl W5 {
             compaction: Compaction {
                 every: 100,
                 keep: 10,
+                frame: w5_frame(256),
             },
             ..Self::manifest()
         }
@@ -615,6 +635,11 @@ pub struct Case {
     /// only those at the highest: W2's catch-up is the point of the case
     /// (karyos#899 review).
     pub converged: bool,
+    /// A snapshot piece lost, deterministically (karyos#682): every
+    /// server drops the piece with this index (from 0) of the first
+    /// snapshot transfer it receives, as if the network lost it, so the
+    /// transfer breaks off and the leader's core asks again.
+    pub lose_snapshot_piece: Option<u64>,
     /// What the case does not cover, stated in every raw result line of
     /// its runs: W2's [`W2::IN_FLIGHT_BYTES`].
     pub notes: Vec<&'static str>,
@@ -702,6 +727,7 @@ impl Case {
             limits: None,
             window: 1,
             converged: false,
+            lose_snapshot_piece: None,
             notes: Vec::new(),
             behind: None,
             compaction: None,
@@ -1014,6 +1040,9 @@ pub fn run<C: ConsensusCore>(case: &Case, seed: u64) -> Result<Outcome, RunError
         }
         if let Some(compaction) = case.compaction {
             server = server.with_compaction(compaction);
+            if let Some(piece) = case.lose_snapshot_piece {
+                server = server.losing_snapshot_piece(piece);
+            }
         }
         #[cfg(feature = "test-hooks")]
         {
