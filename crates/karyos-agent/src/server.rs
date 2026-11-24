@@ -60,8 +60,9 @@
 //!   see [`crate::preview`]), each for the roles that may make the
 //!   operation, the submit refused as `{"error":"token unknown"}`, `token
 //!   expired`, `principal mismatch`, `target mismatch`, `parameters
-//!   mismatch`, `target changed` or `operation id reused` with nothing
-//!   sent. A `join-put` line may
+//!   mismatch`, `target changed`, `operation id conflict` or `operation
+//!   expired` with nothing sent; a retry of a used id is answered with its
+//!   retained outcome, unsent. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
