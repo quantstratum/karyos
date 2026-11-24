@@ -180,7 +180,8 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"guard-preview","state":"forbidden","reason":"role"},"#,
             r#"{"name":"submit","state":"forbidden","reason":"role"},"#,
             r#"{"name":"clocks","state":"served","reason":null},"#,
-            r#"{"name":"rate-limits","state":"served","reason":null}]}"#,
+            r#"{"name":"rate-limits","state":"served","reason":null},"#,
+            r#"{"name":"cluster-command","state":"unavailable","reason":"not_configured"}]}"#,
             "\n"
         )
     );

@@ -433,6 +433,86 @@ pub fn retention_answer(answer: &crate::retention::RetentionAnswer) -> String {
     text
 }
 
+/// A product Cluster's admin command's answer (R-CORE-41, karyos#772):
+/// `{"operation":N,"outcome":"sequenced","index":N,"term":N,"reply":HEX,
+/// "evidence":{"algorithm":S,"digest":HEX}|null}`; a product's refusal
+/// `{"error":"refused","operation":N,"outcome":"refused","code":N,
+/// "reason":S}`; an unknown outcome `{"error":"no answer","operation":N,
+/// "outcome":"unknown"}`; each with `"journalled":false` added when its
+/// outcome record could not be written (the result stands; the record is
+/// missing). The agent's refusals: `{"error":TEXT,"journalled":B}` for
+/// one it journals, `{"error":TEXT}` for `journal unavailable` and
+/// `busy`, and `bad arguments` for an id of 0 or parameters too long.
+#[must_use]
+pub fn cluster_answer(answer: &crate::cluster_admin::ClusterAnswer) -> String {
+    use crate::cluster_admin::{ClusterAnswer, hex};
+    let mut text = String::new();
+    Out(&mut text).object(|fields| match answer {
+        ClusterAnswer::Sequenced {
+            operation,
+            index,
+            term,
+            reply,
+            evidence,
+            journalled,
+        } => {
+            fields.number("operation", operation);
+            fields.string("outcome", "sequenced");
+            fields.number("index", index);
+            fields.number("term", term);
+            fields.string("reply", &hex(reply));
+            fields
+                .key("evidence")
+                .option(evidence.as_ref(), |out, evidence| {
+                    out.object(|fields| {
+                        fields.string("algorithm", &evidence.algorithm);
+                        fields.string("digest", &hex(&evidence.digest));
+                    });
+                });
+            if !journalled {
+                fields.key("journalled").bool(false);
+            }
+        }
+        ClusterAnswer::Refused {
+            operation,
+            code,
+            reason,
+            journalled,
+        } => {
+            fields.string("error", "refused");
+            fields.number("operation", operation);
+            fields.string("outcome", "refused");
+            fields.number("code", code);
+            fields.string("reason", reason);
+            if !journalled {
+                fields.key("journalled").bool(false);
+            }
+        }
+        ClusterAnswer::NoAnswer {
+            operation,
+            journalled,
+        } => {
+            fields.string("error", "no answer");
+            fields.number("operation", operation);
+            fields.string("outcome", "unknown");
+            if !journalled {
+                fields.key("journalled").bool(false);
+            }
+        }
+        ClusterAnswer::Rejected { code, journalled } => {
+            fields.string("error", code.text());
+            fields.key("journalled").bool(*journalled);
+        }
+        ClusterAnswer::BadArguments => {
+            fields.string("error", "bad arguments");
+            fields.string("request", "cluster-command");
+        }
+        ClusterAnswer::JournalUnavailable => fields.string("error", "journal unavailable"),
+        ClusterAnswer::Busy => fields.string("error", "busy"),
+    });
+    text
+}
+
 /// The answer to an acknowledged unknown interval (M10b).
 #[must_use]
 pub fn acknowledged(position: u64) -> String {
