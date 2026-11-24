@@ -28,7 +28,8 @@
 //!   [`Effects::send`] goes in `messages` and
 //!   [`Effects::send_after_persist`] in `after_persist`, which
 //!   [`drive`](super::core::drive) releases once the Ready is durable
-//!   (persist then send).
+//!   (persist then send); [`Effects::send_snapshot`] goes in
+//!   `snapshot_to`.
 //! - Appends: the core sends positions and counts. Each append is filled
 //!   with its entries as soon as the core emits it, from the same view
 //!   the core read: the pending entries, or C4's log through the duty's
@@ -216,6 +217,8 @@ pub struct Custom {
     handed: u64,
     /// Messages to send at once, and after persistence, filled.
     outgoing: Vec<(NodeId, Message)>,
+    /// Followers the core asked a snapshot for, for the next Ready.
+    snapshot_to: Vec<NodeId>,
     after: Vec<(NodeId, Message)>,
     /// What one core call sent, before it is filled.
     sent: Vec<(u64, CoreMessage)>,
@@ -244,6 +247,7 @@ struct Sink<'a> {
     commit: Option<u64>,
     write: Option<(u64, u64)>,
     append: Option<(u64, u64)>,
+    snapshot_to: &'a mut Vec<NodeId>,
 }
 
 impl Effects for Sink<'_> {
@@ -269,6 +273,16 @@ impl Effects for Sink<'_> {
 
     fn commit(&mut self, index: u64) {
         self.commit = Some(index);
+    }
+
+    fn send_snapshot(&mut self, to: u64) {
+        // One request per follower per Ready: the core asks at most once
+        // per election timeout, and a duplicate would only resend.
+        if let Some(to) = node_id(to)
+            && !self.snapshot_to.contains(&to)
+        {
+            self.snapshot_to.push(to);
+        }
     }
 }
 
@@ -417,6 +431,7 @@ impl Custom {
             // The node applies from its log's start after a restart.
             handed: 0,
             outgoing: Vec::with_capacity(READY_CAPACITY),
+            snapshot_to: Vec::new(),
             after: Vec::with_capacity(READY_CAPACITY),
             sent: Vec::with_capacity(READY_CAPACITY),
             sent_after: Vec::with_capacity(READY_CAPACITY),
@@ -454,6 +469,7 @@ impl Custom {
             commit: None,
             write: None,
             append: None,
+            snapshot_to: &mut self.snapshot_to,
         };
         let view = View {
             log,
@@ -719,6 +735,7 @@ impl ConsensusCore for Custom {
         }
         out.ready.messages.append(&mut self.outgoing);
         out.ready.after_persist.append(&mut self.after);
+        out.ready.snapshot_to.append(&mut self.snapshot_to);
         // Committed entries, written or in this Ready, from the last
         // handed out, as many as the duty's reads cover: `drive` applies
         // them once this Ready is durable.
