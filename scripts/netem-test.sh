@@ -25,6 +25,10 @@ base="${KARYOS_LINUX_IMAGE:-rust:1.99}"
 image="karyos-netem:$(printf '%s' "$base" | tr -c 'A-Za-z0-9_.-' '-')"
 tree="$(basename "$root" | tr -c 'A-Za-z0-9_.-\n' '-')"
 sum="$(printf '%s' "$root" | cksum | cut -d ' ' -f 1)"
+# Labels the target volume and prunes stale ones, as linux-test.sh does
+# (KARYOS_LINUX_KEEP_VOLUMES=1 skips the pruning).
+# shellcheck source=scripts/linux-target-volume.sh
+. "$root/scripts/linux-target-volume.sh"
 # The same target volume as scripts/linux-test.sh: the same code, built
 # the same way.
 target="${KARYOS_LINUX_TARGET:-karyos-linux-target-$tree-$sum}"
@@ -42,6 +46,7 @@ if [ ${#args[@]} -eq 0 ]; then
     args=(-p karyos-driver --lib --locked netem -- --ignored --test-threads=1 --nocapture)
 fi
 
+karyos_target_volume_prepare "$target" "$root"
 exec docker run --rm \
     --cap-add NET_ADMIN \
     ${name_args[@]+"${name_args[@]}"} \

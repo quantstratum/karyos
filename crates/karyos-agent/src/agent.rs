@@ -229,6 +229,8 @@ pub struct Agent {
     used_ids: std::collections::HashSet<u64>,
     /// This host's boot identity, journalled with each submit (karyos#738).
     boot: Vec<u8>,
+    /// The product Clusters attached for admin commands (karyos#772).
+    clusters: crate::cluster_admin::Clusters,
 }
 
 impl Agent {
@@ -281,7 +283,16 @@ impl Agent {
         let outcomes = crate::preview::Outcomes::rebuild(&operations, (start, &boot));
         // Only callers' ids: the agent's own direct ids are not journalled
         // as submits, and its allocator starts past them (karyos#738).
-        let used_ids = outcomes.ids().collect();
+        // And the ids of every admin command sent to a Cluster (karyos#772).
+        let used_ids = outcomes
+            .ids()
+            .chain(
+                operations
+                    .iter()
+                    .filter(|record| record.kind == crate::journal::Kind::ClusterRequest)
+                    .map(|record| record.operation),
+            )
+            .collect();
         let unopened_gap = journal_error.as_ref().map(|_| Gap {
             position: UNOPENED_POSITION,
             reason: GapReason::JournalUnavailableAtStart,
@@ -304,6 +315,7 @@ impl Agent {
             outcomes,
             used_ids,
             boot,
+            clusters: crate::cluster_admin::Clusters::default(),
         }
     }
 
@@ -328,6 +340,66 @@ impl Agent {
             .ok_or(GuardAnswer::UnknownDriver)?;
         let window = driver.trace.as_ref().ok_or(GuardAnswer::Unattached)?;
         Ok(window.buckets(from, count, epoch, crate::api::MAX_BUCKET_REPLY))
+    }
+
+    /// The clocks of the driver in `dir` (R-CORE-40, karyos#741): its
+    /// local trace journals' clocks as the agent's trace window last saw
+    /// them, with their domains, epochs and uncertainties, and the
+    /// calibrations the agent can see. The agent reads no calibration
+    /// source until karyos#118 produces one, so every clock's calibration
+    /// is unavailable, `no_calibration`, and the list is empty with the
+    /// reason `no_producer`: a clocks view may legitimately show no
+    /// cross-host calibration until then. Read from the window the agent
+    /// holds, never from a mapping: O(journals), within `max_journals`.
+    ///
+    /// # Errors
+    ///
+    /// [`GuardAnswer::UnknownDriver`] for a directory not configured, and
+    /// [`GuardAnswer::Unattached`] before the agent has attached to it.
+    pub fn clocks(&self, dir: &Path) -> Result<crate::api::ClocksRead, GuardAnswer> {
+        /// The calibrations the agent can see: none until karyos#118.
+        const CALIBRATIONS: &[karyos_trace::Calibration] = &[];
+        let driver = self
+            .drivers
+            .iter()
+            .find(|driver| driver.dir == dir)
+            .ok_or(GuardAnswer::UnknownDriver)?;
+        let (Some(window), Some(instance)) = (driver.trace.as_ref(), driver.instance) else {
+            return Err(GuardAnswer::Unattached);
+        };
+        let (clocks, calibrations) = window.clocks(CALIBRATIONS);
+        Ok(crate::api::ClocksRead {
+            dir: driver.dir.clone(),
+            read_ns: host_monotonic_ns(),
+            driver: instance,
+            clocks,
+            calibrations,
+            calibrations_unavailable: Some("no_producer"),
+        })
+    }
+
+    /// The rate limiters of the driver in `dir` (R-CORE-40, karyos#741):
+    /// per network publication, the policy in force, its version and each
+    /// limiter's refusals, from the counter cells of the agent's last
+    /// sampling pass, never from a mapping: O(cells), within the counters
+    /// region.
+    ///
+    /// # Errors
+    ///
+    /// [`GuardAnswer::UnknownDriver`] for a directory not configured, and
+    /// [`GuardAnswer::Unattached`] before a pass of it was read.
+    pub fn rate_limits(&self, dir: &Path) -> Result<crate::api::RateLimitsRead, GuardAnswer> {
+        let driver = self
+            .drivers
+            .iter()
+            .find(|driver| driver.dir == dir)
+            .ok_or(GuardAnswer::UnknownDriver)?;
+        let sample = driver.sample.as_ref().ok_or(GuardAnswer::Unattached)?;
+        Ok(crate::api::RateLimitsRead {
+            dir: driver.dir.clone(),
+            read_ns: sample.counters.first().map(|counter| counter.read_ns),
+            publications: crate::resources::rate_limits(&sample.counters),
+        })
     }
 
     /// Up to `count` raw trace records of the driver in `dir`, from mirror
@@ -366,6 +438,58 @@ impl Agent {
             page.network_journals_refused.attach = driver.refused_at_attach;
             page
         }))
+    }
+
+    /// Attaches a product's Cluster as `name` for admin commands, with the
+    /// commands its gateway registers (R-CORE-41, karyos#772; see
+    /// [`crate::cluster_admin`]).
+    ///
+    /// # Errors
+    ///
+    /// [`crate::cluster_admin::AttachError`], with nothing attached.
+    pub fn attach_cluster(
+        &mut self,
+        name: &str,
+        gateway: Box<dyn crate::cluster_admin::ClusterGateway>,
+    ) -> Result<(), crate::cluster_admin::AttachError> {
+        self.clusters.attach(name, gateway)
+    }
+
+    /// Makes admin command `command` with `parameters` on the Cluster
+    /// attached as `cluster`, under the caller's operation id `operation`,
+    /// for `requester` with `clearance`: journalled before and after, or
+    /// refused and journalled unsent (see [`crate::cluster_admin`]).
+    pub fn cluster_command_for(
+        &mut self,
+        (cluster, command, parameters): (&str, &str, &[u8]),
+        operation: u64,
+        (requester, clearance): (Requester, crate::cluster_admin::Clearance),
+        reason: &[u8],
+    ) -> crate::cluster_admin::ClusterAnswer {
+        let command = crate::cluster_admin::Command {
+            cluster,
+            command,
+            parameters,
+            operation,
+            operator: requester.operator,
+            relay: requester.relay,
+            clearance,
+            reason,
+        };
+        let used_ids = &mut self.used_ids;
+        crate::cluster_admin::cluster_command(
+            self.journal.as_mut(),
+            &self.clusters,
+            &command,
+            (self.config.guard_timeout, |id, take| {
+                if take {
+                    !used_ids.insert(id)
+                } else {
+                    used_ids.contains(&id)
+                }
+            }),
+            host_monotonic_ns,
+        )
     }
 
     /// Attaches the Archive the retention operations go to (M12).
@@ -755,9 +879,13 @@ impl Agent {
     /// the journal's errors.
     pub fn acknowledge_gap(&mut self, position: u64, uid: u32) -> Result<(), JournalError> {
         self.acknowledge_gap_for(position, Requester::local(uid))
+            .map(|_| ())
     }
 
-    /// As [`Agent::acknowledge_gap`], for `requester` (karyos#708).
+    /// As [`Agent::acknowledge_gap`], for `requester` (karyos#708): the
+    /// interval acknowledged, as the view showed it (karyos#726). The
+    /// acknowledgement says the interval was seen and nothing more: what
+    /// happened in it stays unknown.
     ///
     /// # Errors
     ///
@@ -766,15 +894,22 @@ impl Agent {
         &mut self,
         position: u64,
         requester: Requester,
-    ) -> Result<(), JournalError> {
+    ) -> Result<GapView, JournalError> {
         let uid = requester.operator;
         match self.journal.as_mut() {
-            Some(journal) => journal.acknowledge_gap_relayed(
-                position,
-                u64::from(uid),
-                requester.relay,
-                host_monotonic_ns(),
-            ),
+            Some(journal) => {
+                let gap = journal
+                    .gap()
+                    .filter(|gap| gap.position == position)
+                    .ok_or(JournalError::NoGap)?;
+                journal.acknowledge_gap_relayed(
+                    position,
+                    u64::from(uid),
+                    requester.relay,
+                    host_monotonic_ns(),
+                )?;
+                Ok(gap_view(gap))
+            }
             None => match self.unopened_gap.take_if(|gap| gap.position == position) {
                 // The one operator act nothing durable records: logged at
                 // info on standard error, as the agent logs (DESIGN's P3 on
@@ -788,7 +923,7 @@ impl Agent {
                         gap.from,
                         gap.to,
                     );
-                    Ok(())
+                    Ok(gap_view(gap))
                 }
                 None => Err(JournalError::NoGap),
             },
@@ -806,18 +941,7 @@ impl Agent {
             unavailable: journal.is_none_or(Journal::unavailable),
             error: self.journal_error.clone(),
             failed_appends: journal.map_or(0, Journal::failed_appends),
-            gap: gap.map(|gap| GapView {
-                position: gap.position,
-                from: gap.from,
-                to: gap.to,
-                reason: match gap.reason {
-                    GapReason::RequestWithoutOutcome => "request_without_outcome",
-                    GapReason::TornTail => "torn_tail",
-                    GapReason::JournalReplaced => "journal_replaced",
-                    GapReason::JournalUnavailableAtStart => "journal_unavailable_at_start",
-                    _ => "unclean_stop",
-                },
-            }),
+            gap: gap.map(gap_view),
             // An unknown interval stays an alert until it is acknowledged;
             // a journal that failed is one from its failure on, until the
             // restart that records it (DESIGN's P3 on #485).
@@ -1058,6 +1182,15 @@ impl Agent {
             (Some(_), Some(_)) => (None, None),
         };
         let catalog = self.drivers.iter().any(|driver| driver.catalog.is_some());
+        // The admin command clearance these flags name: an administrator
+        // acknowledges, an operator or a risk officer closes (karyos#772).
+        let clearance = if acknowledge {
+            crate::cluster_admin::Clearance::Administrator
+        } else if close {
+            crate::cluster_admin::Clearance::Operator
+        } else {
+            crate::cluster_admin::Clearance::None
+        };
         CAPABILITIES
             .iter()
             .map(|&name| {
@@ -1068,7 +1201,7 @@ impl Agent {
                     "catalog" => ((!catalog).then_some("not_configured"), true),
                     // Served to every role, always.
                     "view" | "trace-window" | "limits" | "trace-buckets" | "trace-export"
-                    | "join-registry" => (None, true),
+                    | "join-registry" | "clocks" | "rate-limits" => (None, true),
                     "join-put" => (None, register),
                     // The safety path is a closer's; an administrator's
                     // change needs the journal, which the answer reports.
@@ -1077,6 +1210,18 @@ impl Agent {
                     // preview; a reopen's submit still needs the journal,
                     // which its answer reports (karyos#738).
                     "guard-preview" | "submit" => (None, close || reopen),
+                    // Admin commands need a Cluster attached and a journal
+                    // that records, and are offered to a role only when an
+                    // attached Cluster registers a command it may make
+                    // (karyos#772).
+                    "cluster-command" => (
+                        if self.clusters.is_empty() {
+                            Some("not_configured")
+                        } else {
+                            reopen_off
+                        },
+                        self.clusters.any_allowed(clearance),
+                    ),
                     // A name added to CAPABILITIES must be classified here.
                     _ => (Some("not_configured"), true),
                 };
@@ -1456,6 +1601,22 @@ fn acknowledger(requester: Requester) -> String {
     match requester.relay {
         0 => format!("uid {}", requester.operator),
         relay => format!("operator {} relay {relay}", requester.operator),
+    }
+}
+
+/// `gap` as the view and the answers show it.
+fn gap_view(gap: Gap) -> GapView {
+    GapView {
+        position: gap.position,
+        from: gap.from,
+        to: gap.to,
+        reason: match gap.reason {
+            GapReason::RequestWithoutOutcome => "request_without_outcome",
+            GapReason::TornTail => "torn_tail",
+            GapReason::JournalReplaced => "journal_replaced",
+            GapReason::JournalUnavailableAtStart => "journal_unavailable_at_start",
+            _ => "unclean_stop",
+        },
     }
 }
 

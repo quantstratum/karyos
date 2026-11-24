@@ -42,7 +42,15 @@
 //!   [REASON]` and `guard-reopen DIR GUARD EPOCH [REASON]`, made for the
 //!   peer's uid as the operator, the reason being the rest of the line
 //!   (M10b; a `DIR` holds no space); `gap-ack POSITION`, an
-//!   administrator's acknowledgement of the journal's unknown interval;
+//!   administrator's acknowledgement of the journal's unknown interval,
+//!   relayed or local, never any other role's. Relayed, it answers
+//!   `{"acknowledged":{"position","reason","from","to"},"events":"unknown"}`
+//!   and refuses a position that is no open interval with
+//!   `"refusal":"not_an_unknown_interval"` (karyos#726). The
+//!   acknowledgement records that the interval was seen, by whom and
+//!   through which relay, and nothing more: a front end shows it as
+//!   "unknown interval acknowledged by NAME; what happened in it remains
+//!   unknown", never as resolved, repaired or verified;
 //!   `limits [DIMENSION=VALUE ...]`, the negotiation of the bounds below
 //!   (R-CORE-38); `capabilities`, each capability of the closed v1 list
 //!   served, unavailable in this deployment or forbidden for the peer's
@@ -62,7 +70,14 @@
 //!   expired`, `principal mismatch`, `target mismatch`, `parameters
 //!   mismatch`, `target changed`, `operation id conflict` or `operation
 //!   expired` with nothing sent; a retry of a used id is answered with its
-//!   retained outcome, unsent. A `join-put` line may
+//!   retained outcome, unsent; `clocks DIR` and `rate-limits DIR`
+//!   (R-CORE-40, karyos#741), for every role, see below; `cluster-command OPID CLUSTER COMMAND
+//!   PARAMETERS [REASON]` (R-CORE-41, karyos#772; see
+//!   [`crate::cluster_admin`], which states its contract), a product
+//!   Cluster's registered admin command, `PARAMETERS` hex or `-`, for the
+//!   roles its registration names, a refusal journalled as
+//!   `{"error":"forbidden"}`, `unregistered command`, `unknown cluster` or
+//!   `operation id conflict` with nothing sent. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
@@ -74,6 +89,27 @@
 //!   connection closed. A reply without a final newline, followed by EOF,
 //!   is incomplete and is discarded; the reader retries with the same
 //!   cursor, as reading consumes nothing.
+//! - **Clocks and rate limits (R-CORE-40, karyos#741).** Two read
+//!   resources, new in v1 and changing no other answer. `clocks DIR`
+//!   answers [`json::clocks`]: the clocks of the driver's local trace
+//!   journals the agent follows, with their domains, calibration epochs
+//!   and uncertainties, and the calibrations the agent can see, each with
+//!   its validity range. A clock without a valid calibration reads
+//!   `{"state":"unavailable","reason":R}`, never a number, and no latency
+//!   is derived. No calibration producer exists until karyos#118: until
+//!   it lands, every clock reads `no_calibration` and `calibrations` is
+//!   empty with `"calibrations_unavailable":"no_producer"`, so a clocks
+//!   view legitimately shows no cross-host calibration. `rate-limits DIR`
+//!   answers [`json::rate_limits`]: per network publication, the rate
+//!   policy version in force and its two limiters (the publication's
+//!   bucket and the control reserve's), each limited with its policy and
+//!   refusals, `none` (no such bucket, nothing counted) or `not_counted`
+//!   (a driver without the cells): a 0 is only a bucket that refused
+//!   nothing. Both read what the agent already holds (its trace window and
+//!   its last sampling pass), never a mapping or the data path, at
+//!   O(journals) and O(counter cells) a request. An unknown `DIR` is
+//!   `{"error":"unknown driver"}`, one not attached yet `{"error":"driver
+//!   unavailable"}`.
 //! - **Limits (R-CORE-38).** `limits` answers every dimension of [`LIMITS`]
 //!   with one of three answers, never "unknown": `{"value":N,
 //!   "negotiable":true}`, a bound a client may propose within;
@@ -454,6 +490,7 @@ impl ApiConfig {
     }
 
     /// The same, also serving `relays` for `principals` (karyos#708).
+    /// Each relay id must be 1 or more: [`Server::bind`] refuses 0.
     #[must_use]
     pub fn with_relays(mut self, relays: Vec<(u32, u64)>, principals: Vec<Principal>) -> Self {
         self.relays = relays;
@@ -556,6 +593,10 @@ pub enum ServeError {
     /// Another agent is serving in this directory.
     #[error("a live agent holds {}", .0.display())]
     Live(PathBuf),
+    /// A relay configured with id 0, which the journal reserves for the
+    /// local socket: its requests would read as local ones (karyos#726).
+    #[error("a relay id must be 1 or more: 0 is the local socket's")]
+    ZeroRelay,
     /// The operating system's error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -578,6 +619,10 @@ pub enum Served {
     TraceBuckets,
     /// Raw trace records, or the export's refusal (R-CORE-13).
     TraceExport,
+    /// A driver's clocks and calibrations (R-CORE-40, karyos#741).
+    Clocks,
+    /// A driver's rate limiters (R-CORE-40, karyos#741).
+    RateLimits,
     /// A join registry entry written: put or retired (karyos#736).
     Registered,
     /// A join registry read: an entry or a page.
@@ -606,6 +651,13 @@ impl Server {
     /// socket, or a call that fails.
     pub fn bind(config: ApiConfig) -> Result<Self, ServeError> {
         use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
+        // Relay id 0 is the local socket's in the journal and in the
+        // answers: a relay under it would be served as the local peer
+        // (karyos#726), so it is refused before anything changes, as the
+        // CLI refuses it.
+        if config.relays.iter().any(|(_, relay)| *relay == 0) {
+            return Err(ServeError::ZeroRelay);
+        }
         // Without a relay group, owner only; with one, the group may
         // reach the socket and nothing else.
         let (dir_mode, socket_mode) = match config.relay_group {
@@ -852,10 +904,46 @@ impl Server {
                     forbidden()
                 }
             }
+            (
+                Some((requester, role)),
+                Request::ClusterCommand {
+                    operation,
+                    cluster,
+                    command,
+                    parameters,
+                    reason,
+                },
+            ) => {
+                // The role is checked against the command's registration,
+                // and a refusal journalled, by the agent (karyos#772).
+                let parameters =
+                    crate::cluster_admin::parse_parameters(parameters).unwrap_or_default();
+                let answer = agent.cluster_command_for(
+                    (cluster, command, &parameters),
+                    operation,
+                    (requester, clearance(role)),
+                    reason.as_bytes(),
+                );
+                let served = match answer {
+                    crate::cluster_admin::ClusterAnswer::Rejected { .. }
+                    | crate::cluster_admin::ClusterAnswer::BadArguments => Served::Refused,
+                    _ => Served::Operated,
+                };
+                (json::cluster_answer(&answer), served)
+            }
             (Some((requester, role)), Request::GapAck { position }) => {
                 if role.may_acknowledge() {
+                    // A relayed request is answered with the interval and
+                    // that its events remain unknown, so a console cannot
+                    // show the acknowledgement as a repair (karyos#726);
+                    // the local answer is unchanged.
+                    let relayed = requester.relay != 0;
                     let answer = match agent.acknowledge_gap_for(position, requester) {
-                        Ok(()) => json::acknowledged(position),
+                        Ok(gap) if relayed => json::acknowledged_interval(&gap),
+                        Ok(_) => json::acknowledged(position),
+                        Err(crate::journal::JournalError::NoGap) if relayed => {
+                            json::not_an_unknown_interval(position)
+                        }
                         Err(crate::journal::JournalError::NoGap) => {
                             json::error("no such unknown interval", None)
                         }
@@ -902,6 +990,14 @@ impl Server {
             ) => match agent.trace_export(Path::new(dir), from, count, epoch) {
                 Ok(Ok(page)) => (json::trace_export(&page), Served::TraceExport),
                 Ok(Err(refusal)) => (json::export_refusal(&refusal), Served::Refused),
+                Err(answer) => (json::guard_answer(&answer), Served::Refused),
+            },
+            (Some(_), Request::Clocks { dir }) => match agent.clocks(Path::new(dir)) {
+                Ok(read) => (json::clocks(&read), Served::Clocks),
+                Err(answer) => (json::guard_answer(&answer), Served::Refused),
+            },
+            (Some(_), Request::RateLimits { dir }) => match agent.rate_limits(Path::new(dir)) {
+                Ok(read) => (json::rate_limits(&read), Served::RateLimits),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
             (
@@ -1100,6 +1196,15 @@ enum Request<'a> {
         guard: u64,
         reason: &'a str,
     },
+    /// `cluster-command OPID CLUSTER COMMAND PARAMETERS [REASON]`
+    /// (R-CORE-41, karyos#772): `parameters` checked to parse.
+    ClusterCommand {
+        operation: u64,
+        cluster: &'a str,
+        command: &'a str,
+        parameters: &'a str,
+        reason: &'a str,
+    },
     /// `legal-hold RECORDING [REASON]`, `hold-release RECORDING [REASON]`,
     /// `purge RECORDING BEFORE [REASON]` and `seal-verify RECORDING`
     /// (M12).
@@ -1122,6 +1227,14 @@ enum Request<'a> {
         from: u64,
         count: usize,
         epoch: Option<u128>,
+    },
+    /// `clocks DIR` (R-CORE-40, karyos#741).
+    Clocks {
+        dir: &'a str,
+    },
+    /// `rate-limits DIR` (R-CORE-40, karyos#741).
+    RateLimits {
+        dir: &'a str,
     },
     /// `rate-change DIR STREAM_ID SESSION_ID EXPECTED AUTHORITY MSG_RATE
     /// MSG_BURST BYTE_RATE BYTE_BURST [REASON]` (R-CORE-21, karyos#740).
@@ -1358,6 +1471,36 @@ fn submit(arguments: &str) -> Option<Request<'_>> {
     })
 }
 
+/// `OPID CLUSTER COMMAND PARAMETERS [REASON]` (karyos#772): a nonzero id,
+/// valid names and parameters that parse.
+fn cluster_command(arguments: &str) -> Option<Request<'_>> {
+    use crate::cluster_admin::{parse_parameters, valid_name};
+    let mut fields = arguments.splitn(5, ' ');
+    let operation = fields.next()?.parse::<u64>().ok().filter(|id| *id != 0)?;
+    let cluster = fields.next().filter(|name| valid_name(name))?;
+    let command = fields.next().filter(|name| valid_name(name))?;
+    let parameters = fields
+        .next()
+        .filter(|text| parse_parameters(text).is_some())?;
+    Some(Request::ClusterCommand {
+        operation,
+        cluster,
+        command,
+        parameters,
+        reason: fields.next().unwrap_or(""),
+    })
+}
+
+/// What `role` grants for a product Cluster's admin commands (karyos#772).
+const fn clearance(role: Role) -> crate::cluster_admin::Clearance {
+    use crate::cluster_admin::Clearance;
+    match role {
+        Role::Administrator => Clearance::Administrator,
+        Role::Operator | Role::RiskOfficer => Clearance::Operator,
+        Role::Viewer | Role::Registrar => Clearance::None,
+    }
+}
+
 fn request(rest: &str) -> Option<Request<'_>> {
     let (name, arguments) = rest.split_once(' ').unwrap_or((rest, ""));
     let number = |word: &str| word.parse::<u64>().ok();
@@ -1389,6 +1532,16 @@ fn request(rest: &str) -> Option<Request<'_>> {
             })
         }
         "rate-change" => rate_change(arguments).or(Some(Request::BadArguments("rate-change"))),
+        // One directory, which holds no space.
+        "clocks" | "rate-limits" if arguments.is_empty() || arguments.contains(' ') => {
+            Some(Request::BadArguments(if name == "clocks" {
+                "clocks"
+            } else {
+                "rate-limits"
+            }))
+        }
+        "clocks" => Some(Request::Clocks { dir: arguments }),
+        "rate-limits" => Some(Request::RateLimits { dir: arguments }),
         "guard-close-preview" | "guard-reopen-preview" => {
             let kind = if name == "guard-close-preview" {
                 crate::preview::PreviewKind::Close
@@ -1412,6 +1565,9 @@ fn request(rest: &str) -> Option<Request<'_>> {
             })
         }
         "submit" => submit(arguments).or(Some(Request::BadArguments("submit"))),
+        "cluster-command" => {
+            cluster_command(arguments).or(Some(Request::BadArguments("cluster-command")))
+        }
         "legal-hold" | "hold-release" | "seal-verify" => {
             let (recording, reason) = arguments.split_once(' ').unwrap_or((arguments, ""));
             let operation = match name {
@@ -1962,6 +2118,28 @@ mod tests {
             "read.timeout_ms=1  write.timeout_ms=1",
         ] {
             assert_eq!(negotiate(&LIMITS, bad), Err(Refusal::Bad), "{bad}");
+        }
+    }
+
+    /// R-CORE-40 (karyos#741): `clocks` and `rate-limits` take one
+    /// directory; anything else is the request's own typed error.
+    #[test]
+    fn clocks_and_rate_limits_requests_take_one_directory() {
+        assert_eq!(
+            parse("KARYOS-AGENT 1 clocks /run/a\n"),
+            Request::Clocks { dir: "/run/a" }
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 rate-limits /run/a\n"),
+            Request::RateLimits { dir: "/run/a" }
+        );
+        for (line, name) in [
+            ("KARYOS-AGENT 1 clocks\n", "clocks"),
+            ("KARYOS-AGENT 1 clocks /run/a 1\n", "clocks"),
+            ("KARYOS-AGENT 1 rate-limits\n", "rate-limits"),
+            ("KARYOS-AGENT 1 rate-limits  /run/a\n", "rate-limits"),
+        ] {
+            assert_eq!(parse(line), Request::BadArguments(name), "{line}");
         }
     }
 

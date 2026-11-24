@@ -33,11 +33,22 @@
 //!   [`catalog`] lists its recordings over the Archive's control streams
 //!   on a thread of its own, as a full IPC client of that driver; off by
 //!   default.
+//! - **Clocks and rate limits** (R-CORE-40, karyos#741): `clocks DIR`
+//!   reads the clocks of the trace journals the agent follows and the
+//!   calibrations it can see, each without a valid calibration unavailable
+//!   with its reason; `rate-limits DIR` reads each network publication's
+//!   rate limiters, policy, version and refusals from the driver's counter
+//!   cells. Until karyos#118 produces calibrations, a clocks view
+//!   legitimately shows no cross-host calibration.
 //! - **Not yet.** An endpoint's capability gauges read as one group in
 //!   the view (M6b's `karyos_client::capabilities` reads them).
 //! - **Operations journal** (M10b): [`journal`] keeps the agent's guard
 //!   operations as an Archive recording (owner item 51(7) of the
 //!   2026-10-21 decisions, interim; the gap analysis's new owner item 7).
+//! - **Cluster admin commands** (R-CORE-41, karyos#772): [`cluster_admin`]
+//!   forwards an authorised, journalled admin command to a product's
+//!   Cluster through the gateway the product attaches, and returns its
+//!   sequenced outcome with the product's evidence digest.
 //! - **Crate graph** (owner item 52): it depends on `karyos-archive`,
 //!   `karyos-client`, `karyos-sys` and `karyos-trace`, never on the driver
 //!   or the tools; neither the driver, the client nor the Archive depends
@@ -62,6 +73,7 @@ pub mod alerts;
 pub mod api;
 pub mod catalog;
 pub mod cli;
+pub mod cluster_admin;
 pub mod exporter;
 pub mod journal;
 pub mod json;
@@ -71,6 +83,11 @@ pub mod json;
 )]
 mod model;
 pub mod registry;
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(dead_code, reason = "the attach that uses it is Linux only")
+)]
+mod resources;
 pub mod retention;
 pub mod trace_export;
 #[cfg_attr(

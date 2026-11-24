@@ -23,7 +23,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use karyos_agent::journal::{Journal, JournalRecord, Kind};
-use karyos_agent::server::{ApiConfig, Role, Served, Server};
+use karyos_agent::server::{ApiConfig, Principal, Role, Served, Server};
 use karyos_agent::{Agent, AgentConfig};
 use karyos_driver::guards::Requester;
 use karyos_driver::{DriverConfig, EmbeddedDriver, IpcConfig, SystemClock};
@@ -497,6 +497,78 @@ fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
     assert_eq!(answer, format!("{{\"acknowledged\":{}}}\n", gap.position));
     let journal = agent.view().journal.unwrap();
     assert_eq!((journal.gap, journal.alerts.len()), (None, 0));
+}
+
+/// R-CORE-19 (karyos#726): a relayed `gap-ack`. A relayed operator is
+/// refused and the interval stays open; a position that is no open
+/// interval is refused with a typed refusal; a relayed administrator's
+/// acknowledgement answers with the interval and that its events remain
+/// unknown, and closes it; the local answer stays the bare position.
+#[test]
+fn a_relayed_administrator_acknowledges_the_interval_and_no_more() {
+    let _serial = serial();
+    let dir = dir("relayed-gap");
+    let mut driver = driver(&dir.join("driver"));
+    let mut journal = Journal::open(&dir.join("journal"), 1).unwrap();
+    let _ = journal
+        .append_durable(&JournalRecord::new(Kind::CloseRequest, 2), 2)
+        .unwrap();
+    drop(journal);
+    let mut agent = agent(&dir, true);
+    let gap = agent.view().journal.unwrap().gap.unwrap();
+    let principals = vec![
+        Principal::new("alice@example", 50_001, Role::Administrator).unwrap(),
+        Principal::new("bob@example", 50_002, Role::Operator).unwrap(),
+    ];
+    let mut server = Server::bind(
+        ApiConfig::new(dir.join("api"), vec![(own(), Role::Viewer)])
+            .with_relays(vec![(own(), 7)], principals),
+    )
+    .unwrap();
+    let operator = format!(
+        "KARYOS-AGENT 1 relay bob@example gap-ack {}\n",
+        gap.position
+    );
+    let (answer, served) = ask(&mut driver, &mut server, &mut agent, &operator);
+    assert_eq!(served, [Served::Refused]);
+    assert_eq!(answer, "{\"error\":\"forbidden\"}\n");
+    // The relay's own role is no administrator's either.
+    let local = format!("KARYOS-AGENT 1 gap-ack {}\n", gap.position);
+    let (answer, _) = ask(&mut driver, &mut server, &mut agent, &local);
+    assert_eq!(answer, "{\"error\":\"forbidden\"}\n");
+    assert_eq!(agent.view().journal.unwrap().gap, Some(gap));
+    let wrong = format!(
+        "KARYOS-AGENT 1 relay alice@example gap-ack {}\n",
+        gap.position + 1
+    );
+    let (answer, served) = ask(&mut driver, &mut server, &mut agent, &wrong);
+    assert_eq!(served, [Served::Operated]);
+    assert_eq!(
+        answer,
+        format!(
+            "{{\"error\":\"no such unknown interval\",\"refusal\":\"not_an_unknown_interval\",\"position\":{}}}\n",
+            gap.position + 1
+        )
+    );
+    let ack = format!(
+        "KARYOS-AGENT 1 relay alice@example gap-ack {}\n",
+        gap.position
+    );
+    let (answer, served) = ask(&mut driver, &mut server, &mut agent, &ack);
+    assert_eq!(served, [Served::Operated]);
+    assert_eq!(
+        answer,
+        format!(
+            "{{\"acknowledged\":{{\"position\":{},\"reason\":\"{}\",\"from\":{},\"to\":{}}},\"events\":\"unknown\"}}\n",
+            gap.position, gap.reason, gap.from, gap.to
+        )
+    );
+    assert!(!answer.contains("resolved") && !answer.contains("repaired"));
+    let journal = agent.view().journal.unwrap();
+    assert_eq!((journal.gap, journal.alerts.len()), (None, 0));
+    // Acknowledged once: a second is the typed refusal.
+    let (answer, _) = ask(&mut driver, &mut server, &mut agent, &ack);
+    assert!(answer.contains("not_an_unknown_interval"), "{answer}");
 }
 
 /// R-CORE-21 (karyos#740): a rate change through the agent's socket. An

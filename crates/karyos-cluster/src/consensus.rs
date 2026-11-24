@@ -30,10 +30,52 @@
 //! its entry is from the leader's own term; earlier-term entries commit
 //! with it, never directly.
 //!
-//! Replication is pipelined optimistically here: a leader sends from each
-//! follower's next index and moves it on, and falls back on a rejection.
-//! The strict in-flight limits, the pooled buffers and snapshot install
-//! come in later parts of the issue.
+//! **Flow limits** (part (c)). Replication is pipelined: a leader sends
+//! from each follower's next index and moves it on, and falls back on a
+//! rejection. What it has sent a follower and not yet seen acknowledged
+//! is in flight, and [`Limits`] bounds it strictly per follower, in
+//! entries and in bytes, whatever is lost or delayed: an entry leaves
+//! only when it fits the window, and the window frees only on an
+//! acknowledgement, so a lost append or reply holds its share until a
+//! heartbeat's answer or a rejection settles it. Each send is recorded
+//! (first index, last index, bytes) in a fixed ring per follower, so an
+//! acknowledgement frees exactly the sends it covers, and a send it covers
+//! only in part stays counted whole. A rejection rewinds the follower's
+//! pipeline and starts a new epoch, carried by every append and echoed in
+//! its reply: a rejection of an earlier epoch (a duplicate, a delayed
+//! reply, an append of an earlier term) changes nothing, so no credit is
+//! refunded twice. The one exception to the byte window is an entry larger
+//! than the whole window, which [`Core::propose`] never admits but a log
+//! written under a larger limit may hold: it is sent alone, into an empty
+//! window, so replication cannot stall on it.
+//!
+//! A leader also bounds the entries clients may add while uncommitted
+//! (the request queue): a new leader's no-op and the entries it inherits
+//! are not refused, since refusing them would stall the very commits that
+//! drain the queue. Per duty it looks up at most [`Limits::reads`] entry
+//! sizes, counting every lookup, and sends at most [`Limits::read_bytes`]
+//! bytes of entries, which is what its driver reads from the log for
+//! that duty (W2's log read bound, in bytes). It refuses a proposal it cannot
+//! hold with a typed [`Backpressure`], never by growing anything. The core holds no entry
+//! buffer: messages carry positions and counts, and the driver reads the
+//! entries from C4's log.
+//!
+//! **Snapshots** (quantstratum/karyos#682). The core keeps the base of
+//! the node's latest snapshot, the last index it includes and that
+//! entry's term, and reads the log through it: the base's term comes
+//! from the core, entries below it may be gone. [`Core::compacted`]
+//! moves the base up to a committed index once the driver has compacted
+//! below it. A leader that would send a follower an entry the log no
+//! longer holds asks its driver for [`Effects::send_snapshot`] instead,
+//! holds that follower's appends to heartbeats at the base, and asks
+//! again, for the latest snapshot, when no acknowledgement arrives within
+//! the minimum election timeout (a lost snapshot is retried, never
+//! awaited forever).
+//! The follower's driver installs the snapshot and restarts its log after
+//! the base, then calls [`Core::install`], which commits the base and
+//! acknowledges it to the leader once durable. The core sees no snapshot
+//! bytes: the store and its CRC-32C checks are the driver's, and those
+//! checks detect corruption only; they claim no tamper evidence.
 
 use crate::hard_state::HardState;
 
@@ -48,6 +90,16 @@ pub trait LogTerms {
     /// The term of the entry at `index`; `Some(0)` for index 0, `None`
     /// past the end.
     fn term(&self, index: u64) -> Option<u64>;
+    /// The size in bytes the entry at `index` takes in an append, `None`
+    /// past the end or for index 0.
+    fn size(&self, index: u64) -> Option<u64>;
+    /// What reading the entry at `index` to send it costs a duty, in
+    /// bytes ([`Limits::read_bytes`]): its size by default; a driver
+    /// whose log reads whole frames, or that holds the entry unwritten,
+    /// says so here.
+    fn cost(&self, index: u64) -> Option<u64> {
+        self.size(index)
+    }
 }
 
 /// What the core asks its driver to do, in the order of the calls.
@@ -69,6 +121,13 @@ pub trait Effects {
     fn send_after_persist(&mut self, to: u64, message: Message);
     /// The commit index rose to `index`.
     fn commit(&mut self, index: u64);
+    /// Send the node's latest snapshot to `to`: it needs entries the log
+    /// no longer holds. The core asks at most once per follower per
+    /// minimum election timeout until a base is acknowledged; each request
+    /// supersedes the follower's earlier ones, so a driver keeps at most
+    /// one transfer per follower, replacing or dropping a queued one. A
+    /// transfer is not charged to [`Limits`]: they bound appends.
+    fn send_snapshot(&mut self, to: u64);
 }
 
 /// The persistent term and vote.
@@ -159,6 +218,9 @@ pub enum Message {
         entries: u64,
         /// The leader's commit index.
         commit: u64,
+        /// The leader's pipeline epoch for this follower, echoed in the
+        /// reply.
+        epoch: u64,
     },
     /// An append answer.
     AppendReply {
@@ -166,6 +228,9 @@ pub enum Message {
         term: u64,
         /// Whether it matched.
         outcome: AppendOutcome,
+        /// The epoch of the append it answers; 0 for the acknowledgement of
+        /// an installed snapshot, which answers none.
+        epoch: u64,
     },
 }
 
@@ -201,6 +266,52 @@ pub enum ConfigError {
     Timeouts,
     /// The append batch is 0 entries.
     Batch,
+    /// A flow limit is 0, or the in-flight entries are fewer than a
+    /// batch.
+    Limits,
+}
+
+/// A leader's flow limits (W2's): what it may have in flight to each
+/// follower, how many entries it may hold uncommitted, and how many
+/// entries it reads from the log per duty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Entries sent to one follower and not acknowledged.
+    pub in_flight_entries: u64,
+    /// Bytes of those entries.
+    pub in_flight_bytes: u64,
+    /// Entries clients may have written and not committed: a proposal
+    /// past it is refused. A new leader's no-op is not.
+    pub queue: u64,
+    /// Entry sizes read from the log per duty ([`Core::replicate`], or
+    /// one reply's resend or refill), every read counted.
+    pub reads: u64,
+    /// Bytes of entries sent per duty, across all followers: what the
+    /// driver reads from the log for it (W2's `log_read_bytes`). A
+    /// proposal larger than it is refused, since it could never be read.
+    pub read_bytes: u64,
+}
+
+/// Which limit refused a proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backpressure {
+    /// The entry is larger than a follower's whole byte window, so it
+    /// could never be sent.
+    InFlightBytes,
+    /// The leader holds its limit of uncommitted entries.
+    Queue,
+    /// The entry is larger than a duty's log read, so it could never be
+    /// read to be sent.
+    LogRead,
+}
+
+/// Why a proposal is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposeError {
+    /// The node does not lead.
+    NotLeader(NotLeader),
+    /// A flow limit is reached; retry after commits.
+    Backpressure(Backpressure),
 }
 
 /// Why a message is refused.
@@ -214,6 +325,24 @@ pub enum StepError {
     /// An append would truncate a committed entry: the leader broke
     /// Raft's safety.
     CommittedConflict,
+}
+
+/// Why [`Core::compacted`] is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactError {
+    /// The base is past the commit index: only committed entries may be
+    /// compacted.
+    Uncommitted,
+}
+
+/// Why [`Core::install`] is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallError {
+    /// The core already holds the base, or a later commit.
+    Stale,
+    /// The node leads: a leader's log already holds every committed
+    /// entry.
+    Leader,
 }
 
 /// A proposal refused because the node does not lead.
@@ -234,13 +363,16 @@ pub struct Config {
     heartbeat: u32,
     batch: u64,
     seed: u64,
+    limits: Limits,
 }
 
 impl Config {
     /// A configuration for node `id` of `voters`, whose election timeout
     /// is drawn from `election_min..election_max` ticks with `seed`,
     /// whose leader heartbeats every `heartbeat` ticks and sends at most
-    /// `batch` entries per append.
+    /// `batch` entries per append. Its flow limits are a batch in flight
+    /// per follower and no byte, queue or read limit until
+    /// [`Config::with_limits`] declares them.
     ///
     /// # Errors
     ///
@@ -287,7 +419,39 @@ impl Config {
             heartbeat,
             batch,
             seed,
+            limits: Limits {
+                in_flight_entries: batch,
+                in_flight_bytes: u64::MAX,
+                queue: u64::MAX,
+                reads: u64::MAX,
+                read_bytes: u64::MAX,
+            },
         })
+    }
+
+    /// The same configuration with the flow limits `limits`.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::Limits`] when a limit is 0, or fewer entries may
+    /// be in flight than one batch holds.
+    pub const fn with_limits(mut self, limits: Limits) -> Result<Self, ConfigError> {
+        if limits.in_flight_entries < self.batch
+            || limits.in_flight_bytes == 0
+            || limits.queue == 0
+            || limits.reads == 0
+            || limits.read_bytes == 0
+        {
+            return Err(ConfigError::Limits);
+        }
+        self.limits = limits;
+        Ok(self)
+    }
+
+    /// The flow limits.
+    #[must_use]
+    pub const fn limits(&self) -> Limits {
+        self.limits
     }
 
     /// The node's id.
@@ -313,10 +477,101 @@ struct Peer {
     next: u64,
     /// The highest index known durable on it.
     matched: u64,
+    /// The entries of `sends`, in flight.
+    flight: u64,
+    /// Their bytes.
+    bytes: u64,
+    /// The sends not yet acknowledged, oldest first.
+    sends: Sends,
+    /// The current pipeline epoch.
+    epoch: u64,
     /// Whether it granted this round's pre-vote or vote.
     granted: bool,
     /// Whether it answered this leader since the last quorum check.
     recent: bool,
+    /// A snapshot asked for it: its base index and the ticks since.
+    snapshot: Option<(u64, u32)>,
+}
+
+/// The most sends in flight to one follower: a window full of one-entry
+/// appends.
+pub const MAX_SENDS: usize = 64;
+
+/// One append sent: entries `first..=last` and their bytes.
+#[derive(Debug, Clone, Copy, Default)]
+struct Send {
+    first: u64,
+    last: u64,
+    bytes: u64,
+}
+
+/// A fixed ring of sends, oldest first.
+#[derive(Debug, Clone, Copy)]
+struct Sends {
+    ring: [Send; MAX_SENDS],
+    head: usize,
+    len: usize,
+}
+
+impl Default for Sends {
+    fn default() -> Self {
+        Self {
+            ring: [Send::default(); MAX_SENDS],
+            head: 0,
+            len: 0,
+        }
+    }
+}
+
+impl Sends {
+    const fn is_full(&self) -> bool {
+        self.len == MAX_SENDS
+    }
+
+    fn slot(&self, from_head: usize) -> usize {
+        (self.head + from_head) % MAX_SENDS
+    }
+
+    fn push(&mut self, send: Send) {
+        if self.is_full() {
+            return;
+        }
+        let at = self.slot(self.len);
+        if let Some(slot) = self.ring.get_mut(at) {
+            *slot = send;
+            self.len += 1;
+        }
+    }
+
+    fn front(&self) -> Option<Send> {
+        if self.len == 0 {
+            return None;
+        }
+        self.ring.get(self.head).copied()
+    }
+
+    fn pop_front(&mut self) {
+        if self.len > 0 {
+            self.head = (self.head + 1) % MAX_SENDS;
+            self.len -= 1;
+        }
+    }
+
+    fn back_mut(&mut self) -> Option<&mut Send> {
+        if self.len == 0 {
+            return None;
+        }
+        let at = self.slot(self.len - 1);
+        self.ring.get_mut(at)
+    }
+
+    fn pop_back(&mut self) {
+        self.len = self.len.saturating_sub(1);
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
 }
 
 /// The custom Raft core of one node.
@@ -334,6 +589,10 @@ pub struct Core {
     round: u64,
     /// Ticks since a leader's last quorum check.
     quorum_elapsed: u32,
+    /// The last pipeline epoch given to a follower.
+    epoch: u64,
+    /// The latest snapshot's base: its last index and that entry's term.
+    base: (u64, u64),
 }
 
 impl Core {
@@ -356,10 +615,15 @@ impl Core {
             rng: config.seed ^ config.id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
             round: 0,
             quorum_elapsed: 0,
+            epoch: 0,
+            base: (0, 0),
         };
         // A restarted node starts its rounds at a fresh random point, so
         // a reply to a round before the restart is not counted.
         core.round = core.draw();
+        // Epochs too, so a reply to an append before the restart is not
+        // taken for one of this run.
+        core.epoch = core.draw();
         core.reset_timer();
         core
     }
@@ -383,6 +647,136 @@ impl Core {
         self.commit
     }
 
+    /// What a leader has in flight to voter `id`, as (entries, bytes);
+    /// `None` unless it leads and `id` is another voter.
+    #[must_use]
+    pub fn in_flight(&self, id: u64) -> Option<(u64, u64)> {
+        if self.role != Role::Leader || id == self.config.id {
+            return None;
+        }
+        let peer = self
+            .peers
+            .iter()
+            .take(self.config.count)
+            .find(|peer| peer.id == id)?;
+        Some((peer.flight, peer.bytes))
+    }
+
+    /// A leader's pipeline epoch for voter `id`, which its appends carry
+    /// and their replies echo; `None` unless it leads and `id` is another
+    /// voter.
+    #[must_use]
+    pub fn pipeline_epoch(&self, id: u64) -> Option<u64> {
+        if self.role != Role::Leader || id == self.config.id {
+            return None;
+        }
+        self.peers
+            .iter()
+            .take(self.config.count)
+            .find(|peer| peer.id == id)
+            .map(|peer| peer.epoch)
+    }
+
+    /// The same core recovered over a snapshot whose base is `index`, of
+    /// `term`: the base is committed, and the log starts after it.
+    #[must_use]
+    pub const fn with_snapshot(mut self, index: u64, term: u64) -> Self {
+        if index > self.base.0 {
+            self.base = (index, term);
+        }
+        if index > self.commit {
+            self.commit = index;
+        }
+        self
+    }
+
+    /// The latest snapshot's base, as (index, term); (0, 0) for none.
+    #[must_use]
+    pub const fn snapshot_base(&self) -> (u64, u64) {
+        self.base
+    }
+
+    /// The node compacted its log below a snapshot whose base is
+    /// `index`, of `term`: entries up to it may be gone from the log.
+    ///
+    /// # Errors
+    ///
+    /// [`CompactError::Uncommitted`] when `index` is past the commit
+    /// index; nothing changes.
+    pub const fn compacted(&mut self, index: u64, term: u64) -> Result<(), CompactError> {
+        if index > self.commit {
+            return Err(CompactError::Uncommitted);
+        }
+        if index > self.base.0 {
+            self.base = (index, term);
+        }
+        Ok(())
+    }
+
+    /// Whether [`Core::install`] would take a snapshot whose base is
+    /// `index`: the admission a driver checks before it publishes the
+    /// snapshot over its service and log, with no other call to the core
+    /// in between, so the install it then reports is never refused.
+    ///
+    /// # Errors
+    ///
+    /// As [`Core::install`].
+    pub fn can_install(&self, index: u64) -> Result<(), InstallError> {
+        if self.role == Role::Leader {
+            return Err(InstallError::Leader);
+        }
+        if index <= self.commit {
+            return Err(InstallError::Stale);
+        }
+        Ok(())
+    }
+
+    /// The node installed a leader's snapshot whose base is `index`, of
+    /// `term`: its service holds the state up to `index` and its log
+    /// restarts after it, durably. A log that holds the base's entry keeps
+    /// the entries after it, which the leader may already count (Raft's
+    /// figure 13, step 6); any other log is emptied. The base is
+    /// committed, and it is acknowledged to the leader once durable.
+    ///
+    /// A snapshot holds only committed entries, which every later leader's
+    /// log holds too, so a snapshot sent in an earlier term is still safe
+    /// to install, and its acknowledgement goes to the leader the node
+    /// follows now, whoever sent it: that leader's log matches it up to
+    /// the base. A node that knows no leader acknowledges nothing; the
+    /// leader's next heartbeat at its base is acknowledged instead. The
+    /// acknowledgement answers no append, so it carries epoch 0: an
+    /// accepted reply is never checked against an epoch.
+    ///
+    /// # Errors
+    ///
+    /// [`InstallError::Stale`] when the core already committed `index`;
+    /// [`InstallError::Leader`] when it leads. Nothing changes.
+    pub fn install(
+        &mut self,
+        index: u64,
+        term: u64,
+        out: &mut impl Effects,
+    ) -> Result<(), InstallError> {
+        self.can_install(index)?;
+        self.base = (index, term);
+        self.commit = index;
+        self.elapsed = 0;
+        if let Role::Follower {
+            leader: Some(leader),
+        } = self.role
+        {
+            out.send_after_persist(
+                leader,
+                Message::AppendReply {
+                    term: self.term_vote.term,
+                    outcome: AppendOutcome::Accepted { index },
+                    epoch: 0,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// The current election timeout, in ticks.
     #[must_use]
     pub const fn election_timeout(&self) -> u32 {
@@ -394,6 +788,7 @@ impl Core {
     /// not answered it within the minimum election timeout (check
     /// quorum), so followers it still reaches stop refusing pre-votes.
     pub fn tick(&mut self, log: &impl LogTerms, out: &mut impl Effects) {
+        let log = &Based::new(log, self.base);
         self.elapsed = self.elapsed.saturating_add(1);
         if self.role == Role::Leader {
             self.quorum_elapsed = self.quorum_elapsed.saturating_add(1);
@@ -415,6 +810,22 @@ impl Core {
                     return;
                 }
             }
+            let (retry, base) = (self.config.election_min, self.base.0);
+            for peer in &mut self.peers {
+                if let Some((_, ticks)) = peer.snapshot.as_mut() {
+                    *ticks = ticks.saturating_add(1);
+                    if *ticks >= retry {
+                        // Unacknowledged: lost, or not yet installed. Ask
+                        // again; the driver sends its latest snapshot, and
+                        // an acknowledgement of the first base asked still
+                        // counts, so a slow install is never outrun by
+                        // compaction.
+                        *ticks = 0;
+                        peer.next = base.saturating_add(1);
+                        out.send_snapshot(peer.id);
+                    }
+                }
+            }
             if self.elapsed >= self.config.heartbeat {
                 self.elapsed = 0;
                 self.replicate(log, out);
@@ -424,22 +835,43 @@ impl Core {
         }
     }
 
-    /// The leader's next entry: the driver writes it at the returned
-    /// index with the returned term, then calls [`Core::replicate`].
+    /// The leader's next entry, of `size` bytes: the driver writes it at
+    /// the returned index with the returned term, then calls
+    /// [`Core::replicate`].
     ///
     /// # Errors
     ///
-    /// [`NotLeader`] unless the node leads.
-    pub fn propose(&self, log: &impl LogTerms) -> Result<(u64, u64), NotLeader> {
+    /// [`ProposeError::NotLeader`] unless the node leads, and
+    /// [`ProposeError::Backpressure`] when the entry exceeds the byte
+    /// window or the leader holds its queue of uncommitted entries.
+    pub fn propose(&self, size: u64, log: &impl LogTerms) -> Result<(u64, u64), ProposeError> {
+        let log = &Based::new(log, self.base);
         match self.role {
-            Role::Leader => Ok((log.last_index().saturating_add(1), self.term_vote.term)),
-            Role::Follower { leader } => Err(NotLeader { leader }),
-            Role::PreCandidate | Role::Candidate => Err(NotLeader { leader: None }),
+            Role::Leader => {}
+            Role::Follower { leader } => {
+                return Err(ProposeError::NotLeader(NotLeader { leader }));
+            }
+            Role::PreCandidate | Role::Candidate => {
+                return Err(ProposeError::NotLeader(NotLeader { leader: None }));
+            }
         }
+        let limits = self.config.limits;
+        if size > limits.in_flight_bytes {
+            return Err(ProposeError::Backpressure(Backpressure::InFlightBytes));
+        }
+        if size > limits.read_bytes {
+            return Err(ProposeError::Backpressure(Backpressure::LogRead));
+        }
+        let last = log.last_index();
+        if last.saturating_sub(self.commit) >= limits.queue {
+            return Err(ProposeError::Backpressure(Backpressure::Queue));
+        }
+        Ok((last.saturating_add(1), self.term_vote.term))
     }
 
     /// The leader's own log is durable up to `index`.
     pub fn persisted(&mut self, index: u64, log: &impl LogTerms, out: &mut impl Effects) {
+        let log = &Based::new(log, self.base);
         if self.role != Role::Leader {
             return;
         }
@@ -450,14 +882,17 @@ impl Core {
         self.advance_commit(log, out);
     }
 
-    /// A leader sends each follower the entries from its next index, at
-    /// most a batch, or a heartbeat.
+    /// A leader sends each follower the entries from its next index that
+    /// fit a batch, its in-flight window and this duty's read budget, or
+    /// a heartbeat.
     pub fn replicate(&mut self, log: &impl LogTerms, out: &mut impl Effects) {
+        let log = &Based::new(log, self.base);
         if self.role != Role::Leader {
             return;
         }
+        let mut budget = Duty::of(self.config.limits);
         for at in 0..self.config.count {
-            self.send_append(at, log, out);
+            self.send_append(at, &mut budget, true, log, out);
         }
     }
 
@@ -476,6 +911,7 @@ impl Core {
         log: &impl LogTerms,
         out: &mut impl Effects,
     ) -> Result<(), StepError> {
+        let log = &Based::new(log, self.base);
         if from == self.config.id || !self.config.voters().any(|voter| voter == from) {
             return Err(StepError::UnknownSender);
         }
@@ -519,8 +955,10 @@ impl Core {
                 prev_term,
                 entries,
                 commit,
+                epoch,
             } => {
                 let append = Append {
+                    epoch,
                     term,
                     prev_index,
                     prev_term,
@@ -529,9 +967,13 @@ impl Core {
                 };
                 self.on_append(from, append, terms, log, out)
             }
-            Message::AppendReply { term, outcome } => {
+            Message::AppendReply {
+                term,
+                outcome,
+                epoch,
+            } => {
                 self.observe(term, out);
-                self.on_append_reply(from, term, outcome, log, out);
+                self.on_append_reply(from, term, (outcome, epoch), log, out);
                 Ok(())
             }
         }
@@ -691,9 +1133,15 @@ impl Core {
         self.quorum_elapsed = 0;
         let next = log.last_index().saturating_add(1);
         for peer in self.peers.iter_mut().take(self.config.count) {
+            self.epoch = self.epoch.wrapping_add(1);
             peer.next = next;
             peer.matched = 0;
+            peer.flight = 0;
+            peer.bytes = 0;
+            peer.sends.clear();
+            peer.epoch = self.epoch;
             peer.recent = false;
+            peer.snapshot = None;
         }
         // A no-op of the new term, so earlier-term entries can commit.
         out.append(next, self.term_vote.term);
@@ -727,6 +1175,7 @@ impl Core {
                         probe: append.prev_index,
                         hint: log.last_index(),
                     },
+                    epoch: append.epoch,
                 },
             );
             return Ok(());
@@ -750,7 +1199,12 @@ impl Core {
         self.observe(append.term, out);
         self.role = Role::Follower { leader: Some(from) };
         self.elapsed = 0;
-        let outcome = if append.prev_index > log.last_index() {
+        let outcome = if append.prev_index < self.base.0 {
+            // Up to the base the log holds a committed prefix, which
+            // matches every leader's: acknowledge it, and the leader
+            // resends from after it.
+            AppendOutcome::Accepted { index: self.base.0 }
+        } else if append.prev_index > log.last_index() {
             AppendOutcome::Rejected {
                 probe: append.prev_index,
                 hint: log.last_index(),
@@ -777,6 +1231,7 @@ impl Core {
             Message::AppendReply {
                 term: self.term_vote.term,
                 outcome,
+                epoch: append.epoch,
             },
         );
         Ok(())
@@ -786,7 +1241,7 @@ impl Core {
         &mut self,
         from: u64,
         term: u64,
-        outcome: AppendOutcome,
+        (outcome, epoch): (AppendOutcome, u64),
         log: &impl LogTerms,
         out: &mut impl Effects,
     ) {
@@ -800,40 +1255,174 @@ impl Core {
             return;
         };
         peer.recent = true;
+        match (peer.snapshot, outcome) {
+            (Some((base, _)), AppendOutcome::Accepted { index }) if index >= base => {
+                peer.snapshot = None;
+            }
+            // Until the snapshot is acknowledged, nothing else moves it.
+            (Some(_), _) => return,
+            (None, _) => {}
+        }
+        let mut budget = Duty::of(self.config.limits);
         match outcome {
             AppendOutcome::Accepted { index } => {
-                peer.matched = peer.matched.max(index);
-                peer.next = peer.next.max(index.saturating_add(1));
-                self.advance_commit(log, out);
+                if index > peer.matched {
+                    // Free the sends the acknowledgement covers whole; one
+                    // it covers in part stays counted.
+                    while let Some(send) = peer.sends.front() {
+                        if send.last > index {
+                            break;
+                        }
+                        peer.flight = peer.flight.saturating_sub(send.last - send.first + 1);
+                        peer.bytes = peer.bytes.saturating_sub(send.bytes);
+                        peer.sends.pop_front();
+                    }
+                    peer.matched = index;
+                    peer.next = peer.next.max(index.saturating_add(1));
+                    self.advance_commit(log, out);
+                    // The window opened: refill it.
+                    self.send_append(at, &mut budget, false, log, out);
+                }
             }
-            // A rejection of a prefix since acknowledged is stale: it must
-            // not rewind the pipeline.
-            AppendOutcome::Rejected { probe, .. } if probe <= peer.matched => {}
+            // A rejection of a prefix since acknowledged, or of an earlier
+            // pipeline, is stale: it must not rewind or refund anything.
+            AppendOutcome::Rejected { probe, .. }
+                if probe <= peer.matched || epoch != peer.epoch => {}
             AppendOutcome::Rejected { hint, .. } => {
-                let retry = peer.next.saturating_sub(1).min(hint.saturating_add(1));
+                let sent = peer.next.saturating_sub(1);
+                let retry = sent.min(hint.saturating_add(1));
                 peer.next = retry.max(peer.matched.saturating_add(1)).max(1);
-                self.send_append(at, log, out);
+                // What is past the retry point is no longer in flight; a
+                // send straddling it keeps its whole bytes.
+                let kept = peer.next.saturating_sub(1);
+                while let Some(send) = peer.sends.back_mut() {
+                    if send.first > kept {
+                        let (count, bytes) = (send.last - send.first + 1, send.bytes);
+                        peer.sends.pop_back();
+                        peer.flight = peer.flight.saturating_sub(count);
+                        peer.bytes = peer.bytes.saturating_sub(bytes);
+                    } else {
+                        if send.last > kept {
+                            peer.flight = peer.flight.saturating_sub(send.last - kept);
+                            send.last = kept;
+                        }
+                        break;
+                    }
+                }
+                self.epoch = self.epoch.wrapping_add(1);
+                peer.epoch = self.epoch;
+                self.send_append(at, &mut budget, true, log, out);
             }
         }
     }
 
-    fn send_append(&mut self, at: usize, log: &impl LogTerms, out: &mut impl Effects) {
-        let id = self.config.id;
-        let commit = self.commit;
-        let term = self.term_vote.term;
-        let batch = self.config.batch;
-        let Some(peer) = self.peers.get_mut(at) else {
-            return;
+    /// The previous index, and the entries, bytes and reads of what `at`
+    /// can be sent now, within what is left of the duty's `budget`.
+    fn fit(&self, at: usize, budget: Duty, log: &impl LogTerms) -> (u64, u64, u64, (u64, u64)) {
+        let Some(peer) = self.peers.get(at) else {
+            return (0, 0, 0, (0, 0));
         };
-        if peer.id == id {
-            return;
-        }
+        let limits = self.config.limits;
         let last = log.last_index();
         let prev_index = peer.next.saturating_sub(1).min(last);
+        if peer.sends.is_full() {
+            return (prev_index, 0, 0, (0, 0));
+        }
+        let most = last
+            .saturating_sub(prev_index)
+            .min(self.config.batch)
+            .min(limits.in_flight_entries.saturating_sub(peer.flight));
+        let mut entries = 0;
+        let mut bytes = 0_u64;
+        let mut cost = 0_u64;
+        let mut reads = 0;
+        while entries < most && reads < budget.reads {
+            reads += 1;
+            let index = prev_index.saturating_add(entries).saturating_add(1);
+            let (Some(size), Some(read)) = (log.size(index), log.cost(index)) else {
+                break;
+            };
+            let total = peer.bytes.saturating_add(bytes).saturating_add(size);
+            // An entry larger than the whole window goes alone into an
+            // empty one (see the module notes).
+            let alone = entries == 0 && peer.flight == 0;
+            if total > limits.in_flight_bytes && !alone {
+                break;
+            }
+            // The duty's log read bound has no exception.
+            if cost.saturating_add(read) > budget.bytes {
+                break;
+            }
+            cost = cost.saturating_add(read);
+            bytes = bytes.saturating_add(size);
+            entries += 1;
+            if total > limits.in_flight_bytes {
+                break;
+            }
+        }
+        (prev_index, entries, bytes, (reads, cost))
+    }
+
+    /// Sends `at` what fits, or a heartbeat when nothing does and
+    /// `heartbeat` is set.
+    fn send_append(
+        &mut self,
+        at: usize,
+        budget: &mut Duty,
+        heartbeat: bool,
+        log: &impl LogTerms,
+        out: &mut impl Effects,
+    ) {
+        let id = self.config.id;
+        if self.peers.get(at).is_none_or(|peer| peer.id == id) {
+            return;
+        }
+        let commit = self.commit;
+        let term = self.term_vote.term;
+        if self.snapshot_needed(at, budget, log, out) {
+            // A heartbeat at the base keeps it following, and its answer
+            // acknowledges the snapshot once installed.
+            let (base, prev_term) = self.base;
+            if heartbeat
+                && base > 0
+                && let Some(peer) = self.peers.get(at)
+                && peer.snapshot.is_some()
+            {
+                out.send(
+                    peer.id,
+                    Message::Append {
+                        term,
+                        prev_index: base,
+                        prev_term,
+                        entries: 0,
+                        commit,
+                        epoch: peer.epoch,
+                    },
+                );
+            }
+            return;
+        }
+        let (prev_index, entries, bytes, (reads, cost)) = self.fit(at, *budget, log);
+        budget.reads = budget.reads.saturating_sub(reads);
+        budget.bytes = budget.bytes.saturating_sub(cost);
+        if entries == 0 && !heartbeat {
+            return;
+        }
         let Some(prev_term) = log.term(prev_index) else {
             return;
         };
-        let entries = last.saturating_sub(prev_index).min(batch);
+        let Some(peer) = self.peers.get_mut(at) else {
+            return;
+        };
+        if entries > 0 {
+            peer.sends.push(Send {
+                first: prev_index.saturating_add(1),
+                last: prev_index.saturating_add(entries),
+                bytes,
+            });
+            peer.flight = peer.flight.saturating_add(entries);
+            peer.bytes = peer.bytes.saturating_add(bytes);
+        }
         peer.next = prev_index.saturating_add(entries).saturating_add(1);
         out.send(
             peer.id,
@@ -843,8 +1432,59 @@ impl Core {
                 prev_term,
                 entries,
                 commit,
+                epoch: peer.epoch,
             },
         );
+    }
+
+    /// Whether `at` waits for a snapshot: one asked for, or one it needs
+    /// now because the log no longer holds what it would be sent, which
+    /// is then asked for. A follower waiting for one is sent no entries.
+    fn snapshot_needed(
+        &mut self,
+        at: usize,
+        budget: &mut Duty,
+        log: &impl LogTerms,
+        out: &mut impl Effects,
+    ) -> bool {
+        let base = self.base.0;
+        let Some(peer) = self.peers.get_mut(at) else {
+            return true;
+        };
+        if peer.snapshot.is_some() {
+            return true;
+        }
+        let last = log.last_index();
+        let prev = peer.next.saturating_sub(1).min(last);
+        if base == 0 {
+            return false;
+        }
+        // Below the base a log may keep terms without entries: the next
+        // entry's size says whether it can still be sent. That read is
+        // charged to the duty, and with none left nothing is decided.
+        let gone = if log.term(prev).is_none() {
+            true
+        } else if prev < base && prev < last {
+            if budget.reads == 0 {
+                return false;
+            }
+            budget.reads -= 1;
+            log.size(prev.saturating_add(1)).is_none()
+        } else {
+            false
+        };
+        if !gone {
+            return false;
+        }
+        peer.snapshot = Some((base, 0));
+        peer.next = base.saturating_add(1);
+        peer.sends.clear();
+        peer.flight = 0;
+        peer.bytes = 0;
+        self.epoch = self.epoch.wrapping_add(1);
+        peer.epoch = self.epoch;
+        out.send_snapshot(peer.id);
+        true
     }
 
     /// The highest index a majority holds durably, committed when its
@@ -913,14 +1553,67 @@ impl Core {
     }
 }
 
+/// What is left of a duty's reads.
+#[derive(Debug, Clone, Copy)]
+struct Duty {
+    /// Entry size lookups.
+    reads: u64,
+    /// Bytes of entries sent, read by the driver.
+    bytes: u64,
+}
+
+impl Duty {
+    const fn of(limits: Limits) -> Self {
+        Self {
+            reads: limits.reads,
+            bytes: limits.read_bytes,
+        }
+    }
+}
+
 /// An append's header.
 #[derive(Debug, Clone, Copy)]
 struct Append {
+    epoch: u64,
     term: u64,
     prev_index: u64,
     prev_term: u64,
     entries: u64,
     commit: u64,
+}
+
+/// The node's log read through the snapshot base: the base's term is
+/// known, and the log ends no earlier than the base.
+struct Based<'a, L> {
+    log: &'a L,
+    base: (u64, u64),
+}
+
+impl<'a, L: LogTerms> Based<'a, L> {
+    const fn new(log: &'a L, base: (u64, u64)) -> Self {
+        Self { log, base }
+    }
+}
+
+impl<L: LogTerms> LogTerms for Based<'_, L> {
+    fn last_index(&self) -> u64 {
+        self.log.last_index().max(self.base.0)
+    }
+
+    fn term(&self, index: u64) -> Option<u64> {
+        if index == self.base.0 {
+            return Some(self.base.1);
+        }
+        self.log.term(index)
+    }
+
+    fn size(&self, index: u64) -> Option<u64> {
+        self.log.size(index)
+    }
+
+    fn cost(&self, index: u64) -> Option<u64> {
+        self.log.cost(index)
+    }
 }
 
 fn last(log: &impl LogTerms) -> (u64, u64) {
