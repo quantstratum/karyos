@@ -630,10 +630,21 @@ fn per_stream_network_counters_reach_the_cnc_in_every_mode() {
 /// back, and a reader of the new image receives what the sender offers
 /// after it. The removal then ends with the EOS as usual. This is the
 /// cycle the counters test fell into under load with a 100 ms liveness,
-/// forced here by not running A's duty cycle.
+/// forced here by not running A's duty cycle. B keeps the default
+/// liveness; only the stall steps B's network clock past it (Codex review
+/// of #1245), so a loaded host cannot retire the image during the live
+/// exchanges.
 #[test]
 fn a_sender_stalled_past_liveness_rejoins_and_its_removal_ends() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use crate::sessions::receive::SessionConfig;
+
+    /// Added to the host's time on B's network clock.
+    static AHEAD: AtomicU64 = AtomicU64::new(0);
+    fn b_clock() -> u64 {
+        karyos_sys::host_clock::host_monotonic_ns() + AHEAD.load(Ordering::Relaxed)
+    }
 
     let with = |agents: AgentConfig| {
         EmbeddedDriver::with_config(DriverConfig {
@@ -651,13 +662,16 @@ fn a_sender_stalled_past_liveness_rejoins_and_its_removal_ends() {
         .unwrap()
     };
     let mut a = with(AgentConfig::default());
+    let quiet = AgentConfig::default();
+    let liveness = quiet.image_liveness_timeout;
     let mut b = with(AgentConfig {
         sessions: SessionConfig {
             alias_quarantine: 50 * MS,
             ..SessionConfig::default()
         },
-        ..fast_agents()
+        ..quiet
     });
+    b.net.as_mut().unwrap().set_clock(b_clock);
     let (publication, image) = connected(&mut a, &mut b, true, 10);
     let mut lane = a
         .publication(publication.lane(Lane::ZERO).unwrap())
@@ -674,8 +688,9 @@ fn a_sender_stalled_past_liveness_rejoins_and_its_removal_ends() {
             OfferOutcome::Accepted { .. }
         ));
     }
-    // A stalls: only B runs, past its 100 ms liveness, until the image
-    // retires and the reader's lane is sealed.
+    // A stalls: only B runs, its clock stepped past the liveness, until
+    // the image retires and the reader's lane is sealed.
+    AHEAD.fetch_add(liveness + 1_000 * MS, Ordering::Relaxed);
     let (mut end, mut late) = (None, 0u32);
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while end.is_none() && std::time::Instant::now() < deadline {
@@ -716,12 +731,23 @@ fn a_sender_stalled_past_liveness_rejoins_and_its_removal_ends() {
     // they are the loss the old lane's unclean seal reported.
     let mut reader = b.subscribe_aggregate(&again, Role::Optional).unwrap();
     exchange_on(&mut a, &mut b, &mut lane, &mut reader, 11..16);
-    // The removal ends with the EOS, which retires the new image.
+    // The removal ends with the EOS, which closes the new image: B counts
+    // an image closed by its EOS, not one retired by a timeout (Codex
+    // review of #1245).
+    let closed_eos = |driver: &EmbeddedDriver| {
+        driver
+            .net
+            .as_ref()
+            .and_then(|net| net.receiver_counters())
+            .map_or(0, |counters| counters.images_closed_eos)
+    };
+    let before = closed_eos(&b);
     drop(lane);
     drop(reader);
     a.remove_aggregate(&publication).unwrap();
     pump(&mut [&mut a, &mut b], |drivers| {
         drivers[1].net.as_ref().unwrap().image_count() == 0
+            && closed_eos(drivers[1]) > before
             && drivers[0]
                 .net
                 .as_ref()
