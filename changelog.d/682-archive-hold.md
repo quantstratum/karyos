@@ -1,0 +1,3 @@
+### Added
+
+- A Raft log refuses to remove committed bytes through an Archive hold (karyos#682): `RaftLog::purge_prefix_under`, `install_under` and `open_with_under` read the Archive's hold on the log's recording from a `HoldSource` (A10's `Retention`, or a fixed `HoldState`) right before they write, and while it is held, pending or unknown they refuse with the typed `LogError::ArchiveHeld`, changing nothing; an open that would finish a purge or an install a crash cut short refuses the same way. The harness node reuses a staged snapshot on a retried install and recovers over the newest snapshot its log's commit reaches. `install_crash.rs` crashes every disk operation of a follower's install and of a compaction through the custom core.
