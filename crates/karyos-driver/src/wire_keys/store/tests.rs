@@ -17,12 +17,48 @@ struct Mem {
     refused: RefCell<BTreeSet<String>>,
     fail_writes: Cell<bool>,
     fail_list: Cell<bool>,
+    /// The handle holding the exclusive lock, as `flock` on one descriptor.
+    holder: Cell<Option<usize>>,
 }
 
-#[derive(Clone, Default)]
-struct Dir(Rc<Mem>);
+/// One open descriptor: clones share it, as a moved `SecureDir` does, and
+/// the lock it holds is released when the last clone drops.
+struct Handle {
+    id: usize,
+    mem: Rc<Mem>,
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if self.mem.holder.get() == Some(self.id) {
+            self.mem.holder.set(None);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Dir(Rc<Mem>, Rc<Handle>);
+
+impl Default for Dir {
+    fn default() -> Self {
+        Self::over(Rc::default())
+    }
+}
 
 impl Dir {
+    fn over(mem: Rc<Mem>) -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let handle = Rc::new(Handle {
+            id,
+            mem: Rc::clone(&mem),
+        });
+        Self(mem, handle)
+    }
+    /// The same directory through a second descriptor.
+    fn reopen(&self) -> Self {
+        Self::over(Rc::clone(&self.0))
+    }
     fn put(&self, name: &str, bytes: &[u8]) {
         self.0
             .files
@@ -64,6 +100,16 @@ impl Files for Dir {
         }
         self.put(name, bytes);
         Ok(())
+    }
+
+    fn lock(&self) -> Result<(), FileError> {
+        match self.0.holder.get() {
+            Some(id) if id != self.1.id => Err(FileError::Refused),
+            _ => {
+                self.0.holder.set(Some(self.1.id));
+                Ok(())
+            }
+        }
     }
 }
 
@@ -454,4 +500,115 @@ fn the_revoked_list_parser_follows_the_format() {
     ] {
         assert_eq!(parse_revoked(bad), None, "{bad:?}");
     }
+}
+
+#[test]
+fn a_secret_reused_by_another_key_is_refused() {
+    let (keys, state) = fresh();
+    keys.put("3-1.key", first().as_bytes());
+    // Same reload: a second key with the first one's secret.
+    keys.put(
+        "5-1.key",
+        channel(5, 1, "2026-11-01", "2027-01-30", 0x11).as_bytes(),
+    );
+    let (mut store, report) = Store::start(keys.clone(), state.clone(), DEC_01).unwrap();
+    assert_eq!(reasons(&report), [(5, 1, Reason::ReusedSecret)]);
+    assert_eq!(epochs(&store), [(3, 1)]);
+    // A later epoch of the same key_id reusing it is refused too.
+    keys.remove("5-1.key");
+    keys.put(
+        "3-2.key",
+        channel(3, 2, "2027-01-01", "2027-03-01", 0x11).as_bytes(),
+    );
+    assert_eq!(
+        reasons(&store.reload(DEC_01)),
+        [(3, 2, Reason::ReusedSecret)]
+    );
+    // After a restart, against the durable record alone: the original
+    // key is gone and revoked, and its secret still cannot come back.
+    keys.remove("3-2.key");
+    keys.remove("3-1.key");
+    keys.put(REVOKED, b"3-1\n");
+    store.reload(DEC_01);
+    drop(store);
+    keys.put(
+        "6-1.key",
+        channel(6, 1, "2026-11-01", "2027-01-30", 0x11).as_bytes(),
+    );
+    let (store, report) = Store::start(keys, state.clone(), DEC_01).unwrap();
+    assert_eq!(reasons(&report), [(6, 1, Reason::ReusedSecret)]);
+    assert!(epochs(&store).is_empty());
+    assert!(!committed(&state).admitted.contains_key(&(6, 1)));
+}
+
+#[test]
+fn a_predecessor_stops_signing_at_the_successor_not_before_whatever_happens_to_it() {
+    let (keys, state) = fresh();
+    keys.put("3-1.key", first().as_bytes());
+    keys.put("3-2.key", second().as_bytes());
+    let (mut store, _) = Store::start(keys.clone(), state.clone(), DEC_01).unwrap();
+    let deadline = JAN_01 + DAY - SKEW_S;
+    // E2 deleted after its `not_before`: E1 does not take over signing,
+    // though it still verifies until the deadline.
+    keys.remove("3-2.key");
+    store.reload(JAN_01);
+    assert_eq!(epochs(&store), [(3, 1)]);
+    assert!(store.signing_key(3, JAN_01).is_none());
+    assert_eq!(store.signing_key(3, JAN_01 - 1).unwrap().file_epoch, 1);
+    assert_eq!(store.verify_keys(3, JAN_01).count(), 1);
+    // At the deadline, before any reload retires it, it neither signs nor
+    // verifies.
+    assert!(store.signing_key(3, deadline).is_none());
+    assert_eq!(store.verify_keys(3, deadline).count(), 0);
+    // A revoked E2 does not hand signing back either, nor does a restart.
+    keys.put("3-2.key", second().as_bytes());
+    keys.put(REVOKED, b"3-2\n");
+    store.reload(JAN_01);
+    assert!(store.signing_key(3, JAN_01 + 1).is_none());
+    drop(store);
+    let (store, _) = Store::start(keys, state, JAN_01).unwrap();
+    assert!(store.signing_key(3, JAN_01).is_none());
+    assert_eq!(store.signing_key(3, JAN_01 - 1).unwrap().file_epoch, 1);
+}
+
+#[test]
+fn a_successor_admitted_past_the_deadline_retires_its_predecessor_at_once() {
+    let (keys, state) = fresh();
+    keys.put("3-1.key", first().as_bytes());
+    let (mut store, _) = Store::start(keys.clone(), state.clone(), DEC_01).unwrap();
+    let deadline = JAN_01 + DAY - SKEW_S;
+    // E2 first appears after its overlap has already ended.
+    keys.put("3-2.key", second().as_bytes());
+    assert!(!store.reload(deadline + 1).alarm());
+    assert_eq!(epochs(&store), [(3, 2)]);
+    let durable = committed(&state);
+    assert!(durable.retired.contains(&(3, 1)));
+    assert!(durable.admitted.contains_key(&(3, 2)));
+    // A restart with the clock rolled back does not load E1 again.
+    drop(store);
+    let (store, _) = Store::start(keys, state, DEC_01).unwrap();
+    assert!(epochs(&store).iter().all(|key| *key != (3, 1)));
+    assert!(store.signing_key(3, DEC_01).is_none());
+}
+
+#[test]
+fn a_second_store_cannot_work_from_the_same_state() {
+    let (keys, state) = fresh();
+    keys.put("3-1.key", first().as_bytes());
+    let (store, _) = Store::start(keys.clone(), state.clone(), DEC_01).unwrap();
+    let other = state.reopen();
+    assert_eq!(
+        Store::start(keys.clone(), other.clone(), DEC_01).unwrap_err(),
+        StoreError::Locked
+    );
+    assert_eq!(
+        Store::initialise(&other, Zeroizing::new([7; KEY_LEN])),
+        Err(StoreError::Locked)
+    );
+    // Once the first store drops, the lock is free.
+    drop(store);
+    drop(state);
+    let (store, report) = Store::start(keys, other, DEC_01).unwrap();
+    assert!(!report.alarm());
+    assert_eq!(epochs(&store), [(3, 1)]);
 }

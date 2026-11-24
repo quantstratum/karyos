@@ -15,7 +15,8 @@ publish.workspace = true
 # karyos/reviews/dependency-admission-wire-auth-hmac.md, driver scope).
 ed25519-dalek.workspace = true
 hmac.workspace = true
-sha2.workspace = true
+# `zeroize` erases the SHA-256 states of the keyed fingerprints on drop.
+sha2 = { workspace = true, features = ["zeroize"] }
 zeroize.workspace = true
 karyos-client.workspace = true
 karyos-io.workspace = true

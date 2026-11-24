@@ -14,6 +14,7 @@
 
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Stat, fstat, fsync, openat, renameat, unlinkat};
 use rustix::io::Errno;
@@ -45,6 +46,9 @@ pub enum SecureDirError {
     /// The file does not exist.
     #[error("no such file")]
     NotFound,
+    /// Another open descriptor holds the directory's exclusive lock.
+    #[error("the directory is locked by another opener")]
+    Locked,
     /// A name that is empty, holds `/` or NUL, or is `.` or `..`.
     #[error("bad file name")]
     Name,
@@ -241,9 +245,31 @@ impl SecureDir {
         Ok(filled)
     }
 
+    /// Takes the exclusive `flock` of the directory on this descriptor,
+    /// without waiting. It is held until this [`SecureDir`] drops, so a
+    /// second opener of the same directory, in this process or another,
+    /// gets [`SecureDirError::Locked`].
+    ///
+    /// # Errors
+    ///
+    /// [`SecureDirError::Locked`] when another descriptor holds it, and
+    /// [`SecureDirError::Os`] when the call fails otherwise.
+    pub fn lock_exclusive(&self) -> Result<(), SecureDirError> {
+        rustix::fs::flock(
+            &self.fd,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .map_err(|errno| match errno {
+            Errno::WOULDBLOCK => SecureDirError::Locked,
+            other => os("flock")(other),
+        })
+    }
+
     /// Replaces the file `name` with `bytes`, durably: a temporary file is
     /// written with mode `0600`, `fsync`ed, renamed into place, and the
-    /// directory is `fsync`ed (design section 2.6, "Commit").
+    /// directory is `fsync`ed (design section 2.6, "Commit"). The temporary
+    /// name is unique to this process and call, so overlapping writers
+    /// never unlink each other's staging file; it is removed on failure.
     ///
     /// # Errors
     ///
@@ -251,14 +277,23 @@ impl SecureDir {
     /// its previous bytes or the new ones, never a mix.
     pub fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<(), SecureDirError> {
         check_name(name)?;
-        let temp = format!(".{name}.tmp");
-        match unlinkat(&self.fd, temp.as_str(), AtFlags::empty()) {
-            Ok(()) | Err(Errno::NOENT) => {}
-            Err(errno) => return Err(os("unlinkat")(errno)),
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let temp = format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let outcome = self.stage(temp.as_str(), name, bytes);
+        if outcome.is_err() {
+            let _ = unlinkat(&self.fd, temp.as_str(), AtFlags::empty());
         }
+        outcome
+    }
+
+    fn stage(&self, temp: &str, name: &str, bytes: &[u8]) -> Result<(), SecureDirError> {
         let fd = openat(
             &self.fd,
-            temp.as_str(),
+            temp,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )
@@ -274,7 +309,7 @@ impl SecureDir {
         }
         fsync(&fd).map_err(os("fsync"))?;
         drop(fd);
-        renameat(&self.fd, temp.as_str(), &self.fd, name).map_err(os("renameat"))?;
+        renameat(&self.fd, temp, &self.fd, name).map_err(os("renameat"))?;
         fsync(&self.fd).map_err(os("fsync"))
     }
 }

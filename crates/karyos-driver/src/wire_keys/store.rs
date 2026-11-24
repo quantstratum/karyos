@@ -97,6 +97,14 @@ pub trait Files {
     ///
     /// [`FileError::Refused`] when the commit fails.
     fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<(), FileError>;
+    /// Takes the directory's exclusive lock without waiting, held for as
+    /// long as this handle lives.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Refused`] when another handle holds it or it cannot be
+    /// taken.
+    fn lock(&self) -> Result<(), FileError>;
 }
 
 #[cfg(target_os = "linux")]
@@ -115,6 +123,10 @@ impl Files for karyos_sys::secure_dir::SecureDir {
     fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<(), FileError> {
         Self::write_atomic(self, name, bytes).map_err(|_| FileError::Refused)
     }
+
+    fn lock(&self) -> Result<(), FileError> {
+        Self::lock_exclusive(self).map_err(|_| FileError::Refused)
+    }
 }
 
 /// Why a key, or every key, is not in use. Diagnostics carry this,
@@ -131,6 +143,9 @@ pub enum Reason {
     EpochBackward,
     /// A never-admitted key already past its verify window.
     Expired,
+    /// A never-admitted key whose secret is another admitted key's
+    /// (design section 2.2, "Independent secrets").
+    ReusedSecret,
     /// The `revoked` list was refused or malformed: every key is disabled.
     RevokedList,
     /// The key directory could not be listed: every key is disabled.
@@ -194,6 +209,9 @@ pub enum StoreError {
     /// Writing the initial state failed.
     #[error("the key state could not be written")]
     Commit,
+    /// Another store holds the state directory's lock.
+    #[error("the key state is in use by another store")]
+    Locked,
 }
 
 /// The admitted keys, reloaded against the durable state.
@@ -226,8 +244,10 @@ impl<K: Files, S: Files> KeyStore<K, S> {
     /// # Errors
     ///
     /// [`StoreError::AlreadyInitialised`] when either file exists or cannot
-    /// be read, and [`StoreError::Commit`] when a write fails.
+    /// be read, [`StoreError::Locked`] when another store holds the state
+    /// directory, and [`StoreError::Commit`] when a write fails.
     pub fn initialise(state_dir: &S, random: FingerprintKey) -> Result<(), StoreError> {
+        state_dir.lock().map_err(|_| StoreError::Locked)?;
         let mut probe = Zeroizing::new([0_u8; 2]);
         for name in [STATE, FINGERPRINT_KEY] {
             if state_dir.read(name, probe.as_mut_slice()) != Err(FileError::NotFound) {
@@ -243,13 +263,16 @@ impl<K: Files, S: Files> KeyStore<K, S> {
             .map_err(|_| StoreError::Commit)
     }
 
-    /// Starts the store: the state and the fingerprint key must load, then
-    /// the key directory is loaded as by [`KeyStore::reload`].
+    /// Starts the store: it takes the state directory's exclusive lock and
+    /// holds it for its lifetime, so no second store works from the same
+    /// state; then the state and the fingerprint key must load, and the
+    /// key directory is loaded as by [`KeyStore::reload`].
     ///
     /// # Errors
     ///
     /// The first [`StoreError`] that applies; no key loads.
     pub fn start(keys: K, state_dir: S, now: i64) -> Result<(Self, Report), StoreError> {
+        state_dir.lock().map_err(|_| StoreError::Locked)?;
         let read = |name: &str, buf: &mut [u8]| match state_dir.read(name, buf) {
             Ok(len) => Ok(len),
             Err(FileError::NotFound) => Err(StoreError::NotInitialised),
@@ -294,18 +317,33 @@ impl<K: Files, S: Files> KeyStore<K, S> {
     }
 
     /// The key that signs and sends for `key_id` at `now`: the highest
-    /// loaded epoch whose validity has started and not ended (design
-    /// section 2.3).
+    /// loaded epoch whose validity has started and not ended. A
+    /// predecessor signs only until its successor's `not_before`, taken
+    /// from the durable lineage, so whether the successor is still loaded
+    /// does not matter (design section 2.3).
     #[must_use]
     pub fn signing_key(&self, key_id: u32, now: i64) -> Option<&KeyFile> {
         if self.disabled {
             return None;
         }
+        let lineage = self.state.lineages.get(&key_id).copied();
         self.loaded
             .range((key_id, 0)..=(key_id, u32::MAX))
             .rev()
             .map(|(_, file)| file)
-            .find(|file| file.not_before <= now && now <= file.not_after)
+            .find(|file| {
+                let cutover = match lineage {
+                    Some(lineage) if file.file_epoch == lineage.highest => i64::MAX,
+                    Some(Lineage {
+                        predecessor: Some((epoch, deadline)),
+                        ..
+                    }) if epoch == file.file_epoch => successor_not_before(deadline),
+                    // Below the predecessor: never signs.
+                    Some(_) => i64::MIN,
+                    None => i64::MAX,
+                };
+                file.not_before <= now && now <= file.not_after && now < cutover
+            })
     }
 
     /// The keys that verify for `key_id` at `now`, at most two: each loaded
@@ -406,6 +444,12 @@ impl<K: Files, S: Files> KeyStore<K, S> {
         found.sort_unstable();
         let mut next: BTreeMap<KeyRef, KeyFile> = BTreeMap::new();
         let mut admissions: Vec<(KeyFile, Fingerprints)> = Vec::new();
+        let mut secrets: Vec<[u8; super::KEY_LEN]> = self
+            .state
+            .admitted
+            .values()
+            .filter_map(|prints| prints.secret)
+            .collect();
         let mut buf = Erased::new(MAX_FILE_LEN + 1);
         for (key, name) in found {
             if self.state.is_dead(key) {
@@ -443,7 +487,16 @@ impl<K: Files, S: Files> KeyStore<K, S> {
                     report.push(key, Reason::EpochBackward);
                 }
                 None if expired => report.push(key, Reason::Expired),
-                None => admissions.push((file, prints)),
+                None if prints
+                    .secret
+                    .is_some_and(|secret| secrets.contains(&secret)) =>
+                {
+                    report.push(key, Reason::ReusedSecret);
+                }
+                None => {
+                    secrets.extend(prints.secret);
+                    admissions.push((file, prints));
+                }
             }
         }
         // Deleted, expired, changed or refused keys leave at once.
@@ -452,7 +505,7 @@ impl<K: Files, S: Files> KeyStore<K, S> {
         // 4. New admissions: recorded, committed, and only then used.
         for (file, prints) in admissions {
             let key = (file.key_id, file.file_epoch);
-            self.admit(key, &file, prints);
+            self.admit(key, &file, prints, now);
             next.insert(key, file);
         }
         next.retain(|key, _| !self.state.is_dead(*key));
@@ -510,8 +563,10 @@ impl<K: Files, S: Files> KeyStore<K, S> {
 
     /// Records an admission and moves the lineage forward: the previous
     /// highest epoch becomes the predecessor, with its retirement deadline,
-    /// and an older predecessor still verifying retires at once.
-    fn admit(&mut self, key: KeyRef, file: &KeyFile, prints: Fingerprints) {
+    /// and an older predecessor still verifying retires at once. A
+    /// predecessor whose deadline has already passed retires at once too,
+    /// in the same commit as the admission.
+    fn admit(&mut self, key: KeyRef, file: &KeyFile, prints: Fingerprints, now: i64) {
         let (key_id, epoch) = key;
         self.state.admitted.insert(key, prints);
         self.dirty = true;
@@ -531,6 +586,9 @@ impl<K: Files, S: Files> KeyStore<K, S> {
                     .not_before
                     .saturating_add(OVERLAP_S)
                     .saturating_sub(SKEW_S);
+                if now >= deadline && !self.state.retired.contains(&(key_id, previous.highest)) {
+                    self.retire((key_id, previous.highest));
+                }
                 Lineage {
                     highest: epoch,
                     predecessor: Some((previous.highest, deadline)),
@@ -539,6 +597,12 @@ impl<K: Files, S: Files> KeyStore<K, S> {
         };
         self.state.lineages.insert(key_id, lineage);
     }
+}
+
+/// The successor's `not_before`, from its predecessor's retirement
+/// deadline `not_before + OVERLAP_S - SKEW_S`.
+fn successor_not_before(deadline: i64) -> i64 {
+    deadline.saturating_add(SKEW_S).saturating_sub(OVERLAP_S)
 }
 
 /// Parses a `revoked` list (design section 2.4): one canonical

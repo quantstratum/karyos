@@ -122,3 +122,43 @@ fn files_are_refused_by_link_type_mode_and_size() {
     assert_eq!(dir.write_atomic("", b""), Err(SecureDirError::Name));
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+#[cfg_attr(miri, ignore = "host syscalls")]
+fn the_exclusive_lock_admits_one_opener_until_it_drops() {
+    let base = base("lock");
+    let first = SecureDir::open_beneath(&base, Path::new("keys"), me()).unwrap();
+    let second = SecureDir::open_beneath(&base, Path::new("keys"), me()).unwrap();
+    first.lock_exclusive().unwrap();
+    assert_eq!(second.lock_exclusive(), Err(SecureDirError::Locked));
+    drop(first);
+    second.lock_exclusive().unwrap();
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "host syscalls")]
+fn overlapping_writers_stage_under_their_own_names_and_leave_none_behind() {
+    let base = base("stage");
+    let one = SecureDir::open_beneath(&base, Path::new("keys"), me()).unwrap();
+    let two = SecureDir::open_beneath(&base, Path::new("keys"), me()).unwrap();
+    // A staging file left by another writer under the old fixed name, or
+    // under any other name, is neither reused nor removed.
+    put(&base.join("keys"), ".state.tmp", b"theirs", 0o600);
+    one.write_atomic("state", b"one").unwrap();
+    two.write_atomic("state", b"two").unwrap();
+    let mut buf = [0_u8; 16];
+    assert_eq!(one.read(".state.tmp", &mut buf).unwrap(), 6);
+    let mut names = one.names().unwrap();
+    names.sort();
+    assert_eq!(names, [".state.tmp", "state"]);
+    // A failed write removes its own staging file: a name that is a
+    // directory makes the rename fail.
+    fs::create_dir(base.join("keys").join("busy")).unwrap();
+    fs::write(base.join("keys").join("busy").join("x"), b"").unwrap();
+    assert!(one.write_atomic("busy", b"x").is_err());
+    let mut names = one.names().unwrap();
+    names.sort();
+    assert_eq!(names, [".state.tmp", "busy", "state"]);
+    fs::remove_dir_all(&base).unwrap();
+}

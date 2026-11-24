@@ -2,6 +2,8 @@
 
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+use hmac::{Hmac, KeyInit, Mac};
+
 use super::*;
 
 fn sample() -> KeyState {
@@ -147,6 +149,17 @@ fn fingerprints_are_keyed_and_typed() {
     let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&[1_u8; KEY_LEN]).unwrap();
     mac.update(b"karyos-key-fp-v1filebytes");
     assert_eq!(file.as_slice(), mac.finalize().into_bytes().as_slice());
+    // The written-out HMAC agrees with the `hmac` crate past one block of
+    // message and for every key byte value.
+    let key = Zeroizing::new(core::array::from_fn(|i| u8::try_from(i * 8 + 7).unwrap()));
+    let long = [0xa5_u8; 200];
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_slice()).unwrap();
+    mac.update(b"karyos-key-fp-v1secret");
+    mac.update(&long);
+    assert_eq!(
+        fingerprint(&key, b"secret", &long).as_slice(),
+        mac.finalize().into_bytes().as_slice()
+    );
     let encoded = encode_fingerprint_key(&one);
     assert_eq!(&*decode_fingerprint_key(encoded.as_slice()).unwrap(), &*one);
     assert!(decode_fingerprint_key(&encoded.as_slice()[1..]).is_err());
