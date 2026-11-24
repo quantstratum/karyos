@@ -9,7 +9,8 @@
 use std::collections::BTreeMap;
 
 use karyos_cluster::consensus::{
-    AppendOutcome, Config, ConfigError, Core, Effects, LogTerms, Message, Role, StepError, TermVote,
+    AppendOutcome, Backpressure, Config, ConfigError, Core, Effects, Limits, LogTerms, Message,
+    ProposeError, Role, StepError, TermVote,
 };
 
 /// A log of entry terms: index `i` is `terms[i - 1]`, and `ids[i - 1]`
@@ -53,7 +54,29 @@ impl LogTerms for TestLog {
         let at = usize::try_from(index - 1).ok()?;
         self.terms.get(at).copied()
     }
+
+    fn size(&self, index: u64) -> Option<u64> {
+        let at = usize::try_from(index.checked_sub(1)?).ok()?;
+        self.ids.get(at).map(|&id| size_of(id))
+    }
 }
+
+/// An entry's size in bytes, from its identity: 100 to 500.
+const fn size_of(id: u64) -> u64 {
+    (id % 5 + 1) * 100
+}
+
+/// The model's flow limits: a batch of 4, 8 entries or 1,000 bytes in
+/// flight per follower (two to ten entries, so both bounds are reached),
+/// 16 uncommitted entries, 6 size lookups and 1,500 bytes read per
+/// duty.
+const LIMITS: Limits = Limits {
+    in_flight_entries: 8,
+    in_flight_bytes: 1_000,
+    queue: 16,
+    reads: 6,
+    read_bytes: 1_500,
+};
 
 /// What one core call asked for.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -137,10 +160,12 @@ struct Cluster {
     next_id: u64,
     /// Every event, for the determinism check.
     history: Vec<String>,
+    /// Proposals refused by backpressure.
+    refused: usize,
 }
 
 fn config(id: u64, ids: &[u64], seed: u64) -> Result<Config, ConfigError> {
-    Config::new(id, ids, 10, 20, 3, 4, seed)
+    Config::new(id, ids, 10, 20, 3, 4, seed)?.with_limits(LIMITS)
 }
 
 impl Cluster {
@@ -171,6 +196,7 @@ impl Cluster {
             committed: Vec::new(),
             next_id: 1,
             history: Vec::new(),
+            refused: 0,
         }
     }
 
@@ -244,6 +270,22 @@ impl Cluster {
                     ),
                     _ => (0, 0),
                 };
+                if let Message::Append { entries, .. } = message {
+                    // From the entries themselves, not the core's counters.
+                    let bytes: u64 = node
+                        .log
+                        .ids
+                        .iter()
+                        .skip(from)
+                        .take(count)
+                        .map(|&id| size_of(id))
+                        .sum();
+                    assert!(entries <= 4, "{entries} entries in one append");
+                    assert!(
+                        entries <= 1 || bytes <= LIMITS.in_flight_bytes,
+                        "{bytes} bytes in one append"
+                    );
+                }
                 let terms = node
                     .log
                     .terms
@@ -306,12 +348,19 @@ impl Cluster {
                 let Some(node) = self.nodes.get_mut(&id) else {
                     return;
                 };
-                if let Ok((index, term)) = node.core.propose(&node.log) {
-                    self.history.push(format!("propose {id} {index} {term}"));
-                    assert_eq!(index, node.log.last_index() + 1);
-                    node.log.push(term, self.next_id);
-                    self.next_id += 1;
-                    self.persisted(id);
+                match node.core.propose(size_of(self.next_id), &node.log) {
+                    Ok((index, term)) => {
+                        self.history.push(format!("propose {id} {index} {term}"));
+                        assert_eq!(index, node.log.last_index() + 1);
+                        node.log.push(term, self.next_id);
+                        self.next_id += 1;
+                        self.persisted(id);
+                    }
+                    Err(ProposeError::Backpressure(why)) => {
+                        self.history.push(format!("refused {id} {why:?}"));
+                        self.refused += 1;
+                    }
+                    Err(ProposeError::NotLeader(_)) => {}
                 }
             }
             40 => {
@@ -385,6 +434,19 @@ impl Cluster {
                 term < newest || node.log.entries().starts_with(&self.committed),
                 "leader {id} of term {term} lacks committed entries"
             );
+            // The flow limits hold strictly, whatever the network lost.
+            for &other in &self.ids {
+                if let Some((entries, bytes)) = node.core.in_flight(other) {
+                    assert!(
+                        entries <= LIMITS.in_flight_entries,
+                        "{entries} entries in flight to {other}"
+                    );
+                    assert!(
+                        bytes <= LIMITS.in_flight_bytes,
+                        "{bytes} bytes in flight to {other}"
+                    );
+                }
+            }
         }
         // State machine safety: committed prefixes agree.
         let commit = usize::try_from(node.core.commit()).unwrap_or(usize::MAX);
@@ -434,11 +496,14 @@ fn run(size: u64, seed: u64, events: usize) -> Cluster {
 fn three_and_five_nodes_keep_raft_safety_and_commit() {
     for size in [3, 5] {
         let mut committed = 0;
+        let mut refused = 0;
         for seed in 0..100 {
             let cluster = run(size, seed, 4_000);
             committed += cluster.committed.len();
+            refused += cluster.refused;
         }
         assert!(committed > 1_000, "{size} nodes committed {committed}");
+        assert!(refused > 0, "{size} nodes never reached a flow limit");
     }
 }
 
@@ -453,7 +518,13 @@ fn the_same_seed_reproduces_the_same_history() {
 }
 
 fn core(id: u64, term: u64) -> Core {
-    let config = config(id, &[1, 2, 3], 1);
+    core_with(id, term, None)
+}
+
+/// A core with the default limits, or `limits`.
+fn core_with(id: u64, term: u64, limits: Option<Limits>) -> Core {
+    let config = Config::new(id, &[1, 2, 3], 10, 20, 3, 4, 1)
+        .and_then(|config| limits.map_or(Ok(config), |limits| config.with_limits(limits)));
     assert!(config.is_ok());
     let config = config.unwrap_or_else(|_| unreachable!());
     Core::new(
@@ -491,7 +562,12 @@ fn round_of(recorded: &Recorded) -> u64 {
 
 /// Node 1 elected in term `term + 1` over `log`.
 fn leader(term: u64, log: &TestLog) -> Core {
-    let mut node = core(1, term);
+    leader_with(term, log, None)
+}
+
+/// Node 1 elected in term `term + 1` over `log`, with `limits`.
+fn leader_with(term: u64, log: &TestLog, limits: Option<Limits>) -> Core {
+    let mut node = core_with(1, term, limits);
     let pre = tick_until_pre_vote(&mut node, log);
     let round = round_of(&pre);
     assert_eq!(node.role(), Role::PreCandidate);
@@ -623,6 +699,7 @@ fn a_follower_of_a_live_leader_refuses_a_pre_vote() {
         prev_term: 3,
         entries: 0,
         commit: 0,
+        epoch: 0,
     };
     let mut recorded = Recorded::default();
     assert_eq!(node.step(1, heartbeat, &[], &log, &mut recorded), Ok(()));
@@ -651,9 +728,11 @@ fn an_earlier_term_entry_commits_only_with_one_of_the_leaders_term() {
     let mut node = leader(2, &log);
     let mut recorded = Recorded::default();
     node.persisted(2, &log, &mut recorded);
+    let e2 = epoch_of(&node, 2);
     let accepted = |index| Message::AppendReply {
         term: 3,
         outcome: AppendOutcome::Accepted { index },
+        epoch: e2,
     };
     assert_eq!(node.step(2, accepted(2), &[], &log, &mut recorded), Ok(()));
     assert_eq!(node.commit(), 0);
@@ -682,6 +761,7 @@ fn a_follower_acknowledges_only_after_its_write() {
         prev_term: 1,
         entries: 2,
         commit: 3,
+        epoch: 0,
     };
     let mut recorded = Recorded::default();
     assert_eq!(node.step(1, append, &[2, 2], &log, &mut recorded), Ok(()));
@@ -698,7 +778,8 @@ fn a_follower_acknowledges_only_after_its_write() {
                 1,
                 Message::AppendReply {
                     term: 2,
-                    outcome: AppendOutcome::Accepted { index: 3 }
+                    outcome: AppendOutcome::Accepted { index: 3 },
+                    epoch: 0,
                 }
             ),
         ]
@@ -716,6 +797,7 @@ fn a_mismatched_previous_entry_is_rejected_with_a_hint() {
         prev_term,
         entries: 0,
         commit: 0,
+        epoch: 0,
     };
     let mut recorded = Recorded::default();
     assert_eq!(node.step(1, append(5, 2), &[], &log, &mut recorded), Ok(()));
@@ -725,7 +807,8 @@ fn a_mismatched_previous_entry_is_rejected_with_a_hint() {
             1,
             Message::AppendReply {
                 term: 2,
-                outcome: AppendOutcome::Rejected { probe: 5, hint: 1 }
+                outcome: AppendOutcome::Rejected { probe: 5, hint: 1 },
+                epoch: 0,
             }
         ))
     );
@@ -737,7 +820,8 @@ fn a_mismatched_previous_entry_is_rejected_with_a_hint() {
             1,
             Message::AppendReply {
                 term: 2,
-                outcome: AppendOutcome::Rejected { probe: 1, hint: 0 }
+                outcome: AppendOutcome::Rejected { probe: 1, hint: 0 },
+                epoch: 0,
             }
         )]
     );
@@ -753,6 +837,7 @@ fn an_append_truncating_a_committed_entry_is_refused() {
         prev_term: 1,
         entries: 0,
         commit: 2,
+        epoch: 0,
     };
     let mut recorded = Recorded::default();
     assert_eq!(node.step(1, commit, &[], &log, &mut recorded), Ok(()));
@@ -763,6 +848,7 @@ fn an_append_truncating_a_committed_entry_is_refused() {
         prev_term: 1,
         entries: 1,
         commit: 2,
+        epoch: 0,
     };
     let mut recorded = Recorded::default();
     let before = node.term_vote();
@@ -784,6 +870,7 @@ fn malformed_messages_and_strangers_are_refused() {
         prev_term: 0,
         entries: 2,
         commit: 0,
+        epoch: 0,
     };
     let mut recorded = Recorded::default();
     assert_eq!(
@@ -814,6 +901,7 @@ fn a_rejected_append_is_retried_from_the_hint() {
     let rejected = Message::AppendReply {
         term: 2,
         outcome: AppendOutcome::Rejected { probe: 4, hint: 1 },
+        epoch: epoch_of(&node, 2),
     };
     assert_eq!(node.step(2, rejected, &[], &log, &mut recorded), Ok(()));
     assert_eq!(
@@ -826,6 +914,7 @@ fn a_rejected_append_is_retried_from_the_hint() {
                 prev_term: 1,
                 entries: 3,
                 commit: 0,
+                epoch: epoch_of(&node, 2),
             }
         )]
     );
@@ -915,6 +1004,7 @@ fn a_leader_answered_by_a_quorum_stays() {
             let reply = Message::AppendReply {
                 term: 2,
                 outcome: AppendOutcome::Accepted { index: 1 },
+                epoch: epoch_of(&node, 2),
             };
             assert_eq!(node.step(2, reply, &[], &log, &mut recorded), Ok(()));
         }
@@ -955,13 +1045,473 @@ fn a_late_rejection_of_an_acknowledged_prefix_is_ignored() {
     let accepted = Message::AppendReply {
         term: 2,
         outcome: AppendOutcome::Accepted { index: 4 },
+        epoch: epoch_of(&node, 2),
     };
     assert_eq!(node.step(2, accepted, &[], &log, &mut recorded), Ok(()));
     let late = Message::AppendReply {
         term: 2,
         outcome: AppendOutcome::Rejected { probe: 3, hint: 1 },
+        epoch: epoch_of(&node, 2),
     };
     let mut recorded = Recorded::default();
     assert_eq!(node.step(2, late, &[], &log, &mut recorded), Ok(()));
     assert!(recorded.trace.is_empty(), "no rewind: {recorded:?}");
+}
+
+/// The appends a call sent to `to`, as (prev index, entries).
+fn appends_to(recorded: &Recorded, to: u64) -> Vec<(u64, u64)> {
+    recorded
+        .trace
+        .iter()
+        .filter_map(|effect| match *effect {
+            Effect::Send(
+                peer,
+                Message::Append {
+                    prev_index,
+                    entries,
+                    ..
+                },
+            ) if peer == to => Some((prev_index, entries)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A log of `count` entries of term 1 and 100 bytes each.
+fn hundreds(count: usize) -> TestLog {
+    let mut log = TestLog::default();
+    for _ in 0..count {
+        log.push(1, 5);
+    }
+    log
+}
+
+const TIGHT: Limits = Limits {
+    in_flight_entries: 8,
+    in_flight_bytes: 500,
+    queue: 64,
+    reads: 64,
+    read_bytes: u64::MAX,
+};
+
+#[test]
+fn the_in_flight_window_holds_across_lost_acknowledgements() {
+    let mut log = hundreds(20);
+    let mut node = leader_with(1, &log, Some(TIGHT));
+    log.push(2, 5);
+    let mut recorded = Recorded::default();
+    node.replicate(&log, &mut recorded);
+    assert_eq!(appends_to(&recorded, 2), vec![(20, 1)]);
+    assert_eq!(node.in_flight(2), Some((1, 100)));
+    // The follower is at the start: rewind to it, releasing the probe.
+    let reject = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 20, hint: 0 },
+        epoch: epoch_of(&node, 2),
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, reject, &[], &log, &mut recorded), Ok(()));
+    // A batch of 4 (400 bytes), then 1 more reaches the 500-byte cap.
+    assert_eq!(appends_to(&recorded, 2), vec![(0, 4)]);
+    assert_eq!(node.in_flight(2), Some((4, 400)));
+    let mut recorded = Recorded::default();
+    node.replicate(&log, &mut recorded);
+    assert_eq!(appends_to(&recorded, 2), vec![(4, 1)]);
+    assert_eq!(node.in_flight(2), Some((5, 500)));
+    // Every acknowledgement is lost: heartbeats only, nothing more sent.
+    for _ in 0..3 {
+        let mut recorded = Recorded::default();
+        node.replicate(&log, &mut recorded);
+        assert_eq!(appends_to(&recorded, 2), vec![(5, 0)]);
+        assert_eq!(node.in_flight(2), Some((5, 500)));
+    }
+    // An acknowledgement covering a send in part frees nothing of it.
+    let partial = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Accepted { index: 3 },
+        epoch: epoch_of(&node, 2),
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, partial, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(appends_to(&recorded, 2), vec![]);
+    assert_eq!(node.in_flight(2), Some((5, 500)));
+    // A heartbeat's answer frees the window, and the leader refills it.
+    let accepted = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Accepted { index: 5 },
+        epoch: epoch_of(&node, 2),
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, accepted, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(appends_to(&recorded, 2), vec![(5, 4)]);
+    assert_eq!(node.in_flight(2), Some((4, 400)));
+    // A duplicate of it frees nothing more.
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, accepted, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(node.in_flight(2), Some((4, 400)));
+}
+
+#[test]
+fn a_rejection_releases_what_is_past_the_retry_point() {
+    let log = hundreds(8);
+    let mut node = leader_with(1, &log, Some(TIGHT));
+    let reject = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 8, hint: 0 },
+        epoch: epoch_of(&node, 2),
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, reject, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(node.in_flight(2), Some((4, 400)));
+    let reject = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 2, hint: 1 },
+        epoch: epoch_of(&node, 2),
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, reject, &[], &log, &mut recorded), Ok(()));
+    // The send of 1..=4 straddles the retry point: entry 1 stays in
+    // flight and the send keeps its whole 400 bytes, so one more fits.
+    assert_eq!(appends_to(&recorded, 2), vec![(1, 1)]);
+    assert_eq!(node.in_flight(2), Some((2, 500)));
+}
+
+#[test]
+fn the_entries_in_flight_are_bounded_without_a_byte_cap() {
+    let log = hundreds(30);
+    let limits = Limits {
+        in_flight_entries: 8,
+        in_flight_bytes: u64::MAX,
+        queue: 64,
+        reads: 64,
+        read_bytes: u64::MAX,
+    };
+    let mut node = leader_with(1, &log, Some(limits));
+    let reject = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 30, hint: 0 },
+        epoch: epoch_of(&node, 3),
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(3, reject, &[], &log, &mut recorded), Ok(()));
+    for _ in 0..4 {
+        let mut recorded = Recorded::default();
+        node.replicate(&log, &mut recorded);
+    }
+    assert_eq!(node.in_flight(3), Some((8, 800)));
+}
+
+#[test]
+fn a_duty_reads_at_most_its_budget() {
+    let log = hundreds(8);
+    let limits = Limits {
+        in_flight_entries: 8,
+        in_flight_bytes: u64::MAX,
+        queue: 64,
+        reads: 6,
+        read_bytes: u64::MAX,
+    };
+    let mut node = leader_with(1, &log, Some(limits));
+    for peer in [2, 3] {
+        let reject = Message::AppendReply {
+            term: 2,
+            outcome: AppendOutcome::Rejected { probe: 8, hint: 0 },
+            epoch: epoch_of(&node, peer),
+        };
+        let mut recorded = Recorded::default();
+        assert_eq!(node.step(peer, reject, &[], &log, &mut recorded), Ok(()));
+    }
+    // Both at 4 in flight; one duty may read 6 more entries in all.
+    let mut recorded = Recorded::default();
+    node.replicate(&log, &mut recorded);
+    let sent: u64 = [2, 3]
+        .iter()
+        .flat_map(|&peer| appends_to(&recorded, peer))
+        .map(|(_, entries)| entries)
+        .sum();
+    assert_eq!(sent, 6);
+}
+
+#[test]
+fn proposals_beyond_a_limit_are_refused_with_backpressure() {
+    let log = hundreds(3);
+    let limits = Limits {
+        in_flight_entries: 8,
+        in_flight_bytes: 500,
+        queue: 4,
+        reads: 64,
+        read_bytes: u64::MAX,
+    };
+    let node = leader_with(1, &log, Some(limits));
+    assert_eq!(
+        node.propose(501, &log),
+        Err(ProposeError::Backpressure(Backpressure::InFlightBytes))
+    );
+    assert_eq!(node.propose(500, &log), Ok((4, 2)));
+    let full = hundreds(4);
+    assert_eq!(
+        node.propose(1, &full),
+        Err(ProposeError::Backpressure(Backpressure::Queue))
+    );
+    let follower = core(2, 1);
+    assert!(matches!(
+        follower.propose(1, &log),
+        Err(ProposeError::NotLeader(_))
+    ));
+}
+
+#[test]
+fn flow_limits_are_checked() {
+    let base = Config::new(1, &[1, 2, 3], 10, 20, 3, 4, 0);
+    assert!(base.is_ok());
+    let base = base.unwrap_or_else(|_| unreachable!());
+    let good = Limits {
+        in_flight_entries: 4,
+        in_flight_bytes: 1,
+        queue: 1,
+        reads: 1,
+        read_bytes: u64::MAX,
+    };
+    assert_eq!(base.with_limits(good).map(|c| c.limits()), Ok(good));
+    for bad in [
+        Limits {
+            in_flight_entries: 3,
+            ..good
+        },
+        Limits {
+            in_flight_bytes: 0,
+            ..good
+        },
+        Limits { queue: 0, ..good },
+        Limits { reads: 0, ..good },
+        Limits {
+            read_bytes: 0,
+            ..good
+        },
+    ] {
+        assert_eq!(base.with_limits(bad).err(), Some(ConfigError::Limits));
+    }
+}
+
+/// A leader's pipeline epoch for `peer`.
+fn epoch_of(node: &Core, peer: u64) -> u64 {
+    node.pipeline_epoch(peer).unwrap_or(0)
+}
+
+#[test]
+fn a_duplicate_or_earlier_rejection_refunds_nothing() {
+    let log = hundreds(8);
+    let mut node = leader_with(1, &log, Some(TIGHT));
+    let first = epoch_of(&node, 2);
+    let reject = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 8, hint: 0 },
+        epoch: first,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, reject, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(appends_to(&recorded, 2), vec![(0, 4)]);
+    assert_eq!(node.in_flight(2), Some((4, 400)));
+    assert_ne!(epoch_of(&node, 2), first, "a rewind starts an epoch");
+    // The same rejection again (a duplicate of the reply, or a second
+    // heartbeat's): no rewind, no refund, no resend.
+    for _ in 0..3 {
+        let mut recorded = Recorded::default();
+        assert_eq!(node.step(2, reject, &[], &log, &mut recorded), Ok(()));
+        assert!(recorded.trace.is_empty(), "{recorded:?}");
+        assert_eq!(node.in_flight(2), Some((4, 400)));
+    }
+    // A rejection of a different probe, still from the earlier epoch.
+    let earlier = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 3, hint: 0 },
+        epoch: first,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, earlier, &[], &log, &mut recorded), Ok(()));
+    assert!(recorded.trace.is_empty());
+    assert_eq!(node.in_flight(2), Some((4, 400)));
+}
+
+#[test]
+fn a_new_term_starts_from_an_empty_window() {
+    let log = hundreds(8);
+    let mut node = leader_with(1, &log, Some(TIGHT));
+    let old = epoch_of(&node, 2);
+    let reject = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 8, hint: 0 },
+        epoch: old,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, reject, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(node.in_flight(2), Some((4, 400)));
+    // Deposed by a higher term, then elected again in term 4.
+    let higher = Message::AppendReply {
+        term: 3,
+        outcome: AppendOutcome::Accepted { index: 0 },
+        epoch: 0,
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(3, higher, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(node.in_flight(2), None);
+    let round = round_of(&tick_until_pre_vote(&mut node, &log));
+    for message in [
+        Message::PreVoteReply {
+            term: 4,
+            granted: true,
+            round,
+        },
+        Message::VoteReply {
+            term: 4,
+            granted: true,
+        },
+    ] {
+        let mut recorded = Recorded::default();
+        assert_eq!(node.step(2, message, &[], &log, &mut recorded), Ok(()));
+    }
+    assert_eq!(node.role(), Role::Leader);
+    assert_eq!(node.in_flight(2), Some((0, 0)));
+    assert_ne!(epoch_of(&node, 2), old);
+}
+
+#[test]
+fn an_entry_larger_than_the_window_is_sent_alone() {
+    // Written under a larger limit: 500 bytes against a 300-byte window.
+    let mut log = hundreds(1);
+    log.push(1, 4);
+    log.push(1, 5);
+    let limits = Limits {
+        in_flight_bytes: 300,
+        ..TIGHT
+    };
+    let mut node = leader_with(1, &log, Some(limits));
+    let reject = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Rejected { probe: 3, hint: 1 },
+        epoch: epoch_of(&node, 2),
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, reject, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(appends_to(&recorded, 2), vec![(1, 1)]);
+    assert_eq!(node.in_flight(2), Some((1, 500)));
+    // Nothing joins it until it is acknowledged.
+    let mut recorded = Recorded::default();
+    node.replicate(&log, &mut recorded);
+    assert_eq!(appends_to(&recorded, 2), vec![(2, 0)]);
+    let accepted = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Accepted { index: 2 },
+        epoch: epoch_of(&node, 2),
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, accepted, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(appends_to(&recorded, 2), vec![(2, 1)]);
+    assert_eq!(node.in_flight(2), Some((1, 100)));
+}
+
+#[test]
+fn a_new_leaders_no_op_is_written_past_a_full_queue() {
+    let limits = Limits { queue: 2, ..TIGHT };
+    let mut log = hundreds(2);
+    let node = leader_with(1, &log, Some(limits));
+    // `leader_with` checked the no-op's append at index 3.
+    log.push(2, 5);
+    assert_eq!(
+        node.propose(100, &log),
+        Err(ProposeError::Backpressure(Backpressure::Queue))
+    );
+}
+
+/// A log that counts the entry sizes read through it.
+struct Counting<'a> {
+    log: &'a TestLog,
+    reads: std::cell::Cell<u64>,
+}
+
+impl LogTerms for Counting<'_> {
+    fn last_index(&self) -> u64 {
+        self.log.last_index()
+    }
+
+    fn term(&self, index: u64) -> Option<u64> {
+        self.log.term(index)
+    }
+
+    fn size(&self, index: u64) -> Option<u64> {
+        self.reads.set(self.reads.get() + 1);
+        self.log.size(index)
+    }
+}
+
+#[test]
+fn every_size_read_counts_against_the_duty_budget() {
+    let limits = Limits {
+        in_flight_entries: 8,
+        in_flight_bytes: 350,
+        queue: 64,
+        reads: 6,
+        read_bytes: u64::MAX,
+    };
+    let mut node = leader_with(1, &hundreds(4), Some(limits));
+    // Entries proposed since: both windows are empty, 26 entries to send.
+    let log = hundreds(30);
+    let counting = Counting {
+        log: &log,
+        reads: std::cell::Cell::new(0),
+    };
+    let mut recorded = Recorded::default();
+    node.replicate(&counting, &mut recorded);
+    // The first follower takes 3 entries (300 bytes) and the read of a
+    // fourth that does not fit: 4 reads. Two reads are left for the other.
+    assert_eq!(counting.reads.get(), 6);
+    assert_eq!(appends_to(&recorded, 2), vec![(4, 3)]);
+    assert_eq!(appends_to(&recorded, 3), vec![(4, 2)]);
+    // A reply's refill has its own budget, and keeps to it.
+    let accepted = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Accepted { index: 7 },
+        epoch: epoch_of(&node, 2),
+    };
+    counting.reads.set(0);
+    let mut recorded = Recorded::default();
+    assert_eq!(
+        node.step(2, accepted, &[], &counting, &mut recorded),
+        Ok(())
+    );
+    assert_eq!(counting.reads.get(), 4);
+    assert_eq!(appends_to(&recorded, 2), vec![(7, 3)]);
+}
+
+#[test]
+fn a_duty_sends_at_most_its_log_read_bytes() {
+    let limits = Limits {
+        in_flight_entries: 8,
+        in_flight_bytes: u64::MAX,
+        queue: 64,
+        reads: 64,
+        read_bytes: 600,
+    };
+    let mut node = leader_with(1, &hundreds(4), Some(limits));
+    let log = hundreds(30);
+    // 4 entries (400 bytes) to the first, 2 (200 bytes) to the second.
+    let mut recorded = Recorded::default();
+    node.replicate(&log, &mut recorded);
+    assert_eq!(appends_to(&recorded, 2), vec![(4, 4)]);
+    assert_eq!(appends_to(&recorded, 3), vec![(4, 2)]);
+    // A reply's refill has its own 600 bytes.
+    let accepted = Message::AppendReply {
+        term: 2,
+        outcome: AppendOutcome::Accepted { index: 8 },
+        epoch: epoch_of(&node, 2),
+    };
+    let mut recorded = Recorded::default();
+    assert_eq!(node.step(2, accepted, &[], &log, &mut recorded), Ok(()));
+    assert_eq!(appends_to(&recorded, 2), vec![(8, 4)]);
+    // An entry larger than a duty's read is refused, not stalled on.
+    assert_eq!(
+        node.propose(601, &log),
+        Err(ProposeError::Backpressure(Backpressure::LogRead))
+    );
+    assert!(node.propose(600, &log).is_ok());
 }
