@@ -25,10 +25,11 @@
 //!
 //! **Buffer recycling on this path** (C5 v2, "Buffer recycling"), for
 //! the run record:
-//! - The runner reuses its receive buffer and its outbox between loops,
-//!   outside the core's calls; it builds each datagram's header in a new
-//!   vector, outside the core's calls and the encoding, so the probe does
-//!   not count it.
+//! - The runner reuses its receive buffer and its outbox between loops.
+//!   Each message's encoding, its datagram (the 4-byte sender header and
+//!   the body, in a new vector) and the frees of both and of the message
+//!   after the send are counted as the `encoding` stage, as is each
+//!   decoding; a decoded message is freed inside the core's `step`.
 //! - `raft` (raft-rs 0.7.0): recycles nothing; raft-rs's messages and
 //!   entries are owned `protobuf` values, and their encoding
 //!   (`protobuf` 2.28.0) builds a new vector per message.
