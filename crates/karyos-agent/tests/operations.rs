@@ -476,11 +476,17 @@ fn an_agent_killed_during_a_close_leaves_a_request_without_outcome() {
         }
         stream.set_nonblocking(false).unwrap();
         if !answered.is_empty() {
-            let answered = String::from_utf8_lossy(&answered);
-            assert_eq!(
-                answered, "{\"error\":\"driver unavailable\"}\n",
-                "an answer before the attach"
-            );
+            // A close served in the cycle that admitted the client can be
+            // answered before this read: set aside like any served attempt
+            // (Codex review of #1252). Otherwise the only answer before an
+            // attach is the guard timeout's.
+            if driver.guard_audit().records.len() == audited {
+                let answered = String::from_utf8_lossy(&answered);
+                assert_eq!(
+                    answered, "{\"error\":\"driver unavailable\"}\n",
+                    "an answer before the attach"
+                );
+            }
             let _ = child.kill();
             let _ = child.wait().unwrap();
             continue;
@@ -556,23 +562,41 @@ fn a_close_the_driver_does_not_admit_in_time_is_journalled_as_not_sent() {
         dir.join("driver").display(),
         guard.id()
     );
+    let sent = karyos_sys::host_clock::host_monotonic_ns();
     stream.write_all(close.as_bytes()).unwrap();
-    // The driver is not served: the agent's attach cannot be admitted.
+    // The driver is not served: the agent's attach cannot be admitted. The
+    // read is bounded, so an agent that never answers fails the test
+    // rather than hanging it (Codex review of #1252).
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
     let mut answer = String::new();
-    let _ = stream.read_to_string(&mut answer);
-    assert_eq!(answer, "{\"error\":\"driver unavailable\"}\n");
+    let read = stream.read_to_string(&mut answer);
     child.kill().unwrap();
     let _ = child.wait().unwrap();
+    read.expect("the agent answered within 30 s");
+    assert_eq!(answer, "{\"error\":\"driver unavailable\"}\n");
     // Served now, the driver closes nothing: the close was never sent.
     for _ in 0..100 {
         let _ = driver.do_work().unwrap();
     }
     assert_eq!(driver.guard_audit().records.len(), audited);
     // The kill is itself an unclean stop, which the next agent shows; the
-    // close is not an open request: its outcome was journalled.
+    // close is not an open request: its outcome was journalled. The
+    // interval runs from the last record read, so an interval from after
+    // the close was sent shows a record of the close, and as the reason is
+    // not `request_without_outcome`, that record is its outcome (Codex
+    // review of #1252): a close journalled not at all would leave the
+    // agent's start as the last record, before `sent`.
     let agent = agent(&dir, true);
     let journal = agent.view().journal.unwrap();
-    assert_eq!(journal.gap.unwrap().reason, "unclean_stop");
+    let gap = journal.gap.unwrap();
+    assert_eq!(gap.reason, "unclean_stop");
+    assert!(
+        gap.from >= sent,
+        "{} < {sent}: the close left no record",
+        gap.from
+    );
     assert_eq!(journal.alerts.len(), 1, "one interval, the stop's");
 }
 
