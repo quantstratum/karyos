@@ -119,6 +119,8 @@ pub enum Message {
         last_index: u64,
         /// Its term.
         last_term: u64,
+        /// The sender's pre-vote round, echoed in the replies.
+        round: u64,
     },
     /// A pre-vote answer.
     PreVoteReply {
@@ -126,6 +128,8 @@ pub enum Message {
         term: u64,
         /// Whether it is granted.
         granted: bool,
+        /// The round of the request it answers.
+        round: u64,
     },
     /// A vote request.
     Vote {
@@ -176,6 +180,8 @@ pub enum AppendOutcome {
     /// Its log does not hold the previous entry; it has at most `hint`
     /// entries that may match.
     Rejected {
+        /// The rejected append's previous index.
+        probe: u64,
         /// Where the leader should retry from, plus one.
         hint: u64,
     },
@@ -261,7 +267,9 @@ impl Config {
         if !voters.contains(&id) {
             return Err(ConfigError::NotAVoter);
         }
-        if election_min == 0 || election_min >= election_max || heartbeat == 0 {
+        // At least two timeout values, so nodes that time out together
+        // draw apart.
+        if election_min == 0 || election_max.saturating_sub(election_min) < 2 || heartbeat == 0 {
             return Err(ConfigError::Timeouts);
         }
         if heartbeat >= election_min {
@@ -307,6 +315,8 @@ struct Peer {
     matched: u64,
     /// Whether it granted this round's pre-vote or vote.
     granted: bool,
+    /// Whether it answered this leader since the last quorum check.
+    recent: bool,
 }
 
 /// The custom Raft core of one node.
@@ -320,6 +330,10 @@ pub struct Core {
     elapsed: u32,
     timeout: u32,
     rng: u64,
+    /// The current pre-vote round: replies to another are ignored.
+    round: u64,
+    /// Ticks since a leader's last quorum check.
+    quorum_elapsed: u32,
 }
 
 impl Core {
@@ -340,7 +354,12 @@ impl Core {
             elapsed: 0,
             timeout: 0,
             rng: config.seed ^ config.id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            round: 0,
+            quorum_elapsed: 0,
         };
+        // A restarted node starts its rounds at a fresh random point, so
+        // a reply to a round before the restart is not counted.
+        core.round = core.draw();
         core.reset_timer();
         core
     }
@@ -371,10 +390,31 @@ impl Core {
     }
 
     /// One tick: a follower or candidate whose timeout passes asks for
-    /// pre-votes; a leader heartbeats.
+    /// pre-votes; a leader heartbeats, and steps down when a quorum has
+    /// not answered it within the minimum election timeout (check
+    /// quorum), so followers it still reaches stop refusing pre-votes.
     pub fn tick(&mut self, log: &impl LogTerms, out: &mut impl Effects) {
         self.elapsed = self.elapsed.saturating_add(1);
         if self.role == Role::Leader {
+            self.quorum_elapsed = self.quorum_elapsed.saturating_add(1);
+            if self.quorum_elapsed >= self.config.election_min {
+                self.quorum_elapsed = 0;
+                let id = self.config.id;
+                let heard = self
+                    .peers
+                    .iter()
+                    .take(self.config.count)
+                    .filter(|peer| peer.recent || peer.id == id)
+                    .count();
+                for peer in &mut self.peers {
+                    peer.recent = false;
+                }
+                if heard < self.config.quorum() {
+                    self.role = Role::Follower { leader: None };
+                    self.reset_timer();
+                    return;
+                }
+            }
             if self.elapsed >= self.config.heartbeat {
                 self.elapsed = 0;
                 self.replicate(log, out);
@@ -444,12 +484,19 @@ impl Core {
                 term,
                 last_index,
                 last_term,
+                round,
             } => {
-                self.on_pre_vote(from, term, last_index, last_term, log, out);
+                self.on_pre_vote(from, term, (last_index, last_term), round, log, out);
                 Ok(())
             }
-            Message::PreVoteReply { term, granted } => {
-                self.on_pre_vote_reply(from, term, granted, log, out);
+            Message::PreVoteReply {
+                term,
+                granted,
+                round,
+            } => {
+                if round == self.round {
+                    self.on_pre_vote_reply(from, term, granted, log, out);
+                }
                 Ok(())
             }
             Message::Vote {
@@ -506,12 +553,14 @@ impl Core {
         self.role = Role::PreCandidate;
         self.reset_timer();
         self.clear_grants();
+        self.round = self.round.wrapping_add(1);
         let term = self.term_vote.term.saturating_add(1);
         let (last_index, last_term) = last(log);
         let message = Message::PreVote {
             term,
             last_index,
             last_term,
+            round: self.round,
         };
         for voter in self.config.voters().filter(|&v| v != self.config.id) {
             out.send(voter, message);
@@ -542,8 +591,8 @@ impl Core {
         &mut self,
         from: u64,
         term: u64,
-        last_index: u64,
-        last_term: u64,
+        (last_index, last_term): (u64, u64),
+        round: u64,
         log: &impl LogTerms,
         out: &mut impl Effects,
     ) {
@@ -564,6 +613,7 @@ impl Core {
             Message::PreVoteReply {
                 term: reply_term,
                 granted,
+                round,
             },
         );
     }
@@ -638,10 +688,12 @@ impl Core {
     fn lead(&mut self, log: &impl LogTerms, out: &mut impl Effects) {
         self.role = Role::Leader;
         self.elapsed = 0;
+        self.quorum_elapsed = 0;
         let next = log.last_index().saturating_add(1);
         for peer in self.peers.iter_mut().take(self.config.count) {
             peer.next = next;
             peer.matched = 0;
+            peer.recent = false;
         }
         // A no-op of the new term, so earlier-term entries can commit.
         out.append(next, self.term_vote.term);
@@ -672,6 +724,7 @@ impl Core {
                 Message::AppendReply {
                     term: self.term_vote.term,
                     outcome: AppendOutcome::Rejected {
+                        probe: append.prev_index,
                         hint: log.last_index(),
                     },
                 },
@@ -699,10 +752,12 @@ impl Core {
         self.elapsed = 0;
         let outcome = if append.prev_index > log.last_index() {
             AppendOutcome::Rejected {
+                probe: append.prev_index,
                 hint: log.last_index(),
             }
         } else if log.term(append.prev_index) != Some(append.prev_term) {
             AppendOutcome::Rejected {
+                probe: append.prev_index,
                 hint: append.prev_index.saturating_sub(1),
             }
         } else {
@@ -744,13 +799,17 @@ impl Core {
         let Some(peer) = self.peers.get_mut(at) else {
             return;
         };
+        peer.recent = true;
         match outcome {
             AppendOutcome::Accepted { index } => {
                 peer.matched = peer.matched.max(index);
                 peer.next = peer.next.max(index.saturating_add(1));
                 self.advance_commit(log, out);
             }
-            AppendOutcome::Rejected { hint } => {
+            // A rejection of a prefix since acknowledged is stale: it must
+            // not rewind the pipeline.
+            AppendOutcome::Rejected { probe, .. } if probe <= peer.matched => {}
+            AppendOutcome::Rejected { hint, .. } => {
                 let retry = peer.next.saturating_sub(1).min(hint.saturating_add(1));
                 peer.next = retry.max(peer.matched.saturating_add(1)).max(1);
                 self.send_append(at, log, out);
@@ -836,14 +895,18 @@ impl Core {
         }
     }
 
-    fn reset_timer(&mut self) {
-        self.elapsed = 0;
-        // splitmix64: deterministic for a seed and a node.
+    /// The next splitmix64 draw: deterministic for a seed and a node.
+    const fn draw(&mut self) -> u64 {
         self.rng = self.rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.rng;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
+        z ^ (z >> 31)
+    }
+
+    fn reset_timer(&mut self) {
+        self.elapsed = 0;
+        let z = self.draw();
         let span = u64::from(self.config.election_max - self.config.election_min);
         let offset = u32::try_from(z % span).unwrap_or(0);
         self.timeout = self.config.election_min.saturating_add(offset);
