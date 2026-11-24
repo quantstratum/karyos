@@ -75,6 +75,7 @@ fn fixture_over<O: XskOps>(
             authority: Authority::new(NonZeroU64::MIN),
             route,
             max_pending: nz(max_pending),
+            etf: None,
         })
         .unwrap();
     Fixture { endpoint, queue }
@@ -827,4 +828,31 @@ mod kernel {
             "{error}"
         );
     }
+}
+
+#[test]
+fn an_etf_queue_is_an_unavailable_capability() {
+    let mut endpoint = XdpEndpoint::open(
+        config(local(), MAC_LOCAL),
+        InstanceId::new(NonZeroU32::MIN),
+        ScriptedXsk::new(FRAME, TX, RX, 8),
+    )
+    .unwrap();
+    let route = endpoint.add_route(peer(), MAC_PEER).unwrap();
+    let etf = crate::backend::EtfQueue {
+        interface: 1,
+        priority: 3,
+        delta_ns: 300_000,
+    };
+    assert_eq!(
+        endpoint.open_queue(TxQueueConfig {
+            authority: Authority::new(NonZeroU64::MIN),
+            route,
+            max_pending: nz(1),
+            etf: Some(etf),
+        }),
+        Err(QueueError::EtfUnavailable {
+            reason: crate::backend::Reason::Platform
+        })
+    );
 }

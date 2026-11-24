@@ -781,6 +781,7 @@ impl ControlRoutes {
                 authority: Authority::FIRST,
                 route,
                 max_pending: NonZeroU16::new(CONTROL_QUEUE_DEPTH).unwrap_or(NonZeroU16::MIN),
+                etf: None,
             })
             .map_err(|error| {
                 if super::data::fanout::queue_limit(error) {

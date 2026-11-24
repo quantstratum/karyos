@@ -31,6 +31,13 @@
 //!   `libc` wrapper of `crate::linux_sys` (owner item 12), so the sockets
 //!   of redundant paths are isolated ([`SocketOps::isolates_paths`]).
 //!
+//! - The `etf` route (ADR-0109): an endpoint opened with
+//!   [`SocketsConfig::etf_route`] sets `SO_REUSEPORT` before its bind; the
+//!   first etf queue attaches the steering program `ret #0` to it
+//!   (`crate::linux_sys`), then each etf queue's [`EtfSocket`] joins the
+//!   group with its own `SO_TXTIME` and `SO_PRIORITY`. The etf sockets
+//!   close before the endpoint socket, which so keeps group index 0.
+//!
 //! The data calls neither allocate nor block: the socket is nonblocking
 //! from creation and every send and receive also passes `MSG_DONTWAIT`.
 //! The system calls the backend needs, for a seccomp profile, are
@@ -54,8 +61,10 @@ use rustix::net::{
 use super::endpoint::{
     BufferSize, InterfaceSel, Membership, MulticastConfig, SOCKETS_MAX_BATCH, SocketsConfig,
 };
+use super::errqueue::ErrEntry;
+use super::etf::EtfSocket;
 use super::ops::{Errno, RecvResult, RouteAddr, SendResult, SocketOps, SocketProbes};
-use crate::backend::{CapabilityState, OpenError, Reason};
+use crate::backend::{CapabilityState, EtfQueue, OpenError, Reason};
 
 /// Entries of one `sendmmsg`: the stack arrays of one exposure, equal to
 /// [`SOCKETS_MAX_BATCH`] (checked below without a cast).
@@ -70,9 +79,16 @@ const _: () = assert!(
 /// `EBADF` without a system call.
 #[derive(Debug, Default)]
 pub struct LinuxSocket {
+    /// The `etf` socket of each queue index: one entry per queue of an
+    /// `etf_route` endpoint, allocated at open; empty otherwise and on a
+    /// duplicate. Declared before `fd`, so a drop closes them first too.
+    etf: Vec<Option<EtfSocket>>,
     fd: Option<OwnedFd>,
     /// Whether the `sendmmsg` probe of the last open was `Active`.
     batch: bool,
+    /// Whether the steering program is attached to `fd` (ADR-0109 point
+    /// 5), by the first etf queue.
+    steered: bool,
 }
 
 impl LinuxSocket {
@@ -82,6 +98,8 @@ impl LinuxSocket {
         Self {
             fd: None,
             batch: false,
+            etf: Vec::new(),
+            steered: false,
         }
     }
 
@@ -368,6 +386,12 @@ fn configure(config: &SocketsConfig) -> Result<(OwnedFd, SocketProbes), OpenErro
         retry_intr(|| sockopt::set_socket_reuseaddr(&fd, true))
             .map_err(os("setsockopt SO_REUSEADDR"))?;
     }
+    // Before the bind, so the socket founds the group each etf queue's
+    // socket joins (ADR-0109 point 5); no other endpoint sets it.
+    if config.etf_route {
+        retry_intr(|| sockopt::set_socket_reuseport(&fd, true))
+            .map_err(os("setsockopt SO_REUSEPORT"))?;
+    }
     retry_intr(|| rustix::net::bind(&fd, &config.local)).map_err(os("bind"))?;
     let dont_fragment = dont_fragment(&fd, ipv4);
     let send_buffer = buffer(&fd, config.send_buffer, Direction::Send)?;
@@ -546,10 +570,19 @@ impl SocketOps for LinuxSocket {
         let (fd, probes) = configure(config)?;
         self.batch = probes.tx_batch == CapabilityState::Active;
         self.fd = Some(fd);
+        if config.etf_route {
+            self.etf = std::iter::repeat_with(|| None)
+                .take(usize::from(config.max_queues.get()))
+                .collect();
+        }
         Ok(probes)
     }
 
     fn close(&mut self) {
+        // The etf sockets first: the endpoint socket keeps index 0 of the
+        // group for its whole life (ADR-0109 point 5).
+        self.etf = Vec::new();
+        self.steered = false;
         self.fd = None;
     }
 
@@ -559,7 +592,88 @@ impl SocketOps for LinuxSocket {
         Ok(Self {
             fd: Some(duplicate),
             batch: self.batch,
+            etf: Vec::new(),
+            steered: self.steered,
         })
+    }
+
+    fn open_etf(&mut self, queue: u16, etf: &EtfQueue) -> Result<(), Reason> {
+        let Some(fd) = self.fd.as_ref() else {
+            return Err(Reason::ProbeFailed {
+                errno: Errno::BADF.raw(),
+            });
+        };
+        let Some(entry) = self.etf.get_mut(usize::from(queue)) else {
+            // Not an `etf_route` socket: it founded no group to join.
+            return Err(Reason::ProbeFailed {
+                errno: Errno::INVAL.raw(),
+            });
+        };
+        if !self.steered {
+            crate::linux_sys::attach_reuseport_first(std::os::fd::AsFd::as_fd(fd)).map_err(
+                |error| {
+                    probe_reason(OsErrno::from_raw_os_error(
+                        error.raw_os_error().unwrap_or(0),
+                    ))
+                },
+            )?;
+            self.steered = true;
+        }
+        let local = rustix::net::getsockname(fd)
+            .and_then(SocketAddr::try_from)
+            .map_err(probe_reason)?;
+        let socket =
+            EtfSocket::open_in_group(local, etf.priority).map_err(|error| match error {
+                OpenError::Os { errno, .. } => probe_reason(OsErrno::from_raw_os_error(errno)),
+                _ => Reason::ProbeFailed { errno: 0 },
+            })?;
+        *entry = Some(socket);
+        Ok(())
+    }
+
+    fn close_etf(&mut self, queue: u16) {
+        if let Some(entry) = self.etf.get_mut(usize::from(queue)) {
+            *entry = None;
+        }
+    }
+
+    fn send_etf(
+        &mut self,
+        queue: u16,
+        route: &RouteAddr,
+        datagram: &[u8],
+        txtime_ns: u64,
+    ) -> SendResult {
+        let Some(socket) = self.etf.get(usize::from(queue)).and_then(Option::as_ref) else {
+            return SendResult::Error(Errno::BADF);
+        };
+        match socket.send(route.os(), datagram, txtime_ns) {
+            Ok(len) if len == datagram.len() => SendResult::Sent {
+                sent: 1,
+                error: None,
+            },
+            Ok(_) => SendResult::OutOfAbi { proven: 0 },
+            Err(error) => SendResult::Error(Errno::from_raw(error.0)),
+        }
+    }
+
+    fn drain_etf(&mut self, queue: u16, out: &mut [ErrEntry]) -> Result<usize, Errno> {
+        let socket = self
+            .etf
+            .get(usize::from(queue))
+            .and_then(Option::as_ref)
+            .ok_or(Errno::BADF)?;
+        socket
+            .drain_errors(out)
+            .map_err(|error| Errno::from_raw(error.0))
+    }
+
+    fn tai_now_ns(&mut self) -> Option<u64> {
+        let now = rustix::time::clock_gettime(rustix::time::ClockId::Tai);
+        u64::try_from(now.tv_sec)
+            .ok()?
+            .checked_mul(1_000_000_000)?
+            .checked_add(u64::try_from(now.tv_nsec).ok()?)
     }
 
     fn route_mtu(&mut self, route: &RouteAddr) -> Option<u32> {

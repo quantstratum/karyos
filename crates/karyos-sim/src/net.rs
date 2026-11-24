@@ -447,13 +447,21 @@ impl<M: Clone + Debug> Net<M> {
             Some(faults) => self.draw(from, to, id, "reorder", faults.reorder_ppm),
             None => false,
         };
-        self.enqueue(from, to, id, message.clone(), now, due, overtake)?;
+        // The message itself is delivered, not a copy: only a link that can
+        // duplicate it copies it first, so a receiver gets the buffers its
+        // sender filled (karyos#691, the allocation probe). The draws are the
+        // same, in the same order, whatever is copied.
+        let copy = faults
+            .filter(|faults| faults.duplicate_ppm > 0)
+            .map(|_| message.clone());
+        self.enqueue(from, to, id, message, now, due, overtake)?;
         if let Some(faults) = faults
             && self.draw(from, to, id, "duplicate", faults.duplicate_ppm)
+            && let Some(copy) = copy
         {
             self.count(|c| &mut c.duplicated)?;
             let due = self.delay(from, to, id, now, "copy delay")?;
-            self.enqueue(from, to, id, message, now, due, false)?;
+            self.enqueue(from, to, id, copy, now, due, false)?;
         }
         Ok(id)
     }
