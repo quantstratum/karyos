@@ -43,6 +43,10 @@ pub const ROTATE_AT: u64 = TAG_CAP / 4 * 3;
 /// File epochs that verify at once: the current one and, for the overlap,
 /// its predecessor (manifest 4.4).
 pub const MAX_FILE_EPOCHS: usize = 2;
+/// How long the previous in-band key epoch keeps verifying after a sender
+/// moves to the next one: the 24-hour bound on two accepted key epochs
+/// (manifest 4.4).
+pub const IN_BAND_OVERLAP_S: i64 = crate::wire_keys::store::OVERLAP_S;
 /// Boot ids a publisher retires per receiver and file epoch before it
 /// refuses another new one (ADR-0086 section 7, publisher rule).
 pub const MAX_RETIRED_BOOTS: usize = 8;
@@ -343,6 +347,9 @@ struct EpochKeys {
     file_epoch: u32,
     secret: Zeroizing<[u8; KEY_LEN]>,
     previous: Option<Slot>,
+    /// The previous in-band epoch verifies while `now` is below this, at
+    /// most [`IN_BAND_OVERLAP_S`] after the move (manifest 4.4).
+    previous_until: i64,
     current: Slot,
     next: Option<Slot>,
 }
@@ -391,13 +398,17 @@ impl Verifier {
             epochs: [None, None],
         };
         verifier.refresh(files)?;
+        if verifier.epochs.iter().flatten().next().is_none() {
+            return Err(KeyError::NoKey);
+        }
         Ok(verifier)
     }
 
     /// Replaces the key files after a reload. A file epoch still present
     /// keeps its keys and windows, so replay state is never reset for a
     /// key that still verifies; a file epoch no longer present drops its
-    /// keys at once (ADR-0086 section 7). On an error nothing changes.
+    /// keys at once (ADR-0086 section 7). No file at all clears every key,
+    /// so nothing verifies. On an error nothing changes.
     ///
     /// # Errors
     ///
@@ -414,7 +425,8 @@ impl Verifier {
             *slot = Some(file);
         }
         let [Some(first), second] = chosen else {
-            return Err(KeyError::NoKey);
+            self.epochs = [None, None];
+            return Ok(());
         };
         if let Some(second) = second
             && (second.key_id != first.key_id || second.file_epoch == first.file_epoch)
@@ -477,6 +489,7 @@ impl Verifier {
             file_epoch: file.file_epoch,
             secret,
             previous: None,
+            previous_until: i64::MIN,
             current,
             next,
         })
@@ -486,13 +499,14 @@ impl Verifier {
     /// `key_id` and `party_epoch`, then the fields and the tag are
     /// checked, and only then the replay window of the key that verified
     /// it moves. A datagram under the next in-band epoch that verifies
-    /// makes it current: the old current becomes the previous one, and the
-    /// one before is dropped. Allocates nothing.
+    /// makes it current: the old current becomes the previous one, which
+    /// verifies for [`IN_BAND_OVERLAP_S`] from `now`, and the one before is
+    /// dropped. `now` is the wall clock in seconds. Allocates nothing.
     ///
     /// # Errors
     ///
     /// The [`Refusal`]; nothing changes.
-    pub fn open(&mut self, datagram: &[u8]) -> Result<Opened, Refusal> {
+    pub fn open(&mut self, datagram: &[u8], now: i64) -> Result<Opened, Refusal> {
         let (party_epoch, key_id) =
             header_selectors(datagram).ok_or(Refusal::Envelope(Rejection::Short))?;
         if key_id != self.key_id {
@@ -503,7 +517,7 @@ impl Verifier {
             let Some(keys) = self.epochs.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
-            let (opened, advanced) = match keys.find(party_epoch, datagram) {
+            let (opened, advanced) = match keys.find(party_epoch, datagram, now) {
                 Some(Ok(found)) => found,
                 Some(Err(refusal)) => {
                     if first == Refusal::Envelope(Rejection::Epoch) {
@@ -520,7 +534,7 @@ impl Verifier {
                 let upcoming =
                     next_epoch.map(|epoch| self.slot_for(&secret, key_id, file_epoch, epoch));
                 if let Some(keys) = self.epochs.get_mut(index).and_then(Option::as_mut) {
-                    keys.advance(upcoming);
+                    keys.advance(upcoming, now);
                 }
             }
             return Ok(opened);
@@ -537,7 +551,9 @@ impl EpochKeys {
         &mut self,
         party_epoch: u8,
         datagram: &[u8],
+        now: i64,
     ) -> Option<Result<(Opened, bool), Refusal>> {
+        let previous_open = now < self.previous_until;
         let is_next = self
             .next
             .as_ref()
@@ -549,15 +565,16 @@ impl EpochKeys {
         } else {
             self.previous
                 .as_mut()
-                .filter(|slot| slot.party_epoch == party_epoch)?
+                .filter(|slot| previous_open && slot.party_epoch == party_epoch)?
         };
         Some(slot.check(datagram).map(|opened| (opened, is_next)))
     }
 
-    fn advance(&mut self, upcoming: Option<Slot>) {
+    fn advance(&mut self, upcoming: Option<Slot>, now: i64) {
         if let Some(next) = self.next.take() {
             let current = core::mem::replace(&mut self.current, next);
             self.previous = Some(current);
+            self.previous_until = now.saturating_add(IN_BAND_OVERLAP_S);
             self.next = upcoming;
         }
     }
@@ -580,6 +597,9 @@ impl Slot {
 /// a per-start counter.
 pub struct Proof {
     key_id: u32,
+    /// The current file epoch of the key, from the durable lineage: only a
+    /// proof under it may bind.
+    current: u32,
     /// The signing file epoch's profile, which seals.
     signing: Option<(u32, HmacSha256)>,
     /// One profile per verifying file epoch.
@@ -674,8 +694,10 @@ impl ProofKind {
 
 impl Proof {
     /// A proof of `kind` on `alias`: `signing` is the file `signing_key`
-    /// names, or `None` on a side that only verifies, and `verifying` the
-    /// files `verify_keys` returns.
+    /// names, or `None` on a side that only verifies, `verifying` the files
+    /// `verify_keys` returns, and `current` the key's current file epoch,
+    /// the highest the durable lineage has admitted. Only a proof under
+    /// `current` reports [`Proved::current`], whatever keys are loaded.
     ///
     /// # Errors
     ///
@@ -685,9 +707,11 @@ impl Proof {
         alias: Alias,
         signing: Option<&KeyFile>,
         verifying: impl IntoIterator<Item = &'a KeyFile>,
+        current: u32,
     ) -> Result<Self, KeyError> {
         let mut proof = Self {
             key_id: 0,
+            current,
             signing: None,
             verifying: [None, None],
         };
@@ -739,14 +763,6 @@ impl Proof {
         if key_id != self.key_id {
             return Err(Rejection::Key);
         }
-        let signing_epoch = self.signing.as_ref().map(|(epoch, _)| *epoch);
-        let newest = self
-            .verifying
-            .iter()
-            .flatten()
-            .map(|(epoch, _)| *epoch)
-            .max();
-        let current_epoch = signing_epoch.or(newest);
         let mut first = Rejection::Key;
         for (file_epoch, profile) in self.verifying.iter().flatten() {
             match profile.open_envelope(datagram) {
@@ -754,7 +770,7 @@ impl Proof {
                     return Ok(Proved {
                         opened,
                         file_epoch: *file_epoch,
-                        current: Some(*file_epoch) == current_epoch,
+                        current: *file_epoch == self.current,
                     });
                 }
                 Err(rejection) => {
@@ -905,13 +921,15 @@ impl BootTable {
         BootDecision::Bind
     }
 
-    /// Drops the previous file epoch's boot ids once its key stops
-    /// verifying.
-    pub fn forget_before(&mut self, file_epoch: u32) {
+    /// Drops `receiver_id`'s boot ids of file epochs below `file_epoch`
+    /// once its pairwise key's earlier epoch stops verifying. Each
+    /// receiver's key rotates on its own, so no other receiver is touched.
+    pub fn forget_before(&mut self, receiver_id: u64, file_epoch: u32) {
         for entry in &mut self.entries {
-            if entry
-                .previous
-                .is_some_and(|previous| previous.file_epoch < file_epoch)
+            if entry.receiver_id == receiver_id
+                && entry
+                    .previous
+                    .is_some_and(|previous| previous.file_epoch < file_epoch)
             {
                 entry.previous = None;
             }

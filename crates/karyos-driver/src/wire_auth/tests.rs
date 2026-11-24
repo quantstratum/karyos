@@ -34,6 +34,8 @@ const IDENTITY: Identity = Identity {
 
 const BOOT: [u64; 2] = [0xb0, 0x07];
 
+const NOW: i64 = 1_796_083_200;
+
 fn sender(boot: [u64; 2], nonce: [u64; 2]) -> Party {
     Party::Sender {
         identity: IDENTITY,
@@ -67,14 +69,14 @@ fn a_sealed_datagram_opens_once_and_only_under_its_own_party() {
     let mut sealer = Sealer::new(&file, party, ALIAS).unwrap();
     let mut verifier = Verifier::new([&file], party, ALIAS).unwrap();
     let datagram = sealed(&mut sealer, b"frames");
-    let opened = verifier.open(&datagram).unwrap();
+    let opened = verifier.open(&datagram, NOW).unwrap();
     assert_eq!(
         &datagram[opened.start..opened.start + opened.frames],
         b"frames"
     );
     // The same bytes again: the window refuses them.
     assert_eq!(
-        verifier.open(&datagram),
+        verifier.open(&datagram, NOW),
         Err(Refusal::Replay(Replay::Duplicate))
     );
     // A receiver restart (new boot id) or a new nonce derives another
@@ -82,11 +84,11 @@ fn a_sealed_datagram_opens_once_and_only_under_its_own_party() {
     for other in [sender([0xb1, 0x07], [1, 2]), sender(BOOT, [1, 3])] {
         let mut fresh = Verifier::new([&file], other, ALIAS).unwrap();
         assert_eq!(
-            fresh.open(&datagram),
+            fresh.open(&datagram, NOW),
             Err(Refusal::Envelope(Rejection::Tag))
         );
         let mut again = Sealer::new(&file, other, ALIAS).unwrap();
-        assert!(fresh.open(&sealed(&mut again, b"x")).is_ok());
+        assert!(fresh.open(&sealed(&mut again, b"x"), NOW).is_ok());
     }
     // A sender restart is a new identity, and so a new key.
     let restarted = Party::Sender {
@@ -100,7 +102,7 @@ fn a_sealed_datagram_opens_once_and_only_under_its_own_party() {
     };
     let mut other = Verifier::new([&file], restarted, ALIAS).unwrap();
     assert_eq!(
-        other.open(&datagram),
+        other.open(&datagram, NOW),
         Err(Refusal::Envelope(Rejection::Tag))
     );
 }
@@ -117,33 +119,33 @@ fn a_forged_or_altered_datagram_moves_no_window() {
     let mut forged = first.clone();
     forged[24..32].copy_from_slice(&5000_u64.to_le_bytes());
     assert_eq!(
-        verifier.open(&forged),
+        verifier.open(&forged, NOW),
         Err(Refusal::Envelope(Rejection::Tag))
     );
     let mut flipped = first.clone();
     let last = flipped.len() - 1;
     flipped[last] ^= 1;
     assert_eq!(
-        verifier.open(&flipped),
+        verifier.open(&flipped, NOW),
         Err(Refusal::Envelope(Rejection::Tag))
     );
-    assert!(verifier.open(&first).is_ok());
+    assert!(verifier.open(&first, NOW).is_ok());
     // Wrong key id, short datagram.
     let mut other_key = first.clone();
     other_key[20..24].copy_from_slice(&4_u32.to_le_bytes());
     assert_eq!(
-        verifier.open(&other_key),
+        verifier.open(&other_key, NOW),
         Err(Refusal::Envelope(Rejection::Key))
     );
     assert_eq!(
-        verifier.open(&first[..10]),
+        verifier.open(&first[..10], NOW),
         Err(Refusal::Envelope(Rejection::Short))
     );
     // A domain 4 datagram is never a domain 1 one.
     let pair = pairwise_file(1, 66, 0x22);
     let mut rcv = Sealer::new(&pair, receiver(BOOT), ALIAS).unwrap();
     let sm = sealed(&mut rcv, b"sm");
-    assert!(matches!(verifier.open(&sm), Err(Refusal::Envelope(_))));
+    assert!(matches!(verifier.open(&sm, NOW), Err(Refusal::Envelope(_))));
 }
 
 #[test]
@@ -186,7 +188,8 @@ fn keys_must_fit_their_party() {
             ProofKind::RspSetup { receiver_id: 67 },
             ALIAS,
             Some(&a),
-            [&a]
+            [&a],
+            1
         )
         .unwrap_err(),
         KeyError::Scope
@@ -202,29 +205,29 @@ fn the_overlap_verifies_both_file_epochs_and_a_reload_keeps_their_windows() {
     let mut verifier = Verifier::new([&old, &new], party, ALIAS).unwrap();
     let under_old = sealed(&mut old_sealer, b"a");
     let under_new = sealed(&mut new_sealer, b"b");
-    assert!(verifier.open(&under_old).is_ok());
-    assert!(verifier.open(&under_new).is_ok());
+    assert!(verifier.open(&under_old, NOW).is_ok());
+    assert!(verifier.open(&under_new, NOW).is_ok());
     // A reload with the same two files keeps both windows.
     verifier.refresh([&old, &new]).unwrap();
     assert_eq!(
-        verifier.open(&under_old),
+        verifier.open(&under_old, NOW),
         Err(Refusal::Replay(Replay::Duplicate))
     );
     // The old file epoch retires: its datagrams no longer open, and the
     // new one's window survives.
     verifier.refresh([&new]).unwrap();
     assert!(matches!(
-        verifier.open(&sealed(&mut old_sealer, b"c")),
+        verifier.open(&sealed(&mut old_sealer, b"c"), NOW),
         Err(Refusal::Envelope(_))
     ));
     assert_eq!(
-        verifier.open(&under_new),
+        verifier.open(&under_new, NOW),
         Err(Refusal::Replay(Replay::Duplicate))
     );
     // Another key id is refused and changes nothing.
     let other = channel_file(1, 1);
     assert!(verifier.refresh([&other]).is_err());
-    assert!(verifier.open(&sealed(&mut new_sealer, b"d")).is_ok());
+    assert!(verifier.open(&sealed(&mut new_sealer, b"d"), NOW).is_ok());
 }
 
 #[test]
@@ -240,17 +243,17 @@ fn the_sender_moves_epoch_at_75_percent_and_refuses_at_the_limit() {
     assert_eq!(sealer.party_epoch(), 1);
     assert_eq!(first_new[11], 1);
     assert_eq!(u64::from_le_bytes(first_new[24..32].try_into().unwrap()), 0);
-    assert!(verifier.open(&last_old).is_ok());
-    assert!(verifier.open(&first_new).is_ok());
+    assert!(verifier.open(&last_old, NOW).is_ok());
+    assert!(verifier.open(&first_new, NOW).is_ok());
     // The previous epoch still opens during the overlap; epoch 2 is now
     // the one derived ahead.
     let mut straggler = Sealer::at_seq(&file, party, ALIAS, 0, ROTATE_AT - 3);
-    assert!(verifier.open(&sealed(&mut straggler, b"late")).is_ok());
+    assert!(verifier.open(&sealed(&mut straggler, b"late"), NOW).is_ok());
     let mut two = Sealer::at_seq(&file, party, ALIAS, 2, 0);
-    assert!(verifier.open(&sealed(&mut two, b"two")).is_ok());
+    assert!(verifier.open(&sealed(&mut two, b"two"), NOW).is_ok());
     // Epoch 0 is now two behind and refused.
     assert_eq!(
-        verifier.open(&sealed(&mut straggler, b"later")),
+        verifier.open(&sealed(&mut straggler, b"later"), NOW),
         Err(Refusal::Envelope(Rejection::Epoch))
     );
     // The last in-band epoch cannot move on: the sender stops.
@@ -272,15 +275,15 @@ fn the_sender_moves_epoch_at_75_percent_and_refuses_at_the_limit() {
 #[test]
 fn proofs_bind_their_domain_and_report_the_file_epoch() {
     let (old, new) = (channel_file(1, 0x41), channel_file(2, 0x42));
-    let publisher = Proof::new(ProofKind::Setup, ALIAS, Some(&new), [&old, &new]).unwrap();
+    let publisher = Proof::new(ProofKind::Setup, ALIAS, Some(&new), [&old, &new], 2).unwrap();
     let mut buf = vec![0_u8; 128];
     buf[..5].copy_from_slice(b"setup");
     let len = publisher.seal(&mut buf, 5).unwrap();
-    let receiver_side = Proof::new(ProofKind::Setup, ALIAS, None, [&old, &new]).unwrap();
+    let receiver_side = Proof::new(ProofKind::Setup, ALIAS, None, [&old, &new], 2).unwrap();
     let proved = receiver_side.verify(&buf[..len]).unwrap();
     assert_eq!((proved.file_epoch, proved.current), (2, true));
     // Under the previous epoch's key it verifies, but not as current.
-    let stale = Proof::new(ProofKind::Setup, ALIAS, Some(&old), [&old]).unwrap();
+    let stale = Proof::new(ProofKind::Setup, ALIAS, Some(&old), [&old], 1).unwrap();
     let len = stale.seal(&mut buf, 5).unwrap();
     let proved = receiver_side.verify(&buf[..len]).unwrap();
     assert_eq!((proved.file_epoch, proved.current), (1, false));
@@ -294,6 +297,7 @@ fn proofs_bind_their_domain_and_report_the_file_epoch() {
         ALIAS,
         Some(&pair),
         [&pair],
+        2,
     )
     .unwrap();
     let len = rsp.seal(&mut buf, 5).unwrap();
@@ -347,7 +351,13 @@ fn the_publisher_rule_never_rebinds_a_retired_boot_id() {
         table.decide(66, b1, &proved(2, true)),
         BootDecision::Retired
     );
-    table.forget_before(2);
+    // Forgetting another receiver's old epoch touches nothing here.
+    table.forget_before(67, 2);
+    assert_eq!(
+        table.decide(66, b0, &proved(2, true)),
+        BootDecision::Retired
+    );
+    table.forget_before(66, 2);
     assert_eq!(table.decide(66, b0, &proved(2, true)), BootDecision::Bind);
     // The table of receivers is sized at admission.
     assert_eq!(table.decide(67, b0, &proved(2, true)), BootDecision::Bind);
@@ -377,5 +387,67 @@ fn a_full_retired_list_refuses_new_boot_ids_until_the_next_file_epoch() {
     assert_eq!(
         table.decide(66, fresh, &proved(2, true)),
         BootDecision::Bind
+    );
+}
+
+#[test]
+fn a_verify_only_side_never_takes_the_retiring_key_for_the_current_one() {
+    // Only the retiring file epoch 1 is loaded, but the lineage's current
+    // one is 2: an RSP_SETUP under 1 verifies and must not bind.
+    let old = pairwise_file(1, 66, 0x51);
+    let kind = ProofKind::RspSetup { receiver_id: 66 };
+    let receiver_side = Proof::new(kind, ALIAS, Some(&old), [&old], 1).unwrap();
+    let mut buf = vec![0_u8; 128];
+    let len = receiver_side.seal(&mut buf, 3).unwrap();
+    let publisher = Proof::new(kind, ALIAS, None, [&old], 2).unwrap();
+    let proved = publisher.verify(&buf[..len]).unwrap();
+    assert_eq!((proved.file_epoch, proved.current), (1, false));
+    let mut table = BootTable::new(1);
+    assert_eq!(table.decide(66, BOOT, &proved), BootDecision::PreviousEpoch);
+}
+
+#[test]
+fn the_previous_in_band_epoch_stops_verifying_after_its_overlap() {
+    let file = channel_file(1, 0x11);
+    let party = sender(BOOT, [1, 2]);
+    let mut verifier = Verifier::new([&file], party, ALIAS).unwrap();
+    let mut old = Sealer::at_seq(&file, party, ALIAS, 0, 100);
+    let mut new = Sealer::at_seq(&file, party, ALIAS, 1, 0);
+    let early = sealed(&mut old, b"a");
+    let at_edge = sealed(&mut old, b"b");
+    let too_late = sealed(&mut old, b"c");
+    // The move to epoch 1 at NOW starts the overlap.
+    assert!(verifier.open(&sealed(&mut new, b"n"), NOW).is_ok());
+    assert!(verifier.open(&early, NOW).is_ok());
+    assert!(verifier.open(&at_edge, NOW + IN_BAND_OVERLAP_S - 1).is_ok());
+    // From the deadline on, epoch 0 is gone even within its window.
+    assert_eq!(
+        verifier.open(&too_late, NOW + IN_BAND_OVERLAP_S),
+        Err(Refusal::Envelope(Rejection::Epoch))
+    );
+    // The current epoch still verifies.
+    assert!(
+        verifier
+            .open(&sealed(&mut new, b"m"), NOW + IN_BAND_OVERLAP_S)
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_reload_with_no_key_left_clears_every_key() {
+    let pair = pairwise_file(1, 66, 0x61);
+    let party = receiver(BOOT);
+    let mut sealer = Sealer::new(&pair, party, ALIAS).unwrap();
+    let mut verifier = Verifier::new([&pair], party, ALIAS).unwrap();
+    let datagram = sealed(&mut sealer, b"sm");
+    let none: [&KeyFile; 0] = [];
+    verifier.refresh(none).unwrap();
+    assert_eq!(
+        verifier.open(&datagram, NOW),
+        Err(Refusal::Envelope(Rejection::Epoch))
+    );
+    assert_eq!(
+        verifier.open(&sealed(&mut sealer, b"sm2"), NOW),
+        Err(Refusal::Envelope(Rejection::Epoch))
     );
 }
