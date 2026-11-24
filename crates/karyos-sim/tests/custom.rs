@@ -333,3 +333,187 @@ fn the_buffers_hold_to_the_bounds_the_limits_give() {
         }
     }
 }
+
+/// The custom core's model invariants (`crates/karyos-cluster/tests/
+/// consensus_model.rs`), checked on a harness history: what the run's
+/// observations show of terms, leaders and commits (C5 version 2, the
+/// custom core's trace checking; ADR-0105, decision 4).
+///
+/// - Election safety: at most one server commits as leader in a term.
+/// - State machine safety: every server that commits an index commits the
+///   same entry term there.
+/// - Commit monotone: a server's commit index never moves back while it
+///   is up.
+/// - Leader completeness: a server's first commit as the leader of a term
+///   is at or past every index committed before it in the run.
+fn model_violation(observations: &[Observation]) -> Option<String> {
+    use std::collections::BTreeMap;
+    let mut leaders: BTreeMap<u64, u32> = BTreeMap::new();
+    let mut entries: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut commits: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut led: BTreeMap<(u32, u64), ()> = BTreeMap::new();
+    let mut highest = 0u64;
+    for observation in observations {
+        match observation {
+            Observation::Crashed { node } => {
+                let _ = commits.remove(node);
+            }
+            Observation::Commit {
+                node,
+                term,
+                leader,
+                index,
+                entry_term,
+            } => {
+                if *leader {
+                    let first = leaders.entry(*term).or_insert(*node);
+                    if first != node {
+                        return Some(format!("two leaders in term {term}: {first} and {node}"));
+                    }
+                    if led.insert((*node, *term), ()).is_none() && *index < highest {
+                        return Some(format!(
+                            "leader {node} of term {term} first commits {index}, below {highest}"
+                        ));
+                    }
+                }
+                if let Some(previous) = commits.insert(*node, *index)
+                    && *index < previous
+                {
+                    return Some(format!(
+                        "{node}'s commit moved back from {previous} to {index}"
+                    ));
+                }
+                if let Some(term) = entries.insert(*index, *entry_term)
+                    && term != *entry_term
+                {
+                    return Some(format!(
+                        "index {index} committed with terms {term} and {entry_term}"
+                    ));
+                }
+                highest = highest.max(*index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Every W1, W3, W4, W5 and W6 history of the custom core keeps the
+/// model's invariants on every seed; and each invariant is shown to
+/// catch its violation on a history mutated to break it.
+#[test]
+fn the_harness_histories_keep_the_model_invariants() {
+    use karyos_sim::harness::workloads::W5;
+    let mut cases = W1::skeleton().cases();
+    cases.extend(W3::skeleton().cases());
+    cases.extend(
+        W5::skeleton()
+            .cases()
+            .unwrap()
+            .into_iter()
+            .filter(|case| case.handover.is_none()),
+    );
+    cases.push(W5::manifest().lost_reply_whoever_leads());
+    cases.extend(W6::skeleton().cases());
+    let mut sample = None;
+    for seed in SEEDS {
+        let mut all = cases.clone();
+        all.extend(W4::skeleton(seed).cases());
+        for case in &all {
+            let outcome = workloads::run::<Custom>(case, seed).unwrap();
+            assert_eq!(
+                model_violation(&outcome.observations),
+                None,
+                "{} seed {seed}",
+                case.name
+            );
+            sample.get_or_insert(outcome);
+        }
+    }
+    let sample = sample.unwrap();
+    let commits: Vec<usize> = sample
+        .observations
+        .iter()
+        .enumerate()
+        .filter_map(|(at, observation)| {
+            matches!(observation, Observation::Commit { leader: true, .. }).then_some(at)
+        })
+        .collect();
+    assert!(commits.len() >= 2, "too few leader commits to mutate");
+    let broken = |change: &dyn Fn(&mut Vec<Observation>)| {
+        let mut observations = sample.observations.clone();
+        change(&mut observations);
+        model_violation(&observations)
+    };
+    // A second leader in the same term.
+    assert!(
+        broken(&|o| {
+            if let Some(Observation::Commit { node, .. }) = o.get_mut(commits[1]) {
+                *node += 1;
+            }
+        })
+        .is_some_and(|v| v.contains("two leaders"))
+    );
+    // The same index committed with another term.
+    assert!(
+        broken(&|o| {
+            let copy = o[commits[0]].clone();
+            if let Observation::Commit {
+                node,
+                leader,
+                entry_term,
+                ..
+            } = copy
+            {
+                o.push(Observation::Commit {
+                    node: node.wrapping_add(99), // committed nothing before: only the term differs
+                    term: 0,
+                    leader: false,
+                    index: match o[commits[0]] {
+                        Observation::Commit { index, .. } => index,
+                        _ => 0,
+                    },
+                    entry_term: entry_term + 1,
+                });
+                let _ = leader;
+            }
+        })
+        .is_some_and(|v| v.contains("committed with terms"))
+    );
+    // A commit moving back on a server that stayed up.
+    assert!(
+        broken(&|o| {
+            if let Observation::Commit {
+                node,
+                term,
+                index,
+                entry_term,
+                ..
+            } = o[commits[commits.len() - 1]].clone()
+                && index > 0
+            {
+                o.push(Observation::Commit {
+                    node,
+                    term,
+                    leader: false,
+                    index: index - 1,
+                    entry_term,
+                });
+            }
+        })
+        .is_some_and(|v| v.contains("moved back"))
+    );
+    // A new leader whose first commit is below what was committed.
+    assert!(
+        broken(&|o| {
+            o.push(Observation::Commit {
+                node: 9,
+                term: u64::MAX,
+                leader: true,
+                index: 0,
+                entry_term: 0,
+            });
+        })
+        .is_some_and(|v| v.contains("first commits"))
+    );
+}
