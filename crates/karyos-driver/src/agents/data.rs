@@ -755,8 +755,18 @@ impl<T: StreamTerms> Outbound<T> {
                     .map_or(0, |gate| gate.counts().policies_refused),
             ),
         ];
+        // Its gate's rate limiters (R-CORE-40, karyos#741); all 0 without
+        // a gate, whose limiters word says none exists.
+        let rates = self.guard.as_deref().map_or(
+            [Some(0); crate::guard_gate::RATE_CELLS],
+            GuardGate::rate_cells,
+        );
         let mut values = [0; crate::agents::PUBLICATION_CELLS.len()];
-        for ((value, count), stored) in values.iter_mut().zip(counts).zip(cells.stored()) {
+        for ((value, count), stored) in values
+            .iter_mut()
+            .zip(counts.into_iter().chain(rates))
+            .zip(cells.stored())
+        {
             *value = count.unwrap_or(*stored);
         }
         cells.publish(&values);

@@ -21,6 +21,9 @@ use crate::backend::{
 };
 use crate::sockets::OsSocket;
 
+#[cfg(target_os = "linux")]
+mod privileged;
+
 /// How long a test waits for loopback traffic that should already be there.
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -664,7 +667,7 @@ fn multicast_node(local: SocketAddr, group: Ipv4Addr, loopback: bool) -> Option<
 /// Linux, where `lo` has no multicast flag, or the macOS default route
 /// interface, through which `std` also sends (no `IP_MULTICAST_IF`). A host
 /// without one records a skip. Delivery between namespaces and an explicit
-/// interface stay deferred (`DEFERRED_ROWS`).
+/// interface run in the privileged gate (`privileged`, karyos#179).
 #[test]
 fn multicast_loopback_on_the_default_interface() {
     let group_a = Ipv4Addr::new(239, 255, 77, 1);
