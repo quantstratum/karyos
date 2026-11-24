@@ -88,6 +88,8 @@ pub mod archive_retention;
 #[cfg(target_os = "linux")]
 pub mod operations;
 #[cfg(target_os = "linux")]
+pub mod preview;
+#[cfg(target_os = "linux")]
 pub mod server;
 
 #[cfg(target_os = "linux")]
