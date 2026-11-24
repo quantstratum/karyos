@@ -1347,10 +1347,23 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
     let all = frames(64, 3);
     let length = u64::try_from(all.len()).unwrap();
     let ended_before = rig.sent(2).len();
-    for _ in 0..5000 {
-        if rig.server.agent().describe(1).unwrap().durable == length {
+    // The whole lane written before the stop, which seals what the
+    // recorder wrote (#1067 review): a deadline, not a silent
+    // fall-through. Written, not durable: `start` asks for
+    // `SyncPolicy::PerSegment` with the default segment, which this lane
+    // never finishes, so the durable position moves only at the stop's
+    // close (`SyncPolicy::PerSegment`: when a segment is finished, and at
+    // the close).
+    let begun = std::time::Instant::now();
+    loop {
+        let end = rig.server.agent().describe(1).unwrap().end;
+        if end == length {
             break;
         }
+        assert!(
+            begun.elapsed() < Duration::from_secs(30),
+            "written {end} of {length}"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // Stopped, so each range is sealed; its answer and signal go out.
@@ -1358,7 +1371,23 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
         correlation_id: 2,
         recording_id: 1,
     }));
-    for _ in 0..500 {
+    // The stop ends with the recording's `Stopped` signal: waited for, so
+    // a slow host never measures `ended` before it went out.
+    let stopped = |sent: &[Vec<u8>]| {
+        sent.iter().any(|message| {
+            matches!(
+                decoded(message),
+                ControlMessage::RecordingSignal(RecordingSignal {
+                    recording_id: 1,
+                    signal: Signal::Stopped { .. },
+                    ..
+                })
+            )
+        })
+    };
+    let begun = std::time::Instant::now();
+    while !stopped(&rig.responses.sent.lock().unwrap()) {
+        assert!(begun.elapsed() < Duration::from_secs(30), "never stopped");
         rig.server.duty();
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -1381,6 +1410,16 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
     };
     rig.responses.room.store(0, Ordering::Release);
     rig.raw(encode(request()));
+    // Back-pressured for certain: the server holds an answer the full
+    // stream refused, then keeps its bound for a while (#1067 review: a
+    // slow agent could have produced nothing yet).
+    let begun = std::time::Instant::now();
+    while rig.server.pending() == 0 {
+        rig.server.duty();
+        assert!(rig.server.pending() <= super::REPLICATION_FORWARD);
+        assert!(begun.elapsed() < Duration::from_secs(30), "never held");
+        std::thread::sleep(Duration::from_micros(200));
+    }
     for _ in 0..2000 {
         rig.server.duty();
         assert!(rig.server.pending() <= super::REPLICATION_FORWARD);
@@ -1413,8 +1452,7 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(done, "a final status");
-    assert!(!bytes.is_empty());
-    assert_eq!(bytes[..], all[..bytes.len()]);
+    assert_eq!(bytes, all, "the whole recording, in order");
     let mut short = Rig::with(
         "replication-short",
         Host::of(frames(1, 3), true),

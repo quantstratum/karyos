@@ -24,6 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+use karyos_protocol::protection::hmac_key::HmacKey;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -100,38 +101,16 @@ pub enum StateError {
 /// The fingerprint key: 32 bytes from a CSPRNG, in its own file.
 pub type FingerprintKey = Zeroizing<[u8; KEY_LEN]>;
 
-/// The SHA-256 block length, which HMAC pads its key to.
-const BLOCK_LEN: usize = 64;
-
-/// `HMAC-SHA-256(key, "karyos-key-fp-v1" || kind || bytes)`.
-///
-/// Written out (RFC 2104) rather than through `hmac`, whose key setup
-/// keeps a padded copy of the key in a block it does not erase. Here the
-/// padded key lives in one [`Zeroizing`] block, and both hash states are
-/// erased on drop by `sha2`'s `zeroize` feature; `zeroize` stays without
-/// `alloc`.
+/// `HMAC-SHA-256(key, "karyos-key-fp-v1" || kind || bytes)`, over
+/// [`HmacKey`], whose padded key and hash states are erased.
 #[must_use]
 pub fn fingerprint(key: &FingerprintKey, kind: &[u8], bytes: &[u8]) -> [u8; KEY_LEN] {
-    const IPAD: u8 = 0x36;
-    const OPAD: u8 = 0x5c;
-    let mut pad = Zeroizing::new([IPAD; BLOCK_LEN]);
-    for (byte, key_byte) in pad.iter_mut().zip(key.iter()) {
-        *byte ^= key_byte;
-    }
-    let mut inner = Sha256::new();
-    inner.update(pad.as_slice());
-    inner.update(FINGERPRINT_DOMAIN);
-    inner.update(kind);
-    inner.update(bytes);
-    let inner = inner.finalize();
-    for byte in pad.iter_mut() {
-        *byte ^= IPAD ^ OPAD;
-    }
-    let mut outer = Sha256::new();
-    outer.update(pad.as_slice());
-    outer.update(inner);
+    let mut mac = HmacKey::new(key.as_slice()).mac();
+    mac.update(FINGERPRINT_DOMAIN);
+    mac.update(kind);
+    mac.update(bytes);
     let mut out = [0_u8; KEY_LEN];
-    out.copy_from_slice(&outer.finalize());
+    out.copy_from_slice(mac.finalize().as_slice());
     out
 }
 
