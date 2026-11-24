@@ -2071,3 +2071,54 @@ fn a_large_frame_is_read_alone_and_the_budget_still_checks_the_next_header() {
         other => panic!("{other:?}"),
     }
 }
+
+// Snapshot install and compaction never purge through an Archive hold
+// (karyos#682; owner decisions 2026-10-21, item 35).
+
+/// Every state but none refuses both a purge and an install, typed and
+/// changing nothing; released, both go through.
+#[test]
+fn an_archive_hold_refuses_a_purge_and_an_install_until_released() {
+    use karyos_archive::control::HoldState;
+    use karyos_cluster::snapshot::{Section, SectionKind, SnapshotConfig, SnapshotStore};
+    let dir = TempDir::new("held");
+    let snapshots_dir = TempDir::new("held-snapshots");
+    let mut log = purge_log(&dir.0, 40);
+    let mut snapshots = SnapshotStore::open(
+        StdDisk,
+        &snapshots_dir.0,
+        small(),
+        SnapshotConfig::default(),
+    )
+    .unwrap()
+    .store;
+    let _ = snapshots
+        .write(60, 2, &[Section::new(SectionKind::Service, 1, b"state")])
+        .unwrap();
+    assert_eq!(log.archive_hold(), HoldState::None, "a log starts unheld");
+    for state in [HoldState::Held, HoldState::Pending, HoldState::Unknown] {
+        log.set_archive_hold(state);
+        assert!(
+            matches!(log.purge_prefix(30), Err(LogError::ArchiveHeld { state: got }) if got == state),
+            "{state:?}"
+        );
+        assert!(
+            matches!(log.install(60, 2, &snapshots), Err(LogError::ArchiveHeld { state: got }) if got == state),
+            "{state:?}"
+        );
+        // Nothing changed, and the log is not poisoned: it still appends.
+        assert_eq!((log.first_index(), log.last_index()), (1, Some(40)));
+        assert_eq!(log.entries(1..2, u64::MAX).unwrap().len(), 1);
+    }
+    let _ = log.append(&[entry(41, 1, b"held, still written")]).unwrap();
+    let _ = log.sync().unwrap();
+    // Reopened, the entries the hold kept are all there.
+    drop(log);
+    let mut log = open(StdDisk, &dir.0, small());
+    assert_eq!((log.first_index(), log.last_index()), (1, Some(41)));
+    // Released: the purge and the install go through.
+    log.set_archive_hold(HoldState::None);
+    assert_eq!(log.purge_prefix(30).unwrap(), 30);
+    log.install(60, 2, &snapshots).unwrap();
+    assert_eq!(log.first_index(), 61);
+}
