@@ -27,9 +27,10 @@ for crate in karyos-sys karyos-io karyos-ffi; do
     done <<<"$workspace_lints"
 done
 
-# karyos-io (SPEC.md §14): unsafe_code denied for the crate, expected only
-# on `mod ring` of the backend modules (src/uring.rs, src/xdp.rs), never
-# allowed.
+# karyos-io (SPEC.md §14; the io-uring and libc R8 records): unsafe_code
+# denied for the crate, expected only on `mod ring` of the backend modules
+# (src/uring.rs, src/xdp.rs) and on the Linux-only `mod linux_sys` of
+# src/lib.rs, never allowed.
 io="$root/crates/karyos-io"
 if ! awk '/^\[lints.rust\]/{f=1;next} /^\[/{f=0} f' "$io/Cargo.toml" | grep -qx 'unsafe_code = "deny"'; then
     echo 'karyos-io must set unsafe_code = "deny" in [lints.rust]' >&2
@@ -40,17 +41,28 @@ io_expects="$(cd "$io" && find src -name '*.rs' -print0 | sort -z | xargs -0 per
 while IFS= read -r file; do
     [ -z "$file" ] && continue
     case "$file" in
-        src/uring.rs | src/xdp.rs) ;;
+        src/uring.rs | src/xdp.rs)
+            if ! perl -0ne 'exit(/#\[expect\(\s*unsafe_code,\s*reason\s*=\s*"[^"]+",?\s*\)\]\s*pub mod ring;/ ? 0 : 1)' "$io/$file"; then
+                echo "karyos-io $file: the expect(unsafe_code, reason = \"...\") must sit on mod ring" >&2
+                status=1
+            fi
+            ;;
+        src/lib.rs)
+            if ! perl -0ne 'exit(/#\[cfg\(target_os = "linux"\)\]\s*#\[expect\(\s*unsafe_code,\s*reason\s*=\s*"[^"]+",?\s*\)\]\s*mod linux_sys;/ ? 0 : 1)' "$io/src/lib.rs"; then
+                echo 'karyos-io src/lib.rs: the expect(unsafe_code, reason = "...") must sit on the Linux-only mod linux_sys' >&2
+                status=1
+            fi
+            ;;
         *)
-            echo "karyos-io expects unsafe_code outside src/uring.rs and src/xdp.rs: $file" >&2
+            echo "karyos-io expects unsafe_code outside src/uring.rs, src/xdp.rs (mod ring) and src/lib.rs (mod linux_sys): $file" >&2
             status=1
             ;;
     esac
-    if ! perl -0ne 'exit(/#\[expect\(\s*unsafe_code,\s*reason\s*=\s*"[^"]+",?\s*\)\]\s*pub mod ring;/ ? 0 : 1)' "$io/$file"; then
-        echo "karyos-io $file: the expect(unsafe_code, reason = \"...\") must sit on mod ring" >&2
-        status=1
-    fi
 done <<<"$io_expects"
+if ! printf '%s\n' "$io_expects" | grep -qx 'src/lib.rs'; then
+    echo 'karyos-io src/lib.rs: the Linux-only mod linux_sys must carry its expect(unsafe_code)' >&2
+    status=1
+fi
 if grep -rqE 'allow\(\s*unsafe_code' "$io/src"; then
     echo 'karyos-io must not allow unsafe_code' >&2
     status=1

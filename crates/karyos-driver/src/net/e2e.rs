@@ -3741,8 +3741,8 @@ fn a_fragmented_message_straddling_a_reset_is_read_once_and_whole() {
     exchange_from(&mut a, &mut b, &mut lane, &mut reader, 9, 9..64);
 }
 
-/// Two drivers on a two-path multicast channel of `reliable` delivery, the
-/// isolated-paths switch assumed (as in
+/// Two drivers on a two-path multicast channel of `reliable` delivery, on
+/// real sockets that isolate their paths (owner item 12; as in
 /// `a_two_path_publication_reaches_a_two_path_subscription`), connected:
 /// the publication and B's image. `None` when the host cannot carry
 /// multicast, said on stderr.
@@ -3780,7 +3780,10 @@ fn two_paths(
     };
     let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
     for side in [&mut a, &mut b] {
-        side.net.as_mut().unwrap().assume_isolated_paths();
+        assert!(
+            side.net.as_ref().unwrap().paths_isolated(),
+            "Linux sockets isolate paths (owner item 12)"
+        );
     }
     let _ = b.add_network_subscription(10, &channel).unwrap();
     let publication = a
@@ -3976,8 +3979,8 @@ fn a_tail_lost_on_one_path_arrives_by_the_other() {
 }
 
 /// rp-w4b2c: a publication over two paths reaches a subscription over the
-/// same two paths, with the isolated-paths switch assumed on both drivers
-/// (owner item 12 keeps it off on real sockets): every message once, in
+/// same two paths, on real sockets that isolate the paths (owner item 12,
+/// karyos#624): every message once, in
 /// order, though each path carries a copy. The second path is loopback,
 /// which some hosts cannot carry multicast on; the founding path alone
 /// then delivers, and the test still checks exactly-once order. Linux,
@@ -4013,7 +4016,10 @@ fn a_two_path_publication_reaches_a_two_path_subscription() {
     };
     let (mut a, mut b) = (driver(ThreadingMode::Shared), driver(ThreadingMode::Shared));
     for side in [&mut a, &mut b] {
-        side.net.as_mut().unwrap().assume_isolated_paths();
+        assert!(
+            side.net.as_ref().unwrap().paths_isolated(),
+            "Linux sockets isolate paths (owner item 12)"
+        );
     }
     let _ = b.add_network_subscription(10, &channel).unwrap();
     let publication = a

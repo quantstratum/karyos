@@ -1098,6 +1098,9 @@ fn a_partial_walker_failure_leaves_nothing() {
 #[test]
 fn a_publication_with_paths_is_refused_until_paths_are_isolated() {
     let mut driver = driver();
+    // A backend that cannot isolate path sockets (macOS; Linux isolates
+    // them, karyos#624).
+    driver.net.as_mut().unwrap().assume_unisolated_paths();
     let group = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(239, 7, 9, 21)), free_port());
     let channel = UdpConfig {
         interface: None,

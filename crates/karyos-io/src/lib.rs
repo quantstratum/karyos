@@ -23,6 +23,12 @@ static ALLOCATOR: karyos_sys::alloc_count::CountingAllocator =
 
 pub mod backend;
 pub mod lanes;
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "the libc socket option calls rustix has no API for, behind a safe interface (owner item 12; quantstratum-docs: karyos/reviews/dependency-admission-libc-linux-sockets.md)"
+)]
+mod linux_sys;
 pub mod sockets;
 #[cfg(any(feature = "uring", feature = "test-hooks", test))]
 pub mod uring;

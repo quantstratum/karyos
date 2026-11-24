@@ -549,3 +549,194 @@ fn data_calls_do_not_allocate() {
     });
     assert_eq!(allocations, 0);
 }
+
+/// How long a socket that must not receive a datagram is watched after the
+/// socket that must receive it did: loopback delivery to every matching
+/// socket happens in the same send, so a leak shows at once; the window
+/// only covers scheduling.
+const LEAK_WINDOW: Duration = Duration::from_millis(300);
+
+/// The address of the host's interface toward a public route, for a second
+/// interface beside loopback; `None` on a host with no such route.
+fn lan_address() -> Option<Ipv4Addr> {
+    let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    match probe.local_addr().ok()?.ip() {
+        std::net::IpAddr::V4(address) if !address.is_loopback() => Some(address),
+        _ => None,
+    }
+}
+
+/// A Karyos socket bound to the wildcard address on `port` (0 for any),
+/// joining `group` on the interface of `interface`; `None` when the host
+/// cannot join there (recorded by the caller as a skip).
+fn joined(port: u16, group: Ipv4Addr, interface: Ipv4Addr) -> Option<(LinuxSocket, u16)> {
+    let mut wanted = config(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)));
+    let mut multicast = MulticastConfig::new(group.into(), InterfaceSel::Address(interface));
+    multicast.ttl = 1;
+    multicast.loopback = true;
+    wanted.multicast = Some(multicast);
+    let mut socket = LinuxSocket::new();
+    let probes = socket.open(&wanted).ok()?;
+    Some((socket, probes.local.port()))
+}
+
+/// The negative control: a plain socket set up as the Karyos one is but
+/// without `IP_MULTICAST_ALL` off, so the kernel's default (on) applies.
+fn leaky(port: u16, group: Ipv4Addr, interface: Ipv4Addr) -> Option<OwnedFd> {
+    let fd = rustix::net::socket_with(
+        AddressFamily::INET,
+        SocketType::DGRAM,
+        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+        Some(ipproto::UDP),
+    )
+    .ok()?;
+    sockopt::set_socket_reuseaddr(&fd, true).ok()?;
+    rustix::net::bind(&fd, &SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))).ok()?;
+    sockopt::set_ip_add_membership(&fd, &group, &interface).ok()?;
+    Some(fd)
+}
+
+/// Whether `fd` receives a datagram within [`LEAK_WINDOW`].
+fn leaky_receives(fd: &OwnedFd) -> bool {
+    let mut buffer = [0_u8; 64];
+    let start = Instant::now();
+    while start.elapsed() < LEAK_WINDOW {
+        if rustix::net::recv(fd, &mut buffer, RecvFlags::DONTWAIT).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// Whether `socket` receives a datagram within [`LEAK_WINDOW`].
+fn receives_within_window(socket: &mut LinuxSocket) -> bool {
+    let mut buffer = [0_u8; 64];
+    let start = Instant::now();
+    while start.elapsed() < LEAK_WINDOW {
+        if matches!(socket.recv(&mut buffer), RecvResult::Datagram { .. }) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
+/// Sends one datagram to `group` on `port`, out of the interface of
+/// `interface`, looped back to this host's members.
+fn send_to_group(group: Ipv4Addr, port: u16, interface: Ipv4Addr) -> bool {
+    let Some((mut sender, _)) = joined(0, group, interface) else {
+        return false;
+    };
+    let route = RouteAddr::new(SocketAddr::from((group, port)));
+    matches!(
+        sender.send(&route, &[b"path"]),
+        SendResult::Sent {
+            sent: 1,
+            error: None
+        }
+    )
+}
+
+/// Owner item 12 (karyos#624): sockets bound to the wildcard address on one
+/// port, each joining its own group, receive only their own group. The
+/// negative control, a socket joined the same way with the kernel's
+/// default `IP_MULTICAST_ALL`, receives the other group's datagram: the
+/// leak the option prevents is real on this host, so the positive result
+/// cannot pass vacuously.
+#[test]
+fn a_socket_receives_only_the_group_it_joined() {
+    let Some(lan) = lan_address() else {
+        skip("no interface toward a public route");
+        return;
+    };
+    let (first, second) = (
+        Ipv4Addr::new(239, 255, 62, 41),
+        Ipv4Addr::new(239, 255, 62, 42),
+    );
+    let Some((mut own, port)) = joined(0, first, lan) else {
+        skip("this host cannot join a group on its LAN interface");
+        return;
+    };
+    let (mut other, _) = joined(port, second, lan).unwrap();
+    let control = leaky(port, second, lan).unwrap();
+    assert!(send_to_group(first, port, lan));
+    let mut buffer = [0_u8; 64];
+    assert!(matches!(
+        recv_one(&mut own, &mut buffer),
+        RecvResult::Datagram { len: 4, .. }
+    ));
+    assert!(
+        leaky_receives(&control),
+        "negative control: without the option the other group's datagram arrives"
+    );
+    assert!(
+        !receives_within_window(&mut other),
+        "a socket received a group it did not join"
+    );
+}
+
+/// Owner item 12's two-interface proof (karyos#624): two sockets on one
+/// port join the same group, one on loopback and one on the LAN interface;
+/// a datagram sent out of loopback reaches the loopback path's socket only.
+/// The negative control, joined on the LAN interface with the kernel's
+/// default, receives it: a path socket without the option would count the
+/// other path's datagrams.
+#[test]
+fn a_path_socket_receives_only_its_own_interface() {
+    let Some(lan) = lan_address() else {
+        skip("no interface toward a public route");
+        return;
+    };
+    let group = Ipv4Addr::new(239, 255, 62, 43);
+    let Some((mut loopback_path, port)) = joined(0, group, Ipv4Addr::LOCALHOST) else {
+        skip("this host cannot join a group on loopback");
+        return;
+    };
+    let Some((mut lan_path, _)) = joined(port, group, lan) else {
+        skip("this host cannot join a group on its LAN interface");
+        return;
+    };
+    let control = leaky(port, group, lan).unwrap();
+    assert!(send_to_group(group, port, Ipv4Addr::LOCALHOST));
+    let mut buffer = [0_u8; 64];
+    assert!(matches!(
+        recv_one(&mut loopback_path, &mut buffer),
+        RecvResult::Datagram { len: 4, .. }
+    ));
+    assert!(
+        leaky_receives(&control),
+        "negative control: without the option the loopback datagram reaches the LAN path"
+    );
+    assert!(
+        !receives_within_window(&mut lan_path),
+        "the LAN path's socket received a datagram of the loopback path"
+    );
+}
+
+/// Codex review of #1218 (karyos#624): a kernel without `IPV6_MULTICAST_ALL`
+/// (`ENOPROTOOPT`, before Linux 4.20) keeps an IPv6 join, without the
+/// isolation; an IPv4 socket, or any other error, still fails the open,
+/// naming the option.
+#[test]
+fn an_ipv6_join_survives_a_kernel_without_ipv6_multicast_all() {
+    let missing = || std::io::Error::from_raw_os_error(OsErrno::NOPROTOOPT.raw_os_error());
+    assert_eq!(multicast_all_off(Err(missing()), true), Ok(()));
+    assert!(matches!(
+        multicast_all_off(Err(missing()), false),
+        Err(OpenError::Os {
+            operation: "setsockopt IP_MULTICAST_ALL",
+            ..
+        })
+    ));
+    let other = std::io::Error::from_raw_os_error(OsErrno::BADF.raw_os_error());
+    assert!(matches!(
+        multicast_all_off(Err(other), true),
+        Err(OpenError::Os {
+            operation: "setsockopt IPV6_MULTICAST_ALL",
+            ..
+        })
+    ));
+    assert_eq!(multicast_all_off(Ok(()), true), Ok(()));
+}

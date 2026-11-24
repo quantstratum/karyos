@@ -1619,6 +1619,13 @@ impl<T: StreamTerms> Network<T> {
         self.paths_isolated = true;
     }
 
+    /// Refuses channels with `paths`, as a backend that cannot isolate their
+    /// sockets does (tests of the refusal on a backend that can, karyos#624).
+    #[cfg(test)]
+    pub(crate) fn assume_unisolated_paths(&mut self) {
+        self.paths_isolated = false;
+    }
+
     /// The endpoint joined to the NAK control group of the data group
     /// `config` on `bind`'s port, and the group's address: `None` when the
     /// table names none, or when the join failed (counted, RC-15). The
