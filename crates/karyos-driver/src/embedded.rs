@@ -6137,7 +6137,14 @@ pub(crate) fn stream_network_cells(
     let mut cells = Vec::with_capacity(labels.len());
     for label in labels {
         // The first refusal is counted; nothing more is asked.
-        let Some(cell) = counters.allocate_keyed(TYPE_EVENTS, label, keys) else {
+        // A rate policy's settings are gauges (karyos#741); every other
+        // network cell is a count.
+        let kind = if crate::agents::PUBLICATION_RATE_GAUGES.contains(label) {
+            crate::counters::TYPE_GAUGE
+        } else {
+            TYPE_EVENTS
+        };
+        let Some(cell) = counters.allocate_keyed(kind, label, keys) else {
             for cell in cells {
                 counters.free(cell);
             }
@@ -7217,6 +7224,24 @@ mod stream_cells_tests {
             })
             .collect();
         assert_eq!(keyed, labels);
+        // The rate policy's settings are gauges, every other cell a count
+        // (karyos#741).
+        let gauges: Vec<_> = (0..reader.capacity())
+            .filter_map(|index| match reader.read(index) {
+                CellRead::Allocated { metadata, .. }
+                    if metadata.keys.stream == 7
+                        && metadata.type_id == crate::counters::TYPE_GAUGE =>
+                {
+                    Some(String::from_utf8(metadata.label().to_vec()).unwrap())
+                }
+                CellRead::Allocated { metadata, .. } if metadata.keys.stream == 7 => {
+                    assert_eq!(metadata.type_id, TYPE_EVENTS);
+                    None
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gauges, crate::agents::PUBLICATION_RATE_GAUGES);
         for cell in cells.take() {
             counters.free(cell);
         }

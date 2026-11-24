@@ -1398,6 +1398,24 @@ pub(crate) const PUBLICATION_CELLS: [&str; 18] = [
 /// first word.
 pub(crate) const PUBLICATION_RATE_CELLS: usize = 6;
 
+/// The [`PUBLICATION_CELLS`] that are gauges of a rate policy, not counts
+/// (karyos#741): which buckets exist, the version applied, and each
+/// bucket's rates and bursts. A consumer of the counter region must read a
+/// lower value of one as a new setting, never as a counter reset. The two
+/// refusal cells stay counts.
+pub(crate) const PUBLICATION_RATE_GAUGES: [&str; 10] = [
+    "network rate limiters",
+    "network rate policy version",
+    "network rate messages per second",
+    "network rate message burst",
+    "network rate bytes per second",
+    "network rate byte burst",
+    "network control rate messages per second",
+    "network control rate message burst",
+    "network control rate bytes per second",
+    "network control rate byte burst",
+];
+
 const _: () = assert!(
     PUBLICATION_RATE_CELLS + crate::guard_gate::RATE_CELLS == PUBLICATION_CELLS.len(),
     "the rate cells end the publication's cells"
