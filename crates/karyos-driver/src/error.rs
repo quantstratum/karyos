@@ -118,6 +118,14 @@ pub enum DriverError {
     /// A network endpoint could not be opened or its table is full.
     #[error("network endpoint unavailable")]
     NetworkEndpoint,
+    /// A path of a paired unicast paths channel names an interface address
+    /// this host does not have (`EADDRNOTAVAIL` at its bind), refused at
+    /// channel admission (karyos#1043).
+    #[error("no interface of this host has address {interface}")]
+    UnknownInterface {
+        /// The path's interface address.
+        interface: std::net::IpAddr,
+    },
     /// `AgentConfig::publications` network publications are held (being
     /// added, active or being removed).
     #[error("too many network publications")]

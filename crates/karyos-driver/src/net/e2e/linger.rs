@@ -692,7 +692,10 @@ fn a_removed_two_path_publication_ends_at_its_eos_on_both_paths() {
     };
     let (mut a, mut b) = (lingering(200 * MS), lingering(200 * MS));
     for side in [&mut a, &mut b] {
-        side.net.as_mut().unwrap().assume_isolated_paths();
+        assert!(
+            side.net.as_ref().unwrap().paths_isolated(),
+            "Linux sockets isolate paths (owner item 12)"
+        );
     }
     let _ = b.add_network_subscription(10, &channel).unwrap();
     let publication = a

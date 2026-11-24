@@ -33,8 +33,9 @@
 //!   sender's follow-up, every lane of a routed (redundant paths)
 //!   publication.
 //! - **Scope.** Unicast (the channel's `endpoint` is the local receive
-//!   address) and IPv4 multicast (the group's port, joined on `interface`
-//!   or any); interface names and IPv6 groups are refused.
+//!   address), IPv4 multicast (the group's port, joined on `interface`
+//!   or any) and paired unicast paths (path `i` received at its endpoint,
+//!   karyos#1043); interface names and IPv6 groups are refused.
 //! - **Backings (network-shared-terms n3).** An image is exposed on either
 //!   backing: on an IPC driver its lanes are shared regions, so in-process
 //!   subscribers read it as any stream of the driver and remote clients
@@ -46,7 +47,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use karyos_io::sockets::endpoint::{InterfaceSel, MulticastConfig};
 use karyos_protocol::channel::{ControlMode, Destination, Interface, UdpConfig};
 
-use super::{LATER_PATHS, NetworkSubscription};
+use super::{LATER_PATHS, LaterRoute, NetworkSubscription};
 use crate::agents::images::DEFAULT_MAX_IMAGE_TERM_LENGTH;
 use crate::embedded::{AggregateHandle, EmbeddedDriver, StreamTerms};
 use crate::error::DriverError;
@@ -55,14 +56,125 @@ use crate::membership::ReceiverIdentity;
 /// The local address and multicast group of each later path of a
 /// channel with `paths` (redundant-paths.md): multicast IPv4 only, each
 /// path joining the channel's group on its interface address, the first
-/// path being the route of [`receive_route`]. Unicast `paths` need a
-/// destination per path, which the URI cannot name yet (owner item 11).
+/// path being the route of [`receive_route`]. Unicast paths are paired
+/// instead (owner item 11), [`later_routes`].
+/// Redundant paths on distinct interfaces (karyos#624, Codex review of
+/// #1218): two path addresses that resolve to one interface, such as the
+/// unspecified address and the explicit address of the interface the group
+/// routes through, would hold two memberships on that interface, so each
+/// socket receives every datagram even with `IP_MULTICAST_ALL` off and one
+/// physical path looks like two. Such a channel is refused, as is one whose
+/// path cannot be resolved where the isolation is real (Linux). The same
+/// address given twice shares one endpoint and is skipped as before.
 /// Runs on the control path, so it may allocate.
-fn later_routes(channel: &UdpConfig) -> Result<Vec<(SocketAddr, MulticastConfig)>, DriverError> {
+pub(super) fn paths_on_distinct_interfaces(channel: &UdpConfig) -> Result<(), DriverError> {
+    paths_on_distinct_interfaces_with(channel, karyos_io::sockets::path_interface::path_interface)
+}
+
+/// [`paths_on_distinct_interfaces`] with the resolver given (tests).
+pub(super) fn paths_on_distinct_interfaces_with(
+    channel: &UdpConfig,
+    resolve: impl Fn(Ipv4Addr, Ipv4Addr) -> Option<String>,
+) -> Result<(), DriverError> {
+    if channel.paths.len() < 2 || !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    // Another destination, or an IPv6 group, is refused by the routes.
+    let Destination::Multicast { group, .. } = &channel.destination else {
+        return Ok(());
+    };
+    let IpAddr::V4(group) = group.ip() else {
+        return Ok(());
+    };
+    let mut seen: Vec<(Ipv4Addr, String)> = Vec::with_capacity(channel.paths.len());
+    for path in &channel.paths {
+        let Interface::Address(IpAddr::V4(address)) = path else {
+            return Ok(());
+        };
+        if seen.iter().any(|(held, _)| held == address) {
+            continue;
+        }
+        let name = resolve(*address, group).ok_or(DriverError::UnsupportedChannel)?;
+        if seen.iter().any(|(_, held)| *held == name) {
+            return Err(DriverError::UnsupportedChannel);
+        }
+        seen.push((*address, name));
+    }
+    Ok(())
+}
+
+/// A paired unicast paths publication (owner item 11, karyos#1043) whose
+/// paths really leave through distinct interfaces. Binding a source
+/// address does not pin a datagram's egress on Linux: the route to the
+/// destination does. So for each path `i` the egress interface of the
+/// route to `endpoints[i]` (longest prefix match in `/proc/net/route`)
+/// must be the interface owning path `i`'s address, and the egress
+/// interfaces must differ pairwise; otherwise both paths could leave
+/// through one NIC and one physical path would count twice. A path that
+/// cannot be resolved is refused. IPv6 paired paths are refused as
+/// unverifiable: there is no IPv6 route lookup here. Linux only, where
+/// paths are served; elsewhere they are refused before this. Runs on the
+/// control path, so it may allocate.
+pub(super) fn paired_paths_on_distinct_interfaces(channel: &UdpConfig) -> Result<(), DriverError> {
+    paired_paths_on_distinct_interfaces_with(
+        channel,
+        karyos_io::sockets::path_interface::path_interface,
+    )
+}
+
+/// [`paired_paths_on_distinct_interfaces`] with the resolver given
+/// (tests): `resolve(address, target)` names the interface owning
+/// `address`, or, for the unspecified address, the one of the route to
+/// `target`.
+pub(super) fn paired_paths_on_distinct_interfaces_with(
+    channel: &UdpConfig,
+    resolve: impl Fn(Ipv4Addr, Ipv4Addr) -> Option<String>,
+) -> Result<(), DriverError> {
+    let Destination::PairedPaths { endpoints } = &channel.destination else {
+        return Ok(());
+    };
+    if !cfg!(target_os = "linux") {
+        return Ok(());
+    }
+    let mut egresses: Vec<String> = Vec::with_capacity(channel.paths.len());
+    for (path, endpoint) in channel.paths.iter().zip(endpoints) {
+        let (Interface::Address(IpAddr::V4(address)), IpAddr::V4(to)) = (path, endpoint.ip())
+        else {
+            // An IPv6 path has no route lookup here to verify its egress;
+            // a name or a family mismatch is refused by the routes too.
+            return Err(DriverError::UnsupportedChannel);
+        };
+        let egress = resolve(Ipv4Addr::UNSPECIFIED, to).ok_or(DriverError::UnsupportedChannel)?;
+        let source = resolve(*address, to).ok_or(DriverError::UnsupportedChannel)?;
+        if source != egress || egresses.contains(&egress) {
+            return Err(DriverError::UnsupportedChannel);
+        }
+        egresses.push(egress);
+    }
+    Ok(())
+}
+
+/// A paired unicast paths channel (owner item 11, karyos#1043) receives
+/// path `i` at its own endpoint `endpoints[i]`, joining no group: these
+/// are the later paths' binds, the first path being [`receive_route`]'s.
+/// The interface before each `@` is the sender's, so the receiver binds
+/// only the endpoints. Runs on the control path, so it may allocate.
+fn later_routes(channel: &UdpConfig) -> Result<Vec<LaterRoute>, DriverError> {
+    if let Destination::PairedPaths { endpoints } = &channel.destination {
+        if endpoints.len() != channel.paths.len() || endpoints.len() > LATER_PATHS + 1 {
+            return Err(DriverError::UnsupportedChannel);
+        }
+        return Ok(endpoints
+            .iter()
+            .skip(1)
+            .map(|endpoint| (*endpoint, None))
+            .collect());
+    }
     let Some((_, later)) = channel.paths.split_first() else {
         return Ok(Vec::new());
     };
-    // Unicast `paths`, even a single one, need a destination per path.
+    // Unpaired `paths` are multicast only: a unicast destination names
+    // one endpoint, and paired paths name one per path.
     let Destination::Multicast { group, .. } = &channel.destination else {
         return Err(DriverError::UnsupportedChannel);
     };
@@ -77,7 +189,10 @@ fn later_routes(channel: &UdpConfig) -> Result<Vec<(SocketAddr, MulticastConfig)
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), group.port());
         routes.push((
             bind,
-            MulticastConfig::new(group.ip(), InterfaceSel::Address(*address)),
+            Some(MulticastConfig::new(
+                group.ip(),
+                InterfaceSel::Address(*address),
+            )),
         ));
     }
     Ok(routes)
@@ -92,6 +207,15 @@ fn receive_route(
     channel: &UdpConfig,
     dynamic: bool,
 ) -> Result<(SocketAddr, Option<MulticastConfig>), DriverError> {
+    // Paired unicast paths: the first path receives at its endpoint
+    // (karyos#1043); each interface before an `@` is the sender's, a name
+    // included, so the receiver reads none of them.
+    if let Destination::PairedPaths { endpoints } = &channel.destination {
+        return endpoints
+            .first()
+            .map(|endpoint| (*endpoint, None))
+            .ok_or(DriverError::UnsupportedChannel);
+    }
     let first_path = channel.paths.first().cloned();
     let interface = match first_path.as_ref().or(channel.interface.as_ref()) {
         None => None,
@@ -524,6 +648,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         if !channel.paths.is_empty() && !net.paths_isolated() {
             net.count_paths_refused();
             return Err(DriverError::UnsupportedChannel);
+        }
+        if let Err(error) = paths_on_distinct_interfaces(channel) {
+            net.count_paths_refused();
+            return Err(error);
         }
         // A conflated view of an unreliable channel needs its fail-safe to
         // close the view before the far-window close ends the image

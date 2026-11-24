@@ -105,8 +105,11 @@ fn refusal(error: &DriverError) -> ErrorCode {
         // only a dynamic channel takes: the client path carries no
         // allowlist and no receiver identity, so no retry is granted
         // (karyos#941 item 4).
+        // An interface this host does not have: the channel cannot be
+        // served here, and no retry changes that (karyos#1043).
         DriverError::NetworkUnavailable
         | DriverError::UnsupportedChannel
+        | DriverError::UnknownInterface { .. }
         | DriverError::DynamicRegistrationUnsupported => ErrorCode::UnsupportedChannel,
         DriverError::StreamIdsExhausted | DriverError::ExportIdsExhausted => {
             ErrorCode::IdentitiesExhausted
