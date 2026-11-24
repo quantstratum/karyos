@@ -1095,12 +1095,10 @@ fn a_prepared_replay_never_attached_expires() {
     // timeout after this, however late the test thread runs.
     let begun = std::time::Instant::now();
     let lost = answer(agent.post_prepare_replay(prepare)).unwrap();
-    assert!(matches!(
-        answer(agent.post_prepare_replay(prepare)),
-        Err(AgentError::Full { .. })
-    ));
     // Refused while the lost one holds the slot, then taken once it
-    // expired: at most five seconds.
+    // expired: at most five seconds. A test thread late by the whole
+    // timeout may find it expired at its first attempt already: the bound
+    // below holds either way (#1244 review).
     let again = loop {
         match answer(agent.post_prepare_replay(prepare)) {
             Ok(again) => break again,

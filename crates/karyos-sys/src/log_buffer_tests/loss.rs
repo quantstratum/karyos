@@ -420,8 +420,16 @@ fn test_log_buffer_loss_a_frame_reader_revoked_during_its_serve_is_revoked_not_c
         Ok(Revocation::Sealed)
     );
     let _ = conductor.duty_cycle().unwrap();
+    let ended = FrameStep::Ended(FrameEnd::Revoked { position: 0 });
+    assert_eq!(reader.serve_at_seal().unwrap(), ended);
+    assert!(reader.has_ended(), "a revocation found at the seal is terminal");
+    // Terminal, as the revocation a loan finds: the same answer again,
+    // with no loan taken and nothing to take.
+    assert_eq!(reader.serve_frame().unwrap(), ended);
     assert_eq!(
-        reader.pending_at_seal(),
-        FrameStep::Ended(FrameEnd::Revoked { position: 0 })
+        buffer.cells()[cell].loan.load(Ordering::SeqCst),
+        0,
+        "no loan after the end"
     );
+    assert!(!reader.take(|_, _| panic!("delivered after revocation")));
 }

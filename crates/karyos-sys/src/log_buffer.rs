@@ -3403,10 +3403,16 @@ impl<O: BufferOwner> Subscription<O> {
     fn at_seal_or_pending(&self) -> Result<PollOutcome, SysError> {
         match decode_seal(self.buffer.seal().load(Ordering::Acquire)) {
             SealWord::Positioned(position) if self.cursor.position >= position => {
-                // The driver sets the flag (SeqCst) before it seals, so the
-                // Acquire load above that observed the seal makes the flag
-                // visible here, as it does the reason stored before the
-                // seal swap.
+                // Where the revocation itself seals (`abort`), the driver
+                // stores the flag (SeqCst) before the seal swap (AcqRel),
+                // and the positioning compare-exchange (AcqRel), in this
+                // duty cycle or a later one, keeps that order in the seal
+                // word's release sequence: the Acquire load above that
+                // observed the positioned seal makes the flag visible,
+                // as it does the reason stored before the swap. A
+                // revocation that does not seal (another policy, or a
+                // buffer sealed before) may set the flag after this load;
+                // it is then seen on the next poll, as every revocation is.
                 if self
                     .buffer
                     .cell(self.cursor.cell)?
