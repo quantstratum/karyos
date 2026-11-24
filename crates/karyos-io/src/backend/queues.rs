@@ -32,6 +32,8 @@ pub(crate) struct QueueAccount {
     charged: u16,
     /// The quarantined part of `charged`; it leaves only at reset.
     quarantined: u16,
+    /// Opened as an etf queue (ADR-0109): it takes timed commits.
+    etf: bool,
 }
 
 impl QueueAccount {
@@ -58,6 +60,11 @@ impl QueueAccount {
     /// Quarantined slots charged to the queue until reset.
     pub(crate) fn quarantined(&self) -> u16 {
         self.quarantined
+    }
+
+    /// Whether the queue was opened as an etf queue (ADR-0109 point 1).
+    pub(crate) fn etf(&self) -> bool {
+        self.etf
     }
 
     /// Whether the queue holds `max_pending` claimed, pending and
@@ -111,6 +118,7 @@ impl QueueTable {
             max_pending: config.max_pending,
             charged: 0,
             quarantined: 0,
+            etf: config.etf.is_some(),
         };
         let id = self.queues.insert(account).map_err(|error| match error {
             IssueError::Full => QueueError::QueueLimit,
@@ -265,6 +273,7 @@ mod tests {
             authority: Authority::FIRST,
             route: test_route(),
             max_pending: nz(max_pending),
+            etf: None,
         }
     }
 

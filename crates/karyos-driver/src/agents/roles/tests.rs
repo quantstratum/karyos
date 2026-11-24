@@ -4796,6 +4796,7 @@ fn a_retired_destinations_pending_items_return_queue_closed() {
             authority: Authority::FIRST,
             route,
             max_pending: std::num::NonZeroU16::new(4).unwrap(),
+            etf: None,
         })
         .unwrap();
     let frame = tx.claim_tx(queue, 32).unwrap();
@@ -4935,6 +4936,7 @@ fn a_close_without_its_tx_half_is_dropped_once() {
             authority: Authority::FIRST,
             route,
             max_pending: std::num::NonZeroU16::MIN,
+            etf: None,
         })
         .unwrap();
     let mut queues = [None; super::super::data::OPENED_QUEUES];
@@ -5803,6 +5805,7 @@ fn a_route_in_use_counts_once_and_resets_nothing() {
             authority: Authority::FIRST,
             route,
             max_pending: std::num::NonZeroU16::MIN,
+            etf: None,
         })
         .unwrap()
     };
@@ -5855,6 +5858,7 @@ fn a_close_of_handles_already_gone_asks_no_reset() {
             authority: Authority::FIRST,
             route,
             max_pending: std::num::NonZeroU16::MIN,
+            etf: None,
         })
         .unwrap();
     let _ = tx.close_queue(queue, &mut TxReport::new());
@@ -5969,6 +5973,7 @@ fn limit_after(case: LimitCase) -> (usize, bool) {
             authority: Authority::FIRST,
             route,
             max_pending: std::num::NonZeroU16::MIN,
+            etf: None,
         })
         .unwrap();
     let epoch = tx.capabilities().epoch;
@@ -6272,6 +6277,7 @@ fn a_real_error_at_the_re_close_fails_at_once() {
             authority: Authority::FIRST,
             route,
             max_pending: std::num::NonZeroU16::MIN,
+            etf: None,
         })
         .unwrap();
     let epoch = tx.capabilities().epoch;
@@ -6331,6 +6337,7 @@ fn control_routes_report_limits_and_failed_closes() {
                 authority: Authority::FIRST,
                 route,
                 max_pending: std::num::NonZeroU16::MIN,
+                etf: None,
             })
             .unwrap();
         let mut routes = ControlRoutes::new(2);

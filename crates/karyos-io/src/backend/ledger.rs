@@ -146,7 +146,8 @@ impl TxLedger {
 
     /// Checks a commit in the order of 3.3: the endpoint is Active, the
     /// queue is open with the same epoch and generation, `1 <= len <=
-    /// capacity` and the options are supported.
+    /// capacity` and the options are supported: a send time only on a
+    /// queue opened as an etf queue (ADR-0109 point 1).
     pub(crate) fn check_commit(
         &self,
         active: bool,
@@ -158,16 +159,16 @@ impl TxLedger {
         if !active {
             return Err(CommitError::NotActive);
         }
-        if self.queues.get(queue).is_none() {
+        let Some(account) = self.queues.get(queue) else {
             return Err(CommitError::UnknownQueue);
-        }
+        };
         if len == 0 {
             return Err(CommitError::Empty);
         }
         if len > capacity {
             return Err(CommitError::LengthExceedsClaim { len, capacity });
         }
-        if !options.is_none() {
+        if !options.is_none() && !account.etf() {
             return Err(CommitError::UnsupportedOption);
         }
         Ok(())
@@ -215,6 +216,7 @@ mod tests {
             authority: Authority::FIRST,
             route: test_route(),
             max_pending: nz(max_pending),
+            etf: None,
         }
     }
 
@@ -289,6 +291,47 @@ mod tests {
             ledger.queues().get(queue).unwrap().charged(),
             1,
             "a failed claim leaves no charge"
+        );
+    }
+
+    #[test]
+    fn a_send_time_is_accepted_only_on_an_etf_queue() {
+        let mut ledger = empty_ledger(4);
+        let immediate = ledger.open_queue(config(1)).unwrap();
+        let etf = ledger
+            .open_queue(TxQueueConfig {
+                etf: Some(super::super::EtfQueue {
+                    interface: 1,
+                    priority: 3,
+                    delta_ns: 300_000,
+                }),
+                ..config(1)
+            })
+            .unwrap();
+        let timed = TxOptions::txtime(1_000);
+        assert_eq!(timed.txtime_ns(), Some(1_000));
+        assert!(!timed.is_none());
+        assert_eq!(
+            ledger.check_commit(true, immediate, 1, 1, timed),
+            Err(CommitError::UnsupportedOption)
+        );
+        assert_eq!(
+            ledger.check_commit(true, immediate, 1, 1, TxOptions::none()),
+            Ok(())
+        );
+        assert_eq!(ledger.check_commit(true, etf, 1, 1, timed), Ok(()));
+        assert_eq!(
+            ledger.check_commit(true, etf, 1, 1, TxOptions::none()),
+            Ok(()),
+            "an etf queue takes immediate datagrams too"
+        );
+        // The earlier checks keep their order before the option.
+        assert_eq!(
+            ledger.check_commit(true, immediate, 2, 1, timed),
+            Err(CommitError::LengthExceedsClaim {
+                len: 2,
+                capacity: 1
+            })
         );
     }
 

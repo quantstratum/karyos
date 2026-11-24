@@ -140,6 +140,7 @@ fn queue_capacity_and_overcommit() {
             authority: Authority::FIRST,
             route: h.route,
             max_pending: nz(3),
+            etf: None,
         }),
         Err(QueueError::OverCommitted {
             requested: 3,
@@ -151,6 +152,7 @@ fn queue_capacity_and_overcommit() {
             authority: Authority::FIRST.next().unwrap(),
             route: h.route,
             max_pending: nz(2),
+            etf: None,
         })
         .unwrap();
     h.commit_n(0, 6);
@@ -173,6 +175,7 @@ fn repair_authority_exposure_carries_the_queue_authority() {
             authority: incarnation,
             route: h.route,
             max_pending: nz(1),
+            etf: None,
         })
         .unwrap();
     let control_class = Authority::FIRST.next().unwrap();
@@ -181,6 +184,7 @@ fn repair_authority_exposure_carries_the_queue_authority() {
             authority: control_class,
             route: h.route,
             max_pending: nz(1),
+            etf: None,
         })
         .unwrap();
     h.commit_to(repair, b"repair", 1);
@@ -597,6 +601,7 @@ fn invariant_checks_short_msg_len() {
             authority: Authority::FIRST,
             route,
             max_pending: nz(8),
+            etf: None,
         })
         .unwrap();
     for _ in 0..8 {
@@ -758,6 +763,7 @@ fn tx_failed_stops_the_half() {
                 authority: Authority::FIRST,
                 route,
                 max_pending: nz(8),
+                etf: None,
             })
             .unwrap();
         let mut frame = tx.claim_tx(queue, 1).unwrap();
@@ -842,6 +848,7 @@ fn spent_ops_count_single_sends() {
                 authority: Authority::FIRST,
                 route,
                 max_pending: nz(8),
+                etf: None,
             })
             .unwrap();
         let mut h = Harness {
@@ -954,6 +961,7 @@ fn budget_flush_longer_than_max_batch() {
             authority: Authority::FIRST,
             route,
             max_pending: nz(8),
+            etf: None,
         })
         .unwrap();
     let mut h = Harness {
@@ -1024,6 +1032,7 @@ fn guards_hold_under_an_injected_fault() {
             authority: Authority::FIRST,
             route: h.route,
             max_pending: nz(4),
+            etf: None,
         })
         .unwrap();
     h.commit_n(0, 2);
@@ -1243,6 +1252,7 @@ fn cancel_pending_returns_in_order_across_calls() {
         authority: Authority::FIRST,
         route: h.route,
         max_pending: nz(70),
+        etf: None,
     })
     .unwrap();
 }
@@ -1300,6 +1310,7 @@ fn path_mtu_scripted_routes() {
             authority: Authority::FIRST,
             route: measured,
             max_pending: nz(1),
+            etf: None,
         }),
         Err(QueueError::RouteUnknown)
     );
@@ -1381,6 +1392,7 @@ fn an_unpoppable_unknown_item_gets_one_terminal_report() {
             authority: Authority::FIRST,
             route,
             max_pending: nz(8),
+            etf: None,
         })
         .unwrap();
     let frames: Vec<_> = (0..8)
