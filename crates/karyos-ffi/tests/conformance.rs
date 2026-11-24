@@ -77,9 +77,46 @@ fn build_tool(bin: &str, features: &[&str]) -> PathBuf {
         command.args(["--features", &features.join(",")]);
     }
     let status = command.env("CARGO_TARGET_DIR", &target).status().unwrap();
+    // Copied while the lock is held: another test process on the same
+    // target directory, of this checkout or another, may rebuild the
+    // shared binary once the lock is released, and this process keeps
+    // running the binary it built.
+    let private = status.success().then(|| {
+        let built = target.join(profile.file_name().unwrap()).join(bin);
+        let private = private_tool_dir().join(bin);
+        std::fs::create_dir_all(private_tool_dir()).unwrap();
+        std::fs::copy(&built, &private).unwrap();
+        private
+    });
     lock.unlock().unwrap();
-    assert!(status.success(), "{bin} did not build");
-    target.join(profile.file_name().unwrap()).join(bin)
+    private.unwrap_or_else(|| panic!("{bin} did not build"))
+}
+
+/// This process's copies of the binaries [`build_tool`] built.
+#[cfg(target_os = "linux")]
+fn private_tool_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("karyos-conformance-tools-{}", std::process::id()))
+}
+
+/// karyos#1067 (#1242 review): `build_tool` returns this process's own
+/// executable copy, outside the shared target directory, so a later build
+/// there by another test process never changes what this one runs.
+#[cfg(target_os = "linux")]
+#[test]
+#[cfg_attr(miri, ignore = "runs cargo, which Miri's isolation forbids")]
+fn a_built_tool_is_run_from_a_private_copy() {
+    use std::os::unix::fs::PermissionsExt;
+    let path = build_tool("karyos-admission-stub", &["test-hooks"]);
+    assert_eq!(path, private_tool_dir().join("karyos-admission-stub"));
+    let exe = std::env::current_exe().unwrap();
+    let base = exe.parent().unwrap().parent().unwrap().parent().unwrap();
+    assert!(
+        !path.starts_with(base),
+        "{} is in the target directory",
+        path.display()
+    );
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    assert_ne!(mode & 0o111, 0, "the copy is not executable");
 }
 
 /// The format versions this runner reads.
@@ -2990,10 +3027,10 @@ mod archive_host {
             log: PathBuf,
         }
 
-        /// The karyosd binary: `KARYOS_KARYOSD`, else the one this
-        /// workspace built beside the test, else built now with cargo
-        /// (FORMAT.md's fallback) in the test's own profile, so that it
-        /// lands beside the test under `--release` too.
+        /// The karyosd binary: `KARYOS_KARYOSD`, else built with cargo
+        /// (FORMAT.md's fallback) in the test's own profile, once per
+        /// process, by [`build_tool`](super::super::build_tool), which
+        /// returns this process's private copy of it.
         fn binary() -> PathBuf {
             if let Ok(path) = std::env::var("KARYOS_KARYOSD") {
                 return PathBuf::from(path);
