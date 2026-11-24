@@ -178,7 +178,8 @@ fn capabilities_tell_unavailable_from_forbidden() {
             r#"{"name":"join-put","state":"forbidden","reason":"role"},"#,
             r#"{"name":"rate-change","state":"forbidden","reason":"role"},"#,
             r#"{"name":"guard-preview","state":"forbidden","reason":"role"},"#,
-            r#"{"name":"submit","state":"forbidden","reason":"role"}]}"#,
+            r#"{"name":"submit","state":"forbidden","reason":"role"},"#,
+            r#"{"name":"cluster-command","state":"unavailable","reason":"not_configured"}]}"#,
             "\n"
         )
     );
