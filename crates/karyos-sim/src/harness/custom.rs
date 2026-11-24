@@ -71,7 +71,7 @@
 //! [`InstallRefused::Stale`].
 //!
 //! **Not taken:** leadership transfer answers
-//! [`TransferRefused::Unsupported`]; C5 version 2's W5 retry changes the
+//! [`TransferRefused::Unsupported`](super::core::TransferRefused::Unsupported); C5 version 2's W5 retry changes the
 //! leader by a crash, which needs no handover.
 
 use std::cell::RefCell;
