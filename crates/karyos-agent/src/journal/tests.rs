@@ -99,6 +99,35 @@ fn a_journal_resumes_its_recording() {
     assert!(!journal.unavailable());
 }
 
+/// R-CORE-19 (karyos#726): a relayed acknowledgement records the
+/// authenticated requester and the relay as separate fields of the same
+/// `GapAcknowledged` record, naming the interval, and survives a restart.
+#[test]
+fn a_relayed_acknowledgement_records_the_requester_and_the_relay_apart() {
+    let dir = dir("relayed-ack");
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    let _ = journal
+        .append_durable(&request(Kind::CloseRequest, 15, 3), 15)
+        .unwrap();
+    drop(journal);
+    let mut journal = Journal::open(&dir, 100).unwrap();
+    let gap = journal.gap().unwrap();
+    journal
+        .acknowledge_gap_relayed(gap.position, 50_001, 7, 110)
+        .unwrap();
+    journal.stop(111).unwrap();
+    drop(journal);
+    let journal = Journal::open(&dir, 200).unwrap();
+    assert_eq!(journal.gap(), None);
+    let acks: Vec<_> = journal
+        .scanned
+        .iter()
+        .filter(|record| record.kind == Kind::GapAcknowledged)
+        .map(|record| (record.expected, record.operator, record.relay))
+        .collect();
+    assert_eq!(acks, [(gap.position, 50_001, 7)]);
+}
+
 /// A request with no outcome after it means an operation may have taken
 /// effect unrecorded: the next start records an unknown interval from the
 /// request's time, which stays open across restarts until an

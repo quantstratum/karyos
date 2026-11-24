@@ -1711,13 +1711,17 @@ mod tests {
         }
     }
 
+    /// The send buffer is set small first, so the socket fills within the
+    /// loop whatever the host's `net.core.wmem_default` (a host with a
+    /// 128 MiB default never filled at 40 MiB).
     #[test]
     fn a_full_non_blocking_socket_reports_would_block() {
         let (a, _b) = seqpacket_pair().unwrap();
         rustix::io::ioctl_fionbio(&a, true).unwrap();
-        let message = [0u8; 4096];
+        rustix::net::sockopt::set_socket_send_buffer_size(&a, 4096).unwrap();
+        let message = [0u8; 1024];
         let mut outcome = Sent::Sent;
-        for _ in 0..10_000 {
+        for _ in 0..1_000 {
             outcome = send(a.as_fd(), &message, None).unwrap();
             if outcome == Sent::WouldBlock {
                 break;

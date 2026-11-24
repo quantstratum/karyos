@@ -42,7 +42,15 @@
 //!   [REASON]` and `guard-reopen DIR GUARD EPOCH [REASON]`, made for the
 //!   peer's uid as the operator, the reason being the rest of the line
 //!   (M10b; a `DIR` holds no space); `gap-ack POSITION`, an
-//!   administrator's acknowledgement of the journal's unknown interval;
+//!   administrator's acknowledgement of the journal's unknown interval,
+//!   relayed or local, never any other role's. Relayed, it answers
+//!   `{"acknowledged":{"position","reason","from","to"},"events":"unknown"}`
+//!   and refuses a position that is no open interval with
+//!   `"refusal":"not_an_unknown_interval"` (karyos#726). The
+//!   acknowledgement records that the interval was seen, by whom and
+//!   through which relay, and nothing more: a front end shows it as
+//!   "unknown interval acknowledged by NAME; what happened in it remains
+//!   unknown", never as resolved, repaired or verified;
 //!   `limits [DIMENSION=VALUE ...]`, the negotiation of the bounds below
 //!   (R-CORE-38); `capabilities`, each capability of the closed v1 list
 //!   served, unavailable in this deployment or forbidden for the peer's
@@ -854,8 +862,17 @@ impl Server {
             }
             (Some((requester, role)), Request::GapAck { position }) => {
                 if role.may_acknowledge() {
+                    // A relayed request is answered with the interval and
+                    // that its events remain unknown, so a console cannot
+                    // show the acknowledgement as a repair (karyos#726);
+                    // the local answer is unchanged.
+                    let relayed = requester.relay != 0;
                     let answer = match agent.acknowledge_gap_for(position, requester) {
-                        Ok(()) => json::acknowledged(position),
+                        Ok(gap) if relayed => json::acknowledged_interval(&gap),
+                        Ok(_) => json::acknowledged(position),
+                        Err(crate::journal::JournalError::NoGap) if relayed => {
+                            json::not_an_unknown_interval(position)
+                        }
                         Err(crate::journal::JournalError::NoGap) => {
                             json::error("no such unknown interval", None)
                         }

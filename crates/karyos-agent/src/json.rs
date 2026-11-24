@@ -437,6 +437,41 @@ pub fn acknowledged(position: u64) -> String {
     text
 }
 
+/// A relayed `gap-ack`'s answer (karyos#726): the interval acknowledged,
+/// and that the events in it remain unknown. An acknowledgement records
+/// that an administrator saw the interval; it repairs, verifies and
+/// explains nothing, and the answer says so for a console to show:
+/// `{"acknowledged":{"position":P,"reason":R,"from":F,"to":T},
+/// "events":"unknown"}`.
+#[must_use]
+pub fn acknowledged_interval(gap: &crate::api::GapView) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.key("acknowledged").object(|interval| {
+            interval.number("position", gap.position);
+            interval.string("reason", gap.reason);
+            interval.number("from", gap.from);
+            interval.number("to", gap.to);
+        });
+        fields.string("events", "unknown");
+    });
+    text
+}
+
+/// A relayed `gap-ack`'s refusal of a position that is no open unknown
+/// interval (karyos#726): `{"error":"no such unknown interval",
+/// "refusal":"not_an_unknown_interval","position":P}`.
+#[must_use]
+pub fn not_an_unknown_interval(position: u64) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.string("error", "no such unknown interval");
+        fields.string("refusal", "not_an_unknown_interval");
+        fields.number("position", position);
+    });
+    text
+}
+
 /// `limits`' answer: each dimension's effective value and whether it is
 /// negotiable, or `{"value":null}` for one with no bound (R-CORE-38).
 #[must_use]

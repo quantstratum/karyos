@@ -755,9 +755,13 @@ impl Agent {
     /// the journal's errors.
     pub fn acknowledge_gap(&mut self, position: u64, uid: u32) -> Result<(), JournalError> {
         self.acknowledge_gap_for(position, Requester::local(uid))
+            .map(|_| ())
     }
 
-    /// As [`Agent::acknowledge_gap`], for `requester` (karyos#708).
+    /// As [`Agent::acknowledge_gap`], for `requester` (karyos#708): the
+    /// interval acknowledged, as the view showed it (karyos#726). The
+    /// acknowledgement says the interval was seen and nothing more: what
+    /// happened in it stays unknown.
     ///
     /// # Errors
     ///
@@ -766,15 +770,22 @@ impl Agent {
         &mut self,
         position: u64,
         requester: Requester,
-    ) -> Result<(), JournalError> {
+    ) -> Result<GapView, JournalError> {
         let uid = requester.operator;
         match self.journal.as_mut() {
-            Some(journal) => journal.acknowledge_gap_relayed(
-                position,
-                u64::from(uid),
-                requester.relay,
-                host_monotonic_ns(),
-            ),
+            Some(journal) => {
+                let gap = journal
+                    .gap()
+                    .filter(|gap| gap.position == position)
+                    .ok_or(JournalError::NoGap)?;
+                journal.acknowledge_gap_relayed(
+                    position,
+                    u64::from(uid),
+                    requester.relay,
+                    host_monotonic_ns(),
+                )?;
+                Ok(gap_view(gap))
+            }
             None => match self.unopened_gap.take_if(|gap| gap.position == position) {
                 // The one operator act nothing durable records: logged at
                 // info on standard error, as the agent logs (DESIGN's P3 on
@@ -788,7 +799,7 @@ impl Agent {
                         gap.from,
                         gap.to,
                     );
-                    Ok(())
+                    Ok(gap_view(gap))
                 }
                 None => Err(JournalError::NoGap),
             },
@@ -806,18 +817,7 @@ impl Agent {
             unavailable: journal.is_none_or(Journal::unavailable),
             error: self.journal_error.clone(),
             failed_appends: journal.map_or(0, Journal::failed_appends),
-            gap: gap.map(|gap| GapView {
-                position: gap.position,
-                from: gap.from,
-                to: gap.to,
-                reason: match gap.reason {
-                    GapReason::RequestWithoutOutcome => "request_without_outcome",
-                    GapReason::TornTail => "torn_tail",
-                    GapReason::JournalReplaced => "journal_replaced",
-                    GapReason::JournalUnavailableAtStart => "journal_unavailable_at_start",
-                    _ => "unclean_stop",
-                },
-            }),
+            gap: gap.map(gap_view),
             // An unknown interval stays an alert until it is acknowledged;
             // a journal that failed is one from its failure on, until the
             // restart that records it (DESIGN's P3 on #485).
@@ -1456,6 +1456,22 @@ fn acknowledger(requester: Requester) -> String {
     match requester.relay {
         0 => format!("uid {}", requester.operator),
         relay => format!("operator {} relay {relay}", requester.operator),
+    }
+}
+
+/// `gap` as the view and the answers show it.
+fn gap_view(gap: Gap) -> GapView {
+    GapView {
+        position: gap.position,
+        from: gap.from,
+        to: gap.to,
+        reason: match gap.reason {
+            GapReason::RequestWithoutOutcome => "request_without_outcome",
+            GapReason::TornTail => "torn_tail",
+            GapReason::JournalReplaced => "journal_replaced",
+            GapReason::JournalUnavailableAtStart => "journal_unavailable_at_start",
+            _ => "unclean_stop",
+        },
     }
 }
 
