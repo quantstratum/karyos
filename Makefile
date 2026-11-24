@@ -4,7 +4,7 @@ CARGO ?= cargo
 # Pinned nightly for Miri: rustc 1.101.0-nightly (6f5da406b 2026-10-10).
 MIRI_TOOLCHAIN ?= nightly-2026-10-11
 
-.PHONY: fmt fmt-check lint doc test netem loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri miri-sys-log-buffer miri-sys-rest miri-ffi build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit libkaryos-release-check abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check otlp-graph-check codec-derive-check sbe-graph-check raft-eval lint-sync changelog-check lint-linux pre-push
+.PHONY: fmt fmt-check lint doc test netem privileged loom loom-full sim sim-arch unsafe-report bench measure timing-build-check miri miri-sys-log-buffer miri-sys-rest miri-ffi build-release libkaryos libkaryos-static-check libkaryos-copies-check libkaryos-testkit libkaryos-release-check abi-manifest-check header-check header test-hooks-absent-check deny deps-inventory deps-check shipped-graph-check control-plane-graph-check otlp-graph-check codec-derive-check sbe-graph-check raft-eval lint-sync changelog-check lint-linux pre-push
 
 fmt:
 	$(CARGO) fmt --all
@@ -214,5 +214,10 @@ changelog-check:
 # profile.
 netem:
 	scripts/netem-test.sh
+
+# The sockets rows that need NET_ADMIN, SYS_ADMIN and seccomp profiles in
+# Linux Docker (karyos#179, decision O-7); not part of pre-push.
+privileged:
+	scripts/privileged-test.sh
 
 pre-push: fmt-check changelog-check lint-sync deps-check shipped-graph-check control-plane-graph-check otlp-graph-check tiering-graph-check header-check codec-derive-check sbe-graph-check abi-manifest-check lint lint-linux doc test raft-eval loom build-release test-hooks-absent-check timing-build-check

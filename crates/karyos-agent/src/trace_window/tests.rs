@@ -903,3 +903,120 @@ fn a_bucket_evicted_between_its_pages_is_expired() {
         Err(BucketRefusal::Expired { .. })
     ));
 }
+
+/// R-CORE-40, karyos#741: the clocks read lists each local journal's
+/// clock with the domain and epoch of its last record and the largest
+/// uncertainty of that epoch, which a new epoch starts over. With no
+/// calibration source each reads unavailable, `no_calibration`, never a
+/// number; a network journal has no clock of this host and is not listed.
+#[test]
+fn the_clocks_read_lists_epochs_and_uncertainties_and_no_calibration() {
+    let mut window = window(8);
+    window.journal(12, None, 0);
+    let mut wide = record(Point::Publish, 0, 1000);
+    wide.observed.uncertainty = 9;
+    window.observe(PUBLISHER, &wide, 1);
+    window.observe(PUBLISHER, &record(Point::Publish, 1, 1100), 1);
+    // The subscriber's clock moves to epoch 4: its uncertainty starts over.
+    window.observe(SUBSCRIBER, &wide, 1);
+    let mut next = record(Point::SubscriberPoll, 0, 50);
+    next.observed.epoch = 4;
+    window.observe(SUBSCRIBER, &next, 1);
+    let (clocks, calibrations) = window.clocks(&[]);
+    assert!(calibrations.is_empty());
+    let none = CalibrationState::Unavailable {
+        reason: CalibrationUnavailable::NoCalibration,
+    };
+    assert_eq!(
+        clocks,
+        [
+            ClockState {
+                journal: PUBLISHER,
+                provenance: "host_monotonic",
+                same_namespace: true,
+                domain: Some(1),
+                epoch: Some(3),
+                time: Some(1100),
+                uncertainty: Some(9),
+                calibration: none,
+            },
+            ClockState {
+                journal: SUBSCRIBER,
+                provenance: "host_monotonic",
+                same_namespace: true,
+                domain: Some(1),
+                epoch: Some(4),
+                time: Some(50),
+                uncertainty: Some(2),
+                calibration: none,
+            },
+        ]
+    );
+    // A journal with no record yet is listed with nothing observed.
+    window.journal(13, Some(HOST), 0);
+    let (clocks, _) = window.clocks(&[]);
+    let fresh = clocks.iter().find(|clock| clock.journal == 13).unwrap();
+    assert_eq!(
+        (fresh.epoch, fresh.uncertainty, fresh.calibration),
+        (None, None, none)
+    );
+    // A journal that left the table is forgotten, its clock with it.
+    window.age(1000);
+    assert!(window.clocks(&[]).0.is_empty());
+    assert!(window.observed.is_empty());
+}
+
+/// R-CORE-40: a calibration from a journal's clock is checked at that
+/// clock's last observed time: valid inside its range, expired past it,
+/// and shown with its range either way.
+#[test]
+fn a_calibration_is_checked_at_its_clocks_last_time() {
+    let mut window = window(8);
+    window.observe(PUBLISHER, &record(Point::Publish, 0, 1000), 1);
+    let clock = |journal| ClockKey {
+        observer: ObserverId {
+            driver: [1, 2],
+            journal,
+        },
+        domain: 1,
+        epoch: 3,
+    };
+    let calibration = |valid_to| Calibration {
+        from: clock(PUBLISHER),
+        to: clock(SUBSCRIBER),
+        reference: 900,
+        offset: 5,
+        offset_uncertainty: 1,
+        drift: 0,
+        drift_uncertainty: 0,
+        valid_from: 900,
+        valid_to,
+    };
+    let (clocks, views) = window.clocks(&[calibration(2000)]);
+    let publisher = clocks.iter().find(|c| c.journal == PUBLISHER).unwrap();
+    assert_eq!(publisher.calibration, CalibrationState::Valid { count: 1 });
+    assert_eq!(views[0].state, "valid");
+    assert_eq!(views[0].calibration.valid_to, 2000);
+    let (clocks, views) = window.clocks(&[calibration(999)]);
+    let publisher = clocks.iter().find(|c| c.journal == PUBLISHER).unwrap();
+    assert_eq!(
+        publisher.calibration,
+        CalibrationState::Unavailable {
+            reason: CalibrationUnavailable::Expired
+        }
+    );
+    assert_eq!(views[0].state, "expired");
+    // The subscriber has no record: its calibration has no time to hold at.
+    let mut reverse = calibration(2000);
+    reverse.from = clock(SUBSCRIBER);
+    reverse.to = clock(PUBLISHER);
+    let (clocks, views) = window.clocks(&[reverse]);
+    let subscriber = clocks.iter().find(|c| c.journal == SUBSCRIBER).unwrap();
+    assert_eq!(
+        subscriber.calibration,
+        CalibrationState::Unavailable {
+            reason: CalibrationUnavailable::NotObserved
+        }
+    );
+    assert_eq!(views[0].state, "not_observed");
+}

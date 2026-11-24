@@ -24,6 +24,10 @@ use crate::api::{
     GuardEntry, JournalView, Lane, LaneLatency, LossEntry, Sample, Subscriber, TraceCounts,
 };
 use crate::api::{BucketLane, BucketRead, BucketRefusal, TraceBucket};
+use crate::api::{
+    CalibrationState, CalibrationView, ClockState, ClocksRead, Limiter, PublicationRates,
+    RateLimitsRead,
+};
 use crate::api::{ExportJournal, ExportPage, ExportRefusal};
 use crate::api::{RecordingRetention, RetentionView};
 
@@ -1374,5 +1378,147 @@ fn join_version(out: &mut Out<'_>, version: &crate::registry::Version) {
                 fields.string(name, value);
             }
         });
+    });
+}
+
+/// A `clocks DIR` read (R-CORE-40, karyos#741): the driver's directory and
+/// instance, the read time, the clocks and the calibrations. A clock is
+/// `{"journal","provenance","same_namespace","domain","epoch","time",
+/// "uncertainty","calibration"}`, its calibration `{"state":"valid",
+/// "count":N}` or `{"state":"unavailable","reason":R}`, never a number a
+/// calibration does not justify. `calibrations_unavailable` says why the
+/// list is empty when the agent has no source of them (`"no_producer"`
+/// until karyos#118).
+#[must_use]
+pub fn clocks(read: &ClocksRead) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.string("dir", &read.dir.to_string_lossy());
+        fields.string("driver", &format!("{:032x}", read.driver));
+        fields.number("read_ns", read.read_ns);
+        fields
+            .key("clocks")
+            .array(&read.clocks, |out, clock| clock_json(out, clock));
+        fields
+            .key("calibrations")
+            .array(&read.calibrations, |out, view| calibration_json(out, view));
+        fields
+            .key("calibrations_unavailable")
+            .option(read.calibrations_unavailable, |out, reason| {
+                out.string(reason)
+            });
+    });
+    text
+}
+
+fn clock_json(out: &mut Out<'_>, clock: &ClockState) {
+    out.object(|fields| {
+        fields.number("journal", clock.journal);
+        fields.string("provenance", clock.provenance);
+        fields.key("same_namespace").bool(clock.same_namespace);
+        for (key, value) in [
+            ("domain", clock.domain),
+            ("epoch", clock.epoch),
+            ("time", clock.time),
+            ("uncertainty", clock.uncertainty),
+        ] {
+            fields
+                .key(key)
+                .option(value, |out, value| out.number(value));
+        }
+        fields
+            .key("calibration")
+            .object(|fields| match clock.calibration {
+                CalibrationState::Valid { count } => {
+                    fields.string("state", "valid");
+                    fields.number("count", count);
+                }
+                CalibrationState::Unavailable { reason } => {
+                    fields.string("state", "unavailable");
+                    fields.string("reason", reason.name());
+                }
+            });
+    });
+}
+
+fn clock_key(out: &mut Out<'_>, key: &karyos_trace::ClockKey) {
+    out.object(|fields| {
+        let [high, low] = key.observer.driver;
+        fields.string("driver", &format!("{high:016x}{low:016x}"));
+        fields.number("journal", key.observer.journal);
+        fields.number("domain", key.domain);
+        fields.number("epoch", key.epoch);
+    });
+}
+
+fn calibration_json(out: &mut Out<'_>, view: &CalibrationView) {
+    let calibration = &view.calibration;
+    out.object(|fields| {
+        clock_key(fields.key("from"), &calibration.from);
+        clock_key(fields.key("to"), &calibration.to);
+        fields.number("reference", calibration.reference);
+        fields.number("offset", calibration.offset);
+        fields.number("offset_uncertainty", calibration.offset_uncertainty);
+        fields.number("drift", calibration.drift);
+        fields.number("drift_uncertainty", calibration.drift_uncertainty);
+        fields.number("valid_from", calibration.valid_from);
+        fields.number("valid_to", calibration.valid_to);
+        fields.string("state", view.state);
+    });
+}
+
+/// A `rate-limits DIR` read (R-CORE-40, karyos#741): per network
+/// publication, by registration, its policy `version` (`null` when the
+/// driver publishes none) and its two limiters, `publication` and
+/// `control`, each `{"state":"limited","policy":{...},"refusals":N}`,
+/// `{"state":"none"}` (no such bucket, nothing counted) or
+/// `{"state":"not_counted"}` (the driver publishes no cell for it): a
+/// refusal count of 0 is only ever a bucket that refused nothing.
+#[must_use]
+pub fn rate_limits(read: &RateLimitsRead) -> String {
+    let mut text = String::new();
+    Out(&mut text).object(|fields| {
+        fields.string("dir", &read.dir.to_string_lossy());
+        fields
+            .key("read_ns")
+            .option(read.read_ns, |out, at| out.number(at));
+        fields
+            .key("publications")
+            .array(&read.publications, |out, rates| {
+                publication_rates(out, rates)
+            });
+    });
+    text
+}
+
+fn publication_rates(out: &mut Out<'_>, rates: &PublicationRates) {
+    out.object(|fields| {
+        fields.number("registration", rates.registration);
+        fields
+            .key("version")
+            .option(rates.version, |out, version| out.number(version));
+        limiter(fields.key("publication"), &rates.publication);
+        limiter(fields.key("control"), &rates.control);
+    });
+}
+
+fn limiter(out: &mut Out<'_>, limiter: &Limiter) {
+    let rate = |out: &mut Out<'_>, rate: karyos_sys::rate_limit::Rate| {
+        out.object(|fields| {
+            fields.number("per_second", rate.per_second);
+            fields.number("burst", rate.burst);
+        });
+    };
+    out.object(|fields| match *limiter {
+        Limiter::Unknown => fields.string("state", "not_counted"),
+        Limiter::None => fields.string("state", "none"),
+        Limiter::Limited { policy, refusals } => {
+            fields.string("state", "limited");
+            fields.key("policy").object(|fields| {
+                rate(fields.key("messages"), policy.messages);
+                fields.key("bytes").option(policy.bytes, rate);
+            });
+            fields.number("refusals", refusals);
+        }
     });
 }

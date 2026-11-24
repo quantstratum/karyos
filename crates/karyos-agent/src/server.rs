@@ -62,7 +62,8 @@
 //!   expired`, `principal mismatch`, `target mismatch`, `parameters
 //!   mismatch`, `target changed`, `operation id conflict` or `operation
 //!   expired` with nothing sent; a retry of a used id is answered with its
-//!   retained outcome, unsent. A `join-put` line may
+//!   retained outcome, unsent; `clocks DIR` and `rate-limits DIR`
+//!   (R-CORE-40, karyos#741), for every role, see below. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
@@ -74,6 +75,27 @@
 //!   connection closed. A reply without a final newline, followed by EOF,
 //!   is incomplete and is discarded; the reader retries with the same
 //!   cursor, as reading consumes nothing.
+//! - **Clocks and rate limits (R-CORE-40, karyos#741).** Two read
+//!   resources, new in v1 and changing no other answer. `clocks DIR`
+//!   answers [`json::clocks`]: the clocks of the driver's local trace
+//!   journals the agent follows, with their domains, calibration epochs
+//!   and uncertainties, and the calibrations the agent can see, each with
+//!   its validity range. A clock without a valid calibration reads
+//!   `{"state":"unavailable","reason":R}`, never a number, and no latency
+//!   is derived. No calibration producer exists until karyos#118: until
+//!   it lands, every clock reads `no_calibration` and `calibrations` is
+//!   empty with `"calibrations_unavailable":"no_producer"`, so a clocks
+//!   view legitimately shows no cross-host calibration. `rate-limits DIR`
+//!   answers [`json::rate_limits`]: per network publication, the rate
+//!   policy version in force and its two limiters (the publication's
+//!   bucket and the control reserve's), each limited with its policy and
+//!   refusals, `none` (no such bucket, nothing counted) or `not_counted`
+//!   (a driver without the cells): a 0 is only a bucket that refused
+//!   nothing. Both read what the agent already holds (its trace window and
+//!   its last sampling pass), never a mapping or the data path, at
+//!   O(journals) and O(counter cells) a request. An unknown `DIR` is
+//!   `{"error":"unknown driver"}`, one not attached yet `{"error":"driver
+//!   unavailable"}`.
 //! - **Limits (R-CORE-38).** `limits` answers every dimension of [`LIMITS`]
 //!   with one of three answers, never "unknown": `{"value":N,
 //!   "negotiable":true}`, a bound a client may propose within;
@@ -578,6 +600,10 @@ pub enum Served {
     TraceBuckets,
     /// Raw trace records, or the export's refusal (R-CORE-13).
     TraceExport,
+    /// A driver's clocks and calibrations (R-CORE-40, karyos#741).
+    Clocks,
+    /// A driver's rate limiters (R-CORE-40, karyos#741).
+    RateLimits,
     /// A join registry entry written: put or retired (karyos#736).
     Registered,
     /// A join registry read: an entry or a page.
@@ -904,6 +930,14 @@ impl Server {
                 Ok(Err(refusal)) => (json::export_refusal(&refusal), Served::Refused),
                 Err(answer) => (json::guard_answer(&answer), Served::Refused),
             },
+            (Some(_), Request::Clocks { dir }) => match agent.clocks(Path::new(dir)) {
+                Ok(read) => (json::clocks(&read), Served::Clocks),
+                Err(answer) => (json::guard_answer(&answer), Served::Refused),
+            },
+            (Some(_), Request::RateLimits { dir }) => match agent.rate_limits(Path::new(dir)) {
+                Ok(read) => (json::rate_limits(&read), Served::RateLimits),
+                Err(answer) => (json::guard_answer(&answer), Served::Refused),
+            },
             (
                 Some((requester, role)),
                 Request::JoinPut {
@@ -1122,6 +1156,14 @@ enum Request<'a> {
         from: u64,
         count: usize,
         epoch: Option<u128>,
+    },
+    /// `clocks DIR` (R-CORE-40, karyos#741).
+    Clocks {
+        dir: &'a str,
+    },
+    /// `rate-limits DIR` (R-CORE-40, karyos#741).
+    RateLimits {
+        dir: &'a str,
     },
     /// `rate-change DIR STREAM_ID SESSION_ID EXPECTED AUTHORITY MSG_RATE
     /// MSG_BURST BYTE_RATE BYTE_BURST [REASON]` (R-CORE-21, karyos#740).
@@ -1389,6 +1431,16 @@ fn request(rest: &str) -> Option<Request<'_>> {
             })
         }
         "rate-change" => rate_change(arguments).or(Some(Request::BadArguments("rate-change"))),
+        // One directory, which holds no space.
+        "clocks" | "rate-limits" if arguments.is_empty() || arguments.contains(' ') => {
+            Some(Request::BadArguments(if name == "clocks" {
+                "clocks"
+            } else {
+                "rate-limits"
+            }))
+        }
+        "clocks" => Some(Request::Clocks { dir: arguments }),
+        "rate-limits" => Some(Request::RateLimits { dir: arguments }),
         "guard-close-preview" | "guard-reopen-preview" => {
             let kind = if name == "guard-close-preview" {
                 crate::preview::PreviewKind::Close
@@ -1962,6 +2014,28 @@ mod tests {
             "read.timeout_ms=1  write.timeout_ms=1",
         ] {
             assert_eq!(negotiate(&LIMITS, bad), Err(Refusal::Bad), "{bad}");
+        }
+    }
+
+    /// R-CORE-40 (karyos#741): `clocks` and `rate-limits` take one
+    /// directory; anything else is the request's own typed error.
+    #[test]
+    fn clocks_and_rate_limits_requests_take_one_directory() {
+        assert_eq!(
+            parse("KARYOS-AGENT 1 clocks /run/a\n"),
+            Request::Clocks { dir: "/run/a" }
+        );
+        assert_eq!(
+            parse("KARYOS-AGENT 1 rate-limits /run/a\n"),
+            Request::RateLimits { dir: "/run/a" }
+        );
+        for (line, name) in [
+            ("KARYOS-AGENT 1 clocks\n", "clocks"),
+            ("KARYOS-AGENT 1 clocks /run/a 1\n", "clocks"),
+            ("KARYOS-AGENT 1 rate-limits\n", "rate-limits"),
+            ("KARYOS-AGENT 1 rate-limits  /run/a\n", "rate-limits"),
+        ] {
+            assert_eq!(parse(line), Request::BadArguments(name), "{line}");
         }
     }
 
