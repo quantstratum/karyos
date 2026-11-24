@@ -797,3 +797,40 @@ fn limits_report_the_drivers_configured_trace_bounds() {
     drop(server);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// karyos#738 review: a submit's token may be `-` (a retry needs none):
+/// the request reaches the agent, and a fresh id without a token is
+/// `token unknown`, not `bad arguments`; a malformed token still is.
+#[test]
+fn a_submit_without_a_token_reaches_the_agent() {
+    let _serial = serial();
+    let (_driver, mut agent, dir) = attached("tokenless");
+    let mut server = Server::bind(ApiConfig::new(
+        dir.join("api"),
+        vec![(own(), Role::Operator)],
+    ))
+    .unwrap();
+    let driver = dir.join("driver");
+    let (answer, served) = ask(
+        &mut server,
+        &mut agent,
+        &format!(
+            "KARYOS-AGENT 1 submit 5 - guard-close {} 1\n",
+            driver.display()
+        ),
+    );
+    assert_eq!(served, [Served::Refused]);
+    assert_eq!(answer, "{\"error\":\"token unknown\"}\n");
+    let (answer, _) = ask(
+        &mut server,
+        &mut agent,
+        &format!(
+            "KARYOS-AGENT 1 submit 5 nothex guard-close {} 1\n",
+            driver.display()
+        ),
+    );
+    assert_eq!(
+        answer,
+        "{\"error\":\"bad arguments\",\"request\":\"submit\"}\n"
+    );
+}
