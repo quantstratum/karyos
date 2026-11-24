@@ -33,6 +33,41 @@ fn reopen_and_close_alternate_parity() {
     assert!(admits(&word, 4));
 }
 
+/// karyos#738: a close at an expected epoch closes only a guard open at
+/// it; a closed guard, or one reopened at another epoch since, is refused
+/// with its current state, and nothing is stored.
+#[test]
+fn a_close_at_an_expected_epoch_refuses_a_guard_that_moved() {
+    let word = AtomicU64::new(created());
+    // Closed at 1: nothing to close at 2 yet.
+    assert_eq!(
+        close_at(&word, 2),
+        Err(GuardError::NotOpenAt {
+            expected: 2,
+            current: state(1, false)
+        })
+    );
+    assert_eq!(reopen(&word, 1), Ok(2));
+    assert_eq!(close_at(&word, 2), Ok(3));
+    assert_eq!(load(&word), Ok(state(3, false)));
+    // Closed since: refused, unchanged.
+    assert_eq!(
+        close_at(&word, 2),
+        Err(GuardError::NotOpenAt {
+            expected: 2,
+            current: state(3, false)
+        })
+    );
+    // Reopened at a later epoch: the earlier one is stale.
+    assert_eq!(reopen(&word, 3), Ok(4));
+    assert!(matches!(
+        close_at(&word, 2),
+        Err(GuardError::NotOpenAt { .. })
+    ));
+    assert_eq!(load(&word), Ok(state(4, true)));
+    assert_eq!(close_at(&word, 4), Ok(5));
+}
+
 #[test]
 fn a_stale_reopen_is_refused() {
     let word = AtomicU64::new(created());

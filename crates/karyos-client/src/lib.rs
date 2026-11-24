@@ -75,7 +75,7 @@ pub use karyos_protocol::cnc::{NetworkAdmission, StreamId, SubscriberRole};
 /// with `AttachError::IncompatibleVersion`, naming its own. Written out,
 /// not aliased, so a protocol change has to update the public value on
 /// purpose; it is asserted equal at compile time.
-pub const PROTOCOL_VERSION: u64 = 5;
+pub const PROTOCOL_VERSION: u64 = 6;
 const _: () = assert!(PROTOCOL_VERSION == karyos_protocol::admission::VERSION);
 pub use karyos_protocol::roles::{PublicationRoles, ReceiverIdentity, Strategy};
 /// The publication identity a replay and a live merge name (merge module).

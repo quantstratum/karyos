@@ -95,6 +95,17 @@ use crate::generations::MemberKind;
 use crate::ledger::{BindingRegion, Grant, GrantState, Ledger, Participant};
 use crate::trace_journals::Observed;
 
+/// A guard command's transition (karyos#738).
+#[derive(Debug, Clone, Copy)]
+enum GuardTransition {
+    /// `GuardClose`: close whatever the epoch.
+    Close,
+    /// `GuardCloseAt`: close only if open at this epoch.
+    CloseAt(u64),
+    /// `GuardReopen`: reopen only if closed at this epoch.
+    Reopen(u64),
+}
+
 /// A client's registration in the driver.
 /// A lost `hold` participant whose bound has not been withdrawn yet.
 #[derive(Debug)]
@@ -1527,7 +1538,21 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 request,
                 guard,
                 (operation, operator, parameters),
-                None,
+                GuardTransition::Close,
+            ),
+            Command::GuardCloseAt {
+                guard,
+                expected,
+                operation,
+                operator,
+                parameters,
+                ..
+            } => self.guard_command(
+                client,
+                request,
+                guard,
+                (operation, operator, parameters),
+                GuardTransition::CloseAt(expected),
             ),
             Command::GuardReopen {
                 guard,
@@ -1541,7 +1566,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 request,
                 guard,
                 (operation, operator, parameters),
-                Some(expected),
+                GuardTransition::Reopen(expected),
             ),
             // A rate policy change (R-CORE-21, karyos#740): local control,
             // on the same G1 trust as the guard commands.
@@ -1713,7 +1738,7 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
         request: RequestId,
         guard: u64,
         asked: (u64, u64, u64),
-        reopen: Option<u64>,
+        transition: GuardTransition,
     ) -> Response {
         let (operation, operator, parameters) = asked;
         let requester = match operator {
@@ -1729,12 +1754,17 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
                 driver: self.id,
                 guard,
             });
-        let done = match reopen {
-            None => self
+        let asked = (operation, requester, parameters);
+        let done = match transition {
+            GuardTransition::Close => self
                 .guards
-                .close(handle, operation, requester, parameters, now)
+                .close(handle, None, asked, now)
                 .map(|_| self.seal_guarded_reporting(handle)),
-            Some(expected) => self
+            GuardTransition::CloseAt(expected) => self
+                .guards
+                .close(handle, Some(expected), asked, now)
+                .map(|_| self.seal_guarded_reporting(handle)),
+            GuardTransition::Reopen(expected) => self
                 .guards
                 .reopen(handle, expected, operation, requester, parameters, now)
                 .map(|_| ()),
@@ -1752,10 +1782,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             Err(error) => {
                 let detail = match &error {
                     // The current guard word, as the protocol documents.
-                    DriverError::Guard(karyos_sys::guard::GuardError::NotClosedAt {
-                        current,
-                        ..
-                    }) => karyos_sys::guard::encode(*current).unwrap_or(0),
+                    DriverError::Guard(
+                        karyos_sys::guard::GuardError::NotClosedAt { current, .. }
+                        | karyos_sys::guard::GuardError::NotOpenAt { current, .. },
+                    ) => karyos_sys::guard::encode(*current).unwrap_or(0),
                     _ => guard,
                 };
                 Response::Error {
@@ -6386,6 +6416,83 @@ mod tests {
                     73,
                     by,
                     crate::guards::AuditOutcome::Refused(ErrorCode::UnknownGuard)
+                ),
+            ]
+        );
+    }
+
+    /// karyos#738: `GuardCloseAt` from an admitted client closes a guard
+    /// open at the expected epoch, and refuses one that moved since with
+    /// `GuardNotOpenAt` and the current word; both are audited.
+    #[test]
+    fn a_guard_close_at_an_epoch_refuses_a_guard_that_moved() {
+        let (mut driver, _stream) = driver_with_stream();
+        let guard = driver.add_guard("orders").unwrap();
+        let mut observer = driver.broadcast.receiver();
+        let (client, mut producer) = remote_client(&mut driver, 4);
+        let id = guard.id();
+        let close_at = |sequence, expected, operation| Command::GuardCloseAt {
+            sequence,
+            guard: id,
+            expected,
+            operation,
+            operator: karyos_protocol::cnc::NO_OPERATOR,
+            parameters: 0,
+        };
+        for command in [
+            Command::GuardReopen {
+                sequence: 1,
+                guard: id,
+                expected: 1,
+                operation: 80,
+                operator: karyos_protocol::cnc::NO_OPERATOR,
+                parameters: 0,
+            },
+            close_at(2, 2, 81),
+            close_at(3, 2, 82),
+        ] {
+            write(&mut producer, command);
+        }
+        let mut answers = Vec::new();
+        for _ in 0..4 {
+            let _ = driver.do_work().unwrap();
+            answers.extend(responses(&mut observer));
+        }
+        let request = |sequence| RequestId { client, sequence };
+        assert!(
+            answers.contains(&Response::GuardState {
+                request: request(2),
+                guard: id,
+                state: karyos_sys::guard::GuardState {
+                    epoch: 3,
+                    open: false,
+                },
+            }),
+            "{answers:?}"
+        );
+        // Closed at 3 since: the word of (3, closed) is 6.
+        assert!(
+            answers.contains(&Response::Error {
+                request: request(3),
+                code: ErrorCode::GuardNotOpenAt,
+                detail: 6,
+            }),
+            "{answers:?}"
+        );
+        let audit = driver.guard_audit();
+        let outcomes: Vec<_> = audit
+            .records
+            .iter()
+            .map(|record| (record.operation, record.outcome))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                (80, crate::guards::AuditOutcome::Reopened),
+                (81, crate::guards::AuditOutcome::Closed),
+                (
+                    82,
+                    crate::guards::AuditOutcome::Refused(ErrorCode::GuardNotOpenAt)
                 ),
             ]
         );

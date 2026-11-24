@@ -1,4 +1,4 @@
-abi_version=0.1.7
+abi_version=0.1.8
 struct karyos_client_options size=40 align=8
   size offset=0 size=4
   idle_strategy offset=4 size=4
@@ -149,7 +149,7 @@ struct karyos_subscription_end size=24 align=8
   seal_code offset=16 size=8
 const KARYOS_ABI_VERSION_MAJOR=0
 const KARYOS_ABI_VERSION_MINOR=1
-const KARYOS_ABI_VERSION_PATCH=7
+const KARYOS_ABI_VERSION_PATCH=8
 const KARYOS_NULL_HANDLE=0
 const KARYOS_MAX_CLIENTS=64
 const KARYOS_MAX_PUBLICATIONS=4096
@@ -205,7 +205,7 @@ const KARYOS_MERGE_LIVE_OVERRUN=8
 const KARYOS_MERGE_LIVE=9
 const KARYOS_MERGE_OTHER=255
 const KARYOS_MAX_DRIVERS=8
-const KARYOS_PROTOCOL_VERSION=5
+const KARYOS_PROTOCOL_VERSION=6
 const KARYOS_PUBLICATION_EXCLUSIVE=0
 const KARYOS_PUBLICATION_CONCURRENT=1
 const KARYOS_CLOCK_MONOTONIC=0

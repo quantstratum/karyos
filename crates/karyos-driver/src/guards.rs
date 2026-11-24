@@ -512,21 +512,28 @@ impl Guards {
         self.words.words().get(entry.index)
     }
 
-    /// Closes a guard and records the transition.
+    /// Closes a guard and records the transition; with `expected`, only
+    /// if it is open at that epoch (karyos#738), else refused with
+    /// `NotOpenAt` and audited as refused.
     pub(crate) fn close(
         &mut self,
         handle: GuardHandle,
-        operation: u64,
-        requester: Requester,
-        parameters: u64,
+        expected: Option<u64>,
+        asked: (u64, Requester, u64),
         time: u64,
     ) -> Result<Closed, DriverError> {
+        let (operation, requester, parameters) = asked;
         let checked = self.check(handle).map(|entry| {
             let before = self.raw(entry);
             let result = self
                 .cell(entry)
                 .ok_or(GuardError::Corrupt { word: before })
-                .and_then(guard::close);
+                .and_then(|cell| match expected {
+                    None => guard::close(cell),
+                    Some(expected) => {
+                        guard::close_at(cell, expected).map(|epoch| Closed::Now { epoch })
+                    }
+                });
             (before, self.raw(entry), result)
         });
         let (before, after, result) = match checked {
@@ -804,6 +811,7 @@ pub(crate) fn error_code(error: &DriverError) -> ErrorCode {
     match error {
         DriverError::Guard(GuardError::NotClosedAt { .. }) => ErrorCode::GuardNotClosedAt,
         DriverError::Guard(GuardError::Exhausted) => ErrorCode::GuardExhausted,
+        DriverError::Guard(GuardError::NotOpenAt { .. }) => ErrorCode::GuardNotOpenAt,
         DriverError::RateChange(RateChangeError::VersionMismatch { .. }) => {
             ErrorCode::RateVersionMismatch
         }
@@ -893,7 +901,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            guards.close(orders, 12, Requester::Client(4), 0, 102),
+            guards.close(orders, None, (12, Requester::Client(4), 0), 102),
             Ok(Closed::Now { epoch: 3 })
         );
         let foreign = GuardHandle {
@@ -901,7 +909,7 @@ mod tests {
             guard: 1,
         };
         assert_eq!(
-            guards.close(foreign, 13, Requester::InProcess, 0, 103),
+            guards.close(foreign, None, (13, Requester::InProcess, 0), 103),
             Err(DriverError::UnknownGuard)
         );
         let audit = guards.audit();
@@ -955,7 +963,7 @@ mod tests {
         );
         let guard = guards.add("g").unwrap();
         assert_eq!(
-            guards.close(guard, 1, Requester::InProcess, 0, 0),
+            guards.close(guard, None, (1, Requester::InProcess, 0), 0),
             Ok(Closed::Already { epoch: 1 })
         );
         assert_eq!(guards.audit().overwritten, 1);
