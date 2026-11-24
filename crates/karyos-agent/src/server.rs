@@ -54,7 +54,14 @@
 //!   BYTE_BURST [REASON]` (R-CORE-21, karyos#740; a byte rate and burst
 //!   of 0 and 0 for no byte limit), AUTHORITY `safety` for an operator, a
 //!   risk officer or an administrator and `administrator` for an
-//!   administrator only. A `join-put` line may
+//!   administrator only; `guard-close-preview DIR GUARD [REASON]` and
+//!   `guard-reopen-preview DIR GUARD [REASON]`, then `submit OPID TOKEN
+//!   guard-close|guard-reopen DIR GUARD [REASON]` (R-CORE-18, karyos#738;
+//!   see [`crate::preview`]), each for the roles that may make the
+//!   operation, the submit refused as `{"error":"token unknown"}`, `token
+//!   expired`, `principal mismatch`, `target mismatch`, `parameters
+//!   mismatch`, `target changed` or `operation id reused` with nothing
+//!   sent. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.

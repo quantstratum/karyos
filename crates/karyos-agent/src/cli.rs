@@ -55,7 +55,11 @@ join-get DIR KIND KEY [AT_NS] and join-list DIR [KIND KEY], KIND being
 stream, point or counter, or KARYOS-AGENT 1 rate-change DIR STREAM_ID
 SESSION_ID EXPECTED AUTHORITY MSG_RATE MSG_BURST BYTE_RATE BYTE_BURST
 [REASON], AUTHORITY safety (operator, risk-officer, administrator) or
-administrator (administrator), byte rate and burst 0 0 for no byte limit.
+administrator (administrator), byte rate and burst 0 0 for no byte limit,
+or KARYOS-AGENT 1 guard-close-preview DIR GUARD [REASON] and
+guard-reopen-preview DIR GUARD [REASON], then submit OPID TOKEN
+guard-close|guard-reopen DIR GUARD [REASON] with the preview's token and
+the caller's operation id (the roles of the operation).
 ";
 
 /// The default bound of a signal stop (karyos#710).
