@@ -1245,6 +1245,10 @@ fn a_replayed_group_reaches_no_network_output() {
         match replay.dispatch(&mut handler) {
             Ok(Dispatched::Event { .. }) => {
                 replayed += 1;
+                // More events than recorded is a replay that never ends
+                // (#1257 review): fail, rather than let the progress keep
+                // the watchdog quiet.
+                assert!(replayed <= MESSAGES, "replay passed its {MESSAGES} events");
                 stall.progress_if(true);
             }
             Ok(Dispatched::End) => break,

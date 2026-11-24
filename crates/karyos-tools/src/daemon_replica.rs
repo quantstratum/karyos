@@ -88,7 +88,7 @@ const MESSAGES_PER_DUTY: usize = 16;
 /// failed) may take longer: the replica then leaves, comes back after
 /// [`REJOIN_PAUSE`], and the source asks again once it settles; only time
 /// is lost.
-const LATE_JOIN_GRACE: Duration = crate::daemon_replication::RECONNECT_SETTLE
+pub(crate) const LATE_JOIN_GRACE: Duration = crate::daemon_replication::RECONNECT_SETTLE
     .saturating_add(crate::daemon_replication::BACKOFF_FIRST)
     .saturating_mul(2);
 
@@ -336,6 +336,11 @@ impl Replicas {
             let subscription = driver
                 .add_network_subscription(option.stream_id, &listen_channel(option.bind))
                 .map_err(ReplicaStartError::Subscribe)?;
+            // Each image of it is read from its join (ADR-0100), so a
+            // request's first messages are never missed (karyos#1067).
+            driver
+                .await_network_images(subscription, Role::Required)
+                .map_err(ReplicaStartError::Subscribe)?;
             // Every copy here arrived over a trusted network: no
             // authenticated profile is selected yet (decision 10).
             let replica = Replica::new(location, 0, Enforcement::Unsupported)
@@ -447,6 +452,9 @@ impl ReplicaListener {
                 .add_network_subscription(self.option.stream_id, &listen_channel(self.option.bind))
             {
                 Ok(subscription) => {
+                    // Read from each image's join again (ADR-0100); failing
+                    // that, the late-join leave is the fallback.
+                    let _ = driver.await_network_images(subscription, Role::Required);
                     self.subscription = subscription;
                     self.away_until = None;
                     tracing::info!(
@@ -544,16 +552,28 @@ impl ReplicaListener {
         if newest == current {
             return false;
         }
-        // The older image is retired: nothing it still delivers is read.
+        // The older image is retired: nothing it still delivers is read,
+        // and its late join, if any, no longer counts (#1257 review): the
+        // next image followed decides afresh.
         self.image = None;
         self.state.started = None;
+        self.state.late_since = None;
         let Some((session, handle)) = newest else {
             return true;
         };
         let Some(lane) = handle.lane(Lane::ZERO) else {
             return true;
         };
-        match driver.subscribe(lane, Role::Required) {
+        // From the image's join (ADR-0100): every message the image got,
+        // so the request's start is never missed. Without an awaiting cell
+        // (taken, or a required one past its deadline), at the head: the
+        // late-join leave then recovers a missed start (ADR-0102 decision
+        // 7).
+        let (subscribed, from_join) = match driver.subscribe_image_of(self.subscription, lane) {
+            Ok(reader) => (Ok(reader), true),
+            Err(_) => (driver.subscribe(lane, Role::Required), false),
+        };
+        match subscribed {
             Ok(reader) => {
                 counters.incarnations = counters.incarnations.saturating_add(1);
                 tracing::info!(
@@ -563,7 +583,8 @@ impl ReplicaListener {
                     "replica follows the source's newest incarnation"
                 );
                 self.newest = Some(handle.registration());
-                self.state.followed(reader.position(), now);
+                let join = if from_join { 0 } else { reader.position() };
+                self.state.followed(join, now);
                 self.image = Some((session, handle, reader));
             }
             Err(error) => {
@@ -1111,6 +1132,60 @@ mod tests {
             "a newer one came"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1257 review: the listener's own duty, not only the state's
+    /// decision. A replica that followed an incarnation past its start, with
+    /// no newer one, stays within the grace, then leaves at it (its network
+    /// subscription removed, a rejoin counted) and subscribes again once
+    /// [`REJOIN_PAUSE`] has passed, with the late join forgotten.
+    #[test]
+    fn a_late_join_without_a_newer_incarnation_leaves_at_the_grace_and_comes_back() {
+        use karyos_driver::embedded::DriverConfig;
+        use karyos_driver::net::NetworkConfig;
+        let root =
+            std::env::temp_dir().join(format!("karyosd-replica-duty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let options = crate::args::Options::new(root.join("driver"));
+        let mut driver = EmbeddedDriver::<SharedTerms>::with_ipc(
+            DriverConfig {
+                network: Some(NetworkConfig::default()),
+                ..DriverConfig::default()
+            },
+            crate::daemon::ipc_config(&options.admission),
+            Box::new(karyos_driver::SystemClock::new()),
+        )
+        .unwrap();
+        let option = ReplicaOption {
+            recording_id: RECORDING,
+            source: std::net::Ipv4Addr::LOCALHOST.into(),
+            bind: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            stream_id: 40,
+        };
+        let mut replicas =
+            Replicas::start(&mut driver, &root.join("archive"), [3; 32], &[option], true).unwrap();
+        let listener = &mut replicas.listeners[0];
+        let mut counters = ReplicaCounters::default();
+        let start = Instant::now();
+        listener.state.followed(20_096, start);
+        let _ = listener.duty(&mut driver, start + LATE_JOIN_GRACE / 2, &mut counters);
+        assert_eq!(listener.away_until, None, "left within the grace");
+        assert_eq!(counters.rejoins, 0);
+        let _ = listener.duty(&mut driver, start + LATE_JOIN_GRACE, &mut counters);
+        let until = listener.away_until.expect("did not leave at the grace");
+        assert_eq!(until, start + LATE_JOIN_GRACE + REJOIN_PAUSE);
+        assert_eq!(counters.rejoins, 1);
+        assert_eq!(listener.state.late_since, None);
+        // Still away until the pause ends, then back.
+        let _ = listener.duty(&mut driver, until - Duration::from_millis(1), &mut counters);
+        assert_eq!(listener.away_until, Some(until));
+        let _ = listener.duty(&mut driver, until, &mut counters);
+        assert_eq!(listener.away_until, None, "never subscribed again");
+        assert_eq!(counters.rejoins, 1);
+        drop(replicas);
+        drop(driver);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// karyos#1067: the restart case, deterministically. A restarted

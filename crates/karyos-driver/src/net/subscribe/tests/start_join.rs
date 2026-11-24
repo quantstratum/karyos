@@ -450,3 +450,83 @@ fn a_refused_remote_grant_leaves_the_cell_awaiting() {
     );
     assert_eq!(awaiting(&rig), 1, "the refused grant left the cell tracked");
 }
+
+/// karyos#1067: an in-process network subscription of the embedded API
+/// that awaits its images (ADR-0100 decisions 1 to 4) reads an image from
+/// its join, position 0, although the image received every message before
+/// the attach; a second attach finds no cell and gets the typed error that
+/// sends a caller to the head fallback (decision 6).
+#[test]
+fn an_embedded_awaiting_subscription_reads_from_the_join_what_came_before() {
+    let mut a = driver(ThreadingMode::Shared);
+    let mut b = EmbeddedDriver::with_config(DriverConfig {
+        network: Some(NetworkConfig {
+            threading: ThreadingMode::Shared,
+            ..NetworkConfig::default()
+        }),
+        ..DriverConfig::default()
+    })
+    .unwrap();
+    let address = SocketAddr::new(LOOPBACK, free_port());
+    let subscription = b.add_network_subscription(10, &channel(address)).unwrap();
+    b.await_network_images(subscription, Role::Required)
+        .unwrap();
+    let handle = a
+        .add_network_publication(aggregate(10, 3, 1), &channel(address))
+        .unwrap();
+    let mut publication = a.publication(handle.lane(Lane::ZERO).unwrap()).unwrap();
+    pump(&mut a, &mut b, |_, b| b.network_images(10).len() == 1);
+    // Every message reaches the image before anything attaches.
+    let payloads: [&[u8]; 3] = [b"first", b"second", b"third"];
+    let mut positions = Vec::new();
+    for payload in payloads {
+        let mut at = None;
+        pump(&mut a, &mut b, |_, _| {
+            if at.is_none()
+                && let Ok(OfferOutcome::Accepted { position, .. }) = publication.offer(payload)
+            {
+                at = Some(position);
+            }
+            at.is_some()
+        });
+        positions.push(at.unwrap());
+    }
+    for _ in 0..50 {
+        let _ = (a.do_work().unwrap(), b.do_work().unwrap());
+    }
+    assert_eq!(positions[0], 0, "the publication starts at 0");
+    let image = b.network_images(10)[0].0;
+    let lane = image.lane(Lane::ZERO).unwrap();
+    let mut reader = b.subscribe_image_of(subscription, lane).unwrap();
+    let mut read = Vec::new();
+    let start = std::time::Instant::now();
+    while read.len() < payloads.len() {
+        assert!(start.elapsed() < Duration::from_secs(30), "read {read:?}");
+        let _ = (a.do_work().unwrap(), b.do_work().unwrap());
+        let _ = reader.poll(
+            |bytes, info| read.push((info.position, bytes.to_vec())),
+            karyos_client::MessageLimit::new(8),
+        );
+    }
+    assert_eq!(
+        read,
+        positions
+            .iter()
+            .zip(payloads)
+            .map(|(position, payload)| (*position, payload.to_vec()))
+            .collect::<Vec<_>>(),
+        "every message, from the join"
+    );
+    assert!(matches!(
+        b.subscribe_image_of(subscription, lane),
+        Err(crate::error::DriverError::NoAwaitingCell)
+    ));
+    // A subscription that does not await its images has no cell either.
+    let other = b
+        .add_network_subscription(11, &channel(SocketAddr::new(LOOPBACK, free_port())))
+        .unwrap();
+    assert!(matches!(
+        b.subscribe_image_of(other, lane),
+        Err(crate::error::DriverError::NoAwaitingCell)
+    ));
+}
