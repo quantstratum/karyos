@@ -2075,15 +2075,17 @@ fn a_large_frame_is_read_alone_and_the_budget_still_checks_the_next_header() {
 // Snapshot install and compaction never purge through an Archive hold
 // (karyos#682; owner decisions 2026-10-21, item 35).
 
-/// Every state but none refuses both a purge and an install, typed and
-/// changing nothing; released, both go through.
+/// Every hold state but none refuses both a purge and an install, typed
+/// and changing nothing, before and after a reopen under the same hold;
+/// appends, syncs and the truncation of an uncommitted suffix go on; once
+/// released, both go through.
 #[test]
 fn an_archive_hold_refuses_a_purge_and_an_install_until_released() {
     use karyos_archive::control::HoldState;
     use karyos_cluster::snapshot::{Section, SectionKind, SnapshotConfig, SnapshotStore};
     let dir = TempDir::new("held");
     let snapshots_dir = TempDir::new("held-snapshots");
-    let mut log = purge_log(&dir.0, 40);
+    let mut log = purge_log(&dir.0, 30);
     let mut snapshots = SnapshotStore::open(
         StdDisk,
         &snapshots_dir.0,
@@ -2095,30 +2097,47 @@ fn an_archive_hold_refuses_a_purge_and_an_install_until_released() {
     let _ = snapshots
         .write(60, 2, &[Section::new(SectionKind::Service, 1, b"state")])
         .unwrap();
-    assert_eq!(log.archive_hold(), HoldState::None, "a log starts unheld");
+    let files = |dir: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = files(&dir.0);
     for state in [HoldState::Held, HoldState::Pending, HoldState::Unknown] {
-        log.set_archive_hold(state);
         assert!(
-            matches!(log.purge_prefix(30), Err(LogError::ArchiveHeld { state: got }) if got == state),
+            matches!(log.purge_prefix_under(20, &state), Err(LogError::ArchiveHeld { state: got }) if got == state),
             "{state:?}"
         );
         assert!(
-            matches!(log.install(60, 2, &snapshots), Err(LogError::ArchiveHeld { state: got }) if got == state),
+            matches!(log.install_under(60, 2, &snapshots, &state), Err(LogError::ArchiveHeld { state: got }) if got == state),
             "{state:?}"
         );
-        // Nothing changed, and the log is not poisoned: it still appends.
         assert_eq!((log.first_index(), log.last_index()), (1, Some(40)));
-        assert_eq!(log.entries(1..2, u64::MAX).unwrap().len(), 1);
+        assert_eq!(files(&dir.0), before, "{state:?}: a file changed");
     }
-    let _ = log.append(&[entry(41, 1, b"held, still written")]).unwrap();
+    // Not retention: an uncommitted suffix is truncated, and the log goes on.
+    log.truncate_suffix(36).unwrap();
+    let _ = log.append(&[entry(36, 2, b"held, still written")]).unwrap();
     let _ = log.sync().unwrap();
-    // Reopened, the entries the hold kept are all there.
     drop(log);
-    let mut log = open(StdDisk, &dir.0, small());
-    assert_eq!((log.first_index(), log.last_index()), (1, Some(41)));
+    // Reopened under the hold, with nothing half removed: it opens, and
+    // still refuses.
+    let mut log =
+        RaftLog::open_with_under::<StdDisk>(StdDisk, &dir.0, small(), None, &HoldState::Held)
+            .unwrap()
+            .log;
+    assert_eq!((log.first_index(), log.last_index()), (1, Some(36)));
+    assert!(matches!(
+        log.purge_prefix_under(20, &HoldState::Held),
+        Err(LogError::ArchiveHeld { .. })
+    ));
+    assert_eq!(log.entries(1..37, u64::MAX).unwrap().len(), 36);
     // Released: the purge and the install go through.
-    log.set_archive_hold(HoldState::None);
-    assert_eq!(log.purge_prefix(30).unwrap(), 30);
-    log.install(60, 2, &snapshots).unwrap();
+    assert_eq!(log.purge_prefix_under(20, &HoldState::None).unwrap(), 20);
+    log.install_under(60, 2, &snapshots, &HoldState::None)
+        .unwrap();
     assert_eq!(log.first_index(), 61);
 }

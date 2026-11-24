@@ -104,7 +104,7 @@ use karyos_archive::integrity::journal::{
     IntegrityError, IntegrityJournal, JOURNAL_FILE, read_records,
 };
 use karyos_archive::integrity::{SealKind, SealRecord, digest};
-use karyos_archive::segment::{Geometry, SegmentError, SegmentStore, SyncPolicy};
+use karyos_archive::segment::{DropReason, Geometry, SegmentError, SegmentStore, SyncPolicy};
 
 use crate::file::{self, Read};
 use crate::hard_state::{HARD_STATE_FILE, HARD_STATE_LEN, HardState, HardStateProblem};
@@ -117,6 +117,36 @@ pub use mapping::{EntryAnswer, EntrySlot, SlotAnswer};
 
 /// The A2 recording id of the log.
 pub const LOG_RECORDING: u64 = 1;
+
+/// Where the log reads the Archive's hold on its recording
+/// ([`LOG_RECORDING`]) from: A10's `Retention`, or a fixed state (a node
+/// with no Archive attached holds nothing: [`HoldState::None`]).
+///
+/// The log reads it right before each operation that removes committed
+/// bytes ([`RaftLog::purge_prefix_under`], [`RaftLog::install_under`]),
+/// never from a value cached across calls. Applying a hold and such an
+/// operation must not interleave: the node runs both on its one thread,
+/// as the harness does, so a hold applied before the read inhibits, and
+/// one applied after it finds the operation done.
+pub trait HoldSource {
+    /// The hold state on the log's recording; [`HoldState::Unknown`] when
+    /// it cannot be read.
+    fn hold_state(&self) -> HoldState;
+}
+
+impl HoldSource for HoldState {
+    fn hold_state(&self) -> HoldState {
+        *self
+    }
+}
+
+impl<J: karyos_archive::integrity::retention::OperationsJournal, E: Disk> HoldSource
+    for karyos_archive::integrity::retention::Retention<J, E>
+{
+    fn hold_state(&self) -> HoldState {
+        Self::hold_state(self, LOG_RECORDING)
+    }
+}
 /// The most bytes one seal of the committed log reads at a time, and the
 /// committed bytes a commit advance waits for before it seals: the
 /// journal holds one record per chunk of committed log, not one per
@@ -305,10 +335,14 @@ pub enum LogError {
     },
     /// A prefix purge or an install while the Archive holds the log's
     /// recording ([`LOG_RECORDING`]) under a legal hold, or cannot tell
-    /// whether it does: snapshot install and compaction never purge
-    /// through an Archive hold (owner decisions 2026-10-21, item 35;
-    /// SPEC §8.4). It fails closed, as A10 does: a pending hold and an
-    /// unknown hold state refuse as an applied hold does. Nothing changes.
+    /// whether it does, or an open that would finish one a crash cut short
+    /// (a purge's segments below A2's floor, an install's frames below its
+    /// first index): snapshot install and compaction never purge through
+    /// an Archive hold (owner decisions 2026-10-21, item 35; SPEC §8.4),
+    /// and a crash between the intent and the deletion does not complete
+    /// it once a hold applies (A10's inhibiting direction). It fails
+    /// closed, as A10 does: a pending hold and an unknown hold state refuse
+    /// as an applied hold does. Nothing changes, on disk or in the log.
     #[error("the Archive's hold on the log ({state:?}) forbids removing its entries")]
     ArchiveHeld {
         /// The Archive's hold state on the log's recording.
@@ -472,9 +506,6 @@ pub struct RaftLog<D: Disk + Clone> {
     snapshot_base: Option<u64>,
     hard_state: Option<HardState>,
     poisoned: bool,
-    /// The Archive's hold on the log's recording, as its owner last set
-    /// it ([`RaftLog::set_archive_hold`]).
-    archive_hold: HoldState,
     /// The watermark's file, its newest slot and the mark it holds.
     mark_file: D::File,
     mark_slot: usize,
@@ -682,7 +713,6 @@ impl<D: Disk + Clone> RaftLog<D> {
             snapshot_base: None,
             hard_state,
             poisoned: false,
-            archive_hold: HoldState::None,
             mark_file,
             mark_slot,
             mark,
@@ -727,10 +757,30 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// As [`RaftLog::open`], and [`LogError::InstallUnverified`] for an
     /// installed log without its snapshot.
     pub fn open_with<E: Disk + Clone>(
+        disk: D,
+        dir: &Path,
+        geometry: Geometry,
+        snapshots: Option<&SnapshotStore<E>>,
+    ) -> Result<Opened<D>, LogError> {
+        Self::open_with_under(disk, dir, geometry, snapshots, &HoldState::None)
+    }
+
+    /// [`RaftLog::open_with`] under the Archive's hold on the log: an open
+    /// that would finish removing committed bytes a crash left half
+    /// removed (segments below A2's published floor, an install's frames
+    /// below its first index) refuses while `hold` holds, or may, and
+    /// writes nothing; the bytes stay until the hold is released. An open
+    /// with nothing to remove is not held back.
+    ///
+    /// # Errors
+    ///
+    /// As [`RaftLog::open_with`], and [`LogError::ArchiveHeld`].
+    pub fn open_with_under<E: Disk + Clone>(
         mut disk: D,
         dir: &Path,
         geometry: Geometry,
         snapshots: Option<&SnapshotStore<E>>,
+        hold: &impl HoldSource,
     ) -> Result<Opened<D>, LogError> {
         let (first_index, base_term) =
             match file::read(&mut disk, dir, FIRST_INDEX_FILE, INSTALLED_LEN)? {
@@ -889,6 +939,16 @@ impl<D: Disk + Clone> RaftLog<D> {
                 durable: last,
             });
         }
+        // A purge's segments below A2's floor, or an install's frames
+        // below its first index, are committed bytes a crash left half
+        // removed: not removed through an Archive hold.
+        let purging = plan
+            .dropped
+            .iter()
+            .any(|dropped| dropped.reason == DropReason::Purged);
+        if purging || stale {
+            Self::check_not_held(hold)?;
+        }
         // Decided: apply A2's plan, then cut the torn tail.
         let recovered = SegmentStore::recover(
             disk.clone(),
@@ -923,7 +983,6 @@ impl<D: Disk + Clone> RaftLog<D> {
             snapshot_base: None,
             hard_state,
             poisoned: false,
-            archive_hold: HoldState::None,
             mark_file,
             mark_slot,
             mark,
@@ -1060,7 +1119,8 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// # Errors
     ///
     /// [`LogError::ArchiveHeld`] while the Archive holds the log, or may
-    /// ([`RaftLog::set_archive_hold`]): an install cuts every entry;
+    /// ([`RaftLog::install_under`]; [`RaftLog::install`] holds nothing): an
+    /// install cuts every entry;
     /// [`LogError::InstallUnverified`] unless the store's latest snapshot
     /// verifies at that base, and [`LogError::InstallStale`] for a base
     /// not past the stored commit, all changing nothing;
@@ -1072,8 +1132,24 @@ impl<D: Disk + Clone> RaftLog<D> {
         base_term: u64,
         snapshots: &SnapshotStore<E>,
     ) -> Result<(), LogError> {
+        self.install_under(base_index, base_term, snapshots, &HoldState::None)
+    }
+
+    /// [`RaftLog::install`] under the Archive's hold on the log, read from
+    /// `hold` right before anything is written.
+    ///
+    /// # Errors
+    ///
+    /// As [`RaftLog::install`].
+    pub fn install_under<E: Disk + Clone>(
+        &mut self,
+        base_index: u64,
+        base_term: u64,
+        snapshots: &SnapshotStore<E>,
+        hold: &impl HoldSource,
+    ) -> Result<(), LogError> {
         self.check_writable()?;
-        self.check_not_held()?;
+        Self::check_not_held(hold)?;
         verify_base(Some(snapshots), (base_index, base_term), Base::Exact)?;
         let commit = self.hard_state.and_then(|state| state.commit);
         if commit.is_some_and(|commit| base_index <= commit) {
@@ -1188,27 +1264,10 @@ impl<D: Disk + Clone> RaftLog<D> {
         Ok(())
     }
 
-    /// Sets the Archive's hold state on the log's recording
-    /// ([`LOG_RECORDING`]), as A10's `Retention::hold_state` reports it:
-    /// while it is anything but [`HoldState::None`], a prefix purge and an
-    /// install are refused with [`LogError::ArchiveHeld`]. Its owner sets
-    /// it from the Archive before compacting or installing; a log starts
-    /// with none. Appends, syncs and the truncation of an uncommitted
-    /// suffix are not retention and stay allowed.
-    pub const fn set_archive_hold(&mut self, state: HoldState) {
-        self.archive_hold = state;
-    }
-
-    /// The Archive's hold state on the log's recording, as last set.
-    #[must_use]
-    pub const fn archive_hold(&self) -> HoldState {
-        self.archive_hold
-    }
-
-    /// Refuses an operation that removes committed entries while the
-    /// Archive holds the log, or may: fail closed.
-    const fn check_not_held(&self) -> Result<(), LogError> {
-        match self.archive_hold {
+    /// Refuses an operation that removes committed bytes while the Archive
+    /// holds the log, or may: fail closed.
+    fn check_not_held(hold: &impl HoldSource) -> Result<(), LogError> {
+        match hold.hold_state() {
             HoldState::None => Ok(()),
             state => Err(LogError::ArchiveHeld { state }),
         }
@@ -1402,12 +1461,27 @@ impl<D: Disk + Clone> RaftLog<D> {
     /// # Errors
     ///
     /// [`LogError::ArchiveHeld`] while the Archive holds the log, or may
-    /// ([`RaftLog::set_archive_hold`]), and [`LogError::PurgeBeyondCommit`]
+    /// ([`RaftLog::purge_prefix_under`]; [`RaftLog::purge_prefix`] holds
+    /// nothing), and [`LogError::PurgeBeyondCommit`]
     /// for `below` past the stored commit plus one, both changing nothing; [`LogError::Poisoned`]; the store's
     /// and the disk's errors, which poison the log.
     pub fn purge_prefix(&mut self, below: u64) -> Result<u64, LogError> {
+        self.purge_prefix_under(below, &HoldState::None)
+    }
+
+    /// [`RaftLog::purge_prefix`] under the Archive's hold on the log, read
+    /// from `hold` right before anything is written.
+    ///
+    /// # Errors
+    ///
+    /// As [`RaftLog::purge_prefix`].
+    pub fn purge_prefix_under(
+        &mut self,
+        below: u64,
+        hold: &impl HoldSource,
+    ) -> Result<u64, LogError> {
         self.check_writable()?;
-        self.check_not_held()?;
+        Self::check_not_held(hold)?;
         let commit = self.hard_state.and_then(|state| state.commit);
         if commit
             .and_then(|commit| commit.checked_add(1))
