@@ -557,12 +557,17 @@ fn per_stream_network_counters_reach_the_cnc_in_every_mode() {
         ThreadingMode::Dedicated,
         ThreadingMode::SharedNetwork,
     ] {
-        // A short linger, so the removal ends soon.
+        // A short linger, so the removal ends soon. The default liveness,
+        // not the fast one: under load a 100 ms liveness retires B's image
+        // mid-exchange, which seals the reader's lane, so the exchange can
+        // never finish; every image B recreates then has no reader, stalls
+        // and retires again at the idle timeout. The removal needs no short
+        // timeout: B's image retires with the EOS.
         let quick = || {
             EmbeddedDriver::with_config(DriverConfig {
                 network: Some(NetworkConfig {
                     threading: mode,
-                    agents: fast_agents(),
+                    agents: AgentConfig::default(),
                     stream_defaults: crate::net::NetworkStreamDefaults {
                         publication_linger: 20 * MS,
                         ..crate::net::NetworkStreamDefaults::default()
@@ -616,6 +621,139 @@ fn per_stream_network_counters_reach_the_cnc_in_every_mode() {
             assert!(shutdown.late.is_empty(), "{mode:?}");
         }
     }
+}
+
+/// A sender that stalls past the receiver's image liveness mid-stream
+/// does not leave its publication stuck: the image retires and seals its
+/// reader's lane (`ImageRetired`), the receiver keeps that incarnation out
+/// for `alias_quarantine`, then recreates the image when the sender comes
+/// back, and a reader of the new image receives what the sender offers
+/// after it. The removal then ends with the EOS as usual. This is the
+/// cycle the counters test fell into under load with a 100 ms liveness,
+/// forced here by not running A's duty cycle. B keeps the default
+/// liveness; only the stall steps B's network clock past it (Codex review
+/// of #1245), so a loaded host cannot retire the image during the live
+/// exchanges.
+#[test]
+fn a_sender_stalled_past_liveness_rejoins_and_its_removal_ends() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::sessions::receive::SessionConfig;
+
+    /// Added to the host's time on B's network clock.
+    static AHEAD: AtomicU64 = AtomicU64::new(0);
+    fn b_clock() -> u64 {
+        karyos_sys::host_clock::host_monotonic_ns() + AHEAD.load(Ordering::Relaxed)
+    }
+
+    let with = |agents: AgentConfig| {
+        EmbeddedDriver::with_config(DriverConfig {
+            network: Some(NetworkConfig {
+                threading: ThreadingMode::Shared,
+                agents,
+                stream_defaults: crate::net::NetworkStreamDefaults {
+                    publication_linger: 20 * MS,
+                    ..crate::net::NetworkStreamDefaults::default()
+                },
+                ..NetworkConfig::default()
+            }),
+            ..DriverConfig::default()
+        })
+        .unwrap()
+    };
+    let mut a = with(AgentConfig::default());
+    let quiet = AgentConfig::default();
+    let liveness = quiet.image_liveness_timeout;
+    let mut b = with(AgentConfig {
+        sessions: SessionConfig {
+            alias_quarantine: 50 * MS,
+            ..SessionConfig::default()
+        },
+        ..quiet
+    });
+    b.net.as_mut().unwrap().set_clock(b_clock);
+    let (publication, image) = connected(&mut a, &mut b, true, 10);
+    let mut lane = a
+        .publication(publication.lane(Lane::ZERO).unwrap())
+        .unwrap();
+    let mut reader = b.subscribe_aggregate(&image, Role::Optional).unwrap();
+    exchange_on(&mut a, &mut b, &mut lane, &mut reader, 0..8);
+    // Three more are offered just as A stalls: A's duty cycle never runs,
+    // so they never reach this image.
+    for index in 8u32..11 {
+        let mut payload = [0u8; 1000];
+        payload[..4].copy_from_slice(&index.to_le_bytes());
+        assert!(matches!(
+            lane.offer(&payload).unwrap(),
+            OfferOutcome::Accepted { .. }
+        ));
+    }
+    // A stalls: only B runs, its clock stepped past the liveness, until
+    // the image retires and the reader's lane is sealed.
+    AHEAD.fetch_add(liveness + 1_000 * MS, Ordering::Relaxed);
+    let (mut end, mut late) = (None, 0u32);
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while end.is_none() && std::time::Instant::now() < deadline {
+        let _ = b.do_work().unwrap();
+        let poll = reader.poll(|_, _, _| late += 1, BUDGET);
+        end = poll.lanes.first().and_then(|lane| lane.end);
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    // The three are accounted for, never silently left out: the old reader
+    // got none of them, and its lane ends at the seal right after message
+    // 7 (eight 1000-byte messages of 1056 framed bytes each) with
+    // `ImageRetired`, which is not a clean end: what lies past the seal
+    // is unresolved (publication-seal.md, `SealReason` 7).
+    assert_eq!(late, 0);
+    assert!(
+        matches!(
+            end,
+            Some(LaneEnd::Closed {
+                position: 8_448,
+                reason: SealReason::ImageRetired,
+            })
+        ),
+        "{end:?}"
+    );
+    assert!(!end.unwrap().clean());
+    drop(reader);
+    // A comes back: once the quarantine has passed, B recreates the image.
+    let mut again = None;
+    pump(&mut [&mut a, &mut b], |drivers| {
+        again = drivers[1]
+            .network_image(10, 3)
+            .filter(|again| again.registration() != image.registration());
+        again.is_some()
+    });
+    let again = again.unwrap();
+    // The new image carries what A offers after it: not stuck without data.
+    // It joined at A's position, past the three, which no reader of B got:
+    // they are the loss the old lane's unclean seal reported.
+    let mut reader = b.subscribe_aggregate(&again, Role::Optional).unwrap();
+    exchange_on(&mut a, &mut b, &mut lane, &mut reader, 11..16);
+    // The removal ends with the EOS, which closes the new image: B counts
+    // an image closed by its EOS, not one retired by a timeout (Codex
+    // review of #1245).
+    let closed_eos = |driver: &EmbeddedDriver| {
+        driver
+            .net
+            .as_ref()
+            .and_then(|net| net.receiver_counters())
+            .map_or(0, |counters| counters.images_closed_eos)
+    };
+    let before = closed_eos(&b);
+    drop(lane);
+    drop(reader);
+    a.remove_aggregate(&publication).unwrap();
+    pump(&mut [&mut a, &mut b], |drivers| {
+        drivers[1].net.as_ref().unwrap().image_count() == 0
+            && closed_eos(drivers[1]) > before
+            && drivers[0]
+                .net
+                .as_ref()
+                .and_then(|net| net.sender_counters())
+                .is_some_and(|counters| counters.eos_sent >= 1)
+    });
 }
 
 /// M2b: the cells of a publication and an image still held at the close

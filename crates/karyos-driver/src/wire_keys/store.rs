@@ -5,7 +5,7 @@
 //! 2.3, 2.4 and 2.6).
 //!
 //! [`KeyStore`] reads the key directory and the state directory through
-//! [`Files`], which on Linux is [`karyos_sys::secure_dir::SecureDir`]: each
+//! [`Files`], which on Linux is `karyos_sys::secure_dir::SecureDir`: each
 //! opened once by descriptor and every file checked by `fstat` on its own
 //! descriptor. It fails closed on every path: a refused file is absent, a
 //! `revoked` list that does not validate disables every key, and a failed
