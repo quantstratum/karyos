@@ -1,0 +1,3 @@
+### Added
+
+- `scripts/privileged-test.sh` (`make privileged`) is an opt-in Linux gate for the sockets backend rows the standard container cannot run (karyos#179, decision O-7). It covers multicast between two interfaces, the path MTU of a 1280-byte link, an MTU shrink that faults the queue with `MessageTooLarge`, a real `EAGAIN` from a small `SO_SNDBUF` behind a slow qdisc, and the `sendmmsg` probes under seccomp profiles that answer `ENOSYS` (`Unsupported`) and `EPERM` (`Denied`). It runs Docker with `NET_ADMIN` and `SYS_ADMIN` plus the two seccomp profiles. `scripts/linux-test.sh` keeps its privilege model. The tests are ignored in the standard gate and fail outside the script.

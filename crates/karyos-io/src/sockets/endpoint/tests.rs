@@ -32,43 +32,14 @@ use crate::sockets::scripted::ScriptedSocket;
 /// size), the unverified path MTU, the unanswered port and multicast loop
 /// on the default interface within one host or namespace.
 ///
-/// The four Linux rows below cannot run in `scripts/linux-test.sh`
-/// without changing its privilege model, which is a coordinator decision
-/// (O-7): its `docker run` keeps Docker's default capabilities and seccomp
-/// profile, under which `unshare(CLONE_NEWUSER | CLONE_NEWNET)` fails with
-/// `EPERM` and `CAP_NET_ADMIN` is absent, and the `rust` image has no `ip`
-/// (iproute2).
+/// The four Linux rows the standard container cannot run (multicast
+/// between interfaces, the seccomp probes, the 1280 byte path MTU and the
+/// MTU shrink, a real `EAGAIN` from a small `SO_SNDBUF`) run in the opt-in
+/// privileged gate, `scripts/privileged-test.sh` (`make privileged`,
+/// karyos#179, decision O-7): `loopback::privileged`, ignored in the
+/// standard gate and failing outside the script. What stays deferred is
+/// the driver's.
 const DEFERRED_ROWS: &[(&str, &str)] = &[
-    (
-        "Multicast between interfaces or namespaces (two veth ends), and \
-         no cross group delivery across them",
-        "Linux namespace gate: a container with CAP_NET_ADMIN and \
-         CAP_SYS_ADMIN (or a seccomp profile allowing unprivileged user \
-         namespaces) and iproute2; decision O-7",
-    ),
-    (
-        "Probes (seccomp ENOSYS and EPERM for sendmmsg): Unsupported and \
-         Denied, fallback when optional, failure when required",
-        "Linux seccomp gate: a container run with \
-         --security-opt seccomp=<profile returning ENOSYS, then EPERM, for \
-         sendmmsg>; changes scripts/linux-test.sh, decision O-7",
-    ),
-    (
-        "Path MTU (1280 byte namespace link: PathTooSmall for 1408 bytes \
-         over IPv6; MTU shrink faults the queue with MessageTooLarge)",
-        "Linux namespace gate: CAP_NET_ADMIN to set a link MTU, in a \
-         network namespace with veth ends and iproute2; decision O-7",
-    ),
-    (
-        "Small SO_SNDBUF on loopback: a real EAGAIN under a burst (section 9 \
-         environment); the exact EAGAIN cases are the scripted \
-         tx::transient_errors",
-        "Linux namespace gate: not reproducible on loopback, which releases \
-         each datagram's send buffer charge at transmit (200,000 sends of \
-         1,400 bytes at the minimum SO_SNDBUF of 4,608 gave no EAGAIN in \
-         the rust:1.99 container); needs a rate limited egress, a veth \
-         with a tc qdisc, so CAP_NET_ADMIN; decision O-7",
-    ),
     (
         "Repair authority: partly covered here by \
          tx::repair_authority_exposure_carries_the_queue_authority (every \
@@ -95,7 +66,7 @@ const DEFERRED_ROWS: &[(&str, &str)] = &[
 /// The deferred rows are named, each with its batch.
 #[test]
 fn deferred_rows_name_their_batch() {
-    assert_eq!(DEFERRED_ROWS.len(), 6);
+    assert_eq!(DEFERRED_ROWS.len(), 2);
     assert!(
         DEFERRED_ROWS
             .iter()
