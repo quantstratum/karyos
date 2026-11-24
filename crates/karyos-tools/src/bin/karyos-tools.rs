@@ -20,6 +20,7 @@ karyos-tools: subcommands that read Karyos's files offline.
 Usage: karyos-tools replay diff ...   (see karyos-tools replay diff --help)
        karyos-tools probe --dir <dir>  (Linux; see karyos-tools probe --help)
        karyos-tools compat <FROM> <TO> (see karyos-tools compat --help)
+       karyos-tools calibrate phc ...  (Linux; see karyos-tools calibrate --help)
 
 `karyos-tools replay diff` is `karyos-replay diff` by another name.
 ";
@@ -45,6 +46,12 @@ fn main() -> ExitCode {
         )),
         #[cfg(target_os = "linux")]
         (Some(Some("probe")), _) => ExitCode::from(karyos_tools::probe::run(
+            sub.into_iter().chain(args),
+            &mut std::io::stdout(),
+            &mut std::io::stderr(),
+        )),
+        #[cfg(target_os = "linux")]
+        (Some(Some("calibrate")), _) => ExitCode::from(karyos_tools::calibrate::run(
             sub.into_iter().chain(args),
             &mut std::io::stdout(),
             &mut std::io::stderr(),
