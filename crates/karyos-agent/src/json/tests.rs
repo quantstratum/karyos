@@ -415,7 +415,9 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "join-put",
             "rate-change",
             "guard-preview",
-            "submit"
+            "submit",
+            "clocks",
+            "rate-limits"
         ]
     );
     let known = Capability {
@@ -823,4 +825,140 @@ fn an_export_page_states_the_refused_network_journals() {
     );
     page.network_journals_refused.attach = Some(1);
     assert!(trace_export(&page).contains(r#"{"attach":1,"before":2,"after":3}"#));
+}
+
+/// R-CORE-40 (karyos#741): a clocks read, each clock with its epoch and
+/// uncertainty and a calibration state that is never a number, and the
+/// calibrations with their ranges; an empty list says why.
+#[test]
+fn a_clocks_read_writes_states_never_numbers() {
+    use crate::api::{
+        CalibrationState, CalibrationUnavailable, CalibrationView, ClockState, ClocksRead,
+    };
+    use karyos_trace::{Calibration, ClockKey, ObserverId};
+
+    let clock = |journal| ClockKey {
+        observer: ObserverId {
+            driver: [1, 2],
+            journal,
+        },
+        domain: 1,
+        epoch: 3,
+    };
+    let state = |journal, calibration| ClockState {
+        journal,
+        provenance: "host_monotonic",
+        same_namespace: true,
+        domain: Some(1),
+        epoch: Some(3),
+        time: Some(1000),
+        uncertainty: Some(2),
+        calibration,
+    };
+    let read = ClocksRead {
+        dir: "/run/a".into(),
+        read_ns: 5,
+        driver: 0x1_0000_0000_0000_0002,
+        clocks: vec![
+            state(
+                10,
+                CalibrationState::Unavailable {
+                    reason: CalibrationUnavailable::NoCalibration,
+                },
+            ),
+            state(11, CalibrationState::Valid { count: 1 }),
+        ],
+        calibrations: vec![CalibrationView {
+            calibration: Calibration {
+                from: clock(11),
+                to: clock(10),
+                reference: 900,
+                offset: -5,
+                offset_uncertainty: 1,
+                drift: 2,
+                drift_uncertainty: 3,
+                valid_from: 900,
+                valid_to: 2000,
+            },
+            state: "valid",
+        }],
+        calibrations_unavailable: None,
+    };
+    let driver = "00000000000000010000000000000002";
+    assert_eq!(
+        clocks(&read),
+        [
+            r#"{"dir":"/run/a","driver":""#,
+            driver,
+            r#"","read_ns":5,"clocks":["#,
+            r#"{"journal":10,"provenance":"host_monotonic","same_namespace":true,"domain":1,"epoch":3,"time":1000,"uncertainty":2,"calibration":{"state":"unavailable","reason":"no_calibration"}},"#,
+            r#"{"journal":11,"provenance":"host_monotonic","same_namespace":true,"domain":1,"epoch":3,"time":1000,"uncertainty":2,"calibration":{"state":"valid","count":1}}],"#,
+            r#""calibrations":[{"from":{"driver":""#,
+            driver,
+            r#"","journal":11,"domain":1,"epoch":3},"to":{"driver":""#,
+            driver,
+            r#"","journal":10,"domain":1,"epoch":3},"reference":900,"offset":-5,"offset_uncertainty":1,"drift":2,"drift_uncertainty":3,"valid_from":900,"valid_to":2000,"state":"valid"}],"#,
+            r#""calibrations_unavailable":null}"#,
+        ]
+        .concat()
+    );
+    let empty = ClocksRead {
+        clocks: Vec::new(),
+        calibrations: Vec::new(),
+        calibrations_unavailable: Some("no_producer"),
+        ..read
+    };
+    assert!(
+        clocks(&empty).ends_with(
+            r#""clocks":[],"calibrations":[],"calibrations_unavailable":"no_producer"}"#
+        )
+    );
+}
+
+/// R-CORE-40 (karyos#741): a rate limits read: the version in force and
+/// each limiter limited with its policy and refusals, `none` or
+/// `not_counted`, so a 0 is only a bucket that refused nothing.
+#[test]
+fn a_rate_limits_read_tells_zero_refusals_from_not_counted() {
+    use crate::api::{Limiter, PublicationRates, RateLimitsRead};
+    use karyos_sys::rate_limit::{Rate, RatePolicy};
+
+    let read = RateLimitsRead {
+        dir: "/run/a".into(),
+        read_ns: Some(7),
+        publications: vec![
+            PublicationRates {
+                registration: 5,
+                publication: Limiter::Limited {
+                    policy: RatePolicy {
+                        messages: Rate {
+                            per_second: 100,
+                            burst: 10,
+                        },
+                        bytes: Some(Rate {
+                            per_second: 6400,
+                            burst: 640,
+                        }),
+                    },
+                    refusals: 0,
+                },
+                control: Limiter::None,
+                version: Some(3),
+            },
+            PublicationRates {
+                registration: 7,
+                publication: Limiter::Unknown,
+                control: Limiter::Unknown,
+                version: None,
+            },
+        ],
+    };
+    assert_eq!(
+        rate_limits(&read),
+        concat!(
+            r#"{"dir":"/run/a","read_ns":7,"publications":["#,
+            r#"{"registration":5,"version":3,"publication":{"state":"limited","policy":{"messages":{"per_second":100,"burst":10},"bytes":{"per_second":6400,"burst":640}},"refusals":0},"control":{"state":"none"}},"#,
+            r#"{"registration":7,"version":null,"publication":{"state":"not_counted"},"control":{"state":"not_counted"}}]}"#
+        )
+    );
 }

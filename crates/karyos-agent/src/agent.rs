@@ -330,6 +330,66 @@ impl Agent {
         Ok(window.buckets(from, count, epoch, crate::api::MAX_BUCKET_REPLY))
     }
 
+    /// The clocks of the driver in `dir` (R-CORE-40, karyos#741): its
+    /// local trace journals' clocks as the agent's trace window last saw
+    /// them, with their domains, epochs and uncertainties, and the
+    /// calibrations the agent can see. The agent reads no calibration
+    /// source until karyos#118 produces one, so every clock's calibration
+    /// is unavailable, `no_calibration`, and the list is empty with the
+    /// reason `no_producer`: a clocks view may legitimately show no
+    /// cross-host calibration until then. Read from the window the agent
+    /// holds, never from a mapping: O(journals), within `max_journals`.
+    ///
+    /// # Errors
+    ///
+    /// [`GuardAnswer::UnknownDriver`] for a directory not configured, and
+    /// [`GuardAnswer::Unattached`] before the agent has attached to it.
+    pub fn clocks(&self, dir: &Path) -> Result<crate::api::ClocksRead, GuardAnswer> {
+        /// The calibrations the agent can see: none until karyos#118.
+        const CALIBRATIONS: &[karyos_trace::Calibration] = &[];
+        let driver = self
+            .drivers
+            .iter()
+            .find(|driver| driver.dir == dir)
+            .ok_or(GuardAnswer::UnknownDriver)?;
+        let (Some(window), Some(instance)) = (driver.trace.as_ref(), driver.instance) else {
+            return Err(GuardAnswer::Unattached);
+        };
+        let (clocks, calibrations) = window.clocks(CALIBRATIONS);
+        Ok(crate::api::ClocksRead {
+            dir: driver.dir.clone(),
+            read_ns: host_monotonic_ns(),
+            driver: instance,
+            clocks,
+            calibrations,
+            calibrations_unavailable: Some("no_producer"),
+        })
+    }
+
+    /// The rate limiters of the driver in `dir` (R-CORE-40, karyos#741):
+    /// per network publication, the policy in force, its version and each
+    /// limiter's refusals, from the counter cells of the agent's last
+    /// sampling pass, never from a mapping: O(cells), within the counters
+    /// region.
+    ///
+    /// # Errors
+    ///
+    /// [`GuardAnswer::UnknownDriver`] for a directory not configured, and
+    /// [`GuardAnswer::Unattached`] before a pass of it was read.
+    pub fn rate_limits(&self, dir: &Path) -> Result<crate::api::RateLimitsRead, GuardAnswer> {
+        let driver = self
+            .drivers
+            .iter()
+            .find(|driver| driver.dir == dir)
+            .ok_or(GuardAnswer::UnknownDriver)?;
+        let sample = driver.sample.as_ref().ok_or(GuardAnswer::Unattached)?;
+        Ok(crate::api::RateLimitsRead {
+            dir: driver.dir.clone(),
+            read_ns: sample.counters.first().map(|counter| counter.read_ns),
+            publications: crate::resources::rate_limits(&sample.counters),
+        })
+    }
+
     /// Up to `count` raw trace records of the driver in `dir`, from mirror
     /// sequence `from` on, for a cursor of driver instance `epoch` when
     /// given (R-CORE-13). Read from the attached driver's mirror at the
@@ -1068,7 +1128,7 @@ impl Agent {
                     "catalog" => ((!catalog).then_some("not_configured"), true),
                     // Served to every role, always.
                     "view" | "trace-window" | "limits" | "trace-buckets" | "trace-export"
-                    | "join-registry" => (None, true),
+                    | "join-registry" | "clocks" | "rate-limits" => (None, true),
                     "join-put" => (None, register),
                     // The safety path is a closer's; an administrator's
                     // change needs the journal, which the answer reports.

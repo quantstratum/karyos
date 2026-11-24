@@ -62,8 +62,8 @@ use karyos_trace::{
 };
 
 use crate::api::{
-    BucketCursor, BucketLane, BucketRead, BucketRefusal, LaneLatency, Loss, QuantileBounds,
-    TraceBucket, TraceCounts,
+    BucketCursor, BucketLane, BucketRead, BucketRefusal, CalibrationState, CalibrationUnavailable,
+    CalibrationView, ClockState, LaneLatency, Loss, QuantileBounds, TraceBucket, TraceCounts,
 };
 
 /// Histogram significant digits, as the trace tool's.
@@ -173,6 +173,26 @@ fn shared_source(a: JournalClock, b: JournalClock) -> bool {
     }
 }
 
+/// A journal's clock as its records observed it (R-CORE-40): the domain
+/// and epoch of the last record, its time, and the largest uncertainty of
+/// the records of that domain and epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Observed {
+    domain: u64,
+    epoch: u64,
+    time: u64,
+    uncertainty: u64,
+}
+
+/// The API name of a journal clock's provenance.
+const fn provenance_name(provenance: ClockProvenance) -> &'static str {
+    match provenance {
+        ClockProvenance::StdMonotonic => "std_monotonic",
+        ClockProvenance::HostMonotonic => "host_monotonic",
+        ClockProvenance::Opaque => "opaque",
+    }
+}
+
 /// A message: its publication registration, incarnation, lane, position.
 type Key = (u64, u64, u8, u64);
 
@@ -221,6 +241,9 @@ pub(crate) struct TraceWindow {
     /// Each tracked journal: its clock (`None` for a network journal) and
     /// the agent's time of the last scan that saw it in the table.
     journals: BTreeMap<u64, (Option<JournalClock>, u64)>,
+    /// Each tracked local journal's clock as its last record observed it
+    /// (R-CORE-40): at most one per tracked journal, forgotten with it.
+    observed: BTreeMap<u64, Observed>,
     pending: BTreeMap<Key, Pending>,
     lanes: BTreeMap<(u64, u64, u8), Slices>,
     counts: TraceCounts,
@@ -248,6 +271,7 @@ impl TraceWindow {
             driver,
             cursor: 0,
             journals: BTreeMap::new(),
+            observed: BTreeMap::new(),
             pending: BTreeMap::new(),
             lanes: BTreeMap::new(),
             counts: TraceCounts::default(),
@@ -515,6 +539,7 @@ impl TraceWindow {
             Some((None, _)) => return count(&mut self.counts.network_ignored, 1),
             Some((Some(clock), _)) => *clock,
         };
+        self.note_clock(journal, record);
         let poll = match record.point {
             Point::Publish => false,
             Point::SubscriberPoll => true,
@@ -566,6 +591,94 @@ impl TraceWindow {
         }
     }
 
+    /// Notes the clock `record` of the local journal `journal` observed
+    /// (R-CORE-40): a new domain or epoch starts its uncertainty over.
+    fn note_clock(&mut self, journal: u64, record: &TraceRecord) {
+        let seen = record.observed;
+        let next = Observed {
+            domain: seen.clock,
+            epoch: seen.epoch,
+            time: seen.time,
+            uncertainty: seen.uncertainty,
+        };
+        let entry = self.observed.entry(journal).or_insert(next);
+        let uncertainty = if (entry.domain, entry.epoch) == (next.domain, next.epoch) {
+            entry.uncertainty.max(next.uncertainty)
+        } else {
+            next.uncertainty
+        };
+        *entry = Observed {
+            uncertainty,
+            ..next
+        };
+    }
+
+    /// The clocks of the local journals tracked, by journal number, and
+    /// `calibrations` as the agent shows them, each checked at its source
+    /// clock's last observed time (R-CORE-40). O(journals plus
+    /// calibrations), within `max_journals`.
+    pub(crate) fn clocks(
+        &self,
+        calibrations: &[Calibration],
+    ) -> (Vec<ClockState>, Vec<CalibrationView>) {
+        let key = |journal: u64, observed: &Observed| ClockKey {
+            observer: ObserverId {
+                driver: self.driver,
+                journal,
+            },
+            domain: observed.domain,
+            epoch: observed.epoch,
+        };
+        let clocks = self
+            .journals
+            .iter()
+            .filter_map(|(&journal, (clock, _))| {
+                let clock = (*clock)?;
+                let observed = self.observed.get(&journal);
+                let calibration = match observed {
+                    Some(observed) => crate::resources::calibration_state(
+                        key(journal, observed),
+                        Some(observed.time),
+                        calibrations,
+                    ),
+                    None => CalibrationState::Unavailable {
+                        reason: if calibrations.is_empty() {
+                            CalibrationUnavailable::NoCalibration
+                        } else {
+                            CalibrationUnavailable::NotObserved
+                        },
+                    },
+                };
+                Some(ClockState {
+                    journal,
+                    provenance: provenance_name(clock.provenance),
+                    same_namespace: clock.same_namespace,
+                    domain: observed.map(|observed| observed.domain),
+                    epoch: observed.map(|observed| observed.epoch),
+                    time: observed.map(|observed| observed.time),
+                    uncertainty: observed.map(|observed| observed.uncertainty),
+                    calibration,
+                })
+            })
+            .collect();
+        let views = calibrations
+            .iter()
+            .map(|calibration| {
+                // The source clock's last time, when it is one of this
+                // driver's journals in the calibration's domain and epoch.
+                let at = (calibration.from.observer.driver == self.driver)
+                    .then(|| self.observed.get(&calibration.from.observer.journal))
+                    .flatten()
+                    .filter(|observed| {
+                        key(calibration.from.observer.journal, observed) == calibration.from
+                    })
+                    .map(|observed| observed.time);
+                crate::resources::calibration_view(*calibration, at)
+            })
+            .collect();
+        (clocks, views)
+    }
+
     /// Records one pair's latency in `lane`'s slice of `now`.
     fn record(&mut self, lane: (u64, u64, u8), latency: Latency, now: u64) {
         if !self.lanes.contains_key(&lane) && self.lanes.len() >= self.config.max_lanes {
@@ -609,6 +722,9 @@ impl TraceWindow {
         let window = self.config.window;
         self.journals
             .retain(|_, (_, seen)| now.checked_sub(*seen).is_none_or(|age| age < window));
+        let journals = &self.journals;
+        self.observed
+            .retain(|journal, _| journals.contains_key(journal));
         let slice = now.checked_div(self.config.slice()).unwrap_or(0);
         let slices = self.config.slices.max(1);
         self.lanes.retain(|_, lane| {
