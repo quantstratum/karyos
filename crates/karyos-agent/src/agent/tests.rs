@@ -413,7 +413,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     // Another principal cannot submit it.
     assert_eq!(
         agent.guard_submit_for(
-            (4242, token),
+            (4242, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -425,7 +425,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     // The previewed close, under the caller's id.
     let answer = serving(&mut driver, || {
         agent.guard_submit_for(
-            (4242, token),
+            (4242, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -444,7 +444,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     // The token is used up, and the id too.
     assert_eq!(
         agent.guard_submit_for(
-            (4243, token),
+            (4243, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -453,17 +453,41 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
         ),
         Err(SubmitRefusal::TokenUnknown)
     );
+    // A retry of 4242, whatever its token: the retained outcome, unsent.
     let garbage = Token::parse(&"0".repeat(32)).unwrap();
+    let audited = driver.guard_audit().records.len();
+    let retried = agent.guard_submit_for(
+        (4242, Some(garbage)),
+        PreviewKind::Close,
+        &driver_dir,
+        guard.id(),
+        operator,
+        b"halt",
+    );
+    assert_eq!(retried, answer);
+    assert_eq!(driver.guard_audit().records.len(), audited);
+    // The same id for anything else: a conflict, unsent.
     assert_eq!(
         agent.guard_submit_for(
-            (4242, garbage),
+            (4242, Some(garbage)),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            Requester::local(1001),
+            b"halt",
+        ),
+        Err(SubmitRefusal::OperationConflict)
+    );
+    assert_eq!(
+        agent.guard_submit_for(
+            (4242, Some(garbage)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
             operator,
-            b"halt",
+            b"other",
         ),
-        Err(SubmitRefusal::OperationReused)
+        Err(SubmitRefusal::OperationConflict)
     );
     // A guard that moved after the preview: the driver refuses the close at
     // the previewed epoch, atomically, and audits the refusal.
@@ -479,7 +503,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     assert!(matches!(closed, GuardAnswer::State { state, .. } if state.epoch == 5));
     let moved = serving(&mut driver, || {
         agent.guard_submit_for(
-            (4244, token),
+            (4244, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -512,21 +536,21 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     };
     assert_eq!(
         agent.guard_submit_for(
-            (taken, garbage),
+            (taken, Some(garbage)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
             operator,
             b"halt",
         ),
-        Err(SubmitRefusal::OperationReused)
+        Err(SubmitRefusal::OperationConflict)
     );
     serving(&mut driver, || agent.refresh());
     let (_, _, token) = preview(&mut agent);
     let claimed = agent.next_operation;
     let submitted = serving(&mut driver, || {
         agent.guard_submit_for(
-            (claimed, token),
+            (claimed, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -553,7 +577,7 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     let _ = replacement.add_guard("orders").unwrap();
     let elsewhere = serving(&mut replacement, || {
         agent.guard_submit_for(
-            (777_777, token),
+            (777_777, Some(token)),
             PreviewKind::Close,
             &driver_dir,
             guard.id(),
@@ -563,6 +587,48 @@ fn a_previewed_close_is_submitted_under_the_callers_operation_id() {
     });
     assert_eq!(elsewhere, Ok(GuardAnswer::InstanceChanged));
     drop(replacement);
+    // A restart keeps the outcomes: rebuilt from the journal, a retry of
+    // 4242 still answers its outcome, and 4244's refusal too.
+    drop(agent);
+    let mut agent = Agent::new(
+        AgentConfig::new(vec![driver_dir.clone()])
+            .with_attach_timeout(Duration::from_secs(5))
+            .with_journal(dir.join("journal")),
+    );
+    // A retry needs no token (karyos#738 review).
+    let again = agent.guard_submit_for(
+        (4242, None),
+        PreviewKind::Close,
+        &driver_dir,
+        guard.id(),
+        operator,
+        b"halt",
+    );
+    assert_eq!(again, answer);
+    // The whole reply survives the restart, the refusal's detail too.
+    assert_eq!(
+        agent.guard_submit_for(
+            (4244, None),
+            PreviewKind::Close,
+            &driver_dir,
+            guard.id(),
+            operator,
+            b"halt",
+        ),
+        moved
+    );
+    // The same id on another driver is a conflict, not that outcome.
+    assert_eq!(
+        agent.guard_submit_for(
+            (4244, None),
+            PreviewKind::Close,
+            &dir.join("other"),
+            guard.id(),
+            operator,
+            b"halt",
+        ),
+        Err(SubmitRefusal::OperationConflict)
+    );
     drop(agent);
     let _ = std::fs::remove_dir_all(&dir);
 }

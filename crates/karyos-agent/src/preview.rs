@@ -28,8 +28,33 @@
 //!   sends it, whatever its outcome.
 //! - **The operation id.** A submit journals and audits its request and
 //!   outcome under `OPID`, as one operation: the preview itself leaves no
-//!   record. An id this agent already used in this run is refused
-//!   (`operation id reused`).
+//!   record. An id is used up by its first submit that is sent, whatever
+//!   came of it, and never takes a second operation:
+//!   - **A retry** (the same id, operation, guard, principal and reason,
+//!     with any token or none) is answered with the operation's retained
+//!     outcome, unsent: its state, its refusal, or `no answer` for an
+//!     unknown outcome, which is never retried as a new operation.
+//!   - **A conflict** (the same id with any of those different) is refused
+//!     `operation id conflict`, unsent.
+//!   - **Expiry.** An outcome is retained for [`RETAINED`] after it was
+//!     journalled; past that, the id is a tombstone: a retry is answered
+//!     `operation expired`, distinct from a fresh operation and from a
+//!     retained outcome, and is not sent either.
+//!   - **Restarts.** With a journal, each sent submit is journalled as a
+//!     `Submitted` record (its operation, driver directory, guard,
+//!     principal, reason, epoch, full outcome and this host's boot
+//!     identity), and the retained outcomes, tombstones and caller ids
+//!     are rebuilt at start from those records only, so a restart keeps
+//!     them: the agent's own ids of direct operations are not among them.
+//!     A record of another boot (Linux's `boot_id`), whose monotonic time
+//!     does not compare, is a tombstone. A submit that was not sent (no
+//!     attach) is not journalled as one, and its id stays free. A journal
+//!     that cannot be resumed (a new recording) starts with none, and
+//!     records the unknown interval it opens with.
+//!   - **Retries need no token.** `submit OPID - ...` names no token: it
+//!     reaches a used id's retained outcome, and a fresh id without a
+//!     token is `token unknown`.
+//!   - **Id 0** is no operation id: refused as `operation id conflict`.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -37,6 +62,10 @@ use std::time::{Duration, Instant};
 use karyos_sys::guard::GuardState;
 
 use crate::agent::Requester;
+
+/// How long a submitted operation's outcome is retained for a retry
+/// (karyos#738); past it the id is a tombstone.
+pub const RETAINED: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// How long a preview's token stays valid.
 pub const PREVIEW_TTL: Duration = Duration::from_secs(60);
@@ -188,8 +217,10 @@ pub enum SubmitRefusal {
     ParametersMismatch,
     /// The driver is a new instance since the preview.
     TargetChanged,
-    /// The operation id was already used in this run, or is 0.
-    OperationReused,
+    /// The operation id was used for another operation, or is 0.
+    OperationConflict,
+    /// The operation id's retained outcome expired: a tombstone.
+    OperationExpired,
 }
 
 impl SubmitRefusal {
@@ -203,7 +234,8 @@ impl SubmitRefusal {
             Self::TargetMismatch => "target mismatch",
             Self::ParametersMismatch => "parameters mismatch",
             Self::TargetChanged => "target changed",
-            Self::OperationReused => "operation id reused",
+            Self::OperationConflict => "operation id conflict",
+            Self::OperationExpired => "operation expired",
         }
     }
 }
@@ -318,6 +350,217 @@ pub(crate) fn last_state(audit: &[crate::api::GuardEntry], guard: u64) -> Option
         .rev()
         .filter(|entry| entry.guard == guard && entry.after != 0)
         .find_map(|entry| karyos_sys::guard::decode(entry.after).ok())
+}
+
+/// What an operation id was used for: the operation, its target and its
+/// principal, compared on a retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Used {
+    pub(crate) kind: PreviewKind,
+    /// The driver's directory, journalled with the id (karyos#738 review).
+    pub(crate) dir: Option<PathBuf>,
+    pub(crate) guard: u64,
+    pub(crate) requester: Requester,
+    pub(crate) reason: Vec<u8>,
+}
+
+impl Used {
+    /// Whether `bound` asks for the same operation.
+    fn same(&self, bound: &Bound) -> bool {
+        self.kind == bound.kind
+            && self.dir.as_ref() == Some(&bound.dir)
+            && self.guard == bound.guard
+            && self.requester == bound.requester
+            && self.reason == bound.reason
+    }
+}
+
+/// A used operation id's entry.
+#[derive(Debug, Clone)]
+struct Outcome {
+    used: Used,
+    answer: crate::operations::GuardAnswer,
+    /// When it was journalled, host monotonic nanoseconds; `None` for one
+    /// from before this host's boot, a tombstone.
+    at: Option<u64>,
+}
+
+/// The outcomes of the operation ids used (karyos#738).
+#[derive(Debug, Default)]
+pub(crate) struct Outcomes {
+    by_id: std::collections::HashMap<u64, Outcome>,
+}
+
+impl Outcomes {
+    /// The answer to a submit of `bound` under `operation` at host time
+    /// `now`, if the id was used: the retained outcome of a retry, or the
+    /// refusal of a conflict or an expired id. `None` for a fresh id.
+    pub(crate) fn answer(
+        &self,
+        operation: u64,
+        bound: &Bound,
+        now: u64,
+    ) -> Option<Result<crate::operations::GuardAnswer, SubmitRefusal>> {
+        if operation == 0 {
+            return Some(Err(SubmitRefusal::OperationConflict));
+        }
+        let outcome = self.by_id.get(&operation)?;
+        if !outcome.used.same(bound) {
+            return Some(Err(SubmitRefusal::OperationConflict));
+        }
+        let retained = u64::try_from(RETAINED.as_nanos()).unwrap_or(u64::MAX);
+        let live = outcome
+            .at
+            .is_some_and(|at| now.checked_sub(at).is_some_and(|age| age <= retained));
+        Some(if live {
+            Ok(outcome.answer)
+        } else {
+            Err(SubmitRefusal::OperationExpired)
+        })
+    }
+
+    /// Records `operation`'s use for `used`, answered `answer` at `at`.
+    pub(crate) fn record(
+        &mut self,
+        operation: u64,
+        used: Used,
+        answer: crate::operations::GuardAnswer,
+        at: u64,
+    ) {
+        let _ = self.by_id.insert(
+            operation,
+            Outcome {
+                used,
+                answer,
+                at: Some(at),
+            },
+        );
+    }
+
+    /// Rebuilds the outcomes from the journal's [`Kind::Submitted`]
+    /// records, oldest first, at host time `now` on boot `boot`: only
+    /// caller-chosen ids that were sent are there. A record of another
+    /// boot (or of an unknown one) is a tombstone, as is one older than
+    /// [`RETAINED`] when answered.
+    ///
+    /// [`Kind::Submitted`]: crate::journal::Kind::Submitted
+    pub(crate) fn rebuild(
+        records: &[crate::journal::JournalRecord],
+        (now, boot): (u64, &[u8]),
+    ) -> Self {
+        use crate::journal::{Kind, UNKNOWN_OUTCOME};
+        use crate::operations::GuardAnswer;
+        let mut outcomes = Self::default();
+        for record in records
+            .iter()
+            .filter(|record| record.kind == Kind::Submitted)
+        {
+            let kind = if record.parameters == 2 {
+                PreviewKind::Reopen
+            } else {
+                PreviewKind::Close
+            };
+            let operation = record.operation;
+            let answer = if record.code == UNKNOWN_OUTCOME {
+                GuardAnswer::NoAnswer { operation }
+            } else if record.code == 0 {
+                match karyos_sys::guard::decode(record.word) {
+                    Ok(state) => GuardAnswer::State {
+                        operation,
+                        guard: record.guard,
+                        state,
+                    },
+                    Err(_) => GuardAnswer::NoAnswer { operation },
+                }
+            } else {
+                GuardAnswer::Refused {
+                    operation,
+                    code: record.code,
+                    detail: record.word,
+                }
+            };
+            let used = Used {
+                kind,
+                dir: Some(PathBuf::from(
+                    <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&record.target),
+                )),
+                guard: record.guard,
+                requester: Requester::relayed(
+                    u32::try_from(record.operator).unwrap_or(u32::MAX),
+                    record.relay,
+                ),
+                reason: record.reason.clone(),
+            };
+            let same_boot = !boot.is_empty() && record.boot == boot;
+            let _ = outcomes.by_id.insert(
+                operation,
+                Outcome {
+                    used,
+                    answer,
+                    at: (same_boot && record.time <= now).then_some(record.time),
+                },
+            );
+        }
+        outcomes
+    }
+
+    /// The operation ids the outcomes hold: the caller ids used.
+    pub(crate) fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.by_id.keys().copied()
+    }
+}
+
+/// This host's boot identity (Linux's `boot_id`), or empty when it cannot
+/// be read: then no journalled outcome is taken for this boot's.
+pub(crate) fn boot_id() -> Vec<u8> {
+    std::fs::read("/proc/sys/kernel/random/boot_id")
+        .map(|mut id| {
+            while id.last().is_some_and(u8::is_ascii_whitespace) {
+                let _ = id.pop();
+            }
+            id
+        })
+        .unwrap_or_default()
+}
+
+/// The [`crate::journal::Kind::Submitted`] record of a caller's operation
+/// `operation` that was sent and answered `answer`, at `time` on `boot`.
+pub(crate) fn submitted_record(
+    operation: u64,
+    used: &Used,
+    (epoch, answer): (u64, crate::operations::GuardAnswer),
+    (time, boot): (u64, &[u8]),
+) -> crate::journal::JournalRecord {
+    use crate::journal::{JournalRecord, Kind, UNKNOWN_OUTCOME};
+    use crate::operations::GuardAnswer;
+    let mut record = JournalRecord::new(Kind::Submitted, time);
+    record.operation = operation;
+    record.guard = used.guard;
+    record.expected = epoch;
+    record.parameters = match used.kind {
+        PreviewKind::Close => 1,
+        PreviewKind::Reopen => 2,
+    };
+    record.operator = u64::from(used.requester.operator);
+    record.relay = used.requester.relay;
+    record.reason = used.reason.clone();
+    match answer {
+        GuardAnswer::State { state, .. } => {
+            record.word = karyos_sys::guard::encode(state).unwrap_or(0);
+        }
+        GuardAnswer::Refused { code, detail, .. } => {
+            record.code = code;
+            record.word = detail;
+        }
+        _ => record.code = UNKNOWN_OUTCOME,
+    }
+    record.target = used
+        .dir
+        .as_ref()
+        .map(|dir| std::os::unix::ffi::OsStrExt::as_bytes(dir.as_os_str()).to_vec())
+        .unwrap_or_default();
+    record.boot = boot.to_vec();
+    record
 }
 
 #[cfg(test)]

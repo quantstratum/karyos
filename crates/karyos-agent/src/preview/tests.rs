@@ -197,6 +197,130 @@ fn the_newest_transition_gives_the_state() {
     assert_eq!(last_state(&audit, 9), None);
 }
 
+/// karyos#738: a used id answers its retained outcome to a retry, refuses
+/// a conflict, and is a tombstone past `RETAINED` or from before the boot.
+#[test]
+fn a_used_id_is_retained_then_a_tombstone() {
+    use crate::operations::GuardAnswer;
+    let mut outcomes = Outcomes::default();
+    let close = bound(PreviewKind::Close, 1000, b"halt");
+    let answer = GuardAnswer::State {
+        operation: 5,
+        guard: 7,
+        state: GuardState {
+            epoch: 3,
+            open: false,
+        },
+    };
+    let used = Used {
+        kind: PreviewKind::Close,
+        dir: Some(close.dir.clone()),
+        guard: 7,
+        requester: close.requester,
+        reason: close.reason.clone(),
+    };
+    let at = 1_000;
+    assert_eq!(outcomes.answer(5, &close, at), None);
+    assert_eq!(
+        outcomes.answer(0, &close, at),
+        Some(Err(SubmitRefusal::OperationConflict))
+    );
+    outcomes.record(5, used, answer, at);
+    assert_eq!(outcomes.answer(5, &close, at + 1), Some(Ok(answer)));
+    assert_eq!(
+        outcomes.answer(5, &bound(PreviewKind::Reopen, 1000, b"halt"), at + 1),
+        Some(Err(SubmitRefusal::OperationConflict))
+    );
+    let retained = u64::try_from(RETAINED.as_nanos()).unwrap();
+    assert_eq!(outcomes.answer(5, &close, at + retained), Some(Ok(answer)));
+    assert_eq!(
+        outcomes.answer(5, &close, at + retained + 1),
+        Some(Err(SubmitRefusal::OperationExpired))
+    );
+}
+
+/// karyos#738 review: the outcomes are rebuilt from the journal's
+/// `Submitted` records only, each with its driver target, its whole reply
+/// and its boot. A record of another boot is a tombstone, another target
+/// a conflict, and a direct operation's records are no caller id at all.
+#[test]
+fn outcomes_are_rebuilt_from_submitted_records() {
+    use crate::journal::{JournalRecord, Kind, UNKNOWN_OUTCOME};
+    use crate::operations::GuardAnswer;
+    let close = bound(PreviewKind::Close, 1000, b"halt");
+    let used = Used {
+        kind: PreviewKind::Close,
+        dir: Some(close.dir.clone()),
+        guard: 7,
+        requester: close.requester,
+        reason: close.reason.clone(),
+    };
+    let boot = b"boot-a".as_slice();
+    let state = GuardAnswer::State {
+        operation: 1,
+        guard: 7,
+        state: GuardState {
+            epoch: 3,
+            open: false,
+        },
+    };
+    let refused = GuardAnswer::Refused {
+        operation: 4,
+        code: 29,
+        detail: 6,
+    };
+    let records = [
+        submitted_record(1, &used, (2, state), (10, boot)),
+        submitted_record(
+            3,
+            &used,
+            (2, GuardAnswer::NoAnswer { operation: 3 }),
+            (13, boot),
+        ),
+        submitted_record(4, &used, (2, refused), (16, boot)),
+        submitted_record(5, &used, (2, state), (17, b"boot-b".as_slice())),
+        // A direct close's records: no caller id.
+        JournalRecord::new(Kind::CloseOutcome, 18),
+    ];
+    // The records round-trip the journal's encoding.
+    for record in &records {
+        assert_eq!(
+            JournalRecord::decode(&record.encode()).as_ref(),
+            Some(record)
+        );
+    }
+    assert_eq!(records[1].code, UNKNOWN_OUTCOME);
+    let outcomes = Outcomes::rebuild(&records, (100, boot));
+    let mut ids: Vec<u64> = outcomes.ids().collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 3, 4, 5]);
+    assert_eq!(outcomes.answer(1, &close, 100), Some(Ok(state)));
+    assert_eq!(
+        outcomes.answer(3, &close, 100),
+        Some(Ok(GuardAnswer::NoAnswer { operation: 3 }))
+    );
+    // The whole refusal, its detail included.
+    assert_eq!(outcomes.answer(4, &close, 100), Some(Ok(refused)));
+    // Another boot's: a tombstone, whatever its monotonic time.
+    assert_eq!(
+        outcomes.answer(5, &close, 100),
+        Some(Err(SubmitRefusal::OperationExpired))
+    );
+    // The same id on another driver: a conflict.
+    let mut elsewhere = close.clone();
+    elsewhere.dir = PathBuf::from("/other");
+    assert_eq!(
+        outcomes.answer(1, &elsewhere, 100),
+        Some(Err(SubmitRefusal::OperationConflict))
+    );
+    // No boot identity: nothing is taken for this boot's.
+    let unknown = Outcomes::rebuild(&records, (100, b"".as_slice()));
+    assert_eq!(
+        unknown.answer(1, &close, 100),
+        Some(Err(SubmitRefusal::OperationExpired))
+    );
+}
+
 /// karyos#738 review: a guard closed at the last epoch can never reopen,
 /// so a reopen preview there gives no epoch after and no token.
 #[test]

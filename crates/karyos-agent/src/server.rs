@@ -60,8 +60,9 @@
 //!   see [`crate::preview`]), each for the roles that may make the
 //!   operation, the submit refused as `{"error":"token unknown"}`, `token
 //!   expired`, `principal mismatch`, `target mismatch`, `parameters
-//!   mismatch`, `target changed` or `operation id reused` with nothing
-//!   sent. A `join-put` line may
+//!   mismatch`, `target changed`, `operation id conflict` or `operation
+//!   expired` with nothing sent; a retry of a used id is answered with its
+//!   retained outcome, unsent. A `join-put` line may
 //!   be up to [`MAX_JOIN_REQUEST`] bytes; past it, it is refused above the
 //!   bound `join.request_bytes`. A request this agent knows with arguments it does
 //!   not take is `{"error":"bad arguments","request":NAME}`.
@@ -1093,7 +1094,7 @@ enum Request<'a> {
     /// (R-CORE-18, karyos#738).
     Submit {
         operation: u64,
-        token: crate::preview::Token,
+        token: Option<crate::preview::Token>,
         kind: crate::preview::PreviewKind,
         dir: &'a str,
         guard: u64,
@@ -1329,11 +1330,16 @@ const fn name_of(kind: crate::preview::PreviewKind, preview: bool) -> &'static s
     }
 }
 
-/// `OPID TOKEN guard-close|guard-reopen DIR GUARD [REASON]` (karyos#738).
+/// `OPID TOKEN guard-close|guard-reopen DIR GUARD [REASON]`, `TOKEN` `-`
+/// for none (karyos#738).
 fn submit(arguments: &str) -> Option<Request<'_>> {
     let mut fields = arguments.splitn(6, ' ');
     let operation = fields.next()?.parse::<u64>().ok()?;
-    let token = crate::preview::Token::parse(fields.next()?)?;
+    // `-` names no token: a retry of a used id needs none (karyos#738).
+    let token = match fields.next()? {
+        "-" => None,
+        hex => Some(crate::preview::Token::parse(hex)?),
+    };
     let kind = match fields.next()? {
         "guard-close" => crate::preview::PreviewKind::Close,
         "guard-reopen" => crate::preview::PreviewKind::Reopen,

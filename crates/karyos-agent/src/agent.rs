@@ -220,10 +220,15 @@ pub struct Agent {
     rates: Vec<crate::api::RateView>,
     /// The guard previews whose tokens a submit may name (karyos#738).
     previews: crate::preview::Previews,
-    /// Every operation id used in this run, the agent's own and the ones
-    /// callers chose (karyos#738): one accounting, so no two operations
-    /// share an id.
+    /// The outcomes of the operation ids used, retained for retries and
+    /// rebuilt from the journal at start (karyos#738).
+    outcomes: crate::preview::Outcomes,
+    /// Every operation id used, the agent's own and the ones callers chose,
+    /// rebuilt from the journal at start (karyos#738): one accounting, so
+    /// no two operations share an id.
     used_ids: std::collections::HashSet<u64>,
+    /// This host's boot identity, journalled with each submit (karyos#738).
+    boot: Vec<u8>,
 }
 
 impl Agent {
@@ -261,13 +266,22 @@ impl Agent {
             })
             .collect();
         let start = host_monotonic_ns();
-        let (journal, journal_error) = match config.journal.as_deref() {
+        let (mut journal, journal_error) = match config.journal.as_deref() {
             None => (None, None),
             Some(dir) => match Journal::open(dir, start) {
                 Ok(journal) => (Some(journal), None),
                 Err(error) => (None, Some(error.to_string())),
             },
         };
+        let operations = journal
+            .as_mut()
+            .map(Journal::take_operations)
+            .unwrap_or_default();
+        let boot = crate::preview::boot_id();
+        let outcomes = crate::preview::Outcomes::rebuild(&operations, (start, &boot));
+        // Only callers' ids: the agent's own direct ids are not journalled
+        // as submits, and its allocator starts past them (karyos#738).
+        let used_ids = outcomes.ids().collect();
         let unopened_gap = journal_error.as_ref().map(|_| Gap {
             position: UNOPENED_POSITION,
             reason: GapReason::JournalUnavailableAtStart,
@@ -287,7 +301,9 @@ impl Agent {
             retention: None,
             rates: Vec::new(),
             previews: crate::preview::Previews::default(),
-            used_ids: std::collections::HashSet::new(),
+            outcomes,
+            used_ids,
+            boot,
         }
     }
 
@@ -511,18 +527,14 @@ impl Agent {
     /// sent.
     pub fn guard_submit_for(
         &mut self,
-        (operation, token): (u64, crate::preview::Token),
+        (operation, token): (u64, Option<crate::preview::Token>),
         kind: crate::preview::PreviewKind,
         dir: &Path,
         guard: u64,
         requester: Requester,
         reason: &[u8],
     ) -> Result<GuardAnswer, crate::preview::SubmitRefusal> {
-        use crate::preview::{Bound, PreviewKind, SubmitRefusal};
-        // One accounting with the agent's own ids (karyos#738 review).
-        if operation == 0 || self.used_ids.contains(&operation) {
-            return Err(SubmitRefusal::OperationReused);
-        }
+        use crate::preview::{Bound, PreviewKind, SubmitRefusal, Used};
         let instance = self
             .drivers
             .iter()
@@ -535,22 +547,60 @@ impl Agent {
             requester,
             reason: operations::cut_reason(reason).to_vec(),
         };
+        // A used id: its retained outcome, or its refusal; never sent.
+        if let Some(answer) = self.outcomes.answer(operation, &bound, host_monotonic_ns()) {
+            return answer;
+        }
+        // An id the agent used for an operation of its own (karyos#738
+        // review): a conflict, never sent.
+        if self.used_ids.contains(&operation) {
+            return Err(SubmitRefusal::OperationConflict);
+        }
+        // A fresh id needs its preview's token; a retry above needs none.
+        let token = token.ok_or(SubmitRefusal::TokenUnknown)?;
         let epoch = self
             .previews
             .take(token, &bound, instance, std::time::Instant::now())?;
-        let _ = self.used_ids.insert(operation);
         let transition = match kind {
             PreviewKind::Close => operations::Transition::CloseAt(epoch),
             PreviewKind::Reopen => operations::Transition::Reopen(epoch),
         };
-        Ok(self.guard_command(
+        let answer = self.guard_command(
             dir,
             guard,
             transition,
             requester,
             reason,
             (Some(operation), instance),
-        ))
+        );
+        // Sent: the id is used up, whatever came of it.
+        if matches!(
+            answer,
+            GuardAnswer::State { .. } | GuardAnswer::Refused { .. } | GuardAnswer::NoAnswer { .. }
+        ) {
+            let _ = self.used_ids.insert(operation);
+            let used = Used {
+                kind,
+                dir: Some(bound.dir),
+                guard,
+                requester,
+                reason: bound.reason,
+            };
+            let now = host_monotonic_ns();
+            // Journalled as one submit, with the driver target, the full
+            // outcome and the boot: what a restart rebuilds (karyos#738).
+            if let Some(journal) = self.journal.as_mut() {
+                let record = crate::preview::submitted_record(
+                    operation,
+                    &used,
+                    (epoch, answer),
+                    (now, &self.boot),
+                );
+                let _ = journal.append(&record, now);
+            }
+            self.outcomes.record(operation, used, answer, now);
+        }
+        Ok(answer)
     }
 
     /// The next operation id of the agent's own, skipping any a caller
