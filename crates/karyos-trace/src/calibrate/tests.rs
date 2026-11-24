@@ -112,6 +112,44 @@ fn preempted_reads_are_dropped_by_their_windows() {
 }
 
 #[test]
+fn the_bound_holds_at_the_reference_whatever_the_rate_and_the_read_place() {
+    // A target at twice the source rate, every read at the right edge of
+    // its 100 ns window: the truth at the reference must still lie inside
+    // the converted interval (the bound is taken at the window's ends).
+    let (start, offset, drift) = (1_000_u64, 5_000_i128, 1_000_000_000);
+    let reads = reads(64, start, 1_000, offset, drift, |_| 100, |_, width| width);
+    let calibration = fit(&reads, &config(100, 0)).unwrap().calibration;
+    for at in [calibration.reference, start, reads.last().unwrap().after] {
+        let (low, high) = calibration.convert(i128::from(at), i128::from(at)).unwrap();
+        let real = truth(at, start, offset, drift);
+        assert!(low <= real && real <= high, "{at}: {low} {real} {high}");
+    }
+}
+
+#[test]
+fn a_step_of_a_clock_during_the_run_refuses_the_fit() {
+    let mut reads = reads(64, 1_000, 1_000, 0, 0, |_| 10, |_, _| 5);
+    for read in &mut reads[32..] {
+        read.target += 10_000;
+    }
+    assert!(matches!(
+        fit(&reads, &config(100, 0)),
+        Err(FitError::NotAffine { window: 10, .. })
+    ));
+}
+
+#[test]
+fn the_kept_reads_cover_the_whole_run() {
+    // Equal windows: a quarter kept, one per stretch of four, so the
+    // validity still spans the run.
+    let reads = reads(64, 1_000, 1_000, 0, 0, |_| 10, |_, _| 5);
+    let fitted = fit(&reads, &config(25, 0)).unwrap();
+    assert_eq!(fitted.kept, 16);
+    assert_eq!(fitted.calibration.valid_from, 1_000);
+    assert_eq!(fitted.calibration.valid_to, 1_000 + 60 * 1_000 + 10);
+}
+
+#[test]
 fn the_validity_ends_at_the_last_read_plus_the_extension() {
     let reads = reads(64, 1_000, 1_000, 0, 0, |_| 10, |_, _| 5);
     let fitted = fit(&reads, &config(100, 7)).unwrap();

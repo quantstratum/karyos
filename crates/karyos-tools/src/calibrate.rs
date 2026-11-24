@@ -27,6 +27,14 @@ use karyos_trace::calibrate::{PairedRead, fit};
 use karyos_trace::clocks::ClockKey;
 use karyos_trace::journal::ObserverId;
 
+/// The most reads one run takes: 16 MiB of reads, a few minutes at the
+/// default interval.
+pub const MAX_READS: usize = 1 << 20;
+
+/// The clock source file, read before and after the reads.
+#[cfg(target_os = "linux")]
+const CLOCK_SOURCE: &str = "/sys/devices/system/clocksource/clocksource0/current_clocksource";
+
 /// A usage error or a failed run.
 pub const EXIT_ERROR: u8 = 3;
 
@@ -111,7 +119,10 @@ pub fn parse(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Option<Se
         match arg.as_str() {
             "--device" => settings.device = value.clone().into(),
             "--reads" => {
-                settings.reads = usize::try_from(number()?).map_err(|_| "--reads is too large")?;
+                settings.reads = usize::try_from(number()?)
+                    .ok()
+                    .filter(|reads| *reads <= MAX_READS)
+                    .ok_or_else(|| format!("--reads takes at most {MAX_READS}"))?;
             }
             "--keep" => {
                 settings.keep = u8::try_from(number()?)
@@ -232,6 +243,16 @@ pub fn run(
             return EXIT_ERROR;
         }
     };
+    // The raw clock stands for the TSC only on a tsc clock source, for the
+    // whole run: checked before and after the reads.
+    let source = read_line(std::path::Path::new(CLOCK_SOURCE));
+    if source != "tsc" {
+        let _ = writeln!(
+            err,
+            "karyos-tools calibrate: the clock source is {source}, not tsc: CLOCK_MONOTONIC_RAW does not stand for the TSC, no record"
+        );
+        return EXIT_ERROR;
+    }
     let reads = match collect(file.as_fd(), &settings) {
         Ok(reads) => reads,
         Err(error) => {
@@ -266,12 +287,19 @@ pub fn run(
         },
     );
     let host = read_line(std::path::Path::new("/proc/sys/kernel/hostname"));
-    let source = read_line(std::path::Path::new(
-        "/sys/devices/system/clocksource/clocksource0/current_clocksource",
-    ));
+    let after = read_line(std::path::Path::new(CLOCK_SOURCE));
+    if after != source {
+        let _ = writeln!(
+            err,
+            "karyos-tools calibrate: the clock source changed from {source} to {after} during the reads, no record"
+        );
+        return EXIT_ERROR;
+    }
     let calibration = fitted.calibration;
     let lines = [
-        format!("host {host}, clock source {source}"),
+        format!(
+            "host {host}, clock source {source}; source clock CLOCK_MONOTONIC_RAW in ns (the TSC at the kernel's fixed scale): a consumer converts times of that clock"
+        ),
         format!(
             "phc {} ({}), clock name {}, interfaces {interfaces}",
             settings.device.display(),
@@ -306,26 +334,30 @@ pub fn run(
             calibration.valid_from, calibration.valid_to
         ),
     ];
-    for line in lines {
-        let _ = writeln!(out, "{line}");
-    }
-    if source != "tsc" {
-        let _ = writeln!(
-            out,
-            "note: the clock source is {source}, not tsc: the source clock is CLOCK_MONOTONIC_RAW, not the TSC"
-        );
-    }
-    match calibration.encode() {
-        Ok(words) => {
-            let words: Vec<String> = words.iter().map(|word| format!("{word:#018x}")).collect();
-            let _ = writeln!(out, "record {}", words.join(" "));
-            0
-        }
+    let record = match calibration.encode() {
+        Ok(words) => words
+            .iter()
+            .map(|word| format!("{word:#018x}"))
+            .collect::<Vec<_>>()
+            .join(" "),
         Err(error) => {
             let _ = writeln!(err, "karyos-tools calibrate: {error}");
-            EXIT_ERROR
+            return EXIT_ERROR;
         }
+    };
+    let written = lines
+        .iter()
+        .try_for_each(|line| writeln!(out, "{line}"))
+        .and_then(|()| writeln!(out, "record {record}"))
+        .and_then(|()| out.flush());
+    if let Err(error) = written {
+        let _ = writeln!(
+            err,
+            "karyos-tools calibrate: cannot write the result: {error}"
+        );
+        return EXIT_ERROR;
     }
+    0
 }
 
 #[cfg(test)]
@@ -386,6 +418,13 @@ mod tests {
                 .unwrap_err()
                 .contains("--reads")
         );
+        assert!(
+            parse(args(&["--reads", "18446744073709551615"]))
+                .unwrap_err()
+                .contains("at most")
+        );
+        let past = (super::MAX_READS + 1).to_string();
+        assert!(parse(args(&["--reads", &past])).is_err());
         assert!(parse(args(&["--source-domain", "1"])).is_err());
         assert!(
             parse(args(&["--bogus", "1"]))
