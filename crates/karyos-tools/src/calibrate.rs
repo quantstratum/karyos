@@ -18,9 +18,12 @@
 //! daemon between hosts and a grandmaster, which is an owner decision
 //! (karyos#749); this tool does neither.
 
+#[cfg(target_os = "linux")]
 use std::io::Write;
 
-use karyos_trace::calibrate::{FitConfig, PairedRead, fit};
+use karyos_trace::calibrate::FitConfig;
+#[cfg(target_os = "linux")]
+use karyos_trace::calibrate::{PairedRead, fit};
 use karyos_trace::clocks::ClockKey;
 use karyos_trace::journal::ObserverId;
 
@@ -150,6 +153,7 @@ pub fn fit_config(settings: &Settings) -> FitConfig {
 }
 
 /// A one-line file's text, trimmed, or `unknown`.
+#[cfg(target_os = "linux")]
 fn read_line(path: &std::path::Path) -> String {
     std::fs::read_to_string(path)
         .map_or_else(|_| "unknown".to_owned(), |text| text.trim().to_owned())
