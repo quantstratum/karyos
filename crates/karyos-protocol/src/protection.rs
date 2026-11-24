@@ -19,6 +19,7 @@
 //!   time on each side. It checks the measurement harness end to end and
 //!   is never a profile: its results never reach a decision report.
 
+pub mod hmac_key;
 pub mod hmac_sha256;
 pub mod replay;
 pub mod signed;
