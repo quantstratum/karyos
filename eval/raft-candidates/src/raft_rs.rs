@@ -121,6 +121,33 @@ pub fn append_shape(message: &eraftpb::Message) -> Option<(usize, u64)> {
     })
 }
 
+/// An append's entries as (index, payload bytes), for an oracle that
+/// reads the trace rather than the adapter (C5 version 2's W2 byte case;
+/// karyos#691); `None` for any other message.
+#[must_use]
+pub fn append_entries(message: &eraftpb::Message) -> Option<Vec<(u64, u64)>> {
+    (message.get_msg_type() == eraftpb::MessageType::MsgAppend).then(|| {
+        message
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.index,
+                    u64::try_from(entry.data.len()).unwrap_or(u64::MAX),
+                )
+            })
+            .collect()
+    })
+}
+
+/// The index an accepted append response acknowledges; `None` for any
+/// other message.
+#[must_use]
+pub fn append_ack(message: &eraftpb::Message) -> Option<u64> {
+    (message.get_msg_type() == eraftpb::MessageType::MsgAppendResponse && !message.reject)
+        .then_some(message.index)
+}
+
 /// Node `id`'s election timeout among `voters`, `[min, max)` in ticks:
 /// one value, so raft-rs's `thread_rng` draw is deterministic, staggered
 /// by the node's position among the voters (and itself) in id order, so

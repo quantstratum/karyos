@@ -14,8 +14,8 @@
 
 use karyos_raft_eval::openraft_core::OpenRaft;
 use karyos_raft_eval::raft_rs::{MAX_IN_FLIGHT_ENTRIES, RaftRs};
-use karyos_sim::harness::custom::Custom;
 use karyos_sim::harness::core::{ConsensusCore, Limit, Limits, Unsupported};
+use karyos_sim::harness::custom::Custom;
 use karyos_sim::harness::node::Observation;
 use karyos_sim::harness::workloads::{
     self, Case, Failed, Liveness, RunError, W1, W2, W3, W3Fault, W4, W5, W6,

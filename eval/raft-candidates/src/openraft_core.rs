@@ -809,6 +809,58 @@ pub fn append_shape(message: &Message) -> Option<(usize, u64)> {
     Some((rpc.entries.len(), bytes))
 }
 
+/// An append's entries as (harness index, payload bytes), for an oracle
+/// that reads the trace rather than the adapter (C5 version 2's W2 byte
+/// case; karyos#691); `None` for any other message.
+#[must_use]
+pub fn append_entries(message: &Message) -> Option<Vec<(u64, u64)>> {
+    let Message::Request {
+        request: Request::Append(rpc),
+        ..
+    } = message
+    else {
+        return None;
+    };
+    Some(
+        rpc.entries
+            .iter()
+            .filter_map(|entry| {
+                let harness = to_harness(entry)?;
+                let bytes = match &entry.payload {
+                    EntryPayload::Normal(command) => command.0.len(),
+                    _ => 0,
+                };
+                Some((harness.index, u64::try_from(bytes).unwrap_or(u64::MAX)))
+            })
+            .collect(),
+    )
+}
+
+/// The harness index an append's answer acknowledges: the echoed
+/// request's last entry (or its previous one) on `Success`, the matched
+/// one on `PartialSuccess`; `None` for any other message or answer.
+#[must_use]
+pub fn append_ack(message: &Message) -> Option<u64> {
+    let Message::Response {
+        request: Request::Append(rpc),
+        response: Some(Response::Append(response)),
+        ..
+    } = message
+    else {
+        return None;
+    };
+    let matched = match &**response {
+        AppendEntriesResponse::Success => rpc
+            .entries
+            .last()
+            .map(|entry| entry.log_id)
+            .or_else(|| rpc.prev_log_id),
+        AppendEntriesResponse::PartialSuccess(Some(id)) => Some(*id),
+        _ => None,
+    }?;
+    matched.index.checked_add(1)
+}
+
 impl<const PRE_VOTE: bool, const BATCH: u64> fmt::Debug for OpenRaftCore<PRE_VOTE, BATCH> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OpenRaftCore")
