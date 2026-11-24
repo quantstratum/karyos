@@ -417,7 +417,8 @@ fn capability_names_are_closed_in_v1_and_extensible() {
             "guard-preview",
             "submit",
             "clocks",
-            "rate-limits"
+            "rate-limits",
+            "cluster-command"
         ]
     );
     let known = Capability {
