@@ -72,6 +72,26 @@ pub const REJOIN_PAUSE: Duration = Duration::from_secs(12);
 /// Messages read per duty at most.
 const MESSAGES_PER_DUTY: usize = 16;
 
+/// How long a replica that followed an incarnation past its start waits
+/// for a newer one before it leaves (karyos#1067, ADR-0102 decision 7).
+///
+/// A restarted replica first follows the source's old incarnation at its
+/// tail. The source sees the replica back, waits
+/// [`RECONNECT_SETTLE`](crate::daemon_replication::RECONNECT_SETTLE) for
+/// the connection to hold, stops its request and asks again after its
+/// backoff, which is
+/// [`BACKOFF_FIRST`](crate::daemon_replication::BACKOFF_FIRST) after a
+/// request that streamed: the new incarnation comes within their sum. The
+/// grace is twice that sum, for a loaded host. Leaving at once would hide
+/// the replica from the source before its connection settled, and the
+/// two would never meet. A source whose backoff grew (requests that
+/// failed) may take longer: the replica then leaves, comes back after
+/// [`REJOIN_PAUSE`], and the source asks again once it settles; only time
+/// is lost.
+const LATE_JOIN_GRACE: Duration = crate::daemon_replication::RECONNECT_SETTLE
+    .saturating_add(crate::daemon_replication::BACKOFF_FIRST)
+    .saturating_mul(2);
+
 /// The longest message a replication stream carries.
 const MAX_MESSAGE: usize = karyos_archive::replication::RECORDING_BYTES.max_length as usize;
 
@@ -174,10 +194,14 @@ struct ReplicaState<D: Disk + Clone> {
     store_failed: bool,
     /// The request whose start setup failed: its payload is lost.
     failed_start: Option<u64>,
-    /// Payload of the request was lost (a failed start, or bytes past the
-    /// tail): the source must ask again from its start, which the
-    /// listener makes it do by leaving for [`REJOIN_PAUSE`].
+    /// Payload of the request was lost (a failed start, bytes past the
+    /// tail, or an incarnation followed past its start with no newer one
+    /// within [`LATE_JOIN_GRACE`]): the source must ask again from its
+    /// start, which the listener makes it do by leaving for
+    /// [`REJOIN_PAUSE`].
     rejoin: bool,
+    /// When the incarnation followed now was followed past its start.
+    late_since: Option<Instant>,
 }
 
 /// Every replica of a daemon.
@@ -336,6 +360,7 @@ impl Replicas {
                     store_failed: false,
                     failed_start: None,
                     rejoin: false,
+                    late_since: None,
                 },
                 buf: vec![0; MAX_MESSAGE],
             });
@@ -436,7 +461,14 @@ impl ReplicaListener {
                 }
             }
         }
-        let mut worked = self.follow(driver, counters);
+        let mut worked = self.follow(driver, now, counters);
+        if self.state.late_join_due(now) {
+            self.state.rejoin = true;
+        }
+        if self.state.rejoin {
+            self.leave(driver, now, counters);
+            return true;
+        }
         for _ in 0..MESSAGES_PER_DUTY {
             let Some((_, _, reader)) = self.image.as_mut() else {
                 break;
@@ -480,6 +512,7 @@ impl ReplicaListener {
         self.state.rejoin = false;
         self.state.started = None;
         self.state.failed_start = None;
+        self.state.late_since = None;
         self.image = None;
         let _ = driver.remove_network_subscription(self.subscription);
         self.away_until = now.checked_add(REJOIN_PAUSE);
@@ -496,6 +529,7 @@ impl ReplicaListener {
     fn follow(
         &mut self,
         driver: &mut EmbeddedDriver<SharedTerms>,
+        now: Instant,
         counters: &mut ReplicaCounters,
     ) -> bool {
         // An image older than the newest followed is a superseded
@@ -529,6 +563,7 @@ impl ReplicaListener {
                     "replica follows the source's newest incarnation"
                 );
                 self.newest = Some(handle.registration());
+                self.state.followed(reader.position(), now);
                 self.image = Some((session, handle, reader));
             }
             Err(error) => {
@@ -566,6 +601,34 @@ impl<D: Disk + Clone> ReplicaState<D> {
                 false
             }
         }
+    }
+
+    /// The replica followed an incarnation at stream position `join`, at
+    /// `now`. The source's request on an incarnation starts at its position
+    /// 0 and is sent once, so a reader that joined past it missed the
+    /// request's first messages, its `streaming` status and maybe all its
+    /// payload (karyos#1067: a loaded replica joined at 20096 and then
+    /// waited for payload that had gone by). Unless a newer incarnation
+    /// comes within [`LATE_JOIN_GRACE`], the replica leaves and the source
+    /// asks again from its start (ADR-0102 decision 7). A replica that
+    /// follows in time joins at 0.
+    fn followed(&mut self, join: u64, now: Instant) {
+        self.late_since = (join > 0).then_some(now);
+        if join > 0 {
+            tracing::info!(
+                recording_id = self.recording_id,
+                join,
+                "replica followed an incarnation past its start: it waits for a newer one, then leaves"
+            );
+        }
+    }
+
+    /// Whether the incarnation followed past its start had no newer one
+    /// for [`LATE_JOIN_GRACE`]: then its lost start makes the replica
+    /// rejoin.
+    fn late_join_due(&self, now: Instant) -> bool {
+        self.late_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= LATE_JOIN_GRACE)
     }
 
     /// Acts on one message of the followed incarnation.
@@ -924,6 +987,7 @@ mod tests {
             store_failed: false,
             failed_start: None,
             rejoin: false,
+            late_since: None,
         };
         (state, disk, dir)
     }
@@ -1013,6 +1077,63 @@ mod tests {
         state.take(&bytes(6, 500), Instant::now(), &mut counters);
         assert!(state.rejoin);
         assert_eq!(counters.replication_gaps, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// karyos#1067: an incarnation followed at its start is read from its
+    /// first message. One followed past it asks for a rejoin only once
+    /// [`LATE_JOIN_GRACE`] passed without a newer incarnation, which a
+    /// restarted replica gets from the source's new request; a newer one
+    /// followed at its start clears it.
+    #[test]
+    fn an_incarnation_followed_past_its_start_makes_the_replica_rejoin_after_its_grace() {
+        let (mut state, _disk, dir) = state("late-join");
+        let start = Instant::now();
+        state.followed(0, start);
+        assert!(
+            !state.late_join_due(start + LATE_JOIN_GRACE * 2),
+            "followed in time"
+        );
+        state.followed(20_096, start);
+        assert!(!state.late_join_due(start), "within its grace");
+        assert!(
+            !state.late_join_due(start + LATE_JOIN_GRACE / 2),
+            "within its grace"
+        );
+        assert!(
+            state.late_join_due(start + LATE_JOIN_GRACE),
+            "no newer incarnation came"
+        );
+        // The source's new request: a newer incarnation, followed at 0.
+        state.followed(0, start + LATE_JOIN_GRACE / 2);
+        assert!(
+            !state.late_join_due(start + LATE_JOIN_GRACE * 2),
+            "a newer one came"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// karyos#1067: the restart case, deterministically. A restarted
+    /// replica follows the source's old incarnation at its tail (past its
+    /// start), then, within the grace, the new incarnation of the source's
+    /// new request at its start: it never asks to leave, at any time after.
+    /// The grace is the source's settle and first backoff, twice.
+    #[test]
+    fn a_restarted_replica_waits_for_the_new_incarnation_and_does_not_leave() {
+        use crate::daemon_replication::{BACKOFF_FIRST, RECONNECT_SETTLE};
+        assert_eq!(LATE_JOIN_GRACE, (RECONNECT_SETTLE + BACKOFF_FIRST) * 2);
+        let (mut state, _disk, dir) = state("restart");
+        let start = Instant::now();
+        // The old incarnation, at its tail.
+        state.followed(21_056, start);
+        // The source's new request, after its settle and first backoff.
+        let new = start + RECONNECT_SETTLE + BACKOFF_FIRST;
+        assert!(!state.late_join_due(new), "still within the grace");
+        state.followed(0, new);
+        for later in [new, start + LATE_JOIN_GRACE, start + LATE_JOIN_GRACE * 10] {
+            assert!(!state.late_join_due(later), "left a followed incarnation");
+        }
+        assert!(!state.rejoin);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

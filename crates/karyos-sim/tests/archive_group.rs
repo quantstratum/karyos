@@ -1035,6 +1035,33 @@ fn loopback(port: u16) -> karyos_protocol::channel::UdpConfig {
 /// a loopback round trip and the sender's idle heartbeat.
 const SETTLE: Duration = Duration::from_millis(500);
 
+/// How long a wait may go without progress before it fails.
+const STALL: Duration = Duration::from_secs(30);
+
+/// A wait's watchdog: it fails after [`STALL`] without progress, however
+/// long the wait takes in all while it progresses.
+struct Stall(Instant);
+
+impl Stall {
+    fn new() -> Self {
+        Self(Instant::now())
+    }
+
+    /// Restarts the watchdog when `progressed`.
+    fn progress_if(&mut self, progressed: bool) {
+        if progressed {
+            self.0 = Instant::now();
+        }
+    }
+
+    fn check(&self, what: &str) {
+        assert!(
+            self.0.elapsed() < STALL,
+            "{what}: no progress for {STALL:?}"
+        );
+    }
+}
+
 /// Isolation of external effects over the network (SPEC §15, phase 3;
 /// contract-traceability-phase-3.md, the row's minor): a group whose
 /// handler answers each message on a network publication of driver A is
@@ -1097,13 +1124,16 @@ fn a_replayed_group_reaches_no_network_output() {
             &loopback(port),
         )
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Every wait below fails only after `STALL` without progress, not
+    // after a fixed time for the whole test: a loaded host slows each
+    // phase, which then still progresses (karyos#1067).
+    let stall = Stall::new();
     let image = loop {
         work(&mut driver, &mut remote);
         if let Some(image) = remote.network_image(OUT, 1) {
             break image;
         }
-        assert!(Instant::now() < deadline, "no image of the output on B");
+        stall.check("no image of the output on B");
     };
     let mut out_reader = remote.subscribe_aggregate(&image, Role::Required).unwrap();
     let sender = archive
@@ -1145,7 +1175,9 @@ fn a_replayed_group_reaches_no_network_output() {
     // Live: the handler's answers cross the network, two per message.
     let (mut published, mut dispatched, mut answered) = (0, 0, 0u64);
     let mut handler = answer;
+    let mut stall = Stall::new();
     while dispatched < MESSAGES || answered < 2 * MESSAGES {
+        let before = (published, dispatched, answered);
         if published < MESSAGES
             && let OfferOutcome::Accepted { .. } = publication.offer(&payload(published)).unwrap()
         {
@@ -1156,18 +1188,20 @@ fn a_replayed_group_reaches_no_network_output() {
             dispatched += 1;
         }
         let _ = out_reader.poll(|_, _, _| answered += 1, budget);
-        assert!(Instant::now() < deadline, "live: {dispatched} {answered}");
+        stall.progress_if((published, dispatched, answered) != before);
+        stall.check(&format!("live: {dispatched} {answered}"));
     }
     assert_eq!(
         answered,
         2 * MESSAGES,
         "the live answers crossed the network"
     );
+    let stall = Stall::new();
     let durable = loop {
         work(&mut driver, &mut remote);
         match waiter.wait_durable(MESSAGES, Duration::from_millis(20)) {
             Ok(durable) => break durable,
-            Err(_) => assert!(Instant::now() < deadline, "never durable"),
+            Err(_) => stall.check("never durable"),
         }
     };
     assert_eq!(durable, MESSAGES);
@@ -1205,14 +1239,18 @@ fn a_replayed_group_reaches_no_network_output() {
     )
     .unwrap();
     let mut replayed = 0u64;
+    let mut stall = Stall::new();
     loop {
         work(&mut driver, &mut remote);
         match replay.dispatch(&mut handler) {
-            Ok(Dispatched::Event { .. }) => replayed += 1,
+            Ok(Dispatched::Event { .. }) => {
+                replayed += 1;
+                stall.progress_if(true);
+            }
             Ok(Dispatched::End) => break,
             other => panic!("replay: {other:?}"),
         }
-        assert!(Instant::now() < deadline, "replay never ended");
+        stall.check("replay never ended");
     }
     assert_eq!(replayed, MESSAGES);
     // Nothing reaches B over the settle window, the drivers running.
@@ -1236,19 +1274,19 @@ fn a_replayed_group_reaches_no_network_output() {
     );
     // The control: the same output still reaches B, so the silence above
     // is the replay's, not a dead path.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let stall = Stall::new();
     while !matches!(
         real.lock().unwrap().offer(&[7u8; 8]).unwrap(),
         OfferOutcome::Accepted { .. }
     ) {
         work(&mut driver, &mut remote);
-        assert!(Instant::now() < deadline, "the output refused an offer");
+        stall.check("the output refused an offer");
     }
     let mut after = 0u64;
     while after == 0 {
         work(&mut driver, &mut remote);
         let _ = out_reader.poll(|_, _, _| after += 1, budget);
-        assert!(Instant::now() < deadline, "the output no longer reaches B");
+        stall.check("the output no longer reaches B");
     }
     drop(real);
 }
