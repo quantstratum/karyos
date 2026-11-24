@@ -50,6 +50,12 @@ pub enum ChainError {
     /// No samples, or samples out of time order.
     #[error("the link samples are empty or out of time order")]
     Samples,
+    /// Two link samples further apart than allowed.
+    #[error("two link samples are {gap} ns apart, more than allowed")]
+    Gap {
+        /// The gap.
+        gap: u64,
+    },
     /// The second calibration does not start where the first ends.
     #[error("the second calibration's source is not the first's target")]
     Disjoint,
@@ -66,28 +72,61 @@ pub enum ChainError {
 }
 
 /// A calibration from the server's PHC `server` to the client's `client`,
-/// from the client's `samples` (in time order), valid over their span.
+/// from the client's `samples` (in time order, no two more than `max_gap`
+/// ns apart), valid over their span.
+///
+/// **Assumptions** (stated, not measured, and recorded with every result):
+/// between two samples the offset moves no further than the largest change
+/// observed between consecutive samples, which `max_gap` keeps short; and
+/// the path asymmetry is no larger than the reported mean path delay
+/// (`ptp4l` reports a filtered delay, so a raw exchange can exceed it; the
+/// largest change term covers that too while the lock holds). A run whose
+/// samples break the lock shows it in that largest change, and widens the
+/// bound accordingly.
 ///
 /// # Errors
 ///
 /// [`ChainError::Samples`] for no samples or samples out of order;
+/// [`ChainError::Gap`] for two samples further apart than `max_gap`;
 /// [`ChainError::Overflow`].
 pub fn link(
     server: ClockKey,
     client: ClockKey,
     samples: &[LinkSample],
+    max_gap: u64,
 ) -> Result<Calibration, ChainError> {
     let (Some(first), Some(last)) = (samples.first(), samples.last()) else {
         return Err(ChainError::Samples);
     };
-    if samples.windows(2).any(|pair| matches!(pair, [a, b] if b.time < a.time)) {
+    if samples
+        .windows(2)
+        .any(|pair| matches!(pair, [a, b] if b.time < a.time))
+    {
         return Err(ChainError::Samples);
     }
-    let mut bound = 0_i128;
-    for sample in samples {
-        let offset = i128::from(sample.offset).abs();
-        bound = bound.max(offset + i128::from(sample.path_delay) + 1);
+    let mut change = 0_i128;
+    for pair in samples.windows(2) {
+        if let [a, b] = pair {
+            if b.time - a.time > max_gap {
+                return Err(ChainError::Gap {
+                    gap: b.time - a.time,
+                });
+            }
+            change = change.max((i128::from(b.offset) - i128::from(a.offset)).abs());
+        }
     }
+    let largest_offset = samples
+        .iter()
+        .map(|sample| i128::from(sample.offset).abs())
+        .max()
+        .unwrap_or(0);
+    let largest_delay = samples
+        .iter()
+        .map(|sample| i128::from(sample.path_delay))
+        .max()
+        .unwrap_or(0);
+    // +1 for the samples' whole-nanosecond rounding (rounded outwards).
+    let bound = largest_offset + change + largest_delay + 1;
     // In the server's time: the client's sample times less their offset,
     // widened by the bound so the span is the server's for certain.
     let server_time = |sample: &LinkSample, widen: i128| {
@@ -144,11 +183,22 @@ pub fn compose(first: &Calibration, second: &Calibration) -> Result<Calibration,
             .is_some_and(|(low, high)| second.covers(low, high))
     };
     let (from, to) = (i128::from(first.valid_from), i128::from(first.valid_to));
-    // One time inside, from a scan of 65 evenly spaced times: an overlap
-    // narrower than the scan's step is refused, never guessed.
-    let step = (to - from) / 64 + 1;
-    let found = (0..=64)
-        .map(|index| (from + index * step).min(to))
+    // One time inside. The overlap is one interval (the conversion's
+    // bounds grow with time): seeds where it most likely is, first the
+    // time `first` maps onto the middle of `second`'s validity (one
+    // correction step from its offset), then its reference, its ends and a
+    // scan; none inside means none of these is in an overlap, which is
+    // then refused.
+    let middle = (i128::from(second.valid_from) + i128::from(second.valid_to)) / 2;
+    let guess = (middle - i128::from(first.offset)).clamp(from, to);
+    let corrected = first
+        .convert(guess, guess)
+        .map(|(low, high)| (guess - ((low + high) / 2 - middle)).clamp(from, to));
+    let step = (to - from) / 1024 + 1;
+    let found = corrected
+        .into_iter()
+        .chain([guess, i128::from(first.reference).clamp(from, to), from, to])
+        .chain((0..=1024).map(|index| (from + index * step).min(to)))
         .find(|&time| inside(time))
         .ok_or(ChainError::NoOverlap)?;
     // Below `found` only the lower bound can leave `second`'s validity,
@@ -188,7 +238,13 @@ pub fn compose(first: &Calibration, second: &Calibration) -> Result<Calibration,
     let (c_low, c_high) = second.convert(b_low, b_high).ok_or(ChainError::Overflow)?;
     let centre = c_low + (c_high - c_low) / 2;
     let offset = centre - reference;
-    let offset_uncertainty = (c_high - centre).max(centre - c_low) + 1;
+    // `first`'s conversion rounds by up to 1 ns at any time, and `second`
+    // multiplies that by its slope: its largest slope, rounded up, more.
+    let steepest = ceil_div(
+        BILLION + i128::from(second.drift).abs() + i128::from(second.drift_uncertainty),
+        BILLION,
+    );
+    let offset_uncertainty = (c_high - centre).max(centre - c_low) + 1 + steepest;
     // Every slope `1 + rate / 1e9` of each, multiplied: in ppb,
     // (1e9 + r1)(1e9 + r2) / 1e9 - 1e9.
     let rates = |calibration: &Calibration| {

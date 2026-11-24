@@ -46,7 +46,7 @@ Usage: karyos-tools calibrate phc [--device /dev/ptp0] [--reads 4096]
            [--keep 25] [--interval-us 500] [--extension-ms 0]
            [--source-domain N] [--target-domain N] [--epoch N] [--reverse]
        karyos-tools calibrate link --samples <file> [--server-domain N]
-           [--client-domain N] [--epoch N]
+           [--client-domain N] [--epoch N] [--max-gap-ms 2000]
        karyos-tools calibrate compose <record> <record> [<record>...]
 
 `phc --reverse` reads the PHC, the raw clock and the PHC again, so the
@@ -55,7 +55,8 @@ record converts PHC times into the raw clock (the receiving host of a link).
 time, offsetFromMaster and meanPathDelay in ns, as `pmc` prints them; a
 header line and a `DONE` line are skipped) and prints a calibration from
 the server's PHC to the client's, bounded by the largest offset plus the
-whole path delay (any asymmetry), valid over the samples. `compose` chains
+whole path delay (any asymmetry) and the largest change between samples,
+valid over the samples, which must be no more than --max-gap-ms apart. `compose` chains
 records, each starting where the previous ends, into the one direct
 record a cross-host latency needs. A record is the 18 words `phc`, `link`
 and `compose` print after `record`.
@@ -442,18 +443,29 @@ pub fn parse_samples(
         let [time, offset, delay] = fields.as_slice() else {
             return Err(format!("line {}: three fields expected", number + 1));
         };
-        // pmc prints the offset and the delay with a fraction: whole ns.
-        let whole = |field: &str| field.split('.').next().unwrap_or(field).to_owned();
+        // pmc prints the offset and the delay with a fraction: whole ns,
+        // rounded away from zero so the bound never shrinks; anything but
+        // digits after the point is refused.
+        let whole = |field: &str| -> Option<i64> {
+            let (int, fraction) = field.split_once('.').unwrap_or((field, ""));
+            if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let value: i64 = int.parse().ok()?;
+            let up = fraction.bytes().any(|byte| byte != b'0');
+            Some(match (up, int.starts_with('-')) {
+                (false, _) => value,
+                (true, true) => value - 1,
+                (true, false) => value + 1,
+            })
+        };
+        let bad = |what: &str| format!("line {}: bad {what}", number + 1);
         samples.push(karyos_trace::calibrate::chain::LinkSample {
-            time: time
-                .parse()
-                .map_err(|_| format!("line {}: bad time", number + 1))?,
-            offset: whole(offset)
-                .parse()
-                .map_err(|_| format!("line {}: bad offset", number + 1))?,
+            time: time.parse().map_err(|_| bad("time"))?,
+            offset: whole(offset).ok_or_else(|| bad("offset"))?,
             path_delay: whole(delay)
-                .parse()
-                .map_err(|_| format!("line {}: bad delay", number + 1))?,
+                .and_then(|delay| u64::try_from(delay).ok())
+                .ok_or_else(|| bad("delay"))?,
         });
     }
     Ok(samples)
@@ -467,6 +479,7 @@ pub fn run_link(
 ) -> u8 {
     let mut args = args;
     let (mut samples, mut server, mut client, mut epoch) = (None, 2_u64, 3_u64, 1_u64);
+    let mut max_gap_ms = 2_000_u64;
     while let Some(arg) = args.next() {
         let arg = arg.to_string_lossy().into_owned();
         let Some(value) = args
@@ -482,6 +495,7 @@ pub fn run_link(
             ("--server-domain", Ok(number)) => server = number,
             ("--client-domain", Ok(number)) => client = number,
             ("--epoch", Ok(number)) => epoch = number,
+            ("--max-gap-ms", Ok(number)) => max_gap_ms = number,
             _ => {
                 let _ = writeln!(
                     err,
@@ -508,9 +522,14 @@ pub fn run_link(
     };
     let linked = parsed.and_then(|samples| {
         let count = samples.len();
-        karyos_trace::calibrate::chain::link(key(server), key(client), &samples)
-            .map(|calibration| (calibration, count))
-            .map_err(|error| error.to_string())
+        karyos_trace::calibrate::chain::link(
+            key(server),
+            key(client),
+            &samples,
+            max_gap_ms.saturating_mul(1_000_000),
+        )
+        .map(|calibration| (calibration, count))
+        .map_err(|error| error.to_string())
     });
     let (calibration, count) = match linked {
         Ok(linked) => linked,
@@ -669,6 +688,11 @@ mod tests {
         assert_eq!(samples.len(), 2);
         assert_eq!((samples[0].offset, samples[0].path_delay), (-8, 3219));
         assert!(super::parse_samples("1 2\n").is_err());
+        // Fractions round away from zero; anything else is refused.
+        let rounded = super::parse_samples("5 0.9 10.9\n6 -0.2 3\n").unwrap();
+        assert_eq!((rounded[0].offset, rounded[0].path_delay), (1, 11));
+        assert_eq!(rounded[1].offset, -1);
+        assert!(super::parse_samples("5 1 10.garbage\n").is_err());
     }
 
     #[test]
@@ -720,7 +744,7 @@ mod tests {
         assert_eq!(code, 0, "{}", String::from_utf8_lossy(&err));
         let printed = String::from_utf8(out).unwrap();
         assert!(
-            printed.contains("composed: offset 100 ns +/- 7 ns"),
+            printed.contains("composed: offset 100 ns +/- 8 ns"),
             "{printed}"
         );
         let (mut out, mut err) = (Vec::new(), Vec::new());

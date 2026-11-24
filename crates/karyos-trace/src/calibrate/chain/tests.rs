@@ -116,8 +116,14 @@ fn a_link_bounds_the_offset_by_the_samples_and_the_whole_path_delay() {
             path_delay: 3_218,
         })
         .collect();
-    let calibration = link(key(2), key(3), &samples).unwrap();
-    assert_eq!(calibration.offset_uncertainty, 46 + 3_218 + 1);
+    let calibration = link(key(2), key(3), &samples, 2_000_000_000).unwrap();
+    // The largest offset, the largest change between samples (12 to -46
+    // and back: 58) and the whole delay.
+    assert_eq!(calibration.offset_uncertainty, 46 + 58 + 3_218 + 1);
+    assert_eq!(
+        link(key(2), key(3), &samples, 999_999_999),
+        Err(ChainError::Gap { gap: 1_000_000_000 })
+    );
     assert_eq!(
         (
             calibration.offset,
@@ -128,10 +134,16 @@ fn a_link_bounds_the_offset_by_the_samples_and_the_whole_path_delay() {
     );
     // Valid over the samples' span only, in the server's time.
     assert!(calibration.valid_from > 1_000_000_000 && calibration.valid_to < 100_000_000_000);
-    assert_eq!(link(key(2), key(3), &[]), Err(ChainError::Samples));
+    assert_eq!(
+        link(key(2), key(3), &[], 2_000_000_000),
+        Err(ChainError::Samples)
+    );
     let mut reversed = samples.clone();
     reversed.swap(0, 1);
-    assert_eq!(link(key(2), key(3), &reversed), Err(ChainError::Samples));
+    assert_eq!(
+        link(key(2), key(3), &reversed, 2_000_000_000),
+        Err(ChainError::Samples)
+    );
 }
 
 #[test]
@@ -150,7 +162,7 @@ fn a_cross_host_latency_becomes_a_value_through_the_chain() {
             path_delay: 3_200,
         })
         .collect();
-    let ptp = link(key(2), key(3), &samples).unwrap();
+    let ptp = link(key(2), key(3), &samples, 2_000_000_000).unwrap();
     let b_raw = -1_699_999_000_000_000_000_i128;
     let phc_to_raw = fitted(3, 4, phc_start, b_raw, -68_000);
     let a_to_b = compose(&compose(&raw_to_phc, &ptp).unwrap(), &phc_to_raw).unwrap();
@@ -182,4 +194,58 @@ fn a_cross_host_latency_becomes_a_value_through_the_chain() {
     // link's 3.2 us bound and the fits' own.
     assert!(min <= 30_000 && 30_000 <= max, "{min} {max}");
     assert!(max - min < 10_000, "{min} {max}");
+}
+
+#[test]
+fn a_composition_contains_every_value_of_the_two_conversions() {
+    // Codex's case: slopes of 1 + 1 ppb and 100, rounding amplified.
+    let ab = Calibration {
+        from: key(1),
+        to: key(2),
+        reference: 1_000,
+        offset: 0,
+        offset_uncertainty: 0,
+        drift: 1,
+        drift_uncertainty: 0,
+        valid_from: 0,
+        valid_to: 100_000,
+    };
+    let bc = Calibration {
+        from: key(2),
+        to: key(3),
+        reference: 1_000,
+        offset: 0,
+        offset_uncertainty: 0,
+        drift: 99_000_000_000,
+        drift_uncertainty: 0,
+        valid_from: 0,
+        valid_to: 100_000_000,
+    };
+    let ac = compose(&ab, &bc).unwrap();
+    for t in (ac.valid_from..=ac.valid_to).step_by(97) {
+        let (b_low, b_high) = ab.convert(i128::from(t), i128::from(t)).unwrap();
+        let (c_low, c_high) = bc.convert(b_low, b_high).unwrap();
+        let (low, high) = ac.convert(i128::from(t), i128::from(t)).unwrap();
+        assert!(
+            low <= c_low && c_high <= high,
+            "{t}: [{c_low}, {c_high}] outside [{low}, {high}]"
+        );
+    }
+}
+
+#[test]
+fn a_narrow_overlap_between_scan_points_is_found() {
+    let identity = |from, to, valid_from, valid_to| Calibration {
+        from: key(from),
+        to: key(to),
+        reference: 0,
+        offset: 0,
+        offset_uncertainty: 0,
+        drift: 0,
+        drift_uncertainty: 0,
+        valid_from,
+        valid_to,
+    };
+    let ac = compose(&identity(1, 2, 0, 6_400_000), &identity(2, 3, 50, 60)).unwrap();
+    assert_eq!((ac.valid_from, ac.valid_to), (50, 60));
 }
