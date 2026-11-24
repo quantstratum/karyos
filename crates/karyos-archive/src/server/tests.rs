@@ -1347,10 +1347,18 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
     let all = frames(64, 3);
     let length = u64::try_from(all.len()).unwrap();
     let ended_before = rig.sent(2).len();
-    for _ in 0..5000 {
-        if rig.server.agent().describe(1).unwrap().durable == length {
+    // The whole lane durable before the stop, which seals only what the
+    // recorder wrote (#1067 review): a deadline, not a silent fall-through.
+    let begun = std::time::Instant::now();
+    loop {
+        let durable = rig.server.agent().describe(1).unwrap().durable;
+        if durable == length {
             break;
         }
+        assert!(
+            begun.elapsed() < Duration::from_secs(30),
+            "durable {durable} of {length}"
+        );
         std::thread::sleep(Duration::from_millis(1));
     }
     // Stopped, so each range is sealed; its answer and signal go out.
@@ -1397,6 +1405,16 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
     };
     rig.responses.room.store(0, Ordering::Release);
     rig.raw(encode(request()));
+    // Back-pressured for certain: the server holds an answer the full
+    // stream refused, then keeps its bound for a while (#1067 review: a
+    // slow agent could have produced nothing yet).
+    let begun = std::time::Instant::now();
+    while rig.server.pending() == 0 {
+        rig.server.duty();
+        assert!(rig.server.pending() <= super::REPLICATION_FORWARD);
+        assert!(begun.elapsed() < Duration::from_secs(30), "never held");
+        std::thread::sleep(Duration::from_micros(200));
+    }
     for _ in 0..2000 {
         rig.server.duty();
         assert!(rig.server.pending() <= super::REPLICATION_FORWARD);
@@ -1429,8 +1447,7 @@ fn replication_keeps_backpressure_and_fits_the_stream() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(done, "a final status");
-    assert!(!bytes.is_empty());
-    assert_eq!(bytes[..], all[..bytes.len()]);
+    assert_eq!(bytes, all, "the whole recording, in order");
     let mut short = Rig::with(
         "replication-short",
         Host::of(frames(1, 3), true),
