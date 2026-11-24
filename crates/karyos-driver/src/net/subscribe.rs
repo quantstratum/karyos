@@ -103,13 +103,18 @@ pub(super) fn paths_on_distinct_interfaces_with(
     Ok(())
 }
 
-/// A paired unicast paths publication (owner item 11, karyos#1043) on
-/// distinct interfaces: path `i` sends from the interface owning its
-/// address, or, for the unspecified address, the one of the route to its
-/// endpoint. Two paths that leave through one interface would be one
-/// physical path counted twice, so such a channel is refused, as is one
-/// whose path cannot be resolved where it can be (Linux, IPv4). Runs on
-/// the control path, so it may allocate.
+/// A paired unicast paths publication (owner item 11, karyos#1043) whose
+/// paths really leave through distinct interfaces. Binding a source
+/// address does not pin a datagram's egress on Linux: the route to the
+/// destination does. So for each path `i` the egress interface of the
+/// route to `endpoints[i]` (longest prefix match in `/proc/net/route`)
+/// must be the interface owning path `i`'s address, and the egress
+/// interfaces must differ pairwise; otherwise both paths could leave
+/// through one NIC and one physical path would count twice. A path that
+/// cannot be resolved is refused. IPv6 paired paths are refused as
+/// unverifiable: there is no IPv6 route lookup here. Linux only, where
+/// paths are served; elsewhere they are refused before this. Runs on the
+/// control path, so it may allocate.
 pub(super) fn paired_paths_on_distinct_interfaces(channel: &UdpConfig) -> Result<(), DriverError> {
     paired_paths_on_distinct_interfaces_with(
         channel,
@@ -118,7 +123,9 @@ pub(super) fn paired_paths_on_distinct_interfaces(channel: &UdpConfig) -> Result
 }
 
 /// [`paired_paths_on_distinct_interfaces`] with the resolver given
-/// (tests).
+/// (tests): `resolve(address, target)` names the interface owning
+/// `address`, or, for the unspecified address, the one of the route to
+/// `target`.
 pub(super) fn paired_paths_on_distinct_interfaces_with(
     channel: &UdpConfig,
     resolve: impl Fn(Ipv4Addr, Ipv4Addr) -> Option<String>,
@@ -126,22 +133,23 @@ pub(super) fn paired_paths_on_distinct_interfaces_with(
     let Destination::PairedPaths { endpoints } = &channel.destination else {
         return Ok(());
     };
-    if channel.paths.len() < 2 || !cfg!(target_os = "linux") {
+    if !cfg!(target_os = "linux") {
         return Ok(());
     }
-    let mut seen: Vec<String> = Vec::with_capacity(channel.paths.len());
+    let mut egresses: Vec<String> = Vec::with_capacity(channel.paths.len());
     for (path, endpoint) in channel.paths.iter().zip(endpoints) {
         let (Interface::Address(IpAddr::V4(address)), IpAddr::V4(to)) = (path, endpoint.ip())
         else {
-            // A name or another family is refused by the routes; IPv6 has
-            // no route table to read here.
-            return Ok(());
+            // An IPv6 path has no route lookup here to verify its egress;
+            // a name or a family mismatch is refused by the routes too.
+            return Err(DriverError::UnsupportedChannel);
         };
-        let name = resolve(*address, to).ok_or(DriverError::UnsupportedChannel)?;
-        if seen.contains(&name) {
+        let egress = resolve(Ipv4Addr::UNSPECIFIED, to).ok_or(DriverError::UnsupportedChannel)?;
+        let source = resolve(*address, to).ok_or(DriverError::UnsupportedChannel)?;
+        if source != egress || egresses.contains(&egress) {
             return Err(DriverError::UnsupportedChannel);
         }
-        seen.push(name);
+        egresses.push(egress);
     }
     Ok(())
 }

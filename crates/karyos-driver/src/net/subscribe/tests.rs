@@ -1071,42 +1071,65 @@ fn paired_paths_receive_each_path_at_its_endpoint() {
     );
 }
 
-/// karyos#1043: a paired unicast paths publication whose two paths leave
-/// through one interface is one physical path counted twice: refused; on
-/// distinct interfaces it passes; a path that cannot be resolved where
-/// resolution is real is refused.
+/// karyos#1043 (Codex review of #1230): a paired path's datagrams leave by
+/// the route to its endpoint, not by its source address, so the egress
+/// interface of that route must be the one owning the path's address, and
+/// the paths' egress interfaces must differ. A path whose route leaves by
+/// another interface than its source's is refused; two paths whose routes
+/// leave by one NIC are refused; a path that cannot be resolved is
+/// refused; IPv6 paired paths are refused as unverifiable here.
 #[cfg(target_os = "linux")]
 #[test]
 fn paired_paths_must_leave_through_distinct_interfaces() {
     use super::super::subscribe::paired_paths_on_distinct_interfaces_with;
-    let paired = paired_channel("10.0.0.5@10.0.0.9:40123;10.1.0.5@10.1.0.9:40123");
-    let by_net = |address: Ipv4Addr, _: Ipv4Addr| Some(format!("eth{}", address.octets()[1]));
-    assert_eq!(
-        paired_paths_on_distinct_interfaces_with(&paired, by_net),
-        Ok(())
-    );
-    let one = |_: Ipv4Addr, _: Ipv4Addr| Some("eth0".to_owned());
-    assert_eq!(
-        paired_paths_on_distinct_interfaces_with(&paired, one),
-        Err(crate::error::DriverError::UnsupportedChannel)
-    );
-    assert_eq!(
-        paired_paths_on_distinct_interfaces_with(&paired, |_, _| None),
-        Err(crate::error::DriverError::UnsupportedChannel)
-    );
-    // The unspecified address resolves through the route to its endpoint.
-    let any = paired_channel("0.0.0.0@10.0.0.9:40123;10.1.0.5@10.1.0.9:40123");
-    let routed = |address: Ipv4Addr, to: Ipv4Addr| {
-        let target = if address.is_unspecified() {
+    // A host with 10.0.x.x on eth0 and 10.1.x.x on eth1: an address
+    // belongs to the interface of its second octet, and the route to a
+    // target leaves by the interface of the target's.
+    let host = |address: Ipv4Addr, to: Ipv4Addr| {
+        let by = if address.is_unspecified() {
             to
         } else {
             address
         };
-        Some(format!("eth{}", target.octets()[1]))
+        Some(format!("eth{}", by.octets()[1]))
+    };
+    let paired = paired_channel("10.0.0.5@10.0.0.9:40123;10.1.0.5@10.1.0.9:40123");
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&paired, host),
+        Ok(())
+    );
+    // The unspecified source takes the route's own interface.
+    let any = paired_channel("0.0.0.0@10.0.0.9:40123;10.1.0.5@10.1.0.9:40123");
+    assert_eq!(paired_paths_on_distinct_interfaces_with(&any, host), Ok(()));
+    // Path 2's source is on eth1, but the route to its endpoint leaves by
+    // eth0: its datagrams would not take its interface.
+    let crossed = paired_channel("10.0.0.5@10.0.0.9:40123;10.1.0.5@10.0.0.10:40123");
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&crossed, host),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    // Both routes leave by one NIC, even though the sources differ.
+    let one_nic = |address: Ipv4Addr, _: Ipv4Addr| {
+        Some(if address.is_unspecified() {
+            "eth0".to_owned()
+        } else {
+            format!("eth{}", address.octets()[1])
+        })
     };
     assert_eq!(
-        paired_paths_on_distinct_interfaces_with(&any, routed),
-        Ok(())
+        paired_paths_on_distinct_interfaces_with(&paired, one_nic),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    // Nothing resolves.
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&paired, |_, _| None),
+        Err(crate::error::DriverError::UnsupportedChannel)
+    );
+    // IPv6 has no route lookup here: refused as unverifiable.
+    let ipv6 = paired_channel("::1@[::1]:40123");
+    assert_eq!(
+        paired_paths_on_distinct_interfaces_with(&ipv6, host),
+        Err(crate::error::DriverError::UnsupportedChannel)
     );
 }
 

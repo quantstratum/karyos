@@ -149,6 +149,31 @@ fn route(channel: &UdpConfig, dynamic: bool) -> Result<(SocketAddr, Vec<Path>), 
     Ok((destination, vec![(SocketAddr::new(ip, 0), destination)]))
 }
 
+/// Each paired path's source address belongs to an interface of this host
+/// (karyos#1043): probed by binding a throwaway UDP socket to it, which
+/// fails with `EADDRNOTAVAIL` for an address no interface has, refused as
+/// [`DriverError::UnknownInterface`]. The unspecified address and a
+/// channel without paired paths pass. Control path.
+fn paired_sources_owned(channel: &UdpConfig) -> Result<(), DriverError> {
+    if !matches!(channel.destination, Destination::PairedPaths { .. }) {
+        return Ok(());
+    }
+    for path in &channel.paths {
+        let Interface::Address(ip) = path else {
+            continue;
+        };
+        if ip.is_unspecified() {
+            continue;
+        }
+        if let Err(error) = std::net::UdpSocket::bind(SocketAddr::new(*ip, 0))
+            && error.kind() == std::io::ErrorKind::AddrNotAvailable
+        {
+            return Err(DriverError::UnknownInterface { interface: *ip });
+        }
+    }
+    Ok(())
+}
+
 /// A path of a publication: the local address its endpoint binds, and
 /// where it sends.
 pub(crate) type Path = (SocketAddr, SocketAddr);
@@ -648,6 +673,10 @@ impl<T: StreamTerms> EmbeddedDriver<T> {
             net.count_paths_refused();
             return Err(DriverError::UnsupportedChannel);
         }
+        // A paired path's source address must be this host's before its
+        // route is checked, so an unassigned one is named as such
+        // (karyos#1043, Codex review of #1230).
+        paired_sources_owned(channel)?;
         if let Err(error) = super::subscribe::paths_on_distinct_interfaces(channel)
             .and_then(|()| super::subscribe::paired_paths_on_distinct_interfaces(channel))
         {

@@ -1228,15 +1228,12 @@ fn a_paired_path_on_an_address_this_host_lacks_is_refused() {
     let paired = paired_channel(&format!(
         "127.0.0.1@127.0.0.1:{port};192.0.2.77@127.0.0.2:{port}"
     ));
-    match driver.add_network_publication(aggregate(10, 1), &paired) {
-        Err(DriverError::UnknownInterface { interface }) => {
-            assert_eq!(interface, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77)));
-        }
-        // A host with no route toward TEST-NET resolves no interface for
-        // the path: refused before any bind, which this test cannot use.
-        Err(DriverError::UnsupportedChannel) => return,
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(
+        driver.add_network_publication(aggregate(10, 1), &paired),
+        Err(DriverError::UnknownInterface {
+            interface: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77))
+        })
+    );
     // The first path's endpoint, held before the refusal, is released and
     // closes at the next duties.
     until(&mut driver, |driver| {
