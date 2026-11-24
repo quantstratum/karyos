@@ -5542,8 +5542,10 @@
         },
         {
           "features": [
+            "linux_4_11",
             "net",
-            "std"
+            "std",
+            "time"
           ],
           "from": "workspace:karyos-io@0.1.0-alpha.4",
           "kind": "normal",
@@ -5555,6 +5557,7 @@
         "alloc",
         "event",
         "fs",
+        "linux_4_11",
         "mm",
         "net",
         "param",
