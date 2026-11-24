@@ -1122,6 +1122,15 @@ impl Agent {
             (Some(_), Some(_)) => (None, None),
         };
         let catalog = self.drivers.iter().any(|driver| driver.catalog.is_some());
+        // The admin command clearance these flags name: an administrator
+        // acknowledges, an operator or a risk officer closes (karyos#772).
+        let clearance = if acknowledge {
+            crate::cluster_admin::Clearance::Administrator
+        } else if close {
+            crate::cluster_admin::Clearance::Operator
+        } else {
+            crate::cluster_admin::Clearance::None
+        };
         CAPABILITIES
             .iter()
             .map(|&name| {
@@ -1142,15 +1151,16 @@ impl Agent {
                     // which its answer reports (karyos#738).
                     "guard-preview" | "submit" => (None, close || reopen),
                     // Admin commands need a Cluster attached and a journal
-                    // that records; each command's authority is checked
-                    // when it is made (karyos#772).
+                    // that records, and are offered to a role only when an
+                    // attached Cluster registers a command it may make
+                    // (karyos#772).
                     "cluster-command" => (
                         if self.clusters.is_empty() {
                             Some("not_configured")
                         } else {
                             reopen_off
                         },
-                        close || acknowledge,
+                        self.clusters.any_allowed(clearance),
                     ),
                     // A name added to CAPABILITIES must be classified here.
                     _ => (Some("not_configured"), true),

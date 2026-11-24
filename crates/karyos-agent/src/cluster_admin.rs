@@ -17,8 +17,14 @@
 //! (see `server`), relayed or local as every v1 request (karyos#708):
 //!
 //! - `OPID`: the caller's operation id, a nonzero `u64`. One id names one
-//!   operation: an id the agent already used, in this run or a journalled
-//!   earlier one, is refused as `operation id conflict`, unsent.
+//!   operation. An id becomes used when the command is dispatched (its
+//!   request record durable, the gateway called), whatever comes of it,
+//!   `unknown` included; an id used in this run or a journalled earlier
+//!   one is refused as `operation id conflict`, unsent. An id stays free
+//!   after an agent refusal, `busy`, `journal unavailable` and `bad
+//!   arguments`. An id of 0, or parameters past [`MAX_PARAMETERS`], are
+//!   `bad arguments` on every path ([`cluster_command`]), neither
+//!   journalled nor sent.
 //! - `CLUSTER`: the name the product's Cluster was attached under
 //!   ([`valid_name`]).
 //! - `COMMAND`: one of the names the product registered for that Cluster
@@ -27,8 +33,10 @@
 //!   uppercase hex, at most [`MAX_PARAMETERS`] bytes; `-` for none.
 //! - `REASON`: the operator's reason, the rest of the line, cut to the
 //!   journal's [`MAX_REASON`] bytes.
-//! - The requester: the local peer's uid, or a relay's principal with the
-//!   operator id and role this agent's principal table gives it; the
+//! - The requester: the local peer's uid, or a relay's principal
+//!   (`KARYOS-AGENT 1 relay PRINCIPAL cluster-command ...`) with the
+//!   operator id and role this agent's principal table gives it: the
+//!   principal's role authorises the command, never the relay's. The
 //!   journal records the operator and the relay apart.
 //!
 //! # Registration
@@ -52,6 +60,9 @@
 //! | operator            | no     | no        | yes      | yes          | yes           |
 //! | administrator       | no     | no        | no       | no           | yes           |
 //!
+//! The capability `cluster-command` is served to a role only when an
+//! attached Cluster registers a command that role may make.
+//!
 //! A caller without the command's authority is answered `forbidden`, and
 //! the refusal is journalled ([`Kind::ClusterRefused`], code
 //! [`RefusalCode::Forbidden`]) with nothing sent.
@@ -59,17 +70,25 @@
 //! # The journal
 //!
 //! - **Before.** A [`Kind::ClusterRequest`] record, durable, before the
-//!   command is sent. The core cannot tell a command that only makes the
+//!   command is sent: the only record that is durable and the only one
+//!   that gates dispatch. The core cannot tell a command that only makes the
 //!   product safer from one that loosens it, so every admin command fails
 //!   closed: without a journal, or when the append fails, it is answered
 //!   `journal unavailable` and never sent.
 //! - **After.** A [`Kind::ClusterOutcome`] record: `code` 0 for a
 //!   sequenced command, with the log index in `word` and the term in
 //!   `expected`; the product's refusal code otherwise; or
-//!   [`UNKNOWN_OUTCOME`].
+//!   [`UNKNOWN_OUTCOME`]. Appended, not waited for: when the append fails
+//!   the answer keeps the product's result and carries
+//!   `"journalled":false`, so the caller reconciles it without retrying.
 //! - **Refused before sending.** A [`Kind::ClusterRefused`] record, its
 //!   [`RefusalCode`] in `code`, for a forbidden role, an unregistered
-//!   command, an unknown Cluster and an operation id conflict.
+//!   command, an unknown Cluster and an operation id conflict; the answer
+//!   carries `"journalled":true` or `false` as the append went.
+//! - **Busy.** The Cluster is reserved from before the request record
+//!   until the worker that called its gateway exits, so a command made
+//!   while another is in flight, even one whose caller already got
+//!   `unknown`, is `busy`: neither journalled nor sent.
 //! - Each of the three carries the Cluster's name ([`JournalRecord::target`]),
 //!   the command's name ([`JournalRecord::command`]) and, on an outcome,
 //!   the evidence ([`JournalRecord::evidence`]); `parameters` is the
@@ -101,6 +120,7 @@
 //! record.
 
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -350,6 +370,30 @@ pub struct Attached {
     name: String,
     commands: Vec<AdminCommand>,
     gateway: SharedGateway,
+    /// Set from before a command's request record is appended until the
+    /// worker that calls the gateway exits (karyos#772 review): while set,
+    /// another command to this Cluster is `busy`, neither journalled nor
+    /// sent.
+    in_flight: Arc<AtomicBool>,
+}
+
+/// A Cluster's in-flight reservation: cleared when dropped.
+#[derive(Debug)]
+struct Reservation(Arc<AtomicBool>);
+
+impl Reservation {
+    /// Takes `flag`; `None` when it is already taken.
+    fn take(flag: &Arc<AtomicBool>) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(Arc::clone(flag)))
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl Attached {
@@ -425,6 +469,7 @@ impl Clusters {
             name: name.to_owned(),
             commands,
             gateway: Arc::new(Mutex::new(gateway)),
+            in_flight: Arc::default(),
         });
         Ok(())
     }
@@ -433,6 +478,18 @@ impl Clusters {
     #[must_use]
     pub fn find(&self, name: &str) -> Option<&Attached> {
         self.attached.iter().find(|cluster| cluster.name == name)
+    }
+
+    /// Whether an attached Cluster registers a command `clearance`
+    /// allows.
+    #[must_use]
+    pub fn any_allowed(&self, clearance: Clearance) -> bool {
+        self.attached.iter().any(|cluster| {
+            cluster
+                .commands
+                .iter()
+                .any(|command| clearance.allows(command.authority))
+        })
     }
 
     /// Whether none is attached.
@@ -503,6 +560,9 @@ pub enum ClusterAnswer {
         reply: Vec<u8>,
         /// The evidence the product attached.
         evidence: Option<Evidence>,
+        /// Whether its outcome record was written; `false` when the
+        /// append failed: the result stands, its record is missing.
+        journalled: bool,
     },
     /// The product refused it.
     Refused {
@@ -512,18 +572,30 @@ pub enum ClusterAnswer {
         code: u64,
         /// Its reason.
         reason: String,
+        /// Whether its outcome record was written.
+        journalled: bool,
     },
-    /// Refused by the agent, journalled, never sent.
-    Rejected(RefusalCode),
-    /// No durable request record: never sent.
+    /// Refused by the agent, never sent.
+    Rejected {
+        /// Why.
+        code: RefusalCode,
+        /// Whether its refusal record was written.
+        journalled: bool,
+    },
+    /// No durable request record: never sent, the id still free.
     JournalUnavailable,
-    /// An earlier command to the same Cluster has not returned yet: not
-    /// sent, not journalled.
+    /// An earlier command to the same Cluster is still in flight: not
+    /// sent, not journalled, the id still free.
     Busy,
+    /// An operation id of 0, or parameters past [`MAX_PARAMETERS`]:
+    /// neither journalled nor sent.
+    BadArguments,
     /// Sent, and no answer came: unknown, journalled as such.
     NoAnswer {
         /// The operation id.
         operation: u64,
+        /// Whether its outcome record was written.
+        journalled: bool,
     },
 }
 
@@ -571,18 +643,53 @@ impl Command<'_> {
 
 /// Makes `command` on `clusters`, journalled in `journal`: refused and
 /// journalled, unsent, for an unknown Cluster, an unregistered command, a
-/// caller without the command's authority or an id in `used`; otherwise
-/// sent only once its request record is durable, its outcome journalled
-/// after it. The gateway is called on a worker and waited for at most
-/// `wait`; no answer in time is unknown. `used` decides whether the id
-/// is fresh, and is told when it is taken.
+/// caller without the command's authority or an id in `used`; `busy`,
+/// unjournalled and unsent, while another command to the Cluster is in
+/// flight; otherwise sent only once its request record is durable, its
+/// outcome journalled after it. The gateway is called on a worker and
+/// waited for at most `wait`; no answer in time is unknown. `used` decides
+/// whether the id is fresh, and is told when it is taken: when the command
+/// is dispatched, whatever comes of it.
 pub fn cluster_command(
     mut journal: Option<&mut Journal>,
     clusters: &Clusters,
     command: &Command<'_>,
-    (wait, mut used): (Duration, impl FnMut(u64, bool) -> bool),
+    (wait, used): (Duration, impl FnMut(u64, bool) -> bool),
     mut now: impl FnMut() -> u64,
 ) -> ClusterAnswer {
+    match dispatch(
+        journal.as_deref_mut(),
+        clusters,
+        command,
+        (wait, used),
+        &mut now,
+    ) {
+        Dispatched::Answered(answer) => answer,
+        Dispatched::Sent(answer) => record_outcome(journal, command, answer, now),
+    }
+}
+
+/// What [`dispatch`] came to.
+enum Dispatched {
+    /// Answered without sending: its answer is final.
+    Answered(ClusterAnswer),
+    /// Sent: its answer, whose outcome record is still to write.
+    Sent(ClusterAnswer),
+}
+
+/// Checks `command`, journals its request and calls the gateway: every
+/// step of [`cluster_command`] but the outcome record.
+fn dispatch(
+    journal: Option<&mut Journal>,
+    clusters: &Clusters,
+    command: &Command<'_>,
+    (wait, mut used): (Duration, impl FnMut(u64, bool) -> bool),
+    now: &mut impl FnMut() -> u64,
+) -> Dispatched {
+    // Checked here, whoever calls: nothing is journalled or sent.
+    if command.operation == 0 || command.parameters.len() > MAX_PARAMETERS {
+        return Dispatched::Answered(ClusterAnswer::BadArguments);
+    }
     let refusal = match clusters.find(command.cluster) {
         None => Err(RefusalCode::UnknownCluster),
         Some(cluster) => match cluster
@@ -602,28 +709,30 @@ pub fn cluster_command(
     let cluster = match refusal {
         Ok(cluster) => cluster,
         Err(code) => {
-            if let Some(journal) = journal {
+            let journalled = journal.is_some_and(|journal| {
                 let mut record = command.record(Kind::ClusterRefused, now());
                 record.code = code.code();
-                let _ = journal.append(&record, record.time);
-            }
-            return ClusterAnswer::Rejected(code);
+                journal.append(&record, record.time).is_ok()
+            });
+            return Dispatched::Answered(ClusterAnswer::Rejected { code, journalled });
         }
     };
-    // A call still running holds the gateway: refuse before journalling.
-    if cluster.gateway.try_lock().is_err() {
-        return ClusterAnswer::Busy;
-    }
+    // Reserved before the request record and held by the worker until it
+    // exits, so a second command is `busy`, unjournalled and unsent, even
+    // after this one's caller stopped waiting.
+    let Some(reservation) = Reservation::take(&cluster.in_flight) else {
+        return Dispatched::Answered(ClusterAnswer::Busy);
+    };
     let record = command.record(Kind::ClusterRequest, now());
-    let durable = journal
-        .as_deref_mut()
-        .is_some_and(|journal| journal.append_durable(&record, record.time).is_ok());
+    let durable =
+        journal.is_some_and(|journal| journal.append_durable(&record, record.time).is_ok());
     if !durable {
-        return ClusterAnswer::JournalUnavailable;
+        return Dispatched::Answered(ClusterAnswer::JournalUnavailable);
     }
     let _ = used(command.operation, true);
     let operation = command.operation;
-    let answer = match call(&cluster.gateway, command, wait) {
+    let journalled = false;
+    Dispatched::Sent(match call(&cluster.gateway, command, wait, reservation) {
         Some(ClusterReply::Sequenced {
             index,
             term,
@@ -635,41 +744,67 @@ pub fn cluster_command(
             term,
             reply,
             evidence,
+            journalled,
         },
         Some(ClusterReply::Refused { code, reason }) => ClusterAnswer::Refused {
             operation,
             code: code.get(),
             reason,
+            journalled,
         },
-        Some(ClusterReply::NoAnswer) | None => ClusterAnswer::NoAnswer { operation },
-    };
-    if let Some(journal) = journal {
-        let mut record = command.record(Kind::ClusterOutcome, now());
-        match &answer {
-            ClusterAnswer::Sequenced {
-                index,
-                term,
-                evidence,
-                ..
-            } => {
-                record.word = *index;
-                record.expected = *term;
-                record.evidence = evidence
-                    .as_ref()
-                    .map(Evidence::journalled)
-                    .unwrap_or_default();
-            }
-            ClusterAnswer::Refused { code, .. } => record.code = *code,
-            _ => record.code = UNKNOWN_OUTCOME,
+        Some(ClusterReply::NoAnswer) | None => ClusterAnswer::NoAnswer {
+            operation,
+            journalled,
+        },
+    })
+}
+
+/// Journals the outcome of the sent `command`, `answer`, and reports in
+/// it whether the record was written: a failed append keeps the product's
+/// result and says its record is missing.
+fn record_outcome(
+    journal: Option<&mut Journal>,
+    command: &Command<'_>,
+    mut answer: ClusterAnswer,
+    mut now: impl FnMut() -> u64,
+) -> ClusterAnswer {
+    let mut record = command.record(Kind::ClusterOutcome, now());
+    match &answer {
+        ClusterAnswer::Sequenced {
+            index,
+            term,
+            evidence,
+            ..
+        } => {
+            record.word = *index;
+            record.expected = *term;
+            record.evidence = evidence
+                .as_ref()
+                .map(Evidence::journalled)
+                .unwrap_or_default();
         }
-        let _ = journal.append(&record, record.time);
+        ClusterAnswer::Refused { code, .. } => record.code = *code,
+        _ => record.code = UNKNOWN_OUTCOME,
+    }
+    let written = journal.is_some_and(|journal| journal.append(&record, record.time).is_ok());
+    match &mut answer {
+        ClusterAnswer::Sequenced { journalled, .. }
+        | ClusterAnswer::Refused { journalled, .. }
+        | ClusterAnswer::NoAnswer { journalled, .. } => *journalled = written,
+        _ => {}
     }
     answer
 }
 
 /// Calls the gateway for `command` on a worker, waiting at most `wait`:
 /// `None` when no answer came in time, the call then finishing on its own.
-fn call(gateway: &SharedGateway, command: &Command<'_>, wait: Duration) -> Option<ClusterReply> {
+/// The worker holds `reservation` until it exits.
+fn call(
+    gateway: &SharedGateway,
+    command: &Command<'_>,
+    wait: Duration,
+    reservation: Reservation,
+) -> Option<ClusterReply> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let gateway = Arc::clone(gateway);
     let name = command.command.to_owned();
@@ -678,6 +813,7 @@ fn call(gateway: &SharedGateway, command: &Command<'_>, wait: Duration) -> Optio
     let spawned = std::thread::Builder::new()
         .name("karyos-agent-cluster".to_owned())
         .spawn(move || {
+            let _reservation = reservation;
             let Ok(mut gateway) = gateway.lock() else {
                 return;
             };

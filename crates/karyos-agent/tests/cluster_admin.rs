@@ -310,6 +310,7 @@ fn an_authorised_operator_gets_the_sequenced_outcome_of_a_registered_command() {
             term: TERM,
             reply: vec![0],
             evidence: None,
+            journalled: true,
         }
     );
     assert_eq!(gateway.state(), (true, 0, 1));
@@ -365,7 +366,13 @@ fn an_upgrade_activation_shows_the_evidence_digest_the_product_attached() {
         1,
         Clearance::Operator,
     );
-    assert_eq!(answer, ClusterAnswer::Rejected(RefusalCode::Forbidden));
+    assert_eq!(
+        answer,
+        ClusterAnswer::Rejected {
+            code: RefusalCode::Forbidden,
+            journalled: true
+        }
+    );
     assert_eq!(gateway.state(), (false, 0, 0));
     let answer = submit(
         &mut journal,
@@ -385,6 +392,7 @@ fn an_upgrade_activation_shows_the_evidence_digest_the_product_attached() {
         term: 1,
         reply: vec![0],
         evidence,
+        journalled: true,
     });
     assert!(
         shown.ends_with(&format!(
@@ -413,7 +421,13 @@ fn a_command_the_cluster_applied_but_whose_answer_was_lost_is_unknown() {
         Clearance::Operator,
     );
     // The Cluster did kill: the agent cannot know it, and never says so.
-    assert_eq!(answer, ClusterAnswer::NoAnswer { operation: 1 });
+    assert_eq!(
+        answer,
+        ClusterAnswer::NoAnswer {
+            operation: 1,
+            journalled: true
+        }
+    );
     assert_eq!(gateway.state(), (true, 0, 1));
     assert_eq!(
         karyos_agent::json::cluster_answer(&answer),
@@ -439,7 +453,10 @@ fn an_unregistered_command_never_reaches_the_cluster() {
     );
     assert_eq!(
         answer,
-        ClusterAnswer::Rejected(RefusalCode::UnregisteredCommand)
+        ClusterAnswer::Rejected {
+            code: RefusalCode::UnregisteredCommand,
+            journalled: true
+        }
     );
     assert_eq!(gateway.state(), (false, 0, 0));
 }
@@ -507,7 +524,10 @@ mod socket {
                 &mut agent,
                 "KARYOS-AGENT 1 cluster-command 10 sequencer kill - drill",
             );
-            assert_eq!(answer, r#"{"error":"forbidden"}"#, "{role:?}");
+            assert_eq!(
+                answer, r#"{"error":"forbidden","journalled":true}"#,
+                "{role:?}"
+            );
         }
         assert_eq!(gateway.state(), (false, 0, 0));
         let answer = ask(
@@ -525,7 +545,10 @@ mod socket {
             &mut agent,
             "KARYOS-AGENT 1 cluster-command 10 sequencer reopen -",
         );
-        assert_eq!(answer, r#"{"error":"operation id conflict"}"#);
+        assert_eq!(
+            answer,
+            r#"{"error":"operation id conflict","journalled":true}"#
+        );
         let answer = ask(
             local(&dir, Role::Operator),
             &mut agent,
@@ -565,6 +588,9 @@ mod socket {
             &mut agent,
             "KARYOS-AGENT 1 cluster-command 12 sequencer kill -",
         );
-        assert_eq!(answer, r#"{"error":"operation id conflict"}"#);
+        assert_eq!(
+            answer,
+            r#"{"error":"operation id conflict","journalled":true}"#
+        );
     }
 }

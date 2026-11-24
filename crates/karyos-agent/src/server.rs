@@ -879,7 +879,8 @@ impl Server {
                     reason.as_bytes(),
                 );
                 let served = match answer {
-                    crate::cluster_admin::ClusterAnswer::Rejected(_) => Served::Refused,
+                    crate::cluster_admin::ClusterAnswer::Rejected { .. }
+                    | crate::cluster_admin::ClusterAnswer::BadArguments => Served::Refused,
                     _ => Served::Operated,
                 };
                 (json::cluster_answer(&answer), served)

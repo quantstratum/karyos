@@ -159,6 +159,7 @@ fn an_authorised_registered_command_is_journalled_before_and_after_with_its_evid
                 term: 3,
                 reply: b"ok".to_vec(),
                 evidence: Some(Evidence::new("sha256", &[0xab; 32]).unwrap()),
+                journalled: true,
             }
         );
     }
@@ -201,7 +202,13 @@ fn a_caller_without_the_commands_authority_is_refused_and_journalled_unsent() {
                 &command(name, 5, clearance),
                 &mut used,
             );
-            assert_eq!(answer, ClusterAnswer::Rejected(RefusalCode::Forbidden));
+            assert_eq!(
+                answer,
+                ClusterAnswer::Rejected {
+                    code: RefusalCode::Forbidden,
+                    journalled: true
+                }
+            );
         }
     }
     assert!(product.sent.lock().unwrap().is_empty());
@@ -232,13 +239,19 @@ fn only_registered_commands_of_attached_clusters_are_forwarded() {
     );
     assert_eq!(
         answer,
-        ClusterAnswer::Rejected(RefusalCode::UnregisteredCommand)
+        ClusterAnswer::Rejected {
+            code: RefusalCode::UnregisteredCommand,
+            journalled: true
+        }
     );
     let mut other = command("kill", 5, Clearance::Administrator);
     other.cluster = "venue";
     assert_eq!(
         run(Some(&mut journal), &clusters, &other, &mut used),
-        ClusterAnswer::Rejected(RefusalCode::UnknownCluster)
+        ClusterAnswer::Rejected {
+            code: RefusalCode::UnknownCluster,
+            journalled: true
+        }
     );
     assert!(product.sent.lock().unwrap().is_empty());
     drop(journal);
@@ -261,7 +274,14 @@ fn a_lost_outcome_is_journalled_as_unknown_never_as_success() {
                 &command("kill", 9, Clearance::Operator),
                 &mut used,
             );
-            assert_eq!(answer, ClusterAnswer::NoAnswer { operation: 9 }, "{name}");
+            assert_eq!(
+                answer,
+                ClusterAnswer::NoAnswer {
+                    operation: 9,
+                    journalled: true
+                },
+                "{name}"
+            );
         }
         let records = records(&dir);
         let outcome = records.last().unwrap();
@@ -293,7 +313,8 @@ fn a_product_refusal_is_returned_and_journalled_verbatim() {
             ClusterAnswer::Refused {
                 operation: 9,
                 code: 7,
-                reason: "already killed".to_owned()
+                reason: "already killed".to_owned(),
+                journalled: true,
             }
         );
     }
@@ -331,7 +352,10 @@ fn a_used_operation_id_is_a_conflict_unsent() {
     );
     assert_eq!(
         answer,
-        ClusterAnswer::Rejected(RefusalCode::OperationConflict)
+        ClusterAnswer::Rejected {
+            code: RefusalCode::OperationConflict,
+            journalled: true
+        }
     );
     assert!(product.sent.lock().unwrap().is_empty());
 }
@@ -436,4 +460,195 @@ fn parameters_parse_as_bounded_hex() {
         assert_eq!(parse_parameters(text), None, "{text}");
     }
     assert_eq!(hex(&[0, 0xab]), "00ab");
+}
+
+/// karyos#772 review: the gateway is reserved from before the request
+/// record until the worker exits, so a command made while another is in
+/// flight, even one whose caller stopped waiting at `unknown`, is `busy`:
+/// neither journalled nor sent, and its id stays free.
+#[test]
+fn a_command_while_another_is_in_flight_is_busy_unjournalled_and_unsent() {
+    let dir = dir("busy");
+    let product = Product::new(Mode::Slow);
+    let clusters = clusters(&product);
+    let mut used = HashSet::new();
+    {
+        let mut journal = Journal::open(&dir, 10).unwrap();
+        let first = run(
+            Some(&mut journal),
+            &clusters,
+            &command("kill", 1, Clearance::Operator),
+            &mut used,
+        );
+        assert_eq!(
+            first,
+            ClusterAnswer::NoAnswer {
+                operation: 1,
+                journalled: true
+            },
+            "the caller stopped waiting before the worker returned"
+        );
+        let second = run(
+            Some(&mut journal),
+            &clusters,
+            &command("kill", 2, Clearance::Operator),
+            &mut used,
+        );
+        assert_eq!(second, ClusterAnswer::Busy);
+        assert!(!used.contains(&2), "a busy id stays free");
+        // Once the worker exits the reservation is released.
+        let start = std::time::Instant::now();
+        while clusters
+            .find("seq")
+            .unwrap()
+            .in_flight
+            .load(Ordering::Acquire)
+        {
+            assert!(start.elapsed() < Duration::from_secs(10), "never released");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let third = run(
+            Some(&mut journal),
+            &clusters,
+            &command("kill", 2, Clearance::Operator),
+            &mut used,
+        );
+        assert_ne!(third, ClusterAnswer::Busy);
+    }
+    let sent: Vec<u64> = product
+        .sent
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|sent| sent.2)
+        .collect();
+    assert_eq!(sent, [1, 2], "the busy command was never sent");
+    let operations: Vec<(Kind, u64)> = records(&dir)
+        .iter()
+        .map(|record| (record.kind, record.operation))
+        .collect();
+    assert_eq!(
+        operations,
+        [
+            (Kind::ClusterRequest, 1),
+            (Kind::ClusterOutcome, 1),
+            (Kind::ClusterRequest, 2),
+            (Kind::ClusterOutcome, 2),
+        ],
+        "the busy command was never journalled"
+    );
+}
+
+/// karyos#772 review: an outcome whose record cannot be appended keeps
+/// the product's result and says the record is missing.
+#[test]
+fn an_outcome_whose_record_fails_keeps_the_result_and_says_it_is_not_journalled() {
+    let dir = dir("outcome-unjournalled");
+    let product = Product::new(Mode::Sequence);
+    let clusters = clusters(&product);
+    let mut used = HashSet::new();
+    let mut journal = Journal::open(&dir, 10).unwrap();
+    let command = command("kill", 4, Clearance::Operator);
+    let mut now = || 50;
+    let Dispatched::Sent(answer) = dispatch(
+        Some(&mut journal),
+        &clusters,
+        &command,
+        (Duration::from_secs(5), |id, take| {
+            if take {
+                !used.insert(id)
+            } else {
+                used.contains(&id)
+            }
+        }),
+        &mut now,
+    ) else {
+        panic!("sent");
+    };
+    journal.break_recorder();
+    let answer = record_outcome(Some(&mut journal), &command, answer, now);
+    assert!(
+        matches!(
+            answer,
+            ClusterAnswer::Sequenced {
+                operation: 4,
+                index: 12,
+                journalled: false,
+                ..
+            }
+        ),
+        "{answer:?}"
+    );
+    assert!(crate::json::cluster_answer(&answer).ends_with(r#","journalled":false}"#));
+    // A refusal whose record cannot be written says so too.
+    let answer = run(
+        Some(&mut journal),
+        &clusters,
+        &self::command("kill", 5, Clearance::None),
+        &mut used,
+    );
+    assert_eq!(
+        answer,
+        ClusterAnswer::Rejected {
+            code: RefusalCode::Forbidden,
+            journalled: false
+        }
+    );
+}
+
+/// karyos#772 review: an operation id of 0 and parameters past the bound
+/// are refused on the shared path, before any record or worker.
+#[test]
+fn an_id_of_zero_or_parameters_past_the_bound_are_refused_unjournalled() {
+    let dir = dir("bad-arguments");
+    let product = Product::new(Mode::Sequence);
+    let clusters = clusters(&product);
+    let mut used = HashSet::new();
+    let long = [0u8; MAX_PARAMETERS + 1];
+    {
+        let mut journal = Journal::open(&dir, 10).unwrap();
+        let zero = command("kill", 0, Clearance::Operator);
+        let mut too_long = command("kill", 6, Clearance::Operator);
+        too_long.parameters = &long;
+        for bad in [zero, too_long] {
+            assert_eq!(
+                run(Some(&mut journal), &clusters, &bad, &mut used),
+                ClusterAnswer::BadArguments
+            );
+        }
+        let mut at_bound = command("kill", 7, Clearance::Operator);
+        at_bound.parameters = &long[..MAX_PARAMETERS];
+        assert!(matches!(
+            run(Some(&mut journal), &clusters, &at_bound, &mut used),
+            ClusterAnswer::Sequenced { .. }
+        ));
+    }
+    assert_eq!(product.sent.lock().unwrap().len(), 1);
+    assert_eq!(records(&dir).len(), 2, "only the command at the bound");
+}
+
+/// karyos#772 review: `cluster-command` is offered to a clearance only
+/// when an attached Cluster registers a command it may make.
+#[test]
+fn a_clearance_is_offered_only_the_commands_it_may_make() {
+    #[derive(Debug)]
+    struct AdminOnly;
+    impl ClusterGateway for AdminOnly {
+        fn commands(&self) -> Vec<AdminCommand> {
+            vec![AdminCommand::new("activate-upgrade", Authority::Administrator).unwrap()]
+        }
+        fn submit(&mut self, _: &Submission<'_>) -> ClusterReply {
+            ClusterReply::NoAnswer
+        }
+    }
+    let mut clusters = Clusters::default();
+    clusters.attach("seq", Box::new(AdminOnly)).unwrap();
+    assert!(!clusters.any_allowed(Clearance::None));
+    assert!(!clusters.any_allowed(Clearance::Operator));
+    assert!(clusters.any_allowed(Clearance::Administrator));
+    clusters
+        .attach("venue", Box::new(Product::new(Mode::Silent)))
+        .unwrap();
+    assert!(clusters.any_allowed(Clearance::Operator));
+    assert!(!clusters.any_allowed(Clearance::None));
 }
