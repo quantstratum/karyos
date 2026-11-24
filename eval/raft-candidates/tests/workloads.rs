@@ -377,27 +377,6 @@ fn byte_case(payload_bytes: usize, in_flight_entries: u64, in_flight_bytes: u64)
     w2.cases().unwrap().into_iter().next().unwrap()
 }
 
-/// The byte cap before the entry cap, on the candidates' case (256 B
-/// commands, 8 entries and 1 KiB in flight). ADR-0105, decision 2: the
-/// custom core holds the bytes in flight per follower strictly, as a
-/// metered window; decision 4: the candidates' refusal by entry size "is
-/// their result to report, not a reason to change the case". So the
-/// custom core sends these commands within its window and the case
-/// passes; any refusal it makes is the same typed `InFlightBytes`.
-#[test]
-fn custom_w2_byte_cap_binds_in_flight_not_at_the_proposal() {
-    let case = byte_case(256, 8, 1024);
-    let outcome = workloads::run::<Custom>(&case, 1).unwrap();
-    assert!(outcome.safety.is_ok(), "{}", case.name);
-    assert_eq!(workloads::pass(&case, &outcome), Ok(None), "{}", case.name);
-    let pushed = refusals(&outcome);
-    assert!(
-        pushed.iter().all(|limit| *limit == Limit::InFlightBytes),
-        "{}: {pushed:?}",
-        case.name
-    );
-}
-
 /// A command larger than a follower's whole byte window could never be
 /// sent: the custom core refuses it with the candidates' typed
 /// `Backpressure(InFlightBytes)`, and nothing else.
@@ -415,36 +394,9 @@ fn custom_refuses_a_command_over_the_whole_byte_window() {
     );
 }
 
-/// Version 2's W2 in-flight bytes case (ADR-0105, decision 4): 8 KiB
-/// commands against a 256 KiB byte cap and 64 entries, so 32 entries
-/// reach the byte cap before the entry cap. The same case for all three
-/// cores: the candidates refuse each command over their 4 KiB share with
-/// `InFlightBytes`, their result to report; the custom core meters the
-/// window and passes. Safety holds for all.
-#[test]
-fn version_2_byte_case_on_every_core() {
-    let case = byte_case(8 * 1024, 64, 256 * 1024);
-    for (name, outcome) in [
-        ("raft", workloads::run::<RaftRs>(&case, 1).unwrap()),
-        ("openraft", workloads::run::<OpenRaft>(&case, 1).unwrap()),
-    ] {
-        assert!(outcome.safety.is_ok(), "{name}");
-        let pushed = refusals(&outcome);
-        assert!(!pushed.is_empty(), "{name}");
-        assert!(
-            pushed.iter().all(|limit| *limit == Limit::InFlightBytes),
-            "{name}: {pushed:?}"
-        );
-    }
-    let outcome = workloads::run::<Custom>(&case, 1).unwrap();
-    assert!(outcome.safety.is_ok(), "custom");
-    assert_eq!(workloads::pass(&case, &outcome), Ok(None), "custom");
-    let pushed = refusals(&outcome);
-    assert!(
-        pushed.iter().all(|limit| *limit == Limit::InFlightBytes),
-        "custom: {pushed:?}"
-    );
-}
+// The custom core's byte window, its fill and its bound, and version 2's
+// W2 in-flight byte case on all three cores, are measured from the
+// messages in `tests/w2_bytes.rs` (ADR-0105, decisions 2 and 4).
 
 /// An entry cap of 0 is refused before startup as unsupported limits.
 #[test]
