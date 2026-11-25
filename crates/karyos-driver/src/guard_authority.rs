@@ -138,6 +138,10 @@ pub struct GuardAuthority {
     authority_id: u64,
     key_id: u32,
     signer: Ed25519Signer,
+    /// The file epoch of the signing file the signer came from, once
+    /// pinned ([`GuardAuthority::pinned`]): key application keeps it only
+    /// while that same file signs (H8 R3-2).
+    file_epoch: Option<u32>,
     seq: u64,
     guards: Vec<AuthorityGuard>,
     /// Each guard's highest committed epoch, by position in `guards`.
@@ -210,6 +214,7 @@ impl GuardAuthority {
             authority_id,
             key_id,
             signer,
+            file_epoch: None,
             seq: 0,
             guards,
             committed,
@@ -223,18 +228,86 @@ impl GuardAuthority {
         })
     }
 
-    /// Applies the key store's current key set (H8 finding 4): once its
-    /// `key_id` no longer has a signing file (revoked, expired, or the
-    /// store disabled) the signer is overwritten and signing stops for
-    /// good; STATUS challenges are then refused as
-    /// [`ChallengeRefusal::Uncommitted`]. A restored key does not bring it
-    /// back: a new authority must be configured.
+    /// Pins the signer to the admitted signing file of `file_epoch`
+    /// under its `key_id` (H8 R3-2).
+    #[must_use]
+    pub fn pinned(mut self, file_epoch: u32) -> Self {
+        self.file_epoch = Some(file_epoch);
+        self
+    }
+
+    /// The file epoch the signer is pinned to (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn file_epoch(&self) -> Option<u32> {
+        self.file_epoch
+    }
+
+    /// Applies the key store's current key set (H8 finding 4, R3-2).
+    ///
+    /// A pinned signer is kept only while its own file, `(key_id,
+    /// file_epoch)`, is the one that signs. When a successor of the same
+    /// key id signs instead (a rotation, or the original revoked or
+    /// expired), the old seed is erased and the successor installed if it
+    /// is an authority signing key of the same authority serving every
+    /// guard; otherwise, and when no file signs (revoked, expired, or the
+    /// store disabled), the signer is erased and signing stops for good:
+    /// STATUS challenges are then refused as
+    /// [`ChallengeRefusal::Uncommitted`], and a restored key does not
+    /// bring it back. An unpinned signer (tests) stops only when no file
+    /// signs.
     pub fn apply_keys(&mut self, keys: &dyn crate::wire_auth::KeySet) {
-        if keys.signing(self.key_id).is_none() {
-            self.signing = false;
-            // The old signing key is dropped, and erased, here.
-            self.signer = Ed25519Signer::from_seed(&[0; crate::authority::KEY_LEN]);
+        use crate::wire_keys::{Material, Purpose, Scope};
+
+        if !self.signing {
+            return;
         }
+        let Some(file) = keys.signing(self.key_id) else {
+            self.stop();
+            return;
+        };
+        let Some(pinned) = self.file_epoch else {
+            return;
+        };
+        if file.file_epoch == pinned {
+            return;
+        }
+        let successor = match (&file.purpose, &file.scope, &file.material) {
+            (
+                Purpose::AuthoritySigning,
+                Scope::Authority {
+                    authority_id,
+                    guards,
+                    guard_count,
+                    ..
+                },
+                Material::Secret(seed),
+            ) if *authority_id == self.authority_id
+                && self.guards.iter().all(|guard| {
+                    guards
+                        .get(..*guard_count)
+                        .is_some_and(|served| served.contains(&guard.guard_id))
+                }) =>
+            {
+                Some(Ed25519Signer::from_seed(seed))
+            }
+            _ => None,
+        };
+        match successor {
+            // The old seed is dropped, and erased, by the assignment.
+            Some(signer) => {
+                self.signer = signer;
+                self.file_epoch = Some(file.file_epoch);
+            }
+            None => self.stop(),
+        }
+    }
+
+    /// Erases the signer and stops signing for good.
+    fn stop(&mut self) {
+        self.signing = false;
+        // The old signing key is dropped, and erased, here.
+        self.signer = Ed25519Signer::from_seed(&[0; crate::authority::KEY_LEN]);
     }
 
     /// A new duty cycle.

@@ -8224,6 +8224,58 @@ fn an_abort_that_never_submits_backs_off_and_expires() {
     assert_eq!(rig.agents.sender.role.pending_aborts(), 0);
 }
 
+/// H8 R3-1, measured at the real RX and TX paths of an established
+/// authenticated session: a view the conductor published but a full ring
+/// kept from a role fences that role at the point of use, with no ring in
+/// between; a stale view (the conductor stopped reloading) fences both.
+/// Once the role has applied the view, or the view is fresh again,
+/// delivery resumes.
+#[test]
+fn the_key_fence_stops_rx_and_tx_without_the_rings() {
+    use karyos_sys::log_buffer::Role;
+
+    use crate::wire_auth::Side;
+
+    let (mut rig, _b, _channel) = authenticated_rig();
+    let slot = established(&mut rig);
+    let (_conductor, mut subscriber) = image_subscriber(&rig, slot, 0, Role::Optional);
+    let fence = rig.agents.sender.role.key_fence();
+    let batch = |from: u8| -> Vec<Vec<u8>> { (from..from + 3).map(|i| vec![i; 100]).collect() };
+    assert_eq!(enc_deliver(&mut rig, &mut subscriber, &batch(0)), batch(0));
+    // View 1 published; only the sender applied it (the receiver's ring
+    // was full): the sender seals, the receiver refuses at RX.
+    fence.require(1);
+    fence.applied(Side::Sender, 1);
+    let refused = rig.agents.receiver.role.counters().auth_rejected;
+    assert!(enc_deliver(&mut rig, &mut subscriber, &batch(10)).is_empty());
+    assert!(rig.agents.receiver.role.counters().auth_rejected > refused);
+    // View 2 published; only the receiver applied it: the sender seals
+    // nothing at TX, so nothing even reaches the receiver.
+    fence.require(2);
+    fence.applied(Side::Receiver, 2);
+    let refused = rig.agents.receiver.role.counters().auth_rejected;
+    let staged = enc_deliver(&mut rig, &mut subscriber, &batch(20));
+    assert!(staged.is_empty());
+    assert_eq!(rig.agents.receiver.role.counters().auth_rejected, refused);
+    // Both applied: what was held back now flows.
+    fence.applied(Side::Sender, 2);
+    let mut flowing = Vec::new();
+    for _ in 0..600 {
+        rig.round(true);
+        while let Some(message) = poll_message(&mut subscriber) {
+            flowing.push(message);
+        }
+        if !flowing.is_empty() {
+            break;
+        }
+    }
+    assert!(!flowing.is_empty(), "resumed");
+    // The view goes stale (no reload): both roles stop.
+    fence.renew(0);
+    let held = enc_deliver(&mut rig, &mut subscriber, &batch(30));
+    assert!(held.is_empty());
+}
+
 /// Marks in memory, for a followed guard.
 #[derive(Debug, Default)]
 struct MemoryMarks(std::collections::HashMap<u64, u64>);

@@ -1276,7 +1276,7 @@ impl<T: StreamTerms> Network<T> {
         let Some(wire) = self.wire.as_mut() else {
             return;
         };
-        let Some(view) = wire.duty() else {
+        let Some(view) = wire.duty(&self.links.key_fence) else {
             return;
         };
         let receiver = self

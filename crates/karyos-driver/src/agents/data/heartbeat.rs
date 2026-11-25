@@ -188,7 +188,7 @@ impl<T: StreamTerms> Outbound<T> {
         // An authenticated lane's heartbeat is sealed like its DATA, under
         // a fresh envelope sequence; without a session key none leaves.
         // Nor does one leave an admission-pending publication.
-        if !self.auth.ready() || self.admission_pending() {
+        if !self.auth_ready() || self.admission_pending() {
             return false;
         }
         let Ok(mut frame) = tx.claim_tx(queue, header + self.auth.envelope()) else {

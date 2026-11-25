@@ -349,3 +349,71 @@ fn a_withdrawn_authority_key_signs_no_status() {
         ChallengeRefusal::Uncommitted
     );
 }
+
+/// An authority signing file of `epoch` for authority `authority_id`
+/// serving guards 11 and 12, with every seed byte `fill`.
+fn signing_file(epoch: u32, authority_id: u64, fill: u8) -> crate::wire_keys::KeyFile {
+    let secret: String = (0..32).map(|_| format!("{fill:02x}")).collect();
+    crate::wire_keys::parse(
+        &format!("10-{epoch}.key"),
+        format!(
+            "format=karyos-wire-key-v1\nkey_id=10\nfile_epoch={epoch}\npurpose=authority-signing\nprofile_id=4\nnot_before=2026-11-01T00:00:00Z\nnot_after=2027-04-30T00:00:00Z\nsecret={secret}\nauthority_id={authority_id}\nguards=11,12\nabort=true\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap()
+}
+
+/// Whether `datagram` verifies under the authority key of seed `fill`.
+fn verifies_under(datagram: &[u8], fill: u8) -> bool {
+    let mut intake = SignedIntake::<u8>::new(
+        vec![Authority::of(
+            10,
+            Ed25519Signer::from_seed(&[fill; 32]).verifier(),
+            10,
+            &[11],
+            false,
+        )],
+        0,
+    );
+    matches!(intake.receive(at(2), datagram, 0), Ok(Received::Fresh(_)))
+}
+
+/// H8 R3-2: the signer is pinned to its admitted file epoch. With the
+/// original epoch revoked while a successor of the same key id signs, the
+/// old seed is erased and the validated successor installed: STATUS is
+/// signed under the successor, never under the withdrawn seed.
+#[test]
+fn revoking_the_original_epoch_installs_the_validated_successor() {
+    let mut authority = authority(vec![guard(11, &[(66, at(1))])]).pinned(1);
+    let first = authority.answer(&challenge(11, 66, 1), at(1), 0).unwrap();
+    assert!(verifies_under(first.datagram(), 9));
+    authority.apply_keys(&crate::wire_auth::FixedKeys {
+        files: vec![signing_file(2, 10, 0x0a)],
+    });
+    assert_eq!(authority.file_epoch(), Some(2));
+    assert!(authority.signing());
+    let next = authority.answer(&challenge(11, 66, 2), at(1), 0).unwrap();
+    assert!(verifies_under(next.datagram(), 0x0a));
+    assert!(
+        !verifies_under(next.datagram(), 9),
+        "never the withdrawn seed"
+    );
+}
+
+/// H8 R3-2: a successor that is not this authority's (another authority
+/// id) is not installed: the signer is erased and signing stops.
+#[test]
+fn a_successor_of_another_authority_stops_signing() {
+    let mut authority = authority(vec![guard(11, &[(66, at(1))])]).pinned(1);
+    authority.apply_keys(&crate::wire_auth::FixedKeys {
+        files: vec![signing_file(2, 99, 0x0a)],
+    });
+    assert!(!authority.signing());
+    assert_eq!(
+        authority
+            .answer(&challenge(11, 66, 2), at(1), 0)
+            .unwrap_err(),
+        ChallengeRefusal::Uncommitted
+    );
+}

@@ -957,6 +957,29 @@ pub trait KeySet {
     /// roles bump their [`KeyGeneration`] and drop prepared traffic made
     /// under the previous set (H8 finding 4).
     fn fingerprint(&self) -> u64;
+    /// The number the conductor gave this view when it published it, 0
+    /// for a set no conductor published: a role records it as applied, and
+    /// the [`KeyGeneration`] fence admits its authenticated paths only once
+    /// it has applied the newest published view (H8 R3-1).
+    fn view_generation(&self) -> u64;
+}
+
+/// Which role a [`KeyGeneration`] fence check is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    /// The sender role.
+    Sender = 0,
+    /// The receiver role.
+    Receiver = 1,
+}
+
+/// The process's monotonic clock in nanoseconds, the one every fence
+/// deadline is measured on (H8 R3-1): a wall clock step never moves it.
+#[must_use]
+pub fn monotonic_ns() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// FNV-1a over `words`, from `hash`.
@@ -977,13 +1000,83 @@ const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// prepared send (a queued proof, a signed or sealed datagram, a pending
 /// abort) records the generation it was made under and is dropped, or
 /// revalidated, at submission once the generation has moved.
-#[derive(Debug, Default)]
+///
+/// It is also the fence of H8 R3-1, checked at every authenticated use
+/// (seal, open, verify) with no ring in between: the conductor publishes
+/// the number of each new view (`required`) before posting it, and renews
+/// a monotonic freshness deadline at each reload; a role whose applied
+/// view is older than the required one, or any role once the deadline has
+/// passed (the conductor stalled), stops every authenticated path, fail
+/// closed, until it catches up. With no conductor (no key store) it admits
+/// everything.
+#[derive(Debug)]
 pub struct KeyGeneration {
     generation: core::sync::atomic::AtomicU64,
     fingerprint: core::sync::atomic::AtomicU64,
+    /// The newest view the conductor published.
+    required: core::sync::atomic::AtomicU64,
+    /// The view each role ([`Side`]) applied.
+    applied: [core::sync::atomic::AtomicU64; 2],
+    /// The monotonic deadline of the current view's freshness.
+    fresh_until: core::sync::atomic::AtomicU64,
+}
+
+impl Default for KeyGeneration {
+    fn default() -> Self {
+        Self {
+            generation: core::sync::atomic::AtomicU64::new(0),
+            fingerprint: core::sync::atomic::AtomicU64::new(0),
+            required: core::sync::atomic::AtomicU64::new(0),
+            applied: [
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+            ],
+            fresh_until: core::sync::atomic::AtomicU64::new(u64::MAX),
+        }
+    }
 }
 
 impl KeyGeneration {
+    /// Whether `side` may use authenticated keys at the monotonic `now`:
+    /// it applied the newest published view, and that view is fresh.
+    #[must_use]
+    pub fn admits(&self, side: Side, now: u64) -> bool {
+        use core::sync::atomic::Ordering::Acquire;
+
+        let applied = self
+            .applied
+            .get(side as usize)
+            .map_or(0, |applied| applied.load(Acquire));
+        now < self.fresh_until.load(Acquire) && applied >= self.required.load(Acquire)
+    }
+
+    /// [`KeyGeneration::admits`] now.
+    #[must_use]
+    pub fn admits_now(&self, side: Side) -> bool {
+        self.admits(side, monotonic_ns())
+    }
+
+    /// The conductor published view `generation`: no role admits until it
+    /// has applied it.
+    pub fn require(&self, generation: u64) {
+        self.required
+            .fetch_max(generation, core::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The conductor reloaded: the view stays fresh until the monotonic
+    /// `until`.
+    pub fn renew(&self, until: u64) {
+        self.fresh_until
+            .store(until, core::sync::atomic::Ordering::Release);
+    }
+
+    /// `side` applied view `generation`.
+    pub fn applied(&self, side: Side, generation: u64) {
+        if let Some(applied) = self.applied.get(side as usize) {
+            applied.fetch_max(generation, core::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
     /// The current generation.
     #[must_use]
     pub fn current(&self) -> u64 {
@@ -1106,6 +1199,10 @@ impl<K: crate::wire_keys::store::Files, S: crate::wire_keys::store::Files> KeySe
         }
         hash
     }
+
+    fn view_generation(&self) -> u64 {
+        0
+    }
 }
 
 /// A fixed key set (tests): `files` as loaded, the highest epoch of a
@@ -1146,6 +1243,10 @@ impl KeySet for FixedKeys {
             hash = fnv(hash, &[u64::from(file.key_id), u64::from(file.file_epoch)]);
         }
         hash
+    }
+
+    fn view_generation(&self) -> u64 {
+        0
     }
 }
 

@@ -53,6 +53,10 @@ fn wall() -> i64 {
 
 fn advance(seconds: i64) {
     WALL.with(|wall| wall.set(wall.get() + seconds));
+    // The reload cadence is monotonic (H8 R3-1): it moves too.
+    super::MONO_SKEW.with(|skew| {
+        skew.set(skew.get() + seconds.unsigned_abs() * 1_000_000_000);
+    });
 }
 
 /// An in-memory directory shared with the test, which can fail to list.
@@ -1074,4 +1078,31 @@ fn a_held_generation_fence_stops_the_authenticated_class_and_trusted_keeps_runni
     for driver in [&publisher, &subscriber] {
         assert_eq!(driver.wire_key_counters().unwrap().generation_refused, 1);
     }
+}
+
+/// H8 R3-1: the reload cadence runs on the monotonic clock. A wall clock
+/// stepped back an hour does not delay a revocation: the next reload
+/// comes one interval of monotonic time later and reaches both roles.
+#[test]
+fn a_backward_wall_step_does_not_delay_a_revocation() {
+    let (mut publisher, pub_keys, mut subscriber, sub_keys) = established();
+    for keys in [&pub_keys, &sub_keys] {
+        keys.put("revoked", "3-1\n9-1\n");
+    }
+    WALL.with(|wall| wall.set(wall.get() - 3600));
+    super::MONO_SKEW.with(|skew| {
+        skew.set(skew.get() + RELOAD_INTERVAL_S.unsigned_abs() * 1_000_000_000);
+    });
+    let reached = pump(&mut [&mut publisher, &mut subscriber], |drivers| {
+        roles(drivers[0]).0.1 == 0 && {
+            let (_, images, withdrawn) = roles(drivers[1]).1;
+            images == withdrawn
+        }
+    });
+    assert!(
+        reached,
+        "not withdrawn: {:?} {:?}",
+        roles(&publisher),
+        roles(&subscriber)
+    );
 }

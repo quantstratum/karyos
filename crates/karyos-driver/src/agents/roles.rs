@@ -3135,6 +3135,9 @@ impl<T: StreamTerms> ReceiverRole<T> {
         if let Some(signed) = self.signed.as_deref_mut() {
             signed.for_each_cached(|resend| resend.sealer.apply_keys(keys));
         }
+        // Applied: the fence admits the receiver again (H8 R3-1).
+        self.key_generation
+            .applied(crate::wire_auth::Side::Receiver, keys.view_generation());
     }
 
     /// Follows `guard` as `receiver_id`, its challenges going bare on
@@ -6383,6 +6386,18 @@ impl<T: StreamTerms> Intake<'_, T> {
     /// takes the trusted path unchanged. A refusal changes nothing but its
     /// counter: no SOLICIT, no path queue, no state.
     fn bytes_in(&mut self, source: SocketAddr, bytes: &[u8]) {
+        // An authenticated or encrypted envelope, or a signed control, is
+        // opened only while the key fence admits the receiver: its view is
+        // the newest published and still fresh (H8 R3-1).
+        if (receive_auth::is_envelope(bytes) || crate::wire_enc::is_envelope(bytes))
+            && !self
+                .role
+                .key_generation
+                .admits_now(crate::wire_auth::Side::Receiver)
+        {
+            self.role.count(|c| &mut c.auth_rejected);
+            return;
+        }
         // The encrypted class first (ADR-0114 section 9).
         if self.encrypted_in(source, bytes) {
             return;
@@ -6449,6 +6464,16 @@ impl<T: StreamTerms> Intake<'_, T> {
         let now = self.now;
         if self.role.guard_authority.is_none() {
             return false;
+        }
+        // No STATUS is signed under a stale or unapplied key view (H8
+        // R3-1).
+        if !self
+            .role
+            .key_generation
+            .admits_now(crate::wire_auth::Side::Receiver)
+        {
+            self.role.count(|c| &mut c.guard_challenges_refused);
+            return true;
         }
         // Only the authority's own control endpoints answer (H8 N3).
         if !self.role.guard_authority_endpoints.contains(&self.endpoint) {
@@ -8322,6 +8347,15 @@ impl<T: StreamTerms> SenderRole<T> {
         destination: SocketAddr,
         bytes: &[u8],
     ) -> Sent {
+        // Prepared datagrams (signed, sealed, or a guard challenge) leave
+        // only while the key fence admits the sender (H8 R3-1).
+        if !self
+            .key_generation
+            .admits_now(crate::wire_auth::Side::Sender)
+        {
+            self.count(|c| &mut c.seal_failures);
+            return Sent::NotSubmitted;
+        }
         let tx = halves.iter_mut().find_map(|(held, half)| match half {
             Half::Tx(tx) if *held == endpoint => Some(tx),
             _ => None,
@@ -8384,6 +8418,14 @@ impl<T: StreamTerms> SenderRole<T> {
         for outbound in &mut self.publications {
             outbound.follow_keys(keys);
         }
+        // Applied: the fence admits the sender again (H8 R3-1).
+        self.key_generation
+            .applied(crate::wire_auth::Side::Sender, keys.view_generation());
+    }
+
+    /// The key fence shared by both roles, for the conductor (H8 R3-1).
+    pub(crate) fn key_fence(&self) -> Arc<crate::wire_auth::KeyGeneration> {
+        Arc::clone(&self.key_generation)
     }
 
     fn publication_auth_index(&self, endpoint: EndpointId, alias: Alias) -> Option<usize> {
@@ -8400,6 +8442,14 @@ impl<T: StreamTerms> SenderRole<T> {
         endpoint: EndpointId,
         bytes: &[u8],
     ) -> Option<(Control, Option<Establishing>)> {
+        // Nothing is opened under a stale or unapplied key view (H8 R3-1).
+        if !self
+            .key_generation
+            .admits_now(crate::wire_auth::Side::Sender)
+        {
+            self.count(|c| &mut c.auth_unbound);
+            return None;
+        }
         if crate::wire_enc::is_envelope(bytes) {
             return self.open_enc(endpoint, bytes);
         }
@@ -8479,7 +8529,11 @@ impl<T: StreamTerms> SenderRole<T> {
             .publications
             .iter_mut()
             .find(|outbound| outbound.serves(endpoint) && outbound.alias() == answer.alias)
-            .is_some_and(|outbound| outbound.install_sealer(sealer).is_ok());
+            .is_some_and(|outbound| {
+                let installed = outbound.install_sealer(sealer).is_ok();
+                outbound.set_key_fence(Arc::clone(&self.key_generation));
+                installed
+            });
         if installed {
             self.count(|c| &mut c.auth_sealers_installed);
         }
@@ -8620,6 +8674,15 @@ impl<T: StreamTerms> SenderRole<T> {
         mode: Mode,
         seal: Option<&mut dyn ControlSeal>,
     ) -> Sent {
+        // Nothing is sealed under a stale or unapplied key view (H8 R3-1).
+        if seal.is_some()
+            && !self
+                .key_generation
+                .admits_now(crate::wire_auth::Side::Sender)
+        {
+            self.count(|c| &mut c.seal_failures);
+            return Sent::NotSubmitted;
+        }
         let tx = halves.iter_mut().find_map(|(held, half)| match half {
             Half::Tx(tx) if *held == endpoint => Some(tx),
             _ => None,

@@ -625,3 +625,22 @@ fn a_withdrawn_sealer_seals_nothing() {
     let derived = sealer.with_party(sender(BOOT, [3, 4]), ALIAS).unwrap();
     assert!(!derived.can_seal());
 }
+
+/// H8 R3-1: the key fence admits a role only once it applied the newest
+/// published view, and only while the view is fresh on the monotonic
+/// clock; with no conductor it admits everything.
+#[test]
+fn the_key_fence_admits_only_an_applied_fresh_view() {
+    let fence = KeyGeneration::default();
+    assert!(fence.admits(Side::Sender, NOW) && fence.admits(Side::Receiver, NOW));
+    fence.require(3);
+    assert!(!fence.admits(Side::Sender, NOW) && !fence.admits(Side::Receiver, NOW));
+    fence.applied(Side::Sender, 3);
+    assert!(fence.admits(Side::Sender, NOW));
+    assert!(!fence.admits(Side::Receiver, NOW), "each role on its own");
+    fence.applied(Side::Receiver, 3);
+    fence.renew(NOW + 10);
+    assert!(fence.admits(Side::Receiver, NOW + 9));
+    assert!(!fence.admits(Side::Receiver, NOW + 10), "stale");
+    assert!(!fence.admits(Side::Sender, NOW + 10), "stale");
+}

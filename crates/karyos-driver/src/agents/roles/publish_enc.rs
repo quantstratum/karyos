@@ -740,11 +740,16 @@ impl<T: StreamTerms> SenderRole<T> {
             Ok(EncOpened::RspSetup(control, establishing)) => {
                 if establishing.bind {
                     let sealer = publication.data_sealer(&establishing).ok()?;
+                    let fence = std::sync::Arc::clone(&self.key_generation);
                     let installed = self
                         .publications
                         .iter_mut()
                         .find(|outbound| outbound.serves(endpoint) && outbound.alias() == alias)
-                        .is_some_and(|outbound| outbound.install_enc_sealer(sealer).is_ok());
+                        .is_some_and(|outbound| {
+                            let installed = outbound.install_enc_sealer(sealer).is_ok();
+                            outbound.set_key_fence(fence);
+                            installed
+                        });
                     if !installed {
                         return None;
                     }

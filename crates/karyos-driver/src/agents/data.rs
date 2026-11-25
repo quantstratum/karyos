@@ -447,6 +447,9 @@ pub struct Outbound<T: StreamTerms = HeapTerms> {
     picked: Vec<(TraceExtension, u64)>,
     /// How its sender frames are authenticated (domain 1, ADR-0086).
     auth: SenderAuth,
+    /// The key fence of its role (H8 R3-1): an authenticated publication
+    /// seals nothing while it does not admit the sender.
+    key_fence: Option<Arc<crate::wire_auth::KeyGeneration>>,
     /// A remote guard's spec while the publication is admission-pending:
     /// no incarnation is bound to an open epoch and nothing is sent until
     /// the guard's word first reads `(e, Open)`.
@@ -726,6 +729,7 @@ impl<T: StreamTerms> Outbound<T> {
             fanout: None,
             registration: None,
             auth: SenderAuth::Off,
+            key_fence: None,
             pending_guard: None,
             admission_refused: false,
             route: None,
@@ -1293,7 +1297,7 @@ impl<T: StreamTerms> Outbound<T> {
         }
         // An authenticated publication repairs only under its sealer, and
         // an admission-pending one not at all.
-        if !self.auth.ready() || self.admission_pending() {
+        if !self.auth_ready() || self.admission_pending() {
             return 0;
         }
         let Some(repair) = self.repair.as_deref_mut() else {
@@ -2379,6 +2383,8 @@ impl<T: StreamTerms> Outbound<T> {
         let overflow = AgentError::CountOverflow(AgentKind::Sender);
         let mut staged = 0u32;
         let tai_offset = self.tai_offset;
+        // The key fence, read once per staging call (H8 R3-1).
+        let fenced = !matches!(self.auth, SenderAuth::Off) && !self.fence_admits();
         let (Some(queue), Some(reader)) =
             (self.queues.get(lane).copied(), self.readers.get_mut(lane))
         else {
@@ -2457,7 +2463,7 @@ impl<T: StreamTerms> Outbound<T> {
             // before any read moves the cursor. Its frames fit the inner
             // budget, the MTU less the envelope, which the log was sized
             // for (ADR-0086 section 5); the datagram is the whole MTU.
-            if !self.auth.ready() {
+            if !self.auth.ready() || fenced {
                 self.counters.bump(|c| &mut c.seal_waits, 1);
                 break;
             }

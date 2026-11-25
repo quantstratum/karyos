@@ -184,12 +184,36 @@ impl<T: StreamTerms> Outbound<T> {
         Ok(())
     }
 
+    /// Binds the publication to its role's key `fence` (H8 R3-1).
+    pub(crate) fn set_key_fence(&mut self, fence: std::sync::Arc<crate::wire_auth::KeyGeneration>) {
+        self.key_fence = Some(fence);
+    }
+
+    /// Whether its role's key fence admits the sender now; always without
+    /// one.
+    pub(crate) fn fence_admits(&self) -> bool {
+        self.key_fence
+            .as_ref()
+            .is_none_or(|fence| fence.admits_now(crate::wire_auth::Side::Sender))
+    }
+
+    /// Whether one more datagram can leave: a trusted one always, an
+    /// authenticated or encrypted one with a sealer that can seal and
+    /// while the key fence admits it (H8 R3-1: a stale or unapplied key
+    /// view stops it at the point of use).
+    pub(crate) fn auth_ready(&self) -> bool {
+        self.auth.ready() && (matches!(self.auth, SenderAuth::Off) || self.fence_admits())
+    }
+
     /// Lends the installed sealer, to seal one of the publication's
     /// sender controls (PATH_HB, ERR, RTTM REPLY) in domain 1 under the
     /// same envelope sequence as its DATA; [`Outbound::return_sealer`]
     /// gives it back. `None` while no sealer is installed. Moves a box:
     /// allocates nothing.
     pub(crate) fn lend_sealer(&mut self) -> Option<Box<Sealer>> {
+        if !self.fence_admits() {
+            return None;
+        }
         match core::mem::replace(&mut self.auth, SenderAuth::Pending) {
             SenderAuth::Sealing(sealer) => Some(sealer),
             other => {
@@ -299,6 +323,9 @@ impl<T: StreamTerms> Outbound<T> {
     /// sequence as its DATA; [`Outbound::return_enc_sealer`] gives it back.
     /// Moves a box: allocates nothing.
     pub(crate) fn lend_enc_sealer(&mut self) -> Option<Box<EncSealer>> {
+        if !self.fence_admits() {
+            return None;
+        }
         match core::mem::replace(&mut self.auth, SenderAuth::EncPending) {
             SenderAuth::Encrypting(sealer) => Some(sealer),
             other => {

@@ -2319,6 +2319,10 @@ pub struct AgentLinks<O: SocketOps, T: StreamTerms = HeapTerms> {
     pub receiver: AgentLink<O, T>,
     /// The session rings to the receiver ([`chain`]).
     pub sessions: chain::SessionLink<T>,
+    /// The key fence both roles check at every authenticated use (H8
+    /// R3-1): the conductor publishes each key view's number and the
+    /// view's freshness deadline here, with no ring in between.
+    pub key_fence: Arc<crate::wire_auth::KeyGeneration>,
 }
 
 /// Creates both agents and the conductor's links to them. Every ring is
@@ -2374,6 +2378,7 @@ pub fn network_agents_over<O: SocketOps, T: StreamTerms>(
     let (sender_core, sender_link) = make(AgentKind::Sender);
     let (receiver_core, receiver_link) = make(AgentKind::Receiver);
     let (sender_role, receiver_role) = roles::roles(&config)?;
+    let key_fence = sender_role.key_fence();
     let (session_end, session_link) = chain::session_rings(session_command_capacity);
     Ok((
         NetworkAgents {
@@ -2393,6 +2398,7 @@ pub fn network_agents_over<O: SocketOps, T: StreamTerms>(
             sender: sender_link,
             receiver: receiver_link,
             sessions: session_link,
+            key_fence,
         },
     ))
 }

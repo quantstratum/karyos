@@ -32,6 +32,13 @@ use crate::wire_keys::{KeyFile, Material, Purpose, Scope};
 /// How often the conductor re-reads the key set for expiry, in seconds.
 pub const TICK_S: i64 = 1;
 
+const SECOND_NS: u64 = 1_000_000_000;
+const TICK_NS: u64 = TICK_S.unsigned_abs() * SECOND_NS;
+const RELOAD_NS: u64 = RELOAD_INTERVAL_S.unsigned_abs() * SECOND_NS;
+/// How long a view stays usable without a reload, on the monotonic clock:
+/// two reload intervals (H8 R3-1). Past it every authenticated path stops.
+pub const FRESH_NS: u64 = 2 * RELOAD_NS;
+
 /// A key or state directory the driver's store reads.
 pub type Dir = Box<dyn Files + Send>;
 
@@ -108,6 +115,8 @@ pub struct KeyView {
     keys: Vec<ViewKey>,
     /// The store's [`KeySet::fingerprint`] at that second.
     fingerprint: u64,
+    /// The number the conductor published it under (H8 R3-1).
+    generation: u64,
 }
 
 impl KeyView {
@@ -120,6 +129,7 @@ impl KeyView {
             return Self {
                 keys: Vec::new(),
                 fingerprint,
+                generation: 0,
             };
         }
         let mut ids: Vec<u32> = store.loaded().map(|file| file.key_id).collect();
@@ -137,7 +147,11 @@ impl KeyView {
                 }
             })
             .collect();
-        Self { keys, fingerprint }
+        Self {
+            keys,
+            fingerprint,
+            generation: 0,
+        }
     }
 
     fn key(&self, key_id: u32) -> Option<&ViewKey> {
@@ -169,6 +183,7 @@ impl KeyView {
         Self {
             keys: Vec::new(),
             fingerprint: u64::MAX,
+            generation: 0,
         }
     }
 
@@ -197,6 +212,10 @@ impl KeySet for KeyView {
 
     fn fingerprint(&self) -> u64 {
         self.fingerprint
+    }
+
+    fn view_generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -310,10 +329,16 @@ pub(crate) struct SubscriptionKeys {
 /// The driver's wire key store and its schedule.
 pub(crate) struct WireKeys {
     store: KeyStore<Dir, Dir>,
-    /// The wall clock in seconds.
+    /// The wall clock in seconds: validity evaluation only.
     clock: fn() -> i64,
-    next_reload: i64,
-    next_tick: i64,
+    /// The monotonic clock in nanoseconds: the reload and tick cadence
+    /// and the freshness deadline (H8 R3-1), which a wall clock step never
+    /// delays.
+    mono: fn() -> u64,
+    next_reload: u64,
+    next_tick: u64,
+    /// The number of the last view published.
+    published: u64,
     view: Arc<KeyView>,
     /// A view the rings refused: posted again at the next tick.
     unposted: bool,
@@ -344,6 +369,21 @@ impl core::fmt::Debug for WireKeys {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How far a test moved this thread's monotonic clock ahead, in ns.
+    pub(crate) static MONO_SKEW: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// The monotonic clock of the reload cadence, in nanoseconds: the
+/// process's [`crate::wire_auth::monotonic_ns`], moved ahead by a test.
+fn mono_now() -> u64 {
+    let now = crate::wire_auth::monotonic_ns();
+    #[cfg(test)]
+    let now = now.saturating_add(MONO_SKEW.with(core::cell::Cell::get));
+    now
+}
+
 /// The host wall clock in seconds since the Unix epoch.
 fn wall_seconds() -> i64 {
     std::time::SystemTime::now()
@@ -362,6 +402,8 @@ impl WireKeys {
     ) -> Result<(Self, Report), crate::wire_keys::store::StoreError> {
         let clock = clock.unwrap_or(wall_seconds);
         let now = clock();
+        let mono: fn() -> u64 = mono_now;
+        let at = mono();
         let (store, report) = KeyStore::start(keys, state, now)?;
         let counters = WireKeyCounters {
             events: u64::try_from(report.events.len()).unwrap_or(u64::MAX),
@@ -376,8 +418,11 @@ impl WireKeys {
             Self {
                 store,
                 clock,
-                next_reload: now.saturating_add(RELOAD_INTERVAL_S),
-                next_tick: now.saturating_add(TICK_S),
+                mono,
+                // The first duty reloads, which starts the freshness deadline.
+                next_reload: at,
+                next_tick: at.saturating_add(TICK_NS),
+                published: 0,
                 view,
                 unposted: false,
                 peers: Vec::with_capacity(crate::signed_control::PEER_SLOTS),
@@ -410,14 +455,23 @@ impl WireKeys {
     /// The conductor's duty: a reload when due, and the key set re-read
     /// each tick; the new view when it changed (or a refused one is due
     /// again), for both agents at once.
-    pub(crate) fn duty(&mut self) -> Option<Arc<KeyView>> {
-        let now = (self.clock)();
-        if now < self.next_tick && !self.unposted {
+    ///
+    /// The cadence runs on the monotonic clock and the wall clock only
+    /// evaluates validity (H8 R3-1). Each reload renews `fence`'s
+    /// freshness deadline to [`FRESH_NS`] from now, and each new view's
+    /// number is required on `fence` before it is posted: a role that has
+    /// not applied it, because a ring was full, or any role once the
+    /// conductor stops reloading, refuses every authenticated use.
+    pub(crate) fn duty(&mut self, fence: &crate::wire_auth::KeyGeneration) -> Option<Arc<KeyView>> {
+        let at = (self.mono)();
+        if at < self.next_tick && !self.unposted {
             return None;
         }
-        self.next_tick = now.saturating_add(TICK_S);
-        if now >= self.next_reload {
-            self.next_reload = now.saturating_add(RELOAD_INTERVAL_S);
+        let now = (self.clock)();
+        self.next_tick = at.saturating_add(TICK_NS);
+        if at >= self.next_reload {
+            self.next_reload = at.saturating_add(RELOAD_NS);
+            fence.renew(at.saturating_add(FRESH_NS));
             self.counters.reloads = self.counters.reloads.saturating_add(1);
             let report = self.store.reload(now);
             if report.alarm() {
@@ -429,13 +483,20 @@ impl WireKeys {
                 self.counters.failures = self.counters.failures.saturating_add(1);
             }
         }
-        let view = KeyView::of(&self.store, now);
+        let mut view = KeyView::of(&self.store, now);
         if !self.unposted
             && view.fingerprint == self.view.fingerprint
             && view.summary().eq(self.view.summary())
         {
             return None;
         }
+        if self.unposted && view.summary().eq(self.view.summary()) {
+            // The same view again, under its number.
+            return Some(Arc::clone(&self.view));
+        }
+        self.published = self.published.saturating_add(1);
+        view.generation = self.published;
+        fence.require(self.published);
         self.view = Arc::new(view);
         Some(Arc::clone(&self.view))
     }
@@ -673,6 +734,8 @@ impl WireKeys {
             return Err(refused(AuthRefusal::AuthorityKey));
         };
         let signer = crate::authority::Ed25519Signer::from_seed(seed);
+        // The signer is pinned to this file (H8 R3-2).
+        let file_epoch = file.file_epoch;
         let commits = self
             .commits
             .take()
@@ -685,6 +748,7 @@ impl WireKeys {
             Box::new(crate::remote_guard::GuardMarks::authority(commits)),
             now,
         )
+        .map(|authority| authority.pinned(file_epoch))
         .map_err(|_| DriverError::InvalidConfig)
     }
 
