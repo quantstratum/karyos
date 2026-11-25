@@ -213,6 +213,17 @@ pub enum Kind {
     /// Cluster was busy, its dispatch record could not be made durable or
     /// its driver was unavailable.
     ApprovalExpired,
+    /// A product service's request, before it sends its command
+    /// (R-CORE-42, karyos#773; [`crate::product`]).
+    ProductRequest,
+    /// A product service's outcome, after its command's answer.
+    ProductOutcome,
+    /// A product's request imported after an unknown interval, by
+    /// operation id: `expected` names the interval, `word` the product's
+    /// own time of the original record.
+    ProductRequestImported,
+    /// A product's outcome imported the same way.
+    ProductOutcomeImported,
 }
 
 impl Kind {
@@ -244,6 +255,10 @@ impl Kind {
             Self::ApprovalGranted => 24,
             Self::ApprovalWithdrawn => 25,
             Self::ApprovalExpired => 26,
+            Self::ProductRequest => 27,
+            Self::ProductOutcome => 28,
+            Self::ProductRequestImported => 29,
+            Self::ProductOutcomeImported => 30,
         }
     }
 
@@ -277,6 +292,10 @@ impl Kind {
             Self::ApprovalGranted => "approval_granted",
             Self::ApprovalWithdrawn => "approval_withdrawn",
             Self::ApprovalExpired => "approval_expired",
+            Self::ProductRequest => "product_request",
+            Self::ProductOutcome => "product_outcome",
+            Self::ProductRequestImported => "product_request_imported",
+            Self::ProductOutcomeImported => "product_outcome_imported",
         }
     }
 
@@ -308,6 +327,10 @@ impl Kind {
             24 => Self::ApprovalGranted,
             25 => Self::ApprovalWithdrawn,
             26 => Self::ApprovalExpired,
+            27 => Self::ProductRequest,
+            28 => Self::ProductOutcome,
+            29 => Self::ProductRequestImported,
+            30 => Self::ProductOutcomeImported,
             _ => return None,
         })
     }
@@ -323,6 +346,20 @@ impl Kind {
                 | Self::VerifyRequest
                 | Self::RateRequest
                 | Self::ClusterRequest
+                | Self::ProductRequest
+        )
+    }
+
+    /// Whether its record is a product service's (R-CORE-42, karyos#773),
+    /// which carries the Cluster fields after the relay word: the service,
+    /// the command and the correlation.
+    pub(crate) const fn is_product(self) -> bool {
+        matches!(
+            self,
+            Self::ProductRequest
+                | Self::ProductOutcome
+                | Self::ProductRequestImported
+                | Self::ProductOutcomeImported
         )
     }
 
@@ -473,7 +510,7 @@ impl JournalRecord {
             // The relay word always, then the target and the boot, each
             // after its length word (karyos#738).
             &[&self.target, &self.boot]
-        } else if self.kind.is_cluster() {
+        } else if self.kind.is_cluster() || self.kind.is_product() {
             &[&self.target, &self.command, &self.evidence]
         } else if self.kind.is_approval() {
             &[
@@ -521,7 +558,11 @@ impl JournalRecord {
         let mut evidence = Vec::new();
         let mut bytes = Vec::new();
         let mut instance = 0;
-        let relay = if kind == Kind::Submitted || kind.is_cluster() || kind.is_approval() {
+        let relay = if kind == Kind::Submitted
+            || kind.is_cluster()
+            || kind.is_product()
+            || kind.is_approval()
+        {
             // The relay word, then the fields by length.
             let (relay, mut rest) = tail.split_first_chunk::<8>()?;
             let mut field = || -> Option<Vec<u8>> {
