@@ -47,6 +47,19 @@
 //!   called, so a retry of an accepted request returns its outcome even
 //!   when the same request would now be refused: admission is evaluated
 //!   once, at the first apply.
+//! - **Two rule sets, chosen by the log** ([`SessionTable::set_exact`]).
+//!   A log whose session bounds came in a version 2 `SessionBounds` entry,
+//!   as this build proposes them, and a new table, use the exact identity
+//!   above. A log written by an earlier build, whose bounds are version
+//!   1, replays as it was first applied: sequences in order, a request
+//!   past the next one refused ([`Outcome::OutOfOrder`]), no hole and no
+//!   digest checked, so an upgraded replica never runs a command the
+//!   original apply refused. An earlier build meeting version 2 bounds
+//!   stops at that entry rather than diverge.
+//! - **Acknowledgements across holes.** Under the exact identity the
+//!   client's lowest unanswered sequence moves the base past sequences
+//!   it never submitted, so a gap wider than the window does not stall
+//!   the session; a sequence below the base never runs.
 //! - **No fresh epoch on an unknown outcome.** The table never opens a
 //!   session by itself: a request of an epoch whose session is gone is
 //!   [`Outcome::SessionExpired`], for good, and a new epoch is had only by
@@ -363,6 +376,13 @@ pub enum Outcome<'a> {
     /// The identity applied before with another command: a client's bug
     /// or an attack. Neither run nor answered as a duplicate.
     PayloadMismatch,
+    /// Under the rules of a log written by an earlier build
+    /// ([`SessionTable::set_exact`] `false`): the sequence is past the next
+    /// one the session expects.
+    OutOfOrder {
+        /// The sequence the session expects.
+        expected: u64,
+    },
 }
 
 /// One session slot.
@@ -421,6 +441,9 @@ pub struct SessionTable {
     stored: Vec<Stored>,
     /// `window × response_bytes` per session.
     replies: Vec<u8>,
+    /// The exact identity's rules (karyos#750), or `false` for a log
+    /// written by an earlier build, which replays its contiguous rules.
+    exact: bool,
 }
 
 impl SessionTable {
@@ -496,7 +519,21 @@ impl SessionTable {
             sessions: filled(sessions, Session::default())?,
             stored: filled(slots, Stored::Empty)?,
             replies: filled(reply_bytes, 0)?,
+            exact: true,
         })
+    }
+
+    /// Whether the table applies the exact identity's rules: `true` for a
+    /// new table and for a log whose bounds came in a version 2
+    /// `SessionBounds` entry, `false` for a log of an earlier build.
+    #[must_use]
+    pub fn exact(&self) -> bool {
+        self.exact
+    }
+
+    /// Sets the rules from the log's first bounds entry (see the module).
+    pub fn set_exact(&mut self, exact: bool) {
+        self.exact = exact;
     }
 
     /// The bounds, as advertised at registration.
@@ -610,6 +647,9 @@ impl SessionTable {
     where
         F: FnOnce(&mut [u8]) -> Option<usize>,
     {
+        if !self.exact {
+            return self.request_contiguous(request, event_time, apply);
+        }
         let digest = digest(command);
         self.advance(event_time);
         let Some(slot) = self.find(request.client, request.epoch) else {
@@ -624,10 +664,16 @@ impl SessionTable {
         // The client has seen every reply below its lowest unanswered. The
         // base never goes back: a late duplicate carries an older one.
         let old_base = session.base;
+        // The client has seen every reply below its lowest unanswered and
+        // submitted nothing below it it still waits for: the base moves
+        // there, past holes too, and the next sequence is never below it.
+        // At most to the request's own sequence: it is never below the
+        // base it moves.
         session.base = request
             .lowest_unanswered
-            .max(session.base)
-            .min(session.next);
+            .min(request.sequence)
+            .max(session.base);
+        session.next = session.next.max(session.base);
         let (base, next) = (session.base, session.next);
         // The slots the base passed are free for the sequences a window
         // later: holes and acknowledged replies alike.
@@ -704,6 +750,82 @@ impl SessionTable {
         }
     }
 
+    /// [`Self::request`] under the rules of a log written by an earlier
+    /// build: sequences in order, as that build applied them.
+    fn request_contiguous<F>(&mut self, request: Request, event_time: u64, apply: F) -> Outcome<'_>
+    where
+        F: FnOnce(&mut [u8]) -> Option<usize>,
+    {
+        self.advance(event_time);
+        let Some(slot) = self.find(request.client, request.epoch) else {
+            return Outcome::SessionExpired;
+        };
+        let now = self.now;
+        let window = u64::from(self.config.window);
+        let Some(session) = self.sessions.get_mut(slot) else {
+            return Outcome::SessionExpired;
+        };
+        session.activity = now;
+        session.base = request
+            .lowest_unanswered
+            .max(session.base)
+            .min(session.next);
+        let (base, next) = (session.base, session.next);
+        if request.sequence < base {
+            return Outcome::Duplicate;
+        }
+        if request.sequence < next {
+            return match self.slot(slot, request.sequence) {
+                Some((Stored::Reply(length, _), at)) => self
+                    .reply(at, length)
+                    .map_or(Outcome::Duplicate, Outcome::Retained),
+                Some((Stored::TooLarge(_), _)) => Outcome::ReplyTooLarge,
+                _ => Outcome::Duplicate,
+            };
+        }
+        if request.sequence > next {
+            return Outcome::OutOfOrder { expected: next };
+        }
+        if next.checked_sub(base).is_none_or(|held| held >= window) {
+            return Outcome::WindowFull;
+        }
+        let Some(after) = next.checked_add(1) else {
+            return Outcome::WindowFull;
+        };
+        let Some((_, at)) = self.slot(slot, request.sequence) else {
+            return Outcome::SessionExpired;
+        };
+        let bytes = self.reply_capacity();
+        let Some(buffer) = at
+            .checked_add(bytes)
+            .and_then(|end| self.replies.get_mut(at..end))
+        else {
+            return Outcome::SessionExpired;
+        };
+        let written = apply(buffer);
+        // No digest: this build's rules check none.
+        let stored = match written.filter(|length| *length <= bytes) {
+            Some(length) => {
+                u32::try_from(length).map_or(Stored::TooLarge(0), |length| Stored::Reply(length, 0))
+            }
+            None => Stored::TooLarge(0),
+        };
+        if let Some(session) = self.sessions.get_mut(slot) {
+            session.next = after;
+        }
+        if let Some(index) = self.stored_index(slot, request.sequence)
+            && let Some(entry) = self.stored.get_mut(index)
+        {
+            *entry = stored;
+        }
+        match stored {
+            Stored::Reply(length, _) => self
+                .reply(at, length)
+                .map_or(Outcome::ReplyTooLarge, Outcome::Applied),
+            _ => Outcome::ReplyTooLarge,
+        }
+    }
+
     /// The table as a snapshot's sessions section (see the module).
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
@@ -724,6 +846,7 @@ impl SessionTable {
         out.extend_from_slice(&self.now.to_le_bytes());
         out.push(u8::from(self.registered.is_some()));
         out.extend_from_slice(&self.registered.unwrap_or(0).to_le_bytes());
+        out.push(u8::from(self.exact));
         let count = u32::try_from(live.len()).unwrap_or(u32::MAX);
         out.extend_from_slice(&count.to_le_bytes());
         for (slot, session) in live {
@@ -773,6 +896,17 @@ impl SessionTable {
     /// wrote, a configuration the table cannot hold, or a session outside
     /// its bounds.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        Self::decode_within(bytes, DEFAULT_BUDGET)
+    }
+
+    /// [`Self::decode`] under a byte budget of `budget`: a section whose
+    /// bounds reserve more is refused before anything is allocated
+    /// ([`ConfigError::OverBudget`], as [`Self::new_within`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::decode`].
+    pub fn decode_within(bytes: &[u8], budget: u64) -> Result<Self, DecodeError> {
         let mut input = Input(bytes);
         if input.array::<4>()? != SESSIONS_MAGIC {
             return Err(DecodeError::Format);
@@ -789,13 +923,19 @@ impl SessionTable {
             response_bytes: u32::from_le_bytes(input.array()?),
             ttl: u64::from_le_bytes(input.array()?),
         };
-        let mut table = Self::new(config)?;
+        let mut table = Self::new_within(config, budget)?;
         table.now = u64::from_le_bytes(input.array()?);
         let [flag] = input.array::<1>()?;
         let registered = u64::from_le_bytes(input.array()?);
         table.registered = match (flag, registered) {
             (0, 0) => None,
             (1, index) => Some(index),
+            _ => return Err(DecodeError::Format),
+        };
+        // Version 1 is a log of the contiguous rules.
+        table.exact = match (digests, if digests { input.array::<1>()?[0] } else { 0 }) {
+            (false, _) | (true, 0) => false,
+            (true, 1) => true,
             _ => return Err(DecodeError::Format),
         };
         let count = u32::from_le_bytes(input.array()?);

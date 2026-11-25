@@ -109,8 +109,13 @@ pub const MAX_CONFIGURATION: usize = 4096;
 
 /// Schema 5, the core's own entries (karyos#927).
 pub const CORE_SCHEMA_ID: u16 = 5;
-/// The only version of schema 5.
-pub const CORE_VERSION: u16 = 1;
+/// The version of schema 5 this build writes: 2 since karyos#750, the
+/// same bounds under the exact identity's deduplication rules
+/// ([`crate::dedup`]). Version 1 still decodes: its log replays the
+/// earlier contiguous rules.
+pub const CORE_VERSION: u16 = 2;
+/// The version of schema 5 earlier builds wrote.
+pub const CORE_VERSION_1: u16 = 1;
 /// `SessionBounds`, template 1 of schema 5: a 20-byte block.
 pub const SESSION_BOUNDS: Template = Template {
     schema_id: CORE_SCHEMA_ID,
@@ -118,6 +123,11 @@ pub const SESSION_BOUNDS: Template = Template {
     version: CORE_VERSION,
     block_length: 20,
     max_length: ENVELOPE_LENGTH as u32 + 20,
+};
+/// [`SESSION_BOUNDS`] as earlier builds wrote it, version 1.
+const SESSION_BOUNDS_1: Template = Template {
+    version: CORE_VERSION_1,
+    ..SESSION_BOUNDS
 };
 
 const fn template(template_id: u16, block_length: u16, variable: u32) -> Template {
@@ -167,13 +177,19 @@ fn nonzero32(field: &'static str, value: u32) -> Result<u32, CodecError> {
 pub struct SessionBounds {
     /// The bounds the log carries.
     pub config: DedupConfig,
+    /// The exact identity's rules: a version 2 entry, as this build
+    /// writes; `false` for a version 1 entry of an earlier build.
+    pub exact: bool,
 }
 
 impl SessionBounds {
-    /// The entry for `config`.
+    /// The entry for `config`, as this build writes it (version 2).
     #[must_use]
     pub fn new(config: DedupConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            exact: true,
+        }
     }
 
     /// Encodes into `out`; returns the message's length, 32.
@@ -184,7 +200,12 @@ impl SessionBounds {
     /// [`CodecError::ValueOutOfRange`] for a bound of 0.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CodecError> {
         let config = self.config;
-        let mut encoder = Encoder::new(out, &SESSION_BOUNDS)?;
+        let template = if self.exact {
+            &SESSION_BOUNDS
+        } else {
+            &SESSION_BOUNDS_1
+        };
+        let mut encoder = Encoder::new(out, template)?;
         encoder.u32(0, nonzero32("sessions", config.sessions)?)?;
         encoder.u32(4, nonzero32("window", config.window)?)?;
         encoder.u32(8, nonzero32("response_bytes", config.response_bytes)?)?;
@@ -214,7 +235,7 @@ impl SessionBounds {
     pub fn decode(bytes: &[u8]) -> Result<Self, CodecError> {
         let envelope = karyos_codec::Envelope::read(bytes)?;
         if envelope.schema_id != CORE_SCHEMA_ID
-            || envelope.version != CORE_VERSION
+            || !matches!(envelope.version, CORE_VERSION | CORE_VERSION_1)
             || envelope.template_id != SESSION_BOUNDS.template_id
         {
             return Err(CodecError::UnsupportedSchema {
@@ -223,14 +244,20 @@ impl SessionBounds {
                 version: envelope.version,
             });
         }
-        let (block, decoder) = Decoder::new(bytes, &SESSION_BOUNDS)?;
+        let exact = envelope.version == CORE_VERSION;
+        let template = if exact {
+            &SESSION_BOUNDS
+        } else {
+            &SESSION_BOUNDS_1
+        };
+        let (block, decoder) = Decoder::new(bytes, template)?;
         let config = DedupConfig::default()
             .with_sessions(nonzero32("sessions", block.u32(0)?)?)
             .with_window(nonzero32("window", block.u32(4)?)?)
             .with_response_bytes(nonzero32("response_bytes", block.u32(8)?)?)
             .with_ttl(nonzero("ttl", block.u64(12)?)?);
         decoder.finish()?;
-        Ok(Self { config })
+        Ok(Self { config, exact })
     }
 }
 
@@ -1131,6 +1158,11 @@ impl<S: ClusteredService> ServiceContainer<S> {
                 .map_err(ApplyError::BoundsUnheld)?;
             rebuilt.observe(self.sessions.log_time());
             self.sessions = rebuilt;
+        }
+        // The log's first bounds choose the deduplication rules: a log of
+        // an earlier build replays its own (karyos#750).
+        if !self.bounds_logged {
+            self.sessions.set_exact(bounds.exact);
         }
         self.applied = Some(entry.index);
         self.bounds_logged = true;

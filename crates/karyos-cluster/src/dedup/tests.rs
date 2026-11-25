@@ -58,6 +58,7 @@ fn owned(outcome: Outcome<'_>) -> Outcome<'static> {
         Outcome::SessionExpired => Outcome::SessionExpired,
         Outcome::WindowFull => Outcome::WindowFull,
         Outcome::PayloadMismatch => Outcome::PayloadMismatch,
+        Outcome::OutOfOrder { expected } => Outcome::OutOfOrder { expected },
         Outcome::Applied(_) | Outcome::Retained(_) => unreachable!(),
     }
 }
@@ -294,15 +295,19 @@ fn an_unknown_retry_opens_no_epoch_and_a_new_one_is_asked_for() {
     assert_eq!((outcome, runs), (Outcome::Applied(b"a2"), 1));
 }
 
+/// An acknowledgement moves the base at most to the request's own
+/// sequence (the codec refuses more than one past it): a claim to have
+/// seen replies 0..9 on request 1 drops reply 0 and runs 1, once.
 #[test]
 fn an_acknowledgement_past_the_applied_ones_stops_at_them() {
     let mut table = table();
     table.register(7, 1, 0).unwrap();
     run(&mut table, Request::new(7, 1, 0, 0), 1, b"a");
-    // A claim to have seen replies 0..9 drops only the applied ones.
     let (outcome, _) = run(&mut table, Request::new(7, 1, 1, 9), 2, b"b");
     assert_eq!(outcome, Outcome::Applied(b"b"));
     let (outcome, _) = run(&mut table, Request::new(7, 1, 1, 9), 3, b"x");
+    assert_eq!(outcome, Outcome::Retained(b"b"));
+    let (outcome, _) = run(&mut table, Request::new(7, 1, 0, 9), 4, b"x");
     assert_eq!(outcome, Outcome::Duplicate);
 }
 
@@ -596,8 +601,8 @@ fn a_session_outside_the_bounds_is_refused() {
     table.register(7, 1, 0).unwrap();
     run(&mut table, Request::new(7, 1, 0, 0), 1, b"a");
     let bytes = table.encode();
-    // The header is 49 bytes; the session's slot follows.
-    let slot_at = 49;
+    // The header is 50 bytes; the session's slot follows.
+    let slot_at = 50;
     let mut far = bytes.clone();
     far[slot_at..slot_at + 4].copy_from_slice(&9u32.to_le_bytes());
     assert_eq!(
@@ -632,7 +637,7 @@ fn full_window() -> Vec<u8> {
     table.encode()
 }
 
-const FIRST: usize = 49;
+const FIRST: usize = 50;
 /// Each of client 7's entries: kind, length, two bytes, digest (8).
 const SECOND: usize = FIRST + 44 + 3 * 15;
 
@@ -733,12 +738,17 @@ fn a_version_1_section_still_decodes() {
     table.register(7, 1, 0).unwrap();
     run(&mut table, Request::new(7, 1, 0, 0), 1, b"a");
     let v2 = table.encode();
-    // 49-byte header, 44-byte session, then the reply: 1, length, "a",
-    // and its 8-byte digest, which version 1 did not write.
-    assert_eq!(v2.len(), 49 + 44 + 1 + 4 + 1 + 8);
-    let mut v1 = v2[..v2.len() - 8].to_vec();
+    // 50-byte header (version 1's 49 and the rules' flag), 44-byte
+    // session, then the reply: 1, length, "a", and its 8-byte digest;
+    // version 1 wrote neither the flag nor the digest.
+    assert_eq!(v2.len(), 50 + 44 + 1 + 4 + 1 + 8);
+    // The flag follows the last registration, at 45.
+    let mut v1 = v2[..45].to_vec();
+    v1.extend_from_slice(&v2[46..v2.len() - 8]);
     v1[4..8].copy_from_slice(&1u32.to_le_bytes());
     let mut decoded = SessionTable::decode(&v1).unwrap();
+    // A version 1 table is a log of the contiguous rules.
+    assert!(!decoded.exact());
     let mut runs = 0;
     let outcome = decoded.request(
         Request::new(7, 1, 0, 0),
@@ -754,4 +764,69 @@ fn a_version_1_section_still_decodes() {
     hole.truncate(at);
     hole.push(0);
     assert!(SessionTable::decode(&hole).is_err());
+}
+
+/// Codex review of #1270 (P1, #750): an acknowledgement moves the base
+/// across sequences the client never submitted, so a gap wider than the
+/// window does not stall the session; what is below the base never runs.
+#[test]
+fn an_acknowledgement_crosses_a_gap_wider_than_the_window() {
+    let mut table = table();
+    table.register(7, 1, 0).unwrap();
+    run(&mut table, Request::new(7, 1, 0, 0), 1, b"a");
+    // Window 3: sequences 1 to 3 were never submitted.
+    let (outcome, runs) = run(&mut table, Request::new(7, 1, 4, 4), 2, b"e");
+    assert_eq!((outcome, runs), (Outcome::Applied(b"e"), 1));
+    for sequence in 1..4 {
+        let (outcome, runs) = run(&mut table, Request::new(7, 1, sequence, 4), 3, b"x");
+        assert_eq!((outcome, runs), (Outcome::Duplicate, 0), "{sequence}");
+    }
+    let (outcome, runs) = run(&mut table, Request::new(7, 1, 4, 4), 4, b"x");
+    assert_eq!((outcome, runs), (Outcome::Retained(b"e"), 0));
+}
+
+/// Codex review of #1270 (P1, #750): a table under the rules of a log
+/// written by an earlier build applies them as it did: a sequence past
+/// the next is refused and runs nothing, and the rules travel in the
+/// sessions section.
+#[test]
+fn a_table_of_the_earlier_rules_replays_them() {
+    let mut table = table();
+    table.set_exact(false);
+    table.register(7, 1, 0).unwrap();
+    run(&mut table, Request::new(7, 1, 0, 0), 1, b"a");
+    let (outcome, runs) = run(&mut table, Request::new(7, 1, 2, 0), 2, b"c");
+    assert_eq!((outcome, runs), (Outcome::OutOfOrder { expected: 1 }, 0));
+    // No digest is checked under those rules.
+    let mut runs = 0;
+    let outcome = table.request(
+        Request::new(7, 1, 0, 0),
+        b"other",
+        3,
+        command(&mut runs, b"z"),
+    );
+    assert_eq!((outcome, runs), (Outcome::Retained(b"a"), 0));
+    let decoded = SessionTable::decode(&table.encode()).unwrap();
+    assert!(!decoded.exact());
+    assert!(
+        SessionTable::decode(&self::table().encode())
+            .unwrap()
+            .exact()
+    );
+}
+
+/// Codex review of #1270 (P2, #746): a section is decoded within a byte
+/// budget, refused before anything is allocated when its bounds pass it.
+#[test]
+fn a_section_past_the_budget_is_refused_before_allocating() {
+    let bytes = worked().encode();
+    let asked = small().reserved_bytes().unwrap();
+    assert!(SessionTable::decode_within(&bytes, asked).is_ok());
+    assert_eq!(
+        SessionTable::decode_within(&bytes, asked - 1),
+        Err(DecodeError::Config(ConfigError::OverBudget {
+            asked,
+            budget: asked - 1
+        }))
+    );
 }

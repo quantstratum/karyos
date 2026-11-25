@@ -1268,3 +1268,64 @@ fn test_container_a_restarted_replica_answers_a_retry_alike() {
     assert_eq!(answer(&mut restarted), expected);
     assert!(expected.starts_with("Retained"), "{expected}");
 }
+
+/// Codex review of #1270 (P1, #750): a log written by an earlier build,
+/// whose session bounds are a version 1 entry, replays its contiguous
+/// rules: a request past the next sequence is refused and the service is
+/// not called. This build's version 2 bounds apply the exact identity.
+#[test]
+fn test_container_a_version_1_bounds_log_replays_the_earlier_rules() {
+    for (exact, expect_run) in [(false, false), (true, true)] {
+        let mut container = container();
+        let bounds = SessionBounds {
+            config: container.sessions().config(),
+            exact,
+        };
+        let payload = bounds.to_vec().unwrap();
+        assert_eq!(SessionBounds::decode(&payload).unwrap().exact, exact);
+        container
+            .apply(&Entry {
+                index: 1,
+                term: 1,
+                event_time: 0,
+                payload,
+            })
+            .unwrap();
+        assert_eq!(container.sessions().exact(), exact);
+        container
+            .apply(&entry(2, 0, Envelope::Register { client: 7 }))
+            .unwrap();
+        let first = append(1);
+        container
+            .apply(&entry(
+                3,
+                1,
+                Envelope::Request {
+                    request: Request::new(7, 2, 0, 0),
+                    command: &first,
+                },
+            ))
+            .unwrap();
+        let skipping = append(3);
+        let Applied::Answered { outcome, .. } = container
+            .apply(&entry(
+                4,
+                2,
+                Envelope::Request {
+                    request: Request::new(7, 2, 2, 0),
+                    command: &skipping,
+                },
+            ))
+            .unwrap()
+        else {
+            panic!("not answered");
+        };
+        if expect_run {
+            assert!(matches!(outcome, Outcome::Applied(_)), "{outcome:?}");
+            assert_eq!(container.service().values, [1, 3]);
+        } else {
+            assert_eq!(outcome, Outcome::OutOfOrder { expected: 1 });
+            assert_eq!(container.service().values, [1]);
+        }
+    }
+}
