@@ -27,6 +27,7 @@ use karyos_trace::clocks::ClockKey;
 use karyos_trace::journal::ObserverId;
 
 pub mod journal;
+pub mod utc;
 
 /// The most reads one run takes: 16 MiB of reads, a few minutes at the
 /// default interval.
@@ -52,6 +53,12 @@ Usage: karyos-tools calibrate phc [--device /dev/ptp0] [--reads 4096]
            [--max-bound-ns 10000]
        karyos-tools calibrate compose <record> <record> [<record>...]
        karyos-tools calibrate append --journal <dir> [<word>...]
+       karyos-tools calibrate utc [--tracking <file>] [--window-ms 10000] ...
+       karyos-tools calibrate realtime [--reads 4096] [--domain 4] ...
+
+`utc` turns `chronyc -c tracking` into a UTC reference record for
+CLOCK_REALTIME, and `realtime` fits CLOCK_MONOTONIC_RAW to CLOCK_REALTIME
+(see `calibrate utc --help`).
 
 `phc --reverse` reads the PHC, the raw clock and the PHC again, so the
 record converts PHC times into the raw clock (the receiving host of a link).
@@ -246,6 +253,8 @@ pub fn run(
         }
         Some("link") => return run_link(args, out, err),
         Some("compose") => return run_compose(args, out, err),
+        Some("utc") => return utc::run_utc(args, &mut std::io::stdin().lock(), out, err),
+        Some("realtime") => return utc::run_realtime(args, out, err),
         None | Some("-h" | "--help") => {
             let _ = out.write_all(HELP.as_bytes());
             return 0;
@@ -253,7 +262,7 @@ pub fn run(
         Some(other) => {
             let _ = writeln!(
                 err,
-                "karyos-tools calibrate: unknown clock {other} (only phc)"
+                "karyos-tools calibrate: unknown subcommand {other} (phc, link, compose, append, utc or realtime)"
             );
             return EXIT_ERROR;
         }
