@@ -1272,3 +1272,6 @@ fn a_deferred_unfollow_never_undoes_a_later_follow() {
 
 /// The H8 invariants of the authenticated class (karyos#648).
 mod invariants;
+
+/// H8 unit-level invariants raised to end-to-end proofs (karyos#648).
+mod invariants_e2e;

@@ -9712,3 +9712,6 @@ fn a_held_fence_submits_no_setup_under_an_admitting_key_view() {
     assert!(after.setup_blocked + after.fenced > 0, "{after:?}");
     assert_eq!(rig.agents.receiver.role.posted_challenges().len(), 0);
 }
+
+/// H8 unit-level invariants raised to two-agent proofs (karyos#648).
+mod invariants_e2e;
